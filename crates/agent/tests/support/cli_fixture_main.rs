@@ -1,43 +1,103 @@
 //! Test executable providing a local model transport to the real CLI/owner/worker chain.
 //! No fixture definition enters the compiled model catalog or saved model selection.
+//! The first argument picks the process: `--cli` runs the product CLI, a product process mode
+//! runs as the product starts it, and anything else is a libtest probe of a target without tests.
 #[path = "mod.rs"]
 mod support;
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
+use support::fixture_cli::CLI_MODE;
 use tickloop_agent::{
     agent_access::*,
+    hosted::controller::HOST_MODE,
     model::{ModelConfig, model_client},
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use uuid::Uuid;
 
 const TRANSPORT_FILE: &str = "TICKLOOP_TRANSPORT_FIXTURE";
+const TRANSPORT_FIXTURE_FLAG: &str = "--transport-fixture";
+const DAEMON_MODE: &str = "--agent-owner";
+const WORKER_MODE: &str = "--agent-worker";
+const TICK_LAUNCH_MODE: &str = "--tick-launch";
 
 #[derive(Deserialize)]
 struct Bootstrap {
     epoch: Uuid,
     launch: LaunchSpec,
     control: tickloop_agent::hosted::worker_control::WorkerControlGrant,
+    limits: tickloop_agent::protocol::AccessLimits,
 }
 
 fn main() {
-    let mut arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let result = match arguments.first().and_then(|argument| argument.to_str()) {
+        Some(CLI_MODE) => run_cli(arguments[1..].to_vec()),
+        Some(TICK_LAUNCH_MODE) => run_tick_launch(&arguments),
+        Some(WORKER_MODE) if std::env::var_os(TRANSPORT_FILE).is_some() => {
+            runtime().block_on(worker(&arguments))
+        }
+        Some(DAEMON_MODE | WORKER_MODE | HOST_MODE) => run_product_process(&arguments),
+        _ if arguments == tickloop_agent::hosted::popup::ATTACH_ARGUMENTS => {
+            run_product_process(&arguments)
+        }
+        // No arguments, `--list`, `--exact`, `--nocapture`, a filter or `--help`.
+        _ => return,
+    };
+    if let Err(error) = result {
+        eprintln!("Error: {}", tickloop_agent::terminal::safe_text(&error));
+        std::process::exit(1);
+    }
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+fn run_product_process(arguments: &[OsString]) -> Result<(), String> {
+    runtime()
+        .block_on(tickloop_agent::agent_daemon::run_internal(arguments))
+        .expect("run_internal serves every product process mode")
+}
+
+fn run_cli(mut arguments: Vec<OsString>) -> Result<(), String> {
     if let Some(index) = arguments
         .iter()
-        .position(|arg| arg == "--transport-fixture")
+        .position(|argument| argument == TRANSPORT_FIXTURE_FLAG)
     {
         let path = arguments.remove(index + 1);
         arguments.remove(index);
-        // This standalone test process sets its transport before starting Tokio threads.
-        unsafe {
-            std::env::set_var(TRANSPORT_FILE, &path);
-        }
+        use_transport_fixture(&path);
     }
-    if !arguments.first().is_some_and(|arg| {
-        arg == "--agent-owner" || arg == "--agent-worker" || arg == "--tick-host"
-    }) && let Some(path) = std::env::var_os(TRANSPORT_FILE)
-        && let Ok(bytes) = std::fs::read(path)
+    runtime().block_on(async {
+        match tickloop_agent::agent_daemon::run_internal(&arguments).await {
+            Some(result) => result,
+            None => {
+                tickloop_agent::terminal::run_with_arguments(
+                    arguments
+                        .into_iter()
+                        .map(|argument| argument.into_string().unwrap()),
+                )
+                .await
+            }
+        }
+    })
+}
+
+/// Points this CLI, and through its environment the daemon and workers it starts, at the
+/// fixture transport in `path`.
+fn use_transport_fixture(path: &OsString) {
+    // This standalone test process sets its transport before starting Tokio threads.
+    unsafe {
+        std::env::set_var(TRANSPORT_FILE, path);
+        std::env::set_var("DEEPSEEK_API_KEY", "fixture-compiled-selection-key");
+    }
+    if let Ok(bytes) = std::fs::read(path)
         && let Ok(transport) = serde_json::from_slice::<ModelConfig>(&bytes)
         && let Some(model) = tickloop_agent::model::cards::ModelCatalog::defaults()
             .get(&transport.provider_id, &transport.model_id)
@@ -57,70 +117,34 @@ fn main() {
             serde_json::json!({"provider":model.provider_id,"model":model.model_id});
         std::fs::write(path, serde_json::to_vec(&state).unwrap()).unwrap();
     }
-    if std::env::var_os(TRANSPORT_FILE).is_some() {
-        unsafe {
-            std::env::set_var("DEEPSEEK_API_KEY", "fixture-compiled-selection-key");
-        }
-    }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    if arguments.first().is_some_and(|arg| arg == "--tick-launch") {
-        // A test launcher for hosted Ticks: the same launch contract `tick run` uses.
-        let command = arguments
-            .iter()
-            .skip_while(|arg| *arg != "--")
-            .skip(1)
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        let status = runtime.block_on(async {
-            let context = tick_connect::launch::LaunchContext::from_environment()?
-                .ok_or("no Tick launch context")?;
-            let host = context
-                .verify_foreground()
-                .await
-                .map_err(|error| error.to_string())?;
-            tick_connect::launch::run(host, command, std::env::current_dir().unwrap())
-                .await
-                .map_err(|error| error.to_string())
-        });
-        match status {
-            Ok(status) if status.success() => std::process::exit(0),
-            Ok(_) => std::process::exit(1),
-            Err(error) => {
-                eprintln!("fixture launcher: {error}");
-                std::process::exit(2);
-            }
-        }
-    }
-    let result = runtime.block_on(async {
-        if arguments.is_empty()
-            || arguments
-                .iter()
-                .all(|argument| argument.to_string_lossy().starts_with("--test-threads="))
-        {
-            return Ok(());
-        }
-        if arguments.first().is_some_and(|arg| arg == "--agent-worker")
-            && std::env::var_os(TRANSPORT_FILE).is_some()
-        {
-            return worker(&arguments).await;
-        }
-        match tickloop_agent::agent_daemon::run_internal(&arguments).await {
-            Some(result) => result,
-            None => {
-                tickloop_agent::terminal::run_with_arguments(
-                    arguments.into_iter().map(|arg| arg.into_string().unwrap()),
-                )
-                .await
-            }
-        }
+}
+
+/// A test launcher for hosted Ticks: the same launch contract `tick run` uses.
+fn run_tick_launch(arguments: &[OsString]) -> ! {
+    let command = arguments
+        .iter()
+        .skip_while(|argument| *argument != "--")
+        .skip(1)
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let status = runtime().block_on(async {
+        let context = tick_connect::launch::LaunchContext::from_environment()?
+            .ok_or("no Tick launch context")?;
+        let host = context
+            .verify_foreground()
+            .await
+            .map_err(|error| error.to_string())?;
+        tick_connect::launch::run(host, command, std::env::current_dir().unwrap())
+            .await
+            .map_err(|error| error.to_string())
     });
-    if let Err(error) = result {
-        eprintln!("Error: {}", tickloop_agent::terminal::safe_text(&error));
-        std::process::exit(1);
+    match status {
+        Ok(status) if status.success() => std::process::exit(0),
+        Ok(_) => std::process::exit(1),
+        Err(error) => {
+            eprintln!("fixture launcher: {error}");
+            std::process::exit(2);
+        }
     }
 }
 
@@ -129,7 +153,7 @@ async fn worker(arguments: &[OsString]) -> Result<(), String> {
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut bytes = Vec::new();
     (&mut stdin)
-        .take(tickloop_agent::agent_access::MAX_FRAME_BYTES as u64 + 1)
+        .take(tickloop_agent::agent_daemon::WORKER_BOOTSTRAP_MAX_BYTES as u64 + 1)
         .read_until(b'\n', &mut bytes)
         .await
         .map_err(|error| error.to_string())?;
@@ -158,7 +182,7 @@ async fn worker(arguments: &[OsString]) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let mut probe = [0u8; 1];
     let result = tokio::select! {
-        result = serve_worker_listener(listener, access, bootstrap.epoch) => result.map_err(|error| error.to_string()),
+        result = serve_worker_listener(listener, access, bootstrap.epoch, bootstrap.limits) => result.map_err(|error| error.to_string()),
         result = stdin.read(&mut probe) => result.map(|_| ()).map_err(|error| error.to_string()),
     };
     agent.shutdown().await;

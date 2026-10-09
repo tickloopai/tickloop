@@ -14,6 +14,7 @@ use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
 use super::{AgentAccess, LocalAgentClient, Observation, protocol::*};
+use crate::protocol::FEED_CAPACITY;
 
 pub type ReconnectFactory = Arc<
     dyn Fn() -> Pin<Box<dyn Future<Output = Result<LocalAgentClient, AccessError>> + Send>>

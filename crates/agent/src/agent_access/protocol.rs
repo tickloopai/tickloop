@@ -6,6 +6,7 @@ use uuid::Uuid;
 use crate::{
     model::{ModelConfig, ReasoningEffort, cards::ProviderPatch},
     permissions::{ExecutionMode, PermissionPolicy, PermissionRule, PermissionScope},
+    protocol::{AccessLimits, FEED_CAPACITY, FEED_CHANGE_BYTES, FEED_MAX_BYTES},
     runtime::{
         self, AgentHostOptions, ApprovalHistoryView, ChatSnapshot, CodeRewind,
         DirectedSummaryDraft, DirectedSummaryRequest, Event, InputContext, ModelChange,
@@ -25,11 +26,7 @@ use crate::{
 pub const PROTOCOL_MAJOR: u16 = 10;
 pub const PROTOCOL_MINOR: u16 = 0;
 
-pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
-pub const RESPONSE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-pub const FEED_CAPACITY: usize = 128;
 pub const REPLAY_CAPACITY: usize = 4096;
-pub const FEED_MAX_BYTES: usize = 1024 * 1024;
 pub const RECEIPT_CAPACITY: usize = 4096;
 pub const RECEIPT_RETENTION_SECONDS: u64 = 600;
 pub const VIEW_LEASE_SECONDS: u64 = 45;
@@ -1100,28 +1097,25 @@ pub struct ProtocolLimits {
     pub receipt_items: usize,
     pub receipt_seconds: u64,
     pub view_lease_seconds: u64,
-    #[serde(default)]
     pub page_items: usize,
-    #[serde(default)]
     pub default_page_items: usize,
-    #[serde(default)]
     pub chunk_bytes: usize,
 }
 
-impl ProtocolLimits {
-    pub(crate) fn current() -> Self {
+impl From<AccessLimits> for ProtocolLimits {
+    fn from(transport: AccessLimits) -> Self {
         Self {
-            frame_bytes: MAX_FRAME_BYTES,
+            frame_bytes: transport.frame_bytes(),
             source_items: REPLAY_CAPACITY,
             feed_items: FEED_CAPACITY,
             feed_bytes: FEED_MAX_BYTES,
-            change_bytes: FEED_MAX_BYTES / FEED_CAPACITY,
+            change_bytes: FEED_CHANGE_BYTES,
             receipt_items: RECEIPT_CAPACITY,
             receipt_seconds: RECEIPT_RETENTION_SECONDS,
             view_lease_seconds: VIEW_LEASE_SECONDS,
             page_items: MAX_PAGE_LIMIT,
             default_page_items: DEFAULT_PAGE_LIMIT,
-            chunk_bytes: RESPONSE_CHUNK_BYTES,
+            chunk_bytes: transport.chunk_bytes(),
         }
     }
 }
@@ -1136,8 +1130,7 @@ pub struct ServerHello {
     pub session_id: Uuid,
     #[serde(default)]
     pub capabilities: Vec<AccessCapability>,
-    #[serde(default)]
-    pub limits: Option<ProtocolLimits>,
+    pub limits: ProtocolLimits,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

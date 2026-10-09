@@ -6,6 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use serde::Deserialize;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{
@@ -23,6 +24,7 @@ use super::{
     chunked::{EncodedResponse, IncomingTransfer, response_kind},
     protocol::*,
 };
+use crate::protocol::{AccessLimits, FEED_CAPACITY, HANDSHAKE_FRAME_BYTES};
 
 const OBSERVATION_CANCELLED_BEFORE_OPENING: &str = "observation cancelled before opening";
 
@@ -34,6 +36,7 @@ pub struct LocalAgentClient {
 struct ClientInner {
     writer: Arc<Mutex<OwnedWriteHalf>>,
     hello: ServerHello,
+    limits: AccessLimits,
     pending: Mutex<HashMap<Uuid, oneshot::Sender<Result<Reply, AccessError>>>>,
     subscriptions: Mutex<HashMap<Uuid, Subscription>>,
     cancel: CancellationToken,
@@ -42,6 +45,7 @@ struct ClientInner {
 struct PendingObservationCancel {
     writer: Weak<Mutex<OwnedWriteHalf>>,
     connection: CancellationToken,
+    limits: AccessLimits,
     request_id: Uuid,
     written: Option<oneshot::Receiver<()>>,
 }
@@ -49,13 +53,14 @@ struct PendingObservationCancel {
 async fn write_observation_cancel(
     writer: Arc<Mutex<OwnedWriteHalf>>,
     connection: CancellationToken,
+    limits: AccessLimits,
     observation_id: Uuid,
 ) {
     let result = tokio::select! {
         biased;
         () = connection.cancelled() => return,
         result = async {
-            write_frame(&mut *writer.lock().await, &ClientMessage::CancelObservation { observation_id }).await
+            write_frame(&mut *writer.lock().await, &ClientMessage::CancelObservation { observation_id }, limits.frame_bytes()).await
         } => result,
     };
     if result.is_err() {
@@ -73,6 +78,7 @@ impl Drop for PendingObservationCancel {
         };
         let writer = self.writer.clone();
         let connection = self.connection.clone();
+        let limits = self.limits;
         let observation_id = self.request_id;
         runtime.spawn(async move {
             tokio::select! {
@@ -83,7 +89,7 @@ impl Drop for PendingObservationCancel {
             let Some(writer) = writer.upgrade() else {
                 return;
             };
-            write_observation_cancel(writer, connection, observation_id).await;
+            write_observation_cancel(writer, connection, limits, observation_id).await;
         });
     }
 }
@@ -161,42 +167,12 @@ impl LocalAgentClient {
             .await
             .map_err(|error| AccessError::unavailable(error.to_string()))?;
         verify_peer(&stream)?;
-        write_frame(
-            &mut stream,
-            &ClientMessage::Hello {
-                major: PROTOCOL_MAJOR,
-                minor: PROTOCOL_MINOR,
-            },
-        )
-        .await?;
-        let hello = match read_frame::<_, ServerMessage>(&mut stream).await? {
-            Some(ServerMessage::Hello(hello)) if hello.major == PROTOCOL_MAJOR => hello,
-            Some(ServerMessage::Hello(hello)) => {
-                return Err(AccessError::new(
-                    AccessErrorCode::VersionMismatch,
-                    format!(
-                        "AgentAccess peer protocol {}.{} is incompatible with client {}.{}; use the same Tick Loop version",
-                        hello.major, hello.minor, PROTOCOL_MAJOR, PROTOCOL_MINOR,
-                    ),
-                ));
-            }
-            Some(ServerMessage::Error { error, .. }) => return Err(error),
-            None => {
-                return Err(AccessError::unavailable(
-                    "owner disconnected during protocol negotiation",
-                ));
-            }
-            _ => {
-                return Err(AccessError::new(
-                    AccessErrorCode::VersionMismatch,
-                    "owner did not complete protocol negotiation",
-                ));
-            }
-        };
+        let (hello, limits) = negotiate(&mut stream).await?;
         let (reader, writer) = stream.into_split();
         let inner = Arc::new(ClientInner {
             writer: Arc::new(Mutex::new(writer)),
             hello,
+            limits,
             pending: Mutex::new(HashMap::new()),
             subscriptions: Mutex::new(HashMap::new()),
             cancel: CancellationToken::new(),
@@ -205,6 +181,7 @@ impl LocalAgentClient {
             reader,
             Arc::downgrade(&inner),
             inner.cancel.clone(),
+            limits,
         ));
         Ok(Self { inner })
     }
@@ -271,11 +248,12 @@ impl LocalAgentClient {
         let inner = Arc::downgrade(&self.inner);
         let writer = self.inner.writer.clone();
         let connection = self.inner.cancel.clone();
+        let frame_bytes = self.inner.limits.frame_bytes();
         let send = async move {
             let result = tokio::select! {
                 biased;
                 () = connection.cancelled() => Err(AccessError::unavailable("owner connection is closed")),
-                result = async { write_frame(&mut *writer.lock().await, &message).await } => result,
+                result = async { write_frame(&mut *writer.lock().await, &message, frame_bytes).await } => result,
             };
             if let Err(error) = result {
                 if let Some(inner) = inner.upgrade() {
@@ -313,6 +291,7 @@ impl AgentAccess for LocalAgentClient {
         let mut cancel = PendingObservationCancel {
             writer: Arc::downgrade(&self.inner.writer),
             connection: self.inner.cancel.clone(),
+            limits: self.inner.limits,
             request_id,
             written: Some(waiting),
         };
@@ -390,14 +369,74 @@ impl AgentAccess for LocalAgentClient {
     }
 }
 
+/// The version every AgentAccess major's Hello leads with. It is read before the rest of the
+/// Hello, so a peer whose Hello has another shape is still reported as an incompatible version.
+#[derive(Deserialize)]
+struct PeerVersion {
+    major: u16,
+    minor: u16,
+}
+
+async fn negotiate(stream: &mut UnixStream) -> Result<(ServerHello, AccessLimits), AccessError> {
+    write_frame(
+        stream,
+        &ClientMessage::Hello {
+            major: PROTOCOL_MAJOR,
+            minor: PROTOCOL_MINOR,
+        },
+        HANDSHAKE_FRAME_BYTES,
+    )
+    .await?;
+    let reply = read_frame::<_, serde_json::Value>(stream, HANDSHAKE_FRAME_BYTES)
+        .await?
+        .ok_or_else(|| {
+            AccessError::unavailable("owner disconnected during protocol negotiation")
+        })?;
+    if let Some(Ok(peer)) = reply.get("Hello").map(PeerVersion::deserialize)
+        && peer.major != PROTOCOL_MAJOR
+    {
+        return Err(AccessError::new(
+            AccessErrorCode::VersionMismatch,
+            format!(
+                "AgentAccess peer protocol {}.{} is incompatible with client {}.{}; use the same Tick Loop version",
+                peer.major, peer.minor, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+            ),
+        ));
+    }
+    let hello = match serde_json::from_value::<ServerMessage>(reply)
+        .map_err(|error| AccessError::invalid(error.to_string()))?
+    {
+        ServerMessage::Hello(hello) => hello,
+        ServerMessage::Error { error, .. } => return Err(error),
+        _ => {
+            return Err(AccessError::new(
+                AccessErrorCode::VersionMismatch,
+                "owner did not complete protocol negotiation",
+            ));
+        }
+    };
+    let limits = AccessLimits::new(hello.limits.frame_bytes, hello.limits.chunk_bytes).map_err(
+        |error| {
+            AccessError::new(
+                AccessErrorCode::VersionMismatch,
+                format!(
+                    "AgentAccess peer announced unusable transport limits ({error}); use the same Tick Loop version"
+                ),
+            )
+        },
+    )?;
+    Ok((hello, limits))
+}
+
 async fn read_responses(
     mut reader: OwnedReadHalf,
     inner: Weak<ClientInner>,
     cancel: CancellationToken,
+    limits: AccessLimits,
 ) {
     let mut transfer: Option<IncomingTransfer> = None;
     loop {
-        let response = tokio::select! { _ = cancel.cancelled() => break, response = read_frame::<_, ServerMessage>(&mut reader) => response };
+        let response = tokio::select! { _ = cancel.cancelled() => break, response = read_frame::<_, ServerMessage>(&mut reader, limits.frame_bytes()) => response };
         let Ok(Some(response)) = response else {
             break;
         };
@@ -421,8 +460,14 @@ async fn read_responses(
                 {
                     break;
                 }
-                match IncomingTransfer::new(transfer_id, request_id, kind, total_bytes, chunk_bytes)
-                {
+                match IncomingTransfer::new(
+                    transfer_id,
+                    request_id,
+                    kind,
+                    total_bytes,
+                    chunk_bytes,
+                    limits,
+                ) {
                     Ok(started) => transfer = Some(started),
                     Err(_) => break,
                 }
@@ -495,7 +540,7 @@ async fn read_responses(
                         if let Some(client) = client.upgrade() {
                             client.subscriptions.lock().await.remove(&observation_id);
                         }
-                        write_observation_cancel(writer, connection, observation_id).await;
+                        write_observation_cancel(writer, connection, limits, observation_id).await;
                     });
                     Some(receiver)
                 } else {
@@ -542,6 +587,7 @@ async fn read_responses(
                     tokio::spawn(write_observation_cancel(
                         inner.writer.clone(),
                         cancel.clone(),
+                        limits,
                         observation_id,
                     ));
                 }
@@ -579,6 +625,7 @@ pub async fn serve_listener(
     listener: UnixListener,
     access: Arc<dyn AgentAccess>,
     epoch: Uuid,
+    limits: AccessLimits,
 ) -> Result<(), AccessError> {
     loop {
         let (stream, _) = listener
@@ -587,7 +634,7 @@ pub async fn serve_listener(
             .map_err(|error| AccessError::unavailable(error.to_string()))?;
         let access = access.clone();
         tokio::spawn(async move {
-            let _ = serve_connection(stream, access, epoch).await;
+            let _ = serve_connection(stream, access, epoch, limits).await;
         });
     }
 }
@@ -596,6 +643,7 @@ pub async fn serve_owner_listener(
     listener: UnixListener,
     access: Arc<dyn AgentAccess>,
     epoch: Uuid,
+    limits: AccessLimits,
 ) -> Result<(), AccessError> {
     let shutdown = CancellationToken::new();
     loop {
@@ -608,6 +656,7 @@ pub async fn serve_owner_listener(
                 stream,
                 access,
                 epoch,
+                limits,
                 false,
                 Some(shutdown),
                 #[cfg(test)]
@@ -622,6 +671,7 @@ pub async fn serve_worker_listener(
     listener: UnixListener,
     access: Arc<dyn AgentAccess>,
     epoch: Uuid,
+    limits: AccessLimits,
 ) -> Result<(), AccessError> {
     loop {
         let (stream, _) = listener
@@ -634,6 +684,7 @@ pub async fn serve_worker_listener(
                 stream,
                 access,
                 epoch,
+                limits,
                 true,
                 None,
                 #[cfg(test)]
@@ -648,11 +699,13 @@ pub async fn serve_connection(
     stream: UnixStream,
     access: Arc<dyn AgentAccess>,
     epoch: Uuid,
+    limits: AccessLimits,
 ) -> Result<(), AccessError> {
     serve_connection_mode(
         stream,
         access,
         epoch,
+        limits,
         false,
         None,
         #[cfg(test)]
@@ -665,6 +718,7 @@ async fn serve_connection_mode(
     mut stream: UnixStream,
     access: Arc<dyn AgentAccess>,
     epoch: Uuid,
+    limits: AccessLimits,
     forwarded_sessions: bool,
     owner_shutdown: Option<CancellationToken>,
     #[cfg(test)] observation_hooks: Option<Arc<ObservationTestHooks>>,
@@ -704,6 +758,7 @@ async fn serve_connection_mode(
                         ),
                     ),
                 },
+                HANDSHAKE_FRAME_BYTES,
             )
             .await?;
             return Ok(());
@@ -718,6 +773,7 @@ async fn serve_connection_mode(
                         "AgentAccess connection must begin with protocol negotiation",
                     ),
                 },
+                HANDSHAKE_FRAME_BYTES,
             )
             .await?;
             return Ok(());
@@ -746,7 +802,6 @@ async fn serve_connection_mode(
         AccessCapability::TrustWorkingDirectory,
         AccessCapability::ChunkedResponses,
     ];
-    let limits = ProtocolLimits::current();
     write_frame(
         &mut stream,
         &ServerMessage::Hello(ServerHello {
@@ -756,10 +811,12 @@ async fn serve_connection_mode(
             process_id: std::process::id(),
             session_id,
             capabilities,
-            limits: Some(limits),
+            limits: limits.into(),
         }),
+        HANDSHAKE_FRAME_BYTES,
     )
     .await?;
+    let frame_bytes = limits.frame_bytes();
     let (mut reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
     let observations: Arc<Mutex<HashMap<Uuid, FeedTask>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -776,7 +833,7 @@ async fn serve_connection_mode(
         session_id,
     };
     let result = loop {
-        let incoming = tokio::select! { _ = cancel.cancelled() => break Ok(()), incoming = read_frame::<_, ClientMessage>(&mut reader) => incoming };
+        let incoming = tokio::select! { _ = cancel.cancelled() => break Ok(()), incoming = read_frame::<_, ClientMessage>(&mut reader, frame_bytes) => incoming };
         let message = match incoming {
             Ok(Some(message)) => message,
             Ok(None) => break Ok(()),
@@ -797,12 +854,14 @@ async fn serve_connection_mode(
                             "owner shutdown belongs to another epoch",
                         ),
                     },
+                    frame_bytes,
                 )
                 .await?;
             } else if let Some(shutdown) = &owner_shutdown {
                 write_frame(
                     &mut *writer.lock().await,
                     &ServerMessage::OwnerStopped { request_id },
+                    frame_bytes,
                 )
                 .await?;
                 shutdown.cancel();
@@ -817,6 +876,7 @@ async fn serve_connection_mode(
                             "this endpoint does not expose owner administration",
                         ),
                     },
+                    frame_bytes,
                 )
                 .await?;
             }
@@ -933,6 +993,7 @@ async fn serve_connection_mode(
                                                     observation_id,
                                                     error,
                                                 },
+                                                frame_bytes,
                                             )
                                             .await
                                             .is_err()
@@ -947,6 +1008,7 @@ async fn serve_connection_mode(
                                                 observation_id,
                                                 update: super::bounded_update(update),
                                             },
+                                            frame_bytes,
                                         )
                                         .await
                                         .is_err()
@@ -975,6 +1037,7 @@ async fn serve_connection_mode(
                                 request_id,
                                 false,
                                 &cancel,
+                                limits,
                             )
                             .await
                             {
@@ -1068,6 +1131,7 @@ async fn serve_connection_mode(
                 request_id,
                 command_response,
                 &cancel,
+                limits,
             )
             .await;
         });
@@ -1088,6 +1152,7 @@ async fn write_response<W: AsyncWrite + Unpin>(
     request_id: Uuid,
     command_response: bool,
     cancel: &CancellationToken,
+    limits: AccessLimits,
 ) -> bool {
     let kind = response_kind(&response);
     let mut encoding_failed = false;
@@ -1098,11 +1163,11 @@ async fn write_response<W: AsyncWrite + Unpin>(
                 .await;
         encoding_failed = !matches!(&encoded, Ok(Ok(_)));
         match encoded {
-            Ok(Ok(encoded)) if encoded.total_bytes <= MAX_FRAME_BYTES as u64 => {
+            Ok(Ok(encoded)) if encoded.total_bytes <= limits.frame_bytes() as u64 => {
                 write_encoded_frame(writer, encoded).await
             }
             Ok(Ok(encoded)) => {
-                write_chunked_response(writer, encoded, request_id, kind, cancel).await
+                write_chunked_response(writer, encoded, request_id, kind, cancel, limits).await
             }
             Ok(Err(error)) => Err(error),
             Err(error) => Err(AccessError::invalid(format!(
@@ -1110,7 +1175,7 @@ async fn write_response<W: AsyncWrite + Unpin>(
             ))),
         }
     } else {
-        write_frame(writer, &response).await
+        write_frame(writer, &response, limits.frame_bytes()).await
     };
     match result {
         Ok(()) => true,
@@ -1139,6 +1204,7 @@ async fn write_response<W: AsyncWrite + Unpin>(
                         message,
                     ),
                 },
+                limits.frame_bytes(),
             )
             .await
             .is_err()
@@ -1178,10 +1244,13 @@ async fn write_chunked_response<W: AsyncWrite + Unpin>(
     request_id: Uuid,
     kind: ChunkedResponseKind,
     cancel: &CancellationToken,
+    limits: AccessLimits,
 ) -> Result<(), AccessError> {
     let transfer_id = Uuid::new_v4();
     let total_bytes = encoded.total_bytes;
     let sha256 = encoded.sha256;
+    let frame_bytes = limits.frame_bytes();
+    let chunk_bytes = limits.chunk_bytes();
     let mut file = tokio::fs::File::from_std(encoded.file);
     let transfer = async {
         write_frame(
@@ -1191,14 +1260,15 @@ async fn write_chunked_response<W: AsyncWrite + Unpin>(
                 transfer_id,
                 kind,
                 total_bytes,
-                chunk_bytes: RESPONSE_CHUNK_BYTES,
+                chunk_bytes,
             },
+            frame_bytes,
         )
         .await?;
         let mut offset = 0;
-        let mut bytes = vec![0; RESPONSE_CHUNK_BYTES];
+        let mut bytes = vec![0; chunk_bytes];
         while offset < total_bytes {
-            let length = (total_bytes - offset).min(RESPONSE_CHUNK_BYTES as u64) as usize;
+            let length = (total_bytes - offset).min(chunk_bytes as u64) as usize;
             file.read_exact(&mut bytes[..length])
                 .await
                 .map_err(|error| AccessError::unavailable(error.to_string()))?;
@@ -1209,6 +1279,7 @@ async fn write_chunked_response<W: AsyncWrite + Unpin>(
                     offset,
                     base64: BASE64.encode(&bytes[..length]),
                 },
+                frame_bytes,
             )
             .await?;
             offset += length as u64;
@@ -1220,19 +1291,21 @@ async fn write_chunked_response<W: AsyncWrite + Unpin>(
                 total_bytes,
                 sha256,
             },
+            frame_bytes,
         )
         .await
     };
     tokio::select! { _ = cancel.cancelled() => Err(AccessError::unavailable("response transfer canceled")), result = transfer => result }
 }
 
-pub(crate) async fn write_frame<W: AsyncWrite + Unpin, T: serde::Serialize>(
+async fn write_frame<W: AsyncWrite + Unpin, T: serde::Serialize>(
     writer: &mut W,
     value: &T,
+    frame_bytes: usize,
 ) -> Result<(), AccessError> {
     let bytes =
         serde_json::to_vec(value).map_err(|error| AccessError::invalid(error.to_string()))?;
-    if bytes.len() > MAX_FRAME_BYTES {
+    if bytes.len() > frame_bytes {
         return Err(AccessError::new(
             AccessErrorCode::PayloadTooLarge,
             "AgentAccess frame exceeds the transport limit",
@@ -1252,15 +1325,16 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin, T: serde::Serialize>(
         .map_err(|error| AccessError::unavailable(error.to_string()))
 }
 
-pub(crate) async fn read_frame<R: AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
+async fn read_frame<R: AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
     reader: &mut R,
+    frame_bytes: usize,
 ) -> Result<Option<T>, AccessError> {
     let length = match reader.read_u32().await {
         Ok(length) => length as usize,
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(error) => return Err(AccessError::unavailable(error.to_string())),
     };
-    if length > MAX_FRAME_BYTES {
+    if length > frame_bytes {
         return Err(AccessError::new(
             AccessErrorCode::PayloadTooLarge,
             "AgentAccess frame exceeds the transport limit",
@@ -1294,6 +1368,12 @@ fn verify_peer(stream: &UnixStream) -> Result<(), AccessError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{FEED_CHANGE_BYTES, TRANSPORT_LIMITS};
+
+    const FRAME_BYTES: usize = TRANSPORT_LIMITS.frame_bytes();
+    /// Backpressure needs a request larger than any kernel socket buffer, so these peers keep the
+    /// production frame limit.
+    const BACKPRESSURE_FRAME_BYTES: usize = AccessLimits::DEFAULT.frame_bytes();
 
     struct ControlledFeed {
         sender: Mutex<Option<mpsc::Sender<ObservationUpdate>>>,
@@ -1344,7 +1424,9 @@ mod tests {
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             assert!(matches!(
-                read_frame::<_, ClientMessage>(&mut stream).await.unwrap(),
+                read_frame::<_, ClientMessage>(&mut stream, HANDSHAKE_FRAME_BYTES)
+                    .await
+                    .unwrap(),
                 Some(ClientMessage::Hello { .. })
             ));
         });
@@ -1366,11 +1448,22 @@ mod tests {
                 release: std::sync::atomic::AtomicBool::new(true),
             });
             let (server_stream, mut client) = UnixStream::pair().unwrap();
-            let server = tokio::spawn(serve_connection(server_stream, source.clone(), epoch));
-            write_frame(&mut client, &ClientMessage::Hello { major, minor })
+            let server = tokio::spawn(serve_connection(
+                server_stream,
+                source.clone(),
+                epoch,
+                TRANSPORT_LIMITS,
+            ));
+            write_frame(
+                &mut client,
+                &ClientMessage::Hello { major, minor },
+                HANDSHAKE_FRAME_BYTES,
+            )
+            .await
+            .unwrap();
+            let response = read_frame::<_, ServerMessage>(&mut client, HANDSHAKE_FRAME_BYTES)
                 .await
                 .unwrap();
-            let response = read_frame::<_, ServerMessage>(&mut client).await.unwrap();
             assert!(matches!(
                 response,
                 Some(ServerMessage::Error {
@@ -1382,7 +1475,7 @@ mod tests {
                 })
             ));
             assert!(
-                read_frame::<_, ServerMessage>(&mut client)
+                read_frame::<_, ServerMessage>(&mut client, HANDSHAKE_FRAME_BYTES)
                     .await
                     .unwrap()
                     .is_none()
@@ -1397,6 +1490,94 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_hello_announcing_unusable_limits_is_an_incompatible_peer() {
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = temporary.path().join("limits.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_frame::<_, ClientMessage>(&mut stream, HANDSHAKE_FRAME_BYTES)
+                .await
+                .unwrap();
+            let mut limits = ProtocolLimits::from(TRANSPORT_LIMITS);
+            limits.frame_bytes = HANDSHAKE_FRAME_BYTES - 1;
+            write_frame(
+                &mut stream,
+                &ServerMessage::Hello(ServerHello {
+                    process_id: 0,
+                    major: PROTOCOL_MAJOR,
+                    minor: PROTOCOL_MINOR,
+                    owner_epoch: Uuid::new_v4(),
+                    session_id: Uuid::new_v4(),
+                    capabilities: Vec::new(),
+                    limits,
+                }),
+                HANDSHAKE_FRAME_BYTES,
+            )
+            .await
+            .unwrap();
+        });
+        let error = match LocalAgentClient::connect(&socket).await {
+            Ok(_) => panic!("a client cannot adopt limits below the handshake frame"),
+            Err(error) => error,
+        };
+        server.await.unwrap();
+        assert_eq!(error.code, AccessErrorCode::VersionMismatch);
+        assert!(error.message.contains("transport limits"), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn frames_beyond_the_negotiated_limit_are_refused_on_both_sides() {
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = temporary.path().join("frame.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let epoch = Uuid::new_v4();
+        let source = Arc::new(CompletingLookup {
+            epoch,
+            started: tokio::sync::Notify::new(),
+            release: std::sync::atomic::AtomicBool::new(true),
+        });
+        let server = tokio::spawn(serve_listener(listener, source, epoch, TRANSPORT_LIMITS));
+        let client = LocalAgentClient::connect(&socket).await.unwrap();
+        assert_eq!(client.protocol().limits.frame_bytes, FRAME_BYTES);
+        let error = client
+            .observe(ObservationRequest::Overview {
+                filter: AgentFilter {
+                    workdir: None,
+                    workspace: Some("x".repeat(FRAME_BYTES)),
+                },
+                page: Page::default(),
+                after: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, AccessErrorCode::PayloadTooLarge);
+        assert!(client.is_connected());
+        let receipt = client
+            .observe(ObservationRequest::Receipt {
+                epoch,
+                command_id: Uuid::new_v4(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(receipt.initial, ObservationValue::Receipt(None)));
+
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        negotiate(&mut stream).await.unwrap();
+        stream.write_u32(FRAME_BYTES as u32 + 1).await.unwrap();
+        let mut remaining = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_to_end(&mut remaining),
+        )
+        .await
+        .expect("the server closes a connection that announces an oversized frame")
+        .unwrap();
+        assert!(remaining.is_empty());
+        server.abort();
     }
 
     struct CompletingLookup {
@@ -1462,7 +1643,12 @@ mod tests {
             started: tokio::sync::Notify::new(),
             release: std::sync::atomic::AtomicBool::new(false),
         });
-        let server = tokio::spawn(serve_listener(listener, source.clone(), epoch));
+        let server = tokio::spawn(serve_listener(
+            listener,
+            source.clone(),
+            epoch,
+            TRANSPORT_LIMITS,
+        ));
         let mut client = UnixStream::connect(&socket).await.unwrap();
         write_frame(
             &mut client,
@@ -1470,11 +1656,14 @@ mod tests {
                 major: PROTOCOL_MAJOR,
                 minor: PROTOCOL_MINOR,
             },
+            HANDSHAKE_FRAME_BYTES,
         )
         .await
         .unwrap();
         assert!(matches!(
-            read_frame::<_, ServerMessage>(&mut client).await.unwrap(),
+            read_frame::<_, ServerMessage>(&mut client, HANDSHAKE_FRAME_BYTES)
+                .await
+                .unwrap(),
             Some(ServerMessage::Hello(_))
         ));
         for _ in 0..3 {
@@ -1503,6 +1692,7 @@ mod tests {
                         after: None,
                     },
                 },
+                FRAME_BYTES,
             )
             .await
             .unwrap();
@@ -1512,6 +1702,7 @@ mod tests {
                 &ClientMessage::CancelObservation {
                     observation_id: cancelled_request,
                 },
+                FRAME_BYTES,
             )
             .await
             .unwrap();
@@ -1525,12 +1716,13 @@ mod tests {
                         command_id: Uuid::new_v4(),
                     },
                 },
+                FRAME_BYTES,
             )
             .await
             .unwrap();
             let compatible = tokio::time::timeout(
                 Duration::from_secs(2),
-                read_frame::<_, ServerMessage>(&mut client),
+                read_frame::<_, ServerMessage>(&mut client, FRAME_BYTES),
             )
             .await
             .unwrap()
@@ -1541,14 +1733,14 @@ mod tests {
             source
                 .release
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            let terminal = tokio::time::timeout(Duration::from_secs(2),read_frame::<_,ServerMessage>(&mut client)).await.expect("A completing cancelled lookup must retire its pending request with a terminal response").unwrap();
+            let terminal = tokio::time::timeout(Duration::from_secs(2),read_frame::<_,ServerMessage>(&mut client, FRAME_BYTES)).await.expect("A completing cancelled lookup must retire its pending request with a terminal response").unwrap();
             assert!(
                 matches!(terminal,Some(ServerMessage::Error { request_id:Some(request_id),error:AccessError { code:AccessErrorCode::Unavailable,.. } }) if request_id==cancelled_request)
             );
             assert!(
                 tokio::time::timeout(
                     Duration::from_millis(50),
-                    read_frame::<_, ServerMessage>(&mut client)
+                    read_frame::<_, ServerMessage>(&mut client, FRAME_BYTES)
                 )
                 .await
                 .is_err(),
@@ -1603,7 +1795,9 @@ mod tests {
         let peer = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             assert!(matches!(
-                read_frame::<_, ClientMessage>(&mut stream).await.unwrap(),
+                read_frame::<_, ClientMessage>(&mut stream, HANDSHAKE_FRAME_BYTES)
+                    .await
+                    .unwrap(),
                 Some(ClientMessage::Hello { .. })
             ));
             write_frame(
@@ -1615,8 +1809,9 @@ mod tests {
                     owner_epoch: epoch,
                     session_id: Uuid::new_v4(),
                     capabilities: Vec::new(),
-                    limits: None,
+                    limits: AccessLimits::DEFAULT.into(),
                 }),
+                HANDSHAKE_FRAME_BYTES,
             )
             .await
             .unwrap();
@@ -1633,7 +1828,7 @@ mod tests {
                 panic!("Expected Observe")
             };
             assert!(
-                matches!(read_frame::<_,ClientMessage>(&mut stream).await.unwrap(),Some(ClientMessage::CancelObservation { observation_id }) if observation_id==request_id)
+                matches!(read_frame::<_,ClientMessage>(&mut stream, BACKPRESSURE_FRAME_BYTES).await.unwrap(),Some(ClientMessage::CancelObservation { observation_id }) if observation_id==request_id)
             );
             write_frame(
                 &mut stream,
@@ -1641,12 +1836,15 @@ mod tests {
                     request_id: Some(request_id),
                     error: AccessError::unavailable("Controlled observation cancelled"),
                 },
+                BACKPRESSURE_FRAME_BYTES,
             )
             .await
             .unwrap();
             cancelled.send(()).unwrap();
             let Some(ClientMessage::Observe { request_id, .. }) =
-                read_frame::<_, ClientMessage>(&mut stream).await.unwrap()
+                read_frame::<_, ClientMessage>(&mut stream, BACKPRESSURE_FRAME_BYTES)
+                    .await
+                    .unwrap()
             else {
                 panic!("Expected compatible next request")
             };
@@ -1664,6 +1862,7 @@ mod tests {
                     reset: None,
                     feed: false,
                 },
+                BACKPRESSURE_FRAME_BYTES,
             )
             .await
             .unwrap();
@@ -1719,7 +1918,9 @@ mod tests {
             let peer = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 assert!(matches!(
-                    read_frame::<_, ClientMessage>(&mut stream).await.unwrap(),
+                    read_frame::<_, ClientMessage>(&mut stream, HANDSHAKE_FRAME_BYTES)
+                        .await
+                        .unwrap(),
                     Some(ClientMessage::Hello { .. })
                 ));
                 write_frame(
@@ -1731,14 +1932,17 @@ mod tests {
                         owner_epoch: epoch,
                         session_id: Uuid::new_v4(),
                         capabilities: Vec::new(),
-                        limits: None,
+                        limits: AccessLimits::DEFAULT.into(),
                     }),
+                    HANDSHAKE_FRAME_BYTES,
                 )
                 .await
                 .unwrap();
                 if opened_feed {
                     let Some(ClientMessage::Observe { request_id, .. }) =
-                        read_frame::<_, ClientMessage>(&mut stream).await.unwrap()
+                        read_frame::<_, ClientMessage>(&mut stream, BACKPRESSURE_FRAME_BYTES)
+                            .await
+                            .unwrap()
                     else {
                         panic!("Expected feed request")
                     };
@@ -1756,6 +1960,7 @@ mod tests {
                             reset: None,
                             feed: true,
                         },
+                        BACKPRESSURE_FRAME_BYTES,
                     )
                     .await
                     .unwrap();
@@ -1825,7 +2030,9 @@ mod tests {
             let peer = tokio::spawn(async move {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 assert!(matches!(
-                    read_frame::<_, ClientMessage>(&mut stream).await.unwrap(),
+                    read_frame::<_, ClientMessage>(&mut stream, HANDSHAKE_FRAME_BYTES)
+                        .await
+                        .unwrap(),
                     Some(ClientMessage::Hello { .. })
                 ));
                 write_frame(
@@ -1837,8 +2044,9 @@ mod tests {
                         owner_epoch: epoch,
                         session_id: Uuid::new_v4(),
                         capabilities: Vec::new(),
-                        limits: None,
+                        limits: AccessLimits::DEFAULT.into(),
                     }),
+                    HANDSHAKE_FRAME_BYTES,
                 )
                 .await
                 .unwrap();
@@ -1926,6 +2134,7 @@ mod tests {
                 stream,
                 server_source,
                 epoch,
+                TRANSPORT_LIMITS,
                 false,
                 None,
                 Some(server_hooks),
@@ -1939,11 +2148,14 @@ mod tests {
                 major: PROTOCOL_MAJOR,
                 minor: PROTOCOL_MINOR,
             },
+            HANDSHAKE_FRAME_BYTES,
         )
         .await
         .unwrap();
         assert!(matches!(
-            read_frame::<_, ServerMessage>(&mut stream).await.unwrap(),
+            read_frame::<_, ServerMessage>(&mut stream, HANDSHAKE_FRAME_BYTES)
+                .await
+                .unwrap(),
             Some(ServerMessage::Hello(_))
         ));
         let send_buffer = buffer_size.await.unwrap();
@@ -1958,6 +2170,7 @@ mod tests {
                     after: None,
                 },
             },
+            FRAME_BYTES,
         )
         .await
         .unwrap();
@@ -1966,7 +2179,9 @@ mod tests {
                 request_id,
                 observation_id,
                 ..
-            }) = read_frame::<_, ServerMessage>(&mut stream).await.unwrap()
+            }) = read_frame::<_, ServerMessage>(&mut stream, FRAME_BYTES)
+                .await
+                .unwrap()
                 && request_id == feed_request
             {
                 break observation_id;
@@ -1988,7 +2203,7 @@ mod tests {
         };
         // The largest update the feed forwards unchanged, so one frame is as long as possible.
         let overhead = serde_json::to_vec(&update(1, "")).unwrap().len();
-        let text = "x".repeat(FEED_MAX_BYTES / FEED_CAPACITY - overhead - 64);
+        let text = "x".repeat(FEED_CHANGE_BYTES - overhead - 64);
         let sender = source.sender.lock().await.take().unwrap();
         sender.send(update(1, &text)).await.unwrap();
         sender.send(update(2, &text)).await.unwrap();
@@ -2007,6 +2222,7 @@ mod tests {
         write_frame(
             &mut writer,
             &ClientMessage::CancelObservation { observation_id },
+            FRAME_BYTES,
         )
         .await
         .unwrap();
@@ -2026,6 +2242,7 @@ mod tests {
                     command_id: Uuid::new_v4(),
                 },
             },
+            FRAME_BYTES,
         )
         .await
         .unwrap();
@@ -2036,7 +2253,7 @@ mod tests {
                 .expect("the frame being written when the cancel arrived is whole");
             (
                 in_progress,
-                read_frame::<_, ServerMessage>(&mut reader).await,
+                read_frame::<_, ServerMessage>(&mut reader, FRAME_BYTES).await,
             )
         })
         .await
@@ -2095,6 +2312,7 @@ mod tests {
                 stream,
                 server_source,
                 epoch,
+                TRANSPORT_LIMITS,
                 false,
                 None,
                 Some(server_hooks),
@@ -2142,8 +2360,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn disconnect_during_chunked_open_cancels_the_source_before_any_opened_is_published() {
-        const CHUNKED_OPEN_PREPARATION_TIMEOUT: std::time::Duration =
-            std::time::Duration::from_secs(600);
         let temporary = tempfile::tempdir_in("/tmp").unwrap();
         let socket = temporary.path().join("chunk-cancel.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -2163,7 +2379,7 @@ mod tests {
                     message: crate::model::Message {
                         role: crate::model::Role::User,
                         content: vec![crate::model::Content::Text {
-                            text: "x".repeat(MAX_FRAME_BYTES),
+                            text: "x".repeat(FRAME_BYTES),
                         }],
                     },
                     loop_id: None,
@@ -2177,7 +2393,7 @@ mod tests {
         let server_source = source.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            serve_connection(stream, server_source, epoch)
+            serve_connection(stream, server_source, epoch, TRANSPORT_LIMITS)
                 .await
                 .unwrap();
         });
@@ -2188,11 +2404,14 @@ mod tests {
                 major: PROTOCOL_MAJOR,
                 minor: PROTOCOL_MINOR,
             },
+            HANDSHAKE_FRAME_BYTES,
         )
         .await
         .unwrap();
         assert!(matches!(
-            read_frame::<_, ServerMessage>(&mut stream).await.unwrap(),
+            read_frame::<_, ServerMessage>(&mut stream, HANDSHAKE_FRAME_BYTES)
+                .await
+                .unwrap(),
             Some(ServerMessage::Hello(_))
         ));
         write_frame(
@@ -2205,23 +2424,28 @@ mod tests {
                     after: None,
                 },
             },
+            FRAME_BYTES,
         )
         .await
         .unwrap();
         let response = tokio::time::timeout(
-            CHUNKED_OPEN_PREPARATION_TIMEOUT,
-            read_frame::<_, ServerMessage>(&mut stream),
+            std::time::Duration::from_secs(5),
+            read_frame::<_, ServerMessage>(&mut stream, FRAME_BYTES),
         )
         .await
         .unwrap()
         .unwrap();
-        assert!(matches!(
-            response,
-            Some(ServerMessage::ResponseStart {
-                kind: ChunkedResponseKind::Opened,
-                ..
-            })
-        ));
+        assert!(
+            matches!(
+                response,
+                Some(ServerMessage::ResponseStart {
+                    kind: ChunkedResponseKind::Opened,
+                    chunk_bytes,
+                    ..
+                }) if chunk_bytes == TRANSPORT_LIMITS.chunk_bytes()
+            ),
+            "an Opened beyond the negotiated frame is chunked at the negotiated size: {response:?}"
+        );
         let sender = source.sender.lock().await.take().unwrap();
         drop(stream);
         tokio::time::timeout(std::time::Duration::from_secs(5), sender.closed())
@@ -2235,7 +2459,9 @@ mod tests {
 
     async fn serve_overview_stub(listener: UnixListener, epoch: Uuid, rows: serde_json::Value) {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let _: Option<serde_json::Value> = read_frame(&mut stream).await.unwrap();
+        let _: Option<serde_json::Value> = read_frame(&mut stream, HANDSHAKE_FRAME_BYTES)
+            .await
+            .unwrap();
         write_frame(
             &mut stream,
             &ServerMessage::Hello(ServerHello {
@@ -2245,12 +2471,14 @@ mod tests {
                 owner_epoch: epoch,
                 session_id: Uuid::new_v4(),
                 capabilities: Vec::new(),
-                limits: None,
+                limits: TRANSPORT_LIMITS.into(),
             }),
+            HANDSHAKE_FRAME_BYTES,
         )
         .await
         .unwrap();
-        while let Ok(Some(message)) = read_frame::<_, ClientMessage>(&mut stream).await {
+        while let Ok(Some(message)) = read_frame::<_, ClientMessage>(&mut stream, FRAME_BYTES).await
+        {
             if let ClientMessage::Observe { request_id, .. } = message {
                 let opened = serde_json::json!({
                     "Opened": {
@@ -2262,7 +2490,9 @@ mod tests {
                         "feed": false,
                     }
                 });
-                write_frame(&mut stream, &opened).await.unwrap();
+                write_frame(&mut stream, &opened, FRAME_BYTES)
+                    .await
+                    .unwrap();
             }
         }
     }

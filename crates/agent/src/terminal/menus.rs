@@ -3912,7 +3912,12 @@ mod tests {
         let endpoint = project.join("owner.sock");
         let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
         let epoch = access.owner_epoch();
-        let ipc = tokio::spawn(crate::agent_access::serve_listener(listener, access, epoch));
+        let ipc = tokio::spawn(crate::agent_access::serve_listener(
+            listener,
+            access,
+            epoch,
+            crate::protocol::TRANSPORT_LIMITS,
+        ));
         let client = std::sync::Arc::new(LocalAgentClient::connect(&endpoint).await.unwrap());
         let view = Agent::from_access_for_test(
             client,

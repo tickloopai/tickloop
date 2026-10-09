@@ -54,7 +54,7 @@ async fn read_json_frame(stream: &mut UnixStream) -> Option<Value> {
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return None,
         Err(error) => panic!("{error}"),
     };
-    assert!(length <= MAX_FRAME_BYTES);
+    assert!(length <= tickloop_agent::protocol::AccessLimits::DEFAULT.frame_bytes());
     let mut bytes = vec![0; length];
     stream.read_exact(&mut bytes).await.unwrap();
     Some(serde_json::from_slice(&bytes).unwrap())
@@ -260,7 +260,12 @@ async fn legacy_wire_schema_is_rejected_before_pipelined_create_can_execute() {
     let epoch = Uuid::new_v4();
     let access = Arc::new(EmbeddedAgentAccess::for_worker(runtime.clone(), epoch));
     let listener = UnixListener::bind(&socket).unwrap();
-    let server = tokio::spawn(serve_worker_listener(listener, access, epoch));
+    let server = tokio::spawn(serve_worker_listener(
+        listener,
+        access,
+        epoch,
+        support::TRANSPORT_LIMITS,
+    ));
     let verification = async {
         let mut client = UnixStream::connect(socket).await.unwrap();
         let command = CommandEnvelope {
@@ -994,7 +999,7 @@ impl WorkerFactory for SocketWorkerFactory {
         let socket = self.directory.join("worker.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         self.servers.lock().await.push(tokio::spawn(async move {
-            serve_worker_listener(listener, served, epoch)
+            serve_worker_listener(listener, served, epoch, support::TRANSPORT_LIMITS)
                 .await
                 .unwrap();
         }));
@@ -1031,7 +1036,12 @@ async fn accepted_parent_child_messages_and_burst_feed_cancellation_keep_the_fam
     let epoch = Uuid::new_v4();
     let owner = Arc::new(OwnerServer::new(epoch, factory.clone()));
     let listener = UnixListener::bind(directory.path().join("owner.sock")).unwrap();
-    let server = tokio::spawn(serve_listener(listener, owner, epoch));
+    let server = tokio::spawn(serve_listener(
+        listener,
+        owner,
+        epoch,
+        support::TRANSPORT_LIMITS,
+    ));
     let client = LocalAgentClient::connect(directory.path().join("owner.sock"))
         .await
         .unwrap();

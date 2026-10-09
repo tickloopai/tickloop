@@ -16,6 +16,7 @@ use super::{AgentAccess, Observation, protocol::*, receipts::ReceiptStore, views
 use crate::{
     host_tools::{HerdrInteraction, HostCallContext},
     model::model_client,
+    protocol::FEED_CAPACITY,
     runtime::{Agent, BranchRequest, ShellTaskAction, ShellTaskCenter},
 };
 

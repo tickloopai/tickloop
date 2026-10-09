@@ -23,7 +23,7 @@ fn trust_working_directory(config_root: &std::path::Path, workdir: &std::path::P
 }
 
 fn trusted_agent_command() -> Command {
-    let mut command = Command::new(support::fixture_cli::executable());
+    let mut command = support::fixture_cli::command();
     command.env(
         "TICKLOOP_AGENT_RUNTIME_DIR",
         support::cli_runtime::directory(),
@@ -33,7 +33,7 @@ fn trusted_agent_command() -> Command {
 }
 
 fn trusted_async_agent_command() -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(support::fixture_cli::executable());
+    let mut command = support::fixture_cli::tokio_command();
     command.env(
         "TICKLOOP_AGENT_RUNTIME_DIR",
         support::cli_runtime::directory(),
@@ -43,7 +43,7 @@ fn trusted_async_agent_command() -> tokio::process::Command {
 }
 
 fn product_async_agent_command() -> tokio::process::Command {
-    let mut command = tokio::process::Command::new(support::fixture_cli::executable());
+    let mut command = support::fixture_cli::tokio_command();
     command.env(
         "TICKLOOP_AGENT_RUNTIME_DIR",
         support::cli_runtime::directory(),
@@ -58,7 +58,7 @@ fn malformed_auto_settings_do_not_exit_the_terminal_on_permissions_commands() {
     let config_root = directory.path().join("config-root");
     std::fs::create_dir_all(&config_root).unwrap();
     std::fs::write(config_root.join("settings.json"), r#"{"autoApproval":{"rules":{"softDeny":{"includeBuiltins":false,"custom":[{"id":"invalid","text":"rule"}]}}}}"#).unwrap();
-    let output = Command::new(support::fixture_cli::executable())
+    let output = support::fixture_cli::command()
         .env(
             "TICKLOOP_AGENT_RUNTIME_DIR",
             support::cli_runtime::directory(),
@@ -509,7 +509,7 @@ fn terminal_explains_how_to_start_without_credentials() {
 fn chat_id_opens_the_exact_chat_identity() {
     let directory = tempfile::tempdir().unwrap();
     let chat_id = "00000000-0000-4000-8000-000000000123";
-    let output = Command::new(support::fixture_cli::executable())
+    let output = support::fixture_cli::command()
         .env(
             "TICKLOOP_AGENT_RUNTIME_DIR",
             support::cli_runtime::directory(),
@@ -1885,7 +1885,7 @@ async fn terminal_auto_mode_reviews_with_the_current_chat_model_by_default() {
 #[test]
 fn legacy_independent_reviewer_flags_report_the_permissions_migration() {
     for flag in ["--auto-reviewer-config", "--permission-checker-config"] {
-        let output = Command::new(support::fixture_cli::executable())
+        let output = support::fixture_cli::command()
             .env(
                 "TICKLOOP_AGENT_RUNTIME_DIR",
                 support::cli_runtime::directory(),

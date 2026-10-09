@@ -35,6 +35,7 @@ use crate::{
         WorkerFactory, serve_worker_listener, worker_link,
     },
     model::{ModelClient, ModelConfig, cards::ModelCatalog, model_client},
+    protocol::AccessLimits,
     runtime::Agent,
     settings::UserSettings,
 };
@@ -48,6 +49,10 @@ const STARTUP_DEADLINE: Duration = Duration::from_secs(5);
 const CONNECT_INTERVAL: Duration = Duration::from_millis(25);
 const SOCKET_NAME: &str = "owner.sock";
 const LOCK_NAME: &str = "owner.lock";
+/// A bootstrap line carries the launch environment as JSON byte arrays, up to four characters
+/// for each byte of an environment the operating system already bounds.
+#[doc(hidden)]
+pub const WORKER_BOOTSTRAP_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 struct WorkerBootstrap {
@@ -55,6 +60,8 @@ struct WorkerBootstrap {
     launch: LaunchSpec,
     /// The worker's private grant for hosted Tick requests to its owner.
     control: crate::hosted::worker_control::WorkerControlGrant,
+    /// The transport limits the worker serves its daemon with.
+    limits: AccessLimits,
 }
 
 struct ManagedWorker {
@@ -65,6 +72,7 @@ struct ManagedWorker {
 
 struct ProcessWorkerFactory {
     directory: PathBuf,
+    limits: AccessLimits,
     workers: Mutex<Vec<ManagedWorker>>,
     shutting_down: AtomicBool,
     control: Arc<crate::hosted::worker_control::WorkerControl>,
@@ -135,6 +143,7 @@ impl WorkerFactory for ProcessWorkerFactory {
             epoch: owner_epoch,
             launch: launch.clone(),
             control: grant.clone(),
+            limits: self.limits,
         })
         .map_err(|error| AccessError::invalid(error.to_string()))?;
         bootstrap.push(b'\n');
@@ -473,8 +482,10 @@ async fn run_owner(arguments: &[OsString]) -> Result<(), String> {
     // was killed is stale.
     remove_stale_socket(&control_endpoint)?;
     let (control_listener, control_identity) = private_listener(&control_endpoint)?;
+    let limits = AccessLimits::DEFAULT;
     let factory = Arc::new(ProcessWorkerFactory {
         directory: directory.clone(),
+        limits,
         workers: Mutex::new(Vec::new()),
         shutting_down: AtomicBool::new(false),
         control: control.clone(),
@@ -482,7 +493,7 @@ async fn run_owner(arguments: &[OsString]) -> Result<(), String> {
     let owner = Arc::new(OwnerServer::new(epoch, factory.clone()));
     control.attach_owner((*owner).clone());
     let control_service = tokio::spawn(control.clone().serve(control_listener));
-    let result = crate::agent_access::serve_owner_listener(listener, owner, epoch)
+    let result = crate::agent_access::serve_owner_listener(listener, owner, epoch, limits)
         .await
         .map_err(|error| error.to_string());
     factory.shutdown().await;
@@ -514,11 +525,11 @@ async fn run_worker(arguments: &[OsString]) -> Result<(), String> {
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut bytes = Vec::new();
     (&mut stdin)
-        .take(crate::agent_access::MAX_FRAME_BYTES as u64 + 1)
+        .take(WORKER_BOOTSTRAP_MAX_BYTES as u64 + 1)
         .read_until(b'\n', &mut bytes)
         .await
         .map_err(|error| error.to_string())?;
-    if bytes.len() > crate::agent_access::MAX_FRAME_BYTES {
+    if bytes.len() > WORKER_BOOTSTRAP_MAX_BYTES {
         return Err("worker bootstrap is too large".into());
     }
     let bootstrap: WorkerBootstrap =
@@ -541,7 +552,7 @@ async fn run_worker(arguments: &[OsString]) -> Result<(), String> {
         )
     });
     let mut probe = [0u8; 1];
-    let service = serve_worker_listener(listener, access, bootstrap.epoch);
+    let service = serve_worker_listener(listener, access, bootstrap.epoch, bootstrap.limits);
     tokio::pin!(service);
     let result = loop {
         tokio::select! {

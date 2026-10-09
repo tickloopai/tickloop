@@ -159,9 +159,9 @@ pub(crate) fn preview(conversation: &crate::runtime::ChatSnapshot, title: &str) 
 }
 
 pub(crate) fn bounded_update(mut update: ObservationUpdate) -> ObservationUpdate {
-    if serde_json::to_vec(&update)
-        .map_or(true, |bytes| bytes.len() > FEED_MAX_BYTES / FEED_CAPACITY)
-    {
+    if serde_json::to_vec(&update).map_or(true, |bytes| {
+        bytes.len() > crate::protocol::FEED_CHANGE_BYTES
+    }) {
         update.change = ObservationChange::Resync {
             reason: ResetReason::Lagged,
         };

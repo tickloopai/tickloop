@@ -76,7 +76,9 @@ impl Fixture {
                 let socket = directory.path().join("claims.sock");
                 let listener = UnixListener::bind(&socket).unwrap();
                 let server = tokio::spawn(async move {
-                    serve_listener(listener, embedded, epoch).await.unwrap();
+                    serve_listener(listener, embedded, epoch, support::TRANSPORT_LIMITS)
+                        .await
+                        .unwrap();
                 });
                 let first = tokio::time::timeout(WAIT, LocalAgentClient::connect(&socket))
                     .await

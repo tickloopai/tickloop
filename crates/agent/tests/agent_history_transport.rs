@@ -8,6 +8,7 @@ use tickloop_agent::{
     agent_access::*,
     image::{Image, MAX_BASE64_BYTES, prepare},
     model::*,
+    protocol::AccessLimits,
     runtime::{Agent, EventKind, ImageContext, ImageOrigin, InputContext, RewindMode},
 };
 use tokio::{
@@ -18,9 +19,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-// These corpora exceed a 128 MiB frame and undergo JSON encoding, hashing and decoding.
-const LARGE_HISTORY_TIMEOUT: Duration = Duration::from_secs(600);
-static LARGE_HISTORY_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Long enough for a production-scale history to be encoded, hashed and decoded in release.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct ImageModel {
     image_digest: [u8; 32],
@@ -135,15 +135,15 @@ impl ModelClient for ImageModel {
     }
 }
 
-fn legal_large_image() -> Image {
+fn legal_image(base64_bytes: usize) -> Image {
     let mut source = IoCursor::new(Vec::new());
     image::DynamicImage::new_rgb8(1, 1)
         .write_to(&mut source, image::ImageFormat::Png)
         .unwrap();
     let mut source = source.into_inner();
-    source.resize(MAX_BASE64_BYTES / 4 * 3, 0);
+    source.resize(base64_bytes / 4 * 3, 0);
     let prepared = prepare(&source).unwrap();
-    assert_eq!(prepared.data.len(), MAX_BASE64_BYTES);
+    assert_eq!(prepared.data.len(), base64_bytes);
     prepared
 }
 
@@ -167,7 +167,7 @@ fn envelope(epoch: Uuid, command: AgentCommand) -> CommandEnvelope {
 }
 
 async fn complete(observation: &mut Observation) {
-    tokio::time::timeout(LARGE_HISTORY_TIMEOUT, async {
+    tokio::time::timeout(RESPONSE_TIMEOUT, async {
         loop {
             if matches!(observation.recv().await.unwrap().change,
                 ObservationChange::Event(event) if matches!(event.kind, EventKind::Completed { .. }))
@@ -178,17 +178,24 @@ async fn complete(observation: &mut Observation) {
     }).await.unwrap();
 }
 
-async fn write_json<W: AsyncWrite + Unpin>(stream: &mut W, value: &serde_json::Value) {
+async fn write_json<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    value: &serde_json::Value,
+    limits: AccessLimits,
+) {
     let bytes = serde_json::to_vec(value).unwrap();
-    assert!(bytes.len() <= MAX_FRAME_BYTES);
+    assert!(bytes.len() <= limits.frame_bytes());
     stream.write_u32(bytes.len() as u32).await.unwrap();
     stream.write_all(&bytes).await.unwrap();
 }
 
-async fn read_json<R: AsyncRead + Unpin>(stream: &mut R) -> serde_json::Value {
-    tokio::time::timeout(LARGE_HISTORY_TIMEOUT, async {
+async fn read_json<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    limits: AccessLimits,
+) -> serde_json::Value {
+    tokio::time::timeout(RESPONSE_TIMEOUT, async {
         let length = stream.read_u32().await.unwrap() as usize;
-        assert!(length <= MAX_FRAME_BYTES);
+        assert!(length <= limits.frame_bytes());
         let mut bytes = vec![0; length];
         stream.read_exact(&mut bytes).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
@@ -206,6 +213,7 @@ async fn fault_proxy(
     source: &Path,
     socket: &Path,
     fault: ResponseFault,
+    limits: AccessLimits,
 ) -> tokio::task::JoinHandle<()> {
     let listener = UnixListener::bind(socket).unwrap();
     let source = source.to_path_buf();
@@ -218,16 +226,16 @@ async fn fault_proxy(
             let _ = tokio::io::copy(&mut client_read, &mut upstream_write).await;
         });
         loop {
-            let mut response = read_json(&mut upstream_read).await;
+            let mut response = read_json(&mut upstream_read, limits).await;
             if response.get("ResponseEnd").is_some()
                 && matches!(fault, ResponseFault::InvalidDigest)
             {
                 response["ResponseEnd"]["sha256"] = "invalid digest".into();
-                write_json(&mut client_write, &response).await;
+                write_json(&mut client_write, &response, limits).await;
                 break;
             }
             let chunk = response.get("ResponseChunk").is_some();
-            write_json(&mut client_write, &response).await;
+            write_json(&mut client_write, &response, limits).await;
             if chunk && matches!(fault, ResponseFault::DisconnectAfterFirstChunk) {
                 break;
             }
@@ -239,9 +247,26 @@ async fn fault_proxy(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_rewind_bytes() {
-    let _large_history_fixture = LARGE_HISTORY_FIXTURE.lock().await;
+    repeated_legal_images_case(support::TRANSPORT_LIMITS, legal_image(40_000), 3, 1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "production-scale transfer; run in release with --ignored"]
+async fn repeated_legal_images_cross_the_frame_limit_at_production_limits() {
+    repeated_legal_images_case(AccessLimits::DEFAULT, legal_image(MAX_BASE64_BYTES), 2, 14).await;
+}
+
+/// Submits `prompts` prompts of `images_per_prompt` images each. Every prompt fits one request
+/// frame, while the history they build exceeds a frame and must be read back in chunks.
+async fn repeated_legal_images_case(
+    limits: AccessLimits,
+    image: Image,
+    prompts: usize,
+    images_per_prompt: usize,
+) {
+    assert!(image.data.len() * images_per_prompt < limits.frame_bytes());
+    assert!(image.data.len() * images_per_prompt * prompts > limits.frame_bytes());
     let directory = tempfile::tempdir_in("/tmp").unwrap();
-    let image = legal_large_image();
     let digest: [u8; 32] = Sha256::digest(image.data.as_bytes()).into();
     let model = Arc::new(ImageModel {
         image_digest: digest,
@@ -254,7 +279,7 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
     let epoch = access.owner_epoch();
     let server_access = access.clone();
     let server = tokio::spawn(async move {
-        serve_listener(listener, server_access, epoch)
+        serve_listener(listener, server_access, epoch, limits)
             .await
             .unwrap();
     });
@@ -283,10 +308,7 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
         })
         .await
         .unwrap();
-    for prompt in [
-        "Inspect the first fourteen images",
-        "Inspect the next fourteen images",
-    ] {
+    for prompt in 1..=prompts {
         client
             .execute(envelope(
                 epoch,
@@ -294,8 +316,8 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
                     execution,
                     target_loop: None,
                     input: UserInput::Text {
-                        text: prompt.into(),
-                        contexts: image_contexts(&image, 14),
+                        text: format!("Inspect image group {prompt}"),
+                        contexts: image_contexts(&image, images_per_prompt as u32),
                         paths: Vec::new(),
                     },
                     origin: None,
@@ -307,9 +329,13 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
             .unwrap();
         complete(&mut feed).await;
     }
-    assert_eq!(*model.image_counts.lock().unwrap(), [14, 28]);
+    let image_counts = (1..=prompts)
+        .map(|prompt| prompt * images_per_prompt)
+        .collect::<Vec<_>>();
+    let total_images = prompts * images_per_prompt;
+    assert_eq!(*model.image_counts.lock().unwrap(), image_counts);
     let mut observation = tokio::time::timeout(
-        LARGE_HISTORY_TIMEOUT,
+        RESPONSE_TIMEOUT,
         client.observe(ObservationRequest::Agent {
             execution,
             detail: AgentDetailQuery::Snapshot,
@@ -331,7 +357,7 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
             .values()
             .map(Vec::len)
             .sum::<usize>(),
-        28
+        total_images
     );
     assert!(snapshot.conversation.messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, Content::Text { text } if text == "The images remain readable.")));
     for context in snapshot.conversation.message_contexts.values().flatten() {
@@ -356,6 +382,7 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
         &socket,
         &proxy_socket,
         ResponseFault::DisconnectAfterFirstChunk,
+        limits,
     )
     .await;
     let interrupted = LocalAgentClient::connect(&proxy_socket).await.unwrap();
@@ -370,14 +397,14 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
         },
     );
     let branch_id = branch_command.command_id;
-    let error = tokio::time::timeout(LARGE_HISTORY_TIMEOUT, interrupted.execute(branch_command))
+    let error = tokio::time::timeout(RESPONSE_TIMEOUT, interrupted.execute(branch_command))
         .await
         .expect("a lost acknowledgement must resolve without hanging")
         .expect_err("a partial receipt must not be published");
     assert_eq!(error.code, AccessErrorCode::OutcomeUnknown);
     proxy.await.unwrap();
     let recovered = tokio::time::timeout(
-        LARGE_HISTORY_TIMEOUT,
+        RESPONSE_TIMEOUT,
         client.observe(ObservationRequest::Receipt {
             epoch,
             command_id: branch_id,
@@ -401,7 +428,7 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
             .values()
             .map(Vec::len)
             .sum::<usize>(),
-        28
+        total_images
     );
     drop(snapshot);
     let directory_state = client
@@ -420,9 +447,9 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
         2,
         "receipt reconciliation must not replay Branch"
     );
-    assert_eq!(*model.image_counts.lock().unwrap(), [14, 28]);
+    assert_eq!(*model.image_counts.lock().unwrap(), image_counts);
     let receipt = tokio::time::timeout(
-        LARGE_HISTORY_TIMEOUT,
+        RESPONSE_TIMEOUT,
         client.execute(envelope(
             epoch,
             AgentCommand::EditHistory {
@@ -445,7 +472,7 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
     else {
         panic!("expected original rewind draft");
     };
-    assert_eq!(draft.contexts.len(), 14);
+    assert_eq!(draft.contexts.len(), images_per_prompt);
     for context in draft.contexts {
         let InputContext::Image(context) = context else {
             panic!("expected image draft");
@@ -463,11 +490,12 @@ async fn repeated_legal_images_cross_the_frame_limit_without_losing_history_or_r
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_text_history_is_complete_and_a_corrupt_end_is_never_published() {
-    let _large_history_fixture = LARGE_HISTORY_FIXTURE.lock().await;
+    let limits = support::TRANSPORT_LIMITS;
     let directory = tempfile::tempdir_in("/tmp").unwrap();
+    // Each prompt fits one request frame; the history holding two of them does not.
     let prompt = format!(
         "Original long prompt:{}\n\"Original ending\"",
-        "中".repeat(68 * 1024 * 1024 / 3)
+        "中".repeat(limits.frame_bytes() * 17 / 32 / "中".len())
     );
     let digest: [u8; 32] = Sha256::digest(prompt.as_bytes()).into();
     let model = Arc::new(TextModel {
@@ -481,7 +509,7 @@ async fn large_text_history_is_complete_and_a_corrupt_end_is_never_published() {
     let epoch = access.owner_epoch();
     let server_access = access.clone();
     let server = tokio::spawn(async move {
-        serve_listener(listener, server_access, epoch)
+        serve_listener(listener, server_access, epoch, limits)
             .await
             .unwrap();
     });
@@ -502,21 +530,6 @@ async fn large_text_history_is_complete_and_a_corrupt_end_is_never_published() {
     let CommandResult::Created { execution, .. } = created else {
         panic!("expected Create");
     };
-    client
-        .execute(envelope(
-            epoch,
-            AgentCommand::Configure {
-                provider: None,
-                execution,
-                change: ConfigurationChange::ContextWindow {
-                    tokens: 100_000_000,
-                },
-            },
-        ))
-        .await
-        .unwrap()
-        .into_result()
-        .unwrap();
     let mut feed = client
         .observe(ObservationRequest::Agent {
             execution,
@@ -548,7 +561,7 @@ async fn large_text_history_is_complete_and_a_corrupt_end_is_never_published() {
     }
     assert_eq!(*model.prompt_counts.lock().unwrap(), [1, 2]);
     let proxy_socket = directory.path().join("corrupt.sock");
-    let proxy = fault_proxy(&socket, &proxy_socket, ResponseFault::InvalidDigest).await;
+    let proxy = fault_proxy(&socket, &proxy_socket, ResponseFault::InvalidDigest, limits).await;
     let corrupt = LocalAgentClient::connect(&proxy_socket).await.unwrap();
     let result = corrupt
         .observe(ObservationRequest::Agent {
@@ -569,7 +582,7 @@ async fn large_text_history_is_complete_and_a_corrupt_end_is_never_published() {
     );
     proxy.await.unwrap();
     let restored = tokio::time::timeout(
-        LARGE_HISTORY_TIMEOUT,
+        RESPONSE_TIMEOUT,
         client.observe(ObservationRequest::Agent {
             execution,
             detail: AgentDetailQuery::Snapshot,
@@ -616,6 +629,8 @@ async fn large_text_history_is_complete_and_a_corrupt_end_is_never_published() {
 
 #[tokio::test]
 async fn a_response_with_a_gap_or_an_incomplete_end_never_becomes_an_observation() {
+    let limits = support::TRANSPORT_LIMITS;
+    let total_bytes = limits.frame_bytes() + 1;
     for incomplete_end in [false, true] {
         let temporary = tempfile::tempdir_in("/tmp").unwrap();
         let socket = temporary.path().join("invalid.sock");
@@ -623,23 +638,24 @@ async fn a_response_with_a_gap_or_an_incomplete_end_never_becomes_an_observation
         let epoch = Uuid::new_v4();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            assert!(read_json(&mut stream).await.get("Hello").is_some());
+            assert!(read_json(&mut stream, limits).await.get("Hello").is_some());
             write_json(&mut stream, &serde_json::json!({"Hello": {
                 "process_id": std::process::id(), "major": PROTOCOL_MAJOR, "minor": PROTOCOL_MINOR,
-                "owner_epoch": epoch, "session_id": Uuid::new_v4(), "capabilities": ["ChunkedResponses"]
-            }})).await;
-            let request = read_json(&mut stream).await;
+                "owner_epoch": epoch, "session_id": Uuid::new_v4(), "capabilities": ["ChunkedResponses"],
+                "limits": ProtocolLimits::from(limits)
+            }}), limits).await;
+            let request = read_json(&mut stream, limits).await;
             let transfer = Uuid::new_v4();
             write_json(&mut stream, &serde_json::json!({"ResponseStart": {
                 "request_id": request["Observe"]["request_id"], "transfer_id": transfer,
-                "kind": "Opened", "total_bytes": MAX_FRAME_BYTES + 1, "chunk_bytes": RESPONSE_CHUNK_BYTES
-            }})).await;
+                "kind": "Opened", "total_bytes": total_bytes, "chunk_bytes": limits.chunk_bytes()
+            }}), limits).await;
             let response = if incomplete_end {
-                serde_json::json!({"ResponseEnd": {"transfer_id": transfer, "total_bytes": MAX_FRAME_BYTES + 1, "sha256": "empty"}})
+                serde_json::json!({"ResponseEnd": {"transfer_id": transfer, "total_bytes": total_bytes, "sha256": "empty"}})
             } else {
                 serde_json::json!({"ResponseChunk": {"transfer_id": transfer, "offset": 1, "base64": "eA=="}})
             };
-            write_json(&mut stream, &response).await;
+            write_json(&mut stream, &response, limits).await;
         });
         let client = LocalAgentClient::connect(socket).await.unwrap();
         let result = tokio::time::timeout(

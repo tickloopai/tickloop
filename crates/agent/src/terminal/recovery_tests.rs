@@ -1,5 +1,5 @@
 use super::*;
-use crate::{agent_access::*, model::*, runtime};
+use crate::{agent_access::*, model::*, protocol::FEED_CAPACITY, runtime};
 use async_trait::async_trait;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::{

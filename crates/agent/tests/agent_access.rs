@@ -448,7 +448,7 @@ async fn a_permission_storage_failure_preserves_the_request_for_an_explicit_retr
 
 #[tokio::test]
 async fn large_execution_output_arrives_in_bounded_updates_without_resync() {
-    use tickloop_agent::agent_access::{FEED_CAPACITY, FEED_MAX_BYTES, ObservationChange};
+    use tickloop_agent::{agent_access::ObservationChange, protocol::FEED_CHANGE_BYTES};
     let temporary = tempfile::tempdir().unwrap();
     let output = "result ".repeat(20_000);
     let runtime = Agent::new_embedded(
@@ -504,7 +504,7 @@ async fn large_execution_output_arrives_in_bounded_updates_without_resync() {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let update = observation.recv().await.unwrap();
-            assert!(serde_json::to_vec(&update).unwrap().len() <= FEED_MAX_BYTES / FEED_CAPACITY);
+            assert!(serde_json::to_vec(&update).unwrap().len() <= FEED_CHANGE_BYTES);
             match update.change {
                 ObservationChange::Event(event) => match event.kind {
                     tickloop_agent::runtime::EventKind::Text(text) => streamed.push_str(&text),

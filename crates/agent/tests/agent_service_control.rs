@@ -64,7 +64,7 @@ impl ServiceFixture {
     }
 
     fn command(&self, arguments: &[&str]) -> Command {
-        let mut command = Command::new(support::fixture_cli::executable());
+        let mut command = support::fixture_cli::tokio_command();
         command
             .args(arguments)
             .current_dir(self.directory.path())
@@ -186,7 +186,7 @@ async fn read_frame(stream: &mut UnixStream) -> Option<Value> {
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return None,
         Err(error) => panic!("{error}"),
     };
-    assert!(length <= MAX_FRAME_BYTES);
+    assert!(length <= tickloop_agent::protocol::AccessLimits::DEFAULT.frame_bytes());
     let mut bytes = vec![0; length];
     stream.read_exact(&mut bytes).await.unwrap();
     Some(serde_json::from_slice(&bytes).unwrap())
@@ -863,6 +863,7 @@ async fn management_aliases_reject_every_business_request_before_dispatch() {
         fixture.listener(),
         access.clone(),
         epoch,
+        support::TRANSPORT_LIMITS,
     ));
     let request_id = Uuid::new_v4();
     let requests = [
@@ -915,6 +916,7 @@ async fn management_rejects_wrong_epoch_malformed_and_oversize_frames_without_di
         fixture.listener(),
         access.clone(),
         epoch,
+        support::TRANSPORT_LIMITS,
     ));
     let request_id = Uuid::new_v4();
     for request in [
@@ -979,6 +981,7 @@ async fn worker_socket_has_no_cross_version_management_facade() {
         fixture.listener(),
         access.clone(),
         Uuid::new_v4(),
+        support::TRANSPORT_LIMITS,
     ));
     for major in [1, 2] {
         let mut stream = UnixStream::connect(fixture.runtime.join("owner.sock"))

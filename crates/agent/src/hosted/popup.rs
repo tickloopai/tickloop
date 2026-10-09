@@ -34,7 +34,8 @@ const PANE_ID: &str = "attach";
 const PANE_TITLE: &str = "Tick Loop";
 const POPUP_PLACEMENT: &str = "popup";
 const POPUP_SIZE: &str = "85%";
-const ATTACH_ARGUMENTS: [&str; 2] = ["monitor", "attach"];
+/// Arguments Herdr passes to this executable to open the Monitor popup pane.
+pub const ATTACH_ARGUMENTS: [&str; 2] = ["monitor", "attach"];
 const PLUGIN_DIRECTORY: &str = "herdr-popup-plugin";
 const MANIFEST_FILE: &str = "herdr-plugin.toml";
 const MIN_HERDR_VERSION: &str = "0.9.0";

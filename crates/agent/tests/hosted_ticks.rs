@@ -143,7 +143,6 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_owner()
         .tempdir_in("/private/tmp")
         .unwrap();
     let root = directory.path().canonicalize().unwrap();
-    let launcher = support::fixture_cli::executable();
     let observed = Arc::new(Observed::default());
     let server_observed = observed.clone();
     let host_runtime = root.join("h");
@@ -195,7 +194,7 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_owner()
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
     )
     .unwrap();
-    let mut child = tokio::process::Command::new(&launcher)
+    let mut child = support::fixture_cli::tokio_command()
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", &home)

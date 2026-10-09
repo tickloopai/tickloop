@@ -192,7 +192,7 @@ async fn console_publication_enables_feedback_and_keeps_lifecycle_tools_host_onl
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
     )
     .unwrap();
-    let mut child = tokio::process::Command::new(support::fixture_cli::executable())
+    let mut child = support::fixture_cli::tokio_command()
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", &home)

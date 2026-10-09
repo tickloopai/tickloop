@@ -17,6 +17,7 @@ use super::{
     receipts::ReceiptStore,
     views::{ViewRegistry, command_origin, verify_host},
 };
+use crate::protocol::FEED_CAPACITY;
 
 #[async_trait]
 pub trait WorkerFactory: Send + Sync {

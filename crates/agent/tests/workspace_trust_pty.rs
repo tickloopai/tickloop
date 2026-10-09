@@ -9,7 +9,7 @@ use std::{
     net::{SocketAddr, TcpListener},
     os::unix::fs::PermissionsExt,
     path::PathBuf,
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{PtySize, native_pty_system};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -65,7 +65,7 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = Command::new(support::fixture_cli::executable())
+        let _ = support::fixture_cli::command()
             .args(["service", "stop"])
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -103,7 +103,7 @@ impl Terminal {
             pixel_height: 0,
         };
         let pty = native_pty_system().openpty(size).unwrap();
-        let mut command = CommandBuilder::new(support::fixture_cli::executable());
+        let mut command = support::fixture_cli::pty_command();
         command.env_clear();
         command.env("PATH", "/usr/bin:/bin");
         command.env("TERM", "xterm-256color");
@@ -325,7 +325,7 @@ fn startup_trust_real_input_pty_eof_is_quiet_without_persisting_trust() {
         let fixture = Fixture::new();
         let (input_master, input_slave) = pty_files();
         let (output_master, output_slave) = pty_files();
-        let mut child = Command::new(support::fixture_cli::executable())
+        let mut child = support::fixture_cli::command()
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "xterm-256color")
@@ -557,7 +557,7 @@ fn startup_trust_noninteractive_refusal_and_host_assertion_keep_their_contracts(
     for host_assertion in [false, true] {
         let fixture = Fixture::new();
         fixture.valid_model();
-        let mut command = Command::new(support::fixture_cli::executable());
+        let mut command = support::fixture_cli::command();
         command
             .env_clear()
             .env("PATH", "/usr/bin:/bin")

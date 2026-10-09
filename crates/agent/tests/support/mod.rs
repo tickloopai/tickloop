@@ -231,6 +231,13 @@ pub fn reminded_plan_file(request: &ModelRequest) -> Option<String> {
     })
 }
 
+/// Small transport limits that let tests cross the frame and chunk boundaries with little data.
+pub const TRANSPORT_LIMITS: tickloop_agent::protocol::AccessLimits =
+    match tickloop_agent::protocol::AccessLimits::new(64 << 10, 16 << 10) {
+        Ok(limits) => limits,
+        Err(_) => panic!("the test AccessLimits are valid"),
+    };
+
 /// How long [`next_event`] waits for the next runtime event.
 const EVENT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 

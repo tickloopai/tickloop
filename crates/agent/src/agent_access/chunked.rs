@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::protocol::*;
+use crate::protocol::AccessLimits;
 
 pub(super) struct EncodedResponse {
     pub file: File,
@@ -87,8 +88,9 @@ impl IncomingTransfer {
         kind: ChunkedResponseKind,
         total_bytes: u64,
         chunk_bytes: usize,
+        limits: AccessLimits,
     ) -> Result<Self, AccessError> {
-        if total_bytes <= MAX_FRAME_BYTES as u64 || chunk_bytes != RESPONSE_CHUNK_BYTES {
+        if total_bytes <= limits.frame_bytes() as u64 || chunk_bytes != limits.chunk_bytes() {
             return Err(AccessError::invalid("invalid chunked response limits"));
         }
         Ok(Self {

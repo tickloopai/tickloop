@@ -10,7 +10,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tickloop_agent::{agent_access::*, runtime::Agent};
+use tickloop_agent::{agent_access::*, protocol::AccessLimits, runtime::Agent};
 use tokio::{
     net::UnixListener,
     sync::{Mutex, Notify},
@@ -185,11 +185,20 @@ async fn serve(
     directory: &Path,
     owner: Arc<OwnerServer>,
 ) -> (LocalAgentClient, tokio::task::JoinHandle<()>) {
+    serve_with_limits(directory, owner, support::TRANSPORT_LIMITS).await
+}
+async fn serve_with_limits(
+    directory: &Path,
+    daemon: Arc<OwnerServer>,
+    limits: AccessLimits,
+) -> (LocalAgentClient, tokio::task::JoinHandle<()>) {
     let socket = directory.join("a.sock");
     let listener = UnixListener::bind(&socket).unwrap();
-    let epoch = owner.owner_epoch();
+    let epoch = daemon.owner_epoch();
     let server = tokio::spawn(async move {
-        serve_listener(listener, owner, epoch).await.unwrap();
+        serve_listener(listener, daemon, epoch, limits)
+            .await
+            .unwrap();
     });
     (LocalAgentClient::connect(socket).await.unwrap(), server)
 }
@@ -516,9 +525,12 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
         "host_endpoint": temporary.path().join("host.sock"),
         "intent_renewal": Duration::from_secs(100),
     });
-    let mut bootstrap = serde_json::to_vec(
-        &serde_json::json!({ "epoch": epoch, "launch": launch, "control": control }),
-    )
+    let mut bootstrap = serde_json::to_vec(&serde_json::json!({
+        "epoch": epoch,
+        "launch": launch,
+        "control": control,
+        "limits": support::TRANSPORT_LIMITS,
+    }))
     .unwrap();
     bootstrap.push(b'\n');
     lifeline.write_all(&bootstrap).await.unwrap();
@@ -959,7 +971,7 @@ async fn controlled_connections(
             let (stream, _) = listener.accept().await.unwrap();
             let owner = owner.clone();
             let task = tokio::spawn(async move {
-                let _ = serve_connection(stream, owner, epoch).await;
+                let _ = serve_connection(stream, owner, epoch, support::TRANSPORT_LIMITS).await;
             });
             saved.lock().await.push(task.abort_handle());
         }
@@ -1219,7 +1231,12 @@ async fn a_recovering_client_fences_an_old_execution_when_the_owner_epoch_change
     let owner = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
     let listener = UnixListener::bind(&socket).unwrap();
     let epoch = owner.owner_epoch();
-    let old_server = tokio::spawn(serve_owner_listener(listener, owner, epoch));
+    let old_server = tokio::spawn(serve_owner_listener(
+        listener,
+        owner,
+        epoch,
+        support::TRANSPORT_LIMITS,
+    ));
     let initial = LocalAgentClient::connect(&socket).await.unwrap();
     let old_epoch = initial.owner_epoch();
     let old_session = initial.session_id();
@@ -1254,7 +1271,12 @@ async fn a_recovering_client_fences_an_old_execution_when_the_owner_epoch_change
     ));
     let epoch = replacement_owner.owner_epoch();
     let listener = UnixListener::bind(&socket).unwrap();
-    let new_server = tokio::spawn(serve_owner_listener(listener, replacement_owner, epoch));
+    let new_server = tokio::spawn(serve_owner_listener(
+        listener,
+        replacement_owner,
+        epoch,
+        support::TRANSPORT_LIMITS,
+    ));
     let error = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             match observation.recv().await {
@@ -1630,7 +1652,7 @@ fn accept_links(
             accepted.fetch_add(1, Ordering::SeqCst);
             let served = served.clone();
             connections.lock().await.push(tokio::spawn(async move {
-                let _ = serve_connection(stream, served, epoch).await;
+                let _ = serve_connection(stream, served, epoch, support::TRANSPORT_LIMITS).await;
             }));
         }
     })
@@ -1895,7 +1917,12 @@ async fn an_execution_feed_can_close_while_the_owner_connection_stays_available(
     let listener = UnixListener::bind(&socket).unwrap();
     let epoch = access.owner_epoch();
     let service = access.clone();
-    let server = tokio::spawn(serve_listener(listener, service, epoch));
+    let server = tokio::spawn(serve_listener(
+        listener,
+        service,
+        epoch,
+        support::TRANSPORT_LIMITS,
+    ));
     let client = LocalAgentClient::connect(socket).await.unwrap();
     let command = create(epoch, temporary.path());
     let target = execution(client.execute(command.clone()).await.unwrap());
@@ -1996,7 +2023,7 @@ struct OversizedResponseAccess {
     executions: AtomicUsize,
 }
 
-const OVERSIZED_RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
+const OVERSIZED_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[async_trait]
 impl AgentAccess for OversizedResponseAccess {
@@ -2046,13 +2073,18 @@ async fn oversized_response_fixture(
     let target = execution(inner.execute(create(epoch, directory)).await.unwrap());
     let access = Arc::new(OversizedResponseAccess {
         inner,
-        text: "x".repeat(MAX_FRAME_BYTES),
+        text: "x".repeat(support::TRANSPORT_LIMITS.frame_bytes()),
         enlarge_receipts: AtomicBool::new(true),
         executions: AtomicUsize::new(0),
     });
     let socket = directory.join("oversized.sock");
     let listener = UnixListener::bind(&socket).unwrap();
-    let server = tokio::spawn(serve_listener(listener, access.clone(), epoch));
+    let server = tokio::spawn(serve_listener(
+        listener,
+        access.clone(),
+        epoch,
+        support::TRANSPORT_LIMITS,
+    ));
     let client = LocalAgentClient::connect(socket).await.unwrap();
     (client, access, target, server)
 }
@@ -2660,14 +2692,11 @@ async fn default_history_pages_return_multiple_records_and_transcript_messages()
             .capabilities
             .contains(&AccessCapability::DisplayRegistration)
     );
-    let limits = client
-        .protocol()
-        .limits
-        .as_ref()
-        .expect("negotiated finite limits");
-    assert_eq!(limits.frame_bytes, MAX_FRAME_BYTES);
+    let limits = &client.protocol().limits;
+    assert_eq!(limits.frame_bytes, support::TRANSPORT_LIMITS.frame_bytes());
+    assert_eq!(limits.chunk_bytes, support::TRANSPORT_LIMITS.chunk_bytes());
     assert_eq!(limits.view_lease_seconds, VIEW_LEASE_SECONDS);
-    assert!(limits.feed_bytes < limits.frame_bytes);
+    assert!(limits.change_bytes < limits.frame_bytes);
     factory.shutdown().await;
     server.abort();
 }
@@ -2677,7 +2706,8 @@ async fn the_owner_discovers_and_routes_more_than_one_page_in_one_worker() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let factory = Arc::new(FixtureFactory::new(vec![]));
     let owner = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
-    let (client, server) = serve(temporary.path(), owner).await;
+    // A full directory page is larger than the small test frame.
+    let (client, server) = serve_with_limits(temporary.path(), owner, AccessLimits::DEFAULT).await;
     let root = execution(
         client
             .execute(create(client.owner_epoch(), temporary.path()))
@@ -2758,7 +2788,7 @@ async fn a_client_rejected_oversized_create_does_not_mark_acceptance_unknown() {
         .dispatch(
             LaunchSpec::embedded(temporary.path().into()),
             UserInput::Text {
-                text: "x".repeat(MAX_FRAME_BYTES),
+                text: "x".repeat(support::TRANSPORT_LIMITS.frame_bytes()),
                 contexts: vec![],
                 paths: vec![],
             },
@@ -2787,5 +2817,158 @@ async fn a_client_rejected_oversized_create_does_not_mark_acceptance_unknown() {
     assert_eq!(factory.started.load(Ordering::SeqCst), 1);
     assert_eq!(agents(&client).await.len(), 1);
     factory.shutdown().await;
+    server.abort();
+}
+
+/// Serves each worker behind its own socket with the small test limits, as a worker process
+/// serves the limits its bootstrap carries.
+struct SocketWorkerFactory {
+    directory: PathBuf,
+    model: Arc<support::ScriptedModel>,
+    runtimes: Mutex<Vec<Agent>>,
+    announced: Mutex<Vec<ProtocolLimits>>,
+    servers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+#[async_trait]
+impl WorkerFactory for SocketWorkerFactory {
+    async fn start(
+        &self,
+        _: &LaunchSpec,
+        epoch: Uuid,
+    ) -> Result<Arc<dyn AgentAccess>, AccessError> {
+        let runtime = Agent::new_embedded(support::config(), self.model.clone());
+        self.runtimes.lock().await.push(runtime.clone());
+        let served = Arc::new(EmbeddedAgentAccess::for_worker(runtime, epoch));
+        let socket = self.directory.join("worker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        self.servers.lock().await.push(tokio::spawn(async move {
+            serve_worker_listener(listener, served, epoch, support::TRANSPORT_LIMITS)
+                .await
+                .unwrap();
+        }));
+        let client = LocalAgentClient::connect(&socket).await?;
+        self.announced
+            .lock()
+            .await
+            .push(client.protocol().limits.clone());
+        Ok(Arc::new(worker_link(client, socket, || true)))
+    }
+
+    async fn exited(&self, _: &Arc<dyn AgentAccess>) -> bool {
+        false
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_daemon_frames_its_worker_hop_with_the_limits_that_worker_announces() {
+    let temporary = tempfile::tempdir_in("/tmp").unwrap();
+    let factory = Arc::new(SocketWorkerFactory {
+        directory: temporary.path().into(),
+        model: Arc::new(support::ScriptedModel::new(vec![
+            support::text("First reply."),
+            support::text("Second reply."),
+        ])),
+        runtimes: Mutex::new(Vec::new()),
+        announced: Mutex::new(Vec::new()),
+        servers: Mutex::new(Vec::new()),
+    });
+    let daemon = Arc::new(OwnerServer::new(Uuid::new_v4(), factory.clone()));
+    // Only the worker hop is small; the console hop keeps the production limits.
+    let (client, server) = serve_with_limits(temporary.path(), daemon, AccessLimits::DEFAULT).await;
+    let epoch = client.owner_epoch();
+    let target = execution(
+        client
+            .execute(create(epoch, temporary.path()))
+            .await
+            .unwrap(),
+    );
+    let announced = factory.announced.lock().await[0].clone();
+    assert_eq!(
+        (announced.frame_bytes, announced.chunk_bytes),
+        (
+            support::TRANSPORT_LIMITS.frame_bytes(),
+            support::TRANSPORT_LIMITS.chunk_bytes()
+        )
+    );
+    let submit = |text: String| {
+        envelope(
+            epoch,
+            AgentCommand::Submit {
+                execution: target,
+                target_loop: None,
+                input: UserInput::Text {
+                    text,
+                    contexts: vec![],
+                    paths: vec![],
+                },
+                origin: None,
+            },
+        )
+    };
+    let mut feed = client
+        .observe(ObservationRequest::Agent {
+            execution: target,
+            detail: AgentDetailQuery::Snapshot,
+            after: None,
+        })
+        .await
+        .unwrap();
+    // Each prompt fits one worker frame; the history holding both must cross it in chunks.
+    let prompt = "x".repeat(support::TRANSPORT_LIMITS.frame_bytes() * 5 / 8);
+    for _ in 0..2 {
+        client
+            .execute(submit(prompt.clone()))
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(feed.recv().await.unwrap().change,
+                    ObservationChange::Event(event) if matches!(event.kind, tickloop_agent::runtime::EventKind::Completed { .. }))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let refused = client
+        .execute(submit("x".repeat(support::TRANSPORT_LIMITS.frame_bytes())))
+        .await
+        .unwrap();
+    assert_eq!(
+        refused.error.map(|error| error.code),
+        Some(AccessErrorCode::PayloadTooLarge),
+        "a request the console hop admits is still bounded by the worker frame"
+    );
+    let observed = client
+        .observe(ObservationRequest::Agent {
+            execution: target,
+            detail: AgentDetailQuery::Snapshot,
+            after: None,
+        })
+        .await
+        .unwrap();
+    let ObservationValue::Agent(snapshot) = observed.initial else {
+        panic!("expected the chunked worker history");
+    };
+    let prompts = snapshot
+        .conversation
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter(|content| matches!(content, tickloop_agent::model::Content::Text { text } if *text == prompt))
+        .count();
+    assert_eq!(prompts, 2);
+    assert_eq!(factory.model.requests.lock().unwrap().len(), 2);
+    for runtime in factory.runtimes.lock().await.iter() {
+        runtime.shutdown().await;
+    }
+    for worker in factory.servers.lock().await.iter() {
+        worker.abort();
+    }
     server.abort();
 }

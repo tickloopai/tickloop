@@ -41,7 +41,7 @@ use std::{
 };
 
 use futures_util::FutureExt;
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{PtySize, native_pty_system};
 use serde_json::{Value, json};
 use tickloop_agent::{agent_access::*, runtime::UserShellState};
 
@@ -193,7 +193,7 @@ impl PtyView {
                 pixel_height: 0,
             })
             .unwrap();
-        let mut command = CommandBuilder::new(support::fixture_cli::executable());
+        let mut command = support::fixture_cli::pty_command();
         command.args(["--working-directory-is-trusted", "--transport-fixture"]);
         command.arg(fixture.path("model.json"));
         if !saves_chats {

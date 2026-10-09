@@ -3669,6 +3669,7 @@ mod tests {
     use crate::{
         host_tools::{HostCallContext, HostToolPermission, HostToolProvider, PreparedHostCall},
         model::ToolDefinition,
+        protocol::TRANSPORT_LIMITS,
         terminal::test_support as support,
     };
     use async_trait::async_trait;
@@ -3962,7 +3963,9 @@ mod tests {
         let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
         let epoch = access.owner_epoch();
         let server = tokio::spawn(async move {
-            serve_listener(listener, access, epoch).await.unwrap();
+            serve_listener(listener, access, epoch, TRANSPORT_LIMITS)
+                .await
+                .unwrap();
         });
         let client = Arc::new(LocalAgentClient::connect(socket).await.unwrap());
         let terminal = ConsoleExecution::from_access(
@@ -3978,7 +3981,7 @@ mod tests {
         );
         let chat = terminal.create_chat(directory.path().into()).await.unwrap();
         let error = terminal
-            .submit(chat, None, "x".repeat(MAX_FRAME_BYTES))
+            .submit(chat, None, "x".repeat(TRANSPORT_LIMITS.frame_bytes()))
             .await
             .unwrap_err();
         let message = error.to_string();
