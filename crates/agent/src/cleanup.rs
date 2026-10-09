@@ -7,6 +7,8 @@
 //! Live runtimes hold shared retention locks for Transcripts and associated resources.
 //! Cleanup holds an exclusive lock throughout deletion and conservatively retains uncertain locks.
 //! After runtime exit, the kernel releases its lock and the existing modification-time policy applies.
+//! Removing a whole Transcript ends the Chat, so the Agent owner hears of it before and after the
+//! unlink ([`ChatDeletionNotice`]); without its answer the Transcript stays for a later round.
 //!
 //! 只认 Tick Loop 自己写出的名称：`<chatId>.jsonl` 的 Transcript、`<chatId>` 命名的 Chat 目录、文件回滚
 //! 备份目录与图片缓存目录（连字符分隔的小写 UUID），防止配置目录被误设为主目录这类情况下删除用户
@@ -27,7 +29,7 @@ use uuid::Uuid;
 use crate::file_history::FILE_HISTORY_DIRECTORY;
 use crate::runtime::{
     MAX_PLAN_SLUG_BYTES, PLAN_FILE_EXTENSION, PLANS_DIRECTORY, TOOL_RESULTS_SUBDIRECTORY,
-    is_valid_plan_slug, plan_file_slug,
+    WATERMARK_DIRECTORY, is_valid_plan_slug, plan_file_slug,
 };
 use crate::settings::{CleanupPeriod, UserSettings};
 use crate::terminal::{IMAGE_CACHE_DIRECTORY, PASTE_CACHE_DIRECTORY, PASTE_FILE_EXTENSION};
@@ -66,6 +68,16 @@ impl CleanupResult {
     }
 }
 
+/// The Agent owner's side of deleting a whole Transcript, called with the Chat's retention lock
+/// held so no runtime can load the Chat meanwhile. Only Transcripts are announced: tool results,
+/// plans and caches never end a Chat.
+pub trait ChatDeletionNotice: Send + Sync {
+    /// Announces the deletion and returns its operation; an error keeps the Transcript.
+    fn begin(&self, chat: Uuid) -> Result<Uuid, String>;
+    /// Reports that the cleanup is done with the Transcript, whether or not it removed it.
+    fn finish(&self, chat: Uuid, operation: Uuid);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CleanupOutcome {
     Completed(CleanupResult),
@@ -75,13 +87,16 @@ pub enum CleanupOutcome {
 
 /// 照 Claude Code `cleanupOldMessageFilesInBackground`：读取 `<root>/settings.json` 的清理天数后依次
 /// 清理各类文件。设置有问题且显式配置了清理天数时跳过，不回退到默认天数。阻塞调用。
-pub fn cleanup_old_message_files_in_background(root: &Path) -> CleanupOutcome {
+pub fn cleanup_old_message_files_in_background(
+    root: &Path,
+    deletion: &dyn ChatDeletionNotice,
+) -> CleanupOutcome {
     let days = match UserSettings::in_root(root).cleanup_period_for_cleanup() {
         CleanupPeriod::Days(days) => days,
         CleanupPeriod::SkipInvalidSettings => return CleanupOutcome::Skipped,
     };
     let cutoff = cutoff_date(days);
-    let (mut result, mut active_chats) = cleanup_old_transcript_files(root, cutoff);
+    let (mut result, mut active_chats) = cleanup_old_transcript_files(root, cutoff, deletion);
     result.add(cleanup_old_plan_files(root, cutoff, &active_chats));
     result.add(cleanup_old_file_history_backups(
         root,
@@ -179,7 +194,11 @@ impl ActiveChats {
 /// 照 Claude Code `cleanupOldSessionFiles`：每个项目目录中删除过期的 `<chatId>.jsonl`；`<chatId>` Chat 目录中
 /// 只清理 `tool-results/` 下的文件及其下一层目录中的文件，再依次尝试删除空的工具目录、`tool-results/`、
 /// Chat 目录与项目目录。同时收集 Transcript 仍保留的 Chat。
-fn cleanup_old_transcript_files(root: &Path, cutoff: SystemTime) -> (CleanupResult, ActiveChats) {
+fn cleanup_old_transcript_files(
+    root: &Path,
+    cutoff: SystemTime,
+    deletion: &dyn ChatDeletionNotice,
+) -> (CleanupResult, ActiveChats) {
     let mut result = CleanupResult::default();
     let mut active_chats = ActiveChats::new(root);
     if active_chats.unavailable {
@@ -209,7 +228,7 @@ fn cleanup_old_transcript_files(root: &Path, cutoff: SystemTime) -> (CleanupResu
                     continue;
                 };
                 let outcome = if active_chats.can_remove(chat_id) {
-                    unlink_if_old(&entry.path, cutoff)
+                    remove_old_transcript(&entry.path, chat_id, cutoff, deletion)
                 } else {
                     Ok(false)
                 };
@@ -485,6 +504,33 @@ fn has_extension(path: &Path, extension: &str) -> bool {
 
 fn is_old(path: &Path, cutoff: SystemTime) -> io::Result<bool> {
     Ok(fs::symlink_metadata(path)?.modified()? < cutoff)
+}
+
+/// Removes an expired Transcript between the owner's begin and finish notices, and with it the
+/// Chat's Tick delivery watermarks; a Transcript that is not expired is never announced.
+fn remove_old_transcript(
+    path: &Path,
+    chat_id: Uuid,
+    cutoff: SystemTime,
+    deletion: &dyn ChatDeletionNotice,
+) -> io::Result<bool> {
+    if !fs::symlink_metadata(path)?.is_file() || !is_old(path, cutoff)? {
+        return Ok(false);
+    }
+    let operation = deletion.begin(chat_id).map_err(io::Error::other)?;
+    let outcome = unlink_if_old(path, cutoff);
+    deletion.finish(chat_id, operation);
+    if matches!(outcome, Ok(true))
+        && let Some(project) = path.parent()
+    {
+        let chat_directory = project.join(chat_id.to_string());
+        let watermarks = chat_directory.join(WATERMARK_DIRECTORY);
+        if read_real_directory(&watermarks).is_some() {
+            let _ = fs::remove_dir_all(&watermarks);
+        }
+        try_rmdir(&chat_directory);
+    }
+    outcome
 }
 
 /// 照 Claude Code `unlinkIfOld`。删除前再次确认仍是普通文件：之后被换成符号链接时 `unlink`

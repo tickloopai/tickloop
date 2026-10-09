@@ -82,6 +82,7 @@ mod system_prompt;
 mod tool_execution;
 mod tool_results;
 mod web_fetch;
+pub(crate) use tick_content::WATERMARK_DIRECTORY;
 use tool_execution::{ToolCallOutcome, ToolInvocation, ToolRegistry};
 pub(crate) use tool_results::TOOL_RESULTS_SUBDIRECTORY;
 mod user_shell;
@@ -92,6 +93,7 @@ pub use interaction::{
     START_GOAL_TOOL_NAME,
 };
 mod commands;
+mod tick_content;
 mod tick_subscriptions;
 pub use tick_subscriptions::{
     DEFAULT_CADENCE_SECONDS, MAX_CADENCE_SECONDS, MAX_DELIVERY_PAYLOAD_BYTES, MIN_CADENCE_SECONDS,
@@ -178,7 +180,7 @@ pub type RunId = Uuid;
 pub use agent_messages::{
     AgentMessageSource, FamilyMessageRejection, FamilyMessageRejectionCode,
     LIST_FAMILY_AGENTS_TOOL_NAME, RECEIVE_AGENT_MESSAGE_TOOL_NAME, SEND_AGENT_MESSAGE_TOOL_NAME,
-    VerifiedUserRelay, WAIT_FOR_AGENT_TOOL_NAME,
+    StoppedChildHook, VerifiedUserRelay, WAIT_FOR_AGENT_TOOL_NAME,
 };
 pub use delegation::{
     DELEGATE_AGENT_TOOL_NAME, DelegationCeiling, DelegationMetadata,
@@ -1031,6 +1033,8 @@ struct Inner {
     judgment: Mutex<Option<Arc<dyn crate::judgment::JudgmentClient>>>,
     auto_health: Mutex<auto_health::AutoHealth>,
     host_tools: std::sync::RwLock<Option<Arc<dyn crate::host_tools::HostToolProvider>>>,
+    hosted_ticks: std::sync::RwLock<Option<Arc<crate::hosted::tools::HostedTickTools>>>,
+    stopped_child_hook: std::sync::RwLock<Option<Arc<dyn StoppedChildHook>>>,
     /// Whether a Workspace Tick Update stream is installed; the Tick Subscription tools reach the
     /// model only then.
     tick_stream_installed: AtomicBool,
@@ -1387,6 +1391,15 @@ impl Agent {
             self.inner.tick_stream_installed.load(Ordering::SeqCst),
         )
         .definitions()
+    }
+
+    /// Installs the worker's hosted Ticks, which its Chats' Monitors list and close directly.
+    pub fn install_hosted_ticks(&self, tools: Arc<crate::hosted::tools::HostedTickTools>) {
+        *self.inner.hosted_ticks.write().unwrap() = Some(tools);
+    }
+
+    pub fn hosted_ticks(&self) -> Option<Arc<crate::hosted::tools::HostedTickTools>> {
+        self.inner.hosted_ticks.read().unwrap().clone()
     }
 
     pub fn install_host_tools(
@@ -1949,6 +1962,8 @@ impl Agent {
                 judgment: Mutex::new(None),
                 auto_health: Mutex::new(auto_health::AutoHealth::default()),
                 host_tools: std::sync::RwLock::new(None),
+                hosted_ticks: std::sync::RwLock::new(None),
+                stopped_child_hook: std::sync::RwLock::new(None),
                 tick_stream_installed: AtomicBool::new(false),
                 tick_deliveries: std::sync::Mutex::new(
                     tick_subscriptions::TickDeliveries::default(),

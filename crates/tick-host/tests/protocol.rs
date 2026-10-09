@@ -27,7 +27,13 @@ async fn start() -> Fixture {
         runtime: directory.path().join("h"),
     };
     let key = host::random_token();
-    let server = tokio::spawn(host::serve(paths.clone(), key.clone()));
+    let server = tokio::spawn(host::serve(
+        paths.clone(),
+        host::HostConfig {
+            controller_key: key.clone(),
+            idle_timeout: host::DEFAULT_IDLE_TIMEOUT,
+        },
+    ));
     for _ in 0..200 {
         if paths.socket().exists() {
             break;

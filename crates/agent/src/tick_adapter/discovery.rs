@@ -23,20 +23,35 @@ pub enum DiscoveryError {
     Unavailable(String),
 }
 
+/// Reads the host state of a Chat's members of one Tick type.
 #[async_trait::async_trait]
-pub trait TickDiscovery: Send + Sync {
-    /// The Tick type whose instances this discovery lists and probes.
+pub trait TickProbe: Send + Sync {
+    /// The Tick type whose instances this probe reports on.
     fn tick_type(&self) -> &'static str;
+    /// The current host state of `chat`'s member `instances`. A host that cannot be read reports
+    /// an error, so earlier findings stay instead of being wiped.
+    async fn probe(
+        &self,
+        chat: Uuid,
+        instances: &[InstanceRef],
+    ) -> Result<MemberFindings, DiscoveryError>;
+}
+
+/// Lists existing instances that can be added to a Chat's Monitor, and probes its members.
+#[async_trait::async_trait]
+pub trait TickDiscovery: TickProbe {
     async fn page(
         &self,
         cursor: Option<PageCursor>,
     ) -> Result<Page<DiscoveredTick>, DiscoveryError>;
-    /// The current host state of `instances`. A host that cannot be read reports an error, so
-    /// earlier findings stay instead of being wiped.
-    async fn probe(
-        &self,
-        instances: &[InstanceRef],
-    ) -> Result<HashMap<InstanceRef, MemberState>, DiscoveryError>;
+}
+
+/// What a host probe found for members no subscription reports on.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MemberFindings {
+    pub states: HashMap<InstanceRef, MemberState>,
+    /// Process samples of the members whose host takes them.
+    pub resources: HashMap<InstanceRef, TickResources>,
 }
 
 /// The programs of the View's current Herdr Workspace.
@@ -52,10 +67,6 @@ impl HerdrDiscovery {
 
 #[async_trait::async_trait]
 impl TickDiscovery for HerdrDiscovery {
-    fn tick_type(&self) -> &'static str {
-        "herdr"
-    }
-
     async fn page(
         &self,
         cursor: Option<PageCursor>,
@@ -112,17 +123,25 @@ impl TickDiscovery for HerdrDiscovery {
                 .map_err(|_| malformed())?,
         })
     }
+}
+
+#[async_trait::async_trait]
+impl TickProbe for HerdrDiscovery {
+    fn tick_type(&self) -> &'static str {
+        "herdr"
+    }
 
     async fn probe(
         &self,
+        _chat: Uuid,
         instances: &[InstanceRef],
-    ) -> Result<HashMap<InstanceRef, MemberState>, DiscoveryError> {
+    ) -> Result<MemberFindings, DiscoveryError> {
         let (located, uncertain) = self
             .access
             .locate_all()
             .await
             .map_err(|error| DiscoveryError::Unavailable(error.to_string()))?;
-        Ok(instances
+        let states = instances
             .iter()
             .map(|instance| {
                 let state = match located
@@ -137,6 +156,10 @@ impl TickDiscovery for HerdrDiscovery {
                 };
                 (instance.clone(), state)
             })
-            .collect())
+            .collect();
+        Ok(MemberFindings {
+            states,
+            resources: HashMap::new(),
+        })
     }
 }

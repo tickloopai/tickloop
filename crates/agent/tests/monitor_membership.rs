@@ -460,3 +460,76 @@ async fn rewind_and_compaction_keep_membership_and_restart_reads_it_back() {
     assert_eq!(restored.snapshot(chat).await.unwrap().monitor, before);
     restored.shutdown().await;
 }
+
+/// A hosted member shows what the latest probe found: running with its process sample, gone,
+/// or lost with its host; every row offers Close, and a lost one also Reopen as new.
+#[tokio::test]
+async fn hosted_members_show_their_probed_state_and_sample_and_offer_close() {
+    use std::collections::HashMap;
+    use tickloop_agent::tick_adapter::{MemberState, TickResources};
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new_embedded(
+        support::config(),
+        Arc::new(support::ScriptedModel::new(Vec::new())),
+    );
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let (running, gone, lost) = (
+        InstanceRef::hosted(uuid::Uuid::new_v4()),
+        InstanceRef::hosted(uuid::Uuid::new_v4()),
+        InstanceRef::hosted(uuid::Uuid::new_v4()),
+    );
+    for instance in [&running, &gone, &lost] {
+        agent
+            .add_monitor_member(chat, instance.clone(), Some("Counter".into()))
+            .await
+            .unwrap();
+    }
+    let sample = TickResources {
+        pid: 4242,
+        cpu_time_ms: Some(120),
+        cpu_percent: None,
+        rss_bytes: Some(8 << 20),
+        sampled_at_ms: 1,
+    };
+    let rows = TickAdapters::presentation().list(&MonitorContext {
+        chat: Some(agent.snapshot(chat).await.unwrap()),
+        member_states: HashMap::from([
+            (running.clone(), MemberState::Live { protocol: true }),
+            (gone.clone(), MemberState::Gone),
+            (lost.clone(), MemberState::Lost),
+        ]),
+        member_resources: HashMap::from([(running.clone(), sample.clone())]),
+        ..Default::default()
+    });
+    let row = |instance: &InstanceRef| {
+        rows.iter()
+            .find(|row| &row.instance == instance)
+            .unwrap()
+            .clone()
+    };
+    let live = row(&running);
+    assert!(live.running);
+    assert_eq!(live.status, "live");
+    assert_eq!(live.resources, Some(sample));
+    let ended = row(&gone);
+    assert!(!ended.running);
+    assert_eq!(ended.status, "gone");
+    assert_eq!(ended.resources, None);
+    for row in [live, ended] {
+        let keys = row
+            .actions
+            .iter()
+            .map(|action| action.key)
+            .collect::<String>();
+        assert_eq!(keys, "oxc", "details, remove and close");
+    }
+    let recoverable = row(&lost);
+    assert_eq!(recoverable.status, "lost");
+    let keys = recoverable
+        .actions
+        .iter()
+        .map(|action| action.key)
+        .collect::<String>();
+    assert_eq!(keys, "oxcn", "a lost Tick can also be reopened as new");
+    agent.shutdown().await;
+}

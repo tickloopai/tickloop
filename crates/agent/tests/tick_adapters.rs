@@ -262,7 +262,7 @@ async fn shell_output_changes_before_exit_and_a_late_watch_uses_a_new_baseline()
     })
     .await
     .unwrap();
-    let adapters = TickAdapters::builtin(Some(agent.clone()), None, None);
+    let adapters = TickAdapters::builtin(Some(agent.clone()), None, None, None);
     let mut stream = adapters.open();
     let instance = InstanceRef::shell(task.command_id);
     let first = Uuid::new_v4();
@@ -411,7 +411,7 @@ async fn shell_subscription_refuses_foreign_chat_before_baseline_and_restoration
             .await
             .is_err()
     );
-    let adapters = Arc::new(TickAdapters::builtin(Some(agent.clone()), None, None));
+    let adapters = Arc::new(TickAdapters::builtin(Some(agent.clone()), None, None, None));
     let instance = InstanceRef::shell(task.command_id);
     agent.install_tick_stream(adapters).await;
     model.enqueue(call(
@@ -529,6 +529,7 @@ async fn shell_subscription_preserves_its_policy_including_final_admission() {
     agent
         .install_tick_stream(Arc::new(TickAdapters::builtin(
             Some(agent.clone()),
+            None,
             None,
             None,
         )))

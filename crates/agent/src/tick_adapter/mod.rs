@@ -5,8 +5,11 @@ mod shell;
 
 #[cfg(test)]
 pub(crate) use builtin::artifact_actions;
-pub use builtin::{ArtifactAdapter, HerdrAdapter, ShellAdapter, shell_status};
-pub use discovery::{DiscoveredTick, DiscoveryError, HerdrDiscovery, TickDiscovery};
+pub use builtin::{ArtifactAdapter, HerdrAdapter, HostedAdapter, ShellAdapter, shell_status};
+pub(crate) use builtin::{HOSTED_CLOSE_KEY, HOSTED_REOPEN_KEY};
+pub use discovery::{
+    DiscoveredTick, DiscoveryError, HerdrDiscovery, MemberFindings, TickDiscovery, TickProbe,
+};
 pub use shell::ShellTickStream;
 
 use crate::{
@@ -133,13 +136,18 @@ pub struct MonitorContext {
     pub metadata_failures: HashMap<String, String>,
     /// What the latest host probe found for members no subscription reports on.
     pub member_states: HashMap<InstanceRef, MemberState>,
+    pub member_resources: HashMap<InstanceRef, TickResources>,
 }
 
 /// A host probe's finding for one member. Probing reads host state only: it never reads Tick
 /// content, subscribes or calls the model.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemberState {
-    Live { protocol: bool },
+    Live {
+        protocol: bool,
+    },
+    /// Its host died with it; a hosted Tick can be reopened as a new instance.
+    Lost,
     Gone,
     IdentityUncertain,
 }
@@ -234,6 +242,7 @@ impl TickAdapters {
         agent: Option<crate::runtime::Agent>,
         root: Option<std::path::PathBuf>,
         access: Option<Arc<tick_connect::access::TickAccess>>,
+        hosted: Option<Arc<crate::hosted::tools::HostedTickTools>>,
     ) -> Self {
         Self::new([
             Arc::new(ArtifactAdapter::new(root)) as Arc<dyn TickAdapter>,
@@ -241,11 +250,12 @@ impl TickAdapters {
             Arc::new(HerdrAdapter::new(access.map(|access| {
                 Arc::new(crate::native_host::NativeHostToolProvider::new(access))
             }))),
+            Arc::new(HostedAdapter::new(hosted)),
         ])
         .expect("unique built-in Tick Adapters")
     }
     pub fn presentation() -> Self {
-        Self::builtin(None, None, None)
+        Self::builtin(None, None, None, None)
     }
     /// The Chat's complete deduplicated Monitor set: adapter rows plus opened and added members,
     /// minus the instances the user removed. Listing never subscribes or calls the model.
@@ -458,6 +468,20 @@ impl TickStreamPort for TickAdapters {
             .and_then(|adapter| adapter.stream())
             .ok_or("Tick stream is unavailable")?;
         stream.revalidate_watch(chat, instance, authority).await
+    }
+    async fn read_current(
+        &self,
+        chat: Uuid,
+        instance: &InstanceRef,
+    ) -> Result<Option<crate::tick_stream::TickObservation>, String> {
+        match self
+            .adapters
+            .get(instance.tick_type())
+            .and_then(|adapter| adapter.stream())
+        {
+            Some(stream) => stream.read_current(chat, instance).await,
+            None => Ok(None),
+        }
     }
     fn set_watch_chats(&self, chats: BTreeMap<WatchId, Uuid>) {
         for stream in self

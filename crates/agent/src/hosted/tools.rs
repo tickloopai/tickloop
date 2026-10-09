@@ -4,13 +4,14 @@
 //! directory and operation id frozen — and the same preparation is approved and dispatched.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
 };
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tick_connect::{
+    host_error::HostError,
     hosted::{CALL_RESPONSE_TIMEOUT, CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role},
     instance::InstanceRef,
     protocol::TickDescriptor,
@@ -20,7 +21,10 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::worker_control::{HostedAdmission, OwnerControl, WorkerRequest};
+use super::{
+    registry::{FileIdentity, TARGET_GONE},
+    worker_control::{HostedAdmission, HostedTickPage, OwnerControl, WorkerRequest},
+};
 use crate::{
     host_tools::{
         HostCallContext, HostCallResult, HostEffect, HostEndpointIdentity, HostToolAuthority,
@@ -34,13 +38,30 @@ use crate::{
 /// The open placement that runs a Tick hidden in the Tick host.
 pub const HIDDEN_PLACEMENT: &str = "hidden";
 pub const MODIFY_TICK: &str = "ModifyTick";
-const READ_TICK: &str = "ReadTick";
+pub(crate) const READ_TICK: &str = "ReadTick";
 const CALL_TICK_TOOL: &str = "CallTickTool";
 
 #[derive(Clone)]
 struct DataBinding {
     endpoint: PathBuf,
     data_token: String,
+}
+
+/// One hosted Tick as its Chat's Monitor shows it.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq)]
+pub struct HostedMember {
+    pub instance: InstanceRef,
+    pub title: Option<String>,
+    pub state: HostedMemberState,
+    pub resources: Option<tick_host::host::Resources>,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HostedMemberState {
+    Running,
+    /// Its host died with it; only an explicit reopen starts a new instance in its place.
+    Lost,
 }
 
 enum Operation {
@@ -69,35 +90,6 @@ enum Operation {
 
 struct HostedPrepared {
     operation: Operation,
-}
-
-/// Which file a path names. Executables also compare their modification time; a directory's
-/// changes with every entry, so a working directory compares device and inode only.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-    modified: Option<i64>,
-}
-
-impl FileIdentity {
-    fn executable(path: &Path) -> Result<Self, String> {
-        Self::read(path, true)
-    }
-
-    fn directory(path: &Path) -> Result<Self, String> {
-        Self::read(path, false)
-    }
-
-    fn read(path: &Path, with_modification: bool) -> Result<Self, String> {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
-        Ok(Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            modified: with_modification.then(|| metadata.mtime()),
-        })
-    }
 }
 
 pub struct HostedTickTools {
@@ -328,7 +320,7 @@ impl HostedTickTools {
             } => {
                 let mut connection = match self.data(chat, &instance).await {
                     Ok(connection) => connection,
-                    Err(error) => return HostCallResult::NotDispatched(error),
+                    Err(error) => return HostCallResult::NotDispatched(error.to_string()),
                 };
                 match connection
                     .request(
@@ -391,7 +383,9 @@ impl HostedTickTools {
                 Err(HostCallResult::NotDispatched(failure.to_string()))
             }
             Ok(Some(Receipt::Failed(failure))) => Err(unknown(failure.to_string())),
-            Ok(Some(Receipt::Dispatched) | None) => Err(unknown(lost.to_string())),
+            Ok(Some(Receipt::Dispatched | Receipt::OwnerEnded { .. }) | None) => {
+                Err(unknown(lost.to_string()))
+            }
             Err(error) => Err(unknown(format!(
                 "{lost}; its receipt is unreadable: {error}"
             ))),
@@ -437,7 +431,10 @@ impl HostedTickTools {
         chat: ChatId,
         instance: &InstanceRef,
     ) -> Result<TickDescriptor, String> {
-        let mut connection = self.data(chat, instance).await?;
+        let mut connection = self
+            .data(chat, instance)
+            .await
+            .map_err(|error| error.to_string())?;
         let value = connection
             .request("describe", json!({}), CONTROL_TIMEOUT)
             .await
@@ -446,9 +443,12 @@ impl HostedTickTools {
     }
 
     async fn read(&self, chat: ChatId, instance: &InstanceRef) -> Result<Value, String> {
-        let mut connection = self.data(chat, instance).await?;
+        let mut connection = self
+            .data(chat, instance)
+            .await
+            .map_err(|error| error.to_string())?;
         let read = connection
-            .request("read", json!({}), CONTROL_TIMEOUT)
+            .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
             .await
             .map_err(|error| error.to_string())?;
         let descriptor = connection
@@ -467,56 +467,212 @@ impl HostedTickTools {
         }))
     }
 
-    /// A data connection for an instance this Chat owns, recovering its binding from the
-    /// owner after a worker restart.
-    async fn data(&self, chat: ChatId, instance: &InstanceRef) -> Result<HostConnection, String> {
-        let cached = self
-            .bindings
-            .lock()
+    /// A data connection for an instance this Chat owns. A binding is recovered from the owner,
+    /// which lists only this Chat's running Ticks, after a worker restart or once a cached one
+    /// stops connecting because its host was replaced.
+    pub(crate) async fn data(
+        &self,
+        chat: ChatId,
+        instance: &InstanceRef,
+    ) -> Result<HostConnection, HostError> {
+        let key = (chat, instance.clone());
+        let cached = self.bindings.lock().await.get(&key).cloned();
+        if let Some(binding) = cached {
+            if let Ok(connection) = binding.connect(instance).await {
+                return Ok(connection);
+            }
+            self.bindings.lock().await.remove(&key);
+        }
+        self.recover_binding(chat, instance)
+            .await?
+            .connect(instance)
             .await
-            .get(&(chat, instance.clone()))
-            .cloned();
-        let binding = match cached {
-            Some(binding) => binding,
-            None => self.recover_binding(chat, instance).await?,
+    }
+
+    /// The Chat's running hosted Ticks for its Monitor, each with a resource sample when the
+    /// host could take one, and those its host was lost with. Sampling reads host process facts
+    /// only, never Tick content, and does not count as using the Tick.
+    pub async fn members(&self, chat: ChatId) -> Result<Vec<HostedMember>, HostError> {
+        let mut members = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.list_page(chat, cursor).await?;
+            for row in page.page.items {
+                let (Some(instance), Some(data_token)) = (row.instance, row.data_token) else {
+                    continue;
+                };
+                let binding = DataBinding {
+                    endpoint: page.endpoint.clone(),
+                    data_token,
+                };
+                let resources = match binding.connect(&instance).await {
+                    Ok(mut connection) => connection
+                        .request("resources", json!({}), CONTROL_TIMEOUT)
+                        .await
+                        .ok()
+                        .and_then(|resources| serde_json::from_value(resources).ok()),
+                    Err(_) => None,
+                };
+                self.bindings
+                    .lock()
+                    .await
+                    .insert((chat, instance.clone()), binding);
+                members.push(HostedMember {
+                    instance,
+                    title: row.title,
+                    state: HostedMemberState::Running,
+                    resources,
+                });
+            }
+            members.extend(page.lost.into_iter().map(|lost| HostedMember {
+                instance: lost.instance,
+                title: lost.title,
+                state: HostedMemberState::Lost,
+                resources: None,
+            }));
+            match page.page.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(members),
+            }
+        }
+    }
+
+    async fn list_page(
+        &self,
+        chat: ChatId,
+        cursor: Option<tick_connect::page::PageCursor>,
+    ) -> Result<HostedTickPage, HostError> {
+        let page = self
+            .owner
+            .request(WorkerRequest::ListHostedTicks { chat, cursor })
+            .await?;
+        serde_json::from_value(page)
+            .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))
+    }
+
+    /// Starts a new instance in place of a lost one because its user asked to. The owner
+    /// prepares the recorded launch again under the Chat's current authority; the lost instance
+    /// and its Watches stay gone, and nothing reopens on its own. Returns the new instance.
+    pub async fn reopen_for_user(
+        &self,
+        chat: ChatId,
+        lost: &InstanceRef,
+    ) -> Result<InstanceRef, HostError> {
+        let operation = Uuid::new_v4();
+        let request = WorkerRequest::ReopenHostedTick {
+            chat,
+            operation,
+            instance: lost.clone(),
+            environment: self.environment.clone(),
+            admission: self.admission(),
         };
-        HostConnection::connect(
-            &binding.endpoint,
-            Role::Instance {
-                instance: instance.clone(),
-                data_token: binding.data_token,
+        let opened = match self.lifecycle(chat, operation, request).await {
+            Ok(opened) => opened,
+            Err(HostCallResult::NotDispatched(message)) => {
+                return Err(HostError::before("Refused", message));
+            }
+            Err(HostCallResult::OutcomeUnknown(message)) => {
+                return Err(HostError::after("OutcomeUnknown", message));
+            }
+            Err(_) => {
+                return Err(HostError::after(
+                    "OutcomeUnknown",
+                    "the reopen ended without an answer",
+                ));
+            }
+        };
+        match self.opened(chat, opened, lost.to_string()).await {
+            HostCallResult::CompletedWithEffect(_, effect) => match *effect {
+                HostEffect::OpenedTick { instance, .. } => Ok(instance),
+                _ => Err(HostError::after(
+                    "OutcomeUnknown",
+                    "unexpected reopen effect",
+                )),
             },
-            &[CAPABILITY_DATA],
-        )
-        .await
-        .map_err(|error| error.to_string())
+            HostCallResult::OutcomeUnknown(message) => {
+                Err(HostError::after("OutcomeUnknown", message))
+            }
+            _ => Err(HostError::after(
+                "OutcomeUnknown",
+                "unexpected reopen result",
+            )),
+        }
+    }
+
+    /// Closes one of the Chat's hosted Ticks because its user asked to, through the same
+    /// prepared close a model's approved ModifyTick runs.
+    pub async fn close_for_user(
+        &self,
+        chat: ChatId,
+        instance: &InstanceRef,
+    ) -> Result<(), HostError> {
+        let cancel = CancellationToken::new();
+        let prepared = self
+            .prepare_call(
+                chat,
+                MODIFY_TICK,
+                &json!({"action":"close","tick_instance_id":instance}),
+                cancel.clone(),
+            )
+            .await
+            .map_err(|error| HostError::before("Invalid", error))?;
+        match self.execute_prepared(chat, prepared, cancel).await {
+            HostCallResult::Completed(result) | HostCallResult::CompletedWithEffect(result, _)
+                if !result.is_error =>
+            {
+                Ok(())
+            }
+            HostCallResult::Completed(result) | HostCallResult::CompletedWithEffect(result, _) => {
+                Err(HostError::after("ToolError", result.content))
+            }
+            HostCallResult::NotDispatched(message) => Err(HostError::before("Refused", message)),
+            HostCallResult::OutcomeUnknown(message) => {
+                Err(HostError::after("OutcomeUnknown", message))
+            }
+        }
+    }
+
+    /// How often Watch intents must be reported again to keep protecting their Ticks.
+    pub(crate) fn intent_renewal(&self) -> std::time::Duration {
+        self.owner.intent_renewal()
+    }
+
+    /// Tells the owner which approved Watches of `chat` keep `instance` from idling.
+    pub(crate) async fn set_watch_intents(
+        &self,
+        chat: ChatId,
+        instance: &InstanceRef,
+        watches: BTreeSet<Uuid>,
+    ) -> Result<(), HostError> {
+        self.owner
+            .request(WorkerRequest::SetWatchIntents {
+                chat,
+                instance: instance.clone(),
+                watches,
+            })
+            .await
+            .map(drop)
     }
 
     async fn recover_binding(
         &self,
         chat: ChatId,
         instance: &InstanceRef,
-    ) -> Result<DataBinding, String> {
+    ) -> Result<DataBinding, HostError> {
         let mut cursor = None;
         loop {
-            let page = self
-                .owner
-                .request(WorkerRequest::ListHostedTicks { chat, cursor })
-                .await
-                .map_err(|error| error.to_string())?;
-            let endpoint = page["endpoint"].as_str().map(PathBuf::from);
-            if let Some(row) = page["items"]
-                .as_array()
+            let page = self.list_page(chat, cursor).await?;
+            if let Some(row) = page
+                .page
+                .items
                 .into_iter()
-                .flatten()
-                .find(|row| row["instance"] == json!(instance))
+                .find(|row| row.instance.as_ref() == Some(instance))
             {
                 let binding = DataBinding {
-                    endpoint: endpoint.ok_or("the owner listed no host endpoint")?,
-                    data_token: row["data_token"]
-                        .as_str()
-                        .ok_or("the hosted Tick is not running")?
-                        .into(),
+                    endpoint: page.endpoint,
+                    data_token: row.data_token.ok_or_else(|| {
+                        HostError::before(TARGET_GONE, "the hosted Tick is not running")
+                    })?,
                 };
                 self.bindings
                     .lock()
@@ -524,15 +680,30 @@ impl HostedTickTools {
                     .insert((chat, instance.clone()), binding.clone());
                 return Ok(binding);
             }
-            match serde_json::from_value(page["next"].clone()).ok().flatten() {
+            match page.page.next {
                 Some(next) => cursor = Some(next),
                 None => {
-                    return Err(format!(
-                        "TargetGone: {instance} is not a running hosted Tick of this Chat"
+                    return Err(HostError::before(
+                        TARGET_GONE,
+                        format!("{instance} is not a running hosted Tick of this Chat"),
                     ));
                 }
             }
         }
+    }
+}
+
+impl DataBinding {
+    async fn connect(&self, instance: &InstanceRef) -> Result<HostConnection, HostError> {
+        HostConnection::connect(
+            &self.endpoint,
+            Role::Instance {
+                instance: instance.clone(),
+                data_token: self.data_token.clone(),
+            },
+            &[CAPABILITY_DATA],
+        )
+        .await
     }
 }
 

@@ -14,8 +14,8 @@ pub(super) const MONITOR_AUTO_MIN_COLUMNS: usize = 121;
 
 pub(super) use crate::tick_adapter::TickGroup;
 use crate::tick_adapter::{
-    MONITOR_ADD_KEY, MemberState, MonitorAction, MonitorContext, TickAdapters, TickDescriptor,
-    TickGlyph, TickOwner, TickResources, page_of,
+    MONITOR_ADD_KEY, MonitorAction, MonitorContext, TickAdapters, TickDescriptor, TickGlyph,
+    TickOwner, TickResources, page_of,
 };
 use crate::tick_stream::InstanceRef;
 
@@ -45,7 +45,7 @@ pub(super) struct Monitor {
     pub(super) subscriptions: Vec<crate::runtime::TickSubscriptionStatus>,
     pub(super) metadata: HashMap<String, Option<crate::artifacts::ArtifactMetadata>>,
     pub(super) metadata_failures: HashMap<String, String>,
-    pub(super) member_states: HashMap<InstanceRef, MemberState>,
+    pub(super) member_findings: crate::tick_adapter::MemberFindings,
     pub(super) confirmation: Option<TickConfirmation>,
     /// The visible page; the complete set is `total` rows.
     entries: Vec<MonitorEntry>,
@@ -114,7 +114,8 @@ impl Monitor {
             subscriptions: self.subscriptions.clone(),
             metadata: self.metadata.clone(),
             metadata_failures: self.metadata_failures.clone(),
-            member_states: self.member_states.clone(),
+            member_states: self.member_findings.states.clone(),
+            member_resources: self.member_findings.resources.clone(),
         };
         let listed = self
             .adapters
