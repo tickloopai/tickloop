@@ -59,7 +59,7 @@ fn artifact_tick(service: &ArtifactService, artifact_id: &str) -> ArtifactTick {
         origin: service.origin.clone(),
         title: "Fixture".into(),
         format: "markdown".into(),
-        url: format!("{}/a/{artifact_id}", service.origin),
+        url: tickloop_agent_artifacts::artifact_url(&service.origin, artifact_id),
         access_role: "owner".into(),
         added_at_ms: 1,
     }
@@ -1134,7 +1134,7 @@ async fn linking_puts_the_account_link_and_claims_a_pending_request_into_its_loo
     ]));
     let (agent, chat, loop_id) = linked_chat(&service, directory.path(), model.clone()).await;
     let link = service.link("doc").expect("the link was put");
-    let put = &service.lifecycle_requests("PUT /api/v1/agent/links/doc")[0];
+    let put = &service.lifecycle_requests("PUT /artifact/api/v1/agent/links/doc")[0];
     assert_eq!(put["body"]["chat_id"], chat.to_string());
     assert_eq!(put["body"]["loop_id"], loop_id.to_string());
     assert_eq!(link.epoch, 1);

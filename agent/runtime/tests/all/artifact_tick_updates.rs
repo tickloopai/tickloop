@@ -62,15 +62,15 @@ async fn service() -> (String, Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
             }
             let request = String::from_utf8_lossy(&bytes);
             let user = json!({"id":if changes.load(Ordering::SeqCst) >= 20 {"owner-two"} else {"owner"},"name":"Owner","email":"owner@example.test"});
-            let body = if request.starts_with("POST /api/v1/auth/device ") {
-                json!({"device_code":"device","user_code":"CODE","verification_uri":format!("{endpoint}/device?code=CODE"),"expires_in":60,"interval":1})
-            } else if request.starts_with("POST /api/v1/auth/device/token ") {
+            let body = if request.starts_with("POST /artifact/api/v1/auth/device ") {
+                json!({"device_code":"device","user_code":"CODE","verification_uri":format!("{endpoint}/artifact/device?code=CODE"),"expires_in":60,"interval":1})
+            } else if request.starts_with("POST /artifact/api/v1/auth/device/token ") {
                 json!({"access_token":if changes.load(Ordering::SeqCst) >= 20 {"test-token-two"} else {"test-token"},"token_type":"Bearer","expires_in":600,"user":user})
-            } else if request.starts_with("GET /api/v1/auth/session ") {
+            } else if request.starts_with("GET /artifact/api/v1/auth/session ") {
                 json!({"user":user,"expires_at":"2099-01-01T00:00:00Z"})
-            } else if request.starts_with("POST /api/v1/auth/logout ") {
+            } else if request.starts_with("POST /artifact/api/v1/auth/logout ") {
                 json!({"revoked":true})
-            } else if request.starts_with("POST /mcp ") {
+            } else if request.starts_with("POST /artifact/mcp ") {
                 let rpc: serde_json::Value =
                     serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
                 if rpc.get("id").is_none() {

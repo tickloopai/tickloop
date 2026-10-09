@@ -269,20 +269,20 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
             drop(reader);
             let user = json!({"id":"owner","name":"Owner","email":"owner@example.test"});
             let artifact = json!({"id":id,"title":"PTY Research","format":"markdown","access_role":"owner","url":"https://docs.example/a/test","updated_at":"2026-10-06T00:00:00Z","metadata_revision":1});
-            let body = if request.starts_with("POST /api/v1/auth/device ") {
-                json!({"device_code":"test-device","user_code":"ABCD","verification_uri":format!("{endpoint}/device?code=ABCD"),"expires_in":60,"interval":1})
-            } else if request.starts_with("POST /api/v1/auth/device/token ") {
+            let body = if request.starts_with("POST /artifact/api/v1/auth/device ") {
+                json!({"device_code":"test-device","user_code":"ABCD","verification_uri":format!("{endpoint}/artifact/device?code=ABCD"),"expires_in":60,"interval":1})
+            } else if request.starts_with("POST /artifact/api/v1/auth/device/token ") {
                 json!({"access_token":"isolated-test-token","token_type":"Bearer","expires_in":600,"user":user})
-            } else if request.starts_with("GET /api/v1/auth/session ") {
+            } else if request.starts_with("GET /artifact/api/v1/auth/session ") {
                 json!({"user":user,"expires_at":"2099-01-01T00:00:00Z"})
-            } else if request.starts_with("GET /api/v1/artifacts/pinned ") {
+            } else if request.starts_with("GET /artifact/api/v1/artifacts/pinned ") {
                 json!({"artifacts":[],"next_cursor":null})
-            } else if request.starts_with("GET /api/v1/artifacts?") {
+            } else if request.starts_with("GET /artifact/api/v1/artifacts?") {
                 json!({"artifacts":[artifact],"next_cursor":null})
-            } else if request.starts_with(&format!("PUT /api/v1/agent/links/{id} ")) {
+            } else if request.starts_with(&format!("PUT /artifact/api/v1/agent/links/{id} ")) {
                 let link: serde_json::Value = serde_json::from_slice(&request_body).unwrap();
                 json!({"artifact_id":id,"binding_id":link["binding_id"],"epoch":1})
-            } else if request.starts_with("GET /api/v1/agent/requests?") {
+            } else if request.starts_with("GET /artifact/api/v1/agent/requests?") {
                 json!({"items":[],"next_cursor":null})
             } else {
                 artifact

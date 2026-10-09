@@ -2,5 +2,7 @@
 
 #[path = "all/builtin_catalog.rs"]
 mod builtin_catalog;
+#[path = "all/builtin_skills.rs"]
+mod builtin_skills;
 #[path = "all/model_configuration.rs"]
 mod model_configuration;

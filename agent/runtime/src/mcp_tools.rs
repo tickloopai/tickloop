@@ -28,7 +28,7 @@ use crate::{
     },
     mcp_http::McpHttpClient,
 };
-use tickloop_agent_artifacts::{ArtifactClient, CredentialSnapshot};
+use tickloop_agent_artifacts::{ArtifactClient, CredentialSnapshot, mcp_endpoint};
 use tickloop_agent_protocol::{
     ChatId, HostCallContext, HostEndpointIdentity, HostToolAuthority, ToolDefinition, ToolResult,
 };
@@ -188,7 +188,7 @@ impl McpHostToolProvider {
         &self,
         credential: &CredentialSnapshot,
     ) -> Result<(RunningService<RoleClient, ClientConfig>, McpHttpClient), String> {
-        let endpoint = reqwest::Url::parse(&format!("{}/mcp", credential.origin))
+        let endpoint = reqwest::Url::parse(&mcp_endpoint(&credential.origin))
             .map_err(|_| "invalid MCP endpoint")?;
         let http = McpHttpClient::new(endpoint.clone(), credential.access_token.clone())?;
         let config = StreamableHttpClientTransportConfig::with_uri(endpoint.as_str().to_owned())

@@ -457,15 +457,15 @@ mod tests {
                     .push(request.lines().next().unwrap().to_owned());
                 let user =
                     serde_json::json!({"id":"owner","name":"Owner","email":"owner@example.test"});
-                let body = if request.starts_with("POST /api/v1/auth/device ") {
-                    serde_json::json!({"device_code":"device","user_code":"CODE","verification_uri":format!("{endpoint}/device?code=CODE"),"expires_in":60,"interval":1})
-                } else if request.starts_with("POST /api/v1/auth/device/token ") {
+                let body = if request.starts_with("POST /artifact/api/v1/auth/device ") {
+                    serde_json::json!({"device_code":"device","user_code":"CODE","verification_uri":format!("{endpoint}/artifact/device?code=CODE"),"expires_in":60,"interval":1})
+                } else if request.starts_with("POST /artifact/api/v1/auth/device/token ") {
                     serde_json::json!({"access_token":"test-token","token_type":"Bearer","expires_in":600,"user":user})
-                } else if request.starts_with("DELETE /api/v1/artifacts/doc ") {
+                } else if request.starts_with("DELETE /artifact/api/v1/artifacts/doc ") {
                     let input: serde_json::Value =
                         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
                     serde_json::json!({"operation_id":input["operation_id"],"status":"committed"})
-                } else if request.starts_with("PUT /api/v1/agent/links/doc ") {
+                } else if request.starts_with("PUT /artifact/api/v1/agent/links/doc ") {
                     let input: serde_json::Value =
                         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
                     serde_json::json!({"artifact_id":"doc","binding_id":input["binding_id"],"epoch":2})
@@ -557,7 +557,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|request| request.starts_with("PUT /api/v1/agent/links/doc "))
+                .any(|request| request.starts_with("PUT /artifact/api/v1/agent/links/doc "))
         );
         assert_eq!(console.test_status_text(), "Artifact feedback linked here");
         let snapshot = agent.snapshot(chat).await.unwrap();

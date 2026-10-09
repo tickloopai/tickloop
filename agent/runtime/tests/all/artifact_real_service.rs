@@ -191,7 +191,14 @@ impl Person {
         let mut request = self
             .service
             .http
-            .request(method.clone(), format!("{}{path}", self.service.origin))
+            .request(
+                method.clone(),
+                format!(
+                    "{}{}{path}",
+                    self.service.origin,
+                    tickloop_agent_artifacts::APP_BASE_PATH
+                ),
+            )
             .header("cookie", format!("{SESSION_COOKIE}={}", self.cookie))
             .header("origin", &self.service.origin)
             .header("x-tickloop-expected-user", &self.id);

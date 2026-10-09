@@ -88,13 +88,13 @@ async fn service() -> (String, Arc<ServiceControl>) {
                     control.release_call_response.notified().await;
                 }
                 let account = control.account.load(Ordering::SeqCst);
-                let response = if path.starts_with("POST /api/v1/auth/device ") {
-                    json!({"device_code":"test-device","user_code":"TEST","verification_uri":format!("{origin}/device?code=TEST"),"expires_in":30,"interval":1})
-                } else if path.starts_with("POST /api/v1/auth/device/token ") {
+                let response = if path.starts_with("POST /artifact/api/v1/auth/device ") {
+                    json!({"device_code":"test-device","user_code":"TEST","verification_uri":format!("{origin}/artifact/device?code=TEST"),"expires_in":30,"interval":1})
+                } else if path.starts_with("POST /artifact/api/v1/auth/device/token ") {
                     json!({"access_token":format!("token-{account}"),"token_type":"Bearer","expires_in":60,"user":{"id":format!("user-{account}"),"name":"Test","email":"test@example.test"}})
-                } else if path.starts_with("GET /api/v1/auth/session ") {
+                } else if path.starts_with("GET /artifact/api/v1/auth/session ") {
                     json!({"user":{"id":format!("user-{account}"),"name":"Test","email":"test@example.test"},"expires_at":"2099-01-01T00:00:00Z"})
-                } else if path.starts_with("POST /mcp ") {
+                } else if path.starts_with("POST /artifact/mcp ") {
                     let result = match body["method"].as_str().unwrap_or("") {
                         "server/discover" => {
                             json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"tickloop-docs","version":"1"}}})

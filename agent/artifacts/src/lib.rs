@@ -12,6 +12,7 @@ use reqwest::{Client, Method, StatusCode, Url, header, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use tickloop_agent_base::{
     network::{HttpPolicy, build_http_client, is_loopback},
@@ -28,7 +29,13 @@ pub use agent_requests::{
 };
 pub use catalog::{AgentLinkMetadata, ArtifactMetadata, ArtifactOperation, ArtifactPage};
 
-pub const DEFAULT_ORIGIN: &str = "https://docs.tickloop.ai";
+pub const DEFAULT_ORIGIN: &str = "https://tickloop.ai";
+/// Every page, API route and the MCP endpoint of the Artifact Service live under this path of its origin.
+pub const APP_BASE_PATH: &str = "/artifact";
+const BASE62_ALPHABET: &[u8; 62] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+/// 62^22 exceeds 2^128, so every UUID fits in 22 base62 digits, left-padded with "0".
+const SHORT_ID_LENGTH: usize = 22;
 const ORIGIN_ENV: &str = "TICKLOOP_ARTIFACT_ORIGIN";
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
@@ -139,6 +146,32 @@ struct ServiceError {
     code: String,
 }
 
+/// The URL form of an artifact ID: a UUID becomes the service's 22-character base62 short ID;
+/// any other identifier passes through unchanged.
+pub fn short_artifact_id(artifact_id: &str) -> String {
+    let hyphenated = artifact_id.len() == 36;
+    let Some(uuid) = Uuid::parse_str(artifact_id).ok().filter(|_| hyphenated) else {
+        return artifact_id.to_owned();
+    };
+    let mut value = uuid.as_u128();
+    let mut digits = [BASE62_ALPHABET[0]; SHORT_ID_LENGTH];
+    for digit in digits.iter_mut().rev() {
+        *digit = BASE62_ALPHABET[(value % 62) as usize];
+        value /= 62;
+    }
+    String::from_utf8(digits.to_vec()).expect("base62 digits are ASCII")
+}
+
+/// The page address of one artifact on a service origin.
+pub fn artifact_url(origin: &str, artifact_id: &str) -> String {
+    format!("{origin}{APP_BASE_PATH}/{}", short_artifact_id(artifact_id))
+}
+
+/// The service's MCP endpoint on a service origin.
+pub fn mcp_endpoint(origin: &str) -> String {
+    format!("{origin}{APP_BASE_PATH}/mcp")
+}
+
 #[derive(Serialize, Deserialize)]
 struct StoredCredential {
     origin: String,
@@ -238,7 +271,7 @@ impl ArtifactClient {
             || device.interval == 0
             || device.interval >= device.expires_in
             || verification.origin() != self.origin.origin()
-            || verification.path() != "/device"
+            || verification.path() != format!("{APP_BASE_PATH}/device")
             || verification
                 .query_pairs()
                 .filter(|(key, _)| key == "code")
@@ -381,7 +414,7 @@ impl ArtifactClient {
 
     fn url(&self, path: &str) -> Result<Url, ArtifactError> {
         self.origin
-            .join(path)
+            .join(&format!("{APP_BASE_PATH}{path}"))
             .map_err(|_| ArtifactError::InvalidOrigin)
     }
 
@@ -663,8 +696,8 @@ mod tests {
     #[tokio::test]
     async fn catalog_allows_larger_pages_but_invalidates_only_rejected_credentials() {
         let (origin, requests) = server(|request, _, _| {
-            if request.starts_with("GET /api/v1/artifacts?") {
-                (200, serde_json::json!({"artifacts":[{"id":"doc","title":"t".repeat(20000),"format":"markdown","access_role":"owner","url":"https://docs.example/a/doc"}],"next_cursor":"next"}).to_string())
+            if request.starts_with("GET /artifact/api/v1/artifacts?") {
+                (200, serde_json::json!({"artifacts":[{"id":"doc","title":"t".repeat(20000),"format":"markdown","access_role":"owner","url":"https://docs.example/artifact/doc"}],"next_cursor":"next"}).to_string())
             } else { (401, r#"{"error":{"code":"unauthorized"}}"#.into()) }
         }).await;
         let (_directory, client) = catalog_client(&origin).await;
@@ -698,7 +731,9 @@ mod tests {
             serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         let id = body["operation_id"].as_str().unwrap();
         assert!(uuid::Uuid::parse_str(id).is_ok());
-        assert!(requests[1].starts_with(&format!("GET /api/v1/artifacts/doc/operations/{id} ")));
+        assert!(requests[1].starts_with(&format!(
+            "GET /artifact/api/v1/artifacts/doc/operations/{id} "
+        )));
     }
 
     #[tokio::test]
@@ -735,8 +770,8 @@ mod tests {
     async fn catalog_limits_do_not_expand_metadata_responses_or_allow_unbounded_pages() {
         let (origin, _) = server(|request, _, _| {
             let size = if request.contains("q=oversize") { 300000 } else { 20000 };
-            let artifact = serde_json::json!({"id":"doc","title":"t".repeat(size),"format":"markdown","access_role":"owner","url":"https://docs.example/a/doc"});
-            (200, if request.starts_with("GET /api/v1/artifacts/pinned ") || request.contains("q=oversize") { serde_json::json!({"artifacts":[artifact],"next_cursor":null}).to_string() } else { artifact.to_string() })
+            let artifact = serde_json::json!({"id":"doc","title":"t".repeat(size),"format":"markdown","access_role":"owner","url":"https://docs.example/artifact/doc"});
+            (200, if request.starts_with("GET /artifact/api/v1/artifacts/pinned ") || request.contains("q=oversize") { serde_json::json!({"artifacts":[artifact],"next_cursor":null}).to_string() } else { artifact.to_string() })
         }).await;
         let (_directory, client) = catalog_client(&origin).await;
         assert_eq!(client.pinned().await.unwrap().artifacts.len(), 1);
@@ -770,13 +805,13 @@ mod tests {
     async fn agent_request_lifecycle_uses_the_contract_endpoints() {
         let (origin, requests) = server(|request, _, _| {
             let line = request.lines().next().unwrap();
-            let body = if line.starts_with("PUT /api/v1/agent/links/doc ") {
+            let body = if line.starts_with("PUT /artifact/api/v1/agent/links/doc ") {
                 serde_json::json!({"artifact_id":"doc","binding_id":request_body(request)["binding_id"],"epoch":3})
-            } else if line.starts_with("GET /api/v1/agent/requests?") {
+            } else if line.starts_with("GET /artifact/api/v1/agent/requests?") {
                 serde_json::json!({"items":[{"request_id":"request-1","thread_id":"thread-1","created_at":"2026-10-08T10:00:00.000Z"}],"next_cursor":"page-2"})
-            } else if line.starts_with("POST /api/v1/agent/requests/request-1/claim ") {
+            } else if line.starts_with("POST /artifact/api/v1/agent/requests/request-1/claim ") {
                 serde_json::json!({"request_id":"request-1","claim_id":"claim-1","fencing_token":"fence-1","lease_expires_at":"2026-10-08T10:01:30.000Z","input":{"artifact_id":"doc","thread_id":"thread-1","text":"@tickloop tighten"}})
-            } else if line.starts_with("POST /api/v1/agent/requests/request-1/renew ") {
+            } else if line.starts_with("POST /artifact/api/v1/agent/requests/request-1/renew ") {
                 serde_json::json!({"lease_expires_at":"2026-10-08T10:03:00.000Z"})
             } else {
                 serde_json::json!({"request_id":"request-1","status":"pending"})
@@ -833,7 +868,7 @@ mod tests {
             serde_json::json!({"binding_id":binding_id,"client_instance_id":client_instance_id,"chat_id":chat_id,"loop_id":loop_id})
         );
         assert!(requests[1].starts_with(&format!(
-            "GET /api/v1/agent/requests?artifact_id=doc&binding_id={binding_id}&epoch=3&cursor=page-1 "
+            "GET /artifact/api/v1/agent/requests?artifact_id=doc&binding_id={binding_id}&epoch=3&cursor=page-1 "
         )));
         assert_eq!(
             request_body(&requests[2]),
@@ -850,7 +885,7 @@ mod tests {
                 .extend(extra.as_object().unwrap().clone());
             assert_eq!(request_body(request), expected);
         }
-        assert!(requests[4].starts_with("POST /api/v1/agent/requests/request-1/release "));
+        assert!(requests[4].starts_with("POST /artifact/api/v1/agent/requests/request-1/release "));
     }
 
     #[tokio::test]
@@ -904,15 +939,15 @@ mod tests {
     async fn login_polls_service_then_status_and_logout_use_the_same_origin() {
         let (origin, requests) = server(|request, count, origin| {
             let path = request.lines().next().unwrap_or("");
-            if path.starts_with("POST /api/v1/auth/device ") {
-                (200, format!(r#"{{"device_code":"private-device-code","user_code":"ABCD-EFGH","verification_uri":"{origin}/device?code=ABCD-EFGH","expires_in":30,"interval":1}}"#))
-            } else if path.starts_with("POST /api/v1/auth/device/token ") && count == 2 {
+            if path.starts_with("POST /artifact/api/v1/auth/device ") {
+                (200, format!(r#"{{"device_code":"private-device-code","user_code":"ABCD-EFGH","verification_uri":"{origin}/artifact/device?code=ABCD-EFGH","expires_in":30,"interval":1}}"#))
+            } else if path.starts_with("POST /artifact/api/v1/auth/device/token ") && count == 2 {
                 (400, r#"{"error":{"code":"authorization_pending","message":"wait"}}"#.into())
-            } else if path.starts_with("POST /api/v1/auth/device/token ") {
+            } else if path.starts_with("POST /artifact/api/v1/auth/device/token ") {
                 (200, format!(r#"{{"access_token":"private-service-token","token_type":"Bearer","expires_in":60,"user":{}}}"#, user_json()))
-            } else if path.starts_with("GET /api/v1/auth/session ") {
+            } else if path.starts_with("GET /artifact/api/v1/auth/session ") {
                 (200, format!(r#"{{"user":{},"expires_at":"2099-01-01T00:00:00Z"}}"#, user_json()))
-            } else if path.starts_with("POST /api/v1/auth/logout ") {
+            } else if path.starts_with("POST /artifact/api/v1/auth/logout ") {
                 (200, r#"{"revoked":true}"#.into())
             } else {
                 (404, r#"{"error":{"code":"not_found","message":"unknown"}}"#.into())
@@ -925,7 +960,7 @@ mod tests {
         assert_eq!(device.user_code, "ABCD-EFGH");
         assert_eq!(
             device.verification_uri,
-            format!("{origin}/device?code=ABCD-EFGH")
+            format!("{origin}/artifact/device?code=ABCD-EFGH")
         );
         let user = client
             .finish_device_login(device, &CancellationToken::new())
@@ -954,7 +989,7 @@ mod tests {
             0o700
         );
         assert_eq!(
-            ArtifactClient::for_origin(&root, "https://docs.tickloop.ai")
+            ArtifactClient::for_origin(&root, "https://tickloop.ai")
                 .unwrap()
                 .status()
                 .await
@@ -997,8 +1032,8 @@ mod tests {
     #[tokio::test]
     async fn cancellation_and_unknown_token_result_stop_without_retry_or_persistence() {
         let (origin, requests) = server(|request, _, origin| {
-            if request.starts_with("POST /api/v1/auth/device ") {
-                (200, format!(r#"{{"device_code":"private-code","user_code":"SAFE","verification_uri":"{origin}/device?code=SAFE","expires_in":30,"interval":1}}"#))
+            if request.starts_with("POST /artifact/api/v1/auth/device ") {
+                (200, format!(r#"{{"device_code":"private-code","user_code":"SAFE","verification_uri":"{origin}/artifact/device?code=SAFE","expires_in":30,"interval":1}}"#))
             } else {
                 (503, r#"{"error":{"code":"unavailable","message":"retry later"}}"#.into())
             }
@@ -1028,7 +1063,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_verification_origin_and_cross_origin_redirect_are_rejected() {
         let (origin, _) = server(|request, _, _| {
-            if request.starts_with("POST /api/v1/auth/device ") {
+            if request.starts_with("POST /artifact/api/v1/auth/device ") {
                 (200, r#"{"device_code":"secret","user_code":"CODE","verification_uri":"https://other.example/device?code=CODE","expires_in":30,"interval":1}"#.into())
             } else {
                 (404, "{}".into())
@@ -1041,6 +1076,36 @@ mod tests {
             client.start_device_login().await,
             Err(ArtifactError::InvalidResponse)
         ));
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    #[test]
+    fn artifact_urls_use_the_services_fixed_width_short_ids_under_its_base_path() {
+        // The same values are pinned in artifact/tests/web-app-paths.test.ts, so both encoders agree.
+        assert_eq!(
+            short_artifact_id("e1b85a39-a57b-4c28-a8a5-ae9233aead3e"),
+            "6rvWPvOnhVABug7llbHb26"
+        );
+        assert_eq!(
+            short_artifact_id("00000000-0000-0000-0000-000000000000"),
+            "0".repeat(22)
+        );
+        assert_eq!(short_artifact_id("doc"), "doc");
+        assert_eq!(
+            artifact_url(
+                "https://tickloop.ai",
+                "e1b85a39-a57b-4c28-a8a5-ae9233aead3e"
+            ),
+            "https://tickloop.ai/artifact/6rvWPvOnhVABug7llbHb26"
+        );
+        assert_eq!(
+            mcp_endpoint("https://tickloop.ai"),
+            "https://tickloop.ai/artifact/mcp"
+        );
     }
 }
 
@@ -1113,7 +1178,7 @@ mod protocol_regression_tests {
                     0 => (
                         200,
                         format!(
-                            r#"{{"device_code":"opaque","user_code":"CODE","verification_uri":"{service_origin}/device?code=CODE","expires_in":30,"interval":1}}"#
+                            r#"{{"device_code":"opaque","user_code":"CODE","verification_uri":"{service_origin}/artifact/device?code=CODE","expires_in":30,"interval":1}}"#
                         ),
                     ),
                     1 => {

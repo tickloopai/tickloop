@@ -87,27 +87,28 @@ async fn console_creation_links_the_artifact_and_shows_only_the_artifact_tools()
                 let (path, request) = read_request(&mut stream).await;
                 let user =
                     json!({"id":"fixture-owner","name":"Fixture","email":"fixture@example.test"});
-                let (content_type, body) = if path.starts_with("POST /api/v1/auth/device ") {
-                    ("application/json", json!({"device_code":"fixture-device","user_code":"TEST","verification_uri":format!("{origin}/device?code=TEST"),"expires_in":30,"interval":1}).to_string())
-                } else if path.starts_with("POST /api/v1/auth/device/token ") {
+                let (content_type, body) = if path.starts_with("POST /artifact/api/v1/auth/device ")
+                {
+                    ("application/json", json!({"device_code":"fixture-device","user_code":"TEST","verification_uri":format!("{origin}/artifact/device?code=TEST"),"expires_in":30,"interval":1}).to_string())
+                } else if path.starts_with("POST /artifact/api/v1/auth/device/token ") {
                     ("application/json", json!({"access_token":"fixture-token","token_type":"Bearer","expires_in":60,"user":user}).to_string())
-                } else if path.starts_with("GET /api/v1/auth/session ") {
+                } else if path.starts_with("GET /artifact/api/v1/auth/session ") {
                     (
                         "application/json",
                         json!({"user":user,"expires_at":"2099-01-01T00:00:00Z"}).to_string(),
                     )
-                } else if path.starts_with("GET /api/v1/artifacts/fixture-artifact ") {
+                } else if path.starts_with("GET /artifact/api/v1/artifacts/fixture-artifact ") {
                     ("application/json", json!({"id":"fixture-artifact","title":FIXTURE_ARTIFACT_TITLE,"format":"markdown","access_role":"owner","url":format!("{origin}/a/fixture-artifact"),"agent_link":null}).to_string())
-                } else if path.starts_with("PUT /api/v1/agent/links/fixture-artifact ") {
+                } else if path.starts_with("PUT /artifact/api/v1/agent/links/fixture-artifact ") {
                     observed.linked.store(true, Ordering::SeqCst);
                     ("application/json", json!({"artifact_id":"fixture-artifact","binding_id":request["binding_id"],"epoch":1}).to_string())
-                } else if path.starts_with("GET /api/v1/agent/requests?") {
+                } else if path.starts_with("GET /artifact/api/v1/agent/requests?") {
                     observed.listened.store(true, Ordering::SeqCst);
                     (
                         "application/json",
                         json!({"items":[],"next_cursor":null}).to_string(),
                     )
-                } else if path.starts_with("POST /mcp ") {
+                } else if path.starts_with("POST /artifact/mcp ") {
                     let result = match request["method"].as_str().unwrap_or("") {
                         "server/discover" => {
                             json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"tickloop-docs","version":"1"}}})
