@@ -8,7 +8,8 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tick_connect::{instance::HOSTED_TYPE, page::MAX_PAGE_SIZE};
+use tick_protocol::{HERDR_INSTANCE_TYPE, HOSTED_INSTANCE_TYPE};
+use tickhost_connect::page::MAX_PAGE_SIZE;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -18,9 +19,8 @@ use crate::{
     },
     hosted::tools::HostedTickTools,
     native_host::NativeHostToolProvider,
-    protocol::{ChatId, ToolDefinition},
-    tools::ToolResult,
 };
+use tickloop_agent_protocol::{ChatId, ToolDefinition, ToolResult};
 
 pub const READ_WORKSPACE: &str = "ReadWorkspace";
 pub const READ_TICK: &str = "ReadTick";
@@ -29,7 +29,6 @@ pub const MODIFY_TICK: &str = "ModifyTick";
 /// The open placement that runs a Tick hidden in the Tickhost. An open without a placement
 /// means the same.
 pub const HIDDEN_PLACEMENT: &str = "hidden";
-const HERDR_TYPE: &str = "herdr";
 const PLACEMENT_DIRECTIONS: [&str; 4] = ["left", "right", "up", "down"];
 
 #[derive(Debug, thiserror::Error)]
@@ -148,8 +147,8 @@ impl TickBackends {
         let operation = name.to_owned();
         let target = input["tick_instance_id"].as_str().unwrap_or_default();
         let error = match target.split_once(':').map(|(kind, _)| kind) {
-            Some(HERDR_TYPE) => return Ok(TickBackend::Herdr),
-            Some(HOSTED_TYPE) => return Ok(TickBackend::Hosted),
+            Some(HERDR_INSTANCE_TYPE) => return Ok(TickBackend::Herdr),
+            Some(HOSTED_INSTANCE_TYPE) => return Ok(TickBackend::Hosted),
             Some("artifact") => TickToolTargetError::Artifact { operation },
             Some("shell") => TickToolTargetError::Shell { operation },
             _ => TickToolTargetError::Invalid {

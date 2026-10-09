@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::settings::{AutoRuleKind, AutoSettings};
+use tickloop_agent_config::AutoSettings;
+use tickloop_agent_protocol::AutoRuleKind;
 
 pub(crate) const AUTO_POLICY_VERSION: u64 = 1;
 pub(crate) const BUILTIN_GROUP_VERSION: u64 = 1;
@@ -44,118 +45,49 @@ const BUILTIN_SOFT_DENIES: [(&str, &str); 8] = [
     ),
 ];
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AutoRuleSource {
-    Builtin { version: u64 },
-    User,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct AutoRule {
-    pub id: String,
-    pub kind: AutoRuleKind,
-    pub text: String,
-    pub source: AutoRuleSource,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AutoEnvironmentSource {
-    Builtin { version: u64 },
-    UserReplacement,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct AutoEnvironment {
-    pub text: String,
-    pub source: AutoEnvironmentSource,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct AutoPolicy {
-    pub version: u64,
-    pub rules: Vec<AutoRule>,
-    pub environment: AutoEnvironment,
-}
-
-impl AutoPolicy {
-    pub fn from_settings(settings: &AutoSettings) -> Self {
-        let configured = &settings.rules;
-        let mut rules = Vec::new();
-        for kind in [
-            AutoRuleKind::SoftAllow,
-            AutoRuleKind::SoftDeny,
-            AutoRuleKind::HardDeny,
-        ] {
-            if configured.group(kind).include_builtins && kind == AutoRuleKind::SoftDeny {
-                rules.extend(BUILTIN_SOFT_DENIES.into_iter().map(|(id, text)| AutoRule {
-                    id: format!("builtin.soft_deny.{id}"),
-                    kind,
-                    text: text.into(),
-                    source: AutoRuleSource::Builtin {
-                        version: BUILTIN_GROUP_VERSION,
-                    },
-                }));
-            }
-            rules.extend(configured.group(kind).custom.iter().map(|custom| AutoRule {
-                id: custom.id.clone(),
+/// The automatic review policy that `settings` configure, built-in rule groups included.
+pub fn auto_policy_from_settings(settings: &AutoSettings) -> AutoPolicy {
+    let configured = &settings.rules;
+    let mut rules = Vec::new();
+    for kind in [
+        AutoRuleKind::SoftAllow,
+        AutoRuleKind::SoftDeny,
+        AutoRuleKind::HardDeny,
+    ] {
+        if configured.group(kind).include_builtins && kind == AutoRuleKind::SoftDeny {
+            rules.extend(BUILTIN_SOFT_DENIES.into_iter().map(|(id, text)| AutoRule {
+                id: format!("builtin.soft_deny.{id}"),
                 kind,
-                text: custom.text.clone(),
-                source: AutoRuleSource::User,
-            }));
-        }
-        let environment = configured.environment_replacement.as_ref().map_or_else(
-            || AutoEnvironment {
-                text: DEFAULT_ENVIRONMENT.into(),
-                source: AutoEnvironmentSource::Builtin {
+                text: text.into(),
+                source: AutoRuleSource::Builtin {
                     version: BUILTIN_GROUP_VERSION,
                 },
-            },
-            |text| AutoEnvironment {
-                text: text.clone(),
-                source: AutoEnvironmentSource::UserReplacement,
-            },
-        );
-        Self {
-            version: AUTO_POLICY_VERSION,
-            rules,
-            environment,
+            }));
         }
+        rules.extend(configured.group(kind).custom.iter().map(|custom| AutoRule {
+            id: custom.id.clone(),
+            kind,
+            text: custom.text.clone(),
+            source: AutoRuleSource::User,
+        }));
     }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskScopeFinding {
-    WithinTask,
-    OutsideTask,
-    Uncertain,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RuleApplicability {
-    Present,
-    Absent,
-    Uncertain,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SoftDenyClearance {
-    ExplicitConsent,
-    SoftAllow(String),
-    Missing,
-    Uncertain,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuleFinding {
-    pub id: String,
-    pub applicability: RuleApplicability,
-    pub clearance: Option<SoftDenyClearance>,
+    let environment = configured.environment_replacement.as_ref().map_or_else(
+        || AutoEnvironment {
+            text: DEFAULT_ENVIRONMENT.into(),
+            source: AutoEnvironmentSource::Builtin {
+                version: BUILTIN_GROUP_VERSION,
+            },
+        },
+        |text| AutoEnvironment {
+            text: text.clone(),
+            source: AutoEnvironmentSource::UserReplacement,
+        },
+    );
+    AutoPolicy {
+        version: AUTO_POLICY_VERSION,
+        rules,
+        environment,
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -163,19 +95,6 @@ pub struct RuleFinding {
 pub struct SemanticFindings {
     pub task_scope: TaskScopeFinding,
     pub rules: Vec<RuleFinding>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum AutoBlockKind {
-    TaskScope,
-    HardDeny,
-    SoftDeny,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct VerdictEvidence {
-    pub task_scope: TaskScopeFinding,
-    pub finding: Option<RuleFinding>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -303,7 +222,7 @@ mod tests {
 
     #[test]
     fn default_policy_migrates_eight_existing_risks_as_soft_denies() {
-        let policy = AutoPolicy::from_settings(&AutoSettings::default());
+        let policy = auto_policy_from_settings(&AutoSettings::default());
         assert_eq!(policy.rules.len(), 8);
         assert!(
             policy

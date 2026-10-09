@@ -10,9 +10,9 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tick_connect::{
+use tick_protocol::TickRead;
+use tickhost_connect::{
     hosted::{CONTROL_TIMEOUT, OBSERVATION_FRAME_BYTES},
-    protocol::TickRead,
     session::{SessionLinkState, SessionObservation},
 };
 use tokio::sync::watch;
@@ -257,7 +257,7 @@ struct HostedFeed {
 
 impl HostedFeed {
     /// Proves the Chat still holds a current binding for the instance before anything is read.
-    async fn check_binding(&self) -> Result<(), tick_connect::host_error::HostError> {
+    async fn check_binding(&self) -> Result<(), tickhost_connect::host_error::HostError> {
         self.tools.data(self.chat, &self.instance).await.map(drop)
     }
 }
@@ -466,7 +466,7 @@ impl TickStreamPort for HostedTickStream {
         instance: &InstanceRef,
         authority: Option<&HostToolAuthority>,
     ) -> Result<(), String> {
-        if instance.tick_type() != tick_connect::instance::HOSTED_TYPE {
+        if instance.tick_type() != tick_protocol::HOSTED_INSTANCE_TYPE {
             return Err("Hosted watch requires a hosted instance".into());
         }
         let scope = self.scope();

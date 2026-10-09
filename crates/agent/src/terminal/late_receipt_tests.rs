@@ -12,12 +12,7 @@ use std::{
 };
 use uuid::Uuid;
 
-mod screen {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/screen.rs"
-    ));
-}
+use crate::terminal::test_support::screen;
 
 const FIXTURE_VARIABLE: &str = "TICKLOOP_LATE_RECEIPT_FIXTURE";
 const DIRECTORY_VARIABLE: &str = "TICKLOOP_LATE_RECEIPT_DIRECTORY";
@@ -168,29 +163,29 @@ struct HeldWhileFlagged {
 }
 
 #[async_trait]
-impl crate::model::ModelClient for HeldWhileFlagged {
+impl tickloop_agent_model::ModelClient for HeldWhileFlagged {
     async fn generate_title(
         &self,
-        request: crate::model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        request: tickloop_agent_model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-        Ok(crate::model::fixture_title(request))
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        Ok(tickloop_agent_model::fixture_title(request))
     }
 
-    fn identity(&self) -> crate::model::ModelIdentity {
+    fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
         self.model.identity()
     }
 
     async fn complete(
         &self,
-        request: crate::model::ModelRequest,
-        events: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        request: tickloop_agent_model::ModelRequest,
+        events: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
         while self.flag.exists() {
             tokio::select! {
-                _ = cancel.cancelled() => return Err(crate::model::ModelError::Cancelled),
+                _ = cancel.cancelled() => return Err(tickloop_agent_model::ModelError::Cancelled),
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {}
             }
         }

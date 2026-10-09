@@ -28,7 +28,7 @@ This stops the daemon and all of its workers, which is every running Agent. Save
 
 省略 `--cwd` 时使用当前目录。需要指定工作目录时，传入一个已经存在的实际目录，例如 `--cwd "$PWD"`；程序不会创建工作目录。
 
-不带参数启动进入空白新 Agent 输入，首次发送才创建执行；空输入按 Left 进入本机全部 Agent 总览。总览输入创建新 Agent，提交后留在总览，默认目录取本次 CLI 启动 cwd；项目／Workspace 筛选不改变派发目录，`/cwd PATH` 可显式替代。总览按状态区分待审批与待回答，根行下展开真实 child；`r` 打开历史选择器。`-c`／`--continue` 继续本目录最近活动的 Chat；`-r`／`--resume CHAT` 按 id 恢复，省略 id 时打开 Chat 选择器；`--fork-session` 只能与 `-c` 或 `-r` 一起使用，把恢复的对话复制成新 Chat 并写入新的 Transcript，原记录不变。自动化可用 `--chat-id CHAT` 打开或创建一个固定身份，不与上述恢复参数或 `--no-session-persistence` 组合。`--no-session-persistence` 让本次运行不保存 Chat，也不在工作目录留下文件；`settings.json` 中 `cleanupPeriodDays` 为 0 时同样不保存 Chat（见下文“过期文件清理”）。一个 View 同一时间显示一个 Agent；已接受任务不因切换或关闭该 View 停止。
+不带参数启动进入空白新 Agent 输入，首次发送才创建执行；空输入按 Left 进入本机全部 Agent 总览。总览输入创建新 Agent，提交后留在总览，默认目录取本次 CLI 启动 cwd；项目／Workspace 筛选不改变派发目录，`/cwd PATH` 可显式替代。总览按状态区分待审批与待回答，根行下展开真实 child；`r` 打开历史选择器。`-c`／`--continue` 继续本目录最近活动的 Chat；`-r`／`--resume CHAT` 按 id 恢复，省略 id 时打开 Chat 选择器；`--fork-session` 只能与 `-c` 或 `-r` 一起使用，把恢复的对话复制成新 Chat 并写入新的 Transcript，原记录不变。自动化可用 `--chat-id CHAT` 打开或创建一个固定身份，不与上述恢复参数或 `--no-session-persistence` 组合。`--no-session-persistence` 让本次运行不保存 Chat，也不在工作目录留下文件；`settings.json` 中 `cleanupPeriodDays` 为 0 时同样不保存 Chat；已保存的 Chat 不会被自动删除。一个 View 同一时间显示一个 Agent；已接受任务不因切换或关闭该 View 停止。
 
 
 总览只列顶层家族，以后台生成的短 Chat 标题和最近消息预览辨认；查看子 Agent 不改变家族标题。输入下方 Subagents 面板来自同一执行目录与运行层不可变代号注册表。进入当前 Agent 的后代始终原位；其他 Agent 若在同一 Herdr 实例有活 View，优先经核实的 Pane 导航，多位置无法确定首选时选择。否则缓存当前界面后原位连接。进入 child 后，面板的 main／子代号标明当前查看对象，@handle 标签与 Message @handle… 提示同步显示，后续文字仍路由到其稳定身份；审批／问题附近面板标实际 requester。`Subagent` 创建真实独立 Chat／Loop，后续输入保持冻结授权上限；根可用 StopSubagent 停止直接子 Agent；嵌套委派、团队调度、child 历史改写和整家族 stop 不提供，拒绝不会转发给 parent。
@@ -85,7 +85,7 @@ Google 用户 OAuth 使用自己的 installed-app client：在环境或私有 `.
 
 API 查询 `/v1/models`，Codex 订阅查询其自己的 `/backend-api/codex/models`，不交叉使用目录。“Account directory checked.” 只代表同连接目录检查成功，不代表工具、图片、额度或所有权限实测通过。缺席/失败/未提供接口均标未验证，不静默降级或换计费；明确拒绝的模型不会出现在选择列表。启动时异步检查当前已配置 Provider；其他连接在首次进入时检查，返回 Provider 层不查询其他账号。Esc 取消且保留登录，模型页可强制刷新当前 Provider。认证失效、模型权限拒绝或额度耗尽的请求报错会使对应缓存失效，下次进入再查；目录在当前进程会话内缓存并按连接、实际 origin/路由、账号隔离，登录/新 Key/注销失效，正常 token 刷新保留身份。DeepSeek/MiniMax/GLM 现有路线未提供发现，使用静态推荐及统一账号未检查说明；Copilot 独立接入通过通用发现 Seam 实施，其账户证据由对应工单记录。
 
-本次假 HTTP、配置/菜单与运行检查见[验证记录](../../.scratch/provider-hierarchy/verification.md)。无 OpenAI API Key，真实 API/Codex 发现、额度与服务端缓存未测。本人有 Key 时可选运行 `cargo run --locked -p tickloop-agent --example openai_probe -- STATE_DIRECTORY [MODEL_CARD_ID] [image]`；探针只调用无副作用 Echo 与结构化 fixture，Key 从该私有目录 `.env` 或 `OPENAI_API_KEY` 读取，输出不含 Key。
+本次假 HTTP、配置/菜单与运行检查见[验证记录](../../.scratch/provider-hierarchy/verification.md)。无 OpenAI API Key，真实 API/Codex 发现、额度与服务端缓存未测。本人有 Key 时可选运行 `cargo run --locked -p tickloop-agent-model --example openai_probe -- STATE_DIRECTORY [MODEL_CARD_ID] [image]`；探针只调用无副作用 Echo 与结构化 fixture，Key 从该私有目录 `.env` 或 `OPENAI_API_KEY` 读取，输出不含 Key。
 
 ### MiniMax
 
@@ -110,9 +110,9 @@ OAuth 使用 Portal 设备授权，终端显示地址和用户码；在自己的
 
 按量连接在账户没有余额或资源包时返回业务码 1113；只订阅了 GLM Coding Plan 的账户在按量连接上也会报这个码，需要改用 Coding Plan 连接。两种计费方式之间不自动探测、不回退。官方条款把 Coding Plan 额度限定在指定工具内，Tick Loop 不在名单，可能被限流或封禁；Coding Plan 模型页会显示这条提示，是否使用由用户自行决定。Coding Plan 只提供 GLM 与 GLM Flash 两个系列，FlashX 不在套餐内。智谱不提供第三方 OAuth，个人版和团队版套餐都用 API Key 认证，团队套餐 Key 与平台其他 Key 不通用。
 
-模型定义与当前接入分开维护。Provider YAML 中的 Model Card 描述具体版本 GLM-5.3、GLM-5.3-Flash、GLM-5.3-FlashX 与 GLM-5.2。当前接入目录 [src/model/access/](src/model/access/) 为每个 Provider 声明系列及推荐卡：`GLM → glm-5.3`、`GLM Flash → glm-5.3-flash`、`GLM FlashX → glm-5.3-flashx`。模型页由这份绑定生成 `GLM-5.3`、`GLM-5.3-Flash`、`GLM-5.3-FlashX` 三个入口；选中后保存、请求和历史记录都使用具体卡，状态栏显示实际版本。三个推荐版本均为 1M 上下文、默认单次输出上限 131,072 tokens、强制 Thinking，档位为 low/high/max（`auto` 即服务端默认 max）；Flash 与 FlashX 接收文字和图片，基础 GLM 只收文字，视频与文件不在当前输入范围。GLM-5.2 卡继续保留供已保存选择和历史使用，可开关 Thinking，档位 high/max，但不再出现在普通菜单。旧保存选择中的 `glm-5.2` 和兼容别名 `glm-5.2-chat-completions` 仍按内置目录解析；不再通过用户 Provider YAML 固定或覆盖卡。新版本发布后，先新增具体卡，再更新系列绑定；已有已知内置选择不会被目录更新静默切换。
+模型定义与当前接入分开维护。Provider YAML 中的 Model Card 描述具体版本 GLM-5.3、GLM-5.3-Flash、GLM-5.3-FlashX 与 GLM-5.2。当前接入目录 [agent/model/src/access/](../../agent/model/src/access/) 为每个 Provider 声明系列及推荐卡：`GLM → glm-5.3`、`GLM Flash → glm-5.3-flash`、`GLM FlashX → glm-5.3-flashx`。模型页由这份绑定生成 `GLM-5.3`、`GLM-5.3-Flash`、`GLM-5.3-FlashX` 三个入口；选中后保存、请求和历史记录都使用具体卡，状态栏显示实际版本。三个推荐版本均为 1M 上下文、默认单次输出上限 131,072 tokens、强制 Thinking，档位为 low/high/max（`auto` 即服务端默认 max）；Flash 与 FlashX 接收文字和图片，基础 GLM 只收文字，视频与文件不在当前输入范围。GLM-5.2 卡继续保留供已保存选择和历史使用，可开关 Thinking，档位 high/max，但不再出现在普通菜单。旧保存选择中的 `glm-5.2` 和兼容别名 `glm-5.2-chat-completions` 仍按内置目录解析；不再通过用户 Provider YAML 固定或覆盖卡。新版本发布后，先新增具体卡，再更新系列绑定；已有已知内置选择不会被目录更新静默切换。
 
-四个连接都使用 GLM 专用 OpenAI Chat Completions Adapter。请求开启 Preserved Thinking（`clear_thinking: false`），同一来源的 `reasoning_content` 原样回放以保持缓存前缀；有工具时开启流式工具参数。结构化审查使用官方 JSON mode 并由宿主严格校验。余额不足、额度耗尽和套餐/模型权限错误不重试；限流与过载按现有预算重试。官方依据与参考实现见[接入规格](../../.scratch/glm-integration/spec.md)，证据与未验收项见[验证记录](../../.scratch/glm-integration/verification.md)；真实账户可用 `cargo run -p tickloop-agent --example glm_probe -- cn|global|cn-coding|global-coding STATE_DIRECTORY` 自行验证，只调用无副作用的 Echo 与结构化 fixture。
+四个连接都使用 GLM 专用 OpenAI Chat Completions Adapter。请求开启 Preserved Thinking（`clear_thinking: false`），同一来源的 `reasoning_content` 原样回放以保持缓存前缀；有工具时开启流式工具参数。结构化审查使用官方 JSON mode 并由宿主严格校验。余额不足、额度耗尽和套餐/模型权限错误不重试；限流与过载按现有预算重试。官方依据与参考实现见[接入规格](../../.scratch/glm-integration/spec.md)，证据与未验收项见[验证记录](../../.scratch/glm-integration/verification.md)；真实账户可用 `cargo run -p tickloop-agent-model --example glm_probe -- cn|global|cn-coding|global-coding STATE_DIRECTORY` 自行验证，只调用无副作用的 Echo 与结构化 fixture。
 
 同一 Chat 可在 Messages、Chat Completions、Responses 模型间切换。原始历史逐条保留实际生成来源，每次按目标模型生成请求副本：文字、工具调用和结果继续有效；异来源可读 Thinking 转普通历史文本，签名/加密等私有状态只重放给兼容来源。切回原模型可以恢复仍保留的原始状态；重启与 rewind 保持来源。运行中或等待工具时切换延后生效，pending/OutcomeUnknown 不因切换重发工具。相同来源保留签名、块顺序、合法调用 ID 与稳定缓存前缀；实际命中以服务端 usage 为准。
 
@@ -120,7 +120,7 @@ OAuth 使用 Portal 设备授权，终端显示地址和用户码；在自己的
 
 ### 内置 Provider 与模型
 
-目前只支持随程序编译的 Provider/model 目录，动态 Provider 接入延期。支持的厂商、连接、地区、模型和所有定义参数均随程序版本变化，目录源文件位于 [src/model/providers/](src/model/providers/)，通过 `include_str!` 编译到程序中。
+目前只支持随程序编译的 Provider/model 目录，动态 Provider 接入延期。支持的厂商、连接、地区、模型和所有定义参数均随程序版本变化，目录源文件位于 [agent/model/src/providers/](../../agent/model/src/providers/)，通过 `include_str!` 编译到程序中。
 
 使用 `tickloop --cwd "$PWD"` 启动；`/provider` 和 `/model` 选择内置连接与模型。模型与 Provider 定义由程序版本提供，不接受外部配置文件，也不读取状态目录 `providers/*.yaml`、旧 `settings.json.providers` 或其他外部 Provider/model 定义。单次输出上限、上下文窗口、端点、认证变量和 Model Card 能力参数均采用内置版本值；外部文件不能覆盖它们。
 
@@ -276,7 +276,7 @@ Chat 的附属文件照 Claude Code 放在 Transcript 同级的 `<chatId>/` 目�
 
 计划属于 Loop，照 Claude Code 写入 `<root>/plans/<slug>-loop-<loopId>.md`：slug 在 Chat 第一次进入 Plan 模式时生成（形容词-动词-名词），记录在之后的每个 Transcript 条目中，恢复时按第一个有效的 slug 找回计划文件（slug 只接受以连字符连接的小写字母单词、最长 64 字节；链上没有有效 slug 时警告并换用新的 slug）。模型可以调用 `EnterPlanMode` 请求进入 Plan 模式，经用户确认后生效。Plan 模式下每次请求的系统提示写明当前 Loop 计划文件的绝对路径，这是唯一允许 `Write`／`Edit` 的文件；模型写好计划后调用 `ExitPlanMode` 提交审批，文件不存在或为空时报错。提交时宿主在计划文件首行写入 `<!-- tickloop plan version: N sha256: <正文摘要> -->` 注释（Markdown 渲染时不可见），版本号与内容一起先写入同目录临时文件（0600）并同步到磁盘，再改名替换，写入中途失败不会留下半截文件；读取不跟随符号链接，只接受普通文件、不超过 64KB 的正文，`plans/` 须是当前用户私有（0700、非符号链接）的目录。`ExitPlanMode` 自动发起属于来源 Agent 的批准请求，进入固定 12 行的输入对话框并等待决定。正文可用 PgUp/PgDn 滚动，`v` 查看全文，全文中的 Esc 先返回批准界面。选择“批准并开始 · Auto / Ask / Full Access”后，宿主核对计划版本、正文与文件摘要，再将 Claude Code 风格的 `User has approved your plan. You can now start coding. …`、路径与审阅正文作为当前工具结果返回，原 Run 继续实施。选择“No, keep planning”后输入反馈，Enter 将反馈作为拒绝工具结果交给模型，保留 Plan 模式继续修订；批准界面的 Esc 取消当前轮并保留待批计划，`/plan` 可重新打开。已处理的计划由 `/plan` 查看，不改变执行模式。计划版本与待批状态随 Loop 状态记录在 Transcript 中，待办仍从最后一次成功的 `TodoWrite` 输入恢复；压缩、rewind 截断、`/branch` 与 `--fork-session` 使之前的调用不在链上时，Loop 状态条目会带上当时的计划版本与待办。恢复时核对计划文件：版本行中的版本等于重建的版本、且摘要与正文相符才沿用该版本；否则（例如提交后文件又被编辑、结果写入 Transcript 之前进程崩溃，或文件在对话之外被修改）计划以大于文件与链上版本的新版本恢复为未批准，按旧版本号的批准一律被拒，并显示加载警告。链上没有记录、也没有版本行的文件是从未提交的草稿，不恢复为计划。计划文件缺失或不可读时该 Loop 暂无计划并显示警告，但保留已知的最高版本，下一次提交从更大的版本继续，版本号不会被复用。重启恢复待批计划时重新进入 Plan 并自动展示同一个批准界面，执行等待明确决定。批准选择的模式与 Execution Mode 一样只在本进程内有效，已处理计划的恢复不会自动开始实施。rewind 不回退计划文件与版本（照 Claude Code 计划文件不随 rewind 恢复），版本号不会被复用。`/branch` 与 `--fork-session` 生成新的 slug 并复制已提交的计划，之后双方修改互不影响。不保存 Chat 时（`--no-session-persistence` 或 `cleanupPeriodDays` 为 0）计划文件照 File History 放在系统临时目录的 `tickloop-<uid>/<项目目录名>/plans/`。
 
-过期文件清理照 Claude Code：保留天数取状态根目录 `settings.json` 的 `cleanupPeriodDays`，默认 30。daemon worker 在首个实际 run／Shell 开始后计时，10 分钟后在后台线程清理一次，不依赖前台 View；仅装载历史不启动清理。活记录由 retention 锁保护；worker 不接收本地草稿、按键或鼠标活动。Embedded 调用者仍可沿原 HousekeepingSchedule 自行记录交互并推迟清理。清理按修改时间删除保留期之前的 `projects/*/<chatId>.jsonl`、`<chatId>` Chat 目录中 `tool-results/` 下的文件、`plans/*.md`、整个 `file-history/<chatId>/` 目录与 `paste-cache/*.txt`（只认 UUID 形式的 chatId，其他同名文件与目录不动），之后删除清空的工具结果目录、Chat 目录、项目目录、`plans/` 与 `file-history/`；`file-changes/`、Loop 租约、`history.jsonl`、进程登记、设置文件与系统临时目录中的 Shell 输出不清理。活 runtime 为每个已加载 Chat 持有私有 retention flock；清理只有在取得独占锁后才按原 TTL 删除记录与附件。共享存活期间保留，即使没有近期输出；最后 shutdown 或进程退出后由内核释放，后续清理沿原期限。锁不是 Agent 身份、数据库或持久 journal。手动删除记录仍会提示后续无法保存。文件回滚备份目录与计划文件不随对话更新修改时间，因此 Transcript 仍未过期的 Chat 保留其 `file-history/<chatId>/`，未过期 Transcript 中记录的计划前缀对应的 `plans/<slug>-loop-<loopId>.md` 也保留（超大 Transcript 头尾各 64KB 没有前缀且超过 64MB 时，本次不删除任何这类计划文件）。符号链接一律跳过，不删除链接，也不进入或删除它指向的内容。`settings.json` 有任何无效内容（清理天数本身、模型、上下文窗口或权限规则）且显式写了 `cleanupPeriodDays` 时，本次不清理，并与其他设置问题一样显示警告；文件不是合法 JSON 时只要其中出现 `"cleanupPeriodDays"` 就不清理，文件不可读时也不清理。`cleanupPeriodDays` 为 0 时 Agent 启动后不写 Transcript（大工具结果、文件回滚备份与 Shell 输出放在系统临时目录，计划只在内存中，与 `--no-session-persistence` 相同），`-c`／`-r` 会提示原因；用户设置与输入历史照常读写；后台清理把修改时间早于清理时刻的上述文件全部删除。是否写 Transcript 在启动时按当时的设置决定，运行中改为 0 或从 0 改回在下次启动生效；清理天数在清理时读取。
+已保存的 Chat 不会被自动删除：Transcript、Chat 目录、`plans/`、`file-history/`、`image-cache/` 与 `paste-cache/` 一直保留，需要时由用户手动删除；运行中 Chat 的 Transcript 被手动删除后，后续内容不再保存并提示原因。`settings.json` 的 `cleanupPeriodDays` 沿用 Claude Code 的设置名，但只有 0 有含义：Agent 启动后不写 Transcript（大工具结果、文件回滚备份、计划文件与 Shell 输出放在系统临时目录，与 `--no-session-persistence` 相同），`-c`／`-r` 会提示原因；用户设置与输入历史照常读写，已有记录不删除。正数与未设置时一样保存 Chat；值不是非负整数时被忽略，并与其他设置问题一样显示警告。是否写 Transcript 在启动时按当时的设置决定，运行中改为 0 或从 0 改回在下次启动生效。
 
 用 `/resume` 或 `/clear` 切走的 Chat 留在本机 daemon 内，其中的目标、定时与事件触发继续运行，结果只写入它自己的 Transcript；前台只显示当前 Chat 的事件，后台 Chat 的回复结束或 Shell 任务完成时只在状态栏提示，不插入前台对话。退出 View 只撤显示登记；明确的 run interrupt／Loop stop 才停止相应工作，不向 child／家族传播。
 
@@ -290,7 +290,7 @@ printf '记住验收词紫罗兰。\n刚才的验收词是什么？\n' | \
 功能进度与真实接入记录见仓库 `.scratch/agent/issues/`；界面与 Claude Code 的逐项对照在 `.scratch/agent/validation/claude-code-ui-checklist.md`。运行终端测试不需要真实模型凭据，测试通过本地 HTTP 服务验证实际编解码和可执行入口：
 
 ```sh
-cargo test -p tickloop-agent --test terminal
+cargo nextest run -p tickloop-agent -E 'binary(all) & test(/^terminal::/)'
 ```
 
 Agent 的呈现与宿主布局分开，Herdr 负责容器外观；颜色、装饰与 Theme 不写入业务上下文和 Agent 存档。

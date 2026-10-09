@@ -1,5 +1,6 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tickloop_agent_protocol::Content;
 
 const THINKING_FIXTURE_VARIABLE: &str = "TICKLOOP_THINKING_STREAM_FIXTURE";
 const THINKING_QUERY_FILE: &str = "thinking-queries";
@@ -26,11 +27,11 @@ struct ThinkingBurst {
 impl ModelClient for ThinkingBurst {
     async fn generate_title(
         &self,
-        request: crate::model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        request: tickloop_agent_model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-        Ok(crate::model::fixture_title(request))
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        Ok(tickloop_agent_model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {

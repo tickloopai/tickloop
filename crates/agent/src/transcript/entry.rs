@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::model::{Message, ModelIdentity, PrivateHistorySource, Role, Usage};
-use crate::private_fs::unix_time_milliseconds;
+use tickloop_agent_base::private_fs::unix_time_milliseconds;
+use tickloop_agent_protocol::{Message, ModelIdentity, PrivateHistorySource, Role, Usage};
 
 /// Transcript 中的一行。未知类型原样跳过，保证旧版本能读取新版本写入的文件。
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -108,7 +108,7 @@ pub(crate) struct ChainEntry {
     pub git_branch: Option<String>,
     pub message: Message,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub invoked_skills: Vec<crate::skills::InvokedSkill>,
+    pub invoked_skills: Vec<tickloop_agent_protocol::InvokedSkill>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_meta: bool,
     /// The execution mode at a user checkpoint stays raw so an unknown legacy value cannot
@@ -497,7 +497,7 @@ pub(crate) struct ArtifactTicksEntry {
     pub chat_id: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<std::path::PathBuf>,
-    pub artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
+    pub artifact_ticks: Vec<tickloop_agent_protocol::ArtifactTick>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub removed_artifact_ticks: std::collections::BTreeSet<String>,
 }

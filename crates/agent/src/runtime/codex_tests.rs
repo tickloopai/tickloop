@@ -13,10 +13,8 @@ use tokio::{io::AsyncWriteExt, net::TcpListener, sync::oneshot};
 use tokio_tungstenite::{accept_async, tungstenite::Message as WsMessage};
 
 use super::{Agent, AgentHostOptions, Event, EventKind, PromptPolicy, RequestKind};
-use crate::{
-    model::{Content, ModelProvider, Protocol, cards::ModelCatalog, codex_test_support::*},
-    permissions::{Decision, ExecutionMode},
-};
+use tickloop_agent_model::{cards::ModelCatalog, codex_test_support::*};
+use tickloop_agent_protocol::{Content, Decision, ExecutionMode, ModelProvider, Protocol};
 
 async fn serve_codex_response() -> (Url, oneshot::Receiver<(String, Value)>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

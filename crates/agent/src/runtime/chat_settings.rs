@@ -16,12 +16,11 @@ use std::{
 
 use uuid::Uuid;
 
-use super::{Agent, AgentError, Chat, ChatSnapshot};
-use crate::model::{ModelClient, ModelConfig, ReasoningEffort, validate_reasoning_effort};
-use crate::output_style::OutputStyle;
-use crate::permissions::{Decision, PermissionRule};
-use crate::protocol::ChatId;
-use crate::settings::{LoadedSettings, ProjectRuleChanges, SettingsError, UserSettings};
+use super::{Agent, AgentError, Chat, ChatBookkeeping, ChatSnapshot};
+use tickloop_agent_base::output_style::OutputStyle;
+use tickloop_agent_config::{LoadedSettings, ProjectRuleChanges, SettingsError, UserSettings};
+use tickloop_agent_model::{ModelClient, ModelConfigExt, validate_reasoning_effort};
+use tickloop_agent_protocol::{ChatId, Decision, ModelConfig, PermissionRule, ReasoningEffort};
 
 /// Persistent rule changes partitioned by canonical project working directory.
 pub(super) type RuleChanges = BTreeMap<PathBuf, ProjectRuleChanges>;
@@ -35,7 +34,7 @@ pub(super) struct SelectedModel {
 /// only execution mode follows host options; other fields keep the empty Chat defaults.
 /// The New Agent draft uses the same rules to preview its first creation.
 pub(crate) struct NewChatSettings {
-    pub(crate) execution_mode: crate::permissions::ExecutionMode,
+    pub(crate) execution_mode: tickloop_agent_protocol::ExecutionMode,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) thinking_enabled: bool,
     pub(crate) context_window_tokens: Option<usize>,
@@ -49,7 +48,7 @@ pub(crate) fn new_chat_settings(
     let host_mode = host_options.execution_mode_override;
     let Some(saved) = saved else {
         return NewChatSettings {
-            execution_mode: host_mode.unwrap_or(crate::permissions::ExecutionMode::Auto),
+            execution_mode: host_mode.unwrap_or(tickloop_agent_protocol::ExecutionMode::Auto),
             reasoning_effort: None,
             thinking_enabled: true,
             context_window_tokens: None,
@@ -57,7 +56,7 @@ pub(crate) fn new_chat_settings(
     };
     let execution_mode = host_mode
         .or_else(|| saved.default_execution_mode())
-        .unwrap_or(crate::permissions::ExecutionMode::Auto);
+        .unwrap_or(tickloop_agent_protocol::ExecutionMode::Auto);
     let context_window_tokens = if model.maximum_context_window_tokens().is_some() {
         None
     } else {
@@ -103,6 +102,7 @@ impl Agent {
     pub(super) fn apply_chat_defaults(
         &self,
         snapshot: &mut ChatSnapshot,
+        bookkeeping: &mut ChatBookkeeping,
     ) -> (Arc<dyn ModelClient>, OutputStyle) {
         let client = {
             let selected = self
@@ -113,11 +113,15 @@ impl Agent {
             snapshot.model = selected.config.clone();
             selected.client.clone()
         };
-        let output_style = self.apply_new_chat_settings(snapshot);
+        let output_style = self.apply_new_chat_settings(snapshot, bookkeeping);
         (client, output_style)
     }
 
-    pub(super) fn apply_new_chat_settings(&self, snapshot: &mut ChatSnapshot) -> OutputStyle {
+    pub(super) fn apply_new_chat_settings(
+        &self,
+        snapshot: &mut ChatSnapshot,
+        bookkeeping: &mut ChatBookkeeping,
+    ) -> OutputStyle {
         let mut saved = self.inner.settings.as_ref().map(UserSettings::load);
         let defaults = new_chat_settings(saved.as_mut(), &self.inner.host_options, &snapshot.model);
         snapshot.policy.mode = defaults.execution_mode;
@@ -128,7 +132,7 @@ impl Agent {
         snapshot.reasoning_effort = defaults.reasoning_effort;
         snapshot.thinking_enabled = defaults.thinking_enabled;
         let output_style = saved.output_style();
-        self.replace_persistent_rules(snapshot, saved);
+        self.replace_persistent_rules(snapshot, bookkeeping, saved);
         output_style
     }
 
@@ -147,6 +151,7 @@ impl Agent {
     pub(super) fn replace_persistent_rules(
         &self,
         snapshot: &mut ChatSnapshot,
+        bookkeeping: &mut ChatBookkeeping,
         mut saved: LoadedSettings,
     ) {
         if snapshot.delegation.is_some() {
@@ -154,7 +159,7 @@ impl Agent {
         }
         let rules = saved.permission_rules(&snapshot.workdir);
         snapshot.policy.rules.retain(|rule| !rule.persistent);
-        snapshot.persistent_rule_projects = rules
+        bookkeeping.persistent_rule_projects = rules
             .iter()
             .map(|rule| (rule.id, snapshot.workdir.clone()))
             .collect();
@@ -268,7 +273,7 @@ impl Agent {
 
     pub async fn save_default_execution_mode(
         &self,
-        mode: crate::permissions::ExecutionMode,
+        mode: tickloop_agent_protocol::ExecutionMode,
     ) -> Result<(), AgentError> {
         self.write_user_settings(move |settings| settings.save_default_execution_mode(mode))
             .await
@@ -324,7 +329,7 @@ impl Agent {
             }
             if let Some(change) = changes.get(&chat.snapshot.workdir) {
                 let project = chat.snapshot.workdir.clone();
-                apply_rule_changes(&mut chat.snapshot, &project, change);
+                apply_rule_changes(chat, &project, change);
             }
         }
     }
@@ -386,7 +391,7 @@ impl Agent {
             return Ok(());
         }
         chat.snapshot.policy.rules.retain(|rule| !rule.persistent);
-        chat.snapshot.persistent_rule_projects = rules
+        chat.bookkeeping.persistent_rule_projects = rules
             .iter()
             .map(|rule| (rule.id, workdir.clone()))
             .collect();
@@ -418,11 +423,16 @@ impl Agent {
             // A tool whose rules name one aspect of the call, such as the WebFetch domain, never
             // saves an exact-input rule.
             let specifier = specifier.or_else(|| {
-                crate::permissions::permission_rule_content(&request.name, &request.input)
+                tickloop_agent_tools::permissions::permission_rule_content(
+                    &request.name,
+                    &request.input,
+                )
             });
             if let Some(specifier) = &specifier {
-                let candidates =
-                    crate::permissions::permission_rule_candidates(&request.name, &request.input);
+                let candidates = tickloop_agent_tools::permissions::permission_rule_candidates(
+                    &request.name,
+                    &request.input,
+                );
                 if !candidates
                     .iter()
                     .any(|candidate| candidate.specifier == *specifier)
@@ -460,7 +470,7 @@ impl Agent {
         let mut chats = self.inner.chats.lock().await;
         self.sync_persistent_rules(&mut chats, &changes, Some(chat_id));
         if let Some(chat) = chats.get_mut(&chat_id) {
-            apply_rule_changes(&mut chat.snapshot, &project, &changes[&project]);
+            apply_rule_changes(chat, &project, &changes[&project]);
         }
         Ok(())
     }
@@ -470,6 +480,7 @@ impl Agent {
 /// 的规则（同 id）既删除旧的也添加新的。删除与修改写回规则记录的分区，新规则写入工作目录的分区。
 pub(super) fn persistent_rule_changes(
     snapshot: &ChatSnapshot,
+    bookkeeping: &ChatBookkeeping,
     rules: &[PermissionRule],
 ) -> Result<RuleChanges, AgentError> {
     if rules
@@ -491,7 +502,7 @@ pub(super) fn persistent_rule_changes(
         .filter(|rule| rule.persistent)
         .collect::<Vec<_>>();
     let project_of = |id: &Uuid| {
-        snapshot
+        bookkeeping
             .persistent_rule_projects
             .get(id)
             .cloned()
@@ -520,13 +531,13 @@ pub(super) fn persistent_rule_changes(
 }
 
 /// 调用方已把规则集整体替换后，更新持久规则所属分区的记录。
-pub(super) fn record_rule_projects(snapshot: &mut ChatSnapshot, changes: &RuleChanges) {
+pub(super) fn record_rule_projects(bookkeeping: &mut ChatBookkeeping, changes: &RuleChanges) {
     for (project, change) in changes {
         for id in &change.removed {
-            snapshot.persistent_rule_projects.remove(id);
+            bookkeeping.persistent_rule_projects.remove(id);
         }
         for rule in &change.added {
-            snapshot
+            bookkeeping
                 .persistent_rule_projects
                 .insert(rule.id, project.clone());
         }
@@ -534,29 +545,29 @@ pub(super) fn record_rule_projects(snapshot: &mut ChatSnapshot, changes: &RuleCh
 }
 
 /// 在 Chat 的规则集中应用一个分区的持久规则改动；有变化时递增规则版本。
-fn apply_rule_changes(snapshot: &mut ChatSnapshot, project: &Path, change: &ProjectRuleChanges) {
+fn apply_rule_changes(chat: &mut Chat, project: &Path, change: &ProjectRuleChanges) {
     let replaced = change
         .removed
         .iter()
         .chain(change.added.iter().map(|rule| &rule.id))
         .collect::<HashSet<_>>();
-    let count = snapshot.policy.rules.len();
-    snapshot
-        .policy
+    let policy = &mut chat.snapshot.policy;
+    let count = policy.rules.len();
+    policy
         .rules
         .retain(|rule| !(rule.persistent && replaced.contains(&rule.id)));
-    let is_changed = snapshot.policy.rules.len() != count || !change.added.is_empty();
+    let is_changed = policy.rules.len() != count || !change.added.is_empty();
     for id in replaced {
-        snapshot.persistent_rule_projects.remove(id);
+        chat.bookkeeping.persistent_rule_projects.remove(id);
     }
     for rule in &change.added {
-        snapshot.policy.rules.push(rule.clone());
-        snapshot
+        policy.rules.push(rule.clone());
+        chat.bookkeeping
             .persistent_rule_projects
             .insert(rule.id, project.to_path_buf());
     }
     if is_changed {
-        snapshot.policy.revision += 1;
+        policy.revision += 1;
     }
 }
 

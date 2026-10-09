@@ -15,18 +15,18 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tick_connect::{
+use tickhost_connect::{
     herdr::{HerdrContext, HerdrPort, SocketHerdr},
     host_error::HostError,
 };
 use tokio_util::sync::CancellationToken;
 
 use super::{attach::ATTACH_ENVIRONMENT, controller::HostedViewGrant};
-use crate::private_fs::{
+use tickloop_agent_base::private_fs::{
     PRIVATE_FILE_MODE, create_private_directory, current_uid, replace_file_atomically,
     verify_private_directory,
 };
-use crate::settings::{MonitorPopup, UserSettings};
+use tickloop_agent_config::{MonitorPopup, UserSettings};
 
 pub(crate) const PLUGIN_ID: &str = "tickloop.monitor";
 const PLUGIN_NAME: &str = "Tick Loop Monitor";

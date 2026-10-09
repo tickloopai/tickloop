@@ -1,0 +1,114 @@
+[
+  {
+    "kind": "overview",
+    "filter": {
+      "workdir": "/work/project",
+      "workspace": null
+    },
+    "page": {
+      "offset": 0,
+      "limit": 50
+    },
+    "after": null
+  },
+  {
+    "kind": "agent",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "detail": {
+      "kind": "account_models",
+      "config": {
+        "connection": {
+          "vendor": "Example",
+          "product": "Example Plan",
+          "kind": "plan",
+          "order": 2,
+          "region": {
+            "name": "Global",
+            "order": 1
+          },
+          "discovery": "provider_api"
+        },
+        "name": "example-plan",
+        "protocol": "messages",
+        "base_url": "https://models.example.test/v1",
+        "model": "example-large",
+        "api_key_env": "EXAMPLE_API_KEY",
+        "max_output_tokens": 32000,
+        "provider": "api",
+        "auth_source": "api_key_env",
+        "provider_id": "example",
+        "provider_name": "Example",
+        "model_id": "example-large",
+        "card": {
+          "id": "example-large",
+          "service_model_id": "example-large-2026",
+          "display_name": "Example Large",
+          "adapter": "messages",
+          "max_output_tokens": 32000,
+          "context_window_tokens": 200000,
+          "thinking": "toggle",
+          "adaptive_by_default": false,
+          "effort_levels": [
+            "low",
+            "high"
+          ],
+          "input_modalities": [
+            "text",
+            "image"
+          ],
+          "thinking_budgets": {
+            "low": 2048,
+            "medium": 8192,
+            "high": 16384
+          }
+        },
+        "input_modalities": [
+          "text",
+          "image"
+        ]
+      },
+      "refresh": true
+    },
+    "after": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "execution": {
+        "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+        "agent_id": "00000000-0000-0000-0000-0000000000a1",
+        "generation": 3
+      },
+      "sequence": 17
+    }
+  },
+  {
+    "kind": "agent",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "detail": {
+      "kind": "snapshot"
+    },
+    "after": null
+  },
+  {
+    "kind": "transcript",
+    "record": {
+      "store_root": "/home/user/.tickloop/chats",
+      "chat_id": "00000000-0000-0000-0000-0000000000c1"
+    },
+    "page": {
+      "offset": 0,
+      "limit": 0
+    }
+  },
+  {
+    "kind": "receipt",
+    "epoch": "00000000-0000-0000-0000-0000000000e0",
+    "command_id": "00000000-0000-0000-0000-000000000081"
+  }
+]

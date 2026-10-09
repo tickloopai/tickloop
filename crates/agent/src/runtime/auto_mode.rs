@@ -5,11 +5,11 @@ use serde_json::json;
 
 use super::approval_context::ApprovalSnapshot;
 use super::auto_rules::{AutoPolicy, RuleVerdict, SemanticFindings, reduce};
-use crate::model::{
-    Content, Message, ModelError, ModelFailureKind, ModelOutput, ModelRequest,
-    ModelResponseRejection, Role, StructuredOutput,
+use tickloop_agent_model::{
+    ModelError, ModelFailureKind, ModelOutput, ModelRequest, ModelResponseRejection,
+    StructuredOutput,
 };
-use crate::settings::AutoRuleKind;
+use tickloop_agent_protocol::{AutoRuleKind, Content, Message, Role};
 
 pub(super) const CLASSIFIER_TOOL_NAME: &str = "classify_result";
 /// Invalid classifier output gets one further classification attempt.
@@ -321,16 +321,16 @@ impl DenialTracking {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Message, ModelConfig, Protocol, Role, Usage};
     use crate::runtime::ChatSnapshot;
+    use tickloop_agent_protocol::{Message, ModelConfig, Protocol, Role, Usage};
 
     fn empty_snapshot() -> ChatSnapshot {
         super::super::empty_snapshot(
             uuid::Uuid::new_v4(),
             "/work".into(),
             ModelConfig {
-                provider: crate::model::ModelProvider::Api,
-                auth_source: crate::model::ModelAuthSource::ApiKeyEnv,
+                provider: tickloop_agent_protocol::ModelProvider::Api,
+                auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
                 name: "fixture".into(),
                 protocol: Protocol::Messages,
                 base_url: "http://127.0.0.1".into(),
@@ -342,7 +342,7 @@ mod tests {
                 model_id: String::new(),
                 connection: None,
                 card: None,
-                input_modalities: vec![crate::model::InputModality::Text],
+                input_modalities: vec![tickloop_agent_protocol::InputModality::Text],
             },
         )
     }
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn a_schema_compliant_classification_is_accepted() {
-        let policy = AutoPolicy::from_settings(&crate::settings::AutoSettings::default());
+        let policy = super::super::auto_rules::auto_policy_from_settings(&tickloop_agent_config::AutoSettings::default());
         let findings = serde_json::json!({
             "task_scope": "within_task",
             "rules": policy.rules.iter().map(|rule| serde_json::json!({
@@ -373,7 +373,7 @@ mod tests {
 
     #[test]
     fn complete_json_wrappers_preserve_the_classification() {
-        let policy = AutoPolicy::from_settings(&crate::settings::AutoSettings::default());
+        let policy = super::super::auto_rules::auto_policy_from_settings(&tickloop_agent_config::AutoSettings::default());
         let findings = json!({
             "task_scope": "within_task",
             "rules": policy.rules.iter().map(|rule| json!({
@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn prose_fences_and_unknown_fields_are_invalid() {
-        let policy = AutoPolicy::from_settings(&crate::settings::AutoSettings::default());
+        let policy = super::super::auto_rules::auto_policy_from_settings(&tickloop_agent_config::AutoSettings::default());
         for text in [
             r#"Verdict: {"thinking":"x","shouldBlock":false,"reason":"safe"}"#,
             "```json\n{\"thinking\":\"x\",\"shouldBlock\":false,\"reason\":\"safe\"}\n```",
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn ambiguous_incomplete_or_refused_classifications_never_allow() {
-        let policy = AutoPolicy::from_settings(&crate::settings::AutoSettings::default());
+        let policy = super::super::auto_rules::auto_policy_from_settings(&tickloop_agent_config::AutoSettings::default());
         let findings = json!({"task_scope":"within_task", "rules":policy.rules.iter().map(|rule| json!({
             "id":rule.id, "applicability":"absent", "clearance":"missing"
         })).collect::<Vec<_>>()});
@@ -530,11 +530,12 @@ mod tests {
         let loop_id = uuid::Uuid::new_v4();
         let run_id = uuid::Uuid::new_v4();
         snapshot.message_runs.insert(0, run_id);
-        snapshot.run_loops.insert(run_id, loop_id);
+        let mut bookkeeping = super::super::ChatBookkeeping::default();
+        bookkeeping.run_loops.insert(run_id, loop_id);
         snapshot.message_ids.insert(0, uuid::Uuid::new_v4());
         snapshot
             .prompt_execution_modes
-            .insert(0, crate::permissions::ExecutionMode::Auto);
+            .insert(0, tickloop_agent_protocol::ExecutionMode::Auto);
         snapshot.messages = vec![
             Message {
                 role: Role::User,
@@ -577,10 +578,11 @@ mod tests {
         };
         let context = super::super::approval_context::capture(
             &snapshot,
+            &bookkeeping,
             &operation,
             None,
-            super::super::auto_rules::AutoPolicy::from_settings(
-                &crate::settings::AutoSettings::default(),
+            super::super::auto_rules::auto_policy_from_settings(
+                &tickloop_agent_config::AutoSettings::default(),
             ),
         )
         .unwrap();

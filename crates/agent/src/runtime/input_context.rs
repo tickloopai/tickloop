@@ -7,11 +7,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    image::{self, Image, MAX_BASE64_BYTES},
-    model::Content,
-    tools::{FileReadRecord, Workspace},
-};
+use tickloop_agent_base::image::{self, Image, MAX_BASE64_BYTES};
+use tickloop_agent_protocol::{Content, FileReadRecord};
+use tickloop_agent_tools::{FileReadRecordExt, Workspace};
 
 pub(super) const MAX_REFERENCES: usize = 20;
 const MAX_RESTORED_CONTEXT_BYTES: usize = 2 * 1024 * 1024;

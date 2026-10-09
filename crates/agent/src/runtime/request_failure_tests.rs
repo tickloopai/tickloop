@@ -2,15 +2,15 @@ use super::{
     Agent, AgentError, LoopSnapshot, LoopState, OperationRecord, OperationState, Receipt,
     RequestKind, RequestOutcome,
 };
-use crate::model::{
-    Content, InputModality, Message, ModelClient, ModelConfig, ModelDelta, ModelError,
-    ModelIdentity, ModelOutput, ModelRequest, Protocol, Role, Usage,
-};
-use crate::permissions::ExecutionMode;
 use serde_json::json;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+use tickloop_agent_protocol::{
+    Content, ExecutionMode, InputModality, Message, ModelConfig, ModelIdentity, Protocol, Role,
+    Usage,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -43,16 +43,16 @@ impl Drop for CompletionGuard<'_> {
 impl ModelClient for Checker {
     async fn generate_title(
         &self,
-        request: crate::model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        request: tickloop_agent_model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-        Ok(crate::model::fixture_title(request))
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        Ok(tickloop_agent_model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
         ModelIdentity {
-            provider: crate::model::ModelProvider::Api,
+            provider: tickloop_agent_protocol::ModelProvider::Api,
             profile: "independent permission checker".into(),
             protocol: Protocol::Responses,
             requested_model: "checker-model".into(),
@@ -78,16 +78,16 @@ struct UnusedConversationModel;
 impl ModelClient for UnusedConversationModel {
     async fn generate_title(
         &self,
-        request: crate::model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        request: tickloop_agent_model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-        Ok(crate::model::fixture_title(request))
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        Ok(tickloop_agent_model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
         ModelIdentity {
-            provider: crate::model::ModelProvider::Api,
+            provider: tickloop_agent_protocol::ModelProvider::Api,
             profile: "conversation profile".into(),
             protocol: Protocol::Messages,
             requested_model: "conversation-model".into(),
@@ -116,8 +116,8 @@ fn reported_usage() -> Usage {
 async fn fixture(checker: Arc<Checker>) -> (tempfile::TempDir, Agent, Receipt, CancellationToken) {
     let directory = tempfile::tempdir().unwrap();
     let config = ModelConfig {
-        provider: crate::model::ModelProvider::Api,
-        auth_source: crate::model::ModelAuthSource::ApiKeyEnv,
+        provider: tickloop_agent_protocol::ModelProvider::Api,
+        auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
         name: "conversation profile".into(),
         protocol: Protocol::Messages,
         base_url: "http://127.0.0.1".into(),
@@ -158,7 +158,7 @@ async fn fixture(checker: Arc<Checker>) -> (tempfile::TempDir, Agent, Receipt, C
             state_since: None,
         });
         chat.snapshot.message_runs.insert(0, receipt.run_id);
-        chat.snapshot
+        chat.bookkeeping
             .run_loops
             .insert(receipt.run_id, receipt.loop_id);
         chat.snapshot.message_ids.insert(0, Uuid::new_v4());

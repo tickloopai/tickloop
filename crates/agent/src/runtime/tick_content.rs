@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::private_fs::{PRIVATE_FILE_MODE, create_private_directory, replace_file_atomically};
+use tickloop_agent_base::private_fs::{
+    PRIVATE_FILE_MODE, create_private_directory, replace_file_atomically,
+};
 
 /// The newest update data of all of one Agent's subscriptions together.
 pub(crate) const CONTENT_CACHE_BYTES: usize = 64 * 1024;

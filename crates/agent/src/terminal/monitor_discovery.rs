@@ -6,15 +6,15 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tick_connect::page::{MAX_PAGE_SIZE, Page, PageCursor};
+use tickhost_connect::page::{MAX_PAGE_SIZE, Page, PageCursor};
 use uuid::Uuid;
 
 use super::tick_actions::{
     PreparedTickAction, TickActionBackend, TickActionContext, TickActionExecutor,
     TickActionOutcome, TickActionUi, TickDetailKey, TickDetailLine, TickDetailView,
 };
-use crate::tick_adapter::{DiscoveredTick, DiscoveryError, MONITOR_ADD_KEY, TickDiscovery};
-use crate::tick_stream::InstanceRef;
+use crate::monitor_rows::{DiscoveredTick, DiscoveryError, MONITOR_ADD_KEY, TickDiscovery};
+use tick_protocol::InstanceRef;
 
 /// The Monitor list key that opens this picker; the picker's own actions report it too.
 /// The list-level action has no single target instance.
@@ -437,7 +437,7 @@ mod tests {
         }
     }
     #[async_trait]
-    impl crate::tick_adapter::TickProbe for NoDiscovery {
+    impl crate::monitor_rows::TickProbe for NoDiscovery {
         fn tick_type(&self) -> &'static str {
             "herdr"
         }
@@ -445,7 +445,7 @@ mod tests {
             &self,
             _: uuid::Uuid,
             _: &[InstanceRef],
-        ) -> Result<crate::tick_adapter::MemberFindings, DiscoveryError> {
+        ) -> Result<crate::monitor_rows::MemberFindings, DiscoveryError> {
             Err(DiscoveryError::Unavailable("unused".into()))
         }
     }

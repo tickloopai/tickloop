@@ -11,13 +11,12 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
-use crate::{
-    file_change::{
-        FileChangeAction, FileChangeArtifactError, FileChangeReview, FileChangeReviewSummary,
-        FileIdentity, build_file_change_review, load_file_change_review,
-    },
-    model::{Content, Role},
-    runtime::{ChatSnapshot, OperationRecord, OperationState, RunId},
+use crate::runtime::{ChatSnapshot, OperationRecord, OperationState, RunId};
+use tickloop_agent_protocol::{
+    Content, FileChangeAction, FileChangeReviewSummary, FileIdentity, Role,
+};
+use tickloop_agent_tools::file_change::{
+    FileChangeArtifactError, FileChangeReview, build_file_change_review, load_file_change_review,
 };
 
 const MAX_CURRENT_TEXT_BYTES: u64 = 8 * 1024 * 1024;
@@ -835,15 +834,11 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::{
-        file_change::PreparedFileChange,
-        model::{
-            InputModality, Message, ModelClient, ModelConfig, ModelDelta, ModelError, ModelOutput,
-            ModelRequest, Protocol,
-        },
-        runtime::{Agent, OperationRecord},
-        tools::{Tools, Workspace},
-    };
+    use crate::runtime::{Agent, OperationRecord};
+    use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+    use tickloop_agent_protocol::PreparedFileChange;
+    use tickloop_agent_protocol::{InputModality, Message, ModelConfig, Protocol};
+    use tickloop_agent_tools::{Tools, Workspace};
 
     struct UnusedModel;
 
@@ -851,18 +846,18 @@ mod tests {
     impl ModelClient for UnusedModel {
         async fn generate_title(
             &self,
-            request: crate::model::ModelRequest,
-            _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+            request: tickloop_agent_model::ModelRequest,
+            _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
             _: tokio_util::sync::CancellationToken,
-        ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-            Ok(crate::model::fixture_title(request))
+        ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+            Ok(tickloop_agent_model::fixture_title(request))
         }
 
-        fn identity(&self) -> tickloop_agent::model::ModelIdentity {
-            tickloop_agent::model::ModelIdentity {
-                provider: crate::model::ModelProvider::Api,
+        fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
+            tickloop_agent_protocol::ModelIdentity {
+                provider: tickloop_agent_protocol::ModelProvider::Api,
                 profile: "fixture".into(),
-                protocol: tickloop_agent::model::Protocol::Messages,
+                protocol: tickloop_agent_protocol::Protocol::Messages,
                 requested_model: "fixture".into(),
             }
         }
@@ -879,8 +874,8 @@ mod tests {
 
     fn model_config() -> ModelConfig {
         ModelConfig {
-            provider: crate::model::ModelProvider::Api,
-            auth_source: crate::model::ModelAuthSource::ApiKeyEnv,
+            provider: tickloop_agent_protocol::ModelProvider::Api,
+            auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
             name: "catalog-test".into(),
             protocol: Protocol::Messages,
             base_url: "http://127.0.0.1".into(),
@@ -1048,10 +1043,9 @@ mod tests {
                 .hunks
                 .iter()
                 .flat_map(|hunk| &hunk.lines)
-                .any(
-                    |line| line.kind == crate::file_change::FileChangeLineKind::Added
-                        && line.text == "staged"
-                )
+                .any(|line| line.kind
+                    == tickloop_agent_tools::file_change::FileChangeLineKind::Added
+                    && line.text == "staged")
         );
 
         let tracked_worktree = current_file(source, "tracked.txt", CurrentLayer::Worktree);
@@ -1072,7 +1066,7 @@ mod tests {
                 .iter()
                 .flat_map(|hunk| &hunk.lines)
                 .any(|line| {
-                    line.kind == crate::file_change::FileChangeLineKind::Removed
+                    line.kind == tickloop_agent_tools::file_change::FileChangeLineKind::Removed
                         && line.text == "staged"
                 })
         );
@@ -1082,7 +1076,7 @@ mod tests {
                 .iter()
                 .flat_map(|hunk| &hunk.lines)
                 .any(|line| {
-                    line.kind == crate::file_change::FileChangeLineKind::Added
+                    line.kind == tickloop_agent_tools::file_change::FileChangeLineKind::Added
                         && line.text == "working"
                 })
         );
@@ -1167,7 +1161,7 @@ mod tests {
                 .iter()
                 .flat_map(|hunk| &hunk.lines)
                 .any(|line| {
-                    line.kind == crate::file_change::FileChangeLineKind::Added
+                    line.kind == tickloop_agent_tools::file_change::FileChangeLineKind::Added
                         && line.text == "staged"
                 })
         );
@@ -1177,7 +1171,7 @@ mod tests {
                 .iter()
                 .flat_map(|hunk| &hunk.lines)
                 .any(|line| {
-                    line.kind == crate::file_change::FileChangeLineKind::Removed
+                    line.kind == tickloop_agent_tools::file_change::FileChangeLineKind::Removed
                         && line.text == "staged"
                 })
         );

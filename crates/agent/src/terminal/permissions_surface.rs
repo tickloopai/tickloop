@@ -1,26 +1,22 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tickloop_agent::{
-    model::credentials::ApiKeyStatus,
-    permissions::{Decision, ExecutionMode, PermissionRule, is_supported_rule_content},
-    runtime::{
-        AutoEnvironmentSource, AutoPolicy, AutoReviewerHealth, AutoRuleSource, PermissionChange,
-        PermissionRuleScope, PermissionRuleSource, PermissionRuleView, PermissionsRevision,
-        PermissionsView,
-    },
-    settings::{
-        AutoReviewerPreference, AutoRuleChange, AutoRuleKind, AutoRuleSettings,
-        AutoSettingsRevision,
-    },
-    tools::WEB_FETCH_TOOL_NAME,
+use tickloop_agent::runtime::{
+    AutoEnvironmentSource, AutoPolicy, AutoReviewerHealth, AutoRuleSource, PermissionChange,
+    PermissionRuleScope, PermissionRuleSource, PermissionRuleView, PermissionsRevision,
+    PermissionsView,
 };
+use tickloop_agent_tools::{WEB_FETCH_TOOL_NAME, permissions::is_supported_rule_content};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
 use super::denials_surface::{DenialsEffect, DenialsSurface};
 use super::editor::{Editor, EditorCommand};
 use super::style::{Role, RoleLine};
+use tickloop_agent_protocol::{
+    ApiKeyStatus, AutoReviewerPreference, AutoRuleChange, AutoRuleKind, AutoRuleSettings,
+    AutoSettingsRevision, Decision, ExecutionMode, PermissionRule,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {

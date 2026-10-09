@@ -38,8 +38,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{Agent, LoopId};
-use crate::private_fs::{PRIVATE_FILE_MODE, PrivateDirectory, replace_file_atomically};
-use crate::protocol::ChatId;
+use tickloop_agent_base::private_fs::{
+    PRIVATE_FILE_MODE, PrivateDirectory, replace_file_atomically,
+};
+use tickloop_agent_protocol::ChatId;
 
 /// 照 Claude Code `LOCK_PROBE_INTERVAL_MS`：拿不到租约的进程重试获取的间隔。
 pub(super) const LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
@@ -255,7 +257,7 @@ fn try_acquire(
         chat_id,
         pid: std::process::id(),
         nonce: Uuid::new_v4(),
-        started_at: crate::private_fs::unix_time_milliseconds(),
+        started_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
         host: local_host_name(),
     };
     let content = serde_json::to_vec(&holder).map_err(io::Error::other)?;
@@ -403,7 +405,7 @@ fn write_run_state(
         generation: current.map_or(0, |current| current.generation) + 1,
         armed: change == RunStateChange::Armed,
         ended: change == RunStateChange::Ended,
-        updated_at: crate::private_fs::unix_time_milliseconds(),
+        updated_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
         pid: std::process::id(),
     };
     let contents = serde_json::to_vec(&next).map_err(io::Error::other)?;

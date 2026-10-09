@@ -1,5 +1,6 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tickloop_agent_protocol::Content;
 
 const FIXTURE_VARIABLE: &str = "TICKLOOP_CACHED_NAVIGATION_FIXTURE";
 const SOURCE_TASK: &str = "NAV-SOURCE-TASK";
@@ -311,7 +312,7 @@ async fn run_cached_navigation_fixture() {
     let accepted = access.submits.lock().unwrap().clone();
     let contains_follow_up = |snapshot: &runtime::ChatSnapshot| {
         snapshot.messages.iter().any(|message| {
-            message.role == crate::model::Role::User
+            message.role == tickloop_agent_protocol::Role::User
                 && message
                     .content
                     .iter()

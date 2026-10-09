@@ -1,7 +1,7 @@
 use super::{Agent, approval_context};
-use crate::model::{Content, Message, ModelRequest, Role};
-use crate::protocol::ChatId;
 use std::{sync::atomic::Ordering, time::Duration};
+use tickloop_agent_model::{ModelRequest, ReasoningEffortExt};
+use tickloop_agent_protocol::{ChatId, Content, Message, Role};
 use unicode_width::UnicodeWidthChar;
 
 const MAX_TITLE_COLUMNS: usize = 64;
@@ -25,13 +25,14 @@ impl Agent {
             {
                 return;
             }
-            let Some(original) = approval_context::originals_for_active_chain(&chat.snapshot)
-                .ok()
-                .and_then(|inputs| {
-                    inputs
-                        .into_iter()
-                        .find(|input| input.chat_id == chat_id && !input.text.trim().is_empty())
-                })
+            let Some(original) =
+                approval_context::originals_for_active_chain(&chat.snapshot, &chat.bookkeeping)
+                    .ok()
+                    .and_then(|inputs| {
+                        inputs
+                            .into_iter()
+                            .find(|input| input.chat_id == chat_id && !input.text.trim().is_empty())
+                    })
             else {
                 return;
             };
@@ -47,15 +48,15 @@ impl Agent {
                     .rev()
                     .collect::<String>(),
                 original.message_id,
-                if crate::model::validate_reasoning_effort(
+                if tickloop_agent_model::validate_reasoning_effort(
                     &chat.snapshot.model,
-                    Some(crate::model::ReasoningEffort::Off),
+                    Some(tickloop_agent_protocol::ReasoningEffort::Off),
                 )
                 .is_ok()
                 {
-                    Some(crate::model::ReasoningEffort::Off)
+                    Some(tickloop_agent_protocol::ReasoningEffort::Off)
                 } else {
-                    crate::model::ReasoningEffort::choices(&chat.snapshot.model)
+                    tickloop_agent_protocol::ReasoningEffort::choices(&chat.snapshot.model)
                         .first()
                         .copied()
                 },

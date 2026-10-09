@@ -17,17 +17,18 @@ dev:
 	"$(DEV_LAUNCHER)" $(ARGS)
 
 build:
-	cargo build --locked $(CARGO_PACKAGE) -p tickloop-ticks --bins
+	cargo build --locked $(CARGO_PACKAGE) -p tickloop-tickhost -p tickloop-tick --bins
 
 install:
 	cargo install --locked --path crates/agent --bins
-	cargo install --locked --path crates/ticks --bin tick
+	cargo install --locked --path tickhost/host --bin tickhost
+	cargo install --locked --path tick/cli --bin tick
 
-## Package the Agent and example Ticks.
+## Package the Agent, the Tickhost and example Ticks.
 package:
-	cargo build --locked --release $(CARGO_PACKAGE) -p tickloop-ticks --bins --target "$(PACKAGE_TARGET)" --target-dir target
+	cargo build --locked --release $(CARGO_PACKAGE) -p tickloop-tickhost -p tickloop-tick --bins --target "$(PACKAGE_TARGET)" --target-dir target
 	@mkdir -p dist
-	tar -czf "$(PACKAGE_ARCHIVE)" -C "target/$(PACKAGE_TARGET)/release" tickloop tick
+	tar -czf "$(PACKAGE_ARCHIVE)" -C "target/$(PACKAGE_TARGET)/release" tickloop tickhost tick
 	@printf 'Package: %s\n' "$(PACKAGE_ARCHIVE)"
 
 test:
@@ -46,7 +47,7 @@ check:
 
 ## 发布已提交的 Docs 快照；默认递增 patch，可用 VERSION=0.1.0 指定版本
 release-docs:
-	@node services/artifacts/scripts/release.mjs
+	@node artifact/scripts/release.mjs
 
 ## 启动一次性 Glyph Set 设置页原型；访问 http://127.0.0.1:8765/?variant=A
 prototype-glyph-set:

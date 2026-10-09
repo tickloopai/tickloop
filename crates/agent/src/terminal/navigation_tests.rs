@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tick_connect::herdr::{HerdrContext, HerdrPort, Pane, SocketHerdr};
+use tickhost_connect::herdr::{HerdrContext, HerdrPort, Pane, SocketHerdr};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 

@@ -16,15 +16,12 @@ use crossterm::event::{
 };
 use crossterm::terminal::{self, Clear, ClearType, ScrollUp};
 use crossterm::{execute, queue};
-use tickloop_agent::{
-    file_change::FileChangeReview,
-    image::Image,
-    runtime::{
-        ImageContext, ImageOrigin, InputContext, QueuedInput, QueuedInputKind,
-        TickSubscriptionStatus,
-    },
-    settings::DisplayPreferences,
+use tickloop_agent::runtime::{
+    ImageContext, ImageOrigin, InputContext, QueuedInput, QueuedInputKind, TickSubscriptionStatus,
 };
+use tickloop_agent_base::image::Image;
+use tickloop_agent_config::DisplayPreferences;
+use tickloop_agent_tools::file_change::FileChangeReview;
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
@@ -487,7 +484,7 @@ impl ArtifactMetadataSink {
         &self,
         chat: Uuid,
         id: String,
-        metadata: Option<crate::artifacts::ArtifactMetadata>,
+        metadata: Option<tickloop_agent_artifacts::ArtifactMetadata>,
     ) {
         let Some(state) = self.state.upgrade() else {
             return;
@@ -654,9 +651,9 @@ pub(super) struct State {
     diff_screen: Option<DiffScreen>,
     diff_screen_cache: HashMap<Uuid, DiffDialog>,
     pub(super) monitor: Monitor,
-    monitor_preference: tickloop_agent::settings::MonitorPreference,
+    monitor_preference: tickloop_agent_config::MonitorPreference,
     /// Whether Monitor may float hosted Ticks in a Herdr popup, as the settings say.
-    monitor_popup: tickloop_agent::settings::MonitorPopup,
+    monitor_popup: tickloop_agent_config::MonitorPopup,
     /// The socket of the Herdr session this View runs inside, where Enter floats hosted Ticks.
     herdr_socket: Option<PathBuf>,
     popup_registration_offered: bool,
@@ -665,11 +662,11 @@ pub(super) struct State {
     /// An attached view owns the terminal; nothing is drawn until it is taken back.
     terminal_lent: bool,
     /// Lists the View's Workspace programs for explicit adding; absent outside a Herdr View.
-    tick_discovery: Option<Arc<dyn crate::tick_adapter::TickDiscovery>>,
+    tick_discovery: Option<Arc<dyn crate::monitor_rows::TickDiscovery>>,
     /// Reads the host state of Monitor members: the discovery inside Herdr, otherwise the
     /// hosted Tick probe.
     /// One probe per Tick type whose members' host state can be read.
-    member_probes: Vec<Arc<dyn crate::tick_adapter::TickProbe>>,
+    member_probes: Vec<Arc<dyn crate::monitor_rows::TickProbe>>,
     member_probe_running: bool,
     task_surface: Option<TaskSurface<Uuid>>,
     task_surface_cache: HashMap<Uuid, TaskSurface<Uuid>>,
@@ -688,7 +685,7 @@ pub(super) struct State {
     conversation_focused: bool,
     status: String,
     provider_failure: Option<String>,
-    provider_failures: HashMap<Uuid, HashMap<String, crate::model::ProviderHttpFailure>>,
+    provider_failures: HashMap<Uuid, HashMap<String, tickloop_agent_protocol::ProviderHttpFailure>>,
     configured_status_lines: Option<Vec<String>>,
     background_status_notice: Option<BackgroundStatusNotice>,
     connection_notice: Option<String>,
@@ -911,15 +908,15 @@ pub(super) struct MemberProbe {
 }
 
 pub(super) struct TypedProbe {
-    pub(super) prober: Arc<dyn crate::tick_adapter::TickProbe>,
-    pub(super) targets: Vec<crate::tick_stream::InstanceRef>,
+    pub(super) prober: Arc<dyn crate::monitor_rows::TickProbe>,
+    pub(super) targets: Vec<tick_protocol::InstanceRef>,
 }
 
 struct MonitorRowTarget {
     chat: Uuid,
     row: usize,
     columns: std::ops::Range<usize>,
-    instance: crate::tick_stream::InstanceRef,
+    instance: tick_protocol::InstanceRef,
 }
 
 fn status_notice_line(
@@ -1087,7 +1084,14 @@ impl Console {
     pub(super) fn artifact_page_loaded(
         &self,
         request: &super::artifacts_picker::ArtifactLoad,
-        result: Result<(crate::artifacts::ArtifactPage, HashSet<String>, bool), String>,
+        result: Result<
+            (
+                tickloop_agent_artifacts::ArtifactPage,
+                HashSet<String>,
+                bool,
+            ),
+            String,
+        >,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if let Some(picker) = state.artifact_picker_for_load(request.picker) {
@@ -1130,7 +1134,7 @@ impl Console {
         chat: Uuid,
         id: &str,
     ) -> Result<(), String> {
-        let instance: crate::tick_stream::InstanceRef = id.parse()?;
+        let instance: tick_protocol::InstanceRef = id.parse()?;
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.clear_artifact_picker(picker);
         let overlay = state.monitor_overlay();
@@ -1157,7 +1161,7 @@ impl Console {
         &self,
         chat: Uuid,
         id: String,
-        metadata: Option<crate::artifacts::ArtifactMetadata>,
+        metadata: Option<tickloop_agent_artifacts::ArtifactMetadata>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let monitor = state.monitor_for_chat_mut(chat);
@@ -1195,7 +1199,7 @@ impl Console {
     /// Installs the discovery that lists what can be added; it also probes members.
     pub(super) fn set_tick_discovery(
         &self,
-        discovery: Arc<dyn crate::tick_adapter::TickDiscovery>,
+        discovery: Arc<dyn crate::monitor_rows::TickDiscovery>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.member_probes.push(discovery.clone());
@@ -1205,7 +1209,7 @@ impl Console {
     /// Adds the probe of one more Tick type's members.
     pub(super) fn add_member_probe(
         &self,
-        probe: Arc<dyn crate::tick_adapter::TickProbe>,
+        probe: Arc<dyn crate::monitor_rows::TickProbe>,
     ) -> Result<(), String> {
         self.state
             .lock()
@@ -1250,7 +1254,7 @@ impl Console {
     pub(super) fn update_member_findings(
         &self,
         chat: Uuid,
-        results: Vec<(&'static str, Option<crate::tick_adapter::MemberFindings>)>,
+        results: Vec<(&'static str, Option<crate::monitor_rows::MemberFindings>)>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.member_probe_running = false;
@@ -1361,7 +1365,7 @@ impl Console {
             .clone())
     }
 
-    pub(super) fn monitor_popup(&self) -> Result<tickloop_agent::settings::MonitorPopup, String> {
+    pub(super) fn monitor_popup(&self) -> Result<tickloop_agent_config::MonitorPopup, String> {
         Ok(self
             .state
             .lock()
@@ -1371,7 +1375,7 @@ impl Console {
 
     pub(super) fn set_monitor_popup(
         &self,
-        popup: tickloop_agent::settings::MonitorPopup,
+        popup: tickloop_agent_config::MonitorPopup,
     ) -> Result<(), String> {
         self.state
             .lock()
@@ -1412,7 +1416,7 @@ impl Console {
 
     pub(super) fn set_monitor_preference(
         &self,
-        preference: tickloop_agent::settings::MonitorPreference,
+        preference: tickloop_agent_config::MonitorPreference,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.monitor_preference = preference;
@@ -1455,7 +1459,7 @@ impl Console {
         };
         let chat = detail.chat();
         Ok(detail
-            .poll(crate::private_fs::unix_time_milliseconds())
+            .poll(tickloop_agent_base::private_fs::unix_time_milliseconds())
             .map(|action| (chat, action)))
     }
     pub(super) fn update_tick_detail<T: super::tick_actions::TickDetailView, R>(
@@ -1969,7 +1973,7 @@ impl Console {
     pub(super) fn set_provider_failures(
         &self,
         chat: Uuid,
-        failures: &HashMap<String, crate::model::ProviderHttpFailure>,
+        failures: &HashMap<String, tickloop_agent_protocol::ProviderHttpFailure>,
     ) -> Result<(), String> {
         self.state
             .lock()
@@ -4961,8 +4965,8 @@ impl State {
             diff_screen: None,
             diff_screen_cache: HashMap::new(),
             monitor: Monitor::default(),
-            monitor_preference: tickloop_agent::settings::MonitorPreference::Auto,
-            monitor_popup: tickloop_agent::settings::MonitorPopup::default(),
+            monitor_preference: tickloop_agent_config::MonitorPreference::Auto,
+            monitor_popup: tickloop_agent_config::MonitorPopup::default(),
             herdr_socket: None,
             popup_registration_offered: false,
             full_screen_attach: None,
@@ -5403,7 +5407,7 @@ impl State {
     /// Whether a focused Monitor covers the conversation instead of sitting beside it.
     fn monitor_overlay(&self) -> bool {
         self.width + 1 < MONITOR_AUTO_MIN_COLUMNS
-            || self.monitor_preference == tickloop_agent::settings::MonitorPreference::Hidden
+            || self.monitor_preference == tickloop_agent_config::MonitorPreference::Hidden
     }
 
     fn monitor_visible(&self) -> bool {
@@ -5430,7 +5434,7 @@ impl State {
             && !self.full_review
             && (self.monitor.overlay
                 || self.width + 1 >= MONITOR_AUTO_MIN_COLUMNS
-                    && self.monitor_preference == tickloop_agent::settings::MonitorPreference::Auto)
+                    && self.monitor_preference == tickloop_agent_config::MonitorPreference::Auto)
     }
 
     #[cfg(test)]
@@ -5609,7 +5613,7 @@ impl State {
                     .lines(
                         width,
                         start - hint.len(),
-                        crate::private_fs::unix_time_milliseconds(),
+                        tickloop_agent_base::private_fs::unix_time_milliseconds(),
                     )
                     .into_iter()
                     .map(|line| line.line)
@@ -5625,7 +5629,7 @@ impl State {
                 side_columns.saturating_sub(2),
                 start,
                 self.display,
-                crate::private_fs::unix_time_milliseconds(),
+                tickloop_agent_base::private_fs::unix_time_milliseconds(),
                 self.tick_discovery.is_some() || !self.monitor.removed().is_empty(),
             );
             if let Some(chat) = self.chat {
@@ -9640,10 +9644,10 @@ impl State {
                 };
             }
             match (key.code, key.modifiers) {
-                (KeyCode::Char(crate::tick_adapter::MONITOR_ADD_KEY), KeyModifiers::NONE) => {
+                (KeyCode::Char(crate::monitor_rows::MONITOR_ADD_KEY), KeyModifiers::NONE) => {
                     return self.open_monitor_discovery();
                 }
-                (KeyCode::Char(crate::tick_adapter::MONITOR_REFRESH_KEY), KeyModifiers::NONE) => {
+                (KeyCode::Char(crate::monitor_rows::MONITOR_REFRESH_KEY), KeyModifiers::NONE) => {
                     let chat = self.chat?;
                     let executor = self.monitor.refresh_action();
                     let action = executor
@@ -9663,7 +9667,7 @@ impl State {
                 (KeyCode::Enter, _) | (KeyCode::Char(_), KeyModifiers::NONE) => {
                     if let Some(entry) = self.monitor.selected().cloned() {
                         let action_key = match key.code {
-                            KeyCode::Enter => crate::tick_adapter::MONITOR_ENTER_KEY,
+                            KeyCode::Enter => crate::monitor_rows::MONITOR_ENTER_KEY,
                             KeyCode::Char(key) => key,
                             _ => unreachable!(),
                         };
@@ -9672,7 +9676,7 @@ impl State {
                             .iter()
                             .find(|action| action.key == action_key)?
                             .intent;
-                        if let crate::tick_adapter::TickIntent::Notify(message) = intent {
+                        if let crate::monitor_rows::TickIntent::Notify(message) = intent {
                             self.hold_status(message);
                             return None;
                         }
@@ -10694,13 +10698,6 @@ fn read_keys(
             continue;
         }
         let event = event::read()?;
-        // 照 Claude Code `processKeysInBatch`：按键、粘贴与鼠标操作是用户输入，推迟后台清理；
-        // 没有按下按钮的指针移动不算。
-        if matches!(&event, Event::Key(_) | Event::Paste(_))
-            || matches!(&event, Event::Mouse(mouse) if mouse.kind != MouseEventKind::Moved)
-        {
-            crate::housekeeping::UserActivity::process().record();
-        }
         let mut state = state
             .lock()
             .map_err(|error| io::Error::other(error.to_string()))?;
@@ -11374,14 +11371,13 @@ fn draft_keeps_context(draft: &str, context: &InputContext) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tickloop_agent::file_change::{
-        FileChangeAction, FileChangeHunk, FileChangeLine, FileChangeLineKind, FileVersion,
-    };
-    use tickloop_agent::permissions::{Decision, ExecutionMode, PermissionRule};
     use tickloop_agent::runtime::{
         EventKind, ShellTask, ShellTaskCapabilities, ShellTaskOrigin, ShellTaskOwner,
         ShellTaskSnapshot, ShellTaskState, TextContext,
     };
+    use tickloop_agent_protocol::{Decision, ExecutionMode, PermissionRule};
+    use tickloop_agent_protocol::{FileChangeAction, FileVersion};
+    use tickloop_agent_tools::file_change::{FileChangeHunk, FileChangeLine, FileChangeLineKind};
 
     use crate::terminal::diff_catalog::{
         CatalogFileChange, CatalogFileChangeId, ChangeSource, CurrentFileStatus, GitFileState,
@@ -11656,10 +11652,8 @@ mod tests {
             id: Uuid::from_u128(u128::from(instance)),
             loop_id: Uuid::from_u128(900),
             loop_state: tickloop_agent::runtime::LoopState::WaitingTrigger,
-            instance: tick_connect::instance::InstanceRef::native(format!(
-                "fixture-run-{instance}"
-            ))
-            .unwrap(),
+            instance: tick_protocol::InstanceRef::native(format!("fixture-run-{instance}"))
+                .unwrap(),
             every_seconds: 60,
             accumulated: 0,
             last_delivery_ms: None,
@@ -13503,7 +13497,8 @@ mod tests {
     #[tokio::test]
     async fn the_question_dialog_answers_every_question_through_menu_keys() {
         use crate::terminal::menus::Menus;
-        use tickloop_agent::{model::Content, tools::ASK_USER_QUESTION_TOOL_NAME};
+        use tickloop_agent_protocol::Content;
+        use tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME;
 
         let directory = tempfile::tempdir().unwrap();
         let model = Arc::new(support::ScriptedModel::new(vec![
@@ -13835,7 +13830,7 @@ mod tests {
     #[tokio::test]
     async fn the_enter_plan_mode_dialog_declines_on_escape_and_enters_on_confirmation() {
         use crate::terminal::menus::Menus;
-        use tickloop_agent::tools::ENTER_PLAN_MODE_TOOL_NAME;
+        use tickloop_agent_tools::ENTER_PLAN_MODE_TOOL_NAME;
 
         let directory = tempfile::tempdir().unwrap();
         let enter = |id| support::call(id, ENTER_PLAN_MODE_TOOL_NAME, serde_json::json!({}));
@@ -14546,11 +14541,12 @@ mod tests {
     #[tokio::test]
     async fn stale_parent_choice_releases_gate_without_dismissing_replacement_menu() {
         use crate::terminal::menus::Menus;
-        use tickloop_agent::model::{HttpModelClient, InputModality, ModelConfig, Protocol};
+        use tickloop_agent_model::HttpModelClient;
+        use tickloop_agent_protocol::{InputModality, ModelConfig, Protocol};
 
         let config = ModelConfig {
-            provider: crate::model::ModelProvider::Api,
-            auth_source: crate::model::ModelAuthSource::ApiKeyEnv,
+            provider: tickloop_agent_protocol::ModelProvider::Api,
+            auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
             name: "menu gate fixture".into(),
             protocol: Protocol::Messages,
             base_url: "http://127.0.0.1".into(),
@@ -14729,10 +14725,10 @@ mod tests {
             description: "Audit evidence".into(),
             available: true,
         };
-        for glyph_set in crate::settings::GlyphSet::ALL {
+        for glyph_set in tickloop_agent_config::GlyphSet::ALL {
             let mut state = State::new(true, 80, 24);
             state.prompt_enabled = true;
-            state.display = DisplayProfile::new(crate::settings::DisplayPreferences {
+            state.display = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
                 glyph_set,
                 ..Default::default()
             });
@@ -15393,7 +15389,7 @@ mod tests {
     }
 
     fn clipboard_image() -> Image {
-        tickloop_agent::image::prepare(&png_bytes()).unwrap()
+        tickloop_agent_base::image::prepare(&png_bytes()).unwrap()
     }
 
     fn state_with_clipboard(image: Option<Image>, remote: bool) -> State {
@@ -17475,17 +17471,17 @@ mod tests {
             let mut state = console.state.lock().unwrap();
             state
                 .monitor
-                .select(&crate::tick_stream::InstanceRef::shell(task));
+                .select(&tick_protocol::InstanceRef::shell(task));
             state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
             state
                 .monitor
-                .select(&crate::tick_stream::InstanceRef::shell(task));
+                .select(&tick_protocol::InstanceRef::shell(task));
             let Some(InputEvent::TickAction { action, .. }) = state.key(key(KeyCode::Enter)) else {
                 panic!("Shell did not open the Tick panel");
             };
             assert_eq!(
                 action.instance,
-                crate::tick_stream::InstanceRef::shell(task).to_string()
+                tick_protocol::InstanceRef::shell(task).to_string()
             );
             state.monitor.detail.as_ref().unwrap().id()
         };
@@ -17502,7 +17498,7 @@ mod tests {
         assert!(state.monitor.detail.is_none());
         assert_eq!(
             state.monitor.selected().unwrap().instance,
-            crate::tick_stream::InstanceRef::shell(task)
+            tick_protocol::InstanceRef::shell(task)
         );
         assert_eq!(state.editor.draft(), "keep this draft");
     }
@@ -18833,13 +18829,12 @@ mod tests {
     #[tokio::test]
     async fn rewind_menu_transitions_keep_keyboard_focus_and_the_insert_draft() {
         use crate::terminal::menus::Menus;
-        use tickloop_agent::{
-            model::{HttpModelClient, InputModality, ModelConfig, Protocol},
-            runtime::ChatSnapshot,
-        };
+        use tickloop_agent::runtime::ChatSnapshot;
+        use tickloop_agent_model::HttpModelClient;
+        use tickloop_agent_protocol::{InputModality, ModelConfig, Protocol};
         let config = ModelConfig {
-            provider: crate::model::ModelProvider::Api,
-            auth_source: crate::model::ModelAuthSource::ApiKeyEnv,
+            provider: tickloop_agent_protocol::ModelProvider::Api,
+            auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
             name: "focus fixture".into(),
             protocol: Protocol::Messages,
             base_url: "http://127.0.0.1".into(),
@@ -18863,7 +18858,7 @@ mod tests {
             "messages":[{"role":"user","content":[{"type":"text","text":"Recorded prompt"}]}],
             "operations":[],"loops":[],"last_sequence":0,
             "message_ids":{"0":Uuid::new_v4()},
-            "prompt_execution_modes":{"0":tickloop_agent::permissions::ExecutionMode::AcceptEdits}
+            "prompt_execution_modes":{"0":tickloop_agent_protocol::ExecutionMode::AcceptEdits}
         }))
         .unwrap();
         let mut state = State::new(true, 100, 30);
@@ -19042,11 +19037,11 @@ mod tests {
 
     #[tokio::test]
     async fn settings_menu_reduce_motion_saves_before_applying_and_keeps_later_actions() {
-        use crate::settings::UserSettings;
         use crate::terminal::menus::{
             Menus, OUTPUT_STYLE_SETTING_INDEX, PERMISSIONS_SETTING_INDEX,
             REDUCE_MOTION_SETTING_INDEX,
         };
+        use tickloop_agent_config::UserSettings;
         let directory = tempfile::tempdir().unwrap();
         let settings = UserSettings::in_root(directory.path());
         let agent = Agent::new_embedded(
@@ -19365,11 +19360,11 @@ mod tests {
             chat,
             HashMap::from([(
                 "deepseek-api".into(),
-                crate::model::ProviderHttpFailure {
+                tickloop_agent_protocol::ProviderHttpFailure {
                     provider_id: "deepseek-api".into(),
                     provider_name: "DeepSeek".into(),
                     status: 403,
-                    class: crate::model::ProviderFailureClass::UsageLimit,
+                    class: tickloop_agent_protocol::ProviderFailureClass::UsageLimit,
                     message: "Monthly limit".into(),
                     hint: "Check allowance".into(),
                     retry_after: None,

@@ -3,22 +3,22 @@ use crate::terminal::monitor::{MonitorEntry, TickGroup};
 
 fn shell(id: Uuid, title: &str) -> MonitorEntry {
     MonitorEntry {
-        instance: crate::tick_stream::InstanceRef::shell(id),
+        instance: tick_protocol::InstanceRef::shell(id),
         group: TickGroup::Shells,
         glyph: Glyph::ShellTick,
         title: title.into(),
         kind: "Shell".into(),
         status: "exit 0".into(),
-        owner: crate::tick_adapter::TickOwner::Unknown,
+        owner: crate::monitor_rows::TickOwner::Unknown,
         updated_at_ms: Some(1000),
         resources: None,
         actions: vec![
-            crate::tick_adapter::MonitorAction {
+            crate::monitor_rows::MonitorAction {
                 key: 'o',
                 label: "open",
-                intent: crate::tick_adapter::TickIntent::OpenShell { task: id },
+                intent: crate::monitor_rows::TickIntent::OpenShell { task: id },
             },
-            crate::tick_adapter::remove_from_monitor(&crate::tick_stream::InstanceRef::shell(id)),
+            crate::monitor_rows::remove_from_monitor(&tick_protocol::InstanceRef::shell(id)),
         ],
     }
 }
@@ -33,7 +33,7 @@ fn chat_snapshot(chat: Uuid) -> crate::runtime::ChatSnapshot {
     .unwrap()
 }
 
-fn removed(instance: crate::tick_stream::InstanceRef) -> crate::runtime::MonitorMembership {
+fn removed(instance: tick_protocol::InstanceRef) -> crate::runtime::MonitorMembership {
     crate::runtime::MonitorMembership {
         members: Vec::new(),
         removed: [instance].into(),
@@ -92,7 +92,7 @@ fn shell_ticks_only_list_background_executions_and_keep_them_until_removed() {
             console.monitor_has_entries().unwrap(),
             "finished background Shell must remain"
         );
-        let task = crate::tick_stream::InstanceRef::shell(snapshot.tasks[0].id);
+        let task = tick_protocol::InstanceRef::shell(snapshot.tasks[0].id);
         {
             let mut state = console.state.lock().unwrap();
             state.monitor.focus(true, None);
@@ -214,10 +214,10 @@ fn tick_shell_detail_and_selection_restore_per_agent_and_ignore_obsolete_mouse_t
             title: "B".into(),
             kind: "Artifact".into(),
             status: String::new(),
-            owner: crate::tick_adapter::TickOwner::Unknown,
+            owner: crate::monitor_rows::TickOwner::Unknown,
             updated_at_ms: None,
             resources: None,
-            actions: crate::tick_adapter::artifact_actions("artifact:https://docs.example/b"),
+            actions: crate::monitor_rows::artifact_actions("artifact:https://docs.example/b"),
         }],
     );
     state.pointer(
@@ -778,7 +778,7 @@ async fn failed_artifact_refresh_keeps_cached_title_but_marks_the_row_and_notifi
         crate::terminal::test_support::config(),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let tick = crate::artifacts::ArtifactTick {
+    let tick = tickloop_agent_protocol::ArtifactTick {
         artifact_id: "doc".into(),
         origin: "https://docs.example".into(),
         title: "Original".into(),
@@ -901,7 +901,7 @@ fn monitor_follows_agent_and_restores_selection_without_leaking_old_results() {
     state.monitor.focus(false, None);
     state
         .monitor
-        .select(&crate::tick_stream::InstanceRef::shell(second));
+        .select(&tick_protocol::InstanceRef::shell(second));
     state.switch_view_chat(Some(b));
     assert!(state.monitor.entries().is_empty());
     state
@@ -939,7 +939,7 @@ fn monitor_width_boundary_and_overlay_do_not_change_visibility_preference() {
     assert!(!state.monitor_visible());
     assert_eq!(
         state.monitor_preference,
-        tickloop_agent::settings::MonitorPreference::Auto
+        tickloop_agent_config::MonitorPreference::Auto
     );
 }
 
@@ -1047,13 +1047,13 @@ fn monitor_columns_preserve_full_width_input_dividers_cursor_and_mouse_geometry(
         state
             .scrollback
             .append(&format!("{}\n", "conversation ".repeat(25)));
-        state.monitor_preference = tickloop_agent::settings::MonitorPreference::Hidden;
+        state.monitor_preference = tickloop_agent_config::MonitorPreference::Hidden;
         let (hidden, hidden_row, hidden_column) = state.frame();
         let hidden_target = state
             .monitor_toggle_target
             .as_ref()
             .map(|target| (target.row, target.columns.clone()));
-        state.monitor_preference = tickloop_agent::settings::MonitorPreference::Auto;
+        state.monitor_preference = tickloop_agent_config::MonitorPreference::Auto;
         state.monitor.overlay = width <= 120;
         let (shown, shown_row, shown_column) = state.frame();
         assert_eq!(shown, hidden, "input rows changed at {width} columns");
@@ -1142,7 +1142,7 @@ fn artifact_metadata_callback_is_filed_under_its_agent_after_a_view_switch() {
 #[test]
 fn failed_monitor_save_keeps_the_current_visibility_and_focus() {
     let directory = tempfile::tempdir().unwrap();
-    let settings = crate::settings::UserSettings::in_root(directory.path());
+    let settings = tickloop_agent_config::UserSettings::in_root(directory.path());
     std::fs::write(directory.path().join("settings.json"), "invalid JSON").unwrap();
     let mut state = State::new(true, 140, 25);
     state.switch_view_chat(Some(Uuid::new_v4()));
@@ -1157,7 +1157,7 @@ fn failed_monitor_save_keeps_the_current_visibility_and_focus() {
     assert!(state.monitor.focused);
     assert_eq!(
         state.monitor_preference,
-        crate::settings::MonitorPreference::Auto
+        tickloop_agent_config::MonitorPreference::Auto
     );
 }
 
@@ -1279,31 +1279,31 @@ fn tick_column_spans_content_top_through_working_and_generic_todo_rows() {
 /// The production row actions for a fixture instance: Artifact actions, or a subscription that
 /// opens on Enter with the shared Monitor removal.
 fn fixture_actions(
-    instance: &crate::tick_stream::InstanceRef,
-) -> Vec<crate::tick_adapter::MonitorAction> {
+    instance: &tick_protocol::InstanceRef,
+) -> Vec<crate::monitor_rows::MonitorAction> {
     if instance.tick_type() == "artifact" {
-        return crate::tick_adapter::artifact_actions(instance.as_str());
+        return crate::monitor_rows::artifact_actions(instance.as_str());
     }
     vec![
-        crate::tick_adapter::MonitorAction {
+        crate::monitor_rows::MonitorAction {
             key: 'o',
             label: "open",
-            intent: crate::tick_adapter::TickIntent::OpenSubscription { id: Uuid::new_v4() },
+            intent: crate::monitor_rows::TickIntent::OpenSubscription { id: Uuid::new_v4() },
         },
-        crate::tick_adapter::remove_from_monitor(instance),
+        crate::monitor_rows::remove_from_monitor(instance),
     ]
 }
 
 #[test]
-fn a_new_adapter_row_intent_runs_through_enter_and_click() {
-    use crate::tick_adapter::*;
+fn a_newly_registered_row_intent_runs_through_enter_and_click() {
+    use crate::monitor_rows::*;
     struct Calendar;
-    impl TickAdapter for Calendar {
+    impl MonitorRows for Calendar {
         fn tick_type(&self) -> &'static str {
             "cal"
         }
         fn list(&self, _: &MonitorContext) -> Vec<TickDescriptor> {
-            let instance = crate::tick_stream::InstanceRef::new("cal", "remote").unwrap();
+            let instance = tick_protocol::InstanceRef::new("cal", "remote").unwrap();
             vec![TickDescriptor {
                 instance: instance.clone(),
                 group: TickGroup {
@@ -1325,15 +1325,12 @@ fn a_new_adapter_row_intent_runs_through_enter_and_click() {
                 }],
             }]
         }
-        fn stream(&self) -> Option<Arc<dyn crate::tick_stream::TickStreamPort>> {
-            None
-        }
     }
     let chat = Uuid::new_v4();
     let mut state = State::new(true, 140, 25);
     state.switch_view_chat(Some(chat));
     state.prompt_enabled = true;
-    let rows = TickAdapters::new([Arc::new(Calendar) as Arc<dyn TickAdapter>])
+    let rows = MonitorRowsRegistry::new([Arc::new(Calendar) as Arc<dyn MonitorRows>])
         .unwrap()
         .list(&MonitorContext::default());
     state.monitor.replace(
@@ -1499,33 +1496,33 @@ async fn shell_detail_confirmation_runs_the_production_adapter_control_callback(
 
 struct FixtureDiscovery;
 #[async_trait::async_trait]
-impl crate::tick_adapter::TickDiscovery for FixtureDiscovery {
+impl crate::monitor_rows::TickDiscovery for FixtureDiscovery {
     async fn page(
         &self,
-        _: Option<tick_connect::page::PageCursor>,
+        _: Option<tickhost_connect::page::PageCursor>,
     ) -> Result<
-        tick_connect::page::Page<crate::tick_adapter::DiscoveredTick>,
-        crate::tick_adapter::DiscoveryError,
+        tickhost_connect::page::Page<crate::monitor_rows::DiscoveredTick>,
+        crate::monitor_rows::DiscoveryError,
     > {
-        Err(crate::tick_adapter::DiscoveryError::Unavailable(
+        Err(crate::monitor_rows::DiscoveryError::Unavailable(
             "not listed in this fixture".into(),
         ))
     }
 }
 #[async_trait::async_trait]
-impl crate::tick_adapter::TickProbe for FixtureDiscovery {
+impl crate::monitor_rows::TickProbe for FixtureDiscovery {
     fn tick_type(&self) -> &'static str {
         "herdr"
     }
     async fn probe(
         &self,
         _chat: Uuid,
-        instances: &[crate::tick_stream::InstanceRef],
-    ) -> Result<crate::tick_adapter::MemberFindings, crate::tick_adapter::DiscoveryError> {
-        Ok(crate::tick_adapter::MemberFindings {
+        instances: &[tick_protocol::InstanceRef],
+    ) -> Result<crate::monitor_rows::MemberFindings, crate::monitor_rows::DiscoveryError> {
+        Ok(crate::monitor_rows::MemberFindings {
             states: instances
                 .iter()
-                .map(|instance| (instance.clone(), crate::tick_adapter::MemberState::Gone))
+                .map(|instance| (instance.clone(), crate::monitor_rows::MemberState::Gone))
                 .collect(),
             resources: HashMap::new(),
         })
@@ -1537,27 +1534,27 @@ struct FixtureHostedProbe {
     fails: bool,
 }
 #[async_trait::async_trait]
-impl crate::tick_adapter::TickProbe for FixtureHostedProbe {
+impl crate::monitor_rows::TickProbe for FixtureHostedProbe {
     fn tick_type(&self) -> &'static str {
-        tick_connect::instance::HOSTED_TYPE
+        tick_protocol::HOSTED_INSTANCE_TYPE
     }
     async fn probe(
         &self,
         _chat: Uuid,
-        instances: &[crate::tick_stream::InstanceRef],
-    ) -> Result<crate::tick_adapter::MemberFindings, crate::tick_adapter::DiscoveryError> {
+        instances: &[tick_protocol::InstanceRef],
+    ) -> Result<crate::monitor_rows::MemberFindings, crate::monitor_rows::DiscoveryError> {
         if self.fails {
-            return Err(crate::tick_adapter::DiscoveryError::Unavailable(
+            return Err(crate::monitor_rows::DiscoveryError::Unavailable(
                 "host unreachable".into(),
             ));
         }
-        Ok(crate::tick_adapter::MemberFindings {
+        Ok(crate::monitor_rows::MemberFindings {
             states: instances
                 .iter()
                 .map(|instance| {
                     (
                         instance.clone(),
-                        crate::tick_adapter::MemberState::Live { protocol: true },
+                        crate::monitor_rows::MemberState::Live { protocol: true },
                     )
                 })
                 .collect(),
@@ -1566,7 +1563,7 @@ impl crate::tick_adapter::TickProbe for FixtureHostedProbe {
                 .map(|instance| {
                     (
                         instance.clone(),
-                        crate::tick_adapter::TickResources {
+                        crate::monitor_rows::TickResources {
                             pid: 42,
                             cpu_time_ms: None,
                             cpu_percent: None,
@@ -1582,7 +1579,7 @@ impl crate::tick_adapter::TickProbe for FixtureHostedProbe {
 
 fn run_probes(
     probe: &MemberProbe,
-) -> Vec<(&'static str, Option<crate::tick_adapter::MemberFindings>)> {
+) -> Vec<(&'static str, Option<crate::monitor_rows::MemberFindings>)> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
@@ -1607,7 +1604,7 @@ fn a_herdr_view_probes_hosted_members_beside_herdr_ones() {
     let console = Console::test_for_chat(Uuid::new_v4());
     let chat = console.state.lock().unwrap().chat.unwrap();
     let mut snapshot = chat_snapshot(chat);
-    let hosted: crate::tick_stream::InstanceRef = "hosted:1a26e59c-a887-457d-8540-5079aea79ca0"
+    let hosted: tick_protocol::InstanceRef = "hosted:1a26e59c-a887-457d-8540-5079aea79ca0"
         .parse()
         .unwrap();
     for (instance, title) in [
@@ -1708,7 +1705,7 @@ fn removed_rows_can_be_restored_without_a_workspace() {
     state.switch_view_chat(Some(chat));
     state.prompt_enabled = true;
     let mut snapshot = chat_snapshot(chat);
-    let shell = crate::tick_stream::InstanceRef::shell(Uuid::new_v4());
+    let shell = tick_protocol::InstanceRef::shell(Uuid::new_v4());
     snapshot.monitor.removed.insert(shell.clone());
     state.monitor.chat_snapshot = Some(snapshot);
     state.monitor.rebuild();
@@ -1817,14 +1814,14 @@ fn probed_herdr_members_report_their_host_state_and_owner() {
         .find(|entry| entry.title == "added")
         .unwrap();
     assert_eq!(added.status, "gone");
-    assert_eq!(added.owner, crate::tick_adapter::TickOwner::Herdr);
+    assert_eq!(added.owner, crate::monitor_rows::TickOwner::Herdr);
     let opened = state
         .monitor
         .entries()
         .iter()
         .find(|entry| entry.title == "opened")
         .unwrap();
-    assert_eq!(opened.owner, crate::tick_adapter::TickOwner::ThisChat);
+    assert_eq!(opened.owner, crate::monitor_rows::TickOwner::ThisChat);
 }
 
 #[test]
@@ -1852,7 +1849,7 @@ fn member_details_show_the_recorded_owner_and_no_invented_resources() {
         .monitor
         .members
         .push(crate::runtime::MonitorMember {
-            instance: crate::tick_stream::InstanceRef::new("herdr", "opened").unwrap(),
+            instance: tick_protocol::InstanceRef::new("herdr", "opened").unwrap(),
             source: crate::runtime::MonitorMemberSource::Opened,
             title: Some("Opened counter".into()),
         });

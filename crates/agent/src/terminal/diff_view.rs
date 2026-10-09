@@ -5,7 +5,8 @@ use std::{
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::file_change::{FileChangeAction, FileChangeLineKind, FileChangeReview};
+use tickloop_agent_protocol::FileChangeAction;
+use tickloop_agent_tools::file_change::{FileChangeLineKind, FileChangeReview};
 
 const TAB_COLUMNS: usize = 4;
 const MAX_CONSECUTIVE_ZERO_WIDTH_CHARACTERS: usize = 16;
@@ -903,7 +904,8 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::file_change::{FileChangeHunk, FileChangeLine, FileVersion};
+    use tickloop_agent_protocol::FileVersion;
+    use tickloop_agent_tools::file_change::{FileChangeHunk, FileChangeLine};
 
     fn version(bytes: u64, lines: u64, newline: bool) -> FileVersion {
         FileVersion {

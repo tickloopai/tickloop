@@ -14,18 +14,7 @@ use std::{
 };
 use uuid::Uuid;
 
-mod screen {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/screen.rs"
-    ));
-}
-mod input_dialog {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/input_dialog.rs"
-    ));
-}
+use crate::terminal::test_support::{input_dialog, screen};
 
 const FIXTURE_VARIABLE: &str = "TICKLOOP_CHILD_CONFIG_FIXTURE";
 const DIRECTORY_VARIABLE: &str = "TICKLOOP_CHILD_CONFIG_DIRECTORY";
@@ -106,13 +95,13 @@ async fn run_child_config_fixture() {
     let config_root = (auto_permissions || model_dialog)
         .then(|| directory.canonicalize().unwrap().join("config-root"));
     let model = if model_dialog {
-        crate::model::credentials::save_api_key(
+        tickloop_agent_model::credentials::save_api_key(
             config_root.as_ref().unwrap(),
             "DEEPSEEK_API_KEY",
             "fixture-key",
         )
         .unwrap();
-        crate::model::cards::ModelCatalog::defaults()
+        tickloop_agent_model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash")
             .unwrap()
     } else {
@@ -169,9 +158,9 @@ async fn run_child_config_fixture() {
     core.set_execution_mode(
         root,
         if auto_permissions {
-            crate::permissions::ExecutionMode::Auto
+            tickloop_agent_protocol::ExecutionMode::Auto
         } else {
-            crate::permissions::ExecutionMode::AcceptEdits
+            tickloop_agent_protocol::ExecutionMode::AcceptEdits
         },
     )
     .await
@@ -241,7 +230,7 @@ async fn run_child_config_fixture() {
         chat: StartupChat::Resumed(Box::new(agent.snapshot(root).await.unwrap()), false),
         user_settings: config_root
             .as_deref()
-            .map(crate::settings::UserSettings::in_root),
+            .map(tickloop_agent_config::UserSettings::in_root),
     };
     let result = interact(&agent, workdir, &console, input, startup, config_root).await;
     std::fs::write(
@@ -305,7 +294,7 @@ impl ChildPty {
         command.env("TICKLOOP_CONFIG_DIR", directory.join("config-root"));
         command.env("TICKLOOP_DAEMON_RUNTIME_DIR", directory.join("runtime"));
         command.env("TICKLOOP_TMPDIR", directory);
-        for model in crate::model::cards::built_in_model_profiles() {
+        for model in tickloop_agent_model::cards::built_in_model_profiles() {
             if !model.api_key_env.is_empty() {
                 command.env_remove(model.api_key_env);
             }
@@ -314,7 +303,7 @@ impl ChildPty {
             command.env("DEEPSEEK_API_KEY", "fixture-key");
         }
         if route == "auto-permissions" {
-            command.env_remove(crate::judgment::JEV_API_KEY_ENV);
+            command.env_remove(tickloop_agent_model::judgment::JEV_API_KEY_ENV);
         }
         command.cwd(directory);
         let child = pair.slave.spawn_command(command).unwrap();
@@ -432,11 +421,12 @@ fn a_real_delegate_child_clear_refusal_preserves_the_view_and_family_panel() {
     let _child = child_fixture(directory.path(), &view);
     view.open_child();
     view.wait_for_child_editor();
-    let opened = view.wait_for("named child view", |frame| {
+    // The family panel rows arrive in a later frame than the child's editor.
+    view.wait_for("named child view with its family panel", |frame| {
         frame.contains("Message @review-notes…")
+            && frame.contains("● review-notes")
+            && frame.contains("○ main")
     });
-    assert!(opened.contains("● review-notes"), "{opened}");
-    assert!(opened.contains("○ main"), "{opened}");
     let baseline = commands(directory.path()).len();
     view.send(b"/clear\r");
     let refused = view.wait_for("child clear refused", |frame| {
@@ -687,7 +677,7 @@ fn inherited_auto_permissions_keep_judgment_read_only_and_root_key_settings_edit
     let env_file = config_root.join(".env");
     let saved_key = std::fs::read(&env_file).unwrap();
     assert!(String::from_utf8_lossy(&saved_key).contains("fixture-private-jev-key"));
-    let settings_file = config_root.join(crate::settings::SETTINGS_FILE_NAME);
+    let settings_file = config_root.join(tickloop_agent_config::SETTINGS_FILE_NAME);
     let saved_settings = std::fs::read(&settings_file).ok();
     view.send(b"\x1b");
     view.wait_for("the root Auto permissions again", |frame| {

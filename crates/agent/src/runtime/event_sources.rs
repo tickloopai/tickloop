@@ -13,7 +13,7 @@ use crate::host_tools::{
     EventAssociationOutcome, EventAssociationRequest, EventClaimOutcome, EventClaimRequest,
     EventLeaseOutcome, EventLeaseRequest, EventPendingOutcome, EventSourceLocator,
 };
-use crate::protocol::ChatId;
+use tickloop_agent_protocol::ChatId;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const IDLE_EVENT_POLL_INTERVAL: Duration = Duration::from_secs(15);

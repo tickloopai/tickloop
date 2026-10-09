@@ -8,8 +8,8 @@ use super::auto_rules::{
     AutoPolicy, RuleApplicability, RuleFinding, RuleVerdict, SemanticFindings, SoftDenyClearance,
     TaskScopeFinding, reduce,
 };
-use crate::judgment::{Answer, Evaluation, EvaluationRequest, Question};
-use crate::settings::AutoRuleKind;
+use tickloop_agent_model::judgment::{Answer, Evaluation, EvaluationRequest, Question};
+use tickloop_agent_protocol::AutoRuleKind;
 
 // Conservative byte budgets below Jev 1.13's 64k request / 32k state-plus-question token limits.
 const MAX_REVIEW_REQUEST_BYTES: usize = 60 * 1024;

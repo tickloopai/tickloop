@@ -24,9 +24,9 @@ pub struct TriggerSource {
 pub(super) fn can_trigger(goal: &LoopSnapshot) -> bool {
     (goal.trigger.as_ref().is_some_and(|trigger| {
         trigger.armed
-            && trigger
-                .expires_at_ms
-                .is_none_or(|deadline| deadline > crate::private_fs::unix_time_milliseconds())
+            && trigger.expires_at_ms.is_none_or(|deadline| {
+                deadline > tickloop_agent_base::private_fs::unix_time_milliseconds()
+            })
     }) || goal
         .event_sources
         .iter()
@@ -80,9 +80,9 @@ fn recover_triggers(snapshot: &mut ChatSnapshot) {
         };
         let armed = trigger.armed;
         if !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
-            && trigger
-                .expires_at_ms
-                .is_some_and(|deadline| deadline <= crate::private_fs::unix_time_milliseconds())
+            && trigger.expires_at_ms.is_some_and(|deadline| {
+                deadline <= tickloop_agent_base::private_fs::unix_time_milliseconds()
+            })
         {
             goal.recover_state(LoopState::Expired);
         }
@@ -157,7 +157,7 @@ impl Agent {
                     .interval_seconds
                     .is_some_and(|seconds| seconds > 31_536_000)
                 || trigger.expires_at_ms.is_some_and(|deadline| {
-                    deadline <= crate::private_fs::unix_time_milliseconds()
+                    deadline <= tickloop_agent_base::private_fs::unix_time_milliseconds()
                 })
                 || (trigger.interval_seconds.is_none() && !trigger.accepts_events))
         {
@@ -296,7 +296,8 @@ impl Agent {
         let deadline = trigger.expires_at_ms.map(|deadline| {
             started
                 + std::time::Duration::from_millis(
-                    deadline.saturating_sub(crate::private_fs::unix_time_milliseconds()),
+                    deadline
+                        .saturating_sub(tickloop_agent_base::private_fs::unix_time_milliseconds()),
                 )
         });
         tokio::spawn(async move {

@@ -1,4 +1,5 @@
 use super::*;
+use tickloop_agent_tools::permissions::PermissionPolicyExt;
 
 pub(crate) fn summary_state(
     loops: &[crate::runtime::LoopSnapshot],
@@ -218,7 +219,7 @@ pub struct FamilyCompletion {
     pub finished_at: u64,
     pub triggering_message_ids: Vec<Uuid>,
     pub notification: SubagentNotificationDelivery,
-    pub usage: crate::model::Usage,
+    pub usage: tickloop_agent_protocol::Usage,
 }
 
 impl Agent {
@@ -384,7 +385,7 @@ impl Agent {
             result,
             error,
             started_at: goal.run_started_at,
-            finished_at: crate::private_fs::unix_time_milliseconds(),
+            finished_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
             triggering_message_ids: snapshot
                 .message_runs
                 .iter()
@@ -457,8 +458,8 @@ pub struct FamilyInputRecord {
 }
 
 pub(super) struct AttachmentAdmission {
-    pub workspace: crate::tools::Workspace,
-    pub reads: Vec<crate::tools::PreparedTool>,
+    pub workspace: tickloop_agent_tools::Workspace,
+    pub reads: Vec<tickloop_agent_tools::PreparedTool>,
 }
 
 impl Agent {
@@ -470,7 +471,7 @@ impl Agent {
         admission: &AttachmentAdmission,
     ) -> Result<(), AgentError> {
         let snapshot = &chats.get(&chat_id).ok_or(AgentError::NotFound)?.snapshot;
-        let workspace = crate::tools::Workspace {
+        let workspace = tickloop_agent_tools::Workspace {
             workdir: snapshot.workdir.clone(),
             additional_directories: snapshot.additional_directories.clone(),
         };
@@ -644,7 +645,7 @@ impl Agent {
                 .trim_start_matches('@')
                 .into(),
             target_run_id: receipt.run_id,
-            submitted_at: crate::private_fs::unix_time_milliseconds(),
+            submitted_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
             response: None,
             state: None,
         };

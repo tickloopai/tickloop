@@ -24,7 +24,6 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    artifacts::{ArtifactClient, CredentialSnapshot},
     host_tools::{
         ClaimedEvent, ConnectAction, ConnectSourceEffect, EventAssociationOutcome,
         EventAssociationRequest, EventClaimOutcome, EventClaimRequest, EventLeaseOutcome,
@@ -34,9 +33,9 @@ use crate::{
         RemoteAssociationOperation, WorkspaceHostContext, connection_result,
     },
     mcp_http::McpHttpClient,
-    protocol::{ChatId, ToolDefinition},
-    tools::ToolResult,
 };
+use tickloop_agent_artifacts::{ArtifactClient, CredentialSnapshot};
+use tickloop_agent_protocol::{ChatId, ToolDefinition, ToolResult};
 
 const SERVER_NAMESPACE: &str = "artifacts";
 const ARTIFACT_ATTACHMENT_URI: &str = "tickloop://artifact-tick-attachments/v1";
@@ -842,7 +841,7 @@ impl McpHostToolProvider {
     fn creation_effect(
         result: &rmcp::model::CallToolResult,
         prepared: &PreparedMcpCall,
-    ) -> Option<crate::artifacts::ArtifactTick> {
+    ) -> Option<tickloop_agent_protocol::ArtifactTick> {
         if result.is_error == Some(true) {
             return None;
         }
@@ -869,14 +868,14 @@ impl McpHostToolProvider {
         if parsed_url.origin() != origin.origin() {
             return None;
         }
-        Some(crate::artifacts::ArtifactTick {
+        Some(tickloop_agent_protocol::ArtifactTick {
             artifact_id: artifact_id.into(),
             origin: prepared.credential.origin.clone(),
             title: title.into(),
             format: format.into(),
             url: url.into(),
             access_role: "owner".into(),
-            added_at_ms: crate::private_fs::unix_time_milliseconds(),
+            added_at_ms: tickloop_agent_base::private_fs::unix_time_milliseconds(),
         })
     }
 
@@ -2556,7 +2555,7 @@ impl HostToolProvider for McpHostToolProvider {
                     if let Some(metadata) = metadata {
                         effect.artifact_tick = Some(metadata.tick(
                             &prepared.credential.origin,
-                            crate::private_fs::unix_time_milliseconds(),
+                            tickloop_agent_base::private_fs::unix_time_milliseconds(),
                         ));
                     }
                     if !self.credential_is_current(&prepared.credential) {

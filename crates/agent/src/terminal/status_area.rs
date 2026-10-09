@@ -569,7 +569,7 @@ impl StatusArea {
             width,
             row_count,
             display,
-            crate::private_fs::unix_time_milliseconds(),
+            tickloop_agent_base::private_fs::unix_time_milliseconds(),
         )
     }
 
@@ -724,7 +724,7 @@ mod tests {
                 child_chat_id: Uuid::from_u128(id),
                 handle: title.into(),
                 description: title.into(),
-                created_at: crate::private_fs::unix_time_milliseconds(),
+                created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
             }),
         };
         let mut area = StatusArea::default();
@@ -752,11 +752,8 @@ mod tests {
 
     #[test]
     fn subagent_panel_elapsed_idle_and_backgrounds_follow_the_view_clock() {
-        use crate::{
-            agent_console::AttentionGroup,
-            settings::{DisplayPreferences, GlyphSet},
-            terminal::style::ThemeName,
-        };
+        use crate::{agent_console::AttentionGroup, terminal::style::ThemeName};
+        use tickloop_agent_config::{DisplayPreferences, GlyphSet};
         let root = Uuid::from_u128(1);
         let child = Uuid::from_u128(2);
         let row = |id, parent, title: &str| AgentRow {
@@ -915,7 +912,7 @@ mod tests {
 
     #[test]
     fn todo_rows_use_each_glyph_set_with_a_first_row_branch_and_aligned_continuations() {
-        use tickloop_agent::settings::{DisplayPreferences, GlyphSet};
+        use tickloop_agent_config::{DisplayPreferences, GlyphSet};
 
         for (glyph_set, expected) in [
             (
@@ -962,7 +959,7 @@ mod tests {
     #[test]
     fn todo_status_colours_and_decorations_follow_the_active_theme_in_both_glyph_sets() {
         use super::super::style::{ColourDepth, ThemeName};
-        use tickloop_agent::settings::{DisplayPreferences, GlyphSet};
+        use tickloop_agent_config::{DisplayPreferences, GlyphSet};
 
         for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
             let mut area = StatusArea::default();
@@ -1038,7 +1035,7 @@ mod tests {
 
     #[test]
     fn narrow_todo_rows_keep_status_marks_and_truncate_subjects_by_display_columns() {
-        use tickloop_agent::settings::{DisplayPreferences, GlyphSet};
+        use tickloop_agent_config::{DisplayPreferences, GlyphSet};
 
         for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
             let mut area = StatusArea::default();

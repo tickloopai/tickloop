@@ -20,7 +20,7 @@ use rmcp::{
 };
 use sse_stream::{Sse, SseStream};
 
-use crate::network::{HttpPolicy, build_http_client};
+use tickloop_agent_base::network::{HttpPolicy, build_http_client};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;

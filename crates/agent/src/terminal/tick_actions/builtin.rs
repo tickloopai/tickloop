@@ -5,10 +5,10 @@ use super::super::{
     tick_shell::{TickShell, TickShellKey},
 };
 use super::*;
-use crate::tick_adapter::{HOSTED_CLOSE_KEY, HOSTED_REOPEN_KEY, TickIntent};
+use crate::monitor_rows::{HOSTED_CLOSE_KEY, HOSTED_REOPEN_KEY, TickIntent};
 
-/// The Console executor that carries out an adapter's intent. A notice has none: the Console only
-/// shows it.
+/// The Console executor that carries out a Monitor row's intent. A notice has none: the Console
+/// only shows it.
 pub(in crate::terminal) fn executor(intent: &TickIntent) -> Option<Arc<dyn TickActionExecutor>> {
     let executor: Arc<dyn TickActionExecutor> = match intent.clone() {
         TickIntent::Notify(_) => return None,
@@ -35,7 +35,7 @@ pub(in crate::terminal) fn artifact(id: &str, key: char) -> Arc<dyn TickActionEx
     Arc::new(ArtifactAction { id: id.into(), key })
 }
 pub(in super::super) fn load_hosted_snapshot(
-    instance: crate::tick_stream::InstanceRef,
+    instance: tick_protocol::InstanceRef,
     panel: Uuid,
 ) -> PreparedTickAction {
     PreparedTickAction::new(
@@ -44,7 +44,7 @@ pub(in super::super) fn load_hosted_snapshot(
         Arc::new(LoadHostedSnapshot { instance, panel }),
     )
 }
-/// Reloads everything the adapters' refresh intents name, in one action.
+/// Reloads everything the registered rows' refresh intents name, in one action.
 pub(in crate::terminal) fn refresh(intents: &[TickIntent]) -> Arc<dyn TickActionExecutor> {
     Arc::new(Refresh {
         actions: intents.iter().filter_map(executor).collect(),
@@ -110,7 +110,7 @@ impl TickActionBackend for SubscriptionAction {
     }
 }
 struct DetailsOpen {
-    instance: crate::tick_stream::InstanceRef,
+    instance: tick_protocol::InstanceRef,
 }
 impl TickActionExecutor for DetailsOpen {
     fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
@@ -131,7 +131,7 @@ impl TickActionExecutor for DetailsOpen {
 /// Enter on a hosted Tick opens it at once: inside Herdr in Tick Loop's Herdr popup, otherwise
 /// full screen in this View's terminal. Either view shows the same process and Esc closes it.
 struct OpenHosted {
-    instance: crate::tick_stream::InstanceRef,
+    instance: tick_protocol::InstanceRef,
 }
 impl TickActionExecutor for OpenHosted {
     fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
@@ -139,7 +139,7 @@ impl TickActionExecutor for OpenHosted {
             .ok_or("This Tick is no longer in Monitor")?;
         Ok(PreparedTickAction::new(
             self.instance.to_string(),
-            crate::tick_adapter::MONITOR_ENTER_KEY,
+            crate::monitor_rows::MONITOR_ENTER_KEY,
             Arc::new(OpenHosted {
                 instance: self.instance.clone(),
             }),
@@ -247,7 +247,7 @@ impl NotFloated {
 struct HerdrPopup {
     herdr: tickloop_agent::hosted::popup::HerdrSession,
     plugin: tickloop_agent::hosted::popup::PopupPlugin,
-    settings: tickloop_agent::settings::UserSettings,
+    settings: tickloop_agent_config::UserSettings,
 }
 
 impl HerdrPopup {
@@ -265,7 +265,7 @@ impl HerdrPopup {
                 .await
                 .map_err(NotFloated::Refused)?,
             plugin: PopupPlugin::for_this_executable(root).map_err(NotFloated::Refused)?,
-            settings: tickloop_agent::settings::UserSettings::in_root(root),
+            settings: tickloop_agent_config::UserSettings::in_root(root),
         }))
     }
 
@@ -284,7 +284,7 @@ impl HerdrPopup {
             PopupReadiness::Foreign { root } => return Err(NotFloated::ForeignPlugin(root)),
         }
         if ctx.console.monitor_popup().map_err(NotFloated::Refused)?
-            == tickloop_agent::settings::MonitorPopup::Disabled
+            == tickloop_agent_config::MonitorPopup::Disabled
         {
             return Err(NotFloated::TurnedOff);
         }
@@ -298,7 +298,7 @@ impl HerdrPopup {
             .await
             .map_err(|error| NotFloated::Refused(format!("cannot register the plugin: {error}")))?;
         ctx.console
-            .set_monitor_popup(tickloop_agent::settings::MonitorPopup::Enabled)
+            .set_monitor_popup(tickloop_agent_config::MonitorPopup::Enabled)
             .map_err(NotFloated::Refused)
     }
 
@@ -306,7 +306,7 @@ impl HerdrPopup {
     async fn float(
         &self,
         ctx: &TickActionContext<'_>,
-        instance: &crate::tick_stream::InstanceRef,
+        instance: &tick_protocol::InstanceRef,
     ) -> Result<(), NotFloated> {
         let grant = ctx
             .agent
@@ -320,13 +320,13 @@ impl HerdrPopup {
 /// Registers, or turns on, Tick Loop's popup plugin in this View's Herdr session once the user
 /// confirmed, then floats the Tick.
 struct RegisterPopup {
-    instance: crate::tick_stream::InstanceRef,
+    instance: tick_protocol::InstanceRef,
 }
 impl TickActionExecutor for RegisterPopup {
     fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
         Ok(PreparedTickAction::new(
             self.instance.to_string(),
-            crate::tick_adapter::MONITOR_ENTER_KEY,
+            crate::monitor_rows::MONITOR_ENTER_KEY,
             Arc::new(RegisterPopup {
                 instance: self.instance.clone(),
             }),
@@ -352,7 +352,7 @@ impl TickActionBackend for RegisterPopup {
 /// only says why it did not open.
 async fn settle_float(
     ctx: &TickActionContext<'_>,
-    instance: &crate::tick_stream::InstanceRef,
+    instance: &tick_protocol::InstanceRef,
     floated: Result<(), NotFloated>,
 ) -> Result<TickActionOutcome, String> {
     match floated {
@@ -369,7 +369,7 @@ async fn settle_float(
 /// `reason` says why it did not float and is shown when the view closes.
 async fn open_full_screen(
     ctx: &TickActionContext<'_>,
-    instance: &crate::tick_stream::InstanceRef,
+    instance: &tick_protocol::InstanceRef,
     reason: String,
 ) -> Result<TickActionOutcome, String> {
     let grant = ctx
@@ -384,7 +384,7 @@ async fn open_full_screen(
 
 /// Opens the text snapshot detail of a hosted Tick.
 struct SnapshotHosted {
-    instance: crate::tick_stream::InstanceRef,
+    instance: tick_protocol::InstanceRef,
 }
 impl TickActionExecutor for SnapshotHosted {
     fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
@@ -400,7 +400,7 @@ impl TickActionExecutor for SnapshotHosted {
 }
 
 struct LoadHostedSnapshot {
-    instance: crate::tick_stream::InstanceRef,
+    instance: tick_protocol::InstanceRef,
     panel: Uuid,
 }
 #[async_trait]
@@ -429,7 +429,7 @@ impl TickActionBackend for NoBackend {
     }
 }
 struct RemoveFromMonitor {
-    instance: crate::tick_stream::InstanceRef,
+    instance: tick_protocol::InstanceRef,
 }
 impl TickActionExecutor for RemoveFromMonitor {
     fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
@@ -462,7 +462,7 @@ const REOPEN_HOSTED_PROMPT: &str = "Start a new instance of this lost Tick? Its 
 /// Ends the hosted Tick at the user's request once confirmed; it stays in the Monitor, shown
 /// gone, until removed.
 struct CloseHosted {
-    instance: crate::tick_stream::InstanceRef,
+    instance: tick_protocol::InstanceRef,
     is_confirmed: bool,
 }
 impl TickActionExecutor for CloseHosted {
@@ -504,7 +504,7 @@ impl TickActionBackend for CloseHosted {
 /// Starts a new instance in place of a hosted Tick lost with its host once confirmed; it joins
 /// the Monitor beside the lost row, and nothing the lost one was subscribed to follows it.
 struct ReopenHosted {
-    instance: crate::tick_stream::InstanceRef,
+    instance: tick_protocol::InstanceRef,
     is_confirmed: bool,
 }
 impl TickActionExecutor for ReopenHosted {
@@ -588,7 +588,7 @@ impl TickActionExecutor for ShellOpen {
         let panel = detail.id;
         ui.open_detail(Box::new(detail));
         Ok(PreparedTickAction::new(
-            crate::tick_stream::InstanceRef::shell(self.task).to_string(),
+            tick_protocol::InstanceRef::shell(self.task).to_string(),
             'o',
             Arc::new(ShellRefresh {
                 panel,
@@ -840,7 +840,7 @@ impl TickDetailView for TickShell {
             TickShellKey::None => TickDetailKey::None,
             TickShellKey::Back => TickDetailKey::Back,
             TickShellKey::Effect(effect) => TickDetailKey::Action(PreparedTickAction::new(
-                crate::tick_stream::InstanceRef::shell(self.task_id).to_string(),
+                tick_protocol::InstanceRef::shell(self.task_id).to_string(),
                 's',
                 Arc::new(ShellEffect {
                     panel: self.id,
@@ -854,7 +854,7 @@ impl TickDetailView for TickShell {
             return None;
         }
         Some(PreparedTickAction::new(
-            crate::tick_stream::InstanceRef::shell(self.task_id).to_string(),
+            tick_protocol::InstanceRef::shell(self.task_id).to_string(),
             'r',
             Arc::new(ShellRefresh {
                 panel: self.id,

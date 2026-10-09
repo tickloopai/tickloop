@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tickloop_agent::private_fs::{
+use tickloop_agent_base::private_fs::{
     PRIVATE_FILE_MODE, create_private_directory, replace_file_atomically,
 };
 use uuid::Uuid;

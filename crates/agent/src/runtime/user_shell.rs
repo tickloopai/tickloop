@@ -2,11 +2,8 @@ use super::{
     Agent, AgentError, Chat, MessageBoundary, TaskNotification, UserShellReceipt, UserShellRecord,
     UserShellState, commands::notification_status, local_messages,
 };
-use crate::model::Message;
-use crate::protocol::ChatId;
-use crate::tools::{
-    CANCELLED_COMMAND_REASON, CommandState, ToolResult, Tools, UserCommandSnapshot,
-};
+use tickloop_agent_protocol::{ChatId, CommandState, Message, ToolResult};
+use tickloop_agent_tools::{CANCELLED_COMMAND_REASON, Tools, UserCommandSnapshot};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -102,7 +99,7 @@ impl Agent {
             let mut snapshot = chat.snapshot.clone();
             snapshot.last_queue_sequence += 1;
             let record = UserShellRecord {
-                updated_at_ms: Some(crate::private_fs::unix_time_milliseconds()),
+                updated_at_ms: Some(tickloop_agent_base::private_fs::unix_time_milliseconds()),
                 id: command_id,
                 chat_id,
                 loop_id,
@@ -124,7 +121,7 @@ impl Agent {
                 output_ref: None,
                 output_bytes: 0,
                 submitted_at_message: snapshot.messages.len(),
-                state_since: Some(crate::private_fs::unix_time_milliseconds()),
+                state_since: Some(tickloop_agent_base::private_fs::unix_time_milliseconds()),
             };
             snapshot.user_shells.push(record.clone());
             self.save(&snapshot);
@@ -430,9 +427,9 @@ impl Agent {
             PermissionApprovalSource, PermissionExecution, PermissionRequest, Receipt,
             session_permissions::{PermissionOwner, SessionPermissionOperation},
         };
-        use crate::permissions::Decision;
+        use tickloop_agent_protocol::Decision;
         let snapshot = self.snapshot(chat_id).await?;
-        let workspace = crate::tools::Workspace {
+        let workspace = tickloop_agent_tools::Workspace {
             workdir: snapshot.workdir.clone(),
             additional_directories: snapshot.additional_directories.clone(),
         };
@@ -442,7 +439,7 @@ impl Agent {
             "run_in_background": record.starts_in_background,
         });
         let prepared = tools
-            .prepare(&workspace, crate::tools::BASH_TOOL_NAME, &input)
+            .prepare(&workspace, tickloop_agent_tools::BASH_TOOL_NAME, &input)
             .await
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
         let mut authorization = None;
@@ -648,7 +645,7 @@ impl Agent {
             if command.output_bytes > record.output_bytes {
                 record.updated_at_ms = command
                     .updated_at_ms
-                    .or_else(|| Some(crate::private_fs::unix_time_milliseconds()));
+                    .or_else(|| Some(tickloop_agent_base::private_fs::unix_time_milliseconds()));
             }
             record.starts_in_background |= command.was_background;
             if user_shell_state_is_terminal(&previous.state) {

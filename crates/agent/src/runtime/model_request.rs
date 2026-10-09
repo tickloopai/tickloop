@@ -8,18 +8,19 @@ use super::{
     RequestFailure, RequestKind, RequestOutcome, RequestOwner, RequestSequence, RequestUsageLedger,
     ResponseRejection, UsageCounter,
 };
-use crate::model::{
-    Content, Message, ModelClient, ModelDelta, ModelError, ModelFailureKind, ModelIdentity,
-    ModelOutput, ModelRequest, ModelRequestContext, ModelResponseRejection, Role,
+use tickloop_agent_model::{
+    ModelClient, ModelDelta, ModelError, ModelFailureKind, ModelOutput, ModelRequest,
+    ModelRequestContext, ModelResponseRejection,
 };
-use crate::protocol::ChatId;
+use tickloop_agent_protocol::{ChatId, Content, Message, ModelIdentity, Role};
 
 const MODEL_DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 const MODEL_DELTA_BATCH_COUNT: usize = 256;
 const MODEL_DELTA_ENVELOPE_BYTES: usize = 1024;
 const MAX_JSON_ESCAPE_EXPANSION: usize = 6;
-const MODEL_DELTA_BATCH_BYTES: usize =
-    (crate::protocol::FEED_CHANGE_BYTES - MODEL_DELTA_ENVELOPE_BYTES) / MAX_JSON_ESCAPE_EXPANSION;
+const MODEL_DELTA_BATCH_BYTES: usize = (tickloop_agent_protocol::FEED_CHANGE_BYTES
+    - MODEL_DELTA_ENVELOPE_BYTES)
+    / MAX_JSON_ESCAPE_EXPANSION;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct RequestContext {
@@ -841,8 +842,10 @@ pub(super) fn model_failure_outcome(error: &ModelError) -> RequestOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Content, InputModality, ModelConfig, ModelIdentity, Protocol, Usage};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tickloop_agent_protocol::{
+        Content, InputModality, ModelConfig, ModelIdentity, Protocol, Usage,
+    };
 
     #[test]
     fn staged_response_rejections_preserve_their_outcome_without_panicking() {
@@ -852,7 +855,7 @@ mod tests {
         ] {
             let plain = ModelError::ResponseRejected(reason);
             let expected = model_failure_outcome(&plain);
-            let staged = plain.at_stage(crate::model::ModelRequestStage::ResponseHeaders);
+            let staged = plain.at_stage(tickloop_agent_model::ModelRequestStage::ResponseHeaders);
             assert_eq!(model_failure_outcome(&staged), expected);
         }
     }
@@ -955,16 +958,16 @@ mod tests {
     impl ModelClient for ControlledModel {
         async fn generate_title(
             &self,
-            request: crate::model::ModelRequest,
-            _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+            request: tickloop_agent_model::ModelRequest,
+            _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
             _: tokio_util::sync::CancellationToken,
-        ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-            Ok(crate::model::fixture_title(request))
+        ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+            Ok(tickloop_agent_model::fixture_title(request))
         }
 
         fn identity(&self) -> ModelIdentity {
             ModelIdentity {
-                provider: crate::model::ModelProvider::Api,
+                provider: tickloop_agent_protocol::ModelProvider::Api,
                 profile: "usage-test".into(),
                 protocol: Protocol::Messages,
                 requested_model: "usage-test".into(),
@@ -1005,8 +1008,8 @@ mod tests {
     async fn fixture(model: Arc<ControlledModel>) -> (tempfile::TempDir, Agent, ChatId) {
         let directory = tempfile::tempdir().unwrap();
         let config = ModelConfig {
-            provider: crate::model::ModelProvider::Api,
-            auth_source: crate::model::ModelAuthSource::ApiKeyEnv,
+            provider: tickloop_agent_protocol::ModelProvider::Api,
+            auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
             name: "usage-test".into(),
             protocol: Protocol::Messages,
             model: "usage-test".into(),

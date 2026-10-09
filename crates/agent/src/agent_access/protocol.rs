@@ -3,20 +3,19 @@ use std::{collections::BTreeMap, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{
-    model::{ModelConfig, ReasoningEffort, cards::ProviderPatch},
-    permissions::{ExecutionMode, PermissionPolicy, PermissionRule, PermissionScope},
-    protocol::{AccessLimits, FEED_CAPACITY, FEED_CHANGE_BYTES, FEED_MAX_BYTES},
-    runtime::{
-        self, AgentHostOptions, ApprovalHistoryView, ChatSnapshot, CodeRewind,
-        DirectedSummaryDraft, DirectedSummaryRequest, Event, InputContext, ModelChange,
-        OperationRecord, PendingCommand, PendingInput, PermissionChange, PermissionRequest,
-        PermissionsRevision, PermissionsView, QuestionAnswer, QuestionRequest, QueuedInput,
-        Receipt, RequestUsageLedger, RewindDraft, RewindMode, RewindPoint, SavedChat, ShellTask,
-        ShellTaskOutputChunk, SummaryDirection, TaskNotification, TickSubscriptionChange,
-        TickSubscriptionStatus, Trigger, TriggerSource, UserShellReceipt, UserShellRecord,
-    },
-    tools::{CommandSnapshot, SearchConfig},
+use crate::runtime::{
+    self, AgentHostOptions, ApprovalHistoryView, ChatSnapshot, CodeRewind, DirectedSummaryDraft,
+    DirectedSummaryRequest, Event, InputContext, ModelChange, OperationRecord, PendingCommand,
+    PendingInput, PermissionChange, PermissionRequest, PermissionsRevision, PermissionsView,
+    QuestionAnswer, QuestionRequest, QueuedInput, Receipt, RequestUsageLedger, RewindDraft,
+    RewindMode, RewindPoint, SavedChat, ShellTask, ShellTaskOutputChunk, SummaryDirection,
+    TaskNotification, TickSubscriptionChange, TickSubscriptionStatus, Trigger, TriggerSource,
+    UserShellReceipt, UserShellRecord,
+};
+use tickloop_agent_protocol::{
+    AccessLimits, CommandSnapshot, ExecutionMode, FEED_CAPACITY, FEED_CHANGE_BYTES, FEED_MAX_BYTES,
+    ModelConfig, PermissionPolicy, PermissionRule, PermissionScope, ProviderPatch, ReasoningEffort,
+    SearchConfig,
 };
 
 /// Business 11.0 names the per-user background process the daemon on the wire: `daemon_epoch`
@@ -47,7 +46,7 @@ pub struct LoopRef {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
-pub enum RequestKind {
+pub enum PendingRequestKind {
     Permission,
     Question,
 }
@@ -56,7 +55,7 @@ pub enum RequestKind {
 pub struct RequestRef {
     pub execution: ExecutionRef,
     pub request_id: Uuid,
-    pub kind: RequestKind,
+    pub kind: PendingRequestKind,
     pub version: u64,
 }
 
@@ -82,7 +81,7 @@ pub struct TranscriptRef {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RecordedMessage {
     pub id: Uuid,
-    pub message: crate::model::Message,
+    pub message: tickloop_agent_protocol::Message,
     pub loop_id: Option<Uuid>,
     pub run_id: Option<Uuid>,
     pub timestamp: String,
@@ -164,7 +163,7 @@ impl ProviderCredentialScope {
         let (service_account_path, service_account_configured) = config_root
             .as_ref()
             .map(|root| {
-                let auth = crate::auth::google::GoogleAuth::new(root);
+                let auth = tickloop_agent_model::auth::google::GoogleAuth::new(root);
                 (
                     auth.service_account_path()
                         .map_err(|error| error.to_string()),
@@ -240,7 +239,7 @@ pub struct CommandEnvelope {
 pub enum AgentCommand {
     AddArtifactTick {
         execution: ExecutionRef,
-        tick: crate::artifacts::ArtifactTick,
+        tick: tickloop_agent_protocol::ArtifactTick,
     },
     RemoveArtifactTick {
         execution: ExecutionRef,
@@ -252,13 +251,13 @@ pub enum AgentCommand {
     /// Adds an existing Tick Instance to the Chat's Monitor without ownership or permission.
     AddMonitorMember {
         execution: ExecutionRef,
-        instance: tick_connect::instance::InstanceRef,
+        instance: tick_protocol::InstanceRef,
         title: Option<String>,
     },
     /// Removes an instance from the Chat's Monitor view only.
     RemoveMonitorMember {
         execution: ExecutionRef,
-        instance: tick_connect::instance::InstanceRef,
+        instance: tick_protocol::InstanceRef,
     },
     /// The Chat's running hosted Ticks with a resource sample of each, for its Monitor.
     ListHostedTicks {
@@ -267,22 +266,22 @@ pub enum AgentCommand {
     /// Ends one of the Chat's hosted Ticks at the user's request.
     CloseHostedTick {
         execution: ExecutionRef,
-        instance: tick_connect::instance::InstanceRef,
+        instance: tick_protocol::InstanceRef,
     },
     /// Starts a new instance in place of a hosted Tick lost with its host, at the user's request.
     ReopenHostedTick {
         execution: ExecutionRef,
-        instance: tick_connect::instance::InstanceRef,
+        instance: tick_protocol::InstanceRef,
     },
     /// The current screen of one of the Chat's hosted Ticks as text, for its Monitor detail.
     HostedTickSnapshot {
         execution: ExecutionRef,
-        instance: tick_connect::instance::InstanceRef,
+        instance: tick_protocol::InstanceRef,
     },
     /// Lets the asking View attach to one of the Chat's hosted Ticks once.
     AttachHostedTick {
         execution: ExecutionRef,
-        instance: tick_connect::instance::InstanceRef,
+        instance: tick_protocol::InstanceRef,
     },
     Create {
         launch: LaunchSpec,
@@ -744,13 +743,13 @@ impl LiveChatSnapshot {
                 .map(|request| RequestRef {
                     execution,
                     request_id: request.id,
-                    kind: RequestKind::Permission,
+                    kind: PendingRequestKind::Permission,
                     version: 1,
                 })
                 .chain(snapshot.questions.iter().map(|request| RequestRef {
                     execution,
                     request_id: request.id,
-                    kind: RequestKind::Question,
+                    kind: PendingRequestKind::Question,
                     version: 1,
                 }))
                 .collect(),
@@ -791,7 +790,7 @@ impl LiveChatSnapshot {
 pub enum ObservationValue {
     AccountModelsPending,
     ProviderCredentials(Box<ProviderCredentialScope>),
-    AccountModels(Result<crate::model::availability::AccountModelDirectory, String>),
+    AccountModels(Result<tickloop_agent_protocol::AccountModelDirectory, String>),
     Overview(Vec<AgentSummary>),
     Agent(Box<LiveChatSnapshot>),
     Permissions(Box<PermissionsView>),
@@ -819,7 +818,7 @@ pub struct ObservationUpdate {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ObservationChange {
-    AccountModels(Result<crate::model::availability::AccountModelDirectory, String>),
+    AccountModels(Result<tickloop_agent_protocol::AccountModelDirectory, String>),
     Event(Event),
     UserShell(UserShellRecord),
     TaskNotification(TaskNotification),
@@ -875,11 +874,11 @@ impl CommandReceipt {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum CommandResult {
-    ArtifactTicks(Vec<crate::artifacts::ArtifactTick>),
+    ArtifactTicks(Vec<tickloop_agent_protocol::ArtifactTick>),
     MonitorMembership(crate::runtime::MonitorMembership),
     HostedTicks(Vec<crate::hosted::tools::HostedMember>),
     HostedTickReopened {
-        instance: tick_connect::instance::InstanceRef,
+        instance: tick_protocol::InstanceRef,
         membership: crate::runtime::MonitorMembership,
     },
     HostedTickSnapshot(crate::hosted::tools::HostedSnapshot),
@@ -1221,6 +1220,9 @@ pub(crate) enum ServerMessage {
 }
 
 #[cfg(test)]
+mod wire_golden_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1234,7 +1236,7 @@ mod tests {
             agent_id: Uuid::new_v4(),
             generation: 1,
         };
-        let instance: tick_connect::instance::InstanceRef = "herdr:counter".parse().unwrap();
+        let instance: tick_protocol::InstanceRef = "herdr:counter".parse().unwrap();
         for notification in [
             SubagentNotificationDelivery::Foreground,
             SubagentNotificationDelivery::Pending,
@@ -1255,7 +1257,7 @@ mod tests {
             });
             snapshot.family_completions.push(FamilyCompletion {
                 notification,
-                usage: crate::model::Usage {
+                usage: tickloop_agent_protocol::Usage {
                     input_tokens: Some(11),
                     output_tokens: Some(7),
                     ..Default::default()
@@ -1299,7 +1301,7 @@ mod tests {
             agent_id: Uuid::new_v4(),
             generation: 1,
         };
-        let instance: tick_connect::instance::InstanceRef = "herdr:counter".parse().unwrap();
+        let instance: tick_protocol::InstanceRef = "herdr:counter".parse().unwrap();
         for command in [
             AgentCommand::AddMonitorMember {
                 execution,

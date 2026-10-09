@@ -1,0 +1,24 @@
+[package]
+name = "tickloop-agent-config"
+description = "Agent user settings"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tickloop-agent-base = { path = "../base" }
+tickloop-agent-model = { path = "../model" }
+tickloop-agent-protocol = { path = "../protocol" }
+tickloop-agent-tools = { path = "../tools" }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+time = { version = "0.3", features = ["formatting", "parsing"] }

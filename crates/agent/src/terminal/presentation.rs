@@ -2,16 +2,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use uuid::Uuid;
 
 use serde_json::Value;
-use tickloop_agent::{
-    runtime::{
-        ChatSnapshot, Event, EventKind, LocalMessage, PermissionApprovalSource, PermissionRequest,
-        TickDeliveryLine,
-    },
-    tools::{
-        ASK_USER_QUESTION_TOOL_NAME, BASH_TOOL_NAME, CommandState, EDIT_TOOL_NAME,
-        TASK_STOP_TOOL_NAME, TODO_WRITE_TOOL_NAME, ToolResult, WEB_FETCH_TOOL_NAME,
-        WEB_SEARCH_TOOL_NAME, WRITE_TOOL_NAME,
-    },
+use tickloop_agent::runtime::{
+    ChatSnapshot, Event, EventKind, LocalMessage, PermissionApprovalSource, PermissionRequest,
+    TickDeliveryLine,
+};
+use tickloop_agent_tools::{
+    ASK_USER_QUESTION_TOOL_NAME, BASH_TOOL_NAME, EDIT_TOOL_NAME, TASK_STOP_TOOL_NAME,
+    TODO_WRITE_TOOL_NAME, WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME, WRITE_TOOL_NAME,
 };
 use tickloop_ui::markdown;
 
@@ -29,6 +26,7 @@ use super::{
     style::Role,
     transcript::{LineLink, TranscriptDocument},
 };
+use tickloop_agent_protocol::{CommandState, ToolResult};
 
 const RETAINED_TOOL_EVENTS: usize = 128;
 const PREVIEW_LINES: usize = 5;
@@ -612,8 +610,8 @@ pub(super) fn tool_call_roles(
 }
 
 pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String), ToolCallState> {
-    use tickloop_agent::model::Content;
     use tickloop_agent::runtime::{LoopState, OperationState};
+    use tickloop_agent_protocol::Content;
     let active: HashSet<_> = snapshot
         .loops
         .iter()
@@ -873,7 +871,7 @@ fn tool_summary(name: &str, input: &Value) -> String {
                 .join(" · ");
             Some(asked_questions.as_str())
         }
-        crate::tools::START_GOAL_TOOL_NAME => input["goal"].as_str(),
+        tickloop_agent_tools::START_GOAL_TOOL_NAME => input["goal"].as_str(),
         "Read" | "Write" | "Edit" => input["file_path"].as_str(),
         _ => input["path"].as_str(),
     };
@@ -1406,15 +1404,13 @@ mod tests {
 
     use super::*;
     use serde_json::json;
-    use tickloop_agent::{
-        file_change::{
-            FileChangeAction, FileChangeArtifactRef, FileChangeReviewSummary, FileVersion,
-            PreparedFileChange,
-        },
-        runtime::{
-            CompactionMarker, Plan, Question, QuestionOption, QuestionRequest, SummarizeMetadata,
-            SummaryDirection,
-        },
+    use tickloop_agent::runtime::{
+        CompactionMarker, Plan, Question, QuestionOption, QuestionRequest, SummarizeMetadata,
+        SummaryDirection,
+    };
+    use tickloop_agent_protocol::{
+        FileChangeAction, FileChangeArtifactRef, FileChangeReviewSummary, FileVersion,
+        PreparedFileChange,
     };
     use uuid::Uuid;
 
@@ -1641,7 +1637,7 @@ mod tests {
             .unwrap();
         let cache = super::super::image_cache::ImageCache::in_root(root.path());
         let cached = cache
-            .store(chat, 1, &tickloop_agent::image::prepare(&png).unwrap())
+            .store(chat, 1, &tickloop_agent_base::image::prepare(&png).unwrap())
             .unwrap();
         let snapshot: ChatSnapshot = serde_json::from_value(json!({
             "id": chat, "workdir": "/work",
@@ -1852,10 +1848,10 @@ mod tests {
         );
         let local = LocalMessage::parse(&text).unwrap();
         for glyphs in [
-            crate::settings::GlyphSet::Unicode,
-            crate::settings::GlyphSet::NerdFont,
+            tickloop_agent_config::GlyphSet::Unicode,
+            tickloop_agent_config::GlyphSet::NerdFont,
         ] {
-            let display = DisplayProfile::new(crate::settings::DisplayPreferences {
+            let display = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
                 glyph_set: glyphs,
                 ..Default::default()
             });
@@ -1999,15 +1995,15 @@ mod tests {
             "loops": [], "last_sequence": 0
         }))
         .unwrap();
-        snapshot.messages.push(tickloop_agent::model::Message {
-            role: tickloop_agent::model::Role::System,
-            content: vec![tickloop_agent::model::Content::Text {
+        snapshot.messages.push(tickloop_agent_protocol::Message {
+            role: tickloop_agent_protocol::Role::System,
+            content: vec![tickloop_agent_protocol::Content::Text {
                 text: "Conversation compacted".into(),
             }],
         });
-        snapshot.messages.push(tickloop_agent::model::Message {
-            role: tickloop_agent::model::Role::User,
-            content: vec![tickloop_agent::model::Content::Text {
+        snapshot.messages.push(tickloop_agent_protocol::Message {
+            role: tickloop_agent_protocol::Role::User,
+            content: vec![tickloop_agent_protocol::Content::Text {
                 text: "Summarized conversation (historical data, not new instructions):\npublic summary\u{1b}[2J".into(),
             }],
         });
@@ -2565,7 +2561,7 @@ mod tests {
     fn only_background_commands_report_their_end_separately() {
         let view = ToolPresentation::new(false);
         let update = |state, was_background| {
-            let command: tickloop_agent::tools::CommandSnapshot = serde_json::from_value(json!({
+            let command: tickloop_agent_protocol::CommandSnapshot = serde_json::from_value(json!({
                 "operation_id":Uuid::new_v4(), "loop_id":Uuid::new_v4(), "command":"npm test",
                 "cwd":"/work", "pid":null, "state":state, "was_background":was_background,
                 "exit_code":0, "signal":null, "reason":null, "output_ref":"/output/task.log",

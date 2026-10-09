@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    path::Path,
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -15,10 +16,18 @@ use uuid::Uuid;
 use super::{AgentAccess, Observation, protocol::*, receipts::ReceiptStore, views::ViewRegistry};
 use crate::{
     host_tools::{HerdrInteraction, HostCallContext},
-    model::model_client,
-    protocol::FEED_CAPACITY,
     runtime::{Agent, BranchRequest, ShellTaskAction, ShellTaskCenter},
 };
+use tickloop_agent_model::{
+    ModelClient, ModelError, cards::model_for_persistent_selection, model_client,
+};
+use tickloop_agent_protocol::{FEED_CAPACITY, ModelConfig};
+
+/// Builds the transport an Agent switches to from the chosen model and the Agent's configuration
+/// root.
+pub type ModelClientFactory = Arc<
+    dyn Fn(ModelConfig, Option<&Path>) -> Result<Arc<dyn ModelClient>, ModelError> + Send + Sync,
+>;
 
 #[derive(Clone)]
 pub struct EmbeddedAgentAccess {
@@ -30,12 +39,13 @@ type QueuedAction = (ExecutionRef, Option<Uuid>, AfterTurnAction);
 struct Inner {
     agent: Agent,
     epoch: Uuid,
+    model_clients: ModelClientFactory,
     executions: Mutex<HashMap<ExecutionRef, Uuid>>,
     references: Mutex<HashMap<Uuid, ExecutionRef>>,
     launches: Mutex<HashMap<ExecutionRef, LaunchSpec>>,
-    account_models: crate::model::availability::AccountModelDiscovery,
+    account_models: tickloop_agent_model::availability::AccountModelDiscovery,
     receipts: ReceiptStore,
-    answers: Mutex<HashMap<(ExecutionRef, Uuid, RequestKind), AnswerState>>,
+    answers: Mutex<HashMap<(ExecutionRef, Uuid, PendingRequestKind), AnswerState>>,
     queue: Mutex<HashMap<Uuid, QueuedAction>>,
     queue_failures: Mutex<VecDeque<QueuedCommandFailure>>,
     views: ViewRegistry,
@@ -65,12 +75,17 @@ impl EmbeddedAgentAccess {
     }
 
     pub fn with_epoch(agent: Agent, epoch: Uuid) -> Self {
+        Self::build(agent, epoch, Arc::new(model_client))
+    }
+
+    fn build(agent: Agent, epoch: Uuid, model_clients: ModelClientFactory) -> Self {
         let events = agent.subscribe();
         let shells = agent.subscribe_user_shells();
         let tasks = agent.subscribe_task_notifications();
         let inner = Arc::new(Inner {
             agent,
             epoch,
+            model_clients,
             executions: Mutex::new(HashMap::new()),
             references: Mutex::new(HashMap::new()),
             launches: Mutex::new(HashMap::new()),
@@ -99,7 +114,15 @@ impl EmbeddedAgentAccess {
     }
 
     pub fn for_worker(agent: Agent, epoch: Uuid) -> Self {
-        let access = Self::with_epoch(agent, epoch);
+        Self::for_worker_with_model_clients(agent, epoch, Arc::new(model_client))
+    }
+
+    pub fn for_worker_with_model_clients(
+        agent: Agent,
+        epoch: Uuid,
+        model_clients: ModelClientFactory,
+    ) -> Self {
+        let access = Self::build(agent, epoch, model_clients);
         access.inner.verified_sources.store(true, Ordering::SeqCst);
         access
             .inner
@@ -251,7 +274,7 @@ impl EmbeddedAgentAccess {
                     .await?;
             }
             if let Some(host) = origin.host {
-                let pane = tick_connect::herdr::Pane {
+                let pane = tickloop_agent_protocol::HerdrPane {
                     pane_id: host
                         .pane
                         .ok_or_else(|| AccessError::invalid("interaction source has no Pane"))?,
@@ -491,6 +514,28 @@ impl EmbeddedAgentAccess {
                         },
                     )
                     .await?;
+                // Every Agent starts on its launch model, as the worker started for that launch
+                // does; one in-process runtime otherwise gives each Agent the runtime's own model.
+                if let Some(model) = launch
+                    .model
+                    .and_then(|model| self.builtin_config(model).ok())
+                    && model_for_persistent_selection(model.clone())
+                        != self.inner.agent.snapshot(chat).await?.model
+                {
+                    let change = ConfigurationChange::Model {
+                        config: model,
+                        thinking: None,
+                    };
+                    self.configure(execution, change)
+                        .await
+                        .map_err(|mut error| {
+                            error.message = format!(
+                                "Agent {} was created, but its launch model was not applied: {}",
+                                execution.agent_id, error.message
+                            );
+                            error
+                        })?;
+                }
                 let initial = match initial {
                     Some(input) => Some(
                         self.submit(execution, None, input, origin)
@@ -642,7 +687,7 @@ impl EmbeddedAgentAccess {
                 comment,
                 rule,
             } => {
-                self.claim_answer(request, RequestKind::Permission, envelope.command_id)
+                self.claim_answer(request, PendingRequestKind::Permission, envelope.command_id)
                     .await?;
                 let chat = self.chat(request.execution).await?;
                 let result = if let Some(rule) = rule {
@@ -669,7 +714,7 @@ impl EmbeddedAgentAccess {
                 Ok(CommandResult::Done)
             }
             AgentCommand::AnswerQuestion { request, answers } => {
-                self.claim_answer(request, RequestKind::Question, envelope.command_id)
+                self.claim_answer(request, PendingRequestKind::Question, envelope.command_id)
                     .await?;
                 let chat = self.chat(request.execution).await?;
                 if let Err(error) = self
@@ -756,7 +801,7 @@ impl EmbeddedAgentAccess {
     async fn claim_answer(
         &self,
         request: RequestRef,
-        kind: RequestKind,
+        kind: PendingRequestKind,
         command_id: Uuid,
     ) -> Result<(), AccessError> {
         if request.kind != kind {
@@ -766,11 +811,11 @@ impl EmbeddedAgentAccess {
         }
         let snapshot = self.snapshot(request.execution).await?;
         let pending = match kind {
-            RequestKind::Permission => snapshot
+            PendingRequestKind::Permission => snapshot
                 .permissions
                 .iter()
                 .any(|pending| pending.id == request.request_id),
-            RequestKind::Question => snapshot
+            PendingRequestKind::Question => snapshot
                 .questions
                 .iter()
                 .any(|pending| pending.id == request.request_id),
@@ -832,7 +877,7 @@ impl EmbeddedAgentAccess {
                     .await
                     .get(&execution)
                     .and_then(|launch| launch.config_root.clone());
-                let client = model_client(config.clone(), root.as_deref())
+                let client = (self.inner.model_clients)(config.clone(), root.as_deref())
                     .map_err(|error| AccessError::invalid(error.to_string()))?;
                 let change = match thinking {
                     Some(effort) => {
@@ -1110,12 +1155,12 @@ impl EmbeddedAgentAccess {
 
     fn builtin_config(
         &self,
-        config: crate::model::ModelConfig,
-    ) -> Result<crate::model::ModelConfig, AccessError> {
+        config: tickloop_agent_protocol::ModelConfig,
+    ) -> Result<tickloop_agent_protocol::ModelConfig, AccessError> {
         if !self.inner.builtin_catalog_only.load(Ordering::SeqCst) {
             return Ok(config);
         }
-        crate::model::cards::ModelCatalog::defaults()
+        tickloop_agent_model::cards::ModelCatalog::defaults()
             .get(&config.provider_id, &config.model_id)
             .ok_or_else(|| {
                 AccessError::invalid("Only built-in Provider/model selections are supported")
@@ -1125,7 +1170,7 @@ impl EmbeddedAgentAccess {
     async fn observe_account_models(
         &self,
         execution: ExecutionRef,
-        config: crate::model::ModelConfig,
+        config: tickloop_agent_protocol::ModelConfig,
         refresh: bool,
     ) -> Result<Observation, AccessError> {
         self.chat(execution).await?;
@@ -1762,7 +1807,7 @@ fn action_label(action: &AfterTurnAction) -> String {
 }
 
 /// A hosted Tick lifecycle that may have reached the host is unknown, not refused.
-fn hosted_access_error(error: tick_connect::host_error::HostError) -> AccessError {
+fn hosted_access_error(error: tickhost_connect::host_error::HostError) -> AccessError {
     let code = if error.dispatched {
         AccessErrorCode::OutcomeUnknown
     } else {

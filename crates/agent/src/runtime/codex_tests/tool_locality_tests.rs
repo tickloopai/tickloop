@@ -12,11 +12,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     host_tools::{HostToolPermission, HostToolProvider},
-    model::{HttpModelClient, cards::ModelCatalog, codex_test_support::*},
-    protocol::{ChatId, ToolDefinition},
     runtime::{Agent, EventKind},
-    tools::ToolResult,
 };
+use tickloop_agent_model::{HttpModelClient, cards::ModelCatalog, codex_test_support::*};
+use tickloop_agent_protocol::{ChatId, ToolDefinition, ToolResult};
 
 const TOOL_NAME: &str = "read_test_space";
 const TOOL_OUTPUT: &str = "locality-marker:research";
@@ -163,7 +162,10 @@ async fn one_new_host_tool_round_trips_through_the_real_api_adapter() {
     config.base_url = endpoint.as_str().trim_end_matches("/responses").into();
     config.api_key_env.clear();
     let client = HttpModelClient::new(config.clone()).unwrap();
-    let agent = Agent::new_embedded(config, crate::model::fixture_client(Arc::new(client)));
+    let agent = Agent::new_embedded(
+        config,
+        tickloop_agent_model::fixture_client(Arc::new(client)),
+    );
     run_agent_round_trip(agent, directory.path()).await;
     assert_wire_round_trip(&requests.await.unwrap(), false);
 }

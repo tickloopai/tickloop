@@ -398,10 +398,8 @@ mod tests {
             id: Uuid::from_u128(u128::from(instance)),
             loop_id: Uuid::from_u128(900),
             loop_state: LoopState::WaitingTrigger,
-            instance: tick_connect::instance::InstanceRef::native(format!(
-                "fixture-run-{instance}"
-            ))
-            .unwrap(),
+            instance: tick_protocol::InstanceRef::native(format!("fixture-run-{instance}"))
+                .unwrap(),
             every_seconds,
             accumulated: 0,
             last_delivery_ms: None,

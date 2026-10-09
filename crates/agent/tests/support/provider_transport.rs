@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tickloop_agent::model::{
-    ModelClient, ModelDelta, ModelError, ModelIdentity, ModelOutput, ModelRequest,
-    ModelRequestContext,
+use tickloop_agent_model::{
+    ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest, ModelRequestContext,
 };
+use tickloop_agent_protocol::ModelIdentity;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
@@ -34,13 +34,13 @@ impl ModelClient for ProviderTransport {
         Err(ModelError::Cancelled)
     }
 
-    async fn close_chat(&self, chat_id: tickloop_agent::protocol::ChatId) {
+    async fn close_chat(&self, chat_id: tickloop_agent_protocol::ChatId) {
         self.0.close_chat(chat_id).await;
     }
 
     async fn complete_for_chat_with_context(
         &self,
-        chat_id: tickloop_agent::protocol::ChatId,
+        chat_id: tickloop_agent_protocol::ChatId,
         request: ModelRequest,
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
@@ -53,7 +53,7 @@ impl ModelClient for ProviderTransport {
 
     async fn complete_for_chat(
         &self,
-        chat_id: tickloop_agent::protocol::ChatId,
+        chat_id: tickloop_agent_protocol::ChatId,
         request: ModelRequest,
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,

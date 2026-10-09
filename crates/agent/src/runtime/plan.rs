@@ -14,26 +14,25 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use super::*;
-use crate::private_fs::{
-    PRIVATE_FILE_MODE, PrivateDirectory, create_private_directory, replace_file_atomically,
-    verify_private_directory,
-};
-use crate::protocol::ToolDefinition;
-use crate::tools::{
-    ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, FileReadRecord, TODO_WRITE_TOOL_NAME,
-    ToolResult,
-};
 use crate::transcript::private_project_temp_directory;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tickloop_agent_base::private_fs::{
+    PRIVATE_FILE_MODE, PrivateDirectory, create_private_directory, replace_file_atomically,
+    verify_private_directory,
+};
+use tickloop_agent_protocol::{FileReadRecord, ToolDefinition, ToolResult};
+use tickloop_agent_tools::{
+    ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, FileReadRecordExt, TODO_WRITE_TOOL_NAME,
+};
 
 mod prompts;
 pub(super) use prompts::{enter_plan_mode_declined, plan_mode_reminder};
 
-/// 计划文件的目录与文件名 `<slug>-loop-<loopId>.md` 的组成部分；过期清理按同一格式识别。
-pub(crate) const PLANS_DIRECTORY: &str = "plans";
+/// 计划文件的目录与文件名 `<slug>-loop-<loopId>.md` 的组成部分。
+const PLANS_DIRECTORY: &str = "plans";
 pub(crate) const PLAN_LOOP_SEPARATOR: &str = "-loop-";
-pub(crate) const PLAN_FILE_EXTENSION: &str = ".md";
+const PLAN_FILE_EXTENSION: &str = ".md";
 const PLANS_DIRECTORY_DESCRIPTION: &str = "plans directory";
 const MAX_PLAN_BYTES: usize = 64 * 1024;
 const PLAN_VERSION_HEADER_PREFIX: &str = "<!-- tickloop plan version: ";
@@ -41,7 +40,7 @@ const PLAN_DIGEST_SEPARATOR: &str = " sha256: ";
 const PLAN_VERSION_HEADER_SUFFIX: &str = " -->";
 const MAX_PLAN_HEADER_BYTES: usize = 128;
 const MAX_PLAN_FILE_BYTES: usize = MAX_PLAN_BYTES + MAX_PLAN_HEADER_BYTES;
-pub(crate) const MAX_PLAN_SLUG_BYTES: usize = 64;
+const MAX_PLAN_SLUG_BYTES: usize = 64;
 const MAX_TODOS: usize = 100;
 const MAX_TODO_TEXT_BYTES: usize = 4096;
 /// 照 Claude Code `MAX_SLUG_RETRIES`：生成的 slug 已被计划文件占用时重新生成。
@@ -295,7 +294,7 @@ pub(super) fn plans_directory(root: &Path) -> PathBuf {
 }
 
 /// slug 由小写字母单词以连字符连接。链上的 slug 可能被篡改，拼接路径前必须通过校验。
-pub(crate) fn is_valid_plan_slug(slug: &str) -> bool {
+pub(super) fn is_valid_plan_slug(slug: &str) -> bool {
     slug.len() <= MAX_PLAN_SLUG_BYTES
         && slug
             .split('-')
@@ -308,14 +307,6 @@ fn invalid_input(message: String) -> io::Error {
 
 fn invalid_data(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-/// `<slug>-loop-<loopId>.md` 文件名中的 slug；文件名不是这种格式时返回 `None`（不校验 slug）。
-pub(crate) fn plan_file_slug(file_name: &str) -> Option<&str> {
-    let stem = file_name.strip_suffix(PLAN_FILE_EXTENSION)?;
-    let (slug, loop_id) = stem.rsplit_once(PLAN_LOOP_SEPARATOR)?;
-    Uuid::try_parse(loop_id).ok()?;
-    Some(slug)
 }
 
 fn plan_file_path(directory: &Path, slug: &str, loop_id: LoopId) -> io::Result<PathBuf> {
@@ -335,21 +326,21 @@ fn plan_file_path(directory: &Path, slug: &str, loop_id: LoopId) -> io::Result<P
 
 /// Chooses the Chat's plan file prefix on first use, like Claude Code's `getPlanSlug`; returns
 /// whether it was chosen now.
-fn ensure_plan_slug(snapshot: &mut ChatSnapshot, directory: &Path) -> bool {
-    if snapshot.plan_slug.is_some() {
+fn ensure_plan_slug(bookkeeping: &mut ChatBookkeeping, directory: &Path) -> bool {
+    if bookkeeping.plan_slug.is_some() {
         return false;
     }
-    snapshot.plan_slug = Some(generate_plan_slug(Some(directory)));
+    bookkeeping.plan_slug = Some(generate_plan_slug(Some(directory)));
     true
 }
 
 /// The Loop's plan file under `directory`; `None` before the Chat has a plan file prefix.
 pub(super) fn current_plan_file(
-    snapshot: &ChatSnapshot,
+    bookkeeping: &ChatBookkeeping,
     directory: &Path,
     loop_id: LoopId,
 ) -> Option<PathBuf> {
-    plan_file_path(directory, snapshot.plan_slug.as_deref()?, loop_id).ok()
+    plan_file_path(directory, bookkeeping.plan_slug.as_deref()?, loop_id).ok()
 }
 
 /// 计划目录必须是当前用户拥有、没有 group/other 权限位的真实目录，与系统临时目录中的私有目录
@@ -477,8 +468,12 @@ fn read_plan_file(directory: &Path, slug: &str, loop_id: LoopId) -> io::Result<P
 /// 照 Claude Code `copyPlanForFork`：`--fork-session` 与 Branch 使用新的 slug，把计划内容写入新文件，
 /// 之后双方各自修改互不影响。复制失败的计划不进入新 Chat，只保留其版本号，之后的计划从更大的
 /// 版本继续。
-pub(super) fn copy_plans_to_new_slug(snapshot: &mut ChatSnapshot, directory: Option<&Path>) {
-    if snapshot.plan_slug.is_none() {
+pub(super) fn copy_plans_to_new_slug(
+    snapshot: &mut ChatSnapshot,
+    bookkeeping: &mut ChatBookkeeping,
+    directory: Option<&Path>,
+) {
+    if bookkeeping.plan_slug.is_none() {
         return;
     }
     let slug = generate_plan_slug(directory);
@@ -487,24 +482,28 @@ pub(super) fn copy_plans_to_new_slug(snapshot: &mut ChatSnapshot, directory: Opt
             match write_plan_file(directory, &slug, plan.loop_id, plan.version, &plan.markdown) {
                 Ok(_) => snapshot.plans.push(plan),
                 Err(_) => {
-                    snapshot
+                    bookkeeping
                         .unavailable_plan_versions
                         .insert(plan.loop_id, plan.version);
                 }
             }
         }
     }
-    snapshot.plan_slug = Some(slug);
+    bookkeeping.plan_slug = Some(slug);
 }
 
 /// 该 Loop 已使用过的最高计划版本，包括内容不可用的计划。
-pub(super) fn highest_plan_version(snapshot: &ChatSnapshot, loop_id: LoopId) -> Option<u64> {
+pub(super) fn highest_plan_version(
+    snapshot: &ChatSnapshot,
+    bookkeeping: &ChatBookkeeping,
+    loop_id: LoopId,
+) -> Option<u64> {
     let current = snapshot
         .plans
         .iter()
         .find(|plan| plan.loop_id == loop_id)
         .map(|plan| plan.version);
-    current.max(snapshot.unavailable_plan_versions.get(&loop_id).copied())
+    current.max(bookkeeping.unavailable_plan_versions.get(&loop_id).copied())
 }
 
 /// 沿对话链重建计划版本与进度：Loop 条目携带的检查点与之后成功的计划、进度工具调用按链上
@@ -517,6 +516,7 @@ pub(super) fn highest_plan_version(snapshot: &ChatSnapshot, loop_id: LoopId) -> 
 /// 从未提交过的草稿不是计划。文件缺失或不可读时保留已知的最高版本，之后的计划从更大的版本继续。
 pub(super) fn rebuild_plans_and_progress(
     snapshot: &mut ChatSnapshot,
+    bookkeeping: &mut ChatBookkeeping,
     checkpoints: &[PlanCheckpoint],
     directory: Option<&Path>,
 ) -> Result<Vec<String>, AgentError> {
@@ -541,7 +541,7 @@ pub(super) fn rebuild_plans_and_progress(
         };
         let Some(loop_id) = call
             .run_id
-            .and_then(|run| snapshot.run_loops.get(&run).copied())
+            .and_then(|run| bookkeeping.run_loops.get(&run).copied())
         else {
             continue;
         };
@@ -585,12 +585,15 @@ pub(super) fn rebuild_plans_and_progress(
         })
         .collect::<HashMap<_, _>>();
     // 与 `--fork-session` 相同，换用新的 slug；旧 slug 无法安全定位计划文件，已记录版本的计划按缺失处理。
-    let mut location = directory.zip(snapshot.plan_slug.clone());
-    if let Some(slug) = snapshot.plan_slug.take_if(|slug| !is_valid_plan_slug(slug)) {
+    let mut location = directory.zip(bookkeeping.plan_slug.clone());
+    if let Some(slug) = bookkeeping
+        .plan_slug
+        .take_if(|slug| !is_valid_plan_slug(slug))
+    {
         warnings.push(format!(
             "ignored the invalid plan file prefix {slug:?} recorded in the conversation; plans are saved under a new prefix"
         ));
-        snapshot.plan_slug = Some(generate_plan_slug(directory));
+        bookkeeping.plan_slug = Some(generate_plan_slug(directory));
         location = None;
     }
     let loop_ids = snapshot
@@ -678,7 +681,7 @@ pub(super) fn rebuild_plans_and_progress(
         }
     }
     snapshot.plans = plans;
-    snapshot.unavailable_plan_versions = unavailable;
+    bookkeeping.unavailable_plan_versions = unavailable;
     snapshot.progress = loop_ids
         .iter()
         .filter_map(|loop_id| {
@@ -829,7 +832,8 @@ impl Agent {
             ));
         }
         let directory = self.plans_directory(&snapshot.workdir);
-        let slug = snapshot
+        let slug = chat
+            .bookkeeping
             .plan_slug
             .as_deref()
             .ok_or_else(|| AgentError::Invalid("the plan file cannot be located".into()))?;
@@ -853,7 +857,7 @@ impl Agent {
         plan.approval_pending = false;
         let markdown = plan.markdown.clone();
         let plan_file = current_plan_file(
-            &snapshot,
+            &chat.bookkeeping,
             self.plans_directory(&snapshot.workdir).path(),
             loop_id,
         )
@@ -901,10 +905,10 @@ impl Agent {
         // The model's Write would create a missing plans directory with ordinary permissions, so
         // the private one is created first; if that fails, ExitPlanMode reports the reason.
         let _ = directory.create();
-        if ensure_plan_slug(&mut chat.snapshot, directory.path()) {
+        if ensure_plan_slug(&mut chat.bookkeeping, directory.path()) {
             self.save(&chat.snapshot);
         }
-        let plan_file = current_plan_file(&chat.snapshot, directory.path(), loop_id)?;
+        let plan_file = current_plan_file(&chat.bookkeeping, directory.path(), loop_id)?;
         Some(plan_mode_reminder(&plan_file, plan_file.exists()))
     }
 
@@ -957,7 +961,14 @@ impl Agent {
                     (None, Some(prompts::entered_plan_mode()))
                 }
                 EXIT_PLAN_MODE_TOOL_NAME => {
-                    let plan = self.submit_plan_file(chat, &mut snapshot, receipt.loop_id)?;
+                    let mut bookkeeping = chat.bookkeeping.clone();
+                    let plan = self.submit_plan_file(
+                        chat,
+                        &mut snapshot,
+                        &mut bookkeeping,
+                        receipt.loop_id,
+                    )?;
+                    chat.bookkeeping = bookkeeping;
                     (Some(EventKind::PlanUpdated { plan }), None)
                 }
                 _ => {
@@ -1009,7 +1020,7 @@ impl Agent {
                 "ExitPlanMode requires user approval, but user prompts are unavailable.".into(),
             );
         }
-        let (plan, path, workspace, snapshot) = {
+        let (plan, path, workspace, snapshot, bookkeeping) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
             let plan = chat
@@ -1020,7 +1031,7 @@ impl Agent {
                 .cloned()
                 .ok_or("plan is unavailable")?;
             let path = current_plan_file(
-                &chat.snapshot,
+                &chat.bookkeeping,
                 self.plans_directory(&chat.snapshot.workdir).path(),
                 receipt.loop_id,
             )
@@ -1028,12 +1039,14 @@ impl Agent {
             (
                 plan,
                 path,
-                WorkspaceScope::capture(&configured_workspace_for_chat(chat))
+                super::session_permissions::capture_workspace_scope(&configured_workspace_for_chat(chat))
                     .map_err(|error| error.to_string())?,
                 chat.snapshot.clone(),
+                chat.bookkeeping.clone(),
             )
         };
-        self.checkpoint_plan_approval(&snapshot).await?;
+        self.checkpoint_plan_approval(&snapshot, &bookkeeping)
+            .await?;
         let mut request_operation = operation.clone();
         request_operation.input = json!({"plan_version": plan.version});
         let session_operation = SessionPermissionOperation::from_normalized(
@@ -1086,6 +1099,7 @@ impl Agent {
         &self,
         chat: &Chat,
         snapshot: &mut ChatSnapshot,
+        bookkeeping: &mut ChatBookkeeping,
         loop_id: LoopId,
     ) -> Result<Plan, String> {
         if snapshot.policy.mode != ExecutionMode::Plan {
@@ -1096,8 +1110,8 @@ impl Agent {
             .create()
             .map_err(|error| format!("cannot prepare the plans directory: {error}"))?;
         let directory = directory.path();
-        ensure_plan_slug(snapshot, directory);
-        let slug = snapshot.plan_slug.clone().unwrap_or_default();
+        ensure_plan_slug(bookkeeping, directory);
+        let slug = bookkeeping.plan_slug.clone().unwrap_or_default();
         let path = plan_file_path(directory, &slug, loop_id).map_err(|error| error.to_string())?;
         let markdown = match read_plan_file(directory, &slug, loop_id) {
             Ok(file) => file.markdown,
@@ -1114,7 +1128,7 @@ impl Agent {
         if markdown.trim().is_empty() {
             return Err(prompts::empty_plan_file(&path));
         }
-        let version = highest_plan_version(snapshot, loop_id).unwrap_or(0) + 1;
+        let version = highest_plan_version(snapshot, bookkeeping, loop_id).unwrap_or(0) + 1;
         let contents = write_plan_file(directory, &slug, loop_id, version, &markdown)
             .map_err(|error| format!("cannot save the plan: {error}"))?;
         let file_reads = chat.tools.file_reads();
@@ -1126,7 +1140,7 @@ impl Agent {
                 FileReadRecord::whole_file(&contents, modified),
             );
         }
-        snapshot.unavailable_plan_versions.remove(&loop_id);
+        bookkeeping.unavailable_plan_versions.remove(&loop_id);
         let plan = Plan {
             loop_id,
             version,

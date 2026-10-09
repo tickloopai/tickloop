@@ -2,14 +2,14 @@ use super::prompt_suggestion::{SuggestionRequest, generate};
 use super::test_support;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use tickloop_agent::model::HttpModelClient;
-use tickloop_agent::model::{Content, Message, Role};
 use tickloop_agent::runtime::{Agent, ChatSnapshot, EventKind};
+use tickloop_agent_model::HttpModelClient;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::model::model_http_support as http;
+use tickloop_agent_protocol::{Content, Message, Role};
+use tickloop_agent_test_support::model_http_support as http;
 
 fn request() -> SuggestionRequest {
     SuggestionRequest {
@@ -33,7 +33,7 @@ fn conversation() -> Vec<Message> {
 }
 
 async fn snapshot(
-    model: tickloop_agent::model::ModelConfig,
+    model: tickloop_agent_protocol::ModelConfig,
     messages: Vec<Message>,
 ) -> ChatSnapshot {
     let directory = tempfile::tempdir().unwrap();
@@ -130,7 +130,7 @@ async fn prompt_suggestion_responses_completion_reasoning_is_bounded_without_cou
             http::serve_response(200, responses_reasoning_reply(&summary, prefix.as_deref())).await;
         let mut model = test_support::config();
         model.base_url = url;
-        model.protocol = tickloop_agent::model::Protocol::Responses;
+        model.protocol = tickloop_agent_protocol::Protocol::Responses;
         let context = snapshot(model, conversation()).await;
         let request = request();
         let output = generate(&request, &context, None).await;
@@ -149,7 +149,7 @@ async fn prompt_suggestion_responses_completion_reasoning_is_bounded_without_cou
 async fn prompt_suggestion_completion_backstop_counts_protocol_readable_reasoning() {
     let client = test_support::ScriptedModel::new(vec![vec![
         Content::ProtocolData {
-            protocol: tickloop_agent::model::Protocol::Responses,
+            protocol: tickloop_agent_protocol::Protocol::Responses,
             value: json!({"type":"reasoning","summary":[{"type":"summary_text","text":"x".repeat(2_048)}],"encrypted_content":"opaque-fixture"}),
         },
         Content::Text {
@@ -158,11 +158,11 @@ async fn prompt_suggestion_completion_backstop_counts_protocol_readable_reasonin
     ]]);
     let cancel = CancellationToken::new();
     let result =
-        tickloop_agent::model::GenerationBudget::new(1_024, std::time::Duration::from_secs(10))
+        tickloop_agent_model::GenerationBudget::new(1_024, std::time::Duration::from_secs(10))
             .complete(
                 &client,
                 Uuid::new_v4(),
-                tickloop_agent::model::ModelRequest {
+                tickloop_agent_model::ModelRequest {
                     history_sources: vec![],
                     messages: conversation(),
                     tools: vec![],
@@ -175,8 +175,8 @@ async fn prompt_suggestion_completion_backstop_counts_protocol_readable_reasonin
             .await;
     assert!(matches!(
         result,
-        Err(tickloop_agent::model::ModelError::ResponseRejected(
-            tickloop_agent::model::ModelResponseRejection::OutputLimit
+        Err(tickloop_agent_model::ModelError::ResponseRejected(
+            tickloop_agent_model::ModelResponseRejection::OutputLimit
         ))
     ));
     assert!(cancel.is_cancelled());
@@ -295,7 +295,7 @@ async fn prompt_suggestion_openai_stream_hits_the_output_budget_before_the_deadl
     });
     let mut model = test_support::config();
     model.base_url = url;
-    model.protocol = tickloop_agent::model::Protocol::ChatCompletions;
+    model.protocol = tickloop_agent_protocol::Protocol::ChatCompletions;
     let context = snapshot(model, conversation()).await;
     let request = request();
     let running = request.clone();

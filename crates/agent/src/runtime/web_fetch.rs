@@ -10,8 +10,9 @@ use super::{
     Agent, AgentError, Receipt, RequestKind, RequestOutcome,
     model_request::{PendingModelResponse, RequestContext},
 };
-use crate::model::{Content, Message, ModelClient, ModelError, ModelRequest, Role};
-use crate::tools::{SecondaryModel, ToolError};
+use tickloop_agent_model::{ModelClient, ModelError, ModelRequest};
+use tickloop_agent_protocol::{Content, Message, Role};
+use tickloop_agent_tools::{SecondaryModel, ToolError};
 
 /// Claude Code's answer when the secondary model returns no text.
 const NO_RESPONSE: &str = "No response from model";

@@ -3,7 +3,7 @@ use super::*;
 
 const SUGGESTION_FIXTURE_STACK_BYTES: usize = 16 * 1024 * 1024;
 
-use crate::model::model_http_support as suggestion_http;
+use tickloop_agent_test_support::model_http_support as suggestion_http;
 
 #[test]
 #[ignore]
@@ -19,7 +19,7 @@ fn prompt_suggestion_pty_fixture() {
                 .block_on(async {
                     let user_case = directory.join("user-case").exists();
                     let mut model = if user_case {
-                        tickloop_agent::model::cards::ModelCatalog::defaults()
+                        tickloop_agent_model::cards::ModelCatalog::defaults()
                             .get("kimi-cn-api", "kimi-k3")
                             .unwrap()
                     } else {
@@ -56,7 +56,7 @@ fn prompt_suggestion_pty_fixture() {
                     );
                     let mut chat = agent.create_chat(directory.clone()).await.unwrap();
                     if user_case {
-                        core.set_execution_mode(chat, tickloop_agent::permissions::ExecutionMode::Auto).await.unwrap();
+                        core.set_execution_mode(chat, tickloop_agent_protocol::ExecutionMode::Auto).await.unwrap();
                         let mut events = core.subscribe();
                         let receipt = core.submit(chat, None, "Complete the fixture family".into()).await.unwrap();
                         loop {
@@ -72,7 +72,7 @@ fn prompt_suggestion_pty_fixture() {
                         agent
                             .set_execution_mode(
                                 chat,
-                                tickloop_agent::permissions::ExecutionMode::Plan,
+                                tickloop_agent_protocol::ExecutionMode::Plan,
                             )
                             .await
                             .unwrap();
@@ -89,7 +89,7 @@ fn prompt_suggestion_pty_fixture() {
                         &console,
                         &model,
                         &directory,
-                        tickloop_agent::permissions::ExecutionMode::Auto,
+                        tickloop_agent_protocol::ExecutionMode::Auto,
                         vec![],
                     )
                     .unwrap();
@@ -101,7 +101,7 @@ fn prompt_suggestion_pty_fixture() {
                         input,
                         crate::terminal::StartupState {
                             chat: crate::terminal::StartupChat::Resumed(Box::new(snapshot), false),
-                            user_settings: Some(tickloop_agent::settings::UserSettings::in_root(
+                            user_settings: Some(tickloop_agent_config::UserSettings::in_root(
                                 &directory,
                             )),
                         },
@@ -129,10 +129,10 @@ fn prompt_suggestion_pty_fixture() {
                         .unwrap()
                         .iter()
                         .flat_map(|request| &request.messages)
-                        .filter(|message| message.role == tickloop_agent::model::Role::User)
+                        .filter(|message| message.role == tickloop_agent_protocol::Role::User)
                         .flat_map(|message| &message.content)
                         .filter_map(|content| match content {
-                            tickloop_agent::model::Content::Text { text } => Some(text.clone()),
+                            tickloop_agent_protocol::Content::Text { text } => Some(text.clone()),
                             _ => None,
                         })
                         .collect::<Vec<_>>();

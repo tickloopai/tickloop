@@ -3,12 +3,7 @@ use crate::agent_console::AttentionGroup;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::Read;
 
-mod screen {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/screen.rs"
-    ));
-}
+use crate::terminal::test_support::screen;
 
 const ROOT_AGENT: Uuid = Uuid::from_u128(100);
 const CHILD_AGENT: Uuid = Uuid::from_u128(101);
@@ -537,7 +532,7 @@ fn agent_row(id: Uuid, parent: Option<Uuid>, title: &str) -> AgentRow {
             child_chat_id: id,
             handle: format!("child-{}", id.as_u128() % 1000),
             description: title.into(),
-            created_at: crate::private_fs::unix_time_milliseconds(),
+            created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
         }),
     }
 }
@@ -616,14 +611,14 @@ fn agent_layout_removed_footer_item_chooses_the_nearest_surviving_task() {
         .lock()
         .unwrap()
         .monitor
-        .select(&crate::tick_stream::InstanceRef::shell(selected));
+        .select(&tick_protocol::InstanceRef::shell(selected));
     snapshot.tasks.retain(|task| task.id != selected);
     console.update_shell_ticks(&snapshot).unwrap();
     let state = console.state.lock().unwrap();
     assert_eq!(state.monitor.entries().len(), 19);
     assert_ne!(
         state.monitor.selected().unwrap().instance,
-        crate::tick_stream::InstanceRef::shell(selected)
+        tick_protocol::InstanceRef::shell(selected)
     );
     assert_eq!(state.editor.draft(), "cached draft");
 }
@@ -3577,7 +3572,7 @@ fn fleet_row(
             child_chat_id: id,
             handle: format!("child-{}", id.as_u128() % 1000),
             description: title.into(),
-            created_at: crate::private_fs::unix_time_milliseconds(),
+            created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
         }),
     }
 }
@@ -5000,7 +4995,7 @@ fn agent_layout_filter_cycling_keeps_a_still_listed_heading_selected() {
 
 #[test]
 fn agent_layout_known_age_ends_the_row_and_the_glyph_carries_the_state_role() {
-    let now = crate::private_fs::unix_time_milliseconds();
+    let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
     let six_minutes_ago = now - 6 * 60_000 - 30_000;
     let finished = Uuid::from_u128(0xa100);
     let asking = Uuid::from_u128(0xa200);

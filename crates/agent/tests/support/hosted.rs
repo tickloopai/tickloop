@@ -18,13 +18,13 @@ pub fn tick_environment() -> Vec<(String, String)> {
     vec![("PATH".into(), "/usr/bin:/bin".into())]
 }
 
-/// `program` started through the fixture CLI's Tick launcher.
+/// `program` started through `tickhost open`, the launcher of protocol programs.
 pub fn launch_command(program: Vec<String>) -> Vec<String> {
     let mut command = vec![
-        super::fixture_cli::executable()
+        super::fixture_cli::tickhost()
             .to_string_lossy()
             .into_owned(),
-        "--tick-launch".into(),
+        "open".into(),
         "--".into(),
     ];
     command.extend(program);
@@ -45,7 +45,7 @@ pub fn python_program(script: &Path, arguments: &[String]) -> Vec<String> {
 /// The example counter Tick.
 pub fn counter_program() -> Vec<String> {
     let counter = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/ticks/counter.py")
+        .join("../../tick/examples/counter.py")
         .canonicalize()
         .unwrap();
     python_program(&counter, &[])

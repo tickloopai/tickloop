@@ -7,7 +7,7 @@ const EXTERNAL_MODEL: &str = "external-fixture";
 
 fn startup_config(model: &str) -> ModelConfig {
     if model == STARTUP_MODEL {
-        return crate::model::cards::ModelCatalog::defaults()
+        return tickloop_agent_model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash")
             .unwrap();
     }

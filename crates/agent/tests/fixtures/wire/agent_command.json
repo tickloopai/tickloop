@@ -1,0 +1,312 @@
+[
+  {
+    "kind": "create",
+    "launch": {
+      "workdir": "/work/project",
+      "config_root": "/home/user/.tickloop",
+      "model": {
+        "connection": {
+          "vendor": "Example",
+          "product": "Example Plan",
+          "kind": "plan",
+          "order": 2,
+          "region": {
+            "name": "Global",
+            "order": 1
+          },
+          "discovery": "provider_api"
+        },
+        "name": "example-plan",
+        "protocol": "messages",
+        "base_url": "https://models.example.test/v1",
+        "model": "example-large",
+        "api_key_env": "EXAMPLE_API_KEY",
+        "max_output_tokens": 32000,
+        "provider": "api",
+        "auth_source": "api_key_env",
+        "provider_id": "example",
+        "provider_name": "Example",
+        "model_id": "example-large",
+        "card": {
+          "id": "example-large",
+          "service_model_id": "example-large-2026",
+          "display_name": "Example Large",
+          "adapter": "messages",
+          "max_output_tokens": 32000,
+          "context_window_tokens": 200000,
+          "thinking": "toggle",
+          "adaptive_by_default": false,
+          "effort_levels": [
+            "low",
+            "high"
+          ],
+          "input_modalities": [
+            "text",
+            "image"
+          ],
+          "thinking_budgets": {
+            "low": 2048,
+            "medium": 8192,
+            "high": 16384
+          }
+        },
+        "input_modalities": [
+          "text",
+          "image"
+        ]
+      },
+      "host_options": {
+        "execution_mode_override": "acceptEdits",
+        "directory_trust": "CallerManaged",
+        "prompt_policy": "Interactive"
+      },
+      "session_persistence": true,
+      "exact_chat": "00000000-0000-0000-0000-0000000000c1",
+      "environment": [
+        {
+          "name": [
+            84,
+            69,
+            82,
+            77
+          ],
+          "value": [
+            120,
+            116,
+            101,
+            114,
+            109,
+            45,
+            50,
+            53,
+            54,
+            99,
+            111,
+            108,
+            111,
+            114
+          ]
+        }
+      ],
+      "host_work_context": {
+        "socket": "/run/herdr.sock",
+        "workspace": "w1"
+      }
+    },
+    "initial": {
+      "kind": "text",
+      "text": "Check the counter",
+      "contexts": [
+        {
+          "kind": "file",
+          "path": "/work/project/notes.md",
+          "content": "notes",
+          "truncated": false
+        },
+        {
+          "kind": "image",
+          "origin": {
+            "type": "pasted",
+            "id": 1
+          },
+          "image": {
+            "media_type": "image/png",
+            "data": "iVBORw0KGgo=",
+            "width": 1,
+            "height": 1
+          }
+        }
+      ],
+      "paths": [
+        "/work/project/notes.md"
+      ]
+    },
+    "origin": {
+      "view": {
+        "session_id": "00000000-0000-0000-0000-000000000051",
+        "view_id": "00000000-0000-0000-0000-000000000052"
+      },
+      "display_version": 2,
+      "host": {
+        "host_instance": "herdr:16777220:42",
+        "socket": "/run/herdr.sock",
+        "workspace": "w1",
+        "tab": "t1",
+        "pane": "p1",
+        "terminal": "term-1",
+        "client": null
+      }
+    }
+  },
+  {
+    "kind": "submit",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "target_loop": "00000000-0000-0000-0000-000000000010",
+    "input": {
+      "kind": "skill",
+      "name": "tickloop",
+      "arguments": "status"
+    },
+    "origin": null
+  },
+  {
+    "kind": "configure",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "change": {
+      "kind": "model",
+      "config": {
+        "connection": {
+          "vendor": "Example",
+          "product": "Example Plan",
+          "kind": "plan",
+          "order": 2,
+          "region": {
+            "name": "Global",
+            "order": 1
+          },
+          "discovery": "provider_api"
+        },
+        "name": "example-plan",
+        "protocol": "messages",
+        "base_url": "https://models.example.test/v1",
+        "model": "example-large",
+        "api_key_env": "EXAMPLE_API_KEY",
+        "max_output_tokens": 32000,
+        "provider": "api",
+        "auth_source": "api_key_env",
+        "provider_id": "example",
+        "provider_name": "Example",
+        "model_id": "example-large",
+        "card": {
+          "id": "example-large",
+          "service_model_id": "example-large-2026",
+          "display_name": "Example Large",
+          "adapter": "messages",
+          "max_output_tokens": 32000,
+          "context_window_tokens": 200000,
+          "thinking": "toggle",
+          "adaptive_by_default": false,
+          "effort_levels": [
+            "low",
+            "high"
+          ],
+          "input_modalities": [
+            "text",
+            "image"
+          ],
+          "thinking_budgets": {
+            "low": 2048,
+            "medium": 8192,
+            "high": 16384
+          }
+        },
+        "input_modalities": [
+          "text",
+          "image"
+        ]
+      },
+      "thinking": null
+    }
+  },
+  {
+    "kind": "configure",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "change": {
+      "kind": "replace_rules",
+      "rules": [
+        {
+          "id": "00000000-0000-0000-0000-000000000071",
+          "decision": "allow",
+          "tool": "Bash",
+          "specifier": "git status",
+          "input": {
+            "command": "git status"
+          },
+          "loop_id": null,
+          "persistent": true
+        }
+      ]
+    }
+  },
+  {
+    "kind": "decide_permission",
+    "request": {
+      "execution": {
+        "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+        "agent_id": "00000000-0000-0000-0000-0000000000a1",
+        "generation": 3
+      },
+      "request_id": "00000000-0000-0000-0000-000000000061",
+      "kind": "Permission",
+      "version": 1
+    },
+    "allow": true,
+    "scope": "Session",
+    "comment": null,
+    "rule": "Bash(git status)"
+  },
+  {
+    "kind": "manage_loop",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "action": {
+      "kind": "configure_trigger",
+      "loop_id": "00000000-0000-0000-0000-000000000010",
+      "trigger": {
+        "id": "00000000-0000-0000-0000-000000000030",
+        "prompt": "Report changes",
+        "interval_seconds": 60,
+        "expires_at_ms": null,
+        "accepts_events": false,
+        "armed": true,
+        "subscriptions": []
+      }
+    }
+  },
+  {
+    "kind": "add_monitor_member",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "instance": "herdr:session/workspace/pane/counter",
+    "title": "Counter"
+  },
+  {
+    "kind": "hosted_tick_snapshot",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "instance": "hosted:00000000-0000-0000-0000-000000000040"
+  },
+  {
+    "kind": "load_record",
+    "record": {
+      "store_root": "/home/user/.tickloop/chats",
+      "chat_id": "00000000-0000-0000-0000-0000000000c1"
+    },
+    "as_new": false,
+    "launch": null
+  },
+  {
+    "kind": "flush_transcripts"
+  }
+]

@@ -11,7 +11,7 @@ use std::{
 
 use ::image::{DynamicImage, ImageFormat, RgbaImage};
 
-use tickloop_agent::image::{self, Image};
+use tickloop_agent_base::image::{self, Image};
 
 /// OSC 52 travels in-band through the terminal, and terminals cap how much they
 /// will accept. Refusing past the cap is better than silently pasting a

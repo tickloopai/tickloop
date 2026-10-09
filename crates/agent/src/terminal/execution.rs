@@ -16,10 +16,11 @@ use super::permissions_surface::{
 };
 use crate::{
     agent_access::*,
-    model::{ModelClient, ModelConfig, ReasoningEffort, model_client},
-    permissions::{ExecutionMode, PermissionRule, PermissionScope},
     runtime::{self, AgentError, ChatSnapshot, InputContext, Receipt},
-    tools::{CommandSnapshot, ToolResult},
+};
+use tickloop_agent_protocol::{
+    CommandSnapshot, ExecutionMode, ModelConfig, PermissionRule, PermissionScope, ReasoningEffort,
+    ToolResult,
 };
 
 /// Why a New Agent Permissions change was not applied. Nothing was written or staged.
@@ -258,7 +259,6 @@ struct Inner {
     access: Arc<dyn AgentAccess>,
     epoch: Uuid,
     launch: LaunchSpec,
-    embedded: Option<runtime::Agent>,
     recovery: Option<RecoveringAgentClient>,
     references: RwLock<HashMap<Uuid, ExecutionRef>>,
     snapshots: RwLock<HashMap<Uuid, LiveChatSnapshot>>,
@@ -274,11 +274,14 @@ struct Inner {
     draft: Mutex<NewAgentDraft>,
     first_create: Mutex<Option<FirstCreateState>>,
     /// The View's settings, sharing its transient Providers; New Agent defaults save through it.
-    user_settings: Mutex<Option<crate::settings::UserSettings>>,
+    user_settings: Mutex<Option<tickloop_agent_config::UserSettings>>,
     default_model: Mutex<Option<ModelConfig>>,
     /// Inputs whose acceptance is unknown, by execution; no further input goes there until the
     /// receipt resolves.
     unconfirmed_inputs: Mutex<HashMap<ExecutionRef, (Uuid, Uuid)>>,
+    /// The in-process access a test View was built on, so the test can stop its runtime.
+    #[cfg(test)]
+    in_process_access: Option<EmbeddedAgentAccess>,
     #[cfg(test)]
     recovery_probe:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<super::recovery_tests::RecoveryFact>>>,
@@ -377,7 +380,7 @@ impl ConsoleExecution {
             }),
         );
         let mut execution =
-            Self::from_access(Arc::new(recovery.clone()), epoch, view, launch, host, None);
+            Self::from_access(Arc::new(recovery.clone()), epoch, view, launch, host);
         Arc::get_mut(&mut execution.inner)
             .expect("new connection is unique")
             .recovery = Some(recovery);
@@ -390,14 +393,12 @@ impl ConsoleExecution {
         view: ViewRef,
         launch: LaunchSpec,
         host: Option<HostLocation>,
-        embedded: Option<runtime::Agent>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 access,
                 epoch,
                 launch,
-                embedded,
                 recovery: None,
                 references: RwLock::new(HashMap::new()),
                 snapshots: RwLock::new(HashMap::new()),
@@ -420,6 +421,8 @@ impl ConsoleExecution {
                 user_settings: Mutex::new(None),
                 default_model: Mutex::new(None),
                 unconfirmed_inputs: Mutex::new(HashMap::new()),
+                #[cfg(test)]
+                in_process_access: None,
                 #[cfg(test)]
                 recovery_probe: Mutex::new(None),
                 #[cfg(test)]
@@ -476,11 +479,14 @@ impl ConsoleExecution {
         launch: LaunchSpec,
         host: Option<HostLocation>,
     ) -> Self {
-        Self::from_access(access, epoch, view, launch, host, None)
+        Self::from_access(access, epoch, view, launch, host)
     }
 
     #[cfg(test)]
-    pub(super) fn new_embedded(model: ModelConfig, client: Arc<dyn ModelClient>) -> Self {
+    pub(super) fn new_embedded(
+        model: ModelConfig,
+        client: Arc<dyn tickloop_agent_model::ModelClient>,
+    ) -> Self {
         let core = runtime::Agent::new_embedded(model.clone(), client);
         Self::from_embedded(core, model)
     }
@@ -489,7 +495,7 @@ impl ConsoleExecution {
     pub(super) fn open_embedded(
         root: PathBuf,
         model: ModelConfig,
-        client: Arc<dyn ModelClient>,
+        client: Arc<dyn tickloop_agent_model::ModelClient>,
     ) -> Result<Self, AgentError> {
         let core = runtime::Agent::open_embedded(root.clone(), model.clone(), client)?;
         let mut execution = Self::from_embedded(core, model);
@@ -515,7 +521,7 @@ impl ConsoleExecution {
 
     #[cfg(test)]
     pub(super) fn from_embedded(core: runtime::Agent, model: ModelConfig) -> Self {
-        let adapter = EmbeddedAgentAccess::new(core.clone());
+        let adapter = EmbeddedAgentAccess::new(core);
         let epoch = adapter.daemon_epoch();
         let view = ViewRef {
             session_id: Uuid::new_v4(),
@@ -524,7 +530,11 @@ impl ConsoleExecution {
         let mut launch =
             LaunchSpec::embedded(std::env::current_dir().expect("test current directory"));
         launch.model = Some(model);
-        Self::from_access(Arc::new(adapter), epoch, view, launch, None, Some(core))
+        let mut execution = Self::from_access(Arc::new(adapter.clone()), epoch, view, launch, None);
+        Arc::get_mut(&mut execution.inner)
+            .expect("new execution is unique")
+            .in_process_access = Some(adapter);
+        execution
     }
 
     pub(super) fn launch_spec(&self) -> LaunchSpec {
@@ -636,7 +646,7 @@ impl ConsoleExecution {
                                 )
                         })
                         && !snapshot.permissions.iter().any(|request| {
-                            request.name == crate::tools::EXIT_PLAN_MODE_TOOL_NAME
+                            request.name == tickloop_agent_tools::EXIT_PLAN_MODE_TOOL_NAME
                                 && request.loop_id == plan.loop_id
                         })
                 })
@@ -1369,11 +1379,10 @@ impl ConsoleExecution {
                     *self.inner.draft.lock().unwrap() = draft;
                     return Box::pin(self.create_from_draft(workdir)).await;
                 }
-                let mut replay = draft
+                let replay = draft
                     .clone()
                     .into_first_create(self.effective_launch(), workdir);
                 let (chat, execution) = self.settle_create(epoch, command_id, outcome, draft)?;
-                self.apply_launch_model_in_process(chat, &mut replay);
                 (chat, execution, replay, None)
             }
             None => {
@@ -1387,8 +1396,6 @@ impl ConsoleExecution {
                     .send_create(epoch, command_id, replay.launch.clone())
                     .await;
                 let (chat, execution) = self.settle_create(epoch, command_id, outcome, draft)?;
-                let mut replay = replay;
-                self.apply_launch_model_in_process(chat, &mut replay);
                 (chat, execution, replay, None)
             }
         };
@@ -1456,7 +1463,15 @@ impl ConsoleExecution {
             let epoch = self.daemon_epoch();
             let command_id = Uuid::new_v4();
             match self
-                .apply_replayed(chat, execution, epoch, command_id, change)
+                .send(
+                    epoch,
+                    command_id,
+                    AgentCommand::Configure {
+                        execution,
+                        change,
+                        provider: None,
+                    },
+                )
                 .await
             {
                 CommandOutcome::Completed(_) => replay.complete_step(),
@@ -1489,30 +1504,6 @@ impl ConsoleExecution {
             }
         }
         Ok(chat)
-    }
-    /// The daemon starts each Agent's worker with the launch model, but the in-process runtime gives
-    /// every Agent its own model. There the launch model precedes staged model and effort choices,
-    /// after execution mode, directories and rules have been replayed.
-    fn apply_launch_model_in_process(&self, chat: Uuid, replay: &mut FirstCreate) {
-        let (Some(_), Some(model)) = (&self.inner.embedded, replay.launch.model.clone()) else {
-            return;
-        };
-        let created = self
-            .inner
-            .snapshots
-            .read()
-            .unwrap()
-            .get(&chat)
-            .map(|snapshot| snapshot.model.clone());
-        if created.as_ref() != Some(&model) {
-            replay.changes.insert(
-                0,
-                ConfigurationChange::Model {
-                    config: model,
-                    thinking: None,
-                },
-            );
-        }
     }
     /// What the first Create's reply or receipt proves; anything short of a created Agent is kept
     /// so that nothing is created twice.
@@ -1583,55 +1574,6 @@ impl ConsoleExecution {
             },
             ReplayStep::Change(change) => change,
         })
-    }
-    /// Sends one replayed choice under `command_id`. The in-process runtime switches models with
-    /// its own client, as a visible Agent's model change does.
-    async fn apply_replayed(
-        &self,
-        chat: Uuid,
-        execution: ExecutionRef,
-        epoch: Uuid,
-        command_id: Uuid,
-        change: ConfigurationChange,
-    ) -> CommandOutcome {
-        if let (Some(core), ConfigurationChange::Model { config, thinking }) =
-            (&self.inner.embedded, &change)
-        {
-            let client =
-                match model_client(config.clone(), self.inner.launch.config_root.as_deref()) {
-                    Ok(client) => client,
-                    Err(error) => {
-                        return CommandOutcome::Refused {
-                            error: AccessError::invalid(error.to_string()),
-                            registered: None,
-                        };
-                    }
-                };
-            let applied = match thinking {
-                Some(effort) => {
-                    core.set_model_with_thinking(chat, config.clone(), client, *effort)
-                        .await
-                }
-                None => core.set_model(chat, config.clone(), client).await,
-            };
-            return match applied {
-                Ok(change) => CommandOutcome::Completed(CommandResult::ModelChanged(change)),
-                Err(error) => CommandOutcome::Refused {
-                    error: AccessError::invalid(error.to_string()),
-                    registered: None,
-                },
-            };
-        }
-        self.send(
-            epoch,
-            command_id,
-            AgentCommand::Configure {
-                execution,
-                change,
-                provider: None,
-            },
-        )
-        .await
     }
     /// Whether the Agent `chat` was created for this View's first input but still waits for the
     /// View to attach and apply its staged choices.
@@ -1749,7 +1691,7 @@ impl ConsoleExecution {
         target: ConfigTarget,
         config: ModelConfig,
         refresh: bool,
-    ) -> Result<crate::model::availability::AccountModelDirectory, String> {
+    ) -> Result<tickloop_agent_protocol::AccountModelDirectory, String> {
         let ConfigTarget::Agent(chat) = target else {
             return Err("New Agent has no execution".into());
         };
@@ -1834,20 +1776,22 @@ impl ConsoleExecution {
             return Ok(false);
         };
         let save = |write: &dyn Fn(
-            &crate::settings::UserSettings,
-        ) -> Result<(), crate::settings::SettingsError>| {
+            &tickloop_agent_config::UserSettings,
+        ) -> Result<(), tickloop_agent_config::SettingsError>| {
             write(&settings).map_err(|error| invalid(&error))
         };
         match change {
             ConfigurationChange::Model { config, thinking } => {
-                let config = crate::model::cards::model_for_persistent_selection(config.clone());
-                crate::model::validate_model_config(&config).map_err(|error| invalid(&error))?;
+                let config =
+                    tickloop_agent_model::cards::model_for_persistent_selection(config.clone());
+                tickloop_agent_model::validate_model_config(&config)
+                    .map_err(|error| invalid(&error))?;
                 if let Some(effort) = thinking {
-                    crate::model::validate_reasoning_effort(&config, *effort)
+                    tickloop_agent_model::validate_reasoning_effort(&config, *effort)
                         .map_err(|error| invalid(&error))?;
                 }
                 let clear_context_window =
-                    !crate::model::compatible_private_history(&current.model, &config);
+                    !tickloop_agent_model::compatible_private_history(&current.model, &config);
                 save(&|settings| match thinking {
                     Some(effort) => {
                         settings.save_model_with_thinking(&config, clear_context_window, *effort)
@@ -1857,18 +1801,18 @@ impl ConsoleExecution {
                 self.select_default_model(config);
             }
             ConfigurationChange::ReasoningEffort { effort } => {
-                crate::model::validate_reasoning_effort(&current.model, *effort)
+                tickloop_agent_model::validate_reasoning_effort(&current.model, *effort)
                     .map_err(|error| invalid(&error))?;
                 save(&|settings| settings.save_reasoning_effort(*effort))?;
             }
             ConfigurationChange::ThinkingEnabled { enabled } => {
-                crate::model::validate_reasoning_effort(
+                tickloop_agent_model::validate_reasoning_effort(
                     &current.model,
                     (!enabled).then_some(ReasoningEffort::Off),
                 )
                 .map_err(|error| invalid(&error))?;
                 let enable_effort = (*enabled
-                    && crate::model::validate_reasoning_effort(
+                    && tickloop_agent_model::validate_reasoning_effort(
                         &current.model,
                         Some(ReasoningEffort::On),
                     )
@@ -1917,7 +1861,7 @@ impl ConsoleExecution {
         let expected = expected.unwrap_or(&revision);
         let changes = match change {
             runtime::PermissionChange::UpsertRule { rule } if rule.persistent => {
-                crate::settings::ProjectRuleChanges {
+                tickloop_agent_config::ProjectRuleChanges {
                     removed: rules
                         .iter()
                         .filter(|saved| saved.id == rule.id)
@@ -1929,7 +1873,7 @@ impl ConsoleExecution {
             runtime::PermissionChange::RemoveRule { id }
                 if rules.iter().any(|rule| rule.id == *id) =>
             {
-                crate::settings::ProjectRuleChanges {
+                tickloop_agent_config::ProjectRuleChanges {
                     removed: std::collections::HashSet::from([*id]),
                     added: Vec::new(),
                 }
@@ -1938,22 +1882,23 @@ impl ConsoleExecution {
         };
         match settings.update_permission_rules_cas(project, expected, [(project, &changes)]) {
             Ok(()) => Ok(RuleSave::Saved),
-            Err(crate::settings::SettingsError::Conflict) => Ok(RuleSave::Conflict),
+            Err(tickloop_agent_config::SettingsError::Conflict) => Ok(RuleSave::Conflict),
             Err(error) => Err(invalid(&error)),
         }
     }
     /// Shares the View's settings, so New Agent defaults use its transient Providers and saves.
-    pub(super) fn use_user_settings(&self, settings: Option<crate::settings::UserSettings>) {
+    pub(super) fn use_user_settings(&self, settings: Option<tickloop_agent_config::UserSettings>) {
         *self.inner.user_settings.lock().unwrap() = settings;
     }
-    fn user_settings(&self) -> Option<crate::settings::UserSettings> {
+    fn user_settings(&self) -> Option<tickloop_agent_config::UserSettings> {
         self.inner.user_settings.lock().unwrap().clone()
     }
     /// Later new, dispatched and resumed Agents of this View start with the model last chosen
     /// here, replacing the startup choice, as the runtime's own default selection does.
     fn select_default_model(&self, config: ModelConfig) {
-        *self.inner.default_model.lock().unwrap() =
-            Some(crate::model::cards::model_for_persistent_selection(config));
+        *self.inner.default_model.lock().unwrap() = Some(
+            tickloop_agent_model::cards::model_for_persistent_selection(config),
+        );
     }
     /// The View's launch with the model its latest confirmed selection made the default.
     fn effective_launch(&self) -> LaunchSpec {
@@ -1973,7 +1918,7 @@ impl ConsoleExecution {
         let configuration = self.configuration(ConfigTarget::NewDraft).await?;
         let project = rule_project(project)?;
         let storage =
-            |error: crate::settings::SettingsError| AgentError::Storage(error.to_string());
+            |error: tickloop_agent_config::SettingsError| AgentError::Storage(error.to_string());
         let settings = self.user_settings();
         let (saved_rules, warnings, project_revision) = match &settings {
             Some(settings) => settings
@@ -1984,14 +1929,14 @@ impl ConsoleExecution {
         let (auto, auto_revision) = match &settings {
             Some(settings) => settings.auto_settings_with_revision().map_err(storage)?,
             None => (
-                crate::settings::AutoSettings::default(),
-                crate::settings::AutoSettingsRevision::default(),
+                tickloop_agent_config::AutoSettings::default(),
+                tickloop_agent_config::empty_auto_settings_revision(),
             ),
         };
         let jev_key_status = runtime::jev_key_status_in(
             settings
                 .as_ref()
-                .and_then(crate::settings::UserSettings::root),
+                .and_then(tickloop_agent_config::UserSettings::root),
         )?;
         let rules = saved_rules
             .into_iter()
@@ -2005,7 +1950,7 @@ impl ConsoleExecution {
             execution_mode: configuration.execution_mode,
             chat_model_label: configuration.model.model.clone(),
             preferred_reviewer: auto.reviewer,
-            auto_policy: runtime::AutoPolicy::from_settings(&auto),
+            auto_policy: runtime::auto_rules::auto_policy_from_settings(&auto),
             auto_rule_settings: auto.rules.clone(),
             jev_key_status,
             auto_reviewer_health: None,
@@ -2055,9 +2000,9 @@ impl ConsoleExecution {
         }
         let view = &current.content;
         let settings = self.user_settings();
-        let written = |result: Result<_, crate::settings::SettingsError>| match result {
+        let written = |result: Result<_, tickloop_agent_config::SettingsError>| match result {
             Ok(_) => Ok(()),
-            Err(crate::settings::SettingsError::Conflict) => Err(None),
+            Err(tickloop_agent_config::SettingsError::Conflict) => Err(None),
             Err(error) => Err(Some(AgentError::Storage(error.to_string()))),
         };
         let kept = match change {
@@ -2156,8 +2101,8 @@ impl ConsoleExecution {
                 if view.preferred_reviewer == reviewer {
                     return Err(invalid("reviewer is unchanged"));
                 }
-                if reviewer == crate::settings::AutoReviewerPreference::Jev
-                    && view.jev_key_status == crate::model::credentials::ApiKeyStatus::Missing
+                if reviewer == tickloop_agent_protocol::AutoReviewerPreference::Jev
+                    && view.jev_key_status == tickloop_agent_protocol::ApiKeyStatus::Missing
                 {
                     return Err(invalid("Jev key is missing"));
                 }
@@ -2222,14 +2167,9 @@ impl ConsoleExecution {
             self.configure(chat, change).await?;
             return Ok(ConfigurationOutcome::Applied);
         };
-        let client = model_client(config.clone(), self.inner.launch.config_root.as_deref())
-            .map_err(|error| AgentError::Invalid(error.to_string()))?;
         let change = match thinking {
-            Some(effort) => {
-                self.set_model_with_thinking(chat, config, client, effort)
-                    .await?
-            }
-            None => self.set_model(chat, config, client).await?,
+            Some(effort) => self.set_model_with_thinking(chat, config, effort).await?,
+            None => self.set_model(chat, config).await?,
         };
         Ok(match change {
             runtime::ModelChange::Applied => ConfigurationOutcome::Applied,
@@ -2250,16 +2190,20 @@ impl ConsoleExecution {
             .config_root
             .as_ref()
             .map(|root| root.join("skills"));
-        crate::skills::SkillRegistry::discover(workdir, user_skills.as_deref())
-            .expand(name, arguments, crate::skills::SkillCaller::User)
-            .and_then(crate::skills::InvokedSkill::try_from)
+        tickloop_agent_config::skills::SkillRegistry::discover(workdir, user_skills.as_deref())
+            .expand(
+                name,
+                arguments,
+                tickloop_agent_config::skills::SkillCaller::User,
+            )
+            .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
     /// What the worker of the first Create starts with, read the way it will read it.
     fn new_agent_defaults(&self) -> AgentConfiguration {
         let launch = &self.effective_launch();
-        let model = crate::model::cards::model_for_persistent_selection(
+        let model = tickloop_agent_model::cards::model_for_persistent_selection(
             crate::agent_daemon::launch_model(launch),
         );
         let mut saved = self.user_settings().map(|settings| settings.load());
@@ -2493,7 +2437,7 @@ impl ConsoleExecution {
     pub(super) async fn set_permission_rules(
         &self,
         chat: Uuid,
-        rules: Vec<crate::permissions::PermissionRule>,
+        rules: Vec<tickloop_agent_protocol::PermissionRule>,
     ) -> Result<(), AgentError> {
         self.configure(chat, ConfigurationChange::ReplaceRules { rules })
             .await
@@ -2519,11 +2463,7 @@ impl ConsoleExecution {
         &self,
         chat: Uuid,
         config: ModelConfig,
-        client: Arc<dyn ModelClient>,
     ) -> Result<runtime::ModelChange, AgentError> {
-        if let Some(core) = &self.inner.embedded {
-            return core.set_model(chat, config, client).await;
-        }
         match self
             .configure(
                 chat,
@@ -2542,14 +2482,8 @@ impl ConsoleExecution {
         &self,
         chat: Uuid,
         config: ModelConfig,
-        client: Arc<dyn ModelClient>,
         effort: Option<ReasoningEffort>,
     ) -> Result<runtime::ModelChange, AgentError> {
-        if let Some(core) = &self.inner.embedded {
-            return core
-                .set_model_with_thinking(chat, config, client, effort)
-                .await;
-        }
         match self
             .configure(
                 chat,
@@ -2612,7 +2546,7 @@ impl ConsoleExecution {
         &self,
         chat: Uuid,
         id: Uuid,
-        kind: RequestKind,
+        kind: PendingRequestKind,
     ) -> Result<RequestRef, AgentError> {
         self.snapshot(chat).await?;
         let snapshots = self.inner.snapshots.read().unwrap();
@@ -2639,7 +2573,7 @@ impl ConsoleExecution {
         scope: PermissionScope,
         comment: Option<String>,
     ) -> Result<(), AgentError> {
-        let request = self.request(chat, id, RequestKind::Permission).await?;
+        let request = self.request(chat, id, PendingRequestKind::Permission).await?;
         self.command(
             AgentCommand::DecidePermission {
                 request,
@@ -2659,7 +2593,7 @@ impl ConsoleExecution {
         id: Uuid,
         specifier: String,
     ) -> Result<(), AgentError> {
-        let request = self.request(chat, id, RequestKind::Permission).await?;
+        let request = self.request(chat, id, PendingRequestKind::Permission).await?;
         self.command(
             AgentCommand::DecidePermission {
                 request,
@@ -2699,7 +2633,7 @@ impl ConsoleExecution {
         id: Uuid,
         answers: Vec<runtime::QuestionAnswer>,
     ) -> Result<(), AgentError> {
-        let request = self.request(chat, id, RequestKind::Question).await?;
+        let request = self.request(chat, id, PendingRequestKind::Question).await?;
         self.command(AgentCommand::AnswerQuestion { request, answers }, None)
             .await
             .map(|_| ())
@@ -2737,10 +2671,6 @@ impl ConsoleExecution {
         }
     }
     pub(super) async fn disable_event_sources(&self) -> Result<(), AgentError> {
-        if let Some(core) = &self.inner.embedded {
-            core.disable_event_sources().await;
-            return Ok(());
-        }
         let root = self.inner.launch.config_root.as_ref();
         for row in self.catalog().await? {
             if row.availability != ExecutionAvailability::Live
@@ -2864,8 +2794,8 @@ impl ConsoleExecution {
     pub(super) async fn add_artifact_tick(
         &self,
         chat: Uuid,
-        tick: crate::artifacts::ArtifactTick,
-    ) -> Result<Vec<crate::artifacts::ArtifactTick>, AgentError> {
+        tick: tickloop_agent_protocol::ArtifactTick,
+    ) -> Result<Vec<tickloop_agent_protocol::ArtifactTick>, AgentError> {
         let execution = self.reference(chat).await?;
         match self
             .command(AgentCommand::AddArtifactTick { execution, tick }, None)
@@ -2879,7 +2809,7 @@ impl ConsoleExecution {
         &self,
         chat: Uuid,
         instance_id: String,
-    ) -> Result<Vec<crate::artifacts::ArtifactTick>, AgentError> {
+    ) -> Result<Vec<tickloop_agent_protocol::ArtifactTick>, AgentError> {
         let execution = self.reference(chat).await?;
         match self
             .command(
@@ -2898,7 +2828,7 @@ impl ConsoleExecution {
     pub(super) async fn add_monitor_member(
         &self,
         chat: Uuid,
-        instance: crate::tick_stream::InstanceRef,
+        instance: tick_protocol::InstanceRef,
         title: Option<String>,
     ) -> Result<runtime::MonitorMembership, AgentError> {
         let execution = self.reference(chat).await?;
@@ -2920,7 +2850,7 @@ impl ConsoleExecution {
     pub(super) async fn remove_monitor_member(
         &self,
         chat: Uuid,
-        instance: crate::tick_stream::InstanceRef,
+        instance: tick_protocol::InstanceRef,
     ) -> Result<runtime::MonitorMembership, AgentError> {
         let execution = self.reference(chat).await?;
         match self
@@ -2940,7 +2870,7 @@ impl ConsoleExecution {
     pub(super) async fn artifact_ticks(
         &self,
         chat: Uuid,
-    ) -> Result<Vec<crate::artifacts::ArtifactTick>, AgentError> {
+    ) -> Result<Vec<tickloop_agent_protocol::ArtifactTick>, AgentError> {
         let execution = self.reference(chat).await?;
         match self
             .command(AgentCommand::ListArtifactTicks { execution }, None)
@@ -2966,10 +2896,10 @@ impl ConsoleExecution {
     pub(super) async fn reopen_hosted_tick(
         &self,
         chat: Uuid,
-        instance: crate::tick_stream::InstanceRef,
+        instance: tick_protocol::InstanceRef,
     ) -> Result<
         (
-            crate::tick_stream::InstanceRef,
+            tick_protocol::InstanceRef,
             tickloop_agent::runtime::MonitorMembership,
         ),
         AgentError,
@@ -2995,7 +2925,7 @@ impl ConsoleExecution {
     pub(super) async fn close_hosted_tick(
         &self,
         chat: Uuid,
-        instance: crate::tick_stream::InstanceRef,
+        instance: tick_protocol::InstanceRef,
     ) -> Result<(), AgentError> {
         let execution = self.reference(chat).await?;
         match self
@@ -3015,7 +2945,7 @@ impl ConsoleExecution {
     pub(super) async fn hosted_tick_snapshot(
         &self,
         chat: Uuid,
-        instance: crate::tick_stream::InstanceRef,
+        instance: tick_protocol::InstanceRef,
     ) -> Result<tickloop_agent::hosted::tools::HostedSnapshot, AgentError> {
         let execution = self.reference(chat).await?;
         match self
@@ -3035,7 +2965,7 @@ impl ConsoleExecution {
     pub(super) async fn attach_hosted_tick(
         &self,
         chat: Uuid,
-        instance: crate::tick_stream::InstanceRef,
+        instance: tick_protocol::InstanceRef,
     ) -> Result<tickloop_agent::hosted::controller::HostedViewGrant, AgentError> {
         let execution = self.reference(chat).await?;
         match self
@@ -3563,15 +3493,9 @@ impl ConsoleExecution {
         snapshots
     }
     pub(super) fn saves_chats(&self) -> bool {
-        self.inner
-            .embedded
-            .as_ref()
-            .map(runtime::Agent::saves_chats)
-            .unwrap_or_else(|| {
-                self.inner.launch.session_persistence
-                    && self.inner.launch.config_root.as_ref().is_some_and(|root| {
-                        !crate::settings::UserSettings::in_root(root).skips_transcripts()
-                    })
+        self.inner.launch.session_persistence
+            && self.inner.launch.config_root.as_ref().is_some_and(|root| {
+                !tickloop_agent_config::UserSettings::in_root(root).skips_transcripts()
             })
     }
     pub(super) fn user_settings_warnings(&self, chat: Uuid) -> Vec<String> {
@@ -3609,29 +3533,36 @@ impl ConsoleExecution {
     }
     pub(super) async fn jev_key_status(
         &self,
-    ) -> Result<crate::model::credentials::ApiKeyStatus, AgentError> {
+    ) -> Result<tickloop_agent_protocol::ApiKeyStatus, AgentError> {
         let root = self
             .inner
             .launch
             .config_root
             .as_ref()
             .ok_or_else(|| AgentError::Invalid("Jev key storage is unavailable".into()))?;
-        crate::model::credentials::api_key_status(root, crate::judgment::JEV_API_KEY_ENV)
-            .map_err(|error| AgentError::Storage(error.to_string()))
+        tickloop_agent_model::credentials::api_key_status(
+            root,
+            tickloop_agent_model::judgment::JEV_API_KEY_ENV,
+        )
+        .map_err(|error| AgentError::Storage(error.to_string()))
     }
     pub(super) async fn save_jev_key(
         &self,
         value: &str,
-    ) -> Result<crate::model::credentials::ApiKeyStatus, AgentError> {
+    ) -> Result<tickloop_agent_protocol::ApiKeyStatus, AgentError> {
         let root = self
             .inner
             .launch
             .config_root
             .as_ref()
             .ok_or_else(|| AgentError::Invalid("Jev key storage is unavailable".into()))?;
-        crate::model::credentials::save_api_key(root, crate::judgment::JEV_API_KEY_ENV, value)
-            .map_err(|error| AgentError::Storage(error.to_string()))?;
-        Ok(crate::model::credentials::ApiKeyStatus::Saved)
+        tickloop_agent_model::credentials::save_api_key(
+            root,
+            tickloop_agent_model::judgment::JEV_API_KEY_ENV,
+            value,
+        )
+        .map_err(|error| AgentError::Storage(error.to_string()))?;
+        Ok(tickloop_agent_protocol::ApiKeyStatus::Saved)
     }
     pub(super) async fn refresh_configuration(&self, chat: Uuid) -> Result<(), AgentError> {
         let execution = self.reference(chat).await?;
@@ -3642,8 +3573,8 @@ impl ConsoleExecution {
 
     #[cfg(test)]
     pub(super) async fn shutdown(&self) {
-        if let Some(core) = &self.inner.embedded {
-            core.shutdown().await;
+        if let Some(access) = &self.inner.in_process_access {
+            access.shutdown().await;
         }
     }
 }
@@ -3666,15 +3597,15 @@ fn agent_error(error: AccessError) -> AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_access::TRANSPORT_LIMITS;
     use crate::{
         host_tools::{HostCallContext, HostToolPermission, HostToolProvider, PreparedHostCall},
-        protocol::TRANSPORT_LIMITS,
-        protocol::ToolDefinition,
         terminal::test_support as support,
     };
     use async_trait::async_trait;
     use serde_json::{Value, json};
     use std::os::unix::fs::MetadataExt;
+    use tickloop_agent_protocol::ToolDefinition;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     struct ReadInteractionSource;
@@ -3702,9 +3633,10 @@ mod tests {
         terminal.display_chat(Some(chat)).await.unwrap();
         let execution = terminal.reference(chat).await.unwrap();
         let old_source = terminal.origin().unwrap();
-        let elapsed = std::time::Instant::now();
-        tokio::time::sleep(std::time::Duration::from_secs(VIEW_LEASE_SECONDS + 1)).await;
-        assert!(elapsed.elapsed() >= std::time::Duration::from_secs(VIEW_LEASE_SECONDS + 1));
+        // View leases run on Tokio's clock, so the lease expires without waiting it out.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(VIEW_LEASE_SECONDS + 1)).await;
+        tokio::time::resume();
         let rejected = access
             .execute(CommandEnvelope {
                 daemon_epoch: epoch,
@@ -3840,7 +3772,7 @@ mod tests {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         let socket = directory.path().join("host.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let pane = Arc::new(tokio::sync::Mutex::new(tick_connect::herdr::Pane {
+        let pane = Arc::new(tokio::sync::Mutex::new(tickhost_connect::herdr::Pane {
             pane_id: "source-pane".into(),
             terminal_id: "source-terminal".into(),
             workspace_id: "workspace-first".into(),
@@ -3900,7 +3832,6 @@ mod tests {
                 terminal: Some("source-terminal".into()),
                 client: Some("source-client".into()),
             }),
-            Some(runtime.clone()),
         );
         let chat = terminal.create_chat(directory.path().into()).await.unwrap();
         terminal.display_chat(Some(chat)).await.unwrap();
@@ -3976,7 +3907,6 @@ mod tests {
                 view_id: Uuid::new_v4(),
             },
             LaunchSpec::embedded(directory.path().into()),
-            None,
             None,
         );
         let chat = terminal.create_chat(directory.path().into()).await.unwrap();
@@ -4210,7 +4140,7 @@ mod tests {
     fn recording_terminal(directory: &Path) -> (runtime::Agent, Arc<Recording>, ConsoleExecution) {
         recording_terminal_with_model(
             directory,
-            crate::model::cards::ModelCatalog::defaults()
+            tickloop_agent_model::cards::ModelCatalog::defaults()
                 .get("deepseek-api", "deepseek-flash")
                 .unwrap(),
         )
@@ -4254,11 +4184,12 @@ mod tests {
 
     #[tokio::test]
     async fn dependent_model_and_effort_choices_replay_in_the_order_they_were_made() {
-        use crate::model::cards::ModelCatalog;
+        use tickloop_agent_model::cards::ModelCatalog;
         let high = Some(ReasoningEffort::High);
         let profiles = ModelCatalog::defaults().profiles();
-        let supports_high =
-            |model: &ModelConfig| crate::model::validate_reasoning_effort(model, high).is_ok();
+        let supports_high = |model: &ModelConfig| {
+            tickloop_agent_model::validate_reasoning_effort(model, high).is_ok()
+        };
         let lacking = profiles
             .iter()
             .find(|model| !supports_high(model))
@@ -4926,10 +4857,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (runtime, access, terminal) = recording_terminal(directory.path());
         let config_root = directory.path().canonicalize().unwrap().join("config");
-        let settings = crate::settings::UserSettings::in_root(&config_root);
+        let settings = tickloop_agent_config::UserSettings::in_root(&config_root);
         terminal.use_user_settings(Some(settings.clone()));
         let project = directory.path().canonicalize().unwrap();
-        let saved = |settings: &crate::settings::UserSettings| {
+        let saved = |settings: &tickloop_agent_config::UserSettings| {
             settings
                 .project_rules_with_revision(&project)
                 .unwrap()
@@ -4994,7 +4925,7 @@ mod tests {
                 &current.project_rules,
                 [(
                     project.as_path(),
-                    &crate::settings::ProjectRuleChanges {
+                    &tickloop_agent_config::ProjectRuleChanges {
                         removed: Default::default(),
                         added: vec![elsewhere.clone()],
                     },
@@ -5020,14 +4951,14 @@ mod tests {
                 directory.path(),
                 &latest,
                 runtime::PermissionChange::SelectReviewer {
-                    reviewer: crate::settings::AutoReviewerPreference::Jev,
+                    reviewer: tickloop_agent_protocol::AutoReviewerPreference::Jev,
                 },
             )
             .await;
         assert!(matches!(reviewer, Err(DraftPermissionsError::Rejected(_))));
         assert_eq!(
             settings.auto_settings_with_revision().unwrap().0.reviewer,
-            crate::settings::AutoReviewerPreference::Llm,
+            tickloop_agent_protocol::AutoReviewerPreference::Llm,
             "Jev without a key changes nothing"
         );
 
@@ -5067,11 +4998,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_saved_new_agent_model_is_the_launch_model_for_dispatch_and_the_first_create() {
-        use crate::model::cards::ModelCatalog;
+        use tickloop_agent_model::cards::ModelCatalog;
         let directory = tempfile::tempdir().unwrap();
         let (runtime, access, terminal) = recording_terminal(directory.path());
         let config_root = directory.path().canonicalize().unwrap().join("config");
-        terminal.use_user_settings(Some(crate::settings::UserSettings::in_root(&config_root)));
+        terminal.use_user_settings(Some(tickloop_agent_config::UserSettings::in_root(
+            &config_root,
+        )));
         let initial_model = terminal.launch_spec().model.unwrap().model;
         let chosen = ModelCatalog::defaults()
             .profiles()

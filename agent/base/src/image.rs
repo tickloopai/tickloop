@@ -1,0 +1,257 @@
+use std::io::Cursor;
+
+use ::image::{
+    DynamicImage, GenericImageView, ImageFormat, codecs::jpeg::JpegEncoder, imageops::FilterType,
+};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use tickloop_agent_protocol::{Image, ImageMediaType};
+
+/// Largest source file accepted for preparation; callers read at most this many bytes plus one.
+pub const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+/// Anthropic's per-image base64 limit, shared by every image entry point.
+pub const MAX_BASE64_BYTES: usize = 5 * 1024 * 1024;
+const MAX_DIMENSION: u32 = 2000;
+const JPEG_FALLBACK_QUALITY: u8 = 80;
+
+#[derive(Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ImageError {
+    #[error("image file is empty")]
+    Empty,
+    #[error("unsupported image format; use PNG, JPEG, GIF or WebP")]
+    UnsupportedFormat,
+    #[error("image could not be decoded: {0}")]
+    Undecodable(String),
+    #[error("image could not be re-encoded: {0}")]
+    Encode(String),
+    #[error("image is too large to send even after compression")]
+    TooLarge,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceFormat {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+}
+
+/// Whether the bytes start with the signature of an image format that `prepare` accepts.
+pub fn is_supported_image(bytes: &[u8]) -> bool {
+    source_format(bytes).is_some()
+}
+
+/// Turns image file bytes into a model-ready image: longest side at most 2000px in the
+/// original format, GIF as PNG, and one JPEG re-encode when the base64 exceeds 5 MB.
+pub fn prepare(bytes: &[u8]) -> Result<Image, ImageError> {
+    if bytes.is_empty() {
+        return Err(ImageError::Empty);
+    }
+    if bytes.len() > MAX_SOURCE_BYTES {
+        return Err(ImageError::TooLarge);
+    }
+    let format = source_format(bytes).ok_or(ImageError::UnsupportedFormat)?;
+    let decoded = ::image::load_from_memory_with_format(bytes, format.decoder_format())
+        .map_err(|error| ImageError::Undecodable(error.to_string()))?;
+    let (width, height) = decoded.dimensions();
+    let (pixels, encoded, media_type) = if width.max(height) > MAX_DIMENSION {
+        let resized = decoded.resize(MAX_DIMENSION, MAX_DIMENSION, FilterType::Triangle);
+        let media_type = format.output_media_type();
+        let encoded = encode(&resized, media_type)?;
+        (resized, encoded, media_type)
+    } else if format == SourceFormat::Gif {
+        let encoded = encode(&decoded, ImageMediaType::Png)?;
+        (decoded, encoded, ImageMediaType::Png)
+    } else {
+        (decoded, bytes.to_vec(), format.output_media_type())
+    };
+    let mut image = Image {
+        media_type,
+        data: BASE64.encode(&encoded),
+        width: pixels.width(),
+        height: pixels.height(),
+    };
+    if image.data.len() > MAX_BASE64_BYTES {
+        image.media_type = ImageMediaType::Jpeg;
+        image.data = BASE64.encode(encode(&pixels, ImageMediaType::Jpeg)?);
+        if image.data.len() > MAX_BASE64_BYTES {
+            return Err(ImageError::TooLarge);
+        }
+    }
+    Ok(image)
+}
+
+fn source_format(bytes: &[u8]) -> Option<SourceFormat> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        Some(SourceFormat::Png)
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some(SourceFormat::Jpeg)
+    } else if bytes.starts_with(b"GIF8") {
+        Some(SourceFormat::Gif)
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some(SourceFormat::Webp)
+    } else {
+        None
+    }
+}
+
+impl SourceFormat {
+    fn decoder_format(self) -> ImageFormat {
+        match self {
+            Self::Png => ImageFormat::Png,
+            Self::Jpeg => ImageFormat::Jpeg,
+            Self::Gif => ImageFormat::Gif,
+            Self::Webp => ImageFormat::WebP,
+        }
+    }
+
+    fn output_media_type(self) -> ImageMediaType {
+        match self {
+            Self::Png | Self::Gif => ImageMediaType::Png,
+            Self::Jpeg => ImageMediaType::Jpeg,
+            Self::Webp => ImageMediaType::Webp,
+        }
+    }
+}
+
+fn encode(image: &DynamicImage, media_type: ImageMediaType) -> Result<Vec<u8>, ImageError> {
+    let mut bytes = Vec::new();
+    let result = match media_type {
+        ImageMediaType::Png => image.write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png),
+        ImageMediaType::Webp => image.write_to(&mut Cursor::new(&mut bytes), ImageFormat::WebP),
+        ImageMediaType::Jpeg => JpegEncoder::new_with_quality(&mut bytes, JPEG_FALLBACK_QUALITY)
+            .encode_image(&DynamicImage::ImageRgb8(image.to_rgb8())),
+    };
+    result.map_err(|error| ImageError::Encode(error.to_string()))?;
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::image::{Rgb, RgbImage, Rgba, RgbaImage};
+
+    fn gradient(width: u32, height: u32) -> DynamicImage {
+        DynamicImage::ImageRgba8(RgbaImage::from_fn(width, height, |x, y| {
+            Rgba([(x % 256) as u8, (y % 256) as u8, 128, 255])
+        }))
+    }
+
+    fn encoded(image: &DynamicImage, format: ImageFormat) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let image = if format == ImageFormat::Jpeg {
+            DynamicImage::ImageRgb8(image.to_rgb8())
+        } else {
+            image.clone()
+        };
+        image
+            .write_to(&mut Cursor::new(&mut bytes), format)
+            .unwrap();
+        bytes
+    }
+
+    fn decoded(image: &Image) -> DynamicImage {
+        ::image::load_from_memory(&BASE64.decode(&image.data).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn small_images_keep_their_bytes_and_format_detected_from_the_header() {
+        for (format, media_type) in [
+            (ImageFormat::Png, ImageMediaType::Png),
+            (ImageFormat::Jpeg, ImageMediaType::Jpeg),
+            (ImageFormat::WebP, ImageMediaType::Webp),
+        ] {
+            let bytes = encoded(&gradient(40, 30), format);
+
+            let image = prepare(&bytes).unwrap();
+
+            assert_eq!(image.media_type, media_type);
+            assert_eq!(BASE64.decode(&image.data).unwrap(), bytes);
+            assert_eq!((image.width, image.height), (40, 30));
+            assert!(is_supported_image(&bytes));
+        }
+    }
+
+    #[test]
+    fn images_longer_than_the_limit_shrink_proportionally_in_their_original_format() {
+        for (format, media_type) in [
+            (ImageFormat::Png, ImageMediaType::Png),
+            (ImageFormat::Jpeg, ImageMediaType::Jpeg),
+        ] {
+            let bytes = encoded(&gradient(4000, 1000), format);
+
+            let image = prepare(&bytes).unwrap();
+
+            assert_eq!(image.media_type, media_type);
+            assert_eq!((image.width, image.height), (2000, 500));
+            assert_eq!(decoded(&image).dimensions(), (2000, 500));
+        }
+    }
+
+    #[test]
+    fn images_at_the_limit_are_not_resized() {
+        let bytes = encoded(&gradient(2000, 20), ImageFormat::Png);
+
+        let image = prepare(&bytes).unwrap();
+
+        assert_eq!((image.width, image.height), (2000, 20));
+        assert_eq!(BASE64.decode(&image.data).unwrap(), bytes);
+    }
+
+    #[test]
+    fn gif_images_become_png() {
+        let bytes = encoded(&gradient(12, 8), ImageFormat::Gif);
+
+        let image = prepare(&bytes).unwrap();
+
+        assert_eq!(image.media_type, ImageMediaType::Png);
+        assert_eq!((image.width, image.height), (12, 8));
+        assert_eq!(
+            ::image::guess_format(&BASE64.decode(&image.data).unwrap()).unwrap(),
+            ImageFormat::Png
+        );
+    }
+
+    #[test]
+    fn images_whose_base64_exceeds_the_limit_are_reencoded_as_jpeg_once() {
+        // Low-amplitude noise defeats PNG compression but JPEG smooths it away.
+        let mut seed = 0x2545_f491_u32;
+        let noisy = RgbImage::from_fn(1800, 1800, |x, y| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let noise = (seed % 24) as u8;
+            Rgb([
+                (x / 8) as u8 ^ noise,
+                (y / 8) as u8 ^ noise,
+                noise.wrapping_mul(7),
+            ])
+        });
+        let bytes = encoded(&DynamicImage::ImageRgb8(noisy), ImageFormat::Png);
+        assert!(BASE64.encode(&bytes).len() > MAX_BASE64_BYTES);
+
+        let image = prepare(&bytes).unwrap();
+
+        assert_eq!(image.media_type, ImageMediaType::Jpeg);
+        assert!(image.data.len() <= MAX_BASE64_BYTES);
+        assert_eq!((image.width, image.height), (1800, 1800));
+        assert_eq!(
+            ::image::guess_format(&BASE64.decode(&image.data).unwrap()).unwrap(),
+            ImageFormat::Jpeg
+        );
+    }
+
+    #[test]
+    fn empty_unsupported_and_corrupt_inputs_report_distinct_errors() {
+        let mut corrupt_png = encoded(&gradient(4, 4), ImageFormat::Png);
+        corrupt_png.truncate(20);
+
+        assert_eq!(prepare(&[]), Err(ImageError::Empty));
+        assert_eq!(prepare(b"BM\x00\x00"), Err(ImageError::UnsupportedFormat));
+        assert_eq!(prepare(b"plain text"), Err(ImageError::UnsupportedFormat));
+        assert!(matches!(
+            prepare(&corrupt_png),
+            Err(ImageError::Undecodable(_))
+        ));
+        assert!(!is_supported_image(b"BM\x00\x00"));
+    }
+}

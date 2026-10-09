@@ -1,5 +1,6 @@
 use super::*;
-use crate::tools::{CANCELLED_COMMAND_REASON, CommandSnapshot, CommandState, ToolResult, Tools};
+use tickloop_agent_protocol::{CommandSnapshot, CommandState, ToolResult};
+use tickloop_agent_tools::{CANCELLED_COMMAND_REASON, Tools};
 
 impl Agent {
     pub async fn commands(&self, chat_id: ChatId) -> Result<Vec<CommandSnapshot>, AgentError> {
@@ -274,7 +275,7 @@ fn merge_command_snapshot(
     let Some(existing) = existing else {
         incoming
             .updated_at_ms
-            .get_or_insert_with(crate::private_fs::unix_time_milliseconds);
+            .get_or_insert_with(tickloop_agent_base::private_fs::unix_time_milliseconds);
         return incoming;
     };
     if command_state_is_terminal(&existing.state) {
@@ -284,7 +285,7 @@ fn merge_command_snapshot(
         if incoming.output_bytes > authoritative.output_bytes {
             authoritative.updated_at_ms = incoming
                 .updated_at_ms
-                .or_else(|| Some(crate::private_fs::unix_time_milliseconds()));
+                .or_else(|| Some(tickloop_agent_base::private_fs::unix_time_milliseconds()));
         }
         authoritative.output_bytes = authoritative.output_bytes.max(incoming.output_bytes);
         return authoritative;
@@ -292,7 +293,7 @@ fn merge_command_snapshot(
     if incoming.updated_at_ms.is_none() {
         incoming.updated_at_ms =
             if incoming.state != existing.state || incoming.output_bytes > existing.output_bytes {
-                Some(crate::private_fs::unix_time_milliseconds())
+                Some(tickloop_agent_base::private_fs::unix_time_milliseconds())
             } else {
                 existing.updated_at_ms
             };
@@ -331,10 +332,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::model::{
-        InputModality, ModelClient, ModelConfig, ModelDelta, ModelError, ModelOutput, ModelRequest,
-        Protocol,
-    };
+    use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+    use tickloop_agent_protocol::{InputModality, ModelConfig, Protocol};
 
     struct UnusedModel;
 
@@ -342,18 +341,18 @@ mod tests {
     impl ModelClient for UnusedModel {
         async fn generate_title(
             &self,
-            request: crate::model::ModelRequest,
-            _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+            request: tickloop_agent_model::ModelRequest,
+            _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
             _: tokio_util::sync::CancellationToken,
-        ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-            Ok(crate::model::fixture_title(request))
+        ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+            Ok(tickloop_agent_model::fixture_title(request))
         }
 
-        fn identity(&self) -> tickloop_agent::model::ModelIdentity {
-            tickloop_agent::model::ModelIdentity {
-                provider: crate::model::ModelProvider::Api,
+        fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
+            tickloop_agent_protocol::ModelIdentity {
+                provider: tickloop_agent_protocol::ModelProvider::Api,
                 profile: "fixture".into(),
-                protocol: tickloop_agent::model::Protocol::Messages,
+                protocol: tickloop_agent_protocol::Protocol::Messages,
                 requested_model: "fixture".into(),
             }
         }
@@ -370,8 +369,8 @@ mod tests {
 
     fn model_config() -> ModelConfig {
         ModelConfig {
-            provider: crate::model::ModelProvider::Api,
-            auth_source: crate::model::ModelAuthSource::ApiKeyEnv,
+            provider: tickloop_agent_protocol::ModelProvider::Api,
+            auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
             name: "test".into(),
             protocol: Protocol::Messages,
             base_url: "http://127.0.0.1".into(),
@@ -426,7 +425,7 @@ mod tests {
                     loop_id,
                     run_id: Uuid::new_v4(),
                     call_id: "shell-call".into(),
-                    name: crate::tools::BASH_TOOL_NAME.into(),
+                    name: tickloop_agent_tools::BASH_TOOL_NAME.into(),
                     input: serde_json::json!({"command":"printf agent"}),
                     file_change: None,
                     state: OperationState::Admitted,

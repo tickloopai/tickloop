@@ -41,7 +41,7 @@ struct DaemonFiles {
     lock_path: PathBuf,
 }
 
-pub(super) async fn run(arguments: &[OsString]) -> Result<(), String> {
+pub(crate) async fn run(arguments: &[OsString]) -> Result<(), String> {
     let Some(command) = arguments.first().and_then(|value| value.to_str()) else {
         return Err(DAEMON_USAGE.into());
     };

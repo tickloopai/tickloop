@@ -1,0 +1,229 @@
+[
+  {
+    "Hello": {
+      "process_id": 4242,
+      "major": 11,
+      "minor": 0,
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "session_id": "00000000-0000-0000-0000-000000000051",
+      "capabilities": [
+        "Overview",
+        "ChunkedResponses"
+      ],
+      "limits": {
+        "frame_bytes": 134217728,
+        "source_items": 4096,
+        "feed_items": 1024,
+        "feed_bytes": 8388608,
+        "change_bytes": 1048576,
+        "receipt_items": 4096,
+        "receipt_seconds": 600,
+        "view_lease_seconds": 45,
+        "page_items": 256,
+        "default_page_items": 100,
+        "chunk_bytes": 4194304
+      }
+    }
+  },
+  {
+    "Opened": {
+      "request_id": "00000000-0000-0000-0000-000000000002",
+      "observation_id": "00000000-0000-0000-0000-000000000006",
+      "initial": {
+        "Overview": [
+          {
+            "availability": "Live",
+            "execution": {
+              "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+              "agent_id": "00000000-0000-0000-0000-0000000000a1",
+              "generation": 3
+            },
+            "chat_id": "00000000-0000-0000-0000-0000000000c1",
+            "workdir": "/work/project",
+            "state": "Running",
+            "run_id": "00000000-0000-0000-0000-000000000020",
+            "title": "Counter check",
+            "has_work": true,
+            "updated_at": 2000,
+            "waiting_permissions": 1,
+            "waiting_questions": 0,
+            "parent": null,
+            "record": null,
+            "workspace": "w1",
+            "capabilities": [
+              "Submit"
+            ],
+            "views": [
+              {
+                "view": {
+                  "session_id": "00000000-0000-0000-0000-000000000051",
+                  "view_id": "00000000-0000-0000-0000-000000000052"
+                },
+                "version": 2,
+                "execution": {
+                  "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+                  "agent_id": "00000000-0000-0000-0000-0000000000a1",
+                  "generation": 3
+                },
+                "host": {
+                  "host_instance": "herdr:16777220:42",
+                  "socket": "/run/herdr.sock",
+                  "workspace": "w1",
+                  "tab": "t1",
+                  "pane": "p1",
+                  "terminal": "term-1",
+                  "client": null
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "cursor": {
+        "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+        "execution": {
+          "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+          "agent_id": "00000000-0000-0000-0000-0000000000a1",
+          "generation": 3
+        },
+        "sequence": 17
+      },
+      "reset": "EpochChanged",
+      "feed": true
+    }
+  },
+  {
+    "Changed": {
+      "observation_id": "00000000-0000-0000-0000-000000000006",
+      "update": {
+        "cursor": {
+          "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+          "execution": {
+            "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+            "agent_id": "00000000-0000-0000-0000-0000000000a1",
+            "generation": 3
+          },
+          "sequence": 17
+        },
+        "change": {
+          "Event": {
+            "sequence": 10,
+            "chat_id": "00000000-0000-0000-0000-0000000000c1",
+            "loop_id": "00000000-0000-0000-0000-000000000010",
+            "run_id": "00000000-0000-0000-0000-000000000020",
+            "kind": {
+              "ToolStarted": {
+                "call_id": "call-1",
+                "name": "ReadTick",
+                "input": {
+                  "instance": "herdr:counter"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "Receipt": {
+      "request_id": "00000000-0000-0000-0000-000000000003",
+      "receipt": {
+        "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+        "command_id": "00000000-0000-0000-0000-000000000081",
+        "target": {
+          "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+          "agent_id": "00000000-0000-0000-0000-0000000000a1",
+          "generation": 3
+        },
+        "state": "Completed",
+        "result": {
+          "HostedTicks": [
+            {
+              "instance": "hosted:00000000-0000-0000-0000-000000000040",
+              "title": "Quotes",
+              "state": "running",
+              "resources": {
+                "business_pid": 4242,
+                "cpu_time_ms": 1500,
+                "rss_bytes": null,
+                "sampled_at_ms": 9000
+              }
+            },
+            {
+              "instance": "hosted:00000000-0000-0000-0000-000000000041",
+              "title": null,
+              "state": "lost",
+              "resources": null
+            }
+          ]
+        },
+        "error": null,
+        "persistence": "FlushObserved"
+      }
+    }
+  },
+  {
+    "Display": {
+      "request_id": "00000000-0000-0000-0000-000000000004",
+      "receipt": {
+        "view": {
+          "session_id": "00000000-0000-0000-0000-000000000051",
+          "view_id": "00000000-0000-0000-0000-000000000052"
+        },
+        "version": 2,
+        "displayed": true
+      }
+    }
+  },
+  {
+    "ObservationClosed": {
+      "observation_id": "00000000-0000-0000-0000-000000000006",
+      "error": {
+        "code": "VersionMismatch",
+        "message": "business major 10 is not supported",
+        "latest_permissions": null,
+        "path": null
+      }
+    }
+  },
+  {
+    "Error": {
+      "request_id": null,
+      "error": {
+        "code": "VersionMismatch",
+        "message": "business major 10 is not supported",
+        "latest_permissions": null,
+        "path": null
+      }
+    }
+  },
+  {
+    "ResponseStart": {
+      "request_id": "00000000-0000-0000-0000-000000000002",
+      "transfer_id": "00000000-0000-0000-0000-000000000007",
+      "kind": "Opened",
+      "total_bytes": 10,
+      "chunk_bytes": 8
+    }
+  },
+  {
+    "ResponseChunk": {
+      "transfer_id": "00000000-0000-0000-0000-000000000007",
+      "offset": 8,
+      "base64": "e30="
+    }
+  },
+  {
+    "ResponseEnd": {
+      "transfer_id": "00000000-0000-0000-0000-000000000007",
+      "total_bytes": 10,
+      "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    }
+  },
+  {
+    "DaemonStopped": {
+      "request_id": "00000000-0000-0000-0000-000000000001"
+    }
+  }
+]

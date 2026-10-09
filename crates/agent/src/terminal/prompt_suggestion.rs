@@ -1,14 +1,11 @@
 use std::{path::PathBuf, sync::LazyLock, time::Duration};
 
 use regex::Regex;
-use tickloop_agent::{
-    model::{
-        Content, GenerationBudget, Message, ModelError, ModelRequest, ModelResponseRejection,
-        ReasoningEffort, Role, model_client,
-    },
-    permissions::ExecutionMode,
-    runtime::{ChatSnapshot, LoopState},
+use tickloop_agent::runtime::{ChatSnapshot, LoopState};
+use tickloop_agent_model::{
+    GenerationBudget, ModelError, ModelRequest, ModelResponseRejection, model_client,
 };
+use tickloop_agent_protocol::{Content, ExecutionMode, Message, ReasoningEffort, Role};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -126,7 +123,7 @@ pub(super) async fn generate(
     );
     let model = budget.apply_model_limit(model);
     let reasoning_effort =
-        tickloop_agent::model::validate_reasoning_effort(&model, Some(ReasoningEffort::Off))
+        tickloop_agent_model::validate_reasoning_effort(&model, Some(ReasoningEffort::Off))
             .is_ok()
             .then_some(ReasoningEffort::Off);
     let client = match model_client(model, root.as_deref()) {

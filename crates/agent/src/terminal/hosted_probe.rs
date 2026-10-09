@@ -9,9 +9,9 @@ use uuid::Uuid;
 use super::execution::ConsoleExecution;
 use crate::{
     hosted::tools::HostedMemberState,
-    tick_adapter::{DiscoveryError, MemberFindings, MemberState, TickProbe, TickResources},
-    tick_stream::InstanceRef,
+    monitor_rows::{DiscoveryError, MemberFindings, MemberState, TickProbe, TickResources},
 };
+use tick_protocol::InstanceRef;
 
 pub(super) struct HostedProbe {
     agent: ConsoleExecution,
@@ -26,7 +26,7 @@ impl HostedProbe {
 #[async_trait::async_trait]
 impl TickProbe for HostedProbe {
     fn tick_type(&self) -> &'static str {
-        tick_connect::instance::HOSTED_TYPE
+        tick_protocol::HOSTED_INSTANCE_TYPE
     }
 
     async fn probe(

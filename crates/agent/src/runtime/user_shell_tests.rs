@@ -1,19 +1,15 @@
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
-use tickloop_agent::{
-    model::{
-        Content, InputModality, ModelClient, ModelConfig, ModelDelta, ModelError, ModelOutput,
-        ModelRequest, Protocol, Usage,
-    },
-    runtime::{
-        Agent, ChatSnapshot, EventKind, LoopSnapshot, LoopState, PendingInput, Receipt, Trigger,
-        TriggerSource, UserShellState,
-    },
+use tickloop_agent::runtime::{
+    Agent, ChatSnapshot, EventKind, LoopSnapshot, LoopState, PendingInput, Receipt, Trigger,
+    TriggerSource, UserShellState,
 };
+use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
-use crate::tools::{CommandState, UserCommandSnapshot};
+use tickloop_agent_protocol::{CommandState, Content, InputModality, ModelConfig, Protocol, Usage};
+use tickloop_agent_tools::UserCommandSnapshot;
 
 #[derive(Default)]
 struct CapturingModel {
@@ -31,18 +27,18 @@ struct BlockingModel {
 impl ModelClient for BlockingModel {
     async fn generate_title(
         &self,
-        request: crate::model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        request: tickloop_agent_model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-        Ok(crate::model::fixture_title(request))
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        Ok(tickloop_agent_model::fixture_title(request))
     }
 
-    fn identity(&self) -> tickloop_agent::model::ModelIdentity {
-        tickloop_agent::model::ModelIdentity {
-            provider: crate::model::ModelProvider::Api,
+    fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
+        tickloop_agent_protocol::ModelIdentity {
+            provider: tickloop_agent_protocol::ModelProvider::Api,
             profile: "fixture".into(),
-            protocol: tickloop_agent::model::Protocol::Messages,
+            protocol: tickloop_agent_protocol::Protocol::Messages,
             requested_model: "fixture".into(),
         }
     }
@@ -71,18 +67,18 @@ impl ModelClient for BlockingModel {
 impl ModelClient for CapturingModel {
     async fn generate_title(
         &self,
-        request: crate::model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        request: tickloop_agent_model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-        Ok(crate::model::fixture_title(request))
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        Ok(tickloop_agent_model::fixture_title(request))
     }
 
-    fn identity(&self) -> tickloop_agent::model::ModelIdentity {
-        tickloop_agent::model::ModelIdentity {
-            provider: crate::model::ModelProvider::Api,
+    fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
+        tickloop_agent_protocol::ModelIdentity {
+            provider: tickloop_agent_protocol::ModelProvider::Api,
             profile: "fixture".into(),
-            protocol: tickloop_agent::model::Protocol::Messages,
+            protocol: tickloop_agent_protocol::Protocol::Messages,
             requested_model: "fixture".into(),
         }
     }
@@ -107,8 +103,8 @@ impl ModelClient for CapturingModel {
 
 fn config() -> ModelConfig {
     ModelConfig {
-        provider: crate::model::ModelProvider::Api,
-        auth_source: crate::model::ModelAuthSource::ApiKeyEnv,
+        provider: tickloop_agent_protocol::ModelProvider::Api,
+        auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
         name: "test".into(),
         protocol: Protocol::Messages,
         base_url: "http://127.0.0.1".into(),
@@ -160,13 +156,15 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
         });
         // Transcript 在第一条对话消息写入时才创建，没有消息的 Chat 不会被保存。
         for (role, text) in [
-            (tickloop_agent::model::Role::User, "start the schedule"),
-            (tickloop_agent::model::Role::Assistant, "scheduled"),
+            (tickloop_agent_protocol::Role::User, "start the schedule"),
+            (tickloop_agent_protocol::Role::Assistant, "scheduled"),
         ] {
-            chat.snapshot.messages.push(tickloop_agent::model::Message {
-                role,
-                content: vec![Content::Text { text: text.into() }],
-            });
+            chat.snapshot
+                .messages
+                .push(tickloop_agent_protocol::Message {
+                    role,
+                    content: vec![Content::Text { text: text.into() }],
+                });
         }
         chat.snapshot.last_queue_sequence = 1;
         chat.snapshot.pending_inputs.push(PendingInput {

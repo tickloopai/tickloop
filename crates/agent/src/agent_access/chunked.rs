@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::protocol::*;
-use crate::protocol::AccessLimits;
+use tickloop_agent_protocol::AccessLimits;
 
 pub(super) struct EncodedResponse {
     pub file: File,

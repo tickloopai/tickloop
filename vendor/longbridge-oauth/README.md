@@ -26,7 +26,7 @@ refresh error propagation remain upstream behavior. Runtime refresh does not
 start a browser callback. Tick Loop retains its startup authorization guard.
 
 Regression coverage lives at the application HTTP seam in
-`crates/ticks/tests/auth.rs`: an already constructed OAuth object crosses its
+`tick/cli/tests/all/auth.rs`: an already constructed OAuth object crosses its
 refresh window, calls `access_token()`, reaches the appropriate local AP/US stub,
 and persists renewed credentials. It also covers omitted refresh tokens and
 revocation without including credentials in the displayed error.

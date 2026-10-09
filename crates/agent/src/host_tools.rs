@@ -5,10 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    protocol::{ChatId, ToolDefinition},
-    tools::ToolResult,
-};
+use tickloop_agent_protocol::{ChatId, HerdrPane, ToolDefinition, ToolResult};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HostCallContext {
@@ -20,7 +17,31 @@ pub struct HostCallContext {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HerdrInteraction {
     pub socket: PathBuf,
-    pub pane: tick_connect::herdr::Pane,
+    pub pane: HerdrPane,
+}
+
+/// The Herdr Pane a wire interaction names, as the Herdr Adapter takes it.
+pub fn herdr_adapter_pane(pane: HerdrPane) -> tickhost_connect::herdr::Pane {
+    let HerdrPane {
+        pane_id,
+        terminal_id,
+        workspace_id,
+        tab_id,
+        cwd,
+        foreground_cwd,
+        title,
+        tokens,
+    } = pane;
+    tickhost_connect::herdr::Pane {
+        pane_id,
+        terminal_id,
+        workspace_id,
+        tab_id,
+        cwd,
+        foreground_cwd,
+        title,
+        tokens,
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -195,11 +216,11 @@ pub enum HostCallResult {
 #[derive(Clone, Debug)]
 pub enum HostEffect {
     PublishedSource(PublishedSourceEffect),
-    CreatedArtifact(crate::artifacts::ArtifactTick),
+    CreatedArtifact(tickloop_agent_protocol::ArtifactTick),
     /// A verified open created this Tick Instance for the calling Chat. It joins that Chat's
     /// Monitor without subscribing; a failed or unknown open never produces this effect.
     OpenedTick {
-        instance: tick_connect::instance::InstanceRef,
+        instance: tick_protocol::InstanceRef,
         title: Option<String>,
     },
     /// A strictly validated connection read. It carries the private service envelope, so it is
@@ -218,7 +239,7 @@ pub struct PublishedSourceEffect {
     pub directory_fingerprint: [u8; 32],
     pub bridge_fingerprint: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact_tick: Option<crate::artifacts::ArtifactTick>,
+    pub artifact_tick: Option<tickloop_agent_protocol::ArtifactTick>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -388,6 +409,8 @@ pub struct WorkspaceHostContext {
     /// Whether this Agent can run Ticks hidden in the Tickhost, in any container.
     pub tickhost: WorkspaceIntegration,
     pub tick_executable: Option<PathBuf>,
+    /// The bundled `tickhost`, whose `open` connects a protocol program to Agents.
+    pub tickhost_executable: Option<PathBuf>,
 }
 
 impl WorkspaceHostContext {
@@ -400,12 +423,16 @@ impl WorkspaceHostContext {
         )
     }
 
-    /// The same container, where this Agent can also run hidden Ticks with the bundled `tick`.
+    /// The same container, where this Agent can also run hidden Ticks with the bundled `tick`
+    /// and `tickhost`.
     pub fn with_tickhost(mut self) -> Self {
         self.tickhost = WorkspaceIntegration::Available;
         self.tick_executable = self
             .tick_executable
-            .or_else(tick_connect::access::bundled_tick_executable);
+            .or_else(tickhost_connect::access::bundled_tick_executable);
+        self.tickhost_executable = self
+            .tickhost_executable
+            .or_else(tickhost_connect::access::bundled_tickhost_executable);
         self
     }
 
@@ -424,15 +451,20 @@ impl WorkspaceHostContext {
             integration: WorkspaceIntegration::Unavailable,
             tickhost: WorkspaceIntegration::Unavailable,
             tick_executable: None,
+            tickhost_executable: None,
         }
     }
 
-    pub fn attached_herdr(tick_executable: Option<PathBuf>) -> Self {
+    pub fn attached_herdr(
+        tick_executable: Option<PathBuf>,
+        tickhost_executable: Option<PathBuf>,
+    ) -> Self {
         Self {
             name: WorkspaceHostName::Herdr,
             integration: WorkspaceIntegration::Available,
             tickhost: WorkspaceIntegration::Unavailable,
             tick_executable,
+            tickhost_executable,
         }
     }
 

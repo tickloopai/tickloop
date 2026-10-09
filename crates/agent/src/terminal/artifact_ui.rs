@@ -2,11 +2,9 @@ use super::{
     console::{Console, InputEvent},
     execution::ConsoleExecution,
 };
-use crate::{
-    artifacts::{ArtifactClient, ArtifactError},
-    runtime::TickSubscriptionChange,
-};
+use crate::runtime::TickSubscriptionChange;
 use std::path::Path;
+use tickloop_agent_artifacts::{ArtifactClient, ArtifactError};
 use uuid::Uuid;
 
 pub(super) async fn refresh(
@@ -76,7 +74,7 @@ pub(super) async fn tick_action(
         let artifact = rows
             .iter()
             .find(|row| row.id == subscription_id)
-            .and_then(|row| crate::tick_adapter::artifact_target(&row.instance));
+            .and_then(|row| crate::monitor_rows::artifact_target(&row.instance));
         let Some((origin, artifact_id)) = artifact.filter(|_| matches!(action, 'o' | 'c' | 'f'))
         else {
             console.show_subscriptions_at(chat, rows, subscription_id, action == 'x')?;
@@ -106,7 +104,7 @@ pub(super) async fn tick_action(
         let target = rows
             .iter()
             .find(|row| row.instance.as_str() == id)
-            .and_then(|row| crate::tick_adapter::artifact_target(&row.instance));
+            .and_then(|row| crate::monitor_rows::artifact_target(&row.instance));
         let Some((origin, artifact_id)) = target else {
             return Ok(None);
         };
@@ -306,7 +304,7 @@ pub(super) async fn load_page(
     request: &super::artifacts_picker::ArtifactLoad,
 ) -> Result<
     (
-        crate::artifacts::ArtifactPage,
+        tickloop_agent_artifacts::ArtifactPage,
         std::collections::HashSet<String>,
         bool,
     ),
@@ -360,7 +358,10 @@ async fn apply_choice_with_client(
     match choice.action {
         ArtifactPickerAction::Add => {
             let chat = chat.ok_or("Select a Chat before adding an artifact")?;
-            let tick = artifact.tick(client.origin(), crate::private_fs::unix_time_milliseconds());
+            let tick = artifact.tick(
+                client.origin(),
+                tickloop_agent_base::private_fs::unix_time_milliseconds(),
+            );
             let id = tick.instance_id();
             agent
                 .add_artifact_tick(chat, tick)
@@ -420,8 +421,7 @@ async fn apply_choice_with_client(
                 ));
             }
             if let Some(chat) = chat {
-                let instance =
-                    tick_connect::instance::artifact_instance_id(client.origin(), &artifact.id);
+                let instance = tick_protocol::artifact_instance_id(client.origin(), &artifact.id);
                 remove_local_artifact(agent, console, chat, &instance)
                     .await
                     .map_err(|error| format!("Artifact deleted; local cleanup failed: {error}"))?;
@@ -558,7 +558,7 @@ mod tests {
             None,
         );
         let chat = agent.create_chat(directory.into()).await.unwrap();
-        remote.rows.lock().unwrap().push(serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":tick_connect::instance::artifact_instance_id(origin,"doc"),"every_seconds":60,"accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live","kind":"Protocol","title":"Subscribed document","updated_at_ms":1000})).unwrap());
+        remote.rows.lock().unwrap().push(serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":tick_protocol::artifact_instance_id(origin,"doc"),"every_seconds":60,"accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live","kind":"Protocol","title":"Subscribed document","updated_at_ms":1000})).unwrap());
         (agent, core, remote, chat)
     }
 
@@ -692,7 +692,7 @@ mod tests {
         );
         let agent = ConsoleExecution::from_embedded(core.clone(), test_support::config());
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        let tick = crate::artifacts::ArtifactTick {
+        let tick = tickloop_agent_protocol::ArtifactTick {
             artifact_id: "doc".into(),
             origin: "https://docs.example".into(),
             title: "Feedback".into(),
@@ -816,7 +816,7 @@ mod tests {
             None,
         );
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        let tick = crate::artifacts::ArtifactTick {
+        let tick = tickloop_agent_protocol::ArtifactTick {
             artifact_id: "doc".into(),
             origin: "https://docs.example".into(),
             title: "Feedback".into(),

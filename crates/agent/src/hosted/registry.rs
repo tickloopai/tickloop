@@ -14,19 +14,17 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tick_connect::{host_error::HostError, instance::InstanceRef};
+use tick_protocol::InstanceRef;
 use tickhost::host::{Receipt, TickOwner};
+use tickhost_connect::host_error::HostError;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use super::controller::{HostController, LIFECYCLE_TIMEOUT, OwnerListing, WatchIntents};
 
-use crate::{
-    private_fs::{
-        PRIVATE_FILE_MODE, create_private_directory, replace_file_atomically,
-        unix_time_milliseconds, verify_private_directory,
-    },
-    transcript::retention::RetentionGuard,
+use tickloop_agent_base::private_fs::{
+    PRIVATE_FILE_MODE, create_private_directory, replace_file_atomically, unix_time_milliseconds,
+    verify_private_directory,
 };
 
 const REGISTRY_DIRECTORY: &str = "tickhost";
@@ -36,8 +34,6 @@ const OWNER_FILE: &str = "owner.json";
 const MANIFEST_FILE: &str = "manifest.json";
 const LAUNCH_PREFIX: &str = "launch-";
 const RECORD_EXTENSION: &str = ".json";
-/// How often the daemon checks whether a cleanup still holds a Chat it is deleting.
-const DELETION_SETTLE_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 /// The host's answer for an instance or owner it no longer runs.
 pub const TARGET_GONE: &str = "TargetGone";
 /// The most one registry record, or one owner or Watch message to the host, may serialize to.
@@ -45,16 +41,12 @@ pub const TARGET_GONE: &str = "TargetGone";
 pub const SHARD_BYTES: usize = 1024 * 1024;
 const RECORD_TOO_LARGE: &str = "RecordTooLarge";
 
-/// Whether a Chat may own hosted Ticks. Retention deletion of its Transcript and an explicit
-/// StopSubagent end it; nothing else does. A deleted Chat leaves no state behind once its Ticks end.
+/// Whether a Chat may own hosted Ticks. Only an explicit StopSubagent ends it.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum OwnerState {
     #[default]
     Active,
-    /// A cleanup holding the Chat's retention lock is about to remove its Transcript. The Chat
-    /// keeps its Ticks until the outcome is known; it opens none meanwhile.
-    Deleting { operation: Uuid },
     /// StopSubagent stopped this child Chat; its host cleanup is not yet confirmed.
     Stopping { operation: Uuid },
     /// Only an explicit Continue lets this Chat own Ticks again.
@@ -295,7 +287,6 @@ impl Drop for LifecycleTurn<'_> {
 }
 
 struct RegistryFiles {
-    config_root: PathBuf,
     directory: PathBuf,
     _lease: File,
     writes: std::sync::Mutex<()>,
@@ -322,7 +313,6 @@ impl RegistryFiles {
             ));
         }
         Ok(Self {
-            config_root: config_root.to_path_buf(),
             directory,
             _lease: lease,
             writes: std::sync::Mutex::new(()),
@@ -439,15 +429,6 @@ impl RegistryFiles {
         }
     }
 
-    fn remove_chat(&self, chat: Uuid) -> Result<(), HostError> {
-        let _written = self.written();
-        match std::fs::remove_dir_all(self.chat_directory(chat)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(failed(&error)),
-        }
-    }
-
     /// `chat`'s directory once it is verified as a private real directory; `None` while it does
     /// not exist.
     fn existing_chat_directory(&self, chat: Uuid) -> Result<Option<PathBuf>, HostError> {
@@ -515,18 +496,6 @@ impl RegistryFiles {
             }
         }
         Ok(chats)
-    }
-
-    /// Whether the cleanup that announced `chat`'s deletion is done with it: it no longer holds
-    /// the Chat's retention lock, and no runtime holds it either.
-    fn deletion_finished(&self, chat: Uuid) -> bool {
-        RetentionGuard::exclusive(&self.config_root, chat).is_ok()
-    }
-
-    fn has_transcript(&self, chat: Uuid) -> Result<bool, HostError> {
-        crate::transcript::locate(&self.config_root, chat)
-            .map(|transcript| transcript.is_some())
-            .map_err(|error| failed(&error))
     }
 }
 
@@ -685,14 +654,6 @@ impl RootRegistry {
         }
         match self.owner_state(chat).await? {
             OwnerState::Active => Ok(true),
-            OwnerState::Deleting { operation } => {
-                // A cleanup still holding the retention lock has not finished; until it has, the
-                // Chat keeps its Ticks.
-                let finished = self
-                    .on_files(move |files| Ok(files.deletion_finished(chat)))
-                    .await?;
-                Ok(!finished || !self.settle_deletion(controller, owner, operation).await?)
-            }
             OwnerState::Stopping { operation } => {
                 self.end_stopped(controller, owner, operation).await?;
                 Ok(false)
@@ -805,73 +766,6 @@ impl RootRegistry {
             }
         }
         controller.set_intents(&intents).await
-    }
-
-    /// Records that a cleanup holding `chat`'s retention lock is about to remove its Transcript.
-    pub async fn begin_deletion(&self, chat: Uuid, operation: Uuid) -> Result<(), HostError> {
-        let _lifecycle = self.lifecycle(chat).await;
-        match self.owner_state(chat).await? {
-            OwnerState::Active | OwnerState::Deleting { .. } => {
-                self.set_owner_state(chat, &OwnerState::Deleting { operation })
-                    .await
-            }
-            OwnerState::Stopping { .. } | OwnerState::Stopped { .. } => Ok(()),
-        }
-    }
-
-    /// Settles deletion `operation` of a Chat no runtime can load meanwhile: a Transcript still
-    /// present makes the Chat Active again; a removed one ends its Ticks and drops its state.
-    /// Returns whether the Chat ended. Any other operation or state is left as it is.
-    pub async fn settle_deletion(
-        &self,
-        controller: &HostController,
-        owner: &TickOwner,
-        operation: Uuid,
-    ) -> Result<bool, HostError> {
-        let chat = owner.chat;
-        let _lifecycle = self.lifecycle(chat).await;
-        if self.owner_state(chat).await? != (OwnerState::Deleting { operation }) {
-            return Ok(false);
-        }
-        if self
-            .on_files(move |files| files.has_transcript(chat))
-            .await?
-        {
-            self.set_owner_state(chat, &OwnerState::Active).await?;
-            return Ok(false);
-        }
-        controller
-            .end_owner(owner, self.revision().await?, operation)
-            .await?;
-        self.on_files(move |files| files.remove_chat(chat)).await?;
-        Ok(true)
-    }
-
-    /// Settles deletion `operation` as soon as the cleanup that announced it lets go of the
-    /// Chat, whether or not its finish answer arrives; stops once the Chat is no longer being
-    /// deleted by it.
-    pub async fn settle_deletion_once_released(
-        self: Arc<Self>,
-        controller: Arc<HostController>,
-        owner: TickOwner,
-        operation: Uuid,
-    ) {
-        let chat = owner.chat;
-        loop {
-            tokio::time::sleep(DELETION_SETTLE_POLL).await;
-            match self.owner_state(chat).await {
-                Ok(OwnerState::Deleting { operation: current }) if current == operation => {}
-                _ => return,
-            }
-            let released = self
-                .on_files(move |files| Ok(files.deletion_finished(chat)))
-                .await
-                .unwrap_or(false);
-            if released {
-                let _ = self.settle_deletion(&controller, &owner, operation).await;
-                return;
-            }
-        }
     }
 
     /// Ends the Ticks of a child Chat StopSubagent stopped. The decision is durable before the host

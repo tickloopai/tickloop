@@ -3,7 +3,7 @@
 //! 对话只截断内存：rewind 到某条提示时丢弃它及之后的消息，下一条消息接在最后保留的消息之后，
 //! 在同一 Transcript 中形成分叉，被放弃的消息仍留在文件中。代码按目标提示的文件回滚快照恢复。
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -14,17 +14,15 @@ use uuid::Uuid;
 
 use super::loop_lease::RunStateChange;
 use super::{
-    Agent, AgentError, Chat, ChatSnapshot, Event, EventKind, InputContext, LoopId, LoopSnapshot,
-    LoopState, RunId, UserShellState,
+    Agent, AgentError, Chat, ChatBookkeeping, ChatSnapshot, Event, EventKind, InputContext, LoopId,
+    LoopSnapshot, LoopState, RunId, UserShellState,
 };
 use crate::file_history::{
     FileHistoryError, FileHistorySnapshot, FileRestoreReport, create_first_backup,
 };
-use crate::model::{Content, Message};
-use crate::permissions::ExecutionMode;
-use crate::private_fs::PrivateDirectory;
-use crate::protocol::ChatId;
 use crate::transcript::private_project_temp_directory;
+use tickloop_agent_base::private_fs::PrivateDirectory;
+use tickloop_agent_protocol::{ChatId, Content, ExecutionMode, Message};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum RewindMode {
@@ -82,7 +80,7 @@ pub struct RewindOutcome {
 
 impl ChatSnapshot {
     pub fn conversation_messages(&self) -> Result<Vec<Message>, AgentError> {
-        super::context::projected_messages(self)
+        super::context::projected_messages(self, &BTreeMap::new())
     }
 
     pub fn conversation_events(&self) -> Vec<Event> {
@@ -166,7 +164,7 @@ impl Agent {
                 .map(|goal| goal.id)
                 .collect::<HashSet<_>>();
             if mode.restores_conversation() {
-                conversation_before(&chat.snapshot, &point, &loops_at_start)?;
+                conversation_before(&chat.snapshot, &chat.bookkeeping, &point, &loops_at_start)?;
             }
             chat.active = Some(CancellationToken::new());
             (point, chat.file_history.clone(), loops_at_start)
@@ -270,11 +268,13 @@ impl Agent {
             }),
         };
         let draft = if mode.restores_conversation() {
-            let (candidate, loop_id) = conversation_before(&chat.snapshot, &point, loops_at_start)?;
+            let (candidate, candidate_bookkeeping, loop_id) =
+                conversation_before(&chat.snapshot, &chat.bookkeeping, &point, loops_at_start)?;
             if let Some(recorder) = &self.inner.recorder {
-                recorder.truncate(&mut chat.snapshot, point.message_index);
+                recorder.truncate(&chat.snapshot, &chat.bookkeeping, point.message_index);
             }
             chat.snapshot = candidate;
+            chat.bookkeeping = candidate_bookkeeping;
             self.reset_restored_todo_graces(chat);
             self.emit_conversation_rewound(chat, loop_id, point.message_id);
             Some(RewindDraft {
@@ -430,11 +430,13 @@ impl Agent {
 /// 连同其排队输入、权限请求与提问；占用期间新建的 Loop 保留，创建位置移到截断点。
 fn conversation_before(
     snapshot: &ChatSnapshot,
+    bookkeeping: &ChatBookkeeping,
     point: &RewindPoint,
     loops_at_start: &HashSet<LoopId>,
-) -> Result<(ChatSnapshot, LoopId), AgentError> {
+) -> Result<(ChatSnapshot, ChatBookkeeping, LoopId), AgentError> {
     let index = point.message_index;
     let mut candidate = snapshot.clone();
+    let mut candidate_bookkeeping = bookkeeping.clone();
     let goal = prompt_loop_goal(snapshot, index).unwrap_or_else(|| point.prompt.clone());
     let kept_runs = candidate
         .message_runs
@@ -450,7 +452,7 @@ fn conversation_before(
     candidate.messages.truncate(index);
     candidate.message_runs.split_off(&index);
     candidate.message_contexts.split_off(&index);
-    candidate.denial_references.split_off(&index);
+    candidate_bookkeeping.denial_references.split_off(&index);
     candidate.message_ids.split_off(&index);
     candidate.original_user_message_ids.split_off(&index);
     candidate.prompt_execution_modes.split_off(&index);
@@ -475,13 +477,13 @@ fn conversation_before(
         .events
         .retain(|event| !abandoned_runs.contains(&event.run_id));
     // Loop 随对话链生效：截断位置或之后创建的 Loop 在新的对话链上不存在。
-    let removed_loops = candidate
+    let removed_loops = candidate_bookkeeping
         .loop_starts
         .iter()
         .filter(|(loop_id, start)| **start >= index && loops_at_start.contains(loop_id))
         .map(|(loop_id, _)| *loop_id)
         .collect::<HashSet<_>>();
-    for start in candidate.loop_starts.values_mut() {
+    for start in candidate_bookkeeping.loop_starts.values_mut() {
         *start = (*start).min(index);
     }
     candidate
@@ -496,7 +498,7 @@ fn conversation_before(
     candidate
         .loops
         .retain(|goal| !removed_loops.contains(&goal.id));
-    candidate
+    candidate_bookkeeping
         .loop_starts
         .retain(|loop_id, _| !removed_loops.contains(loop_id));
     candidate
@@ -505,7 +507,7 @@ fn conversation_before(
     candidate
         .plans
         .retain(|plan| !removed_loops.contains(&plan.loop_id));
-    candidate
+    candidate_bookkeeping
         .unavailable_plan_versions
         .retain(|loop_id, _| !removed_loops.contains(loop_id));
     candidate
@@ -515,19 +517,22 @@ fn conversation_before(
         candidate.policy.mode = point.execution_mode;
         candidate.policy.revision += 1;
     }
-    super::context::projected_messages(&candidate)?;
+    super::context::projected_messages(&candidate, &candidate_bookkeeping.denial_references)?;
     let loop_id = Uuid::new_v4();
-    candidate.add_loop(LoopSnapshot {
-        id: loop_id,
-        goal,
-        state: LoopState::Idle,
-        run_id: None,
-        run_started_at: None,
-        trigger: None,
-        event_sources: Vec::new(),
-        state_since: None,
-    });
-    Ok((candidate, loop_id))
+    candidate_bookkeeping.add_loop(
+        &mut candidate,
+        LoopSnapshot {
+            id: loop_id,
+            goal,
+            state: LoopState::Idle,
+            run_id: None,
+            run_started_at: None,
+            trigger: None,
+            event_sources: Vec::new(),
+            state_since: None,
+        },
+    );
+    Ok((candidate, candidate_bookkeeping, loop_id))
 }
 
 /// 目标提示所属 Loop 的目标文字。提示的 run 仍是 Loop 当前 run、有用量或操作记录时直接对应；
@@ -604,11 +609,9 @@ mod tests {
 
     use super::*;
     use crate::file_history::test_pause;
-    use crate::model::{
-        InputModality, ModelClient, ModelConfig, ModelDelta, ModelError, ModelIdentity,
-        ModelOutput, ModelRequest, Protocol, Usage,
-    };
     use crate::runtime::{Event, Receipt, UserShellRecord};
+    use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+    use tickloop_agent_protocol::{InputModality, ModelConfig, ModelIdentity, Protocol, Usage};
 
     const WRITE_PREFIX: &str = "write ";
     const STEP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -620,16 +623,16 @@ mod tests {
     impl ModelClient for EditingModel {
         async fn generate_title(
             &self,
-            request: crate::model::ModelRequest,
-            _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+            request: tickloop_agent_model::ModelRequest,
+            _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
             _: tokio_util::sync::CancellationToken,
-        ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-            Ok(crate::model::fixture_title(request))
+        ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+            Ok(tickloop_agent_model::fixture_title(request))
         }
 
         fn identity(&self) -> ModelIdentity {
             ModelIdentity {
-                provider: crate::model::ModelProvider::Api,
+                provider: tickloop_agent_protocol::ModelProvider::Api,
                 profile: "fixture".into(),
                 protocol: Protocol::Messages,
                 requested_model: "fixture".into(),
@@ -951,8 +954,8 @@ mod tests {
 
     fn config() -> ModelConfig {
         ModelConfig {
-            provider: crate::model::ModelProvider::Api,
-            auth_source: crate::model::ModelAuthSource::ApiKeyEnv,
+            provider: tickloop_agent_protocol::ModelProvider::Api,
+            auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
             name: "fixture".into(),
             protocol: Protocol::Messages,
             base_url: "http://127.0.0.1".into(),
@@ -1017,7 +1020,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let agent = Agent::new_embedded(
             config(),
-            Arc::new(crate::model::HttpModelClient::new(config()).unwrap()),
+            Arc::new(tickloop_agent_model::HttpModelClient::new(config()).unwrap()),
         );
         let chat_id = agent.create_chat(directory.path().into()).await.unwrap();
         {

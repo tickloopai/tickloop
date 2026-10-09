@@ -1,5 +1,6 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tickloop_agent_protocol::Content;
 
 const QUEUE_FIXTURE: &str = "TICKLOOP_PENDING_INPUT_FIXTURE";
 const QUEUE_ROUTE: &str = "TICKLOOP_PENDING_INPUT_ROUTE";
@@ -47,11 +48,11 @@ impl AgentAccess for QueueAccess {
 impl ModelClient for QueueModel {
     async fn generate_title(
         &self,
-        request: crate::model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        request: tickloop_agent_model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-        Ok(crate::model::fixture_title(request))
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        Ok(tickloop_agent_model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {

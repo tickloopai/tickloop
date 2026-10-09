@@ -10,15 +10,12 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use super::{
-    ActiveConversationItem, Agent, AgentError, Chat, ChatSnapshot, InputContext, LoopId, LoopState,
-    OperationState, RequestUsageLedger, RunId, SummaryDirection, UserShellState,
+    ActiveConversationItem, Agent, AgentError, Chat, ChatBookkeeping, ChatSnapshot, InputContext,
+    LoopId, LoopState, OperationState, RequestUsageLedger, RunId, SummaryDirection, UserShellState,
     tool_results::ContentReplacementState,
 };
-use crate::{
-    model::{Content, Message, Protocol, Role},
-    permissions::PermissionPolicy,
-    protocol::ChatId,
-    tools::CommandState,
+use tickloop_agent_protocol::{
+    ChatId, CommandState, Content, Message, PermissionPolicy, Protocol, Role,
 };
 
 const MAX_BRANCH_NAME_CHARACTERS: usize = 100;
@@ -222,7 +219,7 @@ impl Agent {
             .iter()
             .map(|directory| canonical_directory(directory))
             .collect::<Result<Vec<_>, _>>()?;
-        let seed = public_seed_with_sources(&source.snapshot)?;
+        let seed = public_seed_with_sources(source)?;
         let model_seed = seed
             .iter()
             .map(|(message, _)| message.clone())
@@ -235,7 +232,6 @@ impl Agent {
         }
 
         let child_chat_id = unused_chat_id(&chats);
-        let retention = self.retain_chat(child_chat_id)?;
         let name = branch_title(
             requested_name.as_deref(),
             &public_seed,
@@ -265,7 +261,7 @@ impl Agent {
                 source_raw_boundary: source.snapshot.messages.len(),
                 source_public_boundary: public_seed.len(),
                 source_fingerprint,
-                created_at_ms: crate::private_fs::unix_time_milliseconds(),
+                created_at_ms: tickloop_agent_base::private_fs::unix_time_milliseconds(),
                 model_seed_message_count: model_seed.len(),
                 model_seed_start: 0,
                 public_seed,
@@ -296,7 +292,6 @@ impl Agent {
             invoked_skills: source.snapshot.invoked_skills.clone(),
             message_runs: BTreeMap::new(),
             message_contexts: BTreeMap::new(),
-            denial_references: BTreeMap::new(),
             message_ids: BTreeMap::new(),
             agent_message_origins: source.snapshot.agent_message_origins.clone(),
             human_family_origins: source.snapshot.human_family_origins.clone(),
@@ -308,7 +303,6 @@ impl Agent {
             message_sources: BTreeMap::new(),
             message_models: BTreeMap::new(),
             loops: Vec::new(),
-            loop_starts: BTreeMap::new(),
             resume_triggers: Vec::new(),
             last_sequence: 0,
             permissions: Vec::new(),
@@ -318,7 +312,6 @@ impl Agent {
             last_queue_sequence: 0,
             operations: Vec::new(),
             policy: PermissionPolicy::default(),
-            persistent_rule_projects: BTreeMap::new(),
             additional_directories,
             events: Vec::new(),
             pending_thinking: BTreeMap::new(),
@@ -326,22 +319,24 @@ impl Agent {
             pending_model: None,
             plans: Vec::new(),
             progress: Vec::new(),
-            plan_slug: source.snapshot.plan_slug.clone(),
-            unavailable_plan_versions: BTreeMap::new(),
-            run_loops: BTreeMap::new(),
             commands: Vec::new(),
             user_shells: Vec::new(),
             last_model_run: None,
         };
-        let output_style = self.apply_new_chat_settings(&mut snapshot);
+        let mut bookkeeping = ChatBookkeeping {
+            plan_slug: source.bookkeeping.plan_slug.clone(),
+            ..ChatBookkeeping::default()
+        };
+        let output_style = self.apply_new_chat_settings(&mut snapshot, &mut bookkeeping);
         carry_rewind_points(&mut snapshot, &source.snapshot, &seed);
         carry_compaction_summaries(&mut snapshot, &source.snapshot, &seed);
-        carry_loops(&mut snapshot, &source.snapshot, &seed);
-        carry_plans_and_progress(&mut snapshot, &source.snapshot);
+        carry_loops(&mut snapshot, &mut bookkeeping, source, &seed);
+        carry_plans_and_progress(&mut snapshot, &mut bookkeeping, source);
         // 照 Claude Code `copyPlanForFork`：Branch 使用新的 slug 并复制计划文件，之后双方各自修改。
         let plans_directory = self.plans_directory(&snapshot.workdir);
         super::plan::copy_plans_to_new_slug(
             &mut snapshot,
+            &mut bookkeeping,
             plans_directory
                 .create()
                 .is_ok()
@@ -369,12 +364,12 @@ impl Agent {
             )
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
         if let Some(recorder) = &self.inner.recorder
-            && let Some(source) = chats.get_mut(&request.source_chat_id)
+            && let Some(source) = chats.get(&request.source_chat_id)
         {
-            recorder.register_branch(&mut source.snapshot, child_chat_id, &name);
+            recorder.register_branch(&source.snapshot, &source.bookkeeping, child_chat_id, &name);
         }
         let tools = self.create_chat_tools(&snapshot);
-        let skills = crate::skills::SkillRegistry::discover(
+        let skills = tickloop_agent_config::skills::SkillRegistry::discover(
             &snapshot.workdir,
             self.inner.user_skills_directory.as_deref(),
         );
@@ -399,9 +394,9 @@ impl Agent {
             Chat {
                 family_generation: 0,
                 snapshot: snapshot.clone(),
+                bookkeeping,
                 todo_completion_graces: Default::default(),
                 start_new_tool_result_message: false,
-                retention,
                 // 备份在锁外复制完成之前占住子 Chat，不能开始 Run 或 rewind。
                 active: Some(tokio_util::sync::CancellationToken::new()),
                 active_run: None,
@@ -581,10 +576,11 @@ fn materialize_active_items(
 }
 
 /// 源 Chat 发给模型的公开对话（去掉私有推理与空消息），以及每条消息投影自的源消息下标。
-fn public_seed_with_sources(
-    source: &ChatSnapshot,
-) -> Result<Vec<(Message, Option<usize>)>, AgentError> {
-    let mut seed = super::context::projected_messages_with_sources(source)?;
+fn public_seed_with_sources(source: &Chat) -> Result<Vec<(Message, Option<usize>)>, AgentError> {
+    let mut seed = super::context::projected_messages_with_sources(
+        &source.snapshot,
+        &source.bookkeeping.denial_references,
+    )?;
     for (message, _) in &mut seed {
         message.content.retain(|content| {
             !matches!(
@@ -635,17 +631,28 @@ fn carry_rewind_points(
 /// Branch 按当前对话链复制，分出点之前创建的 Loop 就是源 Chat 当前的全部 Loop。它们照重启恢复
 /// 的规则进入子 Chat：运行或等待中的转为已中断，武装中的 Trigger 解除武装，由用户向该 Loop
 /// 提交输入时重新武装。创建位置换算到复制对话中第一条晚于创建位置的消息之前。
-fn carry_loops(child: &mut ChatSnapshot, source: &ChatSnapshot, seed: &[(Message, Option<usize>)]) {
-    for goal in &source.loops {
-        let source_start = source.loop_starts.get(&goal.id).copied().unwrap_or(0);
+fn carry_loops(
+    child: &mut ChatSnapshot,
+    child_bookkeeping: &mut ChatBookkeeping,
+    source: &Chat,
+    seed: &[(Message, Option<usize>)],
+) {
+    for goal in &source.snapshot.loops {
+        let source_start = source
+            .bookkeeping
+            .loop_starts
+            .get(&goal.id)
+            .copied()
+            .unwrap_or(0);
         let child_start = seed
             .iter()
             .position(|(_, source_index)| source_index.is_some_and(|index| index >= source_start))
             .unwrap_or(seed.len());
-        child.loop_starts.insert(goal.id, child_start);
+        child_bookkeeping.loop_starts.insert(goal.id, child_start);
         child.loops.push(goal.clone());
     }
     child.resume_triggers = source
+        .snapshot
         .resume_triggers
         .iter()
         .copied()
@@ -655,9 +662,14 @@ fn carry_loops(child: &mut ChatSnapshot, source: &ChatSnapshot, seed: &[(Message
 }
 
 /// Copies Loop plans and progress without process-local approvals or execution modes.
-fn carry_plans_and_progress(child: &mut ChatSnapshot, source: &ChatSnapshot) {
+fn carry_plans_and_progress(
+    child: &mut ChatSnapshot,
+    child_bookkeeping: &mut ChatBookkeeping,
+    source: &Chat,
+) {
     let carries = |loop_id: &LoopId| child.loops.iter().any(|goal| goal.id == *loop_id);
     let plans = source
+        .snapshot
         .plans
         .iter()
         .filter(|plan| carries(&plan.loop_id))
@@ -667,13 +679,15 @@ fn carry_plans_and_progress(child: &mut ChatSnapshot, source: &ChatSnapshot) {
         })
         .collect();
     let progress = source
+        .snapshot
         .progress
         .iter()
         .filter(|progress| carries(&progress.loop_id))
         .cloned()
         .collect();
     child.plans = plans;
-    child.unavailable_plan_versions = source
+    child_bookkeeping.unavailable_plan_versions = source
+        .bookkeeping
         .unavailable_plan_versions
         .iter()
         .filter(|(loop_id, _)| carries(loop_id))
@@ -1028,10 +1042,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::model::{
-        InputModality, ModelClient, ModelConfig, ModelDelta, ModelError, ModelIdentity,
-        ModelOutput, ModelRequest, Protocol,
-    };
+    use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+    use tickloop_agent_protocol::{InputModality, ModelConfig, ModelIdentity, Protocol};
 
     struct UnusedModel;
 
@@ -1039,16 +1051,16 @@ mod tests {
     impl ModelClient for UnusedModel {
         async fn generate_title(
             &self,
-            request: crate::model::ModelRequest,
-            _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+            request: tickloop_agent_model::ModelRequest,
+            _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
             _: tokio_util::sync::CancellationToken,
-        ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-            Ok(crate::model::fixture_title(request))
+        ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+            Ok(tickloop_agent_model::fixture_title(request))
         }
 
         fn identity(&self) -> ModelIdentity {
             ModelIdentity {
-                provider: crate::model::ModelProvider::Api,
+                provider: tickloop_agent_protocol::ModelProvider::Api,
                 profile: "branch-test".into(),
                 protocol: Protocol::Messages,
                 requested_model: "branch-test".into(),
@@ -1067,8 +1079,8 @@ mod tests {
 
     fn model_config() -> ModelConfig {
         ModelConfig {
-            provider: crate::model::ModelProvider::Api,
-            auth_source: crate::model::ModelAuthSource::ApiKeyEnv,
+            provider: tickloop_agent_protocol::ModelProvider::Api,
+            auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
             name: "branch-test".into(),
             protocol: Protocol::Messages,
             base_url: "http://127.0.0.1".into(),
@@ -1213,27 +1225,29 @@ mod tests {
                     state_since: None,
                 }),
                 Self::AgentShell(state) => {
-                    chat.snapshot.commands.push(crate::tools::CommandSnapshot {
-                        updated_at_ms: None,
-                        operation_id: Uuid::new_v4(),
-                        loop_id,
-                        command: "sleep 30".into(),
-                        description: None,
-                        cwd: chat.snapshot.workdir.clone(),
-                        pid: Some(42),
-                        state: state.clone(),
-                        was_background: false,
-                        backgrounded_on_timeout: false,
-                        exit_code: None,
-                        signal: None,
-                        reason: None,
-                        output_ref: chat
-                            .tools
-                            .chat_directory()
-                            .path()
-                            .join("busy-agent-shell.log"),
-                        output_bytes: 0,
-                    });
+                    chat.snapshot
+                        .commands
+                        .push(tickloop_agent_protocol::CommandSnapshot {
+                            updated_at_ms: None,
+                            operation_id: Uuid::new_v4(),
+                            loop_id,
+                            command: "sleep 30".into(),
+                            description: None,
+                            cwd: chat.snapshot.workdir.clone(),
+                            pid: Some(42),
+                            state: state.clone(),
+                            was_background: false,
+                            backgrounded_on_timeout: false,
+                            exit_code: None,
+                            signal: None,
+                            reason: None,
+                            output_ref: chat
+                                .tools
+                                .chat_directory()
+                                .path()
+                                .join("busy-agent-shell.log"),
+                            output_bytes: 0,
+                        });
                 }
                 Self::UserShell(state) => {
                     chat.snapshot

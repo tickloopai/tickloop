@@ -9,7 +9,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use reqwest::Url;
-use tickloop_agent::image::{self, Image, ImageError};
+use tickloop_agent_base::image::{self, Image, ImageError};
 
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
 const FILE_URL_SCHEME: &str = "file";

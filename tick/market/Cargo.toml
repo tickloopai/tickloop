@@ -1,0 +1,39 @@
+[package]
+name = "tickloop-tick-market"
+description = "The financial Ticks: quote, watchlist, kline, positions, news, earnings, options and reader"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "tick_market"
+doctest = false
+
+[dependencies]
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+futures-util = "0.3"
+libc = "0.2"
+ratatui = "0.30"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+schemars = "1"
+scraper = "0.22"
+sha1 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tickloop-tick-protocol = { path = "../protocol" }
+tickloop-tick-provider = { path = "../provider" }
+tickloop-tick-sdk = { path = "../sdk" }
+tickloop-ui = { path = "../../crates/ui" }
+time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
+time-tz = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "io-std", "io-util", "sync"] }
+tempfile = "3"
+tokio-stream = { version = "0.1", features = ["signal"] }
+toml = "0.8"
+
+[dev-dependencies]
+tickloop-tick-builtin = { path = "../providers/builtin" }
+tokio = { version = "1", features = ["test-util"] }

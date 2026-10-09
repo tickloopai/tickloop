@@ -8,12 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod screen {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/screen.rs"
-    ));
-}
+use crate::terminal::test_support::screen;
 
 const DIRECTORY: &str = "TICKLOOP_SETTINGS_UX_FIXTURE_DIR";
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -25,13 +20,13 @@ fn settings_ux_pty_fixture() {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             let directory = PathBuf::from(std::env::var_os(DIRECTORY).unwrap()).canonicalize().unwrap();
             let root = directory.join("config");
-            crate::model::credentials::save_api_key(&root, "DEEPSEEK_API_KEY", "fixture-key").unwrap();
-            crate::model::credentials::save_api_key(&root, "MINIMAX_GLOBAL_API_KEY", "fixture-minimax-key").unwrap();
+            tickloop_agent_model::credentials::save_api_key(&root, "DEEPSEEK_API_KEY", "fixture-key").unwrap();
+            tickloop_agent_model::credentials::save_api_key(&root, "MINIMAX_GLOBAL_API_KEY", "fixture-minimax-key").unwrap();
             let discovery = std::env::var("TICKLOOP_SETTINGS_UX_MODE").as_deref() == Ok("discovery");
-            if discovery { crate::model::credentials::save_api_key(&root, "ANTHROPIC_API_KEY", "fixture-anthropic-key").unwrap(); }
+            if discovery { tickloop_agent_model::credentials::save_api_key(&root, "ANTHROPIC_API_KEY", "fixture-anthropic-key").unwrap(); }
             let model = if discovery {
-                crate::model::cards::ModelCatalog::defaults().get("anthropic-api", "claude-opus-5").unwrap()
-            } else { crate::model::cards::ModelCatalog::defaults().get("deepseek-api", "deepseek-flash").unwrap() };
+                tickloop_agent_model::cards::ModelCatalog::defaults().get("anthropic-api", "claude-opus-5").unwrap()
+            } else { tickloop_agent_model::cards::ModelCatalog::defaults().get("deepseek-api", "deepseek-flash").unwrap() };
             let settings = UserSettings::in_root(&root);
             let core = crate::runtime::Agent::new_with_user_settings_embedded(model.clone(), Arc::new(test_support::ScriptedModel::new(Vec::new())), settings.clone());
             let embedded = EmbeddedAgentAccess::new(core.clone());
@@ -153,22 +148,22 @@ impl AgentAccess for FixtureAccess {
             while !self.directory.join("release-discovery").exists() {
                 tokio::time::sleep(Duration::from_millis(15)).await;
             }
-            let models = crate::model::cards::ModelCatalog::defaults()
+            let models = tickloop_agent_model::cards::ModelCatalog::defaults()
                 .profiles()
                 .into_iter()
                 .filter(|model| model.provider_id == config.provider_id)
                 .map(|model| {
                     (
                         model.model,
-                        crate::model::availability::ModelAvailability::DirectoryListed,
+                        tickloop_agent_protocol::ModelAvailability::DirectoryListed,
                     )
                 })
                 .collect();
             return Ok(Observation {
                 initial: ObservationValue::AccountModels(Ok(
-                    crate::model::availability::AccountModelDirectory {
+                    tickloop_agent_protocol::AccountModelDirectory {
                         models,
-                        semantics: crate::model::availability::DirectorySemantics::Directory,
+                        semantics: tickloop_agent_protocol::DirectorySemantics::Directory,
                         complete: true,
                     },
                 )),
@@ -580,7 +575,7 @@ fn settings_ux_pty_provider_credential_escape_leaves_field_then_pages() {
     fixture.send(b"\x1b");
     fixture.wait(|frame| !frame.contains("Choose Provider") && frame.contains("Ctrl+G editor"));
     assert_eq!(
-        crate::model::credentials::load_api_key(
+        tickloop_agent_model::credentials::load_api_key(
             &fixture
                 .directory
                 .path()

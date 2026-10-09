@@ -5,7 +5,7 @@ use std::{
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tick_connect::access::{
+use tickhost_connect::access::{
     AccessContext, AccessPermission, PreparedOperation, TickAccess, TickLocation,
 };
 use tokio_util::sync::CancellationToken;
@@ -13,12 +13,11 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     host_tools::{
         HostCallContext, HostCallResult, HostEffect, HostEndpointIdentity, HostToolPermission,
-        HostToolProvider, PreparedHostCall, WorkspaceHostContext,
+        HostToolProvider, PreparedHostCall, WorkspaceHostContext, herdr_adapter_pane,
     },
-    protocol::{ChatId, ToolDefinition},
     tick_tool_router::TickBackends,
-    tools::ToolResult,
 };
+use tickloop_agent_protocol::{ChatId, ToolDefinition, ToolResult};
 
 /// The Herdr backend of the native Tick tools: Workspace discovery and the Panes it lists or
 /// opens visibly. A worker installs it behind [`crate::tick_tool_router::TickToolRouter`].
@@ -91,7 +90,8 @@ impl NativeHostToolProvider {
                         &AccessContext {
                             workdir: context.workdir.clone(),
                             workspace_id: context.workspace_id.clone(),
-                            interaction: interaction.map(|source| source.pane.clone()),
+                            interaction: interaction
+                                .map(|source| herdr_adapter_pane(source.pane.clone())),
                         },
                     )
                     .await
@@ -175,7 +175,8 @@ impl HostToolProvider for NativeHostToolProvider {
 
     fn workspace_host_context(&self) -> Option<WorkspaceHostContext> {
         Some(WorkspaceHostContext::attached_herdr(
-            tick_connect::access::bundled_tick_executable(),
+            tickhost_connect::access::bundled_tick_executable(),
+            tickhost_connect::access::bundled_tickhost_executable(),
         ))
     }
 

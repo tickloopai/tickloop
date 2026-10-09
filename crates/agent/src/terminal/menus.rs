@@ -12,12 +12,6 @@ use std::{
 
 use tickloop_agent::{
     agent_access::ConfigurationChange,
-    file_change::load_file_change_review,
-    model::{ModelConfig, Protocol, ReasoningEffort},
-    output_style::OutputStyle,
-    permissions::{
-        ExecutionMode, PermissionRuleCandidate, PermissionScope, permission_rule_candidates,
-    },
     runtime::{
         ChatSnapshot, CounterSummary, CounterTotal, DirectedSummaryRequest, EventKind,
         PermissionApprovalSource, PermissionChange, PermissionChangeError, PermissionRequest,
@@ -25,8 +19,13 @@ use tickloop_agent::{
         ResponseRejection, RewindMode, RewindOutcome, SummaryDirection, UsageCounter,
         UsageCoverage, UsageSummary,
     },
-    settings::{AutoReviewerPreference, DisplayPreferences, GlyphSet, UserSettings},
-    tools::ENTER_PLAN_MODE_TOOL_NAME,
+};
+use tickloop_agent_base::output_style::OutputStyle;
+use tickloop_agent_config::{DisplayPreferences, GlyphSet, UserSettings};
+use tickloop_agent_tools::{
+    ENTER_PLAN_MODE_TOOL_NAME,
+    file_change::load_file_change_review,
+    permissions::{PermissionRuleCandidate, permission_rule_candidates},
 };
 use uuid::Uuid;
 
@@ -44,6 +43,10 @@ use super::{
     safe_line, safe_text, settings,
     style::ThemeName,
     workflows::{self, Workflow},
+};
+use tickloop_agent_model::{ModelConfigExt, ReasoningEffortExt};
+use tickloop_agent_protocol::{
+    AutoReviewerPreference, ExecutionMode, ModelConfig, PermissionScope, Protocol, ReasoningEffort,
 };
 
 pub(super) const REDUCE_MOTION_SETTING_INDEX: usize = 9;
@@ -464,7 +467,7 @@ pub(super) struct Menus {
     provider: providers::ProviderSession,
     config_root: Option<PathBuf>,
     refresh_connections: HashMap<(Option<Uuid>, String), Uuid>,
-    model_discovery: tickloop_agent::model::availability::AccountModelDiscovery,
+    model_discovery: tickloop_agent_model::availability::AccountModelDiscovery,
     font_manager: Option<NerdFontManager<SystemFontAdapter>>,
     /// Where the next New Agent will be created; its saved project rules are shown before the
     /// first input.
@@ -1266,7 +1269,7 @@ impl Menus {
         mut menu: Menu,
         selection: Selection,
         comment_options: Vec<usize>,
-        review: Result<tickloop_agent::file_change::FileChangeReview, String>,
+        review: Result<tickloop_agent_tools::file_change::FileChangeReview, String>,
     ) -> Result<(), String> {
         if self.prepare_dialog(console, selection.request_id())? == RequestPresentation::Deferred {
             return Ok(());
@@ -1311,9 +1314,9 @@ impl Menus {
             }
             ConfigTarget::NewDraft => HashMap::new(),
         };
-        let catalog = tickloop_agent::model::cards::ModelCatalog::defaults();
-        let defaults = tickloop_agent::model::cards::ModelCatalog::defaults();
-        let access = tickloop_agent::model::access::AccessCatalog::defaults();
+        let catalog = tickloop_agent_model::cards::ModelCatalog::defaults();
+        let defaults = tickloop_agent_model::cards::ModelCatalog::defaults();
+        let access = tickloop_agent_model::access::AccessCatalog::defaults();
         access.validate(&catalog)?;
         let profiles = catalog
             .profiles()
@@ -1321,15 +1324,15 @@ impl Menus {
             .filter(|profile| {
                 access
                     .ordinary_candidate(profile, &defaults)
-                    .unwrap_or_else(|| tickloop_agent::model::cards::is_default_visible(profile))
+                    .unwrap_or_else(|| tickloop_agent_model::cards::is_default_visible(profile))
             })
             .collect();
         let mut choices = settings::model_choices_with_profiles(&snapshot.model, profiles);
         if let Some(pending) = &snapshot.pending_model
             && !choices.contains(pending)
-            && tickloop_agent::model::access::AccessCatalog::defaults().ordinary_candidate(
+            && tickloop_agent_model::access::AccessCatalog::defaults().ordinary_candidate(
                 pending,
-                &tickloop_agent::model::cards::ModelCatalog::defaults(),
+                &tickloop_agent_model::cards::ModelCatalog::defaults(),
             ) != Some(false)
         {
             choices.push(pending.clone());
@@ -1414,7 +1417,7 @@ impl Menus {
             .configuration(target)
             .await
             .map_err(|error| error.to_string())?;
-        let choices = if tickloop_agent::model::validate_reasoning_effort(
+        let choices = if tickloop_agent_model::validate_reasoning_effort(
             &snapshot.model,
             Some(ReasoningEffort::On),
         )
@@ -1503,7 +1506,7 @@ impl Menus {
             )));
         }
         let artifact_account = if let Some(root) = &self.config_root {
-            match crate::artifacts::ArtifactClient::new(root) {
+            match tickloop_agent_artifacts::ArtifactClient::new(root) {
                 Ok(client) => match client.status().await {
                     Ok(Some(user)) => {
                         format!("{} · Sign out", super::safe_text(user.display_name()))
@@ -1526,10 +1529,10 @@ impl Menus {
                     "Model".into(),
                     format!(
                         "Thinking: {}",
-                        match tickloop_agent::model::cards::model_card(&snapshot.model)
+                        match tickloop_agent_model::cards::model_card(&snapshot.model)
                             .map(|card| card.thinking)
                         {
-                            Some(tickloop_agent::model::cards::ThinkingControl::Toggle) => {
+                            Some(tickloop_agent_protocol::ThinkingControl::Toggle) => {
                                 if snapshot
                                     .model
                                     .thinking_enabled(
@@ -1543,10 +1546,9 @@ impl Menus {
                                     "Off"
                                 }
                             }
-                            Some(tickloop_agent::model::cards::ThinkingControl::AlwaysOn) =>
-                                "Always on",
-                            Some(tickloop_agent::model::cards::ThinkingControl::Unsupported)
-                            | None => "Model default",
+                            Some(tickloop_agent_protocol::ThinkingControl::AlwaysOn) => "Always on",
+                            Some(tickloop_agent_protocol::ThinkingControl::Unsupported) | None =>
+                                "Model default",
                         }
                     ),
                     format!(
@@ -2211,7 +2213,7 @@ impl Menus {
             if let Some(request) = snapshot.permissions.iter().find(|request| {
                 pending.contains_key(&request.id) && next_request.is_none_or(|id| id == request.id)
             }) {
-                if request.name == tickloop_agent::tools::EXIT_PLAN_MODE_TOOL_NAME {
+                if request.name == tickloop_agent_tools::EXIT_PLAN_MODE_TOOL_NAME {
                     let (mut menu, workflow) = Workflow::plan(agent, chat, request.loop_id).await?;
                     if console.dialog_chat()? != Some(chat) {
                         menu.title = format!("Plan approval · {requester}");
@@ -2802,7 +2804,7 @@ impl Menus {
                         }
                         providers::ConnectionAction::CredentialDetails => {
                             self.provider.provider_nav.back_stack.push(parent);
-                            let root = self.provider_root().map(|root| root.join(if provider.models[0].auth_source == tickloop_agent::model::ModelAuthSource::ApiKeyEnv || provider.models[0].auth_source == tickloop_agent::model::ModelAuthSource::GoogleCloud { ".env" } else { "auth" }).display().to_string()).unwrap_or_else(|| "No private store".into());
+                            let root = self.provider_root().map(|root| root.join(if provider.models[0].auth_source == tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv || provider.models[0].auth_source == tickloop_agent_protocol::ModelAuthSource::GoogleCloud { ".env" } else { "auth" }).display().to_string()).unwrap_or_else(|| "No private store".into());
                             let reference = &provider.models[0].api_key_env;
                             let context = vec![self.provider_auth_label(&provider).into(), safe_text(&format!("Credential reference: {reference}")), safe_text(&format!("Private store: {root}")), "Saved values take precedence over the Agent's inherited environment. Removing saved values does not unset the environment.".into()];
                             self.show(console, Menu { id: Uuid::new_v4(), title: format!("Credential details · {}", provider.model_page_name()), context, options: vec!["Back to connection".into()], selected: 0, confirmation: false }, Selection::CredentialDetails { target })?;
@@ -2814,7 +2816,7 @@ impl Menus {
                         self.provider_back(agent, console, target).await?;
                     } else if matches!(action, providers::ConnectionAction::RemoveKey) {
                         let root = self.provider_root().ok_or("Cannot locate the Agent credential directory")?;
-                        if let Err(error) = tickloop_agent::model::credentials::remove_api_key(root, &provider.models[0].api_key_env) {
+                        if let Err(error) = tickloop_agent_model::credentials::remove_api_key(root, &provider.models[0].api_key_env) {
                             self.provider_back(agent, console, target).await?;
                             return Err(error.to_string());
                         }
@@ -2840,7 +2842,7 @@ impl Menus {
                     if index == Some(0) {
                         let root = self.provider_root().ok_or("Cannot locate the Agent state directory; set TICKLOOP_CONFIG_DIR.")?;
                         let path = comment.as_deref().unwrap_or("").trim();
-                        if let Err(error) = crate::auth::google::GoogleAuth::new(root).save_service_account_path(path) {
+                        if let Err(error) = tickloop_agent_model::auth::google::GoogleAuth::new(root).save_service_account_path(path) {
                             self.provider_service_account(console, target, provider, Some(path))?;
                             return Err(error.to_string());
                         }
@@ -2854,7 +2856,7 @@ impl Menus {
                 Selection::ApiKey { target, provider } => {
                     if index == Some(0) {
                         let root = self.provider_root().ok_or("Cannot locate the Agent state directory; set TICKLOOP_CONFIG_DIR.")?;
-                        let result = tickloop_agent::model::credentials::save_api_key(root, &provider.models[0].api_key_env, comment.as_deref().unwrap_or(""));
+                        let result = tickloop_agent_model::credentials::save_api_key(root, &provider.models[0].api_key_env, comment.as_deref().unwrap_or(""));
                         if let Err(error) = result {
                             self.provider_api_key(console, target, provider, comment.as_deref())?;
                             return Err(error.to_string());
@@ -3009,7 +3011,7 @@ impl Menus {
                     if index == Some(1) {
                         let root = self.config_root.as_ref().ok_or("Artifact Service needs a state directory")?;
                         agent.disable_event_sources().await.map_err(|error| error.to_string())?;
-                        let client = crate::artifacts::ArtifactClient::new(root).map_err(|error| error.to_string())?;
+                        let client = tickloop_agent_artifacts::ArtifactClient::new(root).map_err(|error| error.to_string())?;
                         client.logout().await.map_err(|error| error.to_string())?;
                         console.write("Artifact Service signed out.\n")?;
                     }
@@ -3027,9 +3029,9 @@ impl Menus {
                     Some(1) => {
                         let configuration = agent.configuration(target).await.map_err(|error| error.to_string())?;
                         if matches!(
-                            tickloop_agent::model::cards::model_card(&configuration.model)
+                            tickloop_agent_model::cards::model_card(&configuration.model)
                                 .map(|card| card.thinking),
-                            Some(tickloop_agent::model::cards::ThinkingControl::Toggle)
+                            Some(tickloop_agent_protocol::ThinkingControl::Toggle)
                         ) {
                             let enabled = !configuration.model.thinking_enabled(configuration.reasoning_effort, configuration.thinking_enabled).unwrap_or(configuration.thinking_enabled);
                             agent.change_configuration(target, ConfigurationChange::ThinkingEnabled { enabled }).await.map_err(|error| error.to_string())?;
@@ -3603,10 +3605,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use serde_json::json;
-    use tickloop_agent::{
-        model::{Content, Message, ModelIdentity, Role},
-        runtime::{CodeRewind, ModelUsageSummary, RewindDraft},
-    };
+    use tickloop_agent::runtime::{CodeRewind, ModelUsageSummary, RewindDraft};
+    use tickloop_agent_protocol::{Content, Message, ModelIdentity, Role};
 
     use super::*;
 
@@ -3618,7 +3618,7 @@ mod tests {
             support::config(),
             std::sync::Arc::new(support::ScriptedModel::new(vec![support::call(
                 "snapshot-question",
-                crate::tools::ASK_USER_QUESTION_TOOL_NAME,
+                tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME,
                 support::single_question("Which fixture?"),
             )])),
         );
@@ -3678,8 +3678,10 @@ mod tests {
         let root_a = project.join("a");
         let root_b = project.join("b");
         let reference = "PICKER_SCOPE_TEST_KEY";
-        crate::model::credentials::save_api_key(&root_a, reference, "root-a-fixture-key").unwrap();
-        crate::model::credentials::save_api_key(&root_b, reference, "root-b-fixture-key").unwrap();
+        tickloop_agent_model::credentials::save_api_key(&root_a, reference, "root-a-fixture-key")
+            .unwrap();
+        tickloop_agent_model::credentials::save_api_key(&root_b, reference, "root-b-fixture-key")
+            .unwrap();
         let mut model = support::config();
         model.api_key_env = reference.into();
         let core = crate::runtime::Agent::new_embedded(
@@ -3736,7 +3738,7 @@ mod tests {
             panic!("Expected connection details")
         };
         assert_eq!(provider.models[0], choice);
-        crate::model::credentials::save_api_key(
+        tickloop_agent_model::credentials::save_api_key(
             menus.provider_root().unwrap(),
             reference,
             "replacement-for-a",
@@ -3744,13 +3746,13 @@ mod tests {
         .unwrap();
         menus.provider_back(&view, &console, target).await.unwrap();
         assert_eq!(
-            crate::model::credentials::load_api_key(&root_a, reference)
+            tickloop_agent_model::credentials::load_api_key(&root_a, reference)
                 .unwrap()
                 .as_deref(),
             Some("replacement-for-a")
         );
         assert_eq!(
-            crate::model::credentials::load_api_key(&root_b, reference)
+            tickloop_agent_model::credentials::load_api_key(&root_b, reference)
                 .unwrap()
                 .as_deref(),
             Some("root-b-fixture-key")
@@ -3774,12 +3776,12 @@ mod tests {
         let project = directory.path().canonicalize().unwrap();
         let root = project.join("state");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = crate::model::cards::ModelCatalog::defaults()
+        let mut config = tickloop_agent_model::cards::ModelCatalog::defaults()
             .get("openai-api", "gpt-6.1-sol")
             .unwrap();
         config.base_url = format!("http://{}/v1", listener.local_addr().unwrap());
         config.api_key_env = "PICKER_OBSERVATION_KEY".into();
-        crate::model::credentials::save_api_key(
+        tickloop_agent_model::credentials::save_api_key(
             &root,
             &config.api_key_env,
             "synthetic-observation-key",
@@ -3862,12 +3864,12 @@ mod tests {
         let project = directory.path().canonicalize().unwrap();
         let root = project.join("state");
         let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = crate::model::cards::ModelCatalog::defaults()
+        let mut config = tickloop_agent_model::cards::ModelCatalog::defaults()
             .get("openai-api", "gpt-6.1-sol")
             .unwrap();
         config.base_url = format!("http://{}/v1", http.local_addr().unwrap());
         config.api_key_env = "REVIEW_LARGE_DIRECTORY_KEY".into();
-        crate::model::credentials::save_api_key(
+        tickloop_agent_model::credentials::save_api_key(
             &root,
             &config.api_key_env,
             "synthetic-large-directory-key",
@@ -3917,7 +3919,7 @@ mod tests {
             listener,
             access,
             epoch,
-            crate::protocol::TRANSPORT_LIMITS,
+            crate::agent_access::TRANSPORT_LIMITS,
         ));
         let client = std::sync::Arc::new(LocalAgentClient::connect(&endpoint).await.unwrap());
         let view = Agent::from_access_for_test(
@@ -3942,7 +3944,7 @@ mod tests {
         assert!(serde_json::to_vec(&models).unwrap().len() > 8192);
         assert_eq!(
             models.availability("model-0399"),
-            crate::model::availability::ModelAvailability::DirectoryListed
+            tickloop_agent_protocol::ModelAvailability::DirectoryListed
         );
         ipc.abort();
         core.shutdown().await;
@@ -3960,13 +3962,17 @@ mod tests {
         let project = directory.path().canonicalize().unwrap();
         let root = project.join("state");
         let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = crate::model::cards::ModelCatalog::defaults()
+        let mut config = tickloop_agent_model::cards::ModelCatalog::defaults()
             .get("openai-api", "gpt-6.1-sol")
             .unwrap();
         config.base_url = format!("http://{}/v1", http.local_addr().unwrap());
         config.api_key_env = "REVIEW_WARMUP_KEY".into();
-        crate::model::credentials::save_api_key(&root, &config.api_key_env, "synthetic-warmup-key")
-            .unwrap();
+        tickloop_agent_model::credentials::save_api_key(
+            &root,
+            &config.api_key_env,
+            "synthetic-warmup-key",
+        )
+        .unwrap();
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = calls.clone();
         let http_task = tokio::spawn(async move {
@@ -4043,7 +4049,7 @@ mod tests {
     #[tokio::test]
     async fn model_levels_hide_account_denials_and_keep_unknown_models_selectable() {
         use crate::terminal::test_support as support;
-        use tickloop_agent::model::availability::{AccountModelDirectory, DirectorySemantics};
+        use tickloop_agent_protocol::{AccountModelDirectory, DirectorySemantics};
         let directory = tempfile::tempdir().unwrap();
         let agent = Agent::new_embedded(
             support::config(),
@@ -4052,7 +4058,7 @@ mod tests {
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let before = agent.snapshot(chat).await.unwrap().model;
         let (console, _) = Console::start(false).unwrap();
-        let catalog = tickloop_agent::model::cards::ModelCatalog::defaults();
+        let catalog = tickloop_agent_model::cards::ModelCatalog::defaults();
         let providers = ProviderModels::group(vec![
             catalog.get("deepseek-api", "deepseek-flash").unwrap(),
             catalog.get("openai-api", "gpt-6-astra").unwrap(),
@@ -4129,12 +4135,12 @@ mod tests {
     struct CountingDirectory(std::sync::atomic::AtomicUsize);
 
     #[async_trait::async_trait]
-    impl tickloop_agent::model::availability::AccountDirectoryAdapter for CountingDirectory {
+    impl tickloop_agent_model::availability::AccountDirectoryAdapter for CountingDirectory {
         async fn identity(
             &self,
             _: &tokio_util::sync::CancellationToken,
-        ) -> Result<tickloop_agent::model::availability::DiscoveryIdentity, String> {
-            Ok(tickloop_agent::model::availability::DiscoveryIdentity {
+        ) -> Result<tickloop_agent_model::availability::DiscoveryIdentity, String> {
+            Ok(tickloop_agent_model::availability::DiscoveryIdentity {
                 provider: "test-provider".into(),
                 origin: "https://api.example.com".into(),
                 resource: "models".into(),
@@ -4144,11 +4150,11 @@ mod tests {
         async fn fetch(
             &self,
             _: &tokio_util::sync::CancellationToken,
-        ) -> Result<tickloop_agent::model::availability::AccountModelDirectory, String> {
+        ) -> Result<tickloop_agent_protocol::AccountModelDirectory, String> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(tickloop_agent::model::availability::AccountModelDirectory {
+            Ok(tickloop_agent_protocol::AccountModelDirectory {
                 models: BTreeMap::new(),
-                semantics: tickloop_agent::model::availability::DirectorySemantics::Directory,
+                semantics: tickloop_agent_protocol::DirectorySemantics::Directory,
                 complete: true,
             })
         }
@@ -4230,7 +4236,7 @@ mod tests {
 
     fn identity(requested_model: &str) -> ModelIdentity {
         ModelIdentity {
-            provider: crate::model::ModelProvider::Api,
+            provider: tickloop_agent_protocol::ModelProvider::Api,
             profile: "fixture".into(),
             protocol: Protocol::Messages,
             requested_model: requested_model.into(),
@@ -4477,7 +4483,7 @@ mod tests {
                 .map(|(profile, protocol, requested_model)| {
                     group(
                         ModelIdentity {
-                            provider: crate::model::ModelProvider::Api,
+                            provider: tickloop_agent_protocol::ModelProvider::Api,
                             profile: profile.into(),
                             protocol,
                             requested_model: requested_model.into(),
@@ -4591,7 +4597,7 @@ mod tests {
             request_count: 1,
             groups: vec![group(
                 ModelIdentity {
-                    provider: crate::model::ModelProvider::Api,
+                    provider: tickloop_agent_protocol::ModelProvider::Api,
                     profile: "custom\u{1b}[31m\r\nprofile\tname\u{07}".into(),
                     protocol: Protocol::Messages,
                     requested_model: long_name.clone(),

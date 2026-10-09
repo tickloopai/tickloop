@@ -1,10 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     os::unix::fs::{FileTypeExt, MetadataExt},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::Instant};
 use uuid::Uuid;
 
 use super::protocol::*;
@@ -238,10 +238,11 @@ impl HostLocation {
             .terminal
             .as_ref()
             .ok_or_else(|| AccessError::invalid("interaction source has no terminal"))?;
-        let access = tick_connect::access::TickAccess::new(tick_connect::herdr::HerdrContext {
-            socket: self.socket.clone(),
-            caller_pane: pane_id.clone(),
-        });
+        let access =
+            tickhost_connect::access::TickAccess::new(tickhost_connect::herdr::HerdrContext {
+                socket: self.socket.clone(),
+                caller_pane: pane_id.clone(),
+            });
         let pane = tokio::time::timeout(Duration::from_secs(5), access.caller())
             .await
             .map_err(|_| AccessError::unavailable("interaction source host did not respond"))?

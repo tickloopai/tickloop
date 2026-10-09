@@ -1,0 +1,91 @@
+[
+  {
+    "role": "system",
+    "content": [
+      {
+        "type": "text",
+        "text": "You are Tick Loop."
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "Check the counter"
+      },
+      {
+        "type": "image",
+        "source": {
+          "type": "base64",
+          "media_type": "image/png",
+          "data": "iVBORw0KGgo="
+        },
+        "width": 1,
+        "height": 1
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "thinking",
+        "thinking": "Read it first.",
+        "signature": "sig-1"
+      },
+      {
+        "type": "thinking",
+        "thinking": "Unsigned."
+      },
+      {
+        "type": "tool_use",
+        "id": "call-1",
+        "name": "ReadTick",
+        "input": {
+          "instance": "herdr:counter"
+        }
+      },
+      {
+        "type": "protocol_data",
+        "protocol": "responses",
+        "value": {
+          "encrypted": "opaque"
+        }
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "tool_result",
+        "tool_use_id": "call-1",
+        "content": "7",
+        "is_error": false
+      },
+      {
+        "type": "tool_result",
+        "tool_use_id": "call-2",
+        "content": [
+          {
+            "type": "text",
+            "text": "chart"
+          },
+          {
+            "type": "image",
+            "source": {
+              "type": "base64",
+              "media_type": "image/png",
+              "data": "iVBORw0KGgo="
+            },
+            "width": 2,
+            "height": 2
+          }
+        ],
+        "is_error": true
+      }
+    ]
+  }
+]

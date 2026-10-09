@@ -35,13 +35,14 @@ use crate::{
         AccessError, AgentAccess, DaemonServer, EmbeddedAgentAccess, LaunchSpec, LocalAgentClient,
         WorkerFactory, serve_worker_listener, worker_link,
     },
-    model::{ModelClient, ModelConfig, cards::ModelCatalog, model_client},
-    protocol::AccessLimits,
     runtime::Agent,
-    settings::UserSettings,
 };
+use tickloop_agent_config::UserSettings;
+use tickloop_agent_model::{ModelClient, cards::ModelCatalog, model_client};
+use tickloop_agent_protocol::{AccessLimits, ModelConfig};
 
-mod daemon_control;
+pub(crate) mod daemon_control;
+pub mod worker_control;
 
 const ARTIFACT_EVENT_BRIDGE_URI: &str = "tickloop://event-bridge/v2";
 const ARTIFACT_EVENT_BRIDGE_FALLBACK_URI: &str = "tickloop://event-bridge/v1";
@@ -52,8 +53,8 @@ const CONNECT_INTERVAL: Duration = Duration::from_millis(25);
 const RUNTIME_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const SOCKET_NAME: &str = "daemon.sock";
 const LOCK_NAME: &str = "daemon.lock";
-const DAEMON_COMMAND: &str = "daemon";
-const RUN_SUBCOMMAND: &str = "run";
+pub(crate) const DAEMON_COMMAND: &str = "daemon";
+pub(crate) const RUN_SUBCOMMAND: &str = "run";
 /// Hidden process entries: none appears in `--help`, and each names its role in `ps`.
 #[doc(hidden)]
 pub const DAEMON_RUN_ARGUMENTS: [&str; 2] = [DAEMON_COMMAND, RUN_SUBCOMMAND];
@@ -85,7 +86,7 @@ struct ProcessWorkerFactory {
     limits: AccessLimits,
     workers: Mutex<Vec<ManagedWorker>>,
     shutting_down: AtomicBool,
-    control: Arc<crate::hosted::worker_control::WorkerControl>,
+    control: Arc<worker_control::WorkerControl>,
 }
 
 impl ProcessWorkerFactory {
@@ -441,22 +442,7 @@ fn incompatible_daemon_guidance(
     )
 }
 
-pub async fn run_internal(arguments: &[OsString]) -> Option<Result<(), String>> {
-    let command = arguments.first()?.to_str()?;
-    let subcommand = arguments.get(1).and_then(|value| value.to_str());
-    match (command, subcommand) {
-        (DAEMON_COMMAND, Some(RUN_SUBCOMMAND)) => Some(run_daemon(&arguments[2..]).await),
-        (DAEMON_COMMAND, _) => Some(daemon_control::run(&arguments[1..]).await),
-        (WORKER_ARGUMENT, _) => Some(run_worker(&arguments[1..]).await),
-        _ if arguments == crate::hosted::controller::TICKHOST_RUN_ARGUMENTS => {
-            Some(run_tickhost().await)
-        }
-        ("monitor", _) => Some(crate::monitor_command::run(&arguments[1..]).await),
-        _ => None,
-    }
-}
-
-async fn run_daemon(arguments: &[OsString]) -> Result<(), String> {
+pub(crate) async fn run_daemon(arguments: &[OsString]) -> Result<(), String> {
     let [directory, descriptor] = arguments else {
         return Err("invalid private daemon invocation".into());
     };
@@ -480,15 +466,18 @@ async fn run_daemon(arguments: &[OsString]) -> Result<(), String> {
     let endpoint = directory.join(SOCKET_NAME);
     let (listener, socket_identity) = private_listener(&endpoint)?;
     let epoch = Uuid::new_v4();
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let tickhost = std::env::current_exe()
+        .and_then(|executable| executable.canonicalize())
+        .map_err(|error| error.to_string())?
+        .with_file_name(crate::hosted::controller::TICKHOST_EXECUTABLE);
     let controller = Arc::new(crate::hosted::controller::HostController::new(
         &directory,
         tickhost::paths::HostPaths::from_environment(),
         epoch,
-        executable,
+        tickhost,
         tickhost::host::DEFAULT_IDLE_TIMEOUT,
     ));
-    let control = Arc::new(crate::hosted::worker_control::WorkerControl::new(
+    let control = Arc::new(worker_control::WorkerControl::new(
         &directory, epoch, controller,
     ));
     let control_endpoint = control.endpoint().to_path_buf();
@@ -586,16 +575,7 @@ fn unreachable_reason(
         .then(|| "Agent daemon lock changed; the daemon stepped down.".into())
 }
 
-/// The Tickhost process the daemon starts on demand. It runs only the host library.
-async fn run_tickhost() -> Result<(), String> {
-    let config =
-        tickhost::host::read_config(std::io::stdin().lock()).map_err(|error| error.to_string())?;
-    tickhost::host::serve(tickhost::paths::HostPaths::from_environment(), config)
-        .await
-        .map_err(|error| format!("Tickhost: {error}"))
-}
-
-async fn run_worker(arguments: &[OsString]) -> Result<(), String> {
+pub(crate) async fn run_worker(arguments: &[OsString]) -> Result<(), String> {
     let [endpoint] = arguments else {
         return Err("invalid private worker invocation".into());
     };
@@ -615,37 +595,17 @@ async fn run_worker(arguments: &[OsString]) -> Result<(), String> {
     let bootstrap: WorkerBootstrap =
         serde_json::from_slice(&bytes).map_err(|_| "invalid worker bootstrap")?;
     let agent = build_runtime(&bootstrap.launch, Some(bootstrap.control.clone())).await?;
-    let mut execution_events = agent.subscribe();
-    let mut shell_events = agent.subscribe_user_shells();
     let access = Arc::new(EmbeddedAgentAccess::for_worker(
         agent.clone(),
         bootstrap.epoch,
     ));
     let (listener, socket_identity) = private_listener(&endpoint)?;
-    let mut housekeeping = bootstrap.launch.config_root.as_ref().map(|root| {
-        crate::housekeeping::HousekeepingSchedule::new(
-            root.clone(),
-            crate::housekeeping::UserActivity::process().clone(),
-            Arc::new(crate::hosted::lifecycle::DaemonLifecycle::new(
-                bootstrap.control.clone(),
-            )),
-        )
-    });
     let mut probe = [0u8; 1];
-    let service = serve_worker_listener(listener, access, bootstrap.epoch, bootstrap.limits);
-    tokio::pin!(service);
-    let result = loop {
-        tokio::select! {
-            result=&mut service=>break result.map_err(|error|error.to_string()),
-            result=stdin.read(&mut probe)=>break result.map(|_|()).map_err(|error|error.to_string()),
-            Ok(event)=execution_events.recv()=>{
-                if matches!(event.kind,crate::runtime::EventKind::Started)
-                    && let Some(schedule)=housekeeping.as_mut() {schedule.start();}
-            },
-            Ok(_)=shell_events.recv()=>{
-                if let Some(schedule)=housekeeping.as_mut() {schedule.start();}
-            },
+    let result = tokio::select! {
+        result = serve_worker_listener(listener, access, bootstrap.epoch, bootstrap.limits) => {
+            result.map_err(|error| error.to_string())
         }
+        result = stdin.read(&mut probe) => result.map(|_| ()).map_err(|error| error.to_string()),
     };
     agent.shutdown().await;
     remove_owned_socket(&endpoint, socket_identity)?;
@@ -714,8 +674,8 @@ pub async fn build_runtime_with_client(
     .map_err(|error| error.to_string())?;
     use crate::tick_adapter::TickAdapters;
     let access = launch.host_work_context.as_ref().map(|work| {
-        Arc::new(tick_connect::access::TickAccess::new(
-            tick_connect::herdr::HerdrContext {
+        Arc::new(tickhost_connect::access::TickAccess::new(
+            tickhost_connect::herdr::HerdrContext {
                 socket: work.socket.clone(),
                 caller_pane: String::new(),
             },
@@ -759,14 +719,14 @@ pub async fn build_runtime_with_client(
         agent.install_hosted_ticks(hosted.clone());
     }
     let adapters = Arc::new(TickAdapters::builtin(
-        Some(agent.clone()),
+        agent.clone(),
         launch.config_root.clone(),
         access,
         hosted,
     ));
     agent.install_tick_stream(adapters.clone()).await;
     if let Some(root) = launch.config_root.as_ref()
-        && let Ok(artifact) = crate::artifacts::ArtifactClient::new(root)
+        && let Ok(artifact) = tickloop_agent_artifacts::ArtifactClient::new(root)
     {
         agent
             .install_host_tools(Arc::new(

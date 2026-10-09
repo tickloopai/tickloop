@@ -143,11 +143,11 @@ fn merged_provider_diagnostics_resize_with_the_selected_connection_and_live_clea
             chat,
             HashMap::from([(
                 "deepseek-api".into(),
-                crate::model::ProviderHttpFailure {
+                tickloop_agent_protocol::ProviderHttpFailure {
                     provider_id: "deepseek-api".into(),
                     provider_name: "DeepSeek".into(),
                     status: 403,
-                    class: crate::model::ProviderFailureClass::UsageLimit,
+                    class: tickloop_agent_protocol::ProviderFailureClass::UsageLimit,
                     message: "Bounded provider notice".into(),
                     hint: "Check allowance".into(),
                     retry_after: None,
@@ -387,7 +387,7 @@ async fn content_height_permission_rule_editor_stays_visible_or_blocks_input_whe
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut view = agent.permissions_view(chat).await.unwrap();
-    view.execution_mode = crate::permissions::ExecutionMode::Auto;
+    view.execution_mode = tickloop_agent_protocol::ExecutionMode::Auto;
     let mut surface =
         PermissionsSurface::open(view, PermissionsReturn::ModePicker { settings: false });
     surface.open_auto();
@@ -498,8 +498,8 @@ fn content_height_resume_fits_empty_short_and_overflow_lists_without_moving_focu
 
 #[test]
 fn content_height_artifacts_fits_loading_groups_and_overflow() {
-    use crate::artifacts::{ArtifactMetadata, ArtifactPage};
     use crate::terminal::artifacts_picker::ArtifactsPicker;
+    use tickloop_agent_artifacts::{ArtifactMetadata, ArtifactPage};
     for (height, count, expected) in [
         (24, 0, 5),
         (24, 2, 10),
@@ -580,7 +580,7 @@ async fn content_height_permission_management_history_fits_loaded_and_empty_reco
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut view = agent.permissions_view(chat).await.unwrap();
-    view.execution_mode = crate::permissions::ExecutionMode::AcceptEdits;
+    view.execution_mode = tickloop_agent_protocol::ExecutionMode::AcceptEdits;
     let record = crate::runtime::ApprovalRecord {
         id: Uuid::new_v4(),
         chat_id: chat,
@@ -686,7 +686,7 @@ async fn content_height_permission_management_history_fits_loaded_and_empty_reco
             assert!(frame.last().unwrap().text().contains("r retry"));
         }
     }
-    view.execution_mode = crate::permissions::ExecutionMode::Auto;
+    view.execution_mode = tickloop_agent_protocol::ExecutionMode::Auto;
     for (height, count, expected) in [
         (24, 0, 10),
         (40, 2, 12),
@@ -697,7 +697,7 @@ async fn content_height_permission_management_history_fits_loaded_and_empty_reco
         view.auto_policy.rules = (0..count)
             .map(|index| crate::runtime::AutoRule {
                 id: format!("controlled-{index}"),
-                kind: crate::settings::AutoRuleKind::SoftAllow,
+                kind: tickloop_agent_protocol::AutoRuleKind::SoftAllow,
                 text: format!("Controlled rule {index}"),
                 source: crate::runtime::AutoRuleSource::User,
             })

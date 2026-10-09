@@ -66,19 +66,15 @@ impl TickActionUi<'_> {
     pub fn notify(&mut self, message: &str) {
         self.state.hold_status(message);
     }
-    pub(super) fn monitor_members(
-        &self,
-    ) -> std::collections::BTreeSet<crate::tick_stream::InstanceRef> {
+    pub(super) fn monitor_members(&self) -> std::collections::BTreeSet<tick_protocol::InstanceRef> {
         self.state.monitor.members()
     }
-    pub(super) fn monitor_removed(
-        &self,
-    ) -> std::collections::BTreeSet<crate::tick_stream::InstanceRef> {
+    pub(super) fn monitor_removed(&self) -> std::collections::BTreeSet<tick_protocol::InstanceRef> {
         self.state.monitor.removed()
     }
     pub(super) fn monitor_entry(
         &self,
-        instance: &crate::tick_stream::InstanceRef,
+        instance: &tick_protocol::InstanceRef,
     ) -> Option<super::monitor::MonitorEntry> {
         self.state
             .monitor

@@ -1,0 +1,555 @@
+[
+  {
+    "Event": {
+      "sequence": 10,
+      "chat_id": "00000000-0000-0000-0000-0000000000c1",
+      "loop_id": "00000000-0000-0000-0000-000000000010",
+      "run_id": "00000000-0000-0000-0000-000000000020",
+      "kind": {
+        "ToolStarted": {
+          "call_id": "call-1",
+          "name": "ReadTick",
+          "input": {
+            "instance": "herdr:counter"
+          }
+        }
+      }
+    }
+  },
+  {
+    "Event": {
+      "sequence": 11,
+      "chat_id": "00000000-0000-0000-0000-0000000000c1",
+      "loop_id": "00000000-0000-0000-0000-000000000010",
+      "run_id": "00000000-0000-0000-0000-000000000020",
+      "kind": {
+        "Completed": {
+          "usage": {
+            "input_tokens": 120,
+            "output_tokens": 30,
+            "cache_read_input_tokens": null,
+            "cache_write_input_tokens": null
+          }
+        }
+      }
+    }
+  },
+  "Changed",
+  {
+    "Resync": {
+      "reason": "Lagged"
+    }
+  },
+  {
+    "Reset": {
+      "reason": "ConversationChanged",
+      "snapshot": {
+        "execution": {
+          "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+          "agent_id": "00000000-0000-0000-0000-0000000000a1",
+          "generation": 3
+        },
+        "conversation": {
+          "failure_events": [],
+          "provider_failures": {},
+          "artifact_ticks": [
+            {
+              "artifact_id": "doc",
+              "origin": "https://claude.ai",
+              "title": "Plan",
+              "format": "html",
+              "url": "https://claude.ai/artifact/doc",
+              "access_role": "writer",
+              "added_at_ms": 1000
+            }
+          ],
+          "monitor": {
+            "members": [
+              {
+                "instance": "herdr:session/workspace/pane/counter",
+                "source": "added",
+                "title": "Counter"
+              }
+            ],
+            "removed": [
+              "hosted:00000000-0000-0000-0000-000000000040"
+            ]
+          },
+          "id": "00000000-0000-0000-0000-0000000000c1",
+          "branch_origin": null,
+          "delegation": {
+            "delegation_id": "00000000-0000-0000-0000-0000000000d1",
+            "parent_chat_id": "00000000-0000-0000-0000-0000000000c0",
+            "parent_loop_id": "00000000-0000-0000-0000-000000000010",
+            "parent_run_id": "00000000-0000-0000-0000-000000000020",
+            "parent_call_id": "call-subagent",
+            "task": "Audit the counter",
+            "ceiling": {
+              "workdir": "/work/project",
+              "additional_directories": [
+                "/work/shared"
+              ],
+              "policy": {
+                "mode": "acceptEdits",
+                "rules": [
+                  {
+                    "id": "00000000-0000-0000-0000-000000000071",
+                    "decision": "allow",
+                    "tool": "Bash",
+                    "specifier": "git status",
+                    "input": {
+                      "command": "git status"
+                    },
+                    "loop_id": null,
+                    "persistent": true
+                  }
+                ],
+                "project_constraints": [
+                  {
+                    "id": "00000000-0000-0000-0000-000000000072",
+                    "decision": "ask",
+                    "tool": "Bash",
+                    "specifier": "git status",
+                    "input": {
+                      "command": "git status"
+                    },
+                    "loop_id": "00000000-0000-0000-0000-000000000010",
+                    "persistent": false
+                  }
+                ],
+                "managed_constraints": [
+                  {
+                    "id": "00000000-0000-0000-0000-000000000073",
+                    "decision": "deny",
+                    "tool": "Bash",
+                    "specifier": "git status",
+                    "input": {
+                      "command": "git status"
+                    },
+                    "loop_id": null,
+                    "persistent": true
+                  }
+                ],
+                "revision": 4
+              },
+              "session_denials": [
+                {
+                  "tool": "Bash",
+                  "identity_sha256": "abababababababababababababababababababababababababababababababab",
+                  "workspace": {
+                    "workdir": "/work/project",
+                    "additional_directories": []
+                  }
+                }
+              ],
+              "host_context": {
+                "workdir": "/work/project",
+                "workspace_id": "w1",
+                "interaction": {
+                  "socket": "/run/herdr.sock",
+                  "pane": {
+                    "pane_id": "p1",
+                    "terminal_id": "term-1",
+                    "workspace_id": "w1",
+                    "tab_id": "t1",
+                    "cwd": "/work/project",
+                    "foreground_cwd": null,
+                    "title": null,
+                    "tokens": {
+                      "agent": "tickloop"
+                    }
+                  }
+                }
+              },
+              "host_tools": {
+                "CallTickTool": [
+                  {
+                    "kind": "mcp",
+                    "server_id": "calendar",
+                    "account_id": "me"
+                  }
+                ],
+                "ReadTick": [
+                  {
+                    "kind": "native",
+                    "endpoint": {
+                      "kind": "herdr_socket",
+                      "path": "/run/herdr.sock",
+                      "owner": 501,
+                      "device": 16777220,
+                      "inode": 42
+                    }
+                  },
+                  {
+                    "kind": "native",
+                    "endpoint": {
+                      "kind": "tickhost",
+                      "endpoint": "/run/tickhost.sock",
+                      "uid": 501
+                    }
+                  }
+                ]
+              },
+              "tick_instances": [
+                "herdr:session/workspace/pane/counter",
+                "hosted:00000000-0000-0000-0000-000000000040"
+              ]
+            },
+            "trusted_user_inputs": null
+          },
+          "family_completions": [
+            {
+              "child_chat_id": "00000000-0000-0000-0000-0000000000c2",
+              "child_loop_id": "00000000-0000-0000-0000-000000000011",
+              "child_run_id": "00000000-0000-0000-0000-000000000021",
+              "handle": "audit",
+              "state": "Completed",
+              "result": "Actual child report",
+              "error": null,
+              "started_at": 1,
+              "finished_at": 2,
+              "triggering_message_ids": [
+                "00000000-0000-0000-0000-000000000091"
+              ],
+              "notification": {
+                "rejected": {
+                  "code": "stale_target",
+                  "message": "The receiving parent is stopped"
+                }
+              },
+              "usage": {
+                "input_tokens": 11,
+                "output_tokens": 7,
+                "cache_read_input_tokens": null,
+                "cache_write_input_tokens": null
+              }
+            }
+          ],
+          "generated_title": "Counter check",
+          "workdir": "/work/project",
+          "messages": [
+            {
+              "role": "system",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "You are Tick Loop."
+                }
+              ]
+            },
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Check the counter"
+                },
+                {
+                  "type": "image",
+                  "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgo="
+                  },
+                  "width": 1,
+                  "height": 1
+                }
+              ]
+            },
+            {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "thinking",
+                  "thinking": "Read it first.",
+                  "signature": "sig-1"
+                },
+                {
+                  "type": "thinking",
+                  "thinking": "Unsigned."
+                },
+                {
+                  "type": "tool_use",
+                  "id": "call-1",
+                  "name": "ReadTick",
+                  "input": {
+                    "instance": "herdr:counter"
+                  }
+                },
+                {
+                  "type": "protocol_data",
+                  "protocol": "responses",
+                  "value": {
+                    "encrypted": "opaque"
+                  }
+                }
+              ]
+            },
+            {
+              "role": "user",
+              "content": [
+                {
+                  "type": "tool_result",
+                  "tool_use_id": "call-1",
+                  "content": "7",
+                  "is_error": false
+                },
+                {
+                  "type": "tool_result",
+                  "tool_use_id": "call-2",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "chart"
+                    },
+                    {
+                      "type": "image",
+                      "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "iVBORw0KGgo="
+                      },
+                      "width": 2,
+                      "height": 2
+                    }
+                  ],
+                  "is_error": true
+                }
+              ]
+            }
+          ],
+          "message_runs": {
+            "2": "00000000-0000-0000-0000-000000000020"
+          },
+          "message_contexts": {},
+          "message_ids": {
+            "1": "00000000-0000-0000-0000-000000000091",
+            "2": "00000000-0000-0000-0000-000000000092"
+          },
+          "prompt_execution_modes": {
+            "1": "acceptEdits"
+          },
+          "inherited_prompts": [
+            1
+          ],
+          "message_compactions": {},
+          "message_usage": {
+            "2": {
+              "input_tokens": 120,
+              "output_tokens": 30,
+              "cache_read_input_tokens": 100,
+              "cache_write_input_tokens": null
+            }
+          },
+          "message_sources": {},
+          "message_models": {
+            "2": {
+              "profile": "example-plan",
+              "protocol": "messages",
+              "requested_model": "example-large",
+              "provider": "api"
+            }
+          },
+          "loops": [
+            {
+              "id": "00000000-0000-0000-0000-000000000010",
+              "goal": "Watch the counter",
+              "state": "WaitingTrigger",
+              "run_id": "00000000-0000-0000-0000-000000000020",
+              "run_started_at": 1000,
+              "trigger": {
+                "id": "00000000-0000-0000-0000-000000000030",
+                "prompt": "Report changes",
+                "interval_seconds": 60,
+                "expires_at_ms": null,
+                "accepts_events": true,
+                "armed": true,
+                "subscriptions": []
+              },
+              "state_since": 2000
+            }
+          ],
+          "plans": [],
+          "progress": []
+        },
+        "model": {
+          "connection": {
+            "vendor": "Example",
+            "product": "Example Plan",
+            "kind": "plan",
+            "order": 2,
+            "region": {
+              "name": "Global",
+              "order": 1
+            },
+            "discovery": "provider_api"
+          },
+          "name": "example-plan",
+          "protocol": "messages",
+          "base_url": "https://models.example.test/v1",
+          "model": "example-large",
+          "api_key_env": "EXAMPLE_API_KEY",
+          "max_output_tokens": 32000,
+          "provider": "api",
+          "auth_source": "api_key_env",
+          "provider_id": "example",
+          "provider_name": "Example",
+          "model_id": "example-large",
+          "card": {
+            "id": "example-large",
+            "service_model_id": "example-large-2026",
+            "display_name": "Example Large",
+            "adapter": "messages",
+            "max_output_tokens": 32000,
+            "context_window_tokens": 200000,
+            "thinking": "toggle",
+            "adaptive_by_default": false,
+            "effort_levels": [
+              "low",
+              "high"
+            ],
+            "input_modalities": [
+              "text",
+              "image"
+            ],
+            "thinking_budgets": {
+              "low": 2048,
+              "medium": 8192,
+              "high": 16384
+            }
+          },
+          "input_modalities": [
+            "text",
+            "image"
+          ]
+        },
+        "reasoning_effort": "high",
+        "thinking_enabled": true,
+        "policy": {
+          "mode": "acceptEdits",
+          "rules": [
+            {
+              "id": "00000000-0000-0000-0000-000000000071",
+              "decision": "allow",
+              "tool": "Bash",
+              "specifier": "git status",
+              "input": {
+                "command": "git status"
+              },
+              "loop_id": null,
+              "persistent": true
+            }
+          ],
+          "project_constraints": [
+            {
+              "id": "00000000-0000-0000-0000-000000000072",
+              "decision": "ask",
+              "tool": "Bash",
+              "specifier": "git status",
+              "input": {
+                "command": "git status"
+              },
+              "loop_id": "00000000-0000-0000-0000-000000000010",
+              "persistent": false
+            }
+          ],
+          "managed_constraints": [
+            {
+              "id": "00000000-0000-0000-0000-000000000073",
+              "decision": "deny",
+              "tool": "Bash",
+              "specifier": "git status",
+              "input": {
+                "command": "git status"
+              },
+              "loop_id": null,
+              "persistent": true
+            }
+          ],
+          "revision": 4
+        },
+        "additional_directories": [
+          "/work/shared"
+        ],
+        "last_sequence": 9,
+        "permissions": [],
+        "questions": [],
+        "pending_inputs": [],
+        "pending_commands": [],
+        "operations": [],
+        "events": [],
+        "pending_thinking": {
+          "00000000-0000-0000-0000-000000000020": "Reading"
+        },
+        "pending_model": {
+          "connection": {
+            "vendor": "Example",
+            "product": "Example Plan",
+            "kind": "plan",
+            "order": 2,
+            "region": {
+              "name": "Global",
+              "order": 1
+            },
+            "discovery": "provider_api"
+          },
+          "name": "example-plan",
+          "protocol": "messages",
+          "base_url": "https://models.example.test/v1",
+          "model": "example-large",
+          "api_key_env": "EXAMPLE_API_KEY",
+          "max_output_tokens": 32000,
+          "provider": "api",
+          "auth_source": "api_key_env",
+          "provider_id": "example",
+          "provider_name": "Example",
+          "model_id": "example-large",
+          "card": {
+            "id": "example-large",
+            "service_model_id": "example-large-2026",
+            "display_name": "Example Large",
+            "adapter": "messages",
+            "max_output_tokens": 32000,
+            "context_window_tokens": 200000,
+            "thinking": "toggle",
+            "adaptive_by_default": false,
+            "effort_levels": [
+              "low",
+              "high"
+            ],
+            "input_modalities": [
+              "text",
+              "image"
+            ],
+            "thinking_budgets": {
+              "low": 2048,
+              "medium": 8192,
+              "high": 16384
+            }
+          },
+          "input_modalities": [
+            "text",
+            "image"
+          ]
+        },
+        "commands": [],
+        "user_shells": [],
+        "request_usage": {
+          "last_sequence": 0,
+          "entries": []
+        },
+        "context_window_tokens": 200000,
+        "last_model_run": "00000000-0000-0000-0000-000000000020",
+        "warnings": [
+          "slow disk"
+        ],
+        "request_refs": [],
+        "resume_triggers": [],
+        "last_queue_sequence": 0,
+        "transcript_write_error": "disk full",
+        "loop_trigger_notices": [],
+        "queue_failures": []
+      }
+    }
+  }
+]

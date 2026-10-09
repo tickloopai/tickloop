@@ -199,7 +199,7 @@ impl TickShell {
             let mut metadata = vec!["Command".into()];
             metadata.extend(task.command.lines().map(str::to_owned));
             metadata.extend([
-                format!("State: {}", shell_status(task)),
+                format!("State: {}", task.status_label()),
                 format!(
                     "Started {} · updated {}",
                     relative_time(self.started_at_ms, now),
@@ -258,8 +258,6 @@ impl TickShell {
         }
     }
 }
-
-pub(super) use crate::tick_adapter::shell_status;
 
 #[cfg(test)]
 mod tests {

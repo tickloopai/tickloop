@@ -6,18 +6,7 @@ use crate::{
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::Read;
 
-mod screen {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/screen.rs"
-    ));
-}
-mod dialog {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/input_dialog.rs"
-    ));
-}
+use crate::terminal::test_support::{input_dialog as dialog, screen};
 
 const DIRECTORY: &str = "TICKLOOP_MODEL_DIALOG_FIXTURE_DIR";
 const TIMEOUT: Duration = Duration::from_secs(15);
@@ -40,8 +29,8 @@ fn model_dialog_pty_fixture() {
         runtime.block_on(async {
             let directory = PathBuf::from(std::env::var_os(DIRECTORY).unwrap()).canonicalize().unwrap();
             let root = directory.join("config");
-            crate::model::credentials::save_api_key(&root, "DEEPSEEK_API_KEY", "fixture-key").unwrap();
-            let model = crate::model::cards::ModelCatalog::defaults().get("deepseek-api", "deepseek-flash").unwrap();
+            tickloop_agent_model::credentials::save_api_key(&root, "DEEPSEEK_API_KEY", "fixture-key").unwrap();
+            let model = tickloop_agent_model::cards::ModelCatalog::defaults().get("deepseek-api", "deepseek-flash").unwrap();
             let core = crate::runtime::Agent::new_embedded(model.clone(), Arc::new(test_support::ScriptedModel::new(Vec::new())));
             let access = Arc::new(EmbeddedAgentAccess::new(core.clone()));
             let mut launch = LaunchSpec::embedded(directory.clone());
@@ -58,7 +47,7 @@ fn model_dialog_pty_fixture() {
             console.set_prompt_enabled(true).unwrap();
             console.record_input("Pinned model dialog fixture").unwrap();
             console.state.lock().unwrap().insert("Unsent fixture draft");
-            let mut menus = Menus::new(Some(crate::settings::UserSettings::in_root(&root)), Some(root));
+            let mut menus = Menus::new(Some(tickloop_agent_config::UserSettings::in_root(&root)), Some(root));
             menus.models(&agent, &console, ConfigTarget::Agent(first)).await.unwrap();
             let model_menu = console.dialog_menu_id().unwrap().unwrap();
             let chrome = |phase: &str| {

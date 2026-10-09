@@ -1149,8 +1149,8 @@ mod tests {
         scrollback.append_as("  ⎿ result\n", Some(Role::MutedText), None);
         scrollback.append_as("✓ Done", Some(Role::Success), None);
         let unicode = DisplayProfile::default();
-        let nerd_font = DisplayProfile::new(tickloop_agent::settings::DisplayPreferences {
-            glyph_set: tickloop_agent::settings::GlyphSet::NerdFont,
+        let nerd_font = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
+            glyph_set: tickloop_agent_config::GlyphSet::NerdFont,
             prefers_reduced_motion: false,
         });
 
@@ -1167,8 +1167,8 @@ mod tests {
             ]
         );
         let before_reduced_motion = scrollback.frame(80, 8).lines;
-        let reduced_motion = DisplayProfile::new(tickloop_agent::settings::DisplayPreferences {
-            glyph_set: tickloop_agent::settings::GlyphSet::NerdFont,
+        let reduced_motion = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
+            glyph_set: tickloop_agent_config::GlyphSet::NerdFont,
             prefers_reduced_motion: true,
         });
         scrollback.remap_display(nerd_font, reduced_motion);
@@ -1198,8 +1198,8 @@ mod tests {
         assert_eq!(linked_text(&mut scrollback, 40), ["[Image #1]"]);
         assert_eq!(linked_text(&mut scrollback, 12), ["[Image", " #1]"]);
 
-        let nerd_font = DisplayProfile::new(tickloop_agent::settings::DisplayPreferences {
-            glyph_set: tickloop_agent::settings::GlyphSet::NerdFont,
+        let nerd_font = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
+            glyph_set: tickloop_agent_config::GlyphSet::NerdFont,
             prefers_reduced_motion: false,
         });
         scrollback.remap_display(DisplayProfile::default(), nerd_font);
@@ -1300,8 +1300,8 @@ mod tests {
         let mut scrollback = Scrollback::new();
         scrollback.append_markdown("reply", "⏺ ", true);
         scrollback.frame(20, 4);
-        let nerd_font = DisplayProfile::new(tickloop_agent::settings::DisplayPreferences {
-            glyph_set: tickloop_agent::settings::GlyphSet::NerdFont,
+        let nerd_font = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
+            glyph_set: tickloop_agent_config::GlyphSet::NerdFont,
             prefers_reduced_motion: false,
         });
         scrollback.remap_display(DisplayProfile::default(), nerd_font);

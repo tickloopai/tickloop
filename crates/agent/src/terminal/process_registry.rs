@@ -12,7 +12,9 @@ use std::{
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::private_fs::{PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, unix_time_milliseconds};
+use tickloop_agent_base::private_fs::{
+    PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, unix_time_milliseconds,
+};
 
 const SESSIONS_DIRECTORY: &str = "sessions";
 const INTERACTIVE_KIND: &str = "interactive";

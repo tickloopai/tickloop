@@ -1,0 +1,13 @@
+[package]
+name = "tickloop-agent-test-support"
+description = "Test fixtures shared by the Agent crates' tests"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

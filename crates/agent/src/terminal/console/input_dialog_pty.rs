@@ -2,12 +2,7 @@ use super::*;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::Read;
 
-mod screen {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/screen.rs"
-    ));
-}
+use crate::terminal::test_support::screen;
 
 pub(super) const FIXTURE_DIRECTORY: &str = "TICKLOOP_INPUT_DIALOG_FIXTURE_DIR";
 pub(super) const TIMEOUT: Duration = Duration::from_secs(8);
@@ -346,7 +341,8 @@ fn input_dialog_pty_preserves_search_and_draft_through_permission_preemption() {
 #[ignore]
 fn plan_approval_pty_fixture() {
     use crate::terminal::{execution::ConsoleExecution, menus::Menus, test_support};
-    use tickloop_agent::{permissions::ExecutionMode, runtime::EventKind};
+    use tickloop_agent::runtime::EventKind;
+    use tickloop_agent_protocol::ExecutionMode;
     let directory = PathBuf::from(std::env::var(FIXTURE_DIRECTORY).unwrap());
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         let model = Arc::new(test_support::ScriptedModel::new(vec![

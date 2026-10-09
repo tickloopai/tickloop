@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    Agent, AgentError, Chat, ChatSnapshot, InputContext, RequestOutcome, RequestSequence,
-    ResponseRejection, UserShellState,
+    Agent, AgentError, Chat, ChatBookkeeping, ChatSnapshot, InputContext, RequestOutcome,
+    RequestSequence, ResponseRejection, UserShellState,
     compaction::{
         self, CompactBoundary, CompactTrigger, CompactionLayout, CompactionMarker, MessageSource,
         SummarizeMetadata,
@@ -22,8 +22,8 @@ use super::{
     context,
     model_request::{self, RequestContext},
 };
-use crate::model::{Content, Message, ModelClient, ModelConfig, ModelRequest, Role, strip_images};
-use crate::protocol::ChatId;
+use tickloop_agent_model::{ModelClient, ModelRequest, strip_images};
+use tickloop_agent_protocol::{ChatId, Content, Message, ModelConfig, Role};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,7 +129,7 @@ impl Agent {
             }
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
             ensure_summary_idle(chat)?;
-            let plan = prepare_plan(&chat.snapshot, request)?;
+            let plan = prepare_plan(&chat.snapshot, &chat.bookkeeping, request)?;
             let client = chat.client.clone();
             let mut candidate = chat.clone();
             let sequence = model_request::start_tracked_model_request(
@@ -203,7 +203,7 @@ impl Agent {
         if cancel.is_cancelled() {
             self.finish_summary_request(chat_id, sequence, RequestOutcome::Cancelled)
                 .await?;
-            return Err(crate::model::ModelError::Cancelled.into());
+            return Err(tickloop_agent_model::ModelError::Cancelled.into());
         }
         let summary = match complete_summary(response.output) {
             Ok(summary) => summary,
@@ -233,7 +233,7 @@ impl Agent {
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         if cancel.is_cancelled() {
             finish_request(self, chat, sequence, RequestOutcome::Cancelled)?;
-            return Err(crate::model::ModelError::Cancelled.into());
+            return Err(tickloop_agent_model::ModelError::Cancelled.into());
         }
         if !source_matches(&chat.snapshot, &plan) {
             return reject_candidate(
@@ -255,6 +255,7 @@ impl Agent {
                 preserved_by_later_summary: false,
                 original_user_inputs: super::approval_context::originals_for_active_chain(
                     &chat.snapshot,
+                    &chat.bookkeeping,
                 )
                 .ok(),
                 model: Some(Box::new(plan.original_model.clone())),
@@ -266,8 +267,9 @@ impl Agent {
                 direction: plan.direction,
             }),
         };
-        let mut candidate = layout.apply(&chat.snapshot);
-        match context::directed_summary_fits(&candidate) {
+        let (mut candidate, candidate_bookkeeping) =
+            layout.apply(&chat.snapshot, &chat.bookkeeping);
+        match context::directed_summary_fits(&candidate, &candidate_bookkeeping) {
             Ok(true) => {}
             Ok(false) => {
                 return reject_candidate(
@@ -295,15 +297,16 @@ impl Agent {
         let renamed_snapshots = chat.file_history.rename_messages(&renamed);
         if let Some(recorder) = &self.inner.recorder {
             recorder.compact(
-                &mut chat.snapshot,
-                &mut candidate,
+                chat,
+                &candidate,
+                &candidate_bookkeeping,
                 &layout,
                 &renamed_snapshots,
-                &chat.content_replacements,
             );
         }
         self.save(&candidate);
         chat.snapshot = candidate;
+        chat.bookkeeping = candidate_bookkeeping;
         // Like Claude Code's partial compaction, the summary replaces the file contents read so far.
         chat.tools.file_reads().clear();
         Ok(DirectedSummaryOutcome {
@@ -333,6 +336,7 @@ impl Agent {
 /// 压缩边界之后；向后保留时，保留消息中的旧边界和旧摘要被去掉（新摘要已覆盖它们）。
 fn prepare_plan(
     snapshot: &ChatSnapshot,
+    bookkeeping: &ChatBookkeeping,
     request: DirectedSummaryRequest,
 ) -> Result<DirectedSummaryPlan, AgentError> {
     let point = snapshot.rewind_point(request.message_id).ok_or_else(|| {
@@ -366,7 +370,11 @@ fn prepare_plan(
         SummaryDirection::FromHere => pivot..end,
         SummaryDirection::UpToHere => active_start..pivot,
     };
-    let source_messages = context::public_projection_of(snapshot, summarized.clone())?;
+    let source_messages = context::public_projection_of(
+        snapshot,
+        &bookkeeping.denial_references,
+        summarized.clone(),
+    )?;
     if source_messages.is_empty() {
         return Err(AgentError::Invalid(
             "there is no visible conversation in the selected range to summarize".into(),
@@ -409,7 +417,10 @@ fn prepare_plan(
         logical_parent,
         preserves_messages: !kept.is_empty(),
         messages_summarized: summarized.len(),
-        pre_tokens: context::estimate_request_tokens(&context::projected_messages(snapshot)?),
+        pre_tokens: context::estimate_request_tokens(&context::projected_messages(
+            snapshot,
+            &bookkeeping.denial_references,
+        )?),
         original_model: snapshot.model.clone(),
         original_messages: snapshot.messages.clone(),
         original_message_runs: snapshot.message_runs.clone(),
@@ -460,7 +471,7 @@ fn summary_request(plan: &DirectedSummaryPlan) -> ModelRequest {
 }
 
 fn complete_summary(
-    output: crate::model::ModelOutput,
+    output: tickloop_agent_model::ModelOutput,
 ) -> Result<String, (ResponseRejection, String)> {
     if output.content.iter().any(|content| {
         matches!(
@@ -557,7 +568,8 @@ fn reject_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ModelOutput, Usage};
+    use tickloop_agent_model::ModelOutput;
+    use tickloop_agent_protocol::Usage;
 
     #[test]
     fn complete_summary_keeps_text_block_boundaries() {

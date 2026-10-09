@@ -11,11 +11,9 @@ use tokio_tungstenite::{
     },
 };
 
-use crate::{
-    model::{ModelProvider, cards::ModelCatalog, codex_test_support::*},
-    permissions::{Decision, ExecutionMode},
-    runtime::{Agent, AgentHostOptions, EventKind, PromptPolicy, RequestKind},
-};
+use crate::runtime::{Agent, AgentHostOptions, EventKind, PromptPolicy, RequestKind};
+use tickloop_agent_model::{cards::ModelCatalog, codex_test_support::*};
+use tickloop_agent_protocol::{Decision, ExecutionMode, ModelProvider};
 
 fn agent_with_codex(state_dir: &Path, endpoint: &str) -> Agent {
     let config = ModelCatalog::defaults()

@@ -3,75 +3,14 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use super::auto_rules::AutoPolicy;
-use crate::model::credentials::ApiKeyStatus;
-use crate::permissions::{Decision, ExecutionMode, PermissionRule, is_supported_rule_content};
-use crate::settings::{
-    AutoReviewerPreference, AutoRuleChange, AutoRuleSettings, AutoSettings, AutoSettingsRevision,
-    SettingsError,
+use tickloop_agent_config::{AutoSettings, SettingsError};
+use tickloop_agent_tools::permissions::is_supported_rule_content;
+
+use super::{Agent, AgentError, AutoReviewerHealth, ChatBookkeeping, ChatSnapshot};
+use tickloop_agent_protocol::{
+    ApiKeyStatus, AutoReviewerPreference, AutoRuleChange, AutoRuleSettings, AutoSettingsRevision,
+    ChatId, Decision, ExecutionMode, PermissionRule,
 };
-
-use super::{Agent, AgentError, AutoReviewerHealth, ChatSnapshot};
-use crate::protocol::ChatId;
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PermissionsRevision {
-    local: u64,
-    project_rules: String,
-    auto_settings: AutoSettingsRevision,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct PermissionsView {
-    pub chat_id: ChatId,
-    pub revision: PermissionsRevision,
-    pub execution_mode: ExecutionMode,
-    pub chat_model_label: String,
-    pub preferred_reviewer: AutoReviewerPreference,
-    pub auto_policy: AutoPolicy,
-    pub auto_rule_settings: AutoRuleSettings,
-    pub auto_settings_revision: AutoSettingsRevision,
-    pub jev_key_status: ApiKeyStatus,
-    pub auto_reviewer_health: AutoReviewerHealth,
-    pub selected_loop_id: Option<Uuid>,
-    pub rules: Vec<PermissionRuleView>,
-    pub working_directory: PathBuf,
-    pub additional_directories: Vec<PathBuf>,
-    pub warnings: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum PermissionRuleSource {
-    ChatSession,
-    ProjectUser,
-    ProjectConstraint,
-    ManagedConstraint,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum PermissionRuleScope {
-    Chat,
-    Loop(Uuid),
-    Project(PathBuf),
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct PermissionRuleView {
-    pub rule: PermissionRule,
-    pub source: PermissionRuleSource,
-    pub scope: PermissionRuleScope,
-    pub editable: bool,
-    pub effective_note: Option<String>,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub enum PermissionChange {
-    UpsertRule { rule: PermissionRule },
-    RemoveRule { id: Uuid },
-    AddDirectory { path: PathBuf },
-    RemoveDirectory { path: PathBuf },
-    SelectReviewer { reviewer: AutoReviewerPreference },
-    ChangeAutoRules { change: AutoRuleChange },
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PermissionChangeError {
@@ -130,7 +69,7 @@ impl Agent {
                 != serde_json::to_value(&saved_rules).expect("rules serialize")
             {
                 chat.snapshot.policy.rules.retain(|rule| !rule.persistent);
-                chat.snapshot.persistent_rule_projects = saved_rules
+                chat.bookkeeping.persistent_rule_projects = saved_rules
                     .iter()
                     .map(|rule| (rule.id, workdir.clone()))
                     .collect();
@@ -141,6 +80,7 @@ impl Agent {
         }
         Ok(view_from_snapshot(
             &chat.snapshot,
+            &chat.bookkeeping,
             chat.client.identity().requested_model,
             project_rules,
             warnings,
@@ -173,7 +113,8 @@ impl Agent {
                 validate_rule(&rule)?;
                 let (workdir, rules, changes) = {
                     let chats = self.inner.chats.lock().await;
-                    let snapshot = &chats.get(&chat_id).ok_or(AgentError::NotFound)?.snapshot;
+                    let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+                    let snapshot = &chat.snapshot;
                     validate_editable_rule(snapshot, &rule)?;
                     let mut rules = snapshot.policy.rules.clone();
                     if let Some(index) = rules.iter().position(|existing| existing.id == rule.id) {
@@ -186,7 +127,11 @@ impl Agent {
                     } else {
                         rules.push(rule);
                     }
-                    let changes = super::chat_settings::persistent_rule_changes(snapshot, &rules)?;
+                    let changes = super::chat_settings::persistent_rule_changes(
+                        snapshot,
+                        &chat.bookkeeping,
+                        &rules,
+                    )?;
                     (snapshot.workdir.clone(), rules, changes)
                 };
                 self.apply_rule_change(chat_id, workdir, rules, changes, &expected_revision)
@@ -195,7 +140,8 @@ impl Agent {
             PermissionChange::RemoveRule { id } => {
                 let (workdir, rules, changes) = {
                     let chats = self.inner.chats.lock().await;
-                    let snapshot = &chats.get(&chat_id).ok_or(AgentError::NotFound)?.snapshot;
+                    let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+                    let snapshot = &chat.snapshot;
                     if snapshot
                         .policy
                         .project_constraints
@@ -213,7 +159,11 @@ impl Agent {
                             "rule does not exist or is read-only".into(),
                         ));
                     }
-                    let changes = super::chat_settings::persistent_rule_changes(snapshot, &rules)?;
+                    let changes = super::chat_settings::persistent_rule_changes(
+                        snapshot,
+                        &chat.bookkeeping,
+                        &rules,
+                    )?;
                     (snapshot.workdir.clone(), rules, changes)
                 };
                 self.apply_rule_change(chat_id, workdir, rules, changes, &expected_revision)
@@ -390,7 +340,7 @@ impl Agent {
         self.sync_persistent_rules(&mut chats, &changes, Some(chat_id));
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         chat.snapshot.policy.rules = rules;
-        super::chat_settings::record_rule_projects(&mut chat.snapshot, &changes);
+        super::chat_settings::record_rule_projects(&mut chat.bookkeeping, &changes);
         chat.snapshot.policy.revision += 1;
         self.save(&chat.snapshot);
         Ok(())
@@ -440,7 +390,7 @@ pub(crate) fn rule_views(
             },
             editable: true,
             effective_note: (mode == ExecutionMode::Auto
-                && crate::permissions::bypasses_auto_classifier(rule))
+                && tickloop_agent_tools::permissions::bypasses_auto_classifier(rule))
             .then(|| "broad Allow does not bypass Auto review".into()),
         })
         .chain(project_constraints.iter().map(|rule| PermissionRuleView {
@@ -469,6 +419,7 @@ struct AutoViewState {
 
 fn view_from_snapshot(
     snapshot: &ChatSnapshot,
+    bookkeeping: &ChatBookkeeping,
     chat_model_label: String,
     project_rules: String,
     warnings: Vec<String>,
@@ -483,7 +434,7 @@ fn view_from_snapshot(
     let rules = rule_views(
         &snapshot.policy.rules,
         |rule| {
-            snapshot
+            bookkeeping
                 .persistent_rule_projects
                 .get(&rule.id)
                 .cloned()
@@ -504,7 +455,7 @@ fn view_from_snapshot(
         execution_mode: snapshot.policy.mode,
         chat_model_label,
         preferred_reviewer: auto_settings.reviewer,
-        auto_policy: AutoPolicy::from_settings(&auto_settings),
+        auto_policy: super::auto_rules::auto_policy_from_settings(&auto_settings),
         auto_rule_settings: auto_settings.rules,
         auto_settings_revision,
         jev_key_status,

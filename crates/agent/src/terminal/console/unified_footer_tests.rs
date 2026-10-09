@@ -73,7 +73,7 @@ fn agent(id: u128, parent: Option<Uuid>, title: &str) -> AgentRow {
                 title.into()
             },
             description: title.into(),
-            created_at: crate::private_fs::unix_time_milliseconds(),
+            created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
         }),
     }
 }
@@ -122,7 +122,7 @@ fn command_feedback_keeps_provider_failure_visible_with_an_empty_custom_status()
 
 #[test]
 fn child_input_badge_placeholder_and_panel_background_are_display_only() {
-    use crate::settings::{DisplayPreferences, GlyphSet};
+    use tickloop_agent_config::{DisplayPreferences, GlyphSet};
     for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
         for theme in ThemeName::ALL {
             let console = fixture();
@@ -285,7 +285,7 @@ fn expanded_subagents_start_at_the_entry_without_an_items_or_blank_summary_row()
 
 #[test]
 fn subagents_robot_prefix_preserves_divider_bounds_and_hints_in_both_states_and_glyph_sets() {
-    use tickloop_agent::settings::GlyphSet;
+    use tickloop_agent_config::GlyphSet;
 
     for (glyph_set, robot) in [(GlyphSet::Unicode, "⏺"), (GlyphSet::NerdFont, "\u{f06a9}")] {
         let console = fixture();
@@ -343,13 +343,13 @@ fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks()
     console.state.lock().unwrap().monitor.replace(
         TickGroup::Shells,
         vec![MonitorEntry {
-            instance: crate::tick_stream::InstanceRef::shell(TASK),
+            instance: tick_protocol::InstanceRef::shell(TASK),
             group: TickGroup::Shells,
             glyph: Glyph::ShellTick,
             title: "edge Shell".into(),
             kind: "Shell".into(),
             status: "running".into(),
-            owner: crate::tick_adapter::TickOwner::Unknown,
+            owner: crate::monitor_rows::TickOwner::Unknown,
             updated_at_ms: None,
             resources: None,
             actions: Vec::new(),
@@ -405,7 +405,7 @@ fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks()
 
 #[test]
 fn subagents_and_context_colors_resolve_from_theme_roles() {
-    use tickloop_agent::settings::GlyphSet;
+    use tickloop_agent_config::GlyphSet;
 
     for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
         for theme_name in ThemeName::ALL {
@@ -650,7 +650,7 @@ fn single_shell_activation_and_detail_updates_keep_the_exact_eligible_task() {
     };
     assert_eq!(
         action.instance,
-        crate::tick_stream::InstanceRef::shell(TASK).to_string()
+        tick_protocol::InstanceRef::shell(TASK).to_string()
     );
     let panel = console
         .state
@@ -711,7 +711,7 @@ fn multiple_shell_shortcut_opens_the_list_after_an_earlier_single_detail() {
     );
     key(&console, KeyCode::Char('j'));
     assert!(
-        matches!(key(&console, KeyCode::Enter), Some(InputEvent::TickAction {action,..}) if action.instance == crate::tick_stream::InstanceRef::shell(second).to_string())
+        matches!(key(&console, KeyCode::Enter), Some(InputEvent::TickAction {action,..}) if action.instance == tick_protocol::InstanceRef::shell(second).to_string())
     );
     assert_eq!(
         console.state.lock().unwrap().editor.draft(),
@@ -754,7 +754,7 @@ fn assert_single_shell_shortcut(cached_detail: bool) {
     };
     assert_eq!(
         action.instance,
-        crate::tick_stream::InstanceRef::shell(target).to_string()
+        tick_protocol::InstanceRef::shell(target).to_string()
     );
     let panel = console
         .state

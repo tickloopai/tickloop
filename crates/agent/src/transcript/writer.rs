@@ -11,7 +11,7 @@ use super::entry::{
     SubagentsEntry,
 };
 use super::listing::{LITE_READ_BUF_SIZE, last_json_string_field};
-use crate::private_fs::{PRIVATE_FILE_MODE, create_private_directory};
+use tickloop_agent_base::private_fs::{PRIVATE_FILE_MODE, create_private_directory};
 
 /// 照 Claude Code `FLUSH_INTERVAL_MS`：条目先排队，最多每 100ms 批量追加一次。
 pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
@@ -79,7 +79,7 @@ struct FileState {
     materialized: bool,
     /// 文件已在磁盘上：本进程追加成功过，或恢复时从磁盘读取。之后的追加不再创建文件。
     exists_on_disk: bool,
-    /// 已在磁盘上的文件被外部删除（例如过期清理）。之后丢弃该文件的全部条目，不重建文件：
+    /// 已在磁盘上的文件被外部删除。之后丢弃该文件的全部条目，不重建文件：
     /// 只含后续条目的文件父指针断链，恢复时丢失之前的对话。
     deleted: bool,
     /// 第一条 user／assistant 条目到来前缓存的条目，文件此时尚未创建。
@@ -356,7 +356,7 @@ fn read_tail(path: &Path) -> io::Result<String> {
 mod tests {
     use super::super::entry::ChainEntry;
     use super::*;
-    use crate::model::{Content, Message, Role};
+    use tickloop_agent_protocol::{Content, Message, Role};
 
     fn chain(uuid: Uuid, role: Role) -> Line {
         Line::chain(
@@ -432,7 +432,7 @@ mod tests {
         }
     }
 
-    /// 已写出的文件被外部删除（例如另一进程的过期清理）后不再重建：只含后续条目的文件父指针断链，
+    /// 已写出的文件被外部删除后不再重建：只含后续条目的文件父指针断链，
     /// 退出时追加的元数据也会写出空壳。改为报告写入错误并停止记录该文件。
     #[test]
     fn a_deleted_transcript_is_not_recreated_and_the_deletion_is_reported() {

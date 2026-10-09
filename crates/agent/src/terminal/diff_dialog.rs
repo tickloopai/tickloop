@@ -10,7 +10,7 @@ use super::{
         navigate_error, render_diff, render_error,
     },
 };
-use crate::file_change::{FileChangeAction, FileChangeReviewSummary};
+use tickloop_agent_protocol::{FileChangeAction, FileChangeReviewSummary};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DiffDialogMode {
@@ -450,14 +450,12 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::{
-        file_change::{
-            FileChangeAction, FileChangeHunk, FileChangeLine, FileChangeLineKind, FileChangeReview,
-            FileVersion,
-        },
-        terminal::diff_catalog::{
-            CatalogFileChange, CatalogFileChangeId, CatalogUnavailableKind, ChangeSourceState,
-        },
+    use crate::terminal::diff_catalog::{
+        CatalogFileChange, CatalogFileChangeId, CatalogUnavailableKind, ChangeSourceState,
+    };
+    use tickloop_agent_protocol::{FileChangeAction, FileVersion};
+    use tickloop_agent_tools::file_change::{
+        FileChangeHunk, FileChangeLine, FileChangeLineKind, FileChangeReview,
     };
 
     fn version(bytes: u64, lines: u64, exists: bool) -> FileVersion {

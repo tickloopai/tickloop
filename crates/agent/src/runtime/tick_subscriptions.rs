@@ -19,12 +19,11 @@ use super::tick_content::{
     write_watermark,
 };
 use super::*;
-use crate::protocol::ToolDefinition;
 use crate::tick_stream::{
     ObservationKind, TickConnectionState, TickObservation, TickStreamEvent, TickStreamPort, WatchId,
 };
-use crate::tools::ToolResult;
-use tick_connect::instance::InstanceRef;
+use tick_protocol::InstanceRef;
+use tickloop_agent_protocol::{ToolDefinition, ToolResult};
 
 pub const TICK_SUBSCRIPTION_SOURCE: &str = "tick_subscription";
 pub const DEFAULT_CADENCE_SECONDS: u64 = 60;
@@ -323,7 +322,7 @@ impl TickDeliveries {
                 trigger.armed
                     && trigger.accepts_events
                     && trigger.expires_at_ms.is_none_or(|deadline| {
-                        deadline > crate::private_fs::unix_time_milliseconds()
+                        deadline > tickloop_agent_base::private_fs::unix_time_milliseconds()
                     })
             })
             .ok_or_else(|| {
@@ -1166,7 +1165,7 @@ impl Agent {
         let mut deliveries = self.tick_deliveries();
         match outcome {
             Ok(_) => {
-                let delivered_at = crate::private_fs::unix_time_milliseconds();
+                let delivered_at = tickloop_agent_base::private_fs::unix_time_milliseconds();
                 let summary = delivery_summary(&items, truncated);
                 for item in &items {
                     if let Some(runtime) = deliveries.subscriptions.get_mut(&item.subscription) {

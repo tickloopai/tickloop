@@ -1577,7 +1577,7 @@ impl OverviewState {
                 Role::MutedText,
             ));
         }
-        let now = crate::private_fs::unix_time_milliseconds();
+        let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
         let rooms = entries
             .iter()
             .filter_map(|entry| match entry {

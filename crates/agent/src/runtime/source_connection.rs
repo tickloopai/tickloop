@@ -11,13 +11,11 @@ use super::{
     ChatSnapshot, EventSourceBinding, FrozenAssociationRequest, LoopId, LoopState, Receipt, RunId,
     SourceConnection, SourcePublication,
 };
-use crate::{
-    host_tools::{
-        ConnectAction, ConnectSourceEffect, EventAssociationOutcome, EventAssociationRequest,
-        PublishedSourceEffect, RemoteAssociation, RemoteAssociationOperation, connection_result,
-    },
-    tools::ToolResult,
+use crate::host_tools::{
+    ConnectAction, ConnectSourceEffect, EventAssociationOutcome, EventAssociationRequest,
+    PublishedSourceEffect, RemoteAssociation, RemoteAssociationOperation, connection_result,
 };
+use tickloop_agent_protocol::ToolResult;
 
 pub(super) fn has_recorded_publication(
     snapshot: &ChatSnapshot,

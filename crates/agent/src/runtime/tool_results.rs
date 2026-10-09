@@ -15,7 +15,7 @@
 //! 与之生成时内容一致的结果上。
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -24,17 +24,16 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use super::{Agent, AgentError, ChatSnapshot, Receipt};
-use crate::model::{Content, Message, Role, ToolResultContent};
-use crate::private_fs::{PRIVATE_FILE_MODE, PrivateDirectory};
-use crate::tools::{
-    BASH_TOOL_NAME, GREP_TOOL_NAME, PERSISTED_OUTPUT_TAG, PREVIEW_LABEL, READ_TOOL_NAME,
-    SAVED_TO_LABEL, TASK_OUTPUT_SUBDIRECTORY, ToolResult, Tools, large_output_message,
-    utf16_length,
-};
 use crate::transcript::{ContentReplacementRecord, private_family_temp_directory};
+use tickloop_agent_base::private_fs::{PRIVATE_FILE_MODE, PrivateDirectory};
+use tickloop_agent_protocol::{Content, Message, Role, ToolResult, ToolResultContent};
+use tickloop_agent_tools::{
+    BASH_TOOL_NAME, GREP_TOOL_NAME, PERSISTED_OUTPUT_TAG, PREVIEW_LABEL, READ_TOOL_NAME,
+    SAVED_TO_LABEL, TASK_OUTPUT_SUBDIRECTORY, Tools, large_output_message, utf16_length,
+};
 
-/// Chat 目录中大工具结果的子目录；过期清理按同一布局查找。
-pub(crate) const TOOL_RESULTS_SUBDIRECTORY: &str = "tool-results";
+/// Chat 目录中大工具结果的子目录。
+const TOOL_RESULTS_SUBDIRECTORY: &str = "tool-results";
 /// Claude Code `DEFAULT_MAX_RESULT_SIZE_CHARS`：各工具声明的上限再受此值约束。
 const DEFAULT_MAX_RESULT_SIZE_CHARS: usize = 50_000;
 /// Claude Code `MAX_TOOL_RESULTS_PER_MESSAGE_CHARS`。
@@ -267,7 +266,8 @@ impl ContentReplacementState {
         snapshot: &ChatSnapshot,
         records: &[ContentReplacementRecord],
     ) -> Self {
-        let messages = super::context::projected_messages(snapshot).unwrap_or_default();
+        let messages =
+            super::context::projected_messages(snapshot, &BTreeMap::new()).unwrap_or_default();
         Self::reconstruct_from_messages(&messages, records)
     }
 
@@ -489,7 +489,7 @@ pub(super) fn enforce_tool_result_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{format_file_size, generate_preview};
+    use tickloop_agent_tools::{format_file_size, generate_preview};
 
     #[test]
     fn file_sizes_and_previews_follow_claude_code() {
@@ -629,16 +629,16 @@ mod tests {
         let chat_directory = PrivateDirectory::trusted(directory.path().to_path_buf());
         let text = "a".repeat(MAX_TOOL_RESULTS_PER_MESSAGE_CHARS + 1);
         let mut messages = tool_round("with-image", "").to_vec();
-        let image = crate::model::ToolResultBlock::Image {
-            source: crate::model::ImageSource::Base64 {
-                media_type: crate::image::ImageMediaType::Png,
+        let image = tickloop_agent_protocol::ToolResultBlock::Image {
+            source: tickloop_agent_protocol::ImageSource::Base64 {
+                media_type: tickloop_agent_base::image::ImageMediaType::Png,
                 data: "iVBORw0KGgo=".into(),
             },
             width: 8,
             height: 8,
         };
         let content = ToolResultContent::Blocks(vec![
-            crate::model::ToolResultBlock::Text { text: text.clone() },
+            tickloop_agent_protocol::ToolResultBlock::Text { text: text.clone() },
             image,
         ]);
         let Content::ToolResult {

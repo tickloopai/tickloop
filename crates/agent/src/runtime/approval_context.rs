@@ -8,20 +8,11 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::auto_rules::AutoPolicy;
-use super::{ChatSnapshot, OperationRecord};
-use crate::model::{Content, Role};
+use super::{ChatBookkeeping, ChatSnapshot, OperationRecord};
+use tickloop_agent_protocol::{Content, Role};
 
 pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v2";
 pub(super) const REVIEW_TEMPLATE_VERSION: &str = "auto-review-v3";
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct OriginalUserInput {
-    pub chat_id: Uuid,
-    pub loop_id: Uuid,
-    pub run_id: Uuid,
-    pub message_id: Uuid,
-    pub text: String,
-}
 
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct ApprovalOperation {
@@ -52,12 +43,14 @@ pub(super) enum ApprovalContextError {
 
 pub(super) fn originals_for_active_chain(
     snapshot: &ChatSnapshot,
+    bookkeeping: &ChatBookkeeping,
 ) -> Result<Vec<OriginalUserInput>, ApprovalContextError> {
-    originals_for_active_chain_with_legacy(snapshot, None, None)
+    originals_for_active_chain_with_legacy(snapshot, bookkeeping, None, None)
 }
 
 fn originals_for_active_chain_with_legacy(
     snapshot: &ChatSnapshot,
+    bookkeeping: &ChatBookkeeping,
     legacy: Option<Vec<OriginalUserInput>>,
     proposed_call_id: Option<&str>,
 ) -> Result<Vec<OriginalUserInput>, ApprovalContextError> {
@@ -97,7 +90,7 @@ fn originals_for_active_chain_with_legacy(
             if let Some(run_id) = snapshot.message_runs.get(&index).copied() {
                 for content in &message.content {
                     if let Content::ToolUse { id, name, .. } = content
-                        && name == crate::tools::ASK_USER_QUESTION_TOOL_NAME
+                        && name == tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME
                     {
                         let message_id = snapshot
                             .message_ids
@@ -123,7 +116,7 @@ fn originals_for_active_chain_with_legacy(
             let Some(run_id) = snapshot.message_runs.get(&index).copied() else {
                 return Err(ApprovalContextError::MissingOriginalUserInput);
             };
-            let Some(loop_id) = snapshot.run_loops.get(&run_id).copied() else {
+            let Some(loop_id) = bookkeeping.run_loops.get(&run_id).copied() else {
                 return Err(ApprovalContextError::MissingOriginalUserInput);
             };
             let Some(message_id) = snapshot
@@ -164,7 +157,7 @@ fn originals_for_active_chain_with_legacy(
         let Some(run_id) = snapshot.message_runs.get(&index).copied() else {
             continue;
         };
-        let Some(loop_id) = snapshot.run_loops.get(&run_id).copied() else {
+        let Some(loop_id) = bookkeeping.run_loops.get(&run_id).copied() else {
             continue;
         };
         for content in &message.content {
@@ -207,12 +200,17 @@ fn originals_for_active_chain_with_legacy(
 
 pub(super) fn capture(
     snapshot: &ChatSnapshot,
+    bookkeeping: &ChatBookkeeping,
     operation: &OperationRecord,
     legacy: Option<Vec<OriginalUserInput>>,
     auto_policy: AutoPolicy,
 ) -> Result<ApprovalSnapshot, ApprovalContextError> {
-    let originals =
-        originals_for_active_chain_with_legacy(snapshot, legacy, Some(&operation.call_id))?;
+    let originals = originals_for_active_chain_with_legacy(
+        snapshot,
+        bookkeeping,
+        legacy,
+        Some(&operation.call_id),
+    )?;
     let mut original_user_inputs = originals
         .into_iter()
         .filter(|input| input.chat_id == snapshot.id && input.loop_id == operation.loop_id)

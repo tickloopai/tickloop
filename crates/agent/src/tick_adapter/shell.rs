@@ -234,7 +234,7 @@ impl TickStreamPort for ShellTickStream {
                                             publisher.observation(&[*watch], TickObservation {
                                                 instance: instance.clone(), sequence: cursor.sequence,
                                                 observed_at: task.updated_at_ms.map(crate::transcript::format_timestamp).unwrap_or_else(crate::transcript::now_timestamp), dropped: 0,
-                                                data: serde_json::json!({"task_id":task.id,"status":shell_status(task),"state":task.state,"exit_code":task.exit_code,"signal":task.signal,"output_bytes":task.output_bytes,"output":output,"truncated":task.output_bytes > OUTPUT_SUMMARY_BYTES as u64}),
+                                                data: serde_json::json!({"task_id":task.id,"status":task.status_label(),"state":task.state,"exit_code":task.exit_code,"signal":task.signal,"output_bytes":task.output_bytes,"output":output,"truncated":task.output_bytes > OUTPUT_SUMMARY_BYTES as u64}),
                                                 kind: ObservationKind::Protocol, recover_with: Some("Read the output_file returned by Bash with Read; use the Shell detail for user commands".into()), gap: false,
                                             });
                                         }

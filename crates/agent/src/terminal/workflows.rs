@@ -2,15 +2,9 @@ use super::execution::ConsoleExecution as Agent;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use tickloop_agent::{
-    model::{Content, Role},
-    permissions::ExecutionMode,
-    runtime::{
-        BranchPublicItem, BranchPublicSource, ChatSnapshot, EventKind,
-        FOLDED_TICK_REPLY_CHARACTERS, InputContext, LocalMessage, LoopState, Receipt, SavedChat,
-        UserShellRecord, UserShellState,
-    },
-    tools::{CommandSnapshot, CommandState, ToolResult},
+use tickloop_agent::runtime::{
+    BranchPublicItem, BranchPublicSource, ChatSnapshot, EventKind, FOLDED_TICK_REPLY_CHARACTERS,
+    InputContext, LocalMessage, LoopState, Receipt, SavedChat, UserShellRecord, UserShellState,
 };
 use uuid::Uuid;
 
@@ -26,6 +20,9 @@ use super::{
     image_cache::ImageLinks,
     presentation, safe_text,
     style::RoleSpan,
+};
+use tickloop_agent_protocol::{
+    CommandSnapshot, CommandState, Content, ExecutionMode, Role, ToolResult,
 };
 
 const COMMAND_OUTPUT_PAGE_BYTES: usize = 16 * 1024;
@@ -354,7 +351,7 @@ impl Workflow {
             .permissions
             .iter()
             .find(|request| {
-                request.name == tickloop_agent::tools::EXIT_PLAN_MODE_TOOL_NAME
+                request.name == tickloop_agent_tools::EXIT_PLAN_MODE_TOOL_NAME
                     && request.loop_id == goal
             })
             .map(|request| request.id);
@@ -1127,7 +1124,7 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
 }
 
 /// A Tick Update delivery: the Chat shows its `◉` lines, never the payload the model reads.
-fn is_tick_delivery(message: &tickloop_agent::model::Message) -> bool {
+fn is_tick_delivery(message: &tickloop_agent_protocol::Message) -> bool {
     message.role == Role::User
         && message.content.iter().any(|content| match content {
             Content::Text { text } => {
@@ -1142,7 +1139,7 @@ fn is_tick_delivery(message: &tickloop_agent::model::Message) -> bool {
 
 /// A quiet answer to a delivery: one short piece of text and no tool call, so it folds into one
 /// muted line instead of a full reply block.
-fn is_folded_tick_reply(message: &tickloop_agent::model::Message) -> bool {
+fn is_folded_tick_reply(message: &tickloop_agent_protocol::Message) -> bool {
     message.role == Role::Assistant
         && message.content.iter().all(|content| match content {
             Content::Text { text } => text.chars().count() <= FOLDED_TICK_REPLY_CHARACTERS,
@@ -1155,7 +1152,7 @@ fn append_public_message(
     tool_calls: &mut HashMap<(Uuid, Option<Uuid>, String), (String, serde_json::Value)>,
     source: &BranchPublicSource,
     contexts: &[InputContext],
-    message: &tickloop_agent::model::Message,
+    message: &tickloop_agent_protocol::Message,
     display: DisplayProfile,
     folded: bool,
 ) {
@@ -1300,11 +1297,11 @@ mod tests {
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
     use serde_json::json;
     use std::sync::Arc;
-    use tickloop_agent::{
-        model::{InputModality, Message, ModelConfig, Protocol},
-        permissions::{Decision, PermissionRule},
-        runtime::{BranchRequest, CompactionMarker, Event, LoopSnapshot, SummaryDirection},
+    use tickloop_agent::runtime::{
+        BranchRequest, CompactionMarker, Event, LoopSnapshot, SummaryDirection,
     };
+    use tickloop_agent_protocol::{Decision, PermissionRule};
+    use tickloop_agent_protocol::{InputModality, Message, ModelConfig, Protocol};
 
     async fn completed(
         events: &mut tokio::sync::broadcast::Receiver<tickloop_agent::runtime::Event>,
@@ -1327,12 +1324,12 @@ mod tests {
                 support::text("Second report."),
             ],
             vec![
-                tickloop_agent::model::Usage {
+                tickloop_agent_protocol::Usage {
                     input_tokens: Some(31),
                     output_tokens: Some(7),
                     ..Default::default()
                 },
-                tickloop_agent::model::Usage {
+                tickloop_agent_protocol::Usage {
                     input_tokens: Some(117),
                     output_tokens: Some(29),
                     ..Default::default()
@@ -1498,8 +1495,8 @@ mod tests {
             "id": chat_id,
             "workdir": "/workspace",
             "model": ModelConfig {
-                provider: crate::model::ModelProvider::Api,
-                auth_source: crate::model::ModelAuthSource::ApiKeyEnv,
+                provider: tickloop_agent_protocol::ModelProvider::Api,
+                auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
                 name: "fixture".into(),
                 protocol: Protocol::Messages,
                 base_url: "https://example.invalid".into(),
@@ -1634,7 +1631,7 @@ mod tests {
             .unwrap();
         let cache = crate::terminal::image_cache::ImageCache::in_root(root.path());
         let cached = cache
-            .store(chat, 1, &tickloop_agent::image::prepare(&png).unwrap())
+            .store(chat, 1, &tickloop_agent_base::image::prepare(&png).unwrap())
             .unwrap();
         let snapshot: ChatSnapshot = serde_json::from_value(json!({
             "id": chat,
@@ -1831,8 +1828,8 @@ mod tests {
 
     #[test]
     fn restored_history_uses_the_selected_glyph_set() {
-        let display = DisplayProfile::new(tickloop_agent::settings::DisplayPreferences {
-            glyph_set: tickloop_agent::settings::GlyphSet::NerdFont,
+        let display = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
+            glyph_set: tickloop_agent_config::GlyphSet::NerdFont,
             prefers_reduced_motion: false,
         });
 
@@ -2250,7 +2247,7 @@ mod tests {
             loop {
                 match support::next_event(events).await.kind {
                     EventKind::PermissionRequested { request }
-                        if request.name == tickloop_agent::tools::EXIT_PLAN_MODE_TOOL_NAME =>
+                        if request.name == tickloop_agent_tools::EXIT_PLAN_MODE_TOOL_NAME =>
                     {
                         return;
                     }

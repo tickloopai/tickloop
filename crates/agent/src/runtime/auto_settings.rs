@@ -1,10 +1,11 @@
 use std::path::Path;
 
-use crate::judgment::JEV_API_KEY_ENV;
-use crate::model::credentials::{ApiKeyStatus, api_key_status, save_api_key};
-use crate::settings::{AutoSettings, AutoSettingsRevision};
+use tickloop_agent_config::{AutoSettings, empty_auto_settings_revision};
+use tickloop_agent_model::credentials::{api_key_status, save_api_key};
+use tickloop_agent_model::judgment::JEV_API_KEY_ENV;
 
 use super::{Agent, AgentError};
+use tickloop_agent_protocol::{ApiKeyStatus, AutoSettingsRevision};
 
 /// Jev key status from the credentials under `root`, or from the environment without one.
 pub(crate) fn jev_key_status_in(root: Option<&Path>) -> Result<ApiKeyStatus, AgentError> {
@@ -27,7 +28,7 @@ impl Agent {
         &self,
     ) -> Result<(AutoSettings, AutoSettingsRevision), AgentError> {
         let Some(settings) = self.inner.settings.clone() else {
-            return Ok((AutoSettings::default(), AutoSettingsRevision::default()));
+            return Ok((AutoSettings::default(), empty_auto_settings_revision()));
         };
         tokio::task::spawn_blocking(move || settings.auto_settings_with_revision())
             .await
@@ -40,7 +41,7 @@ impl Agent {
             .inner
             .settings
             .as_ref()
-            .and_then(crate::settings::UserSettings::root)
+            .and_then(tickloop_agent_config::UserSettings::root)
             .map(ToOwned::to_owned);
         tokio::task::spawn_blocking(move || jev_key_status_in(root.as_deref()))
             .await
@@ -52,7 +53,7 @@ impl Agent {
             .inner
             .settings
             .as_ref()
-            .and_then(crate::settings::UserSettings::root)
+            .and_then(tickloop_agent_config::UserSettings::root)
             .ok_or_else(|| AgentError::Invalid("Jev key storage is unavailable".into()))?
             .to_owned();
         let value = value.to_owned();

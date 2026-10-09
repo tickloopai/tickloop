@@ -3,9 +3,8 @@
 //!
 //! Files live at `<root>/image-cache/<chatId>/<N>.<ext>`, private to the user. Claude Code
 //! keys the directory by process; Tick Loop keys it by Chat because one process hosts many
-//! Chats and several processes may run at once, and the directory expires with the Chat's
-//! Transcript (`cleanup.rs`). The cache only serves links: nothing reads it back as model
-//! context.
+//! Chats and several processes may run at once. The cache only serves links: nothing reads it
+//! back as model context.
 
 use std::{
     fs, io,
@@ -14,12 +13,14 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use tickloop_agent::image::{Image, ImageMediaType};
+use tickloop_agent_base::image::{Image, ImageMediaType};
 use uuid::Uuid;
 
 use super::hyperlink::Hyperlink;
-use crate::private_fs::{PRIVATE_FILE_MODE, create_private_directory, replace_file_atomically};
-use crate::settings::IMAGE_CACHE_DIRECTORY;
+use tickloop_agent_base::private_fs::{
+    PRIVATE_FILE_MODE, create_private_directory, replace_file_atomically,
+};
+use tickloop_agent_config::IMAGE_CACHE_DIRECTORY;
 
 const PLACEHOLDER_PREFIX: &str = "[Image #";
 const PLACEHOLDER_SUFFIX: char = ']';
@@ -131,7 +132,7 @@ mod tests {
         ::image::DynamicImage::ImageRgba8(::image::RgbaImage::new(width, height))
             .write_to(&mut io::Cursor::new(&mut bytes), ::image::ImageFormat::Png)
             .unwrap();
-        tickloop_agent::image::prepare(&bytes).unwrap()
+        tickloop_agent_base::image::prepare(&bytes).unwrap()
     }
 
     #[test]

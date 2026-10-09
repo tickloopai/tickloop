@@ -2,10 +2,10 @@ use super::{
     EventPublisher, InstanceRef, ObservationKind, TickConnectionState, TickObservation,
     TickStreamHandle, TickStreamPort, WatchId,
 };
-use crate::artifacts::{ArtifactClient, ArtifactError, ArtifactMetadata};
 use crate::host_tools::HostToolAuthority;
 use crate::runtime::{DEFAULT_CADENCE_SECONDS, MAX_CADENCE_SECONDS, MIN_CADENCE_SECONDS};
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use tickloop_agent_artifacts::{ArtifactClient, ArtifactError, ArtifactMetadata};
 use tokio::{sync::watch, time::Instant};
 use uuid::Uuid;
 
@@ -216,7 +216,7 @@ fn authorized_client(
     root: &std::path::Path,
     instance: &InstanceRef,
     authority: Option<&HostToolAuthority>,
-) -> Result<(ArtifactClient, crate::artifacts::CredentialSnapshot), String> {
+) -> Result<(ArtifactClient, tickloop_agent_artifacts::CredentialSnapshot), String> {
     let (origin, _) = instance
         .artifact_parts()
         .ok_or("Artifact watch identity is invalid")?;

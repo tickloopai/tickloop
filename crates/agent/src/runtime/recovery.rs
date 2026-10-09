@@ -1,6 +1,7 @@
 use super::{AgentError, ChatSnapshot, LoopId, OperationState};
-use crate::model::{Content, Message, Role, validate_model_for_resume_in_root};
-use crate::tools::{ASK_USER_QUESTION_TOOL_NAME, ToolResult};
+use tickloop_agent_model::validate_model_for_resume_in_root;
+use tickloop_agent_protocol::{Content, Message, Role, ToolResult};
+use tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME;
 
 pub(super) fn before_resume(
     snapshot: &mut ChatSnapshot,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::tick_adapter::{MonitorAction, TickIntent};
+use crate::monitor_rows::{MonitorAction, TickIntent};
 
 #[test]
 fn input_dialog_top_rule_matches_claude_code_in_both_themes() {
@@ -240,14 +240,13 @@ fn input_dialog_rule_click_never_submits_a_menu_or_trust_choice() {
 pub(super) fn fixture_ticks() -> Vec<MonitorEntry> {
     (0..2)
         .map(|index| MonitorEntry {
-            instance: crate::tick_stream::InstanceRef::new("fixture", &format!("tick-{index}"))
-                .unwrap(),
+            instance: tick_protocol::InstanceRef::new("fixture", &format!("tick-{index}")).unwrap(),
             group: TickGroup::Artifacts,
             glyph: Glyph::ArtifactTick,
             title: format!("Fixture Tick {index}"),
             kind: "Document".into(),
             status: "read".into(),
-            owner: crate::tick_adapter::TickOwner::Unknown,
+            owner: crate::monitor_rows::TickOwner::Unknown,
             updated_at_ms: None,
             resources: None,
             actions: vec![MonitorAction {
@@ -1349,13 +1348,13 @@ fn latest_user_message_stays_at_the_top_left_with_ticks_and_an_input_dialog() {
     state.monitor.replace(
         TickGroup::Shells,
         vec![MonitorEntry {
-            instance: crate::tick_stream::InstanceRef::new("shell", "fixture").unwrap(),
+            instance: tick_protocol::InstanceRef::new("shell", "fixture").unwrap(),
             group: TickGroup::Shells,
             glyph: Glyph::ShellTick,
             title: "Fixture Shell".into(),
             kind: "Shell".into(),
             status: "running".into(),
-            owner: crate::tick_adapter::TickOwner::Unknown,
+            owner: crate::monitor_rows::TickOwner::Unknown,
             updated_at_ms: None,
             resources: None,
             actions: Vec::new(),
@@ -1932,7 +1931,8 @@ fn provider_vendor_headers_never_submit_and_model_rows_keep_mouse_identity() {
 #[tokio::test]
 async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_across_switches() {
     use crate::terminal::{execution::ConsoleExecution, menus::Menus, test_support};
-    use tickloop_agent::{permissions::ExecutionMode, runtime::EventKind};
+    use tickloop_agent::runtime::EventKind;
+    use tickloop_agent_protocol::ExecutionMode;
     let directory = tempfile::tempdir().unwrap();
     let markdown = (0..30)
         .map(|index| format!("Plan line {index}"))
@@ -2102,7 +2102,8 @@ async fn exit_plan_mode_automatically_opens_the_agent_dialog_and_preserves_it_ac
 #[tokio::test]
 async fn restored_pending_plan_automatically_uses_the_same_approval_dialog() {
     use crate::terminal::{execution::ConsoleExecution, menus::Menus, test_support};
-    use tickloop_agent::{permissions::ExecutionMode, runtime::EventKind};
+    use tickloop_agent::runtime::EventKind;
+    use tickloop_agent_protocol::ExecutionMode;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("state");
     let agent = ConsoleExecution::open_embedded(
@@ -2225,10 +2226,8 @@ fn plan_feedback_uses_text_editing_and_esc_closes_the_field_before_cancelling() 
 #[tokio::test]
 async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
     use crate::terminal::{execution::ConsoleExecution, menus::Menus, test_support};
-    use tickloop_agent::{
-        permissions::ExecutionMode,
-        runtime::{BranchRequest, EventKind},
-    };
+    use tickloop_agent::runtime::{BranchRequest, EventKind};
+    use tickloop_agent_protocol::ExecutionMode;
     let directory = tempfile::tempdir().unwrap();
     let agent = ConsoleExecution::open_embedded(
         directory.path().join("state"),
@@ -2335,7 +2334,8 @@ async fn copied_loop_ids_keep_distinct_pending_plan_dialogs_for_each_agent() {
 #[tokio::test]
 async fn another_view_decision_retires_a_restored_plan_dialog_and_stale_esc_cannot_repend_it() {
     use crate::terminal::{execution::ConsoleExecution, menus::Menus, test_support};
-    use tickloop_agent::{permissions::ExecutionMode, runtime::EventKind};
+    use tickloop_agent::runtime::EventKind;
+    use tickloop_agent_protocol::ExecutionMode;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("state");
     let original = ConsoleExecution::open_embedded(
@@ -2455,10 +2455,8 @@ async fn a_child_reopens_its_dismissed_approval_but_cannot_enter_plan_mode_witho
     use crate::terminal::{
         execution::ConsoleExecution, menus::Menus, open_current_plan, test_support,
     };
-    use tickloop_agent::{
-        permissions::{ExecutionMode, PermissionScope},
-        runtime::EventKind,
-    };
+    use tickloop_agent::runtime::EventKind;
+    use tickloop_agent_protocol::{ExecutionMode, PermissionScope};
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(test_support::ScriptedModel::new(vec![
         test_support::call(
@@ -2612,7 +2610,8 @@ async fn a_child_reopens_its_dismissed_approval_but_cannot_enter_plan_mode_witho
 #[tokio::test]
 async fn a_new_plan_version_replaces_a_stale_restored_request_in_another_view() {
     use crate::terminal::{execution::ConsoleExecution, menus::Menus, test_support};
-    use tickloop_agent::{permissions::ExecutionMode, runtime::EventKind};
+    use tickloop_agent::runtime::EventKind;
+    use tickloop_agent_protocol::ExecutionMode;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("state");
     let original = ConsoleExecution::open_embedded(

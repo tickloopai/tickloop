@@ -1,12 +1,10 @@
 use super::*;
-use crate::{
-    protocol::ToolDefinition,
-    tools::{
-        ASK_USER_QUESTION_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, START_GOAL_TOOL_NAME, ToolResult,
-    },
-};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use tickloop_agent_protocol::{ToolDefinition, ToolResult};
+use tickloop_agent_tools::{
+    ASK_USER_QUESTION_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, START_GOAL_TOOL_NAME,
+};
 
 const QUESTION_HEADER_MAX_CHARACTERS: usize = 12;
 const MIN_QUESTIONS: usize = 1;
@@ -418,16 +416,19 @@ impl Agent {
             loop_id: Uuid::new_v4(),
             run_id: Uuid::new_v4(),
         };
-        snapshot.add_loop(LoopSnapshot {
-            id: new_receipt.loop_id,
-            goal: parsed.goal.clone(),
-            state: LoopState::Queued,
-            run_id: None,
-            run_started_at: None,
-            trigger: None,
-            event_sources: Vec::new(),
-            state_since: Some(crate::private_fs::unix_time_milliseconds()),
-        });
+        chat.bookkeeping.add_loop(
+            &mut snapshot,
+            LoopSnapshot {
+                id: new_receipt.loop_id,
+                goal: parsed.goal.clone(),
+                state: LoopState::Queued,
+                run_id: None,
+                run_started_at: None,
+                trigger: None,
+                event_sources: Vec::new(),
+                state_since: Some(tickloop_agent_base::private_fs::unix_time_milliseconds()),
+            },
+        );
         let index = snapshot
             .pending_inputs
             .iter()

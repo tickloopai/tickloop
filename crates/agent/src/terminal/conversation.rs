@@ -1,10 +1,9 @@
 use std::path::PathBuf;
 
-use tickloop_agent::{
-    model::{Content, Protocol, Role, Usage},
-    runtime::{ChatSnapshot, Event, EventKind, PermissionRequest, Plan, QuestionRequest},
-    tools::CommandSnapshot,
+use tickloop_agent::runtime::{
+    ChatSnapshot, Event, EventKind, PermissionRequest, Plan, QuestionRequest,
 };
+use tickloop_agent_protocol::{CommandSnapshot, Content, Protocol, Role, Usage};
 use uuid::Uuid;
 
 /// 与 `runtime/persistence.rs` 恢复对话时追加的消息文本一致，取自 Claude Code
@@ -724,11 +723,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use serde_json::json;
-    use tickloop_agent::{
-        model::Message,
-        runtime::{Question, QuestionOption},
-        tools::ToolResult,
-    };
+    use tickloop_agent::runtime::{Question, QuestionOption};
+    use tickloop_agent_protocol::Message;
+    use tickloop_agent_protocol::ToolResult;
 
     use super::*;
 
@@ -740,9 +737,9 @@ mod tests {
             "loops": []
         }))
         .unwrap();
-        snapshot.model = tickloop_agent::model::ModelConfig {
-            provider: crate::model::ModelProvider::Api,
-            auth_source: crate::model::ModelAuthSource::ApiKeyEnv,
+        snapshot.model = tickloop_agent_protocol::ModelConfig {
+            provider: tickloop_agent_protocol::ModelProvider::Api,
+            auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
             name: "fixture".into(),
             protocol: Protocol::Messages,
             base_url: "http://127.0.0.1".into(),
@@ -754,7 +751,7 @@ mod tests {
             model_id: String::new(),
             connection: None,
             card: None,
-            input_modalities: vec![tickloop_agent::model::InputModality::Text],
+            input_modalities: vec![tickloop_agent_protocol::InputModality::Text],
         };
         snapshot
     }

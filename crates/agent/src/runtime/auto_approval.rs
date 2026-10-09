@@ -1,4 +1,3 @@
-use crate::model::Content;
 use std::{sync::Arc, time::Duration};
 
 use tokio_util::sync::CancellationToken;
@@ -15,13 +14,11 @@ use super::{
     Agent, AgentError, AutoReview, EventKind, Receipt, RequestKind, RequestOutcome,
     ResponseRejection, auto_mode, model_request,
 };
-use crate::{
+use tickloop_agent_model::{
+    ModelClient, ModelError, ModelFailureKind, ModelResponseRejection,
     judgment::{JevClient, JevConfig, JudgmentClient},
-    model::{
-        ModelClient, ModelError, ModelFailureKind, ModelIdentity, ModelProvider,
-        ModelResponseRejection, Protocol,
-    },
 };
+use tickloop_agent_protocol::{Content, ModelIdentity, ModelProvider, Protocol};
 
 const MAX_ATTEMPTS: usize = 2;
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
@@ -64,7 +61,7 @@ impl Agent {
     ) -> Result<
         (
             Arc<dyn JudgmentClient>,
-            Option<crate::judgment::JevConnectionVersion>,
+            Option<tickloop_agent_model::judgment::JevConnectionVersion>,
         ),
         ModelError,
     > {
@@ -81,7 +78,7 @@ impl Agent {
                 .unwrap_or_else(JevConfig::default);
             let root = settings
                 .as_ref()
-                .and_then(crate::settings::UserSettings::root)
+                .and_then(tickloop_agent_config::UserSettings::root)
                 .map(ToOwned::to_owned);
             JevClient::bind(config, root)
         })
@@ -513,7 +510,9 @@ pub(super) fn failure_kind(error: &ModelError) -> ApprovalFailureKind {
         ModelFailureKind::ResponseRejected
             if matches!(
                 error,
-                ModelError::ResponseRejected(crate::model::ModelResponseRejection::ContextLimit)
+                ModelError::ResponseRejected(
+                    tickloop_agent_model::ModelResponseRejection::ContextLimit
+                )
             ) =>
         {
             ApprovalFailureKind::ContextLimit

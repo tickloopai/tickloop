@@ -1,0 +1,19 @@
+[package]
+name = "tickloop-tick-builtin"
+description = "Offline simulated quotes, account, news and options; needs no account or network"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "tick_builtin"
+doctest = false
+
+[dependencies]
+async-trait = "0.1"
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+serde_json = "1"
+tickloop-tick-provider = { path = "../../provider" }
+time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
+time-tz = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }

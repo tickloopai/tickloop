@@ -3,7 +3,7 @@ use std::{collections::hash_map::Entry, sync::Arc, time::Duration};
 use tokio::time::Instant;
 
 use super::{Agent, Chat, EventKind, LoopId, Progress, Receipt, TodoItem, TodoStatus};
-use crate::protocol::ChatId;
+use tickloop_agent_protocol::ChatId;
 
 const TODO_COMPLETION_GRACE: Duration = Duration::from_secs(5);
 
@@ -93,7 +93,7 @@ impl Agent {
         let progress = progress.clone();
         chat.todo_completion_graces.remove(&loop_id);
         if let Some(recorder) = &self.inner.recorder {
-            recorder.record_todo_retirement(&chat.snapshot, loop_id);
+            recorder.record_todo_retirement(&chat.snapshot, &chat.bookkeeping, loop_id);
             chat.start_new_tool_result_message = true;
         }
         let run_id = chat
@@ -108,7 +108,7 @@ impl Agent {
                     .iter()
                     .rev()
                     .find_map(|(_, run)| {
-                        (chat.snapshot.run_loops.get(run) == Some(&loop_id)).then_some(*run)
+                        (chat.bookkeeping.run_loops.get(run) == Some(&loop_id)).then_some(*run)
                     })
             });
         if let Some(run_id) = run_id {

@@ -1,5 +1,6 @@
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tickloop_agent_protocol::Content;
 
 const BACKGROUND_FIXTURE_VARIABLE: &str = "TICKLOOP_BACKGROUND_REQUEST_FIXTURE";
 const BACKGROUND_STAGE_FILE: &str = "background-request-stage";
@@ -46,11 +47,11 @@ impl AgentAccess for RecoveringBackgroundAccess {
 impl ModelClient for AfterAnswerGate {
     async fn generate_title(
         &self,
-        request: crate::model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        request: tickloop_agent_model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-        Ok(crate::model::fixture_title(request))
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        Ok(tickloop_agent_model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -203,9 +204,9 @@ async fn run_background_request_fixture() {
     *monitor_access.background.lock().unwrap() = Some(monitor.reference(background).await.unwrap());
     core.set_permission_rules(
         background,
-        vec![crate::permissions::PermissionRule {
+        vec![tickloop_agent_protocol::PermissionRule {
             id: Uuid::new_v4(),
-            decision: crate::permissions::Decision::Ask,
+            decision: tickloop_agent_protocol::Decision::Ask,
             tool: "Write".into(),
             specifier: None,
             input: None,
@@ -292,7 +293,7 @@ async fn run_background_request_fixture() {
                 background,
                 request_id,
                 true,
-                crate::permissions::PermissionScope::Session,
+                tickloop_agent_protocol::PermissionScope::Session,
             )
             .await
     };

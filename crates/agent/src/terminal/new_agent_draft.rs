@@ -13,12 +13,12 @@ use uuid::Uuid;
 
 use crate::{
     agent_access::{ConfigurationChange, LaunchSpec},
-    model::{ModelConfig, ReasoningEffort, validate_model_config, validate_reasoning_effort},
-    permissions::{ExecutionMode, PermissionRule},
     runtime::{AgentError, ChatSnapshot, PermissionChange},
 };
+use tickloop_agent_model::{validate_model_config, validate_reasoning_effort};
 
 use super::completion::CHILD_AUTHORIZATION_FIXED;
+use tickloop_agent_protocol::{ExecutionMode, ModelConfig, PermissionRule, ReasoningEffort};
 
 /// Which configuration a settings menu or command shows and changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -270,7 +270,7 @@ fn apply_preview(configuration: &mut AgentConfiguration, change: &ConfigurationC
     match change {
         ConfigurationChange::Model { config, thinking } => {
             configuration.model =
-                crate::model::cards::model_for_persistent_selection(config.clone());
+                tickloop_agent_model::cards::model_for_persistent_selection(config.clone());
             match thinking {
                 Some(effort) => {
                     configuration.reasoning_effort =
@@ -309,7 +309,7 @@ fn apply_preview(configuration: &mut AgentConfiguration, change: &ConfigurationC
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::cards::ModelCatalog;
+    use tickloop_agent_model::cards::ModelCatalog;
 
     fn model(provider: &str, id: &str) -> ModelConfig {
         ModelCatalog::defaults()

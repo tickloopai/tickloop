@@ -1,0 +1,22 @@
+[package]
+name = "tickloop-tick-sdk"
+description = "The Tick side of the Tick standard: answers describe, read and tool calls and publishes Tick Updates"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "tick_sdk"
+doctest = false
+
+[dependencies]
+futures-util = "0.3"
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tickloop-tick-protocol = { path = "../protocol" }
+time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }

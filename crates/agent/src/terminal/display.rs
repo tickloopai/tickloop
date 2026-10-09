@@ -1,4 +1,4 @@
-use tickloop_agent::settings::{DisplayPreferences, GlyphSet};
+use tickloop_agent_config::{DisplayPreferences, GlyphSet};
 
 use super::style::{Theme, ThemeName};
 

@@ -3,17 +3,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
-use crate::judgment::JevConnectionVersion;
+use tickloop_agent_model::judgment::JevConnectionVersion;
 
 const COOLDOWN: Duration = Duration::from_secs(60);
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AutoReviewerHealth {
-    Ready,
-    CoolingDown { remaining_seconds: u64 },
-    Probing,
-}
 
 #[derive(Clone, Copy)]
 pub(super) struct AttemptPermit {

@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 use icu_normalizer::ComposingNormalizerBorrowed;
 use uuid::Uuid;
 
-use crate::private_fs::{PrivateDirectory, current_uid};
+use tickloop_agent_base::private_fs::{PrivateDirectory, current_uid};
 
-/// Transcript 的项目目录与文件名后缀；过期清理与列表按同一布局查找。
-pub(crate) const PROJECTS_DIRECTORY: &str = "projects";
-pub(crate) const TRANSCRIPT_FILE_SUFFIX: &str = ".jsonl";
+/// Transcript 的项目目录与文件名后缀；列表按同一布局查找。
+const PROJECTS_DIRECTORY: &str = "projects";
+pub(super) const TRANSCRIPT_FILE_SUFFIX: &str = ".jsonl";
 /// 多数文件系统单个路径段上限 255 字节；照 Claude Code 保留 200，给哈希后缀留出空间。
 const MAX_SANITIZED_LENGTH: usize = 200;
 const TEMP_DIRECTORY_ENV: &str = "TICKLOOP_TMPDIR";

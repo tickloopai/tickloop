@@ -1,0 +1,274 @@
+[
+  {
+    "Hello": {
+      "major": 11,
+      "minor": 0
+    }
+  },
+  {
+    "ShutdownDaemon": {
+      "request_id": "00000000-0000-0000-0000-000000000001",
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0"
+    }
+  },
+  {
+    "Observe": {
+      "request_id": "00000000-0000-0000-0000-000000000002",
+      "query": {
+        "kind": "agent",
+        "execution": {
+          "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+          "agent_id": "00000000-0000-0000-0000-0000000000a1",
+          "generation": 3
+        },
+        "detail": {
+          "kind": "account_models",
+          "config": {
+            "connection": {
+              "vendor": "Example",
+              "product": "Example Plan",
+              "kind": "plan",
+              "order": 2,
+              "region": {
+                "name": "Global",
+                "order": 1
+              },
+              "discovery": "provider_api"
+            },
+            "name": "example-plan",
+            "protocol": "messages",
+            "base_url": "https://models.example.test/v1",
+            "model": "example-large",
+            "api_key_env": "EXAMPLE_API_KEY",
+            "max_output_tokens": 32000,
+            "provider": "api",
+            "auth_source": "api_key_env",
+            "provider_id": "example",
+            "provider_name": "Example",
+            "model_id": "example-large",
+            "card": {
+              "id": "example-large",
+              "service_model_id": "example-large-2026",
+              "display_name": "Example Large",
+              "adapter": "messages",
+              "max_output_tokens": 32000,
+              "context_window_tokens": 200000,
+              "thinking": "toggle",
+              "adaptive_by_default": false,
+              "effort_levels": [
+                "low",
+                "high"
+              ],
+              "input_modalities": [
+                "text",
+                "image"
+              ],
+              "thinking_budgets": {
+                "low": 2048,
+                "medium": 8192,
+                "high": 16384
+              }
+            },
+            "input_modalities": [
+              "text",
+              "image"
+            ]
+          },
+          "refresh": true
+        },
+        "after": {
+          "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+          "execution": {
+            "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+            "agent_id": "00000000-0000-0000-0000-0000000000a1",
+            "generation": 3
+          },
+          "sequence": 17
+        }
+      }
+    }
+  },
+  {
+    "Execute": {
+      "request_id": "00000000-0000-0000-0000-000000000003",
+      "command": {
+        "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+        "command_id": "00000000-0000-0000-0000-000000000081",
+        "command": {
+          "kind": "create",
+          "launch": {
+            "workdir": "/work/project",
+            "config_root": "/home/user/.tickloop",
+            "model": {
+              "connection": {
+                "vendor": "Example",
+                "product": "Example Plan",
+                "kind": "plan",
+                "order": 2,
+                "region": {
+                  "name": "Global",
+                  "order": 1
+                },
+                "discovery": "provider_api"
+              },
+              "name": "example-plan",
+              "protocol": "messages",
+              "base_url": "https://models.example.test/v1",
+              "model": "example-large",
+              "api_key_env": "EXAMPLE_API_KEY",
+              "max_output_tokens": 32000,
+              "provider": "api",
+              "auth_source": "api_key_env",
+              "provider_id": "example",
+              "provider_name": "Example",
+              "model_id": "example-large",
+              "card": {
+                "id": "example-large",
+                "service_model_id": "example-large-2026",
+                "display_name": "Example Large",
+                "adapter": "messages",
+                "max_output_tokens": 32000,
+                "context_window_tokens": 200000,
+                "thinking": "toggle",
+                "adaptive_by_default": false,
+                "effort_levels": [
+                  "low",
+                  "high"
+                ],
+                "input_modalities": [
+                  "text",
+                  "image"
+                ],
+                "thinking_budgets": {
+                  "low": 2048,
+                  "medium": 8192,
+                  "high": 16384
+                }
+              },
+              "input_modalities": [
+                "text",
+                "image"
+              ]
+            },
+            "host_options": {
+              "execution_mode_override": "acceptEdits",
+              "directory_trust": "CallerManaged",
+              "prompt_policy": "Interactive"
+            },
+            "session_persistence": true,
+            "exact_chat": "00000000-0000-0000-0000-0000000000c1",
+            "environment": [
+              {
+                "name": [
+                  84,
+                  69,
+                  82,
+                  77
+                ],
+                "value": [
+                  120,
+                  116,
+                  101,
+                  114,
+                  109,
+                  45,
+                  50,
+                  53,
+                  54,
+                  99,
+                  111,
+                  108,
+                  111,
+                  114
+                ]
+              }
+            ],
+            "host_work_context": {
+              "socket": "/run/herdr.sock",
+              "workspace": "w1"
+            }
+          },
+          "initial": {
+            "kind": "text",
+            "text": "Check the counter",
+            "contexts": [
+              {
+                "kind": "file",
+                "path": "/work/project/notes.md",
+                "content": "notes",
+                "truncated": false
+              },
+              {
+                "kind": "image",
+                "origin": {
+                  "type": "pasted",
+                  "id": 1
+                },
+                "image": {
+                  "media_type": "image/png",
+                  "data": "iVBORw0KGgo=",
+                  "width": 1,
+                  "height": 1
+                }
+              }
+            ],
+            "paths": [
+              "/work/project/notes.md"
+            ]
+          },
+          "origin": {
+            "view": {
+              "session_id": "00000000-0000-0000-0000-000000000051",
+              "view_id": "00000000-0000-0000-0000-000000000052"
+            },
+            "display_version": 2,
+            "host": {
+              "host_instance": "herdr:16777220:42",
+              "socket": "/run/herdr.sock",
+              "workspace": "w1",
+              "tab": "t1",
+              "pane": "p1",
+              "terminal": "term-1",
+              "client": null
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "ShowView": {
+      "request_id": "00000000-0000-0000-0000-000000000004",
+      "update": {
+        "Displayed": {
+          "view": {
+            "session_id": "00000000-0000-0000-0000-000000000051",
+            "view_id": "00000000-0000-0000-0000-000000000052"
+          },
+          "expected_version": 1,
+          "execution": {
+            "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+            "agent_id": "00000000-0000-0000-0000-0000000000a1",
+            "generation": 3
+          },
+          "host": null
+        }
+      }
+    }
+  },
+  {
+    "ShowView": {
+      "request_id": "00000000-0000-0000-0000-000000000005",
+      "update": {
+        "SessionClosed": {
+          "session_id": "00000000-0000-0000-0000-000000000051"
+        }
+      }
+    }
+  },
+  {
+    "CancelObservation": {
+      "observation_id": "00000000-0000-0000-0000-000000000006"
+    }
+  }
+]

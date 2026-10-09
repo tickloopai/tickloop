@@ -111,7 +111,7 @@ impl AgentConsole {
             closed: false,
             unconfirmed_dispatch: None,
             created: None,
-            clock: Arc::new(crate::private_fs::unix_time_milliseconds),
+            clock: Arc::new(tickloop_agent_base::private_fs::unix_time_milliseconds),
             last_viewed: HashMap::new(),
             retirements: HashMap::new(),
         }

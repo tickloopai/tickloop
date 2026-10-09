@@ -1,0 +1,26 @@
+[package]
+name = "tickloop-tickhost-connect"
+description = "Host-side access to Ticks: TickAccess, per-instance Tick Sessions, the Herdr Adapter and the launch contract"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "tickhost_connect"
+doctest = false
+
+[dependencies]
+async-trait = "0.1"
+libc = "0.2"
+jsonschema = { version = "0.56.0", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tickloop-tick-protocol = { path = "../../tick/protocol" }
+tokio = { version = "1", features = ["full", "test-util"] }
+tokio-util = "0.7"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"

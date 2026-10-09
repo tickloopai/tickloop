@@ -84,9 +84,7 @@ mod system_prompt;
 mod tool_execution;
 mod tool_results;
 mod web_fetch;
-pub(crate) use tick_content::WATERMARK_DIRECTORY;
 use tool_execution::{ToolCallOutcome, ToolInvocation, ToolRegistry};
-pub(crate) use tool_results::TOOL_RESULTS_SUBDIRECTORY;
 mod user_shell;
 #[cfg(test)]
 mod user_shell_tests;
@@ -123,9 +121,6 @@ pub use permission_management::{
     PermissionRuleView, PermissionsRevision, PermissionsView,
 };
 pub(crate) use permission_management::{canonical_directory, rule_views, validate_rule};
-pub(crate) use plan::{
-    MAX_PLAN_SLUG_BYTES, PLAN_FILE_EXTENSION, PLANS_DIRECTORY, is_valid_plan_slug, plan_file_slug,
-};
 pub use plan::{Plan, Progress, TodoItem, TodoStatus};
 pub use rewind::{CodeRewind, RewindDraft, RewindMode, RewindOutcome, RewindPoint};
 pub(crate) use shell_task_center::recover_shell_update_time;
@@ -150,28 +145,28 @@ use tokio_util::sync::CancellationToken;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::file_change::load_file_change_review;
 use crate::file_history::FileHistory;
-use crate::model::{
-    Content, Message, ModelClient, ModelConfig, ModelError, ModelRequest, ModelResponseRejection,
-    ReasoningEffort, Role, ToolResultBlock, ToolResultContent, Usage,
-};
-use crate::output_style::OutputStyle;
-use crate::permissions::{
-    Decision, ExecutionMode, PermissionPolicy, PermissionRule, PermissionScope,
-    SessionPermissionDecision,
-};
-use crate::protocol::ChatId;
 pub use session_permissions::SessionPermissionDenial;
 use session_permissions::{PermissionOwner, SessionPermissionOperation, WorkspaceScope};
+use tickloop_agent_base::output_style::OutputStyle;
+use tickloop_agent_model::{
+    ModelClient, ModelConfigExt, ModelError, ModelRequest, ModelResponseRejection,
+};
+use tickloop_agent_protocol::{
+    ChatId, Content, Decision, ExecutionMode, Message, ModelConfig, PermissionPolicy,
+    PermissionRule, PermissionScope, ReasoningEffort, Role, ToolResultBlock, ToolResultContent,
+    Usage,
+};
+use tickloop_agent_tools::permissions::SessionPermissionDecision;
+use tickloop_agent_tools::{
+    file_change::load_file_change_review, permissions::PermissionPolicyExt,
+};
 
 const EVENT_REPLAY_LIMIT: usize = 1024;
 const MAX_OUTPUT_LIMIT_CONTINUATIONS: usize = 3;
 const OUTPUT_LIMIT_CONTINUATION_PROMPT: &str = "Output token limit hit. Continue directly from the unfinished response without repeating or summarizing it. Break the remaining work into smaller pieces.";
 const SHELL_STATE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
-pub type LoopId = Uuid;
-pub type RunId = Uuid;
 pub use agent_messages::{
     AgentMessageSource, FamilyMessageRejection, FamilyMessageRejectionCode,
     LIST_SUBAGENTS_TOOL_NAME, SEND_AGENT_MESSAGE_TOOL_NAME, StoppedChildHook, VerifiedUserRelay,
@@ -180,740 +175,6 @@ pub use delegation::{
     DelegationCeiling, DelegationMetadata, MAX_SUBAGENT_HANDLE_CHARACTERS, SUBAGENT_TOOL_NAME,
     SubagentRegistration,
 };
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub enum LoopState {
-    Idle,
-    Queued,
-    WaitingPermission,
-    WaitingQuestion,
-    WaitingPlan,
-    WaitingTrigger,
-    Expired,
-    Running,
-    Completed,
-    Failed,
-    Interrupted,
-    Stopped,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct LoopSnapshot {
-    pub id: LoopId,
-    pub goal: String,
-    pub state: LoopState,
-    pub run_id: Option<RunId>,
-    pub run_started_at: Option<u64>,
-    #[serde(default)]
-    pub trigger: Option<Trigger>,
-    /// Unix milliseconds when the runtime moved this Loop into its current state. A state set by
-    /// restoring, and records written before this field, leave it unknown.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state_since: Option<u64>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub event_sources: Vec<EventSourceBinding>,
-}
-
-/// A feedback source of a Loop. Saved through `event_sources::EventSourceRecord`, which reads
-/// publication-only records written by earlier versions unchanged.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(
-    try_from = "event_sources::EventSourceRecord",
-    into = "event_sources::EventSourceRecord"
-)]
-pub struct EventSourceBinding {
-    pub server_id: String,
-    pub owner_account_id: String,
-    pub source_key: String,
-    /// Proof of a confirmed publication by this Chat; absent for a source that was only connected.
-    pub publication: Option<SourcePublication>,
-    /// Earlier confirmed publications for replay detection after a later publication.
-    pub publication_history: Vec<SourcePublication>,
-    /// The explicit connection that created this source and its complete frozen request.
-    pub connection: Option<SourceConnection>,
-    pub association_operation_id: String,
-    pub binding_id: Uuid,
-    pub client_instance_id: Uuid,
-    pub credential_generation: [u8; 32],
-    pub directory_fingerprint: [u8; 32],
-    pub bridge_fingerprint: [u8; 32],
-    pub association_epoch: Option<u64>,
-    pub resume_required: bool,
-    /// The association may have been dispatched without a confirmed outcome.
-    pub association_unknown: bool,
-    /// Public error code of an authenticated definite association rejection.
-    pub association_rejected: Option<String>,
-    pub pending_cursor: Option<String>,
-    pub claim_operations: Vec<EventClaimOperation>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SourcePublication {
-    pub version_id: String,
-    pub operation_id: String,
-    pub receipt: Receipt,
-}
-
-#[derive(Clone, Debug)]
-pub struct SourceConnection {
-    pub operation_id: String,
-    /// The Receipt of the run whose approved connect created this request.
-    pub receipt: Receipt,
-    pub request: FrozenAssociationRequest,
-}
-
-/// The complete association request saved before its only dispatch; an exact same-ID retry
-/// reuses it unchanged.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct FrozenAssociationRequest {
-    pub server_id: String,
-    pub owner_account_id: String,
-    pub source_key: String,
-    pub operation_id: String,
-    pub binding_id: Uuid,
-    pub client_instance_id: Uuid,
-    pub chat_id: ChatId,
-    pub loop_id: LoopId,
-    pub expected_epoch: Option<u64>,
-    pub replace_existing: bool,
-    pub credential_generation: [u8; 32],
-    pub directory_fingerprint: [u8; 32],
-    pub bridge_fingerprint: [u8; 32],
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct EventClaimOperation {
-    pub event_id: String,
-    pub operation_id: String,
-    pub status: EventClaimStatus,
-    #[serde(default)]
-    pub claim_id: Option<String>,
-    #[serde(default)]
-    pub lease_expires_at: Option<String>,
-    #[serde(default)]
-    pub renewal_operation_id: Option<String>,
-    #[serde(default)]
-    pub release_operation_id: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub enum EventClaimStatus {
-    Pending,
-    Claimed,
-    Completed,
-    NeedsAttention,
-}
-
-impl LoopSnapshot {
-    /// Moves the Loop to `state`, recording the moment only when the state actually changes.
-    pub(crate) fn set_state(&mut self, state: LoopState) {
-        if self.state != state {
-            self.state = state;
-            self.state_since = Some(crate::private_fs::unix_time_milliseconds());
-        }
-    }
-
-    /// A state the Loop is found in when it is restored, not one it entered now: when the state
-    /// changes, nobody knows when that happened, so its time becomes unknown.
-    pub(crate) fn recover_state(&mut self, state: LoopState) {
-        if self.state != state {
-            self.state = state;
-            self.state_since = None;
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChatSnapshot {
-    #[serde(default)]
-    pub failure_events: Vec<Event>,
-    #[serde(default)]
-    pub provider_failures: HashMap<String, crate::model::ProviderHttpFailure>,
-    #[serde(skip)]
-    pub tool_call_recoveries: Vec<ToolCallRecovery>,
-    #[serde(default)]
-    pub artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
-    #[serde(skip)]
-    pub removed_artifact_ticks: std::collections::BTreeSet<String>,
-    #[serde(default, skip_serializing_if = "MonitorMembership::is_empty")]
-    pub monitor: MonitorMembership,
-    /// 本进程内的请求用量账本（不持久化，照 Claude Code 用量只记在 assistant 消息上）。
-    #[serde(skip)]
-    pub request_usage: RequestUsageLedger,
-    pub id: ChatId,
-    #[serde(default)]
-    pub branch_origin: Option<BranchOrigin>,
-    #[serde(default)]
-    pub delegation: Option<DelegationMetadata>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub family_completions: Vec<FamilyCompletion>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub family_inputs: BTreeMap<Uuid, FamilyInputRecord>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub sent_agent_messages: BTreeMap<Uuid, AgentMessageSource>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generated_title: Option<String>,
-    pub workdir: PathBuf,
-    /// Chat 当前使用的模型，只在本进程内有效；恢复时使用宿主当前选择的模型。
-    #[serde(skip, default = "unselected_model")]
-    pub model: ModelConfig,
-    #[serde(skip)]
-    pub reasoning_effort: Option<crate::model::ReasoningEffort>,
-    #[serde(skip, default = "thinking_enabled_by_default")]
-    pub thinking_enabled: bool,
-    pub messages: Vec<Message>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub invoked_skills: Vec<crate::skills::InvokedSkill>,
-    #[serde(default)]
-    pub message_runs: BTreeMap<usize, RunId>,
-    #[serde(default)]
-    pub message_contexts: BTreeMap<usize, Vec<InputContext>>,
-    #[serde(skip)]
-    denial_references: BTreeMap<usize, denials::DenialReference>,
-    /// 消息在 Transcript 中的 uuid，文件回滚快照以此关联消息。用户提示与模型回复写入对话时
-    /// 确定，恢复时只重建用户提示的；其余消息的 uuid 在写入 Transcript 时生成。
-    #[serde(default)]
-    pub message_ids: BTreeMap<usize, Uuid>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub agent_message_origins: BTreeMap<Uuid, serde_json::Value>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub human_family_origins: BTreeMap<Uuid, DirectedHumanSource>,
-    /// Stable source IDs for genuine prompts rewritten across directed summaries.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub original_user_message_ids: BTreeMap<usize, Uuid>,
-    /// Execution modes captured for user prompts that can serve as rewind points.
-    #[serde(default)]
-    pub prompt_execution_modes: BTreeMap<usize, ExecutionMode>,
-    /// Copied prompts in a Branch remain rewind points, but are not fresh child-Chat authorization.
-    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
-    pub inherited_prompts: HashSet<usize>,
-    /// 压缩边界与压缩摘要消息（链上字段）。
-    #[serde(default)]
-    pub message_compactions: BTreeMap<usize, CompactionMarker>,
-    /// assistant 消息的用量（链上字段）。定向摘要保留的消息在恢复时照 Claude Code 清零。
-    #[serde(default)]
-    pub message_usage: BTreeMap<usize, Usage>,
-    #[serde(default)]
-    pub message_sources: BTreeMap<usize, crate::model::PrivateHistorySource>,
-    #[serde(default)]
-    pub message_models: BTreeMap<usize, crate::model::ModelIdentity>,
-    /// 链上字段：由对话链上的 Loop 条目重放得到。
-    #[serde(default)]
-    pub loops: Vec<LoopSnapshot>,
-    /// 各 Loop 创建时的对话消息数（链上字段）。rewind 截断到这个位置或更早时 Loop 不再存在。
-    #[serde(skip)]
-    pub(crate) loop_starts: BTreeMap<LoopId, usize>,
-    /// Trigger 已解除武装、等待用户向该 Loop 提交输入时重新武装的 Loop（重启恢复或 Branch
-    /// 复制后）。随 Loop 条目记录在对话链上。
-    #[serde(skip)]
-    pub resume_triggers: Vec<LoopId>,
-    /// The fields through `pending_model` are process-local state and are not persisted with the
-    /// Chat. Recovery starts them from defaults; persistent rules and context limits come from
-    /// user settings.
-    #[serde(skip)]
-    pub last_sequence: u64,
-    #[serde(skip)]
-    pub permissions: Vec<PermissionRequest>,
-    #[serde(skip)]
-    pub questions: Vec<QuestionRequest>,
-    #[serde(skip)]
-    pub pending_inputs: Vec<PendingInput>,
-    #[serde(skip)]
-    pub pending_commands: Vec<PendingCommand>,
-    #[serde(skip)]
-    pub last_queue_sequence: u64,
-    #[serde(skip)]
-    pub operations: Vec<OperationRecord>,
-    #[serde(skip)]
-    pub policy: PermissionPolicy,
-    /// 规则集中每条持久规则所属的项目分区（规范化的工作目录），删除或修改时写回该分区。
-    #[serde(skip)]
-    pub(crate) persistent_rule_projects: BTreeMap<Uuid, PathBuf>,
-    #[serde(skip)]
-    pub additional_directories: Vec<PathBuf>,
-    #[serde(skip)]
-    pub events: Vec<Event>,
-    #[serde(skip)]
-    pub pending_thinking: BTreeMap<RunId, String>,
-    #[serde(skip)]
-    pub context_window_tokens: Option<usize>,
-    #[serde(skip)]
-    pub pending_model: Option<ModelConfig>,
-    /// 各 Loop 的计划与进度。计划内容写在 `<root>/plans/<slug>-loop-<loopId>.md`，版本与进度
-    /// 恢复时由对话链重建；批准时选择的模式只在本进程内有效。
-    #[serde(default)]
-    pub plans: Vec<Plan>,
-    #[serde(default)]
-    pub progress: Vec<Progress>,
-    /// 照 Claude Code：Chat 的计划文件名前缀，第一次设置计划时生成，记录在之后的每个链上条目中。
-    #[serde(skip)]
-    pub(crate) plan_slug: Option<String>,
-    /// 计划内容不可用（恢复时计划文件缺失或不可读、`--fork-session`／Branch 复制失败）的 Loop 已使用过的
-    /// 最高计划版本；该 Loop 之后的计划从更大的版本继续，版本号不会被复用。
-    #[serde(skip)]
-    pub(crate) unavailable_plan_versions: BTreeMap<LoopId, u64>,
-    /// 本 Chat 中各 run 所属的 Loop，写入链上条目的 `loopId`；恢复时由条目重建。
-    #[serde(skip)]
-    pub(crate) run_loops: BTreeMap<RunId, LoopId>,
-    /// 本进程内的 Agent 命令状态，不随 Chat 保存，重启后不可见。
-    #[serde(skip)]
-    pub commands: Vec<crate::tools::CommandSnapshot>,
-    /// 本进程内的 `!` 命令状态，不随 Chat 保存，重启后不可见。
-    #[serde(skip)]
-    pub user_shells: Vec<UserShellRecord>,
-    /// 本进程内最后一次模型回复所在的 run，只用于显示流式回复；不随 Chat 保存。
-    #[serde(skip)]
-    pub last_model_run: Option<RunId>,
-}
-
-fn thinking_enabled_by_default() -> bool {
-    true
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub enum UserShellState {
-    Queued,
-    WaitingPermission,
-    Running,
-    Background,
-    Cancelling,
-    Completed,
-    Failed,
-    Unknown,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct UserShellRecord {
-    pub id: Uuid,
-    pub chat_id: ChatId,
-    #[serde(default)]
-    pub loop_id: Option<LoopId>,
-    pub command: String,
-    pub cwd: PathBuf,
-    #[serde(default)]
-    pub starts_in_background: bool,
-    #[serde(default)]
-    pub queued_sequence: u64,
-    #[serde(default)]
-    pub armed: bool,
-    #[serde(default)]
-    pub preceding_model_runs: Vec<RunId>,
-    pub state: UserShellState,
-    pub pid: Option<u32>,
-    pub exit_code: Option<i32>,
-    pub signal: Option<i32>,
-    pub reason: Option<String>,
-    pub output_ref: Option<PathBuf>,
-    pub output_bytes: u64,
-    #[serde(default)]
-    pub updated_at_ms: Option<u64>,
-    /// 提交时的对话消息数，只用于 Task Center 排序。
-    pub submitted_at_message: usize,
-    /// Unix milliseconds when the Shell entered its current state; output growth does not move it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state_since: Option<u64>,
-}
-
-impl UserShellRecord {
-    /// Moves the Shell to `state`, recording the moment only when the state actually changes.
-    pub(crate) fn set_state(&mut self, state: UserShellState) {
-        if self.state != state {
-            self.state = state;
-            self.state_since = Some(crate::private_fs::unix_time_milliseconds());
-            self.updated_at_ms = self.state_since;
-        }
-    }
-
-    /// Whether the Shell still waits for admission: for approval, or accepted but without a
-    /// started process.
-    pub(crate) fn awaits_admission(&self) -> bool {
-        self.state == UserShellState::WaitingPermission
-            || self.state == UserShellState::Running && self.pid.is_none()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct UserShellReceipt {
-    pub chat_id: ChatId,
-    pub command_id: Uuid,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub enum PermissionExecution {
-    ToolCall { run_id: RunId, call_id: String },
-    UserShell { command_id: Uuid },
-}
-
-impl PermissionExecution {
-    pub fn run_id(&self) -> Option<RunId> {
-        match self {
-            Self::ToolCall { run_id, .. } => Some(*run_id),
-            Self::UserShell { .. } => None,
-        }
-    }
-    pub fn call_key(&self) -> String {
-        match self {
-            Self::ToolCall { call_id, .. } => call_id.clone(),
-            Self::UserShell { command_id } => format!("user-shell:{command_id}"),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PermissionRequest {
-    pub id: Uuid,
-    pub loop_id: LoopId,
-    pub execution: PermissionExecution,
-    pub name: String,
-    pub input: serde_json::Value,
-    #[serde(default)]
-    pub file_change: Option<Box<crate::file_change::PreparedFileChange>>,
-    #[serde(default)]
-    pub approval_reason: Option<String>,
-    #[serde(default)]
-    pub approval_source: PermissionApprovalSource,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PermissionApprovalSource {
-    #[default]
-    PermissionPolicy,
-    ExplicitAsk,
-    SafetyCheck,
-    AutoReviewer,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub enum OperationState {
-    Proposed,
-    Admitted,
-    Completed,
-    Failed,
-    Unknown,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct OperationRecord {
-    pub id: Uuid,
-    pub loop_id: LoopId,
-    pub run_id: RunId,
-    pub call_id: String,
-    pub name: String,
-    pub input: serde_json::Value,
-    #[serde(default)]
-    pub file_change: Option<crate::file_change::PreparedFileChange>,
-    pub state: OperationState,
-    pub result: Option<crate::tools::ToolResult>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ToolCallRecovery {
-    pub run_id: Option<RunId>,
-    pub call_id: String,
-    pub was_admitted: Option<bool>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Event {
-    pub sequence: u64,
-    pub chat_id: ChatId,
-    pub loop_id: LoopId,
-    pub run_id: RunId,
-    pub kind: EventKind,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum AutoReviewerNotice {
-    Fallback { failure: ApprovalFailureKind },
-    Recovered,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ProposedToolCall {
-    pub call_id: String,
-    pub name: String,
-    pub input: serde_json::Value,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum EventKind {
-    FamilyInputUpdated {
-        record: FamilyInputRecord,
-    },
-    FamilyRunCompleted {
-        completion: FamilyCompletion,
-    },
-    Started,
-    Text(String),
-    Thinking(String),
-    AssistantMessageCommitted {
-        message_id: Uuid,
-        tool_calls: Vec<ProposedToolCall>,
-    },
-    Completed {
-        usage: Usage,
-    },
-    Failed(String),
-    ModelRetry {
-        kind: RequestKind,
-        error: String,
-        attempt: usize,
-        max_retries: usize,
-        delay_ms: u64,
-    },
-    Interrupted,
-    InputMerged {
-        into_run_id: RunId,
-    },
-    InputTakenBack,
-    AgentMessageQueued {
-        source: AgentMessageSource,
-    },
-    ConversationRewound {
-        message_id: Uuid,
-    },
-    PermissionRequested {
-        request: PermissionRequest,
-    },
-    QuestionAsked {
-        request: QuestionRequest,
-    },
-    GoalEnded {
-        reason: String,
-        operations: Vec<OperationRecord>,
-    },
-    ToolStarted {
-        call_id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    ToolCompleted {
-        call_id: String,
-        result: crate::tools::ToolResult,
-    },
-    PermissionChecked {
-        decision: Decision,
-        reason: String,
-    },
-    ApprovalAssessed {
-        assessment: Box<ApprovalAssessmentDetails>,
-    },
-    AutoReviewerNotice {
-        notice: AutoReviewerNotice,
-    },
-    ContextCompaction {
-        status: CompactionStatus,
-        error: Option<String>,
-    },
-    PlanUpdated {
-        plan: Plan,
-    },
-    ProgressUpdated {
-        progress: Progress,
-    },
-    CommandUpdated {
-        command: crate::tools::CommandSnapshot,
-    },
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Receipt {
-    pub chat_id: ChatId,
-    pub loop_id: LoopId,
-    pub run_id: RunId,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PendingInput {
-    pub receipt: Receipt,
-    pub input: String,
-    #[serde(default)]
-    pub contexts: Vec<InputContext>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_message: Option<AgentMessageSource>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub directed_human: Option<DirectedHumanSource>,
-    #[serde(default)]
-    denial_reference: Option<denials::DenialReference>,
-    #[serde(default)]
-    pub trigger_source: Option<TriggerSource>,
-    #[serde(default)]
-    pub armed: bool,
-    #[serde(default)]
-    pub queued_sequence: u64,
-    /// A queued continuation for a completed background task; its notification is already in the conversation.
-    #[serde(default)]
-    pub task_continuation: bool,
-    #[serde(skip)]
-    is_skill_invocation: bool,
-    /// Files attached whole with the prompt; they count as read once the prompt enters the
-    /// conversation. Not persisted, so a restored prompt grants no reads.
-    #[serde(skip)]
-    attached_file_reads: Vec<(PathBuf, crate::tools::FileReadRecord)>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum QueuedInputKind {
-    Message,
-    Command,
-    Shell,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PendingCommand {
-    pub id: Uuid,
-    pub chat_id: ChatId,
-    pub loop_id: Option<LoopId>,
-    pub command: String,
-    pub queued_sequence: u64,
-    #[serde(default)]
-    pub armed: bool,
-    #[serde(default)]
-    pub dispatched: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct QueuedInput {
-    pub id: Uuid,
-    pub chat_id: ChatId,
-    pub loop_id: Option<LoopId>,
-    pub kind: QueuedInputKind,
-    pub text: String,
-    #[serde(default)]
-    pub contexts: Vec<InputContext>,
-    pub queued_sequence: u64,
-    #[serde(default)]
-    pub armed: bool,
-}
-
-impl ChatSnapshot {
-    pub(super) fn run_response_text(&self, run: RunId) -> Option<String> {
-        self.messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(index, message)| {
-                message.role == Role::Assistant && self.message_runs.get(index) == Some(&run)
-            })
-            .map(|(_, message)| {
-                message
-                    .content
-                    .iter()
-                    .filter_map(|content| match content {
-                        Content::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-    }
-
-    pub fn default_input_loop(&self) -> Option<LoopId> {
-        (self.loops.len() == 1).then(|| self.loops[0].id)
-    }
-
-    pub(crate) fn effective_reasoning_effort(&self) -> Option<crate::model::ReasoningEffort> {
-        if !self.thinking_enabled
-            && crate::model::validate_reasoning_effort(
-                &self.model,
-                Some(crate::model::ReasoningEffort::Off),
-            )
-            .is_ok()
-        {
-            Some(crate::model::ReasoningEffort::Off)
-        } else {
-            self.reasoning_effort
-        }
-    }
-
-    pub fn effective_context_window_tokens(&self) -> Option<usize> {
-        context::context_window(self)
-    }
-
-    /// Whether the model that answers the next user input accepts images; a pending model
-    /// switch takes effect before that input runs.
-    pub fn accepts_images(&self) -> bool {
-        self.pending_model
-            .as_ref()
-            .unwrap_or(&self.model)
-            .accepts_images()
-    }
-
-    /// The highest `[Image #N]` pasted into this conversation, sent or queued, so a resumed
-    /// editor numbers new pastes after it.
-    pub fn highest_pasted_image_id(&self) -> Option<u32> {
-        self.message_contexts
-            .values()
-            .chain(self.pending_inputs.iter().map(|pending| &pending.contexts))
-            .flatten()
-            .filter_map(|context| match context {
-                InputContext::Image(ImageContext {
-                    origin: ImageOrigin::Pasted { id },
-                    ..
-                }) => Some(*id),
-                _ => None,
-            })
-            .max()
-    }
-
-    /// 新建 Loop，记下创建时的对话位置。
-    pub(crate) fn add_loop(&mut self, goal: LoopSnapshot) {
-        self.loop_starts.insert(goal.id, self.messages.len());
-        self.loops.push(goal);
-    }
-
-    pub fn queued_inputs(&self) -> Vec<QueuedInput> {
-        let mut entries = self
-            .pending_inputs
-            .iter()
-            .filter(|pending| {
-                pending.trigger_source.is_none()
-                    && !pending.task_continuation
-                    && pending.agent_message.is_none()
-            })
-            .map(|pending| QueuedInput {
-                id: pending.receipt.run_id,
-                chat_id: pending.receipt.chat_id,
-                loop_id: Some(pending.receipt.loop_id),
-                kind: QueuedInputKind::Message,
-                text: pending.input.clone(),
-                contexts: pending.contexts.clone(),
-                queued_sequence: pending.queued_sequence,
-                armed: pending.armed,
-            })
-            .chain(self.pending_commands.iter().map(|command| QueuedInput {
-                id: command.id,
-                chat_id: command.chat_id,
-                loop_id: command.loop_id,
-                kind: QueuedInputKind::Command,
-                text: command.command.clone(),
-                contexts: Vec::new(),
-                queued_sequence: command.queued_sequence,
-                armed: command.armed,
-            }))
-            .chain(
-                self.user_shells
-                    .iter()
-                    .filter(|record| record.state == UserShellState::Queued)
-                    .map(|record| QueuedInput {
-                        id: record.id,
-                        chat_id: record.chat_id,
-                        loop_id: record.loop_id,
-                        kind: QueuedInputKind::Shell,
-                        text: record.command.clone(),
-                        contexts: Vec::new(),
-                        queued_sequence: record.queued_sequence,
-                        armed: record.armed,
-                    }),
-            )
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.queued_sequence);
-        entries
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct Observation {
@@ -925,7 +186,7 @@ pub struct Observation {
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
     #[error(transparent)]
-    Model(#[from] crate::model::ModelError),
+    Model(#[from] tickloop_agent_model::ModelError),
     #[error("request usage ledger: {0}")]
     Usage(#[from] LedgerError),
     #[error("storage failure: {0}")]
@@ -942,52 +203,6 @@ pub enum AgentError {
         "the current model does not support image input; remove the attached images such as @image mentions, or switch to a model that accepts images with /model"
     )]
     ImageInputUnsupported,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum DirectoryTrustPolicy {
-    #[default]
-    CallerManaged,
-    RequireUserTrust,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum PromptPolicy {
-    #[default]
-    Interactive,
-    DenyOnPrompt,
-    Unrestricted,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct AgentHostOptions {
-    pub execution_mode_override: Option<ExecutionMode>,
-    pub directory_trust: DirectoryTrustPolicy,
-    pub prompt_policy: PromptPolicy,
-}
-
-impl Default for AgentHostOptions {
-    fn default() -> Self {
-        Self::product_defaults()
-    }
-}
-
-impl AgentHostOptions {
-    pub const fn product_defaults() -> Self {
-        Self {
-            execution_mode_override: None,
-            directory_trust: DirectoryTrustPolicy::RequireUserTrust,
-            prompt_policy: PromptPolicy::Interactive,
-        }
-    }
-
-    pub const fn embedded_defaults() -> Self {
-        Self {
-            execution_mode_override: Some(ExecutionMode::AcceptEdits),
-            directory_trust: DirectoryTrustPolicy::CallerManaged,
-            prompt_policy: PromptPolicy::Interactive,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -1022,7 +237,7 @@ struct Inner {
     /// 本进程当前选择的模型；新建与恢复的 Chat 使用它，`set_model` 随选择更新。
     selected_model: std::sync::Mutex<chat_settings::SelectedModel>,
     /// 用户设置文件；不写设置的 Agent（测试等）为 `None`。
-    settings: Option<crate::settings::UserSettings>,
+    settings: Option<tickloop_agent_config::UserSettings>,
     host_options: AgentHostOptions,
     user_skills_directory: Option<PathBuf>,
     /// 本进程内设置读写的次序：写入设置并同步已加载的 Chat、以及读取设置并加入新 Chat 都在
@@ -1030,7 +245,8 @@ struct Inner {
     settings_writes: Mutex<()>,
     /// 最近一次为各 Chat 读取用户设置时发现的问题。
     settings_warnings: std::sync::Mutex<HashMap<ChatId, Vec<String>>>,
-    provider_failures: std::sync::Mutex<HashMap<String, crate::model::ProviderHttpFailure>>,
+    provider_failures:
+        std::sync::Mutex<HashMap<String, tickloop_agent_protocol::ProviderHttpFailure>>,
     trusted_working_directories: std::sync::Mutex<HashSet<PathBuf>>,
     host_contexts: std::sync::Mutex<host_context::HostContexts>,
     subagent_invocations: Mutex<HashMap<(RunId, String), delegation::SubagentInvocation>>,
@@ -1051,7 +267,7 @@ struct Inner {
     question_answers: Mutex<HashMap<Uuid, oneshot::Sender<String>>>,
     closed: AtomicBool,
     auto_reviewer: Mutex<Option<Arc<dyn ModelClient>>>,
-    judgment: Mutex<Option<Arc<dyn crate::judgment::JudgmentClient>>>,
+    judgment: Mutex<Option<Arc<dyn tickloop_agent_model::judgment::JudgmentClient>>>,
     auto_health: Mutex<auto_health::AutoHealth>,
     host_tools: std::sync::RwLock<Option<Arc<dyn crate::host_tools::HostToolProvider>>>,
     hosted_ticks: std::sync::RwLock<Option<Arc<crate::hosted::tools::HostedTickTools>>>,
@@ -1066,13 +282,39 @@ struct Inner {
     shutdown: CancellationToken,
 }
 
+/// Runtime bookkeeping about a Chat's conversation that never leaves this process. Recovery and
+/// Branch copies rebuild it from the conversation chain.
+#[derive(Clone, Debug, Default)]
+struct ChatBookkeeping {
+    denial_references: BTreeMap<usize, denials::DenialReference>,
+    /// 各 Loop 创建时的对话消息数。rewind 截断到这个位置或更早时 Loop 不再存在。
+    loop_starts: BTreeMap<LoopId, usize>,
+    /// 规则集中每条持久规则所属的项目分区（规范化的工作目录），删除或修改时写回该分区。
+    persistent_rule_projects: BTreeMap<Uuid, PathBuf>,
+    /// 照 Claude Code：Chat 的计划文件名前缀，第一次设置计划时生成，记录在之后的每个链上条目中。
+    plan_slug: Option<String>,
+    /// 计划内容不可用（恢复时计划文件缺失或不可读、`--fork-session`／Branch 复制失败）的 Loop 已使用过的
+    /// 最高计划版本；该 Loop 之后的计划从更大的版本继续，版本号不会被复用。
+    unavailable_plan_versions: BTreeMap<LoopId, u64>,
+    /// 本 Chat 中各 run 所属的 Loop，写入链上条目的 `loopId`；恢复时由条目重建。
+    run_loops: BTreeMap<RunId, LoopId>,
+}
+
+impl ChatBookkeeping {
+    /// 新建 Loop，记下创建时的对话位置。
+    fn add_loop(&mut self, snapshot: &mut ChatSnapshot, goal: LoopSnapshot) {
+        self.loop_starts.insert(goal.id, snapshot.messages.len());
+        snapshot.loops.push(goal);
+    }
+}
+
 #[derive(Clone)]
 struct Chat {
     family_generation: u64,
     snapshot: ChatSnapshot,
+    bookkeeping: ChatBookkeeping,
     todo_completion_graces: HashMap<LoopId, todo_lifecycle::CompletionGrace>,
     start_new_tool_result_message: bool,
-    retention: Option<Arc<crate::transcript::retention::RetentionGuard>>,
     active: Option<CancellationToken>,
     active_run: Option<RunId>,
     parked: HashMap<RunId, ParkedRun>,
@@ -1082,8 +324,8 @@ struct Chat {
     pending_model_thinking: Option<PendingModelThinking>,
     /// Chat 的工具；其 Chat 目录持久化时为 Transcript 同级的 `<chatId>/`，不持久化时位于
     /// 系统临时目录的项目目录下，外存的工具结果与文件改动 review 写在这里。
-    tools: Arc<crate::tools::Tools>,
-    skills: crate::skills::SkillRegistry,
+    tools: Arc<tickloop_agent_tools::Tools>,
+    skills: tickloop_agent_config::skills::SkillRegistry,
     /// 照 Claude Code，替换决定只在运行期保存，恢复时由 Transcript 中的内容替换条目重建。
     content_replacements: tool_results::ContentReplacementState,
     file_history: FileHistory,
@@ -1137,12 +379,12 @@ struct SubmissionOptions {
     attachment_admission: Option<family::AttachmentAdmission>,
     family_generation: Option<u64>,
     contexts: Vec<InputContext>,
-    attached_file_reads: Vec<(PathBuf, crate::tools::FileReadRecord)>,
+    attached_file_reads: Vec<(PathBuf, tickloop_agent_protocol::FileReadRecord)>,
     denial_reference: Option<denials::DenialReference>,
     trigger_source: Option<TriggerSource>,
     trigger_cancel: Option<CancellationToken>,
     event_claim: Option<ActiveEventClaim>,
-    invoked_skill: Option<crate::skills::InvokedSkill>,
+    invoked_skill: Option<tickloop_agent_protocol::InvokedSkill>,
     host_context: Option<crate::host_tools::HostCallContext>,
     agent_message: Option<AgentMessageSource>,
     directed_human: Option<DirectedHumanSource>,
@@ -1265,8 +507,8 @@ impl Chat {
     }
 }
 
-fn configured_workspace_for_chat(chat: &Chat) -> crate::tools::Workspace {
-    crate::tools::Workspace {
+fn configured_workspace_for_chat(chat: &Chat) -> tickloop_agent_tools::Workspace {
+    tickloop_agent_tools::Workspace {
         workdir: chat.snapshot.workdir.clone(),
         additional_directories: chat.snapshot.additional_directories.clone(),
     }
@@ -1275,10 +517,10 @@ fn configured_workspace_for_chat(chat: &Chat) -> crate::tools::Workspace {
 /// 从 Transcript 重建或反序列化快照时的占位模型；恢复流程随后换成宿主当前选择的模型。
 fn unselected_model() -> ModelConfig {
     ModelConfig {
-        provider: crate::model::ModelProvider::Api,
-        auth_source: crate::model::ModelAuthSource::ApiKeyEnv,
+        provider: tickloop_agent_protocol::ModelProvider::Api,
+        auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
         name: String::new(),
-        protocol: crate::model::Protocol::Messages,
+        protocol: tickloop_agent_protocol::Protocol::Messages,
         base_url: String::new(),
         model: String::new(),
         api_key_env: String::new(),
@@ -1288,7 +530,7 @@ fn unselected_model() -> ModelConfig {
         model_id: String::new(),
         connection: None,
         card: None,
-        input_modalities: vec![crate::model::InputModality::Text],
+        input_modalities: vec![tickloop_agent_protocol::InputModality::Text],
     }
 }
 
@@ -1367,7 +609,6 @@ fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnaps
         invoked_skills: Vec::new(),
         message_runs: BTreeMap::new(),
         message_contexts: BTreeMap::new(),
-        denial_references: BTreeMap::new(),
         message_ids: BTreeMap::new(),
         agent_message_origins: BTreeMap::new(),
         human_family_origins: BTreeMap::new(),
@@ -1379,7 +620,6 @@ fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnaps
         message_sources: BTreeMap::new(),
         message_models: BTreeMap::new(),
         loops: Vec::new(),
-        loop_starts: BTreeMap::new(),
         resume_triggers: Vec::new(),
         last_sequence: 0,
         permissions: Vec::new(),
@@ -1389,7 +629,6 @@ fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnaps
         last_queue_sequence: 0,
         operations: Vec::new(),
         policy: PermissionPolicy::default(),
-        persistent_rule_projects: BTreeMap::new(),
         additional_directories: Vec::new(),
         events: Vec::new(),
         pending_thinking: BTreeMap::new(),
@@ -1397,9 +636,6 @@ fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnaps
         pending_model: None,
         plans: Vec::new(),
         progress: Vec::new(),
-        plan_slug: None,
-        unavailable_plan_versions: BTreeMap::new(),
-        run_loops: BTreeMap::new(),
         commands: Vec::new(),
         user_shells: Vec::new(),
         last_model_run: None,
@@ -1417,7 +653,7 @@ impl Drop for Inner {
 }
 
 impl Agent {
-    fn tool_definitions(&self, chat: &Chat) -> Vec<crate::protocol::ToolDefinition> {
+    fn tool_definitions(&self, chat: &Chat) -> Vec<tickloop_agent_protocol::ToolDefinition> {
         ToolRegistry::for_chat(
             chat,
             self.inner.host_tools.read().unwrap().clone(),
@@ -1460,7 +696,7 @@ impl Agent {
         &self,
         receipt: &Receipt,
         input: &serde_json::Value,
-    ) -> Result<crate::tools::ToolResult, String> {
+    ) -> Result<tickloop_agent_protocol::ToolResult, String> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct SkillInput {
@@ -1470,7 +706,10 @@ impl Agent {
         }
 
         let input = serde_json::from_value::<SkillInput>(input.clone()).map_err(|error| {
-            format!("invalid {} input: {error}", crate::skills::SKILL_TOOL_NAME)
+            format!(
+                "invalid {} input: {error}",
+                tickloop_agent_config::skills::SKILL_TOOL_NAME
+            )
         })?;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats
@@ -1478,13 +717,17 @@ impl Agent {
             .ok_or_else(|| "chat is unavailable".to_string())?;
         let invoked = chat
             .skills
-            .expand(&input.skill, &input.args, crate::skills::SkillCaller::Model)
-            .and_then(crate::skills::InvokedSkill::try_from)
+            .expand(
+                &input.skill,
+                &input.args,
+                tickloop_agent_config::skills::SkillCaller::Model,
+            )
+            .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
             .map_err(|error| error.to_string())?;
         let name = invoked.name.clone();
         record_invoked_skill(&mut chat.snapshot, invoked);
         self.save(&chat.snapshot);
-        Ok(crate::tools::ToolResult {
+        Ok(tickloop_agent_protocol::ToolResult {
             content: format!("Launching skill: {name}"),
             is_error: false,
             output_ref: None,
@@ -1525,7 +768,7 @@ impl Agent {
         operation: &OperationRecord,
         cancel: CancellationToken,
     ) -> Result<approval_assessment::ApprovalAssessment, AgentError> {
-        let (snapshot, chat_client, boundary_id, legacy_path) = {
+        let (snapshot, bookkeeping, chat_client, boundary_id, legacy_path) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
             let boundary_id =
@@ -1545,6 +788,7 @@ impl Agent {
                 .and_then(|_| self.inner.recorder.as_ref()?.path_for_chat(receipt.chat_id));
             (
                 chat.snapshot.clone(),
+                chat.bookkeeping.clone(),
                 chat.client.clone(),
                 boundary_id,
                 legacy_path,
@@ -1583,9 +827,10 @@ impl Agent {
         };
         let context = approval_context::capture(
             &snapshot,
+            &bookkeeping,
             operation,
             legacy,
-            auto_rules::AutoPolicy::from_settings(&auto_settings),
+            auto_rules::auto_policy_from_settings(&auto_settings),
         );
         let context = match context {
             Ok(context) => context,
@@ -1609,7 +854,7 @@ impl Agent {
         let has_isolated_reviewer = configured_reviewer.is_some();
         let has_judgment_adapter = self.inner.judgment.lock().await.is_some();
         let llm_client = configured_reviewer.unwrap_or(chat_client);
-        let use_jev = preferred == crate::settings::AutoReviewerPreference::Jev
+        let use_jev = preferred == tickloop_agent_protocol::AutoReviewerPreference::Jev
             || (has_judgment_adapter && !has_isolated_reviewer);
         let assess = |run: auto_approval::ReviewerRun,
                       fallback_from: Option<ApprovalReviewerKind>,
@@ -1776,7 +1021,7 @@ impl Agent {
             cancel.cancel();
             if let Some(run_id) = chat.active_run {
                 chat.user_cancelled_runs.insert(run_id);
-                interrupted_loop = chat.snapshot.run_loops.get(&run_id).copied();
+                interrupted_loop = chat.bookkeeping.run_loops.get(&run_id).copied();
             }
         } else if let Some(waiting) = chat.parked.values().max_by_key(|run| run.sequence) {
             waiting.cancel.cancel();
@@ -1806,7 +1051,7 @@ impl Agent {
     /// 打开以 `root` 为根目录的持久化 Agent。打开时不加载任何 Chat；
     /// 用 [`Agent::resume_chat`] 按 id 恢复，用 [`Agent::saved_chats`] 列出已保存的 Chat。
     ///
-    /// 照 Claude Code `shouldSkipPersistence`：用户设置的清理天数为 0 时不保存 Chat，与
+    /// 照 Claude Code `shouldSkipPersistence`：用户设置的 `cleanupPeriodDays` 为 0 时不保存 Chat，与
     /// [`Agent::new_with_user_settings`] 相同，仍读写用户设置。设置只在打开时读取一次。
     pub fn open(
         root: PathBuf,
@@ -1837,7 +1082,7 @@ impl Agent {
         root: PathBuf,
         model: ModelConfig,
         client: Arc<dyn ModelClient>,
-        settings: crate::settings::UserSettings,
+        settings: tickloop_agent_config::UserSettings,
         host_options: AgentHostOptions,
     ) -> Result<Self, AgentError> {
         Self::open_with_settings_options(root, model, client, Some(settings), host_options)
@@ -1847,10 +1092,10 @@ impl Agent {
         root: PathBuf,
         model: ModelConfig,
         client: Arc<dyn ModelClient>,
-        settings: Option<crate::settings::UserSettings>,
+        settings: Option<tickloop_agent_config::UserSettings>,
         host_options: AgentHostOptions,
     ) -> Result<Self, AgentError> {
-        crate::private_fs::create_private_directory(&root)
+        tickloop_agent_base::private_fs::create_private_directory(&root)
             .map_err(|error| AgentError::Storage(error.to_string()))?;
         let root = root
             .canonicalize()
@@ -1860,7 +1105,8 @@ impl Agent {
                 "session root is not a directory".into(),
             ));
         }
-        let settings = settings.unwrap_or_else(|| crate::settings::UserSettings::in_root(&root));
+        let settings =
+            settings.unwrap_or_else(|| tickloop_agent_config::UserSettings::in_root(&root));
         let recorder =
             (!settings.skips_transcripts()).then(|| persistence::ChatRecorder::new(root));
         Ok(Self::build(
@@ -1872,7 +1118,7 @@ impl Agent {
         ))
     }
 
-    /// 是否把 Chat 保存为 Transcript：不持久化的 Agent、以及清理天数为 0 时为 `false`。
+    /// 是否把 Chat 保存为 Transcript：不持久化的 Agent、以及 `cleanupPeriodDays` 为 0 时为 `false`。
     pub fn saves_chats(&self) -> bool {
         self.inner.recorder.is_some()
     }
@@ -1915,7 +1161,7 @@ impl Agent {
     pub fn new_with_user_settings(
         model: ModelConfig,
         client: Arc<dyn ModelClient>,
-        settings: crate::settings::UserSettings,
+        settings: tickloop_agent_config::UserSettings,
     ) -> Self {
         Self::build(
             model,
@@ -1929,7 +1175,7 @@ impl Agent {
     pub fn new_with_user_settings_embedded(
         model: ModelConfig,
         client: Arc<dyn ModelClient>,
-        settings: crate::settings::UserSettings,
+        settings: tickloop_agent_config::UserSettings,
     ) -> Self {
         Self::build(
             model,
@@ -1943,7 +1189,7 @@ impl Agent {
     pub fn new_with_user_settings_and_options(
         model: ModelConfig,
         client: Arc<dyn ModelClient>,
-        settings: crate::settings::UserSettings,
+        settings: tickloop_agent_config::UserSettings,
         host_options: AgentHostOptions,
     ) -> Self {
         Self::build(model, client, None, Some(settings), host_options)
@@ -1953,13 +1199,13 @@ impl Agent {
         model: ModelConfig,
         client: Arc<dyn ModelClient>,
         recorder: Option<persistence::ChatRecorder>,
-        settings: Option<crate::settings::UserSettings>,
+        settings: Option<tickloop_agent_config::UserSettings>,
         host_options: AgentHostOptions,
     ) -> Self {
-        let model = crate::model::cards::model_for_persistent_selection(model);
+        let model = tickloop_agent_model::cards::model_for_persistent_selection(model);
         let user_skills_directory = settings
             .as_ref()
-            .and_then(crate::settings::UserSettings::root)
+            .and_then(tickloop_agent_config::UserSettings::root)
             .map(|root| root.join("skills"));
         Self {
             inner: Arc::new(Inner {
@@ -2120,11 +1366,11 @@ impl Agent {
             ));
         }
         self.require_working_directory_trust(&workdir)?;
-        let retention = self.retain_chat(id)?;
         if let Some(recorder) = &self.inner.recorder {
             recorder.register_chat(id, &workdir);
         }
         let mut snapshot = empty_snapshot(id, workdir, unselected_model());
+        let mut bookkeeping = ChatBookkeeping::default();
         let _settings_gate = self.inner.settings_writes.lock().await;
         let (client, output_style) =
             if let Some((metadata, parent, client, output_style)) = inherited {
@@ -2136,7 +1382,7 @@ impl Agent {
                 snapshot.delegation = Some(metadata);
                 (client, output_style)
             } else {
-                self.apply_chat_defaults(&mut snapshot)
+                self.apply_chat_defaults(&mut snapshot, &mut bookkeeping)
             };
         self.inner
             .subagent_registry
@@ -2145,7 +1391,7 @@ impl Agent {
             .entry(id)
             .or_default();
         let tools = self.create_chat_tools(&snapshot);
-        let skills = crate::skills::SkillRegistry::discover(
+        let skills = tickloop_agent_config::skills::SkillRegistry::discover(
             &snapshot.workdir,
             self.inner.user_skills_directory.as_deref(),
         );
@@ -2170,9 +1416,9 @@ impl Agent {
             Chat {
                 family_generation: 0,
                 snapshot,
+                bookkeeping,
                 todo_completion_graces: HashMap::new(),
                 start_new_tool_result_message: false,
-                retention,
                 active: None,
                 active_run: None,
                 parked: HashMap::new(),
@@ -2234,8 +1480,12 @@ impl Agent {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
             chat.skills
-                .expand(name, arguments, crate::skills::SkillCaller::User)
-                .and_then(crate::skills::InvokedSkill::try_from)
+                .expand(
+                    name,
+                    arguments,
+                    tickloop_agent_config::skills::SkillCaller::User,
+                )
+                .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
                 .map_err(|error| AgentError::Invalid(error.to_string()))?
         };
         let input = if arguments.trim().is_empty() {
@@ -2276,11 +1526,18 @@ impl Agent {
         name: &str,
         arguments: &str,
     ) -> Result<(), AgentError> {
-        crate::skills::SkillRegistry::discover(workdir, self.inner.user_skills_directory.as_deref())
-            .expand(name, arguments, crate::skills::SkillCaller::User)
-            .and_then(crate::skills::InvokedSkill::try_from)
-            .map(|_| ())
-            .map_err(|error| AgentError::Invalid(error.to_string()))
+        tickloop_agent_config::skills::SkillRegistry::discover(
+            workdir,
+            self.inner.user_skills_directory.as_deref(),
+        )
+        .expand(
+            name,
+            arguments,
+            tickloop_agent_config::skills::SkillCaller::User,
+        )
+        .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
+        .map(|_| ())
+        .map_err(|error| AgentError::Invalid(error.to_string()))
     }
 
     pub async fn has_skill(&self, chat_id: ChatId, name: &str) -> Result<bool, AgentError> {
@@ -2373,7 +1630,7 @@ impl Agent {
             if goal.is_some_and(|id| !snapshot.loops.iter().any(|existing| existing.id == id)) {
                 return Err(AgentError::NotFound);
             }
-            let workspace = crate::tools::Workspace {
+            let workspace = tickloop_agent_tools::Workspace {
                 workdir: snapshot.workdir.clone(),
                 additional_directories: snapshot.additional_directories.clone(),
             };
@@ -2382,9 +1639,9 @@ impl Agent {
                 .map(PathBuf::as_path)
                 .chain(contexts.iter().filter_map(InputContext::path))
                 .map(|path| {
-                    crate::tools::prepare(
+                    tickloop_agent_tools::prepare(
                         &workspace,
-                        crate::tools::READ_TOOL_NAME,
+                        tickloop_agent_tools::READ_TOOL_NAME,
                         &serde_json::json!({"file_path":path}),
                     )
                     .map_err(|error| AgentError::Invalid(error.to_string()))
@@ -2507,16 +1764,19 @@ impl Agent {
             id
         } else {
             let id = Uuid::new_v4();
-            chat.snapshot.add_loop(LoopSnapshot {
-                id,
-                goal: goal_title.unwrap_or_else(|| input.clone()),
-                state: LoopState::Idle,
-                run_id: None,
-                run_started_at: None,
-                trigger: None,
-                event_sources: Vec::new(),
-                state_since: None,
-            });
+            chat.bookkeeping.add_loop(
+                &mut chat.snapshot,
+                LoopSnapshot {
+                    id,
+                    goal: goal_title.unwrap_or_else(|| input.clone()),
+                    state: LoopState::Idle,
+                    run_id: None,
+                    run_started_at: None,
+                    trigger: None,
+                    event_sources: Vec::new(),
+                    state_since: None,
+                },
+            );
             id
         };
         let run_id = Uuid::new_v4();
@@ -2534,7 +1794,7 @@ impl Agent {
                 self.inner
                     .settings
                     .as_ref()
-                    .and_then(crate::settings::UserSettings::root_directory),
+                    .and_then(tickloop_agent_config::UserSettings::root_directory),
             )?;
         }
         if !chat.snapshot.accepts_images()
@@ -2561,10 +1821,9 @@ impl Agent {
                     .trigger
                     .as_mut()
                     .ok_or_else(|| AgentError::Invalid("restored trigger is unavailable".into()))?;
-                if trigger
-                    .expires_at_ms
-                    .is_some_and(|deadline| deadline <= crate::private_fs::unix_time_milliseconds())
-                {
+                if trigger.expires_at_ms.is_some_and(|deadline| {
+                    deadline <= tickloop_agent_base::private_fs::unix_time_milliseconds()
+                }) {
                     return Err(AgentError::Invalid(
                         "goal deadline has passed; create a new goal".into(),
                     ));
@@ -2703,7 +1962,7 @@ impl Agent {
     }
 
     fn emit(&self, chat: &mut Chat, receipt: &Receipt, kind: EventKind) {
-        chat.snapshot
+        chat.bookkeeping
             .run_loops
             .insert(receipt.run_id, receipt.loop_id);
         self.publish_event(chat, receipt, kind);
@@ -2737,7 +1996,7 @@ impl Agent {
         mut request: ModelRequest,
         cancel: CancellationToken,
         used_calls: &mut HashSet<String>,
-    ) -> Result<crate::model::ModelOutput, AgentError> {
+    ) -> Result<tickloop_agent_model::ModelOutput, AgentError> {
         {
             let chats = self.inner.chats.lock().await;
             if cancel.is_cancelled()
@@ -2745,7 +2004,7 @@ impl Agent {
                     .get(&receipt.chat_id)
                     .is_none_or(|chat| chat.active_run != Some(receipt.run_id))
             {
-                return Err(crate::model::ModelError::Cancelled.into());
+                return Err(tickloop_agent_model::ModelError::Cancelled.into());
             }
         }
         self.maybe_compact(receipt, cancel.clone()).await?;
@@ -2764,8 +2023,12 @@ impl Agent {
             {
                 let invoked = chat
                     .skills
-                    .expand("tickloop", "", crate::skills::SkillCaller::Model)
-                    .and_then(crate::skills::InvokedSkill::try_from)
+                    .expand(
+                        "tickloop",
+                        "",
+                        tickloop_agent_config::skills::SkillCaller::Model,
+                    )
+                    .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
                     .map_err(|error| AgentError::Invalid(error.to_string()))?;
                 record_invoked_skill(&mut chat.snapshot, invoked);
                 self.save(&chat.snapshot);
@@ -2782,7 +2045,7 @@ impl Agent {
             let state = serde_json::json!({
                 "workdir": chat.snapshot.workdir,
                 "family_temp_directory": chat.tools.family_temp_directory(),
-                "scratchpad": chat.tools.family_temp_directory().join(crate::tools::SCRATCHPAD_SUBDIRECTORY),
+                "scratchpad": chat.tools.family_temp_directory().join(tickloop_agent_tools::SCRATCHPAD_SUBDIRECTORY),
                 "delegation": chat.snapshot.delegation,
                 "workspace_host": workspace_host,
                 "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
@@ -2923,7 +2186,7 @@ impl Agent {
         self.finish_model_request(receipt.chat_id, response.sequence, outcome)
             .await?;
         if invalid_call {
-            return Err(crate::model::ModelError::InvalidResponse(
+            return Err(tickloop_agent_model::ModelError::InvalidResponse(
                 "invalid or repeated tool call; no incomplete operation was executed".into(),
             )
             .into());
@@ -3051,7 +2314,7 @@ impl Agent {
         let current_session_operation = SessionPermissionOperation::from_normalized(
             operation.name.clone(),
             permission_input.clone(),
-            WorkspaceScope::capture(&configured_workspace_for_chat(chat))
+            session_permissions::capture_workspace_scope(&configured_workspace_for_chat(chat))
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
@@ -3087,7 +2350,7 @@ impl Agent {
             .find(|record| record.id == operation.id)
             .expect("proposed host operation remains present")
             .state = OperationState::Admitted;
-        let approval = ApprovalRecord::allowed(
+        let approval = denials::allowed_approval_record(
             receipt.chat_id,
             operation,
             permission_input,
@@ -3186,7 +2449,7 @@ impl Agent {
                     if let Some(record) = denial {
                         self.record_final_denial(record).await;
                     }
-                    let command_state=if name==crate::tools::BASH_TOOL_NAME {self.command_state_for_call(&receipt,&id).await} else {None};
+                    let command_state=if name==tickloop_agent_tools::BASH_TOOL_NAME {self.command_state_for_call(&receipt,&id).await} else {None};
                     let (host_effect, connection_effect) = match host_effect {
                         Some(crate::host_tools::HostEffect::ConnectSource(effect)) => (None, Some(effect)),
                         other => (other, None),
@@ -3209,7 +2472,7 @@ impl Agent {
                                 || chat.snapshot.policy.mode == ExecutionMode::Plan;
                             let mut decision = source_connection::apply(&mut chat.snapshot, chat.active_run, &receipt, effect, activation_blocked);
                             if let Some(request) = &decision.dispatch
-                                && let Err(error) = self.checkpoint_connection(&chat.snapshot, chat.tools.chat_directory().clone(), request.loop_id).await
+                                && let Err(error) = self.checkpoint_connection(&chat.snapshot, &chat.bookkeeping, chat.tools.chat_directory().clone(), request.loop_id).await
                             {
                                 source_connection::record_outcome(&mut chat.snapshot, request, crate::host_tools::EventAssociationOutcome::NotDispatched(error.clone()), decision.previously_unknown);
                                 decision.result = crate::host_tools::connection_result(&identity, "not_dispatched", serde_json::json!({"reason":"persistence_unavailable"}), true, "This attempt dispatched no association because the exact recovery request could not be saved. Any earlier unresolved attempt remains unknown.");
@@ -3237,10 +2500,10 @@ impl Agent {
                         let state=match (host_call_status, command_state) {
                             (Some(crate::host_tools::HostCallStatus::OutcomeUnknown), _)=>OperationState::Unknown,
                             (Some(crate::host_tools::HostCallStatus::NotDispatched), _)=>OperationState::Failed,
-                            (_, Some(crate::tools::CommandState::Running|crate::tools::CommandState::Background|crate::tools::CommandState::Cancelling))=>OperationState::Admitted,
-                            (_, Some(crate::tools::CommandState::Unknown))=>OperationState::Unknown,
-                            (_, Some(crate::tools::CommandState::Completed))=>OperationState::Completed,
-                            (_, Some(crate::tools::CommandState::Failed))=>OperationState::Failed,
+                            (_, Some(tickloop_agent_protocol::CommandState::Running|tickloop_agent_protocol::CommandState::Background|tickloop_agent_protocol::CommandState::Cancelling))=>OperationState::Admitted,
+                            (_, Some(tickloop_agent_protocol::CommandState::Unknown))=>OperationState::Unknown,
+                            (_, Some(tickloop_agent_protocol::CommandState::Completed))=>OperationState::Completed,
+                            (_, Some(tickloop_agent_protocol::CommandState::Failed))=>OperationState::Failed,
                             _ if result.is_error=>OperationState::Failed,
                             _=>OperationState::Completed,
                         };
@@ -3314,7 +2577,7 @@ impl Agent {
                     }
                     self.save(&chat.snapshot);
                     if let Some(request) = &connection_dispatch
-                        && let Err(error) = self.checkpoint_connection(&chat.snapshot, chat.tools.chat_directory().clone(), request.loop_id).await
+                        && let Err(error) = self.checkpoint_connection(&chat.snapshot, &chat.bookkeeping, chat.tools.chat_directory().clone(), request.loop_id).await
                     {
                         source_connection::record_outcome(&mut chat.snapshot, request, crate::host_tools::EventAssociationOutcome::NotDispatched(error), connection_previously_unknown);
                         connection_dispatch = None;
@@ -3601,7 +2864,7 @@ impl Agent {
     /// outside the lock through `complete_file_history_snapshots`.
     fn append_input_message(&self, chat: &mut Chat, pending: PendingInput) {
         if pending.task_continuation {
-            chat.snapshot
+            chat.bookkeeping
                 .run_loops
                 .insert(pending.receipt.run_id, pending.receipt.loop_id);
             return;
@@ -3610,7 +2873,7 @@ impl Agent {
         chat.snapshot
             .message_runs
             .insert(message_index, pending.receipt.run_id);
-        chat.snapshot
+        chat.bookkeeping
             .run_loops
             .insert(pending.receipt.run_id, pending.receipt.loop_id);
         chat.snapshot.messages.push(Message {
@@ -3628,7 +2891,7 @@ impl Agent {
             chat.tools.file_reads().record(path, record);
         }
         if let Some(reference) = pending.denial_reference {
-            chat.snapshot
+            chat.bookkeeping
                 .denial_references
                 .insert(message_index, reference);
         }
@@ -3829,7 +3092,7 @@ impl Agent {
                 self.inner
                     .settings
                     .as_ref()
-                    .and_then(crate::settings::UserSettings::root_directory),
+                    .and_then(tickloop_agent_config::UserSettings::root_directory),
             )?;
             candidate.snapshot.pending_inputs.remove(index);
             let mut merged_inputs = Vec::new();
@@ -3882,7 +3145,7 @@ impl Agent {
                 .unwrap();
             goal.set_state(LoopState::Running);
             goal.run_id = Some(pending.receipt.run_id);
-            goal.run_started_at = Some(crate::private_fs::unix_time_milliseconds());
+            goal.run_started_at = Some(tickloop_agent_base::private_fs::unix_time_milliseconds());
             let cancel = CancellationToken::new();
             candidate.active = Some(cancel.clone());
             candidate.active_run = Some(pending.receipt.run_id);
@@ -4067,7 +3330,7 @@ impl Agent {
     pub async fn set_search(
         &self,
         chat_id: ChatId,
-        config: Option<crate::tools::SearchConfig>,
+        config: Option<tickloop_agent_protocol::SearchConfig>,
     ) -> Result<(), AgentError> {
         let tools = self
             .inner
@@ -4119,14 +3382,14 @@ impl Agent {
         let changes = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-            chat_settings::persistent_rule_changes(&chat.snapshot, &rules)?
+            chat_settings::persistent_rule_changes(&chat.snapshot, &chat.bookkeeping, &rules)?
         };
         self.save_persistent_rule_changes(&changes).await?;
         let mut chats = self.inner.chats.lock().await;
         self.sync_persistent_rules(&mut chats, &changes, Some(chat_id));
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         chat.snapshot.policy.rules = rules;
-        chat_settings::record_rule_projects(&mut chat.snapshot, &changes);
+        chat_settings::record_rule_projects(&mut chat.bookkeeping, &changes);
         chat.snapshot.policy.revision += 1;
         self.save(&chat.snapshot);
         Ok(())
@@ -4210,12 +3473,12 @@ impl Agent {
         if chat.snapshot.workdir != workdir {
             // 持久规则属于工作目录的分区：换目录时换成新目录的持久规则，会话规则保留。
             chat.snapshot.workdir = workdir;
-            chat.skills = crate::skills::SkillRegistry::discover(
+            chat.skills = tickloop_agent_config::skills::SkillRegistry::discover(
                 &chat.snapshot.workdir,
                 self.inner.user_skills_directory.as_deref(),
             );
             if let Some(saved) = saved {
-                self.replace_persistent_rules(&mut chat.snapshot, saved);
+                self.replace_persistent_rules(&mut chat.snapshot, &mut chat.bookkeeping, saved);
             }
         }
         chat.snapshot.additional_directories = additional;
@@ -4280,7 +3543,7 @@ impl Agent {
             if chats.get(&chat_id).is_some_and(|chat| {
                 chat.snapshot.permissions.iter().any(|request| {
                     request.id == request_id
-                        && request.name == crate::tools::EXIT_PLAN_MODE_TOOL_NAME
+                        && request.name == tickloop_agent_tools::EXIT_PLAN_MODE_TOOL_NAME
                 })
             }) {
                 return Err(AgentError::Invalid(
@@ -4781,9 +4044,6 @@ impl Agent {
         }
         self.inner.loop_leases.release_all();
         self.close_transcripts().await;
-        for chat in self.inner.chats.lock().await.values_mut() {
-            chat.retention = None;
-        }
     }
 }
 
@@ -4797,7 +4057,7 @@ pub(crate) fn validate_host_schema_input(
 }
 
 pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
-    crate::tools::Tools::definitions()
+    tickloop_agent_tools::Tools::definitions()
         .into_iter()
         .chain(plan::definitions())
         .chain(interaction::definitions())
@@ -4805,11 +4065,16 @@ pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
         .chain(delegation::definitions())
         .chain(agent_messages::definitions(false))
         .map(|definition| definition.name)
-        .chain(std::iter::once(crate::skills::SKILL_TOOL_NAME.into()))
+        .chain(std::iter::once(
+            tickloop_agent_config::skills::SKILL_TOOL_NAME.into(),
+        ))
         .collect()
 }
 
-fn record_invoked_skill(snapshot: &mut ChatSnapshot, invoked: crate::skills::InvokedSkill) {
+fn record_invoked_skill(
+    snapshot: &mut ChatSnapshot,
+    invoked: tickloop_agent_protocol::InvokedSkill,
+) {
     snapshot
         .invoked_skills
         .retain(|existing| existing.name != invoked.name);
@@ -4822,15 +4087,15 @@ mod thinking_settings_tests {
 
     #[test]
     fn disabled_preference_applies_only_when_model_card_allows_it() {
-        let model = crate::model::cards::built_in_model_profiles().remove(0);
+        let model = tickloop_agent_model::cards::built_in_model_profiles().remove(0);
         let mut snapshot = empty_snapshot(Uuid::new_v4(), PathBuf::new(), model.clone());
         snapshot.thinking_enabled = false;
         assert_eq!(
             snapshot.effective_reasoning_effort(),
-            Some(crate::model::ReasoningEffort::Off)
+            Some(tickloop_agent_protocol::ReasoningEffort::Off)
         );
 
-        snapshot.model = crate::model::cards::ModelCatalog::defaults()
+        snapshot.model = tickloop_agent_model::cards::ModelCatalog::defaults()
             .get("anthropic-api", "claude-fable-5-messages")
             .unwrap();
         assert_eq!(snapshot.effective_reasoning_effort(), None);
@@ -4839,7 +4104,7 @@ mod thinking_settings_tests {
         snapshot.model = model;
         assert_eq!(
             snapshot.effective_reasoning_effort(),
-            Some(crate::model::ReasoningEffort::Off)
+            Some(tickloop_agent_protocol::ReasoningEffort::Off)
         );
     }
 }

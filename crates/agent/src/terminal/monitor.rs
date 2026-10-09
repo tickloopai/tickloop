@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
-use tick_connect::page::{MAX_PAGE_SIZE, PageCursor, PageError};
+use tickhost_connect::page::{MAX_PAGE_SIZE, PageCursor, PageError};
 
 use super::{
     display::{DisplayProfile, Glyph},
@@ -12,12 +12,12 @@ const MILLISECONDS_PER_SECOND: f64 = 1000.0;
 const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
 pub(super) const MONITOR_AUTO_MIN_COLUMNS: usize = 121;
 
-pub(super) use crate::tick_adapter::TickGroup;
-use crate::tick_adapter::{
-    MONITOR_ADD_KEY, MonitorAction, MonitorContext, TickAdapters, TickDescriptor, TickGlyph,
+pub(super) use crate::monitor_rows::TickGroup;
+use crate::monitor_rows::{
+    MONITOR_ADD_KEY, MonitorAction, MonitorContext, MonitorRowsRegistry, TickDescriptor, TickGlyph,
     TickOwner, TickResources, page_of,
 };
-use crate::tick_stream::InstanceRef;
+use tick_protocol::InstanceRef;
 
 #[derive(Clone, Debug)]
 pub(super) struct MonitorEntry {
@@ -43,9 +43,9 @@ pub(super) struct TickConfirmation {
 pub(super) struct Monitor {
     pub(super) detail: Option<Box<dyn super::tick_actions::TickDetailView>>,
     pub(super) subscriptions: Vec<crate::runtime::TickSubscriptionStatus>,
-    pub(super) metadata: HashMap<String, Option<crate::artifacts::ArtifactMetadata>>,
+    pub(super) metadata: HashMap<String, Option<tickloop_agent_artifacts::ArtifactMetadata>>,
     pub(super) metadata_failures: HashMap<String, String>,
-    pub(super) member_findings: crate::tick_adapter::MemberFindings,
+    pub(super) member_findings: crate::monitor_rows::MemberFindings,
     pub(super) confirmation: Option<TickConfirmation>,
     /// The visible page; the complete set is `total` rows.
     entries: Vec<MonitorEntry>,
@@ -55,7 +55,7 @@ pub(super) struct Monitor {
     earlier_pages: Vec<Option<PageCursor>>,
     next_page: Option<PageCursor>,
     selected: Option<InstanceRef>,
-    adapters: Option<TickAdapters>,
+    rows: Option<MonitorRowsRegistry>,
     pub(super) chat_snapshot: Option<crate::runtime::ChatSnapshot>,
     pub(super) shell_snapshot: Option<crate::runtime::ShellTaskSnapshot>,
     pub(super) focused: bool,
@@ -72,8 +72,8 @@ impl Monitor {
         &mut self,
     ) -> std::sync::Arc<dyn super::tick_actions::TickActionExecutor> {
         let intents = self
-            .adapters
-            .get_or_insert_with(TickAdapters::presentation)
+            .rows
+            .get_or_insert_with(MonitorRowsRegistry::builtin)
             .refresh_intents();
         super::tick_actions::builtin::refresh(&intents)
     }
@@ -118,8 +118,8 @@ impl Monitor {
             member_resources: self.member_findings.resources.clone(),
         };
         let listed = self
-            .adapters
-            .get_or_insert_with(TickAdapters::presentation)
+            .rows
+            .get_or_insert_with(MonitorRowsRegistry::builtin)
             .list(&context);
         self.group_totals.clear();
         for entry in &listed {
@@ -159,7 +159,7 @@ impl Monitor {
         self.entries.retain(|entry| entry.group != group);
         self.entries.extend(rows);
         self.entries.sort_by(|a, b| {
-            crate::tick_adapter::display_order(
+            crate::monitor_rows::display_order(
                 (a.group, a.updated_at_ms, &a.instance),
                 (b.group, b.updated_at_ms, &b.instance),
             )
@@ -300,7 +300,7 @@ impl Monitor {
                     .map(|action| {
                         format!(
                             "{} {}",
-                            if action.key == crate::tick_adapter::MONITOR_ENTER_KEY {
+                            if action.key == crate::monitor_rows::MONITOR_ENTER_KEY {
                                 "Enter".into()
                             } else {
                                 action.key.to_string()
@@ -634,19 +634,19 @@ impl From<TickDescriptor> for MonitorEntry {
 }
 
 #[cfg(test)]
-mod adapter_tests {
+mod registered_rows_tests {
     use super::*;
-    use crate::tick_adapter::{TickAdapter, TickIntent};
+    use crate::monitor_rows::{MonitorRows, TickIntent};
     use std::sync::Arc;
 
     struct Calendar;
-    impl TickAdapter for Calendar {
+    impl MonitorRows for Calendar {
         fn tick_type(&self) -> &'static str {
             "calendar"
         }
         fn list(&self, _: &MonitorContext) -> Vec<TickDescriptor> {
             vec![TickDescriptor {
-                instance: crate::tick_stream::InstanceRef::new("calendar", "earnings").unwrap(),
+                instance: tick_protocol::InstanceRef::new("calendar", "earnings").unwrap(),
                 group: TickGroup {
                     order: 4,
                     name: "Calendars",
@@ -655,7 +655,7 @@ mod adapter_tests {
                 title: "Earnings calendar".into(),
                 kind: "Calendar".into(),
                 status: "waiting".into(),
-                owner: crate::tick_adapter::TickOwner::Unknown,
+                owner: crate::monitor_rows::TickOwner::Unknown,
                 updated_at_ms: None,
                 running: true,
                 resources: None,
@@ -669,15 +669,12 @@ mod adapter_tests {
                     .collect(),
             }]
         }
-        fn stream(&self) -> Option<Arc<dyn crate::tick_stream::TickStreamPort>> {
-            None
-        }
     }
     #[test]
-    fn registered_adapter_groups_rows_and_hints_render_without_list_type_changes() {
+    fn registered_rows_group_and_hints_render_without_list_type_changes() {
         let mut list = Monitor {
-            adapters: Some(
-                TickAdapters::new([Arc::new(Calendar) as Arc<dyn TickAdapter>]).unwrap(),
+            rows: Some(
+                MonitorRowsRegistry::new([Arc::new(Calendar) as Arc<dyn MonitorRows>]).unwrap(),
             ),
             ..Default::default()
         };

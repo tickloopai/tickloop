@@ -12,7 +12,7 @@ fn main() {
         .expect("cannot start the Agent terminal runtime");
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let result = runtime.block_on(async {
-        match tickloop_agent::agent_daemon::run_internal(&arguments).await {
+        match tickloop_agent::entry::run_internal(&arguments).await {
             Some(result) => result,
             None => tickloop_agent::terminal::run().await,
         }

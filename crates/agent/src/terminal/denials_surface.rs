@@ -5,7 +5,7 @@ use tickloop_agent::runtime::{
     ApprovalPath, ApprovalRecord, ApprovalResult, ApprovalReviewerKind, DenialCategory,
     DenialPersistence, PermissionApprovalSource,
 };
-use tickloop_agent::settings::AutoReviewerPreference;
+use tickloop_agent_protocol::AutoReviewerPreference;
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 

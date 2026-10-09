@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 
 use super::*;
-use crate::{protocol::ToolDefinition, tools::ToolResult};
+use tickloop_agent_protocol::{ToolDefinition, ToolResult};
 
 pub const SEND_AGENT_MESSAGE_TOOL_NAME: &str = "SendMessage";
 pub const LIST_SUBAGENTS_TOOL_NAME: &str = "ListSubagents";
@@ -397,21 +397,23 @@ impl Agent {
                             "relay reference must be a genuine human message ID".into(),
                         )
                     })?;
-                let original =
-                    approval_context::originals_for_active_chain(&chats[&sender.chat_id].snapshot)
-                        .ok()
-                        .and_then(|inputs| {
-                            inputs.into_iter().find(|original| {
-                                original.chat_id == sender.chat_id && original.message_id == id
-                            })
-                        })
-                        .ok_or_else(|| {
-                            reject(
+                let original = approval_context::originals_for_active_chain(
+                    &chats[&sender.chat_id].snapshot,
+                    &chats[&sender.chat_id].bookkeeping,
+                )
+                .ok()
+                .and_then(|inputs| {
+                    inputs.into_iter().find(|original| {
+                        original.chat_id == sender.chat_id && original.message_id == id
+                    })
+                })
+                .ok_or_else(|| {
+                    reject(
                         FamilyMessageRejectionCode::InvalidUserRelay,
                         "relay reference is not genuine human input in the sender's active chain"
                             .into(),
                     )
-                        })?;
+                })?;
                 Ok(VerifiedUserRelay {
                     original_chat_id: original.chat_id,
                     original_message_id: original.message_id,
@@ -422,7 +424,11 @@ impl Agent {
             .transpose()?;
         let mut policy_input = input.clone();
         policy_input["to"] = target.to_string().into();
-        let cause = family_mailbox::current_cause(&chats[&sender.chat_id].snapshot, sender)?;
+        let cause = family_mailbox::current_cause(
+            &chats[&sender.chat_id].snapshot,
+            &chats[&sender.chat_id].bookkeeping,
+            sender,
+        )?;
         Ok(PreparedFamilyMessage {
             cause,
             policy_input,
@@ -567,8 +573,12 @@ impl Agent {
         let mut cause = if let Some(prepared) = prepared {
             prepared.cause.clone()
         } else {
-            family_mailbox::current_cause(&chats[&sender.chat_id].snapshot, sender)
-                .map_err(|rejection| rejection.message)?
+            family_mailbox::current_cause(
+                &chats[&sender.chat_id].snapshot,
+                &chats[&sender.chat_id].bookkeeping,
+                sender,
+            )
+            .map_err(|rejection| rejection.message)?
         };
         cause.depth = cause.depth.saturating_add(1);
         let original = chats.get_mut(&target_id).unwrap();
@@ -619,7 +629,7 @@ impl Agent {
         ) {
             goal.set_state(LoopState::Queued);
         }
-        let now = crate::private_fs::unix_time_milliseconds();
+        let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
         let pending_count = receiver
             .snapshot
             .pending_inputs
@@ -819,8 +829,8 @@ impl Agent {
                 .filter(|command| {
                     matches!(
                         command.state,
-                        crate::tools::CommandState::Running
-                            | crate::tools::CommandState::Background
+                        tickloop_agent_protocol::CommandState::Running
+                            | tickloop_agent_protocol::CommandState::Background
                     )
                 })
                 .map(|command| command.operation_id)

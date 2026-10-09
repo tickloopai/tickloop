@@ -5,12 +5,12 @@ use serde_json::{Value, json};
 use super::*;
 use crate::{
     host_tools::{HostCallContext, HostToolAuthority, HostToolProvider},
-    protocol::ToolDefinition,
     tick_tool_router::{
         CALL_TICK_TOOL, MODIFY_TICK, READ_TICK, READ_WORKSPACE, TickBackend, TickBackends,
     },
-    tools::{PreparedTool, ToolResult, Workspace},
 };
+use tickloop_agent_protocol::{ToolDefinition, ToolResult};
+use tickloop_agent_tools::{PreparedTool, Workspace, permissions::PermissionPolicyExt};
 
 pub const SUBAGENT_TOOL_NAME: &str = "Subagent";
 
@@ -43,7 +43,7 @@ pub struct DelegationCeiling {
     /// delegated. Each call must run under one of them; a backend found later never joins.
     pub host_tools: BTreeMap<String, BTreeSet<HostToolAuthority>>,
     #[serde(default)]
-    pub tick_instances: Vec<tick_connect::instance::InstanceRef>,
+    pub tick_instances: Vec<tick_protocol::InstanceRef>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -161,7 +161,7 @@ pub(super) fn check_call(
     let session_operation = SessionPermissionOperation::from_normalized(
         name.to_owned(),
         input.clone(),
-        WorkspaceScope::capture(&Workspace {
+        super::session_permissions::capture_workspace_scope(&Workspace {
             workdir: ceiling.workdir.clone(),
             additional_directories: ceiling.additional_directories.clone(),
         })
@@ -170,7 +170,7 @@ pub(super) fn check_call(
     .map_err(|error| error.to_string())?;
     if denials
         .iter()
-        .any(|denial| denial.matches(&session_operation))
+        .any(|denial| super::session_permissions::denial_matches(denial, &session_operation))
     {
         return Err("the frozen parent Session denial applies to this delegated operation".into());
     }
@@ -189,7 +189,7 @@ pub(super) fn check_call(
                 "the parent's current denial still applies to this delegated operation".into(),
             );
         }
-        if name != crate::tools::BASH_TOOL_NAME
+        if name != tickloop_agent_tools::BASH_TOOL_NAME
             && current_parent_decision == Some(Decision::Ask)
             && chat.snapshot.policy.explicit_decision_with_session(
                 name,
@@ -304,7 +304,7 @@ pub(super) fn permission_authority(
     sessions: &session_permissions::SessionPermissionContext,
     receipt: &Receipt,
     prepared: &PreparedTool,
-    session: Option<crate::permissions::SessionPermissionDecision>,
+    session: Option<tickloop_agent_tools::permissions::SessionPermissionDecision>,
     plan_file: Option<&std::path::Path>,
 ) -> Option<PermissionAuthority> {
     let chat = chats.get(&receipt.chat_id)?;
@@ -322,7 +322,7 @@ pub(super) fn permission_authority(
             &prepared.input,
             receipt.loop_id,
             session,
-        ) == Some(crate::permissions::ExplicitPermissionDecision::Ask),
+        ) == Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Ask),
         policy_revision: policy.revision,
         parent_revision: None,
     };
@@ -330,7 +330,7 @@ pub(super) fn permission_authority(
         .snapshot
         .delegation
         .as_ref()
-        .filter(|_| prepared.name == crate::tools::BASH_TOOL_NAME)
+        .filter(|_| prepared.name == tickloop_agent_tools::BASH_TOOL_NAME)
     else {
         return Some(own);
     };
@@ -363,12 +363,13 @@ pub(super) fn permission_authority(
             return (Decision::Deny, false, Some(parent.snapshot.policy.revision));
         };
         let parent_session = sessions.evaluate(owner, &operation).decision;
-        let effective_session =
-            if parent_session == Some(crate::permissions::SessionPermissionDecision::Deny) {
-                parent_session
-            } else {
-                session
-            };
+        let effective_session = if parent_session
+            == Some(tickloop_agent_tools::permissions::SessionPermissionDecision::Deny)
+        {
+            parent_session
+        } else {
+            session
+        };
         (
             parent.snapshot.policy.decide_with_plan_file(
                 prepared,
@@ -510,7 +511,7 @@ impl Agent {
         let sessions = self.inner.session_permissions.lock().await;
         let plan_file = chats.get(&receipt.chat_id).and_then(|chat| {
             super::plan::current_plan_file(
-                &chat.snapshot,
+                &chat.bookkeeping,
                 self.plans_directory(&chat.snapshot.workdir).path(),
                 receipt.loop_id,
             )
@@ -567,7 +568,7 @@ impl Agent {
                         .subagents(parent.chat_id)
                         .await
                         .map_err(|error| error.to_string())?;
-                    let (snapshot, client, output_style, session_denials, name) = {
+                    let (snapshot, bookkeeping, client, output_style, session_denials, name) = {
                         let chats = self.inner.chats.lock().await;
                         let chat = chats.get(&parent.chat_id).ok_or("parent is unavailable")?;
                         if chat.snapshot.delegation.is_some() {
@@ -578,6 +579,7 @@ impl Agent {
                         let sessions = self.inner.session_permissions.lock().await;
                         (
                             chat.snapshot.clone(),
+                            chat.bookkeeping.clone(),
                             chat.client.clone(),
                             chat.output_style,
                             sessions.freeze_denials(parent_owner),
@@ -590,7 +592,7 @@ impl Agent {
                             ),
                         )
                     };
-                    let mut cause = family_mailbox::current_cause(&snapshot, parent)
+                    let mut cause = family_mailbox::current_cause(&snapshot, &bookkeeping, parent)
                         .map_err(|rejection| rejection.message)?;
                     cause.depth = cause.depth.saturating_add(1);
                     if cause.depth > family_mailbox::MAX_MESSAGE_DEPTH {
@@ -645,7 +647,7 @@ impl Agent {
                         child_chat_id: Uuid::new_v4(),
                         handle: name,
                         description: description.clone(),
-                        created_at: crate::private_fs::unix_time_milliseconds(),
+                        created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
                     };
                     let metadata = DelegationMetadata {
                         delegation_id: Uuid::new_v4(),
@@ -656,6 +658,7 @@ impl Agent {
                         task: task.clone(),
                         trusted_user_inputs: approval_context::originals_for_active_chain(
                             &snapshot,
+                            &bookkeeping,
                         )
                         .ok()
                         .map(|inputs| {
@@ -715,7 +718,7 @@ impl Agent {
                         cause,
                         message_id: Uuid::new_v4(),
                         call_id: None,
-                        created_at: crate::private_fs::unix_time_milliseconds(),
+                        created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
                         sender_chat_id: parent.chat_id,
                         sender_loop_id: parent.loop_id,
                         sender_run_id: parent.run_id,

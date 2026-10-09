@@ -1,9 +1,7 @@
+use tickloop_agent_model::cards::built_in_model_profiles;
 #[cfg(test)]
-use tickloop_agent::model::cards::upgrade_saved_legacy_builtin_model;
-use tickloop_agent::{
-    model::{ModelConfig, Protocol, cards::built_in_model_profiles},
-    permissions::ExecutionMode,
-};
+use tickloop_agent_model::cards::upgrade_saved_legacy_builtin_model;
+use tickloop_agent_protocol::{ExecutionMode, ModelConfig, Protocol};
 
 #[cfg(test)]
 const LEGACY_DEEPSEEK_MAX_OUTPUT_TOKENS: u32 = 4096;
@@ -23,8 +21,8 @@ pub(super) fn model_choices_with_profiles(
     current: &ModelConfig,
     profiles: Vec<ModelConfig>,
 ) -> Vec<ModelConfig> {
-    let defaults = tickloop_agent::model::cards::ModelCatalog::defaults();
-    if tickloop_agent::model::access::AccessCatalog::defaults()
+    let defaults = tickloop_agent_model::cards::ModelCatalog::defaults();
+    if tickloop_agent_model::access::AccessCatalog::defaults()
         .ordinary_candidate(current, &defaults)
         == Some(false)
     {
@@ -93,6 +91,7 @@ pub(super) fn execution_modes() -> Vec<(ExecutionMode, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tickloop_agent_model::ModelConfigExt;
 
     #[test]
     fn preferred_profiles_keep_visible_current_and_hide_legacy_adapter_duplicates() {
@@ -102,12 +101,12 @@ mod tests {
             include_str!("../../tests/support/legacy_models/deepseek-chat-config.json"),
             include_str!("../../tests/support/legacy_models/deepseek-v4-pro-config.json"),
         ] {
-            let current: ModelConfig = tickloop_agent::model::cards::migrate_legacy_model(
+            let current: ModelConfig = tickloop_agent_model::cards::migrate_legacy_model(
                 serde_json::from_str(source).unwrap(),
             );
             let choices = model_choices(&current);
             assert_eq!(choices.len(), built_in_model_profiles().len());
-            if tickloop_agent::model::cards::is_default_visible(&current) {
+            if tickloop_agent_model::cards::is_default_visible(&current) {
                 assert!(choices.contains(&current));
                 assert_eq!(choices.iter().filter(|value| **value == current).count(), 1);
             } else {
@@ -119,20 +118,20 @@ mod tests {
                     .iter()
                     .filter(|model| model.provider_id == "deepseek-api")
                     .all(|model| model.adapter()
-                        == tickloop_agent::model::cards::Adapter::DeepseekChatCompletions)
+                        == tickloop_agent_protocol::Adapter::DeepseekChatCompletions)
             );
         }
     }
 
     #[test]
     fn default_deepseek_chat_completions_profile_keeps_legacy_identity_and_accepts_images() {
-        let mut example = tickloop_agent::model::cards::migrate_legacy_model(
+        let mut example = tickloop_agent_model::cards::migrate_legacy_model(
             serde_json::from_str(include_str!(
                 "../../tests/support/legacy_models/deepseek-chat-config.json"
             ))
             .unwrap(),
         );
-        let default = tickloop_agent::model::cards::ModelCatalog::defaults()
+        let default = tickloop_agent_model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash-chat-completions")
             .unwrap();
         assert_eq!(default.connection(), example.connection());

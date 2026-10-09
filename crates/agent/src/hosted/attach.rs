@@ -10,14 +10,14 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tick_connect::{
+use tickhost::pty::{MAX_COLUMNS, MAX_ROWS, MIN_COLUMNS, MIN_ROWS};
+use tickhost_connect::{
     host_error::HostError,
     hosted::{
         self, ATTACH_INPUT_BYTES, ATTACH_REQUEST_FRAME_BYTES, BUSINESS_FRAME_BYTES,
         CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role,
     },
 };
-use tickhost::pty::{MAX_COLUMNS, MAX_ROWS, MIN_COLUMNS, MIN_ROWS};
 
 use super::controller::HostedViewGrant;
 

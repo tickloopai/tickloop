@@ -8,9 +8,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{
+use tickloop_agent_tools::{
+    PreparedTool, Workspace,
     permissions::{SessionPermissionDecision, permission_rule_content},
-    tools::{PreparedTool, Workspace},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -28,14 +28,9 @@ impl PermissionOwner {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub(crate) struct WorkspaceScope {
-    workdir: PathBuf,
-    additional_directories: Vec<PathBuf>,
-}
-
-impl WorkspaceScope {
-    pub(crate) fn capture(workspace: &Workspace) -> Result<Self, SessionPermissionError> {
+pub(crate) fn capture_workspace_scope(
+    workspace: &Workspace,
+) -> Result<WorkspaceScope, SessionPermissionError> {
         let workdir = canonical_directory(&workspace.workdir)?;
         let mut additional_directories = workspace
             .additional_directories
@@ -43,11 +38,10 @@ impl WorkspaceScope {
             .map(|directory| canonical_directory(directory))
             .collect::<Result<BTreeSet<_>, _>>()?;
         additional_directories.remove(&workdir);
-        Ok(Self {
+        Ok(WorkspaceScope::new(
             workdir,
-            additional_directories: additional_directories.into_iter().collect(),
-        })
-    }
+            additional_directories.into_iter().collect(),
+        ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,19 +53,13 @@ pub(crate) struct SessionPermissionOperation {
     workspace: WorkspaceScope,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct SessionPermissionDenial {
-    tool: String,
-    identity_sha256: String,
-    workspace: WorkspaceScope,
-}
-
-impl SessionPermissionDenial {
-    pub(crate) fn matches(&self, operation: &SessionPermissionOperation) -> bool {
-        self.tool == operation.tool
-            && self.workspace == operation.workspace
-            && self.identity_sha256 == identity_digest(&operation.identity)
-    }
+pub(crate) fn denial_matches(
+    denial: &SessionPermissionDenial,
+    operation: &SessionPermissionOperation,
+) -> bool {
+    denial.tool() == operation.tool
+        && *denial.workspace() == operation.workspace
+        && denial.identity_sha256() == identity_digest(&operation.identity)
 }
 
 fn identity_digest(identity: &Value) -> String {
@@ -87,7 +75,7 @@ impl SessionPermissionOperation {
         Self::from_normalized(
             operation.name.clone(),
             operation.input.clone(),
-            WorkspaceScope::capture(configured_workspace)?,
+            capture_workspace_scope(configured_workspace)?,
         )
     }
 
@@ -186,10 +174,12 @@ impl SessionPermissionContext {
             .filter(|grant| {
                 owners.contains(&grant.owner) && grant.decision == SessionPermissionDecision::Deny
             })
-            .map(|grant| SessionPermissionDenial {
-                tool: grant.operation.tool.clone(),
-                identity_sha256: identity_digest(&grant.operation.identity),
-                workspace: grant.operation.workspace.clone(),
+            .map(|grant| {
+                SessionPermissionDenial::new(
+                    grant.operation.tool.clone(),
+                    identity_digest(&grant.operation.identity),
+                    grant.operation.workspace.clone(),
+                )
             })
             .collect()
     }
@@ -382,3 +372,6 @@ fn canonical_directory(path: &Path) -> Result<PathBuf, SessionPermissionError> {
     }
     Ok(canonical)
 }
+
+#[cfg(test)]
+mod tests;

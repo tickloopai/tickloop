@@ -10,12 +10,7 @@ use std::{
 };
 use uuid::Uuid;
 
-mod screen {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/screen.rs"
-    ));
-}
+use crate::terminal::test_support::screen;
 
 const FIXTURE_VARIABLE: &str = "TICKLOOP_DAEMON_LOSS_FIXTURE";
 const UNREACHABLE_VARIABLE: &str = "TICKLOOP_DAEMON_LOSS_FLAG";

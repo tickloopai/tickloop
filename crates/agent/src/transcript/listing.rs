@@ -6,10 +6,10 @@ use uuid::Uuid;
 
 use super::entry::{ForkedFrom, Line};
 use super::path::TRANSCRIPT_FILE_SUFFIX;
-use crate::model::Content;
+use tickloop_agent_protocol::Content;
 
 /// 照 Claude Code `LITE_READ_BUF_SIZE`：列表只读每个文件的头尾各 64KB。
-pub(crate) const LITE_READ_BUF_SIZE: usize = 64 * 1024;
+pub(super) const LITE_READ_BUF_SIZE: usize = 64 * 1024;
 const FORKED_FROM_PATTERN: &str = "\"forkedFrom\":{";
 
 #[derive(Clone, Debug)]

@@ -1,9 +1,7 @@
 use super::{ScriptedModel, call, next_event, text};
 use serde_json::Value;
-use tickloop_agent::{
-    permissions::{Decision, ExecutionMode, PermissionRule},
-    runtime::{Agent, EventKind},
-};
+use tickloop_agent::runtime::{Agent, EventKind};
+use tickloop_agent_protocol::{Decision, ExecutionMode, PermissionRule};
 use uuid::Uuid;
 
 pub struct AdmissionCase {

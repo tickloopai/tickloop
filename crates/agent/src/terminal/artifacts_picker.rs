@@ -7,12 +7,12 @@ use super::{
     permissions_surface::tab_header_line,
     style::{Role, RoleLine},
 };
-use crate::artifacts::{ArtifactMetadata, ArtifactPage};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::{
     collections::HashSet,
     time::{Duration, Instant},
 };
+use tickloop_agent_artifacts::{ArtifactMetadata, ArtifactPage};
 use uuid::Uuid;
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -400,7 +400,7 @@ impl ArtifactsPicker {
         let mut targets = Vec::new();
         let mut selected_row = 0;
         let mut previous_group = None;
-        let now = crate::private_fs::unix_time_milliseconds();
+        let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
         for index in self.picker.matching_indices() {
             let artifact = &self.entries[*index];
             let added = self.added.contains(&artifact.id);

@@ -127,7 +127,7 @@ async fn delivery_fixture() -> (
         test_support::config(),
         Arc::new(test_support::ScriptedModel::new(vec![test_support::call(
             "retained-question",
-            crate::tools::ASK_USER_QUESTION_TOOL_NAME,
+            tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME,
             test_support::single_question("Which fixture?"),
         )])),
     );

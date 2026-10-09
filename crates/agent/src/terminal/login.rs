@@ -4,19 +4,17 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{
-    auth::{
-        AuthError, BrowserCallback, CodexAuth,
-        copilot::{self, CopilotAuth},
-        minimax::{MiniMaxAuth, MiniMaxRegion},
-    },
-    model::ModelAuthSource,
+use tickloop_agent_model::auth::{
+    AuthError, BrowserCallback, CodexAuth,
+    copilot::{self, CopilotAuth},
+    minimax::{MiniMaxAuth, MiniMaxRegion},
 };
 
 use super::{
     console::{Console, Menu},
     safe_text,
 };
+use tickloop_agent_protocol::ModelAuthSource;
 
 #[derive(Clone, Copy)]
 pub(super) enum LoginMethod {
@@ -26,7 +24,7 @@ pub(super) enum LoginMethod {
     MiniMax(MiniMaxRegion),
     Copilot,
     Google,
-    Subscription(crate::auth::device_subscriptions::DeviceSubscription),
+    Subscription(tickloop_agent_model::auth::device_subscriptions::DeviceSubscription),
 }
 
 impl LoginMethod {
@@ -50,7 +48,7 @@ pub(super) enum SignInTarget {
     MiniMax(MiniMaxRegion),
     Copilot,
     Google,
-    Subscription(crate::auth::device_subscriptions::DeviceSubscription),
+    Subscription(tickloop_agent_model::auth::device_subscriptions::DeviceSubscription),
 }
 
 impl SignInTarget {
@@ -59,7 +57,7 @@ impl SignInTarget {
             return Some(Self::Google);
         }
         if let Some(provider) =
-            crate::auth::device_subscriptions::DeviceSubscription::from_auth(source)
+            tickloop_agent_model::auth::device_subscriptions::DeviceSubscription::from_auth(source)
         {
             return Some(Self::Subscription(provider));
         }
@@ -192,7 +190,7 @@ impl LoginFlow {
         let task = tokio::spawn(async move {
             if let LoginMethod::Artifact = method {
                 let result = async {
-                    let client = crate::artifacts::ArtifactClient::new(root)
+                    let client = tickloop_agent_artifacts::ArtifactClient::new(root)
                         .map_err(|error| error.to_string())?;
                     let device = client
                         .start_device_login()
@@ -213,7 +211,7 @@ impl LoginFlow {
                 return;
             }
             if let LoginMethod::Google = method {
-                let auth = crate::auth::google::GoogleAuth::new(root);
+                let auth = tickloop_agent_model::auth::google::GoogleAuth::new(root);
                 let result = async {
                     let login = auth.start_browser_login(&task_cancel).await?;
                     let address = login.browser.authorization_url.clone();
@@ -224,12 +222,14 @@ impl LoginFlow {
                     tokio::select! { result = &mut finish => result, () = &mut launch => finish.await }
                 }.await;
                 let _ = updates.send(LoginUpdate::Finished(
-                    result.map_err(|error: crate::model::ModelError| error.to_string()),
+                    result.map_err(|error: tickloop_agent_model::ModelError| error.to_string()),
                 ));
                 return;
             }
             if let LoginMethod::Subscription(provider) = method {
-                let auth = crate::auth::device_subscriptions::SubscriptionAuth::new(root, provider);
+                let auth = tickloop_agent_model::auth::device_subscriptions::SubscriptionAuth::new(
+                    root, provider,
+                );
                 let result = async {
                     let login = auth.start_device_login(&task_cancel).await?;
                     let address = login.verification_uri.clone();
@@ -242,7 +242,7 @@ impl LoginFlow {
                 let _ = updates.send(LoginUpdate::Finished(
                     result
                         .map(|access| access.identity.to_string())
-                        .map_err(|error: crate::model::ModelError| error.to_string()),
+                        .map_err(|error: tickloop_agent_model::ModelError| error.to_string()),
                 ));
                 return;
             }
@@ -577,7 +577,9 @@ impl LogoutFlow {
                     .logout(&task_cancel)
                     .await
                     .map_err(|error| match error {
-                        crate::auth::minimax::MiniMaxAuthError::Cancelled => AuthError::Cancelled,
+                        tickloop_agent_model::auth::minimax::MiniMaxAuthError::Cancelled => {
+                            AuthError::Cancelled
+                        }
                         _ => AuthError::MiniMax(error.to_string()),
                     }),
                 SignInTarget::Copilot => {
@@ -589,15 +591,17 @@ impl LogoutFlow {
                             _ => AuthError::Copilot(error.to_string()),
                         })
                 }
-                SignInTarget::Google => crate::auth::google::GoogleAuth::new(root)
+                SignInTarget::Google => tickloop_agent_model::auth::google::GoogleAuth::new(root)
                     .logout(&task_cancel)
                     .await
                     .map_err(|error| AuthError::Provider(error.to_string())),
                 SignInTarget::Subscription(provider) => {
-                    crate::auth::device_subscriptions::SubscriptionAuth::new(root, provider)
-                        .logout(&task_cancel)
-                        .await
-                        .map_err(|error| AuthError::Provider(error.to_string()))
+                    tickloop_agent_model::auth::device_subscriptions::SubscriptionAuth::new(
+                        root, provider,
+                    )
+                    .logout(&task_cancel)
+                    .await
+                    .map_err(|error| AuthError::Provider(error.to_string()))
                 }
                 SignInTarget::Codex => terminal_auth(root).logout(&task_cancel).await,
             }
@@ -692,18 +696,7 @@ async fn launch_browser_result(address: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    mod input_dialog {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/support/input_dialog.rs"
-        ));
-    }
-    mod screen {
-        include!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/support/screen.rs"
-        ));
-    }
+    use crate::terminal::test_support::{input_dialog, screen};
 
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use serde_json::json;
@@ -898,7 +891,7 @@ mod tests {
         for name in ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"] {
             command.env_remove(name);
         }
-        for model in crate::model::cards::built_in_model_profiles() {
+        for model in tickloop_agent_model::cards::built_in_model_profiles() {
             if !model.api_key_env.is_empty() {
                 command.env_remove(model.api_key_env);
             }
@@ -1050,10 +1043,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         if let Some(model) = selected_model {
-            let config = crate::model::cards::ModelCatalog::defaults()
+            let config = tickloop_agent_model::cards::ModelCatalog::defaults()
                 .get("openai-codex", model)
                 .unwrap();
-            crate::settings::UserSettings::in_root(&root.join("state"))
+            tickloop_agent_config::UserSettings::in_root(&root.join("state"))
                 .save_model(&config, false)
                 .unwrap();
         }
@@ -1220,7 +1213,7 @@ mod tests {
         for name in ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"] {
             command.env_remove(name);
         }
-        for model in crate::model::cards::built_in_model_profiles() {
+        for model in tickloop_agent_model::cards::built_in_model_profiles() {
             if !model.api_key_env.is_empty() {
                 command.env_remove(model.api_key_env);
             }
@@ -1533,7 +1526,7 @@ mod tests {
                 "saved login must open models without authenticating again"
             );
             if selected_model == Some("gpt-5.6-sol") {
-                let saved = crate::settings::UserSettings::in_root(&root.join("state"))
+                let saved = tickloop_agent_config::UserSettings::in_root(&root.join("state"))
                     .model()
                     .unwrap();
                 assert_eq!(saved.model, "gpt-5.6-sol");

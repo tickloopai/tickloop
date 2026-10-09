@@ -1,9 +1,7 @@
 use std::{fmt, ops::Range};
 
-use tickloop_agent::{
-    image::Image,
-    runtime::{ImageContext, ImageOrigin},
-};
+use tickloop_agent::runtime::{ImageContext, ImageOrigin};
+use tickloop_agent_base::image::Image;
 
 pub(super) const LARGE_PASTE_CHARACTER_THRESHOLD: usize = 800;
 pub(super) const LARGE_PASTE_LINE_THRESHOLD: usize = 3;
@@ -774,7 +772,7 @@ mod tests {
 
     fn image(width: u32) -> Image {
         Image {
-            media_type: tickloop_agent::image::ImageMediaType::Png,
+            media_type: tickloop_agent_base::image::ImageMediaType::Png,
             data: "iVBORw0KGgo=".into(),
             width,
             height: 1,

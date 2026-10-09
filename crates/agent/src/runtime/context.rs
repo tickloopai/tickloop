@@ -1,20 +1,22 @@
 use super::{
-    Agent, AgentError, Chat, ChatSnapshot, EventKind, PendingModelThinking, Receipt, RequestKind,
-    RequestOutcome, ResponseRejection, RunId,
+    Agent, AgentError, Chat, ChatBookkeeping, ChatSnapshot, EventKind, PendingModelThinking,
+    Receipt, RequestKind, RequestOutcome, ResponseRejection, RunId,
     compaction::{self, CompactBoundary, CompactTrigger, CompactionLayout, MessageSource},
+    denials::DenialReference,
     model_request::RequestContext,
 };
-use crate::model::{
-    Content, ImageSource, Message, ModelClient, ModelConfig, ModelRequest, ReasoningEffort, Role,
-    ToolResultBlock, ToolResultContent, strip_images, validate_model_config,
-    validate_reasoning_effort,
-};
-use crate::protocol::ChatId;
-use crate::protocol::ToolDefinition;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
+};
+use tickloop_agent_model::{
+    ModelClient, ModelConfigExt, ModelRequest, strip_images, validate_model_config,
+    validate_reasoning_effort,
+};
+use tickloop_agent_protocol::{
+    ChatId, Content, ImageSource, Message, ModelConfig, ReasoningEffort, Role, ToolDefinition,
+    ToolResultBlock, ToolResultContent,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -50,11 +52,12 @@ pub(super) fn model_history(
 ) -> Result<
     (
         Vec<Message>,
-        Vec<Option<crate::model::PrivateHistorySource>>,
+        Vec<Option<tickloop_agent_protocol::PrivateHistorySource>>,
     ),
     AgentError,
 > {
-    let projected = projected_messages_with_sources(&chat.snapshot)?;
+    let projected =
+        projected_messages_with_sources(&chat.snapshot, &chat.bookkeeping.denial_references)?;
     let mut messages = Vec::with_capacity(projected.len());
     let mut sources = Vec::with_capacity(projected.len());
     for (message, index) in projected {
@@ -76,7 +79,7 @@ pub(super) fn model_history(
         );
         sources.insert(0, None);
     }
-    let projected = crate::model::history::project_request(
+    let projected = tickloop_agent_model::history::project_request(
         ModelRequest {
             messages,
             history_sources: sources,
@@ -208,33 +211,40 @@ pub(super) fn history_calls_in(
     Ok(calls)
 }
 
-pub(super) fn projected_messages(snapshot: &ChatSnapshot) -> Result<Vec<Message>, AgentError> {
-    Ok(projected_messages_with_sources(snapshot)?
-        .into_iter()
-        .map(|(message, _)| message)
-        .collect())
+pub(super) fn projected_messages(
+    snapshot: &ChatSnapshot,
+    denial_references: &BTreeMap<usize, DenialReference>,
+) -> Result<Vec<Message>, AgentError> {
+    Ok(
+        projected_messages_with_sources(snapshot, denial_references)?
+            .into_iter()
+            .map(|(message, _)| message)
+            .collect(),
+    )
 }
 
 /// 发给模型的对话，以及每条消息投影自的原始消息下标（合成的工具结果没有下标）。
 /// 照 Claude Code `getMessagesAfterCompactBoundary`，只投影最后一个压缩边界之后的消息。
 pub(super) fn projected_messages_with_sources(
     snapshot: &ChatSnapshot,
+    denial_references: &BTreeMap<usize, DenialReference>,
 ) -> Result<Vec<(Message, Option<usize>)>, AgentError> {
     let range = snapshot.active_start()..snapshot.messages.len();
     let calls = history_calls_in(snapshot, range.clone())?;
     let mut projected = Vec::new();
-    append_raw_projection(&mut projected, snapshot, &calls, range);
+    append_raw_projection(&mut projected, snapshot, denial_references, &calls, range);
     Ok(projected)
 }
 
 /// 最后一个压缩边界之后、给定范围内的消息投影，去掉私有推理与空消息。定向摘要用它构造摘要请求。
 pub(super) fn public_projection_of(
     snapshot: &ChatSnapshot,
+    denial_references: &BTreeMap<usize, DenialReference>,
     range: std::ops::Range<usize>,
 ) -> Result<Vec<Message>, AgentError> {
     let calls = history_calls_in(snapshot, snapshot.active_start()..snapshot.messages.len())?;
     let mut projected = Vec::new();
-    append_raw_projection(&mut projected, snapshot, &calls, range);
+    append_raw_projection(&mut projected, snapshot, denial_references, &calls, range);
     let mut messages = projected
         .into_iter()
         .map(|(message, _)| message)
@@ -247,6 +257,7 @@ pub(super) fn public_projection_of(
 pub(super) fn append_raw_projection(
     projected: &mut Vec<(Message, Option<usize>)>,
     snapshot: &ChatSnapshot,
+    denial_references: &BTreeMap<usize, DenialReference>,
     calls: &[HistoryCall],
     range: std::ops::Range<usize>,
 ) {
@@ -309,7 +320,7 @@ pub(super) fn append_raw_projection(
         if let Some(contexts) = snapshot.message_contexts.get(&message_index) {
             content.extend(contexts.iter().flat_map(super::input_context::render));
         }
-        if let Some(reference) = snapshot.denial_references.get(&message_index) {
+        if let Some(reference) = denial_references.get(&message_index) {
             content.push(Content::Text {
                 text: super::denials::render_reference(reference),
             });
@@ -360,7 +371,11 @@ fn apply_model_thinking(chat: &mut Chat, selection: Option<PendingModelThinking>
 
 impl ChatSnapshot {
     pub fn public_model_text_messages(&self) -> Result<Vec<Message>, AgentError> {
-        let mut messages = public_projection_of(self, self.active_start()..self.messages.len())?;
+        let mut messages = public_projection_of(
+            self,
+            &BTreeMap::new(),
+            self.active_start()..self.messages.len(),
+        )?;
         for message in &mut messages {
             message.content.retain(|content| matches!(content, Content::Text { text } if super::LocalMessage::parse(text).is_none()));
         }
@@ -398,7 +413,7 @@ impl Agent {
         client: Arc<dyn ModelClient>,
         thinking_choice: Option<Option<ReasoningEffort>>,
     ) -> Result<ModelChange, AgentError> {
-        let config = crate::model::cards::model_for_persistent_selection(config);
+        let config = tickloop_agent_model::cards::model_for_persistent_selection(config);
         validate_model_config(&config).map_err(|error| AgentError::Invalid(error.to_string()))?;
         if let Some(effort) = thinking_choice {
             validate_reasoning_effort(&config, effort)
@@ -773,8 +788,11 @@ impl Agent {
                             messages_summarized: None,
                             preserved_by_later_summary: false,
                             original_user_inputs:
-                                super::approval_context::originals_for_active_chain(&chat.snapshot)
-                                    .ok(),
+                                super::approval_context::originals_for_active_chain(
+                                    &chat.snapshot,
+                                    &chat.bookkeeping,
+                                )
+                                .ok(),
                             model: Some(Box::new(chat.snapshot.model.clone())),
                         },
                         summary: compaction::full_summary_message(
@@ -784,12 +802,12 @@ impl Agent {
                         ),
                         summarize_metadata: None,
                     };
-                    let snapshot = layout.apply(&chat.snapshot);
+                    let (snapshot, bookkeeping) = layout.apply(&chat.snapshot, &chat.bookkeeping);
                     if let Some(window) = context_window(&snapshot) {
                         let candidate_messages =
-                            projected_messages(&snapshot).map_err(|error| {
-                                (ResponseRejection::InvalidSummary, error.to_string())
-                            })?;
+                            projected_messages(&snapshot, &bookkeeping.denial_references).map_err(
+                                |error| (ResponseRejection::InvalidSummary, error.to_string()),
+                            )?;
                         if estimate_request_tokens_for_snapshot(&snapshot, &candidate_messages)
                             > window.saturating_sub(snapshot.model.max_output_tokens as usize)
                         {
@@ -797,24 +815,19 @@ impl Agent {
                                 "summary still exceeds the configured model capacity; the previous context was retained".into()));
                         }
                     }
-                    Ok((snapshot, layout, summary))
+                    Ok((snapshot, bookkeeping, layout, summary))
                 })();
                 match compacted {
-                    Ok((mut snapshot, layout, summary)) => {
+                    Ok((mut snapshot, bookkeeping, layout, summary)) => {
                         snapshot
                             .request_usage
                             .finish(response.sequence, RequestOutcome::Accepted)?;
                         if let Some(recorder) = &self.inner.recorder {
-                            recorder.compact(
-                                &mut chat.snapshot,
-                                &mut snapshot,
-                                &layout,
-                                &[],
-                                &chat.content_replacements,
-                            );
+                            recorder.compact(chat, &snapshot, &bookkeeping, &layout, &[]);
                         }
                         self.save(&snapshot);
                         chat.snapshot = snapshot;
+                        chat.bookkeeping = bookkeeping;
                         // Like Claude Code, compaction drops the file contents read so far.
                         chat.tools.file_reads().clear();
                         Ok(CompactionOutcome {
@@ -861,7 +874,7 @@ impl Agent {
 }
 
 fn changed_model(current: &ModelConfig, selected: &ModelConfig) -> bool {
-    !crate::model::compatible_private_history(current, selected)
+    !tickloop_agent_model::compatible_private_history(current, selected)
 }
 
 fn complete_boundaries(messages: &[Message]) -> Result<Vec<usize>, AgentError> {
@@ -928,17 +941,21 @@ pub(super) fn context_window(snapshot: &ChatSnapshot) -> Option<usize> {
         .or(snapshot.context_window_tokens)
 }
 
-pub(super) fn directed_summary_fits(snapshot: &ChatSnapshot) -> Result<bool, AgentError> {
+pub(super) fn directed_summary_fits(
+    snapshot: &ChatSnapshot,
+    bookkeeping: &ChatBookkeeping,
+) -> Result<bool, AgentError> {
     let Some(window) = context_window(snapshot) else {
         return Ok(true);
     };
     let available = window.saturating_sub(snapshot.model.max_output_tokens as usize);
-    Ok(estimate_request_tokens_for_snapshot(snapshot, &projected_messages(snapshot)?) <= available)
+    let messages = projected_messages(snapshot, &bookkeeping.denial_references)?;
+    Ok(estimate_request_tokens_for_snapshot(snapshot, &messages) <= available)
 }
 
 pub(super) fn estimate_request_tokens(messages: &[Message]) -> usize {
     // Serialized request bytes include UTF-8 text and JSON syntax; they are not token counts.
-    serialized_request_bytes(messages, &crate::tools::Tools::definitions())
+    serialized_request_bytes(messages, &tickloop_agent_tools::Tools::definitions())
         .div_ceil(ESTIMATED_UTF8_BYTES_PER_TOKEN)
         .saturating_add(REQUEST_OVERHEAD_TOKENS)
 }
@@ -994,7 +1011,8 @@ fn image_tokens(width: u32, height: u32) -> usize {
 }
 
 fn estimate_request_tokens_for_snapshot(snapshot: &ChatSnapshot, messages: &[Message]) -> usize {
-    let current_bytes = serialized_request_bytes(messages, &crate::tools::Tools::definitions());
+    let current_bytes =
+        serialized_request_bytes(messages, &tickloop_agent_tools::Tools::definitions());
     let identity = snapshot.model.identity();
     let calibrated = snapshot
         .request_usage
@@ -1024,8 +1042,8 @@ fn estimate_request_tokens_for_snapshot(snapshot: &ChatSnapshot, messages: &[Mes
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{HttpModelClient, cards::ModelCatalog};
     use std::{fs::OpenOptions, time::Duration};
+    use tickloop_agent_model::{HttpModelClient, cards::ModelCatalog};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn model_selection_keeps_chat_locked_while_settings_write_waits() {

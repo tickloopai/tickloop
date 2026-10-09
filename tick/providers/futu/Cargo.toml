@@ -1,0 +1,21 @@
+[package]
+name = "tickloop-tick-futu"
+description = "Futu OpenD option chains and quotes"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "tick_futu"
+doctest = false
+
+[dependencies]
+async-trait = "0.1"
+serde_json = "1"
+sha1 = "0.10"
+tickloop-tick-provider = { path = "../../provider" }
+time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
+tokio = { version = "1", features = ["io-util", "net", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

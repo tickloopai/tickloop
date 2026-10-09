@@ -1,6 +1,5 @@
 use super::{Agent, AgentError};
-use crate::artifacts::ArtifactTick;
-use crate::protocol::ChatId;
+use tickloop_agent_protocol::{ArtifactTick, ChatId};
 
 impl Agent {
     pub(super) fn auto_attach_artifact_tick(&self, chat: &mut super::Chat, tick: ArtifactTick) {
@@ -95,12 +94,12 @@ fn normalize_artifact_tick(mut tick: ArtifactTick) -> Result<ArtifactTick, Agent
         || !origin.username().is_empty()
         || origin.password().is_some()
         || (origin.scheme() != "https"
-            && !(origin.scheme() == "http" && crate::network::is_loopback(&origin)))
+            && !(origin.scheme() == "http" && tickloop_agent_base::network::is_loopback(&origin)))
     {
         return Err(AgentError::Invalid("invalid artifact Tick".into()));
     }
     tick.origin = tick.origin.trim_end_matches('/').to_owned();
-    tick_connect::instance::InstanceRef::artifact(&tick.origin, &tick.artifact_id)
+    tick_protocol::InstanceRef::artifact(&tick.origin, &tick.artifact_id)
         .map_err(|error| AgentError::Invalid(error.into()))?;
     Ok(tick)
 }

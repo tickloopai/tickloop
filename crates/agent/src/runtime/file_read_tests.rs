@@ -5,10 +5,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use super::{Agent, EventKind};
-use crate::model::{
-    Content, ModelClient, ModelConfig, ModelDelta, ModelError, ModelIdentity, ModelOutput,
-    ModelRequest, Protocol, Usage,
-};
+use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+use tickloop_agent_protocol::{Content, ModelConfig, ModelIdentity, Protocol, Usage};
 
 struct ReadOnce;
 
@@ -16,16 +14,16 @@ struct ReadOnce;
 impl ModelClient for ReadOnce {
     async fn generate_title(
         &self,
-        request: crate::model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        request: tickloop_agent_model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-        Ok(crate::model::fixture_title(request))
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        Ok(tickloop_agent_model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
         ModelIdentity {
-            provider: crate::model::ModelProvider::Api,
+            provider: tickloop_agent_protocol::ModelProvider::Api,
             profile: "read-once".into(),
             protocol: Protocol::Messages,
             requested_model: "read-once".into(),
@@ -65,8 +63,8 @@ impl ModelClient for ReadOnce {
 
 fn config() -> ModelConfig {
     ModelConfig {
-        provider: crate::model::ModelProvider::Api,
-        auth_source: crate::model::ModelAuthSource::ApiKeyEnv,
+        provider: tickloop_agent_protocol::ModelProvider::Api,
+        auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
         name: "read-once".into(),
         protocol: Protocol::Messages,
         base_url: "http://127.0.0.1".into(),
@@ -78,7 +76,7 @@ fn config() -> ModelConfig {
         model_id: String::new(),
         connection: None,
         card: None,
-        input_modalities: vec![crate::model::InputModality::Text],
+        input_modalities: vec![tickloop_agent_protocol::InputModality::Text],
     }
 }
 

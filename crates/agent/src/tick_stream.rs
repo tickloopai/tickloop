@@ -12,7 +12,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-pub use tick_connect::instance::InstanceRef;
+use tick_protocol::InstanceRef;
 use tokio::sync::{Notify, mpsc, watch};
 use uuid::Uuid;
 
@@ -244,10 +244,7 @@ pub trait TickStreamPort: Send + Sync + 'static {
 }
 
 /// A protocol Tick's current content as an observation, for a delivery read again.
-fn current_observation(
-    instance: &InstanceRef,
-    read: tick_connect::protocol::TickRead,
-) -> TickObservation {
+fn current_observation(instance: &InstanceRef, read: tick_protocol::TickRead) -> TickObservation {
     TickObservation {
         instance: instance.clone(),
         sequence: read.sequence,
@@ -787,16 +784,16 @@ trait ProtocolFeed: Send + Sync {
         &self,
     ) -> Result<
         (
-            tick_connect::protocol::TickRead,
+            tick_protocol::TickRead,
             u64,
-            watch::Receiver<tick_connect::session::SessionObservation>,
+            watch::Receiver<tickhost_connect::session::SessionObservation>,
         ),
         String,
     >;
 }
 
 #[async_trait::async_trait]
-impl ProtocolFeed for tick_connect::session::SessionClient {
+impl ProtocolFeed for tickhost_connect::session::SessionClient {
     async fn recovery_tool(&self) -> Result<Option<String>, String> {
         self.describe()
             .await
@@ -808,13 +805,13 @@ impl ProtocolFeed for tick_connect::session::SessionClient {
         &self,
     ) -> Result<
         (
-            tick_connect::protocol::TickRead,
+            tick_protocol::TickRead,
             u64,
-            watch::Receiver<tick_connect::session::SessionObservation>,
+            watch::Receiver<tickhost_connect::session::SessionObservation>,
         ),
         String,
     > {
-        tick_connect::session::SessionClient::watch(self)
+        tickhost_connect::session::SessionClient::watch(self)
             .await
             .map_err(|error| error.to_string())
     }
@@ -859,7 +856,7 @@ impl TickStreamPort for NativeTickStream {
         instance: &InstanceRef,
         authority: Option<&crate::host_tools::HostToolAuthority>,
     ) -> Result<(), String> {
-        if instance.tick_type() != "herdr" {
+        if instance.tick_type() != tick_protocol::HERDR_INSTANCE_TYPE {
             return Err("Native watch requires a Herdr instance".into());
         }
         self.scope().revalidate(authority)
@@ -1076,7 +1073,7 @@ fn connection_state(code: &str) -> TickConnectionState {
 }
 
 async fn observe_terminal(
-    access: &tick_connect::access::TickAccess,
+    access: &tickhost_connect::access::TickAccess,
     instance: &InstanceRef,
     wanted: &mut watch::Receiver<BTreeSet<WatchId>>,
     publisher: &EventPublisher,
@@ -1193,7 +1190,7 @@ async fn observe_terminal(
 }
 
 async fn observe_native_protocol(
-    access: &tick_connect::access::TickAccess,
+    access: &tickhost_connect::access::TickAccess,
     instance: &InstanceRef,
     wanted: &mut watch::Receiver<BTreeSet<WatchId>>,
     publisher: &EventPublisher,
@@ -1228,7 +1225,7 @@ async fn observe_protocol(
     ready_watches: &mut BTreeSet<WatchId>,
     scope: &dyn WatchAdmission,
 ) -> bool {
-    use tick_connect::session::SessionLinkState;
+    use tickhost_connect::session::SessionLinkState;
 
     let attempted = scope.admitted(&wanted.borrow_and_update().clone(), instance, publisher);
     if attempted.is_empty() {
@@ -1405,7 +1402,7 @@ struct ProtocolCursor {
 
 fn publish_protocol_update(
     instance: &InstanceRef,
-    observation: &tick_connect::session::SessionObservation,
+    observation: &tickhost_connect::session::SessionObservation,
     targets: &BTreeSet<WatchId>,
     cursors: &mut BTreeMap<WatchId, ProtocolCursor>,
     recovery_tool: Option<&str>,

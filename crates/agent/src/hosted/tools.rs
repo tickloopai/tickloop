@@ -11,13 +11,12 @@ use std::{
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tick_connect::{
+use tick_protocol::{InstanceRef, TickDescriptor};
+use tickhost::host::Receipt;
+use tickhost_connect::{
     host_error::HostError,
     hosted::{CALL_RESPONSE_TIMEOUT, CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role},
-    instance::InstanceRef,
-    protocol::TickDescriptor,
 };
-use tickhost::host::Receipt;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -32,9 +31,10 @@ use crate::{
         HostCallContext, HostCallResult, HostEffect, HostEndpointIdentity, HostToolAuthority,
         HostToolPermission, HostToolProvider, PreparedHostCall,
     },
-    protocol::{ChatId, ToolDefinition},
     tick_tool_router::{CALL_TICK_TOOL, MODIFY_TICK, READ_TICK, TickBackends},
-    tools::ToolResult,
+};
+use tickloop_agent_protocol::{
+    ChatId, HostedResources, HostedScreenSnapshot, ToolDefinition, ToolResult,
 };
 
 /// How results name the Tickhost that runs a hidden Tick.
@@ -52,15 +52,47 @@ pub struct HostedMember {
     pub instance: InstanceRef,
     pub title: Option<String>,
     pub state: HostedMemberState,
-    pub resources: Option<tickhost::host::Resources>,
+    pub resources: Option<HostedResources>,
 }
 
 /// A hosted Tick's screen as text when it was taken: the newest lines within the snapshot
 /// limits, saying whether older ones were cut.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 pub struct HostedSnapshot {
-    pub screen: tickhost::screen::ScreenSnapshot,
+    pub screen: HostedScreenSnapshot,
     pub taken_at_ms: u64,
+}
+
+fn hosted_resources(resources: tickhost::host::Resources) -> HostedResources {
+    let tickhost::host::Resources {
+        business_pid,
+        cpu_time_ms,
+        rss_bytes,
+        sampled_at_ms,
+    } = resources;
+    HostedResources {
+        business_pid,
+        cpu_time_ms,
+        rss_bytes,
+        sampled_at_ms,
+    }
+}
+
+fn hosted_screen_snapshot(screen: tickhost::screen::ScreenSnapshot) -> HostedScreenSnapshot {
+    let tickhost::screen::ScreenSnapshot {
+        lines,
+        truncated,
+        rows,
+        columns,
+        alternate_screen,
+    } = screen;
+    HostedScreenSnapshot {
+        lines,
+        truncated,
+        rows,
+        columns,
+        alternate_screen,
+    }
 }
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -153,7 +185,7 @@ impl HostedTickTools {
                 }
                 .canonicalize()
                 .map_err(|error| format!("cannot resolve cwd: {error}"))?;
-                let executable = tick_connect::access::resolve_executable(&words[0], &cwd)
+                let executable = tickhost_connect::access::resolve_executable(&words[0], &cwd)
                     .map_err(|error| error.to_string())?;
                 let mut command = words.clone();
                 command[0] = executable.to_string_lossy().into_owned();
@@ -590,7 +622,8 @@ impl HostedTickTools {
                         .request("resources", json!({}), CONTROL_TIMEOUT)
                         .await
                         .ok()
-                        .and_then(|resources| serde_json::from_value(resources).ok()),
+                        .and_then(|resources| serde_json::from_value(resources).ok())
+                        .map(hosted_resources),
                     Err(_) => None,
                 };
                 self.bindings
@@ -636,7 +669,7 @@ impl HostedTickTools {
     async fn list_page(
         &self,
         chat: ChatId,
-        cursor: Option<tick_connect::page::PageCursor>,
+        cursor: Option<tickhost_connect::page::PageCursor>,
     ) -> Result<HostedTickPage, HostError> {
         let page = self
             .daemon
@@ -735,8 +768,9 @@ impl HostedTickTools {
             .await?;
         Ok(HostedSnapshot {
             screen: serde_json::from_value(screen)
+                .map(hosted_screen_snapshot)
                 .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))?,
-            taken_at_ms: crate::private_fs::unix_time_milliseconds(),
+            taken_at_ms: tickloop_agent_base::private_fs::unix_time_milliseconds(),
         })
     }
 
@@ -945,11 +979,11 @@ impl HostToolProvider for HostedTickTools {
 mod tests {
     use std::collections::HashSet;
 
-    use tick_connect::{
+    use tickhost::host::{TickOwner, TickRow, TickState};
+    use tickhost_connect::{
         hosted::{BUSINESS_FRAME_BYTES, read_frame, write_frame},
         page::Page,
     };
-    use tickhost::host::{TickOwner, TickRow, TickState};
 
     use super::*;
     use crate::hosted::worker_control::WorkerControlGrant;

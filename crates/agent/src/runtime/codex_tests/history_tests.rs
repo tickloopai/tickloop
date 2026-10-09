@@ -9,21 +9,19 @@ use tokio::{
 use tokio_tungstenite::accept_async;
 use uuid::Uuid;
 
-use crate::{
-    model::{
-        Content, HttpModelClient, ModelClient, ModelConfig,
-        cards::ModelCatalog,
-        codex_test_support::{
-            LoopbackCodexClient, function_call_stream, reply_stream, send_ws_stream,
-            serve_scripted_responses, state_with_credentials, text_stream,
-        },
-    },
-    permissions::ExecutionMode,
-    runtime::{
-        Agent, BranchRequest, Event, EventKind, LoopState, RequestKind, RewindMode, Trigger,
-        TriggerSource,
+use crate::runtime::{
+    Agent, BranchRequest, Event, EventKind, LoopState, RequestKind, RewindMode, Trigger,
+    TriggerSource,
+};
+use tickloop_agent_model::{
+    HttpModelClient, ModelClient,
+    cards::ModelCatalog,
+    codex_test_support::{
+        LoopbackCodexClient, function_call_stream, reply_stream, send_ws_stream,
+        serve_scripted_responses, state_with_credentials, text_stream,
     },
 };
+use tickloop_agent_protocol::{Content, ExecutionMode, ModelConfig};
 
 fn config() -> ModelConfig {
     ModelCatalog::defaults()
@@ -73,7 +71,7 @@ async fn triggered_request_after_logout(interval_seconds: Option<u64>) {
         .unwrap();
     completed(&mut events).await;
     let saved = std::fs::read(state.join("auth/openai-codex-credentials.json")).unwrap();
-    crate::auth::CodexAuth::new(&state)
+    tickloop_agent_model::auth::CodexAuth::new(&state)
         .logout(&tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
@@ -183,7 +181,7 @@ async fn source_switch_and_rewind_preserve_original_private_checkpoint() {
         .into_iter()
         .find(|point| point.prompt == "Second checkpoint")
         .unwrap();
-    let mut api = crate::model::cards::ModelCatalog::defaults()
+    let mut api = tickloop_agent_model::cards::ModelCatalog::defaults()
         .get("deepseek-api", "deepseek-flash-responses")
         .unwrap();
     api.api_key_env = "CODEX_HISTORY_TEST_MISSING_API_KEY".into();

@@ -2,12 +2,7 @@ use super::*;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::Read;
 
-mod screen {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/screen.rs"
-    ));
-}
+use crate::terminal::test_support::screen;
 
 const DIRECTORY: &str = "TICKLOOP_DIALOG_HEIGHT_FIXTURE_DIR";
 const TIMEOUT: Duration = Duration::from_secs(15);

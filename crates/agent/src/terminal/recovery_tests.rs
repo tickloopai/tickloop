@@ -1,5 +1,5 @@
 use super::*;
-use crate::{agent_access::*, model::*, protocol::FEED_CAPACITY, runtime};
+use crate::{agent_access::*, runtime};
 use async_trait::async_trait;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::{
@@ -7,6 +7,8 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use tickloop_agent_model::*;
+use tickloop_agent_protocol::{FEED_CAPACITY, ModelIdentity, ModelProvider, Protocol, Usage};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -21,12 +23,7 @@ mod startup_status_tests;
 mod thinking_stream_tests;
 mod working_activity_tests;
 
-mod screen {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/support/screen.rs"
-    ));
-}
+use crate::terminal::test_support::screen;
 
 const REPLY: &str = "child follow-up acknowledged";
 const FIRST_REPLY_DELTA: &str = "child follow-";
@@ -109,11 +106,11 @@ struct GatedReply {
 impl ModelClient for GatedReply {
     async fn generate_title(
         &self,
-        request: crate::model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        request: tickloop_agent_model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-        Ok(crate::model::fixture_title(request))
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        Ok(tickloop_agent_model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -887,11 +884,11 @@ struct GuardedReplies {
 impl ModelClient for GuardedReplies {
     async fn generate_title(
         &self,
-        request: crate::model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        request: tickloop_agent_model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-        Ok(crate::model::fixture_title(request))
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        Ok(tickloop_agent_model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -1276,11 +1273,11 @@ const RETAINED_COMPLETION_STAGE: &str = "retained-completion-stage";
 impl ModelClient for RetainedCompletionModel {
     async fn generate_title(
         &self,
-        request: crate::model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        request: tickloop_agent_model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-        Ok(crate::model::fixture_title(request))
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        Ok(tickloop_agent_model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -1795,11 +1792,11 @@ struct HeldRequests {
 impl ModelClient for HeldRequests {
     async fn generate_title(
         &self,
-        request: crate::model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        request: tickloop_agent_model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-        Ok(crate::model::fixture_title(request))
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        Ok(tickloop_agent_model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -1949,7 +1946,7 @@ async fn run_merge_boundary_fixture() {
         None,
     );
     let chat = agent.create_chat(workdir.clone()).await.unwrap();
-    core.set_execution_mode(chat, crate::permissions::ExecutionMode::FullAccess)
+    core.set_execution_mode(chat, tickloop_agent_protocol::ExecutionMode::FullAccess)
         .await
         .unwrap();
     let (probe, mut facts) = mpsc::unbounded_channel();

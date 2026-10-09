@@ -17,18 +17,15 @@ use uuid::Uuid;
 
 use super::denials::{ApprovalRecord, DenialRecord, DenialWindow, MAX_RECENT_DENIALS};
 use super::{
-    Agent, AgentError, BranchOrigin, Chat, ChatSnapshot, InputContext, LocalMessage, LoopId,
-    LoopSnapshot, LoopState, RunId, SummaryDirection, TodoItem, ToolCallRecovery, Trigger,
+    Agent, AgentError, BranchOrigin, Chat, ChatBookkeeping, ChatSnapshot, InputContext,
+    LocalMessage, LoopId, LoopSnapshot, LoopState, RunId, SummaryDirection, TodoItem,
+    ToolCallRecovery, Trigger,
     compaction::{
         CompactBoundary, CompactTrigger, CompactionLayout, CompactionMarker, MessageSource,
         SummarizeMetadata,
     },
 };
 use crate::file_history::{FileHistory, FileHistorySnapshot};
-use crate::model::{Content, Message, PrivateHistorySource, Role, Usage};
-use crate::permissions::ExecutionMode;
-use crate::private_fs::unix_time_milliseconds;
-use crate::protocol::ChatId;
 use crate::transcript::{
     ArtifactTicksEntry, BranchOriginEntry, COMPACT_BOUNDARY_SUBTYPE, CachedMetadata, ChainEntry,
     CompactMetadata, CompactTriggerEntry, ContentReplacementEntry, ContentReplacementRecord,
@@ -37,6 +34,10 @@ use crate::transcript::{
     LastPromptEntry, Line, LoadedTranscript, LoopRecord, MonitorMembersEntry,
     PartialCompactDirection, SummarizeMetadataEntry, TranscriptWriter, format_timestamp,
     list_project, load, locate, project_directory, transcript_path,
+};
+use tickloop_agent_base::private_fs::unix_time_milliseconds;
+use tickloop_agent_protocol::{
+    ChatId, Content, ExecutionMode, Message, PrivateHistorySource, Role, Usage,
 };
 
 /// 照 Claude Code：恢复时末尾是工具结果，追加这条 meta user 消息表示从中断处继续。
@@ -140,12 +141,12 @@ fn write_denial_windows(
                 let directory = path
                     .parent()
                     .ok_or_else(|| "denial path has no parent".to_owned())?;
-                crate::private_fs::create_private_directory(directory)
+                tickloop_agent_base::private_fs::create_private_directory(directory)
                     .map_err(|error| error.to_string())?;
-                crate::private_fs::replace_file_atomically(
+                tickloop_agent_base::private_fs::replace_file_atomically(
                     &path,
                     &bytes,
-                    crate::private_fs::PRIVATE_FILE_MODE,
+                    tickloop_agent_base::private_fs::PRIVATE_FILE_MODE,
                 )
                 .map_err(|error| error.to_string())
             });
@@ -300,9 +301,9 @@ impl ChatRecorder {
 
     fn load_denials(&self, path: &Path, chat_id: ChatId) -> DenialWindow {
         let path = path.with_extension("denials.json");
-        let contents = match crate::private_fs::open_without_following_links(
+        let contents = match tickloop_agent_base::private_fs::open_without_following_links(
             &path,
-            crate::private_fs::OpenTarget::Entry,
+            tickloop_agent_base::private_fs::OpenTarget::Entry,
         )
         .and_then(|file| {
             let mut contents = Vec::new();
@@ -472,11 +473,12 @@ impl ChatRecorder {
     /// 把 Branch 的来源与标题排入子 Chat 的 Transcript；子 Chat 与来源放在同一项目目录。
     pub(super) fn register_branch(
         &self,
-        source: &mut ChatSnapshot,
+        source: &ChatSnapshot,
+        source_bookkeeping: &ChatBookkeeping,
         child_chat_id: ChatId,
         title: &str,
     ) {
-        self.enqueue_sync(source);
+        self.enqueue_sync(source, source_bookkeeping);
         let (path, leaf) = {
             let logs = self.logs.lock().unwrap();
             let Some(log) = logs.get(&source.id) else {
@@ -547,8 +549,13 @@ impl ChatRecorder {
 
     /// rewind 截断对话前调用：先写出截断前尚未写出的消息，被放弃的消息照 Claude Code 留在
     /// 文件中；之后的条目接在最后保留的消息后面，在同一文件中形成分叉。
-    pub(super) fn truncate(&self, snapshot: &mut ChatSnapshot, message_count: usize) {
-        self.enqueue_sync(snapshot);
+    pub(super) fn truncate(
+        &self,
+        snapshot: &ChatSnapshot,
+        bookkeeping: &ChatBookkeeping,
+        message_count: usize,
+    ) {
+        self.enqueue_sync(snapshot, bookkeeping);
         let chat_id = snapshot.id;
         if let Some(log) = self.logs.lock().unwrap().get_mut(&chat_id) {
             log.links.truncate(message_count);
@@ -574,16 +581,17 @@ impl ChatRecorder {
     /// 跳过边界之前的记录，否则保留消息中被替换的结果会以原文发送。
     pub(super) fn compact(
         &self,
-        snapshot: &mut ChatSnapshot,
-        compacted: &mut ChatSnapshot,
+        chat: &Chat,
+        compacted: &ChatSnapshot,
+        compacted_bookkeeping: &ChatBookkeeping,
         layout: &CompactionLayout,
         renamed_snapshots: &[FileHistorySnapshot],
-        content_replacements: &super::tool_results::ContentReplacementState,
     ) {
-        let Some((path, mut lines)) = self.sync_chat(snapshot) else {
+        let Some((path, mut lines)) = self.sync_chat(&chat.snapshot, &chat.bookkeeping) else {
             return;
         };
-        let compaction_lines = self.compaction_lines(snapshot, compacted, layout);
+        let compaction_lines =
+            self.compaction_lines(&chat.snapshot, compacted, compacted_bookkeeping, layout);
         let Some(compaction_lines) = compaction_lines else {
             self.writer.enqueue(&path, lines);
             return;
@@ -596,7 +604,7 @@ impl ChatRecorder {
                 is_snapshot_update: false,
             }))
         }));
-        let replacements = content_replacements.records_for(compacted);
+        let replacements = chat.content_replacements.records_for(compacted);
         if !replacements.is_empty() {
             lines.push(Line::ContentReplacement(ContentReplacementEntry {
                 chat_id: compacted.id,
@@ -612,6 +620,7 @@ impl ChatRecorder {
         &self,
         snapshot: &ChatSnapshot,
         compacted: &ChatSnapshot,
+        compacted_bookkeeping: &ChatBookkeeping,
         layout: &CompactionLayout,
     ) -> Option<Vec<Line>> {
         let mut logs = self.logs.lock().unwrap();
@@ -639,10 +648,14 @@ impl ChatRecorder {
             .iter()
             .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
             .map(|goal| {
-                let start = compacted.loop_starts.get(&goal.id).copied().unwrap_or(0);
+                let start = compacted_bookkeeping
+                    .loop_starts
+                    .get(&goal.id)
+                    .copied()
+                    .unwrap_or(0);
                 (
                     start.max(first_loop_position),
-                    loop_entry_content(compacted, goal),
+                    loop_entry_content(compacted, compacted_bookkeeping, goal),
                 )
             })
             .collect::<Vec<_>>();
@@ -666,6 +679,7 @@ impl ChatRecorder {
                 lines.push(record_loop(
                     log,
                     compacted,
+                    compacted_bookkeeping,
                     content,
                     &mut parent,
                     &timestamp,
@@ -679,7 +693,15 @@ impl ChatRecorder {
             let message = compacted.messages[index].clone();
             let role = message.role;
             let blocks = message.content.len();
-            let mut entry = chain_entry(compacted, index, uuid, message, parent, &timestamp);
+            let mut entry = chain_entry(
+                compacted,
+                compacted_bookkeeping,
+                index,
+                uuid,
+                message,
+                parent,
+                &timestamp,
+            );
             if *source == MessageSource::Boundary {
                 entry.logical_parent_uuid = layout
                     .logical_parent
@@ -700,6 +722,7 @@ impl ChatRecorder {
             lines.push(record_loop(
                 log,
                 compacted,
+                compacted_bookkeeping,
                 content,
                 &mut parent,
                 &timestamp,
@@ -711,10 +734,11 @@ impl ChatRecorder {
             .iter()
             .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
         {
-            if let Some(content) = plan_entry_content(compacted, goal) {
+            if let Some(content) = plan_entry_content(compacted, compacted_bookkeeping, goal) {
                 lines.push(record_loop(
                     log,
                     compacted,
+                    compacted_bookkeeping,
                     content,
                     &mut parent,
                     &timestamp,
@@ -724,7 +748,7 @@ impl ChatRecorder {
         for goal in &compacted.loops {
             log.recorded_loops
                 .entry(goal.id)
-                .or_insert_with(|| loop_entry_content(compacted, goal));
+                .or_insert_with(|| loop_entry_content(compacted, compacted_bookkeeping, goal));
         }
         log.meta_messages = layout
             .sources
@@ -797,20 +821,25 @@ impl ChatRecorder {
         std::mem::take(&mut *self.dirty.lock().unwrap())
     }
 
-    fn enqueue_sync(&self, snapshot: &ChatSnapshot) {
-        if let Some((path, lines)) = self.sync_chat(snapshot) {
+    fn enqueue_sync(&self, snapshot: &ChatSnapshot, bookkeeping: &ChatBookkeeping) {
+        if let Some((path, lines)) = self.sync_chat(snapshot, bookkeeping) {
             self.writer.enqueue(&path, lines);
         }
     }
 
-    pub(super) fn record_todo_retirement(&self, snapshot: &ChatSnapshot, loop_id: LoopId) {
-        let Some((path, mut lines)) = self.sync_chat(snapshot) else {
+    pub(super) fn record_todo_retirement(
+        &self,
+        snapshot: &ChatSnapshot,
+        bookkeeping: &ChatBookkeeping,
+        loop_id: LoopId,
+    ) {
+        let Some((path, mut lines)) = self.sync_chat(snapshot, bookkeeping) else {
             return;
         };
         let Some(goal) = snapshot.loops.iter().find(|goal| goal.id == loop_id) else {
             return;
         };
-        let Some(content) = plan_entry_content(snapshot, goal) else {
+        let Some(content) = plan_entry_content(snapshot, bookkeeping, goal) else {
             return;
         };
         let mut logs = self.logs.lock().unwrap();
@@ -822,6 +851,7 @@ impl ChatRecorder {
         lines.push(record_loop(
             log,
             snapshot,
+            bookkeeping,
             content,
             &mut parent,
             &format_timestamp(milliseconds),
@@ -833,7 +863,11 @@ impl ChatRecorder {
 
     /// 差分依据：运行时对消息只有三种修改：追加新消息；向最后一条消息追加内容块（并行工具
     /// 结果），写成标记接续该消息的新条目；rewind 截断对话，由 `truncate` 事先同步到已写出的条目。
-    fn sync_chat(&self, snapshot: &ChatSnapshot) -> Option<(PathBuf, Vec<Line>)> {
+    fn sync_chat(
+        &self,
+        snapshot: &ChatSnapshot,
+        bookkeeping: &ChatBookkeeping,
+    ) -> Option<(PathBuf, Vec<Line>)> {
         let mut logs = self.logs.lock().unwrap();
         let log = logs.get_mut(&snapshot.id)?;
         if snapshot.messages.len() < log.links.len() {
@@ -852,14 +886,14 @@ impl ChatRecorder {
             .loops
             .iter()
             .filter_map(|goal| {
-                let content = loop_entry_content(snapshot, goal);
+                let content = loop_entry_content(snapshot, bookkeeping, goal);
                 if log.recorded_loops.get(&goal.id) == Some(&content) {
                     return None;
                 }
                 let position = if log.recorded_loops.contains_key(&goal.id) {
                     snapshot.messages.len()
                 } else {
-                    snapshot
+                    bookkeeping
                         .loop_starts
                         .get(&goal.id)
                         .copied()
@@ -889,6 +923,7 @@ impl ChatRecorder {
                 // 接在最后写出的条目之后：消息之后可能已经有 Loop 条目。
                 let mut entry = chain_entry(
                     snapshot,
+                    bookkeeping,
                     index,
                     Uuid::new_v4(),
                     appended,
@@ -921,7 +956,14 @@ impl ChatRecorder {
                 .is_some_and(|(position, _)| *position <= index)
             {
                 let (_, content) = loop_updates.pop_front().unwrap();
-                lines.push(record_loop(log, snapshot, content, &mut parent, &timestamp));
+                lines.push(record_loop(
+                    log,
+                    snapshot,
+                    bookkeeping,
+                    content,
+                    &mut parent,
+                    &timestamp,
+                ));
             }
             let message = snapshot.messages[index].clone();
             let role = message.role;
@@ -937,7 +979,15 @@ impl ChatRecorder {
             .then(|| typed_prompt(&message))
             .flatten();
             let blocks = message.content.len();
-            let mut entry = chain_entry(snapshot, index, uuid, message, parent, &timestamp);
+            let mut entry = chain_entry(
+                snapshot,
+                bookkeeping,
+                index,
+                uuid,
+                message,
+                parent,
+                &timestamp,
+            );
             if entry.is_compact_boundary() && entry.parent_uuid.is_none() {
                 entry.logical_parent_uuid = parent;
             }
@@ -959,15 +1009,29 @@ impl ChatRecorder {
             }
         }
         for (_, content) in loop_updates {
-            lines.push(record_loop(log, snapshot, content, &mut parent, &timestamp));
+            lines.push(record_loop(
+                log,
+                snapshot,
+                bookkeeping,
+                content,
+                &mut parent,
+                &timestamp,
+            ));
         }
         for goal in snapshot
             .loops
             .iter()
             .filter(|goal| first_recorded_loops.contains(&goal.id))
         {
-            if let Some(content) = plan_entry_content(snapshot, goal) {
-                lines.push(record_loop(log, snapshot, content, &mut parent, &timestamp));
+            if let Some(content) = plan_entry_content(snapshot, bookkeeping, goal) {
+                lines.push(record_loop(
+                    log,
+                    snapshot,
+                    bookkeeping,
+                    content,
+                    &mut parent,
+                    &timestamp,
+                ));
             }
         }
         if !lines.is_empty() {
@@ -1021,6 +1085,7 @@ impl ChatRecorder {
     fn adopt_restored_loops(
         &self,
         snapshot: &ChatSnapshot,
+        bookkeeping: &ChatBookkeeping,
         checkpoints: &[super::plan::PlanCheckpoint],
     ) {
         let recorded_plans = checkpoints
@@ -1036,7 +1101,7 @@ impl ChatRecorder {
                 .loops
                 .iter()
                 .map(|goal| {
-                    let (mut record, run) = loop_entry_content(snapshot, goal);
+                    let (mut record, run) = loop_entry_content(snapshot, bookkeeping, goal);
                     record.plan_version = recorded_plans.get(&goal.id).map(|(version, _)| *version);
                     record.plan_approval_pending = recorded_plans
                         .get(&goal.id)
@@ -1061,7 +1126,7 @@ impl ChatRecorder {
     pub(super) fn flush_on_drop(&self, chats: &mut HashMap<ChatId, Chat>) {
         self.closed.cancel();
         for chat in chats.values() {
-            self.enqueue_sync(&chat.snapshot);
+            self.enqueue_sync(&chat.snapshot, &chat.bookkeeping);
         }
         self.writer.flush_blocking();
         let writes = chats
@@ -1089,6 +1154,7 @@ impl ChatRecorder {
 
 fn chain_entry(
     snapshot: &ChatSnapshot,
+    bookkeeping: &ChatBookkeeping,
     index: usize,
     uuid: Uuid,
     message: Message,
@@ -1177,15 +1243,19 @@ fn chain_entry(
         loop_id: snapshot
             .message_runs
             .get(&index)
-            .and_then(|run| snapshot.run_loops.get(run))
+            .and_then(|run| bookkeeping.run_loops.get(run))
             .copied(),
-        slug: snapshot.plan_slug.clone(),
+        slug: bookkeeping.plan_slug.clone(),
         loop_record: None,
     }
 }
 
 /// Loop 在对话链上的完整状态。等待手动恢复的 Trigger 一并记录，重启后仍能由用户重新武装。
-fn loop_entry_content(snapshot: &ChatSnapshot, goal: &LoopSnapshot) -> LoopEntryContent {
+fn loop_entry_content(
+    snapshot: &ChatSnapshot,
+    bookkeeping: &ChatBookkeeping,
+    goal: &LoopSnapshot,
+) -> LoopEntryContent {
     (
         LoopRecord {
             failure_events: snapshot
@@ -1207,7 +1277,7 @@ fn loop_entry_content(snapshot: &ChatSnapshot, goal: &LoopSnapshot) -> LoopEntry
                 .iter()
                 .filter_map(|source| serde_json::to_value(source).ok())
                 .collect(),
-            plan_version: super::plan::highest_plan_version(snapshot, goal.id),
+            plan_version: super::plan::highest_plan_version(snapshot, bookkeeping, goal.id),
             plan_approval_pending: snapshot
                 .plans
                 .iter()
@@ -1221,8 +1291,12 @@ fn loop_entry_content(snapshot: &ChatSnapshot, goal: &LoopSnapshot) -> LoopEntry
 }
 
 /// 带计划版本与进度的 Loop 状态；该 Loop 既没有计划也没有进度时返回 `None`。
-fn plan_entry_content(snapshot: &ChatSnapshot, goal: &LoopSnapshot) -> Option<LoopEntryContent> {
-    let plan_version = super::plan::highest_plan_version(snapshot, goal.id);
+fn plan_entry_content(
+    snapshot: &ChatSnapshot,
+    bookkeeping: &ChatBookkeeping,
+    goal: &LoopSnapshot,
+) -> Option<LoopEntryContent> {
+    let plan_version = super::plan::highest_plan_version(snapshot, bookkeeping, goal.id);
     let progress = snapshot
         .progress
         .iter()
@@ -1231,7 +1305,7 @@ fn plan_entry_content(snapshot: &ChatSnapshot, goal: &LoopSnapshot) -> Option<Lo
     if plan_version.is_none() && progress.is_none() {
         return None;
     }
-    let (mut record, run_id) = loop_entry_content(snapshot, goal);
+    let (mut record, run_id) = loop_entry_content(snapshot, bookkeeping, goal);
     record.plan_version = plan_version;
     record.progress = progress;
     Some((record, run_id))
@@ -1241,6 +1315,7 @@ fn plan_entry_content(snapshot: &ChatSnapshot, goal: &LoopSnapshot) -> Option<Lo
 fn record_loop(
     log: &mut ChatLog,
     snapshot: &ChatSnapshot,
+    bookkeeping: &ChatBookkeeping,
     (record, run_id): LoopEntryContent,
     parent: &mut Option<Uuid>,
     timestamp: &str,
@@ -1300,7 +1375,7 @@ fn record_loop(
         model: None,
         private_source: None,
         loop_id: None,
-        slug: snapshot.plan_slug.clone(),
+        slug: bookkeeping.plan_slug.clone(),
         loop_record: Some(record.clone()),
     };
     *parent = Some(entry.uuid);
@@ -1405,7 +1480,7 @@ fn current_git_branch(workdir: &Path) -> Option<String> {
 
 struct RestoredChain {
     messages: Vec<Message>,
-    invoked_skills: Vec<crate::skills::InvokedSkill>,
+    invoked_skills: Vec<tickloop_agent_protocol::InvokedSkill>,
     message_runs: BTreeMap<usize, RunId>,
     tool_call_recoveries: BTreeMap<usize, Vec<ToolCallRecovery>>,
     message_contexts: BTreeMap<usize, Vec<InputContext>>,
@@ -1418,7 +1493,7 @@ struct RestoredChain {
     message_compactions: BTreeMap<usize, CompactionMarker>,
     message_usage: BTreeMap<usize, Usage>,
     message_sources: BTreeMap<usize, PrivateHistorySource>,
-    message_models: BTreeMap<usize, crate::model::ModelIdentity>,
+    message_models: BTreeMap<usize, tickloop_agent_protocol::ModelIdentity>,
     links: Vec<MessageLink>,
     meta_messages: HashSet<usize>,
     message_of_entry: HashMap<Uuid, usize>,
@@ -1719,6 +1794,7 @@ impl RestoredChain {
 
 struct RecoveredSnapshot {
     snapshot: ChatSnapshot,
+    bookkeeping: ChatBookkeeping,
     meta_messages: HashSet<usize>,
 }
 
@@ -1813,8 +1889,9 @@ fn recover_transcript(
             }
         })
         .unwrap_or_default();
-    kept.fill_conversation(&mut snapshot);
-    recover_snapshot_for_resume(snapshot, kept.meta_messages.clone())
+    let mut bookkeeping = ChatBookkeeping::default();
+    kept.fill_conversation(&mut snapshot, &mut bookkeeping);
+    recover_snapshot_for_resume(snapshot, bookkeeping, kept.meta_messages.clone())
 }
 
 /// Branch 来源元数据属于写入这份 Transcript 的 Chat；名称取标题，没有有效标题时使用默认名称。
@@ -1843,7 +1920,7 @@ fn restored_branch_origin(
 }
 
 impl RestoredChain {
-    fn fill_conversation(&self, snapshot: &mut ChatSnapshot) {
+    fn fill_conversation(&self, snapshot: &mut ChatSnapshot, bookkeeping: &mut ChatBookkeeping) {
         snapshot.messages = self.messages.clone();
         snapshot.invoked_skills = self.invoked_skills.clone();
         snapshot.message_runs = self.message_runs.clone();
@@ -1864,9 +1941,9 @@ impl RestoredChain {
         snapshot.message_sources = self.message_sources.clone();
         snapshot.message_models = self.message_models.clone();
         snapshot.message_compactions = self.message_compactions.clone();
-        snapshot.run_loops = self.run_loops.clone();
-        snapshot.plan_slug = self.plan_slug.clone();
-        self.replay_loops(snapshot);
+        bookkeeping.run_loops = self.run_loops.clone();
+        bookkeeping.plan_slug = self.plan_slug.clone();
+        self.replay_loops(snapshot, bookkeeping);
     }
 
     /// 链上 Loop 条目携带的计划版本与进度。
@@ -1889,9 +1966,9 @@ impl RestoredChain {
 
     /// 沿对话链按顺序重放 Loop 条目：每条以完整状态覆盖同一 Loop，创建位置取第一条的位置。
     /// 无法解析的条目跳过。
-    fn replay_loops(&self, snapshot: &mut ChatSnapshot) {
+    fn replay_loops(&self, snapshot: &mut ChatSnapshot, bookkeeping: &mut ChatBookkeeping) {
         snapshot.loops.clear();
-        snapshot.loop_starts.clear();
+        bookkeeping.loop_starts.clear();
         snapshot.resume_triggers.clear();
         snapshot.failure_events.clear();
         for (position, (record, run_id)) in &self.loop_records {
@@ -1944,7 +2021,7 @@ impl RestoredChain {
             {
                 Some(existing) => *existing = goal,
                 None => {
-                    snapshot.loop_starts.insert(goal.id, *position);
+                    bookkeeping.loop_starts.insert(goal.id, *position);
                     snapshot.loops.push(goal);
                 }
             }
@@ -1963,15 +2040,17 @@ impl RestoredChain {
 /// Removed assistant messages take their tool calls with them, so no operation state is migrated.
 fn recover_snapshot_for_resume(
     mut snapshot: ChatSnapshot,
+    bookkeeping: ChatBookkeeping,
     mut meta_messages: HashSet<usize>,
 ) -> Result<RecoveredSnapshot, AgentError> {
     super::triggers::recover_loops(&mut snapshot);
     super::recovery::close_dangling_tool_calls(&mut snapshot, None)?;
     append_interruption_messages(&mut snapshot, &mut meta_messages);
     super::branch::validate_snapshot(&snapshot)?;
-    super::context::projected_messages(&snapshot)?;
+    super::context::projected_messages(&snapshot, &bookkeeping.denial_references)?;
     Ok(RecoveredSnapshot {
         snapshot,
+        bookkeeping,
         meta_messages,
     })
 }
@@ -2086,11 +2165,12 @@ impl Agent {
     pub(super) async fn checkpoint_plan_approval(
         &self,
         snapshot: &ChatSnapshot,
+        bookkeeping: &ChatBookkeeping,
     ) -> Result<(), String> {
         let Some(recorder) = &self.inner.recorder else {
             return Ok(());
         };
-        recorder.enqueue_sync(snapshot);
+        recorder.enqueue_sync(snapshot, bookkeeping);
         let path = recorder
             .path_for_chat(snapshot.id)
             .ok_or("Plan approval has no Transcript path")?;
@@ -2104,13 +2184,14 @@ impl Agent {
     pub(super) async fn checkpoint_connection(
         &self,
         snapshot: &ChatSnapshot,
-        directory: crate::private_fs::PrivateDirectory,
+        bookkeeping: &ChatBookkeeping,
+        directory: tickloop_agent_base::private_fs::PrivateDirectory,
         loop_id: LoopId,
     ) -> Result<(), String> {
         let Some(recorder) = &self.inner.recorder else {
             return Err("Connection requires a persistent Chat".into());
         };
-        recorder.enqueue_sync(snapshot);
+        recorder.enqueue_sync(snapshot, bookkeeping);
         let path = recorder
             .path_for_chat(snapshot.id)
             .ok_or("Connection Chat has no Transcript path")?;
@@ -2128,7 +2209,7 @@ impl Agent {
         &self,
         chat_id: ChatId,
         workdir: &Path,
-        artifact_ticks: Vec<crate::artifacts::ArtifactTick>,
+        artifact_ticks: Vec<tickloop_agent_protocol::ArtifactTick>,
         removed_artifact_ticks: std::collections::BTreeSet<String>,
     ) {
         self.record_chat_metadata(
@@ -2242,7 +2323,7 @@ impl Agent {
             let chats = self.inner.chats.lock().await;
             for chat_id in recorder.take_dirty() {
                 if let Some(chat) = chats.get(&chat_id) {
-                    recorder.enqueue_sync(&chat.snapshot);
+                    recorder.enqueue_sync(&chat.snapshot, &chat.bookkeeping);
                 }
             }
         }
@@ -2328,7 +2409,7 @@ impl Agent {
             let chats = self.inner.chats.lock().await;
             recorder.take_dirty();
             for chat in chats.values() {
-                recorder.enqueue_sync(&chat.snapshot);
+                recorder.enqueue_sync(&chat.snapshot, &chat.bookkeeping);
             }
         }
         let writer = recorder.writer.clone();
@@ -2399,7 +2480,7 @@ impl Agent {
             return;
         };
         if let Some(chat) = self.inner.chats.lock().await.get(&chat_id) {
-            recorder.enqueue_sync(&chat.snapshot);
+            recorder.enqueue_sync(&chat.snapshot, &chat.bookkeeping);
         }
         let Some(path) = recorder
             .logs
@@ -2453,7 +2534,6 @@ impl Agent {
         if let Some(chat) = self.inner.chats.lock().await.get(&chat_id) {
             return Ok(chat.snapshot.clone());
         }
-        let retention = self.retain_chat(chat_id)?;
         let (path, loaded) = self.load_saved_transcript(chat_id).await?;
         if let Some(delegation) = loaded
             .metadata
@@ -2468,7 +2548,6 @@ impl Agent {
                 ));
             }
             if !self.inner.chats.lock().await.contains_key(&parent_id) {
-                let parent_retention = self.retain_chat(parent_id)?;
                 let (parent_path, parent_loaded) = self.load_saved_transcript(parent_id).await?;
                 if parent_loaded.metadata.delegation.is_some() {
                     return Err(AgentError::Invalid(
@@ -2479,12 +2558,11 @@ impl Agent {
                     parent_id,
                     parent_loaded,
                     RestoreTarget::Resume(parent_path),
-                    parent_retention,
                 )
                 .await?;
             }
         }
-        self.insert_restored_chat(chat_id, loaded, RestoreTarget::Resume(path), retention)
+        self.insert_restored_chat(chat_id, loaded, RestoreTarget::Resume(path))
             .await
     }
 
@@ -2498,7 +2576,6 @@ impl Agent {
             return Err(AgentError::NotFound);
         };
         let _resume = recorder.resume_lock.lock().await;
-        let _source_retention = self.retain_chat(source_chat_id)?;
         self.flush_transcripts().await;
         let (_, loaded) = self.load_saved_transcript(source_chat_id).await?;
         if loaded.metadata.delegation.is_some() {
@@ -2516,7 +2593,6 @@ impl Agent {
             RestoreTarget::NewChat {
                 source: source_chat_id,
             },
-            self.retain_chat(new_chat_id)?,
         )
         .await
     }
@@ -2544,7 +2620,6 @@ impl Agent {
         chat_id: ChatId,
         loaded: LoadedTranscript,
         target: RestoreTarget,
-        retention: Option<Arc<crate::transcript::retention::RetentionGuard>>,
     ) -> Result<ChatSnapshot, AgentError> {
         let recorder = self.inner.recorder.as_ref().ok_or(AgentError::NotFound)?;
         // 替换决定、文件回滚备份与元数据都属于写入这份 Transcript 的 Chat：恢复时是自己，以新 chatId 恢复时是源 Chat。
@@ -2563,6 +2638,7 @@ impl Agent {
         let plan_checkpoints = restored.without(&removed).plan_checkpoints();
         let plan_warnings = super::plan::rebuild_plans_and_progress(
             &mut recovered.snapshot,
+            &mut recovered.bookkeeping,
             &plan_checkpoints,
             Some(&plans_directory),
         )?;
@@ -2578,9 +2654,10 @@ impl Agent {
             &replacement_records,
         );
         let mut snapshot = recovered.snapshot;
+        let mut bookkeeping = recovered.bookkeeping;
         // 与设置写入互斥到 Chat 加入本进程为止，期间写入的持久规则改动不会漏掉这个 Chat。
         let _settings_gate = self.inner.settings_writes.lock().await;
-        let (client, output_style) = self.apply_chat_defaults(&mut snapshot);
+        let (client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
         if let Some(delegation) = &snapshot.delegation {
             snapshot.workdir = delegation.ceiling.workdir.clone();
             snapshot.additional_directories = delegation.ceiling.additional_directories.clone();
@@ -2616,11 +2693,15 @@ impl Agent {
                     recovered.meta_messages,
                     loaded,
                 );
-                recorder.adopt_restored_loops(&snapshot, &plan_checkpoints);
+                recorder.adopt_restored_loops(&snapshot, &bookkeeping, &plan_checkpoints);
             }
             RestoreTarget::NewChat { .. } => {
                 // 照 Claude Code `copyPlanForFork`：以新 chatId 恢复时使用新的 slug 并复制计划文件。
-                super::plan::copy_plans_to_new_slug(&mut snapshot, Some(&plans_directory));
+                super::plan::copy_plans_to_new_slug(
+                    &mut snapshot,
+                    &mut bookkeeping,
+                    Some(&plans_directory),
+                );
                 recorder.register_resumed_copy(
                     chat_id,
                     &snapshot.workdir,
@@ -2630,7 +2711,7 @@ impl Agent {
                 );
                 // 重写的对话以压缩边界开头；替换决定与文件回滚快照写在对话之后，新文件超过 5MB
                 // 时加载不会随边界之前的内容跳过它们。
-                recorder.enqueue_sync(&snapshot);
+                recorder.enqueue_sync(&snapshot, &bookkeeping);
                 // 照 Claude Code `processResumedConversation`：以新 chatId 重新记录源 Chat
                 // 的全部替换决定；替换文本仍指向源 Chat 目录中的外存文件。
                 if !replacement_records.is_empty() {
@@ -2651,11 +2732,11 @@ impl Agent {
                 }
             }
         }
-        self.checkpoint_plan_approval(&snapshot)
+        self.checkpoint_plan_approval(&snapshot, &bookkeeping)
             .await
             .map_err(AgentError::Storage)?;
         let tools = self.create_chat_tools(&snapshot);
-        let skills = crate::skills::SkillRegistry::discover(
+        let skills = tickloop_agent_config::skills::SkillRegistry::discover(
             &snapshot.workdir,
             self.inner.user_skills_directory.as_deref(),
         );
@@ -2664,9 +2745,9 @@ impl Agent {
             Chat {
                 family_generation: 0,
                 snapshot: snapshot.clone(),
+                bookkeeping,
                 todo_completion_graces: HashMap::new(),
                 start_new_tool_result_message: false,
-                retention,
                 active: None,
                 active_run: None,
                 parked: HashMap::new(),
@@ -2703,30 +2784,6 @@ impl Agent {
         self.start_restored_todo_graces(chat_id).await;
         Ok(snapshot)
     }
-
-    pub(super) fn retain_chat(
-        &self,
-        chat_id: ChatId,
-    ) -> Result<Option<Arc<crate::transcript::retention::RetentionGuard>>, AgentError> {
-        self.inner
-            .recorder
-            .as_ref()
-            .map(|recorder| recorder.root.as_path())
-            .or_else(|| {
-                self.inner
-                    .settings
-                    .as_ref()
-                    .and_then(crate::settings::UserSettings::root)
-            })
-            .map(|root| {
-                crate::transcript::retention::RetentionGuard::shared(root, chat_id)
-                    .map(Arc::new)
-                    .map_err(|error| {
-                        AgentError::Storage(format!("cannot retain live Chat {chat_id}: {error}"))
-                    })
-            })
-            .transpose()
-    }
 }
 
 enum RestoreTarget {
@@ -2753,7 +2810,7 @@ mod history_tests {
             Message {
                 role: Role::Assistant,
                 content: vec![Content::ProtocolData {
-                    protocol: crate::model::Protocol::Responses,
+                    protocol: tickloop_agent_protocol::Protocol::Responses,
                     value: serde_json::json!({"type":"reasoning","encrypted_content":"opaque"}),
                 }],
             },

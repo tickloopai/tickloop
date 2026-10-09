@@ -9,7 +9,7 @@ mod recovering;
 mod views;
 
 pub use daemon::{DaemonServer, WorkerFactory};
-pub use embedded::EmbeddedAgentAccess;
+pub use embedded::{EmbeddedAgentAccess, ModelClientFactory};
 pub use ipc::{
     LocalAgentClient, serve_connection, serve_daemon_listener, serve_listener,
     serve_worker_listener,
@@ -19,6 +19,14 @@ pub use recovering::{ReconnectFactory, RecoveringAgentClient, worker_link};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+
+/// Small limits that let unit tests cross the frame and chunk boundaries with little data.
+#[cfg(test)]
+pub(crate) const TRANSPORT_LIMITS: tickloop_agent_protocol::AccessLimits =
+    match tickloop_agent_protocol::AccessLimits::new(64 << 10, 16 << 10) {
+        Ok(limits) => limits,
+        Err(_) => panic!("the test AccessLimits are valid"),
+    };
 
 #[derive(Debug)]
 pub struct Observation {
@@ -98,7 +106,7 @@ const PREVIEW_MAX_CHARACTERS: usize = 160;
 /// prompt with its text (an image-only prompt reads as an image cue). Tool traffic, thinking and
 /// local notices are skipped; text that only repeats `title` adds nothing.
 pub(crate) fn preview(conversation: &crate::runtime::ChatSnapshot, title: &str) -> Option<String> {
-    use crate::model::{Content, Role};
+    use tickloop_agent_protocol::{Content, Role};
     let text = conversation
         .messages
         .iter()
@@ -161,7 +169,7 @@ pub(crate) fn preview(conversation: &crate::runtime::ChatSnapshot, title: &str) 
 
 pub(crate) fn bounded_update(mut update: ObservationUpdate) -> ObservationUpdate {
     if serde_json::to_vec(&update).map_or(true, |bytes| {
-        bytes.len() > crate::protocol::FEED_CHANGE_BYTES
+        bytes.len() > tickloop_agent_protocol::FEED_CHANGE_BYTES
     }) {
         update.change = ObservationChange::Resync {
             reason: ResetReason::Lagged,

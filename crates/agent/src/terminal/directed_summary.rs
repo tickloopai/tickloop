@@ -1,10 +1,10 @@
 use super::execution::ConsoleExecution as Agent;
 use std::collections::HashMap;
 
-use tickloop_agent::model::ModelError;
 use tickloop_agent::runtime::{
     AgentError, ChatSnapshot, DirectedSummaryOutcome, DirectedSummaryRequest, SummaryDirection,
 };
+use tickloop_agent_model::ModelError;
 use tokio::task::{Id, JoinSet};
 use uuid::Uuid;
 

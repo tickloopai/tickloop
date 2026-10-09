@@ -123,6 +123,7 @@ impl FamilyMailbox {
 
 pub(super) fn current_cause(
     snapshot: &ChatSnapshot,
+    bookkeeping: &ChatBookkeeping,
     receipt: &Receipt,
 ) -> Result<MessageCause, FamilyMessageRejection> {
     let primary_input = snapshot
@@ -146,7 +147,7 @@ pub(super) fn current_cause(
             || snapshot
                 .message_runs
                 .get(&index)
-                .and_then(|run| snapshot.run_loops.get(run))
+                .and_then(|run| bookkeeping.run_loops.get(run))
                 != Some(&receipt.loop_id)
         {
             continue;

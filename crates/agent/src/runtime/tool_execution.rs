@@ -4,9 +4,10 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::protocol::ToolDefinition;
-use crate::tools::{
-    ASK_USER_QUESTION_TOOL_NAME, ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, ToolResult,
+use tickloop_agent_protocol::{ToolDefinition, ToolResult};
+use tickloop_agent_tools::{
+    ASK_USER_QUESTION_TOOL_NAME, ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME,
+    permissions::PermissionPolicyExt,
 };
 
 struct AutoPermissionDecision {
@@ -56,7 +57,7 @@ impl ToolRegistry {
         host_provider: Option<Arc<dyn crate::host_tools::HostToolProvider>>,
         tick_stream_installed: bool,
     ) -> Self {
-        let mut tools = crate::tools::Tools::definitions()
+        let mut tools = tickloop_agent_tools::Tools::definitions()
             .into_iter()
             .map(|definition| RegisteredTool {
                 definition,
@@ -322,7 +323,7 @@ pub(crate) fn validate_schema(schema: &Value, value: &Value, location: &str) -> 
 pub(super) struct ToolCallOutcome {
     pub(super) result: ToolResult,
     /// Images for the model only, sent after the result text.
-    pub(super) images: Vec<crate::image::Image>,
+    pub(super) images: Vec<tickloop_agent_base::image::Image>,
     pub(super) host_call_status: Option<crate::host_tools::HostCallStatus>,
     pub(super) host_effect: Option<crate::host_tools::HostEffect>,
     pub(super) permission_comment: Option<String>,
@@ -603,7 +604,7 @@ impl Agent {
             Some(ToolRoute::TickSubscription)
         ) && name == "SubscribeTick"
         {
-            let instance: crate::tick_stream::InstanceRef =
+            let instance: tick_protocol::InstanceRef =
                 match serde_json::from_value(input["tick_instance_id"].clone()) {
                     Ok(instance) => instance,
                     Err(error) => return Ok(ToolCallOutcome::not_admitted(error.to_string())),
@@ -690,7 +691,7 @@ impl Agent {
             let session_operation = SessionPermissionOperation::from_normalized(
                 normalized_name.to_owned(),
                 permission_input.clone(),
-                WorkspaceScope::capture(&configured_workspace)
+                super::session_permissions::capture_workspace_scope(&configured_workspace)
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
@@ -738,7 +739,8 @@ impl Agent {
                         host_permission,
                         chat.snapshot.policy.mode,
                     ),
-                    explicit_decision == Some(crate::permissions::ExplicitPermissionDecision::Ask),
+                    explicit_decision
+                        == Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Ask),
                     chat.snapshot.policy.revision,
                     session_evaluation,
                     chat.snapshot.policy.mode,
@@ -1147,7 +1149,7 @@ impl Agent {
                         let session_evaluation =
                             sessions.evaluate(permission_owner, &session_operation);
                         let plan_file = plan::current_plan_file(
-                            &chat.snapshot,
+                            &chat.bookkeeping,
                             self.plans_directory(&chat.snapshot.workdir).path(),
                             receipt.loop_id,
                         );
@@ -1529,7 +1531,7 @@ impl Agent {
                                 None => ApprovalPath::Direct,
                             }
                         };
-                        let approval = ApprovalRecord::allowed(
+                        let approval = super::denials::allowed_approval_record(
                             receipt.chat_id,
                             &operation,
                             &operation.input,
@@ -1561,7 +1563,7 @@ impl Agent {
                             },
                         );
                         let tools = chat.tools.clone();
-                        let context = crate::tools::ExecutionContext {
+                        let context = tickloop_agent_tools::ExecutionContext {
                             operation_id: operation.id,
                             loop_id: receipt.loop_id,
                             accepts_images: chat.snapshot.model.accepts_images(),

@@ -16,11 +16,11 @@ struct ActivityModel(AtomicUsize);
 impl ModelClient for ActivityModel {
     async fn generate_title(
         &self,
-        request: crate::model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<crate::model::ModelDelta>,
+        request: tickloop_agent_model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<crate::model::ModelOutput, crate::model::ModelError> {
-        Ok(crate::model::fixture_title(request))
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        Ok(tickloop_agent_model::fixture_title(request))
     }
 
     fn identity(&self) -> ModelIdentity {
@@ -226,7 +226,7 @@ fn working_activity_pty_fixture() {
                     ),
                                 user_settings: None,
                 };
-                let (console, input) = Console::start_with_display(true, tickloop_agent::settings::DisplayPreferences {
+                let (console, input) = Console::start_with_display(true, tickloop_agent_config::DisplayPreferences {
                     prefers_reduced_motion: std::env::var(ACTIVITY_ROUTE).as_deref() == Ok("observe-only"),
                     ..Default::default()
                 }).unwrap();
@@ -440,13 +440,17 @@ fn working_activity_without_loop_control_omits_the_action_and_esc_keeps_it_runni
     fixture.wait_for("Enter a message to");
     fixture.send(b"Activity without advertised control\r");
     fixture.wait_until_shown("Working without an unavailable Esc action", |frame| {
-        frame.contains("Working (0s)") && !frame.contains("Esc to interrupt")
+        working_seconds(frame).is_some() && !frame.contains("Esc to interrupt")
     });
+    // A loaded machine may draw the first frame or skip a reduced-motion tick a second late, so
+    // the elapsed time is compared rather than matched.
+    let before_escape =
+        working_seconds(&screen::visible_screen(&fixture.raw_output(), 80, 24)).unwrap();
     fixture.send(b"\x1b");
     fixture.wait_until_shown(
         "reduced-motion elapsed advances without interrupting",
         |frame| {
-            frame.contains("Working (2s)")
+            working_seconds(frame).is_some_and(|seconds| seconds >= before_escape + 2)
                 && !frame.contains("Esc to interrupt")
                 && !frame.contains("Interrupted")
         },
@@ -455,4 +459,10 @@ fn working_activity_without_loop_control_omits_the_action_and_esc_keeps_it_runni
     fixture.wait_for("Activity reply 1");
     fixture.wait_for("Done");
     fixture.send(b"\x04\x04");
+}
+
+/// The elapsed seconds of the Working row, when it shows a known start time.
+fn working_seconds(frame: &str) -> Option<u64> {
+    let (_, elapsed) = frame.split_once("Working (")?;
+    elapsed.split_once('s')?.0.parse().ok()
 }

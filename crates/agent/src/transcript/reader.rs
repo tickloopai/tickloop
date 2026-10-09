@@ -8,7 +8,6 @@ use super::entry::{
     ChainEntry, ContentReplacementEntry, FileHistorySnapshotEntry, Line, parse_timestamp_ms,
 };
 use super::writer::CachedMetadata;
-use crate::model::{Content, Role, Usage};
 use crate::runtime::approval_context::OriginalUserInput;
 
 pub(crate) struct LoadedTranscript {
@@ -60,6 +59,7 @@ pub(crate) fn load(path: &Path) -> io::Result<Option<LoadedTranscript>> {
 }
 
 use super::entry::{MetadataHeader, MetadataKind};
+use tickloop_agent_protocol::{Content, Role, Usage};
 
 fn validate_delegation_records(lines: &[(u64, &[u8])]) -> io::Result<()> {
     let mut has_delegation_authorization = false;
@@ -636,11 +636,11 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::model::Message;
     use crate::transcript::entry::{
         COMPACT_BOUNDARY_SUBTYPE, CompactMetadata, CompactTriggerEntry, PreservedSegmentEntry,
         format_timestamp,
     };
+    use tickloop_agent_protocol::Message;
 
     fn entry(
         uuid: Uuid,

@@ -89,17 +89,17 @@ fn workspace_trust_modal_owns_input_and_keeps_choices_visible_across_sizes() {
         state.prompt_enabled = true;
         state.insert("hidden jk draft");
         state.chat = Some(Uuid::from_u128(9001));
-        state.monitor_preference = crate::settings::MonitorPreference::Auto;
+        state.monitor_preference = tickloop_agent_config::MonitorPreference::Auto;
         state.monitor.replace(
             TickGroup::Shells,
             vec![MonitorEntry {
-                instance: crate::tick_stream::InstanceRef::new("shell", "hidden").unwrap(),
+                instance: tick_protocol::InstanceRef::new("shell", "hidden").unwrap(),
                 group: TickGroup::Shells,
                 glyph: Glyph::ShellTick,
                 title: "hidden Shell Tick".into(),
                 kind: "Shell".into(),
                 status: "running".into(),
-                owner: crate::tick_adapter::TickOwner::Unknown,
+                owner: crate::monitor_rows::TickOwner::Unknown,
                 updated_at_ms: None,
                 resources: None,
                 actions: Vec::new(),

@@ -1,0 +1,589 @@
+pub type LoopId = Uuid;
+
+pub type RunId = Uuid;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ChatSnapshot {
+    #[serde(default)]
+    pub failure_events: Vec<Event>,
+    #[serde(default)]
+    pub provider_failures: HashMap<String, ProviderHttpFailure>,
+    #[serde(skip)]
+    pub tool_call_recoveries: Vec<ToolCallRecovery>,
+    #[serde(default)]
+    pub artifact_ticks: Vec<ArtifactTick>,
+    #[serde(skip)]
+    pub removed_artifact_ticks: std::collections::BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "MonitorMembership::is_empty")]
+    pub monitor: MonitorMembership,
+    /// 本进程内的请求用量账本（不持久化，照 Claude Code 用量只记在 assistant 消息上）。
+    #[serde(skip)]
+    pub request_usage: RequestUsageLedger,
+    pub id: ChatId,
+    #[serde(default)]
+    pub branch_origin: Option<BranchOrigin>,
+    #[serde(default)]
+    pub delegation: Option<DelegationMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub family_completions: Vec<FamilyCompletion>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub family_inputs: BTreeMap<Uuid, FamilyInputRecord>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sent_agent_messages: BTreeMap<Uuid, AgentMessageSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_title: Option<String>,
+    pub workdir: PathBuf,
+    /// Chat 当前使用的模型，只在本进程内有效；恢复时使用宿主当前选择的模型。
+    #[serde(skip, default = "ModelConfig::unselected")]
+    pub model: ModelConfig,
+    #[serde(skip)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(skip, default = "thinking_enabled_by_default")]
+    pub thinking_enabled: bool,
+    pub messages: Vec<Message>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invoked_skills: Vec<InvokedSkill>,
+    #[serde(default)]
+    pub message_runs: BTreeMap<usize, RunId>,
+    #[serde(default)]
+    pub message_contexts: BTreeMap<usize, Vec<InputContext>>,
+    /// 消息在 Transcript 中的 uuid，文件回滚快照以此关联消息。用户提示与模型回复写入对话时
+    /// 确定，恢复时只重建用户提示的；其余消息的 uuid 在写入 Transcript 时生成。
+    #[serde(default)]
+    pub message_ids: BTreeMap<usize, Uuid>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_message_origins: BTreeMap<Uuid, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub human_family_origins: BTreeMap<Uuid, DirectedHumanSource>,
+    /// Stable source IDs for genuine prompts rewritten across directed summaries.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub original_user_message_ids: BTreeMap<usize, Uuid>,
+    /// Execution modes captured for user prompts that can serve as rewind points.
+    #[serde(default)]
+    pub prompt_execution_modes: BTreeMap<usize, ExecutionMode>,
+    /// Copied prompts in a Branch remain rewind points, but are not fresh child-Chat authorization.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub inherited_prompts: HashSet<usize>,
+    /// 压缩边界与压缩摘要消息（链上字段）。
+    #[serde(default)]
+    pub message_compactions: BTreeMap<usize, CompactionMarker>,
+    /// assistant 消息的用量（链上字段）。定向摘要保留的消息在恢复时照 Claude Code 清零。
+    #[serde(default)]
+    pub message_usage: BTreeMap<usize, Usage>,
+    #[serde(default)]
+    pub message_sources: BTreeMap<usize, PrivateHistorySource>,
+    #[serde(default)]
+    pub message_models: BTreeMap<usize, ModelIdentity>,
+    /// 链上字段：由对话链上的 Loop 条目重放得到。
+    #[serde(default)]
+    pub loops: Vec<LoopSnapshot>,
+    /// Trigger 已解除武装、等待用户向该 Loop 提交输入时重新武装的 Loop（重启恢复或 Branch
+    /// 复制后）。随 Loop 条目记录在对话链上。
+    #[serde(skip)]
+    pub resume_triggers: Vec<LoopId>,
+    /// The fields through `pending_model` are process-local state and are not persisted with the
+    /// Chat. Recovery starts them from defaults; persistent rules and context limits come from
+    /// user settings.
+    #[serde(skip)]
+    pub last_sequence: u64,
+    #[serde(skip)]
+    pub permissions: Vec<PermissionRequest>,
+    #[serde(skip)]
+    pub questions: Vec<QuestionRequest>,
+    #[serde(skip)]
+    pub pending_inputs: Vec<PendingInput>,
+    #[serde(skip)]
+    pub pending_commands: Vec<PendingCommand>,
+    #[serde(skip)]
+    pub last_queue_sequence: u64,
+    #[serde(skip)]
+    pub operations: Vec<OperationRecord>,
+    #[serde(skip)]
+    pub policy: PermissionPolicy,
+    #[serde(skip)]
+    pub additional_directories: Vec<PathBuf>,
+    #[serde(skip)]
+    pub events: Vec<Event>,
+    #[serde(skip)]
+    pub pending_thinking: BTreeMap<RunId, String>,
+    #[serde(skip)]
+    pub context_window_tokens: Option<usize>,
+    #[serde(skip)]
+    pub pending_model: Option<ModelConfig>,
+    /// 各 Loop 的计划与进度。计划内容写在 `<root>/plans/<slug>-loop-<loopId>.md`，版本与进度
+    /// 恢复时由对话链重建；批准时选择的模式只在本进程内有效。
+    #[serde(default)]
+    pub plans: Vec<Plan>,
+    #[serde(default)]
+    pub progress: Vec<Progress>,
+    /// 本进程内的 Agent 命令状态，不随 Chat 保存，重启后不可见。
+    #[serde(skip)]
+    pub commands: Vec<CommandSnapshot>,
+    /// 本进程内的 `!` 命令状态，不随 Chat 保存，重启后不可见。
+    #[serde(skip)]
+    pub user_shells: Vec<UserShellRecord>,
+    /// 本进程内最后一次模型回复所在的 run，只用于显示流式回复；不随 Chat 保存。
+    #[serde(skip)]
+    pub last_model_run: Option<RunId>,
+}
+
+fn thinking_enabled_by_default() -> bool {
+    true
+}
+
+impl ChatSnapshot {
+    pub fn run_response_text(&self, run: RunId) -> Option<String> {
+        self.messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(index, message)| {
+                message.role == Role::Assistant && self.message_runs.get(index) == Some(&run)
+            })
+            .map(|(_, message)| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        Content::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+    }
+
+    pub fn default_input_loop(&self) -> Option<LoopId> {
+        (self.loops.len() == 1).then(|| self.loops[0].id)
+    }
+
+    /// Whether the model that answers the next user input accepts images; a pending model
+    /// switch takes effect before that input runs.
+    pub fn accepts_images(&self) -> bool {
+        self.pending_model
+            .as_ref()
+            .unwrap_or(&self.model)
+            .accepts_images()
+    }
+
+    /// The highest `[Image #N]` pasted into this conversation, sent or queued, so a resumed
+    /// editor numbers new pastes after it.
+    pub fn highest_pasted_image_id(&self) -> Option<u32> {
+        self.message_contexts
+            .values()
+            .chain(self.pending_inputs.iter().map(|pending| &pending.contexts))
+            .flatten()
+            .filter_map(|context| match context {
+                InputContext::Image(ImageContext {
+                    origin: ImageOrigin::Pasted { id },
+                    ..
+                }) => Some(*id),
+                _ => None,
+            })
+            .max()
+    }
+
+    pub fn queued_inputs(&self) -> Vec<QueuedInput> {
+        let mut entries = self
+            .pending_inputs
+            .iter()
+            .filter(|pending| {
+                pending.trigger_source.is_none()
+                    && !pending.task_continuation
+                    && pending.agent_message.is_none()
+            })
+            .map(|pending| QueuedInput {
+                id: pending.receipt.run_id,
+                chat_id: pending.receipt.chat_id,
+                loop_id: Some(pending.receipt.loop_id),
+                kind: QueuedInputKind::Message,
+                text: pending.input.clone(),
+                contexts: pending.contexts.clone(),
+                queued_sequence: pending.queued_sequence,
+                armed: pending.armed,
+            })
+            .chain(self.pending_commands.iter().map(|command| QueuedInput {
+                id: command.id,
+                chat_id: command.chat_id,
+                loop_id: command.loop_id,
+                kind: QueuedInputKind::Command,
+                text: command.command.clone(),
+                contexts: Vec::new(),
+                queued_sequence: command.queued_sequence,
+                armed: command.armed,
+            }))
+            .chain(
+                self.user_shells
+                    .iter()
+                    .filter(|record| record.state == UserShellState::Queued)
+                    .map(|record| QueuedInput {
+                        id: record.id,
+                        chat_id: record.chat_id,
+                        loop_id: record.loop_id,
+                        kind: QueuedInputKind::Shell,
+                        text: record.command.clone(),
+                        contexts: Vec::new(),
+                        queued_sequence: record.queued_sequence,
+                        armed: record.armed,
+                    }),
+            )
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.queued_sequence);
+        entries
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Receipt {
+    pub chat_id: ChatId,
+    pub loop_id: LoopId,
+    pub run_id: RunId,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Event {
+    pub sequence: u64,
+    pub chat_id: ChatId,
+    pub loop_id: LoopId,
+    pub run_id: RunId,
+    pub kind: EventKind,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum EventKind {
+    FamilyInputUpdated {
+        record: FamilyInputRecord,
+    },
+    FamilyRunCompleted {
+        completion: FamilyCompletion,
+    },
+    Started,
+    Text(String),
+    Thinking(String),
+    AssistantMessageCommitted {
+        message_id: Uuid,
+        tool_calls: Vec<ProposedToolCall>,
+    },
+    Completed {
+        usage: Usage,
+    },
+    Failed(String),
+    ModelRetry {
+        kind: RequestKind,
+        error: String,
+        attempt: usize,
+        max_retries: usize,
+        delay_ms: u64,
+    },
+    Interrupted,
+    InputMerged {
+        into_run_id: RunId,
+    },
+    InputTakenBack,
+    AgentMessageQueued {
+        source: AgentMessageSource,
+    },
+    ConversationRewound {
+        message_id: Uuid,
+    },
+    PermissionRequested {
+        request: PermissionRequest,
+    },
+    QuestionAsked {
+        request: QuestionRequest,
+    },
+    GoalEnded {
+        reason: String,
+        operations: Vec<OperationRecord>,
+    },
+    ToolStarted {
+        call_id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolCompleted {
+        call_id: String,
+        result: ToolResult,
+    },
+    PermissionChecked {
+        decision: Decision,
+        reason: String,
+    },
+    ApprovalAssessed {
+        assessment: Box<ApprovalAssessmentDetails>,
+    },
+    AutoReviewerNotice {
+        notice: AutoReviewerNotice,
+    },
+    ContextCompaction {
+        status: CompactionStatus,
+        error: Option<String>,
+    },
+    PlanUpdated {
+        plan: Plan,
+    },
+    ProgressUpdated {
+        progress: Progress,
+    },
+    CommandUpdated {
+        command: CommandSnapshot,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProposedToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum AutoReviewerNotice {
+    Fallback { failure: ApprovalFailureKind },
+    Recovered,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum PermissionExecution {
+    ToolCall { run_id: RunId, call_id: String },
+    UserShell { command_id: Uuid },
+}
+
+impl PermissionExecution {
+    pub fn run_id(&self) -> Option<RunId> {
+        match self {
+            Self::ToolCall { run_id, .. } => Some(*run_id),
+            Self::UserShell { .. } => None,
+        }
+    }
+    pub fn call_key(&self) -> String {
+        match self {
+            Self::ToolCall { call_id, .. } => call_id.clone(),
+            Self::UserShell { command_id } => format!("user-shell:{command_id}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PermissionRequest {
+    pub id: Uuid,
+    pub loop_id: LoopId,
+    pub execution: PermissionExecution,
+    pub name: String,
+    pub input: serde_json::Value,
+    #[serde(default)]
+    pub file_change: Option<Box<PreparedFileChange>>,
+    #[serde(default)]
+    pub approval_reason: Option<String>,
+    #[serde(default)]
+    pub approval_source: PermissionApprovalSource,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionApprovalSource {
+    #[default]
+    PermissionPolicy,
+    ExplicitAsk,
+    SafetyCheck,
+    AutoReviewer,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum OperationState {
+    Proposed,
+    Admitted,
+    Completed,
+    Failed,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct OperationRecord {
+    pub id: Uuid,
+    pub loop_id: LoopId,
+    pub run_id: RunId,
+    pub call_id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+    #[serde(default)]
+    pub file_change: Option<PreparedFileChange>,
+    pub state: OperationState,
+    pub result: Option<ToolResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ToolCallRecovery {
+    pub run_id: Option<RunId>,
+    pub call_id: String,
+    pub was_admitted: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum UserShellState {
+    Queued,
+    WaitingPermission,
+    Running,
+    Background,
+    Cancelling,
+    Completed,
+    Failed,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct UserShellRecord {
+    pub id: Uuid,
+    pub chat_id: ChatId,
+    #[serde(default)]
+    pub loop_id: Option<LoopId>,
+    pub command: String,
+    pub cwd: PathBuf,
+    #[serde(default)]
+    pub starts_in_background: bool,
+    #[serde(default)]
+    pub queued_sequence: u64,
+    #[serde(default)]
+    pub armed: bool,
+    #[serde(default)]
+    pub preceding_model_runs: Vec<RunId>,
+    pub state: UserShellState,
+    pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub reason: Option<String>,
+    pub output_ref: Option<PathBuf>,
+    pub output_bytes: u64,
+    #[serde(default)]
+    pub updated_at_ms: Option<u64>,
+    /// 提交时的对话消息数，只用于 Task Center 排序。
+    pub submitted_at_message: usize,
+    /// Unix milliseconds when the Shell entered its current state; output growth does not move it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_since: Option<u64>,
+}
+
+impl UserShellRecord {
+    /// Whether the Shell still waits for admission: for approval, or accepted but without a
+    /// started process.
+    pub fn awaits_admission(&self) -> bool {
+        self.state == UserShellState::WaitingPermission
+            || self.state == UserShellState::Running && self.pid.is_none()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UserShellReceipt {
+    pub chat_id: ChatId,
+    pub command_id: Uuid,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PendingInput {
+    pub receipt: Receipt,
+    pub input: String,
+    #[serde(default)]
+    pub contexts: Vec<InputContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_message: Option<AgentMessageSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directed_human: Option<DirectedHumanSource>,
+    #[serde(default)]
+    pub denial_reference: Option<DenialReference>,
+    #[serde(default)]
+    pub trigger_source: Option<TriggerSource>,
+    #[serde(default)]
+    pub armed: bool,
+    #[serde(default)]
+    pub queued_sequence: u64,
+    /// A queued continuation for a completed background task; its notification is already in the conversation.
+    #[serde(default)]
+    pub task_continuation: bool,
+    #[serde(skip)]
+    pub is_skill_invocation: bool,
+    /// Files attached whole with the prompt; they count as read once the prompt enters the
+    /// conversation. Not persisted, so a restored prompt grants no reads.
+    #[serde(skip)]
+    pub attached_file_reads: Vec<(PathBuf, FileReadRecord)>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuedInputKind {
+    Message,
+    Command,
+    Shell,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PendingCommand {
+    pub id: Uuid,
+    pub chat_id: ChatId,
+    pub loop_id: Option<LoopId>,
+    pub command: String,
+    pub queued_sequence: u64,
+    #[serde(default)]
+    pub armed: bool,
+    #[serde(default)]
+    pub dispatched: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct QueuedInput {
+    pub id: Uuid,
+    pub chat_id: ChatId,
+    pub loop_id: Option<LoopId>,
+    pub kind: QueuedInputKind,
+    pub text: String,
+    #[serde(default)]
+    pub contexts: Vec<InputContext>,
+    pub queued_sequence: u64,
+    #[serde(default)]
+    pub armed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DirectoryTrustPolicy {
+    #[default]
+    CallerManaged,
+    RequireUserTrust,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PromptPolicy {
+    #[default]
+    Interactive,
+    DenyOnPrompt,
+    Unrestricted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentHostOptions {
+    pub execution_mode_override: Option<ExecutionMode>,
+    pub directory_trust: DirectoryTrustPolicy,
+    pub prompt_policy: PromptPolicy,
+}
+
+impl Default for AgentHostOptions {
+    fn default() -> Self {
+        Self::product_defaults()
+    }
+}
+
+impl AgentHostOptions {
+    pub const fn product_defaults() -> Self {
+        Self {
+            execution_mode_override: None,
+            directory_trust: DirectoryTrustPolicy::RequireUserTrust,
+            prompt_policy: PromptPolicy::Interactive,
+        }
+    }
+
+    pub const fn embedded_defaults() -> Self {
+        Self {
+            execution_mode_override: Some(ExecutionMode::AcceptEdits),
+            directory_trust: DirectoryTrustPolicy::CallerManaged,
+            prompt_policy: PromptPolicy::Interactive,
+        }
+    }
+}

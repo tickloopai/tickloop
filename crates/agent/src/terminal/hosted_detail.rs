@@ -167,12 +167,12 @@ mod tests {
             instance: "hosted:1a26e59c-a887-457d-8540-5079aea79ca0"
                 .parse()
                 .unwrap(),
-            group: crate::tick_adapter::TickGroup::Ticks,
+            group: crate::monitor_rows::TickGroup::Ticks,
             glyph: super::super::display::Glyph::ProtocolTick,
             title: "Keys".into(),
             kind: "Tick".into(),
             status: "live".into(),
-            owner: crate::tick_adapter::TickOwner::ThisChat,
+            owner: crate::monitor_rows::TickOwner::ThisChat,
             updated_at_ms: None,
             resources: None,
             actions: Vec::new(),
@@ -194,7 +194,7 @@ mod tests {
         assert!(text(&mut detail).contains("Screen    loading…"));
         assert_eq!(detail.hint(), "r refresh · Esc back");
         detail.show(Ok(HostedSnapshot {
-            screen: tickhost::screen::ScreenSnapshot {
+            screen: tickloop_agent_protocol::HostedScreenSnapshot {
                 lines: vec!["newest".into()],
                 truncated: true,
                 rows: 30,

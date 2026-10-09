@@ -14,19 +14,19 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tick_connect::{
-    host_error::HostError,
-    hosted::{CAPABILITY_LIFECYCLE, CONTROL_TIMEOUT, HostConnection, Role},
-};
 use tickhost::{
     host::{OpenRequest, OpenedTick, OwnerSnapshotChunk, Receipt, TickOwner},
     paths::HostPaths,
 };
+use tickhost_connect::{
+    host_error::HostError,
+    hosted::{BUILD_VERSION, CAPABILITY_LIFECYCLE, CONTROL_TIMEOUT, HostConnection, Role},
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-/// The daemon's hidden entry that runs the host library in its own process.
-pub const TICKHOST_RUN_ARGUMENTS: [&str; 2] = ["tickhost", "run"];
+/// The executable the daemon starts the Tickhost from: the one installed next to `tickloop`.
+pub const TICKHOST_EXECUTABLE: &str = "tickhost";
 const KEY_FILE: &str = "tickhost.key";
 pub const START_ATTEMPTS: u32 = 3;
 pub const START_WAIT: Duration = Duration::from_secs(3);
@@ -53,7 +53,7 @@ const HOST_NOT_RUNNING: &str = "HostNotRunning";
 pub struct HostedViewGrant {
     pub endpoint: PathBuf,
     pub host_epoch: Uuid,
-    pub instance: tick_connect::instance::InstanceRef,
+    pub instance: tick_protocol::InstanceRef,
     pub view: Uuid,
 }
 
@@ -64,7 +64,7 @@ pub struct WatchIntents(Value);
 impl WatchIntents {
     pub fn new(
         owner: &TickOwner,
-        instance: &tick_connect::instance::InstanceRef,
+        instance: &tick_protocol::InstanceRef,
         watches: &std::collections::BTreeSet<Uuid>,
     ) -> Result<Self, HostError> {
         let request = json!({"owner":owner,"instance":instance,"watches":watches});
@@ -86,19 +86,19 @@ pub struct OwnerListing {
 /// The instances one host epoch runs for an owner.
 pub struct HostListing {
     pub epoch: Uuid,
-    pub live: std::collections::HashSet<tick_connect::instance::InstanceRef>,
+    pub live: std::collections::HashSet<tick_protocol::InstanceRef>,
 }
 
 struct ListedPage {
     listing: HostListing,
-    next: Option<tick_connect::page::PageCursor>,
+    next: Option<tickhost_connect::page::PageCursor>,
 }
 
 impl HostListing {
     /// One page of a host `list` reply, which names the host epoch that produced it.
     fn from_page(page: &Value) -> Option<ListedPage> {
         let epoch = serde_json::from_value(page.get("epoch")?.clone()).ok()?;
-        let page: tick_connect::page::Page<tickhost::host::TickRow> =
+        let page: tickhost_connect::page::Page<tickhost::host::TickRow> =
             serde_json::from_value(page.clone()).ok()?;
         Some(ListedPage {
             listing: HostListing {
@@ -174,7 +174,7 @@ impl HostController {
         &self,
         operation: Uuid,
         owner: &TickOwner,
-        instance: &tick_connect::instance::InstanceRef,
+        instance: &tick_protocol::InstanceRef,
     ) -> Result<Receipt, HostError> {
         let value = match self
             .request(
@@ -291,7 +291,7 @@ impl HostController {
     pub async fn allow_view(
         &self,
         owner: &TickOwner,
-        instance: &tick_connect::instance::InstanceRef,
+        instance: &tick_protocol::InstanceRef,
     ) -> Result<HostedViewGrant, HostError> {
         let granted = self
             .request(
@@ -316,7 +316,7 @@ impl HostController {
     /// What the host runs for `owner`, read across all pages of one host, and the moment the
     /// reading began: launch records written after it are newer than the listing.
     pub async fn owner_listing(&self, owner: &TickOwner) -> Result<OwnerListing, HostError> {
-        let started_ms = crate::private_fs::unix_time_milliseconds();
+        let started_ms = tickloop_agent_base::private_fs::unix_time_milliseconds();
         Ok(OwnerListing {
             started_ms,
             running: self.live_instances(owner).await?,
@@ -393,7 +393,7 @@ impl HostController {
     pub async fn list(
         &self,
         owner: &TickOwner,
-        cursor: Option<tick_connect::page::PageCursor>,
+        cursor: Option<tickhost_connect::page::PageCursor>,
     ) -> Result<Value, HostError> {
         match self
             .request(
@@ -406,7 +406,7 @@ impl HostController {
         {
             Err(error) if error.code == HOST_NOT_RUNNING => {
                 let rows = Vec::<tickhost::host::TickRow>::new();
-                tick_connect::page::paginate(
+                tickhost_connect::page::paginate(
                     rows,
                     |row| row.terminal.to_string(),
                     cursor.as_ref(),
@@ -491,6 +491,7 @@ impl HostController {
                 key
             }
         };
+        self.check_executable()?;
         let mut last_failure = String::new();
         for _ in 0..START_ATTEMPTS {
             // A host that exits before it takes its configuration is one more failed start.
@@ -551,12 +552,43 @@ impl HostController {
         .await
     }
 
+    /// Refuses to start a Tickhost of another build: its version must be this daemon's.
+    fn check_executable(&self) -> Result<(), HostError> {
+        let output = std::process::Command::new(&self.executable)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|error| {
+                HostError::before(
+                    "HostUnavailable",
+                    format!(
+                        "cannot run the Tickhost {}: {error}; install tickhost next to tickloop from the same build",
+                        self.executable.display()
+                    ),
+                )
+            })?;
+        let reported = String::from_utf8_lossy(&output.stdout);
+        let expected = format!("{TICKHOST_EXECUTABLE} {BUILD_VERSION}");
+        if !output.status.success() || reported.trim() != expected {
+            return Err(HostError::before(
+                "IncompatibleHost",
+                format!(
+                    "the Tickhost {} reports {:?}, but this Agent needs {expected}; install tickloop and tickhost from the same build",
+                    self.executable.display(),
+                    reported.trim()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Starts the host as its own session: it outlives this daemon and is reaped here only
     /// while the daemon still runs.
     fn spawn(&self, key: &str) -> std::io::Result<()> {
         let mut command = std::process::Command::new(&self.executable);
         command
-            .args(TICKHOST_RUN_ARGUMENTS)
+            .arg(tickhost::cli::RUN_COMMAND)
             .env(tickhost::paths::RUNTIME_DIR_ENV, &self.paths.runtime)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())

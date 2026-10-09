@@ -5,9 +5,8 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tickloop_agent::model::{
-    Content, Message, ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest, Role,
-};
+use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+use tickloop_agent_protocol::{Content, Message, Role};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
@@ -31,14 +30,14 @@ impl RoutedModel {
 impl ModelClient for RoutedModel {
     async fn generate_title(
         &self,
-        request: tickloop_agent::model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        request: tickloop_agent_model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
         _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
         Ok(super::title_output(request))
     }
 
-    fn identity(&self) -> tickloop_agent::model::ModelIdentity {
+    fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
         super::ScriptedModel::new(vec![]).identity()
     }
     async fn complete(

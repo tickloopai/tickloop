@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{ChatSnapshot, SummaryDirection};
-use crate::model::{Content, Message, ModelConfig, Role, Usage};
+use super::{ChatBookkeeping, ChatSnapshot, SummaryDirection};
+use tickloop_agent_protocol::{Content, Message, ModelConfig, Role, Usage};
 
 /// 照 Claude Code `createCompactBoundaryMessage` 的 `content`。
 pub const COMPACT_BOUNDARY_TEXT: &str = "Conversation compacted";
@@ -156,13 +156,18 @@ impl CompactionLayout {
     /// 把保留的消息作为新条目直线重写在新边界之后，因此它们换上新的消息 id（关联提示 id 的文件
     /// 回滚快照由调用方按 [`Self::renamed_message_ids`] 重记）；其中 assistant 消息的用量照
     /// Claude Code 重接时的做法清零，被带到新边界之后的旧边界标记为 `preserved_by_later_summary`。
-    pub(super) fn apply(&self, snapshot: &ChatSnapshot) -> ChatSnapshot {
+    pub(super) fn apply(
+        &self,
+        snapshot: &ChatSnapshot,
+        bookkeeping: &ChatBookkeeping,
+    ) -> (ChatSnapshot, ChatBookkeeping) {
         let rewrites_existing = !self.keeps_existing_prefix(snapshot.messages.len());
         let mut compacted = snapshot.clone();
+        let mut compacted_bookkeeping = bookkeeping.clone();
         compacted.messages = Vec::with_capacity(self.sources.len());
         compacted.message_runs = BTreeMap::new();
         compacted.message_contexts = BTreeMap::new();
-        compacted.denial_references = BTreeMap::new();
+        compacted_bookkeeping.denial_references = BTreeMap::new();
         compacted.message_ids = BTreeMap::new();
         compacted.original_user_message_ids = BTreeMap::new();
         compacted.prompt_execution_modes = BTreeMap::new();
@@ -181,8 +186,10 @@ impl CompactionLayout {
                     if let Some(contexts) = snapshot.message_contexts.get(&original) {
                         compacted.message_contexts.insert(index, contexts.clone());
                     }
-                    if let Some(reference) = snapshot.denial_references.get(&original) {
-                        compacted.denial_references.insert(index, reference.clone());
+                    if let Some(reference) = bookkeeping.denial_references.get(&original) {
+                        compacted_bookkeeping
+                            .denial_references
+                            .insert(index, reference.clone());
                     }
                     if let Some(id) = snapshot.message_ids.get(&original) {
                         let id = if rewrites_existing {
@@ -277,11 +284,11 @@ impl CompactionLayout {
             }
         }
         if rewrites_existing {
-            for start in compacted.loop_starts.values_mut() {
+            for start in compacted_bookkeeping.loop_starts.values_mut() {
                 *start = self.moved_loop_start(*start, snapshot.messages.len());
             }
         }
-        compacted
+        (compacted, compacted_bookkeeping)
     }
 
     /// 定向摘要后 Loop 的创建位置：压缩后对话中第一条代表创建之后消息的条目之前。保留的消息

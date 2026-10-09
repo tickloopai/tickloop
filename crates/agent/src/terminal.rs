@@ -5,21 +5,17 @@ use std::{
     path::PathBuf,
 };
 
-use tick_connect::{access::TickAccess, herdr::HerdrContext};
+use tickhost_connect::{access::TickAccess, herdr::HerdrContext};
 
-use tickloop_agent::{
-    model::{ModelConfig, ReasoningEffort, Usage},
-    permissions::{Decision, ExecutionMode, PermissionRule, PermissionScope},
-    runtime::{
-        AgentError, AgentHostOptions, BranchOutcome, BranchRequest, ChatSnapshot,
-        DirectoryTrustPolicy, EventKind, InputContext, LoopId, PermissionChange, PromptPolicy,
-        QuestionRequest, Receipt, RequestKind, RequestOutcome, ShellTaskNotice,
-        ShellTaskPromptWatchdog, ShellTaskState, ShellTaskSubscriptionEvent, TaskNotification,
-        TaskNotificationStatus, TodoItem, Trigger, TriggerSource, UserShellRecord, UserShellState,
-    },
-    settings::{LoadedSettings, UserSettings, config_root_directory},
-    tools::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME},
+use tickloop_agent::runtime::{
+    AgentError, AgentHostOptions, BranchOutcome, BranchRequest, ChatSnapshot, DirectoryTrustPolicy,
+    EventKind, InputContext, LoopId, PermissionChange, PromptPolicy, QuestionRequest, Receipt,
+    RequestKind, RequestOutcome, ShellTaskNotice, ShellTaskPromptWatchdog, ShellTaskState,
+    ShellTaskSubscriptionEvent, TaskNotification, TaskNotificationStatus, TodoItem, Trigger,
+    TriggerSource, UserShellRecord, UserShellState,
 };
+use tickloop_agent_config::{LoadedSettings, UserSettings, config_root_directory};
+use tickloop_agent_tools::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
 use tokio::sync::{broadcast, mpsc};
 
 mod artifact_ui;
@@ -87,7 +83,7 @@ mod subscription_surface;
 mod task_access;
 mod task_surface;
 #[cfg(test)]
-#[path = "../tests/support/mod.rs"]
+#[path = "../tests/support/common.rs"]
 mod test_support;
 mod thinking_preview;
 pub mod tick_actions;
@@ -118,6 +114,9 @@ use style::Role;
 
 const DISCONNECTED_CACHED_VIEW_NOTICE: &str = "Disconnected · cached view";
 const VIEW_REGISTRATION_UNAVAILABLE_NOTICE: &str = "View registration unavailable";
+const DISPATCH_DIRECTORY_MISSING: &str = "Dispatch directory must exist";
+const EXECUTION_UNAVAILABLE_FOR_INPUT: &str =
+    "This execution is unavailable; inspect cached history or use /resume explicitly";
 use subscription_surface::SubscriptionEffect;
 use tickloop_agent::agent_access::{
     AgentDetailQuery, ConfigurationChange, ObservationRequest, ObservationValue,
@@ -127,6 +126,10 @@ use task_access::{ShellTaskCenter, ShellTaskSubscription};
 /// How often an open subscription view re-reads the Agent's snapshot; an unchanged one repaints
 /// nothing, so the poll only has to be fast enough to look live.
 use thinking_preview::ThinkingPreview;
+use tickloop_agent_model::{ModelConfigExt, ReasoningEffortExt};
+use tickloop_agent_protocol::{
+    Decision, ExecutionMode, ModelConfig, PermissionRule, PermissionScope, ReasoningEffort, Usage,
+};
 use workflows::Workflow;
 
 const SUBSCRIPTION_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
@@ -635,7 +638,7 @@ Starting without -c or -r opens a new Chat.
 --chat-id opens or creates one exact saved Chat identity.
 Chats are saved under ~/.tickloop, or TICKLOOP_CONFIG_DIR when it is set.
 --no-session-persistence runs without saving Chats; so does cleanupPeriodDays 0 in settings.json.
-Transcripts, large tool results, plans, file backups and paste cache older than cleanupPeriodDays (default 30) are removed in the background 10 minutes after the first prompt (at start when input is not a terminal), later while you are typing.
+Saved Chats and their files are never removed automatically.
 /provider opens Codex subscription authorization; choose browser or device code there. Judgment settings manages the separate Jev (TypeSafe) key.
 /provider: press s to sign out of Codex locally; requests already sent are not revoked.
 Built-in /model choices and persistent rules are saved in settings.json there; model definitions are owned by the program version.
@@ -893,10 +896,10 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         .map(LoadedSettings::into_warnings)
         .unwrap_or_default();
     let config = saved_model.unwrap_or_else(|| {
-        crate::model::cards::ModelCatalog::defaults()
+        tickloop_agent_model::cards::ModelCatalog::defaults()
             .get(
                 "deepseek-api",
-                crate::model::access::AccessCatalog::defaults()
+                tickloop_agent_model::access::AccessCatalog::defaults()
                     .recommended_model("deepseek-api")
                     .expect("built-in recommendation"),
             )
@@ -937,8 +940,8 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
                     client: None,
                 }),
                 Some(
-                    std::sync::Arc::new(crate::tick_adapter::HerdrDiscovery::new(access))
-                        as std::sync::Arc<dyn crate::tick_adapter::TickDiscovery>,
+                    std::sync::Arc::new(crate::monitor_rows::HerdrDiscovery::new(access))
+                        as std::sync::Arc<dyn crate::monitor_rows::TickDiscovery>,
                 ),
             )
         } else {
@@ -975,7 +978,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     };
     if (resumes_saved_chat || exact_chat.is_some()) && !agent.saves_chats() {
         return Err(
-            "conversations are not saved because cleanupPeriodDays is 0 in settings.json; set it to a positive number of days to keep and resume Chats".into(),
+            "conversations are not saved because cleanupPeriodDays is 0 in settings.json; remove it or set it to a positive number to keep and resume Chats".into(),
         );
     }
     let startup = if let Some(chat) = exact_chat {
@@ -1924,11 +1927,7 @@ async fn interact(
             && menu_commands.is_empty()
             && eof
         {
-            return if failed {
-                Err("one or more tasks failed; review the errors above".into())
-            } else {
-                Ok(())
-            };
+            return view_exit(interactive, failed);
         }
         let summary_input_locked =
             !directed_summaries.is_empty() || !summary_recovery_required.is_empty();
@@ -2060,7 +2059,7 @@ async fn interact(
                             }
                         }
                     }
-                    Err(crate::auth::AuthError::Cancelled) => outln!(console, "Logout cancelled; saved login remains."),
+                    Err(tickloop_agent_model::auth::AuthError::Cancelled) => outln!(console, "Logout cancelled; saved login remains."),
                     Err(error) => outln!(console, "Cannot log out: {}", safe_text(&error.to_string())),
                 }
                 reauthenticate_after_logout = false;
@@ -2579,7 +2578,7 @@ async fn interact(
                     if let Some(id) = active_login {
                         if matches!(line.trim(), "cancel" | "/cancel" | "/exit") {
                             close_login_session(logins.remove(&id).unwrap(), console, &mut menus, true)?;
-                            if line.trim() == "/exit" { return Ok(()); }
+                            if line.trim() == "/exit" { return view_exit(interactive, failed); }
                         } else if logins[&id].flow.is_browser() && !logins[&id].flow.completed() {
                             logins[&id].flow.submit_callback(console, Some(&line))?;
                         } else {
@@ -2606,14 +2605,14 @@ async fn interact(
                         continue;
                     }
                     if overview_active {
-                        if line.trim()=="/exit" {return Ok(());}
+                        if line.trim()=="/exit" {return view_exit(interactive,failed);}
                         // The reference is shown in place; only a command the overview cannot name becomes a Skill dispatch.
                         if line.trim()=="/help advanced" {menus.help_advanced(console)?;continue;}
                         if let Some(command_id)=line.trim().strip_prefix("/acknowledge-create ") {
                             match command_id.parse::<uuid::Uuid>().map_err(|error|error.to_string())
                                 .and_then(|id|global.interpret(crate::agent_console::Intent::AcknowledgeUnconfirmedDispatch(id)).map_err(|error|error.to_string())) {
                                 Ok(_)=>{console.set_creation_notice(None)?;console.set_status("Unknown creation acknowledged; no command was replayed")?;},
-                                Err(error)=>console.restore_rejected_prompt(restored_contexts,&error)?,
+                                Err(error)=>{console.restore_rejected_prompt(restored_contexts,&error)?;report_refused_input(console,&error,&mut failed);},
                             }
                             continue;
                         }
@@ -2631,7 +2630,7 @@ async fn interact(
                                     console.set_global_overview(None)?;global.interpret(crate::agent_console::Intent::Back).map_err(|error|error.to_string())?;
                                     overview_active=false;history_return_overview=true;menus.conversations(console,workflow)?;
                                 },
-                                Err(error)=>console.restore_rejected_prompt(restored_contexts,&error)?,
+                                Err(error)=>{console.restore_rejected_prompt(restored_contexts,&error)?;report_refused_input(console,&error,&mut failed);},
                             }
                             continue;
                         }
@@ -2642,7 +2641,7 @@ async fn interact(
                                     overview_active=false;goal=show_opened_chat(console,agent,&snapshot,true)?;selected_chat=Some(snapshot.id);
                                     sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
                                 },
-                                Err(error)=>console.restore_rejected_prompt(restored_contexts,&error)?,
+                                Err(error)=>{console.restore_rejected_prompt(restored_contexts,&error)?;report_refused_input(console,&error,&mut failed);},
                             }
                             continue;
                         }
@@ -2651,7 +2650,7 @@ async fn interact(
                             let directory=if directory.is_absolute(){directory}else{global.projection().dispatch_directory.join(directory)};
                             match directory.canonicalize() {
                                 Ok(directory) if directory.is_dir()=>{global.interpret(crate::agent_console::Intent::DispatchDirectory(directory)).map_err(|error|error.to_string())?;},
-                                _=>{console.restore_rejected_prompt(restored_contexts,"Dispatch directory must exist")?;continue;}
+                                _=>{console.restore_rejected_prompt(restored_contexts,DISPATCH_DIRECTORY_MISSING)?;report_refused_input(console,DISPATCH_DIRECTORY_MISSING,&mut failed);continue;}
                             }
                             global_refresh.reset_immediately();status_dirty=true;continue;
                         }
@@ -2660,7 +2659,9 @@ async fn interact(
                             continue;
                         }
                         if let Some((command,reason))=completion::unavailable_command(&line,completion::CommandScope::Overview) {
-                            console.restore_rejected_prompt(restored_contexts,&completion::command_refusal(console.command_scope(),command,reason))?;
+                            let refusal=completion::command_refusal(console.command_scope(),command,reason);
+                            console.restore_rejected_prompt(restored_contexts,&refusal)?;
+                            report_refused_input(console,&refusal,&mut failed);
                             continue;
                         }
                         let input=if let Some(skill)=line.trim().strip_prefix('/') {
@@ -2671,16 +2672,30 @@ async fn interact(
                         };
                         console.record_input(&line)?;console.record_prompt_history(&line)?;
                         if let Err(error)=agent.refresh_interaction_source().await {
-                            console.restore_rejected_prompt(restored_contexts,&safe_line(&error.to_string()))?;
+                            let reason=safe_line(&error.to_string());
+                            console.restore_rejected_prompt(restored_contexts,&reason)?;
+                            report_refused_input(console,&reason,&mut failed);
                             continue;
                         }
                         match global.dispatch(agent.launch_spec(),input,agent.origin()).await {
                             Ok(receipt)=>match agent.accept_created(receipt).await {
                                 CreationAcceptance::Attached(submitted)=>{if let Some(receipt)=submitted {suggestible_runs.insert(receipt.run_id);pending.insert(receipt.run_id,receipt);}},
-                                CreationAcceptance::AttachUnavailable(error)=>console.set_status(&creation_attach_unavailable(&error))?,
-                                CreationAcceptance::Rejected(error)=>console.restore_rejected_prompt(restored_contexts,&format!("New Agent was not accepted: {error}"))?,
+                                CreationAcceptance::AttachUnavailable(error)=>{
+                                    let notice=creation_attach_unavailable(&error);
+                                    console.set_status(&notice)?;
+                                    report_refused_input(console,&notice,&mut failed);
+                                },
+                                CreationAcceptance::Rejected(error)=>{
+                                    let reason=format!("New Agent was not accepted: {error}");
+                                    console.restore_rejected_prompt(restored_contexts,&reason)?;
+                                    report_refused_input(console,&reason,&mut failed);
+                                },
                             },
-                            Err(error)=>console.restore_rejected_prompt(restored_contexts,&format!("New Agent acceptance is unconfirmed: {error}; check the receipt before another submission"))?,
+                            Err(error)=>{
+                                let reason=format!("New Agent acceptance is unconfirmed: {error}; check the receipt before another submission");
+                                console.restore_rejected_prompt(restored_contexts,&reason)?;
+                                report_refused_input(console,&reason,&mut failed);
+                            },
                         }
                         show_creation_feedback(console,&global.projection())?;
                         global_refresh.reset_immediately();
@@ -2689,7 +2704,8 @@ async fn interact(
                     if selected_chat.is_some() && agent.disconnected().is_some()
                         && !matches!(line.trim(),"/exit"|"/clear"|"/status"|"/help"|"/help advanced"|"/resume"|"/tui"|"/details")
                         && !line.trim().starts_with("/resume ") {
-                        console.restore_rejected_prompt(restored_contexts,"This execution is unavailable; inspect cached history or use /resume explicitly")?;
+                        console.restore_rejected_prompt(restored_contexts,EXECUTION_UNAVAILABLE_FOR_INPUT)?;
+                        report_refused_input(console,EXECUTION_UNAVAILABLE_FOR_INPUT,&mut failed);
                         continue;
                     }
                     if let (Some(source_chat), Some(target)) = (selected_chat, family_target) {
@@ -2706,9 +2722,19 @@ async fn interact(
                                 if let Some(id) = adopted { console.set_status(&input_adopted(id))?; }
                                 global_refresh.reset_immediately();
                             }
-                            InputSend::Unknown(id, error) => console.restore_unknown_prompt(restored_contexts, &error.to_string(), Some(id))?,
-                            InputSend::Held(error) => console.restore_unknown_prompt(restored_contexts, &error.to_string(), None)?,
-                            InputSend::Failed(error) => console.restore_rejected_prompt(restored_contexts, &format!("Directed message failed · {}", safe_line(&error.to_string())))?,
+                            InputSend::Unknown(id, error) => {
+                                console.restore_unknown_prompt(restored_contexts, &error.to_string(), Some(id))?;
+                                report_refused_input(console, &error.to_string(), &mut failed);
+                            }
+                            InputSend::Held(error) => {
+                                console.restore_unknown_prompt(restored_contexts, &error.to_string(), None)?;
+                                report_refused_input(console, &error.to_string(), &mut failed);
+                            }
+                            InputSend::Failed(error) => {
+                                let reason = format!("Directed message failed · {}", safe_line(&error.to_string()));
+                                console.restore_rejected_prompt(restored_contexts, &reason)?;
+                                report_refused_input(console, &reason, &mut failed);
+                            }
                         }
                         status_dirty = true; continue;
                     }
@@ -2746,12 +2772,17 @@ async fn interact(
                                 InputSend::Unknown(id, error)=>{
                                     if let Some(echo)=echo {console.withdraw_echo(Some(chat),echo)?;}
                                     console.restore_unknown_prompt(restored_contexts,&safe_line(&error.to_string()),Some(id))?;
+                                    report_refused_input(console,&error.to_string(),&mut failed);
                                 },
                                 InputSend::Held(error)=>{
                                     if retry_of.is_none() && let Some(echo)=echo {console.withdraw_echo(Some(chat),echo)?;}
                                     console.restore_unknown_prompt(restored_contexts,&safe_line(&error.to_string()),None)?;
+                                    report_refused_input(console,&error.to_string(),&mut failed);
                                 },
-                                InputSend::Failed(error)=>console.restore_unknown_prompt(restored_contexts,&safe_line(&error.to_string()),None)?,
+                                InputSend::Failed(error)=>{
+                                    console.restore_unknown_prompt(restored_contexts,&safe_line(&error.to_string()),None)?;
+                                    report_refused_input(console,&error.to_string(),&mut failed);
+                                },
                             }
                             status_dirty=true;
                             continue;
@@ -2769,7 +2800,7 @@ async fn interact(
                     }
                     if should_dismiss_menu_before_dispatch(&line) {menus.dismiss(console)?;}
                     match line.as_str() {
-                        "/exit" => return Ok(()),
+                        "/exit" => return view_exit(interactive, failed),
                         "/help" | "/" if interactive => menus.help(console,None)?,
                         "/help" => outln!(console, "{}",help_text()),
                         "/help advanced" if interactive => menus.help_advanced(console)?,
@@ -2777,7 +2808,7 @@ async fn interact(
                         command if command == "/artifacts" || command.starts_with("/artifacts ") => {
                             if command.trim() != "/artifacts" { outln!(console, "Use /artifacts"); continue; }
                             let Some(root) = config_root.as_ref() else { outln!(console, "Artifact Service needs a state directory; set TICKLOOP_CONFIG_DIR."); continue; };
-                            match tickloop_agent::artifacts::ArtifactClient::new(root).map_err(|error| error.to_string()) {
+                            match tickloop_agent_artifacts::ArtifactClient::new(root).map_err(|error| error.to_string()) {
                                 Ok(client) => match client.status().await {
                                     Ok(Some(_)) => { if let Err(error) = artifact_ui::open(agent, console, root, selected_chat, interactive).await { outln!(console, "Cannot open Artifacts: {}", safe_text(&error)); } }
                                     Ok(None) => match LoginFlow::start(root.clone(), console, login::LoginMethod::Artifact) { Ok(flow) => { logins.insert(flow.id(), LoginSession { flow, from_provider: false, succeeded: false }); }, Err(error) => outln!(console, "Cannot start Artifact Service login: {}", safe_text(&error)) },
@@ -3021,7 +3052,7 @@ async fn interact(
                             let result=async {
                                 let config=if path=="off" {None} else {
                                     let bytes=std::fs::read(path).map_err(|_|"cannot read search configuration file")?;
-                                    Some(serde_json::from_slice::<tickloop_agent::tools::SearchConfig>(&bytes).map_err(|_|"invalid search configuration JSON; provide endpoint and optional api_key_env")?)
+                                    Some(serde_json::from_slice::<tickloop_agent_protocol::SearchConfig>(&bytes).map_err(|_|"invalid search configuration JSON; provide endpoint and optional api_key_env")?)
                                 };
                                 agent.change_configuration(target,ConfigurationChange::Search {config:config.clone()}).await.map_err(|error|error.to_string())?;
                                 Ok::<_,String>(config)
@@ -3269,7 +3300,7 @@ async fn interact(
                             }
                             let chat_id = match ensure_chat_for_input(console,agent,&mut selected_chat,&directory,retry_of,&original_input,&mut echo).await? {
                                 Ok(chat)=>chat,
-                                Err(error)=>{console.restore_rejected_prompt(restored_contexts,&error)?;status_dirty=true;continue;},
+                                Err(error)=>{console.restore_rejected_prompt(restored_contexts,&error)?;report_refused_input(console,&error,&mut failed);status_dirty=true;continue;},
                             };
                             if !agent.has_skill(chat_id, name).await.map_err(|error|error.to_string())? {
                                 outln!(console, "Unknown command; use /help.");
@@ -3289,11 +3320,13 @@ async fn interact(
                                     if let Some(echo)=echo {console.withdraw_echo(Some(chat_id),echo)?;}
                                     outln!(console, "Failed: {}", safe_text(&error.to_string()));
                                     console.restore_unknown_prompt(restored_contexts,&safe_line(&error.to_string()),Some(id))?;
+                                    failed=true;
                                 },
                                 InputSend::Held(error) => {
                                     if retry_of.is_none() && let Some(echo)=echo {console.withdraw_echo(Some(chat_id),echo)?;}
                                     outln!(console, "Failed: {}", safe_text(&error.to_string()));
                                     console.restore_unknown_prompt(restored_contexts,&safe_line(&error.to_string()),None)?;
+                                    failed=true;
                                 },
                                 InputSend::Failed(error) => outln!(console, "Unknown or unavailable Skill: {}", safe_text(&error.to_string())),
                             }
@@ -3313,7 +3346,7 @@ async fn interact(
                             let directory=global.projection().dispatch_directory;
                             let chat_id = match ensure_chat_for_input(console,agent,&mut selected_chat,&directory,retry_of,&original_input,&mut echo).await? {
                                 Ok(chat)=>chat,
-                                Err(error)=>{console.restore_rejected_prompt(restored_contexts,&error)?;status_dirty=true;continue;},
+                                Err(error)=>{console.restore_rejected_prompt(restored_contexts,&error)?;report_refused_input(console,&error,&mut failed);status_dirty=true;continue;},
                             };
                             if record_after_chat {
                                 console.record_prompt_history(&original_input)?;
@@ -3871,8 +3904,16 @@ async fn interact(
                         if let Ok(Some(receipt))=global.reconcile_dispatch().await {
                             match agent.accept_created(receipt).await {
                                 CreationAcceptance::Attached(submitted)=>{if let Some(receipt)=submitted {pending.insert(receipt.run_id,receipt);}},
-                                CreationAcceptance::AttachUnavailable(error)=>console.set_status(&creation_attach_unavailable(&error))?,
-                                CreationAcceptance::Rejected(error)=>console.set_status(&safe_text(&format!("Creation receipt resolved: {error}")))?,
+                                CreationAcceptance::AttachUnavailable(error)=>{
+                                    let notice=creation_attach_unavailable(&error);
+                                    console.set_status(&notice)?;
+                                    report_refused_input(console,&notice,&mut failed);
+                                },
+                                CreationAcceptance::Rejected(error)=>{
+                                    let notice=safe_text(&format!("Creation receipt resolved: {error}"));
+                                    console.set_status(&notice)?;
+                                    report_refused_input(console,&notice,&mut failed);
+                                },
                             }
                         }
                         let projection=global.projection();
@@ -4126,9 +4167,9 @@ fn set_monitor_visible(
     let settings =
         settings.ok_or("No Agent state directory is configured; cannot save Monitor preference")?;
     let preference = if show {
-        crate::settings::MonitorPreference::Auto
+        tickloop_agent_config::MonitorPreference::Auto
     } else {
-        crate::settings::MonitorPreference::Hidden
+        tickloop_agent_config::MonitorPreference::Hidden
     };
     settings
         .save_monitor_preference(preference)
@@ -5257,7 +5298,7 @@ async fn command_control(
 
 fn print_command(
     console: &Console,
-    command: &tickloop_agent::tools::CommandSnapshot,
+    command: &tickloop_agent_protocol::CommandSnapshot,
 ) -> Result<(), String> {
     outln!(
         console,
@@ -5606,7 +5647,7 @@ fn consumed_input_text(snapshot: &ChatSnapshot, input: uuid::Uuid) -> Option<&st
         .enumerate()
         .find_map(|(index, message)| {
             if snapshot.message_runs.get(&index) != Some(&input)
-                || message.role != tickloop_agent::model::Role::User
+                || message.role != tickloop_agent_protocol::Role::User
             {
                 return None;
             }
@@ -5618,7 +5659,7 @@ fn consumed_input_text(snapshot: &ChatSnapshot, input: uuid::Uuid) -> Option<&st
                 return None;
             }
             message.content.iter().find_map(|content| match content {
-                tickloop_agent::model::Content::Text { text }
+                tickloop_agent_protocol::Content::Text { text }
                     if presentation::typed_local_message(text, false).is_none()
                         && !conversation::is_interruption_placeholder(message.role, text) =>
                 {
@@ -5655,13 +5696,13 @@ fn show_consumed_family_input(
                 Some(Role::MutedText),
             )])?;
             for content in &message.content {
-                if let tickloop_agent::model::Content::Text { text } = content {
+                if let tickloop_agent_protocol::Content::Text { text } = content {
                     console.write(&format!("{}\n", safe_text(text)))?;
                 }
             }
         }
         for content in &message.content {
-            if let tickloop_agent::model::Content::Text { text } = content
+            if let tickloop_agent_protocol::Content::Text { text } = content
                 && let Some(
                     local @ tickloop_agent::runtime::LocalMessage::AgentCommunication { .. },
                 ) = tickloop_agent::runtime::LocalMessage::parse(text)
@@ -6556,6 +6597,25 @@ fn creation_notice(projection: &crate::agent_console::Projection) -> Option<Stri
     })
 }
 
+/// Piped input that hit a failure exits non-zero, also when it ends with /exit; an interactive
+/// View has already shown every failure.
+fn view_exit(interactive: bool, failed: bool) -> Result<(), String> {
+    if failed && !interactive {
+        Err("one or more tasks failed; review the errors above".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Piped input has no editor or status line to hold a refused input, so the reason goes to
+/// stderr and the process ends as failed.
+fn report_refused_input(console: &Console, reason: &str, failed: &mut bool) {
+    if !console.is_interactive() {
+        eprintln!("Failed: {}", safe_line(reason));
+        *failed = true;
+    }
+}
+
 fn creation_attach_unavailable(error: &AgentError) -> String {
     format!(
         "New Agent created; local connection unavailable · {}",
@@ -6758,7 +6818,7 @@ async fn navigate_agent(
     reply_lines: &mut HashMap<uuid::Uuid, ReplyLines>,
 ) -> Result<Option<ChatSnapshot>, String> {
     use crate::agent_console::{Destination, Intent};
-    use tick_connect::herdr::{HerdrPort, SocketHerdr};
+    use tickhost_connect::herdr::{HerdrPort, SocketHerdr};
     for _ in 0..2 {
         if let Destination::Unavailable(record) = &effect.destination {
             console.set_status(&format!(
@@ -6924,7 +6984,7 @@ async fn navigate_agent(
                         return Ok(None);
                     }
                 };
-                let current: tick_connect::herdr::Pane =
+                let current: tickhost_connect::herdr::Pane =
                     match serde_json::from_value(pane["pane"].clone()) {
                         Ok(pane) => pane,
                         Err(error) => {
@@ -7083,9 +7143,9 @@ mod tests {
         };
         let row: crate::agent_access::AgentSummary = serde_json::from_value(serde_json::json!({"execution":child,"chat_id":child.agent_id,"workdir":"/test","state":"Completed","title":"Title","has_work":true,"waiting_permissions":0,"waiting_questions":0,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"subagent":{"child_chat_id":child.agent_id,"handle":"audit","description":"Check \u{001b}[2J evidence","created_at":1}})).unwrap();
         let row = super::agent_rows(&[row], false).pop().unwrap();
-        for glyph_set in crate::settings::GlyphSet::ALL {
+        for glyph_set in tickloop_agent_config::GlyphSet::ALL {
             let display =
-                super::display::DisplayProfile::new(crate::settings::DisplayPreferences {
+                super::display::DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
                     glyph_set,
                     ..Default::default()
                 });
@@ -7462,20 +7522,19 @@ mod tests {
         collections::{HashMap, HashSet},
         path::PathBuf,
     };
-    use tickloop_agent::permissions::{Decision, PermissionRule};
     use tickloop_agent::runtime::{RequestKind, RequestOutcome, RequestOwner};
+    use tickloop_agent_protocol::{Decision, PermissionRule};
     use uuid::Uuid;
 
     #[tokio::test]
     async fn todos_show_their_content_and_the_running_goal_shows_its_active_form() {
         use super::{RunningShimmer, style};
-        use tickloop_agent::settings;
 
         let directory = tempfile::tempdir().unwrap();
         let model = Arc::new(support::ScriptedModel::new(vec![
             support::call(
                 "todos",
-                tickloop_agent::tools::TODO_WRITE_TOOL_NAME,
+                tickloop_agent_tools::TODO_WRITE_TOOL_NAME,
                 serde_json::json!({"todos": [
                     {"content": "Read the notes", "status": "completed", "activeForm": "Reading the notes"},
                     {"content": "Draft the\nreport", "status": "in_progress", "activeForm": "Drafting\tthe\nreport"},
@@ -7526,10 +7585,13 @@ mod tests {
             working_activity(&snapshot, Some(receipt.loop_id)),
             "Drafting the report"
         );
-        for glyph_set in [settings::GlyphSet::Unicode, settings::GlyphSet::NerdFont] {
+        for glyph_set in [
+            tickloop_agent_config::GlyphSet::Unicode,
+            tickloop_agent_config::GlyphSet::NerdFont,
+        ] {
             let (console, _) = Console::start_with_display(
                 false,
-                settings::DisplayPreferences {
+                tickloop_agent_config::DisplayPreferences {
                     glyph_set,
                     prefers_reduced_motion: true,
                 },
@@ -7589,7 +7651,7 @@ mod tests {
         let model = Arc::new(support::ScriptedModel::new(vec![
             support::call(
                 "first-todos",
-                tickloop_agent::tools::TODO_WRITE_TOOL_NAME,
+                tickloop_agent_tools::TODO_WRITE_TOOL_NAME,
                 serde_json::json!({"todos":[
                     {"content":"Draft the first report","status":"in_progress","activeForm":"Drafting the first report"},
                     {"content":"Review the first report","status":"pending","activeForm":"Reviewing the first report"},
@@ -7598,7 +7660,7 @@ mod tests {
             support::text("First goal recorded."),
             support::call(
                 "second-todos",
-                tickloop_agent::tools::TODO_WRITE_TOOL_NAME,
+                tickloop_agent_tools::TODO_WRITE_TOOL_NAME,
                 serde_json::json!({"todos":[
                     {"content":"Check the second dataset","status":"completed","activeForm":"Checking the second dataset"},
                     {"content":"Summarize the second dataset","status":"in_progress","activeForm":"Summarizing the second dataset"},
@@ -7687,7 +7749,7 @@ mod tests {
         let chat_id = agent.create_chat(PathBuf::from("/tmp")).await.unwrap();
         let mut snapshot = agent.snapshot(chat_id).await.unwrap();
         assert_eq!(context_usage(&snapshot), None);
-        snapshot.model = tickloop_agent::model::cards::ModelCatalog::defaults()
+        snapshot.model = tickloop_agent_model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash-messages")
             .unwrap();
         assert_eq!(context_usage(&snapshot), Some((0, 1_000_000)));
@@ -7715,7 +7777,7 @@ mod tests {
             .request_usage
             .observe(
                 request,
-                tickloop_agent::model::Usage {
+                tickloop_agent_protocol::Usage {
                     input_tokens: Some(10_000),
                     output_tokens: None,
                     cache_read_input_tokens: Some(2_000),

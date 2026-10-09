@@ -7,11 +7,15 @@ Tick Loop 提供完整的终端 Agent 和 example Tick。使用原生 Herdr 的 
 | 成员 | 二进制 | 内容 |
 | --- | --- | --- |
 | `crates/agent` | `tickloop` | 完整 Agent Console、工具、权限、Transcript 和 Loop |
-| `crates/ticks` | `tick` | 金融示例、离线 demo 和外部协议 launcher |
-| `crates/tick-connect` | — | Herdr 接入、每实例 Session 与通用 Tick 协议 |
+| `tickhost/host` | `tickhost` | Tick 宿主服务（`tickhost run`，由 daemon 按需拉起）、`tickhost open` 外部协议 launcher 与 `tickhost stop` |
+| `tick/cli` | `tick` | `tick <provider> <tick>` 与 Reader |
+| `tick/market` | — | 金融 Tick 本体，只经 provider 接口读取数据 |
+| `tick/provider`、`tick/providers/*` | — | provider 接口，以及 builtin（离线模拟）、longbridge、futu 实现 |
+| `tick/protocol`、`tick/sdk` | — | Tick 标准，以及 Tick 侧的协议实现 |
+| `tickhost/connect` | — | Herdr 接入、每实例 Session 与 launch 契约 |
 | `crates/ui` | — | 共享终端呈现规则 |
 
-使用当前 Rust stable（edition 2024）。`make build` 构建 Agent 和示例；`make install` 安装 `tickloop` 和 `tick`；`make package` 打包这两个入口。
+使用当前 Rust stable（edition 2024）。`make build` 构建 Agent 和示例；`make install` 安装 `tickloop`、`tickhost` 和 `tick`；`make package` 打包这三个入口。daemon 只拉起与自己同目录、同版本的 `tickhost`，版本不一致时拒绝启动并报错；`tickhost stop` 结束所有 hosted Tick，下次 Agent 打开 Tick 时自动启动新的 Tickhost，被结束的 Tick 显示为丢失，只在明确要求时重开。
 
 ## 在 Herdr 中完成双向操作
 
@@ -20,32 +24,40 @@ Agent 会确认运行环境，并在 Herdr 接入可用时自动加载 Tick 操�
 要并排观察，可以说“在你当前 Tab 右边打开一个 K 线 Tick”；已有 Tick 则说“把刚才那个 Tick 移到你这个 Tab”。移动会保留实例及订阅。支持右侧或下方分屏，操作不抢焦点。
 
 1. 在一个 Herdr Pane 运行 `tickloop`，按 [Agent 说明](crates/agent/README.md) 配置模型。
-2. 在另一个 Pane 运行 `tick demo kline`。它会自动接入，使用模拟数据，无需金融账户。也可让 Agent 打开这条命令。
+2. 在另一个 Pane 运行 `tick builtin kline 700.HK`。它会自动接入，使用模拟数据，无需金融账户。也可让 Agent 打开这条命令。
 3. 在 Agent 中说：“读取当前 Workspace 的 Kline，并每 5 秒订阅它的变化。”Agent 先读目录，再为当前 Loop 建立订阅。
 4. 在 Kline 按 `5` 切换到 5 分钟周期；订阅收到新内容后，所属 Loop 按 cadence 继续执行。
 5. 在 Agent 中说：“在刚才那张图上添加一个标注，然后移除它。”Agent 读取 `mark` / `unmark` 的参数并经权限流程操作，结果显示在原来的 Tick 中。
 
-普通日志或 CLI 可直接在 Pane 中运行。让 Agent 读取并明确订阅后，新终端文字也能推动 Loop；它不提供结构化工具目录和完整历史。外部协议程序使用 `tick run -- python3 examples/ticks/counter.py`，在 Counter Pane 输入 `+` 后回车可产生更新，也可让 Agent 调用 `increment`。
+普通日志或 CLI 可直接在 Pane 中运行。让 Agent 读取并明确订阅后，新终端文字也能推动 Loop；它不提供结构化工具目录和完整历史。外部协议程序使用 `tickhost open -- python3 tick/examples/counter.py`，在 Counter Pane 输入 `+` 后回车可产生更新，也可让 Agent 调用 `increment`。
 
 打开和读取不会自动订阅。默认范围是当前 Workspace；跨 Workspace 要明确指定。detach/attach 保留活进程，关闭 Pane 退出其中程序；重启后的实例要重新选取。操作、协议和边界说明见[原生 Herdr 接入](docs/design/native-herdr.md)。
 
 # Tick Command `tick`
 
-`tick` 是 Tick Loop 的 Tick Command，提供报价、自选、K 线、持仓、资讯和财报视图。它通过 Tick Instance 流输出 Tick Update，并在同一条流上声明和执行自己的 Tick Tool；既可以独立运行，也可以在 Herdr Pane 内自动接入 Agent。
+`tick` 是 Tick Loop 的 Tick Command，提供报价、自选、K 线、持仓、资讯和财报视图。命令形式为 `tick <provider> <tick>`：provider 决定数据来源，同一个 Tick 在各 provider 上界面一致。
+
+| provider | 实现的接口 | 可运行的 Tick |
+| --- | --- | --- |
+| `builtin` | QuoteApi、TradeApi、NewsApi、OptionsApi | 全部 Tick 与示例原文 Reader；模拟数据，无需账户或网络 |
+| `longbridge` | QuoteApi、TradeApi、NewsApi | quote、watchlist、kline、positions、news、earnings |
+| `futu` | OptionsApi | options |
+
+provider 没有实现某个 Tick 需要的接口时直接报错，并列出可用的 provider，例如 `tick longbridge options` 提示改用 `tick futu options`。Reader 读取本地原文缓存，不经 provider，命令为 `tick reader`。它通过 Tick Instance 流输出 Tick Update，并在同一条流上声明和执行自己的 Tick Tool；既可以独立运行，也可以在 Herdr Pane 内自动接入 Agent。
 
 ## 安装与离线体验
 
 ```sh
 cargo build --locked --release --workspace --bins
 ./target/release/tick --help
-./target/release/tick demo quote --size 40x12
-./target/release/tick demo kline --size 60x20
-./target/release/tick demo news --size 40x12
+./target/release/tick builtin quote TSLA 700 9988 --size 40x12
+./target/release/tick builtin kline 700.HK --size 60x20
+./target/release/tick builtin news --size 40x12
 ```
 
 安装入口使用 `make install`，把 Agent 与 `tick` 放入 PATH。交互模式要求 UTF-8 locale 和支持真彩色的终端；独立运行使用 TTY，Native 接入由 launcher 保留控制终端，并把 stdin/stdout 留给协议。macOS 为当前目标环境。`--help` 和 `describe` 无需 UTF-8 locale 或登录。默认 Unicode 图标不需要特殊字体；`--icon-theme nerd` 需要 Nerd Font v3。
 
-所有 demo 均在真实 TUI 中运行，使用带 `Demo` 标识的模拟数据，不访问网络或读取账户。`--size` 以字符列×行限制显示区域，仍受实际终端尺寸约束。用 `q` 退出；可替换为 `quote`、`watchlist`、`kline`、`positions`、`news`。demo 支持下述全局显示参数。验收时分别缩小窗口、滚动、打开帮助并退出，检查终端恢复。
+`builtin` 的 Tick 均在真实 TUI 中运行，使用带 `Demo` 标识的模拟数据，不访问网络或读取账户。`--size` 以字符列×行限制显示区域，仍受实际终端尺寸约束，对所有 provider 都可用。用 `q` 退出；可替换为 `quote`、`watchlist`、`kline`、`positions`、`news`、`earnings`、`options`、`reader`。builtin 支持下述全局显示参数。验收时分别缩小窗口、滚动、打开帮助并退出，检查终端恢复。
 
 剩余人工验收可使用临时终端向导：
 
@@ -59,18 +71,18 @@ bash .scratch/longbridge-ticks/accept.sh live
 ## 授权
 
 ```sh
-tick auth
-tick auth status
-tick auth logout
+tick longbridge auth
+tick longbridge auth status
+tick longbridge auth logout
 ```
 
-授权在 TUI 中完成：方向键或 `j/k` 选择中国大陆或全球接入区域，Enter 确认；随后在固定画面中显示验证网址、用户码和剩余有效时间，不会逐行刷倒计时。请在自己可操作的设备打开网址确认，终端会自动完成登录。远程 agent 无法代替用户完成网页步骤；在用户终端运行 `! tick auth`。
+授权在 TUI 中完成：方向键或 `j/k` 选择中国大陆或全球接入区域，Enter 确认；随后在固定画面中显示验证网址、用户码和剩余有效时间，不会逐行刷倒计时。请在自己可操作的设备打开网址确认，终端会自动完成登录。远程 agent 无法代替用户完成网页步骤；在用户终端运行 `! tick longbridge auth`。
 
 设备码确认期间，连接中断或授权端点返回 HTTP 5xx 会按原轮询间隔退避重试，保留当前端点并只提示一次连续故障；代理返回的 502 也按同一规则处理。重试以设备码原始有效期为限，明确拒绝或过期仍结束登录。
 
-报价、自选、K 线、持仓和资讯的交互式命令共用这套授权界面。启动时未授权会先显示授权 TUI；运行中授权失效时先清理当前订阅，再进入授权 TUI。成功后继续或重启原来的 Tick Command。`--once` 和重定向输出属于非交互调用，不打开授权界面，仍提示运行 `tick auth` 并返回退出码 3。
+报价、自选、K 线、持仓和资讯的交互式命令共用这套授权界面。启动时未授权会先显示授权 TUI；运行中授权失效时先清理当前订阅，再进入授权 TUI。成功后继续或重启原来的 Tick Command。`--once` 和重定向输出属于非交互调用，不打开授权界面，仍提示运行 `tick longbridge auth` 并返回退出码 3。
 
-令牌存于 `~/.tickloop/longbridge/auth.json`，明文 JSON、0600 权限、原子替换。客户端注册信息单独保存并复用。启动及持续运行期间自动续期，授权失效会提示重新运行 `tick auth`，不会打开浏览器回调流程。`auth status` 仅读取本地状态，不发起续期；`auth logout` 删除本地令牌。
+令牌存于 `~/.tickloop/longbridge/auth.json`，明文 JSON、0600 权限、原子替换。客户端注册信息单独保存并复用。启动及持续运行期间自动续期，授权失效会提示重新运行 `tick longbridge auth`，不会打开浏览器回调流程。`auth status` 仅读取本地状态，不发起续期；`auth logout` 删除本地令牌。
 
 ## 配置
 
@@ -92,30 +104,30 @@ ambiguous_width = "narrow"  # narrow / wide
 
 | 命令 | 参数与行为 |
 | --- | --- |
-| `tick auth [status\|logout]` | 设备码登录、查看本地状态、退出登录 |
-| `tick quote TSLA 700` | 一个或多个标的；纯字母补 `.US`，纯数字补 `.HK`；单标的错误显示在对应行 |
-| `tick watchlist [--group ID或名称]` | 默认第一个自选分组；左右方向键或 `[` / `]` 切组 |
-| `tick kline 700.HK [--period day] [--count 80] [--adjust none]` | 单标的 K 线；周期 `day/week/month/1m/5m/15m/30m/60m`；数量 1–1000；复权 `none/forward` |
-| `tick positions` | 股票持仓、按币种汇总市值和浮盈亏；只读账户，不执行交易 |
-| `tick news [700.HK] [--limit 20]` | 个股资讯；无代码时读长桥公开 RSS；数量 1–100 |
-| `tick earnings TSLA.US [--count 10]` | 已发布财报的预期、实际、意外与财报前后走势；只支持美股；期数 1–20 |
-| `tick options AAPL.US [--expiry YYYY-MM-DD]` | 富途 OpenD 的期权链、买卖价、IV、持仓量和近平值跨式参考；支持美股/港股标的 |
+| `tick longbridge auth [status\|logout]` | 设备码登录、查看本地状态、退出登录 |
+| `tick longbridge quote TSLA 700` | 一个或多个标的；纯字母补 `.US`，纯数字补 `.HK`；单标的错误显示在对应行 |
+| `tick longbridge watchlist [--group ID或名称]` | 默认第一个自选分组；左右方向键或 `[` / `]` 切组 |
+| `tick longbridge kline 700.HK [--period day] [--count 80] [--adjust none]` | 单标的 K 线；周期 `day/week/month/1m/5m/15m/30m/60m`；数量 1–1000；复权 `none/forward` |
+| `tick longbridge positions` | 股票持仓、按币种汇总市值和浮盈亏；只读账户，不执行交易 |
+| `tick longbridge news [700.HK] [--limit 20]` | 个股资讯；无代码时读长桥公开 RSS；数量 1–100 |
+| `tick longbridge earnings TSLA.US [--count 10]` | 已发布财报的预期、实际、意外与财报前后走势；只支持美股；期数 1–20 |
+| `tick futu options AAPL.US [--expiry YYYY-MM-DD] [--host 127.0.0.1] [--port 11111]` | 富途 OpenD 的期权链、买卖价、IV、持仓量和近平值跨式参考；支持美股/港股标的 |
 | `tick reader URL或文件 [更多URL或文件]` | 在终端阅读 HTML、Markdown、文本或 PDF 原文，搜索、章节定位和固定版本引用 |
 
 八个业务命令默认进入 TUI，均支持 `--once` 和 `--once --format json`。JSON 输出没有横幅或 ANSI；普通行情表按业务行输出，财报、期权、事件行情和原文还保留各自的来源、时间和结构。缺失值为 `null` / `--`，管道表格不输出颜色。
 
 ```sh
-tick quote TSLA 700 --once --format json
-tick watchlist --group Technology --color-mode green-up
-tick kline 700.HK --period 5m --adjust forward
-tick positions --once
-tick news --limit 10
-tick earnings TSLA.US --count 12 --once --format json
-tick kline AAPL.US --event-date 2026-07-30 --event-session after-hours --published-at 2026-07-30T16:05:00-04:00
-tick options AAPL.US --host 127.0.0.1 --port 11111
+tick longbridge quote TSLA 700 --once --format json
+tick longbridge watchlist --group Technology --color-mode green-up
+tick longbridge kline 700.HK --period 5m --adjust forward
+tick longbridge positions --once
+tick longbridge news --limit 10
+tick longbridge earnings TSLA.US --count 12 --once --format json
+tick longbridge kline AAPL.US --event-date 2026-07-30 --event-session after-hours --published-at 2026-07-30T16:05:00-04:00
+tick futu options AAPL.US --host 127.0.0.1 --port 11111
 tick reader ./earnings-release.pdf --symbol AAPL.US --fiscal-period FY2026Q3
-tick demo options
-tick demo reader
+tick builtin options DEMO.US
+tick builtin reader
 ```
 
 上面的财报事件时间只是参数示例，不是已核验的公司日程。事件行情在 Kline 内运行：`--event-date` 为交易所当地日期，`--published-at` 只填已确认的实际发布时间；未知时留空。`--chart-mode line/minute/daily` 切换事件分时、5 分钟 K、日 K，`--event-range auto/first-session/five-sessions` 切范围。窗口使用长桥交易日历与市场时区；没有精确发布时间就不画精确 T=0，未知发布时段也不生成伪造的发布前基准。
@@ -159,7 +171,7 @@ US 账户目前读取 US 资产持仓接口；该响应不能确认可用数量�
 
 Agent 通过一个 `CallTickTool` 调用声明的能力。`SubscribeTick` 属于当前 Loop，默认每 60 秒投递最新内容，范围 5–86400 秒；打开、读取和发现不会自动订阅。普通程序按 5 秒采集终端文字，之后等待 Loop cadence；采样不保证完整输出或即时响应。
 
-外部接入示例见 [Counter](examples/ticks/counter.py)，协议约束见[原生 Herdr 接入](docs/design/native-herdr.md)。
+外部接入示例见 [Counter](tick/examples/counter.py)，协议约束见[原生 Herdr 接入](docs/design/native-herdr.md)。
 
 ## 退出码
 
