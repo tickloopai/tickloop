@@ -2376,20 +2376,20 @@ impl Menus {
         let options = if explicit_ask {
             vec![
                 "Yes, once".into(),
-                "No, and tell Claude what to do differently (esc)".into(),
+                "No, and tell the Agent what to do differently (esc)".into(),
             ]
         } else if persistent {
             vec![
                 "Yes".into(),
                 "Yes, for this session".into(),
                 persistent_option,
-                "No, and tell Claude what to do differently (esc)".into(),
+                "No, and tell the Agent what to do differently (esc)".into(),
             ]
         } else {
             vec![
                 "Yes".into(),
                 "Yes, for this session".into(),
-                "No, and tell Claude what to do differently (esc)".into(),
+                "No, and tell the Agent what to do differently (esc)".into(),
             ]
         };
         let menu = Menu {

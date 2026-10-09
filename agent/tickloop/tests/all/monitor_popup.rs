@@ -408,7 +408,7 @@ async fn the_installed_popup_shows_the_same_hosted_tick_until_esc_closes_it() {
     let shown = client.shows("keys");
     assert!(shown.contains("┌Tickloop"), "{shown}");
     let listed = row(&controller.list(&owner, None).await.unwrap(), &opened);
-    assert_eq!(listed["attached"], true, "{listed}");
+    assert_eq!(listed["views"], 1, "{listed}");
     assert_eq!(listed["business_pid"], opened.business_pid);
     let first_attach = wait_until(
         "the popup's attach process",
@@ -428,7 +428,7 @@ async fn the_installed_popup_shows_the_same_hosted_tick_until_esc_closes_it() {
     client.send(b"\x02\x1b");
     let first_kept = client.shows("keys 78 1b");
     let listed = row(&controller.list(&owner, None).await.unwrap(), &opened);
-    assert_eq!(listed["attached"], true);
+    assert_eq!(listed["views"], 1);
     assert_eq!(listed["business_pid"], opened.business_pid);
     assert_eq!(popup_attach_processes(&herdr), [first_attach]);
 
@@ -436,7 +436,7 @@ async fn the_installed_popup_shows_the_same_hosted_tick_until_esc_closes_it() {
     let mut detached = None;
     for _ in 0..(TIMEOUT.as_millis() / 25) {
         let listed = row(&controller.list(&owner, None).await.unwrap(), &opened);
-        if listed["attached"] == false {
+        if listed["views"] == 0 {
             detached = Some(listed);
             break;
         }

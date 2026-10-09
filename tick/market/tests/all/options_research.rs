@@ -398,9 +398,10 @@ async fn options_tick_changes_expiry_and_exposes_live_tools_without_a_longbridge
     let mut view = OptionsView::new(request, snapshot, api, store);
     let mut state = ViewState::default();
     assert!(
-        view.on_key(KeyCode::Esc, &NoMarketApi, &mut state)
+        view.on_key(KeyCode::Backspace, &NoMarketApi, &mut state)
             .await
-            .unwrap()
+            .unwrap(),
+        "Backspace at the root stays in the Tick"
     );
     view.on_key(KeyCode::Char(']'), &NoMarketApi, &mut state)
         .await
@@ -450,11 +451,27 @@ async fn options_tick_changes_expiry_and_exposes_live_tools_without_a_longbridge
             .collect::<String>();
         assert!(contents.contains("saved snapshot"));
     }
-    view.on_key(KeyCode::Esc, &NoMarketApi, &mut state)
+    view.on_key(KeyCode::Backspace, &NoMarketApi, &mut state)
         .await
         .unwrap();
-    view.on_key(KeyCode::Esc, &NoMarketApi, &mut state)
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 28)).unwrap();
+    terminal
+        .draw(|frame| view.draw(frame, &mut state, &Settings::default()))
+        .unwrap();
+    let history = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(
+        !history.contains("Contract / saved snapshot"),
+        "Backspace closed the details: {history}"
+    );
+    assert_eq!(view.table().rows.len(), 1, "the history stays open");
+    view.on_key(KeyCode::Backspace, &NoMarketApi, &mut state)
         .await
         .unwrap();
-    assert!(view.table().rows.len() > 1);
+    assert!(view.table().rows.len() > 1, "Backspace closed the history");
 }

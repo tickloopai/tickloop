@@ -101,9 +101,9 @@ async fn news_detail_returns_to_the_selected_item_without_extra_business_events(
             KeyCode::Down,
             KeyCode::Enter,
             KeyCode::Down,
-            KeyCode::Esc,
+            KeyCode::Backspace,
             KeyCode::Enter,
-            KeyCode::Esc,
+            KeyCode::Backspace,
             KeyCode::Char('q'),
         ] {
             tokio::time::sleep(std::time::Duration::from_millis(45)).await;
@@ -188,7 +188,7 @@ async fn periodic_news_refresh_preserves_selection_by_article_id() {
         ))))
         .unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(31)).await;
-        for code in [KeyCode::Enter, KeyCode::Esc, KeyCode::Char('q')] {
+        for code in [KeyCode::Enter, KeyCode::Backspace, KeyCode::Char('q')] {
             keys.send(Ok(Event::Key(KeyEvent::new(code, KeyModifiers::NONE))))
                 .unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -349,7 +349,10 @@ async fn news_renderer_applies_resolved_styles_to_selection_markdown_and_blank_c
     }
     assert_eq!(article[(78, 17)].symbol(), " ");
     assert_eq!(article[(78, 17)].bg, Color::Indexed(103));
-    assert_eq!(rendered_cell(article, "Esc Back").fg, Color::Indexed(111));
+    assert_eq!(
+        rendered_cell(article, "Backspace Back").fg,
+        Color::Indexed(111)
+    );
 }
 
 fn rendered_cell<'a>(buffer: &'a ratatui::buffer::Buffer, text: &str) -> &'a ratatui::buffer::Cell {

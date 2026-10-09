@@ -578,10 +578,13 @@ impl crate::runtime::LiveView for KlineView {
         Ok(json!({"marks": self.marks}))
     }
     fn help(&self) -> &'static str {
-        "q / Ctrl+C  Quit · Esc Back\nh/l or Left/Right  Select candle\nj/k or Ctrl+N/P  Navigate visible list / event samples\ne  Edit publication event (Tab field, Enter apply)\nv  Event view picker · r Event range picker\n[ / ]  Previous / next event range\nEnter  Event candle detail · Esc Back\na  Ask Chat about the selected research observation\ng / G  First / latest candle\nPageUp / PageDown  Move one screen\nOrdinary Kline: 1 day · 2 week · 3 month · 4 1m\n5 5m · 6 15m · 7 30m · 8 60m · m MA\nHistory refresh every 30s; API calendar determines sessions"
+        "q / Ctrl+C  Quit · Backspace Back\nh/l or Left/Right  Select candle\nj/k or Ctrl+N/P  Navigate visible list / event samples\ne  Edit publication event (Tab field, Enter apply, Ctrl+C cancel)\nv  Event view picker · r Event range picker\n[ / ]  Previous / next event range\nEnter  Event candle detail\na  Ask Chat about the selected research observation\ng / G  First / latest candle\nPageUp / PageDown  Move one screen\nOrdinary Kline: 1 day · 2 week · 3 month · 4 1m\n5 5m · 6 15m · 7 30m · 8 60m · m MA\nHistory refresh every 30s; API calendar determines sessions"
     }
     fn captures_text(&self) -> bool {
         self.event_editor.is_some()
+    }
+    fn cancel_text(&mut self) {
+        self.event_editor = None;
     }
     fn on_market(&mut self, event: &tick_provider::api::MarketEvent) {
         if self.event.is_some() || self.research.is_some() {
@@ -647,7 +650,6 @@ impl crate::runtime::LiveView for KlineView {
         if let Some(editor) = &mut self.event_editor {
             match editor.on_key(key) {
                 EventEditResult::Continue => (),
-                EventEditResult::Cancel => self.event_editor = None,
                 EventEditResult::Apply(config) => {
                     self.set_event(config)?;
                     self.event_editor = None;
@@ -699,7 +701,6 @@ impl crate::runtime::LiveView for KlineView {
                 .await;
         }
         match key {
-            KeyCode::Esc => (),
             KeyCode::Left | KeyCode::Char('h') | KeyCode::Up | KeyCode::Char('k') => {
                 self.cursor = self.cursor.saturating_sub(1)
             }
