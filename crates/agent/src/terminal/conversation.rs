@@ -263,13 +263,17 @@ pub(super) fn project(snapshot: &ChatSnapshot) -> ConversationProjection {
     }
 
     blocks.extend(snapshot.permissions.iter().cloned().map(|request| {
-        let exchange = exchange(snapshot.id, Some(request.run_id), &request.call_id);
+        let exchange = exchange(
+            snapshot.id,
+            request.execution.run_id(),
+            &request.execution.call_key(),
+        );
         ConversationBlock {
             id: ConversationBlockId::Permission {
                 chat_id: snapshot.id,
                 request_id: request.id,
             },
-            metadata: metadata(Some(request.run_id), Some(request.loop_id), None),
+            metadata: metadata(request.execution.run_id(), Some(request.loop_id), None),
             kind: ConversationBlockKind::Permission { request, exchange },
         }
     }));
@@ -466,13 +470,20 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
             }
         }
         EventKind::PermissionRequested { request } => {
-            let exchange = exchange(event.chat_id, Some(event.run_id), &request.call_id);
+            let exchange = exchange(
+                event.chat_id,
+                request.execution.run_id(),
+                &request.execution.call_key(),
+            );
             ConversationBlock {
                 id: ConversationBlockId::Permission {
                     chat_id: event.chat_id,
                     request_id: request.id,
                 },
-                metadata: event_metadata,
+                metadata: ConversationBlockMetadata {
+                    run_id: request.execution.run_id(),
+                    ..event_metadata
+                },
                 kind: ConversationBlockKind::Permission {
                     request: request.clone(),
                     exchange,
@@ -810,8 +821,10 @@ mod tests {
         snapshot.permissions.push(PermissionRequest {
             id: permission_id,
             loop_id,
-            run_id,
-            call_id: "call".into(),
+            execution: crate::runtime::PermissionExecution::ToolCall {
+                run_id,
+                call_id: "call".into(),
+            },
             name: "Bash".into(),
             input: json!({"command":"pwd"}),
             file_change: None,

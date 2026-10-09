@@ -539,7 +539,10 @@ async fn parked_loop_survives_other_completion(fixture: &PrivateFixture) {
         |snapshot| snapshot.permissions.len() == 1,
     )
     .await;
-    let first_run = parked.permissions[0].run_id;
+    let first_run = parked.permissions[0]
+        .execution
+        .run_id()
+        .expect("a model permission has its Run");
     client
         .execute(CommandEnvelope {
             owner_epoch: client.owner_epoch(),
@@ -573,7 +576,13 @@ async fn parked_loop_survives_other_completion(fixture: &PrivateFixture) {
     );
     let still_parked = snapshot(&client, execution).await;
     assert_eq!(still_parked.permissions.len(), 1);
-    assert_eq!(still_parked.permissions[0].run_id, first_run);
+    assert_eq!(
+        still_parked.permissions[0]
+            .execution
+            .run_id()
+            .expect("a model permission has its Run"),
+        first_run
+    );
     assert!(!marker.exists());
     let request = *still_parked
         .request_refs
@@ -742,7 +751,10 @@ async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture, res
         |snapshot| snapshot.permissions.len() == 1,
     )
     .await;
-    let interrupted_run = before.permissions[0].run_id;
+    let interrupted_run = before.permissions[0]
+        .execution
+        .run_id()
+        .expect("a model permission has its Run");
     client
         .execute(CommandEnvelope {
             owner_epoch: client.owner_epoch(),

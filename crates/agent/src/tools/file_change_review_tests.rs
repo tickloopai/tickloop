@@ -273,9 +273,14 @@ async fn oversized_existing_file_fails_before_a_review_is_created() {
 async fn artifact_failure_aborts_preparation_before_the_target_is_changed() {
     let directory = tempfile::tempdir().unwrap();
     let output = tempfile::tempdir().unwrap();
-    let invalid_output_dir = output.path().join("not-a-directory");
-    std::fs::write(&invalid_output_dir, "occupied").unwrap();
-    let tools = Tools::new(invalid_output_dir);
+    let output_dir = output.path().join("chat-output");
+    std::fs::create_dir(&output_dir).unwrap();
+    std::fs::write(
+        output_dir.join(crate::file_change::ARTIFACT_DIRECTORY),
+        "occupied",
+    )
+    .unwrap();
+    let tools = Tools::new(output_dir);
     let error = tools
         .prepare(
             &workspace(directory.path()),

@@ -235,6 +235,41 @@ impl ScopedHostSocket {
     }
 }
 
+fn install_routed_authorities(agent: &Agent, directory: &std::path::Path) -> ScopedHostSocket {
+    use tickloop_agent::{
+        hosted::{
+            tools::HostedTickTools,
+            worker_control::{OwnerControl, WorkerControlGrant},
+        },
+        native_host::NativeHostToolProvider,
+        tick_tool_router::TickToolRouter,
+    };
+    let socket = ScopedHostSocket::start(directory.join("routed.sock"));
+    let native = Arc::new(NativeHostToolProvider::new(Arc::new(
+        tick_connect::access::TickAccess::new(tick_connect::herdr::HerdrContext::without_view(
+            socket.path.clone(),
+        )),
+    )));
+    let grant = WorkerControlGrant {
+        endpoint: directory.join("owner.sock"),
+        owner_epoch: uuid::Uuid::new_v4(),
+        binding: uuid::Uuid::new_v4(),
+        capability: "0".repeat(64),
+        host_endpoint: directory.join("host.sock"),
+        intent_renewal: std::time::Duration::from_secs(60),
+    };
+    agent
+        .install_host_tools(Arc::new(TickToolRouter::new(
+            Some(native),
+            Some(Arc::new(HostedTickTools::new(
+                OwnerControl::new(grant),
+                vec![],
+            ))),
+        )))
+        .unwrap();
+    socket
+}
+
 async fn access_command(
     access: &tickloop_agent::agent_access::EmbeddedAgentAccess,
     command: tickloop_agent::agent_access::AgentCommand,
@@ -1159,7 +1194,7 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
 }
 
 #[tokio::test]
-async fn child_follow_up_and_direct_shell_cannot_expand_the_frozen_ceiling() {
+async fn child_file_scope_and_denials_remain_fixed_while_full_access_shell_is_inherited() {
     use tickloop_agent::permissions::{Decision, PermissionRule};
     use tickloop_agent::runtime::UserShellState;
     let directory = tempfile::tempdir().unwrap();
@@ -1225,8 +1260,12 @@ async fn child_follow_up_and_direct_shell_cannot_expand_the_frozen_ceiling() {
         if event.chat_id != parent
             && let EventKind::ToolCompleted { call_id, result } = &event.kind
         {
-            assert!(result.is_error, "{call_id}: {}", result.content);
-            refused.insert(call_id.clone());
+            if call_id == "escape" {
+                assert!(!result.is_error, "{}", result.content);
+            } else {
+                assert!(result.is_error, "{call_id}: {}", result.content);
+                refused.insert(call_id.clone());
+            }
         }
         if event.chat_id == parent && matches!(event.kind, EventKind::Completed { .. }) {
             break;
@@ -1235,7 +1274,7 @@ async fn child_follow_up_and_direct_shell_cannot_expand_the_frozen_ceiling() {
     let child = child.unwrap();
     assert_eq!(
         refused,
-        ["outside", "escape", "denied"]
+        ["outside", "denied"]
             .into_iter()
             .map(str::to_owned)
             .collect()
@@ -1297,11 +1336,10 @@ async fn child_follow_up_and_direct_shell_cannot_expand_the_frozen_ceiling() {
         format!("cat {}", outside_file.display()),
         "python3 -c 'print(123)'".into(),
     ] {
-        let error = agent
+        agent
             .submit_user_shell_for_goal(child, None, command, false)
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("Unsupported"));
+            .unwrap();
     }
     let shell = agent
         .submit_user_shell_for_goal(child, None, "touch direct.txt".into(), false)
@@ -1388,7 +1426,7 @@ async fn permission_and_question_requests_belong_to_the_child() {
             EventKind::PermissionRequested { request } => {
                 assert_ne!(event.chat_id, parent);
                 child = Some(event.chat_id);
-                assert_eq!(request.run_id, event.run_id);
+                assert_eq!(request.execution.run_id(), Some(event.run_id));
                 assert!(
                     agent
                         .answer_permission(parent, request.id, true)
@@ -1636,7 +1674,7 @@ async fn console_opens_the_real_child_in_place_and_routes_follow_up_with_its_cei
         })
         .await
         .unwrap();
-    assert!(shell.error.unwrap().message.contains("Unsupported"));
+    assert!(shell.error.is_none());
     let answered = access
         .execute(CommandEnvelope {
             owner_epoch: access.owner_epoch(),
@@ -2014,4 +2052,1084 @@ async fn compacted_child_retains_authorization_with_legal_metadata_whitespace_an
         assert_eq!(serde_json::to_value(delegation.ceiling).unwrap(), expected);
         restored.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn a_full_access_child_can_run_an_interpreter_under_its_frozen_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "launch",
+            "Subagent",
+            json!({"task":"Check interpreter output","name":"audit"}),
+        ),
+        call(
+            "python",
+            "Bash",
+            json!({"command":"python3 -c 'print(7319)'","description":"Check interpreter output"}),
+        ),
+        text("Child finished"),
+        text("Root finished"),
+    ]));
+    let core = Agent::new_embedded(config(), model);
+    let routed = install_routed_authorities(&core, directory.path());
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    core.set_execution_mode(root, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let mut events = core.subscribe();
+    let receipt = core
+        .submit(root, None, "Run the bounded interpreter check".into())
+        .await
+        .unwrap();
+    let mut result = None;
+    loop {
+        let event = support::next_event(&mut events).await;
+        if let EventKind::ToolCompleted {
+            call_id,
+            result: output,
+        } = event.kind
+        {
+            if call_id == "python" {
+                result = Some(output);
+            }
+        } else if event.run_id == receipt.run_id
+            && matches!(event.kind, EventKind::Completed { .. })
+        {
+            break;
+        }
+    }
+    let child = core.subagents(root).await.unwrap()[0].child_chat_id;
+    let ceiling = core
+        .snapshot(child)
+        .await
+        .unwrap()
+        .delegation
+        .unwrap()
+        .ceiling;
+    assert_eq!(ceiling.host_tools["ReadTick"].len(), 2);
+    assert!(!ceiling.host_tools.contains_key("Bash"));
+    core.shutdown().await;
+    routed.stop().await;
+    let result = result.expect("the real delegated Bash call must return");
+    assert!(!result.is_error, "{}", result.content);
+    assert!(result.content.contains("7319"), "{}", result.content);
+}
+
+#[tokio::test]
+async fn a_child_interpreter_asks_for_its_own_normal_permission_and_once_runs_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "launch",
+            "Subagent",
+            json!({"task":"Check interpreter with approval","name":"audit"}),
+        ),
+        call(
+            "python",
+            "Bash",
+            json!({"command":"python3 -c 'print(8426)'","description":"Check approved interpreter"}),
+        ),
+        text("Child finished"),
+        text("Root finished"),
+    ]));
+    let core = Agent::new_embedded(config(), model);
+    let routed = install_routed_authorities(&core, directory.path());
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    core.set_execution_mode(root, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = core.subscribe();
+    let receipt = core
+        .submit(root, None, "Run an interpreter after approval".into())
+        .await
+        .unwrap();
+    let (child, request) = loop {
+        let event = support::next_event(&mut events).await;
+        if let EventKind::PermissionRequested { request } = event.kind {
+            assert_ne!(event.chat_id, root);
+            assert_eq!(request.name, "Bash");
+            break (event.chat_id, request);
+        }
+        assert!(
+            !(event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. })),
+            "unknown child Bash must enter normal approval, not end as Unsupported"
+        );
+    };
+    assert!(core.snapshot(child).await.unwrap().commands.is_empty());
+    assert!(
+        core.answer_permission(root, request.id, true)
+            .await
+            .is_err()
+    );
+    core.answer_permission(child, request.id, true)
+        .await
+        .unwrap();
+    let mut result = None;
+    loop {
+        let event = support::next_event(&mut events).await;
+        if let EventKind::ToolCompleted {
+            call_id,
+            result: output,
+        } = event.kind
+        {
+            if call_id == "python" {
+                result = Some(output);
+            }
+        } else if event.run_id == receipt.run_id
+            && matches!(event.kind, EventKind::Completed { .. })
+        {
+            break;
+        }
+    }
+    core.shutdown().await;
+    routed.stop().await;
+    let result = result.unwrap();
+    assert!(!result.is_error, "{}", result.content);
+    assert!(result.content.contains("8426"));
+}
+
+struct HeldChildModel {
+    hold_at: usize,
+    model: ScriptedModel,
+    calls: std::sync::atomic::AtomicUsize,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+#[async_trait::async_trait]
+impl tickloop_agent::model::ModelClient for HeldChildModel {
+    fn identity(&self) -> tickloop_agent::model::ModelIdentity {
+        self.model.identity()
+    }
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        events: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        self.model.generate_title(request, events, cancel).await
+    }
+    async fn complete(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        events: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == self.hold_at {
+            self.entered.notify_one();
+            tokio::select! { ()=self.release.notified()=>{}, ()=cancel.cancelled()=>return Err(tickloop_agent::model::ModelError::Cancelled) }
+        }
+        self.model.complete(request, events, cancel).await
+    }
+}
+
+#[tokio::test]
+async fn parent_mode_tightening_turns_the_childs_frozen_full_access_bash_into_ask() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(HeldChildModel {
+        hold_at: 1,
+        model: ScriptedModel::new(vec![
+            call(
+                "launch",
+                "Subagent",
+                json!({"task":"Check mode tightening"}),
+            ),
+            call(
+                "python",
+                "Bash",
+                json!({"command":"python3 -c 'print(1957)'"}),
+            ),
+            text("Child done"),
+            text("Root done"),
+        ]),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let core = Agent::new_embedded(config(), model.clone());
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    core.set_execution_mode(root, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let mut events = core.subscribe();
+    core.submit(root, None, "Run a check under current authority".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), model.entered.notified())
+        .await
+        .unwrap();
+    core.set_execution_mode(root, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    model.release.notify_one();
+    let observed = loop {
+        let event = support::next_event(&mut events).await;
+        match event.kind {
+            EventKind::PermissionRequested { request } if request.name == "Bash" => {
+                break Some((event.chat_id, request));
+            }
+            EventKind::ToolStarted { call_id, .. } if call_id == "python" => break None,
+            _ => {}
+        }
+    };
+    if let Some((child, request)) = &observed {
+        core.answer_permission(*child, request.id, false)
+            .await
+            .unwrap();
+    }
+    core.shutdown().await;
+    assert!(
+        observed.is_some(),
+        "a parent tightened to Ask must still constrain its already-created Full Access child"
+    );
+}
+
+#[tokio::test]
+async fn direct_child_shell_returns_a_receipt_and_uses_the_same_child_permission_route() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "launch",
+            "Subagent",
+            json!({"task":"Wait for direct human Shell","name":"audit"}),
+        ),
+        text("Child ready"),
+        text("Root ready"),
+    ]));
+    let core = Agent::new_embedded(config(), model.clone());
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    core.set_execution_mode(root, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = core.subscribe();
+    let root_run = core
+        .submit(root, None, "Create a child for direct commands".into())
+        .await
+        .unwrap();
+    loop {
+        let event = support::next_event(&mut events).await;
+        if event.run_id == root_run.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    let child = core.subagents(root).await.unwrap()[0].child_chat_id;
+    let child_loop = core.snapshot(child).await.unwrap().loops[0].id;
+    let sent = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        core.submit_user_shell_for_goal(
+            child,
+            Some(child_loop),
+            "python3 -c 'print(4268)'".into(),
+            false,
+        ),
+    )
+    .await
+    .unwrap();
+    if sent.is_err() {
+        core.shutdown().await;
+    }
+    let receipt =
+        sent.expect("direct child Shell must be accepted without awaiting or bypassing approval");
+    let request = loop {
+        let event = support::next_event(&mut events).await;
+        if event.chat_id == child
+            && let EventKind::PermissionRequested { request } = event.kind
+        {
+            break request;
+        }
+    };
+    assert!(
+        core.snapshot(child)
+            .await
+            .unwrap()
+            .user_shells
+            .iter()
+            .all(|shell| shell.pid.is_none())
+    );
+    core.answer_permission(child, request.id, true)
+        .await
+        .unwrap();
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let snapshot = core.snapshot(child).await.unwrap();
+            if snapshot.user_shells.iter().any(|shell| {
+                shell.id == receipt.command_id
+                    && shell.state == tickloop_agent::runtime::UserShellState::Completed
+            }) {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let output = core
+        .read_user_shell_output(child, receipt.command_id, 0, 1024)
+        .await
+        .unwrap();
+    core.shutdown().await;
+    assert!(output.content.contains("4268"));
+    assert_eq!(completed.loops.len(), 1);
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        3,
+        "direct Shell permission must not fabricate a model turn"
+    );
+}
+
+#[tokio::test]
+async fn child_interpreters_honor_the_frozen_explicit_allow_and_deny_rules() {
+    use tickloop_agent::permissions::{Decision, PermissionRule};
+    let command = "python3 -c 'print(5438)'";
+    for decision in [Decision::Allow, Decision::Deny] {
+        let directory = tempfile::tempdir().unwrap();
+        let model = Arc::new(ScriptedModel::new(vec![
+            call(
+                "launch",
+                "Subagent",
+                json!({"task":"Check explicit Bash policy"}),
+            ),
+            call("python", "Bash", json!({"command":command})),
+            text("Child done"),
+            text("Root done"),
+        ]));
+        let core = Agent::new_embedded(config(), model);
+        let root = core.create_chat(directory.path().into()).await.unwrap();
+        core.set_execution_mode(root, ExecutionMode::AcceptEdits)
+            .await
+            .unwrap();
+        core.set_permission_rules(
+            root,
+            vec![PermissionRule {
+                id: uuid::Uuid::new_v4(),
+                decision,
+                tool: "Bash".into(),
+                specifier: Some(command.into()),
+                input: None,
+                loop_id: None,
+                persistent: false,
+            }],
+        )
+        .await
+        .unwrap();
+        let mut events = core.subscribe();
+        let receipt = core
+            .submit(
+                root,
+                None,
+                "Run according to the explicit Shell rule".into(),
+            )
+            .await
+            .unwrap();
+        let mut result = None;
+        loop {
+            let event = support::next_event(&mut events).await;
+            match event.kind {
+                EventKind::PermissionRequested { request } => {
+                    core.answer_permission(event.chat_id, request.id, false)
+                        .await
+                        .unwrap();
+                    panic!("a frozen {decision:?} rule must not become a different approval path");
+                }
+                EventKind::ToolCompleted {
+                    call_id,
+                    result: output,
+                } if call_id == "python" => result = Some(output),
+                EventKind::Completed { .. } if event.run_id == receipt.run_id => break,
+                _ => {}
+            }
+        }
+        core.shutdown().await;
+        let output = result.unwrap();
+        assert_eq!(
+            output.is_error,
+            decision == Decision::Deny,
+            "{}",
+            output.content
+        );
+        if decision == Decision::Allow {
+            assert!(output.content.contains("5438"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_once_answer_cannot_override_a_parent_bash_denial_added_while_the_child_waits() {
+    use tickloop_agent::permissions::{Decision, PermissionRule};
+    let directory = tempfile::tempdir().unwrap();
+    let command =
+        r#"python3 -c 'from pathlib import Path; Path("not-admitted").write_text("bad")'"#;
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "launch",
+            "Subagent",
+            json!({"task":"Wait for interpreter permission"}),
+        ),
+        call("python", "Bash", json!({"command":command})),
+        text("Child done"),
+        text("Root done"),
+    ]));
+    let core = Agent::new_embedded(config(), model);
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    core.set_execution_mode(root, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = core.subscribe();
+    core.submit(root, None, "Keep the inherited Shell denial current".into())
+        .await
+        .unwrap();
+    let (child, request) = loop {
+        let event = support::next_event(&mut events).await;
+        if let EventKind::PermissionRequested { request } = event.kind {
+            break (event.chat_id, request);
+        }
+    };
+    core.set_permission_rules(
+        root,
+        vec![PermissionRule {
+            id: uuid::Uuid::new_v4(),
+            decision: Decision::Deny,
+            tool: "Bash".into(),
+            specifier: None,
+            input: None,
+            loop_id: None,
+            persistent: false,
+        }],
+    )
+    .await
+    .unwrap();
+    core.answer_permission(child, request.id, true)
+        .await
+        .unwrap();
+    let mut refused = false;
+    loop {
+        let event = support::next_event(&mut events).await;
+        match event.kind {
+            EventKind::ToolStarted { call_id, .. } if call_id == "python" => {
+                panic!("late parent Deny must win over child Once")
+            }
+            EventKind::ToolCompleted { call_id, result } if call_id == "python" => {
+                refused = result.is_error;
+                break;
+            }
+            EventKind::Failed(reason) if event.chat_id == child => {
+                assert!(reason.contains("denial"), "{reason}");
+                refused = true;
+                break;
+            }
+            EventKind::Completed { .. } if event.chat_id == child => break,
+            _ => {}
+        }
+    }
+    core.shutdown().await;
+    assert!(refused);
+    assert!(!directory.path().join("not-admitted").exists());
+}
+
+struct BackgroundResultModel {
+    scripted: ScriptedModel,
+}
+#[async_trait::async_trait]
+impl tickloop_agent::model::ModelClient for BackgroundResultModel {
+    fn identity(&self) -> tickloop_agent::model::ModelIdentity {
+        self.scripted.identity()
+    }
+    async fn generate_title(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        events: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        self.scripted.generate_title(request, events, cancel).await
+    }
+    async fn complete(
+        &self,
+        request: tickloop_agent::model::ModelRequest,
+        events: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
+        use tickloop_agent::model::{Content, ModelOutput, Role, Usage};
+        let already_ready = request.messages.iter().any(|message| {
+            message.role == Role::Assistant
+                && message
+                    .content
+                    .iter()
+                    .any(|content| matches!(content,Content::Text{text} if text=="Child ready"))
+        });
+        let notification = request.messages.iter().rev().find(|message|message.role==Role::User).is_some_and(|message|message.content.iter().all(|content|matches!(content,Content::Text{text} if text.starts_with("<task-notification>"))));
+        if already_ready && notification {
+            return Ok(ModelOutput {
+                content: text("Output notification received"),
+                usage: Usage::default(),
+                stop_reason: "end_turn".into(),
+                private_source: None,
+            });
+        }
+        self.scripted.complete(request, events, cancel).await
+    }
+}
+
+#[tokio::test]
+async fn a_child_reads_its_announced_background_output_without_permission() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(BackgroundResultModel {
+        scripted: ScriptedModel::new(vec![
+            call(
+                "launch",
+                "Subagent",
+                json!({"task":"Keep a background result","name":"result"}),
+            ),
+            call(
+                "background-output",
+                "Bash",
+                json!({"command":"echo child-background-result","run_in_background":true}),
+            ),
+            text("Child ready"),
+            text("Root ready"),
+        ]),
+    });
+    let core = Agent::new_embedded(config(), model.clone());
+    let routed = install_routed_authorities(&core, directory.path());
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    core.set_execution_mode(root, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = core.subscribe();
+    let receipt = core
+        .submit(root, None, "Create a result reader".into())
+        .await
+        .unwrap();
+    loop {
+        let event = support::next_event(&mut events).await;
+        if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    let child = core.subagents(root).await.unwrap()[0].child_chat_id;
+    let path = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let snapshot = core.snapshot(child).await.unwrap();
+            let command = snapshot.commands.last().unwrap();
+            if command.output_bytes > 0
+                && command.state == tickloop_agent::tools::CommandState::Completed
+            {
+                break command.output_ref.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    model
+        .scripted
+        .enqueue(call("read-result", "Read", json!({"file_path":path})));
+    model.scripted.enqueue(text("Read complete"));
+    let receipt = core
+        .submit(child, None, "Read your announced output file".into())
+        .await
+        .unwrap();
+    let mut result = None;
+    loop {
+        let event = support::next_event(&mut events).await;
+        match event.kind {
+            EventKind::PermissionRequested { .. } => panic!("own session output must not prompt"),
+            EventKind::ToolCompleted {
+                call_id,
+                result: output,
+            } if call_id == "read-result" => result = Some(output),
+            EventKind::Completed { .. } if event.run_id == receipt.run_id => break,
+            _ => {}
+        }
+    }
+    core.shutdown().await;
+    routed.stop().await;
+    let result = result.unwrap();
+    assert!(!result.is_error, "{}", result.content);
+    assert!(
+        result.content.contains("child-background-result"),
+        "{}",
+        result.content
+    );
+}
+
+#[tokio::test]
+async fn stopping_a_direct_child_shell_waiting_for_permission_cancels_its_request() {
+    for stop_loop in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let model = Arc::new(ScriptedModel::new(vec![
+            call(
+                "launch",
+                "Subagent",
+                json!({"task":"Await Shell permission"}),
+            ),
+            text("Child ready"),
+            text("Root ready"),
+        ]));
+        let core = Agent::new_embedded(config(), model);
+        let root = core.create_chat(directory.path().into()).await.unwrap();
+        core.set_execution_mode(root, ExecutionMode::AcceptEdits)
+            .await
+            .unwrap();
+        let mut events = core.subscribe();
+        let receipt = core
+            .submit(root, None, "Create a cancellable child Shell".into())
+            .await
+            .unwrap();
+        loop {
+            let event = support::next_event(&mut events).await;
+            if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+                break;
+            }
+        }
+        let child = core.subagents(root).await.unwrap()[0].child_chat_id;
+        let shell = core
+            .submit_user_shell_for_goal(
+                child,
+                None,
+                "python3 -c 'print(unsupported_after_cancel)'".into(),
+                false,
+            )
+            .await
+            .unwrap();
+        let request = loop {
+            let event = support::next_event(&mut events).await;
+            if let EventKind::PermissionRequested { request } = event.kind {
+                break request;
+            }
+        };
+        let queued = if stop_loop {
+            Some(
+                core.submit_user_shell_for_goal(
+                    child,
+                    None,
+                    "touch queued-after-stop".into(),
+                    false,
+                )
+                .await
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        let stopped = if stop_loop {
+            let loop_id = core.snapshot(child).await.unwrap().loops[0].id;
+            core.stop(child, loop_id).await.unwrap();
+            core.snapshot(child)
+                .await
+                .unwrap()
+                .user_shells
+                .iter()
+                .find(|record| record.id == shell.command_id)
+                .unwrap()
+                .clone()
+        } else {
+            core.stop_user_shell(child, shell.command_id).await.unwrap()
+        };
+        assert_eq!(
+            stopped.state,
+            tickloop_agent::runtime::UserShellState::Failed
+        );
+        assert!(
+            core.answer_permission(child, request.id, true)
+                .await
+                .is_err()
+        );
+        let snapshot = core.snapshot(child).await.unwrap();
+        assert!(snapshot.permissions.is_empty());
+        if let Some(queued) = queued {
+            assert_eq!(
+                snapshot
+                    .user_shells
+                    .iter()
+                    .find(|shell| shell.id == queued.command_id)
+                    .unwrap()
+                    .state,
+                tickloop_agent::runtime::UserShellState::Failed
+            );
+            assert!(!directory.path().join("queued-after-stop").exists());
+        }
+        assert!(snapshot.user_shells.iter().all(|shell| shell.pid.is_none()));
+        assert!(
+            serde_json::to_value(&snapshot).unwrap()["run_loops"]
+                .get(uuid::Uuid::nil().to_string())
+                .is_none()
+        );
+        core.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn resuming_only_a_child_loads_current_parent_authority_before_shell_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("state");
+    let core = Agent::open_embedded(
+        store.clone(),
+        config(),
+        Arc::new(ScriptedModel::new(vec![
+            call(
+                "launch",
+                "Subagent",
+                json!({"task":"Check resumed authority"}),
+            ),
+            text("Child ready"),
+            text("Root ready"),
+        ])),
+    )
+    .unwrap();
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    core.set_execution_mode(root, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let mut events = core.subscribe();
+    let receipt = core
+        .submit(root, None, "Create a child before tightening".into())
+        .await
+        .unwrap();
+    loop {
+        let event = support::next_event(&mut events).await;
+        if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    let child = core.subagents(root).await.unwrap()[0].child_chat_id;
+    core.set_execution_mode(root, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    core.shutdown().await;
+    let restored =
+        Agent::open_embedded(store, config(), Arc::new(ScriptedModel::new(vec![]))).unwrap();
+    restored.resume_chat(child).await.unwrap();
+    assert_eq!(
+        restored.snapshot(root).await.unwrap().policy.mode,
+        ExecutionMode::AcceptEdits
+    );
+    let mut events = restored.subscribe();
+    let command = restored
+        .submit_user_shell_for_goal(child, None, "python3 -c 'print(8841)'".into(), false)
+        .await
+        .unwrap();
+    let request = loop {
+        let event = support::next_event(&mut events).await;
+        if let EventKind::PermissionRequested { request } = event.kind {
+            assert_eq!(event.chat_id, child);
+            break request;
+        }
+    };
+    assert!(
+        restored
+            .snapshot(child)
+            .await
+            .unwrap()
+            .user_shells
+            .iter()
+            .find(|shell| shell.id == command.command_id)
+            .unwrap()
+            .pid
+            .is_none()
+    );
+    restored
+        .answer_permission(child, request.id, false)
+        .await
+        .unwrap();
+    restored.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_direct_child_shell_session_grant_applies_to_the_same_prepared_command() {
+    use tickloop_agent::permissions::PermissionScope;
+    let directory = tempfile::tempdir().unwrap();
+    let core = Agent::new_embedded(
+        config(),
+        Arc::new(ScriptedModel::new(vec![
+            call(
+                "launch",
+                "Subagent",
+                json!({"task":"Reuse a Shell session grant"}),
+            ),
+            text("Child ready"),
+            text("Root ready"),
+        ])),
+    );
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    let mut events = core.subscribe();
+    let receipt = core
+        .submit(root, None, "Create a child".into())
+        .await
+        .unwrap();
+    loop {
+        let event = support::next_event(&mut events).await;
+        if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    let child = core.subagents(root).await.unwrap()[0].child_chat_id;
+    let command = "python3 -c 'print(4268)'";
+    let first = core
+        .submit_user_shell_for_goal(child, None, command.into(), false)
+        .await
+        .unwrap();
+    let request = loop {
+        let event = support::next_event(&mut events).await;
+        if let EventKind::PermissionRequested { request } = event.kind {
+            break request;
+        }
+    };
+    core.answer_permission_with_scope(child, request.id, true, PermissionScope::Session)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if core
+                .snapshot(child)
+                .await
+                .unwrap()
+                .user_shells
+                .iter()
+                .any(|shell| {
+                    shell.id == first.command_id
+                        && shell.state == tickloop_agent::runtime::UserShellState::Completed
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let second = core
+        .submit_user_shell_for_goal(child, None, command.into(), false)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let snapshot = core.snapshot(child).await.unwrap();
+            assert!(
+                snapshot.permissions.is_empty(),
+                "an exact Session grant must not prompt again"
+            );
+            if snapshot.user_shells.iter().any(|shell| {
+                shell.id == second.command_id
+                    && shell.state == tickloop_agent::runtime::UserShellState::Completed
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_parent_loop_scoped_bash_denial_stays_frozen_after_the_parent_removes_it() {
+    use tickloop_agent::permissions::{Decision, PermissionRule};
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(HeldChildModel {
+        hold_at: 2,
+        model: ScriptedModel::new(vec![
+            text("Root goal ready"),
+            call(
+                "launch",
+                "Subagent",
+                json!({"task":"Keep the scoped Bash denial"}),
+            ),
+            call(
+                "scoped-python",
+                "Bash",
+                json!({"command":"python3 -c 'print(7391)'"}),
+            ),
+            text("Child done"),
+            text("Root done"),
+        ]),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let core = Agent::new_embedded(config(), model.clone());
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    core.set_execution_mode(root, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let mut events = core.subscribe();
+    let initial = core
+        .submit(root, None, "Establish the parent Loop".into())
+        .await
+        .unwrap();
+    loop {
+        let event = support::next_event(&mut events).await;
+        if event.run_id == initial.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    core.set_permission_rules(
+        root,
+        vec![PermissionRule {
+            id: uuid::Uuid::new_v4(),
+            decision: Decision::Deny,
+            tool: "Bash".into(),
+            specifier: None,
+            input: None,
+            loop_id: Some(initial.loop_id),
+            persistent: false,
+        }],
+    )
+    .await
+    .unwrap();
+    let receipt = core
+        .submit(
+            root,
+            Some(initial.loop_id),
+            "Delegate under that Loop denial".into(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), model.entered.notified())
+        .await
+        .unwrap();
+    core.set_permission_rules(root, vec![]).await.unwrap();
+    model.release.notify_one();
+    let mut denied = false;
+    loop {
+        let event = support::next_event(&mut events).await;
+        match event.kind {
+            EventKind::ToolStarted { call_id, .. } if call_id == "scoped-python" => {
+                panic!("a frozen parent Loop denial must remain a denial")
+            }
+            EventKind::ToolCompleted { call_id, result } if call_id == "scoped-python" => {
+                denied = result.is_error
+            }
+            EventKind::Failed(reason) if event.chat_id != root => {
+                assert!(
+                    reason.contains("denies") || reason.contains("denial"),
+                    "{reason}"
+                );
+                denied = true;
+            }
+            EventKind::Completed { .. } if event.run_id == receipt.run_id => break,
+            _ => {}
+        }
+    }
+    core.shutdown().await;
+    assert!(denied);
+}
+
+#[tokio::test]
+async fn stop_subagent_is_successful_when_its_loop_already_cancelled_a_pending_shell() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "launch",
+            "Subagent",
+            json!({"task":"Wait for direct Shell","name":"waiting"}),
+        ),
+        text("Child ready"),
+        text("Root ready"),
+    ]));
+    let core = Agent::new_embedded(config(), model.clone());
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    let mut events = core.subscribe();
+    let initial = core
+        .submit(root, None, "Create a child".into())
+        .await
+        .unwrap();
+    loop {
+        let event = support::next_event(&mut events).await;
+        if event.run_id == initial.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    let child = core.subagents(root).await.unwrap()[0].child_chat_id;
+    core.submit_user_shell_for_goal(child, None, "python3 -c 'print(8841)'".into(), false)
+        .await
+        .unwrap();
+    let request = loop {
+        let event = support::next_event(&mut events).await;
+        if let EventKind::PermissionRequested { request } = event.kind {
+            break request;
+        }
+    };
+    model.enqueue(call(
+        "stop-pending",
+        "StopSubagent",
+        json!({"to":"waiting"}),
+    ));
+    model.enqueue(text("Root stopped child"));
+    core.submit(root, Some(initial.loop_id), "Stop the child".into())
+        .await
+        .unwrap();
+    loop {
+        let event = support::next_event(&mut events).await;
+        if let EventKind::ToolCompleted { call_id, result } = event.kind
+            && call_id == "stop-pending"
+        {
+            assert!(!result.is_error, "{}", result.content);
+            break;
+        }
+    }
+    assert!(
+        core.answer_permission(child, request.id, true)
+            .await
+            .is_err()
+    );
+    assert!(core.snapshot(child).await.unwrap().permissions.is_empty());
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_child_preserves_the_parents_frozen_persistent_shell_allow_rule() {
+    use tickloop_agent::permissions::{Decision, PermissionRule};
+    let directory = tempfile::tempdir().unwrap();
+    let command = "python3 -c 'print(5438)'";
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "launch",
+            "Subagent",
+            json!({"task":"Use the configured interpreter rule"}),
+        ),
+        call("configured-python", "Bash", json!({"command":command})),
+        text("Child done"),
+        text("Root done"),
+    ]));
+    let core = Agent::open_embedded(directory.path().join("state"), config(), model).unwrap();
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    core.set_permission_rules(
+        root,
+        vec![PermissionRule {
+            id: uuid::Uuid::new_v4(),
+            decision: Decision::Allow,
+            tool: "Bash".into(),
+            specifier: Some(command.into()),
+            input: None,
+            loop_id: None,
+            persistent: true,
+        }],
+    )
+    .await
+    .unwrap();
+    let mut events = core.subscribe();
+    let receipt = core
+        .submit(root, None, "Use the saved Shell permission".into())
+        .await
+        .unwrap();
+    let mut result = None;
+    loop {
+        let event = support::next_event(&mut events).await;
+        match event.kind {
+            EventKind::PermissionRequested { .. } => {
+                panic!("a frozen matching persistent Allow must not be deleted by refresh")
+            }
+            EventKind::ToolCompleted {
+                call_id,
+                result: output,
+            } if call_id == "configured-python" => result = Some(output),
+            EventKind::Completed { .. } if event.run_id == receipt.run_id => break,
+            _ => {}
+        }
+    }
+    core.shutdown().await;
+    let result = result.unwrap();
+    assert!(!result.is_error, "{}", result.content);
+    assert!(result.content.contains("5438"));
 }

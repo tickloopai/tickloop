@@ -31,7 +31,10 @@ async fn complete_turn(agent: &Agent, chat: ChatId, goal: Option<LoopId>, prompt
         }
         match event.kind {
             EventKind::PermissionRequested { request } => {
-                panic!("unexpected permission request for {}", request.call_id)
+                panic!(
+                    "unexpected permission request for {}",
+                    request.execution.call_key()
+                )
             }
             EventKind::Completed { .. } => return receipt,
             EventKind::Failed(error) => panic!("turn failed: {error}"),
@@ -456,7 +459,7 @@ async fn background_shell_output_of_concurrent_agents_is_written_under_each_chat
             .unwrap();
         outputs.push((agent, chat, receipt.command_id, marker));
     }
-    let project_temp_root = user_temp_directory();
+    let private_temp_root = user_temp_directory();
     let mut paths = Vec::new();
     for (agent, chat, command_id, marker) in outputs {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -489,7 +492,7 @@ async fn background_shell_output_of_concurrent_agents_is_written_under_each_chat
         );
         assert_eq!(
             chat_directory.parent().unwrap().parent().unwrap(),
-            project_temp_root
+            private_temp_root
         );
         assert!(!path.starts_with(directory.path().canonicalize().unwrap()));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), marker);
@@ -499,8 +502,7 @@ async fn background_shell_output_of_concurrent_agents_is_written_under_each_chat
     first.flush_transcripts().await;
     first.shutdown().await;
     second.shutdown().await;
-    let transcript_project = transcript_file(&root, paths[0].0);
-    let project_name = transcript_project.parent().unwrap().file_name().unwrap();
+    let family_temp_directory_name = std::ffi::OsStr::new("sessions");
     for (_, path) in &paths {
         assert_eq!(
             path.parent()
@@ -511,7 +513,7 @@ async fn background_shell_output_of_concurrent_agents_is_written_under_each_chat
                 .unwrap()
                 .file_name()
                 .unwrap(),
-            project_name
+            family_temp_directory_name
         );
     }
     assert!(!directory.path().join(".tickloop").exists());
@@ -690,35 +692,18 @@ fn user_temp_directory() -> PathBuf {
         .join(format!("tickloop-private-{}", unsafe { libc::getuid() }))
 }
 
-/// 与 Agent 相同的项目临时目录：`<用户临时目录>/<项目目录名>`。
-fn project_temp_directory(workdir: &Path) -> PathBuf {
+fn family_temp_directory(chat: uuid::Uuid) -> PathBuf {
     use std::os::unix::fs::DirBuilderExt;
-    let user_directory = user_temp_directory();
-    match std::fs::DirBuilder::new()
+    let sessions = user_temp_directory().join("sessions");
+    std::fs::DirBuilder::new()
+        .recursive(true)
         .mode(0o700)
-        .create(&user_directory)
-    {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => panic!("cannot create {}: {error}", user_directory.display()),
-    }
-    let name = workdir
-        .canonicalize()
-        .unwrap()
-        .to_string_lossy()
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    user_directory.join(name)
+        .create(&sessions)
+        .unwrap();
+    sessions.join(chat.to_string())
 }
 
-/// 测试结束时移除预先布置在系统临时目录中的项目临时目录（符号链接只删除链接本身）。
+/// 测试结束时移除预先布置在系统临时目录中的家族临时空间（符号链接只删除链接本身）。
 struct RemoveOnDrop(PathBuf);
 
 impl Drop for RemoveOnDrop {
@@ -735,24 +720,23 @@ impl Drop for RemoveOnDrop {
     }
 }
 
-/// 模拟共享 `/tmp` 上的另一用户预先布置项目临时目录：`tamper` 布置目录并返回要读取的文件。
+/// 模拟共享 `/tmp` 上的另一用户预先布置家族临时空间：`tamper` 布置目录并返回要读取的文件。
 /// 该文件的只读访问必须请求授权，后台任务输出必须拒绝写入该目录。
-async fn assert_untrusted_project_temp_directory(
-    tamper: impl FnOnce(&Path, &Path) -> PathBuf,
+async fn assert_untrusted_family_temp_directory(
+    tamper: impl Fn(&Path, &Path) -> PathBuf,
     expected_reason: &str,
 ) {
     let directory = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
-    let project_temp = project_temp_directory(directory.path());
-    let _cleanup = RemoveOnDrop(project_temp.clone());
-    let secret = tamper(&project_temp, outside.path());
-
-    let model = Arc::new(ScriptedModel::new(vec![
-        call("read-secret", "Read", json!({"file_path": secret})),
-        text("Done."),
-    ]));
-    let agent = Agent::open_embedded(directory.path().join("root"), config(), model).unwrap();
+    let model = Arc::new(ScriptedModel::new(Vec::new()));
+    let agent =
+        Agent::open_embedded(directory.path().join("root"), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let family_temp = family_temp_directory(chat);
+    let _cleanup = RemoveOnDrop(family_temp.clone());
+    let secret = tamper(&family_temp, outside.path());
+    model.enqueue(call("read-secret", "Read", json!({"file_path":secret})));
+    model.enqueue(text("Done."));
     let mut events = agent.subscribe();
     let receipt = agent
         .submit(chat, None, "Read the secret".into())
@@ -765,22 +749,30 @@ async fn assert_untrusted_project_temp_directory(
         }
         match event.kind {
             EventKind::PermissionRequested { request } => {
-                assert_eq!(request.call_id, "read-secret");
+                assert_eq!(request.execution.call_key(), "read-secret");
                 agent
                     .answer_permission(chat, request.id, false)
                     .await
                     .unwrap();
                 break;
             }
-            EventKind::ToolCompleted { .. } | EventKind::Completed { .. } => {
-                panic!("a file behind an untrusted temporary directory was read without permission")
+            EventKind::ToolCompleted { result, .. } => {
+                assert!(result.is_error);
+                break;
             }
-            EventKind::Failed(error) => panic!("turn failed: {error}"),
+            EventKind::Completed { .. } => panic!("unsafe directory must fail closed"),
+            EventKind::Failed(error) => {
+                assert!(error.contains(expected_reason), "{error}");
+                break;
+            }
             _ => {}
         }
     }
 
     let shell_chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let shell_temp = family_temp_directory(shell_chat);
+    let _shell_cleanup = RemoveOnDrop(shell_temp.clone());
+    tamper(&shell_temp, outside.path());
     let shell = agent
         .submit_user_shell_for_goal(shell_chat, None, "printf leaked".into(), true)
         .await
@@ -810,7 +802,7 @@ async fn assert_untrusted_project_temp_directory(
     };
     let reason = record.reason.unwrap_or_default();
     assert!(
-        reason.contains(&project_temp.display().to_string()) && reason.contains(expected_reason),
+        reason.contains(&shell_temp.display().to_string()) && reason.contains(expected_reason),
         "{reason}"
     );
     assert!(!outside.path().join(shell_chat.to_string()).exists());
@@ -818,12 +810,12 @@ async fn assert_untrusted_project_temp_directory(
 }
 
 #[tokio::test]
-async fn a_symlinked_project_temp_directory_is_not_trusted() {
-    assert_untrusted_project_temp_directory(
-        |project_temp, outside| {
+async fn a_symlinked_family_temp_directory_is_not_trusted() {
+    assert_untrusted_family_temp_directory(
+        |family_temp, outside| {
             let secret = outside.join("secret.txt");
             std::fs::write(&secret, "classified").unwrap();
-            std::os::unix::fs::symlink(outside, project_temp).unwrap();
+            std::os::unix::fs::symlink(outside, family_temp).unwrap();
             secret
         },
         "symbolic link",
@@ -832,13 +824,13 @@ async fn a_symlinked_project_temp_directory_is_not_trusted() {
 }
 
 #[tokio::test]
-async fn a_project_temp_directory_accessible_to_other_users_is_not_trusted() {
+async fn a_family_temp_directory_accessible_to_other_users_is_not_trusted() {
     use std::os::unix::fs::PermissionsExt;
-    assert_untrusted_project_temp_directory(
-        |project_temp, _| {
-            std::fs::create_dir(project_temp).unwrap();
-            std::fs::set_permissions(project_temp, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let secret = project_temp.join("secret.txt");
+    assert_untrusted_family_temp_directory(
+        |family_temp, _| {
+            std::fs::create_dir(family_temp).unwrap();
+            std::fs::set_permissions(family_temp, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let secret = family_temp.join("secret.txt");
             std::fs::write(&secret, "classified").unwrap();
             secret
         },
@@ -848,9 +840,8 @@ async fn a_project_temp_directory_accessible_to_other_users_is_not_trusted() {
 }
 
 #[tokio::test]
-async fn task_output_in_the_project_temp_directory_is_readable_without_permission() {
+async fn task_output_is_readable_by_its_session_but_another_session_requires_approval() {
     let directory = tempfile::tempdir().unwrap();
-    let _cleanup = RemoveOnDrop(project_temp_directory(directory.path()));
     let model = Arc::new(ScriptedModel::new(Vec::new()));
     let agent = Agent::new_embedded(config(), model.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -876,20 +867,35 @@ async fn task_output_in_the_project_temp_directory_is_readable_without_permissio
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    assert!(output.starts_with(project_temp_directory(directory.path())));
-    let reader = Arc::new(ScriptedModel::new(vec![
-        call("read-output", "Read", json!({"file_path": output})),
-        text("Read it."),
-    ]));
-    let agent_with_reader = Agent::new_embedded(config(), reader.clone());
-    let reader_chat = agent_with_reader
-        .create_chat(directory.path().into())
+    assert!(output.starts_with(family_temp_directory(chat)));
+    model.enqueue(call("read-output", "Read", json!({"file_path":output})));
+    model.enqueue(text("Read it."));
+    complete_turn(&agent, chat, None, "Read the output").await;
+    assert!(tool_results(&requests(&model)[1])[0].1.contains("visible"));
+    let other = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(other, ExecutionMode::AcceptEdits)
         .await
         .unwrap();
-    complete_turn(&agent_with_reader, reader_chat, None, "Read the output").await;
-    assert!(tool_results(&requests(&reader)[1])[0].1.contains("visible"));
+    model.enqueue(call("other-read", "Read", json!({"file_path":output})));
+    let mut events = agent.subscribe();
+    agent
+        .submit(other, None, "Read another session output".into())
+        .await
+        .unwrap();
+    loop {
+        let event = next_event(&mut events).await;
+        if let EventKind::PermissionRequested { request } = event.kind {
+            assert_eq!(event.chat_id, other);
+            agent
+                .answer_permission(other, request.id, false)
+                .await
+                .unwrap();
+            break;
+        }
+        assert!(!matches!(event.kind, EventKind::ToolStarted { .. }));
+    }
     agent.shutdown().await;
-    agent_with_reader.shutdown().await;
 }
 
 #[tokio::test]

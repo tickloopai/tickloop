@@ -70,23 +70,29 @@ pub(super) struct ShellInput {
     /// Internal directories whose files shell commands may read without approval.
     #[serde(skip)]
     pub(super) readable_directories: Vec<PathBuf>,
-}
-
-pub(super) struct UserShellExecution {
-    pub(super) command: String,
-    pub(super) operation_id: Uuid,
-    pub(super) chat_id: Uuid,
-    pub(super) background: bool,
+    #[serde(skip)]
+    pub(super) editable_directory: Option<PathBuf>,
 }
 
 impl ShellInput {
     /// Claude Code's rule-free read-only admission, evaluated with default-mode path checks.
     pub(super) fn is_read_only(&self, cwd: &Path, workspace: &super::Workspace) -> bool {
-        permission::is_allowed_without_rules(
-            &self.command,
-            &self.permission_context(cwd, workspace),
-            false,
-        )
+        let mut context = self.permission_context(cwd, workspace);
+        context.editable_directory = None;
+        permission::is_allowed_without_rules(&self.command, &context, false)
+    }
+
+    pub(super) fn is_allowed_with_family_temp(
+        &self,
+        cwd: &Path,
+        workspace: &super::Workspace,
+    ) -> bool {
+        self.editable_directory.is_some()
+            && permission::is_allowed_without_rules(
+                &self.command,
+                &self.permission_context(cwd, workspace),
+                false,
+            )
     }
 
     /// Claude Code's rule-free Accept Edits admission for the same command.
@@ -114,6 +120,7 @@ impl ShellInput {
                 .cloned()
                 .collect(),
             readable_directories: &self.readable_directories,
+            editable_directory: self.editable_directory.as_deref(),
         }
     }
 
@@ -892,31 +899,15 @@ impl Registry {
     pub(super) async fn execute_user(
         &self,
         cwd: &Path,
+        input: ShellInput,
         task_output_dir: &PrivateDirectory,
-        execution: UserShellExecution,
+        operation_id: Uuid,
+        chat_id: Uuid,
         cancel: CancellationToken,
     ) -> Result<ToolResult, ToolError> {
-        let UserShellExecution {
-            command,
-            operation_id,
-            chat_id,
-            background,
-        } = execution;
-        if command.trim().is_empty() || command.contains('\0') {
-            return Err(ToolError::InvalidInput(
-                "command cannot be empty or contain NUL".into(),
-            ));
-        }
         self.execute_process(
             cwd,
-            ShellInput {
-                command,
-                timeout: None,
-                description: None,
-                run_in_background: background,
-                cwd: None,
-                readable_directories: Vec::new(),
-            },
+            input,
             task_output_dir,
             CommandOwner::User {
                 operation_id,
@@ -1343,6 +1334,7 @@ mod tests {
             run_in_background: false,
             cwd: None,
             readable_directories: Vec::new(),
+            editable_directory: None,
         }
     }
 
@@ -1770,13 +1762,10 @@ mod tests {
         registry
             .execute_user(
                 &working_directory,
+                shell_input("sleep 0.1"),
                 &PrivateDirectory::trusted(working_directory.join("output")),
-                UserShellExecution {
-                    command: "sleep 0.1".into(),
-                    operation_id,
-                    chat_id,
-                    background: false,
-                },
+                operation_id,
+                chat_id,
                 CancellationToken::new(),
             )
             .await
@@ -1811,13 +1800,10 @@ mod tests {
         registry
             .execute_user(
                 &working_directory,
+                shell_input("/bin/sh -c 'trap \"\" TERM; echo $$ > descendant.pid; sleep 0.8; echo late > late-write' &"),
                 &output_directory,
-                UserShellExecution {
-                    command: "/bin/sh -c 'trap \"\" TERM; echo $$ > descendant.pid; sleep 0.8; echo late > late-write' &".into(),
-                    operation_id,
-                    chat_id,
-                    background: false,
-                },
+                operation_id,
+                chat_id,
                 CancellationToken::new(),
             )
             .await
@@ -1849,13 +1835,10 @@ mod tests {
         registry
             .execute_user(
                 &working_directory,
+                shell_input("dd if=/dev/zero bs=1048576 count=65 2>/dev/null"),
                 &output_directory,
-                UserShellExecution {
-                    command: "dd if=/dev/zero bs=1048576 count=65 2>/dev/null".into(),
-                    operation_id,
-                    chat_id: Uuid::new_v4(),
-                    background: false,
-                },
+                operation_id,
+                Uuid::new_v4(),
                 CancellationToken::new(),
             )
             .await
@@ -1890,13 +1873,10 @@ mod tests {
         registry
             .execute_user(
                 &working_directory,
+                shell_input("sleep 30"),
                 &PrivateDirectory::trusted(working_directory.join("output")),
-                UserShellExecution {
-                    command: "sleep 30".into(),
-                    operation_id,
-                    chat_id,
-                    background: false,
-                },
+                operation_id,
+                chat_id,
                 CancellationToken::new(),
             )
             .await

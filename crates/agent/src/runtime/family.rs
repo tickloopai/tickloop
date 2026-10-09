@@ -11,6 +11,9 @@ pub(crate) fn summary_state(
             .iter()
             .any(|shell| states.contains(&shell.state))
     };
+    if any_shell(&[UserShellState::WaitingPermission]) {
+        return LoopState::WaitingPermission;
+    }
     if let Some(state) = [
         LoopState::WaitingPermission,
         LoopState::WaitingQuestion,

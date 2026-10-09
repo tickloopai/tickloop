@@ -1811,39 +1811,38 @@ async fn interact(
                         .map(|(_, message)| format!(" · Trigger: {message}"))
                         .collect::<String>(),
                 );
-                let displayed_background =
-                    background_wait(selected_chat, &pending, &permissions, &questions)
-                        .map(|wait| {
-                            let message = match wait.kind {
-                                BackgroundWaitKind::Approval => "waiting for approval",
-                                BackgroundWaitKind::Answer => "waiting for your answer",
-                            };
-                            (
-                                wait.chat_id,
-                                BackgroundRunNotice {
-                                    message: message.into(),
-                                    compact_message: None,
-                                    necessary: true,
-                                },
-                                Role::Permission,
-                            )
-                        })
-                        .or_else(|| {
-                            background_notice
-                                .clone()
-                                .filter(|(chat, notice)| {
-                                    notice.message != REPLY_COMPLETED_NOTICE
-                                        || !agent.cached_is_delegated(*chat)
-                                })
-                                .map(|(chat, notice)| {
-                                    let role = if notice.necessary {
-                                        Role::Warning
-                                    } else {
-                                        Role::MutedText
-                                    };
-                                    (chat, notice, role)
-                                })
-                        });
+                let displayed_background = background_wait(selected_chat, &permissions, &questions)
+                    .map(|wait| {
+                        let message = match wait.kind {
+                            BackgroundWaitKind::Approval => "waiting for approval",
+                            BackgroundWaitKind::Answer => "waiting for your answer",
+                        };
+                        (
+                            wait.chat_id,
+                            BackgroundRunNotice {
+                                message: message.into(),
+                                compact_message: None,
+                                necessary: true,
+                            },
+                            Role::Permission,
+                        )
+                    })
+                    .or_else(|| {
+                        background_notice
+                            .clone()
+                            .filter(|(chat, notice)| {
+                                notice.message != REPLY_COMPLETED_NOTICE
+                                    || !agent.cached_is_delegated(*chat)
+                            })
+                            .map(|(chat, notice)| {
+                                let role = if notice.necessary {
+                                    Role::Warning
+                                } else {
+                                    Role::MutedText
+                                };
+                                (chat, notice, role)
+                            })
+                    });
                 console.set_background_status_notice(
                     displayed_background
                         .map(|(chat, notice, role)| {
@@ -1915,7 +1914,7 @@ async fn interact(
         }
         if eof
             && let Some(message) =
-                input_closed_while_waiting(selected_chat, &pending, &permissions, &questions)
+                input_closed_while_waiting(selected_chat, &permissions, &questions)
         {
             return Err(message);
         }
@@ -2811,7 +2810,7 @@ async fn interact(
                                 }
                                 let mut shell_stop_failed=false;
                                 let tasks=task_center.snapshot(chat).await.map_err(|error|error.to_string())?;
-                                for shell in tasks.tasks.iter().filter(|task|task.chat_id==chat && agent.disconnected().is_none() && !task.was_background && task.capabilities.can_stop && matches!(task.state,ShellTaskState::Running|ShellTaskState::Queued)) {
+                                for shell in tasks.tasks.iter().filter(|task|task.chat_id==chat && agent.disconnected().is_none() && !task.was_background && task.capabilities.can_stop && matches!(task.state,ShellTaskState::Running|ShellTaskState::Queued|ShellTaskState::WaitingPermission)) {
                                     if let Err(error)=task_center.dispatch(chat,shell.id,tickloop_agent::runtime::ShellTaskAction::Stop).await {
                                         console.set_status(&format!("Cannot clear the foreground Shell: {}",safe_line(&error.to_string())))?;
                                         shell_stop_failed=true;
@@ -3176,9 +3175,8 @@ async fn interact(
                                 if let Some(selected_goal) = selected_goal {
                                     match agent.stop(chat, selected_goal).await {
                                         Ok(operations) => {
-                                            let runs = pending.values().filter(|receipt|receipt.loop_id==selected_goal).map(|receipt|receipt.run_id).collect::<Vec<_>>();
                                             pending.retain(|_,receipt|receipt.loop_id!=selected_goal);
-                                            permissions.retain(|_,run| !runs.contains(run));
+                                            permissions.retain(|_,request| request.chat_id!=chat || request.loop_id!=selected_goal);
                                             questions.retain(|_,question|question.chat_id!=chat||question.loop_id!=selected_goal);
                                             outln!(console, "Stopped goal {selected_goal}. Future inputs require another goal; use /loops new.");
                                             for operation in operations { outln!(console, "Operation {} remains {:?}: {}",operation.id,operation.state,safe_text(&operation.name)); }
@@ -3755,8 +3753,8 @@ async fn interact(
                         match agent.snapshot(chat).await {
                             Ok(snapshot)=>background_snapshots.push(snapshot),
                             Err(AgentError::NotFound)=>{
-                                let runs=pending.extract_if(|_,receipt|receipt.chat_id==chat).map(|(run,_)|run).collect::<HashSet<_>>();
-                                permissions.retain(|_,run|!runs.contains(run));
+                                pending.retain(|_,receipt|receipt.chat_id!=chat);
+                                permissions.retain(|_,request|request.chat_id!=chat);
                                 questions.retain(|_,question|question.chat_id!=chat);
                             },
                             Err(error)=>return Err(error.to_string()),
@@ -3941,7 +3939,7 @@ async fn interact(
                             else {visible_family.clear();console.set_agent_family(Vec::new(),None)?;console.set_family_input_targets(Vec::new())?;}
                         } else {visible_family.clear();console.set_agent_family(Vec::new(),None)?;console.set_family_input_targets(Vec::new())?;}
                         let background_request_chats=permissions.values()
-                            .filter_map(|run|pending.get(run).map(|receipt|receipt.chat_id))
+                            .map(|request|request.chat_id)
                             .chain(questions.values().map(|request|request.chat_id))
                             .filter(|chat|!visible_family.contains(chat))
                             .collect::<HashSet<_>>();
@@ -3953,7 +3951,7 @@ async fn interact(
                                 }).await
                                 && let ObservationValue::Agent(snapshot)=observation.initial
                             {
-                                sync_snapshot_requests(&snapshot.conversation,&pending,&mut permissions,&mut questions);
+                                sync_snapshot_requests(&snapshot.conversation,&mut permissions,&mut questions);
                             }
                         }
                         let live_visible=selected_chat.filter(|chat|visible_rows.iter().any(|row|row.chat_id==*chat && row.availability==crate::agent_access::ExecutionAvailability::Live));
@@ -4453,11 +4451,11 @@ fn user_shell_is_terminal(record: &UserShellRecord) -> bool {
 fn sync_snapshot(
     snapshot: &tickloop_agent::runtime::ChatSnapshot,
     pending: &mut HashMap<uuid::Uuid, Receipt>,
-    permissions: &mut HashMap<uuid::Uuid, uuid::Uuid>,
+    permissions: &mut HashMap<uuid::Uuid, PermissionRequestOwner>,
     questions: &mut HashMap<uuid::Uuid, QuestionRequest>,
 ) {
     use tickloop_agent::runtime::LoopState;
-    sync_snapshot_requests(snapshot, pending, permissions, questions);
+    sync_snapshot_requests(snapshot, permissions, questions);
     pending.retain(|_, receipt| receipt.chat_id != snapshot.id);
     for input in snapshot.pending_inputs.iter().filter(|input| input.armed) {
         pending.insert(input.receipt.run_id, input.receipt.clone());
@@ -4480,19 +4478,34 @@ fn sync_snapshot(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PermissionRequestOwner {
+    chat_id: uuid::Uuid,
+    loop_id: uuid::Uuid,
+    run_id: Option<uuid::Uuid>,
+}
+
+impl PermissionRequestOwner {
+    fn new(chat_id: uuid::Uuid, request: &tickloop_agent::runtime::PermissionRequest) -> Self {
+        Self {
+            chat_id,
+            loop_id: request.loop_id,
+            run_id: request.execution.run_id(),
+        }
+    }
+}
+
 fn sync_snapshot_requests(
     snapshot: &tickloop_agent::runtime::ChatSnapshot,
-    pending: &HashMap<uuid::Uuid, Receipt>,
-    permissions: &mut HashMap<uuid::Uuid, uuid::Uuid>,
+    permissions: &mut HashMap<uuid::Uuid, PermissionRequestOwner>,
     questions: &mut HashMap<uuid::Uuid, QuestionRequest>,
 ) {
-    permissions.retain(|_, run| {
-        pending
-            .get(run)
-            .is_some_and(|receipt| receipt.chat_id != snapshot.id)
-    });
+    permissions.retain(|_, request| request.chat_id != snapshot.id);
     for request in &snapshot.permissions {
-        permissions.insert(request.id, request.run_id);
+        permissions.insert(
+            request.id,
+            PermissionRequestOwner::new(snapshot.id, request),
+        );
     }
     questions.retain(|_, question| question.chat_id != snapshot.id);
     for request in &snapshot.questions {
@@ -5786,7 +5799,7 @@ async fn track_accepted_input(
     receipt: Receipt,
     adopted: Option<uuid::Uuid>,
     pending: &mut HashMap<uuid::Uuid, Receipt>,
-    permissions: &mut HashMap<uuid::Uuid, uuid::Uuid>,
+    permissions: &mut HashMap<uuid::Uuid, PermissionRequestOwner>,
     questions: &mut HashMap<uuid::Uuid, QuestionRequest>,
 ) -> Result<(), String> {
     let Some(id) = adopted else {
@@ -6185,7 +6198,7 @@ fn announce_background_event(
 fn track_run_requests(
     event: &tickloop_agent::runtime::Event,
     pending: &mut HashMap<uuid::Uuid, Receipt>,
-    permissions: &mut HashMap<uuid::Uuid, uuid::Uuid>,
+    permissions: &mut HashMap<uuid::Uuid, PermissionRequestOwner>,
     questions: &mut HashMap<uuid::Uuid, QuestionRequest>,
 ) {
     let receipt = || Receipt {
@@ -6195,14 +6208,9 @@ fn track_run_requests(
     };
     match &event.kind {
         EventKind::GoalEnded { .. } => {
-            let ended_runs = pending
-                .values()
-                .filter(|receipt| {
-                    receipt.chat_id == event.chat_id && receipt.loop_id == event.loop_id
-                })
-                .map(|receipt| receipt.run_id)
-                .collect::<Vec<_>>();
-            permissions.retain(|_, run| !ended_runs.contains(run));
+            permissions.retain(|_, request| {
+                request.chat_id != event.chat_id || request.loop_id != event.loop_id
+            });
             questions.retain(|_, question| {
                 question.chat_id != event.chat_id || question.loop_id != event.loop_id
             });
@@ -6211,7 +6219,7 @@ fn track_run_requests(
             });
         }
         EventKind::Completed { .. } | EventKind::Failed(_) | EventKind::Interrupted => {
-            permissions.retain(|_, run| *run != event.run_id);
+            permissions.retain(|_, request| request.run_id != Some(event.run_id));
             questions.retain(|_, question| question.run_id != event.run_id);
             pending.remove(&event.run_id);
         }
@@ -6219,8 +6227,13 @@ fn track_run_requests(
             pending.remove(&event.run_id);
         }
         EventKind::PermissionRequested { request } => {
-            pending.entry(event.run_id).or_insert_with(receipt);
-            permissions.insert(request.id, request.run_id);
+            if let Some(run_id) = request.execution.run_id() {
+                pending.entry(run_id).or_insert_with(receipt);
+            }
+            permissions.insert(
+                request.id,
+                PermissionRequestOwner::new(event.chat_id, request),
+            );
         }
         EventKind::QuestionAsked { request } => {
             pending.entry(event.run_id).or_insert_with(receipt);
@@ -6246,12 +6259,11 @@ struct BackgroundWait {
 /// 非前台 Chat 中等待用户处理的请求；权限请求优先于提问。
 fn background_wait(
     selected_chat: Option<uuid::Uuid>,
-    pending: &HashMap<uuid::Uuid, Receipt>,
-    permissions: &HashMap<uuid::Uuid, uuid::Uuid>,
+    permissions: &HashMap<uuid::Uuid, PermissionRequestOwner>,
     questions: &HashMap<uuid::Uuid, QuestionRequest>,
 ) -> Option<BackgroundWait> {
-    let approval = permissions.iter().find_map(|(request_id, run_id)| {
-        let chat_id = pending.get(run_id)?.chat_id;
+    let approval = permissions.iter().find_map(|(request_id, request)| {
+        let chat_id = request.chat_id;
         (Some(chat_id) != selected_chat).then_some(BackgroundWait {
             chat_id,
             request_id: *request_id,
@@ -6306,7 +6318,7 @@ fn execution_connection_notice(
 fn end_runs_of_lost_executions(
     rows: &[crate::agent_access::AgentSummary],
     pending: &mut HashMap<uuid::Uuid, Receipt>,
-    permissions: &mut HashMap<uuid::Uuid, uuid::Uuid>,
+    permissions: &mut HashMap<uuid::Uuid, PermissionRequestOwner>,
     questions: &mut HashMap<uuid::Uuid, QuestionRequest>,
 ) -> Vec<LostRunNotice> {
     let lost = rows
@@ -6314,6 +6326,8 @@ fn end_runs_of_lost_executions(
         .filter(|row| row.availability == crate::agent_access::ExecutionAvailability::Lost)
         .map(|row| row.chat_id)
         .collect::<HashSet<_>>();
+    permissions.retain(|_, request| !lost.contains(&request.chat_id));
+    questions.retain(|_, request| !lost.contains(&request.chat_id));
     let ended = pending
         .values()
         .filter(|receipt| lost.contains(&receipt.chat_id))
@@ -6323,7 +6337,7 @@ fn end_runs_of_lost_executions(
         .into_iter()
         .map(|receipt| {
             pending.remove(&receipt.run_id);
-            permissions.retain(|_, run| *run != receipt.run_id);
+            permissions.retain(|_, request| request.run_id != Some(receipt.run_id));
             questions.retain(|_, question| question.run_id != receipt.run_id);
             LostRunNotice {
                 chat: receipt.chat_id,
@@ -6341,21 +6355,17 @@ fn end_runs_of_lost_executions(
 /// the owning Chat only when that Chat is in the background.
 fn input_closed_while_waiting(
     selected_chat: Option<uuid::Uuid>,
-    pending: &HashMap<uuid::Uuid, Receipt>,
-    permissions: &HashMap<uuid::Uuid, uuid::Uuid>,
+    permissions: &HashMap<uuid::Uuid, PermissionRequestOwner>,
     questions: &HashMap<uuid::Uuid, QuestionRequest>,
 ) -> Option<String> {
-    let is_foreground_permission = |run_id: &uuid::Uuid| {
-        pending
-            .get(run_id)
-            .is_none_or(|receipt| Some(receipt.chat_id) == selected_chat)
-    };
+    let is_foreground_permission =
+        |request: &PermissionRequestOwner| Some(request.chat_id) == selected_chat;
     if permissions.values().any(is_foreground_permission) {
         return Some(
             "input closed while waiting for permission; no pending operation was approved".into(),
         );
     }
-    let wait = background_wait(selected_chat, pending, permissions, questions);
+    let wait = background_wait(selected_chat, permissions, questions);
     if let Some(wait) = wait.filter(|wait| wait.kind == BackgroundWaitKind::Approval) {
         return Some(format!(
             "input closed while background Chat {} was waiting for permission request {}; no pending operation was approved",
@@ -6388,7 +6398,7 @@ fn recover_background_chat(
     snapshot: &tickloop_agent::runtime::ChatSnapshot,
     label: &str,
     pending: &mut HashMap<uuid::Uuid, Receipt>,
-    permissions: &mut HashMap<uuid::Uuid, uuid::Uuid>,
+    permissions: &mut HashMap<uuid::Uuid, PermissionRequestOwner>,
     questions: &mut HashMap<uuid::Uuid, QuestionRequest>,
 ) -> BackgroundRecovery {
     use tickloop_agent::runtime::LoopState;
@@ -8321,22 +8331,24 @@ mod tests {
             }
         );
         assert!(pending.contains_key(&receipt.run_id));
-        assert_eq!(permissions.get(&request.id), Some(&receipt.run_id));
-        let wait = background_wait(foreground_chat, &pending, &permissions, &questions).unwrap();
+        assert_eq!(
+            permissions.get(&request.id),
+            Some(&super::PermissionRequestOwner::new(
+                background_chat,
+                &request
+            ))
+        );
+        let wait = background_wait(foreground_chat, &permissions, &questions).unwrap();
         assert_eq!(wait.kind, BackgroundWaitKind::Approval);
         assert_eq!(wait.chat_id, background_chat);
         assert_eq!(wait.request_id, request.id);
-        let closed =
-            input_closed_while_waiting(foreground_chat, &pending, &permissions, &questions)
-                .unwrap();
+        let closed = input_closed_while_waiting(foreground_chat, &permissions, &questions).unwrap();
         assert!(
             closed.contains(&format!("background Chat {background_chat}"))
                 && closed.contains(&request.id.to_string()),
             "{closed}"
         );
-        assert!(
-            background_wait(Some(background_chat), &pending, &permissions, &questions).is_none()
-        );
+        assert!(background_wait(Some(background_chat), &permissions, &questions).is_none());
 
         agent
             .answer_permission(background_chat, request.id, true)
@@ -8371,10 +8383,7 @@ mod tests {
             }
         );
         assert!(pending.is_empty() && permissions.is_empty());
-        assert!(
-            input_closed_while_waiting(foreground_chat, &pending, &permissions, &questions)
-                .is_none()
-        );
+        assert!(input_closed_while_waiting(foreground_chat, &permissions, &questions).is_none());
         agent.shutdown().await;
     }
 
@@ -8487,6 +8496,90 @@ mod tests {
             Some((alpha, bravo)),
             "the same merges, both live, still read as one block"
         );
+    }
+
+    #[tokio::test]
+    async fn direct_shell_permission_tracks_its_owner_without_a_pending_model_run() {
+        let chat = Uuid::new_v4();
+        let request = tickloop_agent::runtime::PermissionRequest {
+            id: Uuid::new_v4(),
+            loop_id: Uuid::new_v4(),
+            execution: tickloop_agent::runtime::PermissionExecution::UserShell {
+                command_id: Uuid::new_v4(),
+            },
+            name: "Bash".into(),
+            input: serde_json::json!({"command":"python3 -c 'print(1)'"}),
+            file_change: None,
+            approval_reason: None,
+            approval_source: tickloop_agent::runtime::PermissionApprovalSource::PermissionPolicy,
+        };
+        let event = tickloop_agent::runtime::Event {
+            sequence: 1,
+            chat_id: chat,
+            loop_id: request.loop_id,
+            run_id: Uuid::nil(),
+            kind: EventKind::PermissionRequested {
+                request: request.clone(),
+            },
+        };
+        let mut pending = HashMap::new();
+        let mut permissions = HashMap::new();
+        let mut questions = HashMap::new();
+        track_run_requests(&event, &mut pending, &mut permissions, &mut questions);
+        assert!(pending.is_empty());
+        let wait = background_wait(Some(Uuid::new_v4()), &permissions, &questions).unwrap();
+        assert_eq!(wait.chat_id, chat);
+        assert_eq!(wait.request_id, request.id);
+        let directory = tempfile::tempdir().unwrap();
+        let core = tickloop_agent::runtime::Agent::new_embedded(
+            support::config(),
+            Arc::new(support::ScriptedModel::new(vec![])),
+        );
+        let other = core.create_chat(directory.path().into()).await.unwrap();
+        let mut snapshot = core.snapshot(other).await.unwrap();
+        super::sync_snapshot_requests(&snapshot, &mut permissions, &mut questions);
+        assert!(permissions.contains_key(&request.id));
+        let lost = crate::agent_access::AgentSummary {
+            availability: crate::agent_access::ExecutionAvailability::Lost,
+            execution: crate::agent_access::ExecutionRef {
+                owner_epoch: Uuid::new_v4(),
+                agent_id: chat,
+                generation: 1,
+            },
+            chat_id: chat,
+            workdir: PathBuf::new(),
+            state: tickloop_agent::runtime::LoopState::WaitingPermission,
+            run_id: None,
+            title: "Lost child".into(),
+            subagent: None,
+            has_work: Some(true),
+            updated_at: None,
+            preview: None,
+            waiting_permissions: 1,
+            waiting_questions: 0,
+            parent: None,
+            record: None,
+            workspace: None,
+            capabilities: vec![],
+            views: vec![],
+        };
+        assert!(
+            super::end_runs_of_lost_executions(
+                &[lost],
+                &mut pending,
+                &mut permissions,
+                &mut questions
+            )
+            .is_empty()
+        );
+        assert!(
+            permissions.is_empty(),
+            "lost direct Shell approval must not remain actionable"
+        );
+        snapshot.id = chat;
+        super::sync_snapshot_requests(&snapshot, &mut permissions, &mut questions);
+        assert!(permissions.is_empty());
+        core.shutdown().await;
     }
 
     #[test]

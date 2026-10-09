@@ -34,6 +34,7 @@ pub enum ShellTaskOwner {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShellTaskState {
     Queued,
+    WaitingPermission,
     Running,
     Background,
     Cancelling,
@@ -641,7 +642,10 @@ fn capabilities(
             }
             ShellTaskOrigin::User => matches!(
                 state,
-                ShellTaskState::Queued | ShellTaskState::Running | ShellTaskState::Background
+                ShellTaskState::Queued
+                    | ShellTaskState::WaitingPermission
+                    | ShellTaskState::Running
+                    | ShellTaskState::Background
             ),
         },
         can_read_output: has_output,
@@ -662,6 +666,7 @@ fn map_agent_state(state: CommandState) -> ShellTaskState {
 fn map_user_state(state: &UserShellState) -> ShellTaskState {
     match state {
         UserShellState::Queued => ShellTaskState::Queued,
+        UserShellState::WaitingPermission => ShellTaskState::WaitingPermission,
         UserShellState::Running => ShellTaskState::Running,
         UserShellState::Background => ShellTaskState::Background,
         UserShellState::Cancelling => ShellTaskState::Cancelling,

@@ -18,13 +18,11 @@ use crate::{
     tools::{CommandSnapshot, SearchConfig},
 };
 
-/// Business 9.0: 7.0's Monitor membership and push-completion delivery and usage, the Monitor's
-/// hosted Ticks (`ListHostedTicks`, `CloseHostedTick`, `ReopenHostedTick`, 8.0), and in 9.0 their
-/// screen snapshot and one-time view grant (`HostedTickSnapshot`, `AttachHostedTick`) and a
-/// delegated child's frozen set of authorities per host tool. An older peer cannot decode the
-/// newer commands or snapshots and would drop the whole connection, so other majors are refused
-/// at hello; there are no minor feature gates.
-pub const PROTOCOL_MAJOR: u16 = 9;
+/// Business 10.0 combines hosted Monitor commands, attach grants, routed per-tool authority
+/// sets, and typed model-call versus direct human Shell permission requests.
+/// A 9.0 peer requires the old flat run/call fields and cannot decode the new request shape;
+/// other business majors are refused before dispatch. Frozen management remains independent.
+pub const PROTOCOL_MAJOR: u16 = 10;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;

@@ -2514,12 +2514,22 @@ for line in sys.stdin:
         let host = tick_host::process::sample(launcher).unwrap().parent;
         unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
         assert!(super::gone(business_pid).await);
-        let CommandResult::HostedTicks(members) = owner
-            .command(AgentCommand::ListHostedTicks { execution })
-            .await
-        else {
-            panic!("hosted Ticks expected");
-        };
+        // The subscription's Watch is recorded in the background; a record written while a
+        // listing runs is judged by the next listing, so the loss may show one listing later.
+        let mut members = Vec::new();
+        for _ in 0..200 {
+            let CommandResult::HostedTicks(listed) = owner
+                .command(AgentCommand::ListHostedTicks { execution })
+                .await
+            else {
+                panic!("hosted Ticks expected");
+            };
+            members = listed;
+            if !members.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].instance, lost);
         assert_eq!(members[0].state, HostedMemberState::Lost);

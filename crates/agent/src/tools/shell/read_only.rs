@@ -10,10 +10,11 @@ use regex::Regex;
 
 use super::{
     command_tables::{
-        COMMAND_ALLOWLIST, CommandConfig, FlagArgument, READONLY_COMMANDS, SAFE_XARGS_TARGETS,
+        ARGUMENT_ONLY_XARGS_TARGETS, COMMAND_ALLOWLIST, CommandConfig, FlagArgument,
+        READONLY_COMMANDS,
     },
     security::{Safety, bash_command_is_safe, is_normalized_git_command},
-    syntax::{QuoteToken, quote_tokens},
+    syntax::{QuoteToken, quote_arguments, quote_tokens},
 };
 
 const STDERR_TO_STDOUT_SUFFIX: &str = " 2>&1";
@@ -117,7 +118,10 @@ pub(super) fn is_command_read_only(command: &str) -> bool {
     if let Some(stripped) = command.strip_suffix(STDERR_TO_STDOUT_SUFFIX) {
         command = stripped.trim();
     }
-    if contains_unquoted_expansion(command) {
+    if contains_unquoted_expansion(command)
+        || has_unproven_symlink_traversal(command)
+        || has_input_derived_file_targets(command)
+    {
         return false;
     }
     if is_command_safe_via_flag_parsing(command) {
@@ -130,6 +134,63 @@ pub(super) fn is_command_read_only(command: &str) -> bool {
         && (GIT_INLINE_CONFIG.is_match(command)
             || GIT_EXEC_PATH.is_match(command)
             || GIT_CONFIG_ENV.is_match(command)))
+}
+
+const SYMLINK_FOLLOWING_LONG_FLAGS: &[&str] = &[
+    "--follow",
+    "--follow-symlinks",
+    "--dereference",
+    "--dereference-recursive",
+];
+
+/// Per program, the short flags that make it follow symbolic links while walking directories.
+const SYMLINK_FOLLOWING_SHORT_FLAGS: &[(&str, &str)] = &[
+    ("rg", "L"),
+    ("fd", "L"),
+    ("find", "LH"),
+    ("du", "LH"),
+    ("grep", "RS"),
+    ("ls", "L"),
+    ("ag", "f"),
+    ("tree", "l"),
+];
+
+fn has_unproven_symlink_traversal(command: &str) -> bool {
+    let Some(arguments) = quote_arguments(command) else {
+        return true;
+    };
+    let Some((program, flags)) = arguments.split_first() else {
+        return false;
+    };
+    let following_short_flags = SYMLINK_FOLLOWING_SHORT_FLAGS
+        .iter()
+        .find(|(name, _)| name == program)
+        .map_or("", |(_, flags)| flags);
+    flags
+        .iter()
+        .take_while(|flag| flag.as_str() != "--")
+        .any(|flag| {
+            SYMLINK_FOLLOWING_LONG_FLAGS.contains(&flag.as_str())
+                || flag.starts_with('-')
+                    && !flag.starts_with("--")
+                    && flag[1..]
+                        .chars()
+                        .any(|character| following_short_flags.contains(character))
+        })
+}
+
+/// `wc` and `du` are read-only with any flags, but `--files0-from` takes their targets from a
+/// file, so the paths they read cannot be checked.
+fn has_input_derived_file_targets(command: &str) -> bool {
+    let Some(arguments) = quote_arguments(command) else {
+        return true;
+    };
+    matches!(arguments.first().map(String::as_str), Some("wc" | "du"))
+        && arguments
+            .iter()
+            .skip(1)
+            .take_while(|flag| flag.as_str() != "--")
+            .any(|flag| flag.split('=').next() == Some("--files0-from"))
 }
 
 fn matches_readonly_regex(command: &str) -> bool {
@@ -268,7 +329,7 @@ fn validate_flags(tokens: &[String], start: usize, config: &CommandConfig) -> bo
                 index += 1;
                 token = &tokens[index];
             }
-            return SAFE_XARGS_TARGETS.contains(&token);
+            return ARGUMENT_ONLY_XARGS_TARGETS.contains(&token);
         }
         if token == "--" {
             index += 1;
@@ -283,6 +344,9 @@ fn validate_flags(tokens: &[String], start: usize, config: &CommandConfig) -> bo
         }
         let has_equals = token.contains('=');
         let (flag, inline_value) = token.split_once('=').unwrap_or((token, ""));
+        if has_equals && !flag.starts_with("--") {
+            return false;
+        }
         if flag.is_empty() {
             return false;
         }
@@ -395,7 +459,6 @@ mod tests {
             "echo hello",
             "echo 'a b' \"c\"",
             "cd src",
-            "xargs grep foo",
             "xargs -I {} echo {}",
             "date +%Y-%m-%d",
             "tree -L 2",
@@ -478,6 +541,9 @@ mod tests {
         assert!(is_command_read_only("grep -rni foo src"));
         assert!(!is_command_read_only("grep -rne foo src"));
         assert!(!is_command_read_only("sort -rk2 names.txt"));
+        for command in ["xargs grep foo", "xargs head", "xargs wc -l", "xargs tail"] {
+            assert!(!is_command_read_only(command), "{command}");
+        }
     }
 
     #[test]

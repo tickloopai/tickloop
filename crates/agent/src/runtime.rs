@@ -480,6 +480,7 @@ fn thinking_enabled_by_default() -> bool {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum UserShellState {
     Queued,
+    WaitingPermission,
     Running,
     Background,
     Cancelling,
@@ -529,6 +530,13 @@ impl UserShellRecord {
             self.updated_at_ms = self.state_since;
         }
     }
+
+    /// Whether the Shell still waits for admission: for approval, or accepted but without a
+    /// started process.
+    pub(crate) fn awaits_admission(&self) -> bool {
+        self.state == UserShellState::WaitingPermission
+            || self.state == UserShellState::Running && self.pid.is_none()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -537,12 +545,32 @@ pub struct UserShellReceipt {
     pub command_id: Uuid,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum PermissionExecution {
+    ToolCall { run_id: RunId, call_id: String },
+    UserShell { command_id: Uuid },
+}
+
+impl PermissionExecution {
+    pub fn run_id(&self) -> Option<RunId> {
+        match self {
+            Self::ToolCall { run_id, .. } => Some(*run_id),
+            Self::UserShell { .. } => None,
+        }
+    }
+    pub fn call_key(&self) -> String {
+        match self {
+            Self::ToolCall { call_id, .. } => call_id.clone(),
+            Self::UserShell { command_id } => format!("user-shell:{command_id}"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PermissionRequest {
     pub id: Uuid,
     pub loop_id: LoopId,
-    pub run_id: RunId,
-    pub call_id: String,
+    pub execution: PermissionExecution,
     pub name: String,
     pub input: serde_json::Value,
     #[serde(default)]
@@ -559,7 +587,6 @@ pub enum PermissionApprovalSource {
     #[default]
     PermissionPolicy,
     ExplicitAsk,
-    #[serde(alias = "host_policy")]
     SafetyCheck,
     AutoReviewer,
 }
@@ -1020,6 +1047,7 @@ struct Inner {
     chats: Mutex<HashMap<ChatId, Chat>>,
     events: broadcast::Sender<Event>,
     user_shell_events: broadcast::Sender<UserShellRecord>,
+    user_shell_cancellations: std::sync::Mutex<HashMap<(ChatId, Uuid), CancellationToken>>,
     task_notifications: broadcast::Sender<TaskNotification>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     recorder: Option<persistence::ChatRecorder>,
@@ -1227,7 +1255,9 @@ impl Chat {
         self.snapshot.user_shells.iter().any(|record| {
             matches!(
                 record.state,
-                UserShellState::Running | UserShellState::Cancelling
+                UserShellState::WaitingPermission
+                    | UserShellState::Running
+                    | UserShellState::Cancelling
             )
         })
     }
@@ -1282,15 +1312,25 @@ fn answerable_permission_request(
         .find(|request| request.id == request_id)
         .cloned()
         .ok_or_else(|| AgentError::Invalid("permission request expired".into()))?;
-    if chat
-        .run_cancel(request.run_id)
-        .is_none_or(CancellationToken::is_cancelled)
-        || !chat.snapshot.loops.iter().any(|goal| {
-            goal.id == request.loop_id
-                && goal.run_id == Some(request.run_id)
-                && goal.state == LoopState::WaitingPermission
-        })
-    {
+    let answerable = match request.execution {
+        PermissionExecution::ToolCall { run_id, .. } => {
+            chat.run_cancel(run_id)
+                .is_some_and(|cancel| !cancel.is_cancelled())
+                && chat.snapshot.loops.iter().any(|goal| {
+                    goal.id == request.loop_id
+                        && goal.run_id == Some(run_id)
+                        && goal.state == LoopState::WaitingPermission
+                })
+        }
+        PermissionExecution::UserShell { command_id } => {
+            chat.snapshot.user_shells.iter().any(|shell| {
+                shell.id == command_id
+                    && shell.loop_id == Some(request.loop_id)
+                    && shell.state == UserShellState::WaitingPermission
+            })
+        }
+    };
+    if !answerable {
         return Err(AgentError::Invalid("permission request cancelled".into()));
     }
     if allow && let Some(prepared) = request.file_change.as_deref() {
@@ -1949,6 +1989,7 @@ impl Agent {
                 chats: Mutex::new(HashMap::new()),
                 events: broadcast::channel(256).0,
                 user_shell_events: broadcast::channel(256).0,
+                user_shell_cancellations: std::sync::Mutex::new(HashMap::new()),
                 task_notifications: broadcast::channel(256).0,
                 tasks: Mutex::new(Vec::new()),
                 recorder,
@@ -2003,6 +2044,23 @@ impl Agent {
             (PromptPolicy::DenyOnPrompt, Decision::Ask) => Decision::Deny,
             (PromptPolicy::Unrestricted, Decision::Ask | Decision::Check) => Decision::Allow,
             _ => decision,
+        }
+    }
+
+    /// `apply_prompt_policy`, except that an Ask the user explicitly required still asks under
+    /// an Unrestricted host.
+    fn apply_prompt_policy_with_explicit_ask(
+        &self,
+        decision: Decision,
+        is_explicit_ask: bool,
+    ) -> Decision {
+        if is_explicit_ask
+            && decision == Decision::Ask
+            && self.inner.host_options.prompt_policy == PromptPolicy::Unrestricted
+        {
+            Decision::Ask
+        } else {
+            self.apply_prompt_policy(decision)
         }
     }
 
@@ -2092,7 +2150,7 @@ impl Agent {
             .await
             .entry(id)
             .or_default();
-        let tools = self.create_chat_tools(id, &snapshot.workdir);
+        let tools = self.create_chat_tools(&snapshot);
         let skills = crate::skills::SkillRegistry::discover(
             &snapshot.workdir,
             self.inner.user_skills_directory.as_deref(),
@@ -2654,6 +2712,10 @@ impl Agent {
         chat.snapshot
             .run_loops
             .insert(receipt.run_id, receipt.loop_id);
+        self.publish_event(chat, receipt, kind);
+    }
+
+    fn publish_event(&self, chat: &mut Chat, receipt: &Receipt, kind: EventKind) {
         chat.snapshot.last_sequence += 1;
         let event = Event {
             sequence: chat.snapshot.last_sequence,
@@ -2725,6 +2787,8 @@ impl Agent {
             }
             let state = serde_json::json!({
                 "workdir": chat.snapshot.workdir,
+                "family_temp_directory": chat.tools.family_temp_directory(),
+                "scratchpad": chat.tools.family_temp_directory().join(crate::tools::SCRATCHPAD_SUBDIRECTORY),
                 "delegation": chat.snapshot.delegation,
                 "workspace_host": workspace_host,
                 "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
@@ -3901,32 +3965,60 @@ impl Agent {
         let request = PermissionRequest {
             id: Uuid::new_v4(),
             loop_id: receipt.loop_id,
-            run_id: receipt.run_id,
-            call_id: operation.call_id.clone(),
+            execution: PermissionExecution::ToolCall {
+                run_id: receipt.run_id,
+                call_id: operation.call_id.clone(),
+            },
             name: operation.name.clone(),
             input: operation.input.clone(),
             file_change: operation.file_change.clone().map(Box::new),
             approval_reason,
             approval_source,
         };
+        self.wait_for_permission(receipt.chat_id, request, session_operation, cancel)
+            .await
+    }
+
+    async fn wait_for_permission(
+        &self,
+        chat_id: ChatId,
+        request: PermissionRequest,
+        session_operation: SessionPermissionOperation,
+        cancel: CancellationToken,
+    ) -> Result<PermissionAnswer, String> {
+        let model_receipt = request.execution.run_id().map(|run_id| Receipt {
+            chat_id,
+            loop_id: request.loop_id,
+            run_id,
+        });
         let (sender, receiver) = oneshot::channel();
-        let owner = PermissionOwner::new(receipt.chat_id, receipt.loop_id)
-            .map_err(|error| error.to_string())?;
+        let owner =
+            PermissionOwner::new(chat_id, request.loop_id).map_err(|error| error.to_string())?;
         {
             let mut chats = self.inner.chats.lock().await;
-            let chat = chats.get_mut(&receipt.chat_id).unwrap();
+            let chat = chats
+                .get_mut(&chat_id)
+                .ok_or("permission requester is unavailable")?;
             if cancel.is_cancelled() {
-                return Err("run interrupted before permission request".into());
+                return Err("permission request cancelled before publication".into());
             }
-            chat.snapshot
-                .loops
-                .iter_mut()
-                .find(|goal| goal.id == receipt.loop_id)
-                .unwrap()
-                .set_state(LoopState::WaitingPermission);
+            if let Some(receipt) = &model_receipt {
+                chat.snapshot
+                    .loops
+                    .iter_mut()
+                    .find(|goal| goal.id == receipt.loop_id)
+                    .ok_or("permission Loop is unavailable")?
+                    .set_state(LoopState::WaitingPermission);
+                self.park_run(chat, receipt, cancel.clone())
+                    .map_err(|error| error.to_string())?;
+            } else if let PermissionExecution::UserShell { command_id } = request.execution
+                && !chat.snapshot.user_shells.iter().any(|shell| {
+                    shell.id == command_id && shell.state == UserShellState::WaitingPermission
+                })
+            {
+                return Err("user Shell permission expired".into());
+            }
             chat.snapshot.permissions.push(request.clone());
-            self.park_run(chat, receipt, cancel.clone())
-                .map_err(|error| error.to_string())?;
             self.inner.approvals.lock().await.insert(
                 request.id,
                 PendingApproval {
@@ -3935,34 +4027,45 @@ impl Agent {
                     operation: session_operation,
                 },
             );
-            self.emit(
+            let receipt = model_receipt.clone().unwrap_or(Receipt {
+                chat_id,
+                loop_id: request.loop_id,
+                run_id: Uuid::nil(),
+            });
+            self.publish_event(
                 chat,
-                receipt,
+                &receipt,
                 EventKind::PermissionRequested {
                     request: request.clone(),
                 },
             );
         }
-        let next = self
-            .next_run(receipt.chat_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        if let Some(next) = next {
+        if model_receipt.is_some()
+            && let Some(next) = self
+                .next_run(chat_id)
+                .await
+                .map_err(|error| error.to_string())?
+        {
             self.inner.tasks.lock().await.push(self.run_task(next));
         }
-        let answer = tokio::select! {biased;_ = cancel.cancelled()=>Err("permission request was cancelled".to_string()),answer=receiver=>answer.map_err(|_|"permission request expired".to_string())};
+        let answer = tokio::select! {biased; _ = cancel.cancelled() => Err("permission request cancelled".into()), answer = receiver => answer.map_err(|_| "permission request expired".to_owned())};
         let resumed = if answer.is_ok() {
-            self.resume_parked_run(receipt, cancel.clone()).await
+            if let Some(receipt) = &model_receipt {
+                self.resume_parked_run(receipt, cancel.clone()).await
+            } else {
+                Ok(())
+            }
         } else {
             Ok(())
         };
         let mut chats = self.inner.chats.lock().await;
-        let chat = chats.get_mut(&receipt.chat_id).unwrap();
-        chat.snapshot
-            .permissions
-            .retain(|permission| permission.id != request.id);
+        if let Some(chat) = chats.get_mut(&chat_id) {
+            chat.snapshot
+                .permissions
+                .retain(|permission| permission.id != request.id);
+            self.save(&chat.snapshot);
+        }
         self.inner.approvals.lock().await.remove(&request.id);
-        self.save(&chat.snapshot);
         resumed?;
         answer
     }
