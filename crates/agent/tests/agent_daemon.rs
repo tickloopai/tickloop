@@ -611,25 +611,29 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
     assert!(!socket.exists());
 }
 
-/// Stops whatever daemon serves a test's private runtime directory when the test ends, also
-/// after a failed assertion. The test's runtime may already be gone by then, so the shutdown
-/// runs on its own thread and runtime and is awaited.
-struct PrivateDaemonGuard {
-    socket: std::path::PathBuf,
+/// A test's private daemon runtime directory. Dropping it stops whatever daemon serves the
+/// directory, also after a failed assertion, then removes the directory, which ends a daemon that
+/// did not stop. The test's runtime may already be gone by then, so the shutdown runs on its own
+/// thread and runtime and is awaited.
+struct PrivateDaemon {
+    directory: tempfile::TempDir,
 }
-impl PrivateDaemonGuard {
-    fn new(directory: &Path) -> Self {
+impl PrivateDaemon {
+    fn new() -> Self {
         Self {
-            socket: directory.join("daemon.sock"),
+            directory: support::runtime_dir(),
         }
     }
+    fn path(&self) -> &Path {
+        self.directory.path()
+    }
 }
-impl Drop for PrivateDaemonGuard {
+impl Drop for PrivateDaemon {
     fn drop(&mut self) {
-        if !self.socket.exists() {
+        let socket = self.path().join("daemon.sock");
+        if !socket.exists() {
             return;
         }
-        let socket = self.socket.clone();
         let _ = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -653,11 +657,8 @@ impl Drop for PrivateDaemonGuard {
 
 #[tokio::test]
 async fn a_daemon_killed_without_cleanup_never_blocks_the_next_daemon() {
-    use std::os::unix::fs::PermissionsExt;
-    let temporary = tempfile::tempdir_in("/tmp").unwrap();
-    let private_directory = temporary.path().join("agent-runtime");
-    std::fs::create_dir(&private_directory).unwrap();
-    std::fs::set_permissions(&private_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let daemon = PrivateDaemon::new();
+    let private_directory = daemon.path().to_path_buf();
     let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_tickloop"));
     let killed = tickloop_agent::agent_daemon::connect_or_start_at(
         private_directory.clone(),
@@ -678,7 +679,6 @@ async fn a_daemon_killed_without_cleanup_never_blocks_the_next_daemon() {
         private_directory.join("worker-control.sock").exists(),
         "a killed daemon leaves its endpoints behind"
     );
-    let _guard = PrivateDaemonGuard::new(&private_directory);
     let next = tickloop_agent::agent_daemon::connect_or_start_at(private_directory, executable)
         .await
         .expect("the next daemon replaces the stale endpoints");
@@ -692,10 +692,8 @@ async fn a_real_daemon_answers_hosted_lifecycle_requests_only_for_live_grants() 
         DaemonControl, WorkerControlGrant, WorkerRequest,
     };
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
-    let private_directory = temporary.path().join("agent-runtime");
-    std::fs::create_dir(&private_directory).unwrap();
-    std::fs::set_permissions(&private_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let _guard = PrivateDaemonGuard::new(&private_directory);
+    let daemon = PrivateDaemon::new();
+    let private_directory = daemon.path().to_path_buf();
     let client = tickloop_agent::agent_daemon::connect_or_start_at(
         private_directory.clone(),
         std::path::PathBuf::from(env!("CARGO_BIN_EXE_tickloop")),
@@ -751,10 +749,8 @@ async fn concurrent_cold_start_uses_one_isolated_daemon_and_daemon_exit_closes_w
     use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
     const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
-    let private_directory = temporary.path().join("agent-runtime");
-    std::fs::create_dir(&private_directory).unwrap();
-    std::fs::set_permissions(&private_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let _guard = PrivateDaemonGuard::new(&private_directory);
+    let daemon = PrivateDaemon::new();
+    let private_directory = daemon.path().to_path_buf();
     let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_tickloop"));
     let mut calls = Vec::new();
     for _ in 0..8 {
@@ -953,6 +949,212 @@ async fn concurrent_cold_start_uses_one_isolated_daemon_and_daemon_exit_closes_w
     };
     assert_eq!(old.code, AccessErrorCode::EpochChanged);
     new_daemon.shutdown_daemon().await.unwrap();
+}
+
+/// How soon a daemon clients can no longer reach exits with its workers.
+const STEP_DOWN_DEADLINE: Duration = Duration::from_secs(3);
+/// Long enough for a daemon to check its runtime directory at least twice.
+const TWO_RUNTIME_CHECKS: Duration = Duration::from_millis(2500);
+const DAEMON_HOLDER_REPORT: &str = "TICKLOOP_TEST_DAEMON_HOLDER_REPORT";
+const NEXT_TEST_PROCESS: &str = "TICKLOOP_TEST_NEXT_PROCESS";
+
+/// Starts a daemon in `runtime` with one idle worker, and returns a client of the daemon with the
+/// processes of the daemon and the worker.
+async fn start_daemon_with_worker(runtime: &Path, workdir: &Path) -> (LocalAgentClient, [u32; 2]) {
+    let client = tickloop_agent::agent_daemon::connect_or_start_at(
+        runtime.to_path_buf(),
+        PathBuf::from(env!("CARGO_BIN_EXE_tickloop")),
+    )
+    .await
+    .unwrap();
+    let mut launch = LaunchSpec::embedded(workdir.to_path_buf());
+    launch.session_persistence = false;
+    let mut model = support::config();
+    model.api_key_env = "TICKLOOP_FIXTURE_API_KEY".into();
+    launch.model = Some(model);
+    launch.environment = [
+        ("PATH", "/usr/bin:/bin"),
+        ("TICKLOOP_FIXTURE_API_KEY", "fixture-key"),
+        ("DEEPSEEK_API_KEY", "fixture-compiled-selection-key"),
+    ]
+    .into_iter()
+    .map(|(name, value)| EnvironmentValue {
+        name: name.as_bytes().to_vec(),
+        value: value.as_bytes().to_vec(),
+    })
+    .collect();
+    execution(
+        client
+            .execute(envelope(
+                client.daemon_epoch(),
+                AgentCommand::Create {
+                    launch,
+                    initial: None,
+                    origin: None,
+                },
+            ))
+            .await
+            .unwrap(),
+    );
+    let worker_socket = std::fs::read_dir(runtime)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("w-")
+        })
+        .expect("the daemon published its worker's socket");
+    let worker = LocalAgentClient::connect(&worker_socket).await.unwrap();
+    let processes = [client.server_process_id(), worker.server_process_id()];
+    (client, processes)
+}
+
+async fn assert_exit_before(deadline: std::time::Instant, processes: &[u32]) {
+    while !processes
+        .iter()
+        .all(|process| support::has_exited(*process))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "processes {processes:?} still run"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_daemon_whose_runtime_directory_is_removed_exits_with_its_workers() {
+    let workdir = tempfile::tempdir().unwrap();
+    let runtime = support::runtime_dir();
+    let (_client, processes) = start_daemon_with_worker(runtime.path(), workdir.path()).await;
+    drop(runtime);
+    assert_exit_before(std::time::Instant::now() + STEP_DOWN_DEADLINE, &processes).await;
+}
+
+#[tokio::test]
+async fn a_daemon_whose_socket_is_replaced_exits_and_leaves_the_replacement() {
+    use std::os::unix::fs::MetadataExt;
+    let daemon = PrivateDaemon::new();
+    let client = tickloop_agent::agent_daemon::connect_or_start_at(
+        daemon.path().to_path_buf(),
+        PathBuf::from(env!("CARGO_BIN_EXE_tickloop")),
+    )
+    .await
+    .unwrap();
+    let socket = daemon.path().join("daemon.sock");
+    std::fs::rename(&socket, daemon.path().join("original.sock")).unwrap();
+    let _replacement = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let replacement = std::fs::symlink_metadata(&socket).unwrap();
+    assert_exit_before(
+        std::time::Instant::now() + STEP_DOWN_DEADLINE,
+        &[client.server_process_id()],
+    )
+    .await;
+    let remaining = std::fs::symlink_metadata(&socket).unwrap();
+    assert_eq!(
+        (remaining.dev(), remaining.ino()),
+        (replacement.dev(), replacement.ino())
+    );
+}
+
+#[tokio::test]
+async fn a_daemon_keeps_serving_without_its_lock_file_and_exits_once_the_lock_is_replaced() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let daemon = PrivateDaemon::new();
+    let client = tickloop_agent::agent_daemon::connect_or_start_at(
+        daemon.path().to_path_buf(),
+        PathBuf::from(env!("CARGO_BIN_EXE_tickloop")),
+    )
+    .await
+    .unwrap();
+    let lock = daemon.path().join("daemon.lock");
+    std::fs::remove_file(&lock).unwrap();
+    tokio::time::sleep(TWO_RUNTIME_CHECKS).await;
+    let reconnected = LocalAgentClient::connect(daemon.path().join("daemon.sock"))
+        .await
+        .expect("a daemon whose lock file was only removed keeps serving");
+    assert_eq!(reconnected.daemon_epoch(), client.daemon_epoch());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&lock)
+        .unwrap();
+    assert_exit_before(
+        std::time::Instant::now() + STEP_DOWN_DEADLINE,
+        &[client.server_process_id()],
+    )
+    .await;
+}
+
+/// Runs only as a child of `a_daemon_left_by_a_killed_test_process_exits_once_the_next_starts`:
+/// holds a private daemon with a worker and reports their processes until its stdin closes.
+#[tokio::test]
+async fn daemon_holder_child_process() {
+    let Some(report) = std::env::var_os(DAEMON_HOLDER_REPORT).map(PathBuf::from) else {
+        return;
+    };
+    let workdir = tempfile::tempdir().unwrap();
+    let runtime = support::runtime_dir();
+    let (_client, [daemon, worker]) =
+        start_daemon_with_worker(runtime.path(), workdir.path()).await;
+    let unpublished = report.with_extension("partial");
+    std::fs::write(&unpublished, format!("{daemon} {worker}")).unwrap();
+    std::fs::rename(unpublished, report).unwrap();
+    let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0]);
+}
+
+/// Runs only as a child of the same test: a test process that starts, as the next one would.
+#[test]
+fn next_test_process_child_process() {
+    if std::env::var_os(NEXT_TEST_PROCESS).is_some() {
+        drop(support::runtime_dir());
+    }
+}
+
+#[tokio::test]
+async fn a_daemon_left_by_a_killed_test_process_exits_once_the_next_starts() {
+    let scratch = tempfile::tempdir().unwrap();
+    let report = scratch.path().join("processes");
+    let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "daemon_holder_child_process", "--nocapture"])
+        .env(DAEMON_HOLDER_REPORT, &report)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let processes = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(processes) = std::fs::read_to_string(&report) {
+                break processes
+                    .split(' ')
+                    .map(|process| process.parse::<u32>().unwrap())
+                    .collect::<Vec<_>>();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the holder starts its daemon");
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    assert!(
+        !processes
+            .iter()
+            .any(|process| support::has_exited(*process)),
+        "a test process killed without cleanup leaves its daemon and worker running"
+    );
+    let next_started = std::time::Instant::now();
+    let next = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "next_test_process_child_process"])
+        .env(NEXT_TEST_PROCESS, "1")
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(next.success());
+    assert_exit_before(next_started + STEP_DOWN_DEADLINE, &processes).await;
 }
 
 async fn controlled_connections(
@@ -1238,6 +1440,7 @@ async fn a_recovering_client_fences_an_old_execution_when_the_daemon_epoch_chang
         daemon,
         epoch,
         support::TRANSPORT_LIMITS,
+        tokio_util::sync::CancellationToken::new(),
     ));
     let initial = LocalAgentClient::connect(&socket).await.unwrap();
     let old_epoch = initial.daemon_epoch();
@@ -1278,6 +1481,7 @@ async fn a_recovering_client_fences_an_old_execution_when_the_daemon_epoch_chang
         replacement_daemon,
         epoch,
         support::TRANSPORT_LIMITS,
+        tokio_util::sync::CancellationToken::new(),
     ));
     let error = tokio::time::timeout(Duration::from_secs(3), async {
         loop {

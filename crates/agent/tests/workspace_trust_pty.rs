@@ -28,10 +28,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let root = tempfile::Builder::new()
-            .prefix("tltu")
-            .tempdir_in("/private/tmp")
-            .unwrap();
+        let root = support::runtime_dir();
         for name in ["home", "config", "runtime", "scratch", "work"] {
             let directory = root.path().join(name);
             fs::create_dir(&directory).unwrap();

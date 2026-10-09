@@ -39,7 +39,13 @@ struct ClientInner {
     limits: AccessLimits,
     pending: Mutex<HashMap<Uuid, oneshot::Sender<Result<Reply, AccessError>>>>,
     subscriptions: Mutex<HashMap<Uuid, Subscription>>,
+    /// Cancelled once the connection takes no more requests: a write failed, the daemon closed
+    /// it, or the client was dropped.
     cancel: CancellationToken,
+    /// Stops the response reader, and with it `cancel`. Only dropping the client stops it, so
+    /// replies the daemon wrote before closing, such as `DaemonStopped`, are still delivered
+    /// after a write to the closed connection failed.
+    reader_stop: CancellationToken,
 }
 
 struct PendingObservationCancel {
@@ -157,7 +163,7 @@ enum Reply {
 
 impl Drop for ClientInner {
     fn drop(&mut self) {
-        self.cancel.cancel();
+        self.reader_stop.cancel();
     }
 }
 
@@ -169,18 +175,21 @@ impl LocalAgentClient {
         verify_peer(&stream)?;
         let (hello, limits) = negotiate(&mut stream).await?;
         let (reader, writer) = stream.into_split();
+        let reader_stop = CancellationToken::new();
         let inner = Arc::new(ClientInner {
             writer: Arc::new(Mutex::new(writer)),
             hello,
             limits,
             pending: Mutex::new(HashMap::new()),
             subscriptions: Mutex::new(HashMap::new()),
-            cancel: CancellationToken::new(),
+            cancel: reader_stop.child_token(),
+            reader_stop: reader_stop.clone(),
         });
         tokio::spawn(read_responses(
             reader,
             Arc::downgrade(&inner),
             inner.cancel.clone(),
+            reader_stop,
             limits,
         ));
         Ok(Self { inner })
@@ -432,11 +441,12 @@ async fn read_responses(
     mut reader: OwnedReadHalf,
     inner: Weak<ClientInner>,
     cancel: CancellationToken,
+    stop: CancellationToken,
     limits: AccessLimits,
 ) {
     let mut transfer: Option<IncomingTransfer> = None;
     loop {
-        let response = tokio::select! { _ = cancel.cancelled() => break, response = read_frame::<_, ServerMessage>(&mut reader, limits.frame_bytes()) => response };
+        let response = tokio::select! { _ = stop.cancelled() => break, response = read_frame::<_, ServerMessage>(&mut reader, limits.frame_bytes()) => response };
         let Ok(Some(response)) = response else {
             break;
         };
@@ -639,13 +649,15 @@ pub async fn serve_listener(
     }
 }
 
+/// Serves the daemon endpoint until `shutdown` is cancelled, by a `ShutdownDaemon` request on
+/// any connection or by the daemon itself.
 pub async fn serve_daemon_listener(
     listener: UnixListener,
     access: Arc<dyn AgentAccess>,
     epoch: Uuid,
     limits: AccessLimits,
+    shutdown: CancellationToken,
 ) -> Result<(), AccessError> {
-    let shutdown = CancellationToken::new();
     loop {
         let incoming = tokio::select! { _ = shutdown.cancelled() => return Ok(()), incoming = listener.accept() => incoming };
         let (stream, _) = incoming.map_err(|error| AccessError::unavailable(error.to_string()))?;
@@ -2579,5 +2591,78 @@ mod tests {
             "the `New Agent` title alone never makes a worked Agent empty"
         );
         server.abort();
+    }
+
+    /// A daemon answers `ShutdownDaemon` and closes the connection at once, so a concurrent write,
+    /// such as an observation cancel, fails while the reply is still unread.
+    #[tokio::test]
+    async fn a_reply_written_before_the_daemon_closed_survives_a_failed_write() {
+        use std::io::{Read, Write};
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = temporary.path().join("closing.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let (received, request_arrived) = oneshot::channel();
+        let (reply, reply_allowed) = std::sync::mpsc::channel::<()>();
+        let (closed, daemon_closed) = std::sync::mpsc::channel::<()>();
+        let daemon = std::thread::spawn(move || {
+            let read = |stream: &mut std::os::unix::net::UnixStream| {
+                let mut length = [0; 4];
+                stream.read_exact(&mut length).unwrap();
+                let mut frame = vec![0; u32::from_be_bytes(length) as usize];
+                stream.read_exact(&mut frame).unwrap();
+                serde_json::from_slice::<ClientMessage>(&frame).unwrap()
+            };
+            let write = |stream: &mut std::os::unix::net::UnixStream, message: &ServerMessage| {
+                let frame = serde_json::to_vec(message).unwrap();
+                stream
+                    .write_all(&(frame.len() as u32).to_be_bytes())
+                    .unwrap();
+                stream.write_all(&frame).unwrap();
+            };
+            let (mut stream, _) = listener.accept().unwrap();
+            read(&mut stream);
+            write(
+                &mut stream,
+                &ServerMessage::Hello(ServerHello {
+                    process_id: 0,
+                    major: PROTOCOL_MAJOR,
+                    minor: PROTOCOL_MINOR,
+                    daemon_epoch: Uuid::new_v4(),
+                    session_id: Uuid::new_v4(),
+                    capabilities: Vec::new(),
+                    limits: TRANSPORT_LIMITS.into(),
+                }),
+            );
+            let ClientMessage::ShutdownDaemon { request_id, .. } = read(&mut stream) else {
+                panic!("expected a shutdown request");
+            };
+            received.send(()).unwrap();
+            reply_allowed.recv().unwrap();
+            write(&mut stream, &ServerMessage::DaemonStopped { request_id });
+            drop(stream);
+            closed.send(()).unwrap();
+        });
+        let client = LocalAgentClient::connect(&socket).await.unwrap();
+        let stopping = client.clone();
+        let shutdown = tokio::spawn(async move { stopping.shutdown_daemon().await });
+        request_arrived.await.unwrap();
+        reply.send(()).unwrap();
+        // Blocking this runtime thread keeps the response reader from seeing the reply before the
+        // next write fails on the closed connection.
+        daemon_closed.recv().unwrap();
+        client
+            .execute(CommandEnvelope {
+                daemon_epoch: client.daemon_epoch(),
+                command_id: Uuid::new_v4(),
+                command: AgentCommand::FlushTranscripts,
+            })
+            .await
+            .expect_err("the daemon closed the connection");
+        assert!(!client.is_connected());
+        shutdown
+            .await
+            .unwrap()
+            .expect("the reply sent before the daemon closed is delivered");
+        daemon.join().unwrap();
     }
 }

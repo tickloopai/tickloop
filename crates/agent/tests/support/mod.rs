@@ -5,7 +5,10 @@ pub mod fixture_cli;
 pub mod herdr;
 pub mod hosted;
 pub mod routed;
+mod runtime;
 pub mod tick_admission_contract;
+
+pub use runtime::runtime_dir;
 
 use async_trait::async_trait;
 use std::{collections::VecDeque, sync::Mutex};
@@ -321,6 +324,14 @@ pub fn model_script_requests(
         .iter()
         .filter(|entry| entry.kind != tickloop_agent::runtime::RequestKind::Title)
         .collect()
+}
+
+/// Whether `process_id` has exited, reaping it when it is a child of this test process.
+pub fn has_exited(process_id: u32) -> bool {
+    let process_id = process_id as libc::pid_t;
+    let mut status = 0;
+    let reaped = unsafe { libc::waitpid(process_id, &mut status, libc::WNOHANG) };
+    reaped == process_id || runtime::is_dead(process_id)
 }
 
 /// Stops the Tickhost a test started, if one still runs, through its management channel, so

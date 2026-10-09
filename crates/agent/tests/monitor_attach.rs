@@ -38,7 +38,7 @@ impl Host {
             },
             Uuid::new_v4(),
             support::fixture_cli::executable(),
-            tickhost::host::DEFAULT_IDLE_TIMEOUT,
+            support::hosted::IDLE_TIMEOUT,
         );
         Self {
             directory,

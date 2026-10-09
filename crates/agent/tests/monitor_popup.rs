@@ -360,7 +360,7 @@ async fn the_installed_popup_shows_the_same_hosted_tick_until_esc_closes_it() {
         },
         Uuid::new_v4(),
         support::fixture_cli::executable(),
-        tickhost::host::DEFAULT_IDLE_TIMEOUT,
+        support::hosted::IDLE_TIMEOUT,
     );
     let owner = tickhost::host::TickOwner {
         root: "fixture-root".into(),

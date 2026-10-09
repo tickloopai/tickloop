@@ -35,20 +35,18 @@ const FIXTURE_TEXT: &str = "Keep this saved daemon-stop fixture history.";
 /// The frozen management major on daemon.sock; it has no aliases.
 const MANAGEMENT_MAJOR: u16 = 1;
 
+/// A private runtime and config root. Dropping it stops the daemon of `daemon_epoch` through the
+/// management wire, then removes the directory, which also ends a daemon that did not stop.
 struct DaemonFixture {
     directory: tempfile::TempDir,
     runtime: PathBuf,
     config: PathBuf,
     daemon_epoch: Option<Uuid>,
-    launch_in_progress: bool,
 }
 
 impl DaemonFixture {
     fn new() -> Self {
-        let directory = tempfile::Builder::new()
-            .prefix("tl-stop-")
-            .tempdir_in("/private/tmp")
-            .unwrap();
+        let directory = support::runtime_dir();
         let root = directory.path().canonicalize().unwrap();
         let runtime = root.join("runtime");
         let config = root.join("config");
@@ -61,7 +59,6 @@ impl DaemonFixture {
             runtime,
             config,
             daemon_epoch: None,
-            launch_in_progress: false,
         }
     }
 
@@ -109,27 +106,13 @@ impl DaemonFixture {
 impl Drop for DaemonFixture {
     fn drop(&mut self) {
         let Some(epoch) = self.daemon_epoch else {
-            if self.launch_in_progress {
-                self.directory.disable_cleanup(true);
-                eprintln!(
-                    "Retained owned daemon fixture after an unconfirmed launch: {}",
-                    self.runtime.display()
-                );
-            }
             return;
         };
         let socket = self.runtime.join("daemon.sock");
-        let Ok(mut stream) = BlockingUnixStream::connect(&socket) else {
-            self.directory.disable_cleanup(true);
-            eprintln!(
-                "Retained unreachable owned daemon fixture: {}",
-                self.runtime.display()
-            );
-            return;
-        };
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-        let cleanup = (|| -> std::io::Result<bool> {
+        let stop = || -> std::io::Result<bool> {
+            let mut stream = BlockingUnixStream::connect(&socket)?;
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(2)))?;
             write_blocking(
                 &mut stream,
                 &json!({"Hello":{"major":MANAGEMENT_MAJOR,"minor":0}}),
@@ -145,19 +128,16 @@ impl Drop for DaemonFixture {
             )?;
             let response = read_blocking(&mut stream)?;
             Ok(response["DaemonStopped"]["request_id"] == json!(request_id))
-        })();
-        drop(stream);
-        let confirmed = matches!(cleanup, Ok(true));
-        if confirmed {
+        };
+        if matches!(stop(), Ok(true)) {
             let deadline = std::time::Instant::now() + Duration::from_secs(7);
             while socket.exists() && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(25));
             }
         }
-        if !confirmed || socket.exists() {
-            self.directory.disable_cleanup(true);
+        if socket.exists() {
             eprintln!(
-                "Retained owned daemon fixture after incomplete cleanup: {}",
+                "Daemon fixture cleanup was incomplete; removing {} ends the daemon",
                 self.runtime.display()
             );
         }
@@ -510,29 +490,10 @@ async fn shutdown_ack_is_not_success_until_the_original_daemon_lock_is_released(
 
 async fn assert_processes_exited(process_ids: &[u32]) {
     tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let mut live = false;
-            for process_id in process_ids {
-                let mut status = 0;
-                let reaped = unsafe {
-                    libc::waitpid(*process_id as libc::pid_t, &mut status, libc::WNOHANG)
-                };
-                if reaped == *process_id as libc::pid_t {
-                    continue;
-                }
-                let exists = unsafe { libc::kill(*process_id as libc::pid_t, 0) } == 0;
-                if !exists {
-                    assert_eq!(
-                        std::io::Error::last_os_error().raw_os_error(),
-                        Some(libc::ESRCH),
-                        "could not establish liveness of an owned fixture PID"
-                    );
-                }
-                live |= exists;
-            }
-            if !live {
-                break;
-            }
+        while !process_ids
+            .iter()
+            .all(|process_id| support::has_exited(*process_id))
+        {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
@@ -678,7 +639,6 @@ fn process_arguments(process_id: u32) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_cli_stop_ends_current_daemon_and_active_worker_preserving_saved_history() {
     let mut fixture = DaemonFixture::new();
-    fixture.launch_in_progress = true;
     let daemon = tickloop_agent::agent_daemon::connect_or_start_at(
         fixture.runtime.clone(),
         support::fixture_cli::executable(),
@@ -687,7 +647,6 @@ async fn explicit_cli_stop_ends_current_daemon_and_active_worker_preserving_save
     .unwrap();
     let epoch = daemon.daemon_epoch();
     fixture.daemon_epoch = Some(epoch);
-    fixture.launch_in_progress = false;
     let (launch, mut requests, _release) = launch_active_worker(&fixture).await;
     let created = daemon
         .execute(create_command(epoch, launch))
@@ -742,7 +701,6 @@ async fn explicit_cli_stop_ends_current_daemon_and_active_worker_preserving_save
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn frozen_management_wire_stops_a_daemon_of_any_business_major() {
     let mut fixture = DaemonFixture::new();
-    fixture.launch_in_progress = true;
     let daemon = tickloop_agent::agent_daemon::connect_or_start_at(
         fixture.runtime.clone(),
         env!("CARGO_BIN_EXE_tickloop").into(),
@@ -750,7 +708,6 @@ async fn frozen_management_wire_stops_a_daemon_of_any_business_major() {
     .await
     .unwrap();
     fixture.daemon_epoch = Some(daemon.daemon_epoch());
-    fixture.launch_in_progress = false;
     let mut stream = UnixStream::connect(fixture.runtime.join("daemon.sock"))
         .await
         .unwrap();
@@ -811,6 +768,7 @@ async fn management_session_rejects_every_business_request_before_dispatch() {
         access.clone(),
         epoch,
         support::TRANSPORT_LIMITS,
+        tokio_util::sync::CancellationToken::new(),
     ));
     let request_id = Uuid::new_v4();
     let requests = [
@@ -862,6 +820,7 @@ async fn management_rejects_wrong_epoch_malformed_and_oversize_frames_without_di
         access.clone(),
         epoch,
         support::TRANSPORT_LIMITS,
+        tokio_util::sync::CancellationToken::new(),
     ));
     let request_id = Uuid::new_v4();
     for request in [

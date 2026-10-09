@@ -27,6 +27,7 @@ use tokio::{
     process::{Child, ChildStdin, Command},
     sync::Mutex,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -47,6 +48,8 @@ const ARTIFACT_EVENT_BRIDGE_FALLBACK_URI: &str = "tickloop://event-bridge/v1";
 
 const STARTUP_DEADLINE: Duration = Duration::from_secs(5);
 const CONNECT_INTERVAL: Duration = Duration::from_millis(25);
+/// How often a daemon checks that clients can still reach it through its runtime directory.
+const RUNTIME_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const SOCKET_NAME: &str = "daemon.sock";
 const LOCK_NAME: &str = "daemon.lock";
 const DAEMON_COMMAND: &str = "daemon";
@@ -504,17 +507,83 @@ async fn run_daemon(arguments: &[OsString]) -> Result<(), String> {
     let daemon = Arc::new(DaemonServer::new(epoch, factory.clone()));
     control.attach_daemon((*daemon).clone());
     let control_service = tokio::spawn(control.clone().serve(control_listener));
-    let result = crate::agent_access::serve_daemon_listener(listener, daemon, epoch, limits)
-        .await
-        .map_err(|error| error.to_string());
+    let shutdown = CancellationToken::new();
+    let service = async {
+        let result = crate::agent_access::serve_daemon_listener(
+            listener,
+            daemon,
+            epoch,
+            limits,
+            shutdown.clone(),
+        )
+        .await;
+        shutdown.cancel();
+        result
+    };
+    let (result, step_down) = tokio::join!(
+        service,
+        step_down_when_unreachable(&endpoint, socket_identity, &lock, &lock_path, &shutdown)
+    );
     factory.shutdown().await;
     control_service.abort();
     let cleanup = validate_daemon_lock_path(&lock, &lock_path)
         .and_then(|()| remove_owned_socket(&endpoint, socket_identity))
         .and_then(|()| remove_owned_socket(&control_endpoint, control_identity));
     drop(lock);
+    if let Some(reason) = step_down {
+        return Err(reason);
+    }
     cleanup?;
-    result
+    result.map_err(|error| error.to_string())
+}
+
+/// Waits until clients can no longer reach this daemon, then shuts it down as `ShutdownDaemon`
+/// would and returns why. Returns `None` once the daemon shuts down for another reason.
+async fn step_down_when_unreachable(
+    endpoint: &Path,
+    socket_identity: (u64, u64),
+    lock: &File,
+    lock_path: &Path,
+    shutdown: &CancellationToken,
+) -> Option<String> {
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return None,
+            () = tokio::time::sleep(RUNTIME_CHECK_INTERVAL) => {}
+        }
+        if let Some(reason) = unreachable_reason(endpoint, socket_identity, lock, lock_path) {
+            shutdown.cancel();
+            return Some(reason);
+        }
+    }
+}
+
+/// A daemon is unreachable once its socket is gone or replaced, or once another daemon replaced
+/// its lock. A lock that is only missing keeps the daemon serving, so a temporary-file cleaner
+/// that removed it does not end running Agents.
+fn unreachable_reason(
+    endpoint: &Path,
+    socket_identity: (u64, u64),
+    lock: &File,
+    lock_path: &Path,
+) -> Option<String> {
+    let socket_is_published = std::fs::symlink_metadata(endpoint)
+        .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == socket_identity);
+    if !socket_is_published {
+        return Some(
+            "Agent daemon endpoint changed or was removed; the daemon stepped down.".into(),
+        );
+    }
+    let lock_is_missing = matches!(
+        std::fs::symlink_metadata(lock_path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound
+    );
+    if lock_is_missing {
+        return None;
+    }
+    validate_daemon_lock_path(lock, lock_path)
+        .is_err()
+        .then(|| "Agent daemon lock changed; the daemon stepped down.".into())
 }
 
 /// The Tickhost process the daemon starts on demand. It runs only the host library.

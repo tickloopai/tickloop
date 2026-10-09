@@ -14,7 +14,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::json;
 
 fn incompatible_daemon_output(terminal: bool) -> String {
-    let fixture = tempfile::tempdir_in("/private/tmp").unwrap();
+    let fixture = support::runtime_dir();
     let root = fixture.path().canonicalize().unwrap();
     let runtime = root.join("runtime");
     std::fs::create_dir(&runtime).unwrap();

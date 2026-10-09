@@ -82,7 +82,7 @@ fn idle_controller(directory: &Path) -> HostController {
         },
         Uuid::new_v4(),
         PathBuf::from("/usr/bin/false"),
-        tickhost::host::DEFAULT_IDLE_TIMEOUT,
+        support::hosted::IDLE_TIMEOUT,
     )
 }
 
@@ -262,7 +262,7 @@ async fn a_host_that_never_serves_is_started_three_times_then_reported_unavailab
         },
         Uuid::new_v4(),
         executable,
-        tickhost::host::DEFAULT_IDLE_TIMEOUT,
+        support::hosted::IDLE_TIMEOUT,
     );
     let owner = TickOwner {
         root: "fixture-root".into(),
@@ -384,7 +384,7 @@ async fn an_incompatible_host_is_refused_and_never_replaced() {
         paths.clone(),
         Uuid::new_v4(),
         executable,
-        tickhost::host::DEFAULT_IDLE_TIMEOUT,
+        support::hosted::IDLE_TIMEOUT,
     );
     let owner = TickOwner {
         root: "fixture-root".into(),
@@ -416,7 +416,7 @@ async fn an_open_that_reached_the_host_is_never_sent_again() {
         paths.clone(),
         Uuid::new_v4(),
         executable,
-        tickhost::host::DEFAULT_IDLE_TIMEOUT,
+        support::hosted::IDLE_TIMEOUT,
     );
     let owner = TickOwner {
         root: "fixture-root".into(),
@@ -451,7 +451,7 @@ async fn a_running_host_this_daemon_cannot_verify_is_never_replaced_or_stopped()
         paths.clone(),
         Uuid::new_v4(),
         support::fixture_cli::executable(),
-        tickhost::host::DEFAULT_IDLE_TIMEOUT,
+        support::hosted::IDLE_TIMEOUT,
     );
     let owner = TickOwner {
         root: "fixture-root".into(),
@@ -471,7 +471,7 @@ async fn a_running_host_this_daemon_cannot_verify_is_never_replaced_or_stopped()
         paths.clone(),
         Uuid::new_v4(),
         executable,
-        tickhost::host::DEFAULT_IDLE_TIMEOUT,
+        support::hosted::IDLE_TIMEOUT,
     );
     let key_file = second_runtime.join("tickhost.key");
 

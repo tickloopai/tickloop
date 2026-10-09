@@ -1,6 +1,5 @@
 use std::{
     cell::RefCell,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -15,16 +14,14 @@ thread_local! {
     static DAEMONS: RefCell<Vec<PrivateDaemon>> = const { RefCell::new(Vec::new()) };
 }
 
-struct PrivateDaemon(Option<tempfile::TempDir>);
+/// A CLI fixture's runtime directory. Dropping it stops the daemon there gracefully, flushing its
+/// Transcripts, then removes the directory, which also ends a daemon that did not stop.
+struct PrivateDaemon(tempfile::TempDir);
 
 pub fn directory() -> PathBuf {
-    let directory = tempfile::Builder::new()
-        .prefix("tcli-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = super::runtime_dir();
     let path = directory.path().to_path_buf();
-    DAEMONS.with(|daemons| daemons.borrow_mut().push(PrivateDaemon(Some(directory))));
+    DAEMONS.with(|daemons| daemons.borrow_mut().push(PrivateDaemon(directory)));
     path
 }
 
@@ -42,12 +39,10 @@ pub fn command_directory(command: &std::process::Command) -> PathBuf {
 
 fn verify_owned(directory: &Path) -> Result<(), String> {
     let is_owned = DAEMONS.with(|daemons| {
-        daemons.borrow().iter().any(|daemon| {
-            daemon
-                .0
-                .as_ref()
-                .is_some_and(|owned| owned.path() == directory)
-        })
+        daemons
+            .borrow()
+            .iter()
+            .any(|daemon| daemon.0.path() == directory)
     });
     if !is_owned {
         return Err("refusing to access an endpoint not owned by this CLI fixture".into());
@@ -103,14 +98,11 @@ async fn flush(client: &LocalAgentClient) -> Result<(), String> {
 
 impl Drop for PrivateDaemon {
     fn drop(&mut self) {
-        let Some(owned) = self.0.take() else {
-            return;
-        };
-        if !owned.path().join(DAEMON_SOCKET).exists() {
+        let directory = self.0.path().to_path_buf();
+        if !directory.join(DAEMON_SOCKET).exists() {
             return;
         }
         // Cleanup runs after the test's Tokio runtime may already have been dropped.
-        let directory = owned.keep();
         let cleanup_directory = directory.clone();
         let cleanup = std::thread::Builder::new()
             .name("private-cli-daemon-cleanup".into())
@@ -133,9 +125,7 @@ impl Drop for PrivateDaemon {
                         while cleanup_directory.join(DAEMON_SOCKET).exists() {
                             tokio::time::sleep(Duration::from_millis(25)).await;
                         }
-                        flushed?;
-                        std::fs::remove_dir_all(&cleanup_directory)
-                            .map_err(|error| error.to_string())
+                        flushed
                     })
                     .await
                     .map_err(|_| "private CLI daemon shutdown timed out".to_owned())?
@@ -149,7 +139,7 @@ impl Drop for PrivateDaemon {
         };
         if let Err(error) = result {
             eprintln!(
-                "Private CLI daemon cleanup failed; retained {}: {error}",
+                "Private CLI daemon cleanup failed; removing {} ends the daemon: {error}",
                 directory.display()
             );
         }

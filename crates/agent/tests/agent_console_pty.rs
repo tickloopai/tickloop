@@ -59,6 +59,8 @@ const COMPLETED_FRAME_END: &str = "\x1b[?2026l";
 const CURSOR_VISIBLE: &str = "\x1b[?25h";
 const CURSOR_HIDDEN: &str = "\x1b[?25l";
 
+/// A private CLI environment. Tests stop it with `shutdown`; dropping it after a failure stops the
+/// Tickhost and removes the directory, which ends the daemon and its workers.
 struct PrivateFixture {
     directory: tempfile::TempDir,
 }
@@ -66,7 +68,7 @@ struct PrivateFixture {
 impl PrivateFixture {
     fn new() -> Self {
         use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let directory = support::runtime_dir();
         for name in ["config", "home", "runtime", "work", "scratch"] {
             std::fs::create_dir(directory.path().join(name)).unwrap();
             std::fs::set_permissions(
@@ -144,6 +146,12 @@ impl PrivateFixture {
             .await
             .expect("private daemon and worker sockets must close gracefully");
         }
+    }
+}
+
+impl Drop for PrivateFixture {
+    fn drop(&mut self) {
+        support::stop_tickhost(&self.path("tickhost"), &self.path("runtime/tickhost.key"));
     }
 }
 

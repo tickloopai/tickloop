@@ -415,7 +415,7 @@ mod channel {
         async fn start(chats: usize) -> Self {
             Self::start_with(
                 Arc::new(super::support::ScriptedModel::new(Vec::new())),
-                tickhost::host::DEFAULT_IDLE_TIMEOUT,
+                super::support::hosted::IDLE_TIMEOUT,
                 chats,
             )
             .await
@@ -437,7 +437,7 @@ mod channel {
         ) -> Self {
             Self::start_configured(
                 model,
-                tickhost::host::DEFAULT_IDLE_TIMEOUT,
+                super::support::hosted::IDLE_TIMEOUT,
                 Some(herdr),
                 chats,
             )
@@ -1182,7 +1182,7 @@ for line in sys.stdin:
                 super::support::text("Done")
             }
         }));
-        let daemon = Daemon::start_with(model, tickhost::host::DEFAULT_IDLE_TIMEOUT, 1).await;
+        let daemon = Daemon::start_with(model, super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, root) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         DaemonControl::new(daemon.grants[0].clone())
             .request(list(root))
@@ -1248,7 +1248,7 @@ for line in sys.stdin:
         let model = Arc::new(super::support::ScriptedModel::new(vec![
             super::support::text("Continued"),
         ]));
-        let daemon = Daemon::start_with(model, tickhost::host::DEFAULT_IDLE_TIMEOUT, 1).await;
+        let daemon = Daemon::start_with(model, super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         let tools = daemon.tools();
         let earlier = run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
@@ -1760,7 +1760,7 @@ for line in sys.stdin:
     async fn a_model_reopens_a_lost_tick_only_after_approval_as_a_new_instance() {
         let model = Arc::new(super::support::ScriptedModel::new(Vec::new()));
         let daemon =
-            Daemon::start_with(model.clone(), tickhost::host::DEFAULT_IDLE_TIMEOUT, 1).await;
+            Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         let tools = daemon.tools();
         let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
@@ -1853,7 +1853,7 @@ for line in sys.stdin:
     async fn cancelling_one_hosted_watch_keeps_the_other_and_a_dead_host_fails_closed() {
         let model = Arc::new(super::support::ScriptedModel::new(Vec::new()));
         let daemon =
-            Daemon::start_with(model.clone(), tickhost::host::DEFAULT_IDLE_TIMEOUT, 1).await;
+            Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         let tools = daemon.tools();
         let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
@@ -1997,7 +1997,7 @@ for line in sys.stdin:
         );
         let model = Arc::new(super::support::ScriptedModel::new(Vec::new()));
         let daemon =
-            Daemon::start_with(model.clone(), tickhost::host::DEFAULT_IDLE_TIMEOUT, 1).await;
+            Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         let script = daemon.root.join("refusing.py");
         std::fs::write(&script, REFUSING_TICK).unwrap();
@@ -2485,7 +2485,7 @@ for line in sys.stdin:
         };
         let model = Arc::new(super::support::ScriptedModel::new(Vec::new()));
         let daemon =
-            Daemon::start_with(model.clone(), tickhost::host::DEFAULT_IDLE_TIMEOUT, 1).await;
+            Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat, execution) = (
             daemon.runtimes[0].clone(),
             daemon.chats[0],
@@ -2768,7 +2768,7 @@ for line in sys.stdin:
 
     impl Fixture {
         fn new() -> Self {
-            Self::with_idle_timeout(tickhost::host::DEFAULT_IDLE_TIMEOUT)
+            Self::with_idle_timeout(super::support::hosted::IDLE_TIMEOUT)
         }
 
         fn with_idle_timeout(idle_timeout: Duration) -> Self {
@@ -3346,7 +3346,7 @@ for line in sys.stdin:
         let mut stdin = host.stdin.take().unwrap();
         let config = tickhost::host::HostConfig {
             controller_key: key.clone(),
-            idle_timeout: tickhost::host::DEFAULT_IDLE_TIMEOUT,
+            idle_timeout: super::support::hosted::IDLE_TIMEOUT,
         };
         writeln!(stdin, "{}", serde_json::to_string(&config).unwrap()).unwrap();
         drop(stdin);

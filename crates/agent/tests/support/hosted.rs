@@ -1,10 +1,17 @@
 //! Opens of hosted Ticks for tests that run a private Tickhost: each Tick starts through the
 //! fixture CLI's Tick launcher, as the daemon starts one.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use tickhost::host::{OpenRequest, TickOwner};
 use uuid::Uuid;
+
+/// How long a test Tickhost lets an unused Tick idle: longer than any wait of a test step, and
+/// short enough that a host a killed test left behind exits soon after its Ticks go idle.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The environment a hosted test Tick runs with.
 pub fn tick_environment() -> Vec<(String, String)> {
