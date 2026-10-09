@@ -459,7 +459,7 @@ async fn background_shell_output_of_concurrent_agents_is_written_under_each_chat
             .unwrap();
         outputs.push((agent, chat, receipt.command_id, marker));
     }
-    let project_temp_root = user_temp_directory();
+    let private_temp_root = user_temp_directory();
     let mut paths = Vec::new();
     for (agent, chat, command_id, marker) in outputs {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -492,7 +492,7 @@ async fn background_shell_output_of_concurrent_agents_is_written_under_each_chat
         );
         assert_eq!(
             chat_directory.parent().unwrap().parent().unwrap(),
-            project_temp_root
+            private_temp_root
         );
         assert!(!path.starts_with(directory.path().canonicalize().unwrap()));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), marker);
@@ -502,7 +502,7 @@ async fn background_shell_output_of_concurrent_agents_is_written_under_each_chat
     first.flush_transcripts().await;
     first.shutdown().await;
     second.shutdown().await;
-    let session_directory_name = std::ffi::OsStr::new("sessions");
+    let family_temp_directory_name = std::ffi::OsStr::new("sessions");
     for (_, path) in &paths {
         assert_eq!(
             path.parent()
@@ -513,7 +513,7 @@ async fn background_shell_output_of_concurrent_agents_is_written_under_each_chat
                 .unwrap()
                 .file_name()
                 .unwrap(),
-            session_directory_name
+            family_temp_directory_name
         );
     }
     assert!(!directory.path().join(".tickloop").exists());
@@ -692,7 +692,7 @@ fn user_temp_directory() -> PathBuf {
         .join(format!("tickloop-private-{}", unsafe { libc::getuid() }))
 }
 
-fn session_temp_directory(chat: uuid::Uuid) -> PathBuf {
+fn family_temp_directory(chat: uuid::Uuid) -> PathBuf {
     use std::os::unix::fs::DirBuilderExt;
     let sessions = user_temp_directory().join("sessions");
     std::fs::DirBuilder::new()
@@ -703,7 +703,7 @@ fn session_temp_directory(chat: uuid::Uuid) -> PathBuf {
     sessions.join(chat.to_string())
 }
 
-/// 测试结束时移除预先布置在系统临时目录中的项目临时目录（符号链接只删除链接本身）。
+/// 测试结束时移除预先布置在系统临时目录中的家族临时空间（符号链接只删除链接本身）。
 struct RemoveOnDrop(PathBuf);
 
 impl Drop for RemoveOnDrop {
@@ -720,9 +720,9 @@ impl Drop for RemoveOnDrop {
     }
 }
 
-/// 模拟共享 `/tmp` 上的另一用户预先布置项目临时目录：`tamper` 布置目录并返回要读取的文件。
+/// 模拟共享 `/tmp` 上的另一用户预先布置家族临时空间：`tamper` 布置目录并返回要读取的文件。
 /// 该文件的只读访问必须请求授权，后台任务输出必须拒绝写入该目录。
-async fn assert_untrusted_session_temp_directory(
+async fn assert_untrusted_family_temp_directory(
     tamper: impl Fn(&Path, &Path) -> PathBuf,
     expected_reason: &str,
 ) {
@@ -732,9 +732,9 @@ async fn assert_untrusted_session_temp_directory(
     let agent =
         Agent::open_embedded(directory.path().join("root"), config(), model.clone()).unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let project_temp = session_temp_directory(chat);
-    let _cleanup = RemoveOnDrop(project_temp.clone());
-    let secret = tamper(&project_temp, outside.path());
+    let family_temp = family_temp_directory(chat);
+    let _cleanup = RemoveOnDrop(family_temp.clone());
+    let secret = tamper(&family_temp, outside.path());
     model.enqueue(call("read-secret", "Read", json!({"file_path":secret})));
     model.enqueue(text("Done."));
     let mut events = agent.subscribe();
@@ -770,7 +770,7 @@ async fn assert_untrusted_session_temp_directory(
     }
 
     let shell_chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let shell_temp = session_temp_directory(shell_chat);
+    let shell_temp = family_temp_directory(shell_chat);
     let _shell_cleanup = RemoveOnDrop(shell_temp.clone());
     tamper(&shell_temp, outside.path());
     let shell = agent
@@ -810,12 +810,12 @@ async fn assert_untrusted_session_temp_directory(
 }
 
 #[tokio::test]
-async fn a_symlinked_session_temp_directory_is_not_trusted() {
-    assert_untrusted_session_temp_directory(
-        |project_temp, outside| {
+async fn a_symlinked_family_temp_directory_is_not_trusted() {
+    assert_untrusted_family_temp_directory(
+        |family_temp, outside| {
             let secret = outside.join("secret.txt");
             std::fs::write(&secret, "classified").unwrap();
-            std::os::unix::fs::symlink(outside, project_temp).unwrap();
+            std::os::unix::fs::symlink(outside, family_temp).unwrap();
             secret
         },
         "symbolic link",
@@ -824,13 +824,13 @@ async fn a_symlinked_session_temp_directory_is_not_trusted() {
 }
 
 #[tokio::test]
-async fn a_session_temp_directory_accessible_to_other_users_is_not_trusted() {
+async fn a_family_temp_directory_accessible_to_other_users_is_not_trusted() {
     use std::os::unix::fs::PermissionsExt;
-    assert_untrusted_session_temp_directory(
-        |project_temp, _| {
-            std::fs::create_dir(project_temp).unwrap();
-            std::fs::set_permissions(project_temp, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let secret = project_temp.join("secret.txt");
+    assert_untrusted_family_temp_directory(
+        |family_temp, _| {
+            std::fs::create_dir(family_temp).unwrap();
+            std::fs::set_permissions(family_temp, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let secret = family_temp.join("secret.txt");
             std::fs::write(&secret, "classified").unwrap();
             secret
         },
@@ -867,7 +867,7 @@ async fn task_output_is_readable_by_its_session_but_another_session_requires_app
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    assert!(output.starts_with(session_temp_directory(chat)));
+    assert!(output.starts_with(family_temp_directory(chat)));
     model.enqueue(call("read-output", "Read", json!({"file_path":output})));
     model.enqueue(text("Read it."));
     complete_turn(&agent, chat, None, "Read the output").await;

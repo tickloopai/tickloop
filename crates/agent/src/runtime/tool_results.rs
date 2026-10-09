@@ -32,7 +32,7 @@ use crate::tools::{
     utf16_length,
 };
 use crate::transcript::{
-    ContentReplacementRecord, PrivateDirectory, private_session_temp_directory,
+    ContentReplacementRecord, PrivateDirectory, private_family_temp_directory,
 };
 
 /// Chat 目录中大工具结果的子目录；过期清理按同一布局查找。
@@ -59,16 +59,16 @@ impl Agent {
             .delegation
             .as_ref()
             .map_or(chat_id, |delegation| delegation.parent_chat_id);
-        let session_temp = private_session_temp_directory(family_id);
+        let family_temp = private_family_temp_directory(family_id);
         let persistent_project = self
             .inner
             .recorder
             .as_ref()
             .and_then(|recorder| recorder.project_directory_of(chat_id));
         let temporary_chat = if family_id == chat_id {
-            session_temp.clone()
+            family_temp.clone()
         } else {
-            session_temp.join(chat_id.to_string())
+            family_temp.join(chat_id.to_string())
         };
         let chat_directory = persistent_project.map_or_else(
             || temporary_chat.clone(),
@@ -78,7 +78,7 @@ impl Agent {
         Arc::new(Tools::for_chat(
             chat_directory,
             task_output_directory,
-            session_temp,
+            family_temp,
         ))
     }
 

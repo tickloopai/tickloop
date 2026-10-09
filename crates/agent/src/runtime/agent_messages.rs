@@ -7,6 +7,13 @@ pub const SEND_AGENT_MESSAGE_TOOL_NAME: &str = "SendMessage";
 pub const LIST_SUBAGENTS_TOOL_NAME: &str = "ListSubagents";
 pub const STOP_SUBAGENT_TOOL_NAME: &str = "StopSubagent";
 
+/// Told after StopSubagent stopped a direct child, so what the child owns outside this runtime (its
+/// hosted Ticks) ends with it. Embedded runtimes have none.
+#[async_trait::async_trait]
+pub trait StoppedChildHook: Send + Sync {
+    async fn child_stopped(&self, root: ChatId, child: ChatId) -> Result<(), String>;
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct VerifiedUserRelay {
     pub original_chat_id: ChatId,
@@ -855,8 +862,18 @@ impl Agent {
                 .await
                 .map_err(|error| error.to_string())?;
         }
-        Ok(result(
-            json!({"status":"stopped","child_chat_id":prepared.target,"unresolved_operations":unknown}),
-        ))
+        let mut stopped = json!({"status":"stopped","child_chat_id":prepared.target,"unresolved_operations":unknown});
+        let hook = self.inner.stopped_child_hook.read().unwrap().clone();
+        if let Some(hook) = hook
+            && let Err(error) = hook.child_stopped(sender.chat_id, prepared.target).await
+        {
+            stopped["hosted_ticks_error"] = json!(error);
+        }
+        Ok(result(stopped))
+    }
+
+    /// Installs the hook StopSubagent calls once a child is stopped.
+    pub fn install_stopped_child_hook(&self, hook: Arc<dyn StoppedChildHook>) {
+        *self.inner.stopped_child_hook.write().unwrap() = Some(hook);
     }
 }

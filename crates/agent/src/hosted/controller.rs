@@ -19,7 +19,7 @@ use tick_connect::{
     hosted::{CAPABILITY_LIFECYCLE, CONTROL_TIMEOUT, HostConnection, Role},
 };
 use tick_host::{
-    host::{OpenRequest, OpenedTick, Receipt, TickOwner},
+    host::{OpenRequest, OpenedTick, OwnerSnapshotChunk, Receipt, TickOwner},
     paths::HostPaths,
 };
 use tokio::sync::Mutex;
@@ -38,9 +38,61 @@ pub const OPEN_TIMEOUT: Duration = Duration::from_secs(2 * CONTROL_TIMEOUT.as_se
 pub const LIFECYCLE_TIMEOUT: Duration =
     Duration::from_secs(START_ATTEMPTS as u64 * START_WAIT.as_secs() + OPEN_TIMEOUT.as_secs());
 const DISCONNECTED: &str = "Disconnected";
+/// Chat ids per owner snapshot chunk, keeping each chunk well under 1 MiB.
+const SNAPSHOT_CHUNK_OWNERS: usize = 16 * 1024;
 const CONNECT_INTERVAL: Duration = Duration::from_millis(25);
 /// Only an open starts a host; other requests find that no hosted Tick exists.
 const HOST_NOT_RUNNING: &str = "HostNotRunning";
+
+/// One view's permission to attach to a hosted Tick's terminal: it reaches `endpoint` as a
+/// viewer of `instance` once, and only the host process `host_epoch` honours it. It carries no
+/// data token.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostedViewGrant {
+    pub endpoint: PathBuf,
+    pub host_epoch: Uuid,
+    pub instance: tick_connect::instance::InstanceRef,
+    pub view: Uuid,
+}
+
+/// What the host ran for an owner when a listing began.
+pub struct OwnerListing {
+    pub started_ms: u64,
+    /// `None` when no host ran.
+    pub running: Option<HostListing>,
+}
+
+/// The instances one host epoch runs for an owner.
+pub struct HostListing {
+    pub epoch: Uuid,
+    pub live: std::collections::HashSet<tick_connect::instance::InstanceRef>,
+}
+
+struct ListedPage {
+    listing: HostListing,
+    next: Option<tick_connect::page::PageCursor>,
+}
+
+impl HostListing {
+    /// One page of a host `list` reply, which names the host epoch that produced it.
+    fn from_page(page: &Value) -> Option<ListedPage> {
+        let epoch = serde_json::from_value(page.get("epoch")?.clone()).ok()?;
+        let page: tick_connect::page::Page<tick_host::host::TickRow> =
+            serde_json::from_value(page.clone()).ok()?;
+        Some(ListedPage {
+            listing: HostListing {
+                epoch,
+                live: page
+                    .items
+                    .into_iter()
+                    .filter_map(|row| row.instance)
+                    .collect(),
+            },
+            next: page.next,
+        })
+    }
+}
 
 #[derive(Clone, Copy)]
 enum Start {
@@ -53,6 +105,8 @@ pub struct HostController {
     key_file: PathBuf,
     owner_epoch: Uuid,
     executable: PathBuf,
+    /// How long a host this owner starts lets an unused Tick idle.
+    idle_timeout: Duration,
     /// Connections between requests. Each request holds its own connection, so a slow open of
     /// one Tick never delays another worker's request.
     idle: Mutex<Vec<HostConnection>>,
@@ -66,12 +120,14 @@ impl HostController {
         paths: HostPaths,
         owner_epoch: Uuid,
         executable: PathBuf,
+        idle_timeout: Duration,
     ) -> Self {
         Self {
             paths,
             key_file: agent_runtime.join(KEY_FILE),
             owner_epoch,
             executable,
+            idle_timeout,
             idle: Mutex::new(Vec::new()),
             starting: Mutex::new(()),
         }
@@ -79,6 +135,11 @@ impl HostController {
 
     pub fn endpoint(&self) -> PathBuf {
         self.paths.socket()
+    }
+
+    /// How long a host this owner starts lets a Tick idle, and lets Watch intents go unrenewed.
+    pub fn idle_timeout(&self) -> Duration {
+        self.idle_timeout
     }
 
     pub async fn open(&self, request: OpenRequest) -> Result<OpenedTick, HostError> {
@@ -135,6 +196,183 @@ impl HostController {
         };
         serde_json::from_value(value["receipt"].clone())
             .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))
+    }
+
+    /// The epoch of the running host, or none when no host runs.
+    pub async fn host_epoch(&self) -> Result<Option<Uuid>, HostError> {
+        match self
+            .request("diagnostics", json!({}), CONTROL_TIMEOUT, Start::Never)
+            .await
+        {
+            Ok(diagnostics) => serde_json::from_value(diagnostics["epoch"].clone())
+                .map(Some)
+                .map_err(|error| HostError::after("ProtocolViolation", error.to_string())),
+            Err(error) if error.code == HOST_NOT_RUNNING => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Sends a complete owner snapshot of `root` in chunks. Without a running host there are no
+    /// Ticks to reconcile.
+    pub async fn reconcile_owners(
+        &self,
+        root: &str,
+        revision: u64,
+        owners: &[Uuid],
+    ) -> Result<(), HostError> {
+        let chunks = owners.chunks(SNAPSHOT_CHUNK_OWNERS).collect::<Vec<_>>();
+        let count = chunks.len().max(1) as u32;
+        for chunk in 0..count {
+            let snapshot = OwnerSnapshotChunk {
+                root: root.to_owned(),
+                revision,
+                chunk,
+                chunks: count,
+                owners: chunks
+                    .get(chunk as usize)
+                    .map_or_else(Vec::new, |owners| owners.to_vec()),
+            };
+            match self
+                .request(
+                    "reconcile_owners",
+                    json!(snapshot),
+                    CONTROL_TIMEOUT,
+                    Start::Never,
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if error.code == HOST_NOT_RUNNING => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// Replaces and renews the approved Watch intents of one of `owner`'s Ticks. Without a
+    /// running host there is nothing to protect.
+    pub async fn set_intents(
+        &self,
+        owner: &TickOwner,
+        instance: &tick_connect::instance::InstanceRef,
+        watches: &std::collections::BTreeSet<Uuid>,
+    ) -> Result<(), HostError> {
+        match self
+            .request(
+                "set_intents",
+                json!({"owner":owner,"instance":instance,"watches":watches}),
+                CONTROL_TIMEOUT,
+                Start::Never,
+            )
+            .await
+        {
+            Err(error) if error.code == HOST_NOT_RUNNING => Ok(()),
+            result => result.map(|_| ()),
+        }
+    }
+
+    /// Lets one view attach to `owner`'s Tick `instance` on the running host. The grant works
+    /// once and names the host process it was made by.
+    pub async fn allow_view(
+        &self,
+        owner: &TickOwner,
+        instance: &tick_connect::instance::InstanceRef,
+    ) -> Result<HostedViewGrant, HostError> {
+        let granted = self
+            .request(
+                "allow_view",
+                json!({"owner":owner,"instance":instance}),
+                CONTROL_TIMEOUT,
+                Start::Never,
+            )
+            .await?;
+        let field = |name: &str| {
+            serde_json::from_value(granted[name].clone())
+                .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))
+        };
+        Ok(HostedViewGrant {
+            endpoint: self.endpoint(),
+            host_epoch: field("epoch")?,
+            instance: instance.clone(),
+            view: field("view")?,
+        })
+    }
+
+    /// What the host runs for `owner`, read across all pages of one host, and the moment the
+    /// reading began: launch records written after it are newer than the listing.
+    pub async fn owner_listing(&self, owner: &TickOwner) -> Result<OwnerListing, HostError> {
+        let started_ms = crate::private_fs::unix_time_milliseconds();
+        Ok(OwnerListing {
+            started_ms,
+            running: self.live_instances(owner).await?,
+        })
+    }
+
+    /// The running host's epoch and every instance it runs for `owner`, read across all pages
+    /// of that one host; `None` when no host runs.
+    async fn live_instances(&self, owner: &TickOwner) -> Result<Option<HostListing>, HostError> {
+        let mut listing: Option<HostListing> = None;
+        let mut cursor = None;
+        loop {
+            let page = match self
+                .request(
+                    "list",
+                    json!({"owner":owner,"cursor":cursor}),
+                    CONTROL_TIMEOUT,
+                    Start::Never,
+                )
+                .await
+            {
+                Err(error) if error.code == HOST_NOT_RUNNING => return Ok(None),
+                result => result?,
+            };
+            let page = HostListing::from_page(&page)
+                .ok_or_else(|| HostError::before("ProtocolViolation", "malformed host listing"))?;
+            let next = page.next.clone();
+            match &mut listing {
+                None => listing = Some(page.listing),
+                Some(listing) if listing.epoch == page.listing.epoch => {
+                    listing.live.extend(page.listing.live);
+                }
+                Some(_) => {
+                    return Err(HostError::before(
+                        "EpochChanged",
+                        "another Tick host started while its Ticks were listed",
+                    ));
+                }
+            }
+            match next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(listing),
+            }
+        }
+    }
+
+    /// Whether host `epoch` exited only after every Tick it ran had ended.
+    pub fn was_emptied(&self, epoch: Uuid) -> bool {
+        self.paths.was_emptied(epoch)
+    }
+
+    /// Ends every Tick of `owner` and fences its later opens. Without a running host none runs.
+    pub async fn end_owner(
+        &self,
+        owner: &TickOwner,
+        revision: u64,
+        operation: Uuid,
+    ) -> Result<(), HostError> {
+        match self
+            .request(
+                "end_owner",
+                json!({"owner":owner,"revision":revision,"operation":operation}),
+                CONTROL_TIMEOUT,
+                Start::Never,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if error.code == HOST_NOT_RUNNING => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn list(
@@ -308,8 +546,12 @@ impl HostController {
             });
         }
         let mut child = command.spawn()?;
+        let config = serde_json::to_string(&tick_host::host::HostConfig {
+            controller_key: key.to_owned(),
+            idle_timeout: self.idle_timeout,
+        })?;
         let mut stdin = child.stdin.take().expect("piped stdin");
-        stdin.write_all(format!("{key}\n").as_bytes())?;
+        stdin.write_all(format!("{config}\n").as_bytes())?;
         drop(stdin);
         std::thread::spawn(move || {
             let _ = child.wait();

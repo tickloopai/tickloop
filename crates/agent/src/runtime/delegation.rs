@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin};
+use std::{collections::BTreeSet, future::Future, pin::Pin};
 
 use serde_json::{Value, json};
 
@@ -6,6 +6,9 @@ use super::*;
 use crate::{
     host_tools::{HostCallContext, HostToolAuthority, HostToolProvider},
     model::ToolDefinition,
+    tick_tool_router::{
+        CALL_TICK_TOOL, MODIFY_TICK, READ_TICK, READ_WORKSPACE, TickBackend, TickBackends,
+    },
     tools::{PreparedTool, ToolResult, Workspace},
 };
 
@@ -36,7 +39,9 @@ pub struct DelegationCeiling {
     #[serde(default)]
     pub session_denials: Option<Vec<SessionPermissionDenial>>,
     pub host_context: Option<HostCallContext>,
-    pub host_tools: BTreeMap<String, HostToolAuthority>,
+    /// Per host tool, the authorities of every backend that could serve it when the child was
+    /// delegated. Each call must run under one of them; a backend found later never joins.
+    pub host_tools: BTreeMap<String, BTreeSet<HostToolAuthority>>,
     #[serde(default)]
     pub tick_instances: Vec<tick_connect::instance::InstanceRef>,
 }
@@ -229,23 +234,35 @@ pub(super) fn check_call(
     }
     if matches!(
         name,
-        "ReadWorkspace" | "ReadTick" | "CallTickTool" | "ModifyTick" | "SendTickInput"
+        READ_WORKSPACE | READ_TICK | CALL_TICK_TOOL | MODIFY_TICK
     ) {
-        let workspace = ceiling
-            .host_context
-            .as_ref()
-            .and_then(|context| context.workspace_id.as_deref());
-        if workspace.is_none() || input.get("workspace_id").and_then(Value::as_str) != workspace {
-            return Err("delegated host operation is outside the inherited Workspace scope".into());
-        }
-        if name == "SendTickInput"
-            || name == "ModifyTick"
-                && matches!(input["action"].as_str(), Some("open" | "send_input"))
+        if name == MODIFY_TICK
+            && matches!(
+                input["action"].as_str(),
+                Some("open" | "reopen" | "send_input")
+            )
         {
-            return Err("Unsupported: delegated Agents cannot launch an unrestricted terminal program or submit terminal input".into());
+            return Err(
+                "Unsupported: delegated Agents cannot launch a program or submit terminal input"
+                    .into(),
+            );
+        }
+        // A hosted Tick belongs to the Chat that opened it, which the owner enforces on every
+        // call; every other target stays scoped by the inherited Workspace.
+        if TickBackends::ALL.route(name, input) != Ok(TickBackend::Hosted) {
+            let workspace = ceiling
+                .host_context
+                .as_ref()
+                .and_then(|context| context.workspace_id.as_deref());
+            if workspace.is_none() || input.get("workspace_id").and_then(Value::as_str) != workspace
+            {
+                return Err(
+                    "delegated host operation is outside the inherited Workspace scope".into(),
+                );
+            }
         }
         if ceiling.policy.mode == ExecutionMode::Plan
-            && matches!(name, "CallTickTool" | "ModifyTick" | "SendTickInput")
+            && matches!(name, CALL_TICK_TOOL | MODIFY_TICK)
         {
             return Err("delegated Plan authorization does not admit host mutations".into());
         }
@@ -253,27 +270,61 @@ pub(super) fn check_call(
     Ok(())
 }
 
-pub(super) struct ShellPermissionDecision {
+/// A call's permission decision and the policy revisions it was made under.
+pub(super) struct PermissionAuthority {
     pub decision: Decision,
     pub explicit_ask: bool,
-    pub session: Option<crate::permissions::SessionPermissionDecision>,
+    /// The Chat's own policy revision.
+    pub policy_revision: u64,
+    /// The parent policy revision a delegated child's Bash was decided under; `None` for other
+    /// calls, and when the parent is gone, which decides Deny.
+    pub parent_revision: Option<u64>,
 }
 
-pub(super) fn shell_authority_decision(
+impl PermissionAuthority {
+    /// Whether this re-evaluated authority still admits a call approved under the given
+    /// revisions: nothing denies it, and once either policy changed it must allow outright.
+    pub(super) fn still_admits(
+        &self,
+        approved_policy_revision: u64,
+        approved_parent_revision: Option<u64>,
+    ) -> bool {
+        self.decision != Decision::Deny
+            && (self.decision == Decision::Allow
+                || self.policy_revision == approved_policy_revision
+                    && self.parent_revision == approved_parent_revision)
+    }
+}
+
+/// The permission decision for `prepared` in the receipt's Chat and Loop, or `None` when the
+/// Chat is gone. A delegated child's Bash is further narrowed by its frozen ceiling and by its
+/// parent's current policy.
+pub(super) fn permission_authority(
     chats: &HashMap<ChatId, Chat>,
     sessions: &session_permissions::SessionPermissionContext,
     receipt: &Receipt,
     prepared: &PreparedTool,
-    own: ShellPermissionDecision,
+    session: Option<crate::permissions::SessionPermissionDecision>,
     plan_file: Option<&std::path::Path>,
-) -> (Decision, bool, Option<u64>) {
-    let ShellPermissionDecision {
-        decision,
-        explicit_ask,
-        session,
-    } = own;
-    let Some(chat) = chats.get(&receipt.chat_id) else {
-        return (Decision::Deny, explicit_ask, None);
+) -> Option<PermissionAuthority> {
+    let chat = chats.get(&receipt.chat_id)?;
+    let policy = &chat.snapshot.policy;
+    let own = PermissionAuthority {
+        decision: policy.decide_with_plan_file(
+            prepared,
+            &configured_workspace_for_chat(chat),
+            receipt.loop_id,
+            session,
+            plan_file,
+        ),
+        explicit_ask: policy.explicit_match_with_session(
+            &prepared.name,
+            &prepared.input,
+            receipt.loop_id,
+            session,
+        ) == Some(crate::permissions::ExplicitPermissionDecision::Ask),
+        policy_revision: policy.revision,
+        parent_revision: None,
     };
     let Some(delegation) = chat
         .snapshot
@@ -281,7 +332,7 @@ pub(super) fn shell_authority_decision(
         .as_ref()
         .filter(|_| prepared.name == crate::tools::BASH_TOOL_NAME)
     else {
-        return (decision, explicit_ask, None);
+        return Some(own);
     };
     let workspace = Workspace {
         workdir: delegation.ceiling.workdir.clone(),
@@ -335,21 +386,12 @@ pub(super) fn shell_authority_decision(
             Some(parent.snapshot.policy.revision),
         )
     });
-    let decisions = [decision, frozen, current];
-    let restricted = if decisions.contains(&Decision::Deny) {
-        Decision::Deny
-    } else if decisions.contains(&Decision::Ask) {
-        Decision::Ask
-    } else if decisions.contains(&Decision::Check) {
-        Decision::Check
-    } else {
-        Decision::Allow
-    };
-    (
-        restricted,
-        explicit_ask || frozen_ask || parent_ask,
-        revision,
-    )
+    Some(PermissionAuthority {
+        decision: own.decision.stricter(frozen).stricter(current),
+        explicit_ask: own.explicit_ask || frozen_ask || parent_ask,
+        parent_revision: revision,
+        ..own
+    })
 }
 
 impl Agent {
@@ -394,11 +436,14 @@ impl Agent {
             })
     }
 
-    pub(super) async fn check_delegated_host_tool(
+    /// Checks that a delegated call runs under an authority its child inherited for `name`: that
+    /// of the backend this very input routes to, as that backend currently is.
+    pub(super) async fn check_delegated_host_call(
         &self,
         receipt: &Receipt,
         provider: &dyn HostToolProvider,
         name: &str,
+        input: &Value,
     ) -> Result<(), String> {
         if self
             .inner
@@ -413,7 +458,7 @@ impl Agent {
         {
             return Ok(());
         }
-        self.check_delegated_host_authority(receipt, name, provider.tool_authority(name)?)
+        self.check_delegated_host_authority(receipt, name, provider.call_authority(name, input)?)
             .await
     }
 
@@ -428,12 +473,12 @@ impl Agent {
         let Some(delegation) = &chat.snapshot.delegation else {
             return Ok(());
         };
-        let expected = delegation
+        let allowed = delegation
             .ceiling
             .host_tools
             .get(name)
             .ok_or("Unsupported: this tool is outside the child's inherited authorization")?;
-        if authority.as_ref() != Some(expected) {
+        if !authority.is_some_and(|authority| allowed.contains(&authority)) {
             return Err("Unsupported: this tool endpoint or account is outside the child's inherited authorization".into());
         }
         Ok(())
@@ -582,9 +627,9 @@ impl Agent {
                                 .definitions()
                                 .into_iter()
                                 .map(|tool| {
-                                    Ok(provider
-                                        .tool_authority(&tool.name)?
-                                        .map(|authority| (tool.name, authority)))
+                                    let authorities = provider.tool_authorities(&tool.name)?;
+                                    Ok((!authorities.is_empty())
+                                        .then_some((tool.name, authorities)))
                                 })
                                 .collect::<Result<Vec<_>, String>>()
                         })

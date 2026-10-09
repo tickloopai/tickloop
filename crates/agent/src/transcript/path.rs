@@ -18,7 +18,7 @@ const MAX_SANITIZED_LENGTH: usize = 200;
 const TEMP_DIRECTORY_ENV: &str = "TICKLOOP_TMPDIR";
 const DEFAULT_TEMP_DIRECTORY: &str = "/tmp";
 const PRIVATE_TEMP_DIRECTORY_PREFIX: &str = "tickloop-private-";
-const SESSION_TEMP_SUBDIRECTORY: &str = "sessions";
+const FAMILY_TEMP_SUBDIRECTORY: &str = "sessions";
 
 /// `<root>/projects/<项目目录名>`。项目目录名照 Claude Code：canonical 路径做 NFC 规范化后
 /// 替换非字母数字字符；工作目录无法解析时按原路径计算。
@@ -36,10 +36,10 @@ pub(crate) fn private_project_temp_directory(workdir: &Path) -> PrivateDirectory
     private_temp_root().join(project_directory_name(workdir))
 }
 
-pub(crate) fn private_session_temp_directory(session_id: Uuid) -> PrivateDirectory {
+pub(crate) fn private_family_temp_directory(root_chat_id: Uuid) -> PrivateDirectory {
     private_temp_root()
-        .join(SESSION_TEMP_SUBDIRECTORY)
-        .join(session_id.to_string())
+        .join(FAMILY_TEMP_SUBDIRECTORY)
+        .join(root_chat_id.to_string())
 }
 
 fn private_temp_root() -> PrivateDirectory {

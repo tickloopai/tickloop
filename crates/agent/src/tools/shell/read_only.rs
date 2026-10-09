@@ -136,6 +136,25 @@ pub(super) fn is_command_read_only(command: &str) -> bool {
             || GIT_CONFIG_ENV.is_match(command)))
 }
 
+const SYMLINK_FOLLOWING_LONG_FLAGS: &[&str] = &[
+    "--follow",
+    "--follow-symlinks",
+    "--dereference",
+    "--dereference-recursive",
+];
+
+/// Per program, the short flags that make it follow symbolic links while walking directories.
+const SYMLINK_FOLLOWING_SHORT_FLAGS: &[(&str, &str)] = &[
+    ("rg", "L"),
+    ("fd", "L"),
+    ("find", "LH"),
+    ("du", "LH"),
+    ("grep", "RS"),
+    ("ls", "L"),
+    ("ag", "f"),
+    ("tree", "l"),
+];
+
 fn has_unproven_symlink_traversal(command: &str) -> bool {
     let Some(arguments) = quote_arguments(command) else {
         return true;
@@ -143,60 +162,35 @@ fn has_unproven_symlink_traversal(command: &str) -> bool {
     let Some((program, flags)) = arguments.split_first() else {
         return false;
     };
+    let following_short_flags = SYMLINK_FOLLOWING_SHORT_FLAGS
+        .iter()
+        .find(|(name, _)| name == program)
+        .map_or("", |(_, flags)| flags);
     flags
         .iter()
         .take_while(|flag| flag.as_str() != "--")
         .any(|flag| {
-            if matches!(
-                flag.as_str(),
-                "--follow" | "--follow-symlinks" | "--dereference" | "--dereference-recursive"
-            ) {
-                return true;
-            }
-            if !flag.starts_with('-') || flag.starts_with("--") {
-                return false;
-            }
-            let following_flags = match program.as_str() {
-                "rg" | "fd" => "L",
-                "find" | "du" => "LH",
-                "grep" => "RS",
-                "ls" => "L",
-                "ag" => "f",
-                "tree" => "l",
-                _ => "",
-            };
-            flag[1..]
-                .chars()
-                .any(|character| following_flags.contains(character))
+            SYMLINK_FOLLOWING_LONG_FLAGS.contains(&flag.as_str())
+                || flag.starts_with('-')
+                    && !flag.starts_with("--")
+                    && flag[1..]
+                        .chars()
+                        .any(|character| following_short_flags.contains(character))
         })
 }
 
+/// `wc` and `du` are read-only with any flags, but `--files0-from` takes their targets from a
+/// file, so the paths they read cannot be checked.
 fn has_input_derived_file_targets(command: &str) -> bool {
     let Some(arguments) = quote_arguments(command) else {
         return true;
     };
-    let Some((program, flags)) = arguments.split_first() else {
-        return false;
-    };
-    flags
-        .iter()
-        .take_while(|flag| flag.as_str() != "--")
-        .any(|flag| {
-            let name = flag.split('=').next().unwrap_or(flag);
-            match program.as_str() {
-                "file" => {
-                    name == "--files-from" || name.starts_with("-f") && !name.starts_with("--")
-                }
-                "sha256sum" | "sha1sum" | "md5sum" | "shasum" => {
-                    name == "--check"
-                        || name.starts_with('-')
-                            && !name.starts_with("--")
-                            && name[1..].contains('c')
-                }
-                "wc" | "sort" | "du" => name == "--files0-from",
-                _ => false,
-            }
-        })
+    matches!(arguments.first().map(String::as_str), Some("wc" | "du"))
+        && arguments
+            .iter()
+            .skip(1)
+            .take_while(|flag| flag.as_str() != "--")
+            .any(|flag| flag.split('=').next() == Some("--files0-from"))
 }
 
 fn matches_readonly_regex(command: &str) -> bool {

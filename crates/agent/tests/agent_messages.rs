@@ -3,9 +3,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tickloop_agent::{
-    model::{
-        Content, Message, ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest, Role,
-    },
+    model::{Content, ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest, Role},
     runtime::{Agent, EventKind},
 };
 use tokio::sync::mpsc::UnboundedSender;
@@ -14,12 +12,7 @@ use uuid::Uuid;
 
 mod support;
 
-type ResponseScript = dyn Fn(&ModelRequest) -> Vec<Content> + Send + Sync;
-
-struct RoutedModel {
-    requests: Mutex<Vec<ModelRequest>>,
-    respond: Box<ResponseScript>,
-}
+use support::routed::{RoutedModel, has_tool_result, history_text, state, tool_result};
 
 struct PausedParentModel {
     routed: RoutedModel,
@@ -55,15 +48,6 @@ impl ModelClient for PausedParentModel {
             return Err(ModelError::Cancelled);
         }
         self.routed.complete(request, events, cancel).await
-    }
-}
-
-impl RoutedModel {
-    fn new(respond: impl Fn(&ModelRequest) -> Vec<Content> + Send + Sync + 'static) -> Self {
-        Self {
-            requests: Mutex::new(vec![]),
-            respond: Box::new(respond),
-        }
     }
 }
 
@@ -195,42 +179,6 @@ async fn hidden_finished_children_remain_addressable_by_handle_and_reappear_on_m
     core.shutdown().await;
 }
 
-#[async_trait]
-impl ModelClient for RoutedModel {
-    async fn generate_title(
-        &self,
-        request: tickloop_agent::model::ModelRequest,
-        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent::model::ModelDelta>,
-        _: tokio_util::sync::CancellationToken,
-    ) -> Result<tickloop_agent::model::ModelOutput, tickloop_agent::model::ModelError> {
-        Ok(support::title_output(request))
-    }
-
-    fn identity(&self) -> tickloop_agent::model::ModelIdentity {
-        support::ScriptedModel::new(vec![]).identity()
-    }
-    async fn complete(
-        &self,
-        request: ModelRequest,
-        events: UnboundedSender<ModelDelta>,
-        _: CancellationToken,
-    ) -> Result<ModelOutput, ModelError> {
-        self.requests.lock().unwrap().push(request.clone());
-        let content = (self.respond)(&request);
-        for block in &content {
-            if let Content::Text { text } = block {
-                let _ = events.send(ModelDelta::Text(text.clone()));
-            }
-        }
-        Ok(ModelOutput {
-            private_source: None,
-            content,
-            usage: Default::default(),
-            stop_reason: "end_turn".into(),
-        })
-    }
-}
-
 async fn completed(
     events: &mut tokio::sync::broadcast::Receiver<tickloop_agent::runtime::Event>,
     receipt: &tickloop_agent::runtime::Receipt,
@@ -249,14 +197,6 @@ async fn completed(
 
 fn has_text(request: &ModelRequest, text: &str) -> bool {
     history_text(request).contains(text)
-}
-
-fn has_tool_result(request: &ModelRequest, id: &str) -> bool {
-    request
-        .messages
-        .iter()
-        .flat_map(|message| &message.content)
-        .any(|content| matches!(content,Content::ToolResult {tool_use_id,..} if tool_use_id==id))
 }
 
 fn agent_body_count(snapshot: &tickloop_agent::runtime::ChatSnapshot, body: &str) -> usize {
@@ -281,60 +221,6 @@ fn agent_body_count(snapshot: &tickloop_agent::runtime::ChatSnapshot, body: &str
 struct ClarifyingModel {
     requests: Mutex<Vec<ModelRequest>>,
     wait_for_user_context: bool,
-}
-
-fn state(request: &ModelRequest) -> Value {
-    request
-        .messages
-        .iter()
-        .find_map(|message| {
-            if message.role != Role::System {
-                return None;
-            }
-            message.content.iter().find_map(|content| match content {
-                Content::Text { text } => text
-                    .rsplit_once("Current host state: ")
-                    .and_then(|(_, value)| serde_json::from_str(value).ok()),
-                _ => None,
-            })
-        })
-        .unwrap()
-}
-
-fn tool_result(messages: &[Message], call_id: &str) -> Option<Value> {
-    messages
-        .iter()
-        .flat_map(|message| &message.content)
-        .find_map(|content| {
-            if let Content::ToolResult {
-                tool_use_id,
-                content,
-                ..
-            } = content
-                && tool_use_id == call_id
-            {
-                serde_json::from_str(&content.text()).ok()
-            } else {
-                None
-            }
-        })
-}
-
-fn history_text(request: &ModelRequest) -> String {
-    request
-        .messages
-        .iter()
-        .filter(|message| message.role != Role::System)
-        .flat_map(|message| &message.content)
-        .filter_map(|content| {
-            if let Content::Text { text } = content {
-                Some(text.as_str())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 #[async_trait]
@@ -2196,6 +2082,73 @@ async fn each_child_completion_is_recorded_once_and_background_delivery_is_not_r
         completions
     );
     restored.shutdown().await;
+}
+
+/// Records each stopped child and answers with `answer`.
+struct RecordingStopHook {
+    stopped: std::sync::Mutex<Vec<(Uuid, Uuid)>>,
+    answer: Result<(), String>,
+}
+
+#[async_trait::async_trait]
+impl tickloop_agent::runtime::StoppedChildHook for RecordingStopHook {
+    async fn child_stopped(&self, root: Uuid, child: Uuid) -> Result<(), String> {
+        self.stopped.lock().unwrap().push((root, child));
+        self.answer.clone()
+    }
+}
+
+#[tokio::test]
+async fn stop_subagent_tells_its_hook_which_direct_child_stopped_and_reports_a_failed_end() {
+    for answer in [Ok(()), Err("the Agent owner did not answer".to_owned())] {
+        let directory = tempfile::tempdir().unwrap();
+        let model = Arc::new(RoutedModel::new(|request| {
+            if !state(request)["delegation"].is_null() {
+                if !has_tool_result(request, "ready") {
+                    support::call(
+                        "ready",
+                        "SendMessage",
+                        json!({"to":"parent","message":"Child is ready to wait"}),
+                    )
+                } else {
+                    support::text("Awaiting family context.")
+                }
+            } else if !has_tool_result(request, "delegate") {
+                support::call(
+                    "delegate",
+                    "Subagent",
+                    json!({"task":"Wait to be stopped","name":"waiter"}),
+                )
+            } else if !has_tool_result(request, "stop") {
+                support::call("stop", "StopSubagent", json!({"to":"waiter"}))
+            } else {
+                support::text("Stopped")
+            }
+        }));
+        let core = Agent::new_embedded(support::config(), model);
+        let hook = Arc::new(RecordingStopHook {
+            stopped: std::sync::Mutex::new(Vec::new()),
+            answer: answer.clone(),
+        });
+        core.install_stopped_child_hook(hook.clone());
+        let root = core.create_chat(directory.path().into()).await.unwrap();
+        let mut events = core.subscribe();
+        let receipt = core
+            .submit(root, None, "Delegate a waiter then stop it".into())
+            .await
+            .unwrap();
+        completed(&mut events, &receipt).await;
+        let child = core.subagents(root).await.unwrap()[0].child_chat_id;
+        assert_eq!(*hook.stopped.lock().unwrap(), vec![(root, child)]);
+        let stopped = tool_result(&core.snapshot(root).await.unwrap().messages, "stop").unwrap();
+        assert_eq!(stopped["status"], "stopped");
+        assert_eq!(
+            stopped.get("hosted_ticks_error").and_then(Value::as_str),
+            answer.err().as_deref(),
+            "{stopped}"
+        );
+        core.shutdown().await;
+    }
 }
 
 #[tokio::test]

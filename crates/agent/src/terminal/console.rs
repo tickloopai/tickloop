@@ -529,9 +529,16 @@ struct Lifetime {
     surface: TerminalSurface,
 }
 
+/// A hosted Tick that may take the terminal from the detail `panel` of `chat`.
+struct FullScreenAttach {
+    chat: Uuid,
+    panel: Uuid,
+    grant: tickloop_agent::hosted::controller::HostedViewGrant,
+}
+
 pub(super) struct State {
     workspace_trust: Option<WorkspaceTrust>,
-    interactive: bool,
+    pub(super) interactive: bool,
     /// Plain output ends inside a line, such as a reply streamed without its line feed yet.
     plain_line_open: bool,
     renderer: Renderer,
@@ -647,8 +654,18 @@ pub(super) struct State {
     diff_screen_cache: HashMap<Uuid, DiffDialog>,
     pub(super) monitor: Monitor,
     monitor_preference: tickloop_agent::settings::MonitorPreference,
+    /// Whether Monitor may float hosted Ticks in a Herdr popup, as the settings say.
+    pub(super) monitor_popup: tickloop_agent::settings::MonitorPopup,
+    /// A hosted Tick waiting to take this terminal; the input thread attaches it between keys.
+    full_screen_attach: Option<FullScreenAttach>,
+    /// An attached view owns the terminal; nothing is drawn until it is taken back.
+    terminal_lent: bool,
     /// Lists the View's Workspace programs for explicit adding; absent outside a Herdr View.
     tick_discovery: Option<Arc<dyn crate::tick_adapter::TickDiscovery>>,
+    /// Reads the host state of Monitor members: the discovery inside Herdr, otherwise the
+    /// hosted Tick probe.
+    /// One probe per Tick type whose members' host state can be read.
+    member_probes: Vec<Arc<dyn crate::tick_adapter::TickProbe>>,
     member_probe_running: bool,
     task_surface: Option<TaskSurface<Uuid>>,
     task_surface_cache: HashMap<Uuid, TaskSurface<Uuid>>,
@@ -882,10 +899,15 @@ struct FooterBarTarget {
     categories: Vec<(std::ops::Range<usize>, FooterItemId)>,
 }
 
-/// One claimed probe of a Chat's members; its result goes back through `update_member_states`.
+/// One claimed probe of a Chat's members, one per Tick type; the results go back through
+/// `update_member_findings`.
 pub(super) struct MemberProbe {
     pub(super) chat: Uuid,
-    pub(super) discovery: Arc<dyn crate::tick_adapter::TickDiscovery>,
+    pub(super) probes: Vec<TypedProbe>,
+}
+
+pub(super) struct TypedProbe {
+    pub(super) prober: Arc<dyn crate::tick_adapter::TickProbe>,
     pub(super) targets: Vec<crate::tick_stream::InstanceRef>,
 }
 
@@ -1166,14 +1188,26 @@ impl Console {
         state.status = message.into();
         Ok(())
     }
+    /// Installs the discovery that lists what can be added; it also probes members.
     pub(super) fn set_tick_discovery(
         &self,
         discovery: Arc<dyn crate::tick_adapter::TickDiscovery>,
     ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.member_probes.push(discovery.clone());
+        state.tick_discovery = Some(discovery);
+        Ok(())
+    }
+    /// Adds the probe of one more Tick type's members.
+    pub(super) fn add_member_probe(
+        &self,
+        probe: Arc<dyn crate::tick_adapter::TickProbe>,
+    ) -> Result<(), String> {
         self.state
             .lock()
             .map_err(|error| error.to_string())?
-            .tick_discovery = Some(discovery);
+            .member_probes
+            .push(probe);
         Ok(())
     }
     /// Opens the add picker in the current Chat's Monitor, even while the Monitor is empty.
@@ -1189,38 +1223,53 @@ impl Console {
     /// Claims the next host probe of the visible Chat's members, if one is due and none runs.
     pub(super) fn claim_member_probe(&self) -> Result<Option<MemberProbe>, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let (Some(chat), Some(discovery)) = (state.chat, state.tick_discovery.clone()) else {
+        let Some(chat) = state.chat else {
             return Ok(None);
         };
-        let targets = state.monitor.probe_targets(discovery.tick_type());
-        if targets.is_empty() || state.member_probe_running {
+        let probes: Vec<_> = state
+            .member_probes
+            .iter()
+            .map(|prober| TypedProbe {
+                prober: prober.clone(),
+                targets: state.monitor.probe_targets(prober.tick_type()),
+            })
+            .filter(|probe| !probe.targets.is_empty())
+            .collect();
+        if probes.is_empty() || state.member_probe_running {
             return Ok(None);
         }
         state.member_probe_running = true;
-        Ok(Some(MemberProbe {
-            chat,
-            discovery,
-            targets,
-        }))
+        Ok(Some(MemberProbe { chat, probes }))
     }
     /// Applies a finished probe. A failed probe (`None`) keeps the earlier findings, and an
     /// unchanged result neither rebuilds nor repaints.
-    pub(super) fn update_member_states(
+    pub(super) fn update_member_findings(
         &self,
         chat: Uuid,
-        states: Option<HashMap<crate::tick_stream::InstanceRef, crate::tick_adapter::MemberState>>,
+        results: Vec<(&'static str, Option<crate::tick_adapter::MemberFindings>)>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.member_probe_running = false;
-        let Some(states) = states else {
-            return Ok(());
-        };
         let visible = state.chat == Some(chat) && state.monitor_visible();
         let monitor = state.monitor_for_chat_mut(chat);
-        if monitor.member_states == states {
+        let mut findings = monitor.member_findings.clone();
+        for (tick_type, probed) in results {
+            let Some(probed) = probed else {
+                continue;
+            };
+            findings
+                .states
+                .retain(|instance, _| instance.tick_type() != tick_type);
+            findings
+                .resources
+                .retain(|instance, _| instance.tick_type() != tick_type);
+            findings.states.extend(probed.states);
+            findings.resources.extend(probed.resources);
+        }
+        if monitor.member_findings == findings {
             return Ok(());
         }
-        monitor.member_states = states;
+        monitor.member_findings = findings;
         monitor.rebuild();
         if !visible {
             return Ok(());
@@ -1291,6 +1340,33 @@ impl Console {
             .map_err(|error| error.to_string())?
             .monitor_visible())
     }
+    pub(super) fn set_monitor_popup(
+        &self,
+        popup: tickloop_agent::settings::MonitorPopup,
+    ) -> Result<(), String> {
+        self.state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .monitor_popup = popup;
+        Ok(())
+    }
+
+    /// Hands this terminal to the hosted Tick `grant` names as soon as the input thread is
+    /// between keys, provided the detail that asked for it is still the one shown for `chat`.
+    pub(super) fn begin_full_screen_attach(
+        &self,
+        chat: Uuid,
+        panel: Uuid,
+        grant: tickloop_agent::hosted::controller::HostedViewGrant,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if !state.shows_detail(chat, panel) {
+            return Err("The Monitor detail closed before the Tick could be attached".into());
+        }
+        state.full_screen_attach = Some(FullScreenAttach { chat, panel, grant });
+        Ok(())
+    }
+
     pub(super) fn set_monitor_preference(
         &self,
         preference: tickloop_agent::settings::MonitorPreference,
@@ -4843,7 +4919,11 @@ impl State {
             diff_screen_cache: HashMap::new(),
             monitor: Monitor::default(),
             monitor_preference: tickloop_agent::settings::MonitorPreference::Auto,
+            monitor_popup: tickloop_agent::settings::MonitorPopup::default(),
+            full_screen_attach: None,
+            terminal_lent: false,
             tick_discovery: None,
+            member_probes: Vec::new(),
             member_probe_running: false,
             task_surface: None,
             task_surface_cache: HashMap::new(),
@@ -5242,7 +5322,7 @@ impl State {
     }
 
     fn draw(&mut self, output: &mut impl Write) -> io::Result<()> {
-        if !self.interactive {
+        if !self.interactive || self.terminal_lent {
             return Ok(());
         }
         if self.input_dialog_visible() && self.prompt_suggestion_request.is_some() {
@@ -5473,15 +5553,23 @@ impl State {
         let side_columns = MONITOR_COLUMNS.min(self.width);
         let monitor_lines = self.monitor_visible().then(|| {
             if let Some(detail) = &mut self.monitor.detail {
-                return detail
+                let width = side_columns.saturating_sub(2);
+                let shows_hint = self.monitor.focused && start > 2;
+                let mut lines: Vec<RoleLine> = detail
                     .lines(
-                        side_columns.saturating_sub(2),
-                        start,
+                        width,
+                        start - usize::from(shows_hint),
                         crate::private_fs::unix_time_milliseconds(),
                     )
                     .into_iter()
                     .map(|line| line.line)
                     .collect();
+                if shows_hint {
+                    let mut hint = RoleLine::role(detail.hint(), Role::MutedText);
+                    hint.truncate(width);
+                    lines.push(hint);
+                }
+                return lines;
             }
             let frame = self.monitor.frame(
                 side_columns.saturating_sub(2),
@@ -8955,6 +9043,61 @@ impl State {
         Some(outcome)
     }
 
+    fn shows_detail(&self, chat: Uuid, panel: Uuid) -> bool {
+        self.chat == Some(chat)
+            && self
+                .monitor
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.id() == panel)
+    }
+
+    /// Hands the terminal to an attached view: from now on nothing is drawn until it is
+    /// taken back, while Agent events keep updating the state.
+    fn lend_terminal(&mut self) -> io::Result<()> {
+        self.terminal_lent = true;
+        let mut output = io::stdout().lock();
+        self.surface
+            .release(self.renderer, &mut output)
+            .and_then(|()| write!(output, "{RESET_SCROLL_REGION}"))
+            .and_then(|()| disable_input_reporting(&mut output))
+            .and_then(|()| execute!(output, Show))
+            .and_then(|()| output.flush())
+    }
+
+    /// Takes the terminal back from an attached view and asks for a fresh snapshot for the
+    /// detail that asked, which shows how the view ended.
+    fn reclaim_terminal(&mut self, attach: FullScreenAttach, note: String) -> InputEvent {
+        let mut output = io::stdout().lock();
+        let restored = self
+            .surface
+            .take(self.renderer, &mut output)
+            .and_then(|()| enable_input_reporting(&mut output));
+        drop(output);
+        self.terminal_lent = false;
+        self.screen_initialized = false;
+        self.rendered_region = None;
+        if let Err(error) = restored {
+            self.status = format!("Cannot restore terminal after attach: {error}");
+        }
+        if self.shows_detail(attach.chat, attach.panel)
+            && let Some(detail) = self.monitor.detail.as_mut().and_then(|detail| {
+                detail
+                    .as_any_mut()
+                    .downcast_mut::<super::hosted_detail::HostedDetail>()
+            })
+        {
+            detail.set_note(note);
+        }
+        InputEvent::TickAction {
+            chat: attach.chat,
+            action: super::tick_actions::builtin::load_hosted_snapshot(
+                attach.grant.instance,
+                attach.panel,
+            ),
+        }
+    }
+
     fn can_edit_in_external_editor(&self) -> bool {
         self.prompt_enabled
             && self.menu.is_none()
@@ -9494,7 +9637,7 @@ impl State {
                 (KeyCode::Enter, _) | (KeyCode::Char(_), KeyModifiers::NONE) => {
                     if let Some(entry) = self.monitor.selected().cloned() {
                         let action_key = match key.code {
-                            KeyCode::Enter => 'o',
+                            KeyCode::Enter => crate::tick_adapter::MONITOR_ENTER_KEY,
                             KeyCode::Char(key) => key,
                             _ => unreachable!(),
                         };
@@ -10504,6 +10647,17 @@ fn read_keys(
             }
         }
         if !event::poll(INPUT_POLL_INTERVAL)? {
+            let attach = state
+                .lock()
+                .map_err(|error| io::Error::other(error.to_string()))?
+                .full_screen_attach
+                .take();
+            if let Some(attach) = attach {
+                if !lend_terminal_to_attached_view(state, attach, sender, stop)? {
+                    break;
+                }
+                continue;
+            }
             let mut state = state
                 .lock()
                 .map_err(|error| io::Error::other(error.to_string()))?;
@@ -10570,6 +10724,59 @@ fn read_keys(
         }
     }
     Ok(())
+}
+
+/// Lends the terminal to an attached hosted Tick until the user detaches. The input thread runs
+/// the view, so no key reaches the Console, and the state stays unlocked, so Agent events keep
+/// arriving while nothing is drawn. Returns whether input continues.
+fn lend_terminal_to_attached_view(
+    state: &Arc<Mutex<State>>,
+    attach: FullScreenAttach,
+    sender: &mpsc::Sender<InputEvent>,
+    stop: &AtomicBool,
+) -> io::Result<bool> {
+    let lock = || {
+        state
+            .lock()
+            .map_err(|error| io::Error::other(error.to_string()))
+    };
+    let lent = {
+        let mut state = lock()?;
+        if !state.shows_detail(attach.chat, attach.panel) {
+            return Ok(true);
+        }
+        state.lend_terminal()
+    };
+    let note = match lent {
+        Ok(()) => attached_view_note(&attach.grant),
+        Err(error) => format!("Cannot hand the terminal to the Tick: {error}"),
+    };
+    let refresh = {
+        let mut state = lock()?;
+        let refresh = state.reclaim_terminal(attach, note);
+        state.draw(&mut io::stdout().lock())?;
+        refresh
+    };
+    Ok(send_input(sender, stop, refresh))
+}
+
+/// Runs an attached view in this terminal and says how it ended.
+fn attached_view_note(grant: &tickloop_agent::hosted::controller::HostedViewGrant) -> String {
+    use tickloop_agent::hosted::attach::{AttachEnd, run_view};
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())
+        .and_then(|runtime| {
+            runtime
+                .block_on(run_view(grant))
+                .map_err(|error| error.to_string())
+        }) {
+        Ok(AttachEnd::Detached) => "Detached; the Tick keeps running".into(),
+        Ok(AttachEnd::Gone) => "The Tick ended while attached".into(),
+        Ok(AttachEnd::Lost(reason)) => format!("The attached view ended: {reason}"),
+        Err(error) => format!("Cannot attach: {error}"),
+    }
 }
 
 fn read_lines(stop: &AtomicBool, sender: &mpsc::Sender<InputEvent>) -> io::Result<()> {
@@ -13506,7 +13713,7 @@ mod tests {
                 Some(chat),
                 &HashMap::from([(
                     request.id,
-                    crate::terminal::WaitingPermission::new(chat, &request),
+                    crate::terminal::PermissionRequestOwner::new(chat, &request),
                 )]),
                 &HashMap::new(),
             )
@@ -13571,7 +13778,7 @@ mod tests {
                 Some(chat),
                 &HashMap::from([(
                     request.id,
-                    crate::terminal::WaitingPermission::new(chat, &request),
+                    crate::terminal::PermissionRequestOwner::new(chat, &request),
                 )]),
                 &HashMap::new(),
             )
@@ -13635,7 +13842,7 @@ mod tests {
                     Some(chat),
                     &HashMap::from([(
                         request.id,
-                        crate::terminal::WaitingPermission::new(chat, &request),
+                        crate::terminal::PermissionRequestOwner::new(chat, &request),
                     )]),
                     &HashMap::new(),
                 )

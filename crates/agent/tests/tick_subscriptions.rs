@@ -1819,3 +1819,235 @@ async fn cancelling_an_included_watch_discards_the_whole_queued_input() {
 async fn changing_included_watch_cadence_preserves_valid_queued_input() {
     unaffected_watch_queue(false, true).await;
 }
+
+/// The `tick-watermarks` files a saved Agent keeps under `root`.
+fn watermark_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fn walk(directory: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path
+                .parent()
+                .is_some_and(|parent| parent.ends_with("tick-watermarks"))
+            {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(root, &mut found);
+    found
+}
+
+async fn subscribe_loop(
+    agent: &Agent,
+    chat: Uuid,
+    loop_id: Uuid,
+    instances: &[InstanceRef],
+) -> Vec<Uuid> {
+    let subscriptions: Vec<_> = instances
+        .iter()
+        .cloned()
+        .map(|instance| TickSubscription {
+            id: Uuid::new_v4(),
+            instance,
+            every_seconds: 5,
+            authority: None,
+        })
+        .collect();
+    let ids = subscriptions
+        .iter()
+        .map(|subscription| subscription.id)
+        .collect();
+    agent
+        .configure_trigger(
+            chat,
+            loop_id,
+            Some(Trigger {
+                id: Uuid::new_v4(),
+                prompt: "inspect changes".into(),
+                interval_seconds: None,
+                expires_at_ms: None,
+                accepts_events: true,
+                armed: true,
+                subscriptions,
+            }),
+        )
+        .await
+        .unwrap();
+    ids
+}
+
+async fn accumulated(agent: &Agent, chat: Uuid, expected: u64) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let total: u64 = agent
+                .tick_subscriptions(chat)
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.accumulated)
+                .sum();
+            if total == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// A delivered update's sequence is recorded durably before the delivery goes out, so the
+/// same update arriving again is never delivered twice; cancelling the subscription removes
+/// that record.
+#[tokio::test(start_paused = true)]
+async fn a_repeated_update_is_never_delivered_twice_and_cancelling_drops_its_watermark() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let workdir = directory.path().join("work");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        text("ready"),
+        text("saw three"),
+        text("saw four"),
+    ]));
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let stream = InMemoryTickStream::new();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(workdir).await.unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(chat, None, "watch".into()).await.unwrap();
+    wait_for_completion(&mut events).await;
+    let subscription =
+        subscribe_loop(&agent, chat, receipt.loop_id, &[fixture_instance(5)]).await[0];
+
+    stream.push(update(5, 3, "three"));
+    accumulated(&agent, chat, 1).await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    wait_for_completion(&mut events).await;
+    assert!(last_user_text(&model).contains("three"));
+    let files = watermark_files(&root);
+    assert_eq!(files.len(), 1, "{files:?}");
+    let recorded: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+    assert_eq!(recorded["sequence"], 3);
+
+    stream.push(update(5, 3, "three again"));
+    settle().await;
+    accumulated(&agent, chat, 0).await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    settle().await;
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        2,
+        "the repeat woke nothing"
+    );
+
+    stream.push(update(5, 4, "four"));
+    accumulated(&agent, chat, 1).await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    wait_for_completion(&mut events).await;
+    assert!(last_user_text(&model).contains("four"));
+
+    agent
+        .update_tick_subscription(chat, subscription, TickSubscriptionChange::Cancel)
+        .await
+        .unwrap();
+    settle().await;
+    assert!(
+        watermark_files(&root).is_empty(),
+        "a cancelled subscription keeps no watermark"
+    );
+    agent.shutdown().await;
+}
+
+/// Answers `read_current` with a prepared observation, otherwise behaves as the in-memory
+/// stream.
+struct RefillingStream {
+    inner: InMemoryTickStream,
+    current: std::sync::Mutex<std::collections::HashMap<InstanceRef, TickObservation>>,
+}
+
+#[async_trait::async_trait]
+impl tickloop_agent::tick_stream::TickStreamPort for RefillingStream {
+    fn open(&self) -> tickloop_agent::tick_stream::TickStreamHandle {
+        self.inner.open()
+    }
+    fn set_watch_authorities(
+        &self,
+        authorities: std::collections::BTreeMap<
+            Uuid,
+            tickloop_agent::host_tools::HostToolAuthority,
+        >,
+    ) {
+        self.inner.set_watch_authorities(authorities);
+    }
+    async fn revalidate_watch(
+        &self,
+        chat: Uuid,
+        instance: &InstanceRef,
+        authority: Option<&tickloop_agent::host_tools::HostToolAuthority>,
+    ) -> Result<(), String> {
+        self.inner.revalidate_watch(chat, instance, authority).await
+    }
+    async fn read_current(
+        &self,
+        _chat: Uuid,
+        instance: &InstanceRef,
+    ) -> Result<Option<TickObservation>, String> {
+        Ok(self.current.lock().unwrap().get(instance).cloned())
+    }
+}
+
+/// Update data of all subscriptions shares one 64 KiB cache; the oldest is evicted first and is
+/// read again from its Tick when it is delivered, and a delivery empties the cache.
+#[tokio::test(start_paused = true)]
+async fn update_data_stays_within_the_content_budget_and_evicted_data_is_read_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![text("ready"), text("received")]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let stream = Arc::new(RefillingStream {
+        inner: InMemoryTickStream::new(),
+        current: Default::default(),
+    });
+    agent.install_tick_stream(stream.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(chat, None, "watch".into()).await.unwrap();
+    wait_for_completion(&mut events).await;
+    let instances: Vec<_> = (10..16).map(fixture_instance).collect();
+    subscribe_loop(&agent, chat, receipt.loop_id, &instances).await;
+    for instance in &instances {
+        let mut observation = update(0, 1, "large");
+        observation.instance = instance.clone();
+        observation.data = json!({"text": "x".repeat(12 * 1024)});
+        stream.inner.push(observation);
+        settle().await;
+    }
+    accumulated(&agent, chat, 6).await;
+    let used = agent.tick_content_bytes();
+    assert!(
+        used <= 64 * 1024 && used > 4 * 12 * 1024,
+        "{used} bytes of update data are kept"
+    );
+    let mut refilled = update(0, 2, "refilled");
+    refilled.instance = instances[0].clone();
+    stream
+        .current
+        .lock()
+        .unwrap()
+        .insert(instances[0].clone(), refilled);
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    wait_for_completion(&mut events).await;
+    let delivered = last_user_text(&model);
+    assert!(delivered.contains("\"phase\":\"refilled\""), "{delivered}");
+    assert_eq!(
+        agent.tick_content_bytes(),
+        0,
+        "a delivery empties the cache"
+    );
+    agent.shutdown().await;
+}

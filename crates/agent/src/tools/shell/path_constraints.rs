@@ -13,7 +13,11 @@ use std::{
 
 use regex::Regex;
 
-use super::{security::strip_safe_wrappers, sed::sed_command_is_allowed, syntax::quote_arguments};
+use super::{
+    security::strip_safe_wrappers,
+    sed::sed_command_is_allowed,
+    syntax::{QuoteToken, quote_tokens},
+};
 
 const DANGEROUS_FILES: &[&str] = &[
     ".gitconfig",
@@ -30,6 +34,7 @@ const DANGEROUS_FILES: &[&str] = &[
 /// is `.tickloop`, which holds the Agent's settings and permission rules.
 const DANGEROUS_DIRECTORIES: &[&str] = &[".git", ".vscode", ".idea", ".tickloop"];
 const MAX_SYMLINK_DEPTH: usize = 40;
+const GLOB_CHARACTERS: [char; 6] = ['*', '?', '[', ']', '{', '}'];
 
 static SHORT_NAME: LazyLock<Regex> = LazyLock::new(|| pattern(r"~[0-9]"));
 static TRAILING_DOTS_OR_SPACES: LazyLock<Regex> = LazyLock::new(|| pattern(r"[.\s]+$"));
@@ -63,7 +68,15 @@ impl PathPolicy<'_> {
     /// `true` means Claude Code returns `passthrough`.
     pub(super) fn command_paths_allowed(&self, command: &str, compound_has_cd: bool) -> bool {
         let stripped = strip_safe_wrappers(command);
-        let arguments = quote_arguments(&stripped).unwrap_or_default();
+        let tokens = quote_tokens(&stripped).unwrap_or_default();
+        let expands_globs = tokens
+            .iter()
+            .any(|token| matches!(token, QuoteToken::Glob(_)));
+        let arguments = tokens
+            .iter()
+            .filter_map(QuoteToken::as_argument)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         let Some((base_command, arguments)) = arguments.split_first() else {
             return true;
         };
@@ -85,18 +98,23 @@ impl PathPolicy<'_> {
                 });
             if file_flags.contains(&flag) {
                 let value = inline.or_else(|| arguments.get(index + 1).map(String::as_str));
-                if value.is_none_or(|path| !self.validate_path(path, FileOperation::Read)) {
+                if value.is_none_or(|path| {
+                    !self.validate_path(path, FileOperation::Read, expands_globs)
+                }) {
                     return false;
                 }
             }
         }
         if base_command == "diff" {
-            let operands = extract_paths(base_command, arguments);
-            if operands.iter().any(|operand| {
+            let is_directory = |path: &str| {
                 self.cwd
-                    .join(expand_tilde(strip_surrounding_quote(operand)))
+                    .join(expand_tilde(strip_surrounding_quote(path)))
                     .is_dir()
-            }) {
+            };
+            if extract_paths(base_command, arguments)
+                .iter()
+                .any(|operand| is_directory(operand))
+            {
                 return false;
             }
             for flag in arguments
@@ -105,11 +123,8 @@ impl PathPolicy<'_> {
             {
                 if let Some((name, path)) = flag.split_once('=')
                     && matches!(name, "--from-file" | "--to-file" | "--exclude-from")
-                    && (!self.validate_path(path, FileOperation::Read)
-                        || self
-                            .cwd
-                            .join(expand_tilde(strip_surrounding_quote(path)))
-                            .is_dir())
+                    && (!self.validate_path(path, FileOperation::Read, expands_globs)
+                        || is_directory(path))
                 {
                     return false;
                 }
@@ -129,7 +144,10 @@ impl PathPolicy<'_> {
             return false;
         }
         let paths = extract_paths(base_command, arguments);
-        if !paths.iter().all(|path| self.validate_path(path, operation)) {
+        if !paths
+            .iter()
+            .all(|path| self.validate_path(path, operation, expands_globs))
+        {
             return false;
         }
         !(matches!(base_command.as_str(), "rm" | "rmdir")
@@ -150,7 +168,7 @@ impl PathPolicy<'_> {
         targets
             .iter()
             .filter(|target| **target != "/dev/null")
-            .all(|target| self.validate_path(target, FileOperation::Create))
+            .all(|target| self.validate_path(target, FileOperation::Create, false))
     }
 
     fn removal_target(&self, path: &str) -> String {
@@ -164,23 +182,22 @@ impl PathPolicy<'_> {
         }
     }
 
-    /// Port of `validatePath`.
-    fn validate_path(&self, path: &str, operation: FileOperation) -> bool {
+    /// Port of `validatePath`. `expands_globs` says whether the command has an unquoted `*` or
+    /// `?`; without one, such a character in a path is part of a literal file name.
+    fn validate_path(&self, path: &str, operation: FileOperation, expands_globs: bool) -> bool {
         let clean = expand_tilde(strip_surrounding_quote(path));
         if clean.starts_with('~') || clean.contains(['$', '%']) || clean.starts_with('=') {
             return false;
         }
-        let path_to_resolve = if let Some(glob_index) = clean.find(['*', '?', '[', ']', '{', '}']) {
-            if operation != FileOperation::Read {
-                return false;
-            }
-            if PATH_TRAVERSAL.is_match(&clean) {
-                clean.clone()
-            } else {
-                glob_base_directory(&clean[..glob_index])
-            }
-        } else {
-            clean
+        let glob_index = clean.find(GLOB_CHARACTERS);
+        if glob_index.is_some() && operation != FileOperation::Read {
+            return false;
+        }
+        let pattern_index =
+            glob_index.filter(|_| expands_globs || clean.contains(['[', ']', '{', '}']));
+        let path_to_resolve = match pattern_index {
+            Some(index) if !PATH_TRAVERSAL.is_match(&clean) => glob_base_directory(&clean[..index]),
+            _ => clean,
         };
         // Like `path.resolve`, only relative paths are normalized before symlink resolution.
         let absolute = if path_to_resolve.starts_with('/') {
@@ -194,19 +211,27 @@ impl PathPolicy<'_> {
         } else {
             resolved
         };
-        self.is_path_allowed(&resolved, operation)
+        self.is_path_allowed(&resolved, operation, pattern_index.is_none())
     }
 
-    /// Port of `isPathAllowed` without permission rules.
-    fn is_path_allowed(&self, resolved: &Path, operation: FileOperation) -> bool {
+    /// Port of `isPathAllowed` without permission rules. The internal family directories admit
+    /// only an `exact_target`: a pattern can expand to a link that leaves them.
+    fn is_path_allowed(
+        &self,
+        resolved: &Path,
+        operation: FileOperation,
+        exact_target: bool,
+    ) -> bool {
         let paths_to_check = paths_for_permission_check(resolved);
-        if self.editable_directory.is_some_and(|directory| {
-            paths_to_check.iter().all(|path| {
-                resolve_deepest_existing_ancestor(path)
-                    .unwrap_or_else(|| path.clone())
-                    .starts_with(directory)
+        if exact_target
+            && self.editable_directory.is_some_and(|directory| {
+                paths_to_check.iter().all(|path| {
+                    resolve_deepest_existing_ancestor(path)
+                        .unwrap_or_else(|| path.clone())
+                        .starts_with(directory)
+                })
             })
-        }) {
+        {
             return true;
         }
         if operation != FileOperation::Read
@@ -230,6 +255,7 @@ impl PathPolicy<'_> {
             return operation == FileOperation::Read || self.accept_edits;
         }
         operation == FileOperation::Read
+            && exact_target
             && self
                 .readable_directories
                 .iter()
@@ -855,6 +881,8 @@ mod tests {
             "git diff --no-index src/main.rs src/other.rs",
             "head -30",
             "ls 'src/*.rs'",
+            "cat src/*.rs",
+            "wc -l src/m?in.rs src/main.rs",
             "cd src",
             "sed -n '1p' src/main.rs",
         ] {
@@ -876,6 +904,39 @@ mod tests {
             "git diff --no-index /etc/passwd src/main.rs",
         ] {
             assert!(!policy.command_paths_allowed(command, false), "{command}");
+        }
+    }
+
+    #[test]
+    fn internal_directories_admit_exact_files_but_not_patterns() {
+        let fixture = Fixture::new();
+        let internal_directory = tempfile::tempdir().unwrap();
+        let internal = internal_directory.path().canonicalize().unwrap();
+        std::fs::write(internal.join("a*b"), "").unwrap();
+        let readable = [internal.clone()];
+        let internal = internal.display();
+        let read_policy = PathPolicy {
+            readable_directories: &readable,
+            ..fixture.policy(false)
+        };
+        let edit_policy = PathPolicy {
+            editable_directory: Some(&readable[0]),
+            ..fixture.policy(false)
+        };
+        for policy in [read_policy, edit_policy] {
+            for command in [
+                format!("cat '{internal}/a*b'"),
+                format!("cat {internal}/out"),
+            ] {
+                assert!(policy.command_paths_allowed(&command, false), "{command}");
+            }
+            for command in [
+                format!("cat {internal}/*"),
+                format!("cat '{internal}/a*b' src/*.rs"),
+                format!("cat '{internal}/a[1]'"),
+            ] {
+                assert!(!policy.command_paths_allowed(&command, false), "{command}");
+            }
         }
     }
 

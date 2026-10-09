@@ -235,6 +235,41 @@ impl ScopedHostSocket {
     }
 }
 
+fn install_routed_authorities(agent: &Agent, directory: &std::path::Path) -> ScopedHostSocket {
+    use tickloop_agent::{
+        hosted::{
+            tools::HostedTickTools,
+            worker_control::{OwnerControl, WorkerControlGrant},
+        },
+        native_host::NativeHostToolProvider,
+        tick_tool_router::TickToolRouter,
+    };
+    let socket = ScopedHostSocket::start(directory.join("routed.sock"));
+    let native = Arc::new(NativeHostToolProvider::new(Arc::new(
+        tick_connect::access::TickAccess::new(tick_connect::herdr::HerdrContext::without_view(
+            socket.path.clone(),
+        )),
+    )));
+    let grant = WorkerControlGrant {
+        endpoint: directory.join("owner.sock"),
+        owner_epoch: uuid::Uuid::new_v4(),
+        binding: uuid::Uuid::new_v4(),
+        capability: "0".repeat(64),
+        host_endpoint: directory.join("host.sock"),
+        intent_renewal: std::time::Duration::from_secs(60),
+    };
+    agent
+        .install_host_tools(Arc::new(TickToolRouter::new(
+            Some(native),
+            Some(Arc::new(HostedTickTools::new(
+                OwnerControl::new(grant),
+                vec![],
+            ))),
+        )))
+        .unwrap();
+    socket
+}
+
 async fn access_command(
     access: &tickloop_agent::agent_access::EmbeddedAgentAccess,
     command: tickloop_agent::agent_access::AgentCommand,
@@ -473,6 +508,271 @@ async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_work
     );
     original.stop().await;
     other.stop().await;
+}
+
+/// A child freezes, per tool, the authorities of the backends present when it was delegated.
+/// A Tick host added afterwards never serves it, while the frozen Herdr backend still does,
+/// and a record frozen with one authority per tool is no longer restored.
+#[tokio::test]
+async fn a_child_never_gains_a_tick_host_added_after_its_delegation() {
+    use tickloop_agent::{
+        agent_access::{
+            AgentCommand, CommandResult, ConfigurationChange, EmbeddedAgentAccess, HostWorkContext,
+            LaunchSpec, TranscriptRef, UserInput,
+        },
+        hosted::{
+            tools::HostedTickTools,
+            worker_control::{OwnerControl, WorkerControlGrant},
+        },
+        native_host::NativeHostToolProvider,
+        tick_tool_router::TickToolRouter,
+    };
+    let directory = tempfile::Builder::new()
+        .prefix("tl-host-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let store = directory.path().join("state");
+    let herdr = ScopedHostSocket::start(directory.path().join("h.sock"));
+    let native = || {
+        Arc::new(NativeHostToolProvider::new(Arc::new(
+            tick_connect::access::TickAccess::new(tick_connect::herdr::HerdrContext::without_view(
+                herdr.path.clone(),
+            )),
+        )))
+    };
+    let launch = || {
+        let mut launch = LaunchSpec::embedded(directory.path().into());
+        launch.host_work_context = Some(HostWorkContext {
+            socket: herdr.path.clone(),
+            workspace: Some("W1".into()),
+        });
+        launch
+    };
+    let agent = Agent::open_embedded(
+        store.clone(),
+        config(),
+        Arc::new(ScriptedModel::new(vec![
+            call(
+                "delegate",
+                "Subagent",
+                json!({"task":"Read the Workspace."}),
+            ),
+            call("child-host", "ReadWorkspace", json!({})),
+            text("Read."),
+            text("Delegated."),
+        ])),
+    )
+    .unwrap();
+    agent
+        .install_host_tools(Arc::new(TickToolRouter::new(Some(native()), None)))
+        .unwrap();
+    let access = EmbeddedAgentAccess::new(agent.clone());
+    let CommandResult::Created {
+        execution: parent, ..
+    } = access_command(
+        &access,
+        AgentCommand::Create {
+            launch: launch(),
+            initial: None,
+            origin: None,
+        },
+    )
+    .await
+    else {
+        panic!("expected Create");
+    };
+    access_command(
+        &access,
+        AgentCommand::Configure {
+            provider: None,
+            execution: parent,
+            change: ConfigurationChange::ExecutionMode {
+                mode: ExecutionMode::FullAccess,
+            },
+        },
+    )
+    .await;
+    let mut events = agent.subscribe();
+    let CommandResult::Submitted(parent_run) = access_command(
+        &access,
+        AgentCommand::Submit {
+            execution: parent,
+            target_loop: None,
+            input: UserInput::Text {
+                text: "Delegate the read.".into(),
+                contexts: vec![],
+                paths: vec![],
+            },
+            origin: None,
+        },
+    )
+    .await
+    else {
+        panic!("expected Submit");
+    };
+    let mut child = None;
+    loop {
+        let event = support::next_event(&mut events).await;
+        if event.chat_id != parent_run.chat_id {
+            child = Some(event.chat_id);
+            if let EventKind::ToolCompleted { result, .. } = &event.kind {
+                assert!(!result.is_error, "{}", result.content);
+            }
+        }
+        if event.run_id == parent_run.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+            break;
+        }
+    }
+    let child = child.unwrap();
+    let frozen = serde_json::to_value(
+        agent
+            .snapshot(child)
+            .await
+            .unwrap()
+            .delegation
+            .unwrap()
+            .ceiling
+            .host_tools,
+    )
+    .unwrap();
+    for tool in ["ReadWorkspace", "ReadTick", "CallTickTool", "ModifyTick"] {
+        assert_eq!(
+            frozen[tool].as_array().map(Vec::len),
+            Some(1),
+            "{tool}: only Herdr was present: {frozen}"
+        );
+    }
+    access.shutdown().await;
+
+    let grant = WorkerControlGrant {
+        endpoint: directory.path().join("owner.sock"),
+        owner_epoch: uuid::Uuid::new_v4(),
+        binding: uuid::Uuid::new_v4(),
+        capability: "0".repeat(64),
+        host_endpoint: directory.path().join("host.sock"),
+        intent_renewal: std::time::Duration::from_secs(60),
+    };
+    let restored = Agent::open_embedded(
+        store.clone(),
+        config(),
+        Arc::new(ScriptedModel::new(vec![
+            call(
+                "child-hosted",
+                "ReadTick",
+                json!({"tick_instance_id":tick_connect::instance::InstanceRef::hosted(uuid::Uuid::new_v4())}),
+            ),
+            call("child-herdr", "ReadWorkspace", json!({})),
+            text("Checked both."),
+        ])),
+    )
+    .unwrap();
+    restored
+        .install_host_tools(Arc::new(TickToolRouter::new(
+            Some(native()),
+            Some(Arc::new(HostedTickTools::new(
+                OwnerControl::new(grant),
+                Vec::new(),
+            ))),
+        )))
+        .unwrap();
+    let access = EmbeddedAgentAccess::for_worker(restored.clone(), uuid::Uuid::new_v4());
+    let CommandResult::Loaded {
+        execution,
+        snapshot,
+    } = access_command(
+        &access,
+        AgentCommand::LoadRecord {
+            record: TranscriptRef {
+                store_root: store.clone(),
+                chat_id: child,
+            },
+            as_new: false,
+            launch: Some(launch()),
+        },
+    )
+    .await
+    else {
+        panic!("expected LoadRecord");
+    };
+    let mut events = restored.subscribe();
+    let CommandResult::Submitted(run) = access_command(
+        &access,
+        AgentCommand::Submit {
+            execution,
+            target_loop: Some(snapshot.conversation.loops[0].id),
+            input: UserInput::Text {
+                text: "Read a hosted Tick and the Workspace.".into(),
+                contexts: vec![],
+                paths: vec![],
+            },
+            origin: None,
+        },
+    )
+    .await
+    else {
+        panic!("expected Submit");
+    };
+    let mut results = std::collections::BTreeMap::new();
+    loop {
+        let event = support::next_event(&mut events).await;
+        if event.run_id != run.run_id {
+            continue;
+        }
+        match event.kind {
+            EventKind::ToolCompleted { call_id, result } => {
+                results.insert(call_id, result);
+            }
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    access.shutdown().await;
+    let hosted = &results["child-hosted"];
+    assert!(hosted.is_error, "{}", hosted.content);
+    assert!(
+        hosted
+            .content
+            .contains("outside the child's inherited authorization"),
+        "{}",
+        hosted.content
+    );
+    assert!(
+        !results["child-herdr"].is_error,
+        "{}",
+        results["child-herdr"].content
+    );
+
+    let transcript = support::transcript_file(&store, child);
+    let single_authority = std::fs::read_to_string(&transcript)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut entry: Value = serde_json::from_str(line).unwrap();
+            if entry["type"] == "delegation" {
+                for authorities in entry["delegation"]["ceiling"]["host_tools"]
+                    .as_object_mut()
+                    .unwrap()
+                    .values_mut()
+                {
+                    *authorities = authorities[0].clone();
+                }
+            }
+            serde_json::to_string(&entry).unwrap()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(&transcript, single_authority).unwrap();
+    let reopened =
+        Agent::open_embedded(store, config(), Arc::new(ScriptedModel::new(vec![]))).unwrap();
+    let result = reopened.resume_chat(child).await;
+    assert!(
+        result.is_err(),
+        "a child frozen with one authority per tool was restored"
+    );
+    reopened.shutdown().await;
+    herdr.stop().await;
 }
 
 #[tokio::test]
@@ -1772,6 +2072,7 @@ async fn a_full_access_child_can_run_an_interpreter_under_its_frozen_authority()
         text("Root finished"),
     ]));
     let core = Agent::new_embedded(config(), model);
+    let routed = install_routed_authorities(&core, directory.path());
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.set_execution_mode(root, ExecutionMode::FullAccess)
         .await
@@ -1798,7 +2099,18 @@ async fn a_full_access_child_can_run_an_interpreter_under_its_frozen_authority()
             break;
         }
     }
+    let child = core.subagents(root).await.unwrap()[0].child_chat_id;
+    let ceiling = core
+        .snapshot(child)
+        .await
+        .unwrap()
+        .delegation
+        .unwrap()
+        .ceiling;
+    assert_eq!(ceiling.host_tools["ReadTick"].len(), 2);
+    assert!(!ceiling.host_tools.contains_key("Bash"));
     core.shutdown().await;
+    routed.stop().await;
     let result = result.expect("the real delegated Bash call must return");
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("7319"), "{}", result.content);
@@ -1822,6 +2134,7 @@ async fn a_child_interpreter_asks_for_its_own_normal_permission_and_once_runs_it
         text("Root finished"),
     ]));
     let core = Agent::new_embedded(config(), model);
+    let routed = install_routed_authorities(&core, directory.path());
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.set_execution_mode(root, ExecutionMode::AcceptEdits)
         .await
@@ -1870,6 +2183,7 @@ async fn a_child_interpreter_asks_for_its_own_normal_permission_and_once_runs_it
         }
     }
     core.shutdown().await;
+    routed.stop().await;
     let result = result.unwrap();
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("8426"));
@@ -2275,6 +2589,7 @@ async fn a_child_reads_its_announced_background_output_without_permission() {
         ]),
     });
     let core = Agent::new_embedded(config(), model.clone());
+    let routed = install_routed_authorities(&core, directory.path());
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.set_execution_mode(root, ExecutionMode::AcceptEdits)
         .await
@@ -2327,6 +2642,7 @@ async fn a_child_reads_its_announced_background_output_without_permission() {
         }
     }
     core.shutdown().await;
+    routed.stop().await;
     let result = result.unwrap();
     assert!(!result.is_error, "{}", result.content);
     assert!(

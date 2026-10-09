@@ -5,6 +5,7 @@ use super::super::{
     tick_shell::{TickShell, TickShellKey},
 };
 use super::*;
+use crate::tick_adapter::{HOSTED_CLOSE_KEY, HOSTED_REOPEN_KEY};
 
 pub(crate) fn artifact(id: &str, key: char) -> Arc<dyn TickActionExecutor> {
     Arc::new(ArtifactAction { id: id.into(), key })
@@ -17,6 +18,49 @@ pub(crate) fn details(instance: crate::tick_stream::InstanceRef) -> Arc<dyn Tick
 }
 pub(crate) fn remove(instance: crate::tick_stream::InstanceRef) -> Arc<dyn TickActionExecutor> {
     Arc::new(RemoveFromMonitor { instance })
+}
+pub(crate) fn close_hosted(
+    instance: crate::tick_stream::InstanceRef,
+) -> Arc<dyn TickActionExecutor> {
+    Arc::new(CloseHosted {
+        instance,
+        is_confirmed: false,
+    })
+}
+pub(crate) fn reopen_hosted(
+    instance: crate::tick_stream::InstanceRef,
+) -> Arc<dyn TickActionExecutor> {
+    Arc::new(ReopenHosted {
+        instance,
+        is_confirmed: false,
+    })
+}
+/// Enter on a hosted Tick: the Monitor detail with a snapshot of its screen and the reason it is
+/// not floated in a popup.
+pub(crate) fn present_hosted(
+    instance: crate::tick_stream::InstanceRef,
+) -> Arc<dyn TickActionExecutor> {
+    Arc::new(PresentHosted { instance })
+}
+pub(in super::super) fn load_hosted_snapshot(
+    instance: crate::tick_stream::InstanceRef,
+    panel: Uuid,
+) -> PreparedTickAction {
+    PreparedTickAction::new(
+        instance.to_string(),
+        super::super::hosted_detail::REFRESH_KEY,
+        Arc::new(LoadHostedSnapshot { instance, panel }),
+    )
+}
+pub(in super::super) fn attach_hosted_full_screen(
+    instance: crate::tick_stream::InstanceRef,
+    panel: Uuid,
+) -> PreparedTickAction {
+    PreparedTickAction::new(
+        instance.to_string(),
+        super::super::hosted_detail::ATTACH_KEY,
+        Arc::new(AttachHostedFullScreen { instance, panel }),
+    )
 }
 pub(crate) fn shell(task: Uuid) -> Arc<dyn TickActionExecutor> {
     Arc::new(ShellOpen { task })
@@ -105,6 +149,68 @@ impl TickActionExecutor for DetailsOpen {
         ))
     }
 }
+struct PresentHosted {
+    instance: crate::tick_stream::InstanceRef,
+}
+impl TickActionExecutor for PresentHosted {
+    fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
+        let chat = ui.chat().ok_or("No selected Chat")?;
+        let entry = ui
+            .monitor_entry(&self.instance)
+            .ok_or("This Tick is no longer in Monitor")?;
+        let detail = super::super::hosted_detail::HostedDetail::new(
+            chat,
+            entry,
+            ui.not_floated(),
+            ui.can_take_over_terminal(),
+        );
+        let panel = detail.id();
+        ui.open_detail(Box::new(detail));
+        Ok(load_hosted_snapshot(self.instance.clone(), panel))
+    }
+}
+/// Reads the hosted Tick's screen into its open detail; reading it never counts as using it.
+struct LoadHostedSnapshot {
+    instance: crate::tick_stream::InstanceRef,
+    panel: Uuid,
+}
+#[async_trait]
+impl TickActionBackend for LoadHostedSnapshot {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+        let snapshot = ctx
+            .agent
+            .hosted_tick_snapshot(ctx.chat, self.instance.clone())
+            .await
+            .map_err(|error| error.to_string());
+        ctx.update_detail(
+            self.panel,
+            |detail: &mut super::super::hosted_detail::HostedDetail| {
+                detail.show(snapshot);
+                Some(())
+            },
+        )?;
+        Ok(TickActionOutcome::Done)
+    }
+}
+/// Asks the owner for a one-time view of the hosted Tick, which the Console then attaches full
+/// screen in its own terminal.
+struct AttachHostedFullScreen {
+    instance: crate::tick_stream::InstanceRef,
+    panel: Uuid,
+}
+#[async_trait]
+impl TickActionBackend for AttachHostedFullScreen {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+        let grant = ctx
+            .agent
+            .attach_hosted_tick(ctx.chat, self.instance.clone())
+            .await
+            .map_err(|error| format!("Cannot attach {}: {error}", self.instance))?;
+        ctx.console
+            .begin_full_screen_attach(ctx.chat, self.panel, grant)?;
+        Ok(TickActionOutcome::Done)
+    }
+}
 struct NoBackend;
 #[async_trait]
 impl TickActionBackend for NoBackend {
@@ -136,6 +242,96 @@ impl TickActionBackend for RemoveFromMonitor {
             .map_err(|error| format!("Cannot remove from Monitor: {error}"))?;
         ctx.console
             .update_monitor_membership(ctx.chat, membership)?;
+        Ok(TickActionOutcome::Done)
+    }
+}
+const CLOSE_HOSTED_PROMPT: &str =
+    "Close this hosted Tick and end its process? Enter confirm · Esc cancel";
+const REOPEN_HOSTED_PROMPT: &str = "Start a new instance of this lost Tick? Its subscriptions do not follow. Enter confirm · Esc cancel";
+
+/// Ends the hosted Tick at the user's request once confirmed; it stays in the Monitor, shown
+/// gone, until removed.
+struct CloseHosted {
+    instance: crate::tick_stream::InstanceRef,
+    is_confirmed: bool,
+}
+impl TickActionExecutor for CloseHosted {
+    fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
+        Ok(PreparedTickAction::new(
+            self.instance.to_string(),
+            HOSTED_CLOSE_KEY,
+            Arc::new(CloseHosted {
+                instance: self.instance.clone(),
+                is_confirmed: self.is_confirmed,
+            }),
+        ))
+    }
+}
+#[async_trait]
+impl TickActionBackend for CloseHosted {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+        if !self.is_confirmed {
+            ctx.console.confirm_tick_action(
+                ctx.chat,
+                self.instance.to_string(),
+                Arc::new(CloseHosted {
+                    instance: self.instance.clone(),
+                    is_confirmed: true,
+                }),
+                CLOSE_HOSTED_PROMPT,
+            )?;
+            return Ok(TickActionOutcome::Done);
+        }
+        ctx.agent
+            .close_hosted_tick(ctx.chat, self.instance.clone())
+            .await
+            .map_err(|error| format!("Cannot close {}: {error}", self.instance))?;
+        ctx.notify(&format!("Closed {}", self.instance))?;
+        Ok(TickActionOutcome::Done)
+    }
+}
+
+/// Starts a new instance in place of a hosted Tick lost with its host once confirmed; it joins
+/// the Monitor beside the lost row, and nothing the lost one was subscribed to follows it.
+struct ReopenHosted {
+    instance: crate::tick_stream::InstanceRef,
+    is_confirmed: bool,
+}
+impl TickActionExecutor for ReopenHosted {
+    fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
+        Ok(PreparedTickAction::new(
+            self.instance.to_string(),
+            HOSTED_REOPEN_KEY,
+            Arc::new(ReopenHosted {
+                instance: self.instance.clone(),
+                is_confirmed: self.is_confirmed,
+            }),
+        ))
+    }
+}
+#[async_trait]
+impl TickActionBackend for ReopenHosted {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<TickActionOutcome, String> {
+        if !self.is_confirmed {
+            ctx.console.confirm_tick_action(
+                ctx.chat,
+                self.instance.to_string(),
+                Arc::new(ReopenHosted {
+                    instance: self.instance.clone(),
+                    is_confirmed: true,
+                }),
+                REOPEN_HOSTED_PROMPT,
+            )?;
+            return Ok(TickActionOutcome::Done);
+        }
+        let (reopened, membership) = ctx
+            .agent
+            .reopen_hosted_tick(ctx.chat, self.instance.clone())
+            .await
+            .map_err(|error| format!("Cannot reopen {}: {error}", self.instance))?;
+        ctx.console
+            .update_monitor_membership(ctx.chat, membership)?;
+        ctx.notify(&format!("Reopened {} as {reopened}", self.instance))?;
         Ok(TickActionOutcome::Done)
     }
 }

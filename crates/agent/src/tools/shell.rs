@@ -82,7 +82,7 @@ impl ShellInput {
         permission::is_allowed_without_rules(&self.command, &context, false)
     }
 
-    pub(super) fn is_allowed_with_session_temp(
+    pub(super) fn is_allowed_with_family_temp(
         &self,
         cwd: &Path,
         workspace: &super::Workspace,
@@ -1762,15 +1762,7 @@ mod tests {
         registry
             .execute_user(
                 &working_directory,
-                ShellInput {
-                    command: "sleep 0.1".into(),
-                    timeout: None,
-                    description: None,
-                    run_in_background: false,
-                    cwd: None,
-                    readable_directories: vec![],
-                    editable_directory: None,
-                },
+                shell_input("sleep 0.1"),
                 &PrivateDirectory::trusted(working_directory.join("output")),
                 operation_id,
                 chat_id,
@@ -1808,7 +1800,7 @@ mod tests {
         registry
             .execute_user(
                 &working_directory,
-                ShellInput { command: "/bin/sh -c 'trap \"\" TERM; echo $$ > descendant.pid; sleep 0.8; echo late > late-write' &".into(), timeout: None, description: None, run_in_background: false, cwd: None, readable_directories: vec![], editable_directory: None },
+                shell_input("/bin/sh -c 'trap \"\" TERM; echo $$ > descendant.pid; sleep 0.8; echo late > late-write' &"),
                 &output_directory,
                 operation_id,
                 chat_id,
@@ -1843,15 +1835,7 @@ mod tests {
         registry
             .execute_user(
                 &working_directory,
-                ShellInput {
-                    command: "dd if=/dev/zero bs=1048576 count=65 2>/dev/null".into(),
-                    timeout: None,
-                    description: None,
-                    run_in_background: false,
-                    cwd: None,
-                    readable_directories: vec![],
-                    editable_directory: None,
-                },
+                shell_input("dd if=/dev/zero bs=1048576 count=65 2>/dev/null"),
                 &output_directory,
                 operation_id,
                 Uuid::new_v4(),
@@ -1889,15 +1873,7 @@ mod tests {
         registry
             .execute_user(
                 &working_directory,
-                ShellInput {
-                    command: "sleep 30".into(),
-                    timeout: None,
-                    description: None,
-                    run_in_background: false,
-                    cwd: None,
-                    readable_directories: vec![],
-                    editable_directory: None,
-                },
+                shell_input("sleep 30"),
                 &PrivateDirectory::trusted(working_directory.join("output")),
                 operation_id,
                 chat_id,

@@ -5,7 +5,8 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 const HERDR_SOURCE: &str = "herdr:";
-const HOSTED_TYPE: &str = "hosted";
+/// The Tick type of Ticks the dedicated Tick host runs.
+pub const HOSTED_TYPE: &str = "hosted";
 
 pub fn artifact_instance_id(origin: &str, id: &str) -> String {
     format!("artifact:{}/{id}", origin.trim_end_matches('/'))

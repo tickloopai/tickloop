@@ -2583,10 +2583,7 @@ impl Agent {
         if let Some(delegation) = &snapshot.delegation {
             snapshot.workdir = delegation.ceiling.workdir.clone();
             snapshot.additional_directories = delegation.ceiling.additional_directories.clone();
-            snapshot.policy = delegation
-                .ceiling
-                .policy
-                .for_delegation(delegation.parent_loop_id);
+            snapshot.policy = delegation.ceiling.policy.clone();
         }
         if snapshot.plans.iter().any(|plan| plan.approval_pending) {
             snapshot.policy.mode = ExecutionMode::Plan;

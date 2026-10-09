@@ -23,10 +23,48 @@ struct UserShellAuthorization {
     evaluation: super::session_permissions::SessionPermissionEvaluation,
     parent_revision: Option<u64>,
     policy_revision: u64,
-    explicit_ask: bool,
 }
 
 impl Agent {
+    pub(super) fn take_user_shell_cancellation(
+        &self,
+        chat_id: ChatId,
+        command_id: Uuid,
+    ) -> Option<tokio_util::sync::CancellationToken> {
+        self.inner
+            .user_shell_cancellations
+            .lock()
+            .unwrap()
+            .remove(&(chat_id, command_id))
+    }
+
+    /// Withdraws the permission requests of the user Shells `is_withdrawn` selects. The caller
+    /// holds the Chat.
+    pub(super) async fn withdraw_user_shell_requests(
+        &self,
+        snapshot: &mut super::ChatSnapshot,
+        is_withdrawn: impl Fn(Uuid) -> bool,
+    ) {
+        let requests = snapshot
+            .permissions
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request.execution,
+                    super::PermissionExecution::UserShell { command_id } if is_withdrawn(command_id)
+                )
+            })
+            .map(|request| request.id)
+            .collect::<Vec<_>>();
+        snapshot
+            .permissions
+            .retain(|request| !requests.contains(&request.id));
+        let mut approvals = self.inner.approvals.lock().await;
+        for request in requests {
+            approvals.remove(&request);
+        }
+    }
+
     pub fn subscribe_user_shells(&self) -> broadcast::Receiver<UserShellRecord> {
         self.inner.user_shell_events.subscribe()
     }
@@ -149,34 +187,23 @@ impl Agent {
         {
             return Ok(record);
         }
-        if let Some(cancel) = self
-            .inner
-            .user_shell_cancellations
-            .lock()
-            .unwrap()
-            .remove(&(chat_id, command_id))
-        {
+        if let Some(cancel) = self.take_user_shell_cancellation(chat_id, command_id) {
             cancel.cancel();
         }
         let waiting = {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-            if let Some(record) = chat.snapshot.user_shells.iter_mut().find(|record| {
-                record.id == command_id
-                    && (record.state == UserShellState::WaitingPermission
-                        || record.state == UserShellState::Running && record.pid.is_none())
-            }) {
+            if let Some(record) = chat
+                .snapshot
+                .user_shells
+                .iter_mut()
+                .find(|record| record.id == command_id && record.awaits_admission())
+            {
                 record.set_state(UserShellState::Failed);
                 record.reason = Some("cancelled before Shell permission admission".into());
                 let record = record.clone();
-                let requests = chat.snapshot.permissions.iter().filter(|request| matches!(request.execution, super::PermissionExecution::UserShell { command_id: id } if id == command_id)).map(|request| request.id).collect::<Vec<_>>();
-                chat.snapshot
-                    .permissions
-                    .retain(|request| !requests.contains(&request.id));
-                let mut approvals = self.inner.approvals.lock().await;
-                for request in requests {
-                    approvals.remove(&request);
-                }
+                self.withdraw_user_shell_requests(&mut chat.snapshot, |id| id == command_id)
+                    .await;
                 self.save(&chat.snapshot);
                 Some(record)
             } else {
@@ -380,12 +407,7 @@ impl Agent {
                     .admit_user_shell(chat_id, tools, &record, cancel)
                     .await
                 {
-                    agent
-                        .inner
-                        .user_shell_cancellations
-                        .lock()
-                        .unwrap()
-                        .remove(&(chat_id, record.id));
+                    agent.take_user_shell_cancellation(chat_id, record.id);
                     let _ = agent
                         .fail_user_shell(chat_id, record.id, error.to_string())
                         .await;
@@ -407,13 +429,21 @@ impl Agent {
             PermissionApprovalSource, PermissionExecution, PermissionRequest, Receipt,
             session_permissions::{PermissionOwner, SessionPermissionOperation},
         };
-        use crate::permissions::{Decision, ExplicitPermissionDecision};
+        use crate::permissions::Decision;
         let snapshot = self.snapshot(chat_id).await?;
         let workspace = crate::tools::Workspace {
             workdir: snapshot.workdir.clone(),
             additional_directories: snapshot.additional_directories.clone(),
         };
-        let prepared = tools.prepare(&workspace, crate::tools::BASH_TOOL_NAME, &serde_json::json!({"command":record.command,"cwd":record.cwd,"run_in_background":record.starts_in_background})).await.map_err(|error| AgentError::Invalid(error.to_string()))?;
+        let input = serde_json::json!({
+            "command": record.command,
+            "cwd": record.cwd,
+            "run_in_background": record.starts_in_background,
+        });
+        let prepared = tools
+            .prepare(&workspace, crate::tools::BASH_TOOL_NAME, &input)
+            .await
+            .map_err(|error| AgentError::Invalid(error.to_string()))?;
         let mut authorization = None;
         if snapshot.delegation.is_some() {
             self.refresh_project_rules(chat_id).await?;
@@ -432,51 +462,24 @@ impl Agent {
                 .map_err(|error| AgentError::Invalid(error.to_string()))?;
             let operation = SessionPermissionOperation::from_prepared(&prepared, &workspace)
                 .map_err(|error| AgentError::Invalid(error.to_string()))?;
-            let (decision, explicit_ask, parent_revision, mut policy_revision, mut evaluation) = {
+            let (authority, mut evaluation) = {
                 let chats = self.inner.chats.lock().await;
-                let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
                 let sessions = self.inner.session_permissions.lock().await;
                 let evaluation = sessions.evaluate(owner, &operation);
-                let decision = chat.snapshot.policy.decide_with_session(
-                    &prepared,
-                    &workspace,
-                    loop_id,
-                    evaluation.decision,
-                );
-                let explicit = chat.snapshot.policy.explicit_match_with_session(
-                    &prepared.name,
-                    &prepared.input,
-                    loop_id,
-                    evaluation.decision,
-                ) == Some(ExplicitPermissionDecision::Ask);
-                let (decision, explicit, revision) = super::delegation::shell_authority_decision(
+                let authority = super::delegation::permission_authority(
                     &chats,
                     &sessions,
                     &receipt,
                     &prepared,
-                    super::delegation::ShellPermissionDecision {
-                        decision,
-                        explicit_ask: explicit,
-                        session: evaluation.decision,
-                    },
+                    evaluation.decision,
                     None,
-                );
-                (
-                    decision,
-                    explicit,
-                    revision,
-                    chat.snapshot.policy.revision,
-                    evaluation,
                 )
+                .ok_or(AgentError::NotFound)?;
+                (authority, evaluation)
             };
-            let decision = if explicit_ask
-                && decision == Decision::Ask
-                && self.inner.host_options.prompt_policy == super::PromptPolicy::Unrestricted
-            {
-                Decision::Ask
-            } else {
-                self.apply_prompt_policy(decision)
-            };
+            let mut policy_revision = authority.policy_revision;
+            let decision = self
+                .apply_prompt_policy_with_explicit_ask(authority.decision, authority.explicit_ask);
             if decision == Decision::Deny {
                 return Err(AgentError::Invalid(
                     "delegated permission authority denies this Shell".into(),
@@ -492,7 +495,7 @@ impl Agent {
                     name: prepared.name.clone(),
                     input: prepared.input.clone(),
                     file_change: None,
-                    approval_source: if explicit_ask {
+                    approval_source: if authority.explicit_ask {
                         PermissionApprovalSource::ExplicitAsk
                     } else {
                         PermissionApprovalSource::PermissionPolicy
@@ -523,54 +526,41 @@ impl Agent {
                 owner,
                 operation,
                 evaluation,
-                parent_revision,
+                parent_revision: authority.parent_revision,
                 policy_revision,
-                explicit_ask,
             });
             self.refresh_project_rules(chat_id).await?;
         }
         {
             let mut chats = self.inner.chats.lock().await;
             let sessions = self.inner.session_permissions.lock().await;
-            if let Some(authority) = &authorization {
-                let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+            if let Some(authorization) = &authorization {
                 super::delegation::check_call(
                     &chats,
                     &sessions,
-                    &authority.receipt,
+                    &authorization.receipt,
                     &prepared.name,
                     &prepared.input,
                     Some(&prepared),
                     None,
                 )
                 .map_err(AgentError::Invalid)?;
-                let own = chat.snapshot.policy.decide_with_session(
-                    &prepared,
-                    &workspace,
-                    authority.receipt.loop_id,
-                    authority.evaluation.decision,
-                );
-                let (current, _, revision) = super::delegation::shell_authority_decision(
+                let current = super::delegation::permission_authority(
                     &chats,
                     &sessions,
-                    &authority.receipt,
+                    &authorization.receipt,
                     &prepared,
-                    super::delegation::ShellPermissionDecision {
-                        decision: own,
-                        explicit_ask: authority.explicit_ask,
-                        session: authority.evaluation.decision,
-                    },
+                    authorization.evaluation.decision,
                     None,
-                );
-                if current == Decision::Deny
+                )
+                .ok_or(AgentError::NotFound)?;
+                if !current
+                    .still_admits(authorization.policy_revision, authorization.parent_revision)
                     || !sessions.revalidate(
-                        &authority.evaluation.token,
-                        authority.owner,
-                        &authority.operation,
+                        &authorization.evaluation.token,
+                        authorization.owner,
+                        &authorization.operation,
                     )
-                    || ((revision != authority.parent_revision
-                        || chat.snapshot.policy.revision != authority.policy_revision)
-                        && current != Decision::Allow)
                 {
                     return Err(AgentError::Invalid(
                         "Shell permission authority changed before dispatch".into(),
@@ -578,19 +568,19 @@ impl Agent {
                 }
             }
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-            let current = chat
+            let shell = chat
                 .snapshot
                 .user_shells
                 .iter_mut()
                 .find(|shell| shell.id == record.id)
                 .ok_or(AgentError::NotFound)?;
-            if cancel.is_cancelled() || current.state != UserShellState::WaitingPermission {
+            if cancel.is_cancelled() || shell.state != UserShellState::WaitingPermission {
                 return Err(AgentError::Invalid(
                     "user Shell was cancelled before dispatch".into(),
                 ));
             }
-            current.set_state(UserShellState::Running);
-            let update = current.clone();
+            shell.set_state(UserShellState::Running);
+            let update = shell.clone();
             self.save(&chat.snapshot);
             let _ = self.inner.user_shell_events.send(update);
         }
@@ -714,11 +704,7 @@ impl Agent {
         if !user_shell_state_is_terminal(&current.state) {
             return Ok(false);
         }
-        self.inner
-            .user_shell_cancellations
-            .lock()
-            .unwrap()
-            .remove(&(current.chat_id, current.id));
+        self.take_user_shell_cancellation(current.chat_id, current.id);
         if was_announced_as_background || command.was_background {
             if !was_announced_as_background {
                 self.append_foreground_shell_messages(chat, [input, announcement])?;

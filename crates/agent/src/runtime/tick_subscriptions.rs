@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::{Duration, Instant};
 
+use super::tick_content::{
+    DeliveredWatermark, TickContentCache, WATERMARK_DIRECTORY, read_watermark, remove_watermark,
+    write_watermark,
+};
 use super::*;
 use crate::model::ToolDefinition;
 use crate::tick_stream::{
@@ -35,7 +39,7 @@ const SUBSCRIBE_TICK_TOOL: &str = "SubscribeTick";
 const UNSUBSCRIBE_TICK_TOOL: &str = "UnsubscribeTick";
 /// An item the stream or a later delivery replaces is itself one dropped Tick Update.
 const SUPERSEDED_UPDATE: u64 = 1;
-const TRUNCATION_HINT: &str = "Tick Update data was too large for this delivery and was left out where `data` is null; use the native tools for that instance type to recover it.";
+const TRUNCATION_HINT: &str = "Tick Update data was left out where `data` is null, because it was too large for this delivery or could not be read again; use the native tools for that instance type to recover it.";
 
 /// One Loop's association with a Tick Instance: it receives that instance's Tick Updates, and the
 /// latest one is handed to the Agent every `every_seconds`.
@@ -140,6 +144,8 @@ pub(super) struct TickDeliveries {
     pub(super) port: Option<Arc<dyn TickStreamPort>>,
     desired: Option<tokio::sync::watch::Sender<BTreeMap<WatchId, InstanceRef>>>,
     subscriptions: BTreeMap<Uuid, SubscriptionRuntime>,
+    /// The newest update data of every subscription, within the Agent's content budget.
+    content: TickContentCache,
     pending: HashMap<(ChatId, LoopId), PendingDelivery>,
     ready_changed: Arc<tokio::sync::Notify>,
 }
@@ -161,8 +167,13 @@ struct SubscriptionRuntime {
     blocked: Option<TickLinkState>,
     every_seconds: u64,
     due_at: Instant,
-    /// The newest update since the last delivery; earlier ones are counted, not kept.
-    latest: Option<TickObservation>,
+    /// The newest update since the last delivery, without its data, which waits in the content
+    /// cache; earlier ones are counted, not kept.
+    latest: Option<LatestUpdate>,
+    /// The last delivered update; one at or before it is never delivered again.
+    delivered: Option<DeliveredWatermark>,
+    /// Where the delivered watermark is kept for a saved Chat.
+    watermarks: Option<std::path::PathBuf>,
     dropped: u64,
     accumulated: u64,
     gap: bool,
@@ -171,6 +182,15 @@ struct SubscriptionRuntime {
     kind: Option<ObservationKind>,
     title: Option<String>,
     updated_at_ms: Option<u64>,
+}
+
+struct LatestUpdate {
+    sequence: u64,
+    observed_at: String,
+    kind: ObservationKind,
+    recover_with: Option<String>,
+    /// Its data is larger than the content budget and could never fit a delivery either.
+    is_oversized: bool,
 }
 
 #[derive(Default)]
@@ -193,6 +213,12 @@ struct DeliveryItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     recover_with: Option<String>,
     data: Value,
+    /// The data was evicted from the content cache and is read again before delivery.
+    #[serde(skip)]
+    needs_refill: bool,
+    /// The data was too large to keep or deliver; the delivery says so.
+    #[serde(skip)]
+    is_oversized: bool,
 }
 
 impl DeliveryItem {
@@ -248,9 +274,11 @@ impl TickDeliveries {
                     TickConnectionState::Gone => TickLinkState::InstanceGone,
                     TickConnectionState::IdentityUncertain => TickLinkState::IdentityUncertain,
                 };
-                for subscription in self.subscriptions.values_mut().filter(|subscription| {
-                    subscription.instance == instance && audience.contains(&subscription.watch)
-                }) {
+                for (id, subscription) in
+                    self.subscriptions.iter_mut().filter(|(_, subscription)| {
+                        subscription.instance == instance && audience.contains(&subscription.watch)
+                    })
+                {
                     subscription.link = link;
                     if matches!(
                         link,
@@ -258,6 +286,7 @@ impl TickDeliveries {
                     ) {
                         subscription.blocked = Some(link);
                         subscription.latest = None;
+                        self.content.remove(*id);
                     }
                 }
                 let blocked: BTreeSet<_> = self
@@ -394,14 +423,31 @@ impl TickDeliveries {
     }
 
     fn record(&mut self, audience: &[WatchId], observation: &TickObservation) {
-        for subscription in self.subscriptions.values_mut().filter(|subscription| {
+        for (id, subscription) in self.subscriptions.iter_mut().filter(|(_, subscription)| {
             subscription.ready
                 && subscription.blocked.is_none()
                 && audience.contains(&subscription.watch)
                 && subscription.instance == observation.instance
         }) {
             subscription.kind = Some(observation.kind.clone());
-            let superseded = subscription.latest.replace(observation.clone());
+            // A reconnect that repeats a delivered update delivers nothing again. After a gap
+            // the source numbers its updates afresh, so the old watermark no longer applies.
+            if observation.gap {
+                subscription.delivered = None;
+            } else if subscription
+                .delivered
+                .is_some_and(|delivered| observation.sequence <= delivered.sequence)
+            {
+                continue;
+            }
+            let is_kept = self.content.store(*id, observation.data.clone());
+            let superseded = subscription.latest.replace(LatestUpdate {
+                sequence: observation.sequence,
+                observed_at: observation.observed_at.clone(),
+                kind: observation.kind.clone(),
+                recover_with: observation.recover_with.clone(),
+                is_oversized: !is_kept,
+            });
             let replaced = superseded.map_or(0, |_| SUPERSEDED_UPDATE);
             subscription.dropped = subscription
                 .dropped
@@ -415,13 +461,14 @@ impl TickDeliveries {
     }
 
     fn mark_gap(&mut self, instance: &InstanceRef, audience: &[WatchId]) {
-        for subscription in self.subscriptions.values_mut().filter(|subscription| {
+        for (id, subscription) in self.subscriptions.iter_mut().filter(|(_, subscription)| {
             &subscription.instance == instance
                 && audience.contains(&subscription.watch)
                 && subscription.blocked.is_none()
         }) {
             subscription.gap = true;
             if subscription.latest.take().is_some() {
+                self.content.remove(*id);
                 subscription.dropped = subscription.dropped.saturating_add(1);
             }
         }
@@ -437,17 +484,22 @@ impl TickDeliveries {
                 continue;
             }
             subscription.due_at = now + Duration::from_secs(subscription.every_seconds);
-            let item = subscription.latest.take().map(|update| DeliveryItem {
-                subscription: *id,
-                watch: subscription.watch,
-                instance: update.instance,
-                sequence: update.sequence,
-                observed_at: update.observed_at,
-                dropped: std::mem::take(&mut subscription.dropped),
-                gap: std::mem::take(&mut subscription.gap),
-                kind: update.kind,
-                recover_with: update.recover_with,
-                data: update.data,
+            let item = subscription.latest.take().map(|update| {
+                let data = self.content.take(*id);
+                DeliveryItem {
+                    subscription: *id,
+                    watch: subscription.watch,
+                    instance: subscription.instance.clone(),
+                    sequence: update.sequence,
+                    observed_at: update.observed_at,
+                    dropped: std::mem::take(&mut subscription.dropped),
+                    gap: std::mem::take(&mut subscription.gap),
+                    kind: update.kind,
+                    recover_with: update.recover_with,
+                    needs_refill: data.is_none() && !update.is_oversized,
+                    is_oversized: update.is_oversized,
+                    data: data.unwrap_or(Value::Null),
+                }
             });
             elapsed.push(((subscription.chat_id, subscription.loop_id), item));
         }
@@ -507,6 +559,12 @@ impl Agent {
         let task = self.tick_delivery_task(handle.events);
         self.inner.tasks.lock().await.push(task);
         self.sync_tick_subscriptions().await;
+    }
+
+    /// Bytes of Tick Update data waiting in this Agent's content cache.
+    #[doc(hidden)]
+    pub fn tick_content_bytes(&self) -> usize {
+        self.tick_deliveries().content.used_bytes()
     }
 
     pub async fn tick_subscriptions(
@@ -758,49 +816,87 @@ impl Agent {
         if !self.inner.tick_stream_installed.load(Ordering::SeqCst) {
             return;
         }
-        let configured: Vec<_> = self
-            .inner
-            .chats
-            .lock()
-            .await
-            .iter()
-            .flat_map(|(chat_id, chat)| {
-                chat.snapshot
-                    .loops
-                    .iter()
-                    .filter(|goal| {
-                        goal.trigger.as_ref().is_some_and(|trigger| trigger.armed)
-                            && !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
-                    })
-                    .flat_map(|goal| {
-                        goal.trigger
-                            .iter()
-                            .flat_map(|trigger| &trigger.subscriptions)
-                            .map(|subscription| (*chat_id, goal.id, subscription.clone()))
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let saves_chats = self.inner.recorder.is_some();
+        let (configured, existing) = {
+            let chats = self.inner.chats.lock().await;
+            let configured: Vec<_> = chats
+                .iter()
+                .flat_map(|(chat_id, chat)| {
+                    let watermarks = saves_chats.then(|| {
+                        chat.tools
+                            .chat_directory()
+                            .join(WATERMARK_DIRECTORY)
+                            .path()
+                            .to_path_buf()
+                    });
+                    chat.snapshot
+                        .loops
+                        .iter()
+                        .filter(|goal| {
+                            goal.trigger.as_ref().is_some_and(|trigger| trigger.armed)
+                                && !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
+                        })
+                        .flat_map(|goal| {
+                            goal.trigger
+                                .iter()
+                                .flat_map(|trigger| &trigger.subscriptions)
+                                .map(|subscription| {
+                                    (*chat_id, goal.id, subscription.clone(), watermarks.clone())
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            // A disarmed or stopped Loop keeps its subscriptions' delivered watermarks; only a
+            // subscription no Loop configures any more is cancelled.
+            let existing: BTreeSet<Uuid> = chats
+                .values()
+                .flat_map(|chat| &chat.snapshot.loops)
+                .filter_map(|goal| goal.trigger.as_ref())
+                .flat_map(|trigger| &trigger.subscriptions)
+                .map(|subscription| subscription.id)
+                .collect();
+            (configured, existing)
+        };
+        // Watermark files are read and removed outside the delivery lock.
+        let mut cancelled = Vec::new();
+        let mut restored = Vec::new();
         {
             let mut deliveries = self.tick_deliveries();
             let now = Instant::now();
             let kept: BTreeSet<_> = configured
                 .iter()
-                .map(|(_, _, subscription)| subscription.id)
+                .map(|(_, _, subscription, _)| subscription.id)
                 .collect();
-            deliveries.subscriptions.retain(|id, runtime| {
-                kept.contains(id)
-                    && configured.iter().any(|(chat_id, loop_id, subscription)| {
-                        subscription.id == *id
-                            && subscription.instance == runtime.instance
-                            && subscription.authority == runtime.authority
-                            && *chat_id == runtime.chat_id
-                            && *loop_id == runtime.loop_id
-                    })
-            });
+            let removed: Vec<_> = deliveries
+                .subscriptions
+                .iter()
+                .filter(|(id, runtime)| {
+                    !(kept.contains(*id)
+                        && configured
+                            .iter()
+                            .any(|(chat_id, loop_id, subscription, _)| {
+                                subscription.id == **id
+                                    && subscription.instance == runtime.instance
+                                    && subscription.authority == runtime.authority
+                                    && *chat_id == runtime.chat_id
+                                    && *loop_id == runtime.loop_id
+                            }))
+                })
+                .map(|(id, runtime)| (*id, runtime.watermarks.clone()))
+                .collect();
+            for (id, watermarks) in removed {
+                deliveries.subscriptions.remove(&id);
+                deliveries.content.remove(id);
+                if !existing.contains(&id)
+                    && let Some(directory) = watermarks
+                {
+                    cancelled.push((directory, id));
+                }
+            }
             let owners: BTreeSet<_> = configured
                 .iter()
-                .map(|(chat_id, loop_id, _)| (*chat_id, *loop_id))
+                .map(|(chat_id, loop_id, _, _)| (*chat_id, *loop_id))
                 .collect();
             let active_watches: BTreeMap<_, _> = deliveries
                 .subscriptions
@@ -813,7 +909,7 @@ impl Agent {
                     .retain(|_, item| active_watches.get(&item.subscription) == Some(&item.watch));
                 owners.contains(owner) && !pending.items.is_empty()
             });
-            for (chat_id, loop_id, subscription) in configured {
+            for (chat_id, loop_id, subscription, watermarks) in configured {
                 match deliveries.subscriptions.get_mut(&subscription.id) {
                     Some(runtime) if runtime.every_seconds != subscription.every_seconds => {
                         runtime.every_seconds = subscription.every_seconds;
@@ -821,6 +917,9 @@ impl Agent {
                     }
                     Some(_) => {}
                     None => {
+                        if let Some(directory) = &watermarks {
+                            restored.push((subscription.id, directory.clone()));
+                        }
                         deliveries.subscriptions.insert(
                             subscription.id,
                             SubscriptionRuntime {
@@ -835,6 +934,8 @@ impl Agent {
                                 every_seconds: subscription.every_seconds,
                                 due_at: now + Duration::from_secs(subscription.every_seconds),
                                 latest: None,
+                                delivered: None,
+                                watermarks,
                                 dropped: 0,
                                 accumulated: 0,
                                 gap: false,
@@ -850,6 +951,35 @@ impl Agent {
             }
             deliveries.publish_desired();
             deliveries.ready_changed.notify_waiters();
+        }
+        if !cancelled.is_empty() || !restored.is_empty() {
+            // A watermark that cannot be read is treated as none: a corrupt record must not
+            // block deliveries, at the cost of possibly repeating the last one. A cancelled
+            // watermark that cannot be removed only leaves a stale file behind.
+            let loaded = tokio::task::spawn_blocking(move || {
+                for (directory, subscription) in cancelled {
+                    let _ = remove_watermark(&directory, subscription);
+                }
+                restored
+                    .into_iter()
+                    .filter_map(|(subscription, directory)| {
+                        read_watermark(&directory, subscription)
+                            .ok()
+                            .flatten()
+                            .map(|watermark| (subscription, watermark))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            let mut deliveries = self.tick_deliveries();
+            for (subscription, watermark) in loaded {
+                if let Some(runtime) = deliveries.subscriptions.get_mut(&subscription)
+                    && runtime.delivered.is_none()
+                {
+                    runtime.delivered = Some(watermark);
+                }
+            }
         }
         self.inner.tick_wake.notify_one();
         self.discard_invalid_pending_tick_inputs().await;
@@ -926,10 +1056,107 @@ impl Agent {
                 .await;
             }
         }
-        if authorized_items.is_empty() {
+        let mut items = Vec::new();
+        // Data the content cache evicted is read again now, between two revalidations of its
+        // watch; a Tick that cannot be read again is delivered without it.
+        for mut item in authorized_items {
+            if item.needs_refill {
+                let authority = self
+                    .tick_deliveries()
+                    .subscriptions
+                    .get(&item.subscription)
+                    .and_then(|runtime| runtime.authority.clone());
+                let current = match &port {
+                    Some(port) => port.read_current(chat_id, &item.instance).await,
+                    None => Ok(None),
+                };
+                if let Ok(Some(current)) = current
+                    && current.sequence >= item.sequence
+                {
+                    item.dropped += current.sequence - item.sequence;
+                    item.sequence = current.sequence;
+                    item.observed_at = current.observed_at;
+                    item.data = current.data;
+                    item.needs_refill = false;
+                }
+                let still_admitted = match &port {
+                    Some(port) => port
+                        .revalidate_watch(chat_id, &item.instance, authority.as_ref())
+                        .await
+                        .is_ok(),
+                    None => false,
+                };
+                if !still_admitted {
+                    self.apply_stream_event(TickStreamEvent::State {
+                        instance: item.instance,
+                        state: TickConnectionState::IdentityUncertain,
+                        audience: vec![item.watch],
+                    })
+                    .await;
+                    continue;
+                }
+            }
+            items.push(item);
+        }
+        let marks = {
+            let deliveries = self.tick_deliveries();
+            items.retain(|item| {
+                deliveries
+                    .subscriptions
+                    .get(&item.subscription)
+                    .and_then(|runtime| runtime.delivered)
+                    .is_none_or(|delivered| item.sequence > delivered.sequence)
+            });
+            let delivery = Uuid::new_v4();
+            items
+                .iter()
+                .map(|item| {
+                    let watermarks = deliveries
+                        .subscriptions
+                        .get(&item.subscription)
+                        .and_then(|runtime| runtime.watermarks.clone());
+                    (
+                        item.subscription,
+                        watermarks,
+                        DeliveredWatermark {
+                            sequence: item.sequence,
+                            delivery,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        if items.is_empty() {
             return;
         }
-        let items = authorized_items;
+        // The watermark is durable before the delivery is handed on, so a repeat of this update
+        // is never delivered again, even by a later process.
+        let durable = marks.clone();
+        let written = tokio::task::spawn_blocking(move || {
+            durable
+                .iter()
+                .filter_map(|(subscription, directory, mark)| {
+                    directory
+                        .as_ref()
+                        .map(|directory| (directory, subscription, mark))
+                })
+                .try_for_each(|(directory, subscription, mark)| {
+                    write_watermark(directory, *subscription, *mark)
+                })
+        })
+        .await;
+        if !matches!(written, Ok(Ok(()))) {
+            self.tick_deliveries().restore(owner, items);
+            return;
+        }
+        {
+            let mut deliveries = self.tick_deliveries();
+            for (subscription, _, mark) in marks {
+                if let Some(runtime) = deliveries.subscriptions.get_mut(&subscription) {
+                    runtime.delivered = Some(mark);
+                }
+            }
+        }
         let (payload, truncated) = fit_delivery_payload(&items);
         let source = TriggerSource {
             source: TICK_SUBSCRIPTION_SOURCE.into(),
@@ -1146,8 +1373,12 @@ fn delivery_summary(items: &[DeliveryItem], truncated: bool) -> String {
 }
 
 fn delivery_payload(items: &[DeliveryItem], truncated: bool) -> Value {
+    let unreadable = items.iter().filter(|item| item.needs_refill).count();
     let mut payload = json!({"items": items, "truncated": truncated});
-    if truncated {
+    if unreadable > 0 {
+        payload["unreadable_instances"] = json!(unreadable);
+    }
+    if truncated || unreadable > 0 {
         payload["recovery"] = json!(if items
             .iter()
             .any(|item| matches!(item.kind, ObservationKind::Terminal { .. }))
@@ -1156,7 +1387,7 @@ fn delivery_payload(items: &[DeliveryItem], truncated: bool) -> Value {
         } else if let Some(tool) = items.iter().find_map(|item| item.recover_with.as_deref()) {
             if tool.len() <= 128 {
                 format!(
-                    "Tick Update data was too large; recovery guidance from the instance: {tool}. Use Artifact MCP for artifacts, Read on Bash output_file for shells, or CallTickTool for a Herdr protocol query."
+                    "Tick Update data was left out where `data` is null; recovery guidance from the instance: {tool}. Use Artifact MCP for artifacts, Read on Bash output_file for shells, or CallTickTool for a protocol Tick query."
                 )
             } else {
                 TRUNCATION_HINT.to_owned()
@@ -1171,9 +1402,10 @@ fn delivery_payload(items: &[DeliveryItem], truncated: bool) -> Value {
 /// Keeps a delivery within [`MAX_DELIVERY_PAYLOAD_BYTES`] by blanking the largest Tick Update
 /// `data` first, so the model still learns which Tick Instances moved and can fetch the rest.
 fn fit_delivery_payload(items: &[DeliveryItem]) -> (Value, bool) {
-    let mut payload = delivery_payload(items, false);
+    let has_oversized = items.iter().any(|item| item.is_oversized);
+    let mut payload = delivery_payload(items, has_oversized);
     if payload.to_string().len() <= MAX_DELIVERY_PAYLOAD_BYTES {
-        return (payload, false);
+        return (payload, has_oversized);
     }
     let mut delivered = items.to_vec();
     let mut largest_first: Vec<_> = (0..delivered.len()).collect();

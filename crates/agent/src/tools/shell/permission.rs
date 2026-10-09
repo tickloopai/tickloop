@@ -146,17 +146,11 @@ impl Evaluation<'_> {
             return false;
         }
         let base_command = command.split_whitespace().next().unwrap_or_default();
-        if base_command == "sed"
-            && !sed_command_is_allowed(
-                command,
-                self.policy.accept_edits || self.context.editable_directory.is_some(),
-            )
-        {
+        let allows_edits = self.policy.accept_edits || self.context.editable_directory.is_some();
+        if base_command == "sed" && !sed_command_is_allowed(command, allows_edits) {
             return false;
         }
-        if (self.policy.accept_edits || self.context.editable_directory.is_some())
-            && ACCEPT_EDITS_ALLOWED_COMMANDS.contains(&base_command)
-        {
+        if allows_edits && ACCEPT_EDITS_ALLOWED_COMMANDS.contains(&base_command) {
             return true;
         }
         is_read_only_subcommand(command, compound_has_cd, self.context.cwd)

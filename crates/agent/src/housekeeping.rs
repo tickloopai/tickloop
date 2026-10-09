@@ -11,7 +11,9 @@ use std::{
 
 use tokio::{sync::oneshot, task::JoinHandle, time::Instant};
 
-use crate::cleanup::{CleanupOutcome, CleanupResult, cleanup_old_message_files_in_background};
+use crate::cleanup::{
+    ChatDeletionNotice, CleanupOutcome, CleanupResult, cleanup_old_message_files_in_background,
+};
 
 /// 照 Claude Code `DELAY_VERY_SLOW_OPERATIONS_THAT_HAPPEN_EVERY_SESSION`：开始计时后与每次推迟的
 /// 等待时间。
@@ -53,15 +55,21 @@ impl UserActivity {
 pub struct HousekeepingSchedule {
     root: PathBuf,
     activity: UserActivity,
+    deletion: Arc<dyn ChatDeletionNotice>,
     task: Option<JoinHandle<CleanupOutcome>>,
     is_started: bool,
 }
 
 impl HousekeepingSchedule {
-    pub fn new(root: PathBuf, activity: UserActivity) -> Self {
+    pub fn new(
+        root: PathBuf,
+        activity: UserActivity,
+        deletion: Arc<dyn ChatDeletionNotice>,
+    ) -> Self {
         Self {
             root,
             activity,
+            deletion,
             task: None,
             is_started: false,
         }
@@ -76,6 +84,7 @@ impl HousekeepingSchedule {
         self.task = Some(start_background_housekeeping(
             self.root.clone(),
             self.activity.clone(),
+            self.deletion.clone(),
         ));
     }
 
@@ -103,6 +112,7 @@ impl Drop for HousekeepingSchedule {
 pub fn start_background_housekeeping(
     root: PathBuf,
     activity: UserActivity,
+    deletion: Arc<dyn ChatDeletionNotice>,
 ) -> JoinHandle<CleanupOutcome> {
     tokio::spawn(async move {
         tokio::time::sleep(SLOW_HOUSEKEEPING_DELAY).await;
@@ -113,7 +123,10 @@ pub fn start_background_housekeeping(
         let spawned = std::thread::Builder::new()
             .name("agent-cleanup".into())
             .spawn(move || {
-                let _ = sender.send(cleanup_old_message_files_in_background(&root));
+                let _ = sender.send(cleanup_old_message_files_in_background(
+                    &root,
+                    deletion.as_ref(),
+                ));
             });
         let failed = CleanupOutcome::Completed(CleanupResult {
             messages: 0,

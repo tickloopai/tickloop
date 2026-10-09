@@ -4,13 +4,13 @@ use std::{
     ffi::CString,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use support::{ScriptedModel, config, next_event, text};
 use tickloop_agent::{
-    cleanup::{CleanupOutcome, cleanup_old_message_files_in_background},
+    cleanup::{ChatDeletionNotice, CleanupOutcome, cleanup_old_message_files_in_background},
     housekeeping::{
         HousekeepingSchedule, SLOW_HOUSEKEEPING_DELAY, UserActivity, start_background_housekeeping,
     },
@@ -61,11 +61,170 @@ fn exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
+#[derive(Debug, PartialEq)]
+enum Notice {
+    Begin {
+        chat: Uuid,
+        transcript_present: bool,
+    },
+    Finish {
+        chat: Uuid,
+        transcript_present: bool,
+    },
+}
+
+/// Stands in for the Agent owner: records what it is told and whether the Transcript was still
+/// there at that moment; refuses deletions while `is_unavailable`.
+#[derive(Default)]
+struct OwnerNotices {
+    root: PathBuf,
+    is_unavailable: bool,
+    notices: Mutex<Vec<Notice>>,
+}
+
+impl OwnerNotices {
+    fn of(root: &Path) -> Self {
+        Self {
+            root: root.into(),
+            ..Self::default()
+        }
+    }
+
+    fn transcript_present(&self, chat: Uuid) -> bool {
+        std::fs::read_dir(self.root.join("projects"))
+            .into_iter()
+            .flatten()
+            .any(|project| exists(&project.unwrap().path().join(format!("{chat}.jsonl"))))
+    }
+
+    fn taken(&self) -> Vec<Notice> {
+        std::mem::take(&mut self.notices.lock().unwrap())
+    }
+}
+
+impl ChatDeletionNotice for OwnerNotices {
+    fn begin(&self, chat: Uuid) -> Result<Uuid, String> {
+        if self.is_unavailable {
+            return Err("the Agent owner did not answer".into());
+        }
+        let transcript_present = self.transcript_present(chat);
+        self.notices.lock().unwrap().push(Notice::Begin {
+            chat,
+            transcript_present,
+        });
+        Ok(Uuid::new_v4())
+    }
+
+    fn finish(&self, chat: Uuid, _operation: Uuid) {
+        let transcript_present = self.transcript_present(chat);
+        self.notices.lock().unwrap().push(Notice::Finish {
+            chat,
+            transcript_present,
+        });
+    }
+}
+
+fn cleanup(root: &Path) -> CleanupOutcome {
+    cleanup_old_message_files_in_background(root, &OwnerNotices::of(root))
+}
+
 fn completed(outcome: CleanupOutcome) -> tickloop_agent::cleanup::CleanupResult {
     match outcome {
         CleanupOutcome::Completed(result) => result,
         CleanupOutcome::Skipped => panic!("cleanup was skipped"),
     }
+}
+
+/// Removing a whole Transcript ends its Chat, so the owner hears of it while the Transcript is
+/// still there and again after the unlink; nothing else a cleanup removes is announced. Without
+/// the owner's answer the Transcript stays.
+#[test]
+fn the_owner_hears_of_each_removed_transcript_before_and_after_the_unlink() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let project = root.join("projects/-work");
+    let expired_chat = Uuid::new_v4();
+    let expired = file(&project.join(format!("{expired_chat}.jsonl")), EXPIRED);
+    let expired_watermark = file(
+        &project.join(format!(
+            "{expired_chat}/tick-watermarks/{}.json",
+            Uuid::new_v4()
+        )),
+        RECENT,
+    );
+    let recent_chat = Uuid::new_v4();
+    let recent = file(&project.join(format!("{recent_chat}.jsonl")), RECENT);
+    let recent_watermark = file(
+        &project.join(format!(
+            "{recent_chat}/tick-watermarks/{}.json",
+            Uuid::new_v4()
+        )),
+        RECENT,
+    );
+    let tools_only_chat = Uuid::new_v4();
+    file(&project.join(format!("{tools_only_chat}.jsonl")), RECENT);
+    let old_tool_result = file(
+        &project.join(format!("{tools_only_chat}/tool-results/call.txt")),
+        EXPIRED,
+    );
+    let refused_chat = Uuid::new_v4();
+    let refused = file(&project.join(format!("{refused_chat}.jsonl")), EXPIRED);
+    let unlink_fails_chat = Uuid::new_v4();
+    let locked_project = root.join("projects/-locked");
+    let unlink_fails = file(
+        &locked_project.join(format!("{unlink_fails_chat}.jsonl")),
+        EXPIRED,
+    );
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&locked_project, std::fs::Permissions::from_mode(0o500)).unwrap();
+    std::fs::rename(&refused, root.join("held.jsonl")).unwrap();
+
+    let owner = OwnerNotices::of(root);
+    let result = completed(cleanup_old_message_files_in_background(root, &owner));
+    std::fs::set_permissions(&locked_project, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(!exists(&expired) && exists(&recent) && !exists(&old_tool_result));
+    assert!(
+        !exists(&project.join(expired_chat.to_string())),
+        "an ended Chat keeps no Tick watermarks"
+    );
+    assert!(!exists(&expired_watermark) && exists(&recent_watermark));
+    assert!(exists(&unlink_fails));
+    assert_eq!(result.errors, 1, "the failed unlink is reported");
+    let mut notices = owner.taken();
+    notices.sort_by_key(|notice| format!("{notice:?}"));
+    let mut expected = vec![
+        Notice::Begin {
+            chat: expired_chat,
+            transcript_present: true,
+        },
+        Notice::Finish {
+            chat: expired_chat,
+            transcript_present: false,
+        },
+        Notice::Begin {
+            chat: unlink_fails_chat,
+            transcript_present: true,
+        },
+        Notice::Finish {
+            chat: unlink_fails_chat,
+            transcript_present: true,
+        },
+    ];
+    expected.sort_by_key(|notice| format!("{notice:?}"));
+    assert_eq!(notices, expected);
+
+    std::fs::rename(root.join("held.jsonl"), &refused).unwrap();
+    let unavailable = OwnerNotices {
+        is_unavailable: true,
+        ..OwnerNotices::of(root)
+    };
+    let result = completed(cleanup_old_message_files_in_background(root, &unavailable));
+    assert!(
+        exists(&refused) && exists(&unlink_fails),
+        "an unanswered deletion keeps the Transcript"
+    );
+    assert_eq!(result.errors, 2);
 }
 
 /// 照 Claude Code `cleanupOldMessageFilesInBackground`：按修改时间删除过期的 Transcript、Chat 目录中的
@@ -118,7 +277,7 @@ fn only_expired_files_are_removed_and_emptied_directories_are_deleted() {
     let registration = file(&root.join("sessions/12345.json"), EXPIRED);
     let settings_lock = file(&root.join("settings.json.lock"), EXPIRED);
 
-    let result = completed(cleanup_old_message_files_in_background(root));
+    let result = completed(cleanup(root));
 
     for removed in [
         &expired_transcript,
@@ -155,7 +314,7 @@ fn only_expired_files_are_removed_and_emptied_directories_are_deleted() {
     std::fs::remove_file(&plan_notes).unwrap();
     set_age(&recent_backups, EXPIRED);
     std::fs::remove_file(&recent_paste).unwrap();
-    completed(cleanup_old_message_files_in_background(root));
+    completed(cleanup(root));
     assert!(!exists(&plans));
     assert!(!exists(&file_history));
     assert!(exists(&pastes));
@@ -176,7 +335,7 @@ fn the_cleanup_period_comes_from_the_settings_file() {
         5 * DAY,
     );
 
-    completed(cleanup_old_message_files_in_background(root));
+    completed(cleanup(root));
 
     assert!(!exists(&expired));
     assert!(exists(&kept));
@@ -209,7 +368,7 @@ fn symbolic_links_are_skipped_and_never_followed() {
     let linked_paste = root.join("paste-cache/cccccccccccccccc.txt");
     symlink(&outside_paste, &linked_paste, EXPIRED);
 
-    completed(cleanup_old_message_files_in_background(&root));
+    completed(cleanup(&root));
 
     for kept in [
         &outside_transcript,
@@ -254,7 +413,7 @@ fn invalid_settings_with_an_explicit_cleanup_period_skip_cleanup() {
             EXPIRED,
         );
 
-        let outcome = cleanup_old_message_files_in_background(root);
+        let outcome = cleanup(root);
 
         assert_eq!(
             matches!(outcome, CleanupOutcome::Skipped),
@@ -348,7 +507,7 @@ async fn a_zero_cleanup_period_writes_no_transcript() {
         Err(AgentError::NotFound)
     ));
 
-    completed(cleanup_old_message_files_in_background(&root));
+    completed(cleanup(&root));
     assert!(!exists(&earlier_transcript));
     assert!(!exists(&root.join("projects/-earlier")));
 }
@@ -364,7 +523,11 @@ async fn recent_user_input_defers_background_cleanup() {
         EXPIRED,
     );
     let activity = UserActivity::default();
-    let housekeeping = start_background_housekeeping(root, activity.clone());
+    let housekeeping = start_background_housekeeping(
+        root.clone(),
+        activity.clone(),
+        Arc::new(OwnerNotices::of(&root)),
+    );
     let delay = SLOW_HOUSEKEEPING_DELAY;
     // 先让后台任务开始计时，再推进时钟。
     settle().await;
@@ -399,7 +562,11 @@ async fn interactive_housekeeping_starts_counting_at_the_first_submitted_prompt(
         &root.join("projects/-work").join(uuid_name(".jsonl")),
         EXPIRED,
     );
-    let mut schedule = HousekeepingSchedule::new(root, UserActivity::default());
+    let mut schedule = HousekeepingSchedule::new(
+        root.clone(),
+        UserActivity::default(),
+        Arc::new(OwnerNotices::of(&root)),
+    );
     let delay = SLOW_HOUSEKEEPING_DELAY;
     settle().await;
 
@@ -513,7 +680,7 @@ async fn live_runtime_retains_expired_records_until_all_holders_shut_down() {
     set_age(backup.parent().unwrap(), EXPIRED);
     set_age(&transcript, EXPIRED);
     let kept = [&transcript, &tool_result, &image, &backup, &plan];
-    completed(cleanup_old_message_files_in_background(&root));
+    completed(cleanup(&root));
     for path in kept {
         assert!(exists(path), "live record removed: {}", path.display());
     }
@@ -523,13 +690,13 @@ async fn live_runtime_retains_expired_records_until_all_holders_shut_down() {
     second.resume_chat(chat).await.unwrap();
     agent.shutdown().await;
     set_age(&transcript, EXPIRED);
-    completed(cleanup_old_message_files_in_background(&root));
+    completed(cleanup(&root));
     for path in kept {
         assert!(exists(path), "independent holder lost: {}", path.display());
     }
     second.shutdown().await;
     set_age(&transcript, EXPIRED);
-    completed(cleanup_old_message_files_in_background(&root));
+    completed(cleanup(&root));
     for path in kept {
         assert!(
             !exists(path),
@@ -556,7 +723,7 @@ fn an_unusable_retention_lock_preserves_records_without_following_links() {
         std::fs::Permissions::from_mode(0o700),
     )
     .unwrap();
-    completed(cleanup_old_message_files_in_background(&root));
+    completed(cleanup(&root));
     for path in [&transcript, &image, &lock, &outside] {
         assert!(
             exists(path),
@@ -610,12 +777,12 @@ async fn exiting_a_worker_releases_retention_without_a_pid_liveness_check() {
         }
     }
     set_age(&transcript, EXPIRED);
-    completed(cleanup_old_message_files_in_background(&root));
+    completed(cleanup(&root));
     let retained = exists(&transcript);
     drop(worker.stdin.take());
     assert!(worker.wait().unwrap().success());
     assert!(retained);
-    completed(cleanup_old_message_files_in_background(&root));
+    completed(cleanup(&root));
     assert!(!exists(&transcript));
 }
 
@@ -694,7 +861,7 @@ fn backups_and_plans_of_chats_with_recent_transcripts_are_kept() {
         plan("lone-cloud"),
     ];
 
-    let result = completed(cleanup_old_message_files_in_background(root));
+    let result = completed(cleanup(root));
 
     for path in &kept {
         assert!(exists(path), "{} was removed", path.display());
@@ -740,7 +907,7 @@ fn image_caches_expire_with_the_transcripts_of_their_chats() {
         cached_images(uuid_name(""), EXPIRED),
     ];
 
-    let result = completed(cleanup_old_message_files_in_background(root));
+    let result = completed(cleanup(root));
 
     for path in &kept {
         assert!(
@@ -758,7 +925,7 @@ fn image_caches_expire_with_the_transcripts_of_their_chats() {
     for path in &kept {
         std::fs::remove_dir_all(path).unwrap();
     }
-    completed(cleanup_old_message_files_in_background(root));
+    completed(cleanup(root));
     assert!(!exists(&image_cache));
 }
 
@@ -792,7 +959,7 @@ fn only_uuid_named_transcripts_session_directories_and_backups_are_cleaned() {
         },
     ];
 
-    completed(cleanup_old_message_files_in_background(root));
+    completed(cleanup(root));
 
     for path in [&transcript, &session_result, &backups] {
         assert!(!exists(path), "{} was not removed", path.display());

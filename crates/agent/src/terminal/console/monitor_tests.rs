@@ -1640,9 +1640,6 @@ async fn shell_detail_confirmation_runs_the_production_adapter_control_callback(
 struct FixtureDiscovery;
 #[async_trait::async_trait]
 impl crate::tick_adapter::TickDiscovery for FixtureDiscovery {
-    fn tick_type(&self) -> &'static str {
-        "herdr"
-    }
     async fn page(
         &self,
         _: Option<tick_connect::page::PageCursor>,
@@ -1654,18 +1651,156 @@ impl crate::tick_adapter::TickDiscovery for FixtureDiscovery {
             "not listed in this fixture".into(),
         ))
     }
+}
+#[async_trait::async_trait]
+impl crate::tick_adapter::TickProbe for FixtureDiscovery {
+    fn tick_type(&self) -> &'static str {
+        "herdr"
+    }
     async fn probe(
         &self,
+        _chat: Uuid,
         instances: &[crate::tick_stream::InstanceRef],
-    ) -> Result<
-        HashMap<crate::tick_stream::InstanceRef, crate::tick_adapter::MemberState>,
-        crate::tick_adapter::DiscoveryError,
-    > {
-        Ok(instances
-            .iter()
-            .map(|instance| (instance.clone(), crate::tick_adapter::MemberState::Gone))
-            .collect())
+    ) -> Result<crate::tick_adapter::MemberFindings, crate::tick_adapter::DiscoveryError> {
+        Ok(crate::tick_adapter::MemberFindings {
+            states: instances
+                .iter()
+                .map(|instance| (instance.clone(), crate::tick_adapter::MemberState::Gone))
+                .collect(),
+            resources: HashMap::new(),
+        })
     }
+}
+
+/// A hosted probe that finds every member live with a sample, or fails when told to.
+struct FixtureHostedProbe {
+    fails: bool,
+}
+#[async_trait::async_trait]
+impl crate::tick_adapter::TickProbe for FixtureHostedProbe {
+    fn tick_type(&self) -> &'static str {
+        tick_connect::instance::HOSTED_TYPE
+    }
+    async fn probe(
+        &self,
+        _chat: Uuid,
+        instances: &[crate::tick_stream::InstanceRef],
+    ) -> Result<crate::tick_adapter::MemberFindings, crate::tick_adapter::DiscoveryError> {
+        if self.fails {
+            return Err(crate::tick_adapter::DiscoveryError::Unavailable(
+                "host unreachable".into(),
+            ));
+        }
+        Ok(crate::tick_adapter::MemberFindings {
+            states: instances
+                .iter()
+                .map(|instance| {
+                    (
+                        instance.clone(),
+                        crate::tick_adapter::MemberState::Live { protocol: true },
+                    )
+                })
+                .collect(),
+            resources: instances
+                .iter()
+                .map(|instance| {
+                    (
+                        instance.clone(),
+                        crate::tick_adapter::TickResources {
+                            pid: 42,
+                            cpu_time_ms: None,
+                            cpu_percent: None,
+                            rss_bytes: Some(1024),
+                            sampled_at_ms: 1,
+                        },
+                    )
+                })
+                .collect(),
+        })
+    }
+}
+
+fn run_probes(
+    probe: &MemberProbe,
+) -> Vec<(&'static str, Option<crate::tick_adapter::MemberFindings>)> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    probe
+        .probes
+        .iter()
+        .map(|typed| {
+            (
+                typed.prober.tick_type(),
+                runtime
+                    .block_on(typed.prober.probe(probe.chat, &typed.targets))
+                    .ok(),
+            )
+        })
+        .collect()
+}
+
+/// A Herdr View probes its hosted members as well as its Herdr ones, each with its own probe; a
+/// probe that fails keeps its own earlier findings and never wipes the other's.
+#[test]
+fn a_herdr_view_probes_hosted_members_beside_herdr_ones() {
+    let console = Console::test_for_chat(Uuid::new_v4());
+    let chat = console.state.lock().unwrap().chat.unwrap();
+    let mut snapshot = chat_snapshot(chat);
+    let hosted: crate::tick_stream::InstanceRef = "hosted:1a26e59c-a887-457d-8540-5079aea79ca0"
+        .parse()
+        .unwrap();
+    for (instance, title) in [
+        ("herdr:pane".parse().unwrap(), "pane"),
+        (hosted.clone(), "hidden"),
+    ] {
+        snapshot
+            .monitor
+            .members
+            .push(crate::runtime::MonitorMember {
+                instance,
+                source: crate::runtime::MonitorMemberSource::Opened,
+                title: Some(title.into()),
+            });
+    }
+    console.update_monitor_chat(&snapshot).unwrap();
+    console
+        .set_tick_discovery(Arc::new(FixtureDiscovery))
+        .unwrap();
+    console
+        .add_member_probe(Arc::new(FixtureHostedProbe { fails: false }))
+        .unwrap();
+    let probe = console.claim_member_probe().unwrap().unwrap();
+    assert_eq!(
+        probe.probes.len(),
+        2,
+        "one probe per Tick type with members"
+    );
+    console
+        .update_member_findings(chat, run_probes(&probe))
+        .unwrap();
+    let hidden_row = |console: &Console| {
+        console
+            .state
+            .lock()
+            .unwrap()
+            .monitor
+            .entries()
+            .iter()
+            .find(|entry| entry.title == "hidden")
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(hidden_row(&console).status, "live");
+    assert_eq!(hidden_row(&console).resources.unwrap().pid, 42);
+    console
+        .update_member_findings(chat, vec![("herdr", None), ("hosted", None)])
+        .unwrap();
+    assert_eq!(
+        hidden_row(&console).status,
+        "live",
+        "a failed probe keeps the earlier findings"
+    );
 }
 
 fn screen(state: &mut State) -> String {
@@ -1803,18 +1938,17 @@ fn probed_herdr_members_report_their_host_state_and_owner() {
         .unwrap();
     let probe = console.claim_member_probe().unwrap().unwrap();
     assert_eq!(probe.chat, chat);
-    assert_eq!(probe.targets.len(), 2);
+    assert_eq!(probe.probes.len(), 1);
+    assert_eq!(probe.probes[0].targets.len(), 2);
     assert!(
         console.claim_member_probe().unwrap().is_none(),
         "one probe at a time"
     );
-    let states = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap()
-        .block_on(probe.discovery.probe(&probe.targets))
-        .ok();
-    console.update_member_states(chat, states).unwrap();
-    console.update_member_states(chat, None).unwrap();
+    let findings = run_probes(&probe);
+    console.update_member_findings(chat, findings).unwrap();
+    console
+        .update_member_findings(chat, vec![("herdr", None)])
+        .unwrap();
     let state = console.state.lock().unwrap();
     let added = state
         .monitor

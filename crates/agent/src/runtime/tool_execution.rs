@@ -537,7 +537,7 @@ impl Agent {
             });
         let prepared_host_call = if let Some(provider) = host_tools.as_ref() {
             if let Err(error) = self
-                .check_delegated_host_tool(receipt, provider.as_ref(), &name)
+                .check_delegated_host_call(receipt, provider.as_ref(), &name, &input)
                 .await
             {
                 return Ok(ToolCallOutcome::not_admitted(error));
@@ -560,14 +560,19 @@ impl Agent {
             };
             match prepared {
                 Ok(prepared) => {
+                    if prepared.name() != name || prepared.source_input() != &input {
+                        return Err("host provider prepared a different tool invocation".into());
+                    }
                     if let Err(error) = self
-                        .check_delegated_host_tool(receipt, provider.as_ref(), &name)
+                        .check_delegated_host_call(
+                            receipt,
+                            provider.as_ref(),
+                            prepared.name(),
+                            prepared.source_input(),
+                        )
                         .await
                     {
                         return Ok(ToolCallOutcome::not_admitted(error));
-                    }
-                    if prepared.name() != name || prepared.source_input() != &input {
-                        return Err("host provider prepared a different tool invocation".into());
                     }
                     Some(match event_context {
                         Some(context) => prepared.with_event_context(context),
@@ -759,15 +764,11 @@ impl Agent {
             };
             let prompts_unavailable = decision == Decision::Ask
                 && self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt;
-            let mut decision = if (explicit_ask
-                || host_permission == Some(crate::host_tools::HostToolPermission::Confirmation))
-                && decision == Decision::Ask
-                && self.inner.host_options.prompt_policy == PromptPolicy::Unrestricted
-            {
-                Decision::Ask
-            } else {
-                self.apply_prompt_policy(decision)
-            };
+            let mut decision = self.apply_prompt_policy_with_explicit_ask(
+                decision,
+                explicit_ask
+                    || host_permission == Some(crate::host_tools::HostToolPermission::Confirmation),
+            );
             let mut assessment_details = None;
             let mut approval_source = if explicit_ask {
                 PermissionApprovalSource::ExplicitAsk
@@ -889,7 +890,12 @@ impl Agent {
                     (host_tools.as_ref(), prepared_host_call.as_ref())
                 {
                     match self
-                        .check_delegated_host_tool(receipt, provider.as_ref(), &name)
+                        .check_delegated_host_call(
+                            receipt,
+                            provider.as_ref(),
+                            prepared.name(),
+                            prepared.source_input(),
+                        )
                         .await
                     {
                         Ok(()) => {
@@ -1127,61 +1133,40 @@ impl Agent {
                         mut decision,
                         explicit_ask,
                         mut policy_revision,
+                        mut delegated_revision,
                         mut session_evaluation,
                         execution_mode,
                         mut policy,
                         plan_file,
-                        delegated_revision,
                     ) = {
                         let chats = self.inner.chats.lock().await;
                         let chat = chats.get(&receipt.chat_id).unwrap();
-                        let session_evaluation = self
-                            .inner
-                            .session_permissions
-                            .lock()
-                            .await
-                            .evaluate(permission_owner, &session_operation);
+                        let sessions = self.inner.session_permissions.lock().await;
+                        let session_evaluation =
+                            sessions.evaluate(permission_owner, &session_operation);
                         let plan_file = plan::current_plan_file(
                             &chat.snapshot,
                             self.plans_directory(&chat.snapshot.workdir).path(),
                             receipt.loop_id,
                         );
-                        let decision = chat.snapshot.policy.decide_with_plan_file(
+                        let authority = delegation::permission_authority(
+                            &chats,
+                            &sessions,
+                            receipt,
                             &prepared,
-                            &workspace,
-                            receipt.loop_id,
                             session_evaluation.decision,
                             plan_file.as_deref(),
-                        );
-                        let explicit_ask =
-                            chat.snapshot.policy.explicit_match_with_session(
-                                &prepared.name,
-                                &prepared.input,
-                                receipt.loop_id,
-                                session_evaluation.decision,
-                            ) == Some(crate::permissions::ExplicitPermissionDecision::Ask);
-                        let (decision, explicit_ask, delegated_revision) =
-                            delegation::shell_authority_decision(
-                                &chats,
-                                &*self.inner.session_permissions.lock().await,
-                                receipt,
-                                &prepared,
-                                delegation::ShellPermissionDecision {
-                                    decision,
-                                    explicit_ask,
-                                    session: session_evaluation.decision,
-                                },
-                                plan_file.as_deref(),
-                            );
+                        )
+                        .unwrap();
                         (
-                            decision,
-                            explicit_ask,
-                            chat.snapshot.policy.revision,
+                            authority.decision,
+                            authority.explicit_ask,
+                            authority.policy_revision,
+                            authority.parent_revision,
                             session_evaluation,
                             chat.snapshot.policy.mode,
                             chat.snapshot.policy.clone(),
                             plan_file,
-                            delegated_revision,
                         )
                     };
                     let is_plan_mode_side_effect = execution_mode == ExecutionMode::Plan
@@ -1233,14 +1218,7 @@ impl Agent {
                     let bypassed_by_unrestricted_host = !explicit_ask
                         && matches!(decision, Decision::Ask | Decision::Check)
                         && self.inner.host_options.prompt_policy == PromptPolicy::Unrestricted;
-                    decision = if explicit_ask
-                        && decision == Decision::Ask
-                        && self.inner.host_options.prompt_policy == PromptPolicy::Unrestricted
-                    {
-                        Decision::Ask
-                    } else {
-                        self.apply_prompt_policy(decision)
-                    };
+                    decision = self.apply_prompt_policy_with_explicit_ask(decision, explicit_ask);
                     if decision == Decision::Check {
                         let mut review_attempts = 0;
                         loop {
@@ -1271,37 +1249,27 @@ impl Agent {
                                     })
                                     .unwrap_or(false);
                                 if !revision_matches {
-                                    let (
-                                        current_decision,
-                                        current_revision,
-                                        current_session,
-                                        current_policy,
-                                    ) = {
+                                    let (current, current_session, current_policy) = {
                                         let chats = self.inner.chats.lock().await;
                                         let chat = chats.get(&receipt.chat_id).unwrap();
-                                        let current_session = self
-                                            .inner
-                                            .session_permissions
-                                            .lock()
-                                            .await
-                                            .evaluate(permission_owner, &session_operation);
-                                        let current_decision =
-                                            chat.snapshot.policy.decide_with_plan_file(
-                                                &prepared,
-                                                &configured_workspace_for_chat(chat),
-                                                receipt.loop_id,
-                                                current_session.decision,
-                                                plan_file.as_deref(),
-                                            );
-                                        (
-                                            current_decision,
-                                            chat.snapshot.policy.revision,
-                                            current_session,
-                                            chat.snapshot.policy.clone(),
+                                        let sessions = self.inner.session_permissions.lock().await;
+                                        let current_session =
+                                            sessions.evaluate(permission_owner, &session_operation);
+                                        let current = delegation::permission_authority(
+                                            &chats,
+                                            &sessions,
+                                            receipt,
+                                            &prepared,
+                                            current_session.decision,
+                                            plan_file.as_deref(),
                                         )
+                                        .unwrap();
+                                        (current, current_session, chat.snapshot.policy.clone())
                                     };
+                                    let current_decision = current.decision;
                                     policy = current_policy;
-                                    policy_revision = current_revision;
+                                    policy_revision = current.policy_revision;
+                                    delegated_revision = current.parent_revision;
                                     session_evaluation = current_session;
                                     if review_attempts < 2
                                         && current_decision == Decision::Check
@@ -1512,35 +1480,20 @@ impl Agent {
                             .finish(receipt.chat_id, &operation);
                             ToolCallError::denied(reason, record)
                         })?;
-                        let child_decision = chat.snapshot.policy.decide_with_plan_file(
+                        let current = delegation::permission_authority(
+                            &chats,
+                            &session_context,
+                            receipt,
                             &prepared,
-                            &workspace,
-                            receipt.loop_id,
                             session_evaluation.decision,
                             plan_file.as_deref(),
-                        );
-                        let (current_decision, _, current_parent_revision) =
-                            delegation::shell_authority_decision(
-                                &chats,
-                                &session_context,
-                                receipt,
-                                &prepared,
-                                delegation::ShellPermissionDecision {
-                                    decision: child_decision,
-                                    explicit_ask,
-                                    session: session_evaluation.decision,
-                                },
-                                plan_file.as_deref(),
-                            );
+                        )
+                        .unwrap();
                         if !session_context.revalidate(
                             &session_evaluation.token,
                             permission_owner,
                             &current_session_operation,
-                        ) || current_decision == Decision::Deny
-                            || (current_parent_revision != delegated_revision
-                                && current_decision != Decision::Allow)
-                            || (chat.snapshot.policy.revision != policy_revision
-                                && current_decision != Decision::Allow)
+                        ) || !current.still_admits(policy_revision, delegated_revision)
                         {
                             let reason =
                                 "permission policy changed before admission; retry the operation"

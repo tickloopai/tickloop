@@ -435,7 +435,7 @@ fn recorded_reads_keep_the_most_recently_used_hundred_files() {
 }
 
 #[tokio::test]
-async fn family_temp_writes_edits_and_bash_are_allowed_but_other_sessions_and_links_are_not() {
+async fn family_temp_writes_edits_and_bash_are_allowed_but_other_families_and_links_are_not() {
     use tickloop_agent::tools::{Tools, Workspace};
     let directory = tempfile::tempdir().unwrap();
     let internal = tempfile::tempdir().unwrap();
@@ -499,7 +499,7 @@ async fn family_temp_writes_edits_and_bash_are_allowed_but_other_sessions_and_li
 }
 
 #[tokio::test]
-async fn session_temp_auto_allow_does_not_widen_plan_permission() {
+async fn family_temp_auto_allow_does_not_widen_plan_permission() {
     use crate::permissions::{Decision, ExecutionMode, PermissionPolicy};
     let project = tempfile::tempdir().unwrap();
     let temp = tempfile::tempdir().unwrap();
@@ -724,6 +724,10 @@ async fn filename_lists_and_ambiguous_short_values_require_ordinary_permission()
     for command in [
         format!("file -f {}", list.display()),
         format!("sha256sum -c {}", list.display()),
+        format!("sha1sum -bc {}", list.display()),
+        format!("md5sum --check {}", list.display()),
+        format!("wc --files0-from={}", list.display()),
+        format!("du --files0-from {}", list.display()),
         format!("file --magic-file={} {}", other.display(), input.display()),
         format!("base64 -i=123 {}", input.display()),
         format!("grep -f=123 {}", input.display()),
@@ -743,4 +747,59 @@ async fn filename_lists_and_ambiguous_short_values_require_ordinary_permission()
         .await
         .unwrap();
     assert!(!prepared.requires_permission);
+}
+
+#[tokio::test]
+async fn quoted_literal_glob_symlink_does_not_get_family_temp_allowance() {
+    let project = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("*");
+    let target = outside.path().join("target");
+    std::fs::write(&target, "outside fixture").unwrap();
+    std::fs::write(&path, "owned fixture").unwrap();
+    let tools = Tools::new(root);
+    let workspace = workspace(&project.path().canonicalize().unwrap());
+    let command = format!("cat '{}'", path.display());
+    let prepared = tools
+        .prepare(&workspace, "Bash", &json!({"command":command}))
+        .await
+        .unwrap();
+    assert!(!prepared.requires_permission);
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    let prepared = tools
+        .prepare(&workspace, "Bash", &json!({"command":command}))
+        .await
+        .unwrap();
+    assert!(prepared.requires_permission);
+}
+
+#[tokio::test]
+async fn prepared_quoted_literal_glob_rechecks_replaced_symlink() {
+    let project = tempfile::tempdir().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let path = root.join("*");
+    std::fs::write(&path, "owned fixture").unwrap();
+    let target = outside.path().join("target");
+    std::fs::write(&target, "outside fixture").unwrap();
+    let tools = Tools::new(root);
+    let prepared = tools
+        .prepare(
+            &workspace(&project.path().canonicalize().unwrap()),
+            "Bash",
+            &json!({"command":format!("cat '{}'",path.display())}),
+        )
+        .await
+        .unwrap();
+    assert!(!prepared.requires_permission);
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    assert!(matches!(
+        tools.execute(prepared, CancellationToken::new()).await,
+        Err(ToolError::PathChanged(_))
+    ));
 }

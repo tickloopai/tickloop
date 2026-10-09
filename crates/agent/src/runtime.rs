@@ -83,6 +83,7 @@ mod system_prompt;
 mod tool_execution;
 mod tool_results;
 mod web_fetch;
+pub(crate) use tick_content::WATERMARK_DIRECTORY;
 use tool_execution::{ToolCallOutcome, ToolInvocation, ToolRegistry};
 pub(crate) use tool_results::TOOL_RESULTS_SUBDIRECTORY;
 mod user_shell;
@@ -93,6 +94,7 @@ pub use interaction::{
     START_GOAL_TOOL_NAME,
 };
 mod commands;
+mod tick_content;
 mod tick_subscriptions;
 pub use tick_subscriptions::{
     DEFAULT_CADENCE_SECONDS, MAX_CADENCE_SECONDS, MAX_DELIVERY_PAYLOAD_BYTES, MIN_CADENCE_SECONDS,
@@ -178,7 +180,7 @@ pub type LoopId = Uuid;
 pub type RunId = Uuid;
 pub use agent_messages::{
     AgentMessageSource, FamilyMessageRejection, FamilyMessageRejectionCode,
-    LIST_SUBAGENTS_TOOL_NAME, SEND_AGENT_MESSAGE_TOOL_NAME, VerifiedUserRelay,
+    LIST_SUBAGENTS_TOOL_NAME, SEND_AGENT_MESSAGE_TOOL_NAME, StoppedChildHook, VerifiedUserRelay,
 };
 pub use delegation::{
     DelegationCeiling, DelegationMetadata, MAX_SUBAGENT_HANDLE_CHARACTERS, SUBAGENT_TOOL_NAME,
@@ -527,6 +529,13 @@ impl UserShellRecord {
             self.state_since = Some(crate::private_fs::unix_time_milliseconds());
             self.updated_at_ms = self.state_since;
         }
+    }
+
+    /// Whether the Shell still waits for admission: for approval, or accepted but without a
+    /// started process.
+    pub(crate) fn awaits_admission(&self) -> bool {
+        self.state == UserShellState::WaitingPermission
+            || self.state == UserShellState::Running && self.pid.is_none()
     }
 }
 
@@ -1051,6 +1060,8 @@ struct Inner {
     judgment: Mutex<Option<Arc<dyn crate::judgment::JudgmentClient>>>,
     auto_health: Mutex<auto_health::AutoHealth>,
     host_tools: std::sync::RwLock<Option<Arc<dyn crate::host_tools::HostToolProvider>>>,
+    hosted_ticks: std::sync::RwLock<Option<Arc<crate::hosted::tools::HostedTickTools>>>,
+    stopped_child_hook: std::sync::RwLock<Option<Arc<dyn StoppedChildHook>>>,
     /// Whether a Workspace Tick Update stream is installed; the Tick Subscription tools reach the
     /// model only then.
     tick_stream_installed: AtomicBool,
@@ -1419,6 +1430,15 @@ impl Agent {
             self.inner.tick_stream_installed.load(Ordering::SeqCst),
         )
         .definitions()
+    }
+
+    /// Installs the worker's hosted Ticks, which its Chats' Monitors list and close directly.
+    pub fn install_hosted_ticks(&self, tools: Arc<crate::hosted::tools::HostedTickTools>) {
+        *self.inner.hosted_ticks.write().unwrap() = Some(tools);
+    }
+
+    pub fn hosted_ticks(&self) -> Option<Arc<crate::hosted::tools::HostedTickTools>> {
+        self.inner.hosted_ticks.read().unwrap().clone()
     }
 
     pub fn install_host_tools(
@@ -1981,6 +2001,8 @@ impl Agent {
                 judgment: Mutex::new(None),
                 auto_health: Mutex::new(auto_health::AutoHealth::default()),
                 host_tools: std::sync::RwLock::new(None),
+                hosted_ticks: std::sync::RwLock::new(None),
+                stopped_child_hook: std::sync::RwLock::new(None),
                 tick_stream_installed: AtomicBool::new(false),
                 tick_deliveries: std::sync::Mutex::new(
                     tick_subscriptions::TickDeliveries::default(),
@@ -2022,6 +2044,23 @@ impl Agent {
             (PromptPolicy::DenyOnPrompt, Decision::Ask) => Decision::Deny,
             (PromptPolicy::Unrestricted, Decision::Ask | Decision::Check) => Decision::Allow,
             _ => decision,
+        }
+    }
+
+    /// `apply_prompt_policy`, except that an Ask the user explicitly required still asks under
+    /// an Unrestricted host.
+    fn apply_prompt_policy_with_explicit_ask(
+        &self,
+        decision: Decision,
+        is_explicit_ask: bool,
+    ) -> Decision {
+        if is_explicit_ask
+            && decision == Decision::Ask
+            && self.inner.host_options.prompt_policy == PromptPolicy::Unrestricted
+        {
+            Decision::Ask
+        } else {
+            self.apply_prompt_policy(decision)
         }
     }
 
@@ -2099,10 +2138,7 @@ impl Agent {
                 snapshot.reasoning_effort = parent.reasoning_effort;
                 snapshot.thinking_enabled = parent.thinking_enabled;
                 snapshot.additional_directories = metadata.ceiling.additional_directories.clone();
-                snapshot.policy = metadata
-                    .ceiling
-                    .policy
-                    .for_delegation(metadata.parent_loop_id);
+                snapshot.policy = metadata.ceiling.policy.clone();
                 snapshot.delegation = Some(metadata);
                 (client, output_style)
             } else {
@@ -2725,8 +2761,7 @@ impl Agent {
         {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&receipt.chat_id).unwrap();
-            if workspace_host.name == crate::host_tools::WorkspaceHostName::Herdr
-                && workspace_host.integration == crate::host_tools::WorkspaceIntegration::Available
+            if workspace_host.runs_ticks()
                 && !chat
                     .snapshot
                     .invoked_skills
@@ -2752,8 +2787,8 @@ impl Agent {
             }
             let state = serde_json::json!({
                 "workdir": chat.snapshot.workdir,
-                "session_temp_directory": chat.tools.session_temp_directory(),
-                "scratchpad": chat.tools.session_temp_directory().join(crate::tools::SCRATCHPAD_SUBDIRECTORY),
+                "family_temp_directory": chat.tools.family_temp_directory(),
+                "scratchpad": chat.tools.family_temp_directory().join(crate::tools::SCRATCHPAD_SUBDIRECTORY),
                 "delegation": chat.snapshot.delegation,
                 "workspace_host": workspace_host,
                 "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),

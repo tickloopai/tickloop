@@ -428,6 +428,7 @@ pub async fn run_internal(arguments: &[OsString]) -> Option<Result<(), String>> 
         Some("--agent-worker") => Some(run_worker(arguments).await),
         Some(crate::hosted::controller::HOST_MODE) => Some(run_tick_host().await),
         Some("service") => Some(service_control::run(&arguments[1..]).await),
+        Some("monitor") => Some(crate::monitor_command::run(&arguments[1..]).await),
         _ => None,
     }
 }
@@ -462,6 +463,7 @@ async fn run_owner(arguments: &[OsString]) -> Result<(), String> {
         tick_host::paths::HostPaths::from_environment(),
         epoch,
         executable,
+        tick_host::host::DEFAULT_IDLE_TIMEOUT,
     ));
     let control = Arc::new(crate::hosted::worker_control::WorkerControl::new(
         &directory, epoch, controller,
@@ -495,9 +497,9 @@ async fn run_owner(arguments: &[OsString]) -> Result<(), String> {
 
 /// The Tick host process the owner starts on demand. It runs only the host library.
 async fn run_tick_host() -> Result<(), String> {
-    let key = tick_host::host::read_controller_key(std::io::stdin().lock())
-        .map_err(|error| error.to_string())?;
-    tick_host::host::serve(tick_host::paths::HostPaths::from_environment(), key)
+    let config =
+        tick_host::host::read_config(std::io::stdin().lock()).map_err(|error| error.to_string())?;
+    tick_host::host::serve(tick_host::paths::HostPaths::from_environment(), config)
         .await
         .map_err(|error| format!("Tick host: {error}"))
 }
@@ -533,6 +535,9 @@ async fn run_worker(arguments: &[OsString]) -> Result<(), String> {
         crate::housekeeping::HousekeepingSchedule::new(
             root.clone(),
             crate::housekeeping::UserActivity::process().clone(),
+            Arc::new(crate::hosted::lifecycle::OwnerLifecycle::new(
+                bootstrap.control.clone(),
+            )),
         )
     });
     let mut probe = [0u8; 1];
@@ -625,13 +630,16 @@ pub async fn build_runtime_with_client(
             },
         ))
     });
-    // A worker with a Herdr View keeps the Herdr tools; one without gets hosted Ticks, opened
-    // through its owner, whose authority is the Tick host's own endpoint.
-    let native_host = match (&access, control) {
-        (Some(access), _) => Some(Arc::new(crate::native_host::NativeHostToolProvider::new(
-            access.clone(),
-        )) as Arc<dyn crate::host_tools::HostToolProvider>),
-        (None, Some(grant)) => Some(Arc::new(crate::hosted::tools::HostedTickTools::new(
+    if let (Some(grant), Some(_)) = (&control, &launch.config_root) {
+        agent.install_stopped_child_hook(Arc::new(crate::hosted::lifecycle::OwnerLifecycle::new(
+            grant.clone(),
+        )));
+    }
+    // Every worker the owner granted a Tick host opens hidden Ticks there, with its host's own
+    // authority; a worker in a Herdr View also keeps Herdr Workspaces and visible Panes. Each
+    // Tick tool call is routed by its target to one of the two.
+    let hosted = control.map(|grant| {
+        Arc::new(crate::hosted::tools::HostedTickTools::new(
             crate::hosted::worker_control::OwnerControl::new(grant),
             launch
                 .environment
@@ -643,13 +651,27 @@ pub async fn build_runtime_with_client(
                     ))
                 })
                 .collect(),
-        )) as Arc<dyn crate::host_tools::HostToolProvider>),
-        (None, None) => None,
-    };
+        ))
+    });
+    let herdr = access.as_ref().map(|access| {
+        Arc::new(crate::native_host::NativeHostToolProvider::new(
+            access.clone(),
+        ))
+    });
+    let native_host = (herdr.is_some() || hosted.is_some()).then(|| {
+        Arc::new(crate::tick_tool_router::TickToolRouter::new(
+            herdr,
+            hosted.clone(),
+        )) as Arc<dyn crate::host_tools::HostToolProvider>
+    });
+    if let Some(hosted) = &hosted {
+        agent.install_hosted_ticks(hosted.clone());
+    }
     let adapters = Arc::new(TickAdapters::builtin(
         Some(agent.clone()),
         launch.config_root.clone(),
         access,
+        hosted,
     ));
     agent.install_tick_stream(adapters.clone()).await;
     if let Some(root) = launch.config_root.as_ref()

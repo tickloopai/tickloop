@@ -369,7 +369,7 @@ fn plan_approval_pty_fixture() {
         loop {
             tokio::select! {
                 event = events.recv() => match event.unwrap().kind {
-                    EventKind::PermissionRequested { request } => { pending.insert(request.id, crate::terminal::WaitingPermission::new(chat, &request)); }
+                    EventKind::PermissionRequested { request } => { pending.insert(request.id, crate::terminal::PermissionRequestOwner::new(chat, &request)); }
                     EventKind::Failed(error) => panic!("{error}"),
                     EventKind::Completed { .. } => {
                         assert_eq!(model.requests.lock().unwrap().len(), 3);

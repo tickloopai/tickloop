@@ -25,7 +25,7 @@ pub(crate) use entry::{
 pub(crate) use listing::{LITE_READ_BUF_SIZE, list_project};
 pub(crate) use path::{
     PROJECTS_DIRECTORY, PrivateDirectory, TRANSCRIPT_FILE_SUFFIX, locate,
-    private_project_temp_directory, private_session_temp_directory, project_directory,
+    private_family_temp_directory, private_project_temp_directory, project_directory,
     transcript_path,
 };
 pub(crate) use reader::{LoadedTranscript, load, load_original_user_inputs};

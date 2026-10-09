@@ -26,10 +26,16 @@ use crate::instance::InstanceRef;
 pub const MANAGEMENT_MAJOR: u16 = 1;
 pub const MANAGEMENT_MINOR: u16 = 0;
 pub const MANAGEMENT_FRAME_BYTES: usize = 64 * 1024;
-pub const BUSINESS_MAJOR: u16 = 1;
+/// 3.0: owner revisions on open, listings that name their host epoch, owner reconcile/end,
+/// Watch-intent leases, explicit or automatic reads, and one-time view grants; a host of any
+/// other major is refused at hello.
+pub const BUSINESS_MAJOR: u16 = 3;
 pub const BUSINESS_MINOR: u16 = 0;
 /// A complete business frame, large enough for one legal 8 MiB Tick Tool response.
 pub const BUSINESS_FRAME_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
+/// One pushed observation on a watch stream: a Tick Update of at most
+/// [`crate::protocol::MAX_UPDATE_BYTES`] and its envelope.
+pub const OBSERVATION_FRAME_BYTES: usize = crate::protocol::MAX_UPDATE_BYTES + 32 * 1024;
 pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a data client waits for a call's answer: the Tick's whole budget plus transport.
@@ -76,6 +82,12 @@ pub enum Role {
     Instance {
         instance: InstanceRef,
         data_token: String,
+    },
+    /// A view of one instance's terminal, holding the one-time grant its owner asked the host
+    /// for; it can only attach, so no data token leaves the Agent.
+    Viewer {
+        instance: InstanceRef,
+        view: uuid::Uuid,
     },
     /// The launcher of one pending open, holding that open's one-time launch token.
     Launcher {
@@ -352,6 +364,11 @@ impl HostConnection {
     /// Reads the next pushed frame of a stream this connection subscribed to.
     pub async fn next_event(&mut self) -> Result<Option<Value>, HostError> {
         read_frame(&mut self.reader, BUSINESS_FRAME_BYTES).await
+    }
+
+    /// The next pushed event, refusing one larger than `limit`.
+    pub async fn next_event_within(&mut self, limit: usize) -> Result<Option<Value>, HostError> {
+        read_frame(&mut self.reader, limit).await
     }
 
     pub fn into_parts(self) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {

@@ -22,32 +22,83 @@ use tokio::{
 
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Stops the Tick host a test started, if one still runs, through its management channel, so
-/// a failed assertion never leaves a host and its Ticks behind.
-fn stop_test_host(runtime: &Path, key_file: &Path) {
-    use std::io::{BufRead, BufReader, Write};
-    let (Ok(key), Ok(stream)) = (
-        std::fs::read_to_string(key_file),
-        std::os::unix::net::UnixStream::connect(runtime.join("host.sock")),
-    ) else {
-        return;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let mut writer = &stream;
-    let mut reader = BufReader::new(&stream);
-    let mut line = String::new();
-    let hello = json!({"channel":"management","major":1,"minor":0,"controller_key":key.trim()});
-    if writeln!(writer, "{hello}").is_err() || reader.read_line(&mut line).is_err() {
-        return;
+/// An open of `program` for `owner`, started through the CLI's Tick launcher.
+fn tick_request(
+    owner: tick_host::host::TickOwner,
+    cwd: &Path,
+    program: Vec<String>,
+) -> tick_host::host::OpenRequest {
+    let mut command = vec![
+        support::fixture_cli::executable()
+            .to_string_lossy()
+            .into_owned(),
+        "--tick-launch".into(),
+        "--".into(),
+    ];
+    command.extend(program);
+    tick_host::host::OpenRequest {
+        operation: uuid::Uuid::new_v4(),
+        owner,
+        owner_revision: 0,
+        command,
+        cwd: cwd.to_path_buf(),
+        environment: vec![("PATH".into(), "/usr/bin:/bin".into())],
+        title: None,
     }
-    let Ok(hello) = serde_json::from_str::<Value>(&line) else {
-        return;
-    };
-    let shutdown = json!({"id":1,"method":"shutdown_host","params":{"epoch":hello["result"]["epoch"],"operation":uuid::Uuid::new_v4()}});
-    if writeln!(writer, "{shutdown}").is_ok() {
-        line.clear();
-        let _ = reader.read_line(&mut line);
+}
+
+/// An open of the example counter Tick for `owner`.
+fn counter_request(owner: tick_host::host::TickOwner, cwd: &Path) -> tick_host::host::OpenRequest {
+    let counter = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/ticks/counter.py")
+        .canonicalize()
+        .unwrap();
+    tick_request(
+        owner,
+        cwd,
+        vec![
+            "/usr/bin/python3".into(),
+            "-u".into(),
+            counter.to_string_lossy().into_owned(),
+        ],
+    )
+}
+
+fn alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+async fn gone(pid: u32) -> bool {
+    for _ in 0..400 {
+        if !alive(pid) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    false
+}
+
+/// Holds `chat`'s retention lock the way a running cleanup does.
+fn hold_retention(config_root: &std::path::Path, chat: uuid::Uuid) -> std::fs::File {
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{DirBuilderExt, OpenOptionsExt},
+    };
+    let directory = config_root.join("chat-retention");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&directory)
+        .unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(directory.join(format!("{chat}.lock")))
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    lock
 }
 
 async fn read_request(stream: &mut TcpStream) -> (String, Value) {
@@ -277,26 +328,42 @@ mod channel {
     use tickloop_agent::{
         agent_access::{
             AccessError, AgentAccess, AgentCommand, CommandEnvelope, CommandResult,
-            EmbeddedAgentAccess, LaunchSpec, OwnerServer, WorkerFactory,
+            EmbeddedAgentAccess, EnvironmentValue, HostWorkContext, LaunchSpec, OwnerServer,
+            WorkerFactory,
         },
+        agent_daemon::build_runtime_with_client,
         host_tools::{HostCallResult, HostEndpointIdentity, HostToolAuthority, HostToolProvider},
         hosted::{
             controller::HostController,
+            lifecycle::OwnerLifecycle,
             tools::HostedTickTools,
             worker_control::{
                 HostedAdmission, OwnerControl, WorkerControl, WorkerControlGrant, WorkerRequest,
+                root_identity,
             },
         },
+        model::ModelClient,
         runtime::Agent,
+        tick_adapter::TickAdapters,
+        tick_tool_router::TickToolRouter,
     };
     use tokio::sync::Mutex;
+
+    /// The Herdr Workspace a Herdr worker's Chats work in.
+    const HERDR_WORKSPACE: &str = "workspace-a";
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
-    /// Workers in this process, each holding the grant the owner would hand a real worker.
+    /// Workers in this process, each holding the grant the owner would hand a real worker and,
+    /// as a real worker with a config root does, telling the owner when StopSubagent stops a child.
     struct GrantedWorkers {
         control: Arc<WorkerControl>,
+        model: Arc<dyn ModelClient>,
+        /// A Herdr endpoint the workers' Views run in; such a worker is built the way the
+        /// production worker is, with both its Herdr and its hosted Tick tools.
+        herdr: Option<std::path::PathBuf>,
         grants: Mutex<Vec<WorkerControlGrant>>,
+        runtimes: Mutex<Vec<Agent>>,
     }
 
     #[async_trait]
@@ -306,17 +373,55 @@ mod channel {
             launch: &LaunchSpec,
             epoch: Uuid,
         ) -> Result<Arc<dyn AgentAccess>, AccessError> {
-            let runtime = Agent::new_embedded(
-                super::support::config(),
-                Arc::new(super::support::ScriptedModel::new(Vec::new())),
-            );
-            let access: Arc<dyn AgentAccess> =
-                Arc::new(EmbeddedAgentAccess::for_worker(runtime, epoch));
             let grant = self.control.grant();
+            let runtime = match &self.herdr {
+                Some(socket) => {
+                    let mut launch = launch.clone();
+                    launch.host_work_context = Some(HostWorkContext {
+                        socket: socket.clone(),
+                        workspace: Some(HERDR_WORKSPACE.into()),
+                    });
+                    launch.environment = vec![EnvironmentValue {
+                        name: b"PATH".to_vec(),
+                        value: b"/usr/bin:/bin".to_vec(),
+                    }];
+                    build_runtime_with_client(&launch, self.model.clone(), Some(grant.clone()))
+                        .await
+                        .map_err(AccessError::unavailable)?
+                }
+                None => {
+                    let runtime = Agent::new_embedded(super::support::config(), self.model.clone());
+                    runtime
+                        .install_stopped_child_hook(Arc::new(OwnerLifecycle::new(grant.clone())));
+                    let tools = Arc::new(HostedTickTools::new(
+                        OwnerControl::new(grant.clone()),
+                        vec![("PATH".into(), "/usr/bin:/bin".into())],
+                    ));
+                    runtime
+                        .install_host_tools(Arc::new(TickToolRouter::new(
+                            None,
+                            Some(tools.clone()),
+                        )))
+                        .unwrap();
+                    runtime.install_hosted_ticks(tools.clone());
+                    runtime
+                        .install_tick_stream(Arc::new(TickAdapters::builtin(
+                            Some(runtime.clone()),
+                            None,
+                            None,
+                            Some(tools),
+                        )))
+                        .await;
+                    runtime
+                }
+            };
+            let access: Arc<dyn AgentAccess> =
+                Arc::new(EmbeddedAgentAccess::for_worker(runtime.clone(), epoch));
             self.control
                 .register(&grant, access.clone(), launch.config_root.as_deref())
                 .await;
             self.grants.lock().await.push(grant);
+            self.runtimes.lock().await.push(runtime);
             Ok(access)
         }
         async fn exited(&self, _: &Arc<dyn AgentAccess>) -> bool {
@@ -332,12 +437,55 @@ mod channel {
     struct Owner {
         _directory: tempfile::TempDir,
         root: std::path::PathBuf,
+        config_root: std::path::PathBuf,
+        server: OwnerServer,
+        epoch: Uuid,
         chats: Vec<Uuid>,
+        executions: Vec<tickloop_agent::agent_access::ExecutionRef>,
         grants: Vec<WorkerControlGrant>,
+        runtimes: Vec<Agent>,
+        controller: Arc<HostController>,
     }
 
     impl Owner {
         async fn start(chats: usize) -> Self {
+            Self::start_with(
+                Arc::new(super::support::ScriptedModel::new(Vec::new())),
+                tick_host::host::DEFAULT_IDLE_TIMEOUT,
+                chats,
+            )
+            .await
+        }
+
+        async fn start_with(
+            model: Arc<dyn ModelClient>,
+            idle_timeout: Duration,
+            chats: usize,
+        ) -> Self {
+            Self::start_configured(model, idle_timeout, None, chats).await
+        }
+
+        /// An owner whose workers run in a Herdr View at `herdr`, wired as production wires them.
+        async fn start_in_herdr(
+            model: Arc<dyn ModelClient>,
+            herdr: std::path::PathBuf,
+            chats: usize,
+        ) -> Self {
+            Self::start_configured(
+                model,
+                tick_host::host::DEFAULT_IDLE_TIMEOUT,
+                Some(herdr),
+                chats,
+            )
+            .await
+        }
+
+        async fn start_configured(
+            model: Arc<dyn ModelClient>,
+            idle_timeout: Duration,
+            herdr: Option<std::path::PathBuf>,
+            chats: usize,
+        ) -> Self {
             let directory = tempfile::Builder::new()
                 .prefix("thc")
                 .tempdir_in("/private/tmp")
@@ -353,17 +501,22 @@ mod channel {
                 },
                 epoch,
                 super::support::fixture_cli::executable(),
+                idle_timeout,
             ));
-            let control = Arc::new(WorkerControl::new(&root, epoch, controller));
+            let control = Arc::new(WorkerControl::new(&root, epoch, controller.clone()));
             let listener = tokio::net::UnixListener::bind(control.endpoint()).unwrap();
             let factory = Arc::new(GrantedWorkers {
                 control: control.clone(),
+                model,
+                herdr,
                 grants: Mutex::new(Vec::new()),
+                runtimes: Mutex::new(Vec::new()),
             });
             let owner = OwnerServer::new(epoch, factory.clone());
             control.attach_owner(owner.clone());
             tokio::spawn(control.clone().serve(listener));
             let mut created_chats = Vec::new();
+            let mut executions = Vec::new();
             for _ in 0..chats {
                 let mut launch = LaunchSpec::embedded(root.clone());
                 launch.config_root = Some(config_root.clone());
@@ -379,24 +532,86 @@ mod channel {
                     })
                     .await
                     .unwrap();
-                let Some(CommandResult::Created { snapshot, .. }) = created.result else {
+                let Some(CommandResult::Created {
+                    snapshot,
+                    execution,
+                    ..
+                }) = created.result
+                else {
                     panic!("create failed: {created:?}");
                 };
                 created_chats.push(snapshot.conversation.id);
+                executions.push(execution);
             }
             let grants = factory.grants.lock().await.clone();
+            let runtimes = factory.runtimes.lock().await.clone();
             Self {
                 _directory: directory,
                 root,
+                config_root,
+                server: owner,
+                epoch,
                 chats: created_chats,
+                executions,
                 grants,
+                runtimes,
+                controller,
             }
+        }
+
+        /// Runs a command the way a View sends it through the owner to the Chat's worker.
+        async fn command(&self, command: AgentCommand) -> CommandResult {
+            self.try_command(command).await.unwrap()
+        }
+
+        async fn try_command(
+            &self,
+            command: AgentCommand,
+        ) -> Result<CommandResult, tickloop_agent::agent_access::AccessError> {
+            self.server
+                .execute(CommandEnvelope {
+                    owner_epoch: self.epoch,
+                    command_id: Uuid::new_v4(),
+                    command,
+                })
+                .await
+                .unwrap()
+                .into_result()
+        }
+
+        /// The host owner of `chat` under this owner's config root.
+        fn tick_owner(&self, chat: Uuid) -> tick_host::host::TickOwner {
+            tick_host::host::TickOwner {
+                root: root_identity(&self.config_root).unwrap(),
+                chat,
+            }
+        }
+
+        /// Opens a counter Tick for `chat` directly through the owner's host controller, after
+        /// the owner's first-use reconcile of the root so the Tick is not taken for an orphan.
+        async fn open_counter(&self, chat: Uuid) -> tick_host::host::OpenedTick {
+            self.controller
+                .open(super::counter_request(self.tick_owner(chat), &self.root))
+                .await
+                .unwrap()
+        }
+
+        /// The owner state file of `chat`, if the registry keeps one.
+        fn owner_state(&self, chat: Uuid) -> Option<Value> {
+            let path = self
+                .config_root
+                .join("tick-host/chats")
+                .join(chat.to_string())
+                .join("owner.json");
+            std::fs::read(path)
+                .ok()
+                .map(|bytes| serde_json::from_slice(&bytes).unwrap())
         }
     }
 
     impl Drop for Owner {
         fn drop(&mut self) {
-            super::stop_test_host(&self.root.join("h"), &self.root.join("tick-host.key"));
+            super::support::stop_tick_host(&self.root.join("h"), &self.root.join("tick-host.key"));
         }
     }
 
@@ -521,6 +736,7 @@ mod channel {
                 binding: Uuid::new_v4(),
                 capability: "0".repeat(64),
                 host_endpoint: directory.path().join("host.sock"),
+                intent_renewal: std::time::Duration::from_secs(100),
             }),
             Vec::new(),
         );
@@ -575,6 +791,7 @@ mod channel {
             binding: Uuid::new_v4(),
             capability: "0".repeat(64),
             host_endpoint: directory.path().join("host.sock"),
+            intent_renewal: std::time::Duration::from_secs(100),
         };
         let chat = Uuid::new_v4();
         let instance = tick_connect::instance::InstanceRef::hosted(Uuid::new_v4());
@@ -744,6 +961,10 @@ for line in sys.stdin:
         )
         .await;
         let instance = opened["tick_instance_id"].clone();
+        let records = launch_records(&owner.root, chat);
+        assert_eq!(records.len(), 1, "the owner keeps a durable launch record");
+        assert_eq!(records[0]["state"], "live", "{}", records[0]);
+        assert_eq!(records[0]["instance"], instance);
         let approved = tools
             .prepare_call(
                 chat,
@@ -795,11 +1016,1423 @@ for line in sys.stdin:
         )
         .await;
         assert_eq!(closed["status"], "closed");
+        assert!(
+            launch_records(&owner.root, chat).is_empty(),
+            "a closed Tick leaves no launch record"
+        );
+    }
+
+    fn write_transcript(directory: &std::path::Path, chat: Uuid, age: Duration) {
+        std::fs::create_dir_all(directory).unwrap();
+        let path = directory.join(format!("{chat}.jsonl"));
+        std::fs::write(&path, "{}\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+    }
+
+    /// The real retention cleanup in a worker removes an expired Transcript between its owner
+    /// notices, so exactly that Chat's Ticks end, all of them. A Chat that still runs, a failed
+    /// unlink and a cleanup of tool results only end nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_an_expired_transcript_ends_only_that_chats_ticks_through_the_owner() {
+        use tickloop_agent::cleanup::{CleanupOutcome, cleanup_old_message_files_in_background};
+        const EXPIRED: Duration = Duration::from_secs(60 * 24 * 60 * 60);
+        let owner = Owner::start(1).await;
+        let running = owner.chats[0];
+        OwnerControl::new(owner.grants[0].clone())
+            .request(list(running))
+            .await
+            .unwrap();
+        let (deleted, unlink_fails, tools_only) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut deleted_ticks = Vec::new();
+        for _ in 0..21 {
+            deleted_ticks.push(owner.open_counter(deleted).await);
+        }
+        let kept = [
+            owner.open_counter(unlink_fails).await,
+            owner.open_counter(tools_only).await,
+            owner.open_counter(running).await,
+        ];
+        let project = owner.config_root.join("projects/-work");
+        write_transcript(&project, deleted, EXPIRED);
+        write_transcript(&project, running, EXPIRED);
+        write_transcript(&project, tools_only, Duration::ZERO);
+        let tool_result = project.join(format!("{tools_only}/tool-results/call.txt"));
+        std::fs::create_dir_all(tool_result.parent().unwrap()).unwrap();
+        std::fs::write(&tool_result, "result").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&tool_result)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - EXPIRED)
+            .unwrap();
+        let locked_project = owner.config_root.join("projects/-locked");
+        write_transcript(&locked_project, unlink_fails, EXPIRED);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&locked_project, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let notice = OwnerLifecycle::new(owner.grants[0].clone());
+        let config_root = owner.config_root.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            cleanup_old_message_files_in_background(&config_root, &notice)
+        })
+        .await
+        .unwrap();
+        std::fs::set_permissions(&locked_project, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let CleanupOutcome::Completed(result) = outcome else {
+            panic!("cleanup was skipped");
+        };
+        assert_eq!(
+            result.errors, 2,
+            "the failed unlink and the refused running Chat are reported"
+        );
+        assert!(!tool_result.exists());
+        for tick in &deleted_ticks {
+            assert!(
+                super::gone(tick.business_pid).await,
+                "every Tick of the deleted Chat ends"
+            );
+        }
+        for tick in &kept {
+            assert!(super::alive(tick.business_pid), "no other Chat's Tick ends");
+        }
+        assert_eq!(
+            owner.owner_state(deleted),
+            None,
+            "a deleted Chat leaves no state"
+        );
+        assert_eq!(owner.owner_state(unlink_fails).unwrap()["state"], "active");
+        assert_eq!(
+            owner.owner_state(running),
+            None,
+            "a running Chat is never announced"
+        );
+    }
+
+    /// A real root stops its direct child with StopSubagent; the worker's hook tells the owner, which
+    /// checks the family itself and ends only the child's Ticks.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_root_stopping_its_direct_child_ends_only_the_childs_ticks() {
+        use super::support::routed::{
+            RoutedModel, has_tool_result, history_text, state, tool_result,
+        };
+        use tickloop_agent::runtime::{Event, EventKind, Receipt};
+        const STOP_PROMPT: &str = "Stop the waiter now";
+        async fn finished(events: &mut tokio::sync::broadcast::Receiver<Event>, receipt: &Receipt) {
+            loop {
+                let event = super::support::next_event(events).await;
+                if event.run_id == receipt.run_id {
+                    match event.kind {
+                        EventKind::Completed { .. } => return,
+                        EventKind::Failed(error) => panic!("run failed: {error}"),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let model = Arc::new(RoutedModel::new(|request| {
+            if !state(request)["delegation"].is_null() {
+                if !has_tool_result(request, "ready") {
+                    super::support::call(
+                        "ready",
+                        "SendMessage",
+                        json!({"to":"parent","message":"Child is ready to wait"}),
+                    )
+                } else {
+                    super::support::text("Awaiting family context.")
+                }
+            } else if !has_tool_result(request, "delegate") {
+                super::support::call(
+                    "delegate",
+                    "Subagent",
+                    json!({"task":"Wait to be stopped","name":"waiter"}),
+                )
+            } else if history_text(request).contains(STOP_PROMPT)
+                && !has_tool_result(request, "stop")
+            {
+                super::support::call("stop", "StopSubagent", json!({"to":"waiter"}))
+            } else {
+                super::support::text("Done")
+            }
+        }));
+        let owner = Owner::start_with(model, tick_host::host::DEFAULT_IDLE_TIMEOUT, 1).await;
+        let (runtime, root) = (owner.runtimes[0].clone(), owner.chats[0]);
+        OwnerControl::new(owner.grants[0].clone())
+            .request(list(root))
+            .await
+            .unwrap();
+        let mut events = runtime.subscribe();
+        let receipt = runtime
+            .submit(root, None, "Delegate a waiter".into())
+            .await
+            .unwrap();
+        finished(&mut events, &receipt).await;
+        let child = runtime.subagents(root).await.unwrap()[0].child_chat_id;
+        let child_tick = owner.open_counter(child).await;
+        let root_tick = owner.open_counter(root).await;
+        for (claimed_root, claimed_child) in [(root, child), (root, root)] {
+            let refused = OwnerControl::new(owner.grants[0].clone())
+                .request(WorkerRequest::EndStoppedChild {
+                    chat: claimed_root,
+                    child: claimed_child,
+                    operation: Uuid::new_v4(),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(
+                refused.code, "Forbidden",
+                "only a stopped direct child is ended"
+            );
+        }
+        assert!(super::alive(child_tick.business_pid));
+
+        let receipt = runtime
+            .submit(root, None, STOP_PROMPT.into())
+            .await
+            .unwrap();
+        finished(&mut events, &receipt).await;
+
+        let stopped = tool_result(&runtime.snapshot(root).await.unwrap().messages, "stop").unwrap();
+        assert_eq!(stopped["status"], "stopped");
+        assert!(stopped.get("hosted_ticks_error").is_none(), "{stopped}");
+        assert!(
+            super::gone(child_tick.business_pid).await,
+            "the child's Tick ends"
+        );
+        assert!(
+            super::alive(root_tick.business_pid),
+            "the root keeps its Tick"
+        );
+        assert_eq!(owner.owner_state(child).unwrap()["state"], "stopped");
+        assert_eq!(owner.owner_state(root), None);
+        let tools = HostedTickTools::new(
+            OwnerControl::new(owner.grants[0].clone()),
+            vec![("PATH".into(), "/usr/bin:/bin".into())],
+        );
+        let prepared = tools
+            .prepare_call(
+                child,
+                "ModifyTick",
+                &counter_command(&owner),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let HostCallResult::NotDispatched(refused) = tools
+            .execute_prepared(child, prepared, CancellationToken::new())
+            .await
+        else {
+            panic!("a stopped child opens nothing before it continues");
+        };
+        assert!(refused.contains("OwnerEnded"), "{refused}");
+    }
+
+    /// A stop whose end never reached the host leaves the Chat Stopping while its Tick runs on.
+    /// Continuing the Chat restores only the Chat: the earlier Tick ends before it owns a new one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn continuing_a_chat_whose_stop_never_reached_the_host_ends_its_earlier_ticks_first() {
+        use tickloop_agent::runtime::EventKind;
+        let model = Arc::new(super::support::ScriptedModel::new(vec![
+            super::support::text("Continued"),
+        ]));
+        let owner = Owner::start_with(model, tick_host::host::DEFAULT_IDLE_TIMEOUT, 1).await;
+        let (runtime, chat) = (owner.runtimes[0].clone(), owner.chats[0]);
+        let tools = HostedTickTools::new(
+            OwnerControl::new(owner.grants[0].clone()),
+            vec![("PATH".into(), "/usr/bin:/bin".into())],
+        );
+        let earlier = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
+        let earlier_pid = earlier["business_pid"].as_u64().unwrap() as u32;
+        std::fs::write(
+            owner
+                .config_root
+                .join("tick-host/chats")
+                .join(chat.to_string())
+                .join("owner.json"),
+            serde_json::to_vec(&json!({"state":"stopping","operation":Uuid::new_v4()})).unwrap(),
+        )
+        .unwrap();
+        let prepared = tools
+            .prepare_call(
+                chat,
+                "ModifyTick",
+                &counter_command(&owner),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let HostCallResult::NotDispatched(refused) = tools
+            .execute_prepared(chat, prepared, CancellationToken::new())
+            .await
+        else {
+            panic!("a stopped Chat opens nothing before it continues");
+        };
+        assert!(refused.contains("OwnerEnded"), "{refused}");
+        assert!(super::alive(earlier_pid), "the end never reached the host");
+
+        let mut events = runtime.subscribe();
+        runtime.submit(chat, None, "Continue".into()).await.unwrap();
+        loop {
+            match super::support::next_event(&mut events).await.kind {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        let reopened = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
+        assert!(
+            super::gone(earlier_pid).await,
+            "the Tick of the stopped Chat ends"
+        );
+        assert!(super::alive(
+            reopened["business_pid"].as_u64().unwrap() as u32
+        ));
+        let records = launch_records(&owner.root, chat);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["instance"], reopened["tick_instance_id"]);
+        assert_eq!(owner.owner_state(chat).unwrap()["state"], "active");
+    }
+
+    /// A Chat's Watch intents go through its owner, which records them with the launch and
+    /// hands them to the host: any one Watch keeps an otherwise idle Tick, the last one ending
+    /// lets it idle out, and the next complete listing drops its record. Only the Chat that owns
+    /// the instance can protect it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn watch_intents_through_the_owner_keep_a_tick_until_the_last_watch_ends() {
+        let owner = Owner::start_with(
+            Arc::new(super::support::ScriptedModel::new(Vec::new())),
+            Duration::from_secs(2),
+            2,
+        )
+        .await;
+        let (chat, other_chat) = (owner.chats[0], owner.chats[1]);
+        let tools = HostedTickTools::new(
+            OwnerControl::new(owner.grants[0].clone()),
+            vec![("PATH".into(), "/usr/bin:/bin".into())],
+        );
+        let launcher = super::support::fixture_cli::executable();
+        let counter = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/ticks/counter.py")
+            .canonicalize()
+            .unwrap();
+        let prepared = tools
+            .prepare_call(
+                chat,
+                "ModifyTick",
+                &json!({"action":"open","command":[launcher, "--tick-launch", "--", "/usr/bin/python3", "-u", counter],"cwd":owner.root,"placement":{"type":"hidden"}}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let opened = completed(
+            tools
+                .execute_prepared(chat, prepared, CancellationToken::new())
+                .await,
+        );
+        let instance: tick_connect::instance::InstanceRef =
+            serde_json::from_value(opened["tick_instance_id"].clone()).unwrap();
+        let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
+        let watches = |chat, watches: Vec<Uuid>| WorkerRequest::SetWatchIntents {
+            chat,
+            instance: instance.clone(),
+            watches: watches.into_iter().collect(),
+        };
+        let (first_watch, second_watch) = (Uuid::new_v4(), Uuid::new_v4());
+        OwnerControl::new(owner.grants[0].clone())
+            .request(watches(chat, vec![first_watch, second_watch]))
+            .await
+            .unwrap();
+        let recorded = launch_records(&owner.root, chat);
+        assert_eq!(recorded[0]["watches"].as_array().unwrap().len(), 2);
+        let foreign = OwnerControl::new(owner.grants[1].clone())
+            .request(watches(chat, Vec::new()))
+            .await
+            .unwrap_err();
+        assert_eq!(foreign.code, "Forbidden", "another worker's Chat");
+        let not_its_tick = OwnerControl::new(owner.grants[1].clone())
+            .request(watches(other_chat, Vec::new()))
+            .await
+            .unwrap_err();
+        assert_eq!(not_its_tick.code, "TargetGone", "another Chat's Tick");
+
+        // A worker renews its intents well within the idle timeout, as its grant says.
+        let renewal = owner.grants[0].intent_renewal;
+        assert!(renewal < Duration::from_secs(1));
+        let renew = |current: Vec<Uuid>, rounds: u32| {
+            let request = watches(chat, current);
+            let grant = owner.grants[0].clone();
+            async move {
+                for _ in 0..rounds {
+                    OwnerControl::new(grant.clone())
+                        .request(request.clone())
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(renewal).await;
+                }
+            }
+        };
+        renew(vec![first_watch, second_watch], 5).await;
+        assert!(super::alive(business_pid), "a Watch keeps the idle Tick");
+        renew(vec![second_watch], 5).await;
+        assert!(super::alive(business_pid), "the remaining Watch keeps it");
+        OwnerControl::new(owner.grants[0].clone())
+            .request(watches(chat, Vec::new()))
+            .await
+            .unwrap();
+        assert!(
+            super::gone(business_pid).await,
+            "it idles out after the last Watch"
+        );
+        assert_eq!(launch_records(&owner.root, chat).len(), 1);
+        OwnerControl::new(owner.grants[0].clone())
+            .request(list(chat))
+            .await
+            .unwrap();
+        assert!(
+            launch_records(&owner.root, chat).is_empty(),
+            "an idled-out Tick cannot be reopened and leaves no record"
+        );
+    }
+
+    /// Runs one hosted Tick tool for `chat` the way an approved model call would.
+    async fn run_tool(tools: &HostedTickTools, chat: Uuid, name: &str, input: Value) -> Value {
+        let prepared = tools
+            .prepare_call(chat, name, &input, CancellationToken::new())
+            .await
+            .unwrap();
+        completed(
+            tools
+                .execute_prepared(chat, prepared, CancellationToken::new())
+                .await,
+        )
+    }
+
+    fn counter_command(owner: &Owner) -> Value {
+        let counter = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/ticks/counter.py")
+            .canonicalize()
+            .unwrap();
+        json!({"action":"open","command":[super::support::fixture_cli::executable(), "--tick-launch", "--", "/usr/bin/python3", "-u", counter],"cwd":owner.root,"placement":{"type":"hidden"}})
+    }
+
+    /// A Loop subscribed to a hosted Tick: the quiet Tick costs no model call, its Watch keeps it
+    /// from idling, an update wakes the Loop with the new content, and stopping the Loop ends
+    /// the Watch so the Tick idles out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hosted_tick_update_reaches_the_loop_subscribed_to_it() {
+        use tickloop_agent::runtime::EventKind;
+        let model = Arc::new(super::support::ScriptedModel::new(Vec::new()));
+        let owner = Owner::start_with(model.clone(), Duration::from_secs(2), 1).await;
+        let (runtime, chat) = (owner.runtimes[0].clone(), owner.chats[0]);
+        let tools = HostedTickTools::new(
+            OwnerControl::new(owner.grants[0].clone()),
+            vec![("PATH".into(), "/usr/bin:/bin".into())],
+        );
+        let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
+        let instance = opened["tick_instance_id"].clone();
+        let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
+        model.enqueue(super::support::call(
+            "subscribe",
+            "SubscribeTick",
+            json!({"tick_instance_id":instance,"every_seconds":5}),
+        ));
+        model.enqueue(super::support::text("watching"));
+        let mut events = runtime.subscribe();
+        runtime
+            .submit(chat, None, "Watch the counter".into())
+            .await
+            .unwrap();
+        loop {
+            match super::support::next_event(&mut events).await.kind {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        let subscriptions = runtime.tick_subscriptions(chat).await.unwrap();
+        assert_eq!(subscriptions.len(), 1, "{subscriptions:?}");
+        let watched = async {
+            for _ in 0..200 {
+                let records = launch_records(&owner.root, chat);
+                if records[0]["watches"]
+                    .as_array()
+                    .is_some_and(|watches| watches.len() == 1)
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            false
+        };
+        assert!(watched.await, "the Watch reached the owner as an intent");
+
+        tokio::time::sleep(Duration::from_millis(5500)).await;
+        assert!(super::alive(business_pid), "the Watch keeps the quiet Tick");
+        assert_eq!(
+            model.requests.lock().unwrap().len(),
+            2,
+            "a quiet Tick wakes nothing"
+        );
+        model.enqueue(super::support::text("update observed"));
+        run_tool(
+            &tools,
+            chat,
+            "CallTickTool",
+            json!({"tick_instance_id":instance,"tool":"increment","args":{"amount":7}}),
+        )
+        .await;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(15), events.recv())
+                .await
+                .expect("the update wakes the Loop")
+                .unwrap();
+            match event.kind {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        {
+            let requests = model.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            let woken = serde_json::to_string(&requests[2].messages).unwrap();
+            assert!(
+                woken.contains("\\\"value\\\":7") || woken.contains("\"value\":7"),
+                "{woken}"
+            );
+        }
+
+        runtime.stop(chat, subscriptions[0].loop_id).await.unwrap();
+        assert!(
+            super::gone(business_pid).await,
+            "without its Watch the Tick idles out"
+        );
+    }
+
+    /// A Herdr endpoint that records every request it receives and serves an empty Workspace,
+    /// answering anything else as unsupported.
+    struct RecordingHerdr {
+        socket: std::path::PathBuf,
+        methods: Arc<std::sync::Mutex<Vec<String>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl RecordingHerdr {
+        fn start(socket: std::path::PathBuf) -> Self {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let methods = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = methods.clone();
+            let task = tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let mut stream = BufReader::new(stream);
+                    let mut line = String::new();
+                    if stream.read_line(&mut line).await.is_err() {
+                        continue;
+                    }
+                    let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    let method = request["method"].as_str().unwrap_or_default().to_owned();
+                    recorded.lock().unwrap().push(method.clone());
+                    let response = if method == "pane.list" {
+                        json!({"id":request["id"],"result":{"panes":[]}})
+                    } else {
+                        json!({"id":request["id"],"error":{"code":"UnknownMethod","message":method}})
+                    };
+                    let _ = stream
+                        .get_mut()
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await;
+                }
+            });
+            Self {
+                socket,
+                methods,
+                task,
+            }
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.methods.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for RecordingHerdr {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// Submits `text` to `chat` and, once its run completes, returns by call id the tool results
+    /// of that run and of any child it delegated to in the foreground.
+    async fn run_turn(
+        runtime: &Agent,
+        chat: Uuid,
+        text: &str,
+    ) -> std::collections::BTreeMap<String, tickloop_agent::tools::ToolResult> {
+        use tickloop_agent::runtime::EventKind;
+        let mut events = runtime.subscribe();
+        let receipt = runtime.submit(chat, None, text.into()).await.unwrap();
+        let mut results = std::collections::BTreeMap::new();
+        loop {
+            let event = super::support::next_event(&mut events).await;
+            match event.kind {
+                EventKind::ToolCompleted { call_id, result } => {
+                    results.insert(call_id, result);
+                }
+                EventKind::Completed { .. } if event.run_id == receipt.run_id => return results,
+                EventKind::Failed(error) if event.run_id == receipt.run_id => panic!("{error}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// A worker in a Herdr View opens a Tick hidden in the Tick host unless asked for a
+    /// placement: the Tick joins the Chat's Monitor without a subscription or any Herdr layout,
+    /// streams to the Loop that subscribes to it, and closes through its host. Only an explicit
+    /// placement asks Herdr for a visible Pane.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_herdr_worker_opens_hidden_by_default_and_streams_the_hosted_tick() {
+        use tickloop_agent::{
+            agent_access::ConfigurationChange, permissions::ExecutionMode, runtime::EventKind,
+        };
+        let directory = tempfile::Builder::new()
+            .prefix("thh")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let herdr = RecordingHerdr::start(directory.path().join("herdr.sock"));
+        let model = Arc::new(super::support::ScriptedModel::new(Vec::new()));
+        let owner = Owner::start_in_herdr(model.clone(), herdr.socket.clone(), 1).await;
+        let (runtime, chat) = (owner.runtimes[0].clone(), owner.chats[0]);
+        owner
+            .command(AgentCommand::Configure {
+                provider: None,
+                execution: owner.executions[0],
+                change: ConfigurationChange::ExecutionMode {
+                    mode: ExecutionMode::FullAccess,
+                },
+            })
+            .await;
+        let mut open = counter_command(&owner);
+        open.as_object_mut().unwrap().remove("placement");
+        model.enqueue(super::support::call("open", "ModifyTick", open));
+        model.enqueue(super::support::text("opened"));
+        let results = run_turn(&runtime, chat, "Open the counter").await;
+        assert!(!results["open"].is_error, "{}", results["open"].content);
+        let opened: Value = serde_json::from_str(&results["open"].content).unwrap();
+        assert_eq!(opened["status"], "opened", "{opened}");
+        assert_eq!(opened["host"], "tick-host", "{opened}");
+        assert_eq!(opened["visibility"], "hidden", "{opened}");
+        let instance = opened["tick_instance_id"].as_str().unwrap().to_owned();
+        assert!(instance.starts_with("hosted:"), "{instance}");
+        assert!(
+            herdr.methods().is_empty(),
+            "a hidden open asks Herdr nothing: {:?}",
+            herdr.methods()
+        );
+        let members = runtime.snapshot(chat).await.unwrap().monitor.members;
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| (member.instance.as_str(), member.source))
+                .collect::<Vec<_>>(),
+            vec![(
+                instance.as_str(),
+                tickloop_agent::runtime::MonitorMemberSource::Opened
+            )],
+            "the hidden Tick joins this Chat's Monitor"
+        );
+        assert!(
+            runtime.tick_subscriptions(chat).await.unwrap().is_empty(),
+            "opening never subscribes"
+        );
+
+        model.enqueue(super::support::call(
+            "subscribe",
+            "SubscribeTick",
+            json!({"tick_instance_id":instance,"every_seconds":5}),
+        ));
+        model.enqueue(super::support::text("watching"));
+        let results = run_turn(&runtime, chat, "Watch the counter").await;
+        assert!(
+            !results["subscribe"].is_error,
+            "{}",
+            results["subscribe"].content
+        );
+        assert_eq!(runtime.tick_subscriptions(chat).await.unwrap().len(), 1);
+        let mut events = runtime.subscribe();
+        model.enqueue(super::support::text("update observed"));
+        run_tool(
+            &HostedTickTools::new(
+                OwnerControl::new(owner.grants[0].clone()),
+                vec![("PATH".into(), "/usr/bin:/bin".into())],
+            ),
+            chat,
+            "CallTickTool",
+            json!({"tick_instance_id":instance,"tool":"increment","args":{"amount":7}}),
+        )
+        .await;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(15), events.recv())
+                .await
+                .expect("the hosted update wakes the Loop")
+                .unwrap();
+            match event.kind {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        let woken = serde_json::to_string(&model.requests.lock().unwrap()[4].messages).unwrap();
+        assert!(
+            woken.contains("\\\"value\\\":7") || woken.contains("\"value\":7"),
+            "{woken}"
+        );
+
+        model.enqueue(super::support::call(
+            "visible",
+            "ModifyTick",
+            json!({"action":"open","command":["/bin/cat"],"cwd":owner.root,"workspace_id":HERDR_WORKSPACE,"placement":{"type":"new_tab"}}),
+        ));
+        model.enqueue(super::support::call(
+            "close",
+            "ModifyTick",
+            json!({"action":"close","tick_instance_id":instance}),
+        ));
+        model.enqueue(super::support::text("done"));
+        let results = run_turn(&runtime, chat, "Show cat, then close the counter").await;
+        assert!(
+            !herdr.methods().is_empty(),
+            "an explicit placement opens through Herdr"
+        );
+        assert!(
+            !results["visible"].content.contains("tick-host"),
+            "{}",
+            results["visible"].content
+        );
+        let closed: Value = serde_json::from_str(&results["close"].content).unwrap();
+        assert_eq!(closed["status"], "closed", "{closed}");
+        assert_eq!(closed["host"], "tick-host", "{closed}");
+        assert_eq!(closed["tick_instance_id"], instance);
+    }
+
+    /// A child delegated in a Herdr worker inherits both backends' authorities for its tools,
+    /// yet hosted Ticks stay with the Chat that opened them: the child cannot open one, and
+    /// reading its parent's is refused by ownership rather than by a Herdr Workspace check.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delegated_child_cannot_open_or_use_its_parents_hosted_tick() {
+        use tickloop_agent::{agent_access::ConfigurationChange, permissions::ExecutionMode};
+        let directory = tempfile::Builder::new()
+            .prefix("thd")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let herdr = RecordingHerdr::start(directory.path().join("herdr.sock"));
+        let model = Arc::new(super::support::ScriptedModel::new(Vec::new()));
+        let owner = Owner::start_in_herdr(model.clone(), herdr.socket.clone(), 1).await;
+        let (runtime, chat) = (owner.runtimes[0].clone(), owner.chats[0]);
+        owner
+            .command(AgentCommand::Configure {
+                provider: None,
+                execution: owner.executions[0],
+                change: ConfigurationChange::ExecutionMode {
+                    mode: ExecutionMode::FullAccess,
+                },
+            })
+            .await;
+        let parents = HostedTickTools::new(
+            OwnerControl::new(owner.grants[0].clone()),
+            vec![("PATH".into(), "/usr/bin:/bin".into())],
+        );
+        let opened = run_tool(&parents, chat, "ModifyTick", counter_command(&owner)).await;
+        let instance = opened["tick_instance_id"].clone();
+        let mut child_open = counter_command(&owner);
+        child_open.as_object_mut().unwrap().remove("placement");
+        for reply in [
+            super::support::call(
+                "delegate",
+                "Subagent",
+                json!({"task":"Inspect the counter."}),
+            ),
+            super::support::call(
+                "child-read",
+                "ReadTick",
+                json!({"tick_instance_id":instance}),
+            ),
+            super::support::call("child-open", "ModifyTick", child_open),
+            super::support::text("The child is done."),
+            super::support::text("Delegated."),
+        ] {
+            model.enqueue(reply);
+        }
+        let mut events = runtime.subscribe();
+        let results = run_turn(&runtime, chat, "Delegate the inspection").await;
+        let child = loop {
+            let event = events.try_recv().unwrap();
+            if event.chat_id != chat {
+                break event.chat_id;
+            }
+        };
+        assert!(
+            !results["delegate"].is_error,
+            "{}",
+            results["delegate"].content
+        );
+        let read = &results["child-read"];
+        assert!(read.is_error, "{}", read.content);
+        assert!(
+            read.content
+                .contains("not a running hosted Tick of this Chat"),
+            "{}",
+            read.content
+        );
+        let open = &results["child-open"];
+        assert!(open.is_error, "{}", open.content);
+        assert!(
+            open.content.contains("Unsupported") && open.content.contains("launch"),
+            "{}",
+            open.content
+        );
+        let ceiling = serde_json::to_value(
+            &runtime
+                .snapshot(child)
+                .await
+                .unwrap()
+                .delegation
+                .unwrap()
+                .ceiling
+                .host_tools,
+        )
+        .unwrap();
+        for (tool, backends) in [
+            ("ReadTick", 2),
+            ("CallTickTool", 2),
+            ("ModifyTick", 2),
+            ("ReadWorkspace", 1),
+        ] {
+            assert_eq!(
+                ceiling[tool].as_array().map(Vec::len),
+                Some(backends),
+                "{tool}: {ceiling}"
+            );
+        }
+        let read = run_tool(
+            &parents,
+            chat,
+            "ReadTick",
+            json!({"tick_instance_id":instance}),
+        )
+        .await;
+        assert_eq!(
+            read["content"]["value"], 0,
+            "the parent's Tick is untouched"
+        );
+    }
+
+    /// A model reopens a Tick lost with its host through ModifyTick: the reopen waits for
+    /// approval like any change, starts a new hidden instance in place of the lost one, and joins
+    /// the Chat's Monitor under the lost Tick's title without any subscription.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_model_reopens_a_lost_tick_only_after_approval_as_a_new_instance() {
+        use tickloop_agent::runtime::EventKind;
+        let model = Arc::new(super::support::ScriptedModel::new(Vec::new()));
+        let owner =
+            Owner::start_with(model.clone(), tick_host::host::DEFAULT_IDLE_TIMEOUT, 1).await;
+        let (runtime, chat) = (owner.runtimes[0].clone(), owner.chats[0]);
+        let tools = HostedTickTools::new(
+            OwnerControl::new(owner.grants[0].clone()),
+            vec![("PATH".into(), "/usr/bin:/bin".into())],
+        );
+        let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
+        let lost = opened["tick_instance_id"].as_str().unwrap().to_owned();
+        let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
+        let launcher = tick_host::process::sample(business_pid).unwrap().parent;
+        let host = tick_host::process::sample(launcher).unwrap().parent;
+        unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
+        assert!(super::gone(business_pid).await);
+        let host_paths = tick_host::paths::HostPaths {
+            runtime: owner.root.join("h"),
+        };
+
+        model.enqueue(super::support::call(
+            "reopen",
+            "ModifyTick",
+            json!({"action":"reopen","tick_instance_id":lost}),
+        ));
+        model.enqueue(super::support::text("reopened"));
+        let mut events = runtime.subscribe();
+        let receipt = runtime
+            .submit(chat, None, "Reopen the counter".into())
+            .await
+            .unwrap();
+        let mut result = None;
+        loop {
+            let event = super::support::next_event(&mut events).await;
+            match event.kind {
+                EventKind::PermissionRequested { request } => {
+                    assert_eq!(request.input["action"], "reopen");
+                    assert!(
+                        !host_paths.host_running().unwrap(),
+                        "nothing starts before approval"
+                    );
+                    runtime
+                        .answer_permission(chat, request.id, true)
+                        .await
+                        .unwrap();
+                }
+                EventKind::ToolCompleted {
+                    result: completed, ..
+                } => result = Some(completed),
+                EventKind::Completed { .. } if event.run_id == receipt.run_id => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        let result = result.unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        let reopened: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(reopened["status"], "opened", "{reopened}");
+        assert_eq!(reopened["visibility"], "hidden");
+        assert_eq!(reopened["replaces"], lost);
+        let instance = reopened["tick_instance_id"].as_str().unwrap();
+        assert_ne!(instance, lost, "a new instance");
+        assert_ne!(reopened["business_pid"], opened["business_pid"]);
+        let member = runtime
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .monitor
+            .members
+            .into_iter()
+            .find(|member| member.instance.as_str() == instance)
+            .expect("the reopened Tick joins Monitor");
+        assert_eq!(
+            member.source,
+            tickloop_agent::runtime::MonitorMemberSource::Opened
+        );
+        assert!(
+            member
+                .title
+                .as_deref()
+                .is_some_and(|title| title.contains("counter.py")),
+            "{member:?}"
+        );
+        assert!(
+            runtime.tick_subscriptions(chat).await.unwrap().is_empty(),
+            "no subscription follows a reopen"
+        );
+        run_tool(
+            &tools,
+            chat,
+            "ModifyTick",
+            json!({"action":"close","tick_instance_id":instance}),
+        )
+        .await;
+    }
+
+    /// Two Loops watch one hosted Tick: cancelling one keeps the other's Watch and deliveries,
+    /// and once the Tick's host dies the remaining Watch fails closed as gone, calling no model
+    /// and never rebinding to a later host.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_one_hosted_watch_keeps_the_other_and_a_dead_host_fails_closed() {
+        use tickloop_agent::runtime::{EventKind, TickLinkState, TickSubscriptionChange};
+        let model = Arc::new(super::support::ScriptedModel::new(Vec::new()));
+        let owner =
+            Owner::start_with(model.clone(), tick_host::host::DEFAULT_IDLE_TIMEOUT, 1).await;
+        let (runtime, chat) = (owner.runtimes[0].clone(), owner.chats[0]);
+        let tools = HostedTickTools::new(
+            OwnerControl::new(owner.grants[0].clone()),
+            vec![("PATH".into(), "/usr/bin:/bin".into())],
+        );
+        let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
+        let instance = opened["tick_instance_id"].clone();
+        let mut events = runtime.subscribe();
+        let run = |name: &'static str| {
+            model.enqueue(super::support::call(
+                name,
+                "SubscribeTick",
+                json!({"tick_instance_id":instance,"every_seconds":5}),
+            ));
+            model.enqueue(super::support::text("watching"));
+        };
+        for (name, prompt) in [("a", "Watch it as A"), ("b", "Watch it as B")] {
+            run(name);
+            let receipt = runtime.submit(chat, None, prompt.into()).await.unwrap();
+            loop {
+                let event = super::support::next_event(&mut events).await;
+                if event.run_id == receipt.run_id
+                    && matches!(event.kind, EventKind::Completed { .. })
+                {
+                    break;
+                }
+            }
+        }
+        let subscriptions = runtime.tick_subscriptions(chat).await.unwrap();
+        assert_eq!(subscriptions.len(), 2, "{subscriptions:?}");
+        let watch_count = |count: usize| {
+            let root = owner.root.clone();
+            async move {
+                for _ in 0..200 {
+                    if launch_records(&root, chat)[0]["watches"]
+                        .as_array()
+                        .is_some_and(|watches| watches.len() == count)
+                    {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                false
+            }
+        };
+        assert!(watch_count(2).await);
+        runtime
+            .update_tick_subscription(chat, subscriptions[0].id, TickSubscriptionChange::Cancel)
+            .await
+            .unwrap();
+        assert!(watch_count(1).await, "only the cancelled Watch ended");
+
+        let before = model.requests.lock().unwrap().len();
+        model.enqueue(super::support::text("update observed"));
+        run_tool(
+            &tools,
+            chat,
+            "CallTickTool",
+            json!({"tick_instance_id":instance,"tool":"increment","args":{"amount":1}}),
+        )
+        .await;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(15), events.recv())
+                .await
+                .expect("the remaining Watch is delivered")
+                .unwrap();
+            if matches!(event.kind, EventKind::Completed { .. }) {
+                break;
+            }
+        }
+        assert_eq!(model.requests.lock().unwrap().len(), before + 1);
+
+        let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
+        let launcher = tick_host::process::sample(business_pid).unwrap().parent;
+        let host = tick_host::process::sample(launcher).unwrap().parent;
+        unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
+        assert!(super::gone(business_pid).await);
+        let remaining = subscriptions[1].id;
+        let mut is_gone = false;
+        for _ in 0..120 {
+            let link = runtime
+                .tick_subscriptions(chat)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|subscription| subscription.id == remaining)
+                .map(|subscription| subscription.link);
+            if link == Some(TickLinkState::InstanceGone) {
+                is_gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(is_gone, "the Watch of a Tick whose host died fails closed");
+        run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(
+            model.requests.lock().unwrap().len(),
+            before + 1,
+            "nothing reached the model after the host died"
+        );
+    }
+
+    /// A View's Monitor lists its Chat's hosted Ticks with a process sample of each and closes
+    /// the one its user picks; the other keeps running.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_monitor_lists_hosted_ticks_with_samples_and_closes_the_one_picked() {
+        let owner = Owner::start(1).await;
+        let (chat, execution) = (owner.chats[0], owner.executions[0]);
+        let tools = HostedTickTools::new(
+            OwnerControl::new(owner.grants[0].clone()),
+            vec![("PATH".into(), "/usr/bin:/bin".into())],
+        );
+        let closed = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
+        let kept = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
+        let CommandResult::HostedTicks(members) = owner
+            .command(AgentCommand::ListHostedTicks { execution })
+            .await
+        else {
+            panic!("hosted Ticks expected");
+        };
+        assert_eq!(members.len(), 2);
+        for opened in [&closed, &kept] {
+            let member = members
+                .iter()
+                .find(|member| json!(member.instance) == opened["tick_instance_id"])
+                .unwrap();
+            let sample = member.resources.as_ref().expect("a process sample");
+            assert_eq!(json!(sample.business_pid), opened["business_pid"]);
+            assert!(sample.rss_bytes.is_some_and(|bytes| bytes > 0));
+        }
+        let instance = serde_json::from_value(closed["tick_instance_id"].clone()).unwrap();
+        assert!(matches!(
+            owner
+                .command(AgentCommand::CloseHostedTick {
+                    execution,
+                    instance,
+                })
+                .await,
+            CommandResult::Done
+        ));
+        assert!(super::gone(closed["business_pid"].as_u64().unwrap() as u32).await);
+        assert!(super::alive(kept["business_pid"].as_u64().unwrap() as u32));
+        let records = launch_records(&owner.root, chat);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["instance"], kept["tick_instance_id"]);
+    }
+
+    /// A View reads its Chat's hosted Tick as a screen snapshot and attaches through a one-time
+    /// view grant from the owner; neither hands it the Tick's data token, and another Chat's Tick
+    /// is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_view_gets_a_snapshot_and_a_one_time_attach_grant_for_its_chats_tick_only() {
+        use tick_connect::hosted::{CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role};
+        let owner = Owner::start(2).await;
+        let (chat, execution, other) = (owner.chats[0], owner.executions[0], owner.executions[1]);
+        let tools = HostedTickTools::new(
+            OwnerControl::new(owner.grants[0].clone()),
+            vec![("PATH".into(), "/usr/bin:/bin".into())],
+        );
+        let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
+        let instance: tick_connect::instance::InstanceRef =
+            serde_json::from_value(opened["tick_instance_id"].clone()).unwrap();
+        let snapshot = loop {
+            let CommandResult::HostedTickSnapshot(snapshot) = owner
+                .command(AgentCommand::HostedTickSnapshot {
+                    execution,
+                    instance: instance.clone(),
+                })
+                .await
+            else {
+                panic!("a snapshot expected");
+            };
+            if snapshot
+                .screen
+                .lines
+                .iter()
+                .any(|line| line.contains("Counter: 0"))
+            {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(!snapshot.screen.truncated);
+        assert!(snapshot.taken_at_ms > 0);
+        for command in [
+            AgentCommand::HostedTickSnapshot {
+                execution: other,
+                instance: instance.clone(),
+            },
+            AgentCommand::AttachHostedTick {
+                execution: other,
+                instance: instance.clone(),
+            },
+        ] {
+            assert!(
+                owner.try_command(command).await.is_err(),
+                "another Chat's Tick is refused"
+            );
+        }
+        let CommandResult::HostedTickView(grant) = owner
+            .command(AgentCommand::AttachHostedTick {
+                execution,
+                instance: instance.clone(),
+            })
+            .await
+        else {
+            panic!("a view grant expected");
+        };
+        assert_eq!(grant.instance, instance);
+        let viewer = || {
+            HostConnection::connect(
+                &grant.endpoint,
+                Role::Viewer {
+                    instance: grant.instance.clone(),
+                    view: grant.view,
+                },
+                &[CAPABILITY_DATA],
+            )
+        };
+        let mut view = viewer().await.unwrap();
+        assert_eq!(view.epoch(), grant.host_epoch);
+        let attached = view
+            .request(
+                "attach",
+                json!({"size":{"rows":24,"columns":80}}),
+                CONTROL_TIMEOUT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(attached["attached"], true);
+        let frame = view.next_event().await.unwrap().unwrap();
+        assert_eq!(frame["event"], "frame", "{frame}");
+        assert!(viewer().await.is_err(), "the grant works once");
+    }
+
+    /// A Tick whose host died is lost: nothing reopens it on its own. Its user reopens it as a new
+    /// instance with a new process; the lost instance's subscription stays gone rather than
+    /// following it, and asking again never starts a second one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tick_lost_with_its_host_reopens_only_explicitly_as_a_new_instance() {
+        use tickloop_agent::{
+            hosted::tools::HostedMemberState,
+            runtime::{EventKind, TickLinkState},
+        };
+        let model = Arc::new(super::support::ScriptedModel::new(Vec::new()));
+        let owner =
+            Owner::start_with(model.clone(), tick_host::host::DEFAULT_IDLE_TIMEOUT, 1).await;
+        let (runtime, chat, execution) = (
+            owner.runtimes[0].clone(),
+            owner.chats[0],
+            owner.executions[0],
+        );
+        let tools = HostedTickTools::new(
+            OwnerControl::new(owner.grants[0].clone()),
+            vec![("PATH".into(), "/usr/bin:/bin".into())],
+        );
+        let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&owner)).await;
+        let lost: tick_connect::instance::InstanceRef =
+            serde_json::from_value(opened["tick_instance_id"].clone()).unwrap();
+        model.enqueue(super::support::call(
+            "subscribe",
+            "SubscribeTick",
+            json!({"tick_instance_id":lost,"every_seconds":5}),
+        ));
+        model.enqueue(super::support::text("watching"));
+        let mut events = runtime.subscribe();
+        runtime.submit(chat, None, "Watch it".into()).await.unwrap();
+        loop {
+            if matches!(
+                super::support::next_event(&mut events).await.kind,
+                EventKind::Completed { .. }
+            ) {
+                break;
+            }
+        }
+
+        let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
+        let launcher = tick_host::process::sample(business_pid).unwrap().parent;
+        let host = tick_host::process::sample(launcher).unwrap().parent;
+        unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
+        assert!(super::gone(business_pid).await);
+        // The subscription's Watch is recorded in the background; a record written while a
+        // listing runs is judged by the next listing, so the loss may show one listing later.
+        let mut members = Vec::new();
+        for _ in 0..200 {
+            let CommandResult::HostedTicks(listed) = owner
+                .command(AgentCommand::ListHostedTicks { execution })
+                .await
+            else {
+                panic!("hosted Ticks expected");
+            };
+            members = listed;
+            if !members.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].instance, lost);
+        assert_eq!(members[0].state, HostedMemberState::Lost);
+        let host_paths = tick_host::paths::HostPaths {
+            runtime: owner.root.join("h"),
+        };
+        assert!(
+            !host_paths.host_running().unwrap(),
+            "nothing reopened by itself"
+        );
+
+        let CommandResult::HostedTickReopened {
+            instance: reopened,
+            membership,
+        } = owner
+            .command(AgentCommand::ReopenHostedTick {
+                execution,
+                instance: lost.clone(),
+            })
+            .await
+        else {
+            panic!("a reopened Tick expected");
+        };
+        assert_ne!(reopened, lost, "a new instance");
+        assert!(
+            membership
+                .members
+                .iter()
+                .any(|member| member.instance == reopened)
+        );
+        let CommandResult::HostedTicks(members) = owner
+            .command(AgentCommand::ListHostedTicks { execution })
+            .await
+        else {
+            panic!("hosted Ticks expected");
+        };
+        let running = members
+            .iter()
+            .find(|member| member.instance == reopened)
+            .unwrap();
+        let new_pid = running.resources.as_ref().unwrap().business_pid;
+        assert_ne!(new_pid, business_pid, "a new process");
+        assert!(super::alive(new_pid));
+        let records = launch_records(&owner.root, chat);
+        assert!(
+            records
+                .iter()
+                .any(|record| record["state"] == "reopened" && record["instance"] == json!(lost))
+        );
+
+        let mut is_gone = false;
+        for _ in 0..120 {
+            let subscriptions = runtime.tick_subscriptions(chat).await.unwrap();
+            if subscriptions[0].instance == lost
+                && subscriptions[0].link == TickLinkState::InstanceGone
+            {
+                is_gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert!(is_gone, "the lost instance's subscription is not rebound");
+
+        let CommandResult::HostedTickReopened {
+            instance: again, ..
+        } = owner
+            .command(AgentCommand::ReopenHostedTick {
+                execution,
+                instance: lost.clone(),
+            })
+            .await
+        else {
+            panic!("the earlier reopen expected");
+        };
+        assert_eq!(
+            again, reopened,
+            "asking again never starts a second instance"
+        );
+        let CommandResult::HostedTicks(members) = owner
+            .command(AgentCommand::ListHostedTicks { execution })
+            .await
+        else {
+            panic!("hosted Ticks expected");
+        };
+        assert_eq!(
+            members
+                .iter()
+                .filter(|member| member.state == HostedMemberState::Running)
+                .count(),
+            1
+        );
+    }
+
+    /// A cleanup whose finish answer never arrives still ends the deleted Chat's Ticks: the
+    /// owner settles the deletion itself once the cleanup lets go of the Chat.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deletion_whose_finish_is_lost_is_settled_by_the_owner_itself() {
+        let owner = Owner::start(1).await;
+        OwnerControl::new(owner.grants[0].clone())
+            .request(list(owner.chats[0]))
+            .await
+            .unwrap();
+        let deleted = Uuid::new_v4();
+        let tick = owner.open_counter(deleted).await;
+        let transcript = owner
+            .config_root
+            .join(format!("projects/-work/{deleted}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "{}\n").unwrap();
+        let cleanup = super::hold_retention(&owner.config_root, deleted);
+        OwnerControl::new(owner.grants[0].clone())
+            .request(WorkerRequest::BeginChatDeletion {
+                chat: deleted,
+                operation: Uuid::new_v4(),
+            })
+            .await
+            .unwrap();
+        std::fs::remove_file(&transcript).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            super::alive(tick.business_pid),
+            "nothing ends while the cleanup holds the Chat"
+        );
+        drop(cleanup);
+        assert!(super::gone(tick.business_pid).await);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while owner.owner_state(deleted).is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the owner must finish durable deletion after the process exits");
+    }
+
+    /// A lost Tick whose working directory was replaced after it opened is not reopened: the
+    /// user opens it again, under a fresh approval.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lost_tick_whose_launch_changed_is_not_reopened() {
+        let owner = Owner::start(1).await;
+        let (chat, execution) = (owner.chats[0], owner.executions[0]);
+        let tools = HostedTickTools::new(
+            OwnerControl::new(owner.grants[0].clone()),
+            vec![("PATH".into(), "/usr/bin:/bin".into())],
+        );
+        let work = owner.root.join("work");
+        std::fs::create_dir(&work).unwrap();
+        let mut command = counter_command(&owner);
+        command["cwd"] = json!(work);
+        let opened = run_tool(&tools, chat, "ModifyTick", command).await;
+        let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
+        let launcher = tick_host::process::sample(business_pid).unwrap().parent;
+        let host = tick_host::process::sample(launcher).unwrap().parent;
+        unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
+        assert!(super::gone(business_pid).await);
+        std::fs::remove_dir(&work).unwrap();
+        std::fs::create_dir(&work).unwrap();
+        let refused = owner
+            .server
+            .execute(CommandEnvelope {
+                owner_epoch: owner.epoch,
+                command_id: Uuid::new_v4(),
+                command: AgentCommand::ReopenHostedTick {
+                    execution,
+                    instance: serde_json::from_value(opened["tick_instance_id"].clone()).unwrap(),
+                },
+            })
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap_err();
+        assert!(refused.message.contains("LaunchChanged"), "{refused:?}");
+    }
+
+    /// The launch records the owner keeps for one Chat under the config root.
+    fn launch_records(root: &std::path::Path, chat: Uuid) -> Vec<Value> {
+        let directory = root.join("state/tick-host/chats").join(chat.to_string());
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("launch-"))
+            .map(|entry| serde_json::from_slice(&std::fs::read(entry.path()).unwrap()).unwrap())
+            .collect()
     }
 }
 
 mod lifecycle {
-    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use std::{sync::Arc, time::Duration};
+
+    use super::{alive, gone, hold_retention};
 
     use serde_json::json;
     use tick_connect::hosted::{CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role};
@@ -829,11 +2462,12 @@ for line in sys.stdin:
         directory: tempfile::TempDir,
         paths: HostPaths,
         owner: TickOwner,
+        idle_timeout: Duration,
     }
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            super::stop_test_host(
+            super::support::stop_tick_host(
                 &self.paths.runtime,
                 &self.directory.path().join("tick-host.key"),
             );
@@ -842,6 +2476,10 @@ for line in sys.stdin:
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_idle_timeout(tick_host::host::DEFAULT_IDLE_TIMEOUT)
+        }
+
+        fn with_idle_timeout(idle_timeout: Duration) -> Self {
             let directory = tempfile::Builder::new()
                 .prefix("thl")
                 .tempdir_in("/private/tmp")
@@ -856,6 +2494,7 @@ for line in sys.stdin:
                     root: "fixture-root".into(),
                     chat: Uuid::new_v4(),
                 },
+                idle_timeout,
             }
         }
 
@@ -866,38 +2505,16 @@ for line in sys.stdin:
                 self.paths.clone(),
                 Uuid::new_v4(),
                 super::support::fixture_cli::executable(),
+                self.idle_timeout,
             )
         }
 
         fn request(&self, program: Vec<String>) -> OpenRequest {
-            let mut command = vec![
-                super::support::fixture_cli::executable()
-                    .to_string_lossy()
-                    .into_owned(),
-                "--tick-launch".into(),
-                "--".into(),
-            ];
-            command.extend(program);
-            OpenRequest {
-                operation: Uuid::new_v4(),
-                owner: self.owner.clone(),
-                command,
-                cwd: self.directory.path().to_path_buf(),
-                environment: vec![("PATH".into(), "/usr/bin:/bin".into())],
-                title: None,
-            }
+            super::tick_request(self.owner.clone(), self.directory.path(), program)
         }
 
         fn counter(&self) -> OpenRequest {
-            let counter = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../examples/ticks/counter.py")
-                .canonicalize()
-                .unwrap();
-            self.request(vec![
-                "/usr/bin/python3".into(),
-                "-u".into(),
-                counter.to_string_lossy().into_owned(),
-            ])
+            super::counter_request(self.owner.clone(), self.directory.path())
         }
 
         async fn reader(&self, opened: &OpenedTick) -> HostConnection {
@@ -922,20 +2539,6 @@ for line in sys.stdin:
             }
             false
         }
-    }
-
-    fn alive(pid: u32) -> bool {
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
-    }
-
-    async fn gone(pid: u32) -> bool {
-        for _ in 0..400 {
-            if !alive(pid) {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        false
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -970,6 +2573,307 @@ for line in sys.stdin:
         assert!(matches!(receipt, Receipt::Closed { .. }));
         assert!(gone(opened.business_pid).await);
         assert!(fixture.host_exits().await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_owner_reconciles_its_registry_with_the_running_host() {
+        use tickloop_agent::hosted::registry::{LaunchRecord, LaunchState, OwnerState, Registry};
+        let fixture = Fixture::new();
+        let controller = fixture.controller();
+        let config_root = fixture.directory.path().join("state");
+        std::fs::create_dir(&config_root).unwrap();
+        let registry = Registry::default();
+        let root = registry.root(&config_root).await.unwrap();
+        let open_for = |chat: Uuid| {
+            let mut request = fixture.counter();
+            request.owner.chat = chat;
+            request
+        };
+        let kept_request = open_for(fixture.owner.chat);
+        let kept = controller.open(kept_request.clone()).await.unwrap();
+        let mut kept_record = LaunchRecord::opening(
+            kept_request.operation,
+            fixture.owner.chat,
+            kept_request.command.clone(),
+            kept_request.cwd.clone(),
+            None,
+        )
+        .unwrap();
+        kept_record.state = LaunchState::Live {
+            instance: kept.instance.clone(),
+            host_epoch: kept.terminal.epoch,
+        };
+        root.record_launch(&kept_record).await.unwrap();
+        // A Tick whose Chat the registry no longer lists; one whose StopSubagent end was decided
+        // but not carried out when the previous owner stopped; and deletions whose finish was
+        // lost: Transcript gone, Transcript still there, cleanup still holding the lock.
+        let orphan = controller.open(open_for(Uuid::new_v4())).await.unwrap();
+        let (stopping_chat, deleted_chat, present_chat, held_chat) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let stopping = controller.open(open_for(stopping_chat)).await.unwrap();
+        let deleted = controller.open(open_for(deleted_chat)).await.unwrap();
+        let present = controller.open(open_for(present_chat)).await.unwrap();
+        let held = controller.open(open_for(held_chat)).await.unwrap();
+        let stop = Uuid::new_v4();
+        root.set_owner_state(stopping_chat, &OwnerState::Stopping { operation: stop })
+            .await
+            .unwrap();
+        for chat in [deleted_chat, present_chat, held_chat] {
+            root.begin_deletion(chat, Uuid::new_v4()).await.unwrap();
+        }
+        let project = config_root.join("projects/-work");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(format!("{present_chat}.jsonl")), "{}\n").unwrap();
+        let cleanup = hold_retention(&config_root, held_chat);
+
+        root.reconcile_with_host(&controller, &fixture.owner.root)
+            .await
+            .unwrap();
+
+        assert!(
+            gone(orphan.business_pid).await,
+            "a Tick of no listed Chat is reaped"
+        );
+        assert!(
+            gone(stopping.business_pid).await,
+            "a decided end is carried out"
+        );
+        assert_eq!(
+            root.owner_state(stopping_chat).await.unwrap(),
+            OwnerState::Stopped { operation: stop }
+        );
+        assert!(
+            gone(deleted.business_pid).await,
+            "a Chat whose Transcript is gone ends"
+        );
+        assert!(
+            !root.chats().await.unwrap().contains(&deleted_chat),
+            "a deleted Chat leaves no state"
+        );
+        assert!(alive(kept.business_pid), "a listed Chat keeps its Tick");
+        assert!(
+            alive(present.business_pid),
+            "a Transcript that is still there keeps its Chat"
+        );
+        assert_eq!(
+            root.owner_state(present_chat).await.unwrap(),
+            OwnerState::Active
+        );
+        assert!(
+            alive(held.business_pid),
+            "a cleanup that still holds the lock is not second-guessed"
+        );
+        assert!(matches!(
+            root.owner_state(held_chat).await.unwrap(),
+            OwnerState::Deleting { .. }
+        ));
+        drop(cleanup);
+
+        let launcher = tick_host::process::sample(kept.business_pid)
+            .unwrap()
+            .parent;
+        let host = tick_host::process::sample(launcher).unwrap().parent;
+        unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
+        assert!(gone(kept.business_pid).await);
+        root.reconcile_with_host(&controller, &fixture.owner.root)
+            .await
+            .unwrap();
+        let records = root.launches(fixture.owner.chat).await.unwrap();
+        assert!(
+            matches!(&records[0].state, LaunchState::Lost { instance, .. } if *instance == kept.instance),
+            "the record of a Tick whose host died is Lost: {records:?}"
+        );
+        assert!(
+            !root.chats().await.unwrap().contains(&held_chat),
+            "once the cleanup released the lock, its removed Transcript ends the Chat"
+        );
+        assert!(
+            !fixture.paths.host_running().unwrap(),
+            "reconciling starts no host"
+        );
+    }
+
+    /// A new owner hands the host the Watch intents its registry committed, replacing what the
+    /// host held, and drops the records of instances the same host no longer runs instead of
+    /// keeping them for recovery.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconcile_hands_the_host_the_committed_watches_and_drops_idled_out_records() {
+        use std::collections::BTreeSet;
+        use tickloop_agent::hosted::registry::{LaunchRecord, LaunchState, Registry};
+        let fixture = Fixture::with_idle_timeout(Duration::from_secs(2));
+        let controller = fixture.controller();
+        let config_root = fixture.directory.path().join("state");
+        std::fs::create_dir(&config_root).unwrap();
+        let registry = Registry::default();
+        let root = registry.root(&config_root).await.unwrap();
+        // The host still holds a Watch for both; the registry committed that the first one's
+        // Watches all ended while the owner was away.
+        let mut ticks = Vec::new();
+        for committed in [BTreeSet::new(), BTreeSet::from([Uuid::new_v4()])] {
+            let request = fixture.counter();
+            let opened = controller.open(request.clone()).await.unwrap();
+            controller
+                .set_intents(
+                    &fixture.owner,
+                    &opened.instance,
+                    &BTreeSet::from([Uuid::new_v4()]),
+                )
+                .await
+                .unwrap();
+            let mut record = LaunchRecord::opening(
+                request.operation,
+                fixture.owner.chat,
+                request.command,
+                request.cwd,
+                None,
+            )
+            .unwrap();
+            record.state = LaunchState::Live {
+                instance: opened.instance.clone(),
+                host_epoch: opened.terminal.epoch,
+            };
+            record.watches = committed;
+            root.record_launch(&record).await.unwrap();
+            ticks.push(opened);
+        }
+        let [unwatched, watched] = <[_; 2]>::try_from(ticks).unwrap();
+
+        root.reconcile_with_host(&controller, &fixture.owner.root)
+            .await
+            .unwrap();
+        assert!(
+            gone(unwatched.business_pid).await,
+            "the host dropped the Watch the registry no longer has"
+        );
+        assert!(alive(watched.business_pid), "the committed Watch keeps it");
+        root.reconcile_with_host(&controller, &fixture.owner.root)
+            .await
+            .unwrap();
+        let records = root.launches(fixture.owner.chat).await.unwrap();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].instance(), Some(&watched.instance));
+        assert!(matches!(records[0].state, LaunchState::Live { .. }));
+
+        root.set_watches(
+            &controller,
+            &fixture.owner,
+            &watched.instance,
+            BTreeSet::new(),
+        )
+        .await
+        .unwrap();
+        assert!(gone(watched.business_pid).await);
+        assert!(fixture.host_exits().await);
+        root.reconcile_with_host(&controller, &fixture.owner.root)
+            .await
+            .unwrap();
+        assert!(
+            root.launches(fixture.owner.chat).await.unwrap().is_empty(),
+            "a host that exited after all its Ticks ended leaves nothing to recover"
+        );
+    }
+
+    /// A listing settles only records older than itself: an open that completed while the
+    /// host was being listed is neither dropped nor taken for lost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_record_written_after_a_listing_began_waits_for_the_next_one() {
+        use tickloop_agent::hosted::{
+            controller::OwnerListing,
+            registry::{LaunchRecord, LaunchState, Registry},
+        };
+        let fixture = Fixture::new();
+        let controller = fixture.controller();
+        let config_root = fixture.directory.path().join("state");
+        std::fs::create_dir(&config_root).unwrap();
+        let root = Registry::default().root(&config_root).await.unwrap();
+        let request = fixture.counter();
+        let mut record = LaunchRecord::opening(
+            request.operation,
+            fixture.owner.chat,
+            request.command,
+            request.cwd,
+            None,
+        )
+        .unwrap();
+        record.state = LaunchState::Live {
+            instance: tick_connect::instance::InstanceRef::hosted(Uuid::new_v4()),
+            host_epoch: Uuid::new_v4(),
+        };
+        let earlier = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        root.record_launch(&record).await.unwrap();
+        let stale = OwnerListing {
+            started_ms: earlier,
+            running: None,
+        };
+        root.settle_launches(&controller, &fixture.owner, &stale)
+            .await
+            .unwrap();
+        assert!(matches!(
+            root.launches(fixture.owner.chat).await.unwrap()[0].state,
+            LaunchState::Live { .. }
+        ));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let later = controller.owner_listing(&fixture.owner).await.unwrap();
+        root.settle_launches(&controller, &fixture.owner, &later)
+            .await
+            .unwrap();
+        assert!(matches!(
+            root.launches(fixture.owner.chat).await.unwrap()[0].state,
+            LaunchState::Lost { .. }
+        ));
+    }
+
+    /// A Watch change during a listing rewrites the record but not its state: the listing still
+    /// settles it, so a Tick lost with its host is never hidden by a Watch renewal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_watch_change_during_a_listing_does_not_hide_a_lost_tick() {
+        use tickloop_agent::hosted::registry::{LaunchRecord, LaunchState, Registry};
+        let fixture = Fixture::new();
+        let controller = fixture.controller();
+        let config_root = fixture.directory.path().join("state");
+        std::fs::create_dir(&config_root).unwrap();
+        let root = Registry::default().root(&config_root).await.unwrap();
+        let request = fixture.counter();
+        let instance = tick_connect::instance::InstanceRef::hosted(Uuid::new_v4());
+        let mut record = LaunchRecord::opening(
+            request.operation,
+            fixture.owner.chat,
+            request.command,
+            request.cwd,
+            None,
+        )
+        .unwrap();
+        record.state = LaunchState::Live {
+            instance: instance.clone(),
+            host_epoch: Uuid::new_v4(),
+        };
+        root.record_launch(&record).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let listing = controller.owner_listing(&fixture.owner).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        root.set_watches(
+            &controller,
+            &fixture.owner,
+            &instance,
+            [Uuid::new_v4()].into_iter().collect(),
+        )
+        .await
+        .unwrap();
+        root.settle_launches(&controller, &fixture.owner, &listing)
+            .await
+            .unwrap();
+        assert!(matches!(
+            root.launches(fixture.owner.chat).await.unwrap()[0].state,
+            LaunchState::Lost { .. }
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1151,14 +3055,20 @@ for line in sys.stdin:
         }
         let mut host = command.spawn().unwrap();
         let mut stdin = host.stdin.take().unwrap();
-        writeln!(stdin, "{key}").unwrap();
+        let config = tick_host::host::HostConfig {
+            controller_key: key.clone(),
+            idle_timeout: tick_host::host::DEFAULT_IDLE_TIMEOUT,
+        };
+        writeln!(stdin, "{}", serde_json::to_string(&config).unwrap()).unwrap();
         drop(stdin);
-        for _ in 0..200 {
+        // The starved host must serve before the owner asks, or the owner would start its own.
+        for _ in 0..1000 {
             if fixture.paths.socket().exists() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        assert!(fixture.paths.socket().exists(), "the starved host serves");
         let controller = fixture.controller();
         let refused = controller.open(fixture.counter()).await.unwrap_err();
         assert!(!refused.dispatched, "{refused:?}");
@@ -1212,7 +3122,7 @@ for line in sys.stdin:
         }
         assert_eq!(last, "line 1499", "no tail line is lost");
         let read = reader
-            .request("read", json!({}), CONTROL_TIMEOUT)
+            .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
             .await
             .unwrap();
         assert_eq!(read["data"]["lines"], 1500);
@@ -1245,7 +3155,7 @@ for line in sys.stdin:
                 .unwrap();
         }
         let read = reader
-            .request("read", json!({}), CONTROL_TIMEOUT)
+            .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
             .await
             .unwrap();
         assert_eq!(read["data"]["value"], 200);

@@ -939,7 +939,7 @@ async fn transcript_cleanup_removes_its_private_denial_sidecar() {
         .unwrap()
         .set_modified(SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60))
         .unwrap();
-    let _ = cleanup_old_message_files_in_background(&root);
+    let _ = cleanup_old_message_files_in_background(&root, &support::AcceptingOwner);
     assert!(!transcript.exists());
     assert!(!sidecar.exists());
 }

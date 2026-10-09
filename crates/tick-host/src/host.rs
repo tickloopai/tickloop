@@ -48,6 +48,12 @@ use crate::{
 /// A host that was never used exits after this grace.
 pub const INITIAL_GRACE: Duration = Duration::from_secs(5);
 pub const REAP_INTERVAL: Duration = Duration::from_millis(250);
+/// A Tick nobody attaches to, watches or explicitly uses for this long is reaped.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// The start configuration the owner writes on the host's standard input.
+const CONFIG_BYTES: u64 = 1024;
+/// How long a host's emptied mark is kept for owners to settle that host's records.
+const EMPTIED_MARK_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Polite termination before SIGKILL.
 pub const TERMINATE_GRACE: Duration = Duration::from_secs(3);
 pub const RECEIPT_CAPACITY: usize = 4096;
@@ -58,6 +64,8 @@ pub const DIAGNOSTIC_CHARACTERS: usize = 256;
 pub const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The send buffer requested for an attached view; it holds one current frame at a time.
 pub const ATTACH_SEND_BUFFER_BYTES: usize = 64 * 1024;
+/// How long a view grant waits for its view to connect.
+pub const VIEW_GRANT_TIMEOUT: Duration = CONTROL_TIMEOUT;
 /// After the host finished stopping, how long a waiting `shutdown_host` may take to answer.
 pub const SHUTDOWN_REPLY_GRACE: Duration = Duration::from_secs(1);
 /// A failed accept (such as a full descriptor table) is retried after this pause.
@@ -84,6 +92,9 @@ pub struct TickOwner {
 pub struct OpenRequest {
     pub operation: Uuid,
     pub owner: TickOwner,
+    /// The owner registry revision this open was decided at; an owner ended at this revision or
+    /// later cannot open.
+    pub owner_revision: u64,
     pub command: Vec<String>,
     pub cwd: PathBuf,
     pub environment: Vec<(String, String)>,
@@ -106,6 +117,10 @@ pub enum Receipt {
     Opened(OpenedTick),
     Closed {
         instance: InstanceRef,
+    },
+    OwnerEnded {
+        owner: TickOwner,
+        instances: Vec<InstanceRef>,
     },
     Failed(HostError),
 }
@@ -139,6 +154,11 @@ pub enum ReapReason {
     Closed,
     /// The Tick never became ready or exited while starting.
     LaunchFailed,
+    /// A complete owner snapshot no longer lists its Chat.
+    Orphaned,
+    OwnerEnded,
+    /// Nobody attached, watched or explicitly used it for the idle timeout.
+    Idle,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -146,6 +166,15 @@ pub struct ReapedTick {
     pub terminal: Uuid,
     pub instance: Option<InstanceRef>,
     pub reason: ReapReason,
+}
+
+/// Whether a read is someone's explicit use of the Tick, which keeps it from idling, or an
+/// automatic baseline or poll, which does not.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadActivity {
+    Explicit,
+    Automatic,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -181,10 +210,71 @@ struct HostedTick {
     launcher_pid: u32,
     lifecycle: watch::Sender<Lifecycle>,
     session: Mutex<Option<SessionClient>>,
+    /// The last open, explicit read or call, attached input, or removal of the last Watch
+    /// intent; nothing automatic counts.
     last_activity_ms: AtomicU64,
     attached: AtomicBool,
+    /// The one view its owner last allowed to attach, until that view connects or the grant
+    /// expires; a newer grant replaces it.
+    view_grant: std::sync::Mutex<Option<ViewGrant>>,
+    /// The approved Watches that keep this Tick, as its owner last reported them.
+    intents: std::sync::Mutex<WatchIntents>,
     screen_changes: watch::Sender<()>,
     terminal_closed: CancellationToken,
+}
+
+/// A one-time permission for one view to attach to a Tick's terminal.
+struct ViewGrant {
+    view: Uuid,
+    expires: std::time::Instant,
+}
+
+impl ViewGrant {
+    /// Takes the grant if `view` names it and it has not expired; a grant works once.
+    fn claim(grant: &mut Option<Self>, view: Uuid, now: std::time::Instant) -> bool {
+        match grant.take() {
+            Some(granted) if granted.view == view && now < granted.expires => true,
+            Some(granted) if granted.view != view => {
+                *grant = Some(granted);
+                false
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Watch intents are a lease: each report renews them, and ones not renewed within the idle
+/// timeout lapse, so a Watch whose worker or Loop is gone never keeps a Tick forever.
+#[derive(Default)]
+struct WatchIntents {
+    watches: HashSet<Uuid>,
+    renewed_ms: u64,
+}
+
+impl HostedTick {
+    fn note_activity(&self) {
+        self.last_activity_ms
+            .store(Host::now_ms(), Ordering::SeqCst);
+    }
+
+    /// Drops intents that were not renewed in time; their lapse restarts the idle time.
+    fn lapse_stale_intents(&self, now_ms: u64, idle_timeout: Duration) {
+        let mut intents = self.intents.lock().unwrap();
+        if !intents.watches.is_empty()
+            && now_ms.saturating_sub(intents.renewed_ms) >= idle_timeout.as_millis() as u64
+        {
+            intents.watches.clear();
+            self.note_activity();
+        }
+    }
+
+    fn is_idle(&self, now_ms: u64, idle_timeout: Duration) -> bool {
+        matches!(*self.lifecycle.borrow(), Lifecycle::Live { .. })
+            && !self.attached.load(Ordering::SeqCst)
+            && self.intents.lock().unwrap().watches.is_empty()
+            && now_ms.saturating_sub(self.last_activity_ms.load(Ordering::SeqCst))
+                >= idle_timeout.as_millis() as u64
+    }
 }
 
 /// Operation receipts, newest kept, each readable only by the owner it was made for.
@@ -248,13 +338,55 @@ pub struct HostState {
     exiting: bool,
     controller_generation: u64,
     controller_epoch: Option<Uuid>,
+    /// Per config root: the last applied owner snapshot revision and one being received.
+    snapshots: HashMap<String, RootSnapshots>,
+    /// Owners ended at a registry revision; their opens at that revision or earlier fail.
+    ended: HashMap<TickOwner, u64>,
     diagnostics: Diagnostics,
+}
+
+#[derive(Default)]
+struct RootSnapshots {
+    applied_revision: Option<u64>,
+    staged: Option<StagedSnapshot>,
+}
+
+/// A complete owner snapshot arrives in chunks and is applied only once every chunk arrived.
+struct StagedSnapshot {
+    revision: u64,
+    chunks: u32,
+    received: std::collections::BTreeSet<u32>,
+    owners: HashSet<Uuid>,
+}
+
+/// What the owner starts a host with.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostConfig {
+    pub controller_key: String,
+    #[serde(rename = "idle_timeout_ms", with = "milliseconds")]
+    pub idle_timeout: Duration,
+}
+
+mod milliseconds {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(duration.as_millis() as u64)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
+        u64::deserialize(deserializer).map(Duration::from_millis)
+    }
 }
 
 pub struct Host {
     paths: HostPaths,
     epoch: Uuid,
     controller_key: String,
+    idle_timeout: Duration,
     started: Instant,
     state: Mutex<HostState>,
     shutdown: CancellationToken,
@@ -393,7 +525,20 @@ impl Host {
         slave
             .attach(&mut command)
             .map_err(|error| HostError::before("TerminalUnavailable", error.to_string()))?;
+        // The registry guard covers the owner fence, the spawn and the publication of the launch
+        // token: an owner end either comes first and refuses this launch, or comes after the
+        // Tick is registered and ends it with the rest.
         let mut state = self.state.lock().await;
+        if state
+            .ended
+            .get(&request.owner)
+            .is_some_and(|ended| request.owner_revision <= *ended)
+        {
+            return Err(HostError::before(
+                "OwnerEnded",
+                "this owner was ended; it cannot open Ticks",
+            ));
+        }
         let launcher = command
             .spawn()
             .map_err(|error| HostError::before("LaunchFailed", error.to_string()))?;
@@ -416,6 +561,8 @@ impl Host {
             session: Mutex::new(None),
             last_activity_ms: AtomicU64::new(Self::now_ms()),
             attached: AtomicBool::new(false),
+            view_grant: std::sync::Mutex::new(None),
+            intents: std::sync::Mutex::new(WatchIntents::default()),
             screen_changes: watch::channel(()).0,
             terminal_closed: CancellationToken::new(),
         });
@@ -509,6 +656,127 @@ impl Host {
         Ok(receipt)
     }
 
+    /// Applies one chunk of a complete owner snapshot of `root`. Only the last chunk of a revision
+    /// newer than the applied one reaps: Ticks of that root whose Chat is missing and that are
+    /// not still opening. Partial, older or repeated snapshots never reap.
+    async fn reconcile_owners(&self, snapshot: OwnerSnapshotChunk) -> Result<Value, HostError> {
+        let OwnerSnapshotChunk {
+            root,
+            revision,
+            chunk,
+            chunks,
+            owners,
+        } = snapshot;
+        if chunks == 0 || chunk >= chunks {
+            return Err(HostError::before(
+                "InvalidArguments",
+                "a snapshot chunk must lie within its chunk count",
+            ));
+        }
+        let orphans = {
+            let mut state = self.state.lock().await;
+            let snapshots = state.snapshots.entry(root.clone()).or_default();
+            if snapshots
+                .applied_revision
+                .is_some_and(|applied| revision <= applied)
+            {
+                return Err(HostError::before(
+                    "Fenced",
+                    "a newer owner snapshot was already applied",
+                ));
+            }
+            if !snapshots
+                .staged
+                .as_ref()
+                .is_some_and(|staged| staged.revision == revision && staged.chunks == chunks)
+            {
+                snapshots.staged = Some(StagedSnapshot {
+                    revision,
+                    chunks,
+                    received: Default::default(),
+                    owners: HashSet::new(),
+                });
+            }
+            let staged = snapshots.staged.as_mut().expect("staged above");
+            staged.received.insert(chunk);
+            staged.owners.extend(owners);
+            if staged.received.len() < chunks as usize {
+                return Ok(json!({"revision":revision,"applied":false}));
+            }
+            let alive = std::mem::take(&mut staged.owners);
+            snapshots.staged = None;
+            snapshots.applied_revision = Some(revision);
+            state
+                .ticks
+                .values()
+                .filter(|tick| {
+                    tick.owner.root == root
+                        && !alive.contains(&tick.owner.chat)
+                        && matches!(*tick.lifecycle.borrow(), Lifecycle::Live { .. })
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let reaped = self.end_ticks(orphans, ReapReason::Orphaned).await;
+        Ok(json!({"revision":revision,"applied":true,"reaped":reaped}))
+    }
+
+    /// Ends every Tick of `owner` and fences its later opens at `revision`.
+    async fn end_owner(
+        &self,
+        owner: TickOwner,
+        revision: u64,
+        operation: Uuid,
+    ) -> Result<Receipt, HostError> {
+        let ticks = {
+            let mut state = self.state.lock().await;
+            if let Some(receipt) = state.receipts.get(operation, &owner)
+                && receipt != Receipt::Dispatched
+            {
+                return Ok(receipt);
+            }
+            let ended = state.ended.entry(owner.clone()).or_default();
+            *ended = (*ended).max(revision);
+            state
+                .receipts
+                .record(operation, &owner, Receipt::Dispatched);
+            state
+                .ticks
+                .values()
+                .filter(|tick| tick.owner == owner)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let instances = self.end_ticks(ticks, ReapReason::OwnerEnded).await;
+        let receipt = Receipt::OwnerEnded {
+            owner: owner.clone(),
+            instances,
+        };
+        self.record_receipt(operation, &owner, receipt.clone())
+            .await;
+        Ok(receipt)
+    }
+
+    /// Ends `ticks` side by side, so one that ignores SIGTERM delays none of the others.
+    async fn end_ticks(&self, ticks: Vec<Arc<HostedTick>>, reason: ReapReason) -> Vec<InstanceRef> {
+        let mut ended = Vec::new();
+        let mut stopping = tokio::task::JoinSet::new();
+        for tick in &ticks {
+            if let Lifecycle::Live { instance, .. } =
+                tick.lifecycle.send_replace(Lifecycle::Closing)
+            {
+                ended.push(instance);
+            }
+            let tick = tick.clone();
+            stopping.spawn(async move { stop_launcher(&tick).await });
+        }
+        stopping.join_all().await;
+        for tick in ticks {
+            self.reap(tick.terminal, reason).await;
+        }
+        ended
+    }
+
     async fn reap(&self, terminal: Uuid, reason: ReapReason) {
         let mut state = self.state.lock().await;
         let Some(tick) = state.ticks.remove(&terminal) else {
@@ -527,7 +795,55 @@ impl Host {
         tick.terminal_closed.cancel();
     }
 
-    /// Reaps Ticks whose launcher exited and reports whether the host should exit as empty.
+    /// Lets one view attach to `owner`'s Tick `instance`, replacing any earlier grant for it.
+    async fn allow_view(
+        &self,
+        owner: &TickOwner,
+        instance: &InstanceRef,
+    ) -> Result<Value, HostError> {
+        let tick = self
+            .tick_by_instance(instance)
+            .await
+            .filter(|tick| &tick.owner == owner)
+            .ok_or_else(|| HostError::before("TargetGone", "no such Tick of this owner"))?;
+        let view = Uuid::new_v4();
+        *tick.view_grant.lock().unwrap() = Some(ViewGrant {
+            view,
+            expires: std::time::Instant::now() + VIEW_GRANT_TIMEOUT,
+        });
+        Ok(json!({"instance":instance,"view":view,"epoch":self.epoch}))
+    }
+
+    /// Replaces and renews the approved Watch intents of one of `owner`'s Ticks. Removing the
+    /// last one restarts the Tick's idle time.
+    async fn set_intents(
+        &self,
+        owner: &TickOwner,
+        instance: &InstanceRef,
+        watches: HashSet<Uuid>,
+    ) -> Result<Value, HostError> {
+        let tick = self
+            .tick_by_instance(instance)
+            .await
+            .filter(|tick| &tick.owner == owner)
+            .ok_or_else(|| HostError::before("TargetGone", "no such Tick of this owner"))?;
+        let count = watches.len();
+        let previous = std::mem::replace(
+            &mut *tick.intents.lock().unwrap(),
+            WatchIntents {
+                watches,
+                renewed_ms: Self::now_ms(),
+            },
+        )
+        .watches;
+        if count == 0 && !previous.is_empty() {
+            tick.note_activity();
+        }
+        Ok(json!({"instance":instance,"watches":count}))
+    }
+
+    /// Reaps Ticks whose launcher exited or that stayed idle, and reports whether the host
+    /// should exit as empty.
     async fn sweep(&self) -> bool {
         let ticks = self
             .state
@@ -537,6 +853,7 @@ impl Host {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let mut idle = Vec::new();
         for tick in ticks {
             let exited = tick
                 .launcher
@@ -544,8 +861,14 @@ impl Host {
                 .is_ok_and(|mut launcher| !matches!(launcher.try_wait(), Ok(None)));
             if exited {
                 self.reap(tick.terminal, ReapReason::Exited).await;
+                continue;
+            }
+            tick.lapse_stale_intents(Self::now_ms(), self.idle_timeout);
+            if tick.is_idle(Self::now_ms(), self.idle_timeout) {
+                idle.push(tick);
             }
         }
+        self.end_ticks(idle, ReapReason::Idle).await;
         let mut state = self.state.lock().await;
         state.exiting = state.ticks.is_empty()
             && state.pending_opens == 0
@@ -599,7 +922,9 @@ impl Host {
             limit,
         )
         .map_err(|error| HostError::before(error.code(), error.to_string()))?;
-        Ok(json!(page))
+        let mut listed = json!(page);
+        listed["epoch"] = json!(self.epoch);
+        Ok(listed)
     }
 
     async fn diagnostics(&self) -> Value {
@@ -633,6 +958,17 @@ impl Host {
         while closing.join_next().await.is_some() {}
         self.state.lock().await.ticks.clear();
     }
+}
+
+/// One chunk of a complete owner snapshot: every Chat of `root` that still owns hosted Ticks.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerSnapshotChunk {
+    pub root: String,
+    pub revision: u64,
+    pub chunk: u32,
+    pub chunks: u32,
+    pub owners: Vec<Uuid>,
 }
 
 /// Ends a launcher's process group: SIGTERM, up to three seconds, then SIGKILL. Only the group of
@@ -715,7 +1051,7 @@ pub fn random_token() -> String {
 
 /// Runs the host until it is shut down or stays empty. The listener is bound only after the
 /// exclusive lock is held, so a live host is never replaced.
-pub async fn serve(paths: HostPaths, controller_key: String) -> std::io::Result<()> {
+pub async fn serve(paths: HostPaths, config: HostConfig) -> std::io::Result<()> {
     paths.prepare()?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -744,13 +1080,15 @@ pub async fn serve(paths: HostPaths, controller_key: String) -> std::io::Result<
         }
         std::fs::remove_file(&socket)?;
     }
+    paths.prune_emptied(EMPTIED_MARK_RETENTION);
     let listener = UnixListener::bind(&socket)?;
     std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     let identity = paths::file_identity(&socket)?;
     let host = Arc::new(Host {
         paths,
         epoch: Uuid::new_v4(),
-        controller_key,
+        controller_key: config.controller_key,
+        idle_timeout: config.idle_timeout,
         started: Instant::now(),
         state: Mutex::new(HostState {
             ticks: HashMap::new(),
@@ -758,6 +1096,8 @@ pub async fn serve(paths: HostPaths, controller_key: String) -> std::io::Result<
             pending_opens: 0,
             ever_used: false,
             exiting: false,
+            snapshots: HashMap::new(),
+            ended: HashMap::new(),
             controller_generation: 0,
             controller_epoch: None,
             diagnostics: Diagnostics::default(),
@@ -768,6 +1108,7 @@ pub async fn serve(paths: HostPaths, controller_key: String) -> std::io::Result<
     });
     let mut sweep = tokio::time::interval(REAP_INTERVAL);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut emptied = false;
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -779,6 +1120,7 @@ pub async fn serve(paths: HostPaths, controller_key: String) -> std::io::Result<
             },
             _ = sweep.tick() => {
                 if host.sweep().await {
+                    emptied = true;
                     break;
                 }
             }
@@ -789,6 +1131,10 @@ pub async fn serve(paths: HostPaths, controller_key: String) -> std::io::Result<
     host.shutdown.cancel();
     host.shutdown_state.send_replace(ShutdownState::Stopping);
     host.shut_down().await;
+    if emptied {
+        // Without the mark an owner later counts this host's Ticks as lost rather than ended.
+        let _ = host.paths.record_emptied(host.epoch);
+    }
     paths::remove_if_identity(&socket, identity);
     host.shutdown_state.send_replace(ShutdownState::Completed);
     // Requesters waiting on a completed shutdown answer before the process leaves.
@@ -925,6 +1271,8 @@ enum Authority {
         generation: u64,
     },
     Instance(Arc<HostedTick>),
+    /// The one view a grant let in; it can only attach.
+    Viewer(Arc<HostedTick>),
     /// The one connection of a pending launch; `verified` once it proved its foreground.
     Launcher {
         tick: Arc<HostedTick>,
@@ -963,6 +1311,18 @@ async fn authenticate(host: &Arc<Host>, role: Role) -> Result<Authority, HostErr
             .filter(|tick| same_secret(&data_token, &tick.data_token))
             .map(Authority::Instance)
             .ok_or_else(|| HostError::before("Forbidden", "unknown instance or data token")),
+        Role::Viewer { instance, view } => host
+            .tick_by_instance(&instance)
+            .await
+            .filter(|tick| {
+                ViewGrant::claim(
+                    &mut tick.view_grant.lock().unwrap(),
+                    view,
+                    std::time::Instant::now(),
+                )
+            })
+            .map(Authority::Viewer)
+            .ok_or_else(|| HostError::before("Forbidden", "unknown, expired or used view grant")),
         Role::Launcher {
             operation,
             launch_token,
@@ -1079,9 +1439,9 @@ async fn business(
         let id = request["id"].clone();
         let method = request["method"].as_str().unwrap_or_default().to_owned();
         let params = request.get("params").cloned().unwrap_or(json!({}));
-        if let Authority::Instance(tick) = &authority {
+        if let Authority::Instance(tick) | Authority::Viewer(tick) = &authority {
             match method.as_str() {
-                "watch" => {
+                "watch" if matches!(authority, Authority::Instance(_)) => {
                     return stream_observations(reader, writer, &host, tick.clone(), &id).await;
                 }
                 "attach" => match AttachLease::acquire(tick, params) {
@@ -1104,6 +1464,10 @@ async fn business(
                 controller_request(&host, *generation, &method, params).await
             }
             Authority::Instance(tick) => instance_request(tick, &method, params).await,
+            Authority::Viewer(_) => Err(HostError::before(
+                "MethodNotAllowed",
+                format!("a view can only attach, not {method:?}"),
+            )),
             Authority::Launcher { tick, verified } => {
                 launcher_request(&host, tick, verified, &method, params).await
             }
@@ -1178,6 +1542,48 @@ async fn controller_request(
             host.list(owner.as_ref(), cursor, limit).await
         }
         "diagnostics" => Ok(host.diagnostics().await),
+        "set_intents" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Intents {
+                owner: TickOwner,
+                instance: InstanceRef,
+                watches: HashSet<Uuid>,
+            }
+            let Intents {
+                owner,
+                instance,
+                watches,
+            } = parameters(params)?;
+            host.set_intents(&owner, &instance, watches).await
+        }
+        "allow_view" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Allow {
+                owner: TickOwner,
+                instance: InstanceRef,
+            }
+            let Allow { owner, instance } = parameters(params)?;
+            host.allow_view(&owner, &instance).await
+        }
+        "reconcile_owners" => host.reconcile_owners(parameters(params)?).await,
+        "end_owner" => {
+            #[derive(Deserialize)]
+            struct End {
+                owner: TickOwner,
+                revision: u64,
+                operation: Uuid,
+            }
+            let End {
+                owner,
+                revision,
+                operation,
+            } = parameters(params)?;
+            host.end_owner(owner, revision, operation)
+                .await
+                .map(|receipt| json!(receipt))
+        }
         _ => Err(HostError::before(
             "MethodNotAllowed",
             format!("the controller role has no {method:?} method"),
@@ -1222,8 +1628,15 @@ async fn instance_request(
             .map(|descriptor| json!(descriptor))
             .map_err(session_error),
         "read" => {
-            tick.last_activity_ms
-                .store(Host::now_ms(), Ordering::SeqCst);
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Read {
+                activity: ReadActivity,
+            }
+            let Read { activity } = parameters(params)?;
+            if activity == ReadActivity::Explicit {
+                tick.note_activity();
+            }
             session(tick)
                 .await?
                 .read()
@@ -1238,8 +1651,7 @@ async fn instance_request(
                 args: Value,
             }
             let Call { tool, args } = parameters(params)?;
-            tick.last_activity_ms
-                .store(Host::now_ms(), Ordering::SeqCst);
+            tick.note_activity();
             let client = session(tick).await?;
             tokio::time::timeout(
                 CALL_TIMEOUT,
@@ -1460,9 +1872,7 @@ impl AttachLease {
                 format!("input chunks are at most {ATTACH_INPUT_BYTES} bytes"),
             ));
         }
-        self.tick
-            .last_activity_ms
-            .store(Host::now_ms(), Ordering::SeqCst);
+        self.tick.note_activity();
         self.tick
             .pty
             .write_all(data)
@@ -1576,34 +1986,77 @@ fn request_send_buffer(writer: &OwnedWriteHalf, bytes: usize) {
     };
 }
 
-/// Reads the owner's controller key, one hexadecimal line, from the host's standard input.
-pub fn read_controller_key(input: impl std::io::Read) -> std::io::Result<String> {
+/// Reads the start configuration the owner writes on the host's standard input.
+pub fn read_config(input: impl std::io::Read) -> std::io::Result<HostConfig> {
     use std::io::BufRead;
     const KEY_CHARACTERS: usize = TOKEN_BYTES * 2;
     let mut line = String::new();
-    std::io::BufReader::new(input.take(KEY_CHARACTERS as u64 + 1)).read_line(&mut line)?;
-    let key = line.trim_end_matches('\n');
-    if key.len() != KEY_CHARACTERS || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(std::io::Error::other(
-            "the Tick host needs its controller key on standard input",
-        ));
-    }
-    Ok(key.to_owned())
+    std::io::BufReader::new(input.take(CONFIG_BYTES)).read_line(&mut line)?;
+    let config = serde_json::from_str::<HostConfig>(&line)
+        .ok()
+        .filter(|config| {
+            config.controller_key.len() == KEY_CHARACTERS
+                && config
+                    .controller_key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+        })
+        .ok_or_else(|| {
+            std::io::Error::other("the Tick host needs its start configuration on standard input")
+        })?;
+    Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn a_launcher_waits_until_its_registration_can_be_published() {
-        let directory = tempfile::tempdir().unwrap();
-        let host = Arc::new(Host {
+    #[test]
+    fn a_view_grant_is_claimed_once_by_its_own_view_before_it_expires() {
+        let now = std::time::Instant::now();
+        let view = Uuid::new_v4();
+        let mut grant = Some(ViewGrant {
+            view,
+            expires: now + VIEW_GRANT_TIMEOUT,
+        });
+        assert!(!ViewGrant::claim(&mut grant, Uuid::new_v4(), now));
+        assert!(grant.is_some(), "another view leaves the grant in place");
+        assert!(ViewGrant::claim(&mut grant, view, now));
+        assert!(
+            !ViewGrant::claim(&mut grant, view, now),
+            "a grant works once"
+        );
+        let mut expired = Some(ViewGrant { view, expires: now });
+        assert!(!ViewGrant::claim(&mut expired, view, now));
+        assert!(expired.is_none(), "an expired grant is gone");
+    }
+
+    #[test]
+    fn the_start_configuration_needs_a_well_formed_key_and_idle_time() {
+        let key = random_token();
+        let config = read_config(
+            format!("{{\"controller_key\":\"{key}\",\"idle_timeout_ms\":2000}}\n").as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(config.controller_key, key);
+        assert_eq!(config.idle_timeout, Duration::from_secs(2));
+        for refused in [
+            format!("{key}\n"),
+            "{\"controller_key\":\"short\",\"idle_timeout_ms\":2000}\n".to_owned(),
+            format!("{{\"controller_key\":\"{key}\"}}\n"),
+        ] {
+            assert!(read_config(refused.as_bytes()).is_err(), "{refused}");
+        }
+    }
+
+    fn test_host(directory: &tempfile::TempDir) -> Arc<Host> {
+        Arc::new(Host {
             paths: HostPaths {
                 runtime: directory.path().join("host"),
             },
             epoch: Uuid::new_v4(),
             controller_key: random_token(),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             started: Instant::now(),
             state: Mutex::new(HostState {
                 ticks: HashMap::new(),
@@ -1611,6 +2064,8 @@ mod tests {
                 pending_opens: 0,
                 ever_used: false,
                 exiting: false,
+                snapshots: HashMap::new(),
+                ended: HashMap::new(),
                 controller_generation: 0,
                 controller_epoch: None,
                 diagnostics: Diagnostics::default(),
@@ -1618,10 +2073,17 @@ mod tests {
             shutdown: CancellationToken::new(),
             shutdown_requests: std::sync::Mutex::new(HashSet::new()),
             shutdown_state: watch::channel(ShutdownState::Running).0,
-        });
+        })
+    }
+
+    #[tokio::test]
+    async fn a_launcher_waits_until_its_registration_can_be_published() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = test_host(&directory);
         let request = OpenRequest {
             operation: Uuid::new_v4(),
             owner: owner(),
+            owner_revision: 0,
             command: vec![
                 "/bin/sh".into(),
                 "-c".into(),
@@ -1651,6 +2113,45 @@ mod tests {
             !started_without_registration,
             "a launcher ran before its token registration could be published"
         );
+    }
+
+    #[tokio::test]
+    async fn an_owner_ended_while_its_launch_waits_for_the_registry_never_starts() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = test_host(&directory);
+        let request = OpenRequest {
+            operation: Uuid::new_v4(),
+            owner: owner(),
+            owner_revision: 3,
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf started > started".into(),
+            ],
+            cwd: directory.path().to_path_buf(),
+            environment: Vec::new(),
+            title: None,
+        };
+        let mut registry = host.state.lock().await;
+        let launching = {
+            let host = Arc::clone(&host);
+            let request = request.clone();
+            tokio::spawn(async move { host.launch(&request).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        registry.ended.insert(request.owner.clone(), 3);
+        drop(registry);
+        let outcome = tokio::time::timeout(CONTROL_TIMEOUT, launching)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.unwrap_err().code, "OwnerEnded");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !directory.path().join("started").exists(),
+            "nothing spawned"
+        );
+        assert!(host.state.lock().await.ticks.is_empty());
     }
 
     fn owner() -> TickOwner {

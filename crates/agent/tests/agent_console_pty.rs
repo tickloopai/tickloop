@@ -30,6 +30,9 @@ mod auto_review;
 #[path = "agent_console_pty/provider_errors.rs"]
 mod provider_errors;
 
+#[path = "agent_console_pty/hosted_monitor.rs"]
+mod hosted_monitor;
+
 use std::{
     io::{Read, Write},
     panic::AssertUnwindSafe,
@@ -116,6 +119,7 @@ impl PrivateFixture {
     }
 
     async fn shutdown(&self) {
+        support::stop_tick_host(&self.path("tick-host"), &self.path("runtime/tick-host.key"));
         let endpoint = self.path("runtime/owner.sock");
         if endpoint.exists() {
             let client = self.client().await;
@@ -202,6 +206,7 @@ impl PtyView {
         command.env("HOME", fixture.path("home"));
         command.env("TICKLOOP_CONFIG_DIR", fixture.path("config"));
         command.env("TICKLOOP_AGENT_RUNTIME_DIR", fixture.path("runtime"));
+        command.env("TICKLOOP_TICK_HOST_RUNTIME_DIR", fixture.path("tick-host"));
         command.env("TICKLOOP_TMPDIR", fixture.path("scratch"));
         command.env("TMPDIR", fixture.path("scratch"));
         command.env("TICKLOOP_FIXTURE_API_KEY", "fixture-key");

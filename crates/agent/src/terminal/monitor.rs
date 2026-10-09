@@ -14,8 +14,8 @@ pub(super) const MONITOR_AUTO_MIN_COLUMNS: usize = 121;
 
 pub(super) use crate::tick_adapter::TickGroup;
 use crate::tick_adapter::{
-    MONITOR_ADD_KEY, MemberState, MonitorAction, MonitorContext, TickAdapters, TickDescriptor,
-    TickGlyph, TickOwner, TickResources, page_of,
+    MONITOR_ADD_KEY, MonitorAction, MonitorContext, TickAdapters, TickDescriptor, TickGlyph,
+    TickOwner, TickResources, page_of,
 };
 use crate::tick_stream::InstanceRef;
 
@@ -45,7 +45,7 @@ pub(super) struct Monitor {
     pub(super) subscriptions: Vec<crate::runtime::TickSubscriptionStatus>,
     pub(super) metadata: HashMap<String, Option<crate::artifacts::ArtifactMetadata>>,
     pub(super) metadata_failures: HashMap<String, String>,
-    pub(super) member_states: HashMap<InstanceRef, MemberState>,
+    pub(super) member_findings: crate::tick_adapter::MemberFindings,
     pub(super) confirmation: Option<TickConfirmation>,
     /// The visible page; the complete set is `total` rows.
     entries: Vec<MonitorEntry>,
@@ -114,7 +114,8 @@ impl Monitor {
             subscriptions: self.subscriptions.clone(),
             metadata: self.metadata.clone(),
             metadata_failures: self.metadata_failures.clone(),
-            member_states: self.member_states.clone(),
+            member_states: self.member_findings.states.clone(),
+            member_resources: self.member_findings.resources.clone(),
         };
         let listed = self
             .adapters
@@ -403,7 +404,7 @@ impl Monitor {
                         .map(|action| {
                             format!(
                                 "{} {}",
-                                if action.key == 'o' {
+                                if action.key == crate::tick_adapter::MONITOR_ENTER_KEY {
                                     "Enter".into()
                                 } else {
                                     action.key.to_string()
@@ -443,57 +444,57 @@ impl MonitorDetail {
             entry,
         }
     }
+}
 
-    fn facts(&self, now_ms: u64) -> Vec<String> {
-        let entry = &self.entry;
-        let mut facts = vec![
-            super::safe_line(&entry.title),
-            format!("Instance  {}", super::safe_line(entry.instance.as_str())),
-            format!("Kind      {}", entry.kind),
-            format!(
-                "State     {}",
-                if entry.status.is_empty() {
-                    "—"
-                } else {
-                    &entry.status
-                }
-            ),
-            format!("Owner     {}", entry.owner.label()),
-            format!("Updated   {}", relative_time(entry.updated_at_ms, now_ms)),
-        ];
-        match &entry.resources {
-            Some(sample) => {
-                let unavailable = || "unavailable".to_owned();
-                facts.push(format!("PID       {}", sample.pid));
-                facts.push(format!(
-                    "CPU time  {}",
-                    sample.cpu_time_ms.map_or_else(unavailable, |ms| format!(
-                        "{:.1}s",
-                        ms as f64 / MILLISECONDS_PER_SECOND
-                    ))
-                ));
-                facts.push(format!(
-                    "CPU       {}",
-                    sample
-                        .cpu_percent
-                        .map_or_else(unavailable, |percent| format!("{percent:.1}%"))
-                ));
-                facts.push(format!(
-                    "RSS       {}",
-                    sample.rss_bytes.map_or_else(unavailable, |bytes| format!(
-                        "{:.1} MiB",
-                        bytes as f64 / BYTES_PER_MIB
-                    ))
-                ));
-                facts.push(format!(
-                    "Sampled   {}",
-                    relative_time(Some(sample.sampled_at_ms), now_ms)
-                ));
+/// The public facts of one Monitor row: what the Chat recorded and the latest process sample.
+pub(super) fn member_facts(entry: &MonitorEntry, now_ms: u64) -> Vec<String> {
+    let mut facts = vec![
+        super::safe_line(&entry.title),
+        format!("Instance  {}", super::safe_line(entry.instance.as_str())),
+        format!("Kind      {}", entry.kind),
+        format!(
+            "State     {}",
+            if entry.status.is_empty() {
+                "—"
+            } else {
+                &entry.status
             }
-            None => facts.push("Resources unavailable".into()),
+        ),
+        format!("Owner     {}", entry.owner.label()),
+        format!("Updated   {}", relative_time(entry.updated_at_ms, now_ms)),
+    ];
+    match &entry.resources {
+        Some(sample) => {
+            let unavailable = || "unavailable".to_owned();
+            facts.push(format!("PID       {}", sample.pid));
+            facts.push(format!(
+                "CPU time  {}",
+                sample.cpu_time_ms.map_or_else(unavailable, |ms| format!(
+                    "{:.1}s",
+                    ms as f64 / MILLISECONDS_PER_SECOND
+                ))
+            ));
+            facts.push(format!(
+                "CPU       {}",
+                sample
+                    .cpu_percent
+                    .map_or_else(unavailable, |percent| format!("{percent:.1}%"))
+            ));
+            facts.push(format!(
+                "RSS       {}",
+                sample.rss_bytes.map_or_else(unavailable, |bytes| format!(
+                    "{:.1} MiB",
+                    bytes as f64 / BYTES_PER_MIB
+                ))
+            ));
+            facts.push(format!(
+                "Sampled   {}",
+                relative_time(Some(sample.sampled_at_ms), now_ms)
+            ));
         }
-        facts
+        None => facts.push("Resources unavailable".into()),
     }
+    facts
 }
 
 impl super::tick_actions::TickDetailView for MonitorDetail {
@@ -509,7 +510,7 @@ impl super::tick_actions::TickDetailView for MonitorDetail {
         height: usize,
         now: u64,
     ) -> Vec<super::tick_actions::TickDetailLine> {
-        self.facts(now)
+        member_facts(&self.entry, now)
             .into_iter()
             .take(height)
             .map(|text| {

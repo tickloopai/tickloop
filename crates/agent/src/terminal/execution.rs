@@ -2832,6 +2832,108 @@ impl ConsoleExecution {
             _ => Err(unexpected()),
         }
     }
+    pub(super) async fn hosted_ticks(
+        &self,
+        chat: Uuid,
+    ) -> Result<Vec<crate::hosted::tools::HostedMember>, AgentError> {
+        let execution = self.reference(chat).await?;
+        match self
+            .command(AgentCommand::ListHostedTicks { execution }, None)
+            .await?
+        {
+            CommandResult::HostedTicks(members) => Ok(members),
+            _ => Err(unexpected()),
+        }
+    }
+    pub(super) async fn reopen_hosted_tick(
+        &self,
+        chat: Uuid,
+        instance: crate::tick_stream::InstanceRef,
+    ) -> Result<
+        (
+            crate::tick_stream::InstanceRef,
+            tickloop_agent::runtime::MonitorMembership,
+        ),
+        AgentError,
+    > {
+        let execution = self.reference(chat).await?;
+        match self
+            .command(
+                AgentCommand::ReopenHostedTick {
+                    execution,
+                    instance,
+                },
+                None,
+            )
+            .await?
+        {
+            CommandResult::HostedTickReopened {
+                instance,
+                membership,
+            } => Ok((instance, membership)),
+            _ => Err(unexpected()),
+        }
+    }
+    pub(super) async fn close_hosted_tick(
+        &self,
+        chat: Uuid,
+        instance: crate::tick_stream::InstanceRef,
+    ) -> Result<(), AgentError> {
+        let execution = self.reference(chat).await?;
+        match self
+            .command(
+                AgentCommand::CloseHostedTick {
+                    execution,
+                    instance,
+                },
+                None,
+            )
+            .await?
+        {
+            CommandResult::Done => Ok(()),
+            _ => Err(unexpected()),
+        }
+    }
+    pub(super) async fn hosted_tick_snapshot(
+        &self,
+        chat: Uuid,
+        instance: crate::tick_stream::InstanceRef,
+    ) -> Result<tickloop_agent::hosted::tools::HostedSnapshot, AgentError> {
+        let execution = self.reference(chat).await?;
+        match self
+            .command(
+                AgentCommand::HostedTickSnapshot {
+                    execution,
+                    instance,
+                },
+                None,
+            )
+            .await?
+        {
+            CommandResult::HostedTickSnapshot(snapshot) => Ok(snapshot),
+            _ => Err(unexpected()),
+        }
+    }
+    pub(super) async fn attach_hosted_tick(
+        &self,
+        chat: Uuid,
+        instance: crate::tick_stream::InstanceRef,
+    ) -> Result<tickloop_agent::hosted::controller::HostedViewGrant, AgentError> {
+        let execution = self.reference(chat).await?;
+        match self
+            .command(
+                AgentCommand::AttachHostedTick {
+                    execution,
+                    instance,
+                },
+                None,
+            )
+            .await?
+        {
+            CommandResult::HostedTickView(grant) => Ok(grant),
+            _ => Err(unexpected()),
+        }
+    }
     pub(super) async fn tick_subscriptions(
         &self,
         chat: Uuid,

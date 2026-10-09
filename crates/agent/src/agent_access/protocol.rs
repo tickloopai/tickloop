@@ -18,9 +18,11 @@ use crate::{
     tools::{CommandSnapshot, SearchConfig},
 };
 
-/// Business 8.0 identifies model-call and direct human Shell permission requests separately.
-/// Older business peers are refused before dispatch; there are no minor feature gates.
-pub const PROTOCOL_MAJOR: u16 = 8;
+/// Business 10.0 combines hosted Monitor commands, attach grants, routed per-tool authority
+/// sets, and typed model-call versus direct human Shell permission requests.
+/// A 9.0 peer requires the old flat run/call fields and cannot decode the new request shape;
+/// other business majors are refused before dispatch. Frozen management remains independent.
+pub const PROTOCOL_MAJOR: u16 = 10;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
@@ -261,6 +263,30 @@ pub enum AgentCommand {
         execution: ExecutionRef,
         instance: tick_connect::instance::InstanceRef,
     },
+    /// The Chat's running hosted Ticks with a resource sample of each, for its Monitor.
+    ListHostedTicks {
+        execution: ExecutionRef,
+    },
+    /// Ends one of the Chat's hosted Ticks at the user's request.
+    CloseHostedTick {
+        execution: ExecutionRef,
+        instance: tick_connect::instance::InstanceRef,
+    },
+    /// Starts a new instance in place of a hosted Tick lost with its host, at the user's request.
+    ReopenHostedTick {
+        execution: ExecutionRef,
+        instance: tick_connect::instance::InstanceRef,
+    },
+    /// The current screen of one of the Chat's hosted Ticks as text, for its Monitor detail.
+    HostedTickSnapshot {
+        execution: ExecutionRef,
+        instance: tick_connect::instance::InstanceRef,
+    },
+    /// Lets the asking View attach to one of the Chat's hosted Ticks once.
+    AttachHostedTick {
+        execution: ExecutionRef,
+        instance: tick_connect::instance::InstanceRef,
+    },
     Create {
         launch: LaunchSpec,
         initial: Option<UserInput>,
@@ -351,6 +377,11 @@ impl AgentCommand {
             | Self::ListArtifactTicks { execution }
             | Self::AddMonitorMember { execution, .. }
             | Self::RemoveMonitorMember { execution, .. }
+            | Self::ListHostedTicks { execution }
+            | Self::CloseHostedTick { execution, .. }
+            | Self::ReopenHostedTick { execution, .. }
+            | Self::HostedTickSnapshot { execution, .. }
+            | Self::AttachHostedTick { execution, .. }
             | Self::EnqueueAfterTurn { execution, .. }
             | Self::RefreshConfiguration { execution } => Some(*execution),
             Self::DecidePermission { request, .. } | Self::AnswerQuestion { request, .. } => {
@@ -849,6 +880,13 @@ impl CommandReceipt {
 pub enum CommandResult {
     ArtifactTicks(Vec<crate::artifacts::ArtifactTick>),
     MonitorMembership(crate::runtime::MonitorMembership),
+    HostedTicks(Vec<crate::hosted::tools::HostedMember>),
+    HostedTickReopened {
+        instance: tick_connect::instance::InstanceRef,
+        membership: crate::runtime::MonitorMembership,
+    },
+    HostedTickSnapshot(crate::hosted::tools::HostedSnapshot),
+    HostedTickView(crate::hosted::controller::HostedViewGrant),
     Created {
         execution: ExecutionRef,
         snapshot: Box<LiveChatSnapshot>,

@@ -372,23 +372,6 @@ impl Agent {
         if chat.snapshot.workdir != workdir {
             return Err(AgentError::Busy);
         }
-        if let Some(delegation) = &chat.snapshot.delegation {
-            let frozen = delegation
-                .ceiling
-                .policy
-                .for_delegation(delegation.parent_loop_id);
-            rules.extend(
-                frozen
-                    .rules
-                    .into_iter()
-                    .filter(|rule| {
-                        rule.persistent
-                            && rule.decision == Decision::Allow
-                            && !rules.iter().any(|current| current.id == rule.id)
-                    })
-                    .collect::<Vec<_>>(),
-            );
-        }
         let current = chat
             .snapshot
             .policy

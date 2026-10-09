@@ -1,7 +1,7 @@
 //! A namespaced MCP Host tool provider backed by service-scoped credentials.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -389,6 +389,18 @@ impl McpHostToolProvider {
 
     fn is_mcp_name(name: &str) -> bool {
         name.starts_with("mcp__artifacts__")
+    }
+
+    /// The Artifact account the MCP tools act for.
+    fn mcp_authority(&self) -> Result<Option<HostToolAuthority>, String> {
+        Ok(self
+            .artifact
+            .credential_snapshot()
+            .map_err(|_| "Artifact credential unavailable")?
+            .map(|credential| HostToolAuthority::Mcp {
+                server_id: credential.origin,
+                account_id: credential.account_id,
+            }))
     }
 
     fn directory_tool(&self, name: &str) -> Option<(DiscoveredTool, [u8; 32], [u8; 32])> {
@@ -1605,20 +1617,26 @@ impl HostToolProvider for McpHostToolProvider {
             .and_then(|native| native.workspace_host_context())
     }
 
-    fn tool_authority(&self, name: &str) -> Result<Option<HostToolAuthority>, String> {
+    fn tool_authorities(&self, name: &str) -> Result<BTreeSet<HostToolAuthority>, String> {
         if Self::is_mcp_name(name) {
-            return Ok(self
-                .artifact
-                .credential_snapshot()
-                .map_err(|_| "Artifact credential unavailable")?
-                .map(|credential| HostToolAuthority::Mcp {
-                    server_id: credential.origin,
-                    account_id: credential.account_id,
-                }));
+            return Ok(self.mcp_authority()?.into_iter().collect());
         }
         self.native
             .as_ref()
-            .map_or(Ok(None), |native| native.tool_authority(name))
+            .map_or(Ok(BTreeSet::new()), |native| native.tool_authorities(name))
+    }
+
+    fn call_authority(
+        &self,
+        name: &str,
+        input: &Value,
+    ) -> Result<Option<HostToolAuthority>, String> {
+        if Self::is_mcp_name(name) {
+            return self.mcp_authority();
+        }
+        self.native
+            .as_ref()
+            .map_or(Ok(None), |native| native.call_authority(name, input))
     }
 
     fn service_connections(&self) -> Value {

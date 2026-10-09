@@ -167,7 +167,11 @@ fn bind_watches(
     watches: impl IntoIterator<Item = Uuid>,
 ) {
     use tickloop_agent::host_tools::HostToolProvider;
-    let authority = provider.tool_authority("ReadTick").unwrap().unwrap();
+    let authority = provider
+        .tool_authorities("ReadTick")
+        .unwrap()
+        .pop_first()
+        .unwrap();
     stream.set_watch_authorities(
         watches
             .into_iter()
@@ -1186,8 +1190,13 @@ async fn restored_native_watch_refuses_a_changed_frozen_endpoint() {
         .unwrap()
         .id;
     let snapshot = agent.snapshot(child).await.unwrap();
-    let old_authority =
-        snapshot.delegation.as_ref().unwrap().ceiling.host_tools["ReadTick"].clone();
+    let frozen = snapshot.delegation.as_ref().unwrap().ceiling.host_tools["ReadTick"].clone();
+    assert_eq!(
+        frozen.len(),
+        1,
+        "one Herdr endpoint was present: {frozen:?}"
+    );
+    let old_authority = frozen.first().unwrap().clone();
     let loop_id = snapshot.loops[0].id;
     assert_eq!(
         snapshot.loops[0].trigger.as_ref().unwrap().subscriptions[0].authority,
@@ -1195,7 +1204,11 @@ async fn restored_native_watch_refuses_a_changed_frozen_endpoint() {
     );
     agent.shutdown().await;
     let provider_b = Arc::new(NativeHostToolProvider::new(access_b.clone()));
-    let new_authority = provider_b.tool_authority("ReadTick").unwrap().unwrap();
+    let new_authority = provider_b
+        .tool_authorities("ReadTick")
+        .unwrap()
+        .pop_first()
+        .unwrap();
     assert_ne!(old_authority, new_authority);
     let model = Arc::new(ScriptedModel::new(vec![
         call(
@@ -1214,7 +1227,7 @@ async fn restored_native_watch_refuses_a_changed_frozen_endpoint() {
     let snapshot = restored.resume_chat(child).await.unwrap();
     assert_eq!(
         snapshot.delegation.unwrap().ceiling.host_tools["ReadTick"],
-        old_authority
+        frozen
     );
     let mut events = restored.subscribe();
     restored
@@ -1326,5 +1339,5 @@ async fn native_stream_rejects_missing_or_foreign_bindings_before_any_host_read(
         0,
         "unbound or foreign Native watch read host content"
     );
-    assert!(provider.tool_authority("ReadTick").unwrap().is_some());
+    assert!(!provider.tool_authorities("ReadTick").unwrap().is_empty());
 }

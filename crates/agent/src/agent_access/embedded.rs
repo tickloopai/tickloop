@@ -138,6 +138,15 @@ impl EmbeddedAgentAccess {
         execution
     }
 
+    fn hosted_ticks(&self) -> Result<Arc<crate::hosted::tools::HostedTickTools>, AccessError> {
+        self.inner.agent.hosted_ticks().ok_or_else(|| {
+            AccessError::new(
+                AccessErrorCode::Unsupported,
+                "this Agent runs no hosted Ticks",
+            )
+        })
+    }
+
     async fn chat(&self, execution: ExecutionRef) -> Result<Uuid, AccessError> {
         if execution.owner_epoch != self.inner.epoch {
             return Err(AccessError::new(
@@ -353,6 +362,70 @@ impl EmbeddedAgentAccess {
                 let chat = self.chat(execution).await?;
                 Ok(CommandResult::ArtifactTicks(
                     self.inner.agent.artifact_ticks(chat).await?,
+                ))
+            }
+            AgentCommand::ListHostedTicks { execution } => {
+                let chat = self.chat(execution).await?;
+                let members = self
+                    .hosted_ticks()?
+                    .members(chat)
+                    .await
+                    .map_err(|error| AccessError::unavailable(error.to_string()))?;
+                Ok(CommandResult::HostedTicks(members))
+            }
+            AgentCommand::CloseHostedTick {
+                execution,
+                instance,
+            } => {
+                let chat = self.chat(execution).await?;
+                self.hosted_ticks()?
+                    .close_for_user(chat, &instance)
+                    .await
+                    .map_err(hosted_access_error)?;
+                Ok(CommandResult::Done)
+            }
+            AgentCommand::ReopenHostedTick {
+                execution,
+                instance,
+            } => {
+                let chat = self.chat(execution).await?;
+                let reopened = self
+                    .hosted_ticks()?
+                    .reopen_for_user(chat, &instance)
+                    .await
+                    .map_err(hosted_access_error)?;
+                let membership = self
+                    .inner
+                    .agent
+                    .record_reopened_tick(chat, &instance, reopened.clone())
+                    .await?;
+                Ok(CommandResult::HostedTickReopened {
+                    instance: reopened,
+                    membership,
+                })
+            }
+            AgentCommand::HostedTickSnapshot {
+                execution,
+                instance,
+            } => {
+                let chat = self.chat(execution).await?;
+                Ok(CommandResult::HostedTickSnapshot(
+                    self.hosted_ticks()?
+                        .snapshot(chat, &instance)
+                        .await
+                        .map_err(hosted_access_error)?,
+                ))
+            }
+            AgentCommand::AttachHostedTick {
+                execution,
+                instance,
+            } => {
+                let chat = self.chat(execution).await?;
+                Ok(CommandResult::HostedTickView(
+                    self.hosted_ticks()?
+                        .allow_view(chat, &instance)
+                        .await
+                        .map_err(hosted_access_error)?,
                 ))
             }
             AgentCommand::AddMonitorMember {
@@ -1685,4 +1758,14 @@ fn action_label(action: &AfterTurnAction) -> String {
         AfterTurnAction::Loop { .. } => "/loop".into(),
         AfterTurnAction::Submit { .. } => "/submit".into(),
     }
+}
+
+/// A hosted Tick lifecycle that may have reached the host is unknown, not refused.
+fn hosted_access_error(error: tick_connect::host_error::HostError) -> AccessError {
+    let code = if error.dispatched {
+        AccessErrorCode::OutcomeUnknown
+    } else {
+        AccessErrorCode::Unavailable
+    };
+    AccessError::new(code, error.to_string())
 }

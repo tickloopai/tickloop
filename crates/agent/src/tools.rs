@@ -90,7 +90,7 @@ pub struct PreparedTool {
     pub is_read_only: bool,
     pub in_workspace: bool,
     pub file_change: Option<PreparedFileChange>,
-    in_session_temp: bool,
+    in_family_temp: bool,
     automatic_shell_workspace: Option<Workspace>,
     original_path: PathBuf,
     resolved_path: PathBuf,
@@ -171,7 +171,7 @@ impl PreparedTool {
     fn revalidate_automatic_shell_paths(&self) -> Result<(), ToolError> {
         if let (Operation::Shell(input), Some(workspace)) =
             (&self.operation, &self.automatic_shell_workspace)
-            && !input.is_allowed_with_session_temp(&self.resolved_path, workspace)
+            && !input.is_allowed_with_family_temp(&self.resolved_path, workspace)
         {
             return Err(ToolError::PathChanged(self.resolved_path.clone()));
         }
@@ -184,7 +184,7 @@ impl PreparedTool {
             Operation::Shell(_) => true,
             _ => {
                 self.in_workspace
-                    || self.in_session_temp
+                    || self.in_family_temp
                     || self.is_read_only && !self.requires_permission
             }
         }
@@ -210,7 +210,7 @@ impl PreparedTool {
     }
 
     pub fn safety_check(&self) -> Option<SafetyCheck> {
-        if self.in_session_temp {
+        if self.in_family_temp {
             return None;
         }
         match self.operation {
@@ -321,8 +321,8 @@ pub struct Tools {
     output_dir: PrivateDirectory,
     /// 后台任务输出目录，照 Claude Code 位于系统临时目录下的 `<chatId>/tasks`。
     task_output_dir: PrivateDirectory,
-    /// Canonical private family root, shared only with this session's children.
-    session_temp: PrivateDirectory,
+    /// Canonical private family temp space, shared by the family's root and its children.
+    family_temp: PrivateDirectory,
     commands: shell::Registry,
     search: std::sync::Arc<tokio::sync::RwLock<Option<SearchConfig>>>,
     fetched_pages: web::FetchCache,
@@ -340,12 +340,12 @@ impl Tools {
     pub(crate) fn for_chat(
         chat_directory: PrivateDirectory,
         task_output_dir: PrivateDirectory,
-        session_temp: PrivateDirectory,
+        family_temp: PrivateDirectory,
     ) -> Self {
         Self {
             output_dir: chat_directory,
             task_output_dir,
-            session_temp,
+            family_temp,
             commands: shell::Registry::new(),
             search: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             fetched_pages: web::FetchCache::default(),
@@ -363,17 +363,17 @@ impl Tools {
         let owned_name = name.to_owned();
         let owned_input = input.clone();
         let output_dir = self.output_dir.clone();
-        let session_temp = self.session_temp.clone();
-        session_temp
+        let family_temp = self.family_temp.clone();
+        family_temp
             .create()
-            .map_err(|error| io_error(session_temp.path(), error))?;
-        session_temp
-            .join(SCRATCHPAD_SUBDIRECTORY)
+            .map_err(|error| io_error(family_temp.path(), error))?;
+        let scratchpad = family_temp.join(SCRATCHPAD_SUBDIRECTORY);
+        scratchpad
             .create()
-            .map_err(|error| io_error(session_temp.path(), error))?;
+            .map_err(|error| io_error(scratchpad.path(), error))?;
         let readable_directories = vec![
             self.output_dir.path().to_path_buf(),
-            session_temp.path().to_path_buf(),
+            family_temp.path().to_path_buf(),
         ];
         let file_reads = self.file_reads.clone();
         let join_error_path = output_dir.path().to_path_buf();
@@ -383,7 +383,7 @@ impl Tools {
                 &owned_name,
                 &owned_input,
                 &readable_directories,
-                Some(session_temp.path()),
+                Some(family_temp.path()),
                 &file_reads,
             )?;
             if let Operation::Write(operation) = &mut prepared.operation {
@@ -471,8 +471,8 @@ impl Tools {
     ) -> Result<ToolResult, ToolError> {
         shell::command_output(command, offset, limit)
     }
-    pub(crate) fn session_temp_directory(&self) -> &Path {
-        self.session_temp.path()
+    pub(crate) fn family_temp_directory(&self) -> &Path {
+        self.family_temp.path()
     }
 
     pub(crate) fn chat_directory(&self) -> &PrivateDirectory {
@@ -805,7 +805,7 @@ fn prepare_with_readable_directories(
     name: &str,
     input: &Value,
     readable_directories: &[PathBuf],
-    session_temp: Option<&Path>,
+    family_temp: Option<&Path>,
     file_reads: &FileReadState,
 ) -> Result<PreparedTool, ToolError> {
     let registration = builtin_registrations()
@@ -827,9 +827,9 @@ fn prepare_with_readable_directories(
         Operation::Write(_) => false,
         Operation::Shell(input) => {
             input.readable_directories = readable_directories.to_vec();
-            input.editable_directory = session_temp.map(Path::to_path_buf);
+            input.editable_directory = family_temp.map(Path::to_path_buf);
             let cwd = resolve_path(&original_path, true).unwrap_or_else(|_| original_path.clone());
-            if input.is_allowed_with_session_temp(&cwd, workspace) {
+            if input.is_allowed_with_family_temp(&cwd, workspace) {
                 automatic_shell_workspace = Some(workspace.clone());
             }
             input.is_read_only(&cwd, workspace)
@@ -870,8 +870,8 @@ fn prepare_with_readable_directories(
         operation,
         Operation::Read(_) | Operation::Write(_) | Operation::Search(_)
     );
-    let in_session_temp = is_file_operation
-        && session_temp.is_some_and(|root| {
+    let in_family_temp = is_file_operation
+        && family_temp.is_some_and(|root| {
             original_scope.starts_with(root) && resolved_path.starts_with(root)
         });
     let is_internal_read = is_read_only
@@ -880,7 +880,7 @@ fn prepare_with_readable_directories(
             .iter()
             .any(|root| original_scope.starts_with(root) && resolved_path.starts_with(root));
     let requires_permission = operation.has_permission_check()
-        && !in_session_temp
+        && !in_family_temp
         && automatic_shell_workspace.is_none()
         && !is_internal_read
         && (!in_workspace || !is_read_only);
@@ -894,7 +894,7 @@ fn prepare_with_readable_directories(
         is_read_only,
         in_workspace,
         file_change: None,
-        in_session_temp,
+        in_family_temp,
         automatic_shell_workspace,
         original_path,
         resolved_path,
