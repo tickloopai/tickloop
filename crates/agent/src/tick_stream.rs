@@ -1,7 +1,9 @@
 //! Observation stream between a Tick host and the Agent's Loop scheduler.
 
 mod artifact;
+mod hosted;
 pub use artifact::ArtifactTickStream;
+pub use hosted::HostedTickStream;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -221,6 +223,33 @@ pub trait TickStreamPort: Send + Sync + 'static {
         _cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Option<PreparedTickWatch>, String> {
         Ok(None)
+    }
+    /// The instance's current content, read again for a delivery whose update data the
+    /// content cache evicted, after its watch was revalidated. `None` when this kind of Tick
+    /// cannot be read again; such a delivery goes out without the data.
+    async fn read_current(
+        &self,
+        _chat: Uuid,
+        _instance: &InstanceRef,
+    ) -> Result<Option<TickObservation>, String> {
+        Ok(None)
+    }
+}
+
+/// A protocol Tick's current content as an observation, for a delivery read again.
+fn current_observation(
+    instance: &InstanceRef,
+    read: tick_connect::protocol::TickRead,
+) -> TickObservation {
+    TickObservation {
+        instance: instance.clone(),
+        sequence: read.sequence,
+        observed_at: read.observed_at,
+        dropped: 0,
+        data: read.data.unwrap_or(serde_json::Value::Null),
+        kind: ObservationKind::Protocol,
+        recover_with: None,
+        gap: false,
     }
 }
 
@@ -572,6 +601,9 @@ impl NativeWatchScope {
         }
         Ok(())
     }
+}
+
+impl WatchAdmission for NativeWatchScope {
     fn admitted(
         &self,
         requested: &BTreeSet<WatchId>,
@@ -596,6 +628,91 @@ impl NativeWatchScope {
                 }
             })
             .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl InstanceObserver for NativeWatchScope {
+    async fn authorities_changed(&mut self) -> bool {
+        self.authorities.changed().await.is_ok()
+    }
+
+    async fn observe(
+        self,
+        instance: InstanceRef,
+        wanted: watch::Receiver<BTreeSet<WatchId>>,
+        publisher: EventPublisher,
+    ) {
+        observe_native_instance(self, instance, wanted, publisher).await;
+    }
+}
+
+/// Decides which requested watches may still observe an instance; each refused one is told
+/// its identity is uncertain.
+trait WatchAdmission: Send + Sync {
+    fn admitted(
+        &self,
+        requested: &BTreeSet<WatchId>,
+        instance: &InstanceRef,
+        publisher: &EventPublisher,
+    ) -> BTreeSet<WatchId>;
+}
+
+/// Where a stream's watched instances run: one observer per instance follows it for the
+/// watches that want it.
+#[async_trait::async_trait]
+trait InstanceObserver: WatchAdmission + Clone + 'static {
+    /// Waits until the admitted watch authorities change; false once they never will again.
+    async fn authorities_changed(&mut self) -> bool;
+
+    async fn observe(
+        self,
+        instance: InstanceRef,
+        wanted: watch::Receiver<BTreeSet<WatchId>>,
+        publisher: EventPublisher,
+    );
+}
+
+/// A protocol Tick as a watch sees it: its declared recovery tool, and a registration that
+/// yields the current content and then latest-only updates.
+#[async_trait::async_trait]
+trait ProtocolFeed: Send + Sync {
+    async fn recovery_tool(&self) -> Result<Option<String>, String>;
+
+    async fn watch(
+        &self,
+    ) -> Result<
+        (
+            tick_connect::protocol::TickRead,
+            u64,
+            watch::Receiver<tick_connect::session::SessionObservation>,
+        ),
+        String,
+    >;
+}
+
+#[async_trait::async_trait]
+impl ProtocolFeed for tick_connect::session::SessionClient {
+    async fn recovery_tool(&self) -> Result<Option<String>, String> {
+        self.describe()
+            .await
+            .map(|descriptor| descriptor.recover_with)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn watch(
+        &self,
+    ) -> Result<
+        (
+            tick_connect::protocol::TickRead,
+            u64,
+            watch::Receiver<tick_connect::session::SessionObservation>,
+        ),
+        String,
+    > {
+        tick_connect::session::SessionClient::watch(self)
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -647,6 +764,20 @@ impl TickStreamPort for NativeTickStream {
         }
         .revalidate(authority)
     }
+    async fn read_current(
+        &self,
+        _chat: Uuid,
+        instance: &InstanceRef,
+    ) -> Result<Option<TickObservation>, String> {
+        let session = self
+            .provider
+            .access()
+            .session(instance)
+            .await
+            .map_err(|error| error.to_string())?;
+        let read = session.read().await.map_err(|error| error.to_string())?;
+        Ok(Some(current_observation(instance, read)))
+    }
     fn open(&self) -> TickStreamHandle {
         let (desired, wanted) = watch::channel(BTreeMap::new());
         let (publisher, events) = EventPublisher::channel();
@@ -654,13 +785,14 @@ impl TickStreamPort for NativeTickStream {
             provider: self.provider.clone(),
             authorities: self.authorities.subscribe(),
         };
-        tokio::spawn(async move { follow_native(scope, wanted, publisher).await });
+        tokio::spawn(async move { follow_instances(scope, wanted, publisher).await });
         TickStreamHandle { desired, events }
     }
 }
 
-async fn follow_native(
-    mut scope: NativeWatchScope,
+/// Keeps one observer per watched instance, retiring watches that reached a terminal state.
+async fn follow_instances<O: InstanceObserver>(
+    mut scope: O,
     mut desired: watch::Receiver<BTreeMap<WatchId, InstanceRef>>,
     publisher: EventPublisher,
 ) {
@@ -741,13 +873,13 @@ async fn follow_native(
             let publisher = publisher.clone();
             let finished_sender = finished_sender.clone();
             tokio::spawn(async move {
-                observe_native_instance(scope, instance.clone(), receiver, publisher).await;
+                scope.observe(instance.clone(), receiver, publisher).await;
                 let _ = finished_sender.send((instance, generation));
             });
         }
         tokio::select! {
             changed = desired.changed() => if changed.is_err() { return; },
-            changed = scope.authorities.changed() => if changed.is_err() { return; },
+            changed = scope.authorities_changed() => if !changed { return; },
             Some((instance, generation)) = finished.recv() => {
                 if workers.get(&instance).is_some_and(|worker| worker.generation == generation) {
                     let worker = workers.remove(&instance).expect("the worker was present");
@@ -783,7 +915,7 @@ async fn observe_native_instance(
         }
         match location {
             Ok(location) if location.protocol => {
-                let ended = observe_protocol(
+                let ended = observe_native_protocol(
                     access,
                     &instance,
                     &mut wanted,
@@ -963,7 +1095,7 @@ async fn observe_terminal(
     }
 }
 
-async fn observe_protocol(
+async fn observe_native_protocol(
     access: &tick_connect::access::TickAccess,
     instance: &InstanceRef,
     wanted: &mut watch::Receiver<BTreeSet<WatchId>>,
@@ -971,8 +1103,6 @@ async fn observe_protocol(
     ready_watches: &mut BTreeSet<WatchId>,
     scope: &NativeWatchScope,
 ) -> bool {
-    use tick_connect::session::SessionLinkState;
-
     let attempted = scope.admitted(&wanted.borrow_and_update().clone(), instance, publisher);
     if attempted.is_empty() {
         return true;
@@ -988,11 +1118,27 @@ async fn observe_protocol(
             );
         }
     };
-    if scope.admitted(&attempted, instance, publisher).is_empty() {
+    observe_protocol(&session, instance, wanted, publisher, ready_watches, scope).await
+}
+
+/// Follows a protocol Tick for the wanted watches: a baseline for each, then latest-only
+/// updates. Returns whether following ended for good rather than for a reconnect.
+async fn observe_protocol(
+    feed: &dyn ProtocolFeed,
+    instance: &InstanceRef,
+    wanted: &mut watch::Receiver<BTreeSet<WatchId>>,
+    publisher: &EventPublisher,
+    ready_watches: &mut BTreeSet<WatchId>,
+    scope: &dyn WatchAdmission,
+) -> bool {
+    use tick_connect::session::SessionLinkState;
+
+    let attempted = scope.admitted(&wanted.borrow_and_update().clone(), instance, publisher);
+    if attempted.is_empty() {
         return true;
     }
-    let recovery_tool = match session.describe().await {
-        Ok(descriptor) => descriptor.recover_with,
+    let recovery_tool = match feed.recovery_tool().await {
+        Ok(recovery_tool) => recovery_tool,
         Err(_) => {
             publisher.state_to(
                 instance.clone(),
@@ -1005,7 +1151,7 @@ async fn observe_protocol(
     if scope.admitted(&attempted, instance, publisher).is_empty() {
         return true;
     }
-    let (baseline, registration_received, mut updates) = match session.watch().await {
+    let (baseline, registration_received, mut updates) = match feed.watch().await {
         Ok(watch) => watch,
         Err(_) => {
             publisher.state_to(

@@ -18,9 +18,11 @@ use crate::{
     tools::{CommandSnapshot, SearchConfig},
 };
 
-/// Business 7.0 combines Monitor membership with required push-completion delivery and usage.
-/// Pre-push 6.0 peers are refused before dispatch; there are no minor feature gates.
-pub const PROTOCOL_MAJOR: u16 = 7;
+/// Business 8.0 adds the Monitor's hosted Ticks (`ListHostedTicks`, `CloseHostedTick`,
+/// `ReopenHostedTick`) to 7.0's Monitor membership and push-completion delivery and usage. A 7.0
+/// peer cannot decode those commands and would drop the whole connection, so other majors are
+/// refused at hello; there are no minor feature gates.
+pub const PROTOCOL_MAJOR: u16 = 8;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
@@ -261,6 +263,20 @@ pub enum AgentCommand {
         execution: ExecutionRef,
         instance: tick_connect::instance::InstanceRef,
     },
+    /// The Chat's running hosted Ticks with a resource sample of each, for its Monitor.
+    ListHostedTicks {
+        execution: ExecutionRef,
+    },
+    /// Ends one of the Chat's hosted Ticks at the user's request.
+    CloseHostedTick {
+        execution: ExecutionRef,
+        instance: tick_connect::instance::InstanceRef,
+    },
+    /// Starts a new instance in place of a hosted Tick lost with its host, at the user's request.
+    ReopenHostedTick {
+        execution: ExecutionRef,
+        instance: tick_connect::instance::InstanceRef,
+    },
     Create {
         launch: LaunchSpec,
         initial: Option<UserInput>,
@@ -351,6 +367,9 @@ impl AgentCommand {
             | Self::ListArtifactTicks { execution }
             | Self::AddMonitorMember { execution, .. }
             | Self::RemoveMonitorMember { execution, .. }
+            | Self::ListHostedTicks { execution }
+            | Self::CloseHostedTick { execution, .. }
+            | Self::ReopenHostedTick { execution, .. }
             | Self::EnqueueAfterTurn { execution, .. }
             | Self::RefreshConfiguration { execution } => Some(*execution),
             Self::DecidePermission { request, .. } | Self::AnswerQuestion { request, .. } => {
@@ -849,6 +868,11 @@ impl CommandReceipt {
 pub enum CommandResult {
     ArtifactTicks(Vec<crate::artifacts::ArtifactTick>),
     MonitorMembership(crate::runtime::MonitorMembership),
+    HostedTicks(Vec<crate::hosted::tools::HostedMember>),
+    HostedTickReopened {
+        instance: tick_connect::instance::InstanceRef,
+        membership: crate::runtime::MonitorMembership,
+    },
     Created {
         execution: ExecutionRef,
         snapshot: Box<LiveChatSnapshot>,

@@ -115,6 +115,12 @@ impl OwnerServer {
                 )
             })
     }
+    /// Whether `chat` currently runs in any worker of this owner.
+    pub async fn runs_chat(&self, chat: Uuid) -> Result<bool, AccessError> {
+        Ok(self.directory().await?.iter().any(|entry| {
+            entry.chat_id == chat && entry.availability != ExecutionAvailability::Lost
+        }))
+    }
     /// Verifies that `chat` currently runs in `worker` and is not lost, refreshing the directory
     /// first, and returns its execution. A worker can only act for its own Chats, whatever it
     /// claims.

@@ -41,6 +41,7 @@ mod external_editor;
 mod file_mentions;
 mod font_manager;
 mod footer;
+mod hosted_probe;
 mod hyperlink;
 mod image_cache;
 mod subagent_panel;
@@ -1022,8 +1023,12 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     let console = &console;
     console.set_status_lines(status_lines)?;
     console.set_monitor_preference(monitor_preference)?;
-    if let Some(discovery) = tick_discovery {
-        console.set_tick_discovery(discovery)?;
+    // A View outside Herdr works with an Agent whose new Ticks run in the Tick host.
+    match tick_discovery {
+        Some(discovery) => console.set_tick_discovery(discovery)?,
+        None => console.set_member_probe(std::sync::Arc::new(hosted_probe::HostedProbe::new(
+            agent.clone(),
+        )))?,
     }
     console.configure_input_history(config_root.as_deref(), &workdir)?;
     // The image cache expires with Transcripts, so a session that saves no Chats caches nothing.
@@ -3979,14 +3984,14 @@ async fn interact(
                         // A failed or panicked probe keeps the earlier findings and still releases
                         // the probe slot, so probing never stops for the session.
                         let probed = tokio::spawn(async move {
-                            probe.discovery.probe(&probe.targets).await
+                            probe.prober.probe(chat, &probe.targets).await
                         })
                         .await;
-                        let states = match probed {
-                            Ok(Ok(states)) => Some(states),
+                        let findings = match probed {
+                            Ok(Ok(findings)) => Some(findings),
                             Ok(Err(_)) | Err(_) => None,
                         };
-                        let _ = console.update_member_states(chat, states);
+                        let _ = console.update_member_findings(chat, findings);
                     });
                 }
             },

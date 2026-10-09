@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     runtime::{Agent, ShellTask, ShellTaskState, TickLinkState},
-    tick_stream::{ArtifactTickStream, NativeTickStream, ObservationKind},
+    tick_stream::{ArtifactTickStream, HostedTickStream, NativeTickStream, ObservationKind},
 };
 use std::path::PathBuf;
 
@@ -63,6 +63,92 @@ impl TickAdapter for HerdrAdapter {
                     row.kind = "Terminal".into();
                     row.glyph = TickGlyph::Terminal;
                 }
+            }
+            Some(MemberState::Gone | MemberState::Lost) => {
+                row.status = link_status(TickLinkState::InstanceGone).into()
+            }
+            Some(MemberState::IdentityUncertain) => {
+                row.status = link_status(TickLinkState::IdentityUncertain).into()
+            }
+            None => {}
+        }
+        row
+    }
+    fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
+        self.stream.clone()
+    }
+}
+
+/// Ends a hosted Tick from its Monitor row after confirmation; the row stays until removed.
+pub(crate) const HOSTED_CLOSE_KEY: char = 'c';
+/// Starts a new instance in place of a hosted Tick lost with its host, after confirmation.
+pub(crate) const HOSTED_REOPEN_KEY: char = 'n';
+
+/// Ticks this Chat opened in the dedicated Tick host. They belong to the Chat that opened them;
+/// only a worker with a Tick host grant follows them.
+pub struct HostedAdapter {
+    stream: Option<Arc<dyn TickStreamPort>>,
+}
+impl HostedAdapter {
+    pub fn new(tools: Option<Arc<crate::hosted::tools::HostedTickTools>>) -> Self {
+        Self {
+            stream: tools
+                .map(|tools| Arc::new(HostedTickStream::new(tools)) as Arc<dyn TickStreamPort>),
+        }
+    }
+}
+impl TickAdapter for HostedAdapter {
+    fn tick_type(&self) -> &'static str {
+        tick_connect::instance::HOSTED_TYPE
+    }
+    fn list(&self, context: &MonitorContext) -> Vec<TickDescriptor> {
+        subscriptions(context, self.tick_type())
+            .map(|row| TickDescriptor {
+                instance: row.instance.clone(),
+                group: TickGroup::Ticks,
+                glyph: TickGlyph::Protocol,
+                title: row
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| row.instance.to_string()),
+                kind: "Tick".into(),
+                status: link_status(row.link).into(),
+                owner: TickOwner::ThisChat,
+                updated_at_ms: row.last_delivery_ms,
+                running: row.link == TickLinkState::Live,
+                resources: None,
+                actions: subscription_actions(row),
+            })
+            .collect()
+    }
+    /// A hosted member reports its host's latest listing and process sample, and can be closed;
+    /// one lost with its host can be reopened as a new instance.
+    fn member(&self, member: &MonitorMember, context: &MonitorContext) -> TickDescriptor {
+        let mut row = super::member_descriptor(member);
+        row.resources = context.member_resources.get(&member.instance).cloned();
+        row.actions.push(MonitorAction {
+            key: HOSTED_CLOSE_KEY,
+            label: "close",
+            operation: MonitorOperation::Execute(
+                crate::terminal::tick_actions::builtin::close_hosted(member.instance.clone()),
+            ),
+        });
+        match context.member_states.get(&member.instance) {
+            Some(MemberState::Live { .. }) => {
+                row.running = true;
+                row.status = link_status(TickLinkState::Live).into();
+            }
+            Some(MemberState::Lost) => {
+                row.status = "lost".into();
+                row.actions.push(MonitorAction {
+                    key: HOSTED_REOPEN_KEY,
+                    label: "reopen as new",
+                    operation: MonitorOperation::Execute(
+                        crate::terminal::tick_actions::builtin::reopen_hosted(
+                            member.instance.clone(),
+                        ),
+                    ),
+                });
             }
             Some(MemberState::Gone) => row.status = link_status(TickLinkState::InstanceGone).into(),
             Some(MemberState::IdentityUncertain) => {
