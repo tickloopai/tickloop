@@ -552,7 +552,7 @@ impl NewsApi for DemoApi {
             .find(|item| item.id == id)
             .ok_or_else(|| Error::usage("unknown demo article"))?;
         Ok(NewsArticle { id: item.id, title: item.title, source: item.source, published_at: item.published_at, url: item.url,
-            body: "# 示例资讯正文\n\n这是用于检查有限 Panel 中换行与滚动的模拟内容，不代表真实市场消息。\n\n## 观察要点\n\n- 收入和现金流的变化需要分别核对。\n- 中文段落按照窗口宽度换行，缩小窗口后仍可阅读。\n- 使用 j/k、方向键和 PageDown 滚动，Esc 返回列表。\n\n[示例链接](https://example.com)\n\n**TUI demo** 会使用正式命令相同的界面与操作。".into() })
+            body: "# 示例资讯正文\n\n这是用于检查有限 Panel 中换行与滚动的模拟内容，不代表真实市场消息。\n\n## 观察要点\n\n- 收入和现金流的变化需要分别核对。\n- 中文段落按照窗口宽度换行，缩小窗口后仍可阅读。\n- 使用 j/k、方向键和 PageDown 滚动，Backspace 返回列表。\n\n[示例链接](https://example.com)\n\n**TUI demo** 会使用正式命令相同的界面与操作。".into() })
     }
 }
 

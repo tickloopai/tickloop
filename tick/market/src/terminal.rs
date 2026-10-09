@@ -163,24 +163,25 @@ impl Drop for TerminalSession {
     }
 }
 
+/// Resolves at SIGINT or SIGTERM. Input ends there rather than posing as Ctrl+C, which an open
+/// editor takes as cancel: a signal always ends the Tick.
+#[cfg(unix)]
+fn termination_signal() -> Result<impl std::future::Future<Output = ()>> {
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    })
+}
+
 pub fn input_events() -> Result<std::pin::Pin<Box<dyn Stream<Item = std::io::Result<Event>>>>> {
     let keyboard = EventStream::new();
     #[cfg(unix)]
     {
-        let interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-        let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        let signal_event = |_| {
-            Ok(Event::Key(KeyEvent::new(
-                KeyCode::Char('c'),
-                KeyModifiers::CONTROL,
-            )))
-        };
-        let interrupt = tokio_stream::wrappers::SignalStream::new(interrupt).map(signal_event);
-        let terminate = tokio_stream::wrappers::SignalStream::new(terminate).map(signal_event);
-        Ok(Box::pin(futures_util::stream::select(
-            keyboard,
-            futures_util::stream::select(interrupt, terminate),
-        )))
+        Ok(Box::pin(keyboard.take_until(termination_signal()?)))
     }
     #[cfg(not(unix))]
     {
@@ -365,27 +366,12 @@ pub fn visible_input_events()
     let keyboard = tokio_stream::wrappers::ReceiverStream::new(receiver);
     #[cfg(unix)]
     {
-        let interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-        let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         let resize = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
-        let quit = |_| {
-            Ok(Event::Key(KeyEvent::new(
-                KeyCode::Char('c'),
-                KeyModifiers::CONTROL,
-            )))
-        };
         let resize =
             tokio_stream::wrappers::SignalStream::new(resize).map(|_| Ok(Event::Resize(0, 0)));
-        Ok(Box::pin(futures_util::stream::select(
-            keyboard,
-            futures_util::stream::select(
-                resize,
-                futures_util::stream::select(
-                    tokio_stream::wrappers::SignalStream::new(interrupt).map(quit),
-                    tokio_stream::wrappers::SignalStream::new(terminate).map(quit),
-                ),
-            ),
-        )))
+        Ok(Box::pin(
+            futures_util::stream::select(keyboard, resize).take_until(termination_signal()?),
+        ))
     }
     #[cfg(not(unix))]
     {

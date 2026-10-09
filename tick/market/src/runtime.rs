@@ -50,6 +50,16 @@ pub async fn cancellable<T, S: Stream<Item = std::io::Result<Event>> + Unpin>(
     future: impl std::future::Future<Output = Result<T>>,
     input: &mut S,
 ) -> Result<Option<T>> {
+    cancellable_unless_editing(future, input, false).await
+}
+
+/// Like [`cancellable`], except that while an in-Panel editor is open q and Ctrl+C belong to it:
+/// only the end of input cancels, and keys typed meanwhile are dropped as they are for any wait.
+async fn cancellable_unless_editing<T, S: Stream<Item = std::io::Result<Event>> + Unpin>(
+    future: impl std::future::Future<Output = Result<T>>,
+    input: &mut S,
+    editing: bool,
+) -> Result<Option<T>> {
     tokio::pin!(future);
     loop {
         tokio::select! {
@@ -58,7 +68,7 @@ pub async fn cancellable<T, S: Stream<Item = std::io::Result<Event>> + Unpin>(
             event = input.next() => match event {
                 None => return Ok(None),
                 Some(Err(error)) => return Err(error.into()),
-                Some(Ok(event)) if is_exit(&event) => return Ok(None),
+                Some(Ok(event)) if !editing && is_exit(&event) => return Ok(None),
                 _ => (),
             },
         }
@@ -173,12 +183,15 @@ pub trait LiveView: Send {
         )))
     }
     fn help(&self) -> &'static str {
-        "q / Ctrl+C  Quit\nEsc  Back / cancel\n?  Help\nj / k / Ctrl+N / Ctrl+P / arrows  Move\nPageUp / PageDown  Page\ng / G  First / last"
+        "q / Ctrl+C  Quit\n?  Help\nj / k / Ctrl+N / Ctrl+P / arrows  Move\nPageUp / PageDown  Page\ng / G  First / last"
     }
-    /// While an in-Panel editor is open the view owns every printable key; only Ctrl+C still quits.
+    /// While an in-Panel editor is open the view owns every printable key and Backspace, and
+    /// Ctrl+C cancels the edit instead of quitting.
     fn captures_text(&self) -> bool {
         false
     }
+    /// Closes the open in-Panel editor without applying it.
+    fn cancel_text(&mut self) {}
     fn draw(&self, frame: &mut Frame<'_>, state: &mut ViewState, settings: &Settings) {
         draw_table(
             frame,
@@ -252,13 +265,15 @@ async fn refresh_cancellable<V: LiveView, S: Stream<Item = std::io::Result<Event
     api: &QuoteServices,
     input: &mut S,
 ) -> Result<Option<()>> {
-    cancellable(
+    let editing = view.captures_text();
+    cancellable_unless_editing(
         async {
             tokio::time::timeout(REFRESH_TIMEOUT, view.refresh(api))
                 .await
                 .unwrap_or_else(|_| Err(Error::network("refresh timed out")))
         },
         input,
+        editing,
     )
     .await
 }
@@ -395,10 +410,12 @@ pub async fn run<V: LiveView, B: Backend, S: Stream<Item = std::io::Result<Event
                     Some(Ok(Event::Resize(_, _))) => { terminal.clear().map_err(|error| Error::usage(error.to_string()))?; }
                     Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
                         let capturing = view.captures_text();
-                        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) { break; }
+                        let interrupted = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+                        if interrupted && capturing { view.cancel_text(); continue; }
+                        if interrupted { break; }
                         if !capturing && key.code == KeyCode::Char('q') { break; }
                         if !capturing && key.code == KeyCode::Char('?') { state.help = !state.help; continue; }
-                        if state.help { if key.code == KeyCode::Esc { state.help = false; } continue; }
+                        if state.help { if key.code == KeyCode::Backspace { state.help = false; } continue; }
                         if !capturing && let KeyCode::Char(character) = key.code && viewport.handle_key(character) { continue; }
                         let code = if key.modifiers.contains(KeyModifiers::CONTROL) {
                             match key.code {
@@ -410,7 +427,9 @@ pub async fn run<V: LiveView, B: Backend, S: Stream<Item = std::io::Result<Event
                             continue;
                         } else { key.code };
                         let previous_content = view.content();
-                        let handled = match cancellable(view.on_key(code, api, &mut state), &mut input).await {
+                        // Enter submits the edit, so what it waits for is no longer editing and q / Ctrl+C quit again.
+                        let editing = capturing && code != KeyCode::Enter;
+                        let handled = match cancellable_unless_editing(view.on_key(code, api, &mut state), &mut input, editing).await {
                             Ok(Some(handled)) => handled,
                             Ok(None) => break,
                             Err(error) => { state.failed(error)?; continue; }
@@ -426,7 +445,6 @@ pub async fn run<V: LiveView, B: Backend, S: Stream<Item = std::io::Result<Event
                         let length = view.table().rows.len();
                         let page = terminal.size().map_err(|error| Error::usage(error.to_string()))?.height.saturating_sub(4).max(1) as usize;
                         match code {
-                            KeyCode::Char('q') if !capturing => break,
                             KeyCode::Char('j') | KeyCode::Down => state.selected = (state.selected + 1).min(length.saturating_sub(1)),
                             KeyCode::Char('k') | KeyCode::Up => state.selected = state.selected.saturating_sub(1),
                             KeyCode::PageDown => state.selected = (state.selected + page).min(length.saturating_sub(1)),
@@ -499,7 +517,7 @@ fn render<V: LiveView, B: Backend>(
                 })
                 .block(
                     Block::default()
-                        .title(" Keys · ? / Esc close ")
+                        .title(" Keys · ? / Backspace close ")
                         .borders(Borders::ALL)
                         .border_style(styles.border),
                 )
@@ -613,9 +631,9 @@ fn draw_canvas<V: LiveView>(
         format!("{icon} {}", state.availability())
     };
     let keys = if view.captures_text() && area.width >= 40 {
-        "Enter Apply  Esc Back"
+        "Enter Apply  Ctrl+C Cancel"
     } else if view.captures_text() {
-        "Esc Back"
+        "Ctrl+C Cancel"
     } else if area.width >= 40 {
         "? Help  q Quit"
     } else {

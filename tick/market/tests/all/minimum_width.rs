@@ -122,7 +122,7 @@ fn every_tick() -> Vec<Scenario> {
                     "Baseline 2026-08-07 regular close",
                     "America/New_York",
                     "v View · r / [ ] Range · e Event · Enter Detail",
-                    "Esc Back · ? Help · q Quit",
+                    "? Help · q Quit",
                 ],
             )
         },
@@ -156,7 +156,7 @@ fn every_tick() -> Vec<Scenario> {
         scenario(
             TickKind::News,
             &[KeyCode::Enter],
-            &["示例资讯正文", "Esc Back  ·  j/k Scroll  ·  q Quit"],
+            &["示例资讯正文", "Backspace Back · j/k Scroll · q Quit"],
         ),
         scenario(
             TickKind::Earnings,
@@ -214,7 +214,7 @@ fn every_tick() -> Vec<Scenario> {
         scenario(
             TickKind::Earnings,
             &[KeyCode::Char('s')],
-            &["Symbol:", "Enter apply"],
+            &["Symbol:", "Enter apply · Ctrl+C cancel"],
         ),
         scenario(
             TickKind::Earnings,

@@ -284,12 +284,17 @@ async fn event_navigation_does_not_publish_business_changes_and_view_does_reload
     for key in [
         KeyCode::Char('l'),
         KeyCode::Enter,
-        KeyCode::Esc,
+        KeyCode::Backspace,
         KeyCode::Char('v'),
-        KeyCode::Esc,
+        KeyCode::Backspace,
     ] {
         view.on_key(key, &api, &mut state).await.unwrap();
     }
+    let screen = drawn(&view, 120, 32);
+    assert!(
+        !screen.contains("Candle / event detail") && !screen.contains("Enter Select"),
+        "Backspace closed the detail and the picker: {screen}"
+    );
     assert_eq!(before, view.content());
     view.act(ToolCall {
         tool: "set_view".into(),
@@ -325,34 +330,94 @@ async fn failed_new_event_does_not_mislabel_old_candles_and_can_retry() {
 }
 
 #[tokio::test]
-async fn event_chart_renders_at_narrow_and_wide_sizes_and_editor_escape_is_layered() {
+async fn event_chart_renders_at_narrow_and_wide_sizes_and_the_editor_has_no_modes() {
     let api = History::default();
     let mut view = KlineView::with_event(request(), config()).unwrap();
     view.load_event(&api).await.unwrap();
     for (width, height) in [(32, 14), (64, 22), (120, 32)] {
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| view.draw(frame, &mut ViewState::default(), &Settings::default()))
-            .unwrap();
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(rendered.contains("DEMO.US"));
+        assert!(drawn(&view, width, height).contains("DEMO.US"));
     }
     let mut state = ViewState::default();
     view.on_key(KeyCode::Char('e'), &api, &mut state)
         .await
         .unwrap();
     assert!(view.captures_text());
-    view.on_key(KeyCode::Esc, &api, &mut state).await.unwrap();
-    assert!(view.captures_text());
-    view.on_key(KeyCode::Esc, &api, &mut state).await.unwrap();
+    for key in [KeyCode::Esc, KeyCode::Backspace, KeyCode::Char('q')] {
+        view.on_key(key, &api, &mut state).await.unwrap();
+        assert!(view.captures_text(), "{key:?} keeps the editor open");
+    }
+    let editor = drawn(&view, 120, 32);
+    assert!(editor.contains("Event settings"), "{editor}");
+    assert!(editor.contains("Ctrl+C Cancel"), "{editor}");
+    assert!(
+        !editor.contains("NORMAL") && !editor.contains("INSERT"),
+        "{editor}"
+    );
+    view.cancel_text();
     assert!(!view.captures_text());
+}
+
+struct HangingCalendar;
+#[async_trait]
+impl QuoteApi for HangingCalendar {
+    async fn quotes(&self, _: &[String]) -> Result<Vec<Quote>> {
+        unreachable!()
+    }
+    async fn trading_days(&self, _: &str, _: DateRange) -> Result<Vec<time::Date>> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn ctrl_c_quits_while_an_applied_event_edit_is_still_loading() {
+    use crossterm::event::{Event, KeyEvent, KeyModifiers};
+
+    let mut view = KlineView::with_event(request(), config()).unwrap();
+    let (keys, input) = tokio::sync::mpsc::unbounded_channel();
+    for key in [
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    ] {
+        keys.send(Ok(Event::Key(key))).unwrap();
+    }
+    let (_market, market_events) = tokio::sync::mpsc::unbounded_channel();
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
+    let mut updates = tick_sdk::stream::TickStream::in_memory(
+        tick_market::metadata::TickKind::Kline,
+        "longbridge",
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tick_market::runtime::run(
+            &mut view,
+            &HangingCalendar,
+            &Settings::default(),
+            &mut terminal,
+            tokio_stream::wrappers::UnboundedReceiverStream::new(input),
+            market_events,
+            &mut updates,
+        ),
+    )
+    .await
+    .expect("Enter submitted the edit, so Ctrl+C quits its wait")
+    .unwrap();
+    drop(keys);
+}
+
+fn drawn(view: &KlineView, width: u16, height: u16) -> String {
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|frame| view.draw(frame, &mut ViewState::default(), &Settings::default()))
+        .unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect()
 }
 
 #[test]
