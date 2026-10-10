@@ -9,7 +9,7 @@ use uuid::Uuid;
 use super::execution::ConsoleExecution;
 use crate::monitor_rows::{MemberFindings, MemberState, ProbeError, TickProbe, TickResources};
 use tick_protocol::InstanceRef;
-use tickloop_agent_protocol::HostedMemberState;
+use tickloop_agent_protocol::{HostedMemberState, HostedProgramExit};
 
 pub(super) struct HostedProbe {
     agent: ConsoleExecution,
@@ -48,6 +48,16 @@ impl TickProbe for HostedProbe {
             };
             let state = match member.state {
                 HostedMemberState::Running => MemberState::Live { protocol: true },
+                HostedMemberState::Exited => MemberState::Exited(match member.exit {
+                    Some(HostedProgramExit {
+                        code: Some(code), ..
+                    }) => format!("exited {code}"),
+                    Some(HostedProgramExit {
+                        signal: Some(signal),
+                        ..
+                    }) => format!("exited by signal {signal}"),
+                    _ => "exited".into(),
+                }),
                 HostedMemberState::Lost => MemberState::Lost,
             };
             findings.states.insert(instance.clone(), state);

@@ -16,10 +16,10 @@ use tickloop_agent_protocol::{
     ClientMessage, CommandEnvelope, CommandReceipt, CommandResult, ConfigurationChange,
     ConnectionRegion, Content, Cursor, Decision, DisplayReceipt, DisplayUpdate, DisplayedView,
     EnvironmentValue, ExecutionAvailability, ExecutionMode, ExecutionRef, HistoryAction,
-    HostLocation, HostWorkContext, HostedMember, HostedMemberState, HostedResources,
-    HostedScreenSnapshot, HostedSnapshot, HostedViewGrant, ImageMediaType, ImageSource,
-    InputModality, InteractionSource, LaunchSpec, LiveChatSnapshot, LoopAction, Message,
-    ModelAuthSource, ModelCard, ModelConfig, ModelDiscovery, ModelProvider, MonitorMember,
+    HostLocation, HostWorkContext, HostedMember, HostedMemberState, HostedProgramExit,
+    HostedResources, HostedScreenSnapshot, HostedSnapshot, HostedViewGrant, ImageMediaType,
+    ImageSource, InputModality, InteractionSource, LaunchSpec, LiveChatSnapshot, LoopAction,
+    Message, ModelAuthSource, ModelCard, ModelConfig, ModelDiscovery, ModelProvider, MonitorMember,
     MonitorMembership, ObservationChange, ObservationKind, ObservationRequest, ObservationUpdate,
     ObservationValue, PROTOCOL_MAJOR, PROTOCOL_MINOR, Page, PendingRequestKind, PermissionPolicy,
     PermissionRule, PermissionScope, PersistenceState, ProductKind, Protocol, ProtocolLimits,
@@ -425,6 +425,18 @@ fn hosted_members() -> Vec<HostedMember> {
                 sampled_at_ms: 9_000,
             }),
             updated_at_ms: Some(8_000),
+            exit: None,
+        },
+        HostedMember {
+            instance: InstanceRef::hosted(id(0x42)),
+            title: Some("cat".into()),
+            state: HostedMemberState::Exited,
+            resources: None,
+            updated_at_ms: None,
+            exit: Some(HostedProgramExit {
+                code: Some(0),
+                signal: None,
+            }),
         },
         HostedMember {
             instance: InstanceRef::hosted(id(0x41)),
@@ -432,6 +444,7 @@ fn hosted_members() -> Vec<HostedMember> {
             state: HostedMemberState::Lost,
             resources: None,
             updated_at_ms: None,
+            exit: None,
         },
     ]
 }

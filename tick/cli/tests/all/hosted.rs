@@ -57,6 +57,7 @@ async fn a_hidden_builtin_watchlist_runs_on_a_private_pty_without_herdr() {
                 "operation": uuid::Uuid::new_v4(),
                 "owner": owner,
                 "owner_revision": 0,
+                "adapter": "protocol",
                 "command": [env!("CARGO_BIN_EXE_tick"), "builtin", "watchlist"],
                 "cwd": directory.path(),
                 "environment": std::env::vars().collect::<Vec<_>>(),

@@ -14,6 +14,16 @@
         "updated_at_ms": 8000
       },
       {
+        "instance": "hosted:00000000-0000-0000-0000-000000000042",
+        "title": "cat",
+        "state": "exited",
+        "resources": null,
+        "exit": {
+          "code": 0,
+          "signal": null
+        }
+      },
+      {
         "instance": "hosted:00000000-0000-0000-0000-000000000041",
         "title": null,
         "state": "lost",

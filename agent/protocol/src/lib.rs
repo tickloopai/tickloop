@@ -108,7 +108,9 @@ pub use host::{
     HerdrInteraction, HerdrPane, HostCallContext, HostEndpointIdentity, HostToolAuthority,
     HostedResources, HostedScreenSnapshot,
 };
-pub use hosted::{HostedMember, HostedMemberState, HostedSnapshot, HostedViewGrant};
+pub use hosted::{
+    HostedMember, HostedMemberState, HostedProgramExit, HostedSnapshot, HostedViewGrant,
+};
 pub use ids::ChatId;
 pub use image::{Image, ImageMediaType};
 pub use input::{ImageContext, ImageOrigin, InputContext, TextContext, render_input_context};

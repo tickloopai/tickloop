@@ -61,6 +61,7 @@ pub enum WorkerRequest {
     OpenHostedTick {
         chat: Uuid,
         operation: Uuid,
+        adapter: tickhost::host::TickAdapter,
         command: Vec<String>,
         cwd: PathBuf,
         environment: Vec<(String, String)>,

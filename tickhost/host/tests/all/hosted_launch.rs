@@ -146,6 +146,7 @@ impl Fixture {
                     "operation": uuid::Uuid::new_v4(),
                     "owner": self.owner,
                     "owner_revision": 0,
+                    "adapter": "protocol",
                     "command": command,
                     "cwd": cwd,
                     "environment": std::env::vars().collect::<Vec<_>>(),
@@ -154,6 +155,27 @@ impl Fixture {
                 CONTROL_TIMEOUT + Duration::from_secs(2),
             )
             .await
+    }
+
+    /// Opens `command` as a terminal Tick in the fixture directory.
+    async fn open_terminal(&self, controller: &mut HostConnection, command: &[&str]) -> Value {
+        controller
+            .request(
+                "open",
+                json!({
+                    "operation": uuid::Uuid::new_v4(),
+                    "owner": self.owner,
+                    "owner_revision": 0,
+                    "adapter": "terminal",
+                    "command": command,
+                    "cwd": self.directory.path(),
+                    "environment": std::env::vars().collect::<Vec<_>>(),
+                    "title": command.join(" "),
+                }),
+                CONTROL_TIMEOUT,
+            )
+            .await
+            .unwrap()
     }
 
     async fn reader(&self, opened: &Value) -> HostConnection {
@@ -374,6 +396,205 @@ async fn protocol_calls_and_the_screen_belong_to_one_counter_process() {
     shutdown(&fixture).await;
 }
 
+/// Reads a terminal Tick until `ready` accepts what it shows.
+async fn terminal_read_until(reader: &mut HostConnection, ready: impl Fn(&Value) -> bool) -> Value {
+    let mut read = Value::Null;
+    for _ in 0..400 {
+        read = reader
+            .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
+            .await
+            .unwrap();
+        if ready(&read) {
+            return read;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the terminal Tick never showed what was expected: {read}");
+}
+
+/// A program that does not speak the Tick protocol runs directly on its terminal and is Live as
+/// soon as it starts: it describes what it runs, reads as its screen text, and is written to
+/// with input. Its exit is recorded with the screen it left, which stays readable and watched
+/// until the Tick is closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminal_program_takes_input_shows_it_and_keeps_its_exit_code() {
+    let fixture = Fixture::start().await;
+    let mut controller = fixture.controller().await;
+    let opened = fixture.open_terminal(&mut controller, &["/bin/cat"]).await;
+    assert_eq!(opened["adapter"], "terminal");
+    assert!(opened["instance"].as_str().unwrap().starts_with("hosted:"));
+    let listed = controller
+        .request("list", json!({}), CONTROL_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(listed["items"][0]["adapter"], "terminal");
+    assert_eq!(listed["items"][0]["state"], "running");
+    let mut reader = fixture.reader(&opened).await;
+    let described = reader
+        .request("describe", json!({}), CONTROL_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(described["command"], json!(["/bin/cat"]));
+    assert_eq!(described["cwd"], json!(fixture.directory.path()));
+    assert_eq!(described["title"], "/bin/cat");
+    let started = terminal_read_until(&mut reader, |_| true).await;
+    assert_eq!(started["exit"], Value::Null);
+    let mut watcher = fixture.reader(&opened).await;
+    let watched = watcher
+        .request("watch", json!({}), CONTROL_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(watched["read"]["exit"], Value::Null, "{watched}");
+
+    let refused = reader
+        .request(
+            "call",
+            json!({"tool":"anything","args":{},"revision":"1"}),
+            CONTROL_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, "UnsupportedCapability");
+    let written = reader
+        .request(
+            "input",
+            json!({"data": b"hello tickhost\r".to_vec()}),
+            CONTROL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(written["written"], 15);
+    // The terminal echoes the line and cat prints it back.
+    let echoed = terminal_read_until(&mut reader, |read| {
+        read["text"]
+            .as_str()
+            .unwrap()
+            .matches("hello tickhost")
+            .count()
+            == 2
+    })
+    .await;
+    assert!(echoed["seq"].as_u64() > started["seq"].as_u64(), "{echoed}");
+    assert_eq!(echoed["exit"], Value::Null);
+    screen_contains(&mut reader, "hello tickhost").await;
+
+    // Ctrl-D at the start of a line ends cat's input, and cat exits.
+    reader
+        .request("input", json!({"data":[4]}), CONTROL_TIMEOUT)
+        .await
+        .unwrap();
+    let exited = terminal_read_until(&mut reader, |read| read["exit"] != Value::Null).await;
+    assert_eq!(exited["exit"], json!({"code":0,"signal":null}));
+    assert!(exited["text"].as_str().unwrap().contains("hello tickhost"));
+    assert!(exited["seq"].as_u64() > echoed["seq"].as_u64());
+    let refused = reader
+        .request("input", json!({"data": b"late".to_vec()}), CONTROL_TIMEOUT)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, "ProgramExited");
+    // A view still shows the last screen, at its own size, and its keys go nowhere.
+    let (mut events, mut requests) = attach(&fixture, &opened, json!({"rows":10,"columns":40}))
+        .await
+        .into_parts();
+    send(
+        &mut requests,
+        json!({"method":"input","params":{"data":[120]}}),
+    )
+    .await;
+    let mut shown = vt100::Parser::new(10, 40, 0);
+    view_shows(&mut events, &mut shown, "hello tickhost").await;
+    let listed = controller
+        .request("list", json!({}), CONTROL_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(
+        listed["items"][0]["instance"], opened["instance"],
+        "an exited terminal Tick stays until it is closed"
+    );
+    assert_eq!(listed["items"][0]["state"], "exited");
+    assert_eq!(listed["items"][0]["exit"], json!({"code":0,"signal":null}));
+    let refused = reader
+        .request("resources", json!({}), CONTROL_TIMEOUT)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.code, "ProgramExited",
+        "an exited program has no resources to sample"
+    );
+
+    let failing = fixture
+        .open_terminal(&mut controller, &["/bin/sh", "-c", "echo failing; exit 7"])
+        .await;
+    let mut failing_reader = fixture.reader(&failing).await;
+    let failed = terminal_read_until(&mut failing_reader, |read| read["exit"] != Value::Null).await;
+    assert_eq!(failed["exit"], json!({"code":7,"signal":null}));
+    assert_eq!(failed["text"], "failing");
+
+    controller
+        .request(
+            "close",
+            json!({"operation":uuid::Uuid::new_v4(),"owner":fixture.owner,"instance":opened["instance"]}),
+            CONTROL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    let ended = tokio::time::timeout(
+        Duration::from_secs(5),
+        watcher.next_event_within(BUSINESS_FRAME_BYTES),
+    )
+    .await
+    .expect("the watch ends with its Tick")
+    .unwrap();
+    assert_eq!(ended, Some(json!({"event":"gone"})));
+    shutdown(&fixture).await;
+}
+
+/// A terminal Tick's exit is recorded once its program ended and its terminal closed, so the
+/// screen it records is complete; whatever the program left running in its process group ends
+/// when the Tick is closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_an_exited_terminal_tick_ends_what_its_program_left_running() {
+    let fixture = Fixture::start().await;
+    let mut controller = fixture.controller().await;
+    let pid_file = fixture.directory.path().join("background.pid");
+    let script = format!(
+        "(trap '' HUP; exec sleep 600) < /dev/null > /dev/null 2>&1 & echo $! > {}; seq 1 50; exit 3",
+        pid_file.display()
+    );
+    let opened = fixture
+        .open_terminal(&mut controller, &["/bin/sh", "-c", &script])
+        .await;
+    let mut reader = fixture.reader(&opened).await;
+    let exited = terminal_read_until(&mut reader, |read| read["exit"] != Value::Null).await;
+    assert_eq!(exited["exit"], json!({"code":3,"signal":null}));
+    assert!(
+        exited["text"].as_str().unwrap().ends_with("50"),
+        "the exit comes with everything the program wrote: {exited}"
+    );
+    let background: u32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        alive(background),
+        "the program left a process running that outlives the terminal's hangup"
+    );
+    controller
+        .request(
+            "close",
+            json!({"operation":uuid::Uuid::new_v4(),"owner":fixture.owner,"instance":opened["instance"]}),
+            CONTROL_TIMEOUT + host::TERMINATE_GRACE,
+        )
+        .await
+        .unwrap();
+    assert!(
+        gone(background).await,
+        "closing the Tick ends its program's process group"
+    );
+    shutdown(&fixture).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn killing_the_launcher_ends_its_business_process_and_the_host_reaps_it() {
     let fixture = Fixture::start().await;
@@ -473,6 +694,7 @@ async fn a_long_command_is_listed_under_a_bounded_title_and_launches_whole() {
                 "operation": uuid::Uuid::new_v4(),
                 "owner": fixture.owner,
                 "owner_revision": 0,
+                "adapter": "protocol",
                 "command": command,
                 "cwd": work,
                 "environment": std::env::vars().collect::<Vec<_>>(),
@@ -1084,6 +1306,7 @@ async fn the_session_sockets_of_killed_launchers_go_with_their_ticks() {
                 "operation": uuid::Uuid::new_v4(),
                 "owner": fixture.owner,
                 "owner_revision": 0,
+                "adapter": "protocol",
                 "command": [which("python3"), "-c", STUBBORN_LAUNCHER],
                 "cwd": fixture.directory.path(),
                 "environment": std::env::vars().collect::<Vec<_>>(),
@@ -1117,6 +1340,7 @@ async fn open_for(
                 "operation": uuid::Uuid::new_v4(),
                 "owner": {"root": "fixture-root", "chat": chat},
                 "owner_revision": owner_revision,
+                "adapter": "protocol",
                 "command": command,
                 "cwd": work,
                 "environment": std::env::vars().collect::<Vec<_>>(),
@@ -1756,6 +1980,7 @@ async fn concurrent_launches_leave_every_terminal_master_only_in_the_host() {
             "operation": uuid::Uuid::new_v4(),
             "owner": fixture.owner,
             "owner_revision": 0,
+            "adapter": "protocol",
             "command": command,
             "cwd": work,
             "environment": std::env::vars().collect::<Vec<_>>(),

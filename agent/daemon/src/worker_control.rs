@@ -222,6 +222,7 @@ impl WorkerControl {
         match envelope.request {
             WorkerRequest::OpenHostedTick {
                 operation,
+                adapter,
                 command,
                 cwd,
                 environment,
@@ -236,7 +237,7 @@ impl WorkerControl {
                     snapshot.as_deref(),
                 )
                 .await?;
-                let record = LaunchRecord::opening(operation, chat, command, cwd, title)?;
+                let record = LaunchRecord::opening(operation, chat, adapter, command, cwd, title)?;
                 self.launch(&registry, tick_owner, owner_revision, record, environment)
                     .await
                     .map(|opened| json!(opened))
@@ -354,6 +355,7 @@ impl WorkerControl {
                 let record = LaunchRecord::opening(
                     operation,
                     chat,
+                    lost.adapter,
                     lost.command.clone(),
                     lost.cwd.clone(),
                     lost.title.clone(),
@@ -539,6 +541,7 @@ impl WorkerControl {
                 operation,
                 owner,
                 owner_revision,
+                adapter: record.adapter,
                 command: record.command.clone(),
                 cwd: record.cwd.clone(),
                 environment,

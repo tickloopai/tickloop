@@ -59,12 +59,8 @@ impl Host {
                 operation: Uuid::new_v4(),
                 owner: self.owner.clone(),
                 owner_revision: 0,
+                adapter: tickhost::host::TickAdapter::Protocol,
                 command: vec![
-                    support::fixture_cli::tickhost()
-                        .to_string_lossy()
-                        .into_owned(),
-                    "open".into(),
-                    "--".into(),
                     "/usr/bin/python3".into(),
                     "-u".into(),
                     script.to_string_lossy().into_owned(),

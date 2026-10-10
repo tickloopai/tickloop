@@ -247,6 +247,8 @@ pub enum MemberState {
     Live {
         protocol: bool,
     },
+    /// A hosted terminal Tick whose program ended, with how it ended for its status.
+    Exited(String),
     /// Its host died with it; a hosted Tick can be reopened as a new instance.
     Lost,
     Gone,

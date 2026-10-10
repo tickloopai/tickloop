@@ -33,8 +33,11 @@ pub const MANAGEMENT_FRAME_BYTES: usize = 64 * 1024;
 /// controller role carries `daemon_epoch` and the launch binding is read from
 /// `TICKLOOP_TICKHOST_LAUNCH`. 5.0: several views attach to one Tick at once, each naming its
 /// size, every frame names the screen size it draws, every view grant admits its own view, and
-/// listings count each Tick's views. A host of any other major is refused at hello.
-pub const BUSINESS_MAJOR: u16 = 5;
+/// listings count each Tick's views. 6.0: an open names its adapter, protocol or terminal, as do
+/// its answer and the listings; a terminal Tick reads as screen text with its program's exit, is
+/// written to with `input` and is watched only until it ends. A host of any other major is
+/// refused at hello.
+pub const BUSINESS_MAJOR: u16 = 6;
 pub const BUSINESS_MINOR: u16 = 0;
 /// A complete business frame, large enough for one legal 8 MiB Tick Tool response.
 pub const BUSINESS_FRAME_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;

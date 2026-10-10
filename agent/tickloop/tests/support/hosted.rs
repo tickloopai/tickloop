@@ -1,12 +1,12 @@
-//! Opens of hosted Ticks for tests that run a private Tickhost: each Tick starts through the
-//! fixture CLI's Tick launcher, as the daemon starts one.
+//! Opens of hosted Ticks for tests that run a private Tickhost: a protocol program starts behind
+//! the fixture CLI's Tick launcher, which the daemon's host controller puts in front of it.
 
 use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use tickhost::host::{OpenRequest, TickOwner};
+use tickhost::host::{OpenRequest, TickAdapter, TickOwner};
 use uuid::Uuid;
 
 /// How long a test Tickhost lets an unused Tick idle: longer than any wait of a test step, and
@@ -16,19 +16,6 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// The environment a hosted test Tick runs with.
 pub fn tick_environment() -> Vec<(String, String)> {
     vec![("PATH".into(), "/usr/bin:/bin".into())]
-}
-
-/// `program` started through `tickhost open`, the launcher of protocol programs.
-pub fn launch_command(program: Vec<String>) -> Vec<String> {
-    let mut command = vec![
-        super::fixture_cli::tickhost()
-            .to_string_lossy()
-            .into_owned(),
-        "open".into(),
-        "--".into(),
-    ];
-    command.extend(program);
-    command
 }
 
 /// Python running `script` unbuffered with `arguments`.
@@ -51,13 +38,14 @@ pub fn counter_program() -> Vec<String> {
     python_program(&counter, &[])
 }
 
-/// An open of `program` for `owner`, started through the fixture CLI's Tick launcher.
+/// An open of the protocol `program` for `owner`.
 pub fn tick_request(owner: TickOwner, cwd: &Path, program: Vec<String>) -> OpenRequest {
     OpenRequest {
         operation: Uuid::new_v4(),
         owner,
         owner_revision: 0,
-        command: launch_command(program),
+        adapter: TickAdapter::Protocol,
+        command: program,
         cwd: cwd.to_path_buf(),
         environment: tick_environment(),
         title: None,

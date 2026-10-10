@@ -15,7 +15,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tick_protocol::InstanceRef;
-use tickhost::host::{Receipt, TickOwner};
+use tickhost::host::{Receipt, TickAdapter, TickOwner};
 use tickhost_connect::host_error::HostError;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -127,6 +127,7 @@ impl LaunchIdentity {
 pub struct LaunchRecord {
     pub operation: Uuid,
     pub chat: Uuid,
+    pub adapter: TickAdapter,
     pub command: Vec<String>,
     pub cwd: PathBuf,
     pub identity: LaunchIdentity,
@@ -145,6 +146,7 @@ impl LaunchRecord {
     pub fn opening(
         operation: Uuid,
         chat: Uuid,
+        adapter: TickAdapter,
         command: Vec<String>,
         cwd: PathBuf,
         title: Option<String>,
@@ -154,6 +156,7 @@ impl LaunchRecord {
         Ok(Self {
             operation,
             chat,
+            adapter,
             command,
             cwd,
             identity,
@@ -462,8 +465,19 @@ impl RegistryFiles {
             let Some(bytes) = read_unlinked(&entry.path())? else {
                 continue;
             };
-            let record: LaunchRecord =
-                serde_json::from_slice(&bytes).map_err(|error| failed(&error))?;
+            // A record this build cannot read, such as one written before a format change, says
+            // nothing it can act on: it is dropped alone, and the Chat's other records stay.
+            let record: LaunchRecord = match serde_json::from_slice(&bytes) {
+                Ok(record) => record,
+                Err(error) => {
+                    eprintln!(
+                        "tickloop: dropping unreadable hosted Tick record {}: {error}",
+                        entry.path().display()
+                    );
+                    let _ = std::fs::remove_file(entry.path());
+                    continue;
+                }
+            };
             // The file's place, not its content, says whose record it is.
             if record.chat != chat || record.operation.to_string() != operation {
                 return Err(failed(&format!(
@@ -852,6 +866,7 @@ mod tests {
         let mut record = LaunchRecord::opening(
             Uuid::new_v4(),
             chat,
+            TickAdapter::Terminal,
             vec!["/usr/bin/true".into()],
             "/".into(),
             Some("counter".into()),
@@ -1081,6 +1096,37 @@ mod tests {
             root.launches(target).await.is_err(),
             "a linked record is refused"
         );
+    }
+
+    /// A record this build cannot read is dropped alone; the Chat's other records stay readable.
+    #[tokio::test]
+    async fn an_unreadable_record_is_dropped_and_the_others_are_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = Registry::default().root(directory.path()).await.unwrap();
+        let chat = Uuid::new_v4();
+        let kept = record(chat, LaunchState::Opening);
+        root.record_launch(&kept).await.unwrap();
+        let mut old_format = serde_json::to_value(record(chat, LaunchState::Opening)).unwrap();
+        old_format.as_object_mut().unwrap().remove("adapter");
+        let old_path = directory
+            .path()
+            .join(REGISTRY_DIRECTORY)
+            .join(CHATS_DIRECTORY)
+            .join(chat.to_string())
+            .join(format!(
+                "{LAUNCH_PREFIX}{}{RECORD_EXTENSION}",
+                old_format["operation"].as_str().unwrap()
+            ));
+        std::fs::write(&old_path, serde_json::to_vec(&old_format).unwrap()).unwrap();
+        let launches = root.launches(chat).await.unwrap();
+        assert_eq!(
+            launches
+                .iter()
+                .map(|record| record.operation)
+                .collect::<Vec<_>>(),
+            [kept.operation]
+        );
+        assert!(!old_path.exists(), "the unreadable record is gone");
     }
 
     /// A record is changed only as it is now: a change decided on an earlier reading of a record
