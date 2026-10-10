@@ -542,6 +542,7 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
         .spawn()
         .unwrap();
     let mut lifeline = worker.stdin.take().unwrap();
+    let _daemon = grant_shell_spawns(temporary.path(), epoch);
     let control = serde_json::json!({
         "endpoint": temporary.path().join("worker-control.sock"),
         "daemon_epoch": epoch,
@@ -634,6 +635,70 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
         .unwrap();
     assert!(status.success());
     assert!(!socket.exists());
+}
+
+/// Stands in for the daemon side of a worker's control channel: it grants every Shell spawn the
+/// worker asks for, from a Tickhost served in this test, and answers nothing else.
+fn grant_shell_spawns(directory: &Path, epoch: Uuid) -> tokio::task::JoinHandle<()> {
+    use tickhost_connect::hosted::{BUSINESS_FRAME_BYTES, read_frame, write_frame};
+    use tickloop_agent_runtime::hosted::{
+        controller::HostController,
+        worker_control::{IssuedSpawn, WorkerEnvelope, WorkerRequest},
+    };
+    let listener = UnixListener::bind(directory.join("worker-control.sock")).unwrap();
+    let controller = Arc::new(HostController::in_process(
+        directory,
+        tickhost::paths::HostPaths {
+            runtime: directory.join("h"),
+        },
+        epoch,
+    ));
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let controller = controller.clone();
+            tokio::spawn(async move {
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(reader);
+                let frame = read_frame(&mut reader, BUSINESS_FRAME_BYTES)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let envelope: WorkerEnvelope =
+                    serde_json::from_value(frame["envelope"].clone()).unwrap();
+                let WorkerRequest::AllowShellSpawn {
+                    chat,
+                    operation,
+                    approval,
+                } = envelope.request
+                else {
+                    panic!("the worker asked its daemon for something other than a Shell spawn");
+                };
+                let binding = tickhost::shell::SpawnBinding {
+                    operation,
+                    identity: tickhost::shell::ShellIdentity {
+                        daemon_epoch: epoch,
+                        worker: envelope.binding,
+                        chat,
+                    },
+                    approval,
+                };
+                let grant = controller.allow_spawn(&binding).await.unwrap();
+                let issued = IssuedSpawn {
+                    grant,
+                    binding,
+                    endpoint: controller.endpoint(),
+                };
+                write_frame(
+                    &mut writer,
+                    &serde_json::json!({"id":frame["id"],"result":issued}),
+                    BUSINESS_FRAME_BYTES,
+                )
+                .await
+                .unwrap();
+            });
+        }
+    })
 }
 
 /// A test's private daemon runtime directory. Dropping it stops whatever daemon serves the
@@ -982,6 +1047,15 @@ const NEXT_TEST_PROCESS: &str = "TICKLOOP_TEST_NEXT_PROCESS";
 /// Starts a daemon in `runtime` with one idle worker, and returns a client of the daemon with the
 /// processes of the daemon and the worker.
 async fn start_daemon_with_worker(runtime: &Path, workdir: &Path) -> (LocalAgentClient, [u32; 2]) {
+    let (client, _, processes) = start_daemon_with_agent(runtime, workdir).await;
+    (client, processes)
+}
+
+/// [`start_daemon_with_worker`], also returning the Agent the worker runs.
+async fn start_daemon_with_agent(
+    runtime: &Path,
+    workdir: &Path,
+) -> (LocalAgentClient, ExecutionRef, [u32; 2]) {
     let client = tickloop_agent_client::connect_or_start_at(
         runtime.to_path_buf(),
         PathBuf::from(env!("CARGO_BIN_EXE_tickloop")),
@@ -1004,7 +1078,7 @@ async fn start_daemon_with_worker(runtime: &Path, workdir: &Path) -> (LocalAgent
         value: value.as_bytes().to_vec(),
     })
     .collect();
-    execution(
+    let target = execution(
         client
             .execute(envelope(
                 client.daemon_epoch(),
@@ -1029,7 +1103,100 @@ async fn start_daemon_with_worker(runtime: &Path, workdir: &Path) -> (LocalAgent
         .expect("the daemon published its worker's socket");
     let worker = LocalAgentClient::connect(&worker_socket).await.unwrap();
     let processes = [client.server_process_id(), worker.server_process_id()];
-    (client, processes)
+    (client, target, processes)
+}
+
+/// Starts a background `!` command of `target` and returns the process group it runs in.
+async fn start_background_shell(client: &LocalAgentClient, target: ExecutionRef) -> u32 {
+    let CommandResult::ShellSubmitted(shell) = client
+        .execute(envelope(
+            client.daemon_epoch(),
+            AgentCommand::Submit {
+                execution: target,
+                target_loop: None,
+                input: UserInput::Shell {
+                    command: "sleep 300".into(),
+                    background: true,
+                },
+                origin: None,
+            },
+        ))
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap()
+    else {
+        panic!("expected a background shell");
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let observed = client
+                .observe(ObservationRequest::Agent {
+                    execution: target,
+                    detail: AgentDetailQuery::Snapshot,
+                    after: None,
+                })
+                .await
+                .unwrap();
+            if let ObservationValue::Agent(snapshot) = observed.initial
+                && let Some(pid) = snapshot
+                    .user_shells
+                    .iter()
+                    .find(|record| record.id == shell.command_id)
+                    .and_then(|record| record.pid)
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the background shell never started")
+}
+
+async fn assert_group_ends(group: u32) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while tickhost::shell::process_group_exists(group) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "process group {group} still runs"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn daemon_stop_ends_the_background_shells_of_its_workers() {
+    let workdir = tempfile::tempdir().unwrap();
+    let runtime = support::runtime_dir();
+    let (client, target, processes) = start_daemon_with_agent(runtime.path(), workdir.path()).await;
+    let group = start_background_shell(&client, target).await;
+    assert!(tickhost::shell::process_group_exists(group));
+    let stopped = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickloop"))
+        .args(["daemon", "stop"])
+        .env("TICKLOOP_DAEMON_RUNTIME_DIR", runtime.path())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert_exit_before(std::time::Instant::now() + STEP_DOWN_DEADLINE, &processes).await;
+    assert_group_ends(group).await;
+}
+
+#[tokio::test]
+async fn a_crashed_workers_background_shells_end_with_it() {
+    let workdir = tempfile::tempdir().unwrap();
+    let runtime = support::runtime_dir();
+    let (client, target, [_, worker]) =
+        start_daemon_with_agent(runtime.path(), workdir.path()).await;
+    let group = start_background_shell(&client, target).await;
+    assert!(tickhost::shell::process_group_exists(group));
+    unsafe { libc::kill(worker as libc::pid_t, libc::SIGKILL) };
+    assert_group_ends(group).await;
 }
 
 async fn assert_exit_before(deadline: std::time::Instant, processes: &[u32]) {

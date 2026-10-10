@@ -1,7 +1,7 @@
-//! The daemon side of the worker-to-daemon channel for hosted Tick lifecycles: one private
-//! endpoint, one grant per running worker. It verifies that a request's Chat runs in the asking
-//! worker, derives the config root from the worker's launch itself, and dispatches through the
-//! daemon's own host controller.
+//! The daemon side of the worker-to-daemon channel for hosted Tick lifecycles and Shell spawns:
+//! one private endpoint, one grant per running worker. It verifies that a request's Chat runs in
+//! the asking worker, derives the config root from the worker's launch itself, and dispatches
+//! through the daemon's own host controller.
 
 use std::{
     collections::HashMap,
@@ -11,7 +11,10 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tickhost::host::{OpenRequest, Receipt, TickOwner};
+use tickhost::{
+    host::{OpenRequest, Receipt, TickOwner},
+    shell::{ShellIdentity, SpawnBinding},
+};
 use tickhost_connect::{
     host_error::HostError,
     hosted::{
@@ -38,8 +41,8 @@ use tickloop_agent_runtime::{
             TARGET_GONE, Transition,
         },
         worker_control::{
-            ENDPOINT_NAME, HostedAdmission, HostedTickPage, LostTick, WorkerControlGrant,
-            WorkerEnvelope, WorkerRequest, root_identity,
+            ENDPOINT_NAME, HostedAdmission, HostedTickPage, IssuedSpawn, LostTick,
+            WorkerControlGrant, WorkerEnvelope, WorkerRequest, root_identity,
         },
     },
     tick_tools::MODIFY_TICK,
@@ -207,6 +210,30 @@ impl WorkerControl {
             .verify_worker_chat(chat, &worker)
             .await
             .map_err(|error| HostError::before("Forbidden", error.message))?;
+        if let WorkerRequest::AllowShellSpawn {
+            operation,
+            approval,
+            ..
+        } = envelope.request
+        {
+            // The worker approved and checked the command; the host only learns who may start
+            // which one, once.
+            let binding = SpawnBinding {
+                operation,
+                identity: ShellIdentity {
+                    daemon_epoch: self.epoch,
+                    worker: envelope.binding,
+                    chat,
+                },
+                approval,
+            };
+            let grant = self.controller.allow_spawn(&binding).await?;
+            return Ok(json!(IssuedSpawn {
+                grant,
+                binding,
+                endpoint: self.controller.endpoint(),
+            }));
+        }
         let snapshot = match envelope.request.admission() {
             Some(admission) => Some(self.admit(&worker, execution, admission).await?),
             None => None,
@@ -464,6 +491,9 @@ impl WorkerControl {
                 .allow_view(&tick_owner, &instance)
                 .await
                 .map(|grant| json!(grant)),
+            WorkerRequest::AllowShellSpawn { .. } => {
+                unreachable!("Shell spawns are granted before a config root is required")
+            }
             WorkerRequest::EndStoppedChild {
                 child, operation, ..
             } => {

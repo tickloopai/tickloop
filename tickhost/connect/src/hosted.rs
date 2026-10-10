@@ -1,8 +1,8 @@
-//! The Tickhost wire contract shared by the host service, its Agent daemon client, data clients
-//! and the hosted launcher. Frames are one JSON object per line on a private Unix socket. The
-//! first frame names the channel: the frozen management channel only says hello and shuts the
-//! host down; the business channel negotiates its minor version and capabilities and then
-//! serves exactly one authenticated role.
+//! The Tickhost wire contract shared by the host service, its Agent daemon client, data clients,
+//! the hosted launcher and the Shell task spawner. Frames are one JSON object per line on a
+//! private Unix socket. The first frame names the channel: the frozen management channel only
+//! says hello and shuts the host down; the business channel negotiates its minor version and
+//! capabilities and then serves exactly one authenticated role.
 
 use std::{
     os::fd::{AsRawFd, RawFd},
@@ -35,9 +35,11 @@ pub const MANAGEMENT_FRAME_BYTES: usize = 64 * 1024;
 /// size, every frame names the screen size it draws, every view grant admits its own view, and
 /// listings count each Tick's views. 6.0: an open names its adapter, protocol or terminal, as do
 /// its answer and the listings; a terminal Tick reads as screen text with its program's exit, is
-/// written to with `input` and is watched only until it ends. A host of any other major is
-/// refused at hello.
-pub const BUSINESS_MAJOR: u16 = 6;
+/// written to with `input` and is watched only until it ends. 7.0: the controller asks for
+/// one-time spawn grants, a spawner connection runs one Shell task from the descriptors and
+/// launch it passes, and the Shell adapter serves that task's `shell:` instance. A host of any
+/// other major is refused at hello.
+pub const BUSINESS_MAJOR: u16 = 7;
 pub const BUSINESS_MINOR: u16 = 0;
 /// A complete business frame, large enough for one legal 8 MiB Tick Tool response.
 pub const BUSINESS_FRAME_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
@@ -64,8 +66,18 @@ pub const LAUNCH_ENV: &str = "TICKLOOP_TICKHOST_LAUNCH";
 pub const CAPABILITY_LIFECYCLE: &str = "lifecycle";
 pub const CAPABILITY_DATA: &str = "data";
 pub const CAPABILITY_LAUNCH: &str = "launch";
-pub const BUSINESS_CAPABILITIES: [&str; 3] =
-    [CAPABILITY_LIFECYCLE, CAPABILITY_DATA, CAPABILITY_LAUNCH];
+pub const CAPABILITY_SHELL: &str = "shell";
+pub const BUSINESS_CAPABILITIES: [&str; 4] = [
+    CAPABILITY_LIFECYCLE,
+    CAPABILITY_DATA,
+    CAPABILITY_LAUNCH,
+    CAPABILITY_SHELL,
+];
+/// The descriptors a spawner passes before its request: the approved working directory and the
+/// output file.
+pub const SPAWN_DESCRIPTORS: usize = 2;
+/// The one byte that carries passed descriptors.
+const DESCRIPTOR_MARKER: u8 = b'F';
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "channel", rename_all = "snake_case", deny_unknown_fields)]
@@ -107,6 +119,9 @@ pub enum Role {
         operation: uuid::Uuid,
         launch_token: String,
     },
+    /// The submitter of one Shell task, holding the one-time spawn grant its daemon asked the
+    /// host for; the task lives as long as this connection.
+    Spawner { grant: uuid::Uuid, token: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -394,9 +409,139 @@ impl HostConnection {
         read_frame(&mut self.reader, limit).await
     }
 
+    /// Passes `descriptors` to the host ahead of the next request, which they belong to.
+    pub async fn send_descriptors(&self, descriptors: &[RawFd]) -> Result<(), HostError> {
+        self.writer
+            .as_ref()
+            .async_io(tokio::io::Interest::WRITABLE, || {
+                send_with_descriptors(self.writer.as_ref().as_raw_fd(), descriptors)
+            })
+            .await
+            .map_err(|error| HostError::before("Disconnected", error.to_string()))
+    }
+
     pub fn into_parts(self) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
         (self.reader, self.writer)
     }
+}
+
+/// Receives the descriptors a peer passed ahead of its next frame. Nothing may be buffered yet:
+/// the descriptors travel with the first byte after the hello reply.
+pub async fn receive_descriptors(
+    reader: &BufReader<OwnedReadHalf>,
+    count: usize,
+) -> Result<Vec<std::os::fd::OwnedFd>, HostError> {
+    if !reader.buffer().is_empty() {
+        return Err(HostError::before(
+            "InvalidFrame",
+            "descriptors must come before any other frame",
+        ));
+    }
+    let stream = reader.get_ref().as_ref();
+    let descriptors = stream
+        .async_io(tokio::io::Interest::READABLE, || {
+            receive_with_descriptors(stream.as_raw_fd(), count)
+        })
+        .await
+        .map_err(|error| HostError::before("InvalidDescriptors", error.to_string()))?;
+    if descriptors.len() != count {
+        return Err(HostError::before(
+            "InvalidDescriptors",
+            format!(
+                "expected {count} descriptors, received {}",
+                descriptors.len()
+            ),
+        ));
+    }
+    Ok(descriptors)
+}
+
+fn descriptor_space(count: usize) -> usize {
+    unsafe { libc::CMSG_SPACE((count * std::mem::size_of::<RawFd>()) as u32) as usize }
+}
+
+fn send_with_descriptors(socket: RawFd, descriptors: &[RawFd]) -> std::io::Result<()> {
+    let marker = [DESCRIPTOR_MARKER];
+    let mut part = libc::iovec {
+        iov_base: marker.as_ptr() as *mut libc::c_void,
+        iov_len: marker.len(),
+    };
+    let space = descriptor_space(descriptors.len());
+    // Control messages are aligned like the header that leads them.
+    let mut control = vec![0u64; space.div_ceil(std::mem::size_of::<u64>())];
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut part;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = space as _;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&message);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(descriptors) as u32) as _;
+        std::ptr::copy_nonoverlapping(
+            descriptors.as_ptr(),
+            libc::CMSG_DATA(header).cast::<RawFd>(),
+            descriptors.len(),
+        );
+    }
+    match unsafe { libc::sendmsg(socket, &message, 0) } {
+        sent if sent < 0 => Err(std::io::Error::last_os_error()),
+        0 => Err(std::io::ErrorKind::WriteZero.into()),
+        _ => Ok(()),
+    }
+}
+
+fn receive_with_descriptors(
+    socket: RawFd,
+    count: usize,
+) -> std::io::Result<Vec<std::os::fd::OwnedFd>> {
+    use std::os::fd::FromRawFd;
+    let mut marker = [0u8];
+    let mut part = libc::iovec {
+        iov_base: marker.as_mut_ptr().cast(),
+        iov_len: marker.len(),
+    };
+    let space = descriptor_space(count);
+    let mut control = vec![0u64; space.div_ceil(std::mem::size_of::<u64>())];
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut part;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = space as _;
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_CMSG_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let flags = 0;
+    let received = unsafe { libc::recvmsg(socket, &mut message, flags) };
+    if received < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut descriptors = Vec::new();
+    unsafe {
+        let mut header = libc::CMSG_FIRSTHDR(&message);
+        while !header.is_null() {
+            if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
+                let data = libc::CMSG_DATA(header).cast::<RawFd>();
+                let length = (*header).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                for index in 0..length / std::mem::size_of::<RawFd>() {
+                    let descriptor = data.add(index).read_unaligned();
+                    libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC);
+                    descriptors.push(std::os::fd::OwnedFd::from_raw_fd(descriptor));
+                }
+            }
+            header = libc::CMSG_NXTHDR(&message, header);
+        }
+    }
+    if received == 0 {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
+    if marker[0] != DESCRIPTOR_MARKER || message.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(std::io::Error::other(
+            "the passed descriptors were malformed or truncated",
+        ));
+    }
+    Ok(descriptors)
 }
 
 /// Extracts a response's result, or its typed error. With an expected id, a response for any
@@ -452,6 +597,67 @@ mod tests {
         assert_eq!(
             read_frame(&mut reader, LIMIT).await.unwrap_err().code,
             "FrameTooLarge"
+        );
+    }
+
+    fn identity(descriptor: RawFd) -> (u64, u64) {
+        use std::os::{fd::FromRawFd, unix::fs::MetadataExt};
+        let duplicate = unsafe { std::fs::File::from_raw_fd(libc::dup(descriptor)) };
+        let metadata = duplicate.metadata().unwrap();
+        (metadata.dev(), metadata.ino())
+    }
+
+    #[tokio::test]
+    async fn passed_descriptors_arrive_ahead_of_the_frame_they_belong_to() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(directory.path().join("output")).unwrap();
+        let folder = std::fs::File::open(directory.path()).unwrap();
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (_, client_writer) = client.into_split();
+        let (server_reader, _) = server.into_split();
+        let reader = BufReader::new(server_reader);
+        let raw = client_writer.as_ref().as_raw_fd();
+        tokio::task::spawn_blocking(move || {
+            send_with_descriptors(raw, &[folder.as_raw_fd(), file.as_raw_fd()]).unwrap();
+        })
+        .await
+        .unwrap();
+        let mut writer = client_writer;
+        write_frame(&mut writer, &json!({"method":"spawn"}), 64)
+            .await
+            .unwrap();
+        let received = receive_descriptors(&reader, 2).await.unwrap();
+        assert_eq!(
+            identity(received[0].as_raw_fd()),
+            identity(std::fs::File::open(directory.path()).unwrap().as_raw_fd())
+        );
+        assert_eq!(
+            identity(received[1].as_raw_fd()),
+            identity(
+                std::fs::File::open(directory.path().join("output"))
+                    .unwrap()
+                    .as_raw_fd()
+            )
+        );
+        let mut reader = reader;
+        assert_eq!(
+            read_frame(&mut reader, 64).await.unwrap(),
+            Some(json!({"method":"spawn"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_in_place_of_the_descriptors_is_refused() {
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (_, mut writer) = client.into_split();
+        let (server_reader, _) = server.into_split();
+        let reader = BufReader::new(server_reader);
+        write_frame(&mut writer, &json!({"method":"spawn"}), 64)
+            .await
+            .unwrap();
+        assert_eq!(
+            receive_descriptors(&reader, 2).await.unwrap_err().code,
+            "InvalidDescriptors"
         );
     }
 }

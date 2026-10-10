@@ -1,7 +1,8 @@
 //! The worker side and wire types of the authenticated worker-to-daemon channel for hosted Tick
-//! lifecycles. A worker proves its private grant and names the Chat it acts for; the daemon
-//! (`agent_daemon::worker_control`) verifies that the Chat runs in that worker and dispatches
-//! through its own host controller. Workers never hold host control or reconcile rights.
+//! lifecycles and Shell spawns. A worker proves its private grant and names the Chat it acts for;
+//! the daemon (`agent_daemon::worker_control`) verifies that the Chat runs in that worker and
+//! dispatches through its own host controller. Workers never hold host control or reconcile
+//! rights.
 
 use std::{
     collections::BTreeSet,
@@ -108,6 +109,20 @@ pub enum WorkerRequest {
         child: Uuid,
         operation: Uuid,
     },
+    /// A one-time grant for this worker to start the command `chat` approved and checked last.
+    AllowShellSpawn {
+        chat: Uuid,
+        operation: Uuid,
+        approval: tickhost::shell::ShellApproval,
+    },
+}
+
+/// A spawn grant as the daemon hands it to its worker: what it binds, and the host to claim it at.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct IssuedSpawn {
+    pub grant: tickhost::shell::SpawnGrant,
+    pub binding: tickhost::shell::SpawnBinding,
+    pub endpoint: PathBuf,
 }
 
 /// One page of a Chat's hosted Ticks, as the daemon answers its worker.
@@ -147,7 +162,8 @@ impl WorkerRequest {
             | Self::GetHostedOperationReceipt { .. }
             | Self::SetWatchIntents { .. }
             | Self::AllowHostedView { .. }
-            | Self::EndStoppedChild { .. } => None,
+            | Self::EndStoppedChild { .. }
+            | Self::AllowShellSpawn { .. } => None,
         }
     }
 
@@ -160,7 +176,8 @@ impl WorkerRequest {
             | Self::GetHostedOperationReceipt { chat, .. }
             | Self::SetWatchIntents { chat, .. }
             | Self::AllowHostedView { chat, .. }
-            | Self::EndStoppedChild { chat, .. } => *chat,
+            | Self::EndStoppedChild { chat, .. }
+            | Self::AllowShellSpawn { chat, .. } => *chat,
         }
     }
 }

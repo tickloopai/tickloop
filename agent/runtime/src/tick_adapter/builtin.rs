@@ -1,5 +1,8 @@
 use super::*;
-use crate::{Agent, tick_stream::HostedTickStream};
+use crate::{
+    Agent,
+    tick_stream::{HostedTickStream, ShellTickStream},
+};
 
 /// Ticks a Chat opened in the dedicated Tickhost; only a worker with a Tickhost grant follows
 /// them.
@@ -23,6 +26,7 @@ impl TickAdapter for HostedAdapter {
     }
 }
 
+/// Shell tasks, which run in the Tickhost; every Agent follows its own.
 pub struct ShellAdapter {
     stream: Arc<dyn TickStreamPort>,
 }
@@ -35,7 +39,7 @@ impl ShellAdapter {
 }
 impl TickAdapter for ShellAdapter {
     fn tick_type(&self) -> &'static str {
-        "shell"
+        tick_protocol::SHELL_INSTANCE_TYPE
     }
     fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
         Some(self.stream.clone())

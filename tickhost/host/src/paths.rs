@@ -143,8 +143,8 @@ impl HostPaths {
             .map_err(|_| io::Error::other("the Tickhost lock records no process id"))
     }
 
-    /// Creates or verifies the private runtime and session directories and checks that every
-    /// socket path fits.
+    /// Creates or verifies the private runtime and session directories and checks that the
+    /// host's own socket path fits.
     pub fn prepare(&self) -> io::Result<()> {
         private_directory(&self.runtime)?;
         private_directory(&self.sessions())?;
@@ -154,6 +154,13 @@ impl HostPaths {
                 "Tickhost runtime directory is too long for a Unix socket path",
             ));
         }
+        Ok(())
+    }
+
+    /// Checks that every protocol Tick's Session socket fits under its session directory; only
+    /// protocol Ticks have one.
+    pub fn check_session_directories(&self) -> io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
         let longest_tick_session_directory = self.tick_session_directory(u64::MAX);
         if longest_tick_session_directory.as_os_str().as_bytes().len() > MAX_SESSION_DIRECTORY_BYTES
         {
@@ -210,7 +217,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_runtime_fits_only_while_its_longest_tick_session_directory_fits() {
+    fn protocol_ticks_fit_only_while_the_longest_tick_session_directory_fits() {
         let directory = tempfile::Builder::new()
             .prefix("thp")
             .tempdir_in("/private/tmp")
@@ -223,7 +230,10 @@ mod tests {
                 runtime: directory.path().join("r".repeat(bytes - parent_bytes)),
             }
         };
-        assert!(runtime_of(fitting_bytes).prepare().is_ok());
-        assert!(runtime_of(fitting_bytes + 1).prepare().is_err());
+        let fitting = runtime_of(fitting_bytes);
+        assert!(fitting.prepare().is_ok() && fitting.check_session_directories().is_ok());
+        // A longer runtime still serves Shell tasks, but no protocol Tick.
+        let longer = runtime_of(fitting_bytes + 1);
+        assert!(longer.prepare().is_ok() && longer.check_session_directories().is_err());
     }
 }

@@ -6,3 +6,5 @@ mod cli;
 mod hosted_launch;
 #[path = "all/protocol.rs"]
 mod protocol;
+#[path = "all/shell_tasks.rs"]
+mod shell_tasks;

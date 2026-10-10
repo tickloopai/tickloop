@@ -28,7 +28,10 @@ mod search;
 pub use search::{GLOB_TOOL_NAME, GREP_TOOL_NAME};
 mod shell;
 pub use shell::CANCELLED_COMMAND_REASON;
-pub use shell::{BASH_TOOL_NAME, TASK_STOP_TOOL_NAME, UserCommandSnapshot};
+pub use shell::{
+    BASH_TOOL_NAME, ShellExit, ShellHost, ShellLaunch, ShellProcess, TASK_STOP_TOOL_NAME,
+    UserCommandSnapshot,
+};
 mod web;
 pub use web::SecondaryModel;
 pub use web::{WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME};
@@ -362,23 +365,44 @@ pub struct Tools {
 }
 
 impl Tools {
-    /// 独立使用时，附属文件与任务输出都放在 `output_dir` 下。
+    /// 独立使用时，附属文件与任务输出都放在 `output_dir` 下；没有运行命令的宿主，Shell 命令被拒绝。
     pub fn new(output_dir: PathBuf) -> Self {
         let output_dir = PrivateDirectory::trusted(output_dir);
         let task_output_dir = output_dir.join(TASK_OUTPUT_SUBDIRECTORY);
-        Self::for_chat(output_dir.clone(), task_output_dir, output_dir)
+        Self::with_commands(
+            output_dir.clone(),
+            task_output_dir,
+            output_dir,
+            shell::Registry::without_host(),
+        )
     }
 
+    /// The tools of one Chat, whose shell commands run in `shells`.
     pub fn for_chat(
         chat_directory: PrivateDirectory,
         task_output_dir: PrivateDirectory,
         family_temp: PrivateDirectory,
+        shells: std::sync::Arc<dyn ShellHost>,
+    ) -> Self {
+        Self::with_commands(
+            chat_directory,
+            task_output_dir,
+            family_temp,
+            shell::Registry::new(shells),
+        )
+    }
+
+    fn with_commands(
+        chat_directory: PrivateDirectory,
+        task_output_dir: PrivateDirectory,
+        family_temp: PrivateDirectory,
+        commands: shell::Registry,
     ) -> Self {
         Self {
             output_dir: chat_directory,
             task_output_dir,
             family_temp,
-            commands: shell::Registry::new(),
+            commands,
             search: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             fetched_pages: web::FetchCache::default(),
             file_reads: FileReadState::default(),
@@ -870,6 +894,11 @@ fn prepare_with_readable_directories(
         _ => true,
     };
     let resolved_path = operation.resolve_target(&original_path, is_read_only)?;
+    if let Operation::Shell(input) = &mut operation {
+        input.approved_directory = std::fs::metadata(&resolved_path)
+            .ok()
+            .and_then(|metadata| shell::DirectoryIdentity::of(&metadata));
+    }
     let original_scope = match (original_path.parent(), original_path.file_name()) {
         (Some(parent), Some(name)) if matches!(operation, Operation::Write(_)) => {
             resolve_write_target(parent)?.join(name)

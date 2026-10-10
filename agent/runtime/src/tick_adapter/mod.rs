@@ -1,10 +1,9 @@
 //! Registered Tick adapters supply each Tick type's TickStreamPort; the Loop runtime consumes
 //! their common contract. The Console registers the same `<type>` for its Monitor rows.
 mod builtin;
-mod shell;
 
+pub use crate::tick_stream::ShellTickStream;
 pub use builtin::{HostedAdapter, ShellAdapter};
-pub use shell::ShellTickStream;
 
 use crate::tick_stream::{EventPublisher, TickStreamHandle, TickStreamPort, WatchId};
 use std::{collections::BTreeMap, sync::Arc};

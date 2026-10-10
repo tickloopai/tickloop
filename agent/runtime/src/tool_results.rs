@@ -79,6 +79,7 @@ impl Agent {
             chat_directory,
             task_output_directory,
             family_temp,
+            self.inner.shells.for_chat(chat_id),
         ))
     }
 

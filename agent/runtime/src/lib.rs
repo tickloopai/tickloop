@@ -266,10 +266,6 @@ impl Agent {
             inner: Arc::downgrade(&self.inner),
         }
     }
-
-    pub(crate) fn shutdown_token(&self) -> CancellationToken {
-        self.inner.shutdown.clone()
-    }
 }
 
 struct Inner {
@@ -316,6 +312,8 @@ struct Inner {
     auto_health: Mutex<auto_health::AutoHealth>,
     host_tools: std::sync::RwLock<Option<Arc<dyn crate::host_tools::HostToolProvider>>>,
     hosted_ticks: std::sync::RwLock<Option<Arc<crate::hosted::tools::HostedTickTools>>>,
+    /// Where every Chat's shell commands run: the Tickhost.
+    shells: Arc<crate::hosted::shells::ShellTasks>,
     stopped_child_hook: std::sync::RwLock<Option<Arc<dyn StoppedChildHook>>>,
     /// Whether a Workspace Tick Update stream is installed; the Tick Subscription tools reach the
     /// model only then.
@@ -811,6 +809,15 @@ impl Agent {
 
     pub fn hosted_ticks(&self) -> Option<Arc<crate::hosted::tools::HostedTickTools>> {
         self.inner.hosted_ticks.read().unwrap().clone()
+    }
+
+    /// Lets the daemon grant this worker's Shell spawns in its Tickhost.
+    pub fn install_shell_issuer(&self, issuer: Arc<dyn crate::hosted::shells::SpawnIssuer>) {
+        self.inner.shells.install_issuer(issuer);
+    }
+
+    pub fn shell_tasks(&self) -> Arc<crate::hosted::shells::ShellTasks> {
+        self.inner.shells.clone()
     }
 
     pub fn install_host_tools(
@@ -1429,6 +1436,12 @@ impl Agent {
                 auto_health: Mutex::new(auto_health::AutoHealth::default()),
                 host_tools: std::sync::RwLock::new(None),
                 hosted_ticks: std::sync::RwLock::new(None),
+                // Until a daemon grants its spawns, an Agent runs commands in a Tickhost of its own.
+                shells: crate::hosted::shells::ShellTasks::new(Arc::new(
+                    crate::hosted::shells::OwnTickhost::new(
+                        transcript::private_tickhost_directory(),
+                    ),
+                )),
                 stopped_child_hook: std::sync::RwLock::new(None),
                 tick_stream_installed: AtomicBool::new(false),
                 tick_deliveries: std::sync::Mutex::new(

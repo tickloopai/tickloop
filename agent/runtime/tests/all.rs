@@ -154,6 +154,8 @@ mod temp_storage;
 mod tick_adapters;
 #[path = "all/tick_subscriptions.rs"]
 mod tick_subscriptions;
+#[path = "all/tickhost_shells.rs"]
+mod tickhost_shells;
 #[path = "all/tool_results.rs"]
 mod tool_results;
 #[path = "all/transcripts.rs"]

@@ -64,6 +64,8 @@ pub use ipc::{serve_connection, serve_daemon_listener, serve_listener, serve_wor
 
 /// How often a daemon checks that clients can still reach it through its runtime directory.
 const RUNTIME_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// Where a daemon at a directory of its own keeps its Tickhost's runtime files.
+const DAEMON_TICKHOST_DIRECTORY: &str = "tickhost";
 
 /// The hidden process entry of a worker: it does not appear in `--help`, and names its role in
 /// `ps`.
@@ -290,7 +292,7 @@ pub async fn run_daemon(arguments: &[OsString]) -> Result<(), String> {
     let controller = Arc::new(
         tickloop_agent_runtime::hosted::controller::HostController::new(
             &directory,
-            tickhost::paths::HostPaths::from_environment(),
+            tickhost_paths(&directory),
             epoch,
             tickhost,
             tickhost::host::DEFAULT_IDLE_TIMEOUT,
@@ -336,6 +338,21 @@ pub async fn run_daemon(arguments: &[OsString]) -> Result<(), String> {
     }
     cleanup?;
     result.map_err(|error| error.to_string())
+}
+
+/// Where this daemon's Tickhost runs: where the environment says, or for the default daemon the
+/// per-user Tickhost, and for a daemon at any other directory a Tickhost of its own inside that
+/// directory, so two daemons never contend for one Tickhost and its Shell tasks.
+fn tickhost_paths(directory: &Path) -> tickhost::paths::HostPaths {
+    let is_selected = std::env::var_os(tickhost::paths::RUNTIME_DIR_ENV).is_some();
+    if is_selected
+        || tickloop_agent_client::daemon_endpoint::is_default_runtime_directory(directory)
+    {
+        return tickhost::paths::HostPaths::from_environment();
+    }
+    tickhost::paths::HostPaths {
+        runtime: directory.join(DAEMON_TICKHOST_DIRECTORY),
+    }
 }
 
 /// Waits until clients can no longer reach this daemon, then shuts it down as `ShutdownDaemon`
@@ -477,6 +494,12 @@ pub async fn build_runtime_with_client(
     if let (Some(grant), Some(_)) = (&control, &launch.config_root) {
         agent.install_stopped_child_hook(Arc::new(
             tickloop_agent_runtime::hosted::lifecycle::DaemonLifecycle::new(grant.clone()),
+        ));
+    }
+    // A worker's shell commands run in its daemon's Tickhost, under spawns the daemon grants.
+    if let Some(grant) = &control {
+        agent.install_shell_issuer(Arc::new(
+            tickloop_agent_runtime::hosted::worker_control::DaemonControl::new(grant.clone()),
         ));
     }
     // Every worker the daemon granted a Tickhost runs its Ticks there, with its host's own

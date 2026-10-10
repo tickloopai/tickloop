@@ -409,9 +409,12 @@ async fn stopping_a_foreground_user_shell_replaces_its_output_with_the_interrupt
         .submit_user_shell_for_goal(chat, None, "printf started; sleep 30".into(), false)
         .await
         .unwrap();
+    // The command runs once the Tickhost started it and named its process.
     wait_for_snapshot(&agent, chat, |snapshot| {
         snapshot.user_shells.iter().any(|record| {
-            record.id == receipt.command_id && record.state == UserShellState::Running
+            record.id == receipt.command_id
+                && record.state == UserShellState::Running
+                && record.pid.is_some()
         })
     })
     .await;
