@@ -10,7 +10,4 @@ pub mod us_positions;
 
 use tick_provider::Interface;
 
-/// The `source` of the Tick Updates Longbridge data produces.
-pub const SOURCE: &str = "longbridge";
-
 pub const INTERFACES: &[Interface] = &[Interface::Quote, Interface::Trade, Interface::News];

@@ -1824,6 +1824,9 @@ fn session_error(error: tickhost_connect::session::SessionError) -> HostError {
         SessionError::OutcomeUnknown => HostError::after("OutcomeUnknown", error.to_string()),
         SessionError::Gone => HostError::after("TargetGone", error.to_string()),
         SessionError::ChildError(message) => HostError::after("ToolError", message),
+        SessionError::RevisionMismatch => {
+            HostError::before("CapabilitiesChanged", error.to_string())
+        }
         SessionError::Protocol(message) => HostError::before("ProtocolViolation", message),
         SessionError::Io(error) => HostError::before("TargetGone", error.to_string()),
     }
@@ -1866,13 +1869,18 @@ async fn instance_request(
             struct Call {
                 tool: String,
                 args: Value,
+                revision: String,
             }
-            let Call { tool, args } = parameters(params)?;
+            let Call {
+                tool,
+                args,
+                revision,
+            } = parameters(params)?;
             tick.note_activity();
             let client = session(tick).await?;
             tokio::time::timeout(
                 CALL_TIMEOUT,
-                client.call(&tool, args, CancellationToken::new()),
+                client.call(&tool, args, &revision, CancellationToken::new()),
             )
             .await
             .map_err(|_| {

@@ -22,18 +22,17 @@ const TICK_LINE_ENVELOPE: usize = 48;
 /// A Tick whose baseline encodes to exactly `argv[1]` bytes and whose `grow` tool answers with
 /// numbers that grow when re-encoded.
 const LIMITS_TICK: &str = r#"
-import json, os, sys
-instance = os.environ['TICKLOOP_INSTANCE_ID']
+import json, sys
 read_bytes = int(sys.argv[1])
 def encoded(value):
     return json.dumps(value, separators=(',', ':'))
-read = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':1,'observed_at':'2026-10-08T00:00:00Z','data':{'text':''}}
+read = {'seq':1,'at':'2026-10-08T00:00:00Z','data':{'text':''}}
 read['data']['text'] = 'a' * (read_bytes - len(encoded(read)))
 for line in sys.stdin:
     request = json.loads(line)
     method = request['method']
     if method == 'tick/describe':
-        result = {'protocol':2,'tick_type':'test.limits','title':'Limits','description':'Answers at its limits','recover_with':None,'tools':[{'name':'grow','description':'Change state and answer with growing numbers','params':{'type':'object'},'mutates':True},{'name':'echo','description':'Answer briefly','params':{'type':'object'},'mutates':False}]}
+        result = {'protocol':3,'revision':'1','kind':'test.limits','title':'Limits','description':'Answers at its limits','recover_with':None,'tools':[{'name':'grow','description':'Change state and answer with growing numbers','input_schema':{'type':'object'},'mutates':True},{'name':'echo','description':'Answer briefly','input_schema':{'type':'object'},'mutates':False}]}
     elif method == 'tick/read':
         result = read
     elif request['params']['tool'] == 'grow':
@@ -95,7 +94,7 @@ async fn a_call_answered_over_the_limit_once_encoded_has_an_unknown_outcome_and_
  {
     let (_session, client, _directory) = limits_tick(1024).await;
     let answered = client
-        .call("grow", json!({}), CancellationToken::new())
+        .call("grow", json!({}), "1", CancellationToken::new())
         .await
         .unwrap_err();
     assert!(
@@ -104,7 +103,7 @@ async fn a_call_answered_over_the_limit_once_encoded_has_an_unknown_outcome_and_
     );
     assert_eq!(
         client
-            .call("echo", json!({}), CancellationToken::new())
+            .call("echo", json!({}), "1", CancellationToken::new())
             .await
             .unwrap(),
         json!({"echo": true})

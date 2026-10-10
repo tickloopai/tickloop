@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
-use tick_protocol::descriptor_digest;
 use tickhost_connect::session::{
     SessionBackend, SessionClient, SessionError, SessionLaunch, SessionLinkState, TickSession,
 };
@@ -13,20 +12,22 @@ const COUNTER_PANE: &str = "counter-pane";
 
 /// Publishes an update for each `increment` shortly before answering it.
 const COUNTER: &str = r#"
-import json, os, sys, time
-instance = os.environ['TICKLOOP_INSTANCE_ID']
+import json, sys, time
 value = 0
 for line in sys.stdin:
     request = json.loads(line)
     method = request['method']
     if method == 'tick/describe':
-        result = {'protocol':2,'tick_type':'example.counter','title':'Counter','description':'External counter','recover_with':'current','tools':[{'name':'increment','description':'Increment','params':{'type':'object'},'mutates':True},{'name':'current','description':'Read','params':{'type':'object'},'mutates':False}]}
+        result = {'protocol':3,'revision':'1','kind':'example.counter','title':'Counter','description':'External counter','recover_with':'current','tools':[{'name':'increment','description':'Increment','input_schema':{'type':'object'},'mutates':True},{'name':'current','description':'Read','input_schema':{'type':'object'},'mutates':False}]}
     elif method == 'tick/read':
-        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':value,'observed_at':'2026-09-24T00:00:00Z','data':{'value':value}}
-    elif method == 'tool/call':
+        result = {'seq':value,'at':'2026-09-24T00:00:00Z','data':{'value':value}}
+    elif request['params'].get('revision') != '1':
+        print(json.dumps({'jsonrpc':'2.0','id':request['id'],'error':{'code':-32004,'message':'catalog changed'}}),flush=True)
+        continue
+    elif method == 'tick/call':
         if request['params']['tool'] == 'increment':
             value += 1
-            print(json.dumps({'jsonrpc':'2.0','method':'tick/update','params':{'version':3,'tick_instance_id':instance,'source':'example.counter','sequence':value,'observed_at':'2026-09-24T00:00:01Z','data':{'value':value}}}),flush=True)
+            print(json.dumps({'jsonrpc':'2.0','method':'tick/update','params':{'seq':value,'at':'2026-09-24T00:00:01Z','data':{'value':value}}}),flush=True)
             time.sleep(0.1)
         result = {'value':value}
     else:
@@ -76,10 +77,10 @@ async fn later_subscriber_gets_its_own_baseline_and_actual_received_count() {
     .await
     .unwrap();
     let (early_read, early_received, mut early) = client.watch().await.unwrap();
-    assert_eq!(early_read.data, Some(json!({"value":0})));
+    assert_eq!(early_read.data, json!({"value":0}));
     assert_eq!(early_received, 0);
     client
-        .call("increment", json!({}), CancellationToken::new())
+        .call("increment", json!({}), "1", CancellationToken::new())
         .await
         .unwrap();
     early.changed().await.unwrap();
@@ -90,10 +91,10 @@ async fn later_subscriber_gets_its_own_baseline_and_actual_received_count() {
     );
 
     let (late_read, late_received, mut late) = client.watch().await.unwrap();
-    assert_eq!(late_read.data, Some(json!({"value":1})));
+    assert_eq!(late_read.data, json!({"value":1}));
     assert_eq!(late_received, 1);
     client
-        .call("increment", json!({}), CancellationToken::new())
+        .call("increment", json!({}), "1", CancellationToken::new())
         .await
         .unwrap();
     early.changed().await.unwrap();
@@ -116,7 +117,7 @@ async fn status_reports_the_latest_update_time_without_a_watcher_or_its_content(
     assert_eq!(before.received, 0);
     let called = tickhost_connect::access::now_ms();
     client
-        .call("increment", json!({}), CancellationToken::new())
+        .call("increment", json!({}), "1", CancellationToken::new())
         .await
         .unwrap();
     let after = client.status().await.unwrap();
@@ -126,9 +127,11 @@ async fn status_reports_the_latest_update_time_without_a_watcher_or_its_content(
         "{after:?}"
     );
     let wire = serde_json::to_value(after).unwrap();
+    let mut fields: Vec<_> = wire.as_object().unwrap().keys().collect();
+    fields.sort();
     assert_eq!(
-        wire.as_object().unwrap().len(),
-        2,
+        fields,
+        ["ignored_notifications", "received", "updated_at_ms"],
         "status carries no update content: {wire}"
     );
     session.shutdown().await.unwrap();
@@ -142,7 +145,7 @@ async fn slow_subscriber_sees_latest_content_and_all_received_frames_counted() {
     assert_eq!(registration_received, 0);
     for _ in 0..3 {
         client
-            .call("increment", json!({}), CancellationToken::new())
+            .call("increment", json!({}), "1", CancellationToken::new())
             .await
             .unwrap();
     }
@@ -171,8 +174,8 @@ async fn concurrent_clients_with_identical_calls_receive_their_own_responses() {
     .await
     .unwrap();
     let (first_result, second_result) = tokio::join!(
-        first.call("increment", json!({}), CancellationToken::new()),
-        second.call("increment", json!({}), CancellationToken::new())
+        first.call("increment", json!({}), "1", CancellationToken::new()),
+        second.call("increment", json!({}), "1", CancellationToken::new())
     );
     let mut values = [
         first_result.unwrap()["value"].as_u64().unwrap(),
@@ -182,7 +185,7 @@ async fn concurrent_clients_with_identical_calls_receive_their_own_responses() {
     assert_eq!(values, [1, 2]);
     assert_eq!(
         session.client().read().await.unwrap().data,
-        Some(json!({"value":2}))
+        json!({"value":2})
     );
     session.shutdown().await.unwrap();
 }
@@ -196,7 +199,7 @@ async fn closing_one_in_flight_client_does_not_cancel_a_peers_call() {
     let cancellation = CancellationToken::new();
     let called = cancellation.clone();
     let first_call =
-        tokio::spawn(async move { departing.call("increment", json!({}), called).await });
+        tokio::spawn(async move { departing.call("increment", json!({}), "1", called).await });
     observations.changed().await.unwrap();
     assert_eq!(observations.borrow_and_update().received, 1);
     cancellation.cancel();
@@ -205,12 +208,12 @@ async fn closing_one_in_flight_client_does_not_cancel_a_peers_call() {
         Err(SessionError::OutcomeUnknown)
     ));
     assert_eq!(
-        peer.call("increment", json!({}), CancellationToken::new())
+        peer.call("increment", json!({}), "1", CancellationToken::new())
             .await
             .unwrap(),
         json!({"value":2})
     );
-    assert_eq!(peer.read().await.unwrap().data, Some(json!({"value":2})));
+    assert_eq!(peer.read().await.unwrap().data, json!({"value":2}));
     session.shutdown().await.unwrap();
 }
 
@@ -224,24 +227,22 @@ async fn sustained_updates_with_an_unread_watcher_do_not_block_peer_reads_or_too
     let produce = async {
         for _ in 0..16 {
             producer
-                .call("increment", json!({}), CancellationToken::new())
+                .call("increment", json!({}), "1", CancellationToken::new())
                 .await
                 .unwrap();
         }
     };
     let use_peer = async {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let before = peer.read().await.unwrap().data.unwrap()["value"]
-            .as_u64()
-            .unwrap();
+        let before = peer.read().await.unwrap().data["value"].as_u64().unwrap();
         let result = peer
-            .call("increment", json!({}), CancellationToken::new())
+            .call("increment", json!({}), "1", CancellationToken::new())
             .await
             .unwrap();
         assert!(result["value"].as_u64().unwrap() > before);
     };
     tokio::join!(produce, use_peer);
-    assert_eq!(peer.read().await.unwrap().data, Some(json!({"value":17})));
+    assert_eq!(peer.read().await.unwrap().data, json!({"value":17}));
     let latest = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             slow_watcher.changed().await.unwrap();
@@ -264,7 +265,8 @@ async fn cancellation_after_update_reports_unknown_and_does_not_retry() {
     let (_, _, mut observations) = client.watch().await.unwrap();
     let cancellation = CancellationToken::new();
     let called = cancellation.clone();
-    let caller = tokio::spawn(async move { client.call("increment", json!({}), called).await });
+    let caller =
+        tokio::spawn(async move { client.call("increment", json!({}), "1", called).await });
     observations.changed().await.unwrap();
     assert_eq!(
         observations
@@ -282,7 +284,7 @@ async fn cancellation_after_update_reports_unknown_and_does_not_retry() {
     ));
     assert_eq!(
         session.client().read().await.unwrap().data,
-        Some(json!({"value":1}))
+        json!({"value":1})
     );
     session.shutdown().await.unwrap();
 }
@@ -295,7 +297,7 @@ async fn oversized_request_is_rejected_before_the_child_receives_it() {
     assert!(matches!(
         session
             .client()
-            .call("increment", json!({}), cancelled)
+            .call("increment", json!({}), "1", cancelled)
             .await,
         Err(SessionError::CancelledBeforeSend)
     ));
@@ -304,6 +306,7 @@ async fn oversized_request_is_rejected_before_the_child_receives_it() {
         .call(
             "increment",
             json!({"padding":"x".repeat(600_000)}),
+            "1",
             CancellationToken::new(),
         )
         .await;
@@ -312,18 +315,18 @@ async fn oversized_request_is_rejected_before_the_child_receives_it() {
     );
     assert_eq!(
         session.client().read().await.unwrap().data,
-        Some(json!({"value":0}))
+        json!({"value":0})
     );
     session.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn prepared_call_rechecks_catalog_before_dispatch() {
+async fn a_call_naming_another_revision_is_refused_before_it_runs() {
     let (session, _directory) = counter().await;
     let client = session.client();
     let descriptor = client.describe().await.unwrap();
     let stale = client
-        .call_prepared(
+        .call(
             "increment",
             json!({}),
             "stale-catalog",
@@ -331,19 +334,20 @@ async fn prepared_call_rechecks_catalog_before_dispatch() {
         )
         .await;
     assert!(
-        matches!(stale, Err(SessionError::Protocol(message)) if message.contains("catalog changed"))
+        matches!(stale, Err(SessionError::RevisionMismatch)),
+        "{stale:?}"
     );
-    assert_eq!(client.read().await.unwrap().data, Some(json!({"value":0})));
+    assert_eq!(client.read().await.unwrap().data, json!({"value":0}));
     client
-        .call_prepared(
+        .call(
             "increment",
             json!({}),
-            &descriptor_digest(&descriptor),
+            &descriptor.revision,
             CancellationToken::new(),
         )
         .await
         .unwrap();
-    assert_eq!(client.read().await.unwrap().data, Some(json!({"value":1})));
+    assert_eq!(client.read().await.unwrap().data, json!({"value":1}));
     session.shutdown().await.unwrap();
 }
 
@@ -370,14 +374,13 @@ async fn malformed_child_response_after_dispatch_is_unknown() {
         directory.path(),
         "broken",
         r#"
-import json, os, sys
-instance = os.environ['TICKLOOP_INSTANCE_ID']
+import json, sys
 for line in sys.stdin:
     request = json.loads(line)
     if request['method'] == 'tick/describe':
-        result = {'protocol':2,'tick_type':'example.broken','title':'Broken','description':'Fixture','recover_with':'current','tools':[{'name':'increment','description':'Increment','params':{'type':'object'},'mutates':True},{'name':'current','description':'Read','params':{'type':'object'},'mutates':False}]}
+        result = {'protocol':3,'revision':'1','kind':'example.broken','title':'Broken','description':'Fixture','recover_with':'current','tools':[{'name':'increment','description':'Increment','input_schema':{'type':'object'},'mutates':True},{'name':'current','description':'Read','input_schema':{'type':'object'},'mutates':False}]}
     elif request['method'] == 'tick/read':
-        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':0,'observed_at':'2026-09-24T00:00:00Z','data':{'value':0}}
+        result = {'seq':0,'at':'2026-09-24T00:00:00Z','data':{'value':0}}
     else:
         print('not-json', flush=True)
         break
@@ -387,7 +390,7 @@ for line in sys.stdin:
     .await;
     let result = session
         .client()
-        .call("increment", json!({}), CancellationToken::new())
+        .call("increment", json!({}), "1", CancellationToken::new())
         .await;
     assert!(matches!(result, Err(SessionError::OutcomeUnknown)));
     session.shutdown().await.unwrap_or_else(|error| {
@@ -405,12 +408,12 @@ async fn ninth_connection_is_busy_without_dispatching_an_action() {
         watchers.push(receiver);
     }
     let result = client
-        .call("increment", json!({}), CancellationToken::new())
+        .call("increment", json!({}), "1", CancellationToken::new())
         .await;
     assert!(matches!(result, Err(SessionError::Busy)));
     drop(watchers);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert_eq!(client.read().await.unwrap().data, Some(json!({"value":0})));
+    assert_eq!(client.read().await.unwrap().data, json!({"value":0}));
     session.shutdown().await.unwrap();
 }
 
@@ -418,16 +421,15 @@ async fn ninth_connection_is_busy_without_dispatching_an_action() {
 /// each with a response of almost the 8 MiB limit.
 const HOLDING_TICK: &str = r#"
 import json, os, sys, time
-instance = os.environ['TICKLOOP_INSTANCE_ID']
 held = []
 calls = 0
 for line in sys.stdin:
     request = json.loads(line)
     method = request['method']
     if method == 'tick/describe':
-        result = {'protocol':2,'tick_type':'example.holding','title':'Holding','description':'Fixture','recover_with':'calls','tools':[{'name':'hold','description':'Hold','params':{'type':'object'},'mutates':False},{'name':'calls','description':'Count','params':{'type':'object'},'mutates':False}]}
+        result = {'protocol':3,'revision':'1','kind':'example.holding','title':'Holding','description':'Fixture','recover_with':'calls','tools':[{'name':'hold','description':'Hold','input_schema':{'type':'object'},'mutates':False},{'name':'calls','description':'Count','input_schema':{'type':'object'},'mutates':False}]}
     elif method == 'tick/read':
-        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':0,'observed_at':'2026-10-08T00:00:00Z','data':{}}
+        result = {'seq':0,'at':'2026-10-08T00:00:00Z','data':{}}
     elif request['params']['tool'] == 'hold':
         calls += 1
         held.append(request['id'])
@@ -457,7 +459,7 @@ async fn a_ninth_call_in_flight_is_busy_before_dispatch_while_eight_fill_the_res
         let client = session.client();
         held.spawn(async move {
             client
-                .call("hold", json!({}), CancellationToken::new())
+                .call("hold", json!({}), "1", CancellationToken::new())
                 .await
         });
     }
@@ -473,7 +475,7 @@ async fn a_ninth_call_in_flight_is_busy_before_dispatch_while_eight_fill_the_res
         std::time::Duration::from_secs(5),
         session
             .client()
-            .call("hold", json!({}), CancellationToken::new()),
+            .call("hold", json!({}), "1", CancellationToken::new()),
     )
     .await
     .expect("a ninth call is refused at once");
@@ -488,7 +490,7 @@ async fn a_ninth_call_in_flight_is_busy_before_dispatch_while_eight_fill_the_res
     assert!(answered > 8 * (tick_protocol::MAX_TOOL_RESPONSE_BYTES - 8192));
     let calls = session
         .client()
-        .call("calls", json!({}), CancellationToken::new())
+        .call("calls", json!({}), "1", CancellationToken::new())
         .await
         .unwrap();
     assert_eq!(calls["calls"], 8, "the ninth call never reached the Tick");
@@ -517,7 +519,7 @@ async fn client_binding_rejects_a_different_host_or_terminal() {
     assert!(matches!(wrong_terminal, Err(SessionError::Protocol(_))));
     assert_eq!(
         session.client().read().await.unwrap().data,
-        Some(json!({"value":0}))
+        json!({"value":0})
     );
     session.shutdown().await.unwrap();
 }
@@ -529,14 +531,13 @@ async fn oversized_child_response_is_never_reported_as_success() {
         directory.path(),
         "oversized",
         r#"
-import json, os, sys
-instance = os.environ['TICKLOOP_INSTANCE_ID']
+import json, sys
 for line in sys.stdin:
     request = json.loads(line)
     if request['method'] == 'tick/describe':
-        result = {'protocol':2,'tick_type':'example.large','title':'Large','description':'Fixture','recover_with':'current','tools':[{'name':'large','description':'Large','params':{'type':'object'},'mutates':True},{'name':'current','description':'Read','params':{'type':'object'},'mutates':False}]}
+        result = {'protocol':3,'revision':'1','kind':'example.large','title':'Large','description':'Fixture','recover_with':'current','tools':[{'name':'large','description':'Large','input_schema':{'type':'object'},'mutates':True},{'name':'current','description':'Read','input_schema':{'type':'object'},'mutates':False}]}
     elif request['method'] == 'tick/read':
-        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':0,'observed_at':'2026-09-24T00:00:00Z','data':{'value':0}}
+        result = {'seq':0,'at':'2026-09-24T00:00:00Z','data':{'value':0}}
     else:
         result = {'text':'x' * (8 * 1024 * 1024)}
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
@@ -545,7 +546,7 @@ for line in sys.stdin:
     .await;
     let result = session
         .client()
-        .call("large", json!({}), CancellationToken::new())
+        .call("large", json!({}), "1", CancellationToken::new())
         .await;
     assert!(matches!(result, Err(SessionError::OutcomeUnknown)));
     let _ = session.shutdown().await;
@@ -558,14 +559,13 @@ async fn child_that_stops_reading_stdin_expires_and_exits_instead_of_hanging_ses
         directory.path(),
         "nonreader",
         r#"
-import json, os, sys, time
-instance = os.environ['TICKLOOP_INSTANCE_ID']
+import json, sys, time
 for line in sys.stdin:
     request = json.loads(line)
     if request['method'] == 'tick/describe':
-        result = {'protocol':2,'tick_type':'example.nonreader','title':'Nonreader','description':'Fixture','recover_with':None,'tools':[]}
+        result = {'protocol':3,'revision':'1','kind':'example.nonreader','title':'Nonreader','description':'Fixture','recover_with':None,'tools':[]}
     elif request['method'] == 'tick/read':
-        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':0,'observed_at':'2026-09-24T00:00:00Z','data':{}}
+        result = {'seq':0,'at':'2026-09-24T00:00:00Z','data':{}}
     else:
         raise RuntimeError('unexpected request')
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)

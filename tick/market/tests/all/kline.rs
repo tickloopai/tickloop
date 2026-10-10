@@ -47,7 +47,7 @@ async fn kline_once_outputs_adjusted_candles_without_reapplying_adjustment() {
         },
     };
     let mut output = Vec::new();
-    let mut updates = TickStream::in_memory(TickKind::Kline, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Kline);
     kline::run_once(
         &args,
         &History,
@@ -155,7 +155,7 @@ async fn kline_cursor_period_and_push_updates_share_one_live_chart() {
         output: OnceArgs::default(),
     };
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
-    let mut updates = TickStream::in_memory(TickKind::Kline, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Kline);
     kline::run_live(
         &args,
         &api,
@@ -247,7 +247,7 @@ async fn periods_without_push_refresh_on_the_documented_interval() {
         output: OnceArgs::default(),
     };
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
-    let mut updates = TickStream::in_memory(TickKind::Kline, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Kline);
     kline::run_live(
         &args,
         &api,
@@ -334,7 +334,7 @@ async fn forward_adjusted_history_accepts_only_complete_adjusted_updates() {
         output: OnceArgs::default(),
     };
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
-    let mut updates = TickStream::in_memory(TickKind::Kline, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Kline);
     kline::run_live(
         &args,
         &api,
@@ -482,7 +482,7 @@ async fn resizing_recomputes_visible_candles_without_losing_selection_or_emittin
         output: OnceArgs::default(),
     };
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    let mut updates = TickStream::in_memory(TickKind::Kline, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Kline);
     kline::run_live(
         &args,
         &api,
@@ -572,7 +572,7 @@ async fn kline_uses_injected_renderer_styles_for_its_entire_panel_and_chart() {
         &settings,
         &mut terminal,
         input,
-        &mut TickStream::in_memory(TickKind::Kline, "longbridge"),
+        &mut TickStream::in_memory(TickKind::Kline),
     )
     .await
     .unwrap();
@@ -687,7 +687,7 @@ async fn pushed_periods_sync_missing_history_and_reject_regressive_raw_candles()
         output: OnceArgs::default(),
     };
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
-    let mut updates = TickStream::in_memory(TickKind::Kline, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Kline);
     kline::run_live(
         &args,
         &api,
@@ -834,7 +834,7 @@ async fn assert_failed_switch_keeps_original_period(failure: SwitchFailure) {
         output: OnceArgs::default(),
     };
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
-    let mut updates = TickStream::in_memory(TickKind::Kline, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Kline);
     kline::run_live(
         &args,
         api.as_ref(),
@@ -914,7 +914,7 @@ async fn delayed_server_snapshot_cannot_overwrite_a_newer_history_refresh() {
         output: OnceArgs::default(),
     };
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
-    let mut updates = TickStream::in_memory(TickKind::Kline, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Kline);
     kline::run_live(
         &args,
         &api,

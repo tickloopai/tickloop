@@ -57,7 +57,7 @@ async fn news_once_normalizes_symbol_sorts_timestamps_and_limits_both_sources() 
             },
         };
         let mut output = Vec::new();
-        let mut events = TickStream::in_memory(TickKind::News, "longbridge");
+        let mut events = TickStream::in_memory(TickKind::News);
         news::run_once(
             &args,
             &api,
@@ -117,7 +117,7 @@ async fn news_detail_returns_to_the_selected_item_without_extra_business_events(
         output: OnceArgs::default(),
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
-    let mut events = TickStream::in_memory(TickKind::News, "longbridge");
+    let mut events = TickStream::in_memory(TickKind::News);
     news::run_live(
         &args,
         &NoQuotes,
@@ -200,7 +200,7 @@ async fn periodic_news_refresh_preserves_selection_by_article_id() {
         output: OnceArgs::default(),
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
-    let mut events = TickStream::in_memory(TickKind::News, "longbridge");
+    let mut events = TickStream::in_memory(TickKind::News);
     news::run_live(
         &args,
         &api,

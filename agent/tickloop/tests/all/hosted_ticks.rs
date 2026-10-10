@@ -234,7 +234,7 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
     assert_eq!(opened["host"], "tickhost");
     assert!(opened["business_pid"].as_u64().is_some());
     let read: Value = serde_json::from_str(&results[1]).unwrap();
-    assert_eq!(read["content"]["value"], 0, "{results:#?}");
+    assert_eq!(read["data"]["value"], 0, "{results:#?}");
     assert!(read["tools"].to_string().contains("increment"));
     let called: Value = serde_json::from_str(&results[2]).unwrap();
     assert_eq!(called["result"]["value"], 2, "{results:#?}");
@@ -922,25 +922,28 @@ mod channel {
         );
     }
 
-    /// Its catalog grows when `evolve` is called.
+    /// Its catalog grows, under a new revision, when `evolve` is called.
     const EVOLVING: &str = r#"
-import json, os, sys
-instance = os.environ['TICKLOOP_INSTANCE_ID']
-value = 0
-tools = [{'name':'increment','description':'Increment','params':{'type':'object'},'mutates':True},{'name':'evolve','description':'Change the catalog','params':{'type':'object'},'mutates':False}]
+import json, sys
+value, revision = 0, 1
+tools = [{'name':'increment','description':'Increment','input_schema':{'type':'object'},'mutates':True},{'name':'evolve','description':'Change the catalog','input_schema':{'type':'object'},'mutates':False}]
 for line in sys.stdin:
     request = json.loads(line)
     method = request['method']
     if method == 'tick/describe':
-        result = {'protocol':2,'tick_type':'example.evolving','title':'Evolving','description':'Evolving','recover_with':None,'tools':tools}
+        result = {'protocol':3,'revision':str(revision),'kind':'example.evolving','title':'Evolving','description':'Evolving','recover_with':None,'tools':tools}
     elif method == 'tick/read':
-        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':value,'observed_at':'2026-10-07T00:00:00Z','data':{'value':value}}
+        result = {'seq':value,'at':'2026-10-07T00:00:00Z','data':{'value':value}}
+    elif request['params'].get('revision') != str(revision):
+        print(json.dumps({'jsonrpc':'2.0','id':request['id'],'error':{'code':-32004,'message':'catalog changed'}}), flush=True)
+        continue
     else:
         tool = request['params']['tool']
         if tool == 'increment':
             value += 1
         elif tool == 'evolve':
-            tools = tools + [{'name':'decrement','description':'Decrement','params':{'type':'object'},'mutates':True}]
+            tools = tools + [{'name':'decrement','description':'Decrement','input_schema':{'type':'object'},'mutates':True}]
+            revision += 1
         result = {'value':value}
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
 "#;
@@ -989,17 +992,13 @@ for line in sys.stdin:
             json!({"tick_instance_id":instance,"tool":"evolve","args":{}}),
         )
         .await;
-        let changed = tools
-            .revalidate_call(chat, &approved, CancellationToken::new())
+        let HostCallResult::NotDispatched(changed) = tools
+            .execute_prepared(chat, approved, CancellationToken::new())
             .await
-            .unwrap_err();
+        else {
+            panic!("a call prepared against the earlier catalog revision is refused unrun");
+        };
         assert!(changed.contains("catalog changed"), "{changed}");
-        assert!(matches!(
-            tools
-                .execute_prepared(chat, approved, CancellationToken::new())
-                .await,
-            HostCallResult::NotDispatched(_)
-        ));
         let read = run_tool(
             &tools,
             chat,
@@ -1007,7 +1006,7 @@ for line in sys.stdin:
             json!({"tick_instance_id":instance}),
         )
         .await;
-        assert_eq!(read["content"]["value"], 0, "the stale approval never ran");
+        assert_eq!(read["data"]["value"], 0, "the stale approval never ran");
         let other_chat = Uuid::new_v4();
         let HostCallResult::NotDispatched(refused) = call_tool(
             &tools,
@@ -1144,7 +1143,7 @@ for line in sys.stdin:
                         "ReadTick",
                         json!({"tick_instance_id":instance})
                     )
-                    .await["content"]["value"],
+                    .await["data"]["value"],
                     0
                 );
             }
@@ -1769,10 +1768,7 @@ for line in sys.stdin:
             json!({"tick_instance_id":instance}),
         )
         .await;
-        assert_eq!(
-            read["content"]["value"], 0,
-            "the parent's Tick is untouched"
-        );
+        assert_eq!(read["data"]["value"], 0, "the parent's Tick is untouched");
     }
 
     /// A model reopens a Tick lost with its host through ModifyTick: the reopen waits for
@@ -1980,7 +1976,6 @@ for line in sys.stdin:
     /// directory, and logs every describe it receives as `refused` or `served`.
     const REFUSING_TICK: &str = r#"
 import json, os, sys
-instance = os.environ['TICKLOOP_INSTANCE_ID']
 for line in sys.stdin:
     request = json.loads(line)
     if request['method'] == 'tick/describe':
@@ -1990,9 +1985,9 @@ for line in sys.stdin:
         if refused:
             print(json.dumps({'jsonrpc':'2.0','id':request['id'],'error':{'code':-32000,'message':'describe refused'}}), flush=True)
             continue
-        result = {'protocol':2,'tick_type':'test.refusing','title':'Refusing','description':'Refuses describe on request','recover_with':None,'tools':[]}
+        result = {'protocol':3,'revision':'1','kind':'test.refusing','title':'Refusing','description':'Refuses describe on request','recover_with':None,'tools':[]}
     else:
-        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':0,'observed_at':'2026-10-08T00:00:00Z','data':{}}
+        result = {'seq':0,'at':'2026-10-08T00:00:00Z','data':{}}
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
 "#;
 
@@ -2098,18 +2093,17 @@ for line in sys.stdin:
     const GROWN_VALUES: usize = 100_000;
 
     const GROWING_TICK: &str = r#"
-import json, os, sys
-instance = os.environ['TICKLOOP_INSTANCE_ID']
+import json, sys
 for line in sys.stdin:
     request = json.loads(line)
     method = request['method']
     if method == 'tick/describe':
-        result = {'protocol':2,'tick_type':'test.growing','title':'Growing','description':'Publishes one large update','recover_with':None,'tools':[{'name':'grow','description':'Publish a large update','params':{'type':'object'},'mutates':False}]}
+        result = {'protocol':3,'revision':'1','kind':'test.growing','title':'Growing','description':'Publishes one large update','recover_with':None,'tools':[{'name':'grow','description':'Publish a large update','input_schema':{'type':'object'},'mutates':False}]}
     elif method == 'tick/read':
-        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':0,'observed_at':'2026-10-08T00:00:00Z','data':{}}
+        result = {'seq':0,'at':'2026-10-08T00:00:00Z','data':{}}
     else:
         values = ','.join(['1e15'] * int(sys.argv[1]))
-        sys.stdout.write('{"jsonrpc":"2.0","method":"tick/update","params":{"version":3,"tick_instance_id":"%s","source":"test.growing","sequence":1,"observed_at":"2026-10-08T00:00:01Z","data":{"values":[%s]}}}\n' % (instance, values))
+        sys.stdout.write('{"jsonrpc":"2.0","method":"tick/update","params":{"seq":1,"at":"2026-10-08T00:00:01Z","data":{"values":[%s]}}}\n' % values)
         result = {'grown':True}
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
 "#;
@@ -2753,17 +2747,16 @@ mod lifecycle {
     use uuid::Uuid;
 
     const FLOOD: &str = r#"
-import json, os, sys
-instance = os.environ['TICKLOOP_INSTANCE_ID']
+import json, sys
 for line in range(1500):
     print(f'line {line}', file=sys.stderr)
 sys.stderr.flush()
 for line in sys.stdin:
     request = json.loads(line)
     if request['method'] == 'tick/describe':
-        result = {'protocol':2,'tick_type':'example.flood','title':'Flood','description':'Flood','recover_with':None,'tools':[]}
+        result = {'protocol':3,'revision':'1','kind':'example.flood','title':'Flood','description':'Flood','recover_with':None,'tools':[]}
     else:
-        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':1,'observed_at':'2026-10-07T00:00:00Z','data':{'lines':1500}}
+        result = {'seq':1,'at':'2026-10-07T00:00:00Z','data':{'lines':1500}}
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
 "#;
 
@@ -2870,7 +2863,7 @@ for line in sys.stdin:
         reader
             .request(
                 "call",
-                json!({"tool":"increment","args":{"amount":1}}),
+                json!({"tool":"increment","args":{"amount":1},"revision":"1"}),
                 CONTROL_TIMEOUT,
             )
             .await
@@ -3411,7 +3404,7 @@ for line in sys.stdin:
             reader
                 .request(
                     "call",
-                    json!({"tool":"increment","args":{"amount":1}}),
+                    json!({"tool":"increment","args":{"amount":1},"revision":"1"}),
                     CONTROL_TIMEOUT,
                 )
                 .await

@@ -193,7 +193,7 @@ impl TickBackends {
         definitions.push(ToolDefinition {
             name: READ_TICK.into(),
             description: format!(
-                "Read a Tick using {identity}. Protocol Ticks return structured content and their declared tool catalog.{} Reading never subscribes. For artifacts use ArtifactRead; for Shell tasks use Read on Bash's output_file.",
+                "Read a Tick using {identity}. Protocol Ticks return their state (seq, at, and data, which is null until the Tick has content) and their declared tool catalog.{} Reading never subscribes. For artifacts use ArtifactRead; for Shell tasks use Read on Bash's output_file.",
                 if self.herdr {
                     " Ordinary Herdr Pane programs return at most 200 recent plain-text lines and 64 KiB; workspace_id applies to herdr: instances."
                 } else {

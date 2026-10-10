@@ -207,7 +207,7 @@ pub trait LiveView: Send {
 type RunningToolCall<'a> =
     futures_util::future::BoxFuture<'a, (Value, std::result::Result<Value, RpcError>)>;
 
-/// An accepted `tool/call`: a query already running beside the view, or an
+/// An accepted `tick/call`: a query already running beside the view, or an
 /// action the loop still has to apply on the UI path.
 enum AcceptedToolCall<'a> {
     Query(RunningToolCall<'a>),
@@ -218,7 +218,7 @@ fn tool_failure(error: Error) -> RpcError {
     RpcError::new(TOOL_FAILED, error.message).with_data(json!({"code": error.code}))
 }
 
-/// Checks one `tool/call` against the declared catalog and either starts it
+/// Checks one `tick/call` against the declared catalog and either starts it
 /// beside the view or hands the action on; otherwise produces the error to
 /// answer it with. A query never borrows the view, so the Panel keeps drawing
 /// while a market round trip is in flight.
@@ -245,7 +245,8 @@ fn accept_tool_call<'a>(
     let dispatch = tool.prepare(services, call.args).map_err(|message| {
         (
             call.id.clone(),
-            RpcError::new(INVALID_PARAMS, message).with_data(json!({"schema": tool.params()})),
+            RpcError::new(INVALID_PARAMS, message)
+                .with_data(json!({"schema": tool.input_schema()})),
         )
     })?;
     let id = call.id;

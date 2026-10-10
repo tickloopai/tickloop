@@ -20,7 +20,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use tick_protocol::{InstanceRef, TickDescriptor, TickProtocol, TickRead, TickUpdate};
+use tick_protocol::{InstanceRef, TickDescriptor, TickProtocol, TickState};
 
 /// Where Tick Sessions put their sockets when the launch names no directory.
 pub const RUNTIME_DIR_ENV: &str = "TICKLOOP_TICK_RUNTIME_DIR";
@@ -49,6 +49,12 @@ pub enum SessionError {
     OutcomeUnknown,
     #[error("Tick rejected the dispatched call: {0}")]
     ChildError(String),
+    /// The Tick refused the call before running it: its catalog is no longer the one the call
+    /// was prepared and approved against.
+    #[error(
+        "the Tick Tool catalog changed since the call was prepared; read the Tick and prepare the call again"
+    )]
+    RevisionMismatch,
 }
 
 #[derive(Clone, Debug)]
@@ -104,7 +110,7 @@ pub enum SessionLinkState {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SessionObservation {
-    pub update: Option<TickUpdate>,
+    pub update: Option<TickState>,
     pub received: u64,
     pub state: SessionLinkState,
 }
@@ -117,6 +123,8 @@ pub struct SessionStatus {
     pub updated_at_ms: Option<u64>,
     /// How many Tick Updates the session has received.
     pub received: u64,
+    /// How many notifications the session ignored because it does not know their method.
+    pub ignored_notifications: u64,
 }
 
 /// The method that answers a [`SessionStatus`].
@@ -124,9 +132,10 @@ const STATUS_METHOD: &str = "session/status";
 
 struct Content {
     protocol: TickProtocol,
-    read: TickRead,
+    read: TickState,
     observation: SessionObservation,
     updated_at_ms: Option<u64>,
+    ignored_notifications: u64,
 }
 
 struct PendingCall {
@@ -222,14 +231,6 @@ impl TickSession {
             .stdout
             .take()
             .ok_or_else(|| SessionError::Protocol("Tick stdout unavailable".into()))?;
-        let initial = TickRead {
-            version: tick_protocol::NATIVE_UPDATE_VERSION,
-            tick_instance_id: identity,
-            initialized: false,
-            sequence: 0,
-            observed_at: String::new(),
-            data: None,
-        };
         let observation = SessionObservation {
             update: None,
             received: 0,
@@ -245,10 +246,11 @@ impl TickSession {
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             response_budget: Arc::new(Semaphore::new(RESPONSE_BUDGET_BYTES)),
             content: Mutex::new(Content {
-                protocol: TickProtocol::new(instance.to_string()),
-                read: initial,
+                protocol: TickProtocol::default(),
+                read: TickState::empty(),
                 observation,
                 updated_at_ms: None,
+                ignored_notifications: 0,
             }),
             observations,
             shutdown: CancellationToken::new(),
@@ -274,14 +276,7 @@ impl TickSession {
                 HOST_REQUEST_TIMEOUT,
             )
             .await?;
-        session
-            .core
-            .content
-            .lock()
-            .await
-            .protocol
-            .descriptor(descriptor)
-            .map_err(SessionError::Protocol)?;
+        TickDescriptor::parse(descriptor).map_err(SessionError::Protocol)?;
         session.core.read().await?;
         Ok(session)
     }
@@ -404,7 +399,7 @@ impl Core {
         }
     }
 
-    async fn read(&self) -> Result<TickRead, SessionError> {
+    async fn read(&self) -> Result<TickState, SessionError> {
         let result = self
             .request(tick_protocol::READ_METHOD, json!({}), HOST_REQUEST_TIMEOUT)
             .await?;
@@ -417,54 +412,23 @@ impl Core {
         Ok(read)
     }
 
+    /// Dispatches a prepared call as it is: the Tick runs it only while its catalog still has
+    /// the revision the call names.
     async fn call(&self, params: Value) -> Result<Value, SessionError> {
-        let deadline = tokio::time::Instant::now() + TOOL_TIMEOUT;
-        let tool_name = params["tool"]
-            .as_str()
-            .ok_or_else(|| SessionError::Protocol("Tick Tool name missing".into()))?;
+        let (Some(tool), Some(revision)) = (params["tool"].as_str(), params["revision"].as_str())
+        else {
+            return Err(SessionError::Protocol(
+                "a Tick call names its tool and catalog revision".into(),
+            ));
+        };
         let args = params.get("args").cloned().unwrap_or(json!({}));
-        let descriptor_result = self
-            .request(
-                tick_protocol::DESCRIBE_METHOD,
-                json!({}),
-                HOST_REQUEST_TIMEOUT,
-            )
-            .await?;
-        let child_descriptor_digest = tick_protocol::descriptor_digest_value(&descriptor_result);
-        let descriptor = self
-            .content
-            .lock()
-            .await
-            .protocol
-            .descriptor(descriptor_result)
-            .map_err(SessionError::Protocol)?;
-        if let Some(expected) = params
-            .get("expected_descriptor_digest")
-            .and_then(Value::as_str)
-            && expected != tick_protocol::descriptor_digest(&descriptor)
-        {
-            return Err(SessionError::Protocol(
-                "Tick Tool catalog changed before dispatch".into(),
-            ));
-        }
-        let tool = descriptor
-            .tools
-            .iter()
-            .find(|tool| tool.name == tool_name)
-            .ok_or_else(|| SessionError::Protocol(format!("unknown Tick Tool {tool_name:?}")))?;
-        let validator = jsonschema::validator_for(&tool.params).map_err(|error| {
-            SessionError::Protocol(format!("invalid Tick Tool schema: {error}"))
-        })?;
-        if !validator.is_valid(&args) {
-            return Err(SessionError::Protocol(
-                "Tick Tool arguments do not match its schema".into(),
-            ));
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(SessionError::OutcomeUnknown);
-        }
-        self.request(tick_protocol::TOOL_CALL_METHOD, json!({"tool":tool_name,"args":args,"expected_descriptor_digest":child_descriptor_digest}), remaining).await.map_err(|error| match error {
+        self.request(
+            tick_protocol::CALL_METHOD,
+            json!({"tool":tool,"args":args,"revision":revision}),
+            TOOL_TIMEOUT,
+        )
+        .await
+        .map_err(|error| match error {
             SessionError::Gone => SessionError::OutcomeUnknown,
             other => other,
         })
@@ -473,7 +437,7 @@ impl Core {
     async fn watch(
         &self,
     ) -> (
-        TickRead,
+        TickState,
         SessionObservation,
         watch::Receiver<SessionObservation>,
     ) {
@@ -524,6 +488,11 @@ async fn read_child(stdout: tokio::process::ChildStdout, core: Arc<Core>) {
                 )
                 .map(|()| result.clone())
                 .map_err(|_| SessionError::OutcomeUnknown),
+                (None, Some(error))
+                    if error["code"].as_i64() == Some(tick_protocol::REVISION_MISMATCH) =>
+                {
+                    Err(SessionError::RevisionMismatch)
+                }
                 (None, Some(error)) => Err(SessionError::ChildError(error.to_string())),
                 _ => Err(SessionError::Protocol("invalid Tick response".into())),
             };
@@ -532,13 +501,23 @@ async fn read_child(stdout: tokio::process::ChildStdout, core: Arc<Core>) {
             }
             continue;
         }
-        if frame.get("method").and_then(Value::as_str) != Some(tick_protocol::UPDATE_METHOD) {
-            link_state(
-                &core,
-                SessionLinkState::ProtocolError("unknown Tick notification".into()),
-            )
-            .await;
-            return;
+        match frame.get("method").and_then(Value::as_str) {
+            Some(tick_protocol::UPDATE_METHOD) => {}
+            // A notification this host does not know yet is skipped, so a Tick speaking a later
+            // addition to the protocol keeps running. It is recorded in the session status, not
+            // on stderr, which is the Tick's own terminal.
+            Some(_) => {
+                core.content.lock().await.ignored_notifications += 1;
+                continue;
+            }
+            None => {
+                link_state(
+                    &core,
+                    SessionLinkState::ProtocolError("invalid Tick frame".into()),
+                )
+                .await;
+                return;
+            }
         }
         if line.len() > tick_protocol::MAX_UPDATE_BYTES {
             link_state(
@@ -560,14 +539,7 @@ async fn read_child(stdout: tokio::process::ChildStdout, core: Arc<Core>) {
                 return;
             }
         };
-        content.read = TickRead {
-            version: update.version,
-            tick_instance_id: update.tick_instance_id.clone(),
-            initialized: true,
-            sequence: update.sequence,
-            observed_at: update.observed_at.clone(),
-            data: Some(update.data.clone()),
-        };
+        content.read = update.clone();
         content.observation.update = Some(update);
         content.observation.received += 1;
         content.updated_at_ms = Some(crate::access::now_ms());
@@ -679,7 +651,7 @@ async fn serve_connection(mut stream: UnixStream, core: Arc<Core>) -> Result<(),
                 }
             }
         }
-        let response_reservation = if method == tick_protocol::TOOL_CALL_METHOD {
+        let response_reservation = if method == tick_protocol::CALL_METHOD {
             Some(
                 Arc::clone(&core.response_budget)
                     .try_acquire_many_owned(tick_protocol::MAX_TOOL_RESPONSE_BYTES as u32),
@@ -696,6 +668,7 @@ async fn serve_connection(mut stream: UnixStream, core: Arc<Core>) -> Result<(),
                     Ok(json!(SessionStatus {
                         updated_at_ms: content.updated_at_ms,
                         received: content.observation.received,
+                        ignored_notifications: content.ignored_notifications,
                     }))
                 }
                 "session/hello" => Ok(
@@ -708,7 +681,7 @@ async fn serve_connection(mut stream: UnixStream, core: Arc<Core>) -> Result<(),
                     serde_json::to_value(read)
                         .map_err(|error| SessionError::Protocol(error.to_string()))
                 }),
-                tick_protocol::TOOL_CALL_METHOD => core.call(params).await,
+                tick_protocol::CALL_METHOD => core.call(params).await,
                 _ => Err(SessionError::Protocol(format!(
                     "unknown Session method {method:?}"
                 ))),
@@ -725,6 +698,7 @@ async fn serve_connection(mut stream: UnixStream, core: Arc<Core>) -> Result<(),
                     SessionError::OutcomeUnknown => (-32012, true),
                     SessionError::Gone => (-32013, true),
                     SessionError::ChildError(_) => (-32015, true),
+                    SessionError::RevisionMismatch => (-32016, false),
                     _ => (tick_protocol::TOOL_FAILED, false),
                 };
                 json!({"jsonrpc":tick_protocol::JSON_RPC_VERSION,"id":id,"error":{"code":code,"message":error.to_string(),"data":{"dispatched":dispatched}}})
@@ -784,54 +758,43 @@ impl SessionClient {
         let value = self
             .request(tick_protocol::DESCRIBE_METHOD, json!({}), None)
             .await?;
-        TickProtocol::new(self.instance.to_string())
-            .descriptor(value)
-            .map_err(SessionError::Protocol)
+        TickDescriptor::parse(value).map_err(SessionError::Protocol)
     }
     /// When the Tick last updated, without reading its content.
     pub async fn status(&self) -> Result<SessionStatus, SessionError> {
         let value = self.request(STATUS_METHOD, json!({}), None).await?;
         serde_json::from_value(value).map_err(|error| SessionError::Protocol(error.to_string()))
     }
-    pub async fn read(&self) -> Result<TickRead, SessionError> {
+    pub async fn read(&self) -> Result<TickState, SessionError> {
         let value = self
             .request(tick_protocol::READ_METHOD, json!({}), None)
             .await?;
-        TickProtocol::new(self.instance.to_string())
+        TickProtocol::default()
             .read(value)
             .map_err(SessionError::Protocol)
     }
+    /// Calls `tool` against the catalog `revision` it was prepared with; a Tick whose catalog
+    /// changed since refuses it unrun with [`SessionError::RevisionMismatch`].
     pub async fn call(
         &self,
         tool: &str,
         args: Value,
+        revision: &str,
         cancellation: CancellationToken,
     ) -> Result<Value, SessionError> {
         if cancellation.is_cancelled() {
             return Err(SessionError::CancelledBeforeSend);
         }
         self.request(
-            tick_protocol::TOOL_CALL_METHOD,
-            json!({"tool":tool,"args":args}),
+            tick_protocol::CALL_METHOD,
+            json!({"tool":tool,"args":args,"revision":revision}),
             Some(cancellation),
         )
         .await
     }
-    pub async fn call_prepared(
-        &self,
-        tool: &str,
-        args: Value,
-        expected_descriptor_digest: &str,
-        cancellation: CancellationToken,
-    ) -> Result<Value, SessionError> {
-        if cancellation.is_cancelled() {
-            return Err(SessionError::CancelledBeforeSend);
-        }
-        self.request(tick_protocol::TOOL_CALL_METHOD, json!({"tool":tool,"args":args,"expected_descriptor_digest":expected_descriptor_digest}), Some(cancellation)).await
-    }
     pub async fn watch(
         &self,
-    ) -> Result<(TickRead, u64, watch::Receiver<SessionObservation>), SessionError> {
+    ) -> Result<(TickState, u64, watch::Receiver<SessionObservation>), SessionError> {
         let (mut reader, registration) = tokio::time::timeout(HOST_REQUEST_TIMEOUT, async {
             let mut stream = UnixStream::connect(&self.socket).await?;
             write_client_request(&mut stream, self, "session/watch", json!({})).await?;
@@ -846,7 +809,7 @@ impl SessionClient {
                 "Session watch timed out",
             ))
         })??;
-        let baseline = TickProtocol::new(self.instance.to_string())
+        let baseline = TickProtocol::default()
             .read(registration["read"].clone())
             .map_err(SessionError::Protocol)?;
         let received = registration["received"].as_u64().ok_or_else(|| {
@@ -888,7 +851,7 @@ impl SessionClient {
         params: Value,
         cancellation: Option<CancellationToken>,
     ) -> Result<Value, SessionError> {
-        let timeout = if method == tick_protocol::TOOL_CALL_METHOD {
+        let timeout = if method == tick_protocol::CALL_METHOD {
             TOOL_TIMEOUT
         } else {
             HOST_REQUEST_TIMEOUT
@@ -927,7 +890,7 @@ impl SessionClient {
             if let Some(cancel) = &cancellation {
                 tokio::select! { _ = cancel.cancelled() => Err(SessionError::OutcomeUnknown), frame = read_client_frame(&mut reader) => frame.map_err(|error| match error { SessionError::Io(_) | SessionError::Gone => SessionError::OutcomeUnknown, other => other }) }
             } else { read_client_frame(&mut reader).await }
-        }).await.map_err(|_| if method == tick_protocol::TOOL_CALL_METHOD { SessionError::OutcomeUnknown } else { SessionError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Session response timed out")) })??;
+        }).await.map_err(|_| if method == tick_protocol::CALL_METHOD { SessionError::OutcomeUnknown } else { SessionError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "Session response timed out")) })??;
         response_result(response)
     }
 }
@@ -1015,6 +978,7 @@ fn response_result(response: Value) -> Result<Value, SessionError> {
                 Some(-32012) => Err(SessionError::OutcomeUnknown),
                 Some(-32013) => Err(SessionError::Gone),
                 Some(-32015) => Err(SessionError::ChildError(message)),
+                Some(-32016) => Err(SessionError::RevisionMismatch),
                 _ => Err(SessionError::Protocol(message)),
             }
         }
@@ -1121,18 +1085,28 @@ mod tests {
             .unwrap();
         let refused = session
             .client()
-            .call("increment", json!({"amount": 1}), CancellationToken::new())
+            .call(
+                "increment",
+                json!({"amount": 1}),
+                "1",
+                CancellationToken::new(),
+            )
             .await;
         assert!(matches!(refused, Err(SessionError::Busy)), "{refused:?}");
         assert_eq!(
             session.client().read().await.unwrap().data,
-            Some(json!({"value":0})),
+            json!({"value":0}),
             "the Tick never received the call"
         );
         drop(answers);
         let called = session
             .client()
-            .call("increment", json!({"amount": 1}), CancellationToken::new())
+            .call(
+                "increment",
+                json!({"amount": 1}),
+                "1",
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(called["value"], 1);

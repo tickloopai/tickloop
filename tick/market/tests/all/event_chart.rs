@@ -383,10 +383,8 @@ async fn ctrl_c_quits_while_an_applied_event_edit_is_still_loading() {
     }
     let (_market, market_events) = tokio::sync::mpsc::unbounded_channel();
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
-    let mut updates = tick_sdk::stream::TickStream::in_memory(
-        tick_market::metadata::TickKind::Kline,
-        "longbridge",
-    );
+    let mut updates =
+        tick_sdk::stream::TickStream::in_memory(tick_market::metadata::TickKind::Kline);
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
         tick_market::runtime::run(

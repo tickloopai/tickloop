@@ -88,7 +88,7 @@ async fn quote_view_redraws_after_a_push_and_unsubscribes_when_quitting() {
         symbols: vec!["TSLA".into()],
         output: OnceArgs::default(),
     };
-    let mut updates = TickStream::in_memory(TickKind::Quote, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Quote);
     tick_market::commands::quote::run_live(
         &args,
         &api,
@@ -102,13 +102,12 @@ async fn quote_view_redraws_after_a_push_and_unsubscribes_when_quitting() {
     producer.await.unwrap();
     let records: Vec<serde_json::Value> = updates.records().all();
     assert_eq!(records.len(), 4);
-    assert_eq!(records[0]["kind"], "snapshot");
-    assert_eq!(records[1]["kind"], "update");
-    assert_eq!(records[1]["sequence"], 2);
+    assert_eq!(records[0]["seq"], 1);
+    assert_eq!(records[1]["seq"], 2);
     assert_eq!(records[1]["data"][0]["latest_price"], "123.45");
     assert_eq!(records[2]["data"][0]["latest_price"], "150");
     assert_eq!(records[3]["data"][0]["latest_price"], "123.45");
-    assert_eq!(records[3]["sequence"], 4);
+    assert_eq!(records[3]["seq"], 4);
     let screen: String = terminal
         .backend()
         .buffer()
@@ -144,7 +143,7 @@ async fn quit_cancels_initial_network_wait() {
         KeyCode::Char('q'),
         KeyModifiers::NONE,
     )))]);
-    let mut updates = TickStream::in_memory(TickKind::Quote, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Quote);
     tokio::time::timeout(
         std::time::Duration::from_millis(100),
         tick_market::commands::quote::run_live(
@@ -179,7 +178,7 @@ async fn quitting_does_not_wait_forever_for_unsubscribe() {
         KeyCode::Char('q'),
         KeyModifiers::NONE,
     )))]);
-    let mut updates = TickStream::in_memory(TickKind::Quote, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Quote);
     let error = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         tick_market::commands::quote::run_live(
@@ -215,7 +214,7 @@ async fn quote_scrolls_a_small_panel_without_losing_content() {
         KeyCode::Char('q'),
         KeyModifiers::NONE,
     )))]);
-    let mut updates = TickStream::in_memory(TickKind::Quote, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Quote);
     tick_market::commands::quote::run_live(
         &args,
         &api,
@@ -260,7 +259,7 @@ async fn minimum_quote_panel_keeps_symbol_price_and_percentage_visible() {
         KeyCode::Char('q'),
         KeyModifiers::NONE,
     )))]);
-    let mut updates = TickStream::in_memory(TickKind::Quote, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Quote);
     tick_market::commands::quote::run_live(
         &args,
         &api,
@@ -349,7 +348,7 @@ async fn authoritative_previous_close_refresh_does_not_replace_newer_prices_or_r
         symbols: vec!["TSLA".into()],
         output: OnceArgs::default(),
     };
-    let mut updates = TickStream::in_memory(TickKind::Quote, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Quote);
     tick_market::commands::quote::run_live(
         &args,
         &api,
@@ -417,7 +416,7 @@ async fn recovered_snapshot_updates_the_last_trade_without_waiting_for_another_p
         .unwrap();
     });
     let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
-    let mut updates = TickStream::in_memory(TickKind::Quote, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Quote);
     tick_market::commands::quote::run_live(
         &QuoteArgs {
             symbols: vec!["TSLA".into()],

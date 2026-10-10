@@ -10,7 +10,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tick_protocol::TickRead;
+use tick_protocol::TickState;
 use tickhost_connect::{
     hosted::{CONTROL_TIMEOUT, OBSERVATION_FRAME_BYTES},
     session::{SessionLinkState, SessionObservation},
@@ -280,7 +280,7 @@ impl ProtocolFeed for HostedFeed {
 
     /// Registers a host watch: the reply carries the current content, then the host pushes
     /// latest-only observations until the Tick ends or the connection does.
-    async fn watch(&self) -> Result<(TickRead, u64, watch::Receiver<SessionObservation>), String> {
+    async fn watch(&self) -> Result<(TickState, u64, watch::Receiver<SessionObservation>), String> {
         let mut connection = self
             .tools
             .data(self.chat, &self.instance)
@@ -290,7 +290,7 @@ impl ProtocolFeed for HostedFeed {
             .request("watch", json!({}), CONTROL_TIMEOUT)
             .await
             .map_err(|error| error.to_string())?;
-        let baseline: TickRead = serde_json::from_value(registered["read"].clone())
+        let baseline: TickState = serde_json::from_value(registered["read"].clone())
             .map_err(|error| error.to_string())?;
         let received = registered["received"]
             .as_u64()
@@ -501,7 +501,7 @@ impl TickStreamPort for HostedTickStream {
             .request("read", json!({"activity":"automatic"}), CONTROL_TIMEOUT)
             .await
             .map_err(|error| error.to_string())?;
-        let read: TickRead = serde_json::from_value(read).map_err(|error| error.to_string())?;
+        let read: TickState = serde_json::from_value(read).map_err(|error| error.to_string())?;
         Ok(Some(current_observation(instance, read)))
     }
 

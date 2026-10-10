@@ -17,7 +17,8 @@ use tick_market::{
     metadata::TickKind,
 };
 use tick_protocol::{
-    INVALID_PARAMS, METHOD_NOT_FOUND, NATIVE_PROTOCOL_VERSION, NATIVE_UPDATE_VERSION, PARSE_ERROR,
+    CALL_METHOD, INVALID_PARAMS, METHOD_NOT_FOUND, NATIVE_PROTOCOL_VERSION, PARSE_ERROR,
+    REVISION_MISMATCH,
 };
 use tick_provider::{
     api::{MarketEvent, Quote, QuoteApi},
@@ -46,16 +47,10 @@ impl QuoteApi for Quotes {
 
 /// Runs the Quote Tick over an in-memory duplex transport, feeds it the given
 /// request lines, and returns every frame the Tick wrote back.
-async fn serve(requests: &[Value], instance_id: &str) -> Vec<Value> {
+async fn serve(requests: &[Value]) -> Vec<Value> {
     let (mut client_requests, tick_requests) = tokio::io::duplex(8 * 1024);
     let (tick_responses, mut client_responses) = tokio::io::duplex(64 * 1024);
-    let mut session = TickStream::duplex(
-        TickKind::Quote,
-        "longbridge",
-        instance_id.to_owned(),
-        tick_requests,
-        tick_responses,
-    );
+    let mut session = TickStream::duplex(TickKind::Quote, tick_requests, tick_responses);
     for request in requests {
         let mut line = serde_json::to_vec(request).unwrap();
         line.push(b'\n');
@@ -100,6 +95,13 @@ fn responses(frames: &[Value]) -> Vec<&Value> {
         .collect()
 }
 
+/// A `tick/call` against the shipped catalog revision.
+fn call(id: u64, params: Value) -> Value {
+    let mut params = params;
+    params["revision"] = json!("1");
+    json!({"jsonrpc": "2.0", "id": id, "method": CALL_METHOD, "params": params})
+}
+
 fn updates(frames: &[Value]) -> Vec<&Value> {
     frames
         .iter()
@@ -109,41 +111,36 @@ fn updates(frames: &[Value]) -> Vec<&Value> {
 }
 
 #[tokio::test]
-async fn describe_answers_with_protocol_two_and_the_quote_tool_catalog() {
-    let frames = serve(
-        &[json!({"jsonrpc": "2.0", "id": 1, "method": "tick/describe"})],
-        "herdr:test-quote",
-    )
-    .await;
+async fn describe_answers_with_protocol_three_and_the_quote_tool_catalog() {
+    let frames = serve(&[json!({"jsonrpc": "2.0", "id": 1, "method": "tick/describe"})]).await;
 
     let describe = responses(&frames)
         .into_iter()
         .find(|frame| frame["id"] == 1)
         .expect("describe was answered");
     assert_eq!(describe["jsonrpc"], "2.0");
-    assert_eq!(describe["result"]["tick_type"], "quote");
+    assert_eq!(describe["result"]["kind"], "quote");
     assert_eq!(describe["result"]["protocol"], NATIVE_PROTOCOL_VERSION);
+    assert_eq!(describe["result"]["revision"], "1");
     assert_eq!(describe["result"]["recover_with"], "quotes");
     let tools = describe["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["name"], "quotes");
     assert_eq!(tools[0]["mutates"], false);
     assert!(tools[0]["description"].as_str().unwrap().contains("price"));
-    assert_eq!(tools[0]["params"]["properties"]["symbols"]["type"], "array");
-    assert_eq!(tools[0]["params"]["required"], json!(["symbols"]));
+    assert_eq!(
+        tools[0]["input_schema"]["properties"]["symbols"]["type"],
+        "array"
+    );
+    assert_eq!(tools[0]["input_schema"]["required"], json!(["symbols"]));
 }
 
 #[tokio::test]
 async fn a_query_tool_call_answers_with_the_quote_table_json() {
-    let frames = serve(
-        &[json!({
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "tool/call",
-            "params": {"tool": "quotes", "args": {"symbols": ["AAPL"]}}
-        })],
-        "herdr:test-quote",
-    )
+    let frames = serve(&[call(
+        7,
+        json!({"tool": "quotes", "args": {"symbols": ["AAPL"]}}),
+    )])
     .await;
 
     let answer = responses(&frames)
@@ -163,13 +160,10 @@ async fn a_query_tool_call_answers_with_the_quote_table_json() {
 
 #[tokio::test]
 async fn invalid_tool_arguments_are_rejected_with_the_declared_schema() {
-    let frames = serve(
-        &[
-            json!({"jsonrpc": "2.0", "id": 1, "method": "tool/call", "params": {"tool": "quotes", "args": {}}}),
-            json!({"jsonrpc": "2.0", "id": 2, "method": "tool/call", "params": {"tool": "candles", "args": {}}}),
-        ],
-        "herdr:test-quote",
-    )
+    let frames = serve(&[
+        call(1, json!({"tool": "quotes", "args": {}})),
+        call(2, json!({"tool": "candles", "args": {}})),
+    ])
     .await;
 
     let invalid = responses(&frames)
@@ -193,34 +187,46 @@ async fn invalid_tool_arguments_are_rejected_with_the_declared_schema() {
         .into_iter()
         .find(|frame| frame["id"] == 2)
         .expect("the unknown call was answered");
-    assert_eq!(unknown["error"]["code"], METHOD_NOT_FOUND);
+    assert_eq!(unknown["error"]["code"], INVALID_PARAMS);
 }
 
 #[tokio::test]
-async fn the_first_record_is_a_snapshot_carrying_the_version_three_tick_update() {
-    let frames = serve(&[], "herdr:test-42").await;
+async fn a_call_naming_another_catalog_revision_is_refused_before_it_runs() {
+    let frames = serve(&[json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": CALL_METHOD,
+        "params": {"tool": "quotes", "args": {"symbols": ["AAPL"]}, "revision": "0"}
+    })])
+    .await;
 
-    let snapshot = updates(&frames).first().copied().expect("a Tick Update");
-    assert_eq!(snapshot["version"], NATIVE_UPDATE_VERSION);
-    assert_eq!(snapshot["tick"], "quote");
-    assert_eq!(snapshot["tick_instance_id"], "herdr:test-42");
-    assert_eq!(snapshot["source"], "longbridge");
-    assert_eq!(snapshot["sequence"], 1);
-    assert_eq!(snapshot["kind"], "snapshot");
-    assert_eq!(snapshot["data"][0]["symbol"], "AAPL.US");
+    let refused = responses(&frames)
+        .into_iter()
+        .find(|frame| frame["id"] == 7)
+        .expect("the stale call was answered");
+    assert_eq!(refused["error"]["code"], REVISION_MISMATCH);
+}
+
+#[tokio::test]
+async fn the_first_tick_update_carries_only_seq_data_and_at() {
+    let frames = serve(&[]).await;
+
+    let first = updates(&frames).first().copied().expect("a Tick Update");
+    let mut fields: Vec<_> = first.as_object().unwrap().keys().collect();
+    fields.sort();
+    assert_eq!(fields, ["at", "data", "seq"]);
+    assert_eq!(first["seq"], 1);
+    assert_eq!(first["data"][0]["symbol"], "AAPL.US");
 }
 
 #[tokio::test]
 async fn protocol_errors_are_answered_without_closing_the_stream() {
-    let frames = serve(
-        &[
-            json!({"jsonrpc": "2.0", "id": 1, "method": "tick/nope"}),
-            json!({"jsonrpc": "2.0", "id": 2, "method": "tool/call", "params": {"tool": "nope"}}),
-            json!({"jsonrpc": "2.0", "id": 3, "method": "tool/call", "params": {}}),
-            json!({"jsonrpc": "2.0", "id": 4, "method": "tick/describe"}),
-        ],
-        "herdr:test-quote",
-    )
+    let frames = serve(&[
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tick/nope"}),
+        call(2, json!({"tool": "nope"})),
+        json!({"jsonrpc": "2.0", "id": 3, "method": CALL_METHOD, "params": {}}),
+        json!({"jsonrpc": "2.0", "id": 4, "method": "tick/describe"}),
+    ])
     .await;
 
     let codes: Vec<(Value, i64)> = responses(&frames)
@@ -235,7 +241,7 @@ async fn protocol_errors_are_answered_without_closing_the_stream() {
         codes,
         [
             (json!(1), METHOD_NOT_FOUND),
-            (json!(2), METHOD_NOT_FOUND),
+            (json!(2), INVALID_PARAMS),
             (json!(3), INVALID_PARAMS),
             (Value::Null, PARSE_ERROR),
         ]
@@ -243,23 +249,17 @@ async fn protocol_errors_are_answered_without_closing_the_stream() {
     assert!(
         responses(&frames)
             .into_iter()
-            .any(|frame| frame["id"] == 4 && frame["result"]["protocol"] == 2),
+            .any(|frame| frame["id"] == 4 && frame["result"]["protocol"] == 3),
         "the describe after the bad requests is still answered: {frames:?}"
     );
     assert_eq!(updates(&frames).len(), 1);
 }
 
 #[tokio::test]
-async fn a_slow_consumer_receives_only_the_latest_update_and_the_sequence_shows_the_gap() {
+async fn a_slow_consumer_receives_only_the_latest_update_and_the_seq_shows_the_gap() {
     let (writer, mut attempts) = BlockedWriter::new();
     let written = writer.written();
-    let mut session = TickStream::duplex(
-        TickKind::Quote,
-        "longbridge",
-        "herdr:test-9".to_owned(),
-        tokio::io::empty(),
-        writer.clone(),
-    );
+    let mut session = TickStream::duplex(TickKind::Quote, tokio::io::empty(), writer.clone());
 
     session.publish(json!({"step": 1})).unwrap();
     attempts
@@ -279,7 +279,7 @@ async fn a_slow_consumer_receives_only_the_latest_update_and_the_sequence_shows_
         .collect();
     let delivered: Vec<(u64, Value)> = updates(&frames)
         .into_iter()
-        .map(|record| (record["sequence"].as_u64().unwrap(), record["data"].clone()))
+        .map(|record| (record["seq"].as_u64().unwrap(), record["data"].clone()))
         .collect();
     assert_eq!(
         delivered,

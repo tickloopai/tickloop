@@ -45,7 +45,7 @@ fn portfolio() -> Portfolio {
 async fn positions_snapshot_calculates_profit_and_separate_currency_totals_without_internal_fields()
 {
     let mut output = Vec::new();
-    let mut updates = TickStream::in_memory(TickKind::Positions, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Positions);
     let args = OnceArgs {
         once: true,
         format: OutputFormat::Json,
@@ -136,7 +136,7 @@ async fn position_quote_push_changes_screen_and_content_then_unsubscribes() {
         .unwrap();
     });
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 16)).unwrap();
-    let mut updates = TickStream::in_memory(TickKind::Positions, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Positions);
     positions::run_live(
         &OnceArgs::default(),
         &quotes,
@@ -202,7 +202,7 @@ async fn empty_live_account_has_an_explicit_empty_state_and_successful_json_snap
         KeyCode::Char('q'),
         KeyModifiers::NONE,
     )))]);
-    let mut updates = TickStream::in_memory(TickKind::Positions, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Positions);
     positions::run_live(
         &OnceArgs::default(),
         &NoQuotes,
@@ -234,7 +234,7 @@ async fn empty_live_account_has_an_explicit_empty_state_and_successful_json_snap
         &settings,
         false,
         &mut output,
-        &mut TickStream::in_memory(TickKind::Positions, "longbridge"),
+        &mut TickStream::in_memory(TickKind::Positions),
     )
     .await
     .unwrap();
@@ -266,7 +266,7 @@ async fn unavailable_quotes_do_not_fabricate_zero_values_or_partial_currency_tot
         ]}]}),
     );
     let mut output = Vec::new();
-    let mut updates = TickStream::in_memory(TickKind::Positions, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Positions);
     positions::run_once(
         &OnceArgs {
             once: true,
@@ -320,7 +320,7 @@ async fn table_banner_uses_response_account_channel_while_mixed_books_are_reject
             &settings,
             false,
             &mut output,
-            &mut TickStream::in_memory(TickKind::Positions, "longbridge"),
+            &mut TickStream::in_memory(TickKind::Positions),
         )
         .await
         .unwrap();
@@ -343,7 +343,7 @@ async fn table_banner_uses_response_account_channel_while_mixed_books_are_reject
         &settings,
         false,
         &mut output,
-        &mut TickStream::in_memory(TickKind::Positions, "longbridge"),
+        &mut TickStream::in_memory(TickKind::Positions),
     )
     .await
     .unwrap_err();

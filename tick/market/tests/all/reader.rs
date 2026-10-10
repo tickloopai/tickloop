@@ -117,7 +117,7 @@ async fn read_with(keys: Vec<KeyEvent>) -> (String, usize) {
     let library = tick_market::reader::demo_library();
     let input = futures_util::stream::iter(keys.into_iter().map(|key| Ok(Event::Key(key))));
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
-    let mut updates = TickStream::in_memory(TickKind::Reader, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Reader);
     run_live(
         library,
         &Settings::default(),

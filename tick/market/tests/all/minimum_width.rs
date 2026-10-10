@@ -331,7 +331,7 @@ async fn render_keys(
         ..Settings::default()
     };
     let mut terminal = Terminal::new(TestBackend::new(columns, rows)).unwrap();
-    let mut updates = TickStream::in_memory(scenario.kind, "demo");
+    let mut updates = TickStream::in_memory(scenario.kind);
     let input = keys(codes);
     match scenario.kind {
         TickKind::Quote => commands::quote::run_live(

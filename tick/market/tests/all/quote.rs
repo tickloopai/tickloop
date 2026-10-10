@@ -40,7 +40,7 @@ async fn quote_once_normalizes_symbols_and_keeps_individual_errors_in_table_and_
         &Settings::default(),
         false,
         &mut output,
-        &mut TickStream::in_memory(TickKind::Quote, "longbridge"),
+        &mut TickStream::in_memory(TickKind::Quote),
     )
     .await
     .unwrap();
@@ -63,7 +63,7 @@ async fn quote_once_normalizes_symbols_and_keeps_individual_errors_in_table_and_
         &Settings::default(),
         false,
         &mut output,
-        &mut TickStream::in_memory(TickKind::Quote, "longbridge"),
+        &mut TickStream::in_memory(TickKind::Quote),
     )
     .await
     .unwrap();
@@ -98,7 +98,7 @@ async fn quote_table_preserves_meaningful_subcent_prices() {
         &Settings::default(),
         false,
         &mut output,
-        &mut TickStream::in_memory(TickKind::Quote, "longbridge"),
+        &mut TickStream::in_memory(TickKind::Quote),
     )
     .await
     .unwrap();
@@ -132,7 +132,7 @@ async fn whole_service_failure_returns_network_exit_code_without_partial_output(
         &Settings::default(),
         false,
         &mut output,
-        &mut TickStream::in_memory(TickKind::Quote, "longbridge"),
+        &mut TickStream::in_memory(TickKind::Quote),
     )
     .await
     .unwrap_err();
@@ -141,25 +141,16 @@ async fn whole_service_failure_returns_network_exit_code_without_partial_output(
 }
 
 #[test]
-fn tick_updates_use_the_canonical_versioned_schema() {
-    let mut updates = TickStream::in_memory(TickKind::Quote, "demo");
+fn tick_updates_carry_only_seq_data_and_at() {
+    let mut updates = TickStream::in_memory(TickKind::Quote);
     updates
         .publish(serde_json::json!({"symbol":"TSLA.US","last":"421.50"}))
         .unwrap();
 
     let update: serde_json::Value = updates.records().all().remove(0);
-    assert_eq!(update["version"], 3);
-    assert_eq!(update["tick"], "quote");
-    assert!(
-        update["tick_instance_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("herdr:")
-    );
-    assert_eq!(update["source"], "demo");
-    assert_eq!(update["sequence"], 1);
-    assert_eq!(update["kind"], "snapshot");
-    assert!(update["observed_at"].as_str().unwrap().ends_with('Z'));
+    assert_eq!(update.as_object().unwrap().len(), 3, "{update}");
+    assert_eq!(update["seq"], 1);
+    assert!(update["at"].as_str().unwrap().ends_with('Z'));
     assert_eq!(
         update["data"],
         serde_json::json!({"symbol":"TSLA.US","last":"421.50"})

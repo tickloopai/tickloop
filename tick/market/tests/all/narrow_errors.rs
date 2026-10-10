@@ -49,7 +49,7 @@ async fn minimum_panels_show_quote_errors_even_when_name_and_error_columns_are_h
             KeyCode::Char('q'),
             KeyModifiers::NONE,
         )))]);
-        let mut updates = TickStream::in_memory(TickKind::Quote, "longbridge");
+        let mut updates = TickStream::in_memory(TickKind::Quote);
         if is_watchlist {
             watchlist::run_live(
                 &WatchlistArgs {

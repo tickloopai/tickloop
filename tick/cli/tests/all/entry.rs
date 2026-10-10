@@ -371,7 +371,7 @@ fn tick_descriptions_use_tick_terminology_and_minimum_panel_sizes() {
     assert_eq!(kline["title"], "Kline");
     assert_eq!(kline["runtime"], "command");
     assert_eq!(kline["configuration"], "user_input");
-    assert_eq!(kline["protocol"], 2);
+    assert_eq!(kline["protocol"], 3);
     assert_eq!(kline["recover_with"], "candles");
     let kline_tools: Vec<(&str, bool)> = kline["tools"]
         .as_array()
@@ -410,14 +410,14 @@ fn tick_descriptions_use_tick_terminology_and_minimum_panel_sizes() {
     assert_eq!(earnings["title"], "Earnings");
     assert_eq!(earnings["runtime"], "command");
     assert_eq!(earnings["configuration"], "user_input");
-    assert_eq!(earnings["protocol"], 2);
+    assert_eq!(earnings["protocol"], 3);
     assert_eq!(earnings["recover_with"], "history");
     let tools = earnings["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 5);
     assert_eq!(tools[0]["name"], "history");
     assert_eq!(tools[0]["mutates"], false);
     assert_eq!(
-        tools[0]["params"]["properties"]["count"]["maximum"], 20,
+        tools[0]["input_schema"]["properties"]["count"]["maximum"], 20,
         "the declared schema bounds the periods the Agent may ask for"
     );
     assert!(
