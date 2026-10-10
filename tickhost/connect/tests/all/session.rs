@@ -8,9 +8,10 @@ async fn spawn(directory: &Path, command: Vec<String>) -> Result<TickSession, Se
     TickSession::spawn(SessionLaunch {
         command,
         cwd: directory.into(),
-        backend: tickhost_connect::session::SessionBackend::Herdr {
-            socket: PathBuf::from("/tmp/example-herdr.sock"),
-            terminal_id: "fixture-terminal".into(),
+        terminal: tickhost_connect::hosted::HostedTerminal {
+            endpoint: PathBuf::from("/tmp/example-tickhost.sock"),
+            epoch: uuid::Uuid::from_u128(1),
+            terminal: uuid::Uuid::from_u128(2),
         },
         runtime_dir: Some(directory.join("sessions")),
     })
@@ -248,10 +249,7 @@ for line in sys.stdin:
 
 #[tokio::test]
 async fn a_hosted_session_answers_only_its_own_terminal_binding() {
-    use tickhost_connect::{
-        hosted::HostedTerminal,
-        session::{SessionBackend, SessionClient},
-    };
+    use tickhost_connect::{hosted::HostedTerminal, session::SessionClient};
     let directory = tempfile::tempdir().unwrap();
     let script = directory.path().join("quiet.py");
     std::fs::write(&script, r#"
@@ -277,46 +275,35 @@ for line in sys.stdin:
             script.to_string_lossy().into_owned(),
         ],
         cwd: directory.path().into(),
-        backend: SessionBackend::Hosted(terminal.clone()),
+        terminal: terminal.clone(),
         runtime_dir: Some(sessions.clone()),
     })
     .await
     .unwrap();
     let instance = session.instance().clone();
     assert!(instance.hosted_run().is_some(), "{instance}");
-    SessionClient::connect(
-        instance.clone(),
-        SessionBackend::Hosted(terminal.clone()),
-        Some(sessions.clone()),
-    )
-    .await
-    .expect("the binding it was launched with");
+    SessionClient::connect(instance.clone(), terminal.clone(), Some(sessions.clone()))
+        .await
+        .expect("the binding it was launched with");
     let restarted_host = HostedTerminal {
         epoch: uuid::Uuid::new_v4(),
         ..terminal.clone()
     };
     assert!(
-        SessionClient::connect(
-            instance.clone(),
-            SessionBackend::Hosted(restarted_host),
-            Some(sessions.clone()),
-        )
-        .await
-        .is_err(),
+        SessionClient::connect(instance.clone(), restarted_host, Some(sessions.clone()),)
+            .await
+            .is_err(),
         "another host epoch is another binding"
     );
+    let other_terminal = HostedTerminal {
+        terminal: uuid::Uuid::new_v4(),
+        ..terminal
+    };
     assert!(
-        SessionClient::connect(
-            instance,
-            SessionBackend::Herdr {
-                socket: PathBuf::from("/tmp/example-herdr.sock"),
-                terminal_id: "fixture-terminal".into(),
-            },
-            Some(sessions),
-        )
-        .await
-        .is_err(),
-        "a hosted instance never belongs to a Herdr terminal"
+        SessionClient::connect(instance, other_terminal, Some(sessions))
+            .await
+            .is_err(),
+        "another terminal of the same host is another binding"
     );
     session.shutdown().await.unwrap();
 }

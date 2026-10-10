@@ -40,37 +40,19 @@ const DEMO_SYMBOL: &str = "DEMO.US";
 const DEMO_FISCAL_PERIOD: &str = "FY2026Q2";
 
 pub fn run(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
-    let mut arguments: Vec<_> = arguments.into_iter().collect();
-    let preflight = arguments
-        .first()
-        .is_some_and(|arg| arg == tickhost_connect::launch::PREFLIGHT_ARGUMENT);
-    if preflight {
-        arguments.remove(0);
-    }
-    let cli =
-        match Cli::try_parse_from(std::iter::once(OsString::from("tick")).chain(arguments.clone()))
-        {
-            Ok(cli) => cli,
-            Err(error) => {
-                let exit_code = error.exit_code();
-                let _ = error.print();
-                return ExitCode::from(exit_code as u8);
-            }
-        };
+    let cli = match Cli::try_parse_from(std::iter::once(OsString::from("tick")).chain(arguments)) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let exit_code = error.exit_code();
+            let _ = error.print();
+            return ExitCode::from(exit_code as u8);
+        }
+    };
     if let Some((provider, tick)) = cli.command.provider_tick()
         && let Err(error) = provider.check(tick.kind())
     {
         eprintln!("tick: {error}");
         return ExitCode::from(exit_code::USAGE);
-    }
-    if preflight {
-        return match crate::native_launcher::preflight(&cli) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("tick: {error}");
-                ExitCode::from(error.code)
-            }
-        };
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -82,13 +64,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let result = runtime.block_on(async {
-        if let Some(result) = crate::native_launcher::maybe_launch(&cli, &arguments).await {
-            result
-        } else {
-            execute(cli).await
-        }
-    });
+    let result = runtime.block_on(execute(cli));
     runtime.shutdown_timeout(std::time::Duration::from_millis(100));
     match result {
         Ok(()) => ExitCode::from(exit_code::SUCCESS),

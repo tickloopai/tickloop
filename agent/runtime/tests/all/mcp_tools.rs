@@ -814,17 +814,22 @@ async fn artifact_login_state_is_independent_of_directory_and_connection_failure
 }
 
 #[tokio::test]
-async fn model_tool_inventory_keeps_artifact_shell_and_herdr_names() {
+async fn model_tool_inventory_keeps_artifact_shell_and_tick_names() {
+    use tickloop_agent_runtime::hosted::worker_control::{DaemonControl, WorkerControlGrant};
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
     let account = service.login(directory.path()).await;
-    let native = tickloop_agent_runtime::native_host::NativeHostToolProvider::new(Arc::new(
-        tickhost_connect::access::TickAccess::new(
-            tickhost_connect::herdr::HerdrContext::without_view(
-                directory.path().join("unused.sock"),
-            ),
-        ),
-    ));
+    let native = tickloop_agent_runtime::hosted::tools::HostedTickTools::new(
+        DaemonControl::new(WorkerControlGrant {
+            endpoint: directory.path().join("unused-daemon.sock"),
+            daemon_epoch: uuid::Uuid::new_v4(),
+            binding: uuid::Uuid::new_v4(),
+            capability: "unused".into(),
+            host_endpoint: directory.path().join("unused-host.sock"),
+            intent_renewal: std::time::Duration::from_secs(100),
+        }),
+        Vec::new(),
+    );
     let model = Arc::new(ScriptedModel::new(vec![text("Ready.")]));
     let agent = Agent::new_embedded(config(), model.clone());
     agent
@@ -850,6 +855,7 @@ async fn model_tool_inventory_keeps_artifact_shell_and_herdr_names() {
         "TaskStop",
         "CallTickTool",
         "ReadTick",
+        "ModifyTick",
     ] {
         assert!(tool_names(&requests[0]).contains(&name), "{name}");
     }
@@ -871,7 +877,7 @@ async fn model_tool_inventory_keeps_artifact_shell_and_herdr_names() {
             .iter()
             .find(|tool| tool.name == name)
             .unwrap();
-        assert!(definition.description.contains("Herdr"));
+        assert!(definition.description.contains("hosted:"));
         assert!(definition.description.contains("ArtifactRead"));
     }
 }
@@ -1071,7 +1077,7 @@ impl HostToolProvider for NativeFixture {
     }
 
     fn workspace_host_context(&self) -> Option<WorkspaceHostContext> {
-        Some(WorkspaceHostContext::attached_herdr(None, None))
+        Some(WorkspaceHostContext::from_environment().with_herdr_views())
     }
 
     fn permission(

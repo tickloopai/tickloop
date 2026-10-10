@@ -1,74 +1,10 @@
 use super::*;
 use tickloop_agent_protocol::{
-    EventSourceBinding, LoopState, ObservationKind, ShellTask, ShellTaskState, TickLinkState,
+    EventSourceBinding, LoopState, ShellTask, ShellTaskState, TickLinkState,
 };
 
 /// How long a finished background Shell keeps its row once the Chat handled its end.
 pub const FINISHED_SHELL_DISPLAY_MS: u64 = 30_000;
-
-pub struct HerdrRows;
-impl MonitorRows for HerdrRows {
-    fn tick_type(&self) -> &'static str {
-        tick_protocol::HERDR_INSTANCE_TYPE
-    }
-    fn list(&self, context: &MonitorContext) -> Vec<TickDescriptor> {
-        subscriptions(context, self.tick_type())
-            .map(|row| {
-                let terminal = matches!(row.kind, Some(ObservationKind::Terminal { .. }));
-                TickDescriptor {
-                    instance: row.instance.clone(),
-                    group: TickGroup::Ticks,
-                    glyph: if terminal {
-                        TickGlyph::Terminal
-                    } else {
-                        TickGlyph::Protocol
-                    },
-                    title: row
-                        .title
-                        .clone()
-                        .unwrap_or_else(|| row.instance.to_string()),
-                    kind: if terminal { "Terminal" } else { "Tick" }.into(),
-                    status: link_status(row.link).into(),
-                    notes: Vec::new(),
-                    inherent_subscription: false,
-                    owner: TickOwner::Herdr,
-                    tone: link_tone(row.link),
-                    updated_at_ms: row.updated_at_ms,
-                    update: subscription_update(row),
-                    running: row.link == TickLinkState::Live,
-                    resources: None,
-                    actions: vec![remove_from_monitor(&row.instance)],
-                }
-            })
-            .collect()
-    }
-    /// A Herdr member reports the latest probe of its Pane.
-    fn member(&self, member: &MonitorMember, context: &MonitorContext) -> TickDescriptor {
-        let mut row = super::member_descriptor(member);
-        add_probed_update(&mut row, context);
-        match context.member_states.get(&member.instance) {
-            Some(MemberState::Live { protocol }) => {
-                row.running = true;
-                row.status = link_status(TickLinkState::Live).into();
-                row.tone = link_tone(TickLinkState::Live);
-                if !protocol {
-                    row.kind = "Terminal".into();
-                    row.glyph = TickGlyph::Terminal;
-                }
-            }
-            Some(MemberState::Gone | MemberState::Lost | MemberState::Exited(_)) => {
-                row.status = link_status(TickLinkState::InstanceGone).into();
-                row.tone = link_tone(TickLinkState::InstanceGone);
-            }
-            Some(MemberState::IdentityUncertain) => {
-                row.status = link_status(TickLinkState::IdentityUncertain).into();
-                row.tone = link_tone(TickLinkState::IdentityUncertain);
-            }
-            None => {}
-        }
-        row
-    }
-}
 
 /// Shows a hosted Tick's screen as a text snapshot detail.
 pub(crate) const HOSTED_SNAPSHOT_KEY: char = 's';
@@ -135,7 +71,7 @@ impl MonitorRows for HostedRows {
             intent: TickIntent::CloseHosted(member.instance.clone()),
         });
         match context.member_states.get(&member.instance) {
-            Some(MemberState::Live { .. }) => {
+            Some(MemberState::Live) => {
                 row.running = true;
                 row.status = link_status(TickLinkState::Live).into();
                 row.tone = link_tone(TickLinkState::Live);
@@ -156,10 +92,6 @@ impl MonitorRows for HostedRows {
             Some(MemberState::Gone) => {
                 row.status = link_status(TickLinkState::InstanceGone).into();
                 row.tone = link_tone(TickLinkState::InstanceGone);
-            }
-            Some(MemberState::IdentityUncertain) => {
-                row.status = link_status(TickLinkState::IdentityUncertain).into();
-                row.tone = link_tone(TickLinkState::IdentityUncertain);
             }
             None => {}
         }
@@ -755,7 +687,8 @@ fn hosted_subscription_actions(row: &TickSubscriptionStatus) -> Vec<MonitorActio
 mod tests {
     use super::*;
     use tickloop_agent_protocol::{
-        ShellTaskCapabilities, ShellTaskOrigin, ShellTaskOwner, TickSubscriptionFrequency,
+        ObservationKind, ShellTaskCapabilities, ShellTaskOrigin, ShellTaskOwner,
+        TickSubscriptionFrequency,
     };
 
     fn task(command: &str, description: Option<&str>) -> ShellTask {
@@ -992,12 +925,12 @@ mod tests {
     }
 
     /// A protocol Tick keeps the name it was opened under, its declared title plus the arguments
-    /// that tell instances apart, over the bare title its subscription reports; a program named
-    /// by what it runs takes what its host calls it now.
+    /// that tell instances apart, over the bare title its subscription reports; a terminal Tick
+    /// keeps the command it was opened with.
     #[test]
-    fn members_keep_their_names_and_programs_take_their_host_names() {
+    fn members_keep_the_names_they_were_opened_under() {
         let quote = InstanceRef::new("hosted", "quote-run").unwrap();
-        let terminal = InstanceRef::native("terminal:t1:20:birth").unwrap();
+        let terminal = InstanceRef::new("hosted", "terminal-run").unwrap();
         let mut chat: ChatSnapshot = serde_json::from_value(serde_json::json!({
             "id": Uuid::from_u128(1),
             "workdir": "/fixture",
@@ -1025,7 +958,6 @@ mod tests {
                 updated_at_ms: None,
                 link: TickLinkState::Live,
             }],
-            member_titles: [(terminal.clone(), "WAF bypass review".to_owned())].into(),
             ..Default::default()
         };
         let titles = MonitorRowsRegistry::builtin()
@@ -1034,7 +966,7 @@ mod tests {
             .map(|row| (row.instance, row.title))
             .collect::<std::collections::BTreeMap<_, _>>();
         assert_eq!(titles[&quote], "Quote · AAPL.US");
-        assert_eq!(titles[&terminal], "WAF bypass review");
+        assert_eq!(titles[&terminal], "make dev");
     }
 
     fn empty_chat() -> ChatSnapshot {
@@ -1079,7 +1011,7 @@ mod tests {
     #[test]
     fn rows_are_unread_until_the_chat_handles_their_latest_update() {
         let quote = InstanceRef::new("hosted", "quote-run").unwrap();
-        let calendar = InstanceRef::native("calendar-run").unwrap();
+        let calendar = InstanceRef::new("hosted", "calendar-run").unwrap();
         let artifact = InstanceRef::artifact("https://tickloop.ai", "doc-1").unwrap();
         let mut ended = task("make", None);
         ended.state = ShellTaskState::Completed;
@@ -1151,7 +1083,7 @@ mod tests {
     #[test]
     fn a_running_shell_and_a_never_updated_tick_have_nothing_to_read() {
         let running = task("make", None);
-        let pane = InstanceRef::native("terminal:t1:20:birth").unwrap();
+        let pane = InstanceRef::new("hosted", "terminal-run").unwrap();
         let mut chat = empty_chat();
         chat.monitor
             .record_opened(pane.clone(), Some("make dev".into()));
@@ -1162,7 +1094,7 @@ mod tests {
                 live_revision: 1,
                 tasks: vec![running.clone()],
             }),
-            member_states: [(pane.clone(), MemberState::Live { protocol: false })].into(),
+            member_states: [(pane.clone(), MemberState::Live)].into(),
             ..Default::default()
         };
         let rows = MonitorRowsRegistry::builtin().list(&context);
@@ -1190,9 +1122,9 @@ mod tests {
 
     #[test]
     fn gone_ticks_leave_after_thirty_seconds_unless_subscribed_unread_or_lost() {
-        let plain = InstanceRef::native("plain-run").unwrap();
-        let watched = InstanceRef::native("watched-run").unwrap();
-        let unread_gone = InstanceRef::native("unread-run").unwrap();
+        let plain = InstanceRef::new("hosted", "plain-run").unwrap();
+        let watched = InstanceRef::new("hosted", "watched-run").unwrap();
+        let unread_gone = InstanceRef::new("hosted", "unread-run").unwrap();
         let lost = InstanceRef::new("hosted", "lost-run").unwrap();
         let mut chat = empty_chat();
         for instance in [&plain, &watched, &unread_gone, &lost] {

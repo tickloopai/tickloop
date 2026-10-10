@@ -12,11 +12,11 @@ mod agent_titles;
 mod builtin_catalog;
 #[path = "all/busy_inputs.rs"]
 mod busy_inputs;
-#[path = "all/native_host_tools.rs"]
-mod native_host_tools;
 #[path = "all/permission_claims.rs"]
 mod permission_claims;
 #[path = "all/streaming_snapshot.rs"]
 mod streaming_snapshot;
+#[path = "all/tick_tool_approval.rs"]
+mod tick_tool_approval;
 #[path = "all/tick_tool_routes.rs"]
 mod tick_tool_routes;

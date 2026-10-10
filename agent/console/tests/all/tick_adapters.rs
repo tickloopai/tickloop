@@ -356,7 +356,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
         serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":instance,"frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live"})).unwrap()
     };
     let (pane, artifact) = (
-        subscription("herdr:pane"),
+        subscription("calendar:pane"),
         subscription("artifact:https://docs.example/a"),
     );
     let snapshot: tickloop_agent_protocol::ChatSnapshot = serde_json::from_value(json!({"id":chat,"workdir":"/fixture","messages":[],"loops":[],"artifact_ticks":[{"artifact_id":"a","origin":"https://docs.example","title":"Brief","format":"markdown","url":"https://docs.example/a","access_role":"owner","added_at_ms":1}]})).unwrap();
@@ -478,7 +478,7 @@ fn duplicate_instance_projection_keeps_the_newest_delivery_in_any_subscription_o
                frequency: &str,
                link: &str|
      -> TickSubscriptionStatus {
-        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":"herdr:shared","frequency":frequency,"accumulated":0,"last_delivery_ms":time,"last_delivery":null,"kind":"Protocol","title":title,"updated_at_ms":time,"link":link})).unwrap()
+        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":"hosted:shared","frequency":frequency,"accumulated":0,"last_delivery_ms":time,"last_delivery":null,"kind":"Protocol","title":title,"updated_at_ms":time,"link":link})).unwrap()
     };
     let recent = row(Some(2000), Some("Shared Tick"), "high", "Live");
     let baseline = row(None, None, "low", "Initializing");
@@ -546,7 +546,7 @@ async fn shell_subscription_refuses_foreign_chat_before_baseline_and_restoration
             .await
             .is_err()
     );
-    let adapters = Arc::new(TickAdapters::builtin(agent.clone(), None, None));
+    let adapters = Arc::new(TickAdapters::builtin(agent.clone(), None));
     let instance = InstanceRef::shell(task.command_id);
     agent.install_tick_stream(adapters).await;
     model.enqueue(call(

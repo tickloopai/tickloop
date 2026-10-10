@@ -590,7 +590,7 @@ fn click_fixture(width: u16, overlay: bool, group: TickGroup) -> State {
     } else if group == TickGroup::Ticks {
         entry.glyph = Glyph::ProtocolTick;
         entry.kind = "Tick".into();
-        entry.instance = "herdr:clickable".parse().unwrap();
+        entry.instance = "calendar:clickable".parse().unwrap();
         entry.actions = fixture_actions(&entry.instance);
         let mut subscription = tests::subscription_row(1);
         subscription.instance = entry.instance.clone();
@@ -1324,7 +1324,7 @@ fn subscribed_ticks_show_live_status_and_ignore_another_chats_refresh() {
     let mut state = State::new(true, 140, 30);
     let chat = Uuid::new_v4();
     state.switch_view_chat(Some(chat));
-    let row: TickSubscriptionStatus = serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":"herdr:fixture","frequency":"high","accumulated":0,"last_delivery_ms":1000,"last_delivery":null,"link":"Live","kind":{"Terminal":{"truncated":false}},"title":"Quote terminal","updated_at_ms":null})).unwrap();
+    let row: TickSubscriptionStatus = serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":"calendar:fixture","frequency":"high","accumulated":0,"last_delivery_ms":1000,"last_delivery":null,"link":"Live","kind":{"Terminal":{"truncated":false}},"title":"Quote terminal","updated_at_ms":null})).unwrap();
     let console = tests::console_with_state(state);
     console.update_subscribed_ticks(chat, &[row]).unwrap();
     let mut state = console.state.lock().unwrap();
@@ -1726,12 +1726,12 @@ async fn shell_detail_confirmation_runs_the_production_adapter_control_callback(
     core.shutdown().await;
 }
 
-/// A Herdr probe that finds every member gone.
-struct FixtureHerdrProbe;
+/// A probe of the members of one Tick type that finds every member gone.
+struct FixtureGoneProbe(&'static str);
 #[async_trait::async_trait]
-impl crate::monitor_rows::TickProbe for FixtureHerdrProbe {
+impl crate::monitor_rows::TickProbe for FixtureGoneProbe {
     fn tick_type(&self) -> &'static str {
-        "herdr"
+        self.0
     }
     async fn probe(
         &self,
@@ -1769,12 +1769,7 @@ impl crate::monitor_rows::TickProbe for FixtureHostedProbe {
             updates: Default::default(),
             states: instances
                 .iter()
-                .map(|instance| {
-                    (
-                        instance.clone(),
-                        crate::monitor_rows::MemberState::Live { protocol: true },
-                    )
-                })
+                .map(|instance| (instance.clone(), crate::monitor_rows::MemberState::Live))
                 .collect(),
             resources: instances
                 .iter()
@@ -1791,7 +1786,6 @@ impl crate::monitor_rows::TickProbe for FixtureHostedProbe {
                     )
                 })
                 .collect(),
-            titles: HashMap::new(),
         })
     }
 }
@@ -1816,10 +1810,10 @@ fn run_probes(
         .collect()
 }
 
-/// A Herdr View probes its hosted members as well as its Herdr ones, each with its own probe; a
-/// probe that fails keeps its own earlier findings and never wipes the other's.
+/// Members of each Tick type are probed by that type's own probe; a probe that fails keeps its
+/// own earlier findings and never wipes the other's.
 #[test]
-fn a_herdr_view_probes_hosted_members_beside_herdr_ones() {
+fn each_tick_type_probes_its_own_members_beside_the_others() {
     let console = Console::test_for_chat(Uuid::new_v4());
     let chat = console.state.lock().unwrap().chat.unwrap();
     let mut snapshot = chat_snapshot(chat);
@@ -1827,7 +1821,7 @@ fn a_herdr_view_probes_hosted_members_beside_herdr_ones() {
         .parse()
         .unwrap();
     for (instance, title) in [
-        ("herdr:pane".parse().unwrap(), "pane"),
+        ("calendar:pane".parse().unwrap(), "pane"),
         (hosted.clone(), "hidden"),
     ] {
         snapshot.monitor.members.push(MonitorMember {
@@ -1837,7 +1831,7 @@ fn a_herdr_view_probes_hosted_members_beside_herdr_ones() {
     }
     console.update_monitor_chat(&snapshot).unwrap();
     console
-        .add_member_probe(Arc::new(FixtureHerdrProbe))
+        .add_member_probe(Arc::new(FixtureGoneProbe("calendar")))
         .unwrap();
     console
         .add_member_probe(Arc::new(FixtureHostedProbe { fails: false }))
@@ -1866,7 +1860,7 @@ fn a_herdr_view_probes_hosted_members_beside_herdr_ones() {
     assert_eq!(hidden_row(&console).status, "live");
     assert_eq!(hidden_row(&console).resources.unwrap().pid, 42);
     console
-        .update_member_findings(chat, vec![("herdr", None), ("hosted", None)])
+        .update_member_findings(chat, vec![("calendar", None), ("hosted", None)])
         .unwrap();
     assert_eq!(
         hidden_row(&console).status,
@@ -1889,7 +1883,7 @@ fn monitor_pages_hold_at_most_128_rows_while_n_counts_the_full_set() {
     let mut snapshot = chat_snapshot(chat);
     for index in 0..130 {
         snapshot.monitor.members.push(MonitorMember {
-            instance: format!("herdr:member-{index:03}").parse().unwrap(),
+            instance: format!("calendar:member-{index:03}").parse().unwrap(),
             title: None,
         });
     }
@@ -1919,23 +1913,25 @@ fn monitor_pages_hold_at_most_128_rows_while_n_counts_the_full_set() {
 }
 
 #[test]
-fn probed_herdr_members_report_their_host_state_and_owner() {
+fn probed_members_report_their_host_state_and_owner() {
     let console = Console::test_for_chat(Uuid::new_v4());
     let chat = console.state.lock().unwrap().chat.unwrap();
     let mut snapshot = chat_snapshot(chat);
     for id in ["quotes", "news"] {
         snapshot.monitor.members.push(MonitorMember {
-            instance: format!("herdr:{id}").parse().unwrap(),
+            instance: format!("hosted:{id}").parse().unwrap(),
             title: Some(id.into()),
         });
     }
     console.update_monitor_chat(&snapshot).unwrap();
     assert!(
         console.claim_member_probe().unwrap().is_none(),
-        "outside Herdr nothing probes Herdr members"
+        "nothing probes members of a type without a probe"
     );
     console
-        .add_member_probe(Arc::new(FixtureHerdrProbe))
+        .add_member_probe(Arc::new(FixtureGoneProbe(
+            tick_protocol::HOSTED_INSTANCE_TYPE,
+        )))
         .unwrap();
     let probe = console.claim_member_probe().unwrap().unwrap();
     assert_eq!(probe.chat, chat);
@@ -1948,7 +1944,7 @@ fn probed_herdr_members_report_their_host_state_and_owner() {
     let findings = run_probes(&probe);
     console.update_member_findings(chat, findings).unwrap();
     console
-        .update_member_findings(chat, vec![("herdr", None)])
+        .update_member_findings(chat, vec![(tick_protocol::HOSTED_INSTANCE_TYPE, None)])
         .unwrap();
     let state = console.state.lock().unwrap();
     for entry in state.monitor.entries() {
@@ -1980,7 +1976,7 @@ fn member_details_show_the_recorded_owner_and_no_invented_resources() {
     state.prompt_enabled = true;
     let mut snapshot = chat_snapshot(chat);
     snapshot.monitor.members.push(MonitorMember {
-        instance: tick_protocol::InstanceRef::new("herdr", "opened").unwrap(),
+        instance: tick_protocol::InstanceRef::new("calendar", "opened").unwrap(),
         title: Some("Opened counter".into()),
     });
     state.monitor.chat_snapshot = Some(snapshot);
@@ -1995,7 +1991,7 @@ fn member_details_show_the_recorded_owner_and_no_invented_resources() {
     let detail = screen(&mut state);
     for fact in [
         "Opened counter",
-        "Instance  herdr:opened",
+        "Instance  calendar:opened",
         "Owner     this Chat",
         "Resources unavailable",
     ] {
@@ -2031,7 +2027,7 @@ fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_other
     finished.tone = StatusTone::Failed;
     let mut subscribed = shell(Uuid::new_v4(), "Quote board for the whole watchlist");
     subscribed.group = TickGroup::Ticks;
-    subscribed.instance = "herdr:quotes".parse().unwrap();
+    subscribed.instance = "calendar:quotes".parse().unwrap();
     subscribed.status = "live".into();
     subscribed.notes = vec!["⟳ high".into()];
     subscribed.tone = StatusTone::Live;
@@ -2445,7 +2441,7 @@ fn subscribed_fixture(subscriptions: usize) -> State {
     state.monitor.subscriptions = (0..subscriptions)
         .map(|index| {
             let mut row = tests::subscription_row(3 + index as u64);
-            row.instance = tick_protocol::InstanceRef::native("fixture-run").unwrap();
+            row.instance = tick_protocol::InstanceRef::new("calendar", "fixture-run").unwrap();
             row.loop_id = Uuid::from_u128(900 + index as u128);
             row.accumulated = index as u64;
             row
@@ -2684,11 +2680,11 @@ async fn opening_a_row_handles_its_updates_and_other_keys_do_not() {
     let agent =
         ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let quotes = tick_protocol::InstanceRef::native("quotes-run").unwrap();
+    let quotes = tick_protocol::InstanceRef::new("calendar", "quotes-run").unwrap();
     let joined = core
         .record_reopened_tick(
             chat,
-            &tick_protocol::InstanceRef::native("lost-run").unwrap(),
+            &tick_protocol::InstanceRef::new("calendar", "lost-run").unwrap(),
             quotes.clone(),
         )
         .await
@@ -2750,7 +2746,7 @@ fn a_gone_row_leaves_monitor_thirty_seconds_after_it_went() {
     use crate::monitor_rows::{GONE_DISPLAY_MS, MemberFindings, MemberState};
     let chat = Uuid::new_v4();
     let console = Console::test_for_chat(chat);
-    let gone = tick_protocol::InstanceRef::native("gone-run").unwrap();
+    let gone = tick_protocol::InstanceRef::new("hosted", "gone-run").unwrap();
     let mut snapshot = chat_snapshot(chat);
     snapshot
         .monitor
@@ -2761,7 +2757,7 @@ fn a_gone_row_leaves_monitor_thirty_seconds_after_it_went() {
         .update_member_findings(
             chat,
             vec![(
-                tick_protocol::HERDR_INSTANCE_TYPE,
+                tick_protocol::HOSTED_INSTANCE_TYPE,
                 Some(MemberFindings {
                     states: [(gone.clone(), MemberState::Gone)].into(),
                     ..Default::default()

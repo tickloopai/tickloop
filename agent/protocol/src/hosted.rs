@@ -46,6 +46,12 @@ pub struct HostedSnapshot {
     pub taken_at_ms: u64,
 }
 
+/// The `tickloop` arguments that run the attach client of one hosted Tick view: a Monitor popup,
+/// or a Herdr Pane that shows the Tick.
+pub const ATTACH_ARGUMENTS: [&str; 2] = ["monitor", "attach"];
+/// The environment variable through which an attach client receives its view grant as JSON.
+pub const ATTACH_ENVIRONMENT: &str = "TICKLOOP_MONITOR_ATTACH";
+
 /// One view's permission to attach to a hosted Tick's terminal: it reaches `endpoint` as a
 /// viewer of `instance` once, and only the host process `host_epoch` honours it. It carries no
 /// data token.

@@ -1,5 +1,5 @@
-//! The `tickhost` executable: the hidden `run` service as `ps` shows it, `stop`, and the checks
-//! `open` makes before anything starts.
+//! The `tickhost` executable: the hidden `run` service as `ps` shows it, `stop`, and the hidden
+//! `launch` entry.
 
 use std::{
     io::Write,
@@ -118,7 +118,7 @@ async fn stop_ends_every_hosted_tick_and_leaves_them_lost_to_the_daemon() {
                 "owner": {"root":"fixture-root","chat":uuid::Uuid::new_v4()},
                 "owner_revision": 0,
                 "adapter": "protocol",
-                "command": [env!("CARGO_BIN_EXE_tickhost"), "open", "--", "/usr/bin/python3", "-u", counter],
+                "command": [env!("CARGO_BIN_EXE_tickhost"), tickhost::cli::LAUNCH_COMMAND, "--", "/usr/bin/python3", "-u", counter],
                 "cwd": counter.parent().unwrap(),
                 "environment": std::env::vars().collect::<Vec<_>>(),
                 "title": null,
@@ -200,41 +200,21 @@ fn stop_never_signals_a_process_the_host_lock_names_unless_it_is_the_live_tickho
 }
 
 #[test]
-fn open_refuses_a_missing_program_and_a_run_without_a_host() {
-    let missing = tickhost()
-        .args(["__preflight", "open", "--", "/nonexistent/program"])
-        .output()
-        .unwrap();
-    assert_eq!(missing.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("executable not found"));
-
-    let mut alone = tickhost();
-    for (name, _) in std::env::vars_os() {
-        if name.to_string_lossy().starts_with("HERDR_") {
-            alone.env_remove(name);
-        }
-    }
-    let alone = alone
-        .args(["open", "--", "/usr/bin/true"])
-        .env_remove("TICKLOOP_TICKHOST_LAUNCH")
-        .output()
-        .unwrap();
-    assert_eq!(alone.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&alone.stderr)
-            .contains("requires a Herdr Pane or a Tickhost launch"),
-        "{}",
-        String::from_utf8_lossy(&alone.stderr)
-    );
-}
-
-#[test]
-fn run_and_the_preflight_entry_stay_out_of_help() {
+fn only_stop_is_offered_and_open_is_gone() {
     let help = tickhost().arg("--help").output().unwrap();
     let help = String::from_utf8_lossy(&help.stdout);
-    for shown in ["open", "stop"] {
-        assert!(help.contains(&format!("\n  {shown}")), "{help}");
+    assert!(help.contains("\n  stop"), "{help}");
+    for hidden in ["run", "launch", "open"] {
+        assert!(!help.contains(&format!("\n  {hidden}")), "{help}");
     }
-    assert!(!help.contains("\n  run"), "{help}");
-    assert!(!help.contains("__preflight"), "{help}");
+    let open = tickhost()
+        .args(["open", "--", "/usr/bin/true"])
+        .output()
+        .unwrap();
+    assert_eq!(open.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&open.stderr).contains("unrecognized subcommand 'open'"),
+        "{}",
+        String::from_utf8_lossy(&open.stderr)
+    );
 }

@@ -1,5 +1,5 @@
 #![cfg(unix)]
-//! Real `tickhost open` launchers under the Tickhost library: hidden PTYs, the hosted launch contract,
+//! Real `tickhost launch` launchers under the Tickhost library: hidden PTYs, the hosted launch contract,
 //! one business process shared by protocol calls, its screen and its attached views, and process
 //! cleanup.
 
@@ -200,7 +200,7 @@ impl Fixture {
         (
             vec![
                 env!("CARGO_BIN_EXE_tickhost").into(),
-                "open".into(),
+                tickhost::cli::LAUNCH_COMMAND.into(),
                 "--".into(),
                 which("python3"),
                 "-u".into(),
@@ -774,7 +774,7 @@ async fn a_launcher_outside_the_foreground_is_refused_before_its_tick_starts() {
         "launch_token": "0".repeat(64),
     });
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_tickhost"))
-        .args(["open", "--", "/usr/bin/touch"])
+        .args([tickhost::cli::LAUNCH_COMMAND, "--", "/usr/bin/touch"])
         .arg(&marker)
         .env("TICKLOOP_TICKHOST_LAUNCH", binding.to_string())
         .env_remove("HERDR_ENV")
@@ -1853,39 +1853,28 @@ async fn a_launch_token_works_once_and_only_after_a_proven_foreground() {
     shutdown(&fixture).await;
 }
 
+/// Only a launch the Tickhost started runs a program: a person running the launcher, even inside
+/// a Herdr Pane, and an unreadable binding are refused before the program starts.
 #[tokio::test(flavor = "multi_thread")]
-async fn conflicting_or_unreadable_launch_contexts_never_start_a_tick() {
+async fn a_launcher_without_a_readable_tickhost_launch_never_starts_a_tick() {
     let directory = tempfile::Builder::new()
         .prefix("thctx")
         .tempdir_in("/private/tmp")
         .unwrap();
     let marker = directory.path().join("started");
-    let binding = json!({
-        "terminal": {"endpoint": directory.path().join("host.sock"), "epoch": uuid::Uuid::new_v4(), "terminal": uuid::Uuid::new_v4()},
-        "operation": uuid::Uuid::new_v4(),
-        "launch_token": "0".repeat(64),
-    })
-    .to_string();
-    let herdr = [
-        ("HERDR_ENV", "1"),
-        ("HERDR_SOCKET_PATH", "/nonexistent/herdr.sock"),
-        ("HERDR_PANE_ID", "p1"),
-    ];
-    let cases: [(&[(&str, &str)], &str); 3] = [
+    let cases: [(&[(&str, &str)], &str); 2] = [
         (
             &[
-                ("TICKLOOP_TICKHOST_LAUNCH", &binding),
-                herdr[0],
-                herdr[1],
-                herdr[2],
+                ("HERDR_ENV", "1"),
+                ("HERDR_SOCKET_PATH", "/nonexistent/herdr.sock"),
+                ("HERDR_PANE_ID", "p1"),
             ],
-            "cannot also carry a Herdr Pane context",
+            "only the Tickhost starts a launcher",
         ),
         (
             &[("TICKLOOP_TICKHOST_LAUNCH", "{not json")],
             "TICKLOOP_TICKHOST_LAUNCH is invalid",
         ),
-        (&[herdr[0]], "HERDR_SOCKET_PATH is required"),
     ];
     for (environment, expected) in cases {
         // Only the case's own context: never the Herdr session this test may run inside.
@@ -1896,7 +1885,7 @@ async fn conflicting_or_unreadable_launch_contexts_never_start_a_tick() {
             }
         }
         let output = command
-            .args(["open", "--", "/usr/bin/touch"])
+            .args([tickhost::cli::LAUNCH_COMMAND, "--", "/usr/bin/touch"])
             .arg(&marker)
             .env_remove("TICKLOOP_TICKHOST_LAUNCH")
             .envs(environment.iter().copied())

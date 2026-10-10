@@ -1,6 +1,6 @@
 [package]
 name = "tickloop-tickhost-connect"
-description = "Host-side access to Ticks: TickAccess, per-instance Tick Sessions, the Herdr Adapter and the launch contract"
+description = "Host-side access to Ticks: per-instance Tick Sessions, the hosted launch contract and Herdr as the layout host of Tick views"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -12,7 +12,6 @@ doctest = false
 [dependencies]
 async-trait = "0.1"
 libc = "0.2"
-jsonschema = { version = "0.56.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

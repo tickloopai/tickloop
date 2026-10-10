@@ -824,7 +824,7 @@ async fn embedded_monitor_commands_remove_members_of_the_selected_chat() {
     else {
         panic!("missing second execution");
     };
-    let instance: tick_protocol::InstanceRef = "herdr:counter".parse().unwrap();
+    let instance: tick_protocol::InstanceRef = "calendar:counter".parse().unwrap();
     let removed = access
         .execute(envelope(AgentCommand::RemoveMonitorMember {
             execution,

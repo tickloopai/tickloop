@@ -1,7 +1,7 @@
 #![cfg(unix)]
-//! The keys a built-in Tick answers in a real terminal. Esc and Ctrl+B belong to the view around
-//! the Tick, Backspace returns one level outside an editor, and an editor keeps q as text while
-//! Ctrl+C cancels it.
+//! A built-in Tick run in a real terminal is a standalone program, also inside a Herdr Pane, and
+//! the keys it answers there. Esc and Ctrl+B belong to the view around the Tick, Backspace returns
+//! one level outside an editor, and an editor keeps q as text while Ctrl+C cancels it.
 
 use std::{
     fs::File,
@@ -31,6 +31,11 @@ struct StandaloneKline {
 
 impl StandaloneKline {
     fn start() -> Self {
+        Self::start_with(&[])
+    }
+
+    /// The Kline started with `environment` added to its own.
+    fn start_with(environment: &[(&str, &std::ffi::OsStr)]) -> Self {
         let (mut master, mut slave) = (0, 0);
         let mut size = libc::winsize {
             ws_row: 24,
@@ -58,7 +63,8 @@ impl StandaloneKline {
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("LANG", UTF8_LOCALE)
             .env("TERM", "xterm-256color")
-            .env("HOME", home.path());
+            .env("HOME", home.path())
+            .envs(environment.iter().copied());
         unsafe {
             command.pre_exec(move || {
                 if libc::setsid() < 0 || libc::ioctl(slave, libc::TIOCSCTTY.into(), 0) < 0 {
@@ -210,4 +216,31 @@ fn a_termination_signal_ends_the_tick_even_while_it_edits() {
         0
     );
     kline.exits_after("SIGTERM");
+}
+
+/// A person running `tick` in a Herdr Pane gets the standalone program: it never asks Herdr
+/// about its Pane, reports no instance and speaks no protocol, whatever Herdr's variables say.
+#[test]
+fn a_kline_run_in_a_herdr_pane_is_a_standalone_program_and_no_tick_instance() {
+    let herdr = tempfile::tempdir().unwrap();
+    let socket = herdr.path().join("herdr.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut kline = StandaloneKline::start_with(&[
+        ("HERDR_ENV", "1".as_ref()),
+        ("HERDR_SOCKET_PATH", socket.as_os_str()),
+        ("HERDR_PANE_ID", "w1:p1".as_ref()),
+    ]);
+    kline.keeps_running_after("drawing the Kline");
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "tick asked Herdr about its Pane"
+    );
+    assert!(
+        !kline.output().contains("jsonrpc"),
+        "tick spoke the Tick protocol: {}",
+        kline.output()
+    );
+    kline.press(b"q");
+    kline.exits_after("q");
 }

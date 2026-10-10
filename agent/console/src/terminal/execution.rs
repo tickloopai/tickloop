@@ -3895,8 +3895,6 @@ mod tests {
             tab_id: "tab-first".into(),
             cwd: None,
             foreground_cwd: None,
-            terminal_title_stripped: None,
-            tokens: Default::default(),
         }));
         let served_pane = pane.clone();
         let host = tokio::spawn(async move {

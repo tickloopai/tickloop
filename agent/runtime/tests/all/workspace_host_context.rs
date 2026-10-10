@@ -10,9 +10,9 @@ use std::{
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tickhost_connect::{
-    access::TickAccess,
     herdr::{HerdrContext, HerdrPort},
     host_error::HostError,
+    layout::HerdrLayout,
 };
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
@@ -22,7 +22,11 @@ use tickloop_agent_protocol::{
 use tickloop_agent_runtime::{
     Agent,
     host_tools::{HostToolPermission, HostToolProvider, PreparedHostCall},
-    native_host::NativeHostToolProvider,
+    hosted::{
+        tools::HostedTickTools,
+        views::HerdrViews,
+        worker_control::{DaemonControl, WorkerControlGrant},
+    },
 };
 use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
@@ -164,8 +168,6 @@ fn captured_view_context(workdir: &Path, view: &str) -> HostCallContext {
                 tab_id: format!("tab-{view}"),
                 cwd: None,
                 foreground_cwd: None,
-                terminal_title_stripped: None,
-                tokens: Default::default(),
             },
         }),
     }
@@ -339,12 +341,12 @@ fn first_model_request_identifies_host_without_advertising_missing_integrations(
         }
         assert_eq!(
             state["workspace_host"]["tickhost"],
-            if case == "tickhost" {
+            if runs_ticks {
                 "available"
             } else {
                 "unavailable"
             },
-            "{case}: hidden Ticks need the Tickhost"
+            "{case}: Ticks need the Tickhost"
         );
         assert!(!state.to_string().contains("/private/tmux.sock"));
     }
@@ -366,40 +368,30 @@ async fn workspace_host_request_probe() {
         .trust_working_directory(directory.path().into())
         .await
         .unwrap();
-    if case == "herdr" {
-        let access = Arc::new(TickAccess::with_host(
-            HerdrContext {
-                socket: "/private/unused-herdr.sock".into(),
-                caller_pane: "agent".into(),
-            },
-            Arc::new(UnusedHerdrPort),
-        ));
-        agent
-            .install_host_tools(Arc::new(NativeHostToolProvider::new(access)))
-            .unwrap();
-    }
-    if case == "tickhost" {
-        let hosted = tickloop_agent_runtime::hosted::tools::HostedTickTools::new(
-            tickloop_agent_runtime::hosted::worker_control::DaemonControl::new(
-                tickloop_agent_runtime::hosted::worker_control::WorkerControlGrant {
-                    endpoint: directory.path().join("unused-daemon.sock"),
-                    daemon_epoch: uuid::Uuid::new_v4(),
-                    binding: uuid::Uuid::new_v4(),
-                    capability: "unused".into(),
-                    host_endpoint: directory.path().join("unused-host.sock"),
-                    intent_renewal: std::time::Duration::from_secs(100),
-                },
-            ),
+    if matches!(case.as_str(), "herdr" | "tickhost") {
+        let hosted = HostedTickTools::new(
+            DaemonControl::new(WorkerControlGrant {
+                endpoint: directory.path().join("unused-daemon.sock"),
+                daemon_epoch: uuid::Uuid::new_v4(),
+                binding: uuid::Uuid::new_v4(),
+                capability: "unused".into(),
+                host_endpoint: directory.path().join("unused-host.sock"),
+                intent_renewal: std::time::Duration::from_secs(100),
+            }),
             Vec::new(),
         );
-        agent
-            .install_host_tools(Arc::new(
-                tickloop_agent_runtime::tick_tool_router::TickToolRouter::new(
-                    None,
-                    Some(Arc::new(hosted)),
+        let hosted = if case == "herdr" {
+            hosted.with_herdr_views(HerdrViews::new(
+                HerdrLayout::with_host(
+                    HerdrContext::without_view("/private/unused-herdr.sock".into()),
+                    Arc::new(UnusedHerdrPort),
                 ),
+                Path::new("/private/unused/tickloop"),
             ))
-            .unwrap();
+        } else {
+            hosted
+        };
+        agent.install_host_tools(Arc::new(hosted)).unwrap();
     }
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();

@@ -16,10 +16,9 @@ use std::{
 };
 use support::fixture_cli::{BUILD_IDENTITY_MODE, CLI_MODE, build_identity};
 use tickloop_agent_client::DAEMON_RUN_ARGUMENTS;
-use tickloop_agent_console::terminal::popup::ATTACH_ARGUMENTS;
 use tickloop_agent_daemon::{EmbeddedAgentAccess, WORKER_ARGUMENT, serve_worker_listener};
 use tickloop_agent_model::model_client;
-use tickloop_agent_protocol::{LaunchSpec, ModelConfig};
+use tickloop_agent_protocol::{ATTACH_ARGUMENTS, LaunchSpec, ModelConfig};
 use tickloop_agent_runtime::hosted::controller::TICKHOST_EXECUTABLE;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use uuid::Uuid;
@@ -166,10 +165,12 @@ async fn worker(arguments: &[OsString]) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let client: Arc<dyn tickloop_agent_model::ModelClient> =
         Arc::new(TransportClient { inner, config });
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     let agent = tickloop_agent_daemon::build_runtime_with_client(
         &bootstrap.launch,
         client.clone(),
         Some(bootstrap.control),
+        &executable,
     )
     .await?;
     let access = Arc::new(EmbeddedAgentAccess::for_worker_with_model_clients(

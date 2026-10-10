@@ -1,14 +1,15 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
-use tickhost_connect::session::{
-    SessionBackend, SessionClient, SessionError, SessionLaunch, SessionLinkState, TickSession,
+use tickhost_connect::{
+    hosted::HostedTerminal,
+    session::{SessionClient, SessionError, SessionLaunch, SessionLinkState, TickSession},
 };
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
-const HERDR_SOCKET: &str = "/tmp/example-herdr.sock";
-const COUNTER_PANE: &str = "counter-pane";
+const TICKHOST_SOCKET: &str = "/tmp/example-tickhost.sock";
+const COUNTER_TERMINAL: &str = "counter";
 
 /// Publishes an update for each `increment` shortly before answering it.
 const COUNTER: &str = r#"
@@ -35,14 +36,18 @@ for line in sys.stdin:
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
 "#;
 
-fn herdr_backend(terminal_id: &str) -> SessionBackend {
-    SessionBackend::Herdr {
-        socket: PathBuf::from(HERDR_SOCKET),
-        terminal_id: terminal_id.into(),
+/// The Tickhost terminal named `name`: the same name is always the same terminal of one host.
+fn terminal(name: &str) -> HostedTerminal {
+    HostedTerminal {
+        endpoint: PathBuf::from(TICKHOST_SOCKET),
+        epoch: uuid::Uuid::from_u128(1),
+        terminal: uuid::Uuid::from_u128(
+            name.bytes().fold(0, |id, byte| id * 31 + u128::from(byte)),
+        ),
     }
 }
 
-/// Runs the Python Tick `source` as `{name}.py` in `directory`, in the Herdr pane `{name}-pane`.
+/// Runs the Python Tick `source` as `{name}.py` in `directory`, on the terminal `name`.
 async fn spawn_tick(directory: &Path, name: &str, source: &str) -> TickSession {
     let script = directory.join(format!("{name}.py"));
     std::fs::write(&script, source).unwrap();
@@ -53,7 +58,7 @@ async fn spawn_tick(directory: &Path, name: &str, source: &str) -> TickSession {
             script.to_string_lossy().into_owned(),
         ],
         cwd: directory.into(),
-        backend: herdr_backend(&format!("{name}-pane")),
+        terminal: terminal(name),
         runtime_dir: Some(directory.join("sessions")),
     })
     .await
@@ -71,7 +76,7 @@ async fn later_subscriber_gets_its_own_baseline_and_actual_received_count() {
     let (session, directory) = counter().await;
     let client = SessionClient::connect(
         session.instance().clone(),
-        herdr_backend(COUNTER_PANE),
+        terminal(COUNTER_TERMINAL),
         Some(directory.path().join("sessions")),
     )
     .await
@@ -115,7 +120,7 @@ async fn status_reports_the_latest_update_time_without_a_watcher_or_its_content(
     let before = client.status().await.unwrap();
     assert_eq!(before.updated_at_ms, None);
     assert_eq!(before.received, 0);
-    let called = tickhost_connect::access::now_ms();
+    let called = tickhost_connect::session::now_ms();
     client
         .call("increment", json!({}), "1", CancellationToken::new())
         .await
@@ -161,14 +166,14 @@ async fn concurrent_clients_with_identical_calls_receive_their_own_responses() {
     let (session, directory) = counter().await;
     let first = SessionClient::connect(
         session.instance().clone(),
-        herdr_backend(COUNTER_PANE),
+        terminal(COUNTER_TERMINAL),
         Some(directory.path().join("sessions")),
     )
     .await
     .unwrap();
     let second = SessionClient::connect(
         session.instance().clone(),
-        herdr_backend(COUNTER_PANE),
+        terminal(COUNTER_TERMINAL),
         Some(directory.path().join("sessions")),
     )
     .await
@@ -502,9 +507,9 @@ async fn client_binding_rejects_a_different_host_or_terminal() {
     let (session, directory) = counter().await;
     let wrong_host = SessionClient::connect(
         session.instance().clone(),
-        SessionBackend::Herdr {
-            socket: PathBuf::from("/tmp/wrong-herdr.sock"),
-            terminal_id: COUNTER_PANE.into(),
+        HostedTerminal {
+            endpoint: PathBuf::from("/tmp/wrong-tickhost.sock"),
+            ..terminal(COUNTER_TERMINAL)
         },
         Some(directory.path().join("sessions")),
     )
@@ -512,7 +517,7 @@ async fn client_binding_rejects_a_different_host_or_terminal() {
     assert!(matches!(wrong_host, Err(SessionError::Protocol(_))));
     let wrong_terminal = SessionClient::connect(
         session.instance().clone(),
-        herdr_backend("other-pane"),
+        terminal("other"),
         Some(directory.path().join("sessions")),
     )
     .await;
@@ -580,7 +585,7 @@ for line in sys.stdin:
         .unwrap();
     let request = json!({
         "jsonrpc":"2.0", "id":1, "method":"tick/describe",
-        "binding":{"instance_id":session.instance().to_string(),"backend":{"kind":"herdr","socket":HERDR_SOCKET,"terminal_id":"nonreader-pane"}},
+        "binding":{"instance_id":session.instance().to_string(),"terminal":terminal("nonreader")},
         "params":{"padding":"x".repeat(400_000)}
     });
     stream

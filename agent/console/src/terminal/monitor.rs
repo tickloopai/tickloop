@@ -221,7 +221,6 @@ impl Monitor {
             metadata_failures: self.metadata_failures.clone(),
             member_states: self.member_findings.states.clone(),
             member_resources: self.member_findings.resources.clone(),
-            member_titles: self.member_findings.titles.clone(),
             member_updates: self.member_findings.updates.clone(),
             gone_since: self.gone_since.clone(),
             shell_starts: self.shell_starts.clone(),

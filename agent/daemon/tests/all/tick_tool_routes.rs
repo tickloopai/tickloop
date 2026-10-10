@@ -1,5 +1,7 @@
 use std::{
     collections::BTreeSet,
+    os::unix::fs::MetadataExt,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -10,23 +12,22 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tick_protocol::InstanceRef;
 use tickhost_connect::{
-    access::TickAccess,
     herdr::{HerdrContext, HerdrPort},
     host_error::HostError,
+    layout::HerdrLayout,
 };
 use tickloop_agent_protocol::{HostEndpointIdentity, HostToolAuthority};
 use tickloop_agent_runtime::{
     host_tools::HostToolProvider,
     hosted::{
         tools::HostedTickTools,
+        views::HerdrViews,
         worker_control::{DaemonControl, WorkerControlGrant},
     },
-    native_host::NativeHostToolProvider,
-    tick_tool_router::TickToolRouter,
 };
 use tokio_util::sync::CancellationToken;
 
-/// A Herdr that counts requests and refuses them all: routing must never need it.
+/// A Herdr that counts requests and refuses them all: choosing an authority must never need it.
 #[derive(Default)]
 struct CountingHerdr {
     requests: AtomicUsize,
@@ -45,67 +46,78 @@ impl HerdrPort for CountingHerdr {
     }
 }
 
-struct Backends {
+struct Tools {
+    _directory: tempfile::TempDir,
+    _listener: std::os::unix::net::UnixListener,
     herdr: Arc<CountingHerdr>,
     herdr_authority: HostToolAuthority,
     host_authority: HostToolAuthority,
-    native: Arc<NativeHostToolProvider>,
-    hosted: Arc<HostedTickTools>,
+    /// The Tick tools of a worker in a Herdr View.
+    in_herdr: HostedTickTools,
+    /// The Tick tools of a worker outside Herdr.
+    hosted: HostedTickTools,
 }
 
-/// A trusted Herdr adapter and a Tickhost behind a daemon nobody listens on, so a call that
-/// reached either backend would fail visibly.
-fn backends() -> Backends {
+fn hosted_tools(directory: &Path) -> HostedTickTools {
+    HostedTickTools::new(
+        DaemonControl::new(WorkerControlGrant {
+            endpoint: directory.join("unused-daemon.sock"),
+            daemon_epoch: uuid::Uuid::new_v4(),
+            binding: uuid::Uuid::new_v4(),
+            capability: "0".repeat(64),
+            host_endpoint: directory.join("unused-host.sock"),
+            intent_renewal: std::time::Duration::from_secs(60),
+        }),
+        Vec::new(),
+    )
+}
+
+/// Tick tools in and outside Herdr behind a daemon nobody listens on, so a call that reached
+/// the daemon or Herdr would fail visibly.
+fn tools() -> Tools {
+    let directory = tempfile::Builder::new()
+        .prefix("ttr")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    let socket = directory.path().join("herdr.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let metadata = std::fs::metadata(&socket).unwrap();
     let herdr = Arc::new(CountingHerdr::default());
-    let scope = uuid::Uuid::new_v4();
-    let native = Arc::new(NativeHostToolProvider::with_trusted_adapter_identity(
-        Arc::new(TickAccess::with_host(
-            HerdrContext::without_view("/private/tmp/unused-herdr.sock".into()),
-            herdr.clone(),
-        )),
-        scope,
+    let in_herdr = hosted_tools(directory.path()).with_herdr_views(HerdrViews::new(
+        HerdrLayout::with_host(HerdrContext::without_view(socket.clone()), herdr.clone()),
+        Path::new("/private/tmp/unused/tickloop"),
     ));
-    let grant = WorkerControlGrant {
-        endpoint: "/private/tmp/unused-daemon.sock".into(),
-        daemon_epoch: uuid::Uuid::new_v4(),
-        binding: uuid::Uuid::new_v4(),
-        capability: "0".repeat(64),
-        host_endpoint: "/private/tmp/unused-host.sock".into(),
-        intent_renewal: std::time::Duration::from_secs(60),
-    };
-    Backends {
-        herdr,
+    Tools {
         herdr_authority: HostToolAuthority::Native {
-            endpoint: HostEndpointIdentity::TrustedAdapter { scope },
+            endpoint: HostEndpointIdentity::HerdrSocket {
+                path: socket.canonicalize().unwrap(),
+                owner: metadata.uid(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
         },
         host_authority: HostToolAuthority::Native {
             endpoint: HostEndpointIdentity::Tickhost {
-                endpoint: grant.host_endpoint.clone(),
+                endpoint: directory.path().join("unused-host.sock"),
                 uid: unsafe { libc::geteuid() },
             },
         },
-        native,
-        hosted: Arc::new(HostedTickTools::new(DaemonControl::new(grant), Vec::new())),
+        hosted: hosted_tools(directory.path()),
+        in_herdr,
+        herdr,
+        _listener: listener,
+        _directory: directory,
     }
 }
 
 #[tokio::test]
-async fn each_tick_tool_runs_under_the_authority_of_the_backend_its_target_names() {
-    let backends = backends();
-    let router = TickToolRouter::new(Some(backends.native.clone()), Some(backends.hosted.clone()));
-    let herdr = "herdr:terminal:target:1:1";
+async fn ticks_run_under_the_tickhost_and_their_herdr_panes_under_herdr() {
+    let tools = tools();
     let hosted = InstanceRef::hosted(uuid::Uuid::new_v4()).to_string();
-    let herdr_authority = Ok(backends.herdr_authority.clone());
-    let host_authority = Ok(backends.host_authority.clone());
-    let herdr_only = Err("Herdr");
-    let host_only = Err("hosted");
+    let herdr_authority = Ok(tools.herdr_authority.clone());
+    let host_authority = Ok(tools.host_authority.clone());
     for (name, input, expected) in [
         ("ReadWorkspace", json!({}), &herdr_authority),
-        (
-            "ReadTick",
-            json!({"tick_instance_id":herdr}),
-            &herdr_authority,
-        ),
         (
             "ReadTick",
             json!({"tick_instance_id":hosted}),
@@ -138,18 +150,13 @@ async fn each_tick_tool_runs_under_the_authority_of_the_backend_its_target_names
         ),
         (
             "ModifyTick",
-            json!({"action":"open","command":["tick"],"placement":{"type":"pane","pane_id":"p"}}),
-            &herdr_authority,
-        ),
-        (
-            "ModifyTick",
-            json!({"action":"move","tick_instance_id":herdr}),
+            json!({"action":"open","command":["python3","counter.py"],"protocol":true,"placement":{"type":"pane","pane_id":"p"}}),
             &herdr_authority,
         ),
         (
             "ModifyTick",
             json!({"action":"move","tick_instance_id":hosted}),
-            &herdr_only,
+            &herdr_authority,
         ),
         (
             "ModifyTick",
@@ -158,94 +165,78 @@ async fn each_tick_tool_runs_under_the_authority_of_the_backend_its_target_names
         ),
         (
             "ModifyTick",
-            json!({"action":"open","command":["python3","counter.py"],"protocol":true}),
-            &host_authority,
-        ),
-        (
-            "ModifyTick",
-            json!({"action":"open","command":["python3","counter.py"],"protocol":true,"placement":{"type":"new_tab"}}),
-            &Err("Tickhost"),
-        ),
-        (
-            "ModifyTick",
             json!({"action":"close","tick_instance_id":hosted}),
             &host_authority,
-        ),
-        (
-            "ModifyTick",
-            json!({"action":"close","tick_instance_id":herdr}),
-            &herdr_authority,
         ),
         (
             "ModifyTick",
             json!({"action":"reopen","tick_instance_id":hosted}),
             &host_authority,
         ),
-        (
-            "ModifyTick",
-            json!({"action":"reopen","tick_instance_id":herdr}),
-            &host_only,
-        ),
     ] {
-        let routed = router.call_authority(name, &input);
-        match expected {
-            Ok(authority) => assert_eq!(routed, Ok(Some(authority.clone())), "{name} {input}"),
-            Err(reason) => {
-                let error = routed.unwrap_err();
-                assert!(error.contains(reason), "{name} {input}: {error}");
-            }
-        }
+        assert_eq!(
+            tools.in_herdr.call_authority(name, &input),
+            expected.clone().map(Some),
+            "{name} {input}"
+        );
     }
-    let both = BTreeSet::from([
-        backends.herdr_authority.clone(),
-        backends.host_authority.clone(),
-    ]);
-    for name in ["ReadTick", "CallTickTool", "ModifyTick"] {
-        assert_eq!(router.tool_authorities(name), Ok(both.clone()), "{name}");
+    for name in ["ReadTick", "CallTickTool"] {
+        assert_eq!(
+            tools.in_herdr.tool_authorities(name),
+            Ok(BTreeSet::from([tools.host_authority.clone()])),
+            "{name}"
+        );
     }
     assert_eq!(
-        router.tool_authorities("ReadWorkspace"),
-        Ok(BTreeSet::from([backends.herdr_authority.clone()]))
+        tools.in_herdr.tool_authorities("ModifyTick"),
+        Ok(BTreeSet::from([
+            tools.herdr_authority.clone(),
+            tools.host_authority.clone()
+        ]))
+    );
+    assert_eq!(
+        tools.in_herdr.tool_authorities("ReadWorkspace"),
+        Ok(BTreeSet::from([tools.herdr_authority.clone()]))
     );
 
-    let herdr_router = TickToolRouter::new(Some(backends.native.clone()), None);
-    let hidden = herdr_router
-        .call_authority("ModifyTick", &json!({"action":"open","command":["tick"]}))
-        .unwrap_err();
-    assert!(hidden.contains("Tickhost"), "{hidden}");
-    assert_eq!(
-        herdr_router.tool_authorities("ReadTick"),
-        Ok(BTreeSet::from([backends.herdr_authority.clone()]))
-    );
-    let hosted_router = TickToolRouter::new(None, Some(backends.hosted.clone()));
-    let visible = hosted_router
-        .call_authority(
-            "ModifyTick",
-            &json!({"action":"open","command":["tick"],"placement":{"type":"new_tab"}}),
-        )
-        .unwrap_err();
-    assert!(visible.contains("Herdr"), "{visible}");
-    assert_eq!(
-        hosted_router.tool_authorities("ModifyTick"),
-        Ok(BTreeSet::from([backends.host_authority.clone()]))
+    for input in [
+        json!({"action":"open","command":["tick"],"placement":{"type":"new_tab"}}),
+        json!({"action":"move","tick_instance_id":hosted}),
+    ] {
+        let refused = tools
+            .hosted
+            .call_authority("ModifyTick", &input)
+            .unwrap_err();
+        assert!(refused.contains("Herdr"), "{input}: {refused}");
+    }
+    assert!(
+        tools
+            .hosted
+            .call_authority("ReadWorkspace", &json!({}))
+            .unwrap_err()
+            .contains("Herdr")
     );
     assert_eq!(
-        backends.herdr.requests.load(Ordering::SeqCst),
+        tools.hosted.tool_authorities("ModifyTick"),
+        Ok(BTreeSet::from([tools.host_authority.clone()]))
+    );
+    assert_eq!(
+        tools.herdr.requests.load(Ordering::SeqCst),
         0,
-        "routing never asks Herdr"
+        "choosing an authority never asks Herdr"
     );
 }
 
 #[tokio::test]
-async fn artifact_shell_and_untyped_targets_never_reach_a_backend() {
-    let backends = backends();
-    let both = TickToolRouter::new(Some(backends.native.clone()), Some(backends.hosted.clone()));
-    let hosted_only = TickToolRouter::new(None, Some(backends.hosted.clone()));
-    let herdr_only = TickToolRouter::new(Some(backends.native.clone()), None);
+async fn artifact_shell_herdr_and_untyped_targets_never_reach_a_host() {
+    let tools = tools();
     let chat = uuid::Uuid::new_v4();
-    for router in [&both, &hosted_only, &herdr_only] {
-        for (target, native_tool) in [("artifact:doc", "ArtifactRead"), ("shell:task", "TaskStop")]
-        {
+    for tools in [&tools.in_herdr, &tools.hosted] {
+        for (target, native_tool) in [
+            ("artifact:doc", "ArtifactRead"),
+            ("artifact:https://docs.example/doc", "ArtifactRead"),
+            ("shell:task", "TaskStop"),
+        ] {
             for (name, input) in [
                 ("ReadTick", json!({"tick_instance_id":target})),
                 (
@@ -258,8 +249,8 @@ async fn artifact_shell_and_untyped_targets_never_reach_a_backend() {
                 ),
             ] {
                 for error in [
-                    router.call_authority(name, &input).unwrap_err(),
-                    router
+                    tools.call_authority(name, &input).unwrap_err(),
+                    tools
                         .prepare_call(chat, name, &input, CancellationToken::new())
                         .await
                         .unwrap_err(),
@@ -269,40 +260,21 @@ async fn artifact_shell_and_untyped_targets_never_reach_a_backend() {
                 }
             }
         }
-    }
-    for (router, supported, unsupported) in [
-        (&both, vec!["herdr:", "hosted:"], vec![]),
-        (&hosted_only, vec!["hosted:"], vec!["herdr:"]),
-        (&herdr_only, vec!["herdr:"], vec!["hosted:"]),
-    ] {
-        let error = router
-            .prepare_call(
-                chat,
-                "ReadTick",
-                &json!({"tick_instance_id":"1234"}),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.contains("InvalidTickTarget"), "{error}");
-        for reference in supported {
-            assert!(error.contains(reference), "{error}");
-        }
-        for reference in unsupported {
-            assert!(!error.contains(reference), "{error}");
+        for target in ["1234", "herdr:terminal:x:1:1"] {
+            let error = tools
+                .prepare_call(
+                    chat,
+                    "ReadTick",
+                    &json!({"tick_instance_id":target}),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.contains("InvalidTickTarget"), "{error}");
+            assert!(error.contains("hosted:"), "{error}");
         }
     }
-    let error = hosted_only
-        .prepare_call(
-            chat,
-            "ReadTick",
-            &json!({"tick_instance_id":"herdr:terminal:x:1:1"}),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap_err();
-    assert!(error.contains("Herdr"), "{error}");
-    assert_eq!(backends.herdr.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(tools.herdr.requests.load(Ordering::SeqCst), 0);
 }
 
 fn tool<'a>(definitions: &'a [tickloop_agent_protocol::ToolDefinition], name: &str) -> &'a Value {
@@ -340,45 +312,46 @@ fn placement_types(open: &Value) -> BTreeSet<String> {
 }
 
 #[test]
-fn tick_tool_schemas_make_a_hidden_open_the_default() {
-    let backends = backends();
+fn tick_tool_schemas_open_in_the_tickhost_and_place_views_only_in_herdr() {
+    let tools = tools();
     let strings = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect();
 
-    let both = TickToolRouter::new(Some(backends.native.clone()), Some(backends.hosted.clone()))
-        .definitions();
-    let modify = both.iter().find(|tool| tool.name == "ModifyTick").unwrap();
-    assert!(
-        modify.description.contains("hidden"),
-        "{}",
-        modify.description
+    let in_herdr = tools.in_herdr.definitions();
+    assert_eq!(
+        in_herdr
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<BTreeSet<_>>(),
+        strings(&["CallTickTool", "ModifyTick", "ReadTick", "ReadWorkspace"])
     );
-    assert!(
-        modify.description.contains("Monitor"),
-        "{}",
-        modify.description
-    );
-    assert!(
-        !modify.description.contains("creates a new Tab"),
-        "{}",
-        modify.description
-    );
-    let open = variant(tool(&both, "ModifyTick"), "open").unwrap();
+    let modify = in_herdr
+        .iter()
+        .find(|tool| tool.name == "ModifyTick")
+        .unwrap();
+    for fact in ["Tickhost", "Monitor", "view", "closes only that view"] {
+        assert!(
+            modify.description.contains(fact),
+            "{fact}: {}",
+            modify.description
+        );
+    }
+    let open = variant(tool(&in_herdr, "ModifyTick"), "open").unwrap();
     assert_eq!(open["required"], json!(["action", "command"]));
     assert_eq!(
         placement_types(open),
         strings(&["hidden", "current_tab", "pane", "new_tab"])
     );
-    for action in ["move", "send_input", "close", "reopen"] {
+    assert_eq!(open["properties"]["protocol"], json!({"type":"boolean"}));
+    let moved = variant(tool(&in_herdr, "ModifyTick"), "move").unwrap();
+    assert_eq!(placement_types(moved), strings(&["current_tab", "pane"]));
+    for action in ["send_input", "close", "reopen"] {
         assert!(
-            variant(tool(&both, "ModifyTick"), action).is_some(),
+            variant(tool(&in_herdr, "ModifyTick"), action).is_some(),
             "{action}"
         );
     }
-    let read = both.iter().find(|tool| tool.name == "ReadTick").unwrap();
-    assert!(read.description.contains("hosted:"), "{}", read.description);
-    assert!(read.description.contains("herdr:"), "{}", read.description);
 
-    let hosted = TickToolRouter::new(None, Some(backends.hosted.clone())).definitions();
+    let hosted = tools.hosted.definitions();
     assert_eq!(
         hosted
             .iter()
@@ -387,66 +360,27 @@ fn tick_tool_schemas_make_a_hidden_open_the_default() {
         strings(&["CallTickTool", "ModifyTick", "ReadTick"])
     );
     let open = variant(tool(&hosted, "ModifyTick"), "open").unwrap();
-    assert_eq!(open["required"], json!(["action", "command"]));
     assert_eq!(placement_types(open), strings(&["hidden"]));
-    assert_eq!(open["properties"]["protocol"], json!({"type":"boolean"}));
+    assert!(open["properties"].get("workspace_id").is_none());
     assert!(variant(tool(&hosted, "ModifyTick"), "move").is_none());
-    for action in ["send_input", "close", "reopen"] {
+    for definitions in [&in_herdr, &hosted] {
+        let read = definitions
+            .iter()
+            .find(|tool| tool.name == "ReadTick")
+            .unwrap();
+        assert!(read.description.contains("hosted:"), "{}", read.description);
+        assert!(!read.description.contains("herdr:"), "{}", read.description);
         assert!(
-            variant(tool(&hosted, "ModifyTick"), action).is_some(),
-            "{action}"
+            read.description.contains("Terminal Ticks"),
+            "{}",
+            read.description
         );
-    }
-    let read = hosted.iter().find(|tool| tool.name == "ReadTick").unwrap();
-    assert!(
-        read.description.contains("Terminal Ticks"),
-        "{}",
-        read.description
-    );
-    assert_eq!(hosted, backends.hosted.definitions());
-
-    let herdr = TickToolRouter::new(Some(backends.native.clone()), None).definitions();
-    assert!(herdr.iter().any(|tool| tool.name == "ReadWorkspace"));
-    let open = variant(tool(&herdr, "ModifyTick"), "open").unwrap();
-    assert_eq!(open["required"], json!(["action", "command", "placement"]));
-    assert!(
-        open["properties"].get("protocol").is_none(),
-        "only a Tickhost runs protocol programs it is told about"
-    );
-    assert_eq!(
-        placement_types(open),
-        strings(&["current_tab", "pane", "new_tab"])
-    );
-    assert!(variant(tool(&herdr, "ModifyTick"), "reopen").is_none());
-    assert_eq!(herdr, backends.native.definitions());
-}
-
-#[tokio::test]
-async fn native_tick_tools_redirect_artifact_and_shell_ids_before_identity_or_host_resolution() {
-    let directory = tempfile::tempdir().unwrap();
-    let provider =
-        NativeHostToolProvider::new(Arc::new(tickhost_connect::access::TickAccess::new(
-            tickhost_connect::herdr::HerdrContext::without_view(
-                directory.path().join("unused.sock"),
-            ),
-        )));
-    for (instance, native_tool) in [
-        ("artifact:doc", "ArtifactRead"),
-        ("artifact:https://docs.example/doc", "ArtifactRead"),
-        ("shell:task", "TaskStop"),
-    ] {
-        for name in ["ReadTick", "CallTickTool"] {
-            let input = if name == "ReadTick" {
-                json!({"tick_instance_id":instance})
-            } else {
-                json!({"tick_instance_id":instance,"tool":"read","args":{}})
-            };
-            let error = provider
-                .prepare_call(uuid::Uuid::new_v4(), name, &input, CancellationToken::new())
-                .await
-                .unwrap_err();
-            assert!(error.contains("NativeToolRequired"), "{error}");
-            assert!(error.contains(native_tool), "{error}");
+        for definition in definitions.iter() {
+            assert_eq!(
+                definition.input_schema["type"], "object",
+                "{} has an object root for model APIs",
+                definition.name
+            );
         }
     }
 }
@@ -480,17 +414,18 @@ async fn peers_with_the_old_delegation_authority_schema_are_rejected_at_handshak
 }
 
 #[tokio::test]
-async fn root_native_redirect_precedes_invalid_host_authority_resolution() {
+async fn a_native_tool_redirect_precedes_an_invalid_herdr_endpoint() {
     use tickloop_agent_protocol::EventKind;
     use tickloop_agent_runtime::Agent;
     let directory = tempfile::tempdir().unwrap();
     let endpoint = directory.path().join("not-a-socket");
     std::fs::write(&endpoint, "fixture").unwrap();
-    let provider = Arc::new(NativeHostToolProvider::new(Arc::new(
-        tickhost_connect::access::TickAccess::new(
-            tickhost_connect::herdr::HerdrContext::without_view(endpoint),
-        ),
-    )));
+    let provider = Arc::new(
+        hosted_tools(directory.path()).with_herdr_views(HerdrViews::new(
+            HerdrLayout::new(HerdrContext::without_view(endpoint)),
+            Path::new("/private/tmp/unused/tickloop"),
+        )),
+    );
     let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
         tickloop_agent_test_support::call(
             "redirect",
