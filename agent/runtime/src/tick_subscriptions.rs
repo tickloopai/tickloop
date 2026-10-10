@@ -1519,7 +1519,7 @@ fn delivery_payload(items: &[DeliveryItem], truncated: bool) -> Value {
             .iter()
             .any(|item| matches!(item.kind, ObservationKind::Terminal { .. }))
         {
-            "Terminal observation was too large; use ReadTick for the current text. Unobserved terminal history cannot be recovered.".to_owned()
+            "A Terminal Tick's screen was too large for this delivery; use ReadTick for its current screen. Output that scrolled past between periods cannot be recovered.".to_owned()
         } else if let Some(tool) = items.iter().find_map(|item| item.recover_with.as_deref()) {
             if tool.len() <= 128 {
                 format!(

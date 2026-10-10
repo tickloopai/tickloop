@@ -1683,7 +1683,7 @@ async fn an_over_sized_delivery_blanks_its_largest_data_and_points_to_native_rec
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_truncated_terminal_observation_points_to_current_text_without_promising_history() {
+async fn a_truncated_terminal_tick_delivery_points_to_its_current_screen() {
     let directory = tempfile::tempdir().unwrap();
     let run = "calendar:terminal:session:run-88";
     let model = Arc::new(ScriptedModel::new(vec![
@@ -1715,6 +1715,10 @@ async fn a_truncated_terminal_observation_points_to_current_text_without_promisi
     tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
     let delivered = last_user_text(&model);
+    assert!(
+        delivered.contains("A Terminal Tick's screen was too large"),
+        "{delivered}"
+    );
     assert!(delivered.contains("ReadTick"), "{delivered}");
     assert!(delivered.contains("cannot be recovered"), "{delivered}");
     assert!(!delivered.contains("CallTickTool"), "{delivered}");

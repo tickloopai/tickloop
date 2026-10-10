@@ -333,12 +333,14 @@ fn first_model_request_identifies_host_without_advertising_missing_integrations(
             "{case}"
         );
         let runs_ticks = matches!(case, "herdr" | "tickhost");
-        for executable in ["tick_executable", "tickhost_executable"] {
-            assert!(
-                runs_ticks || state["workspace_host"][executable].is_null(),
-                "{case}: only an Agent that can run Ticks names its {executable}"
-            );
-        }
+        assert!(
+            runs_ticks || state["workspace_host"]["tick_executable"].is_null(),
+            "{case}: only an Agent that can run Ticks names its tick_executable"
+        );
+        assert!(
+            state["workspace_host"].get("tickhost_executable").is_none(),
+            "{case}: the bundled tickhost is no program to open"
+        );
         assert_eq!(
             state["workspace_host"]["tickhost"],
             if runs_ticks {
