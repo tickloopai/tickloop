@@ -114,15 +114,6 @@ impl TickStreamPort for TickAdapters {
             stream.set_watch_chats(chats.clone());
         }
     }
-    fn set_cadences(&self, cadences: BTreeMap<WatchId, u64>) {
-        for stream in self
-            .adapters
-            .values()
-            .filter_map(|adapter| adapter.stream())
-        {
-            stream.set_cadences(cadences.clone());
-        }
-    }
     fn open(&self) -> TickStreamHandle {
         let (desired, receiver) = watch::channel(BTreeMap::<WatchId, InstanceRef>::new());
         let (publisher, events) = EventPublisher::channel();

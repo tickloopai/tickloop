@@ -20,12 +20,13 @@ use tickloop_agent_protocol::{
     HostedScreenSnapshot, HostedSnapshot, HostedViewGrant, ImageMediaType, ImageSource,
     InputModality, InteractionSource, LaunchSpec, LiveChatSnapshot, LoopAction, Message,
     ModelAuthSource, ModelCard, ModelConfig, ModelDiscovery, ModelProvider, MonitorMember,
-    MonitorMembership, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue,
-    PROTOCOL_MAJOR, PROTOCOL_MINOR, Page, PendingRequestKind, PermissionPolicy, PermissionRule,
-    PermissionScope, PersistenceState, ProductKind, Protocol, ProtocolLimits, ProviderConnection,
-    ProviderCredentialScope, ReasoningEffort, ReceiptState, RequestRef, ResetReason, Role,
-    ServerHello, ServerMessage, TakenBackPrompt, ThinkingBudgets, ThinkingControl, ToolResultBlock,
-    ToolResultContent, TranscriptRef, UserInput, ViewRef,
+    MonitorMembership, ObservationChange, ObservationKind, ObservationRequest, ObservationUpdate,
+    ObservationValue, PROTOCOL_MAJOR, PROTOCOL_MINOR, Page, PendingRequestKind, PermissionPolicy,
+    PermissionRule, PermissionScope, PersistenceState, ProductKind, Protocol, ProtocolLimits,
+    ProviderConnection, ProviderCredentialScope, ReasoningEffort, ReceiptState, RequestRef,
+    ResetReason, Role, ServerHello, ServerMessage, TakenBackPrompt, ThinkingBudgets,
+    ThinkingControl, TickLinkState, TickSubscriptionChange, TickSubscriptionFrequency,
+    TickSubscriptionStatus, ToolResultBlock, ToolResultContent, TranscriptRef, UserInput, ViewRef,
 };
 
 const BLESS_VARIABLE: &str = "TICKLOOP_BLESS_WIRE_FIXTURES";
@@ -512,11 +513,24 @@ fn agent_commands_keep_their_recorded_wire() {
                             "prompt": "Report changes",
                             "interval_seconds": 60,
                             "expires_at_ms": null,
-                            "accepts_events": false,
+                            "accepts_events": true,
                             "armed": true,
+                            "subscriptions": [{
+                                "id": id(0x31),
+                                "instance": hosted_instance(),
+                                "frequency": "medium",
+                                "authority": null,
+                            }],
                         }))
                         .unwrap(),
                     ),
+                },
+            },
+            AgentCommand::ManageLoop {
+                execution: execution(),
+                action: LoopAction::UpdateSubscription {
+                    subscription_id: id(0x31),
+                    change: TickSubscriptionChange::Frequency(TickSubscriptionFrequency::Low),
                 },
             },
             AgentCommand::ManageLoop {
@@ -649,6 +663,20 @@ fn observation_values_keep_their_recorded_wire() {
                 warnings: vec![],
             },
             ObservationValue::RewindFiles(None),
+            ObservationValue::Subscriptions(vec![TickSubscriptionStatus {
+                id: id(0x31),
+                loop_id: id(0x10),
+                loop_state: tickloop_agent_protocol::LoopState::WaitingTrigger,
+                instance: hosted_instance(),
+                frequency: TickSubscriptionFrequency::High,
+                accumulated: 2,
+                last_delivery_ms: Some(6_000),
+                last_delivery: Some("hosted:00000000-0000-0000-0000-000000000040 #4".into()),
+                kind: Some(ObservationKind::Protocol),
+                title: Some("Quotes".into()),
+                updated_at_ms: Some(6_500),
+                link: TickLinkState::Live,
+            }]),
             ObservationValue::Receipt(Some(Box::new(CommandReceipt {
                 daemon_epoch: id(0xe0),
                 command_id: id(0x81),

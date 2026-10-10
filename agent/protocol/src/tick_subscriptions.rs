@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use tick_protocol::InstanceRef;
 use uuid::Uuid;
@@ -5,26 +7,60 @@ use uuid::Uuid;
 use crate::{HostToolAuthority, LoopId, LoopState};
 
 pub const TICK_SUBSCRIPTION_SOURCE: &str = "tick_subscription";
-pub const DEFAULT_CADENCE_SECONDS: u64 = 60;
-pub const MIN_CADENCE_SECONDS: u64 = 5;
-pub const MAX_CADENCE_SECONDS: u64 = 86_400;
 /// The most one delivery may add to the model's context. A larger one loses its biggest Tick
 /// Update data first and tells the model which tool brings it back.
 pub const MAX_DELIVERY_PAYLOAD_BYTES: usize = 16 * 1024;
 
+/// How often a Tick Subscription hands the latest Tick Update to the Agent. `Immediate` is decided
+/// by the Tick type, never chosen: a Shell Tick is delivered as soon as it updates. Protocol and
+/// Terminal Ticks choose one of [`Self::PERIODIC`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TickSubscriptionFrequency {
+    Immediate,
+    High,
+    Medium,
+    Low,
+}
+
+impl TickSubscriptionFrequency {
+    /// The frequencies a subscriber chooses among, from the most to the least frequent.
+    pub const PERIODIC: [Self; 3] = [Self::High, Self::Medium, Self::Low];
+
+    /// How long a periodic frequency waits between deliveries; `None` for an immediate one.
+    pub fn period(self) -> Option<Duration> {
+        match self {
+            Self::Immediate => None,
+            Self::High => Some(Duration::from_secs(60)),
+            Self::Medium => Some(Duration::from_secs(600)),
+            Self::Low => Some(Duration::from_secs(1800)),
+        }
+    }
+
+    /// The name the model tool and the View use.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+}
+
 /// One Loop's association with a Tick Instance: it receives that instance's Tick Updates, and the
-/// latest one is handed to the Agent every `every_seconds`.
+/// latest one is handed to the Agent at its `frequency`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TickSubscription {
     pub id: Uuid,
     pub instance: InstanceRef,
-    pub every_seconds: u64,
+    pub frequency: TickSubscriptionFrequency,
     pub authority: Option<HostToolAuthority>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TickSubscriptionChange {
-    Cadence(u64),
+    Frequency(TickSubscriptionFrequency),
     Cancel,
 }
 
@@ -46,7 +82,7 @@ pub struct TickSubscriptionStatus {
     pub loop_id: LoopId,
     pub loop_state: LoopState,
     pub instance: InstanceRef,
-    pub every_seconds: u64,
+    pub frequency: TickSubscriptionFrequency,
     /// Tick Updates accumulated since the last delivery.
     pub accumulated: u64,
     pub last_delivery_ms: Option<u64>,

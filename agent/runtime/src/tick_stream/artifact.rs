@@ -4,23 +4,22 @@ use super::{
 };
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use tickloop_agent_artifacts::{ArtifactClient, ArtifactError, ArtifactMetadata};
-use tickloop_agent_protocol::{
-    DEFAULT_CADENCE_SECONDS, HostToolAuthority, MAX_CADENCE_SECONDS, MIN_CADENCE_SECONDS,
-    ObservationKind,
-};
+use tickloop_agent_protocol::{HostToolAuthority, ObservationKind};
 use tokio::{sync::watch, time::Instant};
 use uuid::Uuid;
 
+/// How often a watched artifact is read for human edits; its subscription's frequency decides
+/// only when they are delivered.
+const ARTIFACT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 pub struct ArtifactTickStream {
     root: PathBuf,
-    cadences: watch::Sender<BTreeMap<WatchId, u64>>,
     authorities: watch::Sender<BTreeMap<WatchId, HostToolAuthority>>,
 }
 impl ArtifactTickStream {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
-            cadences: watch::channel(BTreeMap::new()).0,
             authorities: watch::channel(BTreeMap::new()).0,
         }
     }
@@ -65,16 +64,12 @@ impl TickStreamPort for ArtifactTickStream {
     ) -> Result<(), String> {
         authorized_client(&self.root, instance, authority).map(|_| ())
     }
-    fn set_cadences(&self, cadences: BTreeMap<WatchId, u64>) {
-        self.cadences.send_replace(cadences);
-    }
     fn open(&self) -> TickStreamHandle {
         let (desired, receiver) = watch::channel(BTreeMap::<WatchId, InstanceRef>::new());
         let (publisher, events) = EventPublisher::channel();
         tokio::spawn(observe(
             self.root.clone(),
             receiver,
-            self.cadences.subscribe(),
             self.authorities.subscribe(),
             publisher,
         ));
@@ -86,41 +81,28 @@ struct Cursor {
     body_sequence: Option<u64>,
     ready: bool,
     due: Instant,
-    cadence: u64,
 }
 async fn observe(
     root: PathBuf,
     mut desired: watch::Receiver<BTreeMap<WatchId, InstanceRef>>,
-    mut cadences: watch::Receiver<BTreeMap<WatchId, u64>>,
     mut authorities: watch::Receiver<BTreeMap<WatchId, HostToolAuthority>>,
     publisher: EventPublisher,
 ) {
     let mut cursors: BTreeMap<WatchId, Cursor> = BTreeMap::new();
     loop {
         let targets = desired.borrow_and_update().clone();
-        let frequencies = cadences.borrow_and_update().clone();
         publisher.retain(&targets);
         cursors.retain(|watch, cursor| targets.get(watch) == Some(&cursor.instance));
         for (watch, instance) in targets
             .iter()
             .filter(|(_, instance)| instance.tick_type() == "artifact")
         {
-            let cadence = frequencies
-                .get(watch)
-                .copied()
-                .unwrap_or(DEFAULT_CADENCE_SECONDS)
-                .clamp(MIN_CADENCE_SECONDS, MAX_CADENCE_SECONDS);
-            let cursor = cursors.entry(*watch).or_insert_with(|| Cursor {
+            cursors.entry(*watch).or_insert_with(|| Cursor {
                 instance: instance.clone(),
                 body_sequence: None,
                 ready: false,
                 due: Instant::now(),
-                cadence,
             });
-            if cursor.cadence != cadence {
-                cursor.cadence = cadence;
-                cursor.due = Instant::now() + Duration::from_secs(cadence);
-            }
         }
         let now = Instant::now();
         let mut due: BTreeMap<(InstanceRef, Option<HostToolAuthority>), Vec<WatchId>> =
@@ -152,7 +134,7 @@ async fn observe(
                 else {
                     continue;
                 };
-                cursor.due = Instant::now() + Duration::from_secs(cursor.cadence);
+                cursor.due = Instant::now() + ARTIFACT_POLL_INTERVAL;
                 if authorities.borrow().get(&watch) != authority.as_ref()
                     || authorized_client(&root, &instance, authority.as_ref()).is_err()
                 {
@@ -208,7 +190,6 @@ async fn observe(
         let next = cursors.values().map(|cursor| cursor.due).min();
         tokio::select! {
             result = desired.changed() => if result.is_err() { return; },
-            result = cadences.changed() => if result.is_err() { return; },
             result = authorities.changed() => if result.is_err() { return; },
             _ = async { if let Some(next) = next { tokio::time::sleep_until(next).await; } else { std::future::pending::<()>().await; } } => {}
         }

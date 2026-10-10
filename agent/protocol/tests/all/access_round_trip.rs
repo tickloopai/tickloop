@@ -226,3 +226,24 @@ fn a_membership_saved_with_member_sources_loads_every_member_as_opened() {
         "the source is no longer written"
     );
 }
+
+#[test]
+fn a_tick_subscription_saved_with_a_cadence_in_seconds_is_not_converted() {
+    let subscription = |timing: (&str, serde_json::Value)| {
+        let mut wire = serde_json::json!({
+            "id": Uuid::from_u128(1),
+            "instance": "hosted:00000000-0000-0000-0000-000000000040",
+            "authority": null,
+        });
+        wire[timing.0] = timing.1;
+        serde_json::from_value::<tickloop_agent_protocol::TickSubscription>(wire)
+    };
+    assert!(subscription(("every_seconds", serde_json::json!(60))).is_err());
+    assert!(subscription(("frequency", serde_json::json!(60))).is_err());
+    assert_eq!(
+        subscription(("frequency", serde_json::json!("low")))
+            .unwrap()
+            .frequency,
+        tickloop_agent_protocol::TickSubscriptionFrequency::Low
+    );
+}

@@ -32,9 +32,9 @@ async fn shell_subscription_preserves_its_policy_including_final_admission() {
         &[AdmissionCase {
             plan_denied: false,
             name: "SubscribeTick",
-            input: json!({"tick_instance_id":instance,"every_seconds":5}),
+            input: json!({"tick_instance_id":instance}),
             policy_name: "SubscribeTick",
-            policy_input: json!({"tick_instance_id":instance,"every_seconds":5}),
+            policy_input: json!({"tick_instance_id":instance}),
         }],
     )
     .await;

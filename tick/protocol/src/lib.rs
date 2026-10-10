@@ -38,6 +38,8 @@ pub const HERDR_INSTANCE_TYPE: &str = "herdr";
 /// The instance type of a Tick running hidden in the Tickhost. It names where the Tick runs, not
 /// a kind of Tick: its protocol and tools are those of the program it runs.
 pub const HOSTED_INSTANCE_TYPE: &str = "hosted";
+/// The instance type of a Shell Tick: one shell command execution of an Agent.
+pub const SHELL_INSTANCE_TYPE: &str = "shell";
 /// The instance types a host launches a protocol Tick under, as the prefix of the identity it
 /// passes in [`INSTANCE_ID_ENV`].
 const LAUNCHED_INSTANCE_TYPES: [&str; 2] = [HERDR_INSTANCE_TYPE, HOSTED_INSTANCE_TYPE];

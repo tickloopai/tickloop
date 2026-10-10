@@ -774,7 +774,9 @@ fn hosted_subscription_actions(row: &TickSubscriptionStatus) -> Vec<MonitorActio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tickloop_agent_protocol::{ShellTaskCapabilities, ShellTaskOrigin, ShellTaskOwner};
+    use tickloop_agent_protocol::{
+        ShellTaskCapabilities, ShellTaskOrigin, ShellTaskOwner, TickSubscriptionFrequency,
+    };
 
     fn task(command: &str, description: Option<&str>) -> ShellTask {
         let chat_id = Uuid::from_u128(1);
@@ -1034,7 +1036,7 @@ mod tests {
                 loop_id: Uuid::from_u128(3),
                 loop_state: LoopState::WaitingTrigger,
                 instance: quote.clone(),
-                every_seconds: 60,
+                frequency: TickSubscriptionFrequency::High,
                 accumulated: 0,
                 last_delivery_ms: None,
                 last_delivery: None,
@@ -1075,7 +1077,7 @@ mod tests {
             loop_id: Uuid::from_u128(3),
             loop_state: LoopState::WaitingTrigger,
             instance: instance.clone(),
-            every_seconds: 60,
+            frequency: TickSubscriptionFrequency::High,
             accumulated,
             last_delivery_ms: None,
             last_delivery: None,
@@ -1158,7 +1160,7 @@ mod tests {
         );
         let quote_row = rows.iter().find(|row| row.instance == quote).unwrap();
         assert_eq!(quote_row.status, "live");
-        assert_eq!(quote_row.notes, ["⟳ 60s"], "the marker no longer counts");
+        assert_eq!(quote_row.notes, ["⟳ high"], "the marker no longer counts");
         assert_eq!(quote_row.update.as_ref().unwrap().at_ms, 5_000);
     }
 

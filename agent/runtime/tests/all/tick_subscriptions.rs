@@ -6,7 +6,8 @@ use serde_json::json;
 use tick_protocol::InstanceRef;
 use tickloop_agent_protocol::{
     Event, EventKind, LocalMessage, LoopState, MAX_DELIVERY_PAYLOAD_BYTES, ObservationKind,
-    QuestionAnswer, TickLinkState, TickSubscription, TickSubscriptionChange, Trigger,
+    QuestionAnswer, TickLinkState, TickSubscription, TickSubscriptionChange,
+    TickSubscriptionFrequency, Trigger,
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_runtime::tick_stream::{
@@ -16,7 +17,8 @@ use tickloop_agent_test_support::*;
 use tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME;
 use uuid::Uuid;
 
-const CADENCE: Duration = Duration::from_secs(60);
+/// The period of the default `high` frequency.
+const HIGH_PERIOD: Duration = Duration::from_secs(60);
 
 fn fixture_instance(id: u64) -> InstanceRef {
     InstanceRef::native(format!("fixture-run-{id}")).unwrap()
@@ -59,8 +61,19 @@ async fn settle() {
 }
 
 fn last_user_text(model: &ScriptedModel) -> String {
+    let count = model.requests.lock().unwrap().len();
+    user_text(
+        model,
+        count
+            .checked_sub(1)
+            .expect("the model was asked at least once"),
+    )
+}
+
+/// The newest user text of the model request at `index`.
+fn user_text(model: &ScriptedModel, index: usize) -> String {
     let requests = model.requests.lock().unwrap();
-    let request = requests.last().expect("the model was asked at least once");
+    let request = &requests[index];
     request
         .messages
         .iter()
@@ -120,7 +133,7 @@ async fn subscribe_tick_waits_for_the_watch_baseline_before_reporting_ready() {
         call(
             "s1",
             "SubscribeTick",
-            json!({"tick_instance_id": fixture_instance(7), "every_seconds": 5}),
+            json!({"tick_instance_id": fixture_instance(7), "frequency": "medium"}),
         ),
         text("watching"),
     ]));
@@ -150,6 +163,7 @@ async fn subscribe_tick_waits_for_the_watch_baseline_before_reporting_ready() {
     assert_eq!(result["armed"], true);
     assert_eq!(result["ready"], true);
     assert_eq!(result["tick_instance_id"], json!(fixture_instance(7)));
+    assert_eq!(result["frequency"], "medium");
     agent.shutdown().await;
 }
 
@@ -188,7 +202,7 @@ async fn subscribe_tick_reports_an_existing_unready_subscription_at_the_deadline
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_cadence_delivers_the_latest_update_and_counts_the_ones_it_dropped() {
+async fn a_high_frequency_delivers_the_latest_update_and_counts_the_ones_it_dropped() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         call(
@@ -209,7 +223,8 @@ async fn a_cadence_delivers_the_latest_update_and_counts_the_ones_it_dropped() {
     );
     let subscriptions = agent.tick_subscriptions(chat).await.unwrap();
     assert_eq!(subscriptions.len(), 1);
-    assert_eq!(subscriptions[0].every_seconds, 60);
+    assert_eq!(subscriptions[0].frequency, TickSubscriptionFrequency::High);
+    assert_eq!(TickSubscriptionFrequency::High.period(), Some(HIGH_PERIOD));
     assert_eq!(subscriptions[0].loop_id, loop_id);
 
     for (sequence, phase) in [(1, "first"), (2, "second"), (3, "third")] {
@@ -232,7 +247,7 @@ async fn a_cadence_delivers_the_latest_update_and_counts_the_ones_it_dropped() {
         "updates waiting for delivery are unread"
     );
 
-    tokio::time::advance(CADENCE).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
 
     let monitor = agent.snapshot(chat).await.unwrap().monitor;
@@ -334,25 +349,32 @@ async fn the_subscription_tools_reach_the_model_only_with_an_installed_stream() 
             subscribe.input_schema["properties"]["tick_instance_id"]["type"],
             "string"
         );
+        assert_eq!(
+            subscribe.input_schema["properties"]["frequency"]["enum"],
+            json!(["high", "medium", "low"]),
+            "the model chooses among the periodic frequencies only"
+        );
     }
     agent.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_cadence_without_updates_costs_no_model_call() {
+async fn a_period_without_updates_costs_no_model_call() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         call(
             "s1",
             "SubscribeTick",
-            json!({"tick_instance_id": fixture_instance(4), "every_seconds": 5}),
+            json!({"tick_instance_id": fixture_instance(4)}),
         ),
         text("watching instance 4"),
     ]));
     let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
 
-    tokio::time::advance(Duration::from_secs(60)).await;
-    settle().await;
+    for _ in 0..3 {
+        tokio::time::advance(HIGH_PERIOD).await;
+        settle().await;
+    }
 
     assert_eq!(model.requests.lock().unwrap().len(), 2);
     assert_eq!(
@@ -378,7 +400,7 @@ async fn an_update_for_an_instance_nobody_subscribed_to_never_reaches_a_loop() {
 
     stream.push(update(9, 1, "other panel"));
     settle().await;
-    tokio::time::advance(CADENCE).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     settle().await;
 
     assert_eq!(model.requests.lock().unwrap().len(), 2);
@@ -465,13 +487,13 @@ async fn deliveries_that_arrive_during_a_run_merge_into_the_next_one() {
 
     stream.push(update(7, 1, "first"));
     settle().await;
-    tokio::time::advance(CADENCE).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     settle().await;
 
     stream.push(update(7, 2, "second"));
     stream.push(update(7, 3, "third"));
     settle().await;
-    tokio::time::advance(CADENCE).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     settle().await;
     assert_eq!(
         model.requests.lock().unwrap().len(),
@@ -528,7 +550,7 @@ async fn a_loop_waiting_for_the_user_holds_its_delivery_until_the_answer_lands()
 
     stream.push(update(7, 1, "moved"));
     settle().await;
-    tokio::time::advance(CADENCE).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     settle().await;
     assert_eq!(
         model.requests.lock().unwrap().len(),
@@ -541,7 +563,7 @@ async fn a_loop_waiting_for_the_user_holds_its_delivery_until_the_answer_lands()
         .await
         .unwrap();
     wait_for_completion(&mut events).await;
-    tokio::time::advance(CADENCE).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
 
     assert_eq!(model.requests.lock().unwrap().len(), 4);
@@ -587,13 +609,13 @@ async fn unsubscribing_and_stopping_a_loop_take_the_instance_off_the_stream() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_cadence_change_from_the_view_restarts_the_timer() {
+async fn a_frequency_change_from_the_view_restarts_the_timer() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         call(
             "s1",
             "SubscribeTick",
-            json!({"tick_instance_id": fixture_instance(7)}),
+            json!({"tick_instance_id": fixture_instance(7), "frequency": "low"}),
         ),
         text("watching instance 7"),
         text("handled"),
@@ -603,21 +625,383 @@ async fn a_cadence_change_from_the_view_restarts_the_timer() {
     let mut events = agent.subscribe();
 
     agent
-        .update_tick_subscription(chat, subscription, TickSubscriptionChange::Cadence(5))
+        .update_tick_subscription(
+            chat,
+            subscription,
+            TickSubscriptionChange::Frequency(TickSubscriptionFrequency::High),
+        )
         .await
         .unwrap();
     assert_eq!(
-        agent.tick_subscriptions(chat).await.unwrap()[0].every_seconds,
-        5
+        agent.tick_subscriptions(chat).await.unwrap()[0].frequency,
+        TickSubscriptionFrequency::High
+    );
+    assert!(
+        agent
+            .update_tick_subscription(
+                chat,
+                subscription,
+                TickSubscriptionChange::Frequency(TickSubscriptionFrequency::Immediate),
+            )
+            .await
+            .is_err(),
+        "the View cannot make a protocol subscription immediate"
     );
 
     stream.push(update(7, 1, "moved"));
     settle().await;
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
 
     assert_eq!(model.requests.lock().unwrap().len(), 3);
     assert!(last_user_text(&model).contains("moved"));
+    agent.shutdown().await;
+}
+
+/// The result the model received for its tool call `id`, and whether it was an error.
+fn tool_result(model: &ScriptedModel, id: &str) -> (String, bool) {
+    let requests = model.requests.lock().unwrap();
+    requests
+        .iter()
+        .flat_map(|request| &request.messages)
+        .flat_map(|message| &message.content)
+        .find_map(|block| match block {
+            tickloop_agent_protocol::Content::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } if tool_use_id == id => Some((content.text().into_owned(), *is_error)),
+            _ => None,
+        })
+        .expect("the tool result reached the model")
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_periodic_frequency_delivers_on_its_own_period_and_quiet_periods_wake_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "high",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(1), "frequency": "high"}),
+        ),
+        call(
+            "medium",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(2), "frequency": "medium"}),
+        ),
+        call(
+            "low",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(3), "frequency": "low"}),
+        ),
+        text("watching three"),
+        text("high delivered"),
+        text("medium delivered"),
+        text("low delivered"),
+    ]));
+    let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
+    let mut events = agent.subscribe();
+    let mut frequencies = agent
+        .tick_subscriptions(chat)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.instance, row.frequency))
+        .collect::<Vec<_>>();
+    frequencies.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(
+        frequencies,
+        [
+            (fixture_instance(1), TickSubscriptionFrequency::High),
+            (fixture_instance(2), TickSubscriptionFrequency::Medium),
+            (fixture_instance(3), TickSubscriptionFrequency::Low),
+        ]
+    );
+    for instance in 1..=3 {
+        stream.push(update(instance, 1, &format!("moved-{instance}")));
+    }
+    settle().await;
+
+    tokio::time::advance(HIGH_PERIOD).await;
+    wait_for_completion(&mut events).await;
+    assert_eq!(model.requests.lock().unwrap().len(), 5);
+    let delivered = last_user_text(&model);
+    assert!(
+        delivered.contains("moved-1")
+            && !delivered.contains("moved-2")
+            && !delivered.contains("moved-3"),
+        "{delivered}"
+    );
+
+    let periods_until = |frequency: TickSubscriptionFrequency, elapsed: Duration| {
+        (frequency.period().unwrap() - elapsed).as_secs() / HIGH_PERIOD.as_secs()
+    };
+    for _ in 1..periods_until(TickSubscriptionFrequency::Medium, HIGH_PERIOD) {
+        tokio::time::advance(HIGH_PERIOD).await;
+        settle().await;
+    }
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        5,
+        "the high subscription's quiet periods wake nothing"
+    );
+    tokio::time::advance(HIGH_PERIOD).await;
+    wait_for_completion(&mut events).await;
+    assert_eq!(model.requests.lock().unwrap().len(), 6);
+    let delivered = last_user_text(&model);
+    assert!(
+        delivered.contains("moved-2") && !delivered.contains("moved-3"),
+        "{delivered}"
+    );
+
+    let medium = TickSubscriptionFrequency::Medium.period().unwrap();
+    for _ in 1..periods_until(TickSubscriptionFrequency::Low, medium) {
+        tokio::time::advance(HIGH_PERIOD).await;
+        settle().await;
+    }
+    assert_eq!(model.requests.lock().unwrap().len(), 6);
+    tokio::time::advance(HIGH_PERIOD).await;
+    wait_for_completion(&mut events).await;
+    assert_eq!(model.requests.lock().unwrap().len(), 7);
+    assert!(last_user_text(&model).contains("moved-3"));
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_shell_subscription_is_immediate_and_refuses_a_frequency() {
+    let directory = tempfile::tempdir().unwrap();
+    let shell = InstanceRef::shell(Uuid::new_v4());
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "chosen",
+            "SubscribeTick",
+            json!({"tick_instance_id": shell, "frequency": "high"}),
+        ),
+        call("fixed", "SubscribeTick", json!({"tick_instance_id": shell})),
+        text("watching the shell"),
+    ]));
+    let (agent, _, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
+
+    let (refusal, is_error) = tool_result(&model, "chosen");
+    assert!(is_error, "{refusal}");
+    assert!(refusal.contains("omit frequency"), "{refusal}");
+    let (result, is_error) = tool_result(&model, "fixed");
+    assert!(!is_error, "{result}");
+    let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(result["frequency"], "immediate");
+    let rows = agent.tick_subscriptions(chat).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].frequency, TickSubscriptionFrequency::Immediate);
+    assert!(
+        agent
+            .update_tick_subscription(
+                chat,
+                rows[0].id,
+                TickSubscriptionChange::Frequency(TickSubscriptionFrequency::Low),
+            )
+            .await
+            .is_err(),
+        "a Shell subscription stays immediate"
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_protocol_subscription_refuses_immediate_and_unknown_parameters() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "immediate",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7), "frequency": "immediate"}),
+        ),
+        call(
+            "seconds",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7), "every_seconds": 5}),
+        ),
+        text("not watching"),
+    ]));
+    let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
+
+    let (refusal, is_error) = tool_result(&model, "immediate");
+    assert!(is_error, "{refusal}");
+    assert!(refusal.contains("frequency"), "{refusal}");
+    let (refusal, is_error) = tool_result(&model, "seconds");
+    assert!(is_error, "{refusal}");
+    assert!(refusal.contains("every_seconds"), "{refusal}");
+    assert!(agent.tick_subscriptions(chat).await.unwrap().is_empty());
+    assert!(stream.watched().is_empty());
+    agent.shutdown().await;
+}
+
+/// A model whose call `gated_call` waits for `gate`, after telling `entered` it started.
+struct GatedModel {
+    gate: Arc<tokio::sync::Notify>,
+    entered: Arc<tokio::sync::Notify>,
+    gated_call: usize,
+    calls: std::sync::atomic::AtomicUsize,
+    model: Arc<ScriptedModel>,
+}
+
+#[async_trait::async_trait]
+impl tickloop_agent_model::ModelClient for GatedModel {
+    async fn generate_title(
+        &self,
+        request: tickloop_agent_model::ModelRequest,
+        _: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        Ok(tickloop_agent_test_support::title_output(request))
+    }
+
+    fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
+        self.model.identity()
+    }
+
+    async fn complete(
+        &self,
+        request: tickloop_agent_model::ModelRequest,
+        events: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == self.gated_call {
+            self.entered.notify_one();
+            self.gate.notified().await;
+        }
+        self.model.complete(request, events, cancel).await
+    }
+}
+
+/// An immediate subscription needs no period: each update reaches the idle Loop at once, and the
+/// ones that arrive while it runs wait, merged, for the run to end.
+#[tokio::test(start_paused = true)]
+async fn an_immediate_subscription_delivers_at_once_and_queues_while_the_loop_runs() {
+    let directory = tempfile::tempdir().unwrap();
+    let shell_task = Uuid::new_v4();
+    let shell = InstanceRef::shell(shell_task);
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("s1", "SubscribeTick", json!({"tick_instance_id": shell})),
+        text("watching the shell"),
+        text("first delivery handled"),
+        text("merged delivery handled"),
+    ]));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(GatedModel {
+            gate: gate.clone(),
+            entered: entered.clone(),
+            gated_call: 2,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            model: model.clone(),
+        }),
+    );
+    let stream = InMemoryTickStream::new();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "watch the shell".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    let shell_update = |sequence, phase: &str| TickObservation {
+        instance: shell.clone(),
+        sequence,
+        observed_at: "2026-10-13T03:15:00Z".into(),
+        dropped: 0,
+        data: json!({ "task_id": shell_task, "phase": phase }),
+        kind: ObservationKind::Protocol,
+        recover_with: None,
+        gap: false,
+    };
+
+    stream.push(shell_update(1, "first"));
+    entered.notified().await;
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().loops[0].state,
+        LoopState::Running,
+        "the update started a run without any period elapsing"
+    );
+    stream.push(shell_update(2, "second"));
+    settle().await;
+    stream.push(shell_update(3, "third"));
+    settle().await;
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        2,
+        "updates during the run start nothing of their own"
+    );
+
+    gate.notify_one();
+    wait_for_completion(&mut events).await;
+    wait_for_completion(&mut events).await;
+    assert_eq!(model.requests.lock().unwrap().len(), 4);
+    assert!(user_text(&model, 2).contains("first"));
+    let merged = last_user_text(&model);
+    assert!(merged.contains("\"sequence\":3"), "{merged}");
+    assert!(merged.contains("\"dropped\":1"), "{merged}");
+    assert!(!merged.contains("second"), "{merged}");
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_immediate_update_waits_for_the_users_answer_and_is_not_lost() {
+    let directory = tempfile::tempdir().unwrap();
+    let shell = InstanceRef::shell(Uuid::new_v4());
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("s1", "SubscribeTick", json!({"tick_instance_id": shell})),
+        call(
+            "q1",
+            ASK_USER_QUESTION_TOOL_NAME,
+            single_question("which market?"),
+        ),
+        text("answered"),
+        text("exit handled"),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let stream = InMemoryTickStream::new();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "watch the shell".into())
+        .await
+        .unwrap();
+    let question = loop {
+        if let EventKind::QuestionAsked { request } = next_event(&mut events).await.kind {
+            break request;
+        }
+    };
+
+    stream.push(TickObservation {
+        instance: shell,
+        sequence: 1,
+        observed_at: "2026-10-13T03:15:00Z".into(),
+        dropped: 0,
+        data: json!({ "status": "exit 0" }),
+        kind: ObservationKind::Protocol,
+        recover_with: None,
+        gap: false,
+    });
+    settle().await;
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        2,
+        "the update must not bypass the user's answer"
+    );
+
+    agent
+        .answer_question(chat, question.id, vec![QuestionAnswer::other("Hong Kong")])
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    wait_for_completion(&mut events).await;
+    assert_eq!(model.requests.lock().unwrap().len(), 4);
+    assert!(last_user_text(&model).contains("exit 0"));
     agent.shutdown().await;
 }
 
@@ -644,17 +1028,22 @@ async fn a_trigger_rejects_subscriptions_it_cannot_honour() {
         armed: true,
         subscriptions,
     };
-    let subscription = |instance: u64, every_seconds| TickSubscription {
+    let subscription = |instance: InstanceRef, frequency| TickSubscription {
         id: Uuid::new_v4(),
-        instance: fixture_instance(instance),
-        every_seconds,
+        instance,
+        frequency,
         authority: None,
     };
+    let shell = InstanceRef::shell(Uuid::new_v4());
+    use TickSubscriptionFrequency::{High, Immediate, Low};
 
     for rejected in [
-        vec![subscription(1, 4)],
-        vec![subscription(1, 86_401)],
-        vec![subscription(1, 60), subscription(1, 90)],
+        vec![subscription(fixture_instance(1), Immediate)],
+        vec![subscription(shell.clone(), High)],
+        vec![
+            subscription(fixture_instance(1), High),
+            subscription(fixture_instance(1), Low),
+        ],
     ] {
         assert!(
             agent
@@ -663,7 +1052,7 @@ async fn a_trigger_rejects_subscriptions_it_cannot_honour() {
                 .is_err()
         );
     }
-    let mut events_only = trigger(vec![subscription(1, 60)]);
+    let mut events_only = trigger(vec![subscription(fixture_instance(1), High)]);
     events_only.accepts_events = false;
     events_only.interval_seconds = Some(30);
     assert!(
@@ -677,7 +1066,10 @@ async fn a_trigger_rejects_subscriptions_it_cannot_honour() {
             .configure_trigger(
                 chat,
                 receipt.loop_id,
-                Some(trigger(vec![subscription(1, 60)]))
+                Some(trigger(vec![
+                    subscription(fixture_instance(1), High),
+                    subscription(shell, Immediate),
+                ]))
             )
             .await
             .is_ok()
@@ -745,11 +1137,7 @@ async fn native_subscribe_tool_keeps_the_complete_run_identity() {
     let directory = tempfile::tempdir().unwrap();
     let run = "herdr:session/workspace/pane/full-run-00000000-0000-0000-0000-000000000007";
     let model = Arc::new(ScriptedModel::new(vec![
-        call(
-            "s1",
-            "SubscribeTick",
-            json!({"tick_instance_id": run, "every_seconds": 5}),
-        ),
+        call("s1", "SubscribeTick", json!({"tick_instance_id": run})),
         text("watching that run"),
         text("observed"),
     ]));
@@ -779,7 +1167,7 @@ async fn native_subscribe_tool_keeps_the_complete_run_identity() {
         gap: false,
     });
     settle().await;
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
     let delivered = last_user_text(&model);
     assert!(delivered.contains(run));
@@ -797,7 +1185,7 @@ async fn a_cancelled_watch_cannot_deliver_late_events_to_a_new_activation() {
         call(
             "s1",
             "SubscribeTick",
-            json!({"tick_instance_id": fixture_instance(7), "every_seconds": 5}),
+            json!({"tick_instance_id": fixture_instance(7)}),
         ),
         text("watching"),
         text("fresh observation"),
@@ -816,7 +1204,7 @@ async fn a_cancelled_watch_cannot_deliver_late_events_to_a_new_activation() {
     trigger.subscriptions.push(TickSubscription {
         id: subscription,
         instance: fixture_instance(7),
-        every_seconds: 5,
+        frequency: TickSubscriptionFrequency::High,
         authority: None,
     });
     agent
@@ -838,7 +1226,7 @@ async fn a_cancelled_watch_cannot_deliver_late_events_to_a_new_activation() {
     });
     settle().await;
     let mut events = agent.subscribe();
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
     let delivered = last_user_text(&model);
     assert!(delivered.contains("fresh"), "{delivered}");
@@ -853,13 +1241,13 @@ async fn a_late_loop_has_its_own_baseline_on_a_shared_instance() {
         call(
             "s1",
             "SubscribeTick",
-            json!({"tick_instance_id": fixture_instance(7), "every_seconds": 5}),
+            json!({"tick_instance_id": fixture_instance(7), "frequency": "high"}),
         ),
         text("first watcher"),
         call(
             "s2",
             "SubscribeTick",
-            json!({"tick_instance_id": fixture_instance(7), "every_seconds": 10}),
+            json!({"tick_instance_id": fixture_instance(7), "frequency": "medium"}),
         ),
         text("second watcher"),
         text("first saw earlier change"),
@@ -894,9 +1282,10 @@ async fn a_late_loop_has_its_own_baseline_on_a_shared_instance() {
     stream.emit(TickStreamEvent::Ready {
         watch: second_watch,
     });
-    tokio::time::advance(Duration::from_secs(5)).await;
+    let medium_period = TickSubscriptionFrequency::Medium.period().unwrap();
+    tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(medium_period - HIGH_PERIOD).await;
     settle().await;
     assert_eq!(
         model.requests.lock().unwrap().len(),
@@ -907,7 +1296,7 @@ async fn a_late_loop_has_its_own_baseline_on_a_shared_instance() {
     assert_eq!(rows.len(), 2);
     assert_eq!(
         rows.iter()
-            .find(|row| row.every_seconds == 10)
+            .find(|row| row.frequency == TickSubscriptionFrequency::Medium)
             .unwrap()
             .accumulated,
         0
@@ -918,9 +1307,9 @@ async fn a_late_loop_has_its_own_baseline_on_a_shared_instance() {
         value: update(7, 2, "shared"),
     });
     settle().await;
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(medium_period - HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
     assert_eq!(model.requests.lock().unwrap().len(), 7);
     agent.shutdown().await;
@@ -981,7 +1370,7 @@ async fn an_instance_gap_marks_only_its_next_delivery() {
 
     stream.push(update(7, 9, "steady"));
     settle().await;
-    tokio::time::advance(CADENCE).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
     assert!(last_user_text(&model).contains("\"gap\":false"));
 
@@ -990,7 +1379,7 @@ async fn an_instance_gap_marks_only_its_next_delivery() {
     after_gap.gap = true;
     stream.push(after_gap);
     settle().await;
-    tokio::time::advance(CADENCE).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
 
     let delivered = last_user_text(&model);
@@ -1059,7 +1448,7 @@ async fn a_gone_instance_stops_being_watched_and_keeps_its_configuration() {
     stream.push(update(7, 1, "from a Tick that is gone"));
     stream.push(update(8, 1, "from the Tick that stayed"));
     settle().await;
-    tokio::time::advance(CADENCE).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
 
     let delivered = last_user_text(&model);
@@ -1131,7 +1520,7 @@ async fn a_fresh_subscription_can_reobserve_a_stopped_instance_without_rearming_
     assert_eq!(stream.watches(), watches);
     stream.push(update(7, 1, "fresh observation"));
     settle().await;
-    tokio::time::advance(CADENCE).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
     assert!(last_user_text(&model).contains("\"gap\":false"));
     agent.shutdown().await;
@@ -1164,7 +1553,7 @@ async fn an_over_sized_delivery_blanks_its_largest_data_and_points_to_native_rec
     });
     stream.push(update(8, 1, "small enough to keep"));
     settle().await;
-    tokio::time::advance(CADENCE).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
 
     let delivered = last_user_text(&model);
@@ -1201,11 +1590,7 @@ async fn a_truncated_terminal_observation_points_to_current_text_without_promisi
     let directory = tempfile::tempdir().unwrap();
     let run = "herdr:terminal:session:run-88";
     let model = Arc::new(ScriptedModel::new(vec![
-        call(
-            "s1",
-            "SubscribeTick",
-            json!({"tick_instance_id":run,"every_seconds":5}),
-        ),
+        call("s1", "SubscribeTick", json!({"tick_instance_id":run})),
         text("watching terminal"),
         text("handled"),
     ]));
@@ -1230,7 +1615,7 @@ async fn a_truncated_terminal_observation_points_to_current_text_without_promisi
         gap: false,
     });
     settle().await;
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
     let delivered = last_user_text(&model);
     assert!(delivered.contains("ReadTick"), "{delivered}");
@@ -1270,7 +1655,7 @@ async fn many_subscribed_instances_still_fit_one_loop_delivery_under_sixteen_kib
             .map(|instance| TickSubscription {
                 id: Uuid::new_v4(),
                 instance,
-                every_seconds: 5,
+                frequency: TickSubscriptionFrequency::High,
                 authority: None,
             })
             .collect(),
@@ -1308,7 +1693,7 @@ async fn many_subscribed_instances_still_fit_one_loop_delivery_under_sixteen_kib
     })
     .await
     .unwrap();
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
     let delivered = last_user_text(&model);
     assert!(delivered.contains("omitted_instances"), "{delivered}");
@@ -1398,7 +1783,7 @@ async fn invalidated_queued_watch_preserves_user_input(state: Option<TickConnect
     entered.notified().await;
     stream.push(update(7, 1, "INVALID_QUEUED_TICK"));
     settle().await;
-    tokio::time::advance(CADENCE).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     tokio::time::timeout(Duration::from_secs(2), async {
         while agent
             .snapshot(chat)
@@ -1571,7 +1956,7 @@ async fn chat_reading_final_admission(cancel_during_check: bool) {
     wait_for_completion(&mut events).await;
     updates.push(update(7, 1, "changed"));
     settle().await;
-    tokio::time::advance(CADENCE).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     if cancel_during_check {
         tokio::time::timeout(Duration::from_secs(2), entered.notified())
             .await
@@ -1704,7 +2089,7 @@ async fn unaffected_watch_queue(cancel_other: bool, include_other: bool) {
     }
     stream.push(update(8, 1, "VALID_B_ONLY_QUEUED_TICK"));
     settle().await;
-    tokio::time::advance(CADENCE).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     tokio::time::timeout(Duration::from_secs(2), async {
         while agent
             .snapshot(chat)
@@ -1754,7 +2139,7 @@ async fn unaffected_watch_queue(cancel_other: bool, include_other: bool) {
     let change = if cancel_other {
         TickSubscriptionChange::Cancel
     } else {
-        TickSubscriptionChange::Cadence(120)
+        TickSubscriptionChange::Frequency(TickSubscriptionFrequency::Medium)
     };
     agent
         .update_tick_subscription(chat, subscription, change)
@@ -1831,7 +2216,7 @@ async fn cancelling_other_watch_preserves_valid_queued_input() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn changing_other_watch_cadence_preserves_valid_queued_input() {
+async fn changing_other_watch_frequency_preserves_valid_queued_input() {
     unaffected_watch_queue(false, false).await;
 }
 
@@ -1841,7 +2226,7 @@ async fn cancelling_an_included_watch_discards_the_whole_queued_input() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn changing_included_watch_cadence_preserves_valid_queued_input() {
+async fn changing_included_watch_frequency_preserves_valid_queued_input() {
     unaffected_watch_queue(false, true).await;
 }
 
@@ -1877,7 +2262,7 @@ async fn subscribe_loop(
         .map(|instance| TickSubscription {
             id: Uuid::new_v4(),
             instance,
-            every_seconds: 5,
+            frequency: TickSubscriptionFrequency::High,
             authority: None,
         })
         .collect();
@@ -1950,7 +2335,7 @@ async fn a_repeated_update_is_never_delivered_twice_and_cancelling_drops_its_wat
 
     stream.push(update(5, 3, "three"));
     accumulated(&agent, chat, 1).await;
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
     assert!(last_user_text(&model).contains("three"));
     let files = watermark_files(&root);
@@ -1962,7 +2347,7 @@ async fn a_repeated_update_is_never_delivered_twice_and_cancelling_drops_its_wat
     stream.push(update(5, 3, "three again"));
     settle().await;
     accumulated(&agent, chat, 0).await;
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     settle().await;
     assert_eq!(
         model.requests.lock().unwrap().len(),
@@ -1972,7 +2357,7 @@ async fn a_repeated_update_is_never_delivered_twice_and_cancelling_drops_its_wat
 
     stream.push(update(5, 4, "four"));
     accumulated(&agent, chat, 1).await;
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
     assert!(last_user_text(&model).contains("four"));
 
@@ -1985,6 +2370,90 @@ async fn a_repeated_update_is_never_delivered_twice_and_cancelling_drops_its_wat
         watermark_files(&root).is_empty(),
         "a cancelled subscription keeps no watermark"
     );
+    agent.shutdown().await;
+}
+
+/// An immediate subscription has no period to retry a held delivery with: one whose watermark
+/// could not be written is still delivered, shortly after writing works again.
+#[tokio::test]
+async fn an_immediate_delivery_whose_watermark_failed_is_retried_until_it_lands() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let workdir = directory.path().join("work");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        text("ready"),
+        text("saw the start"),
+        text("saw the exit"),
+    ]));
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let stream = InMemoryTickStream::new();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(workdir).await.unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(chat, None, "watch".into()).await.unwrap();
+    wait_for_completion(&mut events).await;
+    let shell = InstanceRef::shell(Uuid::new_v4());
+    agent
+        .configure_trigger(
+            chat,
+            receipt.loop_id,
+            Some(Trigger {
+                id: Uuid::new_v4(),
+                prompt: "report the shell".into(),
+                interval_seconds: None,
+                expires_at_ms: None,
+                accepts_events: true,
+                armed: true,
+                subscriptions: vec![TickSubscription {
+                    id: Uuid::new_v4(),
+                    instance: shell.clone(),
+                    frequency: TickSubscriptionFrequency::Immediate,
+                    authority: None,
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+    let shell_update = |sequence, status: &str| TickObservation {
+        instance: shell.clone(),
+        sequence,
+        observed_at: "2026-10-13T03:15:00Z".into(),
+        dropped: 0,
+        data: json!({ "status": status }),
+        kind: ObservationKind::Protocol,
+        recover_with: None,
+        gap: false,
+    };
+    stream.push(shell_update(1, "started"));
+    wait_for_completion(&mut events).await;
+    let watermarks = watermark_files(&root)[0].parent().unwrap().to_path_buf();
+    let kept = watermarks.with_extension("kept");
+    std::fs::rename(&watermarks, &kept).unwrap();
+    std::fs::write(&watermarks, "a file where the watermark directory belongs").unwrap();
+
+    stream.push(shell_update(2, "exit 0"));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        2,
+        "a delivery whose watermark cannot be written is held"
+    );
+    std::fs::remove_file(&watermarks).unwrap();
+    std::fs::rename(&kept, &watermarks).unwrap();
+
+    while !matches!(
+        next_event_within(&mut events, Duration::from_secs(15))
+            .await
+            .kind,
+        EventKind::Completed { .. }
+    ) {}
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        3,
+        "the held delivery is retried without another update"
+    );
+    assert!(last_user_text(&model).contains("exit 0"));
     agent.shutdown().await;
 }
 
@@ -2062,7 +2531,7 @@ async fn update_data_stays_within_the_content_budget_and_evicted_data_is_read_ag
         .unwrap()
         .insert(instances[0].clone(), refilled);
 
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
     let delivered = last_user_text(&model);
     assert!(delivered.contains("\"phase\":\"refilled\""), "{delivered}");

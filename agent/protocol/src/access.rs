@@ -28,12 +28,11 @@ use crate::{
     TriggerSource, UserShellReceipt, UserShellRecord,
 };
 
-/// Business 17.0 removes adding an existing instance to a Chat's Monitor: the
-/// `AddMonitorMember` command and the source of each Monitor member, since every member is one
-/// the Chat opened; 17.1 adds declining a question. Older business majors are refused before
-/// dispatch; the frozen daemon management protocol remains independent.
-pub const PROTOCOL_MAJOR: u16 = 17;
-pub const PROTOCOL_MINOR: u16 = 1;
+/// Business 18.0 replaces a Tick Subscription's cadence in seconds with one of four frequencies,
+/// in the subscription, its status and the change a View requests. Older business majors are
+/// refused before dispatch; the frozen daemon management protocol remains independent.
+pub const PROTOCOL_MAJOR: u16 = 18;
+pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 

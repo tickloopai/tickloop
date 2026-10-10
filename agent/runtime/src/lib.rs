@@ -322,7 +322,7 @@ struct Inner {
     /// model only then.
     tick_stream_installed: AtomicBool,
     tick_deliveries: std::sync::Mutex<tick_subscriptions::TickDeliveries>,
-    /// Wakes the delivery task when the subscription set or a cadence changed.
+    /// Wakes the delivery task when the subscription set or a frequency changed.
     tick_wake: Notify,
     session_permissions: Mutex<session_permissions::SessionPermissionContext>,
     shutdown: CancellationToken,

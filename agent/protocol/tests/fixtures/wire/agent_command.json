@@ -272,9 +272,31 @@
         "prompt": "Report changes",
         "interval_seconds": 60,
         "expires_at_ms": null,
-        "accepts_events": false,
+        "accepts_events": true,
         "armed": true,
-        "subscriptions": []
+        "subscriptions": [
+          {
+            "id": "00000000-0000-0000-0000-000000000031",
+            "instance": "hosted:00000000-0000-0000-0000-000000000040",
+            "frequency": "medium",
+            "authority": null
+          }
+        ]
+      }
+    }
+  },
+  {
+    "kind": "manage_loop",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "action": {
+      "kind": "update_subscription",
+      "subscription_id": "00000000-0000-0000-0000-000000000031",
+      "change": {
+        "Frequency": "low"
       }
     }
   },

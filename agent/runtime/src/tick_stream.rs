@@ -205,7 +205,6 @@ impl PreparedTickWatch {
 #[async_trait::async_trait]
 pub trait TickStreamPort: Send + Sync + 'static {
     fn open(&self) -> TickStreamHandle;
-    fn set_cadences(&self, _cadences: BTreeMap<WatchId, u64>) {}
     /// Caller identities for active watches, including restored subscriptions.
     fn set_watch_chats(&self, _chats: BTreeMap<WatchId, Uuid>) {}
     /// Prepare subscription admission with the native query policy and stable target ownership.
@@ -1064,14 +1063,14 @@ async fn observe_terminal(
     let mut last_text: Option<String> = None;
     let mut sequence = 0_u64;
     let mut lost_host_events = false;
-    let mut cadence = tokio::time::interval(TERMINAL_SAMPLE_INTERVAL);
-    cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sampling = tokio::time::interval(TERMINAL_SAMPLE_INTERVAL);
+    sampling.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         if wanted.borrow().is_empty() {
             return true;
         }
         tokio::select! {
-            _ = cadence.tick() => {}
+            _ = sampling.tick() => {}
             changed = wanted.changed() => if changed.is_err() { return true; },
         }
         let targets = scope.admitted(&wanted.borrow_and_update().clone(), instance, publisher);

@@ -96,7 +96,7 @@ pub enum TickIntent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubscriptionOperation {
     View,
-    EditCadence,
+    EditFrequency,
     Cancel,
 }
 
@@ -203,7 +203,7 @@ pub struct TickDescriptor {
     pub notes: Vec<String>,
     /// Whether a Loop of this Chat subscribes to the instance through its type rather than a Tick
     /// Subscription, as an artifact's association does with its @tickloop requests. It shows in
-    /// the subscription marker without a cadence, and the row's own `x` ends it.
+    /// the subscription marker without a frequency, and the row's own `x` ends it.
     pub inherent_subscription: bool,
     pub owner: TickOwner,
     pub tone: StatusTone,
@@ -255,8 +255,8 @@ pub enum MemberState {
 /// The row action Enter and a click run.
 pub const MONITOR_ENTER_KEY: char = 'o';
 pub const MONITOR_REFRESH_KEY: char = 'r';
-/// Edits the cadence of a subscribed row's subscription.
-pub const SUBSCRIPTION_CADENCE_KEY: char = 'e';
+/// Changes the frequency of a subscribed row's subscription.
+pub const SUBSCRIPTION_FREQUENCY_KEY: char = 'e';
 /// Cancels a subscribed row's subscription after confirmation.
 pub const UNSUBSCRIBE_KEY: char = 'u';
 /// Shows a subscribed row's Tick Subscriptions; Enter stays with opening the Tick.
@@ -346,13 +346,14 @@ fn subscription_descriptor(row: &TickSubscriptionStatus) -> TickDescriptor {
     }
 }
 
-/// Shows the row's subscriptions as a marker, `⟳ 60s` for one Tick Subscription, `⟳` for the
-/// type's inherent one, which has no cadence, or `⟳ 2` for several, and adds the keys that manage
-/// Tick Subscriptions. Enter always opens the Tick itself; a row without its own opening shows the
-/// Tick's details.
+/// Shows the row's subscriptions as a marker, `⟳ high` for one Tick Subscription at its frequency,
+/// `⟳` for the type's inherent one, which has no frequency, or `⟳ 2` for several, and adds the keys
+/// that manage Tick Subscriptions; the frequency key only while one of them can change, which an
+/// immediate one cannot. Enter always opens the Tick itself; a row without its own opening shows
+/// the Tick's details.
 fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus]) {
     entry.notes.push(match (entry.inherent_subscription, rows) {
-        (false, [row]) => format!("⟳ {}s", row.every_seconds),
+        (false, [row]) => format!("⟳ {}", row.frequency.name()),
         (true, []) => "⟳".into(),
         (inherent, rows) => format!("⟳ {}", rows.len() + usize::from(inherent)),
     });
@@ -378,6 +379,7 @@ fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus])
             },
         );
     }
+    let can_change_frequency = rows.iter().any(|row| row.frequency.period().is_some());
     for (key, label, operation) in [
         (
             SUBSCRIPTIONS_KEY,
@@ -385,9 +387,9 @@ fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus])
             SubscriptionOperation::View,
         ),
         (
-            SUBSCRIPTION_CADENCE_KEY,
-            "cadence",
-            SubscriptionOperation::EditCadence,
+            SUBSCRIPTION_FREQUENCY_KEY,
+            "frequency",
+            SubscriptionOperation::EditFrequency,
         ),
         (
             UNSUBSCRIBE_KEY,
@@ -395,6 +397,9 @@ fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus])
             SubscriptionOperation::Cancel,
         ),
     ] {
+        if key == SUBSCRIPTION_FREQUENCY_KEY && !can_change_frequency {
+            continue;
+        }
         if !entry.actions.iter().any(|action| action.key == key) {
             entry.actions.push(MonitorAction {
                 key,

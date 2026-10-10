@@ -593,6 +593,24 @@
     "RewindFiles": null
   },
   {
+    "Subscriptions": [
+      {
+        "id": "00000000-0000-0000-0000-000000000031",
+        "loop_id": "00000000-0000-0000-0000-000000000010",
+        "loop_state": "WaitingTrigger",
+        "instance": "hosted:00000000-0000-0000-0000-000000000040",
+        "frequency": "high",
+        "accumulated": 2,
+        "last_delivery_ms": 6000,
+        "last_delivery": "hosted:00000000-0000-0000-0000-000000000040 #4",
+        "kind": "Protocol",
+        "title": "Quotes",
+        "updated_at_ms": 6500,
+        "link": "Live"
+      }
+    ]
+  },
+  {
     "Receipt": {
       "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
       "command_id": "00000000-0000-0000-0000-000000000081",

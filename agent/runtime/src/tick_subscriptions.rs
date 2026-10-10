@@ -4,9 +4,9 @@
 //! [`Agent::configure_trigger`] and inherits its chain entries, resume rules and leases. The
 //! Agent keeps the union of every armed subscription's Tick Instance as the desired set of one
 //! [`TickStreamPort`]; updates arriving from that stream accumulate per subscription. When a
-//! subscription's cadence elapses with updates pending, the latest update per Tick Instance
-//! merges into the owning Loop's pending delivery and is handed to [`Agent::trigger`] as soon as
-//! the Loop can take it.
+//! subscription's period elapses with updates pending, or as soon as an immediate one receives an
+//! update, the latest update per Tick Instance merges into the owning Loop's pending delivery and
+//! is handed to [`Agent::trigger`] as soon as the Loop can take it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -24,16 +24,20 @@ use crate::tick_stream::{
 };
 use tick_protocol::InstanceRef;
 use tickloop_agent_protocol::{
-    DEFAULT_CADENCE_SECONDS, HostToolAuthority, LoopId, LoopSnapshot, LoopState,
-    MAX_CADENCE_SECONDS, MAX_DELIVERY_PAYLOAD_BYTES, MIN_CADENCE_SECONDS, ObservationKind, Receipt,
-    TICK_SUBSCRIPTION_SOURCE, TickLinkState, TickSubscription, TickSubscriptionChange,
-    TickSubscriptionStatus, ToolDefinition, ToolResult, Trigger, TriggerSource,
+    HostToolAuthority, LoopId, LoopSnapshot, LoopState, MAX_DELIVERY_PAYLOAD_BYTES,
+    ObservationKind, Receipt, TICK_SUBSCRIPTION_SOURCE, TickLinkState, TickSubscription,
+    TickSubscriptionChange, TickSubscriptionFrequency, TickSubscriptionStatus, ToolDefinition,
+    ToolResult, Trigger, TriggerSource,
 };
 
 const SUBSCRIPTION_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 const SUBSCRIBE_TICK_TOOL: &str = "SubscribeTick";
 const UNSUBSCRIBE_TICK_TOOL: &str = "UnsubscribeTick";
+const DEFAULT_FREQUENCY: TickSubscriptionFrequency = TickSubscriptionFrequency::High;
+/// How soon an immediate subscription looks again at a delivery its Loop could not take; a
+/// periodic one looks again with its next period.
+const HELD_DELIVERY_RETRY: Duration = Duration::from_secs(5);
 /// An item the stream or a later delivery replaces is itself one dropped Tick Update.
 const SUPERSEDED_UPDATE: u64 = 1;
 const TRUNCATION_HINT: &str = "Tick Update data was left out where `data` is null, because it was too large for this delivery or could not be read again; use the native tools for that instance type to recover it.";
@@ -47,11 +51,7 @@ pub(super) fn validate(trigger: &Trigger) -> Result<(), String> {
     }
     let mut instances = BTreeSet::new();
     for subscription in &trigger.subscriptions {
-        if !(MIN_CADENCE_SECONDS..=MAX_CADENCE_SECONDS).contains(&subscription.every_seconds) {
-            return Err(format!(
-                "a Tick Subscription cadence must be {MIN_CADENCE_SECONDS} to {MAX_CADENCE_SECONDS} seconds"
-            ));
-        }
+        check_frequency(&subscription.instance, subscription.frequency)?;
         if !instances.insert(subscription.instance.clone()) {
             return Err("a Loop holds at most one Tick Subscription per Tick Instance".into());
         }
@@ -59,14 +59,62 @@ pub(super) fn validate(trigger: &Trigger) -> Result<(), String> {
     Ok(())
 }
 
+/// The frequency a Tick type decides for every subscription to it, which no subscriber chooses:
+/// a Shell Tick is delivered as soon as it updates. Other types deliver periodically.
+fn fixed_frequency(instance: &InstanceRef) -> Option<TickSubscriptionFrequency> {
+    (instance.tick_type() == tick_protocol::SHELL_INSTANCE_TYPE)
+        .then_some(TickSubscriptionFrequency::Immediate)
+}
+
+fn check_frequency(
+    instance: &InstanceRef,
+    frequency: TickSubscriptionFrequency,
+) -> Result<(), String> {
+    match fixed_frequency(instance) {
+        Some(fixed) if fixed != frequency => Err(format!(
+            "a Shell Tick Subscription is always {}",
+            fixed.name()
+        )),
+        None if frequency.period().is_none() => Err(format!(
+            "only a Shell Tick Subscription is {}; choose {}",
+            frequency.name(),
+            periodic_choices()
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn periodic_choices() -> String {
+    TickSubscriptionFrequency::PERIODIC
+        .map(TickSubscriptionFrequency::name)
+        .join(", ")
+}
+
+/// When a subscription next hands over what it holds: a period from `now`, or for an immediate
+/// one not until an update arrives.
+fn next_delivery(frequency: TickSubscriptionFrequency, now: Instant) -> Option<Instant> {
+    frequency.period().map(|period| now + period)
+}
+
 pub(super) fn definitions() -> Vec<ToolDefinition> {
+    let periods = TickSubscriptionFrequency::PERIODIC
+        .iter()
+        .filter_map(|frequency| {
+            frequency
+                .period()
+                .map(|period| format!("`{}` every {} min", frequency.name(), period.as_secs() / 60))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let frequencies = TickSubscriptionFrequency::PERIODIC.map(TickSubscriptionFrequency::name);
     vec![
         ToolDefinition {
             name: SUBSCRIBE_TICK_TOOL.into(),
             description: format!(
-                "Subscribe the current goal to a Tick Instance. Every {DEFAULT_CADENCE_SECONDS} seconds by default the goal is woken with that instance's latest Tick Update and how many updates were dropped in between; a quiet cadence wakes nothing. Intermediate updates are not kept, so read older data with the Tick's own query tools."
+                "Subscribe the current goal to a Tick Instance. A protocol or terminal Tick wakes the goal with that instance's latest Tick Update and how many updates were dropped in between at the chosen frequency: {periods}; `{}` is the default, and a period without updates wakes nothing. A Shell Tick takes no frequency: its updates are delivered as soon as they arrive. Intermediate updates are not kept, so read older data with the Tick's own query tools.",
+                DEFAULT_FREQUENCY.name()
             ),
-            input_schema: json!({"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":3},"every_seconds":{"type":"integer","minimum":MIN_CADENCE_SECONDS,"maximum":MAX_CADENCE_SECONDS}},"required":["tick_instance_id"],"additionalProperties":false}),
+            input_schema: json!({"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":3},"frequency":{"type":"string","enum":frequencies}},"required":["tick_instance_id"],"additionalProperties":false}),
         },
         ToolDefinition {
             name: UNSUBSCRIBE_TICK_TOOL.into(),
@@ -80,7 +128,29 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
 #[derive(Deserialize)]
 struct SubscribeTickInput {
     tick_instance_id: InstanceRef,
-    every_seconds: Option<u64>,
+    frequency: Option<TickSubscriptionFrequency>,
+}
+
+/// The Tick Instance a `SubscribeTick` call names and the frequency it gets: a Shell Tick is
+/// always immediate and takes no frequency, any other type gets the chosen periodic one or the
+/// default.
+pub(super) fn subscription_request(
+    input: &Value,
+) -> Result<(InstanceRef, TickSubscriptionFrequency), String> {
+    let input: SubscribeTickInput = serde_json::from_value(input.clone())
+        .map_err(|error| format!("invalid {SUBSCRIBE_TICK_TOOL} input: {error}"))?;
+    let frequency = match (fixed_frequency(&input.tick_instance_id), input.frequency) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "a Shell Tick is delivered as soon as it updates and takes no frequency; omit frequency"
+                    .into(),
+            );
+        }
+        (Some(fixed), None) => fixed,
+        (None, requested) => requested.unwrap_or(DEFAULT_FREQUENCY),
+    };
+    check_frequency(&input.tick_instance_id, frequency)?;
+    Ok((input.tick_instance_id, frequency))
 }
 
 #[derive(Deserialize)]
@@ -114,8 +184,10 @@ struct SubscriptionRuntime {
     ready: bool,
     link: TickLinkState,
     blocked: Option<TickLinkState>,
-    every_seconds: u64,
-    due_at: Instant,
+    frequency: TickSubscriptionFrequency,
+    /// When it next hands its newest update to the Loop; `None` while an immediate subscription
+    /// has nothing new.
+    due_at: Option<Instant>,
     /// The newest update since the last delivery, without its data, which waits in the content
     /// cache; earlier ones are counted, not kept.
     latest: Option<LatestUpdate>,
@@ -145,7 +217,8 @@ struct LatestUpdate {
 #[derive(Default)]
 struct PendingDelivery {
     items: BTreeMap<InstanceRef, DeliveryItem>,
-    /// A cadence elapsed while the Loop was executing, so the delivery flushes the moment it can.
+    /// The delivery came due while the Loop could not take it, so it flushes when the Loop's run
+    /// ends.
     due: bool,
 }
 
@@ -333,7 +406,7 @@ impl TickDeliveries {
     fn next_due(&self) -> Option<Instant> {
         self.subscriptions
             .values()
-            .map(|subscription| subscription.due_at)
+            .filter_map(|subscription| subscription.due_at)
             .min()
     }
 
@@ -356,13 +429,6 @@ impl TickDeliveries {
                     .values()
                     .filter(|subscription| subscription.blocked.is_none())
                     .map(|subscription| (subscription.watch, subscription.chat_id))
-                    .collect(),
-            );
-            port.set_cadences(
-                self.subscriptions
-                    .values()
-                    .filter(|subscription| subscription.blocked.is_none())
-                    .map(|subscription| (subscription.watch, subscription.every_seconds))
                     .collect(),
             );
         }
@@ -421,6 +487,9 @@ impl TickDeliveries {
             subscription.updated_at_ms = subscription.updated_at_ms.max(Some(
                 tickloop_agent_base::private_fs::unix_time_milliseconds(),
             ));
+            if subscription.frequency == TickSubscriptionFrequency::Immediate {
+                subscription.due_at = Some(Instant::now());
+            }
         }
     }
 
@@ -438,16 +507,16 @@ impl TickDeliveries {
         }
     }
 
-    /// Moves every elapsed subscription's newest update into its Loop's pending delivery and
-    /// returns the Loops that now have something to flush. A cadence that elapses without a new
-    /// update delivers nothing of its own, but still retries a delivery the Loop is holding.
+    /// Moves every due subscription's newest update into its Loop's pending delivery and returns
+    /// the Loops that now have something to flush. A period that elapses without a new update
+    /// delivers nothing of its own, but still retries a delivery the Loop is holding.
     fn collect_elapsed(&mut self, now: Instant) -> Vec<(ChatId, LoopId)> {
         let mut elapsed = Vec::new();
         for (id, subscription) in &mut self.subscriptions {
-            if subscription.due_at > now {
+            if subscription.due_at.is_none_or(|due_at| due_at > now) {
                 continue;
             }
-            subscription.due_at = now + Duration::from_secs(subscription.every_seconds);
+            subscription.due_at = next_delivery(subscription.frequency, now);
             let item = subscription.latest.take().map(|update| {
                 let data = self.content.take(*id);
                 DeliveryItem {
@@ -500,9 +569,30 @@ impl TickDeliveries {
 
     fn restore(&mut self, owner: (ChatId, LoopId), items: Vec<DeliveryItem>) {
         let pending = self.pending.entry(owner).or_default();
-        pending.due = true;
         for item in items {
             pending.items.entry(item.instance.clone()).or_insert(item);
+        }
+        self.hold(owner, Instant::now());
+    }
+
+    /// Keeps `owner`'s pending delivery until its Loop can take it. It flushes when the Loop's
+    /// run ends, and the Loop's immediate subscriptions, which have no period of their own to
+    /// retry with, look again shortly in case that end came first or the delivery failed.
+    fn hold(&mut self, owner: (ChatId, LoopId), now: Instant) {
+        let Some(pending) = self.pending.get_mut(&owner) else {
+            return;
+        };
+        pending.due = true;
+        let retry_at = now + HELD_DELIVERY_RETRY;
+        for subscription in self.subscriptions.values_mut().filter(|subscription| {
+            (subscription.chat_id, subscription.loop_id) == owner
+                && subscription.frequency == TickSubscriptionFrequency::Immediate
+        }) {
+            subscription.due_at = Some(
+                subscription
+                    .due_at
+                    .map_or(retry_at, |due_at| due_at.min(retry_at)),
+            );
         }
     }
 }
@@ -560,7 +650,7 @@ impl Agent {
                     loop_id,
                     loop_state,
                     instance: subscription.instance.clone(),
-                    every_seconds: subscription.every_seconds,
+                    frequency: subscription.frequency,
                     accumulated: runtime.map_or(0, |runtime| runtime.accumulated),
                     last_delivery_ms: runtime.and_then(|runtime| runtime.last_delivery_ms),
                     last_delivery: runtime.and_then(|runtime| runtime.last_delivery.clone()),
@@ -573,8 +663,9 @@ impl Agent {
             .collect())
     }
 
-    /// Changes one subscription's cadence or cancels it, from Monitor or a model tool. The change
-    /// is written through the owning Loop's Trigger.
+    /// Changes one subscription's frequency or cancels it, from Monitor or a model tool. The
+    /// change is written through the owning Loop's Trigger, which refuses a frequency the Tick
+    /// type does not allow.
     pub async fn update_tick_subscription(
         &self,
         chat_id: ChatId,
@@ -601,10 +692,10 @@ impl Agent {
             TickSubscriptionChange::Cancel => trigger
                 .subscriptions
                 .retain(|subscription| subscription.id != subscription_id),
-            TickSubscriptionChange::Cadence(every_seconds) => {
+            TickSubscriptionChange::Frequency(frequency) => {
                 for subscription in &mut trigger.subscriptions {
                     if subscription.id == subscription_id {
-                        subscription.every_seconds = every_seconds;
+                        subscription.frequency = frequency;
                     }
                 }
             }
@@ -645,9 +736,7 @@ impl Agent {
         input: &Value,
         authority: Option<HostToolAuthority>,
     ) -> Result<String, String> {
-        let input: SubscribeTickInput = serde_json::from_value(input.clone())
-            .map_err(|error| format!("invalid {SUBSCRIBE_TICK_TOOL} input: {error}"))?;
-        let every_seconds = input.every_seconds.unwrap_or(DEFAULT_CADENCE_SECONDS);
+        let (instance, frequency) = subscription_request(input)?;
         let chats = self.inner.chats.lock().await;
         let chat = chats
             .get(&receipt.chat_id)
@@ -675,10 +764,10 @@ impl Agent {
         if let Some(existing) = trigger
             .subscriptions
             .iter()
-            .find(|subscription| subscription.instance == input.tick_instance_id)
+            .find(|subscription| subscription.instance == instance)
         {
             return Err(format!(
-                "this goal already subscribes to Tick Instance {} as {}; change its cadence instead",
+                "this goal already subscribes to Tick Instance {} as {}; cancel it with {UNSUBSCRIBE_TICK_TOOL} before subscribing at another frequency",
                 existing.instance, existing.id
             ));
         }
@@ -687,8 +776,8 @@ impl Agent {
         trigger.accepts_events = true;
         let subscription = TickSubscription {
             id: Uuid::new_v4(),
-            instance: input.tick_instance_id,
-            every_seconds,
+            instance,
+            frequency,
             authority,
         };
         trigger.subscriptions.push(subscription.clone());
@@ -704,7 +793,7 @@ impl Agent {
         let mut answer = json!({
             "subscription": subscription.id,
             "tick_instance_id": subscription.instance,
-            "every_seconds": subscription.every_seconds,
+            "frequency": subscription.frequency,
             "armed": armed,
             "ready": ready,
         });
@@ -875,9 +964,9 @@ impl Agent {
             });
             for (chat_id, loop_id, subscription, watermarks) in configured {
                 match deliveries.subscriptions.get_mut(&subscription.id) {
-                    Some(runtime) if runtime.every_seconds != subscription.every_seconds => {
-                        runtime.every_seconds = subscription.every_seconds;
-                        runtime.due_at = now + Duration::from_secs(subscription.every_seconds);
+                    Some(runtime) if runtime.frequency != subscription.frequency => {
+                        runtime.frequency = subscription.frequency;
+                        runtime.due_at = next_delivery(subscription.frequency, now);
                     }
                     Some(_) => {}
                     None => {
@@ -895,8 +984,8 @@ impl Agent {
                                 ready: false,
                                 link: TickLinkState::Initializing,
                                 blocked: None,
-                                every_seconds: subscription.every_seconds,
-                                due_at: now + Duration::from_secs(subscription.every_seconds),
+                                frequency: subscription.frequency,
+                                due_at: next_delivery(subscription.frequency, now),
                                 latest: None,
                                 delivered: None,
                                 watermarks,
@@ -949,7 +1038,7 @@ impl Agent {
         self.discard_invalid_pending_tick_inputs().await;
     }
 
-    /// Flushes a Loop's pending delivery when a cadence elapsed while it was executing.
+    /// Flushes a Loop's pending delivery that came due while the Loop could not take it.
     pub(super) fn flush_due_tick_delivery(&self, chat_id: ChatId, loop_id: LoopId) {
         if !self.inner.tick_stream_installed.load(Ordering::SeqCst)
             || !self
@@ -964,8 +1053,9 @@ impl Agent {
         tokio::spawn(async move { agent.deliver(chat_id, loop_id).await });
     }
 
-    /// Hands one Loop's pending delivery to [`Agent::trigger`], or marks it due when the Loop is
-    /// executing. A Loop waiting for a permission or a question only accumulates.
+    /// Hands one Loop's pending delivery to [`Agent::trigger`], or marks it due while the Loop
+    /// cannot take it, as when it executes or waits for the user, so it flushes once the Loop's
+    /// run ends instead of bypassing the user's answer.
     async fn deliver(&self, chat_id: ChatId, loop_id: LoopId) {
         let state = {
             let chats = self.inner.chats.lock().await;
@@ -982,16 +1072,15 @@ impl Agent {
             let mut deliveries = self.tick_deliveries();
             match state {
                 LoopState::WaitingTrigger | LoopState::Completed => deliveries.take_delivery(owner),
-                LoopState::Running | LoopState::Queued => {
-                    if let Some(pending) = deliveries.pending.get_mut(&owner) {
-                        pending.due = true;
-                    }
+                _ => {
+                    deliveries.hold(owner, Instant::now());
                     None
                 }
-                _ => None,
             }
         };
         let Some(items) = delivery else {
+            // A held delivery may have set a retry earlier than the delivery task's timer.
+            self.inner.tick_wake.notify_one();
             return;
         };
         let mut authorized_items = Vec::new();
@@ -1111,6 +1200,7 @@ impl Agent {
         .await;
         if !matches!(written, Ok(Ok(()))) {
             self.tick_deliveries().restore(owner, items);
+            self.inner.tick_wake.notify_one();
             return;
         }
         {
@@ -1140,7 +1230,10 @@ impl Agent {
                     }
                 }
             }
-            Err(_) => deliveries.restore(owner, items),
+            Err(_) => {
+                deliveries.restore(owner, items);
+                self.inner.tick_wake.notify_one();
+            }
         }
     }
 
@@ -1273,7 +1366,7 @@ impl Agent {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Owns the stream events and every subscription's cadence.
+    /// Owns the stream events and every subscription's delivery schedule.
     fn tick_delivery_task(
         &self,
         mut events: tokio::sync::mpsc::Receiver<TickStreamEvent>,

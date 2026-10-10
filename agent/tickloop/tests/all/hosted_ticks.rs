@@ -295,6 +295,15 @@ mod channel {
     /// wait for a Watch to become ready, during which a run emits nothing.
     const HOSTED_EVENT_WAIT: Duration = Duration::from_secs(30);
 
+    /// How long a hosted test waits for a `high` subscription to deliver: the first delivery
+    /// comes one period after subscribing.
+    fn high_delivery_wait() -> Duration {
+        tickloop_agent_protocol::TickSubscriptionFrequency::High
+            .period()
+            .unwrap()
+            + Duration::from_secs(15)
+    }
+
     /// Workers in this process, each holding the grant the daemon would hand a real worker and,
     /// as a real worker with a config root does, telling the daemon when StopSubagent stops a child.
     struct GrantedWorkers {
@@ -1406,7 +1415,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_agent_test_support::call(
             "subscribe",
             "SubscribeTick",
-            json!({"tick_instance_id":instance,"every_seconds":5}),
+            json!({"tick_instance_id":instance}),
         ));
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
@@ -1457,7 +1466,7 @@ for line in sys.stdin:
         )
         .await;
         loop {
-            let event = tokio::time::timeout(Duration::from_secs(15), events.recv())
+            let event = tokio::time::timeout(high_delivery_wait(), events.recv())
                 .await
                 .expect("the update wakes the Loop")
                 .unwrap();
@@ -1602,7 +1611,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_agent_test_support::call(
             "subscribe",
             "SubscribeTick",
-            json!({"tick_instance_id":instance,"every_seconds":5}),
+            json!({"tick_instance_id":instance}),
         ));
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let results = run_turn(&runtime, chat, "Watch the counter").await;
@@ -1622,7 +1631,7 @@ for line in sys.stdin:
         )
         .await;
         loop {
-            let event = tokio::time::timeout(Duration::from_secs(15), events.recv())
+            let event = tokio::time::timeout(high_delivery_wait(), events.recv())
                 .await
                 .expect("the hosted update wakes the Loop")
                 .unwrap();
@@ -1885,7 +1894,7 @@ for line in sys.stdin:
             model.enqueue(tickloop_agent_test_support::call(
                 name,
                 "SubscribeTick",
-                json!({"tick_instance_id":instance,"every_seconds":5}),
+                json!({"tick_instance_id":instance}),
             ));
             model.enqueue(tickloop_agent_test_support::text("watching"));
         };
@@ -1935,7 +1944,7 @@ for line in sys.stdin:
         )
         .await;
         loop {
-            let event = tokio::time::timeout(Duration::from_secs(15), events.recv())
+            let event = tokio::time::timeout(high_delivery_wait(), events.recv())
                 .await
                 .expect("the remaining Watch is delivered")
                 .unwrap();
@@ -2039,7 +2048,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_agent_test_support::call(
             "subscribe",
             "SubscribeTick",
-            json!({"tick_instance_id":instance,"every_seconds":5}),
+            json!({"tick_instance_id":instance}),
         ));
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let results = run_turn(&runtime, chat, "Watch it").await;
@@ -2077,7 +2086,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_agent_test_support::call(
             "again",
             "SubscribeTick",
-            json!({"tick_instance_id":instance,"every_seconds":5}),
+            json!({"tick_instance_id":instance}),
         ));
         model.enqueue(tickloop_agent_test_support::text("watching again"));
         let results = run_turn(&runtime, chat, "Watch it again").await;
@@ -2554,7 +2563,7 @@ for line in sys.stdin:
         model.enqueue(tickloop_agent_test_support::call(
             "subscribe",
             "SubscribeTick",
-            json!({"tick_instance_id":lost,"every_seconds":5}),
+            json!({"tick_instance_id":lost}),
         ));
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
