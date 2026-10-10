@@ -11,8 +11,8 @@ use std::{
 
 use crossterm::style::Stylize;
 
-use crate::terminal::attach::{ATTACH_ENVIRONMENT, AttachEnd, run_view};
-use tickloop_agent_protocol::HostedViewGrant;
+use crate::terminal::attach::{AttachEnd, run_view};
+use tickloop_agent_protocol::{ATTACH_ENVIRONMENT, HostedViewGrant};
 
 const MONITOR_USAGE: &str = "Usage: tickloop monitor attach
        tickloop monitor popup install --herdr-socket SOCKET

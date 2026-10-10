@@ -1,9 +1,9 @@
-//! The Tickhost backend of the native Tick tools: the hidden Ticks a Chat opened, protocol Ticks
-//! and terminal Ticks. Opening, reopening and closing go through the daemon, which alone controls
-//! the Tickhost; reading, calling a protocol Tick and typing into a terminal Tick use the
-//! instance's data binding directly. Each call is prepared once — target, catalog revision,
-//! executable, working directory, input and operation id frozen — and the same preparation is
-//! approved and dispatched.
+//! The native Tick tools: the Ticks a Chat opened in the Tickhost, protocol Ticks and terminal
+//! Ticks, and, for a worker in a Herdr View, the Herdr Panes that show them. Opening, reopening
+//! and closing go through the daemon, which alone controls the Tickhost; reading, calling a
+//! protocol Tick and typing into a terminal Tick use the instance's data binding directly. Each
+//! call is prepared once — target, catalog revision, executable, working directory, placement,
+//! input and operation id frozen — and the same preparation is approved and dispatched.
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -13,10 +13,13 @@ use std::{
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tick_protocol::{InstanceRef, TickDescriptor};
-use tickhost::host::{Receipt, TerminalDescription, TerminalRead, TickAdapter};
+use tickhost::host::{Receipt, TerminalDescription, TerminalRead, TickAdapter, TickRow};
 use tickhost_connect::{
+    herdr::Pane,
     host_error::HostError,
     hosted::{CALL_RESPONSE_TIMEOUT, CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role},
+    layout::{LayoutContext, Placement},
+    page::{MAX_PAGE_SIZE, PageCursor},
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -24,13 +27,15 @@ use uuid::Uuid;
 
 use super::{
     registry::{FileIdentity, TARGET_GONE},
+    views::{HerdrViews, WorkspaceListing, interaction_pane, not_created},
     worker_control::{DaemonControl, HostedAdmission, HostedTickPage, WorkerRequest},
 };
 use crate::{
     host_tools::{
         HostCallResult, HostEffect, HostToolPermission, HostToolProvider, PreparedHostCall,
+        WorkspaceHostContext,
     },
-    tick_tool_router::{CALL_TICK_TOOL, MODIFY_TICK, READ_TICK, TickBackends},
+    tick_tools::{CALL_TICK_TOOL, HIDDEN_PLACEMENT, MODIFY_TICK, READ_TICK, READ_WORKSPACE},
 };
 use tickloop_agent_protocol::{
     ChatId, HostCallContext, HostEndpointIdentity, HostToolAuthority, HostedMember,
@@ -38,7 +43,7 @@ use tickloop_agent_protocol::{
     HostedViewGrant, ToolDefinition, ToolResult,
 };
 
-/// How results name the Tickhost that runs a hidden Tick.
+/// How results name the Tickhost that runs a Tick.
 const HOSTED_HOST: &str = "tickhost";
 
 #[derive(Clone)]
@@ -80,6 +85,13 @@ fn hosted_screen_snapshot(screen: tickhost::screen::ScreenSnapshot) -> HostedScr
     }
 }
 
+/// A Herdr view placement frozen before approval, with the Herdr it was frozen in.
+struct PreparedView {
+    workspace: String,
+    placement: Placement,
+    socket: Option<(u64, u64)>,
+}
+
 enum Operation {
     Open {
         operation: Uuid,
@@ -89,6 +101,19 @@ enum Operation {
         executable: FileIdentity,
         directory: FileIdentity,
         title: String,
+        /// Where a Herdr Pane shows the Tick once it runs.
+        view: Option<PreparedView>,
+    },
+    /// Moves the Pane `current` that shows `instance`, or shows it in a new Pane when it has
+    /// none.
+    Move {
+        instance: InstanceRef,
+        current: Option<Pane>,
+        view: PreparedView,
+    },
+    ReadWorkspace {
+        listing: WorkspaceListing,
+        socket: Option<(u64, u64)>,
     },
     Close {
         operation: Uuid,
@@ -128,6 +153,8 @@ pub struct HostedTickTools {
     /// Data bindings of the Ticks each Chat owns; another Chat of this worker never shares one.
     /// A binding goes when its Tick is closed, replaced, or missing from a complete listing.
     bindings: Mutex<HashMap<(ChatId, InstanceRef), DataBinding>>,
+    /// The Herdr Panes that show Ticks, for a worker in a Herdr View.
+    views: Option<HerdrViews>,
 }
 
 impl HostedTickTools {
@@ -139,7 +166,76 @@ impl HostedTickTools {
             daemon,
             environment,
             bindings: Mutex::new(HashMap::new()),
+            views: None,
         }
+    }
+
+    /// The same tools, which also show Ticks in Herdr Panes and list a Workspace's Panes.
+    pub fn with_herdr_views(mut self, views: HerdrViews) -> Self {
+        self.views = Some(views);
+        self
+    }
+
+    fn views(&self) -> Result<&HerdrViews, String> {
+        self.views
+            .as_ref()
+            .ok_or_else(|| "UnsupportedCapability: this Agent does not run in Herdr".into())
+    }
+
+    /// Where a Herdr operation of `context` starts. A View Pane of another Herdr than this
+    /// worker's is no anchor here.
+    fn layout_context(
+        views: &HerdrViews,
+        context: Option<&HostCallContext>,
+    ) -> Result<LayoutContext, String> {
+        let Some(context) = context else {
+            return Ok(LayoutContext::default());
+        };
+        let interaction = match &context.interaction {
+            Some(source) if source.socket == views.layout().context().socket => {
+                Some(interaction_pane(source.pane.clone()))
+            }
+            Some(_) => {
+                return Err("interaction View belongs to a different Herdr instance".into());
+            }
+            None => None,
+        };
+        Ok(LayoutContext {
+            workspace_id: context.workspace_id.clone(),
+            interaction,
+        })
+    }
+
+    /// The Herdr placement of an open or move, frozen in its Workspace: `current` is the Pane a
+    /// move would move.
+    async fn prepare_view(
+        &self,
+        input: &Value,
+        context: Option<&HostCallContext>,
+        is_open: bool,
+        current: Option<&Pane>,
+    ) -> Result<PreparedView, String> {
+        let views = self.views()?;
+        let layout_context = Self::layout_context(views, context)?;
+        let relative_to_view = input["placement"]["type"] == "current_tab"
+            || (!is_open && input.get("placement").is_none());
+        let workspace = views
+            .layout()
+            .workspace(input, &layout_context, relative_to_view)
+            .await
+            .map_err(|error| error.to_string())?
+            .or_else(|| current.map(|pane| pane.workspace_id.clone()))
+            .ok_or("ScopeRequired: specify workspace_id; no default Workspace is configured")?;
+        let placement = views
+            .layout()
+            .prepare_placement(input, &workspace, is_open, current, &layout_context)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(PreparedView {
+            workspace,
+            placement,
+            socket: views.layout().socket_identity(),
+        })
     }
 
     async fn prepare(
@@ -147,12 +243,47 @@ impl HostedTickTools {
         chat: ChatId,
         name: &str,
         input: &Value,
-        workdir: Option<&Path>,
+        context: Option<&HostCallContext>,
     ) -> Result<PreparedHostCall, String> {
-        TickBackends::HOSTED.route(name, input)?;
+        crate::tick_tools::check_call(name, input, self.views.is_some())?;
+        let workdir = context.map(|context| context.workdir.as_path());
         let mut external_declaration = None;
         let mut normalized_input = input.clone();
         let (operation, permission, summary) = match (name, input["action"].as_str()) {
+            (READ_WORKSPACE, _) => {
+                let views = self.views()?;
+                let layout_context = Self::layout_context(views, context)?;
+                let (cursor, limit) = page_request(input)?;
+                let workspace = views
+                    .layout()
+                    .workspace(input, &layout_context, false)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if let Some(workspace) = &workspace {
+                    normalized_input["workspace_id"] = json!(workspace);
+                }
+                let summary = format!(
+                    "List the Herdr Panes of {} and the views of this Chat's Ticks",
+                    workspace
+                        .as_deref()
+                        .map_or("every Workspace".to_owned(), |workspace| format!(
+                            "Workspace {workspace}"
+                        ))
+                );
+                (
+                    Operation::ReadWorkspace {
+                        listing: WorkspaceListing {
+                            workspace,
+                            interaction: layout_context.interaction,
+                            cursor,
+                            limit,
+                        },
+                        socket: views.layout().socket_identity(),
+                    },
+                    HostToolPermission::ReadOnly,
+                    summary,
+                )
+            }
             (MODIFY_TICK, Some("open")) => {
                 let words = input["command"]
                     .as_array()
@@ -172,7 +303,7 @@ impl HostedTickTools {
                 }
                 .canonicalize()
                 .map_err(|error| format!("cannot resolve cwd: {error}"))?;
-                let executable = tickhost_connect::access::resolve_executable(&words[0], &cwd)
+                let executable = tickhost_connect::program::resolve_executable(&words[0], &cwd)
                     .map_err(|error| error.to_string())?;
                 let protocol = match input.get("protocol") {
                     None => false,
@@ -180,7 +311,7 @@ impl HostedTickTools {
                 };
                 if is_same_file(
                     &executable,
-                    tickhost_connect::access::bundled_tickhost_executable(),
+                    tickhost_connect::program::bundled_tickhost_executable(),
                 ) {
                     return Err(
                         "the Tickhost launches protocol programs itself; open the program directly with protocol: true"
@@ -191,7 +322,7 @@ impl HostedTickTools {
                 let adapter = if protocol
                     || is_same_file(
                         &executable,
-                        tickhost_connect::access::bundled_tick_executable(),
+                        tickhost_connect::program::bundled_tick_executable(),
                     ) {
                     TickAdapter::Protocol
                 } else {
@@ -202,6 +333,22 @@ impl HostedTickTools {
                 let command_line = words.join(" ");
                 let command_title = tickhost_connect::naming::command_title(&words);
                 normalized_input["protocol"] = json!(adapter == TickAdapter::Protocol);
+                let view = match input["placement"]["type"].as_str() {
+                    None | Some(HIDDEN_PLACEMENT) => None,
+                    Some(_) => Some(self.prepare_view(input, context, true, None).await?),
+                };
+                let shown = match &view {
+                    Some(view) => {
+                        normalized_input["workspace_id"] = json!(view.workspace);
+                        normalized_input["resolved_placement"] = view.placement.summary();
+                        format!(
+                            " and show it in a Herdr Pane of Workspace {} at {}",
+                            view.workspace,
+                            view.placement.summary()
+                        )
+                    }
+                    None => String::new(),
+                };
                 (
                     Operation::Open {
                         operation: Uuid::new_v4(),
@@ -211,16 +358,64 @@ impl HostedTickTools {
                         command,
                         cwd: cwd.clone(),
                         title: tickhost::host::display_title(&command_title),
+                        view,
                     },
                     HostToolPermission::Reviewable,
                     format!(
-                        "Open `{command_line}` hidden in the Tickhost as a {} (cwd {})",
+                        "Open `{command_line}` in the Tickhost as a {} (cwd {}){shown}",
                         match adapter {
                             TickAdapter::Protocol => "protocol Tick",
                             TickAdapter::Terminal => "terminal Tick",
                         },
                         cwd.display()
                     ),
+                )
+            }
+            (MODIFY_TICK, Some("move")) => {
+                let instance = hosted_target(input)?;
+                // Only a running Tick of this Chat has views to move or show.
+                self.adapter(chat, &instance)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let current = self
+                    .views()?
+                    .pane(chat, &instance)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let view = self
+                    .prepare_view(input, context, false, current.as_ref())
+                    .await?;
+                if let Some(pane) = current
+                    .as_ref()
+                    .filter(|pane| pane.workspace_id != view.workspace)
+                {
+                    return Err(format!(
+                        "UnsupportedCapability: the Herdr Pane showing {instance} is in Workspace {}; moving a view across Workspaces is not supported",
+                        pane.workspace_id
+                    ));
+                }
+                normalized_input["workspace_id"] = json!(view.workspace);
+                normalized_input["resolved_placement"] = view.placement.summary();
+                let summary = match &current {
+                    Some(pane) => format!(
+                        "Move Herdr Pane {} showing hosted Tick {instance} to {}",
+                        pane.pane_id,
+                        view.placement.summary()
+                    ),
+                    None => format!(
+                        "Show hosted Tick {instance} in a new Herdr Pane of Workspace {} at {}",
+                        view.workspace,
+                        view.placement.summary()
+                    ),
+                };
+                (
+                    Operation::Move {
+                        instance,
+                        current,
+                        view,
+                    },
+                    HostToolPermission::Reviewable,
+                    summary,
                 )
             }
             (MODIFY_TICK, Some("close")) => {
@@ -303,8 +498,7 @@ impl HostedTickTools {
             }
             (MODIFY_TICK, _) => {
                 return Err(
-                    "UnsupportedCapability: hosted Ticks support open, send_input, close and reopen"
-                        .into(),
+                    "ModifyTick action must be open, move, send_input, close or reopen".into(),
                 );
             }
             (READ_TICK, _) => {
@@ -364,7 +558,7 @@ impl HostedTickTools {
             _ => return Err(format!("unknown hosted Tick tool: {name}")),
         };
         let mut facts = tickloop_agent_protocol::PreparedApprovalFacts {
-            normalized_input,
+            normalized_input: normalized_input.clone(),
             ..Default::default()
         };
         match &operation {
@@ -372,7 +566,7 @@ impl HostedTickTools {
                 facts.tick_instance = Some(instance.clone());
                 facts.closes_tick = true;
             }
-            Operation::Input { instance, .. } => {
+            Operation::Input { instance, .. } | Operation::Move { instance, .. } => {
                 facts.tick_instance = Some(instance.clone());
             }
             Operation::Call { instance, .. } => {
@@ -381,10 +575,12 @@ impl HostedTickTools {
             }
             _ => {}
         }
+        // Policy and delegation checks see the call as prepared: its Workspace and placement
+        // resolved.
         Ok(PreparedHostCall::new(
             name.to_owned(),
             input.clone(),
-            input.clone(),
+            normalized_input,
             permission,
             summary,
         )
@@ -393,13 +589,14 @@ impl HostedTickTools {
     }
 
     /// Checks before dispatch that nothing the approval relied on changed.
-    fn revalidate(prepared: &HostedPrepared) -> Result<(), String> {
+    async fn revalidate(&self, chat: ChatId, prepared: &HostedPrepared) -> Result<(), String> {
         match &prepared.operation {
             Operation::Open {
                 command,
                 executable,
                 cwd,
                 directory,
+                view,
                 ..
             } => {
                 if FileIdentity::executable(Path::new(&command[0]))? != *executable
@@ -410,8 +607,39 @@ impl HostedTickTools {
                             .into(),
                     );
                 }
-                Ok(())
+                match view {
+                    Some(view) => self.revalidate_view(view).await,
+                    None => Ok(()),
+                }
             }
+            Operation::Move {
+                instance,
+                current,
+                view,
+            } => {
+                self.revalidate_view(view).await?;
+                let now = self
+                    .views()?
+                    .pane(chat, instance)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let unchanged = match (current, &now) {
+                    (None, None) => true,
+                    (Some(approved), Some(now)) => {
+                        approved.pane_id == now.pane_id
+                            && approved.terminal_id == now.terminal_id
+                            && approved.tab_id == now.tab_id
+                            && approved.workspace_id == now.workspace_id
+                    }
+                    _ => false,
+                };
+                if unchanged {
+                    Ok(())
+                } else {
+                    Err("TargetChanged: the Pane showing the Tick changed after approval; prepare and approve again".into())
+                }
+            }
+            Operation::ReadWorkspace { socket, .. } => self.revalidate_socket(*socket),
             // A call's catalog is checked by the Tick itself against the prepared revision.
             Operation::Close { .. }
             | Operation::Reopen { .. }
@@ -421,17 +649,87 @@ impl HostedTickTools {
         }
     }
 
-    async fn execute_operation(&self, chat: ChatId, prepared: HostedPrepared) -> HostCallResult {
-        if let Err(error) = Self::revalidate(&prepared) {
+    async fn revalidate_view(&self, view: &PreparedView) -> Result<(), String> {
+        self.revalidate_socket(view.socket)?;
+        self.views()?
+            .layout()
+            .revalidate_placement(&view.placement)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Fails once another Herdr serves the socket a call was prepared against.
+    fn revalidate_socket(&self, prepared: Option<(u64, u64)>) -> Result<(), String> {
+        if prepared.is_some() && self.views()?.layout().socket_identity() != prepared {
+            return Err("TargetChanged: the Herdr endpoint changed after preparation".into());
+        }
+        Ok(())
+    }
+
+    async fn execute_operation(
+        &self,
+        chat: ChatId,
+        prepared: HostedPrepared,
+        cancel: CancellationToken,
+    ) -> HostCallResult {
+        if let Err(error) = self.revalidate(chat, &prepared).await {
             return HostCallResult::NotDispatched(error);
         }
         match prepared.operation {
+            Operation::ReadWorkspace { listing, .. } => {
+                let shown = async {
+                    let rows = self.running(chat).await?;
+                    self.views()
+                        .map_err(|error| HostError::before("UnsupportedCapability", error))?
+                        .read_workspace(chat, listing, rows)
+                        .await
+                };
+                match shown.await {
+                    Ok(listed) => completed(listed),
+                    Err(error) => HostCallResult::NotDispatched(error.to_string()),
+                }
+            }
+            Operation::Move {
+                instance,
+                current,
+                view,
+            } => {
+                let views = match self.views() {
+                    Ok(views) => views,
+                    Err(error) => return HostCallResult::NotDispatched(error),
+                };
+                let Some(pane) = &current else {
+                    // Without a view the move shows the Tick, and that is all it does.
+                    let shown = self
+                        .show(chat, &instance, &view.workspace, &view.placement, cancel)
+                        .await;
+                    let result = json!({"status":"completed","host":HOSTED_HOST,"tick_instance_id":instance,"view":shown});
+                    return match shown["status"].as_str() {
+                        Some("shown") => completed(result),
+                        Some("failed") => HostCallResult::NotDispatched(result.to_string()),
+                        _ => HostCallResult::OutcomeUnknown(result.to_string()),
+                    };
+                };
+                match views
+                    .move_view(chat, &instance, pane, &view.placement, cancel)
+                    .await
+                {
+                    Ok(moved) => completed(
+                        json!({"status":"completed","host":HOSTED_HOST,"tick_instance_id":instance,"view":moved}),
+                    ),
+                    Err(error) if error.dispatched => {
+                        HostCallResult::OutcomeUnknown(error.to_string())
+                    }
+                    Err(error) => HostCallResult::NotDispatched(error.to_string()),
+                }
+            }
             Operation::Open {
                 operation,
                 adapter,
                 command,
                 cwd,
                 title,
+                view,
                 ..
             } => {
                 let request = WorkerRequest::OpenHostedTick {
@@ -444,10 +742,30 @@ impl HostedTickTools {
                     title: Some(title.clone()),
                     admission: self.admission(),
                 };
-                match self.lifecycle(chat, operation, request).await {
-                    Ok(opened) => self.opened(chat, opened, Some(title), None).await,
-                    Err(unresolved) => unresolved,
+                let opened = match self.lifecycle(chat, operation, request).await {
+                    Ok(opened) => opened,
+                    Err(unresolved) => return unresolved,
+                };
+                let mut opened = match self.opened(chat, opened, Some(title), None).await {
+                    Ok(opened) => opened,
+                    Err(unresolved) => return unresolved,
+                };
+                if let Some(view) = view {
+                    let shown = self
+                        .show(
+                            chat,
+                            &opened.instance,
+                            &view.workspace,
+                            &view.placement,
+                            cancel,
+                        )
+                        .await;
+                    if shown["status"] == "shown" {
+                        opened.result["visibility"] = json!("visible");
+                    }
+                    opened.result["view"] = shown;
                 }
+                opened.complete()
             }
             Operation::Reopen {
                 operation,
@@ -462,7 +780,10 @@ impl HostedTickTools {
                     admission: self.admission(),
                 };
                 match self.lifecycle(chat, operation, request).await {
-                    Ok(opened) => self.opened(chat, opened, title, Some(&lost)).await,
+                    Ok(opened) => match self.opened(chat, opened, title, Some(&lost)).await {
+                        Ok(opened) => opened.complete(),
+                        Err(unresolved) => unresolved,
+                    },
                     Err(unresolved) => unresolved,
                 }
             }
@@ -479,9 +800,13 @@ impl HostedTickTools {
                 match self.lifecycle(chat, operation, request).await {
                     Ok(_) => {
                         self.bindings.lock().await.remove(&(chat, instance.clone()));
-                        completed(
-                            json!({"status":"closed","host":HOSTED_HOST,"tick_instance_id":instance}),
-                        )
+                        let mut closed = json!({"status":"closed","host":HOSTED_HOST,"tick_instance_id":instance});
+                        if let Some(views) = &self.views
+                            && let Some(view) = views.close(chat, &instance).await
+                        {
+                            closed["view"] = view;
+                        }
+                        completed(closed)
                     }
                     Err(unresolved) => unresolved,
                 }
@@ -600,13 +925,13 @@ impl HostedTickTools {
         opened: Value,
         title: Option<String>,
         replaces: Option<&InstanceRef>,
-    ) -> HostCallResult {
+    ) -> Result<OpenedTick, HostCallResult> {
         let instance: InstanceRef = match serde_json::from_value(opened["instance"].clone()) {
             Ok(instance) => instance,
             Err(error) => {
-                return HostCallResult::OutcomeUnknown(format!(
+                return Err(HostCallResult::OutcomeUnknown(format!(
                     "the daemon reported an opened Tick without a valid instance ({error})"
-                ));
+                )));
             }
         };
         let binding = match (
@@ -648,14 +973,35 @@ impl HostedTickTools {
         if let Some(lost) = replaces {
             result["replaces"] = json!(lost);
         }
-        HostCallResult::CompletedWithEffect(
-            ToolResult {
-                content: result.to_string(),
-                is_error: false,
-                output_ref: None,
-            },
-            Box::new(HostEffect::OpenedTick { instance, title }),
-        )
+        Ok(OpenedTick {
+            instance,
+            title,
+            result,
+        })
+    }
+
+    /// Shows `chat`'s running `instance` in a new Herdr Pane at `placement`, with a view grant
+    /// the daemon makes for that Pane alone.
+    async fn show(
+        &self,
+        chat: ChatId,
+        instance: &InstanceRef,
+        workspace: &str,
+        placement: &Placement,
+        cancel: CancellationToken,
+    ) -> Value {
+        let views = match self.views() {
+            Ok(views) => views,
+            Err(error) => return not_created(&HostError::before("UnsupportedCapability", error)),
+        };
+        match self.allow_view(chat, instance).await {
+            Ok(grant) => {
+                views
+                    .show(chat, instance, &grant, workspace, placement, cancel)
+                    .await
+            }
+            Err(error) => not_created(&error),
+        }
     }
 
     async fn describe(
@@ -846,6 +1192,20 @@ impl HostedTickTools {
                     self.forget_unlisted(chat, &listed).await;
                     return Ok(members);
                 }
+            }
+        }
+    }
+
+    /// Every Tick the host runs for `chat`, from one complete listing.
+    async fn running(&self, chat: ChatId) -> Result<Vec<TickRow>, HostError> {
+        let mut rows = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.list_page(chat, cursor).await?;
+            rows.extend(page.page.items);
+            match page.page.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(rows),
             }
         }
     }
@@ -1077,6 +1437,53 @@ async fn described_title(
     ))
 }
 
+/// A just opened Tick: its instance, the name it joins the Monitor under and what the call reports.
+struct OpenedTick {
+    instance: InstanceRef,
+    title: Option<String>,
+    result: Value,
+}
+
+impl OpenedTick {
+    fn complete(self) -> HostCallResult {
+        HostCallResult::CompletedWithEffect(
+            ToolResult {
+                content: self.result.to_string(),
+                is_error: false,
+                output_ref: None,
+            },
+            Box::new(HostEffect::OpenedTick {
+                instance: self.instance,
+                title: self.title,
+            }),
+        )
+    }
+}
+
+/// A ReadWorkspace page request; an absent limit uses the default page size.
+fn page_request(input: &Value) -> Result<(Option<PageCursor>, Option<usize>), String> {
+    let cursor = input
+        .get("cursor")
+        .map(|cursor| serde_json::from_value(cursor.clone()))
+        .transpose()
+        .map_err(|_| {
+            "InvalidArguments: cursor must be the next_cursor object returned by the previous page"
+        })?;
+    let limit = match input.get("limit") {
+        None => None,
+        Some(limit) => Some(
+            limit
+                .as_u64()
+                .and_then(|limit| usize::try_from(limit).ok())
+                .filter(|limit| (1..=MAX_PAGE_SIZE).contains(limit))
+                .ok_or_else(|| {
+                    format!("InvalidArguments: limit must be between 1 and {MAX_PAGE_SIZE}")
+                })?,
+        ),
+    };
+    Ok((cursor, limit))
+}
+
 /// Whether `program` is the `bundled` executable, however either path names it.
 fn is_same_file(program: &Path, bundled: Option<PathBuf>) -> bool {
     bundled
@@ -1113,15 +1520,55 @@ fn completed(value: Value) -> HostCallResult {
 #[async_trait]
 impl HostToolProvider for HostedTickTools {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        TickBackends::HOSTED.definitions()
+        crate::tick_tools::definitions(self.views.is_some())
     }
 
     fn host_endpoint(&self) -> Result<Option<HostEndpointIdentity>, String> {
         Ok(Some(self.endpoint.clone()))
     }
 
+    /// Ticks run under this worker's Tickhost; ReadWorkspace, and the views ModifyTick places or
+    /// moves, under its Herdr.
+    fn tool_authorities(&self, name: &str) -> Result<BTreeSet<HostToolAuthority>, String> {
+        let mut authorities = BTreeSet::new();
+        if name != READ_WORKSPACE {
+            authorities.insert(self.authority());
+        }
+        if let Some(views) = &self.views
+            && matches!(name, READ_WORKSPACE | MODIFY_TICK)
+            && let Some(endpoint) = views.endpoint()?
+        {
+            authorities.insert(HostToolAuthority::Native { endpoint });
+        }
+        Ok(authorities)
+    }
+
+    fn call_authority(
+        &self,
+        name: &str,
+        input: &Value,
+    ) -> Result<Option<HostToolAuthority>, String> {
+        crate::tick_tools::check_call(name, input, self.views.is_some())?;
+        if crate::tick_tools::uses_herdr_layout(name, input) {
+            return Ok(self
+                .views()?
+                .endpoint()?
+                .map(|endpoint| HostToolAuthority::Native { endpoint }));
+        }
+        Ok(Some(self.authority()))
+    }
+
+    fn workspace_host_context(&self) -> Option<WorkspaceHostContext> {
+        let context = WorkspaceHostContext::from_environment().with_tickhost();
+        Some(if self.views.is_some() {
+            context.with_herdr_views()
+        } else {
+            context
+        })
+    }
+
     fn permission(&self, _: ChatId, name: &str, _: &Value) -> HostToolPermission {
-        if name == READ_TICK {
+        if matches!(name, READ_TICK | READ_WORKSPACE) {
             HostToolPermission::ReadOnly
         } else {
             HostToolPermission::Reviewable
@@ -1152,13 +1599,12 @@ impl HostToolProvider for HostedTickTools {
         if cancel.is_cancelled() {
             return Err("hosted Tick operation was cancelled before preparation".into());
         }
-        self.prepare(chat, name, input, Some(&context.workdir))
-            .await
+        self.prepare(chat, name, input, Some(context)).await
     }
 
     async fn revalidate_call(
         &self,
-        _: ChatId,
+        chat: ChatId,
         call: &PreparedHostCall,
         cancel: CancellationToken,
     ) -> Result<(), String> {
@@ -1168,7 +1614,7 @@ impl HostToolProvider for HostedTickTools {
         let prepared = call
             .payload::<HostedPrepared>()
             .ok_or("hosted Tick operation has no prepared binding")?;
-        Self::revalidate(prepared)
+        self.revalidate(chat, prepared).await
     }
 
     async fn execute_prepared(
@@ -1183,7 +1629,7 @@ impl HostToolProvider for HostedTickTools {
             );
         }
         match call.into_payload::<HostedPrepared>() {
-            Ok(prepared) => self.execute_operation(chat, prepared).await,
+            Ok(prepared) => self.execute_operation(chat, prepared, cancel).await,
             Err(_) => HostCallResult::NotDispatched(
                 "hosted Tick operation has no prepared binding".into(),
             ),
@@ -1369,7 +1815,7 @@ mod tests {
         let (lost, reopened) = (hosted(), hosted());
         bind(&tools, chat, &lost).await;
         let opened = json!({"instance":reopened,"adapter":"protocol","terminal":{"endpoint":"/nonexistent/host.sock"},"data_token":"token"});
-        tools.opened(chat, opened, None, Some(&lost)).await;
+        assert!(tools.opened(chat, opened, None, Some(&lost)).await.is_ok());
         assert_eq!(
             bound(&tools).await,
             HashSet::from([(chat, running), (chat, reopened), (other, elsewhere)])

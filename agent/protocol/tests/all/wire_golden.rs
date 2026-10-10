@@ -83,12 +83,12 @@ fn execution() -> ExecutionRef {
     }
 }
 
-fn herdr_instance() -> InstanceRef {
-    InstanceRef::native("session/workspace/pane/counter").unwrap()
-}
-
 fn hosted_instance() -> InstanceRef {
     InstanceRef::hosted(id(0x40))
+}
+
+fn terminal_instance() -> InstanceRef {
+    InstanceRef::hosted(id(0x41))
 }
 
 fn model_config() -> ModelConfig {
@@ -225,7 +225,7 @@ fn messages() -> Vec<Message> {
                 Content::ToolUse {
                     id: "call-1".into(),
                     name: "ReadTick".into(),
-                    input: json!({"instance": "herdr:counter"}),
+                    input: json!({"instance": "hosted:00000000-0000-0000-0000-000000000041"}),
                 },
                 Content::ProtocolData {
                     protocol: Protocol::Responses,
@@ -304,18 +304,19 @@ fn chat_snapshot() -> ChatSnapshot {
                             "workspace_id": "w1",
                             "tab_id": "t1",
                             "cwd": "/work/project",
-                            "tokens": {"agent": "tickloop"},
                         },
                     },
                 },
                 "host_tools": {
-                    "ReadTick": [
+                    "ReadWorkspace": [
                         {"kind": "native", "endpoint": {"kind": "herdr_socket", "path": "/run/herdr.sock", "owner": 501, "device": 16_777_220, "inode": 42}},
+                    ],
+                    "ReadTick": [
                         {"kind": "native", "endpoint": {"kind": "tickhost", "endpoint": "/run/tickhost.sock", "uid": 501}},
                     ],
                     "CallTickTool": [{"kind": "mcp", "server_id": "calendar", "account_id": "me"}],
                 },
-                "tick_instances": [herdr_instance(), hosted_instance()],
+                "tick_instances": [terminal_instance(), hosted_instance()],
             },
         },
         "family_completions": [{
@@ -358,12 +359,12 @@ fn chat_snapshot() -> ChatSnapshot {
     .unwrap();
     snapshot.monitor = MonitorMembership {
         members: vec![MonitorMember {
-            instance: herdr_instance(),
+            instance: terminal_instance(),
             title: Some("Counter".into()),
         }],
         removed: [hosted_instance()].into(),
-        handled: [(herdr_instance(), 7_500)].into(),
-        taken_in: [(herdr_instance(), 7_500)].into(),
+        handled: [(terminal_instance(), 7_500)].into(),
+        taken_in: [(terminal_instance(), 7_500)].into(),
     };
     snapshot.model = model_config();
     snapshot.policy = permission_policy();
@@ -455,7 +456,7 @@ fn monitor_membership() -> MonitorMembership {
             instance: hosted_instance(),
             title: Some("Quotes".into()),
         }],
-        removed: [herdr_instance()].into(),
+        removed: [terminal_instance()].into(),
         handled: [(hosted_instance(), 8_500)].into(),
         taken_in: [(hosted_instance(), 8_500)].into(),
     }
@@ -552,7 +553,7 @@ fn agent_commands_keep_their_recorded_wire() {
             },
             AgentCommand::RemoveMonitorMember {
                 execution: execution(),
-                instance: herdr_instance(),
+                instance: terminal_instance(),
             },
             AgentCommand::HostedTickSnapshot {
                 execution: execution(),
@@ -714,7 +715,7 @@ fn observation_changes_keep_their_recorded_wire() {
                     "chat_id": id(0xc1),
                     "loop_id": id(0x10),
                     "run_id": id(0x20),
-                    "kind": {"ToolStarted": {"call_id": "call-1", "name": "ReadTick", "input": {"instance": "herdr:counter"}}},
+                    "kind": {"ToolStarted": {"call_id": "call-1", "name": "ReadTick", "input": {"instance": "hosted:00000000-0000-0000-0000-000000000041"}}},
                 }))
                 .unwrap(),
             ),

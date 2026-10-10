@@ -30,8 +30,6 @@ use uuid::Uuid;
 
 /// The executable the daemon starts the Tickhost from: the one installed next to `tickloop`.
 pub const TICKHOST_EXECUTABLE: &str = "tickhost";
-/// The Tickhost command that launches a protocol program in its host.
-const LAUNCHER_COMMAND: &str = "open";
 const KEY_FILE: &str = "tickhost.key";
 pub const START_ATTEMPTS: u32 = 3;
 pub const START_WAIT: Duration = Duration::from_secs(3);
@@ -205,7 +203,7 @@ impl HostController {
     }
 
     /// Opens `request` in the host. A protocol program starts behind the host's own launcher,
-    /// `tickhost open`, which connects it through the hosted launch contract; a terminal program
+    /// `tickhost launch`, which connects it through the hosted launch contract; a terminal program
     /// starts as it is.
     pub async fn open(&self, mut request: OpenRequest) -> Result<OpenedTick, HostError> {
         let HostProgram::Executable(executable) = &self.program else {
@@ -217,7 +215,7 @@ impl HostController {
         if request.adapter == TickAdapter::Protocol {
             request.command = [
                 executable.to_string_lossy().into_owned(),
-                LAUNCHER_COMMAND.into(),
+                tickhost::cli::LAUNCH_COMMAND.into(),
                 "--".into(),
             ]
             .into_iter()

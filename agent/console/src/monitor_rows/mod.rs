@@ -7,12 +7,12 @@ mod probe;
 #[cfg(test)]
 pub(crate) use builtin::artifact_actions;
 pub use builtin::{
-    ArtifactRows, FINISHED_SHELL_DISPLAY_MS, HerdrRows, HostedRows, ShellRows, finished_shell_until,
+    ArtifactRows, FINISHED_SHELL_DISPLAY_MS, HostedRows, ShellRows, finished_shell_until,
 };
 pub(crate) use builtin::{
     HOSTED_CLOSE_KEY, HOSTED_REOPEN_KEY, feedback_binding, key_command, shell_tone, signal_name,
 };
-pub use probe::{HerdrProbe, MemberFindings, ProbeError, TickProbe};
+pub use probe::{MemberFindings, ProbeError, TickProbe};
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -104,8 +104,6 @@ pub enum SubscriptionOperation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TickOwner {
     ThisChat,
-    /// A program the user started in Herdr; Herdr owns its Pane and process.
-    Herdr,
     Service(&'static str),
     Unknown,
 }
@@ -113,7 +111,6 @@ impl TickOwner {
     pub fn label(&self) -> &'static str {
         match self {
             Self::ThisChat => "this Chat",
-            Self::Herdr => "Herdr",
             Self::Service(name) => name,
             Self::Unknown => "unknown",
         }
@@ -227,8 +224,6 @@ pub struct MonitorContext {
     /// What the latest host probe found for members no subscription reports on.
     pub member_states: HashMap<InstanceRef, MemberState>,
     pub member_resources: HashMap<InstanceRef, TickResources>,
-    /// What the latest host probe calls members named by what they run.
-    pub member_titles: HashMap<InstanceRef, String>,
     /// When protocol members last sent a Tick Update, as their hosts saw it.
     pub member_updates: HashMap<InstanceRef, u64>,
     /// Since when each instance has shown as gone; it leaves Monitor [`GONE_DISPLAY_MS`] later.
@@ -244,15 +239,12 @@ pub struct MonitorContext {
 /// content, subscribes or calls the model.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemberState {
-    Live {
-        protocol: bool,
-    },
+    Live,
     /// A hosted terminal Tick whose program ended, with how it ended for its status.
     Exited(String),
     /// Its host died with it; a hosted Tick can be reopened as a new instance.
     Lost,
     Gone,
-    IdentityUncertain,
 }
 
 /// The row action Enter and a click run.
@@ -526,7 +518,6 @@ impl MonitorRowsRegistry {
         Self::new([
             Arc::new(ArtifactRows) as Arc<dyn MonitorRows>,
             Arc::new(ShellRows),
-            Arc::new(HerdrRows),
             Arc::new(HostedRows),
         ])
         .expect("unique built-in Monitor rows")
@@ -581,9 +572,6 @@ impl MonitorRowsRegistry {
         }
         let mut entries = merged.into_values().collect::<Vec<_>>();
         for entry in &mut entries {
-            if let Some(title) = context.member_titles.get(&entry.instance) {
-                entry.title = title.clone();
-            }
             entry.actions.retain(|action| {
                 let reserved = MONITOR_KEYS.contains(&action.key);
                 debug_assert!(

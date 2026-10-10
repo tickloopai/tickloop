@@ -27,7 +27,7 @@ use tickhost_connect::{
         HelloReply, HostedTerminal, LaunchBinding, MANAGEMENT_FRAME_BYTES, MANAGEMENT_MAJOR,
         MANAGEMENT_MINOR, Role, SPAWN_DESCRIPTORS, TerminalDevice, same_secret,
     },
-    session::{SessionBackend, SessionClient},
+    session::SessionClient,
 };
 use tokio::{
     io::BufReader,
@@ -2539,7 +2539,7 @@ async fn launcher_request(
             };
             let client = SessionClient::connect(
                 instance.clone(),
-                SessionBackend::Hosted(host.terminal_binding(tick.terminal)),
+                host.terminal_binding(tick.terminal),
                 Some(launch.session_directory.clone()),
             )
             .await

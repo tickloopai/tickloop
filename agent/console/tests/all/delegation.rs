@@ -216,16 +216,27 @@ impl ScopedHostSocket {
         }
     }
 
+    /// The Tick tools of a worker in the Herdr View this socket serves, with a daemon that runs
+    /// no Ticks for it.
+    fn tools(&self) -> tickloop_agent_runtime::hosted::tools::HostedTickTools {
+        self.tools_behind(&self.path.with_extension("daemon.sock"))
+    }
+
+    /// The same tools behind the daemon at `daemon`.
+    fn tools_behind(
+        &self,
+        daemon: &std::path::Path,
+    ) -> tickloop_agent_runtime::hosted::tools::HostedTickTools {
+        tick_tools(daemon).with_herdr_views(tickloop_agent_runtime::hosted::views::HerdrViews::new(
+            tickhost_connect::layout::HerdrLayout::new(
+                tickhost_connect::herdr::HerdrContext::without_view(self.path.clone()),
+            ),
+            std::path::Path::new("/tmp/unused/tickloop"),
+        ))
+    }
+
     fn install(&self, agent: &Agent) {
-        agent
-            .install_host_tools(Arc::new(
-                tickloop_agent_runtime::native_host::NativeHostToolProvider::new(Arc::new(
-                    tickhost_connect::access::TickAccess::new(
-                        tickhost_connect::herdr::HerdrContext::without_view(self.path.clone()),
-                    ),
-                )),
-            ))
-            .unwrap();
+        agent.install_host_tools(Arc::new(self.tools())).unwrap();
     }
 
     async fn stop(self) {
@@ -234,38 +245,45 @@ impl ScopedHostSocket {
     }
 }
 
+/// Tick tools behind the daemon at `daemon`, which answers every request with a listing of no
+/// Ticks.
+fn tick_tools(daemon: &std::path::Path) -> tickloop_agent_runtime::hosted::tools::HostedTickTools {
+    use tickhost_connect::hosted::{BUSINESS_FRAME_BYTES, read_frame, write_frame};
+    use tickloop_agent_runtime::hosted::{
+        tools::HostedTickTools,
+        worker_control::{DaemonControl, WorkerControlGrant},
+    };
+    if !daemon.exists() {
+        let listener = tokio::net::UnixListener::bind(daemon).unwrap();
+        let host_endpoint = daemon.with_extension("host.sock");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(reader);
+                if let Ok(Some(request)) = read_frame(&mut reader, BUSINESS_FRAME_BYTES).await {
+                    let page = json!({"generation":"empty","total":0,"items":[],"endpoint":host_endpoint,"lost":[]});
+                    let answer = json!({"id":request["id"],"result":page});
+                    let _ = write_frame(&mut writer, &answer, BUSINESS_FRAME_BYTES).await;
+                }
+            }
+        });
+    }
+    HostedTickTools::new(
+        DaemonControl::new(WorkerControlGrant {
+            endpoint: daemon.into(),
+            daemon_epoch: uuid::Uuid::new_v4(),
+            binding: uuid::Uuid::new_v4(),
+            capability: "0".repeat(64),
+            host_endpoint: daemon.with_extension("host.sock"),
+            intent_renewal: std::time::Duration::from_secs(60),
+        }),
+        vec![],
+    )
+}
+
 fn install_routed_authorities(agent: &Agent, directory: &std::path::Path) -> ScopedHostSocket {
-    use tickloop_agent_runtime::{
-        hosted::{
-            tools::HostedTickTools,
-            worker_control::{DaemonControl, WorkerControlGrant},
-        },
-        native_host::NativeHostToolProvider,
-        tick_tool_router::TickToolRouter,
-    };
     let socket = ScopedHostSocket::start(directory.join("routed.sock"));
-    let native = Arc::new(NativeHostToolProvider::new(Arc::new(
-        tickhost_connect::access::TickAccess::new(
-            tickhost_connect::herdr::HerdrContext::without_view(socket.path.clone()),
-        ),
-    )));
-    let grant = WorkerControlGrant {
-        endpoint: directory.join("daemon.sock"),
-        daemon_epoch: uuid::Uuid::new_v4(),
-        binding: uuid::Uuid::new_v4(),
-        capability: "0".repeat(64),
-        host_endpoint: directory.join("host.sock"),
-        intent_renewal: std::time::Duration::from_secs(60),
-    };
-    agent
-        .install_host_tools(Arc::new(TickToolRouter::new(
-            Some(native),
-            Some(Arc::new(HostedTickTools::new(
-                DaemonControl::new(grant),
-                vec![],
-            ))),
-        )))
-        .unwrap();
+    socket.install(agent);
     socket
 }
 
@@ -479,6 +497,7 @@ async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_work
                     assert_eq!(value["workspace_id"], "W1", "{case}");
                     assert_eq!(value["host_instance"], json!(original.path), "{case}");
                     assert!(value["caller"].is_null());
+                    assert_eq!(value["ticks"], json!([]), "{case}");
                 } else {
                     assert!(
                         result.content.contains("Unsupported"),
@@ -510,23 +529,15 @@ async fn loaded_delegated_host_authority_stays_with_its_original_socket_and_work
     other.stop().await;
 }
 
-/// A child freezes, per tool, the authorities of the backends present when it was delegated.
-/// A Tickhost added afterwards never serves it, while the frozen Herdr backend still does,
-/// and a record frozen with one authority per tool is no longer restored.
+/// A child freezes, per tool, the authorities of the hosts present when it was delegated.
+/// Herdr views added afterwards are never offered to it, while the frozen Tickhost still serves
+/// it, and a record frozen with one authority per tool is no longer restored.
 #[tokio::test]
-async fn a_child_never_gains_a_tickhost_added_after_its_delegation() {
+async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
     use tickloop_agent_daemon::EmbeddedAgentAccess;
     use tickloop_agent_protocol::{
         AgentCommand, CommandResult, ConfigurationChange, HostWorkContext, LaunchSpec,
         TranscriptRef, UserInput,
-    };
-    use tickloop_agent_runtime::{
-        hosted::{
-            tools::HostedTickTools,
-            worker_control::{DaemonControl, WorkerControlGrant},
-        },
-        native_host::NativeHostToolProvider,
-        tick_tool_router::TickToolRouter,
     };
     let directory = tempfile::Builder::new()
         .prefix("tl-host-")
@@ -534,13 +545,6 @@ async fn a_child_never_gains_a_tickhost_added_after_its_delegation() {
         .unwrap();
     let store = directory.path().join("state");
     let herdr = ScopedHostSocket::start(directory.path().join("h.sock"));
-    let native = || {
-        Arc::new(NativeHostToolProvider::new(Arc::new(
-            tickhost_connect::access::TickAccess::new(
-                tickhost_connect::herdr::HerdrContext::without_view(herdr.path.clone()),
-            ),
-        )))
-    };
     let launch = || {
         let mut launch = LaunchSpec::embedded(directory.path().into());
         launch.host_work_context = Some(HostWorkContext {
@@ -553,19 +557,14 @@ async fn a_child_never_gains_a_tickhost_added_after_its_delegation() {
         store.clone(),
         config(),
         Arc::new(ScriptedModel::new(vec![
-            call(
-                "delegate",
-                "Subagent",
-                json!({"task":"Read the Workspace."}),
-            ),
-            call("child-host", "ReadWorkspace", json!({})),
-            text("Read."),
+            call("delegate", "Subagent", json!({"task":"Watch the Ticks."})),
+            text("Ready."),
             text("Delegated."),
         ])),
     )
     .unwrap();
     agent
-        .install_host_tools(Arc::new(TickToolRouter::new(Some(native()), None)))
+        .install_host_tools(Arc::new(tick_tools(&directory.path().join("d.sock"))))
         .unwrap();
     let access = EmbeddedAgentAccess::new(agent.clone());
     let CommandResult::Created {
@@ -636,45 +635,29 @@ async fn a_child_never_gains_a_tickhost_added_after_its_delegation() {
             .host_tools,
     )
     .unwrap();
-    for tool in ["ReadWorkspace", "ReadTick", "CallTickTool", "ModifyTick"] {
+    for tool in ["ReadTick", "CallTickTool", "ModifyTick"] {
         assert_eq!(
             frozen[tool].as_array().map(Vec::len),
             Some(1),
-            "{tool}: only Herdr was present: {frozen}"
+            "{tool}: only the Tickhost was present: {frozen}"
         );
     }
+    assert!(frozen.get("ReadWorkspace").is_none(), "{frozen}");
     access.shutdown().await;
 
-    let grant = WorkerControlGrant {
-        endpoint: directory.path().join("daemon.sock"),
-        daemon_epoch: uuid::Uuid::new_v4(),
-        binding: uuid::Uuid::new_v4(),
-        capability: "0".repeat(64),
-        host_endpoint: directory.path().join("host.sock"),
-        intent_renewal: std::time::Duration::from_secs(60),
-    };
-    let restored = Agent::open_embedded(
-        store.clone(),
-        config(),
-        Arc::new(ScriptedModel::new(vec![
-            call(
-                "child-hosted",
-                "ReadTick",
-                json!({"tick_instance_id":tick_protocol::InstanceRef::hosted(uuid::Uuid::new_v4())}),
-            ),
-            call("child-herdr", "ReadWorkspace", json!({})),
-            text("Checked both."),
-        ])),
-    )
-    .unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "child-hosted",
+            "ReadTick",
+            json!({"tick_instance_id":tick_protocol::InstanceRef::hosted(uuid::Uuid::new_v4())}),
+        ),
+        text("Checked."),
+    ]));
+    let restored = Agent::open_embedded(store.clone(), config(), model.clone()).unwrap();
     restored
-        .install_host_tools(Arc::new(TickToolRouter::new(
-            Some(native()),
-            Some(Arc::new(HostedTickTools::new(
-                DaemonControl::new(grant),
-                Vec::new(),
-            ))),
-        )))
+        .install_host_tools(Arc::new(
+            herdr.tools_behind(&directory.path().join("d.sock")),
+        ))
         .unwrap();
     let access = EmbeddedAgentAccess::for_worker(restored.clone(), uuid::Uuid::new_v4());
     let CommandResult::Loaded {
@@ -702,7 +685,7 @@ async fn a_child_never_gains_a_tickhost_added_after_its_delegation() {
             execution,
             target_loop: Some(snapshot.conversation.loops[0].id),
             input: UserInput::Text {
-                text: "Read a hosted Tick and the Workspace.".into(),
+                text: "Read a hosted Tick.".into(),
                 contexts: vec![],
                 paths: vec![],
             },
@@ -729,19 +712,24 @@ async fn a_child_never_gains_a_tickhost_added_after_its_delegation() {
         }
     }
     access.shutdown().await;
+    for request in model.requests.lock().unwrap().iter() {
+        let offered = request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(offered.contains(&"ReadTick"), "{offered:?}");
+        assert!(!offered.contains(&"ReadWorkspace"), "{offered:?}");
+    }
     let hosted = &results["child-hosted"];
-    assert!(hosted.is_error, "{}", hosted.content);
     assert!(
-        hosted
-            .content
-            .contains("outside the child's inherited authorization"),
-        "{}",
+        hosted.content.contains("is not a running hosted Tick"),
+        "the frozen Tickhost still serves it: {}",
         hosted.content
     );
     assert!(
-        !results["child-herdr"].is_error,
-        "{}",
-        results["child-herdr"].content
+        herdr.requests.lock().unwrap().is_empty(),
+        "the child never reached Herdr"
     );
 
     let transcript = tickloop_agent_test_support::transcript_file(&store, child);
@@ -777,7 +765,7 @@ async fn a_child_never_gains_a_tickhost_added_after_its_delegation() {
 }
 
 #[tokio::test]
-async fn replacing_the_socket_instance_blocks_a_prepared_native_call_before_dispatch() {
+async fn replacing_the_herdr_socket_blocks_a_prepared_workspace_read_before_dispatch() {
     use tickloop_agent_protocol::HostCallContext;
     use tickloop_agent_runtime::host_tools::{HostCallResult, HostToolProvider};
     let directory = tempfile::Builder::new()
@@ -785,11 +773,7 @@ async fn replacing_the_socket_instance_blocks_a_prepared_native_call_before_disp
         .tempdir_in("/tmp")
         .unwrap();
     let original = ScopedHostSocket::start(directory.path().join("host.sock"));
-    let provider = tickloop_agent_runtime::native_host::NativeHostToolProvider::new(Arc::new(
-        tickhost_connect::access::TickAccess::new(
-            tickhost_connect::herdr::HerdrContext::without_view(original.path.clone()),
-        ),
-    ));
+    let provider = original.tools();
     let call = provider
         .prepare_call_in_context(
             uuid::Uuid::new_v4(),
@@ -2114,7 +2098,8 @@ async fn a_full_access_child_can_run_an_interpreter_under_its_frozen_authority()
         .delegation
         .unwrap()
         .ceiling;
-    assert_eq!(ceiling.host_tools["ReadTick"].len(), 2);
+    assert_eq!(ceiling.host_tools["ReadTick"].len(), 1);
+    assert_eq!(ceiling.host_tools["ModifyTick"].len(), 2);
     assert!(!ceiling.host_tools.contains_key("Bash"));
     core.shutdown().await;
     routed.stop().await;

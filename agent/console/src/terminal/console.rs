@@ -1419,14 +1419,10 @@ impl Console {
                 .resources
                 .retain(|instance, _| instance.tick_type() != tick_type);
             findings
-                .titles
-                .retain(|instance, _| instance.tick_type() != tick_type);
-            findings
                 .updates
                 .retain(|instance, _| instance.tick_type() != tick_type);
             findings.states.extend(probed.states);
             findings.resources.extend(probed.resources);
-            findings.titles.extend(probed.titles);
             findings.updates.extend(probed.updates);
         }
         if monitor.member_findings == findings {
@@ -11863,8 +11859,11 @@ mod tests {
             id: Uuid::from_u128(u128::from(instance)),
             loop_id: Uuid::from_u128(900),
             loop_state: tickloop_agent_protocol::LoopState::WaitingTrigger,
-            instance: tick_protocol::InstanceRef::native(format!("fixture-run-{instance}"))
-                .unwrap(),
+            instance: tick_protocol::InstanceRef::new(
+                "calendar",
+                &format!("fixture-run-{instance}"),
+            )
+            .unwrap(),
             frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
             accumulated: 0,
             last_delivery_ms: None,

@@ -5,10 +5,7 @@ use std::{
     path::PathBuf,
 };
 
-use tickhost_connect::{
-    access::TickAccess,
-    herdr::{HerdrContext, endpoint_instance},
-};
+use tickhost_connect::herdr::{HerdrContext, SocketHerdr, current_pane, endpoint_instance};
 
 use tickloop_agent_config::{LoadedSettings, UserSettings, config_root_directory};
 use tickloop_agent_tools::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME};
@@ -1033,35 +1030,31 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
         },
     };
     use std::os::unix::ffi::OsStrExt;
-    let (host_work_context, view_host, herdr_probe) =
-        if let Some(context) = HerdrContext::from_environment()? {
-            let access = std::sync::Arc::new(TickAccess::new(context.clone()));
-            let pane = access
-                .caller()
-                .await
-                .map_err(|error| format!("cannot inspect the calling Herdr Pane: {error}"))?;
-            let metadata = std::fs::metadata(&context.socket)
-                .map_err(|error| format!("cannot inspect Herdr endpoint: {error}"))?;
-            let host_instance = endpoint_instance(&metadata);
-            (
-                Some(HostWorkContext {
-                    socket: context.socket.clone(),
-                    workspace: Some(pane.workspace_id.clone()),
-                }),
-                Some(HostLocation {
-                    host_instance,
-                    socket: context.socket,
-                    workspace: Some(pane.workspace_id),
-                    tab: Some(pane.tab_id),
-                    pane: Some(pane.pane_id),
-                    terminal: Some(pane.terminal_id),
-                    client: None,
-                }),
-                Some(crate::monitor_rows::HerdrProbe::new(access)),
-            )
-        } else {
-            (None, None, None)
-        };
+    let (host_work_context, view_host) = if let Some(context) = HerdrContext::from_environment()? {
+        let pane = current_pane(&SocketHerdr::new(context.clone()), &context.caller_pane)
+            .await
+            .map_err(|error| format!("cannot inspect the calling Herdr Pane: {error}"))?;
+        let metadata = std::fs::metadata(&context.socket)
+            .map_err(|error| format!("cannot inspect Herdr endpoint: {error}"))?;
+        let host_instance = endpoint_instance(&metadata);
+        (
+            Some(HostWorkContext {
+                socket: context.socket.clone(),
+                workspace: Some(pane.workspace_id.clone()),
+            }),
+            Some(HostLocation {
+                host_instance,
+                socket: context.socket,
+                workspace: Some(pane.workspace_id),
+                tab: Some(pane.tab_id),
+                pane: Some(pane.pane_id),
+                terminal: Some(pane.terminal_id),
+                client: None,
+            }),
+        )
+    } else {
+        (None, None)
+    };
     let herdr_socket = view_host.as_ref().map(|view| view.socket.clone());
     let launch = LaunchSpec {
         workdir: workdir.clone(),
@@ -1165,14 +1158,10 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     console.set_monitor_preference(monitor_preference)?;
     console.set_monitor_popup(monitor_popup)?;
     console.set_monitor_width(monitor_width.map(usize::from))?;
-    // Inside Herdr the View also probes Herdr members; in every View the Agent's new Ticks run in
-    // the Tickhost and are probed there.
-    if let Some(probe) = herdr_probe {
-        console.add_member_probe(std::sync::Arc::new(probe))?;
-    }
     if let Some(socket) = herdr_socket {
         console.set_herdr_socket(socket)?;
     }
+    // The Agent's Ticks run in the Tickhost and are probed there.
     console.add_member_probe(std::sync::Arc::new(hosted_probe::HostedProbe::new(
         agent.clone(),
     )))?;
@@ -7041,7 +7030,7 @@ async fn navigate_agent(
     reply_lines: &mut HashMap<uuid::Uuid, ReplyLines>,
 ) -> Result<Option<ChatSnapshot>, String> {
     use crate::agent_console::{Destination, Intent};
-    use tickhost_connect::herdr::{HerdrPort, SocketHerdr};
+    use tickhost_connect::herdr::HerdrPort;
     for _ in 0..2 {
         if let Destination::Unavailable(record) = &effect.destination {
             console.set_status(&format!(

@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
     time::Duration,
@@ -14,7 +13,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{access::TickAccess, host_error::HostError};
+use crate::host_error::HostError;
 
 pub const HOST_TIMEOUT: Duration = Duration::from_secs(10);
 const HOST_RESPONSE_LIMIT: u64 = 8 * 1024 * 1024;
@@ -62,11 +61,6 @@ pub struct Pane {
     pub cwd: Option<String>,
     #[serde(default)]
     pub foreground_cwd: Option<String>,
-    /// The title the Pane's program set, without Herdr's status marks.
-    #[serde(default)]
-    pub terminal_title_stripped: Option<String>,
-    #[serde(default)]
-    pub tokens: BTreeMap<String, String>,
 }
 
 /// Why a recorded Herdr Pane can no longer be confirmed as the same Pane.
@@ -98,11 +92,8 @@ pub async fn confirm_pane(
     terminal_id: &str,
 ) -> Result<Pane, PaneIdentityError> {
     verify_endpoint(socket, instance)?;
-    let access = TickAccess::new(HerdrContext {
-        socket: socket.to_path_buf(),
-        caller_pane: pane_id.into(),
-    });
-    let pane = tokio::time::timeout(PANE_CONFIRMATION_TIMEOUT, access.caller())
+    let host = SocketHerdr::new(HerdrContext::without_view(socket.to_path_buf()));
+    let pane = tokio::time::timeout(PANE_CONFIRMATION_TIMEOUT, current_pane(&host, pane_id))
         .await
         .map_err(|_| PaneIdentityError::Unresponsive)?
         .map_err(|error| PaneIdentityError::Denied(error.to_string()))?;
@@ -128,6 +119,23 @@ fn verify_endpoint(socket: &Path, instance: &str) -> Result<(), PaneIdentityErro
         return Err(PaneIdentityError::Replaced("Herdr endpoint was replaced"));
     }
     Ok(())
+}
+
+/// The Pane `caller_pane` names now, as Herdr reports it to a program running in that Pane.
+pub async fn current_pane(host: &dyn HerdrPort, caller_pane: &str) -> Result<Pane, HostError> {
+    let response = host
+        .request(
+            "pane.current",
+            json!({"caller_pane_id":caller_pane}),
+            CancellationToken::new(),
+        )
+        .await?;
+    serde_json::from_value(response["pane"].clone()).map_err(|error| {
+        HostError::before(
+            "ProtocolViolation",
+            format!("invalid Herdr response: {error}"),
+        )
+    })
 }
 
 #[async_trait]
@@ -250,54 +258,5 @@ impl HerdrPort for SocketHerdr {
                 dispatched,
             }),
         }
-    }
-}
-
-pub fn process_birth(pid: u32) -> Result<String, HostError> {
-    #[cfg(target_os = "macos")]
-    {
-        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
-        let size = std::mem::size_of::<libc::proc_bsdinfo>();
-        // proc_pidinfo initializes the entire fixed-size structure only on a full-size success.
-        let count = unsafe {
-            libc::proc_pidinfo(
-                pid as i32,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                info.as_mut_ptr().cast(),
-                size as i32,
-            )
-        };
-        if count as usize != size {
-            return Err(HostError::before(
-                "IdentityUncertain",
-                format!("cannot verify process {pid} birth"),
-            ));
-        }
-        let info = unsafe { info.assume_init() };
-        Ok(format!(
-            "{pid}:{}:{}",
-            info.pbi_start_tvsec, info.pbi_start_tvusec
-        ))
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .map_err(|error| HostError::before("IdentityUncertain", error.to_string()))?;
-        let (_, fields) = stat
-            .rsplit_once(')')
-            .ok_or_else(|| HostError::before("IdentityUncertain", "invalid process stat"))?;
-        let birth = fields
-            .split_whitespace()
-            .nth(19)
-            .ok_or_else(|| HostError::before("IdentityUncertain", "process birth unavailable"))?;
-        Ok(format!("{pid}:{birth}"))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        Err(HostError::before(
-            "IdentityUncertain",
-            format!("process {pid} birth verification is unsupported on this OS"),
-        ))
     }
 }

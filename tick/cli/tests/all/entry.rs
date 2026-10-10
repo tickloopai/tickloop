@@ -116,16 +116,6 @@ fn a_provider_refuses_a_tick_it_has_no_interface_for_and_names_the_providers_tha
 }
 
 #[test]
-fn a_preflight_refuses_an_unsupported_provider_tick_before_anything_starts() {
-    let (code, _, stderr) = run(tick().args(["__preflight", "futu", "kline", "700.HK"]));
-    assert_eq!(code, 2, "{stderr}");
-    assert!(
-        stderr.contains("futu does not implement QuoteApi"),
-        "{stderr}"
-    );
-}
-
-#[test]
 fn removed_commands_are_unknown() {
     for command in [
         &["demo", "quote"][..],

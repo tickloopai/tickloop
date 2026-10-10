@@ -5,9 +5,7 @@ use serde_json::{Value, json};
 use super::*;
 use crate::{
     host_tools::HostToolProvider,
-    tick_tool_router::{
-        CALL_TICK_TOOL, MODIFY_TICK, READ_TICK, READ_WORKSPACE, TickBackend, TickBackends,
-    },
+    tick_tools::{CALL_TICK_TOOL, MODIFY_TICK, READ_TICK, READ_WORKSPACE, uses_herdr_layout},
 };
 use tickloop_agent_protocol::local_messages;
 use tickloop_agent_protocol::{
@@ -275,9 +273,9 @@ pub(super) fn check_call(
                     .into(),
             );
         }
-        // A hosted Tick belongs to the Chat that opened it, which the daemon enforces on every
-        // call; every other target stays scoped by the inherited Workspace.
-        if TickBackends::ALL.route(name, input) != Ok(TickBackend::Hosted) {
+        // A Tick belongs to the Chat that opened it, which the daemon enforces on every call;
+        // Herdr Panes stay scoped by the inherited Workspace.
+        if uses_herdr_layout(name, input) {
             let workspace = ceiling
                 .host_context
                 .as_ref()

@@ -319,7 +319,7 @@
       "agent_id": "00000000-0000-0000-0000-0000000000a1",
       "generation": 3
     },
-    "instance": "herdr:session/workspace/pane/counter"
+    "instance": "hosted:00000000-0000-0000-0000-000000000041"
   },
   {
     "kind": "hosted_tick_snapshot",

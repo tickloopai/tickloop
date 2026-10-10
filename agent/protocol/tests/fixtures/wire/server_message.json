@@ -118,7 +118,7 @@
                 "call_id": "call-1",
                 "name": "ReadTick",
                 "input": {
-                  "instance": "herdr:counter"
+                  "instance": "hosted:00000000-0000-0000-0000-000000000041"
                 }
               }
             }

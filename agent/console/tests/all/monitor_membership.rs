@@ -492,7 +492,7 @@ async fn hosted_members_show_their_probed_state_and_sample_and_offer_close() {
     let rows = MonitorRowsRegistry::builtin().list(&MonitorContext {
         chat: Some(snapshot),
         member_states: HashMap::from([
-            (running.clone(), MemberState::Live { protocol: true }),
+            (running.clone(), MemberState::Live),
             (gone.clone(), MemberState::Gone),
             (lost.clone(), MemberState::Lost),
         ]),

@@ -109,7 +109,8 @@ pub use host::{
     HostedResources, HostedScreenSnapshot,
 };
 pub use hosted::{
-    HostedMember, HostedMemberState, HostedProgramExit, HostedSnapshot, HostedViewGrant,
+    ATTACH_ARGUMENTS, ATTACH_ENVIRONMENT, HostedMember, HostedMemberState, HostedProgramExit,
+    HostedSnapshot, HostedViewGrant,
 };
 pub use ids::ChatId;
 pub use image::{Image, ImageMediaType};

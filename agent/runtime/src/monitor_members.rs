@@ -27,7 +27,7 @@ pub(super) enum ReadTarget {
 impl ReadTarget {
     pub(super) fn of(name: &str, input: &Value) -> Option<Self> {
         match name {
-            crate::tick_tool_router::READ_TICK => input["tick_instance_id"]
+            crate::tick_tools::READ_TICK => input["tick_instance_id"]
                 .as_str()?
                 .parse()
                 .ok()

@@ -45,7 +45,7 @@ use tickloop_agent_runtime::{
             WorkerControlGrant, WorkerEnvelope, WorkerRequest, root_identity,
         },
     },
-    tick_tool_router::MODIFY_TICK,
+    tick_tools::MODIFY_TICK,
 };
 
 /// A worker request is small: an open carries argv, cwd and the launch environment.

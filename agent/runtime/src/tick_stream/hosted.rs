@@ -30,7 +30,7 @@ use super::{
 use crate::{
     host_tools::HostToolProvider,
     hosted::{registry::TARGET_GONE, tools::HostedTickTools},
-    tick_tool_router::READ_TICK,
+    tick_tools::READ_TICK,
 };
 use tickloop_agent_protocol::{HostToolAuthority, ObservationKind};
 

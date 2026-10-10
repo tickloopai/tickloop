@@ -100,8 +100,6 @@ mod model_stream_replay;
 mod module_boundaries_live;
 #[path = "all/monitor_updates.rs"]
 mod monitor_updates;
-#[path = "all/native_observation.rs"]
-mod native_observation;
 #[path = "all/observers.rs"]
 mod observers;
 #[path = "all/output_limit_recovery.rs"]

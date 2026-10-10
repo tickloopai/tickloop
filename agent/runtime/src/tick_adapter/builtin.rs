@@ -1,29 +1,8 @@
 use super::*;
 use crate::{
     Agent,
-    tick_stream::{HostedTickStream, NativeTickStream, ShellTickStream},
+    tick_stream::{HostedTickStream, ShellTickStream},
 };
-
-pub struct HerdrAdapter {
-    stream: Option<Arc<dyn TickStreamPort>>,
-}
-impl HerdrAdapter {
-    pub fn new(provider: Option<Arc<crate::native_host::NativeHostToolProvider>>) -> Self {
-        Self {
-            stream: provider.map(|provider| {
-                Arc::new(NativeTickStream::new(provider)) as Arc<dyn TickStreamPort>
-            }),
-        }
-    }
-}
-impl TickAdapter for HerdrAdapter {
-    fn tick_type(&self) -> &'static str {
-        tick_protocol::HERDR_INSTANCE_TYPE
-    }
-    fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
-        self.stream.clone()
-    }
-}
 
 /// Ticks a Chat opened in the dedicated Tickhost; only a worker with a Tickhost grant follows
 /// them.

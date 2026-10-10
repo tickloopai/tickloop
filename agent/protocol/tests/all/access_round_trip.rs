@@ -15,7 +15,7 @@ fn monitor_members_and_required_push_completion_fields_share_one_snapshot_wire()
         agent_id: Uuid::new_v4(),
         generation: 1,
     };
-    let instance: InstanceRef = "herdr:counter".parse().unwrap();
+    let instance: InstanceRef = "hosted:counter".parse().unwrap();
     for notification in [
         SubagentNotificationDelivery::Foreground,
         SubagentNotificationDelivery::Pending,
@@ -79,7 +79,7 @@ fn monitor_membership_commands_cross_the_wire_unchanged() {
         agent_id: Uuid::new_v4(),
         generation: 1,
     };
-    let instance: InstanceRef = "herdr:counter".parse().unwrap();
+    let instance: InstanceRef = "hosted:counter".parse().unwrap();
     for command in [
         AgentCommand::RemoveMonitorMember {
             execution,
@@ -129,13 +129,13 @@ fn subagent_colors_prefer_unused_members_and_older_registrations_decode_without_
 fn handled_marks_only_move_forward_and_stay_bounded() {
     use tickloop_agent_protocol::MonitorMembership;
     let mut membership = MonitorMembership::default();
-    let instance: InstanceRef = "herdr:counter".parse().unwrap();
+    let instance: InstanceRef = "hosted:counter".parse().unwrap();
     assert!(membership.mark_handled(instance.clone(), 2_000));
     assert!(!membership.mark_handled(instance.clone(), 1_000));
     assert_eq!(membership.handled_at(&instance), Some(2_000));
     for index in 0..600_u64 {
         membership.mark_handled(
-            InstanceRef::native(format!("run-{index}")).unwrap(),
+            InstanceRef::new("hosted", &format!("run-{index}")).unwrap(),
             10_000 + index,
         );
     }
@@ -164,8 +164,8 @@ fn handled_marks_only_move_forward_and_stay_bounded() {
 fn an_agent_turn_taking_updates_in_handles_them_and_says_so() {
     use tickloop_agent_protocol::MonitorMembership;
     let mut membership = MonitorMembership::default();
-    let opened: InstanceRef = "herdr:opened".parse().unwrap();
-    let delivered: InstanceRef = "herdr:delivered".parse().unwrap();
+    let opened: InstanceRef = "hosted:opened".parse().unwrap();
+    let delivered: InstanceRef = "hosted:delivered".parse().unwrap();
     assert!(membership.mark_handled(opened.clone(), 2_000));
     assert!(membership.mark_taken_in(delivered.clone(), 2_000));
     assert_eq!(membership.handled_at(&delivered), Some(2_000));
@@ -183,7 +183,7 @@ fn an_agent_turn_taking_updates_in_handles_them_and_says_so() {
     );
     for index in 0..600_u64 {
         membership.mark_handled(
-            InstanceRef::native(format!("run-{index}")).unwrap(),
+            InstanceRef::new("hosted", &format!("run-{index}")).unwrap(),
             10_000 + index,
         );
     }
@@ -192,7 +192,8 @@ fn an_agent_turn_taking_updates_in_handles_them_and_says_so() {
         "a take-in leaves with its handled mark"
     );
     let older: MonitorMembership =
-        serde_json::from_value(serde_json::json!({ "handled": { "herdr:opened": 2000 } })).unwrap();
+        serde_json::from_value(serde_json::json!({ "handled": { "hosted:opened": 2000 } }))
+            .unwrap();
     assert!(older.taken_in.is_empty(), "16.3 membership still decodes");
 }
 
@@ -201,26 +202,26 @@ fn a_membership_saved_with_member_sources_loads_every_member_as_opened() {
     use tickloop_agent_protocol::MonitorMembership;
     let saved: MonitorMembership = serde_json::from_value(serde_json::json!({
         "members": [
-            { "instance": "herdr:opened", "source": "opened", "title": "Quotes" },
-            { "instance": "herdr:added", "source": "added" },
+            { "instance": "hosted:opened", "source": "opened", "title": "Quotes" },
+            { "instance": "hosted:added", "source": "added" },
         ],
-        "removed": ["herdr:hidden"],
+        "removed": ["hosted:hidden"],
     }))
     .unwrap();
     assert_eq!(
         saved.members,
         [
             MonitorMember {
-                instance: "herdr:opened".parse().unwrap(),
+                instance: "hosted:opened".parse().unwrap(),
                 title: Some("Quotes".into()),
             },
             MonitorMember {
-                instance: "herdr:added".parse().unwrap(),
+                instance: "hosted:added".parse().unwrap(),
                 title: None,
             },
         ]
     );
-    assert!(saved.is_removed(&"herdr:hidden".parse().unwrap()));
+    assert!(saved.is_removed(&"hosted:hidden".parse().unwrap()));
     assert!(
         !serde_json::to_string(&saved).unwrap().contains("source"),
         "the source is no longer written"

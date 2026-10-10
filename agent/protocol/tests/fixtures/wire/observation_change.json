@@ -10,7 +10,7 @@
           "call_id": "call-1",
           "name": "ReadTick",
           "input": {
-            "instance": "herdr:counter"
+            "instance": "hosted:00000000-0000-0000-0000-000000000041"
           }
         }
       }
@@ -66,7 +66,7 @@
           "monitor": {
             "members": [
               {
-                "instance": "herdr:session/workspace/pane/counter",
+                "instance": "hosted:00000000-0000-0000-0000-000000000041",
                 "title": "Counter"
               }
             ],
@@ -74,10 +74,10 @@
               "hosted:00000000-0000-0000-0000-000000000040"
             ],
             "handled": {
-              "herdr:session/workspace/pane/counter": 7500
+              "hosted:00000000-0000-0000-0000-000000000041": 7500
             },
             "taken_in": {
-              "herdr:session/workspace/pane/counter": 7500
+              "hosted:00000000-0000-0000-0000-000000000041": 7500
             }
           },
           "id": "00000000-0000-0000-0000-0000000000c1",
@@ -158,11 +158,7 @@
                     "workspace_id": "w1",
                     "tab_id": "t1",
                     "cwd": "/work/project",
-                    "foreground_cwd": null,
-                    "terminal_title_stripped": null,
-                    "tokens": {
-                      "agent": "tickloop"
-                    }
+                    "foreground_cwd": null
                   }
                 }
               },
@@ -178,25 +174,27 @@
                   {
                     "kind": "native",
                     "endpoint": {
+                      "kind": "tickhost",
+                      "endpoint": "/run/tickhost.sock",
+                      "uid": 501
+                    }
+                  }
+                ],
+                "ReadWorkspace": [
+                  {
+                    "kind": "native",
+                    "endpoint": {
                       "kind": "herdr_socket",
                       "path": "/run/herdr.sock",
                       "owner": 501,
                       "device": 16777220,
                       "inode": 42
                     }
-                  },
-                  {
-                    "kind": "native",
-                    "endpoint": {
-                      "kind": "tickhost",
-                      "endpoint": "/run/tickhost.sock",
-                      "uid": 501
-                    }
                   }
                 ]
               },
               "tick_instances": [
-                "herdr:session/workspace/pane/counter",
+                "hosted:00000000-0000-0000-0000-000000000041",
                 "hosted:00000000-0000-0000-0000-000000000040"
               ]
             },
@@ -278,7 +276,7 @@
                   "id": "call-1",
                   "name": "ReadTick",
                   "input": {
-                    "instance": "herdr:counter"
+                    "instance": "hosted:00000000-0000-0000-0000-000000000041"
                   }
                 },
                 {

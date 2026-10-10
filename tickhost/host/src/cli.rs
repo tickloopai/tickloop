@@ -1,18 +1,19 @@
-//! The `tickhost` command: `open` connects a protocol program to the host it runs in, `stop` ends
-//! every hosted Tick, and the hidden `run` is the service the Agent daemon starts.
+//! The `tickhost` command: `stop` ends every Tick the host runs; the hidden `run` is the service
+//! the Agent daemon starts, and the hidden `launch` the launcher the host puts in front of each
+//! protocol program it opens.
 
 use std::{ffi::OsString, os::unix::fs::PermissionsExt, process::ExitCode, time::Duration};
 
 use clap::{Parser, Subcommand};
-use tickhost_connect::{
-    hosted::BUILD_VERSION,
-    launch::{LaunchContext, LaunchHost, PREFLIGHT_ARGUMENT},
-};
+use tickhost_connect::{hosted::BUILD_VERSION, launch::Launch};
 
 use crate::{host, paths::HostPaths};
 
 /// The hidden entry the Agent daemon starts the service with.
 pub const RUN_COMMAND: &str = "run";
+/// The hidden entry that runs a protocol program for a launch the host started; a person running
+/// it gets a refusal.
+pub const LAUNCH_COMMAND: &str = "launch";
 const USAGE: u8 = 2;
 /// How long `stop` waits for the host to end its Ticks: each gets the host's terminate grace,
 /// side by side.
@@ -23,7 +24,7 @@ const STOP_POLL: Duration = Duration::from_millis(50);
 #[command(
     name = "tickhost",
     version = BUILD_VERSION,
-    about = "Tickloop's Tick host: connects protocol programs to Agents and runs the Ticks Agents open hidden"
+    about = "Tickloop's Tick host: runs the Ticks Agents open; Herdr Panes, the Monitor and terminals only show them"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -32,29 +33,21 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run PROGRAM as a Tick: its stdin/stdout speak the Tick protocol to Agents, from a Herdr
-    /// Pane or from the Tickhost that started it
-    Open {
+    /// End every Tick by stopping the Tickhost. The next Tick an Agent opens starts a new
+    /// Tickhost; the stopped Ticks show as lost and are reopened only on request
+    Stop,
+    /// Serve Ticks with the configuration the Agent daemon writes on standard input
+    #[command(hide = true)]
+    Run,
+    /// Run PROGRAM as the protocol Tick of a launch the Tickhost started
+    #[command(name = LAUNCH_COMMAND, hide = true)]
+    Launch {
         #[arg(last = true, required = true, num_args = 1.., value_name = "PROGRAM")]
         command: Vec<String>,
     },
-    /// End every hosted Tick by stopping the Tickhost. The next Tick an Agent opens starts a new
-    /// Tickhost; the stopped Ticks show as lost and are reopened only on request. Ticks in Herdr
-    /// Panes keep running
-    Stop,
-    /// Serve hosted Ticks with the configuration the Agent daemon writes on standard input
-    #[command(hide = true)]
-    Run,
 }
 
 pub fn run(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
-    let mut arguments: Vec<_> = arguments.into_iter().collect();
-    let preflight = arguments
-        .first()
-        .is_some_and(|argument| argument == PREFLIGHT_ARGUMENT);
-    if preflight {
-        arguments.remove(0);
-    }
     let cli =
         match Cli::try_parse_from(std::iter::once(OsString::from("tickhost")).chain(arguments)) {
             Ok(cli) => cli,
@@ -64,15 +57,15 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> ExitCode {
                 return ExitCode::from(code as u8);
             }
         };
-    let result = match (preflight, cli.command) {
-        (true, Command::Open { command }) => check_program(&command),
-        (true, _) => Err("only open can be checked before it starts".into()),
-        (false, Command::Open { command }) => {
-            runtime().and_then(|runtime| runtime.block_on(open(command)))
-        }
-        (false, Command::Stop) => runtime().and_then(|runtime| runtime.block_on(stop())),
-        (false, Command::Run) => runtime().and_then(|runtime| runtime.block_on(serve())),
-    };
+    let result = runtime().and_then(|runtime| {
+        runtime.block_on(async {
+            match cli.command {
+                Command::Stop => stop().await,
+                Command::Run => serve().await,
+                Command::Launch { command } => launch(command).await,
+            }
+        })
+    });
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -89,11 +82,11 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|error| format!("could not start async runtime: {error}"))
 }
 
-/// Refuses a program that is not an executable file, before any host starts it.
+/// Refuses a program that is not an executable file, before it starts.
 fn check_program(command: &[String]) -> Result<(), String> {
     let program = command
         .first()
-        .ok_or("tickhost open requires a command after --")?;
+        .ok_or("tickhost launch requires a command after --")?;
     let candidates = if program.contains('/') {
         vec![std::path::PathBuf::from(program)]
     } else {
@@ -111,17 +104,15 @@ fn check_program(command: &[String]) -> Result<(), String> {
     }
 }
 
-async fn open(command: Vec<String>) -> Result<(), String> {
-    check_program(&command)?;
-    let host: LaunchHost = LaunchContext::from_environment()?
-        .ok_or(
-            "tickhost open requires a Herdr Pane or a Tickhost launch; a program run alone can use its own stdio",
-        )?
-        .verify_foreground()
+/// Runs `command` for the launch the host started this process for, once it proved to be the
+/// foreground of the host's terminal.
+async fn launch(command: Vec<String>) -> Result<(), String> {
+    let launch = Launch::from_environment()
         .await
         .map_err(|error| error.to_string())?;
+    check_program(&command)?;
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let status = tickhost_connect::launch::run(host, command, cwd)
+    let status = tickhost_connect::launch::run(launch, command, cwd)
         .await
         .map_err(|error| error.to_string())?;
     if status.success() {
