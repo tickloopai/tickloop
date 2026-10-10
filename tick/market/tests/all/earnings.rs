@@ -560,7 +560,7 @@ fn args(format: OutputFormat) -> EarningsArgs {
 
 async fn once(api: &QuoteServices, format: OutputFormat) -> Result<(String, TickStream)> {
     let mut output = Vec::new();
-    let mut updates = TickStream::in_memory(TickKind::Earnings, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Earnings);
     run_once(
         &args(format),
         api,
@@ -636,7 +636,7 @@ async fn an_entitlement_gap_fails_instead_of_printing_an_empty_table() {
         &Settings::default(),
         false,
         &mut output,
-        &mut TickStream::in_memory(TickKind::Earnings, "longbridge"),
+        &mut TickStream::in_memory(TickKind::Earnings),
     )
     .await
     .unwrap_err();
@@ -660,7 +660,7 @@ async fn panel(api: &QuoteServices, columns: u16, rows: u16) -> String {
         &Settings::default(),
         &mut terminal,
         input,
-        &mut TickStream::in_memory(TickKind::Earnings, "longbridge"),
+        &mut TickStream::in_memory(TickKind::Earnings),
     )
     .await
     .unwrap();
@@ -760,11 +760,57 @@ async fn the_symbol_prompt_owns_the_keys_and_reloads_the_panel_in_place() {
     view.on_key(KeyCode::Char('s'), &api, &mut state)
         .await
         .unwrap();
-    view.on_key(KeyCode::Esc, &api, &mut state).await.unwrap();
-    assert!(view.captures_text(), "first Esc changes Insert to Normal");
-    view.on_key(KeyCode::Esc, &api, &mut state).await.unwrap();
-    assert!(!view.captures_text(), "second Esc closes the prompt");
+    for key in [KeyCode::Esc, KeyCode::Backspace] {
+        view.on_key(key, &api, &mut state).await.unwrap();
+        assert!(
+            view.captures_text(),
+            "{key:?} in an empty prompt leaves it open"
+        );
+    }
+    view.cancel_text();
+    assert!(!view.captures_text(), "cancelling closes the prompt");
     assert!(view.title().contains("AAPL.US"));
+}
+
+#[tokio::test]
+async fn in_the_running_tick_the_prompt_keeps_q_as_text_and_ctrl_c_cancels_it() {
+    let api = Fundamentals::new(today());
+    let (keys, input) = tokio::sync::mpsc::unbounded_channel();
+    let keyboard = tokio::spawn(async move {
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let typed = |text: &'static str| text.chars().map(move |key| press(KeyCode::Char(key)));
+        let events = typed("sqx")
+            .chain([KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)])
+            .chain(typed("saaplz"))
+            .chain([KeyCode::Backspace, KeyCode::Enter, KeyCode::Char('q')].map(press));
+        for event in events {
+            tokio::time::sleep(std::time::Duration::from_millis(45)).await;
+            keys.send(Ok(Event::Key(event))).unwrap();
+        }
+    });
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    run_live(
+        &args(OutputFormat::Table),
+        &api,
+        &Settings::default(),
+        &mut terminal,
+        tokio_stream::wrappers::UnboundedReceiverStream::new(input),
+        &mut TickStream::in_memory(TickKind::Earnings),
+    )
+    .await
+    .unwrap();
+    keyboard.await.unwrap();
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(
+        screen.contains(" AAPL.US · Earnings"),
+        "Ctrl+C discarded the first prompt and Backspace edited the second: {screen}"
+    );
 }
 
 fn request_of(symbol: &str) -> EarningsRequest {
@@ -902,13 +948,7 @@ impl Panel {
     fn start(api: Arc<dyn QuoteApi>, symbol: &str, count: Option<usize>) -> Self {
         let (requests, tick_requests) = tokio::io::duplex(8 * 1024);
         let (tick_responses, responses) = tokio::io::duplex(64 * 1024);
-        let mut session = TickStream::duplex(
-            TickKind::Earnings,
-            "longbridge",
-            "herdr:test-earnings".to_owned(),
-            tick_requests,
-            tick_responses,
-        );
+        let mut session = TickStream::duplex(TickKind::Earnings, tick_requests, tick_responses);
         let (keys, pressed) = tokio::sync::mpsc::unbounded_channel();
         let arguments = EarningsArgs {
             symbol: symbol.into(),
@@ -1004,8 +1044,8 @@ fn history_call(id: u64, args: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
-        "method": "tool/call",
-        "params": {"tool": "history", "args": args},
+        "method": "tick/call",
+        "params": {"tool": "history", "args": args, "revision": "1"},
     })
 }
 
@@ -1038,7 +1078,7 @@ async fn earnings_declares_history_as_the_tool_that_recovers_its_updates() {
         .await;
     let describe = panel.frame().await;
 
-    assert_eq!(describe["result"]["tick_type"], "earnings");
+    assert_eq!(describe["result"]["kind"], "earnings");
     assert_eq!(describe["result"]["recover_with"], "history");
     let tools = describe["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 5);
@@ -1047,7 +1087,7 @@ async fn earnings_declares_history_as_the_tool_that_recovers_its_updates() {
     assert_eq!(tools[2]["mutates"], true);
     assert_eq!(tools[0]["name"], "history");
     assert_eq!(tools[0]["mutates"], false);
-    let params = &tools[0]["params"];
+    let params = &tools[0]["input_schema"];
     assert_eq!(params["required"], serde_json::json!(["symbol"]));
     assert_eq!(params["properties"]["symbol"]["type"], "string");
     assert_eq!(params["properties"]["count"]["maximum"], 20);
@@ -1103,7 +1143,7 @@ async fn a_history_call_reads_another_symbol_while_the_panel_keeps_answering() {
 async fn changing_the_panel_symbol_publishes_the_new_table_as_a_tick_update() {
     let mut panel = Panel::start(Arc::new(Fundamentals::new(today())), "TSLA", Some(2));
     let snapshot = panel.frame().await;
-    assert_eq!(snapshot["params"]["kind"], "snapshot");
+    assert_eq!(snapshot["params"]["seq"], 1);
     assert_eq!(snapshot["params"]["data"]["symbol"], "TSLA.US");
 
     panel.press(KeyCode::Char('s'));
@@ -1112,8 +1152,7 @@ async fn changing_the_panel_symbol_publishes_the_new_table_as_a_tick_update() {
 
     let update = panel.frame().await;
     assert_eq!(update["method"], "tick/update");
-    assert_eq!(update["params"]["kind"], "update");
-    assert_eq!(update["params"]["sequence"], 2);
+    assert_eq!(update["params"]["seq"], 2);
     assert_eq!(update["params"]["data"]["symbol"], "NVDA.US");
     panel.finish().await;
 }
@@ -1320,7 +1359,9 @@ async fn fiscal_navigation_and_agent_selection_keep_history_and_citations_stable
     view.on_key(KeyCode::Enter, &api, &mut state).await.unwrap();
     assert!(view.title().contains(&second));
     assert_eq!(view.selected_detail().unwrap().period_id, second);
-    view.on_key(KeyCode::Esc, &api, &mut state).await.unwrap();
+    view.on_key(KeyCode::Backspace, &api, &mut state)
+        .await
+        .unwrap();
     assert!(view.title().contains("Compare periods"));
     let result = view
         .act(ToolCall {

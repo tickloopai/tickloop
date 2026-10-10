@@ -104,10 +104,14 @@ struct View {
 
 impl View {
     fn start(grant: &HostedViewGrant, home: &std::path::Path) -> Self {
+        Self::start_sized(grant, home, 24, 80)
+    }
+
+    fn start_sized(grant: &HostedViewGrant, home: &std::path::Path, rows: u16, cols: u16) -> Self {
         let pty = native_pty_system()
             .openpty(PtySize {
-                rows: 24,
-                cols: 80,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -150,9 +154,21 @@ impl View {
     }
 
     fn screen(&self, rows: u16, columns: u16) -> String {
+        self.terminal(rows, columns).screen().contents()
+    }
+
+    fn rows(&self, rows: u16, columns: u16) -> Vec<String> {
+        self.terminal(rows, columns)
+            .screen()
+            .rows(0, columns)
+            .collect()
+    }
+
+    /// This view's terminal, of `rows` and `columns`, after everything the client wrote.
+    fn terminal(&self, rows: u16, columns: u16) -> vt100::Parser {
         let mut parser = vt100::Parser::new(rows, columns, 0);
         parser.process(&self.output.lock().unwrap());
-        parser.screen().contents()
+        parser
     }
 
     fn shows(&self, rows: u16, columns: u16, text: &str) {
@@ -188,9 +204,9 @@ impl View {
 
 /// Every key the user types reaches the same Tick process, wide characters and mouse reports
 /// included; Ctrl+B Esc sends Esc, Ctrl+B Ctrl+B sends one Ctrl+B, Ctrl+B with another key sends
-/// both, pasted text never closes the view, and a resize reaches the Tick. A lone Esc closes the
-/// view, leaves the Tick running, restores the terminal and releases the view, so a second
-/// client is refused only while one is attached; it shows why until a key is pressed.
+/// both, pasted text never closes the view, and a resize reaches the Tick. A second client attaches
+/// beside the first and its keys reach the same process. A lone Esc closes only its own view,
+/// leaves the Tick and the other view running and restores the terminal.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_view_reaches_the_same_process_until_esc_closes_it() {
     let host = Host::start().await;
@@ -216,15 +232,15 @@ async fn an_attached_view_reaches_the_same_process_until_esc_closes_it() {
     view.send(b"\x1b[<0;5;5M");
     view.shows(24, 80, "7e 1b 5b 3c 30 3b 35 3b 35 4d");
 
-    let mut busy = View::start(&host.grant(&opened).await, &home);
-    busy.shows(24, 80, "Press any key to close");
-    busy.send(b"x");
-    assert_ne!(busy.exit_code(), 0, "a second view is refused");
-    assert!(
-        busy.output_text().contains("Busy"),
-        "{}",
-        busy.output_text()
-    );
+    let mut beside = View::start(&host.grant(&opened).await, &home);
+    beside.shows(24, 80, "3c 30 3b 35 3b 35 4d");
+    beside.send(b"y");
+    beside.shows(24, 80, "35 4d 79");
+    view.shows(24, 80, "35 4d 79");
+    beside.send(b"\x1b");
+    assert_eq!(beside.exit_code(), 0, "a lone Esc closes that view");
+    view.send(b"z");
+    view.shows(24, 80, "4d 79 7a");
 
     view.master
         .resize(PtySize {
@@ -264,7 +280,66 @@ async fn an_attached_view_reaches_the_same_process_until_esc_closes_it() {
     let mut again = View::start(&host.grant(&opened).await, &home);
     again.shows(24, 80, "size 80x24");
     again.send(b"\x1b");
-    assert_eq!(again.exit_code(), 0, "the lease was released");
+    assert_eq!(
+        again.exit_code(),
+        0,
+        "a later view attaches as the first did"
+    );
+}
+
+/// Views of different sizes show one screen. It takes the size of the view that typed last, or
+/// of the newest view while none typed; a smaller view shows its top-left part cut at its own
+/// edges and a larger one shows it whole with blank space beyond. When the view it follows
+/// closes, the screen takes the size of the one that remains.
+#[tokio::test(flavor = "multi_thread")]
+async fn views_of_different_sizes_show_one_screen_cut_or_padded_to_fit() {
+    let host = Host::start().await;
+    let opened = host.open_keys().await;
+    let home = host.directory.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let mut large = View::start_sized(&host.grant(&opened).await, &home, 24, 80);
+    large.shows(24, 80, "size 80x24");
+    let mut small = View::start_sized(&host.grant(&opened).await, &home, 10, 40);
+    small.shows(10, 40, "size 40x10");
+    large.shows(24, 80, "size 40x10");
+
+    large.send(b"abcdefghijklmnopqrstuvwx");
+    large.shows(24, 80, "count 24");
+    small.shows(10, 40, "count 24");
+    let typed = large.rows(24, 80);
+    assert_eq!(typed[0], "size 80x24", "{typed:?}");
+    assert!(typed[1].len() > 40, "{typed:?}");
+    let cut = small.rows(10, 40);
+    assert_eq!(cut[0], "size 80x24");
+    assert_eq!(cut[1], typed[1][..40], "the top-left part of the screen");
+    assert_eq!(cut[2], "count 24", "a cut line never runs into the next");
+
+    small.send(b"y");
+    small.shows(10, 40, "count 25");
+    large.shows(24, 80, "count 25");
+    let padded = large.rows(24, 80);
+    assert_eq!(padded[0], "size 40x10", "{padded:?}");
+    assert_eq!(
+        padded[1].len(),
+        40,
+        "the screen's lines end at its own width: {padded:?}"
+    );
+    assert_eq!(padded[3], "count 25");
+    assert!(
+        padded[4..].iter().all(String::is_empty),
+        "blank beyond the screen: {padded:?}"
+    );
+
+    small.send(b"\x1b");
+    assert_eq!(small.exit_code(), 0);
+    large.shows(24, 80, "size 80x24");
+    large.send(b"\x1b");
+    assert_eq!(large.exit_code(), 0);
+    assert_eq!(
+        unsafe { libc::kill(opened.business_pid as i32, 0) },
+        0,
+        "the Tick keeps running"
+    );
 }
 
 /// A paste far larger than the attach client's input queue of 16 reads of 4 KiB reaches the

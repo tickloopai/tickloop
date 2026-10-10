@@ -351,7 +351,7 @@ impl crate::runtime::LiveView for WatchlistView {
     }
 
     fn help(&self) -> &'static str {
-        "q / Ctrl+C  Quit\nEsc  Back / cancel\n?  Help\nj / k / Ctrl+N / Ctrl+P / arrows  Move\nPageUp / PageDown  Page\ng / G  First / last\n[ / ] or Left / Right  Group\nMarket: ◌ Pre · ▶ Trading · ■ Closed\n? Unknown market status"
+        "q / Ctrl+C  Quit\n?  Help\nj / k / Ctrl+N / Ctrl+P / arrows  Move\nPageUp / PageDown  Page\ng / G  First / last\n[ / ] or Left / Right  Group\nMarket: ◌ Pre · ▶ Trading · ■ Closed\n? Unknown market status"
     }
 
     fn draw(

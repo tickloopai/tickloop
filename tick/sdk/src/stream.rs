@@ -1,6 +1,6 @@
 //! One newline-delimited JSON-RPC stream per Tick Instance.
 //!
-//! A hosted Tick uses real stdin/stdout for protocol 2 and update 3. A standalone
+//! A hosted Tick speaks Tick protocol 3 on real stdin/stdout. A standalone
 //! terminal run has no protocol peer. Outbound traffic holds the latest update
 //! plus bounded responses so a slow consumer does not block the visible UI.
 
@@ -8,7 +8,6 @@ use std::{
     collections::VecDeque,
     env, io,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Value, json};
@@ -19,22 +18,22 @@ use tokio::{
 };
 
 use tick_protocol::{
-    DESCRIBE_METHOD, FRAME_TOO_LARGE, INSTANCE_MISMATCH, INVALID_PARAMS, INVALID_REQUEST,
-    JSON_RPC_VERSION, METHOD_NOT_FOUND, PARSE_ERROR, READ_METHOD, TOOL_CALL_METHOD, TOOL_FAILED,
-    TickDescriptor, TickRead, UPDATE_METHOD, VERSION_MISMATCH,
+    CALL_METHOD, DESCRIBE_METHOD, FRAME_TOO_LARGE, INVALID_PARAMS, INVALID_REQUEST,
+    JSON_RPC_VERSION, METHOD_NOT_FOUND, PARSE_ERROR, READ_METHOD, REVISION_MISMATCH, TOOL_FAILED,
+    TickDescriptor, TickState, UPDATE_METHOD, VERSION_MISMATCH,
 };
 
 const INBOUND_CAPACITY: usize = 64;
 
 /// What a Tick tells its stream about itself.
 pub trait Describe: Send + Sync {
-    /// The Tick type every Tick Update names.
-    fn tick_type(&self) -> &str;
-    /// What `tick/describe` answers; the error says why the Tick cannot declare itself.
+    /// What `tick/describe` answers; the error says why the Tick cannot declare itself. Its
+    /// `revision` changes whenever the catalog does, and a `tick/call` naming another revision
+    /// is refused before it reaches the runtime.
     fn descriptor(&self) -> Result<TickDescriptor, String>;
 }
 
-/// A `tool/call` request the runtime still has to answer.
+/// A `tick/call` request the runtime still has to answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolRequest {
     pub id: Value,
@@ -64,7 +63,7 @@ impl RpcError {
     }
 
     pub fn unknown_tool(tool: &str) -> Self {
-        Self::new(METHOD_NOT_FOUND, format!("unknown Tick Tool {tool:?}"))
+        Self::new(INVALID_PARAMS, format!("unknown Tick Tool {tool:?}"))
     }
 
     fn frame(&self, id: Value) -> Value {
@@ -74,16 +73,6 @@ impl RpcError {
         }
         json!({"jsonrpc": JSON_RPC_VERSION, "id": id, "error": error})
     }
-}
-
-/// A `tool/call` request frame sent to a Tick Instance.
-pub fn tool_call_frame(id: Value, tool: &str, args: Value) -> Value {
-    json!({
-        "jsonrpc": JSON_RPC_VERSION,
-        "id": id,
-        "method": TOOL_CALL_METHOD,
-        "params": {"tool": tool, "args": args},
-    })
 }
 
 /// The Tick Update records an in-memory [`TickStream`] collects. The handle can be
@@ -141,65 +130,48 @@ impl Requests {
 
 pub struct TickStream {
     tick: Box<dyn Describe>,
-    source: &'static str,
-    native_instance_id: Option<String>,
-    sequence: u64,
-    previous: Option<Value>,
+    /// The latest published state; its data is null until the first Tick Update.
+    state: TickState,
     outbound: Outbound,
     requests: Option<mpsc::Receiver<InboundFrame>>,
     reader: Option<JoinHandle<()>>,
 }
 
 impl TickStream {
-    /// Uses protocol stdio only for a hosted Tick; standalone runs have no peer.
-    pub fn from_process(tick: impl Describe + 'static, source: &'static str) -> io::Result<Self> {
-        let native_instance_id = environment_value(tick_protocol::INSTANCE_ID_ENV)?;
-        if let Some(native_instance_id) = native_instance_id {
-            if !tick_protocol::is_launched_instance_id(&native_instance_id) {
-                return Err(io::Error::other(format!(
+    /// Uses protocol stdio only for a Tick a host launched; standalone runs have no peer.
+    pub fn from_process(tick: impl Describe + 'static) -> io::Result<Self> {
+        match environment_value(tick_protocol::INSTANCE_ID_ENV)? {
+            Some(instance_id) if !tick_protocol::is_launched_instance_id(&instance_id) => {
+                Err(io::Error::other(format!(
                     "{} needs a complete herdr: or hosted: instance identity",
                     tick_protocol::INSTANCE_ID_ENV
-                )));
+                )))
             }
-            let mut stream = Self::stdio(tick, source);
-            stream.native_instance_id = Some(native_instance_id);
-            return Ok(stream);
+            Some(_) => Ok(Self::stdio(tick)),
+            None => Ok(Self::detached(tick)),
         }
-        Ok(Self::detached(tick, source))
     }
 
     pub fn duplex(
         tick: impl Describe + 'static,
-        source: &'static str,
-        instance_id: String,
         reader: impl AsyncRead + Send + Unpin + 'static,
         writer: impl AsyncWrite + Send + Unpin + 'static,
     ) -> Self {
-        let mut stream = Self::streamed(tick, source, reader, writer);
-        stream.native_instance_id = Some(instance_id);
-        stream
+        Self::streamed(tick, reader, writer)
     }
 
     /// Keeps every published record in memory for tests and one-shot output.
-    pub fn in_memory(tick: impl Describe + 'static, source: &'static str) -> Self {
-        Self {
-            tick: Box::new(tick),
-            source,
-            native_instance_id: Some(format!("herdr:test-{}", generated_tick_instance_id())),
-            sequence: 0,
-            previous: None,
-            outbound: Outbound::Buffered(Records::default()),
-            requests: None,
-            reader: None,
-        }
+    pub fn in_memory(tick: impl Describe + 'static) -> Self {
+        Self::with_outbound(tick, Outbound::Buffered(Records::default()))
     }
 
+    /// Whether something reads this stream: a host, or the in-memory records.
     pub fn is_native(&self) -> bool {
-        self.native_instance_id.is_some()
+        !matches!(self.outbound, Outbound::Discarded)
     }
 
-    pub fn sequence(&self) -> u64 {
-        self.sequence
+    pub fn seq(&self) -> u64 {
+        self.state.seq
     }
 
     /// The Tick Update records published so far; only in-memory Sessions keep them.
@@ -211,43 +183,34 @@ impl TickStream {
     }
 
     /// Enqueues the next Tick Update when `data` differs from the last one.
-    /// The sequence is assigned here, so a replaced slot leaves a gap equal to
+    /// The seq is assigned here, so a replaced slot leaves a gap equal to
     /// the number of dropped updates.
     pub fn publish(&mut self, data: Value) -> io::Result<()> {
-        if self.previous.as_ref() == Some(&data) {
+        if data.is_null() {
+            return Err(io::Error::other("a Tick Update needs data"));
+        }
+        if self.state.data == data {
             return Ok(());
         }
-        let kind = if self.sequence == 0 {
-            "snapshot"
-        } else {
-            "update"
+        let state = TickState {
+            seq: self
+                .state
+                .seq
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("Tick Update seq exhausted"))?,
+            data,
+            at: Some(tick_protocol::now_rfc3339()),
         };
-        let sequence = self
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("Tick Update sequence exhausted"))?;
-        let observed_at = observed_at()?;
-        let record = json!({
-            "version": tick_protocol::NATIVE_UPDATE_VERSION,
-            "tick": self.tick.tick_type(),
-            "tick_instance_id": self.native_instance_id,
-            "source": self.source,
-            "sequence": sequence,
-            "kind": kind,
-            "observed_at": observed_at,
-            "data": data,
-        });
         let frame = encode_limited(
             &json!({
                 "jsonrpc": JSON_RPC_VERSION,
                 "method": UPDATE_METHOD,
-                "params": record,
+                "params": state,
             }),
             tick_protocol::MAX_UPDATE_BYTES,
         )?;
         self.outbound.offer_update(frame);
-        self.sequence = sequence;
-        self.previous = Some(data);
+        self.state = state;
         Ok(())
     }
 
@@ -257,7 +220,7 @@ impl TickStream {
     }
 
     /// Answers everything this protocol version owns and surfaces only the
-    /// `tool/call` requests the runtime has to dispatch.
+    /// `tick/call` requests the runtime has to dispatch.
     pub fn dispatch(&mut self, incoming: InboundFrame) -> Option<ToolRequest> {
         let line = match incoming {
             InboundFrame::Line(line) => line,
@@ -303,32 +266,6 @@ impl TickStream {
             );
             return None;
         }
-        if let Some(protocol) = frame.pointer("/params/protocol").and_then(Value::as_u64)
-            && protocol != u64::from(tick_protocol::NATIVE_PROTOCOL_VERSION)
-        {
-            self.answer(
-                id,
-                Err(RpcError::new(
-                    VERSION_MISMATCH,
-                    "unsupported Tick protocol version",
-                )),
-            );
-            return None;
-        }
-        if let Some(instance) = frame
-            .pointer("/params/tick_instance_id")
-            .and_then(Value::as_str)
-            && Some(instance) != self.native_instance_id.as_deref()
-        {
-            self.answer(
-                id,
-                Err(RpcError::new(
-                    INSTANCE_MISMATCH,
-                    "Tick instance identity mismatch",
-                )),
-            );
-            return None;
-        }
         let Some(method) = frame.get("method").and_then(Value::as_str) else {
             self.answer(
                 id,
@@ -338,73 +275,45 @@ impl TickStream {
         };
         match method {
             DESCRIBE_METHOD => {
-                let answer = self.descriptor();
+                let answer = self.descriptor().and_then(|descriptor| {
+                    serde_json::to_value(descriptor)
+                        .map_err(|error| RpcError::new(TOOL_FAILED, error.to_string()))
+                });
                 self.answer(id, answer);
                 None
             }
             READ_METHOD => {
-                let observed_at = observed_at();
-                let result = observed_at
-                    .map(|observed_at| {
-                        json!(TickRead {
-                            version: tick_protocol::NATIVE_UPDATE_VERSION,
-                            tick_instance_id: self
-                                .native_instance_id
-                                .clone()
-                                .expect("native identity"),
-                            initialized: self.previous.is_some(),
-                            sequence: self.sequence,
-                            observed_at,
-                            data: self.previous.clone(),
-                        })
-                    })
-                    .map_err(|error| RpcError::new(TOOL_FAILED, error.to_string()));
-                self.answer(id, result);
+                let state = json!(self.state);
+                self.answer(id, Ok(state));
                 None
             }
-            TOOL_CALL_METHOD => {
+            CALL_METHOD => {
                 let params = frame.get("params").cloned().unwrap_or(Value::Null);
-                if let Some(expected) = params
-                    .get("expected_descriptor_digest")
-                    .and_then(Value::as_str)
-                {
-                    let current = self.descriptor().and_then(|value| {
-                        serde_json::from_value::<TickDescriptor>(value)
-                            .map_err(|error| RpcError::new(TOOL_FAILED, error.to_string()))
-                    });
-                    match current {
-                        Ok(descriptor)
-                            if tick_protocol::descriptor_digest(&descriptor) == expected => {}
-                        Ok(_) => {
-                            self.answer(
-                                id,
-                                Err(RpcError::new(
-                                    INVALID_REQUEST,
-                                    "Tick Tool catalog changed before dispatch",
-                                )),
-                            );
-                            return None;
-                        }
-                        Err(error) => {
-                            self.answer(id, Err(error));
-                            return None;
-                        }
-                    }
-                }
-                match params.get("tool").and_then(Value::as_str) {
-                    Some(tool) => Some(ToolRequest {
+                let checked = match (
+                    params.get("revision").and_then(Value::as_str),
+                    params.get("tool").and_then(Value::as_str),
+                ) {
+                    (Some(revision), Some(tool)) => match self.descriptor() {
+                        Ok(current) if current.revision == revision => Ok(tool),
+                        Ok(_) => Err(RpcError::new(
+                            REVISION_MISMATCH,
+                            "the Tick Tool catalog changed; describe the Tick and prepare the call again",
+                        )),
+                        Err(error) => Err(error),
+                    },
+                    _ => Err(RpcError::new(
+                        INVALID_PARAMS,
+                        format!("{CALL_METHOD} requires a tool name and the catalog revision"),
+                    )),
+                };
+                match checked {
+                    Ok(tool) => Some(ToolRequest {
                         id,
                         tool: tool.to_owned(),
                         args: params.get("args").cloned().unwrap_or(json!({})),
                     }),
-                    None => {
-                        self.answer(
-                            id,
-                            Err(RpcError::new(
-                                INVALID_PARAMS,
-                                format!("{TOOL_CALL_METHOD} requires a tool name"),
-                            )),
-                        );
+                    Err(error) => {
+                        self.answer(id, Err(error));
                         None
                     }
                 }
@@ -435,22 +344,21 @@ impl TickStream {
         self.outbound.enqueue_response(frame);
     }
 
-    fn descriptor(&self) -> Result<Value, RpcError> {
-        let native = self
+    fn descriptor(&self) -> Result<TickDescriptor, RpcError> {
+        let descriptor = self
             .tick
             .descriptor()
             .map_err(|error| RpcError::new(TOOL_FAILED, error))?;
-        native
+        descriptor
             .validate()
             .map_err(|error| RpcError::new(INVALID_REQUEST, error))?;
-        let value = serde_json::to_value(native)
-            .map_err(|error| RpcError::new(TOOL_FAILED, error.to_string()))?;
-        if serde_json::to_vec(&value).map_or(true, |bytes| {
-            bytes.len() > tick_protocol::MAX_DESCRIPTION_BYTES
-        }) {
-            return Err(RpcError::new(FRAME_TOO_LARGE, "Tick description too large"));
-        }
-        Ok(value)
+        tick_protocol::check_encoded_size(
+            &descriptor,
+            tick_protocol::MAX_DESCRIPTION_BYTES,
+            "Tick description",
+        )
+        .map_err(|error| RpcError::new(FRAME_TOO_LARGE, error))?;
+        Ok(descriptor)
     }
 
     /// Flushes whatever is still queued and stops the transport tasks.
@@ -463,7 +371,6 @@ impl TickStream {
 
     fn streamed(
         tick: impl Describe + 'static,
-        source: &'static str,
         reader: impl AsyncRead + Send + Unpin + 'static,
         writer: impl AsyncWrite + Send + Unpin + 'static,
     ) -> Self {
@@ -472,32 +379,28 @@ impl TickStream {
         let (sender, requests) = mpsc::channel(INBOUND_CAPACITY);
         let reader = tokio::spawn(read_requests(reader, sender));
         Self {
-            tick: Box::new(tick),
-            source,
-            native_instance_id: None,
-            sequence: 0,
-            previous: None,
-            outbound: Outbound::Streamed { queue, writer },
             requests: Some(requests),
             reader: Some(reader),
+            ..Self::with_outbound(tick, Outbound::Streamed { queue, writer })
         }
     }
 
-    fn detached(tick: impl Describe + 'static, source: &'static str) -> Self {
+    fn detached(tick: impl Describe + 'static) -> Self {
+        Self::with_outbound(tick, Outbound::Discarded)
+    }
+
+    fn stdio(tick: impl Describe + 'static) -> Self {
+        Self::streamed(tick, tokio::io::stdin(), tokio::io::stdout())
+    }
+
+    fn with_outbound(tick: impl Describe + 'static, outbound: Outbound) -> Self {
         Self {
             tick: Box::new(tick),
-            source,
-            native_instance_id: None,
-            sequence: 0,
-            previous: None,
-            outbound: Outbound::Discarded,
+            state: TickState::empty(),
+            outbound,
             requests: None,
             reader: None,
         }
-    }
-
-    fn stdio(tick: impl Describe + 'static, source: &'static str) -> Self {
-        Self::streamed(tick, source, tokio::io::stdin(), tokio::io::stdout())
     }
 }
 
@@ -665,12 +568,6 @@ fn encode_limited(frame: &Value, maximum: usize) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn observed_at() -> io::Result<String> {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .map_err(io::Error::other)
-}
-
 fn environment_value(name: &str) -> io::Result<Option<String>> {
     env::var_os(name)
         .map(|value| {
@@ -679,12 +576,4 @@ fn environment_value(name: &str) -> io::Result<Option<String>> {
                 .map_err(|_| io::Error::other(format!("{name} must be valid UTF-8")))
         })
         .transpose()
-}
-
-fn generated_tick_instance_id() -> u64 {
-    let started = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    u64::try_from(started).unwrap_or(u64::MAX) ^ (u64::from(std::process::id()) << 32)
 }

@@ -36,7 +36,7 @@ async fn demo_keeps_streaming_after_switching_candle_periods() {
         output: OnceArgs::default(),
     };
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 14)).unwrap();
-    let mut events = TickStream::in_memory(TickKind::Kline, "demo");
+    let mut events = TickStream::in_memory(TickKind::Kline);
     kline::run_live(
         &args,
         &api,
@@ -64,7 +64,6 @@ async fn demo_keeps_streaming_after_switching_candle_periods() {
         switched[0]["data"]["candles"],
         switched.last().unwrap()["data"]["candles"]
     );
-    assert!(records.iter().all(|record| record["source"] == "demo"));
     let screen: String = terminal
         .backend()
         .buffer()

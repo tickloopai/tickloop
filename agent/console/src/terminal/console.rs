@@ -139,6 +139,7 @@ const CREATION_ATTACH_UNAVAILABLE_PREFIX: &str = "New Agent created; local conne
 const EXECUTION_CONNECTION_DETAILS_HINT: &str = "ctrl+o details";
 const SEND_NOW_HINT: &str = "ctrl+enter send now";
 const HINT_SEGMENT_SEPARATOR: &str = " · ";
+const INTERRUPT_HINT: &str = "esc interrupt";
 /// Blank columns between the key hints and the right-aligned notice.
 const HINT_NOTICE_GAP_COLUMNS: usize = 2;
 const SHELL_INPUT_PROMPT: &str = "!";
@@ -7492,6 +7493,7 @@ impl State {
                 let return_hint;
                 let monitor_hint;
                 let send_now_hint;
+                let empty_input_hint;
                 let hints = if self.confirmation_hint().is_some() || self.help_open {
                     // Help is focused and draws its own close hint; only facts remain.
                     ""
@@ -7532,19 +7534,25 @@ impl State {
                     return_hint.as_str()
                 } else if self.editor.draft().is_empty() {
                     // A visible suggestion takes Tab and →, so → no longer opens Monitor.
-                    let empty_input_hint = if self.visible_prompt_suggestion().is_some() {
-                        "← Agents · tab/→ accept · ? help · ctrl+o details · ctrl+g editor · ctrl+c interrupt"
+                    let navigation_hint = if self.visible_prompt_suggestion().is_some() {
+                        "← Agents · tab/→ accept · ? help · ctrl+o details · ctrl+g editor"
                     } else if self.monitor.total() == 0 {
-                        "← Agents · ? help · ctrl+o details · ctrl+g editor · ctrl+c interrupt"
+                        "← Agents · ? help · ctrl+o details · ctrl+g editor"
                     } else {
-                        "← Agents · → Monitor · ? help · ctrl+o details · ctrl+g editor · ctrl+c interrupt"
+                        "← Agents · → Monitor · ? help · ctrl+o details · ctrl+g editor"
+                    };
+                    // The same key the Working line names, and only while there is a turn to stop.
+                    empty_input_hint = if self.can_interrupt_activity() {
+                        format!("{navigation_hint}{HINT_SEGMENT_SEPARATOR}{INTERRUPT_HINT}")
+                    } else {
+                        navigation_hint.to_owned()
                     };
                     if self.can_send_now() && self.oldest_queued_message().is_some() {
                         send_now_hint =
                             format!("{SEND_NOW_HINT}{HINT_SEGMENT_SEPARATOR}{empty_input_hint}");
                         send_now_hint.as_str()
                     } else {
-                        empty_input_hint
+                        empty_input_hint.as_str()
                     }
                 } else if self.can_send_now() && !self.editor.draft().trim_start().starts_with('/')
                 {

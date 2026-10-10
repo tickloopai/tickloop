@@ -99,7 +99,7 @@ async fn news_network_failure_keeps_the_view_alive_and_next_refresh_publishes_re
         })
         .boxed();
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
-        let mut events = TickStream::in_memory(TickKind::News, "longbridge");
+        let mut events = TickStream::in_memory(TickKind::News);
         news::run_live(
             &arguments(),
             &api,
@@ -152,7 +152,7 @@ async fn refresh_authentication_and_usage_errors_exit_instead_of_retrying() {
             hang_on_call: None,
         };
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
-        let mut events = TickStream::in_memory(TickKind::News, "longbridge");
+        let mut events = TickStream::in_memory(TickKind::News);
         let error = news::run_live(
             &arguments(),
             &api,
@@ -189,7 +189,7 @@ async fn a_hanging_refresh_times_out_and_the_next_cycle_recovers() {
     })
     .boxed();
     let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
-    let mut events = TickStream::in_memory(TickKind::News, "longbridge");
+    let mut events = TickStream::in_memory(TickKind::News);
     news::run_live(
         &arguments(),
         &api,
@@ -227,7 +227,7 @@ async fn a_hanging_retry_shows_recovering_and_remains_cancellable() {
     .boxed();
     let start = tokio::time::Instant::now();
     let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
-    let mut events = TickStream::in_memory(TickKind::News, "longbridge");
+    let mut events = TickStream::in_memory(TickKind::News);
     news::run_live(
         &arguments(),
         &api,
@@ -324,7 +324,7 @@ async fn market_failure_recovers_on_connection_or_data_without_status_ticks() {
         })
         .boxed();
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
-        let mut events = TickStream::in_memory(TickKind::Quote, "longbridge");
+        let mut events = TickStream::in_memory(TickKind::Quote);
         quote::run_live(
             &QuoteArgs {
                 symbols: vec!["AAPL.US".into()],
@@ -373,7 +373,7 @@ async fn market_authentication_failure_exits_with_auth_guidance_and_cleans_up_su
     })
     .unwrap();
     let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
-    let mut events = TickStream::in_memory(TickKind::Quote, "longbridge");
+    let mut events = TickStream::in_memory(TickKind::Quote);
     let error = quote::run_live(
         &QuoteArgs {
             symbols: vec!["AAPL.US".into()],
@@ -452,7 +452,7 @@ async fn switching_candle_periods_keeps_periodic_history_correction_with_push_av
     })
     .boxed();
     let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
-    let mut events = TickStream::in_memory(TickKind::Kline, "longbridge");
+    let mut events = TickStream::in_memory(TickKind::Kline);
     kline::run_live(
         &KlineArgs {
             symbol: "AAPL.US".into(),
@@ -522,7 +522,7 @@ async fn connection_recovery_backfills_candles_and_healthy_probes_do_not_repeat_
         })
         .boxed();
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
-        let mut events = TickStream::in_memory(TickKind::Kline, "longbridge");
+        let mut events = TickStream::in_memory(TickKind::Kline);
         kline::run_live(
             &KlineArgs {
                 symbol: "AAPL.US".into(),
@@ -619,7 +619,7 @@ async fn article_network_failure_keeps_the_list_and_enter_can_retry_without_ui_t
             })
             .boxed();
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
-        let mut events = TickStream::in_memory(TickKind::News, "longbridge");
+        let mut events = TickStream::in_memory(TickKind::News);
         news::run_live(
             &arguments(),
             &api,
@@ -668,7 +668,7 @@ async fn article_authentication_and_usage_errors_remain_fatal() {
             .chain(futures_util::stream::pending())
             .boxed();
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
-        let mut events = TickStream::in_memory(TickKind::News, "longbridge");
+        let mut events = TickStream::in_memory(TickKind::News);
         let error = news::run_live(
             &arguments(),
             &api,

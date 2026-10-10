@@ -61,7 +61,7 @@ async fn us_positions_use_fractional_holdings_and_quotes_without_inventing_avail
  {
     for account_type in ["0", "1", ""] {
         let mut output = Vec::new();
-        let mut updates = TickStream::in_memory(TickKind::Positions, "longbridge");
+        let mut updates = TickStream::in_memory(TickKind::Positions);
         positions::run_once(
             &OnceArgs {
                 once: true,
@@ -119,7 +119,7 @@ async fn incomplete_us_holdings_fail_before_requesting_quotes_or_publishing_cont
             _ => unreachable!(),
         }
         let mut output = Vec::new();
-        let mut updates = TickStream::in_memory(TickKind::Positions, "longbridge");
+        let mut updates = TickStream::in_memory(TickKind::Positions);
         let error = positions::run_once(
             &OnceArgs {
                 once: true,

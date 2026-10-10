@@ -1,6 +1,6 @@
 #![cfg(unix)]
 //! Real `tickhost open` launchers under the Tickhost library: hidden PTYs, the hosted launch contract,
-//! one business process shared by protocol calls, its screen and an attached view, and process
+//! one business process shared by protocol calls, its screen and its attached views, and process
 //! cleanup.
 
 use std::{path::Path, time::Duration};
@@ -22,7 +22,6 @@ use tokio::{
 const COUNTER: &str = r#"
 import json, os, signal, sys, threading, time
 LARGE_PAYLOAD = 8 * 1024 * 1024 - 4096
-instance = os.environ['TICKLOOP_INSTANCE_ID']
 value = 0
 typed = ''
 def draw(*_):
@@ -40,10 +39,10 @@ for line in sys.stdin:
     request = json.loads(line)
     method = request['method']
     if method == 'tick/describe':
-        result = {'protocol':2,'tick_type':'example.counter','title':'Counter','description':'Counter','recover_with':'current','tools':[{'name':'increment','description':'Increment','params':{'type':'object'},'mutates':True},{'name':'current','description':'Read','params':{'type':'object'},'mutates':False},{'name':'flood','description':'Print many lines','params':{'type':'object'},'mutates':False},{'name':'slow','description':'Answer after 16 seconds','params':{'type':'object'},'mutates':False},{'name':'large','description':'Answer with almost 8 MiB','params':{'type':'object'},'mutates':False},{'name':'oversized_update','description':'Send an update beyond the limit','params':{'type':'object'},'mutates':False}]}
+        result = {'protocol':3,'revision':'1','kind':'example.counter','title':'Counter','description':'Counter','recover_with':'current','tools':[{'name':'increment','description':'Increment','input_schema':{'type':'object'},'mutates':True},{'name':'current','description':'Read','input_schema':{'type':'object'},'mutates':False},{'name':'flood','description':'Print many lines','input_schema':{'type':'object'},'mutates':False},{'name':'slow','description':'Answer after 16 seconds','input_schema':{'type':'object'},'mutates':False},{'name':'large','description':'Answer with almost 8 MiB','input_schema':{'type':'object'},'mutates':False},{'name':'oversized_update','description':'Send an update beyond the limit','input_schema':{'type':'object'},'mutates':False}]}
     elif method == 'tick/read':
-        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':value,'observed_at':'2026-10-07T00:00:00Z','data':{'value':value,'note':open('note.txt').read(),'sees_launch_token':'TICKLOOP_TICKHOST_LAUNCH' in os.environ,'argument_bytes':sum(len(argument) for argument in sys.argv[1:])}}
-    elif method == 'tool/call':
+        result = {'seq':value,'at':'2026-10-07T00:00:00Z','data':{'value':value,'note':open('note.txt').read(),'sees_launch_token':'TICKLOOP_TICKHOST_LAUNCH' in os.environ,'argument_bytes':sum(len(argument) for argument in sys.argv[1:])}}
+    elif method == 'tick/call':
         if request['params']['tool'] == 'increment':
             value += 1
             draw()
@@ -54,7 +53,7 @@ for line in sys.stdin:
         elif request['params']['tool'] == 'slow':
             time.sleep(16)
         elif request['params']['tool'] == 'oversized_update':
-            print(json.dumps({'jsonrpc':'2.0','method':'tick/update','params':{'version':3,'tick_instance_id':instance,'source':'example.counter','sequence':value + 1,'observed_at':'2026-10-07T00:00:01Z','data':{'blob':'x' * (600 * 1024)}}}), flush=True)
+            print(json.dumps({'jsonrpc':'2.0','method':'tick/update','params':{'seq':value + 1,'at':'2026-10-07T00:00:01Z','data':{'blob':'x' * (600 * 1024)}}}), flush=True)
         elif request['params']['tool'] == 'large':
             result = {'value':value,'payload':'x' * LARGE_PAYLOAD}
             print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
@@ -224,7 +223,8 @@ async fn send(requests: &mut OwnedWriteHalf, request: Value) {
         .unwrap();
 }
 
-/// Paints the attached view's frames into a terminal model until it shows `needle`.
+/// Paints the attached view's frames into a terminal model, at the screen size each frame names,
+/// until it shows `needle`.
 async fn view_shows(events: &mut BufReader<OwnedReadHalf>, view: &mut vt100::Parser, needle: &str) {
     let painted = tokio::time::timeout(Duration::from_secs(10), async {
         while !view.screen().contents().contains(needle) {
@@ -233,6 +233,11 @@ async fn view_shows(events: &mut BufReader<OwnedReadHalf>, view: &mut vt100::Par
                 .unwrap()
                 .expect("the view stays attached");
             assert_eq!(event["event"], "frame", "{event}");
+            let size = |dimension: &str| event["size"][dimension].as_u64().unwrap() as u16;
+            let (rows, columns) = (size("rows"), size("columns"));
+            if view.screen().size() != (rows, columns) {
+                view.screen_mut().set_size(rows, columns);
+            }
             view.process(event["data"].as_str().unwrap().as_bytes());
         }
     })
@@ -254,18 +259,43 @@ async fn view_end(events: &mut BufReader<OwnedReadHalf>) -> Option<Value> {
     }
 }
 
-async fn attach_when_released(fixture: &Fixture, opened: &Value) -> HostConnection {
-    for _ in 0..200 {
-        let mut view = fixture.reader(opened).await;
-        match view.request("attach", json!({}), CONTROL_TIMEOUT).await {
-            Ok(_) => return view,
-            Err(error) if error.code == "Busy" => {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            Err(error) => panic!("attach failed: {error:?}"),
+/// The terminal size a hosted Tick starts with; a view of this size leaves it unchanged.
+fn initial_size() -> Value {
+    json!({"rows":30,"columns":120})
+}
+
+/// Attaches one more view of `size` to the Tick `opened` names.
+async fn attach(fixture: &Fixture, opened: &Value, size: Value) -> HostConnection {
+    let mut view = fixture.reader(opened).await;
+    let attached = view
+        .request("attach", json!({"size":size}), CONTROL_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(attached["attached"], true);
+    view
+}
+
+/// How many views the host lists for its only Tick.
+async fn listed_views(controller: &mut HostConnection) -> Value {
+    controller
+        .request("list", json!({}), CONTROL_TIMEOUT)
+        .await
+        .unwrap()["items"][0]["views"]
+        .clone()
+}
+
+/// Waits until the host lists `views` views for its only Tick.
+async fn views_become(controller: &mut HostConnection, views: usize) {
+    for _ in 0..400 {
+        if listed_views(controller).await == views {
+            return;
         }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("the attach lease was never released");
+    panic!(
+        "the Tick never had {views} views: {}",
+        listed_views(controller).await
+    );
 }
 
 /// Whether a process holds a pseudo-terminal master descriptor.
@@ -326,7 +356,7 @@ async fn protocol_calls_and_the_screen_belong_to_one_counter_process() {
     let called = reader
         .request(
             "call",
-            json!({"tool":"increment","args":{}}),
+            json!({"tool":"increment","args":{},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await
@@ -383,7 +413,7 @@ async fn killing_the_launcher_ends_its_business_process_and_the_host_reaps_it() 
     reader
         .request(
             "call",
-            json!({"tool":"increment","args":{}}),
+            json!({"tool":"increment","args":{},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await
@@ -541,84 +571,113 @@ async fn a_launcher_outside_the_foreground_is_refused_before_its_tick_starts() {
     shutdown(&fixture).await;
 }
 
+/// Several views attach to one Tick at once and see the same screen, each told its size; keys
+/// from any of them reach the one business process. The terminal takes the size of the view that
+/// typed last, or of the newest view while none typed, so a resize of another view changes only
+/// that view. A view that leaves, even the one the terminal follows, leaves the others and the
+/// Tick running.
 #[tokio::test(flavor = "multi_thread")]
-async fn one_attached_view_controls_the_terminal_until_it_detaches_or_disconnects() {
+async fn several_views_share_one_terminal_sized_by_the_view_that_typed_last() {
     let fixture = Fixture::start().await;
     let mut controller = fixture.controller().await;
     let (command, work) = fixture.counter();
     let opened = fixture.open(&mut controller, command, &work).await.unwrap();
-    let mut first = fixture.reader(&opened).await;
-    let attached = first
-        .request(
-            "attach",
-            json!({"size":{"rows":20,"columns":80}}),
-            CONTROL_TIMEOUT,
-        )
-        .await
-        .unwrap();
-    assert_eq!(attached["attached"], true);
-    let (mut events, mut requests) = first.into_parts();
-    let mut view = vt100::Parser::new(20, 80, 0);
-    view_shows(&mut events, &mut view, "Counter 0 in work 80x20").await;
-    let listed = controller
-        .request("list", json!({}), CONTROL_TIMEOUT)
-        .await
-        .unwrap();
-    assert_eq!(listed["items"][0]["attached"], true);
-
-    let mut second = fixture.reader(&opened).await;
-    let busy = second
-        .request("attach", json!({}), CONTROL_TIMEOUT)
-        .await
-        .unwrap_err();
-    assert_eq!(busy.code, "Busy", "the first view keeps the terminal");
+    let mut reader = fixture.reader(&opened).await;
+    let (mut first_events, mut first_requests) =
+        attach(&fixture, &opened, json!({"rows":20,"columns":80}))
+            .await
+            .into_parts();
+    let mut first = vt100::Parser::new(20, 80, 0);
+    view_shows(&mut first_events, &mut first, "Counter 0 in work 80x20").await;
+    let (mut second_events, mut second_requests) =
+        attach(&fixture, &opened, json!({"rows":24,"columns":100}))
+            .await
+            .into_parts();
+    let mut second = vt100::Parser::new(24, 100, 0);
+    view_shows(&mut second_events, &mut second, "Counter 0 in work 100x24").await;
+    view_shows(&mut first_events, &mut first, "Counter 0 in work 100x24").await;
+    assert_eq!(
+        first.screen().size(),
+        (24, 100),
+        "every view is told the screen size"
+    );
+    assert_eq!(listed_views(&mut controller).await, 2);
 
     send(
-        &mut requests,
+        &mut first_requests,
         json!({"method":"input","params":{"data":b"hello\n".to_vec()}}),
     )
     .await;
-    view_shows(&mut events, &mut view, "typed hello").await;
+    view_shows(&mut first_events, &mut first, "80x20 typed hello").await;
+    view_shows(&mut second_events, &mut second, "80x20 typed hello").await;
     send(
-        &mut requests,
-        json!({"method":"resize","params":{"size":{"rows":24,"columns":100}}}),
+        &mut second_requests,
+        json!({"method":"input","params":{"data":b"world\n".to_vec()}}),
     )
     .await;
-    view.screen_mut().set_size(24, 100);
-    view_shows(&mut events, &mut view, "100x24").await;
-    let called = second
+    view_shows(&mut second_events, &mut second, "100x24 typed world").await;
+    view_shows(&mut first_events, &mut first, "100x24 typed world").await;
+
+    send(
+        &mut first_requests,
+        json!({"method":"resize","params":{"size":{"rows":30,"columns":90}}}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let called = reader
         .request(
             "call",
-            json!({"tool":"increment","args":{}}),
+            json!({"tool":"increment","args":{},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await
         .unwrap();
     assert_eq!(called["value"], 1);
-    view_shows(
-        &mut events,
-        &mut view,
-        "Counter 1 in work 100x24 typed hello",
+    let unchanged = "Counter 1 in work 100x24 typed world";
+    view_shows(&mut second_events, &mut second, unchanged).await;
+    view_shows(&mut first_events, &mut first, unchanged).await;
+    send(
+        &mut second_requests,
+        json!({"method":"resize","params":{"size":{"rows":26,"columns":110}}}),
     )
     .await;
-
-    send(&mut requests, json!({"method":"detach"})).await;
-    assert_eq!(view_end(&mut events).await, None, "detach ends the view");
-    second
-        .request("attach", json!({}), CONTROL_TIMEOUT)
-        .await
-        .expect("detach releases the lease");
-    let (mut events, mut requests) = second.into_parts();
+    view_shows(&mut second_events, &mut second, "110x26 typed world").await;
+    view_shows(&mut first_events, &mut first, "110x26 typed world").await;
     send(
-        &mut requests,
+        &mut first_requests,
+        json!({"method":"input","params":{"data":b"again\n".to_vec()}}),
+    )
+    .await;
+    view_shows(&mut first_events, &mut first, "90x30 typed again").await;
+    view_shows(&mut second_events, &mut second, "90x30 typed again").await;
+
+    send(&mut first_requests, json!({"method":"detach"})).await;
+    assert_eq!(
+        view_end(&mut first_events).await,
+        None,
+        "detach ends the view"
+    );
+    view_shows(&mut second_events, &mut second, "110x26 typed again").await;
+    assert_eq!(listed_views(&mut controller).await, 1);
+    let called = reader
+        .request(
+            "call",
+            json!({"tool":"increment","args":{},"revision":"1"}),
+            CONTROL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(called["value"], 2);
+    view_shows(&mut second_events, &mut second, "Counter 2 in work 110x26").await;
+
+    send(
+        &mut second_requests,
         json!({"method":"input","params":{"data":vec![b'x'; ATTACH_INPUT_BYTES + 1]}}),
     )
     .await;
-    let refused = view_end(&mut events).await.unwrap();
+    let refused = view_end(&mut second_events).await.unwrap();
     assert_eq!(refused["error"]["code"], "InputTooLarge", "{refused}");
-    let third = attach_when_released(&fixture, &opened).await;
-    drop(third);
-    let fourth = attach_when_released(&fixture, &opened).await;
+    views_become(&mut controller, 0).await;
     let listed = controller
         .request("list", json!({}), CONTROL_TIMEOUT)
         .await
@@ -627,15 +686,15 @@ async fn one_attached_view_controls_the_terminal_until_it_detaches_or_disconnect
         listed["items"][0]["business_pid"], opened["business_pid"],
         "views come and go around one business process"
     );
-    drop(fourth);
     shutdown(&fixture).await;
 }
 
-/// The owner lets one view attach to its Tick's terminal without handing out the Tick's data
-/// token: a grant works once, only to attach, only for the Tick it names, and a newer grant
-/// replaces an earlier one.
+/// The owner lets a view attach to its Tick's terminal without handing out the Tick's data
+/// token: every grant admits its own view once, only to attach and only for the Tick it names,
+/// and a newer grant leaves earlier ones usable, so the views of several grants are attached at
+/// once.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_view_grant_attaches_one_view_once_and_allows_nothing_else() {
+async fn every_view_grant_attaches_its_own_view_once_and_allows_nothing_else() {
     async fn grant(controller: &mut HostConnection, owner: &Value, instance: &Value) -> Value {
         controller
             .request(
@@ -680,85 +739,104 @@ async fn a_view_grant_attaches_one_view_once_and_allows_nothing_else() {
         "only the Tick's owner grants a view"
     );
 
-    let replaced = grant(&mut controller, &fixture.owner, &instance).await;
-    let granted = grant(&mut controller, &fixture.owner, &instance).await;
-    let refused = viewer(&fixture, &instance, &replaced).await.err().unwrap();
-    assert_eq!(
-        refused.code, "Forbidden",
-        "a newer grant replaces an earlier one"
-    );
-    let mut view = viewer(&fixture, &instance, &granted).await.unwrap();
-    let read = view
-        .request("read", json!({}), CONTROL_TIMEOUT)
-        .await
-        .unwrap_err();
-    assert_eq!(read.code, "MethodNotAllowed", "a view only attaches");
-    let attached = view
-        .request(
-            "attach",
-            json!({"size":{"rows":20,"columns":80}}),
-            CONTROL_TIMEOUT,
-        )
-        .await
-        .unwrap();
-    assert_eq!(attached["attached"], true);
-    let (mut events, mut requests) = view.into_parts();
-    let mut screen = vt100::Parser::new(20, 80, 0);
-    view_shows(&mut events, &mut screen, "Counter 0 in work 80x20").await;
-    send(&mut requests, json!({"method":"detach"})).await;
-    assert_eq!(view_end(&mut events).await, None, "detach ends the view");
-    let reused = viewer(&fixture, &instance, &granted).await.err().unwrap();
-    assert_eq!(reused.code, "Forbidden", "a grant works once");
+    let earlier = grant(&mut controller, &fixture.owner, &instance).await;
+    let later = grant(&mut controller, &fixture.owner, &instance).await;
+    let mut views = Vec::new();
+    for granted in [&later, &earlier] {
+        let mut view = viewer(&fixture, &instance, granted).await.unwrap();
+        let read = view
+            .request("read", json!({}), CONTROL_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert_eq!(read.code, "MethodNotAllowed", "a view only attaches");
+        let attached = view
+            .request(
+                "attach",
+                json!({"size":{"rows":20,"columns":80}}),
+                CONTROL_TIMEOUT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(attached["attached"], true);
+        let (mut events, requests) = view.into_parts();
+        let mut screen = vt100::Parser::new(20, 80, 0);
+        view_shows(&mut events, &mut screen, "Counter 0 in work 80x20").await;
+        views.push((events, requests));
+    }
+    assert_eq!(listed_views(&mut controller).await, 2);
+    for (mut events, mut requests) in views {
+        send(&mut requests, json!({"method":"detach"})).await;
+        assert_eq!(view_end(&mut events).await, None, "detach ends the view");
+    }
+    for used in [&earlier, &later] {
+        let reused = viewer(&fixture, &instance, used).await.err().unwrap();
+        assert_eq!(reused.code, "Forbidden", "a grant works once");
+    }
     shutdown(&fixture).await;
 }
 
+/// A view that stops reading loses its connection after two seconds; the other views and the Tick
+/// keep running.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stalled_view_loses_its_lease_after_two_seconds_and_the_tick_keeps_running() {
+async fn a_stalled_view_is_dropped_after_two_seconds_and_the_rest_keep_running() {
     let fixture = Fixture::start().await;
     let mut controller = fixture.controller().await;
     let (command, work) = fixture.counter();
     let opened = fixture.open(&mut controller, command, &work).await.unwrap();
-    let mut stalled = fixture.reader(&opened).await;
-    stalled
-        .request("attach", json!({}), CONTROL_TIMEOUT)
-        .await
-        .unwrap();
+    let stalled = attach(&fixture, &opened, initial_size()).await;
     let attached_at = std::time::Instant::now();
+    let (mut events, _requests) = attach(&fixture, &opened, initial_size()).await.into_parts();
+    let (shown, mut showing) = tokio::sync::mpsc::unbounded_channel();
+    let painting = tokio::spawn(async move {
+        let mut screen = vt100::Parser::new(30, 120, 0);
+        while let Ok(Some(event)) = read_frame(&mut events, BUSINESS_FRAME_BYTES).await {
+            screen.process(event["data"].as_str().unwrap_or_default().as_bytes());
+            let _ = shown.send(screen.screen().contents());
+        }
+    });
     let mut reader = fixture.reader(&opened).await;
-    let released = tokio::time::timeout(CONTROL_TIMEOUT, async {
-        loop {
+    tokio::time::timeout(CONTROL_TIMEOUT, async {
+        while listed_views(&mut controller).await != 1 {
             reader
-                .request("call", json!({"tool":"flood","args":{}}), CALL_TIMEOUT)
+                .request(
+                    "call",
+                    json!({"tool":"flood","args":{},"revision":"1"}),
+                    CALL_TIMEOUT,
+                )
                 .await
                 .unwrap();
-            let mut probe = fixture.reader(&opened).await;
-            match probe.request("attach", json!({}), CONTROL_TIMEOUT).await {
-                Ok(_) => break probe,
-                Err(error) if error.code == "Busy" => tokio::task::yield_now().await,
-                Err(error) => panic!("attach failed: {error:?}"),
-            }
         }
     })
     .await
-    .expect("a view that stops reading loses its lease");
+    .expect("a view that stops reading is dropped");
     assert!(attached_at.elapsed() >= host::STREAM_WRITE_TIMEOUT);
     let called = reader
         .request(
             "call",
-            json!({"tool":"increment","args":{}}),
+            json!({"tool":"increment","args":{},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await
         .unwrap();
     assert_eq!(called["value"], 1, "the Tick keeps running");
-    drop(released);
+    tokio::time::timeout(CONTROL_TIMEOUT, async {
+        while !showing
+            .recv()
+            .await
+            .expect("the reading view stays attached")
+            .contains("Counter 1 in work")
+        {}
+    })
+    .await
+    .expect("the reading view keeps showing the Tick");
+    painting.abort();
     drop(stalled);
     shutdown(&fixture).await;
 }
 
-/// A resize outside 2–300 rows or 2–500 columns is refused: an attach asking for one gets an
-/// error, an attached view sending one ends with it, and the terminal keeps its size while the
-/// Tick keeps running.
+/// A resize outside 2–300 rows or 2–500 columns is refused: an attach asking for one, or naming
+/// no size, gets an error, an attached view sending one ends with it, and the terminal keeps its
+/// size while the Tick keeps running.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_invalid_resize_is_refused_and_leaves_the_terminal_and_the_tick_unchanged() {
     let fixture = Fixture::start().await;
@@ -768,6 +846,13 @@ async fn an_invalid_resize_is_refused_and_leaves_the_terminal_and_the_tick_uncha
     let mut reader = fixture.reader(&opened).await;
     screen_contains(&mut reader, "120x30").await;
     let terminal_size = |snapshot: &Value| (snapshot["rows"].clone(), snapshot["columns"].clone());
+    let sizeless = fixture
+        .reader(&opened)
+        .await
+        .request("attach", json!({}), CONTROL_TIMEOUT)
+        .await
+        .unwrap_err();
+    assert_eq!(sizeless.code, "InvalidArguments", "a view names its size");
     let invalid = [
         json!({"rows":1,"columns":80}),
         json!({"rows":301,"columns":80}),
@@ -783,7 +868,8 @@ async fn an_invalid_resize_is_refused_and_leaves_the_terminal_and_the_tick_uncha
             .unwrap_err();
         assert_eq!(refused.code, "InvalidArguments", "{size}");
 
-        let (mut events, mut requests) = attach_when_released(&fixture, &opened).await.into_parts();
+        let (mut events, mut requests) =
+            attach(&fixture, &opened, initial_size()).await.into_parts();
         send(
             &mut requests,
             json!({"method":"resize","params":{"size":size}}),
@@ -803,7 +889,7 @@ async fn an_invalid_resize_is_refused_and_leaves_the_terminal_and_the_tick_uncha
     let called = reader
         .request(
             "call",
-            json!({"tool":"increment","args":{}}),
+            json!({"tool":"increment","args":{},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await
@@ -811,7 +897,7 @@ async fn an_invalid_resize_is_refused_and_leaves_the_terminal_and_the_tick_uncha
     assert_eq!(called["value"], 1, "the Tick keeps running");
     let snapshot = screen_contains(&mut reader, "Counter 1 in work 120x30").await;
     assert_eq!(terminal_size(&snapshot), (json!(30), json!(120)));
-    attach_when_released(&fixture, &opened).await;
+    attach(&fixture, &opened, initial_size()).await;
     shutdown(&fixture).await;
 }
 
@@ -826,7 +912,7 @@ async fn a_reply_left_unread_past_the_control_bound_closes_only_its_connection()
     let (mut replies, mut requests) = fixture.reader(&opened).await.into_parts();
     write_frame(
         &mut requests,
-        &json!({"id":1,"method":"call","params":{"tool":"large","args":{}}}),
+        &json!({"id":1,"method":"call","params":{"tool":"large","args":{},"revision":"1"}}),
         BUSINESS_FRAME_BYTES,
     )
     .await
@@ -845,7 +931,11 @@ async fn a_reply_left_unread_past_the_control_bound_closes_only_its_connection()
     let current = fixture
         .reader(&opened)
         .await
-        .request("call", json!({"tool":"current","args":{}}), CONTROL_TIMEOUT)
+        .request(
+            "call",
+            json!({"tool":"current","args":{},"revision":"1"}),
+            CONTROL_TIMEOUT,
+        )
         .await
         .unwrap();
     assert_eq!(current["value"], 0, "the Tick keeps serving");
@@ -865,7 +955,8 @@ async fn ending_a_stubborn_idle_tick_never_pauses_new_connections() {
         .unwrap();
     // An attached view keeps the other Tick, so the host never empties during the test.
     let kept = fixture.open(&mut controller, command, &work).await.unwrap();
-    let (mut view_events, view_requests) = attach_when_released(&fixture, &kept).await.into_parts();
+    let (mut view_events, view_requests) =
+        attach(&fixture, &kept, initial_size()).await.into_parts();
     let drain = tokio::spawn(async move {
         while let Ok(Some(_)) = read_frame(&mut view_events, BUSINESS_FRAME_BYTES).await {}
     });
@@ -1051,13 +1142,9 @@ async fn an_idle_tick_is_reaped_unless_attached_watched_or_explicitly_used() {
     }
     let pid = |tick: &Value| tick["business_pid"].as_u64().unwrap() as u32;
     let [unused, polled, attached, watched, used] = <[Value; 5]>::try_from(opened).unwrap();
-    let (mut view_events, view_requests) = {
-        let mut view = fixture.reader(&attached).await;
-        view.request("attach", json!({}), CONTROL_TIMEOUT)
-            .await
-            .unwrap();
-        view.into_parts()
-    };
+    let (mut view_events, view_requests) = attach(&fixture, &attached, initial_size())
+        .await
+        .into_parts();
     let drain = tokio::spawn(async move {
         while let Ok(Some(_)) = read_frame(&mut view_events, BUSINESS_FRAME_BYTES).await {}
     });
@@ -1384,7 +1471,7 @@ async fn an_oversized_update_breaks_only_its_own_tick() {
     let _ = reader
         .request(
             "call",
-            json!({"tool":"oversized_update","args":{}}),
+            json!({"tool":"oversized_update","args":{},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await;
@@ -1412,7 +1499,7 @@ async fn an_oversized_update_breaks_only_its_own_tick() {
         .await
         .request(
             "call",
-            json!({"tool":"increment","args":{}}),
+            json!({"tool":"increment","args":{},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await
@@ -1442,7 +1529,7 @@ async fn watchers_that_leave_a_quiet_tick_release_their_session_connections() {
         .await
         .request(
             "call",
-            json!({"tool":"increment","args":{}}),
+            json!({"tool":"increment","args":{},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await
@@ -1459,13 +1546,21 @@ async fn a_legal_eight_mebibyte_tool_answer_passes_through_the_host() {
     let opened = fixture.open(&mut controller, command, &work).await.unwrap();
     let mut reader = fixture.reader(&opened).await;
     let answered = reader
-        .request("call", json!({"tool":"large","args":{}}), CALL_TIMEOUT)
+        .request(
+            "call",
+            json!({"tool":"large","args":{},"revision":"1"}),
+            CALL_TIMEOUT,
+        )
         .await
         .unwrap();
     let payload = answered["payload"].as_str().unwrap().len();
     assert!(payload > tick_protocol::MAX_TOOL_RESPONSE_BYTES - 8192);
     let current = reader
-        .request("call", json!({"tool":"current","args":{}}), CONTROL_TIMEOUT)
+        .request(
+            "call",
+            json!({"tool":"current","args":{},"revision":"1"}),
+            CONTROL_TIMEOUT,
+        )
         .await
         .unwrap();
     assert_eq!(current["value"], 0, "the connection stays usable");
@@ -1603,7 +1698,11 @@ async fn a_tool_call_keeps_its_sixty_second_budget() {
     let mut reader = fixture.reader(&opened).await;
     let started = std::time::Instant::now();
     let answered = reader
-        .request("call", json!({"tool":"slow","args":{}}), CALL_TIMEOUT)
+        .request(
+            "call",
+            json!({"tool":"slow","args":{},"revision":"1"}),
+            CALL_TIMEOUT,
+        )
         .await
         .unwrap();
     assert_eq!(answered["value"], 0);
@@ -1624,7 +1723,7 @@ async fn oversized_requests_never_reach_the_tick_or_change_its_value() {
     let refused = reader
         .request(
             "call",
-            json!({"tool":"increment","args":{"padding":padding}}),
+            json!({"tool":"increment","args":{"padding":padding},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await
@@ -1635,7 +1734,11 @@ async fn oversized_requests_never_reach_the_tick_or_change_its_value() {
     frame.push(b'\n');
     let _ = oversized.write_all(&frame).await;
     let current = reader
-        .request("call", json!({"tool":"current","args":{}}), CONTROL_TIMEOUT)
+        .request(
+            "call",
+            json!({"tool":"current","args":{},"revision":"1"}),
+            CONTROL_TIMEOUT,
+        )
         .await
         .unwrap();
     assert_eq!(current["value"], 0, "no oversized request reached the Tick");

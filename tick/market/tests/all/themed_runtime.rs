@@ -90,7 +90,7 @@ async fn screen(
             .map(|code| Ok(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)))),
     );
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-    let mut events = TickStream::in_memory(TickKind::Quote, "longbridge");
+    let mut events = TickStream::in_memory(TickKind::Quote);
     quote::run_live(
         &QuoteArgs {
             symbols: vec!["AAPL.US".into(), "FAIL.US".into()],

@@ -18,7 +18,7 @@ use crate::{
         self, DEFAULT_PERIOD_COUNT, EarningsInputs, EarningsTable, MAX_PERIOD_COUNT, price_windows,
         released_periods, trading_day_windows,
     },
-    input::{EditOutcome, VimInput},
+    input::{EditOutcome, TextInput},
     output::TableData,
     research::{
         ResearchContext, ResearchDocument, ResearchEvidence, ResearchNavigation, ResearchStatus,
@@ -433,7 +433,7 @@ fn local_offset(unix_timestamp: i64) -> time::UtcOffset {
 }
 
 struct SymbolPrompt {
-    input: VimInput,
+    input: TextInput,
     error: Option<String>,
 }
 
@@ -599,11 +599,14 @@ impl EarningsView {
         let line = Rect::new(area.x, area.bottom() - 2, area.width, 1);
         frame.render_widget(Clear, line);
         frame.buffer_mut().set_style(line, styles.overlay_base());
-        let label = format!("[{}] Symbol: ", prompt.input.mode_label());
-        let label_width = tickloop_ui::format::width(&label, settings.ambiguous_width);
+        let label = "Symbol: ";
+        let label_width = tickloop_ui::format::width(label, settings.ambiguous_width);
         let available = (line.width as usize).saturating_sub(label_width);
         let (visible, cursor) = prompt.input.viewport(available, settings.ambiguous_width);
-        let suffix = prompt.error.as_deref().unwrap_or("Enter apply · Esc back");
+        let suffix = prompt
+            .error
+            .as_deref()
+            .unwrap_or("Enter apply · Ctrl+C cancel");
         let text = format!("{label}{visible} · {suffix}");
         if available > 0 {
             frame.set_cursor_position((line.x + (label_width + cursor) as u16, line.y));
@@ -847,6 +850,9 @@ impl LiveView for EarningsView {
     fn captures_text(&self) -> bool {
         self.prompt.is_some()
     }
+    fn cancel_text(&mut self) {
+        self.prompt = None;
+    }
     async fn on_key(
         &mut self,
         key: KeyCode,
@@ -856,7 +862,6 @@ impl LiveView for EarningsView {
         if let Some(prompt) = &mut self.prompt {
             match prompt.input.handle(key) {
                 EditOutcome::Submit => self.apply_prompt(api).await?,
-                EditOutcome::Cancel => self.prompt = None,
                 EditOutcome::Changed => prompt.error = None,
                 EditOutcome::None => (),
             }
@@ -874,7 +879,7 @@ impl LiveView for EarningsView {
             KeyCode::Char('a') => self.navigate(ResearchTarget::Chat, state.selected),
             KeyCode::Char('s') => {
                 self.prompt = Some(SymbolPrompt {
-                    input: VimInput::new(String::new()),
+                    input: TextInput::new(String::new()),
                     error: None,
                 })
             }
@@ -896,7 +901,7 @@ impl LiveView for EarningsView {
                 self.mode = EarningsMode::Comparison;
                 self.reset_scroll.set(true);
             }
-            KeyCode::Esc => {
+            KeyCode::Backspace => {
                 self.mode = if self.mode == EarningsMode::Filings {
                     self.filings_parent
                 } else {
@@ -995,7 +1000,7 @@ impl LiveView for EarningsView {
             .map_err(|error| Error::usage(error.to_string()))
     }
     fn help(&self) -> &'static str {
-        "q / Ctrl+C  Quit\n?  Help · Esc returns one level\nj / k / Ctrl+N / Ctrl+P / arrows  Move\nEnter  Period detail / selected metric original · c  Compare\n[ / ]  Older / newer fiscal period · u  Upcoming\no  Original · p  Chart · v  Options · a  Ask Chat\nr  Market reactions · f  Period originals · R  Refresh\ns  Change symbol (Vim Insert / Normal)\nPageUp / PageDown  Page · g / G  First / last\nEstimates retrieved now; no verified historical snapshot\nUS symbols · 60s near release, 15m upcoming, daily history"
+        "q / Ctrl+C  Quit\n?  Help · Backspace returns one level\nj / k / Ctrl+N / Ctrl+P / arrows  Move\nEnter  Period detail / selected metric original · c  Compare\n[ / ]  Older / newer fiscal period · u  Upcoming\no  Original · p  Chart · v  Options · a  Ask Chat\nr  Market reactions · f  Period originals · R  Refresh\ns  Change symbol (Enter apply · Ctrl+C cancel)\nPageUp / PageDown  Page · g / G  First / last\nEstimates retrieved now; no verified historical snapshot\nUS symbols · 60s near release, 15m upcoming, daily history"
     }
     fn draw(&self, frame: &mut Frame<'_>, state: &mut ViewState, settings: &Settings) {
         if self.reset_scroll.replace(false) {

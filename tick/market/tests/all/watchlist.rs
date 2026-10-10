@@ -54,7 +54,7 @@ async fn once_defaults_to_first_group_and_publishes_group_identity_without_decor
         },
     };
     let mut output = Vec::new();
-    let mut events = TickStream::in_memory(TickKind::Watchlist, "longbridge");
+    let mut events = TickStream::in_memory(TickKind::Watchlist);
     watchlist::run_once(
         &args,
         &Watchlist,
@@ -100,7 +100,7 @@ async fn requested_group_accepts_name_or_id_and_unknown_groups_are_usage_errors(
             &Settings::default(),
             false,
             &mut output,
-            &mut TickStream::in_memory(TickKind::Watchlist, "longbridge"),
+            &mut TickStream::in_memory(TickKind::Watchlist),
         )
         .await
         .unwrap();
@@ -118,7 +118,7 @@ async fn requested_group_accepts_name_or_id_and_unknown_groups_are_usage_errors(
         &Settings::default(),
         false,
         &mut output,
-        &mut TickStream::in_memory(TickKind::Watchlist, "longbridge"),
+        &mut TickStream::in_memory(TickKind::Watchlist),
     )
     .await
     .unwrap_err();
@@ -188,7 +188,7 @@ async fn switching_groups_updates_subscriptions_and_preserves_push_and_market_ev
         subscriptions: std::sync::Mutex::new(Vec::new()),
     };
     let (keys, key_events) = tokio::sync::mpsc::unbounded_channel();
-    let mut updates = TickStream::in_memory(TickKind::Watchlist, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Watchlist);
     let observed = updates.records();
     let producer = tokio::spawn(async move {
         wait_for(&observed, 1).await;
@@ -288,7 +288,7 @@ async fn narrow_watchlists_keep_symbol_and_change_percent_in_both_icon_themes() 
             &settings,
             &mut terminal,
             input,
-            &mut TickStream::in_memory(TickKind::Watchlist, "longbridge"),
+            &mut TickStream::in_memory(TickKind::Watchlist),
         )
         .await
         .unwrap();
@@ -369,7 +369,7 @@ async fn market_status_refreshes_without_quote_pushes_and_unchanged_status_does_
         ))
     });
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
-    let mut events = TickStream::in_memory(TickKind::Watchlist, "longbridge");
+    let mut events = TickStream::in_memory(TickKind::Watchlist);
     watchlist::run_live(
         &WatchlistArgs {
             group: None,
@@ -436,7 +436,7 @@ async fn a_failed_subscription_releases_any_partially_subscribed_symbols() {
         &Settings::default(),
         &mut terminal,
         futures_util::stream::pending(),
-        &mut TickStream::in_memory(TickKind::Watchlist, "longbridge"),
+        &mut TickStream::in_memory(TickKind::Watchlist),
     )
     .await
     .unwrap_err();
@@ -495,7 +495,7 @@ async fn failed_group_switch_keeps_old_group_and_cleans_up_the_partial_new_subsc
         [KeyCode::Right, KeyCode::Char('q')]
             .map(|key| Ok(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)))),
     );
-    let mut updates = TickStream::in_memory(TickKind::Watchlist, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Watchlist);
     watchlist::run_live(
         &WatchlistArgs {
             group: None,

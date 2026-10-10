@@ -67,8 +67,8 @@ impl<S: ?Sized, E> DeclaredTool<S, E> {
         self.tool.mutates
     }
 
-    pub fn params(&self) -> &Value {
-        &self.tool.params
+    pub fn input_schema(&self) -> &Value {
+        &self.tool.input_schema
     }
 
     /// Checks the arguments against the declared schema and either starts the
@@ -173,7 +173,7 @@ fn declared<A: JsonSchema>(name: &str, description: &str, mutates: bool) -> Tick
     TickTool {
         name: name.to_owned(),
         description: description.to_owned(),
-        params: schemars::schema_for!(A).to_value(),
+        input_schema: schemars::schema_for!(A).to_value(),
         mutates,
     }
 }

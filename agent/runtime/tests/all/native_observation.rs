@@ -806,7 +806,12 @@ async fn protocol_tick_update_after_registration_reaches_its_loop() {
 
     session
         .client()
-        .call("increment", json!({"amount":5}), CancellationToken::new())
+        .call(
+            "increment",
+            json!({"amount":5}),
+            "1",
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     tokio::time::timeout(support::high_delivery_wait(), async {
@@ -831,6 +836,7 @@ async fn protocol_tick_update_after_registration_reaches_its_loop() {
     session.shutdown().await.unwrap();
 }
 
+/// The fixture names no recovery query, so the delivery also says the skipped updates are lost.
 #[tokio::test]
 async fn protocol_sequence_gap_is_reported_separately_from_received_observation_drops() {
     let directory = tempfile::Builder::new()
@@ -841,20 +847,19 @@ async fn protocol_sequence_gap_is_reported_separately_from_received_observation_
     let host_socket = directory.path().join("herdr.sock");
     let script = directory.path().join("sequence_gap.py");
     std::fs::write(&script, r#"
-import json, os, sys
-instance = os.environ['TICKLOOP_INSTANCE_ID']
+import json, sys
 sequence = 0
 for line in sys.stdin:
     request = json.loads(line)
     method = request['method']
     if method == 'tick/describe':
-        result = {'protocol':2,'tick_type':'example.gap','title':'Gap','description':'Sequence gap fixture','recover_with':'current','tools':[{'name':'jump','description':'Jump sequence','params':{'type':'object'},'mutates':True},{'name':'current','description':'Read current','params':{'type':'object'},'mutates':False}]}
+        result = {'protocol':3,'revision':'1','kind':'example.gap','title':'Gap','description':'Sequence gap fixture','tools':[{'name':'jump','description':'Jump sequence','input_schema':{'type':'object'},'mutates':True},{'name':'current','description':'Read current','input_schema':{'type':'object'},'mutates':False}]}
     elif method == 'tick/read':
-        result = {'version':3,'tick_instance_id':instance,'initialized':True,'sequence':sequence,'observed_at':'2026-09-24T00:00:00Z','data':{'value':sequence}}
-    elif method == 'tool/call':
+        result = {'seq':sequence,'at':'2026-09-24T00:00:00Z','data':{'value':sequence}}
+    elif method == 'tick/call':
         if request['params']['tool'] == 'jump':
             sequence += 3
-            print(json.dumps({'jsonrpc':'2.0','method':'tick/update','params':{'version':3,'tick_instance_id':instance,'source':'example.gap','sequence':sequence,'observed_at':'2026-09-24T00:00:01Z','data':{'value':sequence}}}),flush=True)
+            print(json.dumps({'jsonrpc':'2.0','method':'tick/update','params':{'seq':sequence,'at':'2026-09-24T00:00:01Z','data':{'value':sequence}}}),flush=True)
         result = {'value':sequence}
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
 "#).unwrap();
@@ -918,7 +923,7 @@ for line in sys.stdin:
     .unwrap();
     session
         .client()
-        .call("jump", json!({}), CancellationToken::new())
+        .call("jump", json!({}), "1", CancellationToken::new())
         .await
         .unwrap();
     tokio::time::timeout(support::high_delivery_wait(), async {
@@ -937,6 +942,10 @@ for line in sys.stdin:
     assert!(delivered.contains("\"sequence\":3"), "{delivered}");
     assert!(delivered.contains("\"gap\":true"), "{delivered}");
     assert!(delivered.contains("\"dropped\":0"), "{delivered}");
+    assert!(
+        delivered.contains("dropped Tick Updates cannot be recovered"),
+        "{delivered}"
+    );
     agent.shutdown().await;
     session.shutdown().await.unwrap();
 }

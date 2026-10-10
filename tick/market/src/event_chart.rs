@@ -693,7 +693,7 @@ impl EventChart {
     ) -> Result<bool> {
         if let Some((picker, index)) = self.picker.as_mut() {
             match key {
-                KeyCode::Esc => self.picker = None,
+                KeyCode::Backspace => self.picker = None,
                 KeyCode::Up | KeyCode::Char('k') => *index = index.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => *index = (*index + 1).min(2),
                 KeyCode::Enter => {
@@ -718,14 +718,13 @@ impl EventChart {
             return Ok(true);
         }
         if self.details {
-            if matches!(key, KeyCode::Esc | KeyCode::Enter) {
+            if matches!(key, KeyCode::Backspace | KeyCode::Enter) {
                 self.details = false;
             }
             return Ok(true);
         }
         let count = self.data.as_ref().map_or(0, |data| data.candles.len());
         match key {
-            KeyCode::Esc => self.details = false,
             KeyCode::Enter => self.details = !self.details,
             KeyCode::Left | KeyCode::Char('h') | KeyCode::Up | KeyCode::Char('k') => {
                 self.cursor = self.cursor.saturating_sub(1)
@@ -943,7 +942,7 @@ impl EventChart {
         text(
             frame,
             inner.height - 1,
-            "Esc Back · ? Help · q Quit",
+            "? Help · q Quit",
             styles.status_base(),
         );
         if let Some((picker, selected)) = self.picker {
@@ -962,7 +961,7 @@ impl EventChart {
                 .collect::<Vec<_>>()
                 .join("\n");
             frame.render_widget(
-                Paragraph::new(format!("{lines}\nEnter Select · Esc Back"))
+                Paragraph::new(format!("{lines}\nEnter Select · Backspace Back"))
                     .block(
                         Block::default()
                             .title("Events")
@@ -977,7 +976,7 @@ impl EventChart {
         {
             let popup = centered(area, 70, 10);
             frame.render_widget(Clear, popup);
-            frame.render_widget(Paragraph::new(format!("{}\nOpen {}   High {}\nLow {}   Close {}\nVolume {}  Turnover {}\nConference: {}\n{}\nEsc Back", format_instant(candle.timestamp), candle.open,candle.high,candle.low,candle.close,candle.volume,candle.turnover,self.config.conference_at.as_deref().unwrap_or("unknown"),data.map_or("",|data|data.window.session_boundary_note))).block(Block::default().title("Candle / event detail").borders(Borders::ALL).border_style(styles.border)).style(styles.overlay_base()), popup);
+            frame.render_widget(Paragraph::new(format!("{}\nOpen {}   High {}\nLow {}   Close {}\nVolume {}  Turnover {}\nConference: {}\n{}\nBackspace Back", format_instant(candle.timestamp), candle.open,candle.high,candle.low,candle.close,candle.volume,candle.turnover,self.config.conference_at.as_deref().unwrap_or("unknown"),data.map_or("",|data|data.window.session_boundary_note))).block(Block::default().title("Candle / event detail").borders(Borders::ALL).border_style(styles.border)).style(styles.overlay_base()), popup);
         }
     }
 
@@ -1354,13 +1353,12 @@ fn centered(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::la
 
 pub enum EventEditResult {
     Continue,
-    Cancel,
     Apply(EventChartConfig),
 }
 
 pub struct EventEditor {
     config: EventChartConfig,
-    fields: [crate::input::VimInput; 4],
+    fields: [crate::input::TextInput; 4],
     active: usize,
     error: Option<String>,
 }
@@ -1384,7 +1382,7 @@ impl EventEditor {
                 config.published_at.clone().unwrap_or_default(),
                 config.conference_at.clone().unwrap_or_default(),
             ]
-            .map(crate::input::VimInput::new),
+            .map(crate::input::TextInput::new),
             config,
             active: 0,
             error: None,
@@ -1404,7 +1402,6 @@ impl EventEditor {
             _ => (),
         }
         match self.fields[self.active].handle(key) {
-            crate::input::EditOutcome::Cancel => EventEditResult::Cancel,
             crate::input::EditOutcome::Submit => {
                 let mut config = self.config.clone();
                 config.date = self.fields[0].text().trim().into();
@@ -1440,10 +1437,7 @@ impl EventEditor {
         let popup = centered(frame.area(), 88, 13);
         frame.render_widget(Clear, popup);
         let block = Block::default()
-            .title(format!(
-                " Event settings · {} ",
-                self.fields[self.active].mode_label()
-            ))
+            .title(" Event settings ")
             .borders(Borders::ALL)
             .border_style(styles.border)
             .style(styles.overlay_base());
@@ -1490,7 +1484,7 @@ impl EventEditor {
                 ));
             }
         }
-        let help = "Date: exchange-local YYYY-MM-DD\nSession: pre_market / after_hours / during_market / closed / unknown\nActual times: RFC3339 with offset, or blank if unknown\nTab Next field · Enter Apply · Esc Normal / Back";
+        let help = "Date: exchange-local YYYY-MM-DD\nSession: pre_market / after_hours / during_market / closed / unknown\nActual times: RFC3339 with offset, or blank if unknown\nTab Next field · Enter Apply · Ctrl+C Cancel";
         frame.render_widget(
             Paragraph::new(help).style(styles.muted_text),
             ratatui::layout::Rect::new(

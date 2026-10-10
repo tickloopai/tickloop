@@ -236,14 +236,18 @@ pub trait TickStreamPort: Send + Sync + 'static {
     }
 }
 
+/// What a protocol Tick that declares no recovery query tells the Agent instead.
+const NO_RECOVERY: &str =
+    "none: dropped Tick Updates cannot be recovered; ReadTick returns only the current state";
+
 /// A protocol Tick's current content as an observation, for a delivery read again.
-fn current_observation(instance: &InstanceRef, read: tick_protocol::TickRead) -> TickObservation {
+fn current_observation(instance: &InstanceRef, read: tick_protocol::TickState) -> TickObservation {
     TickObservation {
         instance: instance.clone(),
-        sequence: read.sequence,
-        observed_at: read.observed_at,
+        sequence: read.seq,
+        observed_at: read.at.unwrap_or_default(),
         dropped: 0,
-        data: read.data.unwrap_or(serde_json::Value::Null),
+        data: read.data,
         kind: ObservationKind::Protocol,
         recover_with: None,
         gap: false,
@@ -769,7 +773,7 @@ trait ProtocolFeed: Send + Sync {
         &self,
     ) -> Result<
         (
-            tick_protocol::TickRead,
+            tick_protocol::TickState,
             u64,
             watch::Receiver<tickhost_connect::session::SessionObservation>,
         ),
@@ -787,7 +791,7 @@ impl ProtocolFeed for tickhost_connect::session::SessionClient {
         &self,
     ) -> Result<
         (
-            tick_protocol::TickRead,
+            tick_protocol::TickState,
             u64,
             watch::Receiver<tickhost_connect::session::SessionObservation>,
         ),
@@ -1123,7 +1127,7 @@ async fn observe_terminal(
                         TickObservation {
                             instance: instance.clone(),
                             sequence,
-                            observed_at: snapshot.observed_at,
+                            observed_at: snapshot.at,
                             dropped: 0,
                             data: serde_json::json!({"text": text}),
                             kind: ObservationKind::Terminal {
@@ -1252,15 +1256,17 @@ async fn observe_protocol(
             updated_at_ms: None,
         },
     );
-    let recovery_tool = descriptor.recover_with;
-    let mut latest_sequence = baseline.sequence;
+    let recovery = descriptor
+        .recover_with
+        .unwrap_or_else(|| NO_RECOVERY.to_owned());
+    let mut latest_sequence = baseline.seq;
     let baseline_targets = scope.admitted(&wanted.borrow_and_update().clone(), instance, publisher);
     for watch in baseline_targets.iter().copied() {
         cursors.insert(
             watch,
             ProtocolCursor {
                 received: registration_received,
-                sequence: baseline.sequence,
+                sequence: baseline.seq,
             },
         );
         publisher.ready(watch);
@@ -1277,7 +1283,7 @@ async fn observe_protocol(
         &initial,
         &initial_targets,
         &mut cursors,
-        recovery_tool.as_deref(),
+        &recovery,
         publisher,
     ) {
         latest_sequence = sequence;
@@ -1358,7 +1364,7 @@ async fn observe_protocol(
             &observation,
             &targets,
             &mut cursors,
-            recovery_tool.as_deref(),
+            &recovery,
             publisher,
         ) {
             latest_sequence = sequence;
@@ -1388,7 +1394,7 @@ fn publish_protocol_update(
     observation: &tickhost_connect::session::SessionObservation,
     targets: &BTreeSet<WatchId>,
     cursors: &mut BTreeMap<WatchId, ProtocolCursor>,
-    recovery_tool: Option<&str>,
+    recovery: &str,
     publisher: &EventPublisher,
 ) -> Option<u64> {
     let update = observation.update.as_ref()?;
@@ -1399,30 +1405,30 @@ fn publish_protocol_update(
         }
         let accepted = observation.received - cursor.received;
         let dropped = accepted - 1;
-        let source_gap = update.sequence.saturating_sub(cursor.sequence) > accepted;
+        let source_gap = update.seq.saturating_sub(cursor.sequence) > accepted;
         groups
             .entry((dropped, source_gap))
             .or_default()
             .push(*watch);
         cursor.received = observation.received;
-        cursor.sequence = update.sequence;
+        cursor.sequence = update.seq;
     }
     for ((dropped, gap), audience) in groups {
         publisher.observation(
             &audience,
             TickObservation {
                 instance: instance.clone(),
-                sequence: update.sequence,
-                observed_at: update.observed_at.clone(),
+                sequence: update.seq,
+                observed_at: update.at.clone().unwrap_or_default(),
                 dropped,
                 data: update.data.clone(),
                 kind: ObservationKind::Protocol,
-                recover_with: recovery_tool.map(str::to_owned),
+                recover_with: Some(recovery.to_owned()),
                 gap,
             },
         );
     }
-    Some(update.sequence)
+    Some(update.seq)
 }
 
 #[cfg(test)]

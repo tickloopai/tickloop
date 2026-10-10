@@ -67,8 +67,8 @@ pub const DIAGNOSTIC_CHARACTERS: usize = 256;
 pub const TITLE_CHARACTERS: usize = 256;
 /// Ends a title that was cut.
 pub const TITLE_ELLIPSIS: char = '…';
-/// A stalled stream reader or attached view loses its connection and lease; the Tick and other
-/// readers continue.
+/// A stalled stream reader or attached view loses its connection; the Tick, its other views and
+/// other readers continue.
 pub const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The send buffer requested for an attached view; it holds one current frame at a time.
 pub const ATTACH_SEND_BUFFER_BYTES: usize = 64 * 1024;
@@ -143,7 +143,8 @@ pub struct TickRow {
     pub title: Option<String>,
     pub state: TickState,
     pub business_pid: Option<u32>,
-    pub attached: bool,
+    /// How many views are attached to its terminal.
+    pub views: usize,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -232,33 +233,102 @@ struct HostedTick {
     /// The last open, explicit read or call, attached input, or removal of the last Watch
     /// intent; nothing automatic counts.
     last_activity_ms: AtomicU64,
-    attached: AtomicBool,
-    /// The one view its owner last allowed to attach, until that view connects or the grant
-    /// expires; a newer grant replaces it.
-    view_grant: std::sync::Mutex<Option<ViewGrant>>,
+    /// The views attached to its terminal; any one keeps the Tick from idling.
+    views: std::sync::Mutex<Views>,
+    /// The views its owner allowed to attach that have not connected yet.
+    view_grants: std::sync::Mutex<ViewGrants>,
     /// The approved Watches that keep this Tick, as its owner last reported them.
     intents: std::sync::Mutex<WatchIntents>,
     screen_changes: watch::Sender<()>,
     terminal_closed: CancellationToken,
 }
 
-/// A one-time permission for one view to attach to a Tick's terminal.
-struct ViewGrant {
-    view: Uuid,
-    expires: std::time::Instant,
+/// One-time permissions for views to attach to a Tick's terminal: each admits the view it names
+/// once before it expires, whatever grants were issued since.
+#[derive(Default)]
+struct ViewGrants {
+    expiries: HashMap<Uuid, Instant>,
 }
 
-impl ViewGrant {
-    /// Takes the grant if `view` names it and it has not expired; a grant works once.
-    fn claim(grant: &mut Option<Self>, view: Uuid, now: std::time::Instant) -> bool {
-        match grant.take() {
-            Some(granted) if granted.view == view && now < granted.expires => true,
-            Some(granted) if granted.view != view => {
-                *grant = Some(granted);
-                false
-            }
-            _ => false,
+impl ViewGrants {
+    /// Lets `view` attach until the grant expires; expired grants go.
+    fn allow(&mut self, view: Uuid, now: Instant) {
+        self.expiries.retain(|_, expires| now < *expires);
+        self.expiries.insert(view, now + VIEW_GRANT_TIMEOUT);
+    }
+
+    /// Takes the grant of `view` if it has not expired; a grant works once.
+    fn claim(&mut self, view: Uuid, now: Instant) -> bool {
+        self.expiries
+            .remove(&view)
+            .is_some_and(|expires| now < expires)
+    }
+}
+
+/// The views attached to one Tick terminal. The terminal takes the size of the view that typed
+/// last, or of the newest view while none of them typed; without views it keeps its size.
+#[derive(Default)]
+struct Views {
+    /// Orders attaches and input; a view is named by the moment it attached.
+    clock: u64,
+    attached: HashMap<u64, AttachedView>,
+}
+
+struct AttachedView {
+    size: TerminalSize,
+    attached_at: u64,
+    typed_at: Option<u64>,
+}
+
+impl Views {
+    fn attach(&mut self, size: TerminalSize) -> u64 {
+        let view = self.advance();
+        self.attached.insert(
+            view,
+            AttachedView {
+                size,
+                attached_at: view,
+                typed_at: None,
+            },
+        );
+        view
+    }
+
+    fn typed(&mut self, view: u64) {
+        let now = self.advance();
+        if let Some(attached) = self.attached.get_mut(&view) {
+            attached.typed_at = Some(now);
         }
+    }
+
+    fn resized(&mut self, view: u64, size: TerminalSize) {
+        if let Some(attached) = self.attached.get_mut(&view) {
+            attached.size = size;
+        }
+    }
+
+    fn detach(&mut self, view: u64) {
+        self.attached.remove(&view);
+    }
+
+    fn len(&self) -> usize {
+        self.attached.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.attached.is_empty()
+    }
+
+    fn leading_size(&self) -> Option<TerminalSize> {
+        self.attached
+            .values()
+            .max_by_key(|view| (view.typed_at, view.attached_at))
+            .map(|view| view.size)
+    }
+
+    fn advance(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
     }
 }
 
@@ -295,10 +365,37 @@ impl HostedTick {
 
     fn is_idle(&self, now_ms: u64, idle_timeout: Duration) -> bool {
         matches!(*self.lifecycle.borrow(), Lifecycle::Live { .. })
-            && !self.attached.load(Ordering::SeqCst)
+            && self.views.lock().unwrap().is_empty()
             && self.intents.lock().unwrap().watches.is_empty()
             && now_ms.saturating_sub(self.last_activity_ms.load(Ordering::SeqCst))
                 >= idle_timeout.as_millis() as u64
+    }
+
+    /// Applies `change` to the attached views, and gives the terminal the size they now lead with.
+    fn change_views<T>(&self, change: impl FnOnce(&mut Views) -> T) -> Result<T, HostError> {
+        let mut views = self.views.lock().unwrap();
+        let changed = change(&mut views);
+        self.follow_views(&views)?;
+        Ok(changed)
+    }
+
+    /// Gives the terminal the size its views lead with. The model follows first, so the redraw
+    /// the resize signal causes is parsed at the new size; every view's next frame names it.
+    fn follow_views(&self, views: &Views) -> Result<(), HostError> {
+        let Some(size) = views.leading_size() else {
+            return Ok(());
+        };
+        {
+            let mut screen = self.screen.lock().unwrap();
+            if screen.size() == size {
+                return Ok(());
+            }
+            screen.resize(size);
+        }
+        self.screen_changes.send_replace(());
+        self.pty
+            .resize(size)
+            .map_err(|error| HostError::after("TerminalUnavailable", error.to_string()))
     }
 }
 
@@ -637,8 +734,8 @@ impl Host {
             lifecycle: watch::channel(Lifecycle::Opening).0,
             session: Mutex::new(None),
             last_activity_ms: AtomicU64::new(Self::now_ms()),
-            attached: AtomicBool::new(false),
-            view_grant: std::sync::Mutex::new(None),
+            views: std::sync::Mutex::new(Views::default()),
+            view_grants: std::sync::Mutex::new(ViewGrants::default()),
             intents: std::sync::Mutex::new(WatchIntents::default()),
             screen_changes: watch::channel(()).0,
             terminal_closed: CancellationToken::new(),
@@ -882,7 +979,7 @@ impl Host {
         tick.remove_session_directory();
     }
 
-    /// Lets one view attach to `owner`'s Tick `instance`, replacing any earlier grant for it.
+    /// Lets one more view attach to `owner`'s Tick `instance`; earlier grants stay usable.
     async fn allow_view(
         &self,
         owner: &TickOwner,
@@ -894,10 +991,7 @@ impl Host {
             .filter(|tick| &tick.owner == owner)
             .ok_or_else(|| HostError::before("TargetGone", "no such Tick of this owner"))?;
         let view = Uuid::new_v4();
-        *tick.view_grant.lock().unwrap() = Some(ViewGrant {
-            view,
-            expires: std::time::Instant::now() + VIEW_GRANT_TIMEOUT,
-        });
+        tick.view_grants.lock().unwrap().allow(view, Instant::now());
         Ok(json!({"instance":instance,"view":view,"epoch":self.epoch}))
     }
 
@@ -1006,7 +1100,7 @@ impl Host {
                         Lifecycle::Live { business_pid, .. } => Some(business_pid),
                         _ => None,
                     },
-                    attached: tick.attached.load(Ordering::SeqCst),
+                    views: tick.views.lock().unwrap().len(),
                 }
             })
             .collect::<Vec<_>>();
@@ -1390,7 +1484,7 @@ enum Authority {
         generation: u64,
     },
     Instance(Arc<HostedTick>),
-    /// The one view a grant let in; it can only attach.
+    /// A view a grant let in; it can only attach.
     Viewer(Arc<HostedTick>),
     /// The one connection of a pending launch; `verified` once it proved its foreground.
     Launcher {
@@ -1433,13 +1527,7 @@ async fn authenticate(host: &Arc<Host>, role: Role) -> Result<Authority, HostErr
         Role::Viewer { instance, view } => host
             .tick_by_instance(&instance)
             .await
-            .filter(|tick| {
-                ViewGrant::claim(
-                    &mut tick.view_grant.lock().unwrap(),
-                    view,
-                    std::time::Instant::now(),
-                )
-            })
+            .filter(|tick| tick.view_grants.lock().unwrap().claim(view, Instant::now()))
             .map(Authority::Viewer)
             .ok_or_else(|| HostError::before("Forbidden", "unknown, expired or used view grant")),
         Role::Launcher {
@@ -1574,7 +1662,7 @@ async fn business(
                 "watch" if matches!(authority, Authority::Instance(_)) => {
                     return stream_observations(reader, writer, &host, tick.clone(), &id).await;
                 }
-                "attach" => match AttachLease::acquire(tick, params) {
+                "attach" => match ViewLease::acquire(tick, params) {
                     Ok(lease) => return attach_view(reader, writer, &host, lease, &id).await,
                     Err(error) => {
                         write_within(
@@ -1736,6 +1824,9 @@ fn session_error(error: tickhost_connect::session::SessionError) -> HostError {
         SessionError::OutcomeUnknown => HostError::after("OutcomeUnknown", error.to_string()),
         SessionError::Gone => HostError::after("TargetGone", error.to_string()),
         SessionError::ChildError(message) => HostError::after("ToolError", message),
+        SessionError::RevisionMismatch => {
+            HostError::before("CapabilitiesChanged", error.to_string())
+        }
         SessionError::Protocol(message) => HostError::before("ProtocolViolation", message),
         SessionError::Io(error) => HostError::before("TargetGone", error.to_string()),
     }
@@ -1778,13 +1869,18 @@ async fn instance_request(
             struct Call {
                 tool: String,
                 args: Value,
+                revision: String,
             }
-            let Call { tool, args } = parameters(params)?;
+            let Call {
+                tool,
+                args,
+                revision,
+            } = parameters(params)?;
             tick.note_activity();
             let client = session(tick).await?;
             tokio::time::timeout(
                 CALL_TIMEOUT,
-                client.call(&tool, args, CancellationToken::new()),
+                client.call(&tool, args, &revision, CancellationToken::new()),
             )
             .await
             .map_err(|_| {
@@ -1955,48 +2051,38 @@ async fn stream_observations(
     }
 }
 
-/// The single controller lease of one Tick terminal, held by its attached view until EOF,
-/// detach, a stalled write or the end of the Tick.
-struct AttachLease {
+/// One view attached to a Tick terminal, until EOF, detach, a stalled write or the end of the
+/// Tick.
+struct ViewLease {
     tick: Arc<HostedTick>,
+    view: u64,
 }
 
-impl AttachLease {
+impl ViewLease {
     fn acquire(tick: &Arc<HostedTick>, params: Value) -> Result<Self, HostError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Attach {
-            size: Option<TerminalSize>,
+            size: TerminalSize,
         }
         let Attach { size } = parameters(params)?;
         if tick.terminal_closed.is_cancelled() {
             return Err(HostError::before("TargetGone", "the Tick has ended"));
         }
-        if tick
-            .attached
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err(HostError::before(
-                "Busy",
-                "another view controls this Tick terminal and keeps it",
-            ));
-        }
-        let lease = Self { tick: tick.clone() };
-        if let Some(size) = size {
-            lease.resize(size)?;
-        }
-        Ok(lease)
+        let mut views = tick.views.lock().unwrap();
+        let view = views.attach(size);
+        let followed = tick.follow_views(&views);
+        drop(views);
+        let lease = Self {
+            tick: tick.clone(),
+            view,
+        };
+        followed.map(|()| lease)
     }
 
-    /// The model follows first, so the redraw the resize signal causes is parsed at the new size.
     fn resize(&self, size: TerminalSize) -> Result<(), HostError> {
-        self.tick.screen.lock().unwrap().resize(size);
-        self.tick.screen_changes.send_replace(());
         self.tick
-            .pty
-            .resize(size)
-            .map_err(|error| HostError::after("TerminalUnavailable", error.to_string()))
+            .change_views(|views| views.resized(self.view, size))
     }
 
     async fn input(&self, data: &[u8]) -> Result<(), HostError> {
@@ -2007,6 +2093,7 @@ impl AttachLease {
             ));
         }
         self.tick.note_activity();
+        self.tick.change_views(|views| views.typed(self.view))?;
         self.tick
             .pty
             .write_all(data)
@@ -2015,20 +2102,22 @@ impl AttachLease {
     }
 }
 
-impl Drop for AttachLease {
+impl Drop for ViewLease {
     fn drop(&mut self) {
-        self.tick.attached.store(false, Ordering::SeqCst);
+        // The leaving view cannot be told of a failed resize; the terminal then keeps its size.
+        let _ = self.tick.change_views(|views| views.detach(self.view));
     }
 }
 
-/// Serves one attached view: the current frame, then latest-only changes, while its input and
-/// resizes reach the same terminal. Output and input run side by side so neither is cut off
-/// mid-frame; whichever ends first releases the lease and the Tick keeps running.
+/// Serves one attached view: the current frame, then latest-only changes, each naming the screen
+/// size it draws, while its input and resizes reach the same terminal. Output and input run side
+/// by side so neither is cut off mid-frame; whichever ends first ends this view, and the Tick and
+/// its other views keep running.
 async fn attach_view(
     mut reader: BufReader<OwnedReadHalf>,
     mut writer: OwnedWriteHalf,
     host: &Arc<Host>,
-    lease: AttachLease,
+    lease: ViewLease,
     id: &Value,
 ) -> Result<(), HostError> {
     let tick = lease.tick.clone();
@@ -2046,11 +2135,16 @@ async fn attach_view(
         loop {
             changes.borrow_and_update();
             let (bytes, screen) = tick.screen.lock().unwrap().frame_since(shown.as_ref());
+            let (rows, columns) = screen.size();
             shown = Some(screen);
             if !bytes.is_empty() {
                 write_within(
                     &mut writer,
-                    &json!({"event":"frame","data":String::from_utf8_lossy(&bytes)}),
+                    &json!({
+                        "event": "frame",
+                        "size": TerminalSize { rows, columns },
+                        "data": String::from_utf8_lossy(&bytes),
+                    }),
                     BUSINESS_FRAME_BYTES,
                     STREAM_WRITE_TIMEOUT,
                 )
@@ -2159,23 +2253,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_view_grant_is_claimed_once_by_its_own_view_before_it_expires() {
-        let now = std::time::Instant::now();
-        let view = Uuid::new_v4();
-        let mut grant = Some(ViewGrant {
-            view,
-            expires: now + VIEW_GRANT_TIMEOUT,
-        });
-        assert!(!ViewGrant::claim(&mut grant, Uuid::new_v4(), now));
-        assert!(grant.is_some(), "another view leaves the grant in place");
-        assert!(ViewGrant::claim(&mut grant, view, now));
+    fn every_view_grant_is_claimed_once_by_its_own_view_before_it_expires() {
+        let now = Instant::now();
+        let (earlier, later) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut grants = ViewGrants::default();
+        grants.allow(earlier, now);
+        grants.allow(later, now);
+        assert!(!grants.claim(Uuid::new_v4(), now), "a view nobody allowed");
+        assert!(grants.claim(later, now));
+        assert!(!grants.claim(later, now), "a grant works once");
         assert!(
-            !ViewGrant::claim(&mut grant, view, now),
-            "a grant works once"
+            grants.claim(earlier, now),
+            "a newer grant leaves an earlier one usable"
         );
-        let mut expired = Some(ViewGrant { view, expires: now });
-        assert!(!ViewGrant::claim(&mut expired, view, now));
-        assert!(expired.is_none(), "an expired grant is gone");
+        grants.allow(earlier, now);
+        assert!(
+            !grants.claim(earlier, now + VIEW_GRANT_TIMEOUT),
+            "an expired grant admits nothing"
+        );
+        grants.allow(later, now);
+        grants.allow(earlier, now + VIEW_GRANT_TIMEOUT);
+        assert_eq!(
+            grants.expiries.keys().collect::<Vec<_>>(),
+            [&earlier],
+            "expired grants go"
+        );
+    }
+
+    #[test]
+    fn the_terminal_follows_the_view_that_typed_last_or_else_the_newest() {
+        let size = |rows| TerminalSize::validated(rows, 80).unwrap();
+        let mut views = Views::default();
+        assert_eq!(views.leading_size(), None, "no view sizes the terminal");
+        let first = views.attach(size(20));
+        let second = views.attach(size(24));
+        assert_eq!(
+            views.leading_size(),
+            Some(size(24)),
+            "the newest view while none typed"
+        );
+        views.typed(first);
+        assert_eq!(views.leading_size(), Some(size(20)));
+        let third = views.attach(size(30));
+        assert_eq!(
+            views.leading_size(),
+            Some(size(20)),
+            "a newer view does not take over from one that typed"
+        );
+        views.resized(second, size(26));
+        assert_eq!(
+            views.leading_size(),
+            Some(size(20)),
+            "another view's resize changes only that view"
+        );
+        views.resized(first, size(22));
+        assert_eq!(views.leading_size(), Some(size(22)));
+        views.typed(second);
+        assert_eq!(views.leading_size(), Some(size(26)));
+        views.detach(second);
+        assert_eq!(
+            views.leading_size(),
+            Some(size(22)),
+            "then the view that typed before it"
+        );
+        views.detach(first);
+        assert_eq!(views.leading_size(), Some(size(30)), "then the newest");
+        views.detach(third);
+        assert!(views.is_empty());
+        assert_eq!(views.leading_size(), None);
     }
 
     #[test]

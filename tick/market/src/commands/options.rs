@@ -550,7 +550,7 @@ impl LiveView for OptionsView {
         _: &QuoteServices,
         state: &mut ViewState,
     ) -> Result<bool> {
-        if key == KeyCode::Esc {
+        if key == KeyCode::Backspace {
             if self.detail {
                 self.detail = false;
                 self.detail_scroll = 0;
@@ -659,7 +659,7 @@ impl LiveView for OptionsView {
         Ok(true)
     }
     fn help(&self) -> &'static str {
-        "q / Ctrl+C  Quit\nEsc  Close details, then history; stay at root\nj / k / Ctrl+N / Ctrl+P  Move\nEnter  Contract details or saved snapshot\n[ / ]  Previous / next expiry\nr  Refresh current expiry\ns  Save current observation locally\nh  Read saved history\nb / p / c  Saved before / saved after / current\na  Ask Chat with this event and observation\n?  Help\nFutu OpenD: quotes only; no trading\nMissing pre-event snapshots remain missing"
+        "q / Ctrl+C  Quit\nBackspace  Close details, then history; stay at root\nj / k / Ctrl+N / Ctrl+P  Move\nEnter  Contract details or saved snapshot\n[ / ]  Previous / next expiry\nr  Refresh current expiry\ns  Save current observation locally\nh  Read saved history\nb / p / c  Saved before / saved after / current\na  Ask Chat with this event and observation\n?  Help\nFutu OpenD: quotes only; no trading\nMissing pre-event snapshots remain missing"
     }
     fn draw(&self, frame: &mut Frame<'_>, state: &mut ViewState, settings: &Settings) {
         let area = frame.area();
@@ -721,7 +721,7 @@ impl LiveView for OptionsView {
             .wrap(Wrap { trim: false });
         let description_rows = if self.research.is_some() { 5 } else { 3 }
             .max(u16::try_from(description.line_count(body.width)).unwrap_or(u16::MAX));
-        let note=self.notice.as_deref().unwrap_or(if self.research.is_some() { "b before · p after · c current · a Ask Chat · Enter details\ns save CURRENT · r refresh current · h event history · Esc back" } else { "[ ] expiry · Enter details · r refresh · s save · h history · Esc back\nNo last-price substitution; bid/ask midpoint is a pricing approximation." });
+        let note=self.notice.as_deref().unwrap_or(if self.research.is_some() { "b before · p after · c current · a Ask Chat · Enter details\ns save CURRENT · r refresh current · h event history · Backspace back" } else { "[ ] expiry · Enter details · r refresh · s save · h history · Backspace back\nNo last-price substitution; bid/ask midpoint is a pricing approximation." });
         let note = Paragraph::new(note)
             .style(styles.muted_text)
             .wrap(Wrap { trim: false });
@@ -804,7 +804,7 @@ impl LiveView for OptionsView {
                     .scroll((self.detail_scroll, 0))
                     .block(
                         Block::default()
-                            .title(" Contract / saved snapshot · Esc back ")
+                            .title(" Contract / saved snapshot · Backspace back ")
                             .borders(Borders::ALL)
                             .border_style(styles.border),
                     ),

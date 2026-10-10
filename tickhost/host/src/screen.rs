@@ -36,6 +36,11 @@ impl Screen {
         self.parser.screen_mut().set_size(size.rows, size.columns);
     }
 
+    pub fn size(&self) -> TerminalSize {
+        let (rows, columns) = self.parser.screen().size();
+        TerminalSize { rows, columns }
+    }
+
     /// The terminal output that brings a view showing `shown` to the current screen, with the
     /// screen it then shows. A first view, or one of another size, gets the full frame.
     pub fn frame_since(&self, shown: Option<&vt100::Screen>) -> (Vec<u8>, vt100::Screen) {

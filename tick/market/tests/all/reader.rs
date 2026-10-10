@@ -111,22 +111,13 @@ fn document_queries_page_unicode_without_losing_or_duplicating_characters() {
     assert_eq!(text, "# 财报\n\n收入增长。现金流改善。");
 }
 
-#[tokio::test]
-async fn reader_escape_and_control_navigation_do_not_quit_or_publish_cursor_updates() {
+/// Runs the demo Reader on `keys` until they run out and returns the last screen with how many
+/// Tick Updates it published.
+async fn read_with(keys: Vec<KeyEvent>) -> (String, usize) {
     let library = tick_market::reader::demo_library();
-    let keys = vec![
-        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
-        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
-        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
-        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-    ];
     let input = futures_util::stream::iter(keys.into_iter().map(|key| Ok(Event::Key(key))));
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
-    let mut updates = TickStream::in_memory(TickKind::Reader, "longbridge");
+    let mut updates = TickStream::in_memory(TickKind::Reader);
     run_live(
         library,
         &Settings::default(),
@@ -143,12 +134,51 @@ async fn reader_escape_and_control_navigation_do_not_quit_or_publish_cursor_upda
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(text.contains("/qj"), "{text}");
-    assert!(text.contains("NORMAL"), "{text}");
-    assert_eq!(
-        updates.records().len(),
-        1,
-        "navigation is not a business update"
+    (text, updates.records().len())
+}
+
+#[tokio::test]
+async fn reader_backspace_and_control_navigation_do_not_quit_or_publish_cursor_updates() {
+    let (text, updates) = read_with(vec![
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    ])
+    .await;
+    assert!(
+        text.contains("/qj"),
+        "q is text and Backspace edits: {text}"
+    );
+    assert!(!text.contains("/qjk"), "{text}");
+    assert!(
+        !text.contains("NORMAL") && !text.contains("INSERT"),
+        "{text}"
+    );
+    assert_eq!(updates, 1, "navigation is not a business update");
+}
+
+#[tokio::test]
+async fn ctrl_c_cancels_the_reader_search_and_the_tick_keeps_running() {
+    let (text, _) = read_with(vec![
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+    ])
+    .await;
+    assert!(!text.contains("/z"), "the search was cancelled: {text}");
+    assert!(
+        text.contains("s001 · "),
+        "the next key opened the table of contents: {text}"
     );
 }
 
@@ -176,7 +206,7 @@ async fn opening_another_document_keeps_prior_revision_and_reports_load_failures
     assert!(result.is_err());
     assert_eq!(library.read().unwrap().len(), 2);
     let mut state = ViewState::default();
-    view.on_key(KeyCode::Esc, &NoMarketApi, &mut state)
+    view.on_key(KeyCode::Backspace, &NoMarketApi, &mut state)
         .await
         .unwrap();
 }

@@ -35,8 +35,6 @@ use crate::{
     locale, login,
 };
 
-/// The `source` of the Tick Updates the Reader publishes from its documents.
-const DOCUMENT_SOURCE: &str = "documents";
 const DEMO_DOCUMENT: &str = "demo://earnings/FY2026Q2";
 const DEMO_SYMBOL: &str = "DEMO.US";
 const DEMO_FISCAL_PERIOD: &str = "FY2026Q2";
@@ -167,12 +165,12 @@ async fn run_builtin(
                 options: Some(Arc::new(DemoOptions)),
             };
             let running = Running::Provider(tick, services);
-            run_tick(running, &settings, size, tick_builtin::SOURCE).await
+            run_tick(running, &settings, size).await
         }
         BuiltinCommand::Reader(output) => {
             let library = tick_market::reader::demo_library();
             let running = Running::Reader(demo_reader_args(output), library);
-            run_tick(running, &settings, size, tick_builtin::SOURCE).await
+            run_tick(running, &settings, size).await
         }
     }
 }
@@ -213,13 +211,7 @@ async fn run_futu(
         news: None,
         options: Some(api),
     };
-    run_tick(
-        Running::Provider(tick, services),
-        settings,
-        size,
-        tick_futu::SOURCE,
-    )
-    .await
+    run_tick(Running::Provider(tick, services), settings, size).await
 }
 
 async fn run_reader(
@@ -236,13 +228,7 @@ async fn run_reader(
     if args.check {
         return Ok(());
     }
-    run_tick(
-        Running::Reader(args, library),
-        settings,
-        size,
-        DOCUMENT_SOURCE,
-    )
-    .await
+    run_tick(Running::Reader(args, library), settings, size).await
 }
 
 async fn run_longbridge(
@@ -352,13 +338,7 @@ async fn run_longbridge_market(
         news: news.as_ref().map(|news| news as &dyn NewsApi),
         options: None,
     };
-    run_tick(
-        Running::Provider(tick, services),
-        settings,
-        size,
-        tick_longbridge::SOURCE,
-    )
-    .await
+    run_tick(Running::Provider(tick, services), settings, size).await
 }
 
 async fn run_fundamentals_probe(
@@ -462,9 +442,8 @@ async fn run_tick(
     running: Running<'_>,
     settings: &Settings,
     size: Option<ratatui::layout::Size>,
-    source: &'static str,
 ) -> Result<()> {
-    let mut updates = TickStream::from_process(running.kind(), source)?;
+    let mut updates = TickStream::from_process(running.kind())?;
     let result = if running.is_once() {
         let mut output = std::io::stdout();
         let color = output.is_terminal();

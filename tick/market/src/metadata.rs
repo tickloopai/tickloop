@@ -212,19 +212,19 @@ impl TickKind {
     }
 }
 
-impl Describe for TickKind {
-    fn tick_type(&self) -> &str {
-        self.name()
-    }
+/// A shipped Tick's catalog is fixed for its kind while it runs, so one revision names it.
+const CATALOG_REVISION: &str = "1";
 
+impl Describe for TickKind {
     fn descriptor(&self) -> std::result::Result<tick_protocol::TickDescriptor, String> {
         let descriptor = TickKind::descriptor(*self);
         descriptor.validate().map_err(|error| error.message)?;
         Ok(tick_protocol::TickDescriptor {
             protocol: descriptor.protocol,
-            tick_type: self.name().to_owned(),
+            kind: self.name().to_owned(),
             title: descriptor.title.to_owned(),
             description: descriptor.description.to_owned(),
+            revision: CATALOG_REVISION.to_owned(),
             recover_with: descriptor.recover_with.map(str::to_owned),
             tools: descriptor.tools,
         })
@@ -239,7 +239,7 @@ mod tests {
         TickTool {
             name: name.to_owned(),
             description: String::new(),
-            params: serde_json::Value::Null,
+            input_schema: serde_json::Value::Null,
             mutates,
         }
     }
