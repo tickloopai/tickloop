@@ -795,7 +795,7 @@ async fn in_the_running_tick_the_prompt_keeps_q_as_text_and_ctrl_c_cancels_it() 
         &Settings::default(),
         &mut terminal,
         tokio_stream::wrappers::UnboundedReceiverStream::new(input),
-        &mut TickStream::in_memory(TickKind::Earnings, "longbridge"),
+        &mut TickStream::in_memory(TickKind::Earnings),
     )
     .await
     .unwrap();

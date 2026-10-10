@@ -662,7 +662,7 @@ async fn several_views_share_one_terminal_sized_by_the_view_that_typed_last() {
     let called = reader
         .request(
             "call",
-            json!({"tool":"increment","args":{}}),
+            json!({"tool":"increment","args":{},"revision":"1"}),
             CONTROL_TIMEOUT,
         )
         .await
