@@ -1,37 +1,36 @@
 # Tickloop
 
-Tickloop 提供完整的终端 Agent 和 example Tick。使用原生 Herdr 的 Workspace → Tab → Pane 组织程序；Agent 可以读取 Tick、调用它的工具，并通过明确订阅让内容变化推动 Loop 继续执行。
+Tickloop 提供完整的终端 Agent 和 example Tick。Tick 由 Tickhost 运行，可以在 Monitor 中或原生 Herdr 的 Pane 里查看；Agent 可以读取 Tick、调用它的工具，并通过明确订阅让内容变化推动 Loop 继续执行。
 
-主命令是 `tickloop`。Herdr 外仍可使用普通 Agent 功能；跨 Tick 发现、操作和订阅要求受支持的宿主，目前支持 Herdr。
+主命令是 `tickloop`。Herdr 内外都能打开、操作和订阅 Tick；在 Pane 中显示 Tick 目前只支持 Herdr。
 
 | 成员 | 二进制 | 内容 |
 | --- | --- | --- |
 | `agent/tickloop` | `tickloop` | 完整 Agent Console、工具、权限、Transcript 和 Loop（由 `agent/` 下 console、client、daemon、runtime 等 crate 组成） |
-| `tickhost/host` | `tickhost` | Tick 宿主服务（`tickhost run`，由 daemon 按需拉起）、`tickhost open` 外部协议 launcher 与 `tickhost stop` |
+| `tickhost/host` | `tickhost` | Tick 宿主服务（`tickhost run`，由 daemon 按需拉起，运行协议、终端与 Shell Tick）与 `tickhost stop` |
 | `tick/cli` | `tick` | `tick <provider> <tick>` 与 Reader |
 | `tick/market` | — | 金融 Tick 本体，只经 provider 接口读取数据 |
 | `tick/provider`、`tick/providers/*` | — | provider 接口，以及 builtin（离线模拟）、longbridge、futu 实现 |
 | `tick/protocol`、`tick/sdk` | — | Tick 标准，以及 Tick 侧的协议实现 |
-| `tickhost/connect` | — | Herdr 接入、每实例 Session 与 launch 契约 |
+| `tickhost/connect` | — | Tickhost 业务通道、每实例 Session、launch 契约与 Herdr 视图布局 |
 | `ui` | — | 共享终端呈现规则 |
 
-使用当前 Rust stable（edition 2024）。`make build` 构建 Agent 和示例；`make install` 安装 `tickloop`、`tickhost` 和 `tick`；`make package` 打包这三个入口。daemon 只拉起与自己同目录、同版本的 `tickhost`，版本不一致时拒绝启动并报错；`tickhost stop` 结束所有 hosted Tick，下次 Agent 打开 Tick 时自动启动新的 Tickhost，被结束的 Tick 显示为丢失，只在明确要求时重开。
+使用当前 Rust stable（edition 2024）。`make build` 构建 Agent 和示例；`make install` 安装 `tickloop`、`tickhost` 和 `tick`；`make package` 打包这三个入口。daemon 只拉起与自己同目录、同版本的 `tickhost`，版本不一致时拒绝启动并报错；`tickhost stop` 结束 Tickhost 运行的全部 Tick，下次 Agent 打开 Tick 时自动启动新的 Tickhost，被结束的 Tick 显示为丢失，只在明确要求时重开；它只找默认或 `TICKLOOP_TICKHOST_RUNTIME_DIR` 指定的 Tickhost，运行目录非默认的 daemon 使用自己目录下的 `tickhost/`。
 
-## 在 Herdr 中完成双向操作
+## 双向操作
 
-Agent 会确认运行环境，并在 Herdr 接入可用时自动加载 Tick 操作指引。可以直接说“看看特斯拉股价”或“打开特斯拉 K 线”；Agent 优先用 Tick 展示，并读取实例核对结果。真实行情需要 Longbridge 授权。tmux 和 Zellij 当前仅识别并提示尚未接入；宿主外仍可普通对话，但不支持跨 Tick 操作。
+Agent 会确认运行环境，并在 Tickhost 可用时自动加载 Tick 操作指引；Herdr 内外都可以打开、操作和订阅 Tick。可以直接说“看看特斯拉股价”或“打开特斯拉 K 线”；Agent 优先用 Tick 展示，并读取实例核对结果。真实行情需要 Longbridge 授权。Tick 由 Tickhost 运行并出现在 Monitor 中；在 Monitor 对它按 Enter 即可查看，Herdr 内为浮窗，否则全屏，Esc 隐藏视图而 Tick 继续运行。
 
-要并排观察，可以说“在你当前 Tab 右边打开一个 K 线 Tick”；已有 Tick 则说“把刚才那个 Tick 移到你这个 Tab”。移动会保留实例及订阅。支持右侧或下方分屏，操作不抢焦点。
+在 Herdr 中要并排观察，可以说“在你当前 Tab 右边打开一个 K 线 Tick”；已有 Tick 则说“把刚才那个 Tick 显示到你这个 Tab”。Pane 只是视图：移动它保留实例及订阅，关闭它 Tick 继续运行。支持上下左右四个方向分屏，操作不抢焦点。tmux 和 Zellij 当前仅识别并提示不能在其 Pane 中显示 Tick。
 
-1. 在一个 Herdr Pane 运行 `tickloop`，按 [Agent 说明](agent/tickloop/README.md) 配置模型。
-2. 在另一个 Pane 运行 `tick builtin kline 700.HK`。它会自动接入，使用模拟数据，无需金融账户。也可让 Agent 打开这条命令。
-3. 在 Agent 中说：“读取当前 Workspace 的 Kline，并每 5 秒订阅它的变化。”Agent 先读目录，再为当前 Loop 建立订阅。
-4. 在 Kline 按 `5` 切换到 5 分钟周期；订阅收到新内容后，所属 Loop 按 cadence 继续执行。
-5. 在 Agent 中说：“在刚才那张图上添加一个标注，然后移除它。”Agent 读取 `mark` / `unmark` 的参数并经权限流程操作，结果显示在原来的 Tick 中。
+1. 运行 `tickloop`，按 [Agent 说明](agent/tickloop/README.md) 配置模型。
+2. 在 Agent 中说：“打开 `tick builtin kline 700.HK`，并高频订阅它的变化。”Agent 在 Tickhost 中打开它（模拟数据，无需金融账户），再为当前 Loop 建立订阅。
+3. 在 Monitor 中对它按 Enter 打开视图，按 `5` 切换到 5 分钟周期，再按 Esc 隐藏；一分钟内所属 Loop 收到新内容并继续执行。
+4. 在 Agent 中说：“在刚才那张图上添加一个标注，然后移除它。”Agent 读取 `mark` / `unmark` 的参数并经权限流程操作，结果显示在同一个 Tick 中。
 
-普通日志或 CLI 可直接在 Pane 中运行。让 Agent 读取并明确订阅后，新终端文字也能推动 Loop；它不提供结构化工具目录和完整历史。外部协议程序使用 `tickhost open -- python3 tick/examples/counter.py`，在 Counter Pane 输入 `+` 后回车可产生更新，也可让 Agent 调用 `increment`。
+不讲 Tick 协议的交互式程序（日志查看、REPL 等）也可以让 Agent 打开为 Terminal Tick：Agent 读取屏幕文字并输入；订阅后屏幕文字的变化推动 Loop，但它不提供结构化工具目录和完整历史。外部协议程序让 Agent 以 `protocol: true` 打开，例如 `python3 tick/examples/counter.py`；在 Counter 的视图中输入 `+` 后回车可产生更新，也可让 Agent 调用 `increment`。人在 Pane 或终端里自己运行的程序不是 Tick，Agent 不读取它。
 
-打开和读取不会自动订阅。默认范围是当前 Workspace；跨 Workspace 要明确指定。detach/attach 保留活进程，关闭 Pane 退出其中程序；重启后的实例要重新选取。操作、协议和边界说明见[原生 Herdr 接入](docs/design/native-herdr.md)。
+打开和读取不会自动订阅。默认范围是当前 Workspace；跨 Workspace 要明确指定。detach/attach 保留活进程；结束 Tick 要让 Agent 关闭它或在 Monitor 中关闭；重开后的实例要重新选取。操作、协议和边界说明见 [Tickhost 与 Herdr 视图](docs/design/native-herdr.md)。
 
 # Tick Command `tick`
 
@@ -43,7 +42,7 @@ Agent 会确认运行环境，并在 Herdr 接入可用时自动加载 Tick 操�
 | `longbridge` | QuoteApi、TradeApi、NewsApi | quote、watchlist、kline、positions、news、earnings |
 | `futu` | OptionsApi | options |
 
-provider 没有实现某个 Tick 需要的接口时直接报错，并列出可用的 provider，例如 `tick longbridge options` 提示改用 `tick futu options`。Reader 读取本地原文缓存，不经 provider，命令为 `tick reader`。它通过 Tick Instance 流输出 Tick Update，并在同一条流上声明和执行自己的 Tick Tool；既可以独立运行，也可以在 Herdr Pane 内自动接入 Agent。
+provider 没有实现某个 Tick 需要的接口时直接报错，并列出可用的 provider，例如 `tick longbridge options` 提示改用 `tick futu options`。Reader 读取本地原文缓存，不经 provider，命令为 `tick reader`。它通过 Tick Instance 流输出 Tick Update，并在同一条流上声明和执行自己的 Tick Tool；既可以独立运行，也可以由 Agent 打开为 Tick。
 
 ## 安装与离线体验
 
@@ -55,7 +54,7 @@ cargo build --locked --release --workspace --bins
 ./target/release/tick builtin news --size 40x12
 ```
 
-安装入口使用 `make install`，把 Agent 与 `tick` 放入 PATH。交互模式要求 UTF-8 locale 和支持真彩色的终端；独立运行使用 TTY，Native 接入由 launcher 保留控制终端，并把 stdin/stdout 留给协议。macOS 为当前目标环境。`--help` 和 `describe` 无需 UTF-8 locale 或登录。默认 Unicode 图标不需要特殊字体；`--icon-theme nerd` 需要 Nerd Font v3。
+安装入口使用 `make install`，把 `tickloop`、`tickhost` 与 `tick` 放入 PATH。交互模式要求 UTF-8 locale 和支持真彩色的终端；独立运行使用 TTY，由 Agent 打开时 Tickhost 的 launcher 保留控制终端，并把 stdin/stdout 留给协议。macOS 为当前目标环境。`--help` 和 `describe` 无需 UTF-8 locale 或登录。默认 Unicode 图标不需要特殊字体；`--icon-theme nerd` 需要 Nerd Font v3。
 
 `builtin` 的 Tick 均在真实 TUI 中运行，使用带 `Demo` 标识的模拟数据，不访问网络或读取账户。`--size` 以字符列×行限制显示区域，仍受实际终端尺寸约束，对所有 provider 都可用。用 `q` 退出；可替换为 `quote`、`watchlist`、`kline`、`positions`、`news`、`earnings`、`options`、`reader`。builtin 支持下述全局显示参数。验收时分别缩小窗口、滚动、打开帮助并退出，检查终端恢复。
 
@@ -150,28 +149,28 @@ US 账户目前读取 US 资产持仓接口；该响应不能确认可用数量�
 
 | 场景 | 操作 |
 | --- | --- |
-| 通用 | `q`、Ctrl+C 退出；Esc 返回或取消当前层，根视图保持运行；`?` 帮助 |
+| 通用 | `q`、Ctrl+C 退出；Backspace 返回上一层，根视图保持运行；`?` 帮助（Backspace 也关闭）；Esc 与 Ctrl+B 留给附着视图，Tick 不绑定 |
 | 表格、资讯、菜单 | `j/k`、Ctrl+N/P、上下方向键移动；Enter 确认；PageUp/PageDown 翻页；`g/G` 首尾 |
-| 文本编辑 | 明确显示 INSERT / NORMAL；Esc 先退出 INSERT，再取消编辑；NORMAL 中 `i/a` 进入输入、`h/l` 移动、`x` 删除、`u` 撤销 |
+| 文本编辑 | 没有模式：可见字符（含 `q`、`j`、`k`）直接输入；←/→、Home/End 移动；Backspace/Delete 删除；Enter 应用；Ctrl+C 取消编辑；事件编辑用 Tab/Shift+Tab 切换字段 |
 | 自选 | 左右方向键、`[` / `]` 切组 |
 | K 线 | 左右方向键选蜡烛；`1–8` 按上述周期顺序切换；`m` 显示/隐藏 MA5、MA10、MA20 |
-| 资讯 | Enter 读取正文；Esc 回列表并保留选中项；正文可滚动 |
+| 资讯 | Enter 读取正文；Backspace 回列表并保留选中项；正文可滚动 |
 | 财报 | Enter 单期详情；`c` 多期对比；`[` / `]` 前后财期；`r` 市场反应；`f` 公告；`s` 切股票 |
 | 事件行情 | `e` 编辑事件；`v` 选图形；`r` 选范围；Enter 查看选中行情细节 |
 | 期权 | `[` / `]` 切到期日；Enter 详情；`r` 刷新；`s` 保存观察；`h` 本地历史 |
 | 原文 | `d` 资料目录；`t` 章节；`[` / `]` 前后章节；`/` 搜索；`n/N` 前后匹配位置；`c` 显示引用 |
 
-宽度不足时优先保留核心列；高度不足时滚动。`tick describe` 输出各 Tick Command 的最小尺寸，即关键字段完整显示的最窄宽度：报价 52×6、自选 44×6、K 线 45×14（事件图 60×14）、持仓 49×8、资讯/Reader 40×10、财报 62×14、Options 58×14；80 列下所有 Tick 完整可用。Panel 小于最小尺寸时，Tick 仍按最小尺寸布局，底行显示可见范围与滚动键：`<`／`>` 左右滚动，`{`／`}` 上下滚动，选中行和光标自动保持在可见范围内；数据接收继续，容器尺寸由 Herdr 控制。
+宽度不足时优先保留核心列；高度不足时滚动。`tick describe` 输出各 Tick Command 的最小尺寸，即关键字段完整显示的最窄宽度：报价 52×6、自选 44×6、K 线 45×14（事件图 60×14）、持仓 49×8、资讯/Reader 40×10、财报 62×14、Options 58×14；80 列下所有 Tick 完整可用。窗口小于最小尺寸时，Tick 仍按最小尺寸布局，底行显示可见范围与滚动键：`<`／`>` 左右滚动，`{`／`}` 上下滚动，选中行和光标自动保持在可见范围内；数据接收继续，容器尺寸由 Herdr 控制。
 
 网络临时错误保留最后可用内容并提示恢复状态；授权或参数错误仍会退出。显示状态依据实际 API 成功/失败与重试，不能据此推断 SDK WebSocket 的精确连接生命周期。报价昨收基准过旧或交易时段变化时暂不显示涨跌，等权威快照补齐。
 
 ## Tick Instance 流、Tick Tool 与 Tick Subscription
 
-原生 Herdr 接入使用真实 stdin/stdout JSON-RPC 2.0：Native 协议 2、更新记录 3。`tick/describe` 返回开放类型和工具目录，`tick/read` 返回当前内容，`tool/call` 操作同一实例，`tick/update` 推送业务变化。可见示例在同一业务进程的控制终端上绘制，stdout 专用于协议。
+协议 Tick 使用真实 stdin/stdout 上按行 JSON-RPC 2.0 的 Tick 协议 3：`tick/describe` 返回 `kind`、`revision` 与工具目录，`tick/read` 返回当前状态 `{seq, data, at?}`，`tick/call` 带审批时的 `revision` 操作同一实例，`tick/update` 推送业务变化。可见示例在同一业务进程的控制终端上绘制，stdout 专用于协议。
 
-Agent 通过一个 `CallTickTool` 调用声明的能力。`SubscribeTick` 属于当前 Loop，默认每 60 秒投递最新内容，范围 5–86400 秒；打开、读取和发现不会自动订阅。普通程序按 5 秒采集终端文字，之后等待 Loop cadence；采样不保证完整输出或即时响应。
+Agent 通过一个 `CallTickTool` 调用声明的能力。`SubscribeTick` 属于当前 Loop：协议 Tick 与 Terminal Tick 选高频（每分钟，默认）、中频（每 10 分钟）或低频（每 30 分钟），到期投递最新内容；Shell 固定及时，只在退出时投递；产物不接受订阅，经产物关联逐条交付 @tickloop 请求。打开、读取和发现不会自动订阅。Terminal Tick 到期读一次屏幕并与上次送出的文字比较，不保证完整输出或即时响应。
 
-外部接入示例见 [Counter](tick/examples/counter.py)，协议约束见[原生 Herdr 接入](docs/design/native-herdr.md)。
+外部接入示例见 [Counter](tick/examples/counter.py)，协议约束见 [Tickhost 与 Herdr 视图](docs/design/native-herdr.md#tick-协议-3)。
 
 ## 退出码
 
@@ -197,14 +196,14 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 
 整仓测试由 cargo-nextest 运行（`cargo install --locked cargo-nextest`），每个测试独立进程，慢测试超时与 PTY 分组见 `.config/nextest.toml`。`make check` 执行格式、严格 Clippy 和整仓测试（`make test`），并为测试使用隔离状态目录、清除继承的 Herdr 调用者环境。测试的本地 HTTP mock 使用 NO_PROXY，避免开发机代理干扰回环请求。
 
-主要测试入口是 Agent 工具与权限、Tick Subscription 驱动 Loop。真实 stdio 子进程和 PTY 验证协议、可见界面与终端恢复；隔离 Herdr 验证完整 Console 的双向操作。可复核步骤和当前结果见[实施记录](.scratch/herdr-workspace/implementation.md)。
+主要测试入口是 Agent 工具与权限、Tick Subscription 驱动 Loop。真实 stdio 子进程和 PTY 验证协议、可见界面与终端恢复；真实 Tickhost 与隔离 Herdr 验证完整 Console 的双向操作与视图 Pane。可复核步骤和当前结果见[本机 Tick 统一规格的工单](.scratch/tickhost-unification/issues/)。
 
 `tick` 的自动测试使用离线数据与授权 HTTP 桩，默认不连接真实账户。真实 API 测试有 `live-api` feature 且默认忽略。测试模型自动操作、真实模型、用户亲手操作与金融账户验证分别记录。
 
 # 后续范围
 
-当前迁移以完整 Agent、原生 Herdr 接入和 example Tick 为交付中心。tmux、Zellij 适配、通用 Tick SDK、订阅字段条件和交易执行不在本轮范围内。关闭 Agent Pane 会退出该 Agent，未增加独立的后台 Loop 宿主。
+当前以完整 Agent、Tickhost、Herdr 视图和 example Tick 为交付中心。tmux、Zellij 中的视图、通用 Tick SDK、订阅字段条件和交易执行不在本轮范围内。关闭 Agent Pane 只关闭界面，Agent 在本机 daemon 中继续运行。
 
 金融数据 Tick 保留既有来源和授权约束。本轮无需真实金融账户的接入验收不能代表行情权限、线上数据或真实交易验证。
 
-原生操作见 [Herdr 接入](docs/design/native-herdr.md)，Tick 契约见 [Tick 设计记录](docs/design/tick.md)，领域术语见 [CONTEXT.md](CONTEXT.md)。参考源码归属与第三方许可证见 [第三方声明](THIRD_PARTY_NOTICES.md)。
+运行与视图见 [Tickhost 与 Herdr 视图](docs/design/native-herdr.md)，Tick 契约见 [Tick 设计记录](docs/design/tick.md)，领域术语见 [CONTEXT.md](CONTEXT.md)。参考源码归属与第三方许可证见 [第三方声明](THIRD_PARTY_NOTICES.md)。
