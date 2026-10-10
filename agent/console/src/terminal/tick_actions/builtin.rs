@@ -104,8 +104,8 @@ impl TickActionExecutor for OpenSubscriptions {
             crate::monitor_rows::SubscriptionOperation::View => {
                 crate::monitor_rows::SUBSCRIPTIONS_KEY
             }
-            crate::monitor_rows::SubscriptionOperation::EditCadence => {
-                crate::monitor_rows::SUBSCRIPTION_CADENCE_KEY
+            crate::monitor_rows::SubscriptionOperation::EditFrequency => {
+                crate::monitor_rows::SUBSCRIPTION_FREQUENCY_KEY
             }
             crate::monitor_rows::SubscriptionOperation::Cancel => {
                 crate::monitor_rows::UNSUBSCRIBE_KEY

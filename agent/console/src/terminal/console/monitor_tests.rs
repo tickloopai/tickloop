@@ -1324,14 +1324,14 @@ fn subscribed_ticks_show_live_status_and_ignore_another_chats_refresh() {
     let mut state = State::new(true, 140, 30);
     let chat = Uuid::new_v4();
     state.switch_view_chat(Some(chat));
-    let row: TickSubscriptionStatus = serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":"herdr:fixture","every_seconds":60,"accumulated":0,"last_delivery_ms":1000,"last_delivery":null,"link":"Live","kind":{"Terminal":{"truncated":false}},"title":"Quote terminal","updated_at_ms":null})).unwrap();
+    let row: TickSubscriptionStatus = serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":"herdr:fixture","frequency":"high","accumulated":0,"last_delivery_ms":1000,"last_delivery":null,"link":"Live","kind":{"Terminal":{"truncated":false}},"title":"Quote terminal","updated_at_ms":null})).unwrap();
     let console = tests::console_with_state(state);
     console.update_subscribed_ticks(chat, &[row]).unwrap();
     let mut state = console.state.lock().unwrap();
     assert_eq!(state.monitor.entries()[0].title, "Quote terminal");
     assert_eq!(state.monitor.entries()[0].kind, "Terminal");
     assert_eq!(state.monitor.entries()[0].status, "live");
-    assert_eq!(state.monitor.entries()[0].notes, ["⟳ 60s"]);
+    assert_eq!(state.monitor.entries()[0].notes, ["⟳ high"]);
     let instance = state.monitor.entries()[0].instance.clone();
     state.switch_view_chat(Some(Uuid::new_v4()));
     state.update_tick_entries(chat, TickGroup::Ticks, vec![]);
@@ -1399,7 +1399,7 @@ fn a_subscribed_artifact_is_visible_and_merges_with_its_added_tick() {
     let chat = Uuid::new_v4();
     state.chat = Some(chat);
     let console = tests::console_with_state(state);
-    let row: TickSubscriptionStatus = serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":"artifact:https://docs.example/doc","every_seconds":60,"accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live","kind":"Protocol","title":"Subscribed document","updated_at_ms":1000})).unwrap();
+    let row: TickSubscriptionStatus = serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":"artifact:https://docs.example/doc","frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live","kind":"Protocol","title":"Subscribed document","updated_at_ms":1000})).unwrap();
     console.update_subscribed_ticks(chat, &[row]).unwrap();
     let mut state = console.state.lock().unwrap();
     assert_eq!(state.monitor.entries().len(), 1);
@@ -2040,7 +2040,7 @@ fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_other
     subscribed.group = TickGroup::Ticks;
     subscribed.instance = "herdr:quotes".parse().unwrap();
     subscribed.status = "live".into();
-    subscribed.notes = vec!["⟳ 60s".into()];
+    subscribed.notes = vec!["⟳ high".into()];
     subscribed.tone = StatusTone::Live;
     subscribed.update = Some(crate::monitor_rows::RowUpdate {
         at_ms: 1000,
@@ -2050,8 +2050,8 @@ fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_other
     for (width, preferred, entry, details, two_lines) in [
         (140, None, &finished, "101", false),
         (80, None, &finished, "101", false),
-        (140, None, &subscribed, "⟳ 60s · ● 3", true),
-        (200, Some(80), &subscribed, "⟳ 60s · ● 3", false),
+        (140, None, &subscribed, "⟳ high · ● 3", true),
+        (200, Some(80), &subscribed, "⟳ high · ● 3", false),
     ] {
         let mut state = State::new(true, width, 25);
         state.switch_view_chat(Some(Uuid::new_v4()));
@@ -2410,6 +2410,41 @@ fn a_finished_background_shell_a_loop_subscribes_to_stays_as_its_shell_row() {
     );
 }
 
+#[test]
+fn a_subscribed_shell_row_is_marked_immediate_and_offers_no_frequency() {
+    let chat = Uuid::from_u128(77);
+    let console = Console::test_for_chat(chat);
+    let mut snapshot = tests::task_snapshot(chat, 1);
+    snapshot.tasks[0].was_background = true;
+    let shell = tick_protocol::InstanceRef::shell(snapshot.tasks[0].id);
+    console.update_shell_ticks(&snapshot).unwrap();
+    let mut state = console.state.lock().unwrap();
+    let mut subscription = tests::subscription_row(3);
+    subscription.instance = shell.clone();
+    subscription.frequency = tickloop_agent_protocol::TickSubscriptionFrequency::Immediate;
+    state.monitor.subscriptions = vec![subscription];
+    state.monitor.rebuild();
+    let entries = state.monitor.entries();
+    let row = entries
+        .iter()
+        .find(|entry| entry.instance == shell)
+        .unwrap();
+    assert!(
+        row.notes.contains(&"⟳ immediate".to_owned()),
+        "{:?}",
+        row.notes
+    );
+    let keys = row
+        .actions
+        .iter()
+        .map(|action| action.key)
+        .collect::<Vec<_>>();
+    assert!(
+        keys.contains(&'w') && keys.contains(&'u') && !keys.contains(&'e'),
+        "an immediate subscription has no frequency to change: {keys:?}"
+    );
+}
+
 fn subscribed_fixture(subscriptions: usize) -> State {
     let mut state = State::new(true, 140, 30);
     state.switch_view_chat(Some(Uuid::from_u128(77)));
@@ -2448,7 +2483,7 @@ fn requested_key(event: Option<InputEvent>) -> char {
 fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() {
     let mut state = subscribed_fixture(1);
     let text = monitor_text(&mut state);
-    assert!(text.contains("⟳ 60s") && !text.contains("live"), "{text}");
+    assert!(text.contains("⟳ high") && !text.contains("live"), "{text}");
     assert!(
         text.contains("enter open") && text.contains("w subscriptions"),
         "{text}"
@@ -2466,7 +2501,7 @@ fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() 
             ('o', "open"),
             ('x', "remove"),
             ('w', "subscriptions"),
-            ('e', "cadence"),
+            ('e', "frequency"),
             ('u', "unsubscribe")
         ]
     );
@@ -2474,16 +2509,19 @@ fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() 
     assert_eq!(requested_key(press(&mut state, KeyCode::Char('w'))), 'w');
     let text = monitor_text(&mut state);
     assert!(text.contains("Tick Subscriptions 1"), "{text}");
-    assert!(text.contains("› ⟳ every 60s"), "{text}");
+    assert!(text.contains("› ⟳ high · every 1 min"), "{text}");
     assert!(!state.input_dialog_visible(), "the detail stays in Monitor");
 
     press(&mut state, KeyCode::Char('e'));
-    for _ in 0..2 {
-        press(&mut state, KeyCode::Backspace);
-    }
-    press(&mut state, KeyCode::Char('9'));
-    press(&mut state, KeyCode::Char('0'));
-    assert!(monitor_text(&mut state).contains("Every 90s"));
+    press(&mut state, KeyCode::Char('j'));
+    let text = monitor_text(&mut state);
+    assert!(
+        text.contains("  high · every 1 min")
+            && text.contains("› medium · every 10 min")
+            && text.contains("  low · every 30 min")
+            && !text.contains("immediate"),
+        "{text}"
+    );
     assert_eq!(requested_key(press(&mut state, KeyCode::Enter)), 'e');
 
     press(&mut state, KeyCode::Char('u'));
@@ -2547,7 +2585,7 @@ async fn removing_a_subscribed_row_confirms_then_cancels_its_subscriptions() {
             tickloop_agent_test_support::call(
                 "subscribe",
                 "SubscribeTick",
-                serde_json::json!({"tick_instance_id":"cal:watched","every_seconds":30}),
+                serde_json::json!({"tick_instance_id":"cal:watched"}),
             ),
             tickloop_agent_test_support::text("watching"),
         ])),
@@ -2963,7 +3001,7 @@ fn an_artifact_linked_here_shows_the_subscription_marker_and_x_unlinks_it() {
             ('c', "copy"),
             ('f', "feedback"),
             ('w', "subscriptions"),
-            ('e', "cadence"),
+            ('e', "frequency"),
             ('u', "unsubscribe")
         ]
     );

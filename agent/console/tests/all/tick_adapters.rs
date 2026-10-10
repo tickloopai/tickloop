@@ -5,7 +5,9 @@ use tickloop_agent_console::monitor_rows::{
     MonitorAction, MonitorContext, MonitorRows, MonitorRowsRegistry, SubscriptionOperation,
     TickDescriptor, TickGlyph, TickGroup, TickIntent,
 };
-use tickloop_agent_protocol::{EventKind, ObservationKind, TickSubscriptionChange};
+use tickloop_agent_protocol::{
+    EventKind, ObservationKind, TickSubscriptionChange, TickSubscriptionFrequency,
+};
 use tickloop_agent_runtime::{
     Agent, ShellTaskCenter,
     tick_adapter::{ShellAdapter, TickAdapter, TickAdapters},
@@ -57,6 +59,10 @@ impl MonitorRows for CalendarRows {
         }]
     }
 }
+/// How long a Shell test waits to see that nothing more is delivered: a Shell subscription is
+/// immediate, and the Shell Tick looks at its task several times meanwhile.
+const SHELL_QUIET_WAIT: Duration = Duration::from_secs(2);
+
 fn calendar() -> InstanceRef {
     InstanceRef::new("cal", "a").unwrap()
 }
@@ -87,7 +93,7 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
         call(
             "s1",
             "SubscribeTick",
-            json!({"tick_instance_id":calendar(),"every_seconds":5}),
+            json!({"tick_instance_id":calendar()}),
         ),
         text("watching"),
         text("calendar changed"),
@@ -111,7 +117,7 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
         assert!(
             jsonschema::validator_for(&subscribe.input_schema)
                 .unwrap()
-                .is_valid(&json!({"tick_instance_id":"cal:a","every_seconds":5})),
+                .is_valid(&json!({"tick_instance_id":"cal:a","frequency":"medium"})),
             "the model API must accept a short registered identity"
         );
     }
@@ -126,13 +132,14 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].group.name, "Calendars");
     assert_eq!(rows[0].status, "live");
-    assert_eq!(rows[0].notes, ["⟳ 5s"]);
-    tokio::time::advance(Duration::from_secs(5)).await;
+    assert_eq!(rows[0].notes, ["⟳ high"]);
+    let period = TickSubscriptionFrequency::High.period().unwrap();
+    tokio::time::advance(period).await;
     settle().await;
     assert_eq!(
         model.requests.lock().unwrap().len(),
         2,
-        "baseline/quiet cadence must not trigger"
+        "baseline/quiet period must not trigger"
     );
     for sequence in 1..=3 {
         stream.push(TickObservation {
@@ -147,7 +154,7 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
         });
     }
     settle().await;
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(period).await;
     complete(&mut events).await;
     {
         let requests = model.requests.lock().unwrap();
@@ -197,9 +204,11 @@ async fn shell_baseline_output_and_final_exit_use_the_same_subscription_to_loop_
     model.enqueue(call(
         "s1",
         "SubscribeTick",
-        json!({"tick_instance_id":InstanceRef::shell(receipt.command_id),"every_seconds":5}),
+        json!({"tick_instance_id":InstanceRef::shell(receipt.command_id)}),
     ));
     model.enqueue(text("watching"));
+    // The output and the exit may reach the Loop in one delivery or, observed apart, in two.
+    model.enqueue(text("shell updated"));
     model.enqueue(text("shell completed"));
     let mut events = agent.subscribe();
     agent
@@ -208,23 +217,36 @@ async fn shell_baseline_output_and_final_exit_use_the_same_subscription_to_loop_
         .unwrap();
     complete(&mut events).await;
     let subscription = agent.tick_subscriptions(chat).await.unwrap().remove(0);
-    tokio::time::sleep(Duration::from_millis(5200)).await;
+    assert_eq!(subscription.frequency, TickSubscriptionFrequency::Immediate);
+    tokio::time::sleep(SHELL_QUIET_WAIT).await;
     assert_eq!(
         model.requests.lock().unwrap().len(),
         2,
         "existing output is only a baseline"
     );
     std::fs::write(directory.path().join("release"), "").unwrap();
-    complete(&mut events).await;
-    {
-        let requests = model.requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
-        let messages = serde_json::to_string(&requests[2].messages).unwrap();
-        assert!(
-            messages.contains("final-output") && messages.contains("exit 7"),
-            "{messages}"
-        );
-    }
+    let delivered = |needle: &str| {
+        model
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .skip(2)
+            .any(|request| {
+                serde_json::to_string(&request.messages)
+                    .unwrap()
+                    .contains(needle)
+            })
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !delivered("exit 7") {
+            complete(&mut events).await;
+        }
+    })
+    .await
+    .expect("the exit is delivered at once, without a period");
+    assert!(delivered("final-output"));
+    let deliveries = model.requests.lock().unwrap().len() - 2;
     let rows = MonitorRowsRegistry::builtin().list(&MonitorContext {
         shells: Some(center.snapshot(chat).await.unwrap()),
         subscriptions: agent.tick_subscriptions(chat).await.unwrap(),
@@ -233,12 +255,12 @@ async fn shell_baseline_output_and_final_exit_use_the_same_subscription_to_loop_
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].group.name, "Shells");
     assert_eq!(rows[0].status, "exit 7");
-    assert_eq!(rows[0].notes, ["7", "⟳ 5s"]);
+    assert_eq!(rows[0].notes, ["7", "⟳ immediate"]);
     assert!(!rows[0].running);
-    tokio::time::sleep(Duration::from_millis(5200)).await;
+    tokio::time::sleep(SHELL_QUIET_WAIT).await;
     assert_eq!(
         model.requests.lock().unwrap().len(),
-        3,
+        2 + deliveries,
         "finished tasks must become quiet"
     );
     agent
@@ -361,7 +383,7 @@ fn a_subscribed_instance_always_has_a_row_with_its_marker() {
     .unwrap();
     chat.monitor.remove(instance.clone());
     let subscription = |accumulated: u64| -> tickloop_agent_protocol::TickSubscriptionStatus {
-        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":instance,"every_seconds":60,"accumulated":accumulated,"last_delivery_ms":null,"last_delivery":null,"updated_at_ms":5_000,"link":"Live"})).unwrap()
+        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":instance,"frequency":"high","accumulated":accumulated,"last_delivery_ms":null,"last_delivery":null,"updated_at_ms":5_000,"link":"Live"})).unwrap()
     };
     let unread = |rows: &[tickloop_agent_console::monitor_rows::TickDescriptor]| {
         rows[0]
@@ -383,7 +405,7 @@ fn a_subscribed_instance_always_has_a_row_with_its_marker() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].instance, instance);
     assert_eq!(rows[0].status, "live");
-    assert_eq!(rows[0].notes, ["⟳ 60s"]);
+    assert_eq!(rows[0].notes, ["⟳ high"]);
     assert_eq!(unread(&rows), Some(2));
 
     let rows = listed(vec![subscription(0), subscription(1)]);
@@ -431,7 +453,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
     );
     finished.updated_at_ms = Some(1_000);
     let subscription = |instance: &str| -> TickSubscriptionStatus {
-        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":instance,"every_seconds":60,"accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live"})).unwrap()
+        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":instance,"frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live"})).unwrap()
     };
     let (pane, artifact) = (
         subscription("herdr:pane"),
@@ -459,7 +481,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
     let manage = |instance: &InstanceRef| {
         [
             ('w', "subscriptions", SubscriptionOperation::View),
-            ('e', "cadence", SubscriptionOperation::EditCadence),
+            ('e', "frequency", SubscriptionOperation::EditFrequency),
             ('u', "unsubscribe", SubscriptionOperation::Cancel),
         ]
         .map(|(key, label, operation)| {
@@ -552,13 +574,13 @@ fn duplicate_instance_projection_keeps_the_newest_delivery_in_any_subscription_o
     use tickloop_agent_protocol::TickSubscriptionStatus;
     let row = |time: Option<u64>,
                title: Option<&str>,
-               cadence: u64,
+               frequency: &str,
                link: &str|
      -> TickSubscriptionStatus {
-        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":"herdr:shared","every_seconds":cadence,"accumulated":0,"last_delivery_ms":time,"last_delivery":null,"kind":"Protocol","title":title,"updated_at_ms":time,"link":link})).unwrap()
+        serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":"herdr:shared","frequency":frequency,"accumulated":0,"last_delivery_ms":time,"last_delivery":null,"kind":"Protocol","title":title,"updated_at_ms":time,"link":link})).unwrap()
     };
-    let recent = row(Some(2000), Some("Shared Tick"), 5, "Live");
-    let baseline = row(None, None, 86400, "Initializing");
+    let recent = row(Some(2000), Some("Shared Tick"), "high", "Live");
+    let baseline = row(None, None, "low", "Initializing");
     for subscriptions in [
         vec![recent.clone(), baseline.clone()],
         vec![baseline.clone(), recent.clone()],
@@ -629,7 +651,7 @@ async fn shell_subscription_refuses_foreign_chat_before_baseline_and_restoration
     model.enqueue(call(
         "foreign-watch",
         "SubscribeTick",
-        json!({"tick_instance_id":instance,"every_seconds":5}),
+        json!({"tick_instance_id":instance}),
     ));
     model.enqueue(text("watch refused"));
     let mut events = agent.subscribe();
@@ -667,7 +689,7 @@ async fn shell_subscription_refuses_foreign_chat_before_baseline_and_restoration
                 subscriptions: vec![tickloop_agent_protocol::TickSubscription {
                     id: Uuid::new_v4(),
                     instance: instance.clone(),
-                    every_seconds: 5,
+                    frequency: tickloop_agent_protocol::TickSubscriptionFrequency::Immediate,
                     authority: None,
                 }],
             }),
@@ -686,7 +708,7 @@ async fn shell_subscription_refuses_foreign_chat_before_baseline_and_restoration
     .await
     .expect("restored foreign watch must fail closed before its baseline");
     std::fs::write(directory.path().join("release"), "").unwrap();
-    tokio::time::sleep(Duration::from_millis(5200)).await;
+    tokio::time::sleep(SHELL_QUIET_WAIT).await;
     assert!(!model.requests.lock().unwrap().iter().any(|request| {
         serde_json::to_string(&request.messages)
             .unwrap()
@@ -710,7 +732,7 @@ async fn a_titleless_artifact_subscription_preserves_joined_and_cached_titles() 
         added_at_ms: 1,
     };
     agent.add_artifact_tick(chat, tick.clone()).await.unwrap();
-    let row:tickloop_agent_protocol::TickSubscriptionStatus=serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":tick.instance_id(),"every_seconds":60,"accumulated":0,"last_delivery_ms":null,"last_delivery":null,"kind":"Protocol","title":null,"updated_at_ms":null,"link":"Disconnected"})).unwrap();
+    let row:tickloop_agent_protocol::TickSubscriptionStatus=serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":tick.instance_id(),"frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"kind":"Protocol","title":null,"updated_at_ms":null,"link":"Disconnected"})).unwrap();
     let mut context = MonitorContext {
         chat: Some(agent.snapshot(chat).await.unwrap()),
         subscriptions: vec![row],

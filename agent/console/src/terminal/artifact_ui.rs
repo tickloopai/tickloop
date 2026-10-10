@@ -531,7 +531,7 @@ mod tests {
             None,
         );
         let chat = agent.create_chat(directory.into()).await.unwrap();
-        remote.rows.lock().unwrap().push(serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":tick_protocol::artifact_instance_id(origin,"doc"),"every_seconds":60,"accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live","kind":"Protocol","title":"Subscribed document","updated_at_ms":1000})).unwrap());
+        remote.rows.lock().unwrap().push(serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":tick_protocol::artifact_instance_id(origin,"doc"),"frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live","kind":"Protocol","title":"Subscribed document","updated_at_ms":1000})).unwrap());
         (agent, core, remote, chat)
     }
 

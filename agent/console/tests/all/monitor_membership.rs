@@ -220,7 +220,7 @@ async fn removal_outlives_restart_but_never_hides_a_subscription() {
         tickloop_agent_test_support::call(
             "subscribe",
             "SubscribeTick",
-            json!({"tick_instance_id":"cal:watched","every_seconds":30}),
+            json!({"tick_instance_id":"cal:watched","frequency":"low"}),
         ),
         tickloop_agent_test_support::text("watching"),
     ]));
@@ -309,14 +309,14 @@ async fn an_empty_chat_keeps_members_and_removals_across_restart() {
 async fn one_row_merges_every_source_and_frequency_and_pages_cover_the_full_set() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(
-        [15, 45]
+        ["high", "medium"]
             .into_iter()
-            .flat_map(|every_seconds| {
+            .flat_map(|frequency| {
                 vec![
                     tickloop_agent_test_support::call(
-                        &format!("s{every_seconds}"),
+                        &format!("s-{frequency}"),
                         "SubscribeTick",
-                        json!({"tick_instance_id":"cal:shared","every_seconds":every_seconds}),
+                        json!({"tick_instance_id":"cal:shared","frequency":frequency}),
                     ),
                     tickloop_agent_test_support::text("watching"),
                 ]

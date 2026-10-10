@@ -812,7 +812,7 @@ j/k or arrows scroll; g/G or home/end jumps; {/} moves between user prompts.
 Persistent rules apply to every Chat in this working directory; session rules end with this process.
 /cwd [PATH] shows or sets the main directory.
 /plan enters Plan mode and opens a saved plan for the selected goal; /plan GOAL views a specific saved plan.
-Monitor lists this Chat's background Shells and the Tick Subscriptions of its Loops: e changes a subscription's cadence, u cancels one, and x on a subscribed row cancels its subscriptions before hiding it.
+Monitor lists this Chat's background Shells and the Tick Subscriptions of its Loops: e changes a subscription's frequency, u cancels one, and x on a subscribed row cancels its subscriptions before hiding it.
 Shell task state and per-operation output are available only in this process; they are gone after a restart.
 Background Shell completions are added to their Chat as task notifications.
 A completion continues the goal that started the command; commands without a goal only record the notification.

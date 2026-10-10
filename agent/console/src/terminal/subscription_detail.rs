@@ -1,9 +1,10 @@
 //! The Tick Subscriptions on one Monitor row, shown inside the Monitor column.
 //!
-//! Each Loop that subscribes to the row's Tick Instance appears with its cadence, how many Tick
+//! Each Loop that subscribes to the row's Tick Instance appears with its frequency, how many Tick
 //! Updates accumulated since the last delivery, what that delivery was, and whether the link to
-//! the instance is live. The user changes a cadence or cancels a subscription here; creating one
-//! stays with the Agent, which knows which Tick Instance answers the goal.
+//! the instance is live. The user picks another periodic frequency or cancels a subscription
+//! here; an immediate subscription keeps the frequency its Tick type decides. Creating one stays
+//! with the Agent, which knows which Tick Instance answers the goal.
 
 use std::collections::HashMap;
 
@@ -19,14 +20,13 @@ use super::{
     },
 };
 use crate::monitor_rows::{
-    SUBSCRIPTION_CADENCE_KEY as CADENCE_KEY, SubscriptionOperation, UNSUBSCRIBE_KEY,
+    SUBSCRIPTION_FREQUENCY_KEY as FREQUENCY_KEY, SubscriptionOperation, UNSUBSCRIBE_KEY,
 };
 use tickloop_agent_protocol::{
-    LoopId, LoopState, MAX_CADENCE_SECONDS, MIN_CADENCE_SECONDS, TickLinkState,
-    TickSubscriptionChange, TickSubscriptionStatus,
+    LoopId, LoopState, TickLinkState, TickSubscriptionChange, TickSubscriptionFrequency,
+    TickSubscriptionStatus,
 };
 
-const MAX_CADENCE_DIGITS: usize = 5;
 const SUBSCRIPTION_ROWS: usize = 3;
 const HEADER_ROWS: usize = 2;
 const DETAIL_INDENT: &str = "    ";
@@ -34,7 +34,7 @@ const DETAIL_INDENT: &str = "    ";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SubscriptionFocus {
     List,
-    Cadence,
+    Frequency,
     CancelConfirmation,
 }
 
@@ -54,7 +54,8 @@ pub(super) struct SubscriptionDetail {
     goals: HashMap<LoopId, String>,
     selected: Option<Uuid>,
     focus: SubscriptionFocus,
-    cadence_draft: String,
+    /// The periodic frequency the cursor is on while the user picks one.
+    frequency_choice: TickSubscriptionFrequency,
     top: usize,
     error: Option<String>,
     display: DisplayProfile,
@@ -79,7 +80,7 @@ impl SubscriptionDetail {
             rows,
             goals,
             focus: SubscriptionFocus::List,
-            cadence_draft: String::new(),
+            frequency_choice: TickSubscriptionFrequency::PERIODIC[0],
             top: 0,
             error: None,
             display,
@@ -87,7 +88,7 @@ impl SubscriptionDetail {
         if detail.rows.len() == 1 {
             match operation {
                 SubscriptionOperation::View => {}
-                SubscriptionOperation::EditCadence => detail.edit_cadence(),
+                SubscriptionOperation::EditFrequency => detail.edit_frequency(),
                 SubscriptionOperation::Cancel => {
                     detail.focus = SubscriptionFocus::CancelConfirmation
                 }
@@ -145,8 +146,8 @@ impl SubscriptionDetail {
                 | (KeyCode::Char('p'), KeyModifiers::CONTROL) => self.move_by(-1),
                 (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
                 | (KeyCode::Char('n'), KeyModifiers::CONTROL) => self.move_by(1),
-                (KeyCode::Enter, _) | (KeyCode::Char(CADENCE_KEY), KeyModifiers::NONE) => {
-                    self.edit_cadence()
+                (KeyCode::Enter, _) | (KeyCode::Char(FREQUENCY_KEY), KeyModifiers::NONE) => {
+                    self.edit_frequency()
                 }
                 (KeyCode::Char(UNSUBSCRIBE_KEY), KeyModifiers::NONE) => {
                     if self.selected_row().is_some() {
@@ -156,19 +157,13 @@ impl SubscriptionDetail {
                 (KeyCode::Esc | KeyCode::Left, _) => return Err(true),
                 _ => {}
             },
-            SubscriptionFocus::Cadence => match (key.code, key.modifiers) {
-                (KeyCode::Char(digit), KeyModifiers::NONE | KeyModifiers::SHIFT)
-                    if digit.is_ascii_digit() =>
-                {
-                    if self.cadence_draft.len() < MAX_CADENCE_DIGITS {
-                        self.cadence_draft.push(digit);
-                    }
-                }
-                (KeyCode::Backspace, _) => {
-                    self.cadence_draft.pop();
-                }
+            SubscriptionFocus::Frequency => match (key.code, key.modifiers) {
+                (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+                | (KeyCode::Char('p'), KeyModifiers::CONTROL) => self.choose_by(-1),
+                (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+                | (KeyCode::Char('n'), KeyModifiers::CONTROL) => self.choose_by(1),
                 (KeyCode::Esc, _) => self.leave_editing(),
-                (KeyCode::Enter, _) => return Ok(self.confirm_cadence()),
+                (KeyCode::Enter, _) => return Ok(self.confirm_frequency()),
                 _ => {}
             },
             SubscriptionFocus::CancelConfirmation => match (key.code, key.modifiers) {
@@ -188,40 +183,41 @@ impl SubscriptionDetail {
         Ok(None)
     }
 
-    fn edit_cadence(&mut self) {
-        if let Some(row) = self.selected_row() {
-            self.cadence_draft = row.every_seconds.to_string();
-            self.focus = SubscriptionFocus::Cadence;
+    /// Starts picking a frequency for the selected subscription; an immediate one has none to pick.
+    fn edit_frequency(&mut self) {
+        if let Some(frequency) = self
+            .selected_row()
+            .map(|row| row.frequency)
+            .filter(|frequency| frequency.period().is_some())
+        {
+            self.frequency_choice = frequency;
+            self.focus = SubscriptionFocus::Frequency;
         }
     }
 
-    fn confirm_cadence(&mut self) -> Option<SubscriptionRequest> {
-        let Some(subscription) = self.selected else {
-            self.leave_editing();
-            return None;
-        };
-        match self.cadence_draft.parse::<u64>() {
-            Ok(every_seconds)
-                if (MIN_CADENCE_SECONDS..=MAX_CADENCE_SECONDS).contains(&every_seconds) =>
-            {
-                self.leave_editing();
-                Some(SubscriptionRequest {
-                    subscription,
-                    change: TickSubscriptionChange::Cadence(every_seconds),
-                })
-            }
-            _ => {
-                self.error = Some(format!(
-                    "a cadence is {MIN_CADENCE_SECONDS} to {MAX_CADENCE_SECONDS} seconds"
-                ));
-                None
-            }
-        }
+    fn choose_by(&mut self, step: isize) {
+        let choices = TickSubscriptionFrequency::PERIODIC;
+        let current = choices
+            .iter()
+            .position(|choice| *choice == self.frequency_choice)
+            .unwrap_or(0) as isize;
+        let next = (current + step).clamp(0, choices.len() as isize - 1) as usize;
+        self.frequency_choice = choices[next];
+    }
+
+    /// Asks for the chosen frequency, or nothing when it is the one the subscription has.
+    fn confirm_frequency(&mut self) -> Option<SubscriptionRequest> {
+        let current = self.selected_row().map(|row| (row.id, row.frequency));
+        self.leave_editing();
+        let (subscription, frequency) = current?;
+        (frequency != self.frequency_choice).then_some(SubscriptionRequest {
+            subscription,
+            change: TickSubscriptionChange::Frequency(self.frequency_choice),
+        })
     }
 
     fn leave_editing(&mut self) {
         self.focus = SubscriptionFocus::List;
-        self.cadence_draft.clear();
     }
 
     fn move_by(&mut self, step: isize) {
@@ -260,16 +256,16 @@ impl SubscriptionDetail {
         } else {
             Role::MutedText
         };
-        let mut cadence = format!(
-            "{}⟳ every {}s",
+        let mut frequency = format!(
+            "{}⟳ {}",
             if selected { "› " } else { "  " },
-            row.every_seconds
+            frequency_label(row.frequency)
         );
         if row.accumulated > 0 {
-            cadence.push_str(&format!(" · {} new", row.accumulated));
+            frequency.push_str(&format!(" · {} new", row.accumulated));
         }
         [
-            RoleLine::role(cadence, role),
+            RoleLine::role(frequency, role),
             RoleLine::role(
                 format!(
                     "{DETAIL_INDENT}{} {}",
@@ -287,6 +283,56 @@ impl SubscriptionDetail {
                 Role::MutedText,
             ),
         ]
+    }
+
+    fn subscription_list(&mut self, height: usize) -> Vec<RoleLine> {
+        let mut lines = vec![
+            RoleLine::role(super::safe_line(&self.title), Role::Text),
+            RoleLine::role(
+                format!("Tick Subscriptions {}", self.rows.len()),
+                Role::MutedText,
+            ),
+        ];
+        if self.rows.is_empty() {
+            lines.push(RoleLine::role("No subscription left.", Role::MutedText));
+            return lines;
+        }
+        let capacity = (height.saturating_sub(HEADER_ROWS) / SUBSCRIPTION_ROWS).max(1);
+        let selected = self.selected_index().unwrap_or(0);
+        self.top = self.top.min(self.rows.len().saturating_sub(capacity));
+        if selected < self.top {
+            self.top = selected;
+        } else if selected >= self.top + capacity {
+            self.top = selected + 1 - capacity;
+        }
+        for (index, row) in self.rows.iter().enumerate().skip(self.top).take(capacity) {
+            lines.extend(self.subscription_lines(row, index == selected));
+        }
+        lines
+    }
+
+    /// The periodic frequencies the selected subscription can take, the cursor on the chosen one.
+    fn frequency_lines(&self, row: &TickSubscriptionStatus) -> Vec<RoleLine> {
+        let mut lines = vec![
+            RoleLine::role(super::safe_line(&self.title), Role::Text),
+            RoleLine::role(format!("Frequency · {}", self.goal(row)), Role::MutedText),
+        ];
+        lines.extend(TickSubscriptionFrequency::PERIODIC.map(|choice| {
+            let is_chosen = choice == self.frequency_choice;
+            RoleLine::role(
+                format!(
+                    "{}{}",
+                    if is_chosen { "› " } else { "  " },
+                    frequency_label(choice)
+                ),
+                if is_chosen {
+                    Role::Text
+                } else {
+                    Role::MutedText
+                },
+            )
+        }));
+        lines
     }
 }
 
@@ -315,28 +361,13 @@ impl TickDetailView for SubscriptionDetail {
     }
 
     fn lines(&mut self, width: usize, height: usize, _now: u64) -> Vec<TickDetailLine> {
-        let mut lines = vec![
-            RoleLine::role(super::safe_line(&self.title), Role::Text),
-            RoleLine::role(
-                format!("Tick Subscriptions {}", self.rows.len()),
-                Role::MutedText,
-            ),
-        ];
-        if self.rows.is_empty() {
-            lines.push(RoleLine::role("No subscription left.", Role::MutedText));
-        } else {
-            let capacity = (height.saturating_sub(HEADER_ROWS) / SUBSCRIPTION_ROWS).max(1);
-            let selected = self.selected_index().unwrap_or(0);
-            self.top = self.top.min(self.rows.len().saturating_sub(capacity));
-            if selected < self.top {
-                self.top = selected;
-            } else if selected >= self.top + capacity {
-                self.top = selected + 1 - capacity;
-            }
-            for (index, row) in self.rows.iter().enumerate().skip(self.top).take(capacity) {
-                lines.extend(self.subscription_lines(row, index == selected));
-            }
-        }
+        let lines = match self
+            .selected_row()
+            .filter(|_| self.focus == SubscriptionFocus::Frequency)
+        {
+            Some(row) => self.frequency_lines(row),
+            None => self.subscription_list(height),
+        };
         lines
             .into_iter()
             .take(height)
@@ -353,17 +384,17 @@ impl TickDetailView for SubscriptionDetail {
         }
         match self.focus {
             SubscriptionFocus::List if self.rows.is_empty() => "esc back".into(),
-            SubscriptionFocus::List => {
-                format!("{CADENCE_KEY} cadence · {UNSUBSCRIBE_KEY} unsubscribe · esc back")
+            SubscriptionFocus::List
+                if self
+                    .selected_row()
+                    .is_some_and(|row| row.frequency == TickSubscriptionFrequency::Immediate) =>
+            {
+                format!("{UNSUBSCRIBE_KEY} unsubscribe · esc back")
             }
-            SubscriptionFocus::Cadence => format!(
-                "Every {}s · digits edit · enter save · esc back",
-                if self.cadence_draft.is_empty() {
-                    "_"
-                } else {
-                    &self.cadence_draft
-                }
-            ),
+            SubscriptionFocus::List => {
+                format!("{FREQUENCY_KEY} frequency · {UNSUBSCRIBE_KEY} unsubscribe · esc back")
+            }
+            SubscriptionFocus::Frequency => "j/k select · enter save · esc back".into(),
             SubscriptionFocus::CancelConfirmation => "enter confirm · esc back".into(),
         }
     }
@@ -375,7 +406,7 @@ impl TickDetailView for SubscriptionDetail {
             Ok(Some(request)) => TickDetailKey::Action(PreparedTickAction::new(
                 self.instance.to_string(),
                 match request.change {
-                    TickSubscriptionChange::Cadence(_) => CADENCE_KEY,
+                    TickSubscriptionChange::Frequency(_) => FREQUENCY_KEY,
                     TickSubscriptionChange::Cancel => UNSUBSCRIBE_KEY,
                 },
                 super::tick_actions::builtin::change_subscription(self.id, request),
@@ -385,6 +416,14 @@ impl TickDetailView for SubscriptionDetail {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+}
+
+/// The frequency in words, with the period of a periodic one.
+fn frequency_label(frequency: TickSubscriptionFrequency) -> String {
+    match frequency.period() {
+        Some(period) => format!("{} · every {} min", frequency.name(), period.as_secs() / 60),
+        None => frequency.name().to_owned(),
     }
 }
 
@@ -439,7 +478,7 @@ mod tests {
         InstanceRef::native("fixture-run").unwrap()
     }
 
-    fn row(id: u128, every_seconds: u64) -> TickSubscriptionStatus {
+    fn row(id: u128, frequency: TickSubscriptionFrequency) -> TickSubscriptionStatus {
         TickSubscriptionStatus {
             title: None,
             updated_at_ms: None,
@@ -448,7 +487,7 @@ mod tests {
             loop_id: Uuid::from_u128(900 + id),
             loop_state: LoopState::WaitingTrigger,
             instance: instance(),
-            every_seconds,
+            frequency,
             accumulated: 0,
             last_delivery_ms: None,
             last_delivery: None,
@@ -495,55 +534,115 @@ mod tests {
     }
 
     #[test]
-    fn each_subscription_shows_its_cadence_loop_delivery_and_link() {
-        let mut waiting = row(3, 60);
+    fn each_subscription_shows_its_frequency_loop_delivery_and_link() {
+        let mut waiting = row(3, TickSubscriptionFrequency::High);
         waiting.accumulated = 4;
         waiting.last_delivery_ms = Some(1_774_000_845_000);
         waiting.last_delivery = Some("3 #12 · dropped 2".into());
-        let mut detail = detail(vec![waiting, row(4, 90)], SubscriptionOperation::View);
+        let mut detail = detail(
+            vec![waiting, row(4, TickSubscriptionFrequency::Medium)],
+            SubscriptionOperation::View,
+        );
 
         let lines = text(&mut detail);
 
         assert_eq!(lines[0], "Fixture run");
         assert_eq!(lines[1], "Tick Subscriptions 2");
-        assert_eq!(lines[2], "› ⟳ every 60s · 4 new");
+        assert_eq!(lines[2], "› ⟳ high · every 1 min · 4 new");
         assert_eq!(lines[3], "    ◉ Watch run 3");
         assert_eq!(lines[4], "    10:00:45 3 #12 · dropped 2 · live");
-        assert_eq!(lines[5], "  ⟳ every 90s");
+        assert_eq!(lines[5], "  ⟳ medium · every 10 min");
         assert_eq!(lines[7], "    no delivery yet · live");
-        assert_eq!(detail.hint(), "e cadence · u unsubscribe · esc back");
+        assert_eq!(detail.hint(), "e frequency · u unsubscribe · esc back");
     }
 
     #[test]
-    fn a_cadence_is_edited_in_place_and_a_bad_one_keeps_the_editor_open() {
-        let mut detail = detail(vec![row(3, 60)], SubscriptionOperation::EditCadence);
-        assert_eq!(detail.focus(), SubscriptionFocus::Cadence);
-        assert_eq!(
-            detail.hint(),
-            "Every 60s · digits edit · enter save · esc back"
+    fn a_frequency_is_picked_among_the_three_periodic_ones_only() {
+        let mut detail = detail(
+            vec![row(3, TickSubscriptionFrequency::Medium)],
+            SubscriptionOperation::EditFrequency,
         );
-        for _ in 0..2 {
-            press(&mut detail, KeyCode::Backspace);
-        }
-        press(&mut detail, KeyCode::Char('1'));
-        assert_eq!(requested(press(&mut detail, KeyCode::Enter)), None);
-        assert!(detail.hint().starts_with("a cadence is 5 to 86400 seconds"));
-        assert_eq!(detail.focus(), SubscriptionFocus::Cadence);
+        assert_eq!(detail.focus(), SubscriptionFocus::Frequency);
+        assert_eq!(detail.hint(), "j/k select · enter save · esc back");
+        assert_eq!(
+            text(&mut detail),
+            [
+                "Fixture run",
+                "Frequency · Watch run 3",
+                "  high · every 1 min",
+                "› medium · every 10 min",
+                "  low · every 30 min",
+            ],
+            "the cursor starts on the current frequency and immediate is never offered"
+        );
 
-        press(&mut detail, KeyCode::Char('5'));
+        for _ in 0..3 {
+            press(&mut detail, KeyCode::Char('j'));
+        }
+        assert_eq!(text(&mut detail)[4], "› low · every 30 min");
+        for _ in 0..3 {
+            detail.key(
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+                40,
+                20,
+            );
+        }
+        assert_eq!(text(&mut detail)[2], "› high · every 1 min");
+
         assert_eq!(
             detail.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Ok(Some(SubscriptionRequest {
                 subscription: Uuid::from_u128(3),
-                change: TickSubscriptionChange::Cadence(15),
+                change: TickSubscriptionChange::Frequency(TickSubscriptionFrequency::High),
             }))
         );
         assert_eq!(detail.focus(), SubscriptionFocus::List);
     }
 
     #[test]
+    fn keeping_the_current_frequency_or_escaping_changes_nothing() {
+        let mut detail = detail(
+            vec![row(3, TickSubscriptionFrequency::Low)],
+            SubscriptionOperation::EditFrequency,
+        );
+        assert_eq!(requested(press(&mut detail, KeyCode::Enter)), None);
+        assert_eq!(detail.focus(), SubscriptionFocus::List);
+
+        press(&mut detail, KeyCode::Char('e'));
+        press(&mut detail, KeyCode::Char('k'));
+        assert!(matches!(
+            press(&mut detail, KeyCode::Esc),
+            TickDetailKey::None
+        ));
+        assert_eq!(detail.focus(), SubscriptionFocus::List);
+        assert_eq!(text(&mut detail)[2], "› ⟳ low · every 30 min");
+    }
+
+    #[test]
+    fn an_immediate_subscription_shows_immediate_and_offers_no_frequency() {
+        let mut detail = detail(
+            vec![row(3, TickSubscriptionFrequency::Immediate)],
+            SubscriptionOperation::EditFrequency,
+        );
+        assert_eq!(detail.focus(), SubscriptionFocus::List);
+        assert_eq!(text(&mut detail)[2], "› ⟳ immediate");
+        assert_eq!(detail.hint(), "u unsubscribe · esc back");
+
+        for code in [KeyCode::Char('e'), KeyCode::Enter] {
+            assert_eq!(requested(press(&mut detail, code)), None);
+            assert_eq!(detail.focus(), SubscriptionFocus::List);
+        }
+    }
+
+    #[test]
     fn unsubscribing_asks_first_and_escape_keeps_the_subscription() {
-        let mut detail = detail(vec![row(3, 60), row(4, 60)], SubscriptionOperation::Cancel);
+        let mut detail = detail(
+            vec![
+                row(3, TickSubscriptionFrequency::High),
+                row(4, TickSubscriptionFrequency::High),
+            ],
+            SubscriptionOperation::Cancel,
+        );
         assert_eq!(
             detail.focus(),
             SubscriptionFocus::List,
@@ -575,22 +674,35 @@ mod tests {
 
     #[test]
     fn a_single_subscription_opens_straight_into_the_cancel_confirmation() {
-        let mut detail = detail(vec![row(3, 60)], SubscriptionOperation::Cancel);
+        let mut detail = detail(
+            vec![row(3, TickSubscriptionFrequency::Immediate)],
+            SubscriptionOperation::Cancel,
+        );
         assert!(detail.confirmation().is_some());
         assert_eq!(requested(press(&mut detail, KeyCode::Enter)), Some('u'));
     }
 
     #[test]
     fn a_cancelled_subscription_hands_the_cursor_to_its_neighbour() {
-        let mut detail = detail(vec![row(3, 60), row(4, 60)], SubscriptionOperation::View);
+        let mut detail = detail(
+            vec![
+                row(3, TickSubscriptionFrequency::High),
+                row(4, TickSubscriptionFrequency::High),
+            ],
+            SubscriptionOperation::View,
+        );
         press(&mut detail, KeyCode::Down);
         press(&mut detail, KeyCode::Enter);
-        assert_eq!(detail.focus(), SubscriptionFocus::Cadence);
+        assert_eq!(detail.focus(), SubscriptionFocus::Frequency);
 
-        detail.update("Fixture run".into(), vec![row(3, 60)], HashMap::new());
+        detail.update(
+            "Fixture run".into(),
+            vec![row(3, TickSubscriptionFrequency::High)],
+            HashMap::new(),
+        );
 
         assert_eq!(detail.focus(), SubscriptionFocus::List);
-        assert_eq!(text(&mut detail)[2], "› ⟳ every 60s");
+        assert_eq!(text(&mut detail)[2], "› ⟳ high · every 1 min");
         detail.update("Fixture run".into(), Vec::new(), HashMap::new());
         assert_eq!(text(&mut detail)[2], "No subscription left.");
         assert_eq!(detail.hint(), "esc back");

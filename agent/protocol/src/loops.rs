@@ -73,7 +73,7 @@ pub struct Trigger {
     pub expires_at_ms: Option<u64>,
     pub accepts_events: bool,
     pub armed: bool,
-    /// The Tick Instances this Loop receives Tick Updates from, each with its own cadence.
+    /// The Tick Instances this Loop receives Tick Updates from, each at its own frequency.
     #[serde(default)]
     pub subscriptions: Vec<TickSubscription>,
 }

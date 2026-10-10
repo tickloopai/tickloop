@@ -659,11 +659,10 @@ impl Agent {
             Some(ToolRoute::TickSubscription)
         ) && name == "SubscribeTick"
         {
-            let instance: tick_protocol::InstanceRef =
-                match serde_json::from_value(input["tick_instance_id"].clone()) {
-                    Ok(instance) => instance,
-                    Err(error) => return Ok(ToolCallOutcome::not_admitted(error.to_string())),
-                };
+            let instance = match tick_subscriptions::subscription_request(&input) {
+                Ok((instance, _)) => instance,
+                Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),
+            };
             let port = self.tick_deliveries().port.clone();
             match port {
                 Some(port) => match port

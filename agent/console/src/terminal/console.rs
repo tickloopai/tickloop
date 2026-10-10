@@ -11865,7 +11865,7 @@ mod tests {
             loop_state: tickloop_agent_protocol::LoopState::WaitingTrigger,
             instance: tick_protocol::InstanceRef::native(format!("fixture-run-{instance}"))
                 .unwrap(),
-            every_seconds: 60,
+            frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
             accumulated: 0,
             last_delivery_ms: None,
             last_delivery: None,

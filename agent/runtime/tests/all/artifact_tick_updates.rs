@@ -146,7 +146,6 @@ async fn feedback_between_polls_does_not_swallow_the_latest_undelivered_body_cha
             account_id: "owner".into(),
         },
     )]));
-    stream.set_cadences(BTreeMap::from([(watch, 5)]));
     let mut handle = stream.open();
     handle.desired.send_replace(BTreeMap::from([(
         watch,
@@ -184,7 +183,7 @@ async fn feedback_between_polls_does_not_swallow_the_latest_undelivered_body_cha
     assert_eq!(value.data["change"], "edit");
 }
 #[tokio::test]
-async fn subscribed_artifact_baselines_each_watch_polls_at_cadence_and_preserves_feedback_path() {
+async fn subscribed_artifact_baselines_each_watch_polls_again_and_preserves_feedback_path() {
     let (origin, sequence, feedback, reads) = service().await;
     let directory = tempfile::tempdir().unwrap();
     login(directory.path(), &origin).await;
@@ -197,7 +196,6 @@ async fn subscribed_artifact_baselines_each_watch_polls_at_cadence_and_preserves
             account_id: "owner".into(),
         },
     )]));
-    stream.set_cadences(BTreeMap::from([(watch, 5)]));
     let mut handle = stream.open();
     let instance = InstanceRef::artifact(&origin, "doc").unwrap();
     handle
@@ -274,7 +272,7 @@ async fn artifact_subscription_reaches_loop_and_quiet_polling_does_not_call_the_
         tickloop_agent_test_support::call(
             "subscribe",
             "SubscribeTick",
-            json!({"tick_instance_id":instance,"every_seconds":5}),
+            json!({"tick_instance_id":instance}),
         ),
         tickloop_agent_test_support::text("watching"),
         tickloop_agent_test_support::text("human edit observed"),
@@ -309,7 +307,7 @@ async fn artifact_subscription_reaches_loop_and_quiet_polling_does_not_call_the_
     assert_eq!(model.requests.lock().unwrap().len(), 2);
     sequence.store(13, Ordering::SeqCst);
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(12), events.recv())
+        let event = tokio::time::timeout(support::high_delivery_wait(), events.recv())
             .await
             .unwrap()
             .unwrap();
@@ -355,7 +353,7 @@ async fn artifact_subscription_preserves_native_mcp_read_policy() {
             tickloop_agent_test_support::call(
                 "subscribe",
                 "SubscribeTick",
-                json!({"tick_instance_id":instance,"every_seconds":5}),
+                json!({"tick_instance_id":instance}),
             ),
             tickloop_agent_test_support::text("done"),
         ]));
@@ -463,10 +461,7 @@ async fn artifact_subscription_preserves_plan_and_final_admission_as_the_native_
     let chat = agent.create_chat(root).await.unwrap();
     let queries = [
         ("ArtifactRead", json!({"action":"read","artifact_id":"doc"})),
-        (
-            "SubscribeTick",
-            json!({"tick_instance_id":instance,"every_seconds":5}),
-        ),
+        ("SubscribeTick", json!({"tick_instance_id":instance})),
     ];
     let cases = queries
         .into_iter()
@@ -505,7 +500,7 @@ async fn verify_delegated_watch_account(restore: bool) {
         tickloop_agent_test_support::call(
             "parent-subscribe",
             "SubscribeTick",
-            json!({"tick_instance_id":instance,"every_seconds":5}),
+            json!({"tick_instance_id":instance}),
         ),
         tickloop_agent_test_support::call(
             "delegate",
@@ -515,7 +510,7 @@ async fn verify_delegated_watch_account(restore: bool) {
         tickloop_agent_test_support::call(
             "child-subscribe",
             "SubscribeTick",
-            json!({"tick_instance_id":instance,"every_seconds":5}),
+            json!({"tick_instance_id":instance}),
         ),
         tickloop_agent_test_support::text("Child watching."),
         tickloop_agent_test_support::text("Parent watching."),
@@ -641,7 +636,7 @@ async fn verify_delegated_watch_account(restore: bool) {
         }
     }
     let reads_before = reads.load(Ordering::SeqCst);
-    let child_update = tokio::time::timeout(Duration::from_secs(12), async {
+    let child_update = tokio::time::timeout(support::high_delivery_wait(), async {
         loop {
             let event = events.recv().await.unwrap();
             if event.chat_id == child && matches!(event.kind, EventKind::Completed { .. }) {
@@ -722,7 +717,7 @@ async fn a_buffered_artifact_update_is_revalidated_before_waking_the_loop() {
         tickloop_agent_test_support::call(
             "watch",
             "SubscribeTick",
-            json!({"tick_instance_id":instance,"every_seconds":5}),
+            json!({"tick_instance_id":instance}),
         ),
         tickloop_agent_test_support::text("Watching."),
         tickloop_agent_test_support::text("Unexpected update."),
@@ -764,7 +759,7 @@ async fn a_buffered_artifact_update_is_revalidated_before_waking_the_loop() {
     .unwrap();
     sequence.store(25, Ordering::SeqCst);
     login(&root, &origin).await;
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    tokio::time::sleep(support::high_delivery_wait()).await;
     assert_eq!(
         model.requests.lock().unwrap().len(),
         2,
@@ -828,7 +823,7 @@ async fn queued_artifact_update(change_account: bool, invalidate_watch: bool) {
         tickloop_agent_test_support::call(
             "watch",
             "SubscribeTick",
-            json!({"tick_instance_id":instance,"every_seconds":5}),
+            json!({"tick_instance_id":instance}),
         ),
         tickloop_agent_test_support::text("Watching."),
         tickloop_agent_test_support::text("Busy sibling done."),
@@ -880,7 +875,7 @@ async fn queued_artifact_update(change_account: bool, invalidate_watch: bool) {
         recover_with: None,
         gap: false,
     });
-    tokio::time::timeout(Duration::from_secs(8), async {
+    tokio::time::timeout(support::high_delivery_wait(), async {
         loop {
             let snapshot = agent.snapshot(chat).await.unwrap();
             if snapshot.pending_inputs.iter().any(|input| {

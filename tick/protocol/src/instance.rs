@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{HERDR_INSTANCE_TYPE, HOSTED_INSTANCE_TYPE};
+use crate::{HERDR_INSTANCE_TYPE, HOSTED_INSTANCE_TYPE, SHELL_INSTANCE_TYPE};
 
 pub fn artifact_instance_id(origin: &str, id: &str) -> String {
     format!("artifact:{}/{id}", origin.trim_end_matches('/'))
@@ -48,7 +48,7 @@ impl InstanceRef {
     }
 
     pub fn shell(task_id: impl fmt::Display) -> Self {
-        Self::new("shell", &task_id.to_string()).expect("valid Shell task identity")
+        Self::new(SHELL_INSTANCE_TYPE, &task_id.to_string()).expect("valid Shell task identity")
     }
     pub fn native(run: impl AsRef<str>) -> Result<Self, &'static str> {
         let run = run.as_ref();

@@ -150,9 +150,8 @@ pub use shell_tasks::{
 };
 pub use skill::{InvokedSkill, SkillSource};
 pub use tick_subscriptions::{
-    DEFAULT_CADENCE_SECONDS, MAX_CADENCE_SECONDS, MAX_DELIVERY_PAYLOAD_BYTES, MIN_CADENCE_SECONDS,
-    ObservationKind, TICK_SUBSCRIPTION_SOURCE, TickLinkState, TickSubscription,
-    TickSubscriptionChange, TickSubscriptionStatus,
+    MAX_DELIVERY_PAYLOAD_BYTES, ObservationKind, TICK_SUBSCRIPTION_SOURCE, TickLinkState,
+    TickSubscription, TickSubscriptionChange, TickSubscriptionFrequency, TickSubscriptionStatus,
 };
 pub use tool::ToolDefinition;
 pub use tools::{CommandSnapshot, CommandState, FileReadRecord, SearchConfig, ToolResult};

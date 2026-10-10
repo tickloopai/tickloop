@@ -371,14 +371,14 @@ mod tests {
     fn notes_and_a_handled_update_follow_muted() {
         let spans = status_spans(
             StatusTone::Live,
-            &["⟳ 60s".into()],
+            &["⟳ high".into()],
             Some(UpdateMark {
                 age: "2m".into(),
                 unread: None,
             }),
             0,
         );
-        assert_eq!(text(&spans), "⟳ 60s · 2m");
+        assert_eq!(text(&spans), "⟳ high · 2m");
         assert!(spans.iter().all(|(_, role)| *role == Role::MutedText));
         let failed = status_spans(
             StatusTone::Failed,
@@ -400,11 +400,11 @@ mod tests {
         };
         let tick = status_spans(
             StatusTone::Live,
-            &["⟳ 60s".into()],
+            &["⟳ high".into()],
             Some(unread(Some(3))),
             0,
         );
-        assert_eq!(text(&tick), "⟳ 60s · ● 3");
+        assert_eq!(text(&tick), "⟳ high · ● 3");
         assert_eq!(
             tick[tick.len() - 2..],
             [("●".into(), Role::UnreadMark), (" 3".into(), Role::Accent)]

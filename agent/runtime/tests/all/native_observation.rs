@@ -18,7 +18,9 @@ use tickhost_connect::{
     host_error::HostError,
     session::{SessionLaunch, TickSession},
 };
-use tickloop_agent_protocol::{Event, EventKind, LoopState, TickLinkState};
+use tickloop_agent_protocol::{
+    Event, EventKind, LoopState, TickLinkState, TickSubscriptionFrequency,
+};
 use tickloop_agent_runtime::{
     Agent,
     tick_stream::{
@@ -237,13 +239,13 @@ async fn terminal_text_changes_reach_only_the_owning_loops_after_their_baselines
         call(
             "s1",
             "SubscribeTick",
-            json!({"tick_instance_id": one, "every_seconds": 5}),
+            json!({"tick_instance_id": one, "frequency": "high"}),
         ),
         text("watching one"),
         call(
             "s2",
             "SubscribeTick",
-            json!({"tick_instance_id": two, "every_seconds": 10}),
+            json!({"tick_instance_id": two, "frequency": "medium"}),
         ),
         text("watching two"),
         text("handled one"),
@@ -283,13 +285,17 @@ async fn terminal_text_changes_reach_only_the_owning_loops_after_their_baselines
         "unchanged terminal text does not trigger a loop"
     );
 
+    let high = TickSubscriptionFrequency::High.period().unwrap();
+    let medium = TickSubscriptionFrequency::Medium.period().unwrap();
     host.set("one", "changed one");
     host.set("two", "changed two");
     tokio::time::advance(Duration::from_secs(5)).await;
     settle().await;
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(high - Duration::from_secs(15)).await;
     settle().await;
     completed(&mut events).await;
+    tokio::time::advance(medium - high).await;
+    settle().await;
     completed(&mut events).await;
     {
         let requests = model.requests.lock().unwrap();
@@ -345,7 +351,7 @@ async fn terminal_text_changes_reach_only_the_owning_loops_after_their_baselines
     host.set("two", "two after one exited");
     tokio::time::advance(Duration::from_secs(5)).await;
     settle().await;
-    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::time::advance(medium - Duration::from_secs(5)).await;
     settle().await;
     completed(&mut events).await;
     assert!(last_user_text(&model).contains("two after one exited"));
@@ -369,13 +375,13 @@ async fn terminal_host_outage_requires_reselection_after_event_continuity_is_los
         call(
             "subscribe",
             "SubscribeTick",
-            json!({"tick_instance_id":instance,"every_seconds":5}),
+            json!({"tick_instance_id":instance}),
         ),
         text("watching"),
         call(
             "subscribe-again",
             "SubscribeTick",
-            json!({"tick_instance_id":instance,"every_seconds":5}),
+            json!({"tick_instance_id":instance}),
         ),
         text("watching after explicit reselection"),
     ]));
@@ -416,7 +422,7 @@ async fn terminal_host_outage_requires_reselection_after_event_continuity_is_los
         agent.tick_subscriptions(chat).await.unwrap()[0].link,
         TickLinkState::IdentityUncertain
     );
-    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::time::advance(TickSubscriptionFrequency::High.period().unwrap()).await;
     settle().await;
     assert_eq!(
         model.requests.lock().unwrap().len(),
@@ -759,7 +765,7 @@ async fn protocol_tick_update_after_registration_reaches_its_loop() {
         call(
             "subscribe",
             "SubscribeTick",
-            json!({"tick_instance_id":instance,"every_seconds":5}),
+            json!({"tick_instance_id":instance}),
         ),
         text("watching counter"),
         text("counter moved"),
@@ -808,7 +814,7 @@ async fn protocol_tick_update_after_registration_reaches_its_loop() {
         )
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(support::high_delivery_wait(), async {
         loop {
             if matches!(
                 events.recv().await.unwrap().kind,
@@ -889,7 +895,7 @@ for line in sys.stdin:
         call(
             "subscribe",
             "SubscribeTick",
-            json!({"tick_instance_id":instance,"every_seconds":5}),
+            json!({"tick_instance_id":instance}),
         ),
         text("watching gap fixture"),
         text("reported gap"),
@@ -920,7 +926,7 @@ for line in sys.stdin:
         .call("jump", json!({}), "1", CancellationToken::new())
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(support::high_delivery_wait(), async {
         loop {
             if matches!(
                 events.recv().await.unwrap().kind,
@@ -1048,7 +1054,7 @@ async fn herdr_subscriptions_keep_native_query_permissions_and_target_admission(
         AdmissionCase {
             plan_denied: false,
             name: "SubscribeTick",
-            input: json!({"tick_instance_id":instance,"every_seconds":5}),
+            input: json!({"tick_instance_id":instance}),
             policy_name: "ReadTick",
             policy_input: read.input().clone(),
         },
@@ -1078,7 +1084,7 @@ async fn herdr_subscriptions_keep_native_query_permissions_and_target_admission(
             .prepare_watch(
                 chat,
                 &instance,
-                &json!({"tick_instance_id":instance,"every_seconds":5}),
+                &json!({"tick_instance_id":instance}),
                 CancellationToken::new()
             )
             .await
@@ -1150,7 +1156,7 @@ async fn restored_native_watch_refuses_a_changed_frozen_endpoint() {
         call(
             "parent-subscribe",
             "SubscribeTick",
-            json!({"tick_instance_id":instance,"every_seconds":5}),
+            json!({"tick_instance_id":instance}),
         ),
         call(
             "delegate",
@@ -1160,7 +1166,7 @@ async fn restored_native_watch_refuses_a_changed_frozen_endpoint() {
         call(
             "child-subscribe",
             "SubscribeTick",
-            json!({"tick_instance_id":instance,"every_seconds":5}),
+            json!({"tick_instance_id":instance}),
         ),
         text("Child watching"),
         text("Parent watching"),
@@ -1278,7 +1284,7 @@ async fn restored_native_watch_refuses_a_changed_frozen_endpoint() {
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
     host_b.set("one", "CHANGED_ENDPOINT_SECRET");
-    let delivery = tokio::time::timeout(Duration::from_secs(12), async {
+    let delivery = tokio::time::timeout(support::high_delivery_wait(), async {
         loop {
             let event = events.recv().await.unwrap();
             if event.chat_id == child && matches!(event.kind, EventKind::Completed { .. }) {
