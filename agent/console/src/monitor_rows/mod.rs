@@ -202,8 +202,9 @@ pub struct TickDescriptor {
     /// cannot tell, such as a non-zero exit code, a signal or the subscription marker.
     pub notes: Vec<String>,
     /// Whether a Loop of this Chat subscribes to the instance through its type rather than a Tick
-    /// Subscription, as an artifact's association does with its @tickloop requests. It shows in
-    /// the subscription marker without a frequency, and the row's own `x` ends it.
+    /// Subscription, as an artifact's association does with its @tickloop requests. It shows as
+    /// the subscription marker without a frequency, and the row's own `x` ends it. Only a type
+    /// that takes no Tick Subscriptions sets it.
     pub inherent_subscription: bool,
     pub owner: TickOwner,
     pub tone: StatusTone,
@@ -281,6 +282,12 @@ pub trait MonitorRows: Send + Sync + 'static {
     fn refresh_intent(&self) -> Option<TickIntent> {
         None
     }
+    /// Whether Loops follow this type's instances with Tick Subscriptions. A type that subscribes
+    /// through its own relation, as an artifact does through its association, never shows a Tick
+    /// Subscription on its rows.
+    fn takes_tick_subscriptions(&self) -> bool {
+        true
+    }
 }
 
 /// Whether the subscription's Loop can still deliver; a stopped or expired one cannot.
@@ -346,16 +353,16 @@ fn subscription_descriptor(row: &TickSubscriptionStatus) -> TickDescriptor {
     }
 }
 
-/// Shows the row's subscriptions as a marker, `⟳ high` for one Tick Subscription at its frequency,
-/// `⟳` for the type's inherent one, which has no frequency, or `⟳ 2` for several, and adds the keys
-/// that manage Tick Subscriptions; the frequency key only while one of them can change, which an
-/// immediate one cannot. Enter always opens the Tick itself; a row without its own opening shows
-/// the Tick's details.
+/// Shows the row's subscriptions as a marker, `⟳` for the type's inherent one, which has no
+/// frequency, `⟳ high` for one Tick Subscription at its frequency or `⟳ 2` for several, and adds
+/// the keys that manage Tick Subscriptions; the frequency key only while one of them can change,
+/// which an immediate one cannot. Enter always opens the Tick itself; a row without its own opening
+/// shows the Tick's details.
 fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus]) {
-    entry.notes.push(match (entry.inherent_subscription, rows) {
-        (false, [row]) => format!("⟳ {}", row.frequency.name()),
-        (true, []) => "⟳".into(),
-        (inherent, rows) => format!("⟳ {}", rows.len() + usize::from(inherent)),
+    entry.notes.push(match rows {
+        [] => "⟳".into(),
+        [row] => format!("⟳ {}", row.frequency.name()),
+        rows => format!("⟳ {}", rows.len()),
     });
     if rows.is_empty() {
         return;
@@ -523,15 +530,21 @@ impl MonitorRowsRegistry {
         .expect("unique built-in Monitor rows")
     }
     /// The Chat's complete deduplicated Monitor set: each type's rows plus the members the Chat
-    /// opened, minus the instances the user removed. An instance a Loop subscribes to always has
-    /// a row, so no subscription runs out of sight. Listing never subscribes or calls the model.
+    /// opened, minus the instances the user removed. An instance a Loop holds a Tick Subscription
+    /// to always has a row, so no subscription runs out of sight; a type that takes none never
+    /// shows one. Listing never subscribes or calls the model.
     pub fn list(&self, context: &MonitorContext) -> Vec<TickDescriptor> {
         let mut merged = merge_descriptors(
             self.rows
                 .values()
                 .flat_map(|type_rows| type_rows.list(context)),
         );
-        let subscribed = active_subscriptions(context);
+        let mut subscribed = active_subscriptions(context);
+        subscribed.retain(|instance, _| {
+            self.rows
+                .get(instance.tick_type())
+                .is_none_or(|type_rows| type_rows.takes_tick_subscriptions())
+        });
         for (instance, rows) in &subscribed {
             merged
                 .entry(instance.clone())
@@ -713,10 +726,4 @@ fn merge_descriptors(
         }
     }
     merged
-}
-
-pub fn artifact_target(instance: &InstanceRef) -> Option<(String, String)> {
-    instance
-        .artifact_parts()
-        .map(|(origin, id)| (origin.to_owned(), id.to_owned()))
 }

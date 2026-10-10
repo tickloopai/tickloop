@@ -18,8 +18,6 @@ mod auto_review_improvements;
 mod approval_assessment;
 #[path = "all/artifact_real_service.rs"]
 mod artifact_real_service;
-#[path = "all/artifact_tick_updates.rs"]
-mod artifact_tick_updates;
 #[path = "all/auto_configuration.rs"]
 mod auto_configuration;
 #[path = "all/auto_fallback.rs"]

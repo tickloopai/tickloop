@@ -172,7 +172,7 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
 }
 
 #[tokio::test]
-async fn shell_baseline_output_and_final_exit_use_the_same_subscription_to_loop_path() {
+async fn a_shell_subscription_reaches_the_loop_once_when_the_shell_exits() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![]));
     let agent = Agent::new_embedded(config(), model.clone());
@@ -207,8 +207,6 @@ async fn shell_baseline_output_and_final_exit_use_the_same_subscription_to_loop_
         json!({"tick_instance_id":InstanceRef::shell(receipt.command_id)}),
     ));
     model.enqueue(text("watching"));
-    // The output and the exit may reach the Loop in one delivery or, observed apart, in two.
-    model.enqueue(text("shell updated"));
     model.enqueue(text("shell completed"));
     let mut events = agent.subscribe();
     agent
@@ -246,7 +244,11 @@ async fn shell_baseline_output_and_final_exit_use_the_same_subscription_to_loop_
     .await
     .expect("the exit is delivered at once, without a period");
     assert!(delivered("final-output"));
-    let deliveries = model.requests.lock().unwrap().len() - 2;
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        3,
+        "the output before the exit is no update of its own"
+    );
     let rows = MonitorRowsRegistry::builtin().list(&MonitorContext {
         shells: Some(center.snapshot(chat).await.unwrap()),
         subscriptions: agent.tick_subscriptions(chat).await.unwrap(),
@@ -260,115 +262,13 @@ async fn shell_baseline_output_and_final_exit_use_the_same_subscription_to_loop_
     tokio::time::sleep(SHELL_QUIET_WAIT).await;
     assert_eq!(
         model.requests.lock().unwrap().len(),
-        2 + deliveries,
+        3,
         "finished tasks must become quiet"
     );
     agent
         .update_tick_subscription(chat, subscription.id, TickSubscriptionChange::Cancel)
         .await
         .unwrap();
-    agent.shutdown().await;
-}
-
-#[tokio::test]
-async fn shell_output_changes_before_exit_and_a_late_watch_uses_a_new_baseline() {
-    use tickloop_agent_runtime::tick_stream::TickStreamEvent;
-    let directory = tempfile::tempdir().unwrap();
-    let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![])));
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let task = agent.submit_user_shell_for_goal(chat,None,"printf baseline; while [ ! -f output ]; do sleep 0.02; done; printf ' live-output'; while [ ! -f finish ]; do sleep 0.02; done; exit 7".into(),true).await.unwrap();
-    let center = ShellTaskCenter::new(agent.clone());
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if center
-                .snapshot(chat)
-                .await
-                .unwrap()
-                .tasks
-                .iter()
-                .any(|row| row.id == task.command_id && row.output_bytes == 8)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let adapters = TickAdapters::builtin(agent.clone(), None, None, None);
-    let mut stream = adapters.open();
-    let instance = InstanceRef::shell(task.command_id);
-    let first = Uuid::new_v4();
-    adapters.set_watch_chats(std::collections::BTreeMap::from([(first, chat)]));
-    stream
-        .desired
-        .send_replace(std::collections::BTreeMap::from([(
-            first,
-            instance.clone(),
-        )]));
-    tokio::time::timeout(Duration::from_secs(5),async { loop { if matches!(stream.events.recv().await,Some(TickStreamEvent::Ready { watch }) if watch == first) { break } } }).await.unwrap();
-    std::fs::write(directory.path().join("output"), "").unwrap();
-    let live = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Some(TickStreamEvent::Observation { value, .. }) = stream.events.recv().await {
-                break value;
-            }
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(live.data["status"], "running");
-    assert_eq!(live.data["output"], "baseline live-output");
-    std::fs::write(directory.path().join("finish"), "").unwrap();
-    let final_update = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Some(TickStreamEvent::Observation { value, .. }) = stream.events.recv().await {
-                break value;
-            }
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(final_update.data["exit_code"], 7);
-    assert!(final_update.sequence > live.sequence);
-    let late = Uuid::new_v4();
-    adapters.set_watch_chats(std::collections::BTreeMap::from([
-        (first, chat),
-        (late, chat),
-    ]));
-    stream
-        .desired
-        .send_replace(std::collections::BTreeMap::from([
-            (first, instance.clone()),
-            (late, instance),
-        ]));
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match stream.events.recv().await {
-                Some(TickStreamEvent::Ready { watch }) if watch == late => break,
-                Some(TickStreamEvent::Observation { .. }) => {
-                    panic!("late subscription received an old result")
-                }
-                _ => {}
-            }
-        }
-    })
-    .await
-    .unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_millis(600), async {
-            loop {
-                if matches!(
-                    stream.events.recv().await,
-                    Some(TickStreamEvent::Observation { .. })
-                ) {
-                    break;
-                }
-            }
-        })
-        .await
-        .is_err()
-    );
     agent.shutdown().await;
 }
 
@@ -459,7 +359,9 @@ fn built_in_rows_describe_their_actions_as_intents() {
         subscription("herdr:pane"),
         subscription("artifact:https://docs.example/a"),
     );
+    let snapshot: tickloop_agent_protocol::ChatSnapshot = serde_json::from_value(json!({"id":chat,"workdir":"/fixture","messages":[],"loops":[],"artifact_ticks":[{"artifact_id":"a","origin":"https://docs.example","title":"Brief","format":"markdown","url":"https://docs.example/a","access_role":"owner","added_at_ms":1}]})).unwrap();
     let rows = MonitorRowsRegistry::builtin().list(&MonitorContext {
+        chat: Some(snapshot),
         shells: Some(ShellTaskSnapshot {
             chat_id: chat,
             live_revision: 0,
@@ -528,7 +430,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
     ];
     pane_actions.extend(manage(&pane.instance));
     assert_eq!(actions(&pane.instance), pane_actions);
-    let mut artifact_actions = [
+    let artifact_actions = [
         ('o', "open"),
         ('x', "remove"),
         ('c', "copy"),
@@ -545,11 +447,10 @@ fn built_in_rows_describe_their_actions_as_intents() {
         )
     })
     .to_vec();
-    artifact_actions.extend(manage(&artifact.instance));
     assert_eq!(
         actions(&artifact.instance),
         artifact_actions,
-        "a subscribed Artifact keeps opening on Enter"
+        "a Tick Subscription adds no keys to an artifact, whose association is its subscription"
     );
     let member = InstanceRef::new("cal", "member").unwrap();
     let member_row = tickloop_agent_console::monitor_rows::member_descriptor(&MonitorMember {
@@ -645,7 +546,7 @@ async fn shell_subscription_refuses_foreign_chat_before_baseline_and_restoration
             .await
             .is_err()
     );
-    let adapters = Arc::new(TickAdapters::builtin(agent.clone(), None, None, None));
+    let adapters = Arc::new(TickAdapters::builtin(agent.clone(), None, None));
     let instance = InstanceRef::shell(task.command_id);
     agent.install_tick_stream(adapters).await;
     model.enqueue(call(
@@ -718,7 +619,7 @@ async fn shell_subscription_refuses_foreign_chat_before_baseline_and_restoration
 }
 
 #[tokio::test]
-async fn a_titleless_artifact_subscription_preserves_joined_and_cached_titles() {
+async fn an_artifact_row_prefers_its_cached_title_over_the_joined_one() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![])));
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -732,10 +633,8 @@ async fn a_titleless_artifact_subscription_preserves_joined_and_cached_titles() 
         added_at_ms: 1,
     };
     agent.add_artifact_tick(chat, tick.clone()).await.unwrap();
-    let row:tickloop_agent_protocol::TickSubscriptionStatus=serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":tick.instance_id(),"frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"kind":"Protocol","title":null,"updated_at_ms":null,"link":"Disconnected"})).unwrap();
     let mut context = MonitorContext {
         chat: Some(agent.snapshot(chat).await.unwrap()),
-        subscriptions: vec![row],
         ..Default::default()
     };
     let registry = MonitorRowsRegistry::builtin();

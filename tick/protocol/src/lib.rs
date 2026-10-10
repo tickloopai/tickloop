@@ -41,6 +41,8 @@ pub const HERDR_INSTANCE_TYPE: &str = "herdr";
 pub const HOSTED_INSTANCE_TYPE: &str = "hosted";
 /// The instance type of a Shell Tick: one shell command execution of an Agent.
 pub const SHELL_INSTANCE_TYPE: &str = "shell";
+/// The instance type of an artifact Tick: one artifact of the artifact service.
+pub const ARTIFACT_INSTANCE_TYPE: &str = "artifact";
 /// The instance types a host launches a protocol Tick under, as the prefix of the identity it
 /// passes in [`INSTANCE_ID_ENV`].
 const LAUNCHED_INSTANCE_TYPES: [&str; 2] = [HERDR_INSTANCE_TYPE, HOSTED_INSTANCE_TYPE];
