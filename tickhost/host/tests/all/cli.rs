@@ -117,6 +117,7 @@ async fn stop_ends_every_hosted_tick_and_leaves_them_lost_to_the_daemon() {
                 "operation": uuid::Uuid::new_v4(),
                 "owner": {"root":"fixture-root","chat":uuid::Uuid::new_v4()},
                 "owner_revision": 0,
+                "adapter": "protocol",
                 "command": [env!("CARGO_BIN_EXE_tickhost"), "open", "--", "/usr/bin/python3", "-u", counter],
                 "cwd": counter.parent().unwrap(),
                 "environment": std::env::vars().collect::<Vec<_>>(),

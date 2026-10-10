@@ -18,7 +18,7 @@ async fn view_with_keys_ticks(
                     Some((
                         "ModifyTick",
                         &format!("open-keys-{index}"),
-                        json!({"action":"open","command":[support::fixture_cli::tickhost(), "open", "--", "/usr/bin/python3", "-u", script]}),
+                        json!({"action":"open","command":["/usr/bin/python3", "-u", script],"protocol":true}),
                     )),
                     "",
                 ),

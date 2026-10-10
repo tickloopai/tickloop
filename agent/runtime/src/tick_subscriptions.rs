@@ -3,7 +3,9 @@
 //! A subscription is Trigger configuration, so every mutation goes through
 //! [`Agent::configure_trigger`] and inherits its chain entries, resume rules and leases. The
 //! Agent keeps the union of every armed subscription's Tick Instance as the desired set of one
-//! [`TickStreamPort`]; updates arriving from that stream accumulate per subscription. When a
+//! [`TickStreamPort`]; updates arriving from that stream accumulate per subscription. A Terminal
+//! Tick pushes nothing: when its subscription's period elapses, the stream reads its screen once
+//! and reports it as an update if it differs from what that subscription last got. When a
 //! subscription's period elapses with updates pending, or as soon as an immediate one receives an
 //! update, the latest update per Tick Instance merges into the owning Loop's pending delivery and
 //! is handed to [`Agent::trigger`] as soon as the Loop can take it.
@@ -1389,7 +1391,9 @@ impl Agent {
                             None => std::future::pending::<()>().await,
                         }
                     } => {
-                        let ready = agent.tick_deliveries().collect_elapsed(Instant::now());
+                        let now = Instant::now();
+                        agent.sample_due_screens(now).await;
+                        let ready = agent.tick_deliveries().collect_elapsed(now);
                         for (chat_id, loop_id) in ready {
                             agent.deliver(chat_id, loop_id).await;
                         }
@@ -1397,6 +1401,34 @@ impl Agent {
                 }
             }
         })
+    }
+
+    /// Reads the screen of every Terminal Tick whose subscription's period elapsed by `now`: a
+    /// screen that differs from what the watch last got is the update this period delivers.
+    async fn sample_due_screens(&self, now: Instant) {
+        let (port, due) = {
+            let deliveries = self.tick_deliveries();
+            let due = deliveries
+                .subscriptions
+                .values()
+                .filter(|subscription| {
+                    subscription.ready
+                        && subscription.blocked.is_none()
+                        && subscription.frequency.period().is_some()
+                        && subscription.due_at.is_some_and(|due_at| due_at <= now)
+                })
+                .map(|subscription| (subscription.watch, subscription.instance.clone()))
+                .collect::<Vec<_>>();
+            (deliveries.port.clone(), due)
+        };
+        let Some(port) = port else {
+            return;
+        };
+        for (watch, instance) in due {
+            if let Some(observation) = port.sample(watch, &instance).await {
+                self.tick_deliveries().record(&[watch], &observation);
+            }
+        }
     }
 
     async fn apply_stream_event(&self, event: TickStreamEvent) {

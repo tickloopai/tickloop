@@ -1,7 +1,9 @@
 //! Tick Updates of hosted Ticks, which run in the dedicated Tickhost. A watch follows the
 //! instance through the data binding its Chat owns, so a Tick whose host was replaced or whose
-//! owner ended is never silently rebound. The approved watches of each instance reach the daemon
-//! as Watch intents, which keep the Tick from idling out.
+//! owner ended is never silently rebound. A protocol Tick pushes its updates; a terminal Tick's
+//! screen is read when a subscription's period elapses and compared with what that watch last
+//! got. The approved watches of each instance reach the daemon as Watch intents, which keep the
+//! Tick from idling out.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -11,6 +13,7 @@ use std::{
 
 use serde_json::{Value, json};
 use tick_protocol::TickState;
+use tickhost::host::{TerminalDescription, TerminalRead, TickAdapter};
 use tickhost_connect::{
     hosted::{CONTROL_TIMEOUT, OBSERVATION_FRAME_BYTES},
     session::{SessionLinkState, SessionObservation},
@@ -20,19 +23,28 @@ use uuid::Uuid;
 
 use super::{
     ConnectionBudget, EventPublisher, InstanceObserver, InstanceRef, PreparedTickWatch,
-    ProtocolFeed, RECONNECT_PAUSE, TickConnectionState, TickObservation, TickStreamHandle,
-    TickStreamPort, WatchAdmission, WatchId, connection_state, current_observation,
-    follow_instances, observe_protocol,
+    ProtocolFeed, RECONNECT_PAUSE, TickConnectionState, TickMetadata, TickObservation,
+    TickStreamHandle, TickStreamPort, WatchAdmission, WatchId, connection_state,
+    current_observation, follow_instances, observe_protocol,
 };
 use crate::{
     host_tools::HostToolProvider,
     hosted::{registry::TARGET_GONE, tools::HostedTickTools},
     tick_tool_router::READ_TICK,
 };
-use tickloop_agent_protocol::HostToolAuthority;
+use tickloop_agent_protocol::{HostToolAuthority, ObservationKind};
 
 /// How soon a Watch intent change the daemon did not take is offered again.
 const INTENT_RETRY_PAUSE: Duration = Duration::from_secs(5);
+
+/// What each watch of a terminal Tick last got of its screen: where its next sample is compared.
+type Screens = Arc<Mutex<BTreeMap<WatchId, ScreenCursor>>>;
+
+struct ScreenCursor {
+    chat: Uuid,
+    instance: InstanceRef,
+    sent: Value,
+}
 
 pub struct HostedTickStream {
     tools: Arc<HostedTickTools>,
@@ -41,6 +53,7 @@ pub struct HostedTickStream {
     /// The (Chat, instance) pairs with a live watch registration, whose binding is therefore
     /// current.
     live: Arc<Mutex<HashSet<(Uuid, InstanceRef)>>>,
+    screens: Screens,
     budget: ConnectionBudget,
 }
 
@@ -51,6 +64,7 @@ impl HostedTickStream {
             authorities: watch::channel(BTreeMap::new()).0,
             chats: watch::channel(BTreeMap::new()).0,
             live: Arc::default(),
+            screens: Arc::default(),
             budget: ConnectionBudget::default(),
         }
     }
@@ -61,6 +75,7 @@ impl HostedTickStream {
             authorities: self.authorities.subscribe(),
             chats: self.chats.subscribe(),
             live: self.live.clone(),
+            screens: self.screens.clone(),
             budget: self.budget.clone(),
         }
     }
@@ -72,6 +87,7 @@ struct HostedScope {
     authorities: watch::Receiver<BTreeMap<WatchId, HostToolAuthority>>,
     chats: watch::Receiver<BTreeMap<WatchId, Uuid>>,
     live: Arc<Mutex<HashSet<(Uuid, InstanceRef)>>>,
+    screens: Screens,
     budget: ConnectionBudget,
 }
 
@@ -89,6 +105,14 @@ impl HostedScope {
 
     fn chat_of(&self, watch: &WatchId) -> Option<Uuid> {
         self.chats.borrow().get(watch).copied()
+    }
+
+    /// Forgets what `watches` last got of a terminal Tick's screen.
+    fn forget_screens(&self, watches: &BTreeSet<WatchId>) {
+        self.screens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|watch, _| !watches.contains(watch));
     }
 
     fn mark_live(&self, chat: Uuid, instance: &InstanceRef, is_live: bool) {
@@ -148,26 +172,26 @@ impl InstanceObserver for HostedScope {
         wanted: watch::Receiver<BTreeSet<WatchId>>,
         publisher: EventPublisher,
     ) {
-        observe_hosted_instance(self, instance, wanted, publisher).await;
+        let mut ready_watches = BTreeSet::new();
+        observe_hosted_instance(&self, instance, wanted, publisher, &mut ready_watches).await;
+        // A later watch of this Tick starts from the screen as it is then.
+        self.forget_screens(&ready_watches);
     }
 }
 
 async fn observe_hosted_instance(
-    scope: HostedScope,
+    scope: &HostedScope,
     instance: InstanceRef,
     mut wanted: watch::Receiver<BTreeSet<WatchId>>,
     publisher: EventPublisher,
+    ready_watches: &mut BTreeSet<WatchId>,
 ) {
-    let mut ready_watches = BTreeSet::new();
     loop {
         let requested = wanted.borrow_and_update().clone();
         let Some(chat) = requested.iter().find_map(|watch| scope.chat_of(watch)) else {
             return;
         };
-        let owned = OwnedWatches {
-            scope: &scope,
-            chat,
-        };
+        let owned = OwnedWatches { scope, chat };
         let owned_watches = owned.admitted(&requested, &instance, &publisher);
         let attempted = scope.budget.take(&owned_watches, &instance, &publisher);
         if attempted.is_empty() {
@@ -181,32 +205,52 @@ async fn observe_hosted_instance(
             chat,
             instance: instance.clone(),
         };
-        if let Err(error) = feed.check_binding().await {
-            let state = connection_state(&error.code);
-            publisher.state_to(instance.clone(), state, attempted.iter().copied());
-            if matches!(
-                state,
-                TickConnectionState::Gone | TickConnectionState::IdentityUncertain
-            ) {
-                return;
+        match feed.check_binding().await {
+            Err(error) => {
+                let state = connection_state(&error.code);
+                publisher.state_to(instance.clone(), state, attempted.iter().copied());
+                if matches!(
+                    state,
+                    TickConnectionState::Gone | TickConnectionState::IdentityUncertain
+                ) {
+                    return;
+                }
             }
-        } else {
-            scope.mark_live(chat, &instance, true);
-            let ended = observe_protocol(
-                &feed,
-                &instance,
-                &mut wanted,
-                &publisher,
-                &mut ready_watches,
-                &owned,
-            )
-            .await;
-            scope.mark_live(chat, &instance, false);
-            if ended {
-                return;
-            }
-            if !wanted.borrow().is_empty() {
-                publisher.gap_to(instance.clone(), ready_watches.iter().copied());
+            Ok(adapter) => {
+                scope.mark_live(chat, &instance, true);
+                let ended = match adapter {
+                    TickAdapter::Protocol => {
+                        observe_protocol(
+                            &feed,
+                            &instance,
+                            &mut wanted,
+                            &publisher,
+                            ready_watches,
+                            &owned,
+                        )
+                        .await
+                    }
+                    TickAdapter::Terminal => {
+                        observe_terminal_screen(
+                            &feed,
+                            &mut wanted,
+                            &publisher,
+                            ready_watches,
+                            &owned,
+                            &scope.screens,
+                        )
+                        .await
+                    }
+                };
+                scope.mark_live(chat, &instance, false);
+                if ended {
+                    return;
+                }
+                // A terminal Tick loses nothing while disconnected: its next sample compares with
+                // what each watch last got.
+                if adapter == TickAdapter::Protocol && !wanted.borrow().is_empty() {
+                    publisher.gap_to(instance.clone(), ready_watches.iter().copied());
+                }
             }
         }
         if wanted.borrow().is_empty() {
@@ -257,9 +301,189 @@ struct HostedFeed {
 }
 
 impl HostedFeed {
-    /// Proves the Chat still holds a current binding for the instance before anything is read.
-    async fn check_binding(&self) -> Result<(), tickhost_connect::host_error::HostError> {
-        self.tools.data(self.chat, &self.instance).await.map(drop)
+    /// Proves the Chat still holds a current binding for the instance before anything is read,
+    /// and tells which adapter serves it.
+    async fn check_binding(&self) -> Result<TickAdapter, tickhost_connect::host_error::HostError> {
+        self.tools.data(self.chat, &self.instance).await?;
+        self.tools.adapter(self.chat, &self.instance).await
+    }
+
+    /// Registers a host watch of a terminal Tick: what it runs, its screen now, and the state it
+    /// ends in, Gone once the Tick ended or Disconnected when the watch is lost.
+    async fn watch_terminal(
+        &self,
+    ) -> Result<
+        (
+            TerminalDescription,
+            TerminalRead,
+            tokio::sync::oneshot::Receiver<TickConnectionState>,
+        ),
+        String,
+    > {
+        let mut connection = self
+            .tools
+            .data(self.chat, &self.instance)
+            .await
+            .map_err(|error| error.to_string())?;
+        let description = connection
+            .request("describe", json!({}), CONTROL_TIMEOUT)
+            .await
+            .map_err(|error| error.to_string())?;
+        let description: TerminalDescription =
+            serde_json::from_value(description).map_err(|error| error.to_string())?;
+        let registered = connection
+            .request("watch", json!({}), CONTROL_TIMEOUT)
+            .await
+            .map_err(|error| error.to_string())?;
+        let read: TerminalRead = serde_json::from_value(registered["read"].clone())
+            .map_err(|error| error.to_string())?;
+        let (sender, ended) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut sender = sender;
+            let state = tokio::select! {
+                event = connection.next_event_within(OBSERVATION_FRAME_BYTES) => match event {
+                    Ok(Some(event)) if event["event"] == "gone" => TickConnectionState::Gone,
+                    Ok(Some(_)) => TickConnectionState::IdentityUncertain,
+                    Ok(None) | Err(_) => TickConnectionState::Disconnected,
+                },
+                _ = sender.closed() => return,
+            };
+            let _ = sender.send(state);
+        });
+        Ok((description, read, ended))
+    }
+}
+
+/// A terminal Tick's screen, read without counting as using the Tick.
+async fn read_terminal(
+    tools: &HostedTickTools,
+    chat: Uuid,
+    instance: &InstanceRef,
+) -> Result<TerminalRead, String> {
+    let read = tools
+        .data(chat, instance)
+        .await
+        .map_err(|error| error.to_string())?
+        .request("read", json!({"activity":"automatic"}), CONTROL_TIMEOUT)
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::from_value(read).map_err(|error| error.to_string())
+}
+
+fn terminal_observation(instance: &InstanceRef, read: TerminalRead) -> TickObservation {
+    TickObservation {
+        instance: instance.clone(),
+        sequence: read.seq,
+        data: read.data(),
+        observed_at: read.at,
+        dropped: 0,
+        kind: ObservationKind::Terminal {
+            truncated: read.truncated,
+        },
+        recover_with: None,
+        gap: false,
+    }
+}
+
+/// Follows a terminal Tick for the wanted watches. Nothing is pushed: each watch starts from the
+/// screen as it is when it joins, and its subscription samples the screen again at its own
+/// frequency; the host's watch only tells when the Tick ends. Returns whether following ended
+/// for good rather than for a reconnect.
+async fn observe_terminal_screen(
+    feed: &HostedFeed,
+    wanted: &mut watch::Receiver<BTreeSet<WatchId>>,
+    publisher: &EventPublisher,
+    ready_watches: &mut BTreeSet<WatchId>,
+    scope: &dyn WatchAdmission,
+    screens: &Screens,
+) -> bool {
+    let instance = &feed.instance;
+    let attempted = scope.admitted(&wanted.borrow_and_update().clone(), instance, publisher);
+    if attempted.is_empty() {
+        return true;
+    }
+    let (description, mut current, mut ended) = match feed.watch_terminal().await {
+        Ok(watched) => watched,
+        Err(_) => {
+            publisher.state_to(
+                instance.clone(),
+                TickConnectionState::Disconnected,
+                attempted.iter().copied(),
+            );
+            return false;
+        }
+    };
+    let title = description
+        .title
+        .unwrap_or_else(|| tickhost_connect::naming::command_title(&description.command));
+    let mut is_current = true;
+    loop {
+        let targets = scope.admitted(&wanted.borrow_and_update().clone(), instance, publisher);
+        if targets.is_empty() {
+            return true;
+        }
+        let joining = {
+            let mut screens = screens.lock().unwrap_or_else(PoisonError::into_inner);
+            screens.retain(|watch, _| !ready_watches.contains(watch) || targets.contains(watch));
+            targets
+                .iter()
+                .filter(|watch| !screens.contains_key(watch))
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        if !joining.is_empty() {
+            if !is_current {
+                current = match read_terminal(&feed.tools, feed.chat, instance).await {
+                    Ok(read) => read,
+                    Err(_) => {
+                        publisher.state_to(
+                            instance.clone(),
+                            TickConnectionState::Disconnected,
+                            targets.iter().copied(),
+                        );
+                        return false;
+                    }
+                };
+            }
+            let mut screens = screens.lock().unwrap_or_else(PoisonError::into_inner);
+            for watch in joining {
+                screens.insert(
+                    watch,
+                    ScreenCursor {
+                        chat: feed.chat,
+                        instance: instance.clone(),
+                        sent: current.data(),
+                    },
+                );
+                publisher.ready(watch);
+                ready_watches.insert(watch);
+            }
+        }
+        publisher.metadata(
+            instance.clone(),
+            targets.iter().copied(),
+            TickMetadata {
+                title: title.clone(),
+                kind: ObservationKind::Terminal {
+                    truncated: current.truncated,
+                },
+                updated_at_ms: None,
+            },
+        );
+        publisher.state_to(
+            instance.clone(),
+            TickConnectionState::Live,
+            targets.iter().copied(),
+        );
+        tokio::select! {
+            state = &mut ended => {
+                let state = state.unwrap_or(TickConnectionState::Disconnected);
+                publisher.state_to(instance.clone(), state, targets.iter().copied());
+                return state != TickConnectionState::Disconnected;
+            }
+            changed = wanted.changed() => if changed.is_err() { return true; },
+        }
+        is_current = false;
     }
 }
 
@@ -451,6 +675,10 @@ impl TickStreamPort for HostedTickStream {
     }
 
     fn set_watch_chats(&self, chats: BTreeMap<WatchId, Uuid>) {
+        self.screens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|watch, _| chats.contains_key(watch));
         self.chats.send_replace(chats);
     }
 
@@ -492,6 +720,15 @@ impl TickStreamPort for HostedTickStream {
         chat: Uuid,
         instance: &InstanceRef,
     ) -> Result<Option<TickObservation>, String> {
+        let adapter = self
+            .tools
+            .adapter(chat, instance)
+            .await
+            .map_err(|error| error.to_string())?;
+        if adapter == TickAdapter::Terminal {
+            let read = read_terminal(&self.tools, chat, instance).await?;
+            return Ok(Some(terminal_observation(instance, read)));
+        }
         let mut connection = self
             .tools
             .data(chat, instance)
@@ -503,6 +740,35 @@ impl TickStreamPort for HostedTickStream {
             .map_err(|error| error.to_string())?;
         let read: TickState = serde_json::from_value(read).map_err(|error| error.to_string())?;
         Ok(Some(current_observation(instance, read)))
+    }
+
+    /// Reads a terminal Tick's screen for `watch` while it is still admitted, and reports it when
+    /// it differs from what the watch last got, which it then becomes.
+    async fn sample(&self, watch: WatchId, instance: &InstanceRef) -> Option<TickObservation> {
+        let chat = self
+            .screens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&watch)
+            .filter(|cursor| cursor.instance == *instance)?
+            .chat;
+        let scope = self.scope();
+        let is_admitted = scope.chat_of(&watch) == Some(chat)
+            && scope
+                .authorizes(scope.authorities.borrow().get(&watch))
+                .is_ok();
+        if !is_admitted {
+            return None;
+        }
+        let read = read_terminal(&self.tools, chat, instance).await.ok()?;
+        let observation = terminal_observation(instance, read);
+        let mut screens = self.screens.lock().unwrap_or_else(PoisonError::into_inner);
+        let cursor = screens.get_mut(&watch)?;
+        if cursor.sent == observation.data {
+            return None;
+        }
+        cursor.sent = observation.data.clone();
+        Some(observation)
     }
 
     fn open(&self) -> TickStreamHandle {

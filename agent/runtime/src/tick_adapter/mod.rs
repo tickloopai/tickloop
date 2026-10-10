@@ -105,6 +105,17 @@ impl TickStreamPort for TickAdapters {
             None => Ok(None),
         }
     }
+    async fn sample(
+        &self,
+        watch: WatchId,
+        instance: &InstanceRef,
+    ) -> Option<crate::tick_stream::TickObservation> {
+        self.adapters
+            .get(instance.tick_type())
+            .and_then(|adapter| adapter.stream())?
+            .sample(watch, instance)
+            .await
+    }
     fn set_watch_chats(&self, chats: BTreeMap<WatchId, Uuid>) {
         for stream in self
             .adapters

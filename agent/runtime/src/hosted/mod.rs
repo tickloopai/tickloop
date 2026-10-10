@@ -5,5 +5,6 @@
 pub mod controller;
 pub mod lifecycle;
 pub mod registry;
+pub mod terminal_input;
 pub mod tools;
 pub mod worker_control;

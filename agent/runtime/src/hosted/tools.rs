@@ -1,8 +1,9 @@
-//! The Tickhost backend of the native Tick tools: the hidden Ticks a Chat opened. Opening,
-//! reopening and closing go through the daemon, which alone controls the Tickhost; reading and
-//! calling use the instance's data binding directly. Each call is prepared once — target,
-//! catalog revision, executable, working directory and operation id frozen — and the same
-//! preparation is approved and dispatched.
+//! The Tickhost backend of the native Tick tools: the hidden Ticks a Chat opened, protocol Ticks
+//! and terminal Ticks. Opening, reopening and closing go through the daemon, which alone controls
+//! the Tickhost; reading, calling a protocol Tick and typing into a terminal Tick use the
+//! instance's data binding directly. Each call is prepared once — target, catalog revision,
+//! executable, working directory, input and operation id frozen — and the same preparation is
+//! approved and dispatched.
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -12,7 +13,7 @@ use std::{
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tick_protocol::{InstanceRef, TickDescriptor};
-use tickhost::host::Receipt;
+use tickhost::host::{Receipt, TerminalDescription, TerminalRead, TickAdapter};
 use tickhost_connect::{
     host_error::HostError,
     hosted::{CALL_RESPONSE_TIMEOUT, CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role},
@@ -44,6 +45,7 @@ const HOSTED_HOST: &str = "tickhost";
 struct DataBinding {
     endpoint: PathBuf,
     data_token: String,
+    adapter: TickAdapter,
 }
 
 fn hosted_resources(resources: tickhost::host::Resources) -> HostedResources {
@@ -81,6 +83,7 @@ fn hosted_screen_snapshot(screen: tickhost::screen::ScreenSnapshot) -> HostedScr
 enum Operation {
     Open {
         operation: Uuid,
+        adapter: TickAdapter,
         command: Vec<String>,
         cwd: PathBuf,
         executable: FileIdentity,
@@ -98,6 +101,11 @@ enum Operation {
     },
     Read {
         instance: InstanceRef,
+    },
+    /// Input typed into a terminal Tick's program.
+    Input {
+        instance: InstanceRef,
+        data: Vec<u8>,
     },
     /// A Tick Tool call bound to the catalog revision it was prepared against: the Tick refuses
     /// it unrun once its catalog changed.
@@ -143,6 +151,7 @@ impl HostedTickTools {
     ) -> Result<PreparedHostCall, String> {
         TickBackends::HOSTED.route(name, input)?;
         let mut external_declaration = None;
+        let mut normalized_input = input.clone();
         let (operation, permission, summary) = match (name, input["action"].as_str()) {
             (MODIFY_TICK, Some("open")) => {
                 let words = input["command"]
@@ -165,13 +174,28 @@ impl HostedTickTools {
                 .map_err(|error| format!("cannot resolve cwd: {error}"))?;
                 let executable = tickhost_connect::access::resolve_executable(&words[0], &cwd)
                     .map_err(|error| error.to_string())?;
+                let protocol = match input.get("protocol") {
+                    None => false,
+                    Some(protocol) => protocol.as_bool().ok_or("protocol must be a boolean")?,
+                };
+                // The bundled tick always speaks the Tick protocol.
+                let adapter = if protocol
+                    || tickhost_connect::access::bundled_tick_executable().as_ref()
+                        == Some(&executable)
+                {
+                    TickAdapter::Protocol
+                } else {
+                    TickAdapter::Terminal
+                };
                 let mut command = words.clone();
                 command[0] = executable.to_string_lossy().into_owned();
                 let command_line = words.join(" ");
                 let command_title = tickhost_connect::naming::command_title(&words);
+                normalized_input["protocol"] = json!(adapter == TickAdapter::Protocol);
                 (
                     Operation::Open {
                         operation: Uuid::new_v4(),
+                        adapter,
                         executable: FileIdentity::executable(&executable)?,
                         directory: FileIdentity::directory(&cwd)?,
                         command,
@@ -180,7 +204,11 @@ impl HostedTickTools {
                     },
                     HostToolPermission::Reviewable,
                     format!(
-                        "Open `{command_line}` hidden in the Tickhost (cwd {})",
+                        "Open `{command_line}` hidden in the Tickhost as a {} (cwd {})",
+                        match adapter {
+                            TickAdapter::Protocol => "protocol Tick",
+                            TickAdapter::Terminal => "terminal Tick",
+                        },
                         cwd.display()
                     ),
                 )
@@ -222,9 +250,51 @@ impl HostedTickTools {
                     summary,
                 )
             }
+            (MODIFY_TICK, Some("send_input")) => {
+                let instance = hosted_target(input)?;
+                if self
+                    .adapter(chat, &instance)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    == TickAdapter::Protocol
+                {
+                    return Err(format!(
+                        "UnsupportedCapability: {instance} is a protocol Tick; operate it with CallTickTool and the tools it declares"
+                    ));
+                }
+                let text = match input.get("text") {
+                    None => None,
+                    Some(text) => Some(text.as_str().ok_or("text must be a string")?),
+                };
+                let keys = match input.get("keys") {
+                    None => Vec::new(),
+                    Some(keys) => serde_json::from_value::<Vec<String>>(keys.clone())
+                        .map_err(|_| "keys must be an array of key names")?,
+                };
+                let data = super::terminal_input::encode(text, &keys)?;
+                let mut typed = Vec::new();
+                if let Some(text) = text {
+                    typed.push(format!("text {text:?}"));
+                }
+                if !keys.is_empty() {
+                    typed.push(format!("keys {}", keys.join(" ")));
+                }
+                (
+                    Operation::Input {
+                        instance: instance.clone(),
+                        data,
+                    },
+                    HostToolPermission::Reviewable,
+                    format!(
+                        "Type into hosted terminal Tick {instance}: {}",
+                        typed.join(", then ")
+                    ),
+                )
+            }
             (MODIFY_TICK, _) => {
                 return Err(
-                    "UnsupportedCapability: hosted Ticks support open, close and reopen".into(),
+                    "UnsupportedCapability: hosted Ticks support open, send_input, close and reopen"
+                        .into(),
                 );
             }
             (READ_TICK, _) => {
@@ -239,6 +309,16 @@ impl HostedTickTools {
             }
             (CALL_TICK_TOOL, _) => {
                 let instance = hosted_target(input)?;
+                if self
+                    .adapter(chat, &instance)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    == TickAdapter::Terminal
+                {
+                    return Err(format!(
+                        "UnsupportedCapability: {instance} is a terminal Tick and declares no tools; read it with ReadTick and type into it with ModifyTick send_input"
+                    ));
+                }
                 let tool = input["tool"].as_str().ok_or("tool is required")?.to_owned();
                 let args = input["args"].clone();
                 let catalog = self.describe(chat, &instance).await?;
@@ -274,13 +354,16 @@ impl HostedTickTools {
             _ => return Err(format!("unknown hosted Tick tool: {name}")),
         };
         let mut facts = tickloop_agent_protocol::PreparedApprovalFacts {
-            normalized_input: input.clone(),
+            normalized_input,
             ..Default::default()
         };
         match &operation {
             Operation::Close { instance, .. } => {
                 facts.tick_instance = Some(instance.clone());
                 facts.closes_tick = true;
+            }
+            Operation::Input { instance, .. } => {
+                facts.tick_instance = Some(instance.clone());
             }
             Operation::Call { instance, .. } => {
                 facts.tick_instance = Some(instance.clone());
@@ -323,6 +406,7 @@ impl HostedTickTools {
             Operation::Close { .. }
             | Operation::Reopen { .. }
             | Operation::Read { .. }
+            | Operation::Input { .. }
             | Operation::Call { .. } => Ok(()),
         }
     }
@@ -334,6 +418,7 @@ impl HostedTickTools {
         match prepared.operation {
             Operation::Open {
                 operation,
+                adapter,
                 command,
                 cwd,
                 title,
@@ -342,6 +427,7 @@ impl HostedTickTools {
                 let request = WorkerRequest::OpenHostedTick {
                     chat,
                     operation,
+                    adapter,
                     command,
                     cwd,
                     environment: self.environment.clone(),
@@ -394,6 +480,24 @@ impl HostedTickTools {
                 Ok(read) => completed(read),
                 Err(error) => HostCallResult::NotDispatched(error),
             },
+            Operation::Input { instance, data } => {
+                let mut connection = match self.data(chat, &instance).await {
+                    Ok(connection) => connection,
+                    Err(error) => return HostCallResult::NotDispatched(error.to_string()),
+                };
+                match connection
+                    .request("input", json!({"data":data}), CONTROL_TIMEOUT)
+                    .await
+                {
+                    Ok(written) => completed(
+                        json!({"status":"completed","tick_instance_id":instance,"written":written["written"]}),
+                    ),
+                    Err(error) if error.dispatched => {
+                        HostCallResult::OutcomeUnknown(error.to_string())
+                    }
+                    Err(error) => HostCallResult::NotDispatched(error.to_string()),
+                }
+            }
             Operation::Call {
                 instance,
                 tool,
@@ -498,10 +602,12 @@ impl HostedTickTools {
         let binding = match (
             opened["terminal"]["endpoint"].as_str(),
             opened["data_token"].as_str(),
+            serde_json::from_value::<TickAdapter>(opened["adapter"].clone()),
         ) {
-            (Some(endpoint), Some(token)) => Some(DataBinding {
+            (Some(endpoint), Some(token), Ok(adapter)) => Some(DataBinding {
                 endpoint: endpoint.into(),
                 data_token: token.into(),
+                adapter,
             }),
             _ => None,
         };
@@ -514,10 +620,11 @@ impl HostedTickTools {
                 bindings.insert((chat, instance.clone()), binding.clone());
             }
         }
-        // The command named the Tick until now; its declaration names it from here on. Only the
-        // binding this open received is asked, so naming never costs a lookup of the daemon.
+        // The command named the Tick until now; a protocol Tick's declaration names it from here
+        // on. Only the binding this open received is asked, so naming never costs a lookup of the
+        // daemon.
         let title = match (title, &binding) {
-            (Some(command), Some(binding)) => Some(
+            (Some(command), Some(binding)) if binding.adapter == TickAdapter::Protocol => Some(
                 described_title(binding, &instance, &command)
                     .await
                     .unwrap_or(command),
@@ -558,6 +665,10 @@ impl HostedTickTools {
     }
 
     async fn read(&self, chat: ChatId, instance: &InstanceRef) -> Result<Value, String> {
+        let adapter = self
+            .adapter(chat, instance)
+            .await
+            .map_err(|error| error.to_string())?;
         let mut connection = self
             .data(chat, instance)
             .await
@@ -570,15 +681,52 @@ impl HostedTickTools {
             .request("describe", json!({}), CONTROL_TIMEOUT)
             .await
             .map_err(|error| error.to_string())?;
-        Ok(json!({
-            "tick_instance_id": instance,
-            "source": "protocol",
-            "seq": read["seq"],
-            "at": read["at"],
-            "data": read["data"],
-            "descriptor": descriptor,
-            "tools": descriptor["tools"],
-        }))
+        match adapter {
+            TickAdapter::Protocol => Ok(json!({
+                "tick_instance_id": instance,
+                "source": "protocol",
+                "seq": read["seq"],
+                "at": read["at"],
+                "data": read["data"],
+                "descriptor": descriptor,
+                "tools": descriptor["tools"],
+            })),
+            TickAdapter::Terminal => {
+                let read: TerminalRead =
+                    serde_json::from_value(read).map_err(|error| error.to_string())?;
+                let description: TerminalDescription =
+                    serde_json::from_value(descriptor).map_err(|error| error.to_string())?;
+                Ok(json!({
+                    "tick_instance_id": instance,
+                    "source": "terminal",
+                    "seq": read.seq,
+                    "at": read.at,
+                    "data": read.data(),
+                    "truncated": read.truncated,
+                    "command": description.command,
+                    "cwd": description.cwd,
+                }))
+            }
+        }
+    }
+
+    /// Whether `instance` is a protocol or a terminal Tick, as the binding this Chat holds for it
+    /// says; a Tick keeps its adapter for its whole life.
+    pub(crate) async fn adapter(
+        &self,
+        chat: ChatId,
+        instance: &InstanceRef,
+    ) -> Result<TickAdapter, HostError> {
+        let cached = self
+            .bindings
+            .lock()
+            .await
+            .get(&(chat, instance.clone()))
+            .map(|binding| binding.adapter);
+        match cached {
+            Some(adapter) => Ok(adapter),
+            None => Ok(self.recover_binding(chat, instance).await?.adapter),
+        }
     }
 
     /// A data connection for an instance this Chat owns. A binding is recovered from the daemon,
@@ -618,6 +766,7 @@ impl HostedTickTools {
                 let binding = DataBinding {
                     endpoint: page.endpoint.clone(),
                     data_token,
+                    adapter: row.adapter,
                 };
                 let (resources, updated_at_ms) = match binding.connect(&instance).await {
                     Ok(mut connection) => {
@@ -627,16 +776,20 @@ impl HostedTickTools {
                             .ok()
                             .and_then(|resources| serde_json::from_value(resources).ok())
                             .map(hosted_resources);
-                        let status = connection
-                            .request("status", json!({}), CONTROL_TIMEOUT)
-                            .await
-                            .ok()
-                            .and_then(|status| {
-                                serde_json::from_value::<tickhost_connect::session::SessionStatus>(
-                                    status,
-                                )
+                        // A terminal Tick updates only as its subscriptions read it.
+                        let status = match binding.adapter {
+                            TickAdapter::Protocol => connection
+                                .request("status", json!({}), CONTROL_TIMEOUT)
+                                .await
                                 .ok()
-                            });
+                                .and_then(|status| {
+                                    serde_json::from_value::<
+                                        tickhost_connect::session::SessionStatus,
+                                    >(status)
+                                    .ok()
+                                }),
+                            TickAdapter::Terminal => None,
+                        };
                         (resources, status.and_then(|status| status.updated_at_ms))
                     }
                     Err(_) => (None, None),
@@ -844,6 +997,7 @@ impl HostedTickTools {
                         data_token: row.data_token.ok_or_else(|| {
                             HostError::before(TARGET_GONE, "the hosted Tick is not running")
                         })?,
+                        adapter: row.adapter,
                     };
                     self.bindings
                         .lock()
@@ -1034,6 +1188,7 @@ mod tests {
             .iter()
             .map(|instance| TickRow {
                 instance: Some(instance.clone()),
+                adapter: TickAdapter::Protocol,
                 terminal: Uuid::new_v4(),
                 data_token: Some("token".into()),
                 owner: TickOwner {
@@ -1086,6 +1241,7 @@ mod tests {
             DataBinding {
                 endpoint: "/nonexistent/host.sock".into(),
                 data_token: "token".into(),
+                adapter: TickAdapter::Protocol,
             },
         );
     }
@@ -1158,7 +1314,7 @@ mod tests {
 
         let (lost, reopened) = (hosted(), hosted());
         bind(&tools, chat, &lost).await;
-        let opened = json!({"instance":reopened,"terminal":{"endpoint":"/nonexistent/host.sock"},"data_token":"token"});
+        let opened = json!({"instance":reopened,"adapter":"protocol","terminal":{"endpoint":"/nonexistent/host.sock"},"data_token":"token"});
         tools.opened(chat, opened, None, Some(&lost)).await;
         assert_eq!(
             bound(&tools).await,

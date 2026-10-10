@@ -373,12 +373,8 @@ async fn the_installed_popup_shows_the_same_hosted_tick_until_esc_closes_it() {
             operation: Uuid::new_v4(),
             owner: owner.clone(),
             owner_revision: 0,
+            adapter: tickhost::host::TickAdapter::Protocol,
             command: vec![
-                support::fixture_cli::tickhost()
-                    .to_string_lossy()
-                    .into_owned(),
-                "open".into(),
-                "--".into(),
                 "/usr/bin/python3".into(),
                 "-u".into(),
                 script.to_string_lossy().into_owned(),

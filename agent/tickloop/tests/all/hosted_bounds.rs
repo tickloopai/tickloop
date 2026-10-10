@@ -49,6 +49,7 @@ fn live_record(chat: Uuid, title: String) -> LaunchRecord {
     let mut record = LaunchRecord::opening(
         Uuid::new_v4(),
         chat,
+        tickhost::host::TickAdapter::Terminal,
         vec!["/usr/bin/true".into()],
         "/".into(),
         Some(title),

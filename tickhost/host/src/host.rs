@@ -1,6 +1,7 @@
 //! The Tickhost service: one per user by default, holding each hosted Tick's PTY master,
-//! terminal model and launcher. Only the Agent daemon controls lifecycles; data clients read
-//! through a per-instance token; launchers report through a one-time launch token.
+//! terminal model and process: the launcher of a protocol Tick, or a terminal Tick's program
+//! itself. Only the Agent daemon controls lifecycles; data clients read through a per-instance
+//! token; launchers report through a one-time launch token.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -74,6 +75,9 @@ pub const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const ATTACH_SEND_BUFFER_BYTES: usize = 64 * 1024;
 /// How long a view grant waits for its view to connect.
 pub const VIEW_GRANT_TIMEOUT: Duration = CONTROL_TIMEOUT;
+/// How long a terminal Tick's program may hold off input written for it before the write is
+/// abandoned, well within the reader's control timeout.
+const INPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// After the host finished stopping, how long a waiting `shutdown_host` may take to answer.
 pub const SHUTDOWN_REPLY_GRACE: Duration = Duration::from_secs(1);
 /// A failed accept (such as a full descriptor table) is retried after this pause.
@@ -95,6 +99,18 @@ pub struct TickOwner {
     pub chat: Uuid,
 }
 
+/// How the host runs a Tick and offers it to readers.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TickAdapter {
+    /// A Tick protocol program. Its command is a hosted launcher, which registers the Tick once
+    /// it answered; the Tick describes, reads, calls and updates through the protocol.
+    Protocol,
+    /// A program without the Tick protocol, run directly on the terminal and Live as soon as it
+    /// started: its screen text is its read, and its input is what it is called with.
+    Terminal,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenRequest {
@@ -103,6 +119,7 @@ pub struct OpenRequest {
     /// The owner registry revision this open was decided at; an owner ended at this revision or
     /// later cannot open.
     pub owner_revision: u64,
+    pub adapter: TickAdapter,
     pub command: Vec<String>,
     pub cwd: PathBuf,
     pub environment: Vec<(String, String)>,
@@ -112,9 +129,56 @@ pub struct OpenRequest {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct OpenedTick {
     pub instance: InstanceRef,
+    pub adapter: TickAdapter,
     pub terminal: HostedTerminal,
     pub business_pid: u32,
     pub data_token: String,
+}
+
+/// What a terminal Tick runs.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TerminalDescription {
+    pub title: Option<String>,
+    pub command: Vec<String>,
+    pub cwd: PathBuf,
+}
+
+/// A terminal Tick's screen as plain text and, once its program exited, how it ended.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TerminalRead {
+    /// Counts the screen's changes; a later read never has a smaller one.
+    pub seq: u64,
+    /// When the screen was read.
+    pub at: String,
+    pub text: String,
+    /// Older lines were left out to keep within the snapshot bounds.
+    pub truncated: bool,
+    pub exit: Option<ProgramExit>,
+}
+
+impl TerminalRead {
+    /// The content a reader compares and an Agent is given: the text and how the program ended,
+    /// never styles or the cursor.
+    pub fn data(&self) -> Value {
+        json!({"text":self.text,"exit":self.exit})
+    }
+}
+
+/// How a terminal Tick's program ended: its exit code, or the signal that ended it.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProgramExit {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+}
+
+impl ProgramExit {
+    fn of(status: std::process::ExitStatus) -> Self {
+        use std::os::unix::process::ExitStatusExt;
+        Self {
+            code: status.code(),
+            signal: status.signal(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -136,6 +200,7 @@ pub enum Receipt {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct TickRow {
     pub instance: Option<InstanceRef>,
+    pub adapter: TickAdapter,
     pub terminal: Uuid,
     /// The reader token of a running instance, for its owner's own data clients.
     pub data_token: Option<String>,
@@ -218,18 +283,16 @@ struct HostedTick {
     operation: Uuid,
     owner: TickOwner,
     title: Option<String>,
-    launch_token: String,
-    /// Set by the first launcher connection: the launch token works once.
-    launcher_claimed: AtomicBool,
+    adapter: Adapter,
     data_token: String,
-    /// Where its launcher binds the Tick Session socket.
-    session_directory: PathBuf,
     pty: Pty,
     screen: std::sync::Mutex<Screen>,
+    /// Counts the changes of the screen: output parsed, a resize, the program's exit.
+    screen_revision: AtomicU64,
+    /// The process the host spawned: a protocol Tick's launcher, or a terminal Tick's program.
     launcher: Mutex<Child>,
     launcher_pid: u32,
     lifecycle: watch::Sender<Lifecycle>,
-    session: Mutex<Option<SessionClient>>,
     /// The last open, explicit read or call, attached input, or removal of the last Watch
     /// intent; nothing automatic counts.
     last_activity_ms: AtomicU64,
@@ -241,6 +304,37 @@ struct HostedTick {
     intents: std::sync::Mutex<WatchIntents>,
     screen_changes: watch::Sender<()>,
     terminal_closed: CancellationToken,
+}
+
+/// What a hosted Tick holds for its adapter.
+enum Adapter {
+    Protocol(ProtocolLaunch),
+    Terminal(TerminalProgram),
+}
+
+struct ProtocolLaunch {
+    launch_token: String,
+    /// Set by the first launcher connection: the launch token works once.
+    launcher_claimed: AtomicBool,
+    /// Where its launcher binds the Tick Session socket.
+    session_directory: PathBuf,
+    session: Mutex<Option<SessionClient>>,
+}
+
+struct TerminalProgram {
+    command: Vec<String>,
+    cwd: PathBuf,
+    /// Set once the program exited; its last screen stays readable until the Tick ends.
+    exit: std::sync::Mutex<Option<ProgramExit>>,
+}
+
+impl Adapter {
+    fn kind(&self) -> TickAdapter {
+        match self {
+            Self::Protocol(_) => TickAdapter::Protocol,
+            Self::Terminal(_) => TickAdapter::Terminal,
+        }
+    }
 }
 
 /// One-time permissions for views to attach to a Tick's terminal: each admits the view it names
@@ -357,10 +451,43 @@ impl HostedTick {
         }
     }
 
-    /// Removes the session directory once the launcher is gone, with any socket it could not
-    /// remove itself.
+    /// Removes a protocol Tick's session directory once the launcher is gone, with any socket it
+    /// could not remove itself.
     fn remove_session_directory(&self) {
-        let _ = std::fs::remove_dir_all(&self.session_directory);
+        if let Adapter::Protocol(launch) = &self.adapter {
+            let _ = std::fs::remove_dir_all(&launch.session_directory);
+        }
+    }
+
+    fn screen_changed(&self) {
+        self.screen_revision.fetch_add(1, Ordering::SeqCst);
+        self.screen_changes.send_replace(());
+    }
+
+    /// Records how a terminal Tick's program ended, once; the Tick itself keeps running until it
+    /// is closed or idles out, so its last screen stays readable.
+    fn record_exit(&self, program: &TerminalProgram, exit: ProgramExit) {
+        let mut recorded = program.exit.lock().unwrap();
+        if recorded.is_none() {
+            *recorded = Some(exit);
+            drop(recorded);
+            self.screen_changed();
+        }
+    }
+
+    fn terminal_read(&self, program: &TerminalProgram) -> TerminalRead {
+        // The revision is taken before the screen, so a change parsed in between only makes a
+        // later read count it again.
+        let seq = self.screen_revision.load(Ordering::SeqCst);
+        let exit = *program.exit.lock().unwrap();
+        let snapshot = self.screen.lock().unwrap().snapshot();
+        TerminalRead {
+            seq,
+            at: tick_protocol::now_rfc3339(),
+            text: snapshot.lines.join("\n"),
+            truncated: snapshot.truncated,
+            exit,
+        }
     }
 
     fn is_idle(&self, now_ms: u64, idle_timeout: Duration) -> bool {
@@ -392,7 +519,7 @@ impl HostedTick {
             }
             screen.resize(size);
         }
-        self.screen_changes.send_replace(());
+        self.screen_changed();
         self.pty
             .resize(size)
             .map_err(|error| HostError::after("TerminalUnavailable", error.to_string()))
@@ -652,24 +779,17 @@ impl Host {
         result
     }
 
+    /// Starts `request` on a private terminal. A terminal program is Live as soon as it runs; a
+    /// protocol Tick only once its launcher registered it, within the control timeout.
     async fn launch(
         self: &Arc<Self>,
         request: &OpenRequest,
         generation: u64,
     ) -> Result<OpenedTick, HostError> {
         let terminal = Uuid::new_v4();
-        let session_directory = self
-            .paths
-            .tick_session_directory(self.session_serial.fetch_add(1, Ordering::Relaxed));
         let size = TerminalSize::default();
         let (pty, slave) = Pty::open(size)
             .map_err(|error| HostError::before("TerminalUnavailable", error.to_string()))?;
-        let launch_token = random_token();
-        let binding = LaunchBinding {
-            terminal: self.terminal_binding(terminal),
-            operation: request.operation,
-            launch_token: launch_token.clone(),
-        };
         let mut command = Command::new(&request.command[0]);
         command
             .args(&request.command[1..])
@@ -685,15 +805,40 @@ impl Host {
                     })
                     .map(|(name, value)| (name.as_str(), value.as_str())),
             )
-            .env(
-                hosted::LAUNCH_ENV,
-                serde_json::to_string(&binding).expect("launch binding serializes"),
-            )
-            .env(
-                tickhost_connect::session::RUNTIME_DIR_ENV,
-                &session_directory,
-            )
             .env("TERM", "xterm-256color");
+        let adapter = match request.adapter {
+            TickAdapter::Protocol => {
+                let session_directory = self
+                    .paths
+                    .tick_session_directory(self.session_serial.fetch_add(1, Ordering::Relaxed));
+                let launch_token = random_token();
+                let binding = LaunchBinding {
+                    terminal: self.terminal_binding(terminal),
+                    operation: request.operation,
+                    launch_token: launch_token.clone(),
+                };
+                command
+                    .env(
+                        hosted::LAUNCH_ENV,
+                        serde_json::to_string(&binding).expect("launch binding serializes"),
+                    )
+                    .env(
+                        tickhost_connect::session::RUNTIME_DIR_ENV,
+                        &session_directory,
+                    );
+                Adapter::Protocol(ProtocolLaunch {
+                    launch_token,
+                    launcher_claimed: AtomicBool::new(false),
+                    session_directory,
+                    session: Mutex::new(None),
+                })
+            }
+            TickAdapter::Terminal => Adapter::Terminal(TerminalProgram {
+                command: request.command.clone(),
+                cwd: request.cwd.clone(),
+                exit: std::sync::Mutex::new(None),
+            }),
+        };
         slave
             .attach(&mut command)
             .map_err(|error| HostError::before("TerminalUnavailable", error.to_string()))?;
@@ -718,21 +863,26 @@ impl Host {
         let launcher_pid = launcher.id().ok_or_else(|| {
             HostError::before("LaunchFailed", "the launcher exited before it started")
         })?;
+        let lifecycle = match adapter {
+            Adapter::Protocol(_) => Lifecycle::Opening,
+            Adapter::Terminal(_) => Lifecycle::Live {
+                instance: InstanceRef::hosted(Uuid::new_v4()),
+                business_pid: launcher_pid,
+            },
+        };
         let tick = Arc::new(HostedTick {
             terminal,
             operation: request.operation,
             owner: request.owner.clone(),
             title: request.title.as_deref().map(display_title),
-            launch_token,
-            launcher_claimed: AtomicBool::new(false),
+            adapter,
             data_token: random_token(),
-            session_directory,
             pty,
             screen: std::sync::Mutex::new(Screen::new(size)),
+            screen_revision: AtomicU64::new(0),
             launcher: Mutex::new(launcher),
             launcher_pid,
-            lifecycle: watch::channel(Lifecycle::Opening).0,
-            session: Mutex::new(None),
+            lifecycle: watch::channel(lifecycle).0,
             last_activity_ms: AtomicU64::new(Self::now_ms()),
             views: std::sync::Mutex::new(Views::default()),
             view_grants: std::sync::Mutex::new(ViewGrants::default()),
@@ -743,6 +893,20 @@ impl Host {
         state.ticks.insert(terminal, tick.clone());
         drop(state);
         tokio::spawn(drain_terminal(tick.clone()));
+        let opened = |instance, business_pid| OpenedTick {
+            instance,
+            adapter: tick.adapter.kind(),
+            terminal: self.terminal_binding(terminal),
+            business_pid,
+            data_token: tick.data_token.clone(),
+        };
+        if let Lifecycle::Live {
+            instance,
+            business_pid,
+        } = tick.lifecycle.borrow().clone()
+        {
+            return Ok(opened(instance, business_pid));
+        }
         let mut lifecycle = tick.lifecycle.subscribe();
         let live = tokio::time::timeout(CONTROL_TIMEOUT, async {
             loop {
@@ -761,12 +925,7 @@ impl Host {
         })
         .await;
         match live {
-            Ok(Some((instance, business_pid))) => Ok(OpenedTick {
-                instance,
-                terminal: self.terminal_binding(terminal),
-                business_pid,
-                data_token: tick.data_token.clone(),
-            }),
+            Ok(Some((instance, business_pid))) => Ok(opened(instance, business_pid)),
             outcome => {
                 let screen = tick
                     .screen
@@ -1042,13 +1201,26 @@ impl Host {
             if matches!(*tick.lifecycle.borrow(), Lifecycle::Closing) {
                 continue;
             }
-            let exited = tick
-                .launcher
-                .try_lock()
-                .is_ok_and(|mut launcher| !matches!(launcher.try_wait(), Ok(None)));
-            if exited {
-                self.reap(tick.terminal, ReapReason::Exited).await;
-                continue;
+            // A wait that fails can never report the exit later, so it counts as one.
+            let exited =
+                tick.launcher
+                    .try_lock()
+                    .ok()
+                    .and_then(|mut launcher| match launcher.try_wait() {
+                        Ok(None) => None,
+                        Ok(Some(status)) => Some(ProgramExit::of(status)),
+                        Err(_) => Some(ProgramExit {
+                            code: None,
+                            signal: None,
+                        }),
+                    });
+            match (&tick.adapter, exited) {
+                (Adapter::Protocol(_), Some(_)) => {
+                    self.reap(tick.terminal, ReapReason::Exited).await;
+                    continue;
+                }
+                (Adapter::Terminal(program), Some(exit)) => tick.record_exit(program, exit),
+                (_, None) => {}
             }
             tick.lapse_stale_intents(Self::now_ms(), self.idle_timeout);
             if tick.is_idle(Self::now_ms(), self.idle_timeout) {
@@ -1086,6 +1258,7 @@ impl Host {
                 let lifecycle = tick.lifecycle.borrow().clone();
                 TickRow {
                     instance: lifecycle.live_instance().cloned(),
+                    adapter: tick.adapter.kind(),
                     terminal: tick.terminal,
                     data_token: matches!(lifecycle, Lifecycle::Live { .. })
                         .then(|| tick.data_token.clone()),
@@ -1179,7 +1352,8 @@ async fn stop_launcher(tick: &HostedTick) {
     }
 }
 
-/// Drains the PTY continuously so a hidden Tick never blocks on output.
+/// Drains the PTY continuously so a hidden Tick never blocks on output. A protocol Tick ends
+/// with its terminal; a terminal Tick's program that closed it keeps its last screen.
 async fn drain_terminal(tick: Arc<HostedTick>) {
     let mut buffer = vec![0u8; READ_CHUNK_BYTES];
     loop {
@@ -1189,13 +1363,15 @@ async fn drain_terminal(tick: Arc<HostedTick>) {
                 Ok(0) | Err(_) => break,
                 Ok(count) => {
                     tick.screen.lock().unwrap().process(&buffer[..count]);
-                    tick.screen_changes.send_replace(());
+                    tick.screen_changed();
                     tokio::task::yield_now().await;
                 }
             }
         }
     }
-    tick.terminal_closed.cancel();
+    if let Adapter::Protocol(_) = tick.adapter {
+        tick.terminal_closed.cancel();
+    }
 }
 
 fn validate_launch(request: &OpenRequest) -> Result<(), HostError> {
@@ -1542,10 +1718,12 @@ async fn authenticate(host: &Arc<Host>, role: Role) -> Result<Authority, HostErr
             .find(|tick| {
                 tick.operation == operation
                     && *tick.lifecycle.borrow() == Lifecycle::Opening
-                    && same_secret(&launch_token, &tick.launch_token)
+                    && matches!(&tick.adapter, Adapter::Protocol(launch) if same_secret(&launch_token, &launch.launch_token))
             })
             .cloned()
-            .filter(|tick| !tick.launcher_claimed.swap(true, Ordering::SeqCst))
+            .filter(|tick| {
+                matches!(&tick.adapter, Adapter::Protocol(launch) if !launch.launcher_claimed.swap(true, Ordering::SeqCst))
+            })
             .map(|tick| Authority::Launcher {
                 tick,
                 verified: false,
@@ -1660,7 +1838,14 @@ async fn business(
         if let Authority::Instance(tick) | Authority::Viewer(tick) = &authority {
             match method.as_str() {
                 "watch" if matches!(authority, Authority::Instance(_)) => {
-                    return stream_observations(reader, writer, &host, tick.clone(), &id).await;
+                    return match tick.adapter {
+                        Adapter::Protocol(_) => {
+                            stream_observations(reader, writer, &host, tick.clone(), &id).await
+                        }
+                        Adapter::Terminal(_) => {
+                            watch_terminal(reader, writer, &host, tick.clone(), &id).await
+                        }
+                    };
                 }
                 "attach" => match ViewLease::acquire(tick, params) {
                     Ok(lease) => return attach_view(reader, writer, &host, lease, &id).await,
@@ -1809,7 +1994,14 @@ async fn controller_request(
 }
 
 async fn session(tick: &HostedTick) -> Result<SessionClient, HostError> {
-    tick.session
+    let Adapter::Protocol(launch) = &tick.adapter else {
+        return Err(HostError::before(
+            "UnsupportedCapability",
+            "a terminal Tick does not speak the Tick protocol",
+        ));
+    };
+    launch
+        .session
         .lock()
         .await
         .clone()
@@ -1841,12 +2033,6 @@ async fn instance_request(
         return Err(HostError::before("TargetGone", "the Tick has ended"));
     }
     match method {
-        "describe" => session(tick)
-            .await?
-            .describe()
-            .await
-            .map(|descriptor| json!(descriptor))
-            .map_err(session_error),
         "read" => {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -1857,13 +2043,48 @@ async fn instance_request(
             if activity == ReadActivity::Explicit {
                 tick.note_activity();
             }
-            session(tick)
-                .await?
-                .read()
-                .await
-                .map(|read| json!(read))
-                .map_err(session_error)
+            match &tick.adapter {
+                Adapter::Protocol(_) => session(tick)
+                    .await?
+                    .read()
+                    .await
+                    .map(|read| json!(read))
+                    .map_err(session_error),
+                Adapter::Terminal(program) => Ok(json!(tick.terminal_read(program))),
+            }
         }
+        "snapshot" => Ok(json!(tick.screen.lock().unwrap().snapshot())),
+        "resources" => {
+            let Lifecycle::Live { business_pid, .. } = tick.lifecycle.borrow().clone() else {
+                return Err(HostError::before("TargetGone", "the Tick is not running"));
+            };
+            let sample = process::sample(business_pid);
+            Ok(json!(Resources {
+                business_pid,
+                cpu_time_ms: sample.and_then(|sample| sample.cpu_time_ms),
+                rss_bytes: sample.and_then(|sample| sample.rss_bytes),
+                sampled_at_ms: Host::now_ms(),
+            }))
+        }
+        _ => match &tick.adapter {
+            Adapter::Protocol(_) => protocol_request(tick, method, params).await,
+            Adapter::Terminal(program) => terminal_request(tick, program, method, params).await,
+        },
+    }
+}
+
+async fn protocol_request(
+    tick: &Arc<HostedTick>,
+    method: &str,
+    params: Value,
+) -> Result<Value, HostError> {
+    match method {
+        "describe" => session(tick)
+            .await?
+            .describe()
+            .await
+            .map(|descriptor| json!(descriptor))
+            .map_err(session_error),
         "call" => {
             #[derive(Deserialize)]
             struct Call {
@@ -1895,19 +2116,70 @@ async fn instance_request(
             .await
             .map(|status| json!(status))
             .map_err(session_error),
-        "snapshot" => Ok(json!(tick.screen.lock().unwrap().snapshot())),
-        "resources" => {
-            let Lifecycle::Live { business_pid, .. } = tick.lifecycle.borrow().clone() else {
-                return Err(HostError::before("TargetGone", "the Tick is not running"));
-            };
-            let sample = process::sample(business_pid);
-            Ok(json!(Resources {
-                business_pid,
-                cpu_time_ms: sample.and_then(|sample| sample.cpu_time_ms),
-                rss_bytes: sample.and_then(|sample| sample.rss_bytes),
-                sampled_at_ms: Host::now_ms(),
-            }))
+        "input" => Err(HostError::before(
+            "UnsupportedCapability",
+            "a protocol Tick is operated through its declared Tick Tools",
+        )),
+        _ => Err(HostError::before(
+            "MethodNotAllowed",
+            format!("an instance reader has no {method:?} method"),
+        )),
+    }
+}
+
+/// The terminal adapter: a terminal Tick describes what it runs and is called with input for
+/// its program. Its updates are reads its subscriptions take, so it has no status of its own.
+async fn terminal_request(
+    tick: &Arc<HostedTick>,
+    program: &TerminalProgram,
+    method: &str,
+    params: Value,
+) -> Result<Value, HostError> {
+    match method {
+        "describe" => Ok(json!(TerminalDescription {
+            title: tick.title.clone(),
+            command: program.command.clone(),
+            cwd: program.cwd.clone(),
+        })),
+        "input" => {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Input {
+                data: Vec<u8>,
+            }
+            let Input { data } = parameters(params)?;
+            if data.is_empty() || data.len() > ATTACH_INPUT_BYTES {
+                return Err(HostError::before(
+                    "InvalidArguments",
+                    format!("input is 1 to {ATTACH_INPUT_BYTES} bytes"),
+                ));
+            }
+            if program.exit.lock().unwrap().is_some() {
+                return Err(HostError::before(
+                    "ProgramExited",
+                    "the program exited; its last screen stays readable until the Tick is closed",
+                ));
+            }
+            tick.note_activity();
+            tokio::time::timeout(INPUT_WRITE_TIMEOUT, tick.pty.write_all(&data))
+                .await
+                .map_err(|_| {
+                    HostError::after(
+                        "OutcomeUnknown",
+                        "the program did not take its input in time; part of it may have arrived",
+                    )
+                })?
+                .map_err(|error| HostError::after("TerminalUnavailable", error.to_string()))?;
+            Ok(json!({"written":data.len()}))
         }
+        "call" => Err(HostError::before(
+            "UnsupportedCapability",
+            "a terminal Tick declares no Tick Tools; send its program input instead",
+        )),
+        "status" => Err(HostError::before(
+            "UnsupportedCapability",
+            "a terminal Tick updates only as its subscriptions read its screen",
+        )),
         _ => Err(HostError::before(
             "MethodNotAllowed",
             format!("an instance reader has no {method:?} method"),
@@ -1976,15 +2248,21 @@ async fn launcher_request(
                     "the business process is not this launcher's child",
                 ));
             }
+            let Adapter::Protocol(launch) = &tick.adapter else {
+                return Err(HostError::before(
+                    "Forbidden",
+                    "only a protocol Tick has a launcher",
+                ));
+            };
             let client = SessionClient::connect(
                 instance.clone(),
                 SessionBackend::Hosted(host.terminal_binding(tick.terminal)),
-                Some(tick.session_directory.clone()),
+                Some(launch.session_directory.clone()),
             )
             .await
             .map_err(session_error)?;
             client.describe().await.map_err(session_error)?;
-            *tick.session.lock().await = Some(client);
+            *launch.session.lock().await = Some(client);
             // A Tick whose open already timed out and began closing never becomes Live.
             let registered = tick.lifecycle.send_if_modified(|lifecycle| {
                 let opening = *lifecycle == Lifecycle::Opening;
@@ -2051,6 +2329,40 @@ async fn stream_observations(
     }
 }
 
+/// Registers a watch of a terminal Tick: the reply carries its screen now, and the stream then
+/// only tells when the Tick ends. Nothing is pushed in between; each subscription reads the
+/// screen again at its own frequency. The reader's EOF, or anything it sends, ends the watch.
+async fn watch_terminal(
+    mut reader: BufReader<OwnedReadHalf>,
+    mut writer: OwnedWriteHalf,
+    host: &Arc<Host>,
+    tick: Arc<HostedTick>,
+    id: &Value,
+) -> Result<(), HostError> {
+    use tokio::io::AsyncBufReadExt;
+    let Adapter::Terminal(program) = &tick.adapter else {
+        return Err(HostError::before(
+            "UnsupportedCapability",
+            "only a terminal Tick is watched without the Tick protocol",
+        ));
+    };
+    write_within(
+        &mut writer,
+        &hosted::ok(id, json!({"read":tick.terminal_read(program)})),
+        BUSINESS_FRAME_BYTES,
+        CONTROL_TIMEOUT,
+    )
+    .await?;
+    tokio::select! {
+        _ = reader.fill_buf() => Ok(()),
+        _ = tick.terminal_closed.cancelled() => {
+            let _ = write_within(&mut writer, &json!({"event":"gone"}), BUSINESS_FRAME_BYTES, STREAM_WRITE_TIMEOUT).await;
+            Ok(())
+        }
+        _ = host.shutdown.cancelled() => Ok(()),
+    }
+}
+
 /// One view attached to a Tick terminal, until EOF, detach, a stalled write or the end of the
 /// Tick.
 struct ViewLease {
@@ -2091,6 +2403,12 @@ impl ViewLease {
                 "InputTooLarge",
                 format!("input chunks are at most {ATTACH_INPUT_BYTES} bytes"),
             ));
+        }
+        // A terminal Tick whose program exited only shows its last screen.
+        if let Adapter::Terminal(program) = &self.tick.adapter
+            && program.exit.lock().unwrap().is_some()
+        {
+            return Ok(());
         }
         self.tick.note_activity();
         self.tick.change_views(|views| views.typed(self.view))?;
@@ -2377,6 +2695,7 @@ mod tests {
             operation: Uuid::new_v4(),
             owner: owner(),
             owner_revision: 0,
+            adapter: TickAdapter::Protocol,
             command: vec![
                 "/bin/sh".into(),
                 "-c".into(),
@@ -2416,6 +2735,7 @@ mod tests {
             operation: Uuid::new_v4(),
             owner: owner(),
             owner_revision: 3,
+            adapter: TickAdapter::Protocol,
             command: vec![
                 "/bin/sh".into(),
                 "-c".into(),
@@ -2502,6 +2822,7 @@ mod tests {
         let opened = |instance: &InstanceRef| {
             Receipt::Opened(OpenedTick {
                 instance: instance.clone(),
+                adapter: TickAdapter::Protocol,
                 terminal: HostedTerminal {
                     endpoint: PathBuf::from("/host.sock"),
                     epoch: Uuid::new_v4(),
@@ -2546,6 +2867,7 @@ mod tests {
             operation: Uuid::new_v4(),
             owner: owner(),
             owner_revision: 0,
+            adapter: TickAdapter::Protocol,
             command: vec![
                 "/bin/sh".into(),
                 "-c".into(),

@@ -14,7 +14,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use support::hosted::{counter_program, launch_command};
+use support::hosted::counter_program;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -124,7 +124,7 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
     let server_observed = observed.clone();
     let host_runtime = root.join("h");
     let server_host_runtime = host_runtime.clone();
-    let open_command = json!(launch_command(counter_program()));
+    let open_command = json!(counter_program());
     let server = tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let observed = server_observed.clone();
@@ -142,7 +142,7 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
                         observed
                             .host_before_open
                             .store(host_socket.exists(), Ordering::SeqCst);
-                        json!({"type":"tool_use","id":"open","name":"ModifyTick","input":{"action":"open","command":open_command,"placement":{"type":"hidden"}}})
+                        json!({"type":"tool_use","id":"open","name":"ModifyTick","input":{"action":"open","command":open_command,"protocol":true,"placement":{"type":"hidden"}}})
                     }
                     (1, Some(instance)) => {
                         json!({"type":"tool_use","id":"read","name":"ReadTick","input":{"tick_instance_id":instance}})
@@ -286,7 +286,7 @@ mod channel {
     use uuid::Uuid;
 
     use super::support::hosted::{
-        counter_program, counter_request, launch_command, python_program, tick_environment,
+        counter_program, counter_request, python_program, tick_environment,
     };
 
     /// The Herdr Workspace a Herdr worker's Chats work in.
@@ -630,9 +630,9 @@ mod channel {
         }
     }
 
-    /// The ModifyTick input that opens `program` hidden in the daemon's Tickhost.
+    /// The ModifyTick input that opens the protocol `program` hidden in the daemon's Tickhost.
     fn open_command(daemon: &Daemon, program: Vec<String>) -> Value {
-        json!({"action":"open","command":launch_command(program),"cwd":daemon.root,"placement":{"type":"hidden"}})
+        json!({"action":"open","command":program,"protocol":true,"cwd":daemon.root,"placement":{"type":"hidden"}})
     }
 
     fn counter_command(daemon: &Daemon) -> Value {
@@ -719,6 +719,7 @@ mod channel {
             .request(WorkerRequest::OpenHostedTick {
                 chat: chats[1],
                 operation: Uuid::new_v4(),
+                adapter: tickhost::host::TickAdapter::Terminal,
                 command: vec!["/usr/bin/true".into()],
                 cwd: root.clone(),
                 environment: Vec::new(),
@@ -842,6 +843,7 @@ mod channel {
         let instance = tick_protocol::InstanceRef::hosted(Uuid::new_v4());
         let opened = tickhost::host::OpenedTick {
             instance: instance.clone(),
+            adapter: tickhost::host::TickAdapter::Protocol,
             terminal: tickhost_connect::hosted::HostedTerminal {
                 endpoint: directory.path().join("host.sock"),
                 epoch: Uuid::new_v4(),
@@ -1489,6 +1491,265 @@ for line in sys.stdin:
         assert!(
             super::gone(business_pid).await,
             "without its Watch the Tick idles out"
+        );
+    }
+
+    /// The ModifyTick input that opens `/bin/cat` as a terminal Tick in the daemon's Tickhost.
+    fn cat_command(daemon: &Daemon) -> Value {
+        json!({"action":"open","command":["/bin/cat"],"cwd":daemon.root})
+    }
+
+    /// Samples `watch` of `instance` until it reports a screen that `wanted` accepts.
+    async fn sample_until(
+        stream: &HostedTickStream,
+        watch: Uuid,
+        instance: &tick_protocol::InstanceRef,
+        wanted: impl Fn(&Value) -> bool,
+    ) -> tickloop_agent_runtime::tick_stream::TickObservation {
+        for _ in 0..400 {
+            if let Some(sampled) = stream.sample(watch, instance).await
+                && wanted(&sampled.data)
+            {
+                return sampled;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("no sample of {watch} showed what was expected");
+    }
+
+    /// A program opened without `protocol` runs as a terminal Tick: ReadTick returns its screen
+    /// text, send_input types into it, and it declares no tools. Its Watches get nothing pushed:
+    /// each starts from the screen as it is when it joins, and a sample reports the screen only
+    /// when its text, or whether the program exited, differs from what that Watch last got.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_terminal_tick_is_sampled_against_what_each_watch_last_got() {
+        let daemon = Daemon::start(1).await;
+        let chat = daemon.chats[0];
+        let tools = Arc::new(daemon.tools());
+        let opened = run_tool(&tools, chat, "ModifyTick", cat_command(&daemon)).await;
+        let instance = opened["tick_instance_id"].clone();
+        assert!(
+            instance.as_str().unwrap().starts_with("hosted:"),
+            "{opened}"
+        );
+        let read = run_tool(
+            &tools,
+            chat,
+            "ReadTick",
+            json!({"tick_instance_id":instance}),
+        )
+        .await;
+        assert_eq!(read["source"], "terminal", "{read}");
+        assert_eq!(read["command"], json!(["/bin/cat"]));
+        assert_eq!(read["data"]["exit"], Value::Null);
+        let refused = tools
+            .prepare_call(
+                chat,
+                "CallTickTool",
+                &json!({"tick_instance_id":instance,"tool":"increment","args":{}}),
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(refused.contains("terminal Tick"), "{refused}");
+
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let stream = HostedTickStream::new(tools.clone());
+        let authority = tools
+            .tool_authorities("ReadTick")
+            .unwrap()
+            .pop_first()
+            .unwrap();
+        stream.set_watch_chats(BTreeMap::from([(first, chat), (second, chat)]));
+        stream.set_watch_authorities(BTreeMap::from([
+            (first, authority.clone()),
+            (second, authority),
+        ]));
+        let mut handle = stream.open();
+        let target: tick_protocol::InstanceRef = serde_json::from_value(instance.clone()).unwrap();
+        handle
+            .desired
+            .send_replace(BTreeMap::from([(first, target.clone())]));
+        let mut seen = Vec::new();
+        wait_for(
+            &mut handle.events,
+            &mut seen,
+            0,
+            "the first baseline",
+            |event| is_ready(event, first),
+        )
+        .await;
+        assert!(
+            stream.sample(first, &target).await.is_none(),
+            "an unchanged screen is no update"
+        );
+
+        let typed = run_tool(
+            &tools,
+            chat,
+            "ModifyTick",
+            json!({"action":"send_input","tick_instance_id":instance,"text":"hello terminal","keys":["Enter"]}),
+        )
+        .await;
+        assert_eq!(typed["written"], 15, "{typed}");
+        let changed = sample_until(&stream, first, &target, |data| {
+            data["text"]
+                .as_str()
+                .unwrap()
+                .matches("hello terminal")
+                .count()
+                == 2
+        })
+        .await;
+        assert_eq!(
+            changed.kind,
+            tickloop_agent_protocol::ObservationKind::Terminal { truncated: false }
+        );
+        assert_eq!(changed.data["exit"], Value::Null);
+        assert!(
+            stream.sample(first, &target).await.is_none(),
+            "the screen it last got is no update again"
+        );
+
+        handle.desired.send_replace(BTreeMap::from([
+            (first, target.clone()),
+            (second, target.clone()),
+        ]));
+        let joined = seen.len();
+        wait_for(
+            &mut handle.events,
+            &mut seen,
+            joined,
+            "the second baseline",
+            |event| is_ready(event, second),
+        )
+        .await;
+        assert!(
+            stream.sample(second, &target).await.is_none(),
+            "a later Watch starts from the screen as it is when it joins"
+        );
+
+        run_tool(
+            &tools,
+            chat,
+            "ModifyTick",
+            json!({"action":"send_input","tick_instance_id":instance,"keys":["Ctrl-D"]}),
+        )
+        .await;
+        for watch in [first, second] {
+            let exited =
+                sample_until(&stream, watch, &target, |data| data["exit"] != Value::Null).await;
+            assert_eq!(exited.data["exit"], json!({"code":0,"signal":null}));
+            assert!(
+                exited.data["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("hello terminal")
+            );
+        }
+        let late = call_tool(
+            &tools,
+            chat,
+            "ModifyTick",
+            json!({"action":"send_input","tick_instance_id":instance,"text":"late"}),
+        )
+        .await;
+        let HostCallResult::NotDispatched(reason) = late else {
+            panic!("input for a program that exited is never dispatched");
+        };
+        assert!(reason.contains("ProgramExited"), "{reason}");
+
+        let closed = seen.len();
+        run_tool(
+            &tools,
+            chat,
+            "ModifyTick",
+            json!({"action":"close","tick_instance_id":instance}),
+        )
+        .await;
+        for watch in [first, second] {
+            wait_for(
+                &mut handle.events,
+                &mut seen,
+                closed,
+                "the Tick's end",
+                |event| is_state(event, watch, TickConnectionState::Gone),
+            )
+            .await;
+        }
+        assert!(stream.sample(first, &target).await.is_none());
+    }
+
+    /// A Loop subscribed to a terminal Tick at the default high frequency: the screen is read
+    /// once its period elapsed, and the input and exit that changed it wake the Loop once with
+    /// the new text and the exit code.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_high_subscription_to_a_terminal_tick_delivers_its_changed_screen_and_exit() {
+        let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new()));
+        let daemon =
+            Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
+        let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
+        let tools = daemon.tools();
+        let opened = run_tool(&tools, chat, "ModifyTick", cat_command(&daemon)).await;
+        let instance = opened["tick_instance_id"].clone();
+        model.enqueue(tickloop_agent_test_support::call(
+            "subscribe",
+            "SubscribeTick",
+            json!({"tick_instance_id":instance}),
+        ));
+        model.enqueue(tickloop_agent_test_support::text("watching"));
+        let mut events = runtime.subscribe();
+        runtime
+            .submit(chat, None, "Watch the terminal".into())
+            .await
+            .unwrap();
+        loop {
+            match tickloop_agent_test_support::next_event(&mut events)
+                .await
+                .kind
+            {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        let subscriptions = runtime.tick_subscriptions(chat).await.unwrap();
+        assert_eq!(
+            subscriptions[0].frequency,
+            tickloop_agent_protocol::TickSubscriptionFrequency::High
+        );
+        assert_eq!(
+            subscriptions[0].link,
+            tickloop_agent_protocol::TickLinkState::Live
+        );
+
+        model.enqueue(tickloop_agent_test_support::text("screen observed"));
+        run_tool(
+            &tools,
+            chat,
+            "ModifyTick",
+            json!({"action":"send_input","tick_instance_id":instance,"text":"quote ready","keys":["Enter","Ctrl-D"]}),
+        )
+        .await;
+        loop {
+            let event = tokio::time::timeout(high_delivery_wait(), events.recv())
+                .await
+                .expect("the changed screen wakes the Loop")
+                .unwrap();
+            match event.kind {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3, "one delivery");
+        let woken = serde_json::to_string(&requests[2].messages).unwrap();
+        assert!(woken.contains("quote ready"), "{woken}");
+        assert!(
+            woken.contains("\\\"code\\\":0") || woken.contains("\"code\":0"),
+            "{woken}"
         );
     }
 
@@ -2907,6 +3168,7 @@ for line in sys.stdin:
         let mut kept_record = LaunchRecord::opening(
             kept_request.operation,
             fixture.owner.chat,
+            kept_request.adapter,
             kept_request.command.clone(),
             kept_request.cwd.clone(),
             None,
@@ -2992,6 +3254,7 @@ for line in sys.stdin:
             let mut record = LaunchRecord::opening(
                 request.operation,
                 fixture.owner.chat,
+                request.adapter,
                 request.command,
                 request.cwd,
                 None,
@@ -3059,6 +3322,7 @@ for line in sys.stdin:
         let mut record = LaunchRecord::opening(
             request.operation,
             fixture.owner.chat,
+            request.adapter,
             request.command,
             request.cwd,
             None,
@@ -3111,6 +3375,7 @@ for line in sys.stdin:
         let mut record = LaunchRecord::opening(
             request.operation,
             fixture.owner.chat,
+            request.adapter,
             request.command,
             request.cwd,
             None,
@@ -3239,18 +3504,16 @@ for line in sys.stdin:
     async fn a_stuck_open_never_delays_the_daemons_other_requests() {
         let fixture = Fixture::new();
         let controller = Arc::new(fixture.controller());
-        // A launcher that never reports keeps its open pending until the control timeout, and
-        // ignores SIGTERM, so the host must kill it after the terminate grace.
-        let pid_file = fixture.directory.path().join("stubborn.pid");
+        // A protocol program that never answers keeps its open pending until it times out.
+        let pid_file = fixture.directory.path().join("silent.pid");
         let mut never_ready = fixture.counter();
         never_ready.command = vec![
             "/bin/sh".into(),
             "-c".into(),
-            r#"trap "" TERM; echo $$ > "$1"; while :; do sleep 1; done"#.into(),
-            "stubborn".into(),
+            r#"echo $$ > "$1"; while :; do sleep 1; done"#.into(),
+            "silent".into(),
             pid_file.to_string_lossy().into_owned(),
         ];
-        let stuck_since = std::time::Instant::now();
         let stuck = {
             let controller = controller.clone();
             tokio::spawn(async move { controller.open(never_ready).await })
@@ -3272,16 +3535,12 @@ for line in sys.stdin:
         assert_eq!(listed["total"], 2);
         let refused = stuck.await.unwrap().unwrap_err();
         assert_eq!(refused.code, "LaunchFailed");
-        assert!(
-            stuck_since.elapsed() >= CONTROL_TIMEOUT + tickhost::host::TERMINATE_GRACE,
-            "the launcher ignored SIGTERM and was killed after the grace"
-        );
-        let stubborn: u32 = std::fs::read_to_string(&pid_file)
+        let silent: u32 = std::fs::read_to_string(&pid_file)
             .unwrap()
             .trim()
             .parse()
             .unwrap();
-        assert!(!alive(stubborn), "SIGKILL ended the launcher");
+        assert!(gone(silent).await, "a failed open leaves nothing running");
         controller
             .close(Uuid::new_v4(), &fixture.owner, &opened.instance)
             .await

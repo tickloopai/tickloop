@@ -15,7 +15,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tick_protocol::InstanceRef;
-use tickhost::host::{Receipt, TickOwner};
+use tickhost::host::{Receipt, TickAdapter, TickOwner};
 use tickhost_connect::host_error::HostError;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -127,6 +127,7 @@ impl LaunchIdentity {
 pub struct LaunchRecord {
     pub operation: Uuid,
     pub chat: Uuid,
+    pub adapter: TickAdapter,
     pub command: Vec<String>,
     pub cwd: PathBuf,
     pub identity: LaunchIdentity,
@@ -145,6 +146,7 @@ impl LaunchRecord {
     pub fn opening(
         operation: Uuid,
         chat: Uuid,
+        adapter: TickAdapter,
         command: Vec<String>,
         cwd: PathBuf,
         title: Option<String>,
@@ -154,6 +156,7 @@ impl LaunchRecord {
         Ok(Self {
             operation,
             chat,
+            adapter,
             command,
             cwd,
             identity,
@@ -852,6 +855,7 @@ mod tests {
         let mut record = LaunchRecord::opening(
             Uuid::new_v4(),
             chat,
+            TickAdapter::Terminal,
             vec!["/usr/bin/true".into()],
             "/".into(),
             Some("counter".into()),

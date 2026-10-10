@@ -9,7 +9,7 @@ use std::{collections::BTreeSet, sync::Arc};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tick_protocol::{HERDR_INSTANCE_TYPE, HOSTED_INSTANCE_TYPE};
-use tickhost_connect::page::MAX_PAGE_SIZE;
+use tickhost_connect::{hosted::ATTACH_INPUT_BYTES, page::MAX_PAGE_SIZE};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -99,17 +99,22 @@ impl TickBackends {
             MODIFY_TICK => match input["action"].as_str() {
                 Some("open") => match input["placement"]["type"].as_str() {
                     None | Some(HIDDEN_PLACEMENT) => TickBackend::Hosted,
-                    Some(_) => TickBackend::Herdr,
-                },
-                Some(action @ ("move" | "send_input")) => match self.target(name, input)? {
-                    TickBackend::Herdr => TickBackend::Herdr,
-                    TickBackend::Hosted => {
+                    Some(_) if input.get("protocol").is_some() => {
                         return Err(format!(
-                            "UnsupportedCapability: {action} applies to a Herdr Pane and a hosted Tick has none; use CallTickTool for the tools it declares"
+                            "UnsupportedCapability: protocol applies to a Tick opened in the Tickhost; omit placement or pass {{\"type\":\"{HIDDEN_PLACEMENT}\"}}"
                         ));
                     }
+                    Some(_) => TickBackend::Herdr,
                 },
-                Some("close") => self.target(name, input)?,
+                Some("move") => match self.target(name, input)? {
+                    TickBackend::Herdr => TickBackend::Herdr,
+                    TickBackend::Hosted => {
+                        return Err(
+                            "UnsupportedCapability: move applies to a Herdr Pane and a hosted Tick has none".into(),
+                        );
+                    }
+                },
+                Some("send_input" | "close") => self.target(name, input)?,
                 Some("reopen") => match self.target(name, input)? {
                     TickBackend::Hosted => TickBackend::Hosted,
                     TickBackend::Herdr => {
@@ -193,7 +198,12 @@ impl TickBackends {
         definitions.push(ToolDefinition {
             name: READ_TICK.into(),
             description: format!(
-                "Read a Tick using {identity}. Protocol Ticks return their state (seq, at, and data, which is null until the Tick has content) and their declared tool catalog.{} Reading never subscribes. For artifacts use ArtifactRead; for Shell tasks use Read on Bash's output_file.",
+                "Read a Tick using {identity}. Protocol Ticks return their state (seq, at, and data, which is null until the Tick has content) and their declared tool catalog.{}{} Reading never subscribes. For artifacts use ArtifactRead; for Shell tasks use Read on Bash's output_file.",
+                if self.hosted {
+                    " Terminal Ticks in the Tickhost return their screen as plain text (data.text, at most 200 lines and 64 KiB) and data.exit, null while the program runs and its exit code or signal once it ended."
+                } else {
+                    ""
+                },
                 if self.herdr {
                     " Ordinary Herdr Pane programs return at most 200 recent plain-text lines and 64 KiB; workspace_id applies to herdr: instances."
                 } else {
@@ -216,9 +226,13 @@ impl TickBackends {
     }
 
     fn modify_description(self) -> String {
+        let hosted_input = format!(
+            "send_input types text, then logical keys ({}), into a hosted terminal Tick, at most {ATTACH_INPUT_BYTES} bytes; a protocol Tick is operated with CallTickTool.",
+            crate::hosted::terminal_input::KEY_NAMES
+        );
         let mut parts = Vec::new();
         if self.hosted {
-            parts.push("open runs a protocol Tick hidden in the Tickhost when placement is omitted or {\"type\":\"hidden\"}: it keeps running without any View or layout, joins this Chat's Monitor, and is not subscribed.");
+            parts.push("open runs the program hidden in the Tickhost when placement is omitted or {\"type\":\"hidden\"}: it keeps running without any View or layout, joins this Chat's Monitor, and is not subscribed. Pass protocol: true for a program that speaks the Tick protocol; the bundled tick always does. Any other program runs as a terminal Tick: ReadTick returns its screen text and how it exited, and send_input types into it.");
         }
         if self.herdr {
             parts.push(if self.hosted {
@@ -227,6 +241,9 @@ impl TickBackends {
                 "open needs an explicit placement and opens a visible Herdr Pane, since this Agent has no Tickhost for hidden Ticks: current_tab places relative to the View captured for this input, which must still be valid; pane places relative to the named Pane in the selected Workspace; new_tab opens a new Tab."
             });
             parts.push("Explicit Pane targets and new_tab work without an Agent View. Direction accepts left, right, up, or down and defaults to right. Placement is frozen before approval and never follows UI focus. move keeps a herdr: instance and its subscriptions and defaults to current_tab; for an explicit relative direction, invoke move even when the Tick is already in the target Tab. send_input types into a herdr: Pane and is checked before sending, without an atomic identity/send guarantee.");
+        }
+        if self.hosted {
+            parts.push(&hosted_input);
         }
         parts.push(match (self.herdr, self.hosted) {
             (true, true) => "close ends the Tick's process: a hosted: Tick in the Tickhost, or the herdr: Pane in Herdr.",
@@ -252,6 +269,9 @@ impl TickBackends {
         if self.herdr {
             open["properties"]["workspace_id"] = json!({"type":"string","minLength":1});
         }
+        if self.hosted {
+            open["properties"]["protocol"] = json!({"type":"boolean"});
+        }
         if !self.hosted {
             open["required"] = json!(["action", "command", "placement"]);
         }
@@ -260,7 +280,7 @@ impl TickBackends {
             variants.push(json!({"type":"object","properties":{"action":{"const":"move"},"tick_instance_id":{"type":"string","minLength":1},"workspace_id":{"type":"string","minLength":1},"placement":{"type":"object","oneOf":herdr_placements(false)}},"required":["action","tick_instance_id"],"additionalProperties":false}));
             variants.push(json!({"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":1},"workspace_id":{"type":"string","minLength":1},"action":{"type":"string","enum":["send_input","close"]},"text":{"type":"string"},"keys":{"type":"array","minItems":1,"items":{"type":"string"}}},"required":["tick_instance_id","action"],"additionalProperties":false}));
         } else {
-            variants.push(json!({"type":"object","properties":{"action":{"const":"close"},"tick_instance_id":{"type":"string","minLength":1}},"required":["action","tick_instance_id"],"additionalProperties":false}));
+            variants.push(json!({"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":1},"action":{"type":"string","enum":["send_input","close"]},"text":{"type":"string"},"keys":{"type":"array","minItems":1,"items":{"type":"string"}}},"required":["tick_instance_id","action"],"additionalProperties":false}));
         }
         if self.hosted {
             variants.push(json!({"type":"object","properties":{"action":{"const":"reopen"},"tick_instance_id":{"type":"string","minLength":1}},"required":["action","tick_instance_id"],"additionalProperties":false}));

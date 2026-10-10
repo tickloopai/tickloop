@@ -154,7 +154,17 @@ async fn each_tick_tool_runs_under_the_authority_of_the_backend_its_target_names
         (
             "ModifyTick",
             json!({"action":"send_input","tick_instance_id":hosted,"text":"q"}),
-            &herdr_only,
+            &host_authority,
+        ),
+        (
+            "ModifyTick",
+            json!({"action":"open","command":["python3","counter.py"],"protocol":true}),
+            &host_authority,
+        ),
+        (
+            "ModifyTick",
+            json!({"action":"open","command":["python3","counter.py"],"protocol":true,"placement":{"type":"new_tab"}}),
+            &Err("Tickhost"),
         ),
         (
             "ModifyTick",
@@ -379,19 +389,30 @@ fn tick_tool_schemas_make_a_hidden_open_the_default() {
     let open = variant(tool(&hosted, "ModifyTick"), "open").unwrap();
     assert_eq!(open["required"], json!(["action", "command"]));
     assert_eq!(placement_types(open), strings(&["hidden"]));
-    for action in ["move", "send_input"] {
+    assert_eq!(open["properties"]["protocol"], json!({"type":"boolean"}));
+    assert!(variant(tool(&hosted, "ModifyTick"), "move").is_none());
+    for action in ["send_input", "close", "reopen"] {
         assert!(
-            variant(tool(&hosted, "ModifyTick"), action).is_none(),
+            variant(tool(&hosted, "ModifyTick"), action).is_some(),
             "{action}"
         );
     }
-    assert!(variant(tool(&hosted, "ModifyTick"), "reopen").is_some());
+    let read = hosted.iter().find(|tool| tool.name == "ReadTick").unwrap();
+    assert!(
+        read.description.contains("Terminal Ticks"),
+        "{}",
+        read.description
+    );
     assert_eq!(hosted, backends.hosted.definitions());
 
     let herdr = TickToolRouter::new(Some(backends.native.clone()), None).definitions();
     assert!(herdr.iter().any(|tool| tool.name == "ReadWorkspace"));
     let open = variant(tool(&herdr, "ModifyTick"), "open").unwrap();
     assert_eq!(open["required"], json!(["action", "command", "placement"]));
+    assert!(
+        open["properties"].get("protocol").is_none(),
+        "only a Tickhost runs protocol programs it is told about"
+    );
     assert_eq!(
         placement_types(open),
         strings(&["current_tab", "pane", "new_tab"])

@@ -234,6 +234,13 @@ pub trait TickStreamPort: Send + Sync + 'static {
     ) -> Result<Option<TickObservation>, String> {
         Ok(None)
     }
+    /// A Terminal Tick's screen, read for `watch` of `instance` because its subscription's
+    /// period elapsed: the observation when its text, or whether its program exited, differs
+    /// from what this watch last got. `None` when nothing changed, and for the Ticks whose
+    /// updates the stream pushes.
+    async fn sample(&self, _watch: WatchId, _instance: &InstanceRef) -> Option<TickObservation> {
+        None
+    }
 }
 
 /// What a protocol Tick that declares no recovery query tells the Agent instead.
@@ -452,6 +459,8 @@ struct InMemoryState {
     desired: Option<watch::Receiver<BTreeMap<WatchId, InstanceRef>>>,
     events: Option<EventPublisher>,
     auto_ready: bool,
+    /// What the next sample of a watch of each instance finds changed.
+    samples: BTreeMap<InstanceRef, TickObservation>,
 }
 
 impl InMemoryTickStream {
@@ -494,6 +503,11 @@ impl InMemoryTickStream {
         self.emit(TickStreamEvent::Observation { audience, value });
     }
 
+    /// Makes the next sample of a watch of `value`'s instance find `value` changed.
+    pub fn change_on_next_sample(&self, value: TickObservation) {
+        self.state().samples.insert(value.instance.clone(), value);
+    }
+
     pub fn emit(&self, event: TickStreamEvent) {
         if let Some(events) = &self.state().events {
             match event {
@@ -524,6 +538,12 @@ impl InMemoryTickStream {
 #[async_trait::async_trait]
 impl TickStreamPort for InMemoryTickStream {
     fn set_watch_authorities(&self, _authorities: BTreeMap<WatchId, HostToolAuthority>) {}
+    async fn sample(&self, watch: WatchId, instance: &InstanceRef) -> Option<TickObservation> {
+        if self.watches().get(&watch) != Some(instance) {
+            return None;
+        }
+        self.state().samples.remove(instance)
+    }
     async fn revalidate_watch(
         &self,
         _chat: Uuid,

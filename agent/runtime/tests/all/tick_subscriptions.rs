@@ -385,6 +385,73 @@ async fn a_period_without_updates_costs_no_model_call() {
     agent.shutdown().await;
 }
 
+/// What a sample of a Terminal Tick's screen finds when it changed.
+fn screen(instance: u64, sequence: u64, text: &str, exit: serde_json::Value) -> TickObservation {
+    TickObservation {
+        instance: fixture_instance(instance),
+        sequence,
+        observed_at: "2026-10-13T03:15:00Z".into(),
+        dropped: 0,
+        data: json!({"text": text, "exit": exit}),
+        kind: ObservationKind::Terminal { truncated: false },
+        recover_with: None,
+        gap: false,
+    }
+}
+
+/// A Terminal Tick pushes nothing: its subscription samples the screen once each period, a
+/// screen that changed wakes the Loop once, one that did not wakes nothing, and the program's
+/// exit is delivered.
+#[tokio::test(start_paused = true)]
+async fn a_terminal_subscription_samples_the_screen_once_each_period() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(9)}),
+        ),
+        text("watching the terminal"),
+        text("the prompt is back"),
+        text("the program exited"),
+    ]));
+    let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
+    let mut events = agent.subscribe();
+
+    stream.change_on_next_sample(screen(9, 4, "$ ready", serde_json::Value::Null));
+    settle().await;
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        2,
+        "nothing is delivered before the period elapses"
+    );
+    tokio::time::advance(HIGH_PERIOD).await;
+    wait_for_completion(&mut events).await;
+    assert_eq!(model.requests.lock().unwrap().len(), 3);
+    let delivered = last_user_text(&model);
+    assert!(delivered.contains("$ ready"), "{delivered}");
+
+    tokio::time::advance(HIGH_PERIOD).await;
+    settle().await;
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        3,
+        "an unchanged screen wakes nothing"
+    );
+
+    stream.change_on_next_sample(screen(9, 7, "$ ready", json!({"code":0,"signal":null})));
+    tokio::time::advance(HIGH_PERIOD).await;
+    wait_for_completion(&mut events).await;
+    assert_eq!(model.requests.lock().unwrap().len(), 4);
+    let delivered = last_user_text(&model);
+    assert!(delivered.contains("\"code\":0"), "{delivered}");
+    assert_eq!(
+        agent.tick_subscriptions(chat).await.unwrap()[0].kind,
+        Some(ObservationKind::Terminal { truncated: false })
+    );
+    agent.shutdown().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn an_update_for_an_instance_nobody_subscribed_to_never_reaches_a_loop() {
     let directory = tempfile::tempdir().unwrap();
