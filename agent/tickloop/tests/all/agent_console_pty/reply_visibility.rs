@@ -176,15 +176,14 @@ async fn queued_batch(fixture: &PrivateFixture) {
         .unwrap()
         .unwrap();
     assert!(review.get("response_format").is_some());
+    // As in Claude Code, the question shows no row of its own; only the Bash waits as a row.
     let pending = view
-        .wait_for("both proposed calls visible before approval", |frame| {
+        .wait_for("the proposed Bash visible before approval", |frame| {
             let body = conversation_body(frame);
-            body.contains(REPLY)
-                && body.contains("Bash")
-                && body.contains(QUESTION)
-                && body.matches("Queued").count() == 2
+            body.contains(REPLY) && body.contains("Bash") && body.matches("Queued").count() == 1
         })
         .await;
+    assert!(!conversation_body(&pending).contains(QUESTION), "{pending}");
     assert!(!pending.contains("esc cancel"));
     assert!(!fixture.path("work/admission-marker").exists());
     let mut attached = PtyView::start(fixture);
@@ -200,38 +199,37 @@ async fn queued_batch(fixture: &PrivateFixture) {
     select_overview_row(&mut attached, BATCH_PROMPT).await;
     attached.send(b"\r");
     attached
-        .wait_for("attached View projects the same queued calls", |frame| {
+        .wait_for("attached View projects the same queued call", |frame| {
             !frame.contains("Agents · local")
                 && conversation_body(frame).contains(REPLY)
-                && frame.contains(QUESTION)
-                && frame.matches("Queued").count() == 2
+                && conversation_body(frame).matches("Queued").count() == 1
         })
         .await;
     view.send(b"\x0f");
-    view.wait_for("batch Transcript has reply and question", |frame| {
+    view.wait_for("batch Transcript has the reply and the Bash", |frame| {
         frame.contains("Showing detailed transcript")
             && frame.contains(REPLY)
-            && frame.contains(QUESTION)
+            && frame.contains("Bash")
+            && !frame.contains(QUESTION)
     })
     .await;
     view.send(b"\x0f");
     view.wait_for("batch main survives Transcript", |frame| {
-        !frame.contains("Showing detailed transcript") && frame.matches("Queued").count() == 2
+        !frame.contains("Showing detailed transcript") && frame.matches("Queued").count() == 1
     })
     .await;
     release.send(()).unwrap();
     let running = view
         .wait_for("admitted Bash replaces its queued row", |frame| {
-            frame.contains("Bash")
-                && frame.contains(QUESTION)
-                && conversation_body(frame).matches("Queued").count() == 1
+            let body = conversation_body(frame);
+            body.contains("Bash") && !body.contains("Queued")
         })
         .await;
     assert_eq!(conversation_body(&running).matches("Bash").count(), 1);
     assert!(!running.contains("esc cancel"));
     attached
         .wait_for("attached queued row also updates once", |frame| {
-            conversation_body(frame).matches("Queued").count() == 1
+            !conversation_body(frame).contains("Queued")
                 && conversation_body(frame).matches("Bash").count() == 1
         })
         .await;
@@ -261,7 +259,17 @@ async fn queued_batch(fixture: &PrivateFixture) {
     assert_eq!(tool_header_count(&finished, "Bash"), 1, "{finished}");
     assert_eq!(
         tool_header_count(&finished, "AskUserQuestion"),
-        1,
+        0,
+        "{finished}"
+    );
+    assert!(
+        body_shows_once_in_order(
+            &finished,
+            &[
+                "⏺ User answered the Agent's questions:",
+                &format!("⎿  · {QUESTION} → One")
+            ]
+        ),
         "{finished}"
     );
     assert!(!conversation_body(&finished).contains("Queued"));
@@ -647,8 +655,9 @@ async fn interrupted_batch_has_the_same_state_on_attach(fixture: &PrivateFixture
         .unwrap()
         .unwrap();
     assert!(review.get("response_format").is_some());
-    view.wait_for("both calls await admission", |frame| {
-        conversation_body(frame).matches("Queued").count() == 2
+    // The question shows no row of its own, so only the Bash awaits admission as a row.
+    view.wait_for("the Bash awaits admission", |frame| {
+        conversation_body(frame).matches("Queued").count() == 1
     })
     .await;
     let client = fixture.client().await;
@@ -665,8 +674,8 @@ async fn interrupted_batch_has_the_same_state_on_attach(fixture: &PrivateFixture
         .await
         .unwrap();
     let original = view
-        .wait_for("original View marks unadmitted calls Stopped", |frame| {
-            conversation_body(frame).matches("Stopped").count() == 2
+        .wait_for("original View marks the unadmitted Bash Stopped", |frame| {
+            conversation_body(frame).matches("Stopped").count() == 1
         })
         .await;
     assert!(!fixture.path("work/admission-marker").exists());
@@ -684,14 +693,17 @@ async fn interrupted_batch_has_the_same_state_on_attach(fixture: &PrivateFixture
     select_overview_row(&mut attached, BATCH_PROMPT).await;
     attached.send(b"\r");
     let restored = attached
-        .wait_for("attached interrupted proposals remain Stopped", |frame| {
+        .wait_for("attached interrupted Bash remains Stopped", |frame| {
             !frame.contains("Agents · local")
-                && conversation_body(frame).matches("Stopped").count() == 2
+                && conversation_body(frame).matches("Stopped").count() == 1
         })
         .await;
     assert!(original.contains(REPLY) && restored.contains(REPLY));
     assert_eq!(tool_header_count(&restored, "Bash"), 1);
-    assert_eq!(tool_header_count(&restored, "AskUserQuestion"), 1);
+    for frame in [&original, &restored] {
+        assert_eq!(tool_header_count(frame, "AskUserQuestion"), 0, "{frame}");
+        assert!(!conversation_body(frame).contains(QUESTION), "{frame}");
+    }
     eprintln!("[interrupted live]\n{original}\n[interrupted attached]\n{restored}");
     attached.close().await;
     view.close().await;
@@ -857,14 +869,18 @@ async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture, res
                     && conversation_body(frame)
                         .lines()
                         .any(|line| line.contains(CALL) && line.contains("Stopped"))
-                    && conversation_body(frame)
-                        .lines()
-                        .any(|line| line.contains(QUEUED_QUESTION) && line.contains("Stopped"))
             },
         )
         .await;
     assert_eq!(tool_header_count(&restored, "Bash"), 1);
-    assert_eq!(tool_header_count(&restored, "AskUserQuestion"), 1);
+    // The interrupted question shows no row, as in the live View.
+    for frame in [&original, &restored] {
+        assert_eq!(tool_header_count(frame, "AskUserQuestion"), 0, "{frame}");
+        assert!(
+            !conversation_body(frame).contains(QUEUED_QUESTION),
+            "{frame}"
+        );
+    }
     eprintln!("[retention live]\n{original}\n[retention attached]\n{restored}");
     attached.close().await;
     view.close().await;
@@ -894,16 +910,14 @@ async fn interrupted_state_survives_event_eviction(fixture: &PrivateFixture, res
         resumed.resize(120, 60).await;
         let restarted = resumed
             .wait_for("resumed interrupted batch remains Stopped", |frame| {
-                let body = conversation_body(frame);
-                body.lines()
+                conversation_body(frame)
+                    .lines()
                     .any(|line| line.contains(CALL) && line.contains("Stopped"))
-                    && body
-                        .lines()
-                        .any(|line| line.contains(QUEUED_QUESTION) && line.contains("Stopped"))
             })
             .await;
         assert_eq!(tool_header_count(&restarted, "Bash"), 1);
-        assert_eq!(tool_header_count(&restarted, "AskUserQuestion"), 1);
+        assert_eq!(tool_header_count(&restarted, "AskUserQuestion"), 0);
+        assert!(!conversation_body(&restarted).contains(QUEUED_QUESTION));
         assert!(!marker.exists());
         assert!(
             tokio::time::timeout(Duration::from_millis(250), requests.recv())

@@ -587,6 +587,9 @@ pub(super) struct State {
     /// asked for meanwhile is drawn when the last hold ends.
     held_frames: usize,
     frame_deferred: bool,
+    /// Frames painted, so a test can count what one refresh costs.
+    #[cfg(test)]
+    frames_drawn: usize,
     selection: Option<Selection>,
     pub(super) display: DisplayProfile,
     colour_depth: ColourDepth,
@@ -1316,12 +1319,42 @@ impl Console {
 
     pub(super) fn update_monitor_chat(
         &self,
-        snapshot: &tickloop_agent_protocol::ChatSnapshot,
+        snapshot: impl Into<Arc<tickloop_agent_protocol::ChatSnapshot>>,
     ) -> Result<(), String> {
+        let snapshot = snapshot.into();
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state
             .monitor_for_chat_mut(snapshot.id)
-            .set_chat_snapshot(snapshot.clone());
+            .set_chat_snapshot(snapshot);
+        Ok(())
+    }
+    /// Applies the Chat's Shell tasks and subscriptions, read again on Monitor's own cadence.
+    pub(super) fn refresh_monitor_ticks(
+        &self,
+        shells: tickloop_agent_protocol::ShellTaskSnapshot,
+        subscriptions: Option<Vec<TickSubscriptionStatus>>,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let chat = shells.chat_id;
+        state
+            .monitor_for_chat_mut(chat)
+            .refresh_ticks(shells, subscriptions);
+        if state.chat != Some(chat) || !state.monitor_visible() {
+            return Ok(());
+        }
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+    /// Applies what one status refresh read for the Chat's Monitor in a single rebuild.
+    pub(super) fn refresh_monitor(
+        &self,
+        sources: super::monitor::MonitorSources,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state
+            .monitor_for_chat_mut(sources.chat.id)
+            .refresh_sources(sources);
         Ok(())
     }
     pub(super) fn update_artifact_metadata(
@@ -1563,16 +1596,6 @@ impl Console {
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
     }
-    /// Records when the Chat's running Shells started; their Monitor rows count from it.
-    pub(super) fn set_shell_starts(
-        &self,
-        chat: Uuid,
-        starts: HashMap<Uuid, u64>,
-    ) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        state.monitor_for_chat_mut(chat).shell_starts = starts;
-        Ok(())
-    }
     pub(super) fn open_monitor(&self) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.monitor.overlay = state.monitor.total() > 0 && state.monitor_side_columns().is_none();
@@ -1580,16 +1603,6 @@ impl Console {
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
-    }
-    pub(super) fn update_shell_ticks(
-        &self,
-        snapshot: &tickloop_agent_protocol::ShellTaskSnapshot,
-    ) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let monitor = state.monitor_for_chat_mut(snapshot.chat_id);
-        monitor.shell_snapshot = Some(snapshot.clone());
-        monitor.rebuild();
-        Ok(())
     }
 
     pub(super) fn poll_tick_detail(
@@ -2026,6 +2039,7 @@ impl Console {
             let count = state.request_queue_count;
             state.suspend_dialog();
             state.request_queue_count = count;
+            state.yield_focus_to_request();
         }
         state.request_layout = request;
         if request.is_none() {
@@ -4508,11 +4522,12 @@ impl Drop for Lifetime {
 pub(super) enum ConversationPiece {
     /// Starts a block one blank row below the visible content above it.
     Block,
-    /// A block that leaves an open read or search group open, such as a thinking label.
-    Aside(String, Option<Role>),
     Styled(String, Option<Role>),
     /// `⎿` response rows at the end of the conversation, each wrapping under its content.
     Response(Vec<(String, Option<Role>)>),
+    /// A block's body rows indented under its heading with no connector, as Claude Code draws
+    /// a teammate's notification or message, each wrapping under its indent.
+    Body(Vec<(String, Option<Role>)>),
     Input {
         text: String,
         spans: Vec<RoleSpan>,
@@ -4571,7 +4586,6 @@ impl ConversationPiece {
     fn append_to(&self, scrollback: &mut Scrollback, display: DisplayProfile) {
         match self {
             Self::Block => scrollback.start_block(),
-            Self::Aside(text, role) => scrollback.append_aside(text, *role),
             Self::ToolCall {
                 run_id,
                 call_key,
@@ -4582,6 +4596,7 @@ impl ConversationPiece {
             } => scrollback.set_tool_call(*run_id, call_key, spans, *state, collapse.clone()),
             Self::ToolResult { call_key, runs } => scrollback.append_tool_result(call_key, runs),
             Self::Response(runs) => scrollback.append_response(runs),
+            Self::Body(runs) => scrollback.append_body(runs),
             Self::Styled(text, role) if *role == Some(Role::Error) => {
                 let links = hyperlink::web_links(text);
                 for (run, link) in hyperlink::runs(text, &links) {
@@ -4613,12 +4628,11 @@ impl ConversationPiece {
     pub(super) fn text(&self) -> std::borrow::Cow<'_, str> {
         match self {
             Self::Block => "\n".into(),
-            Self::Aside(text, _) => format!("\n{text}").into(),
             Self::Styled(text, _)
             | Self::Input { text, .. }
             | Self::Markdown { text, .. }
             | Self::ToolCall { text, .. } => text.as_str().into(),
-            Self::Response(runs) | Self::ToolResult { runs, .. } => {
+            Self::Response(runs) | Self::Body(runs) | Self::ToolResult { runs, .. } => {
                 runs.iter().map(|(text, _)| text.as_str()).collect()
             }
         }
@@ -5106,6 +5120,8 @@ impl State {
             rendered_rows: Vec::new(),
             held_frames: 0,
             frame_deferred: false,
+            #[cfg(test)]
+            frames_drawn: 0,
             selection: None,
             display: DisplayProfile::new(preferences),
             colour_depth: ColourDepth::detect(
@@ -5773,6 +5789,10 @@ impl State {
     }
 
     fn draw_frame(&mut self, output: &mut impl Write) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            self.frames_drawn += 1;
+        }
         self.monitor_row_targets.clear();
         self.monitor_separator = None;
         self.row_clock_at =
@@ -8491,6 +8511,19 @@ impl State {
         self.footer.clear();
     }
 
+    /// Takes the keys from Monitor, the Subagents list and the conversation for an Agent request,
+    /// so its dialog closes back to the input, as Claude Code's prompt takes the keys back after a
+    /// permission, question or plan dialog.
+    fn yield_focus_to_request(&mut self) {
+        if self.monitor.focused || self.monitor.overlay {
+            self.monitor.focused = false;
+            self.monitor.overlay = false;
+            self.rendered_region = None;
+        }
+        self.clear_footer_selection();
+        self.conversation_focused = false;
+    }
+
     fn clear_footer_selection_if_hidden(&mut self) {
         if !self.help_open && !self.footer_can_own_focus() {
             self.clear_footer_selection();
@@ -8711,6 +8744,12 @@ impl State {
             }
             _ => None,
         }
+    }
+
+    /// The open menu when it is the Agent's permission, question or plan request.
+    fn agent_request_menu(&self) -> Option<Uuid> {
+        let menu = self.menu.as_ref()?;
+        (self.question_menu.is_some() || self.request_menu == Some(menu.id)).then_some(menu.id)
     }
 
     fn selected_menu_accepts_comment(&self) -> bool {
@@ -10157,6 +10196,18 @@ impl State {
             self.history_search_key(key);
             return None;
         }
+        // Claude Code's `PermissionRequest` binds Ctrl+C in its permission, plan and question
+        // dialogs to the same rejection as Esc, also from a comment field or the diff.
+        if (self.menu_focused || self.review_focused)
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('c')
+            && let Some(menu_id) = self.agent_request_menu()
+        {
+            self.escape_confirmation = None;
+            self.exit_confirmation = None;
+            self.begin_menu_submission(menu_id);
+            return Some(InputEvent::Cancel { menu_id });
+        }
         if self.review_focused {
             let action = match (key.code, key.modifiers) {
                 (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
@@ -10186,17 +10237,6 @@ impl State {
             && matches!(key.code, KeyCode::Char('c' | 'd')))
         {
             self.exit_confirmation = None;
-        }
-        // Claude Code binds Ctrl+C in its question dialog to the same cancel as Esc, also from the
-        // Other field.
-        if self.menu_focused
-            && self.question_menu.is_some()
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && key.code == KeyCode::Char('c')
-            && let Some(menu_id) = self.menu.as_ref().map(|menu| menu.id)
-        {
-            self.begin_menu_submission(menu_id);
-            return Some(InputEvent::Cancel { menu_id });
         }
         if (self.menu_focused || self.review_focused)
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -14492,6 +14532,61 @@ mod tests {
     }
 
     #[test]
+    fn control_c_rejects_an_agent_request_as_escape_and_keeps_its_meaning_elsewhere() {
+        let control_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        for plan in [false, true] {
+            let mut state = State::new(true, 80, 24);
+            state.prompt_enabled = true;
+            state.insert("kept draft");
+            let console = console_with_state(state);
+            let request = menu();
+            let id = request.id;
+            console.set_request_layout(Some(id)).unwrap();
+            if plan {
+                console.show_plan_menu(request, true).unwrap();
+            } else {
+                console.show_commentable_menu(request, vec![0, 2]).unwrap();
+            }
+            let mut state = console.state.lock().unwrap();
+            state.exit_confirmation = Some(ExitConfirmation {
+                control: 'C',
+                requested_at: Instant::now(),
+            });
+            if !plan {
+                state.key(key(KeyCode::Tab));
+                assert!(state.menu_comment_is_editing());
+            }
+            assert!(
+                matches!(state.key(control_c), Some(InputEvent::Cancel { menu_id }) if menu_id == id),
+                "plan: {plan}"
+            );
+            assert_eq!(
+                state.pending_exit_control(),
+                None,
+                "rejecting a request does not count toward quitting"
+            );
+            state.mark_menu_submission_finished(id);
+            state.release_finished_submissions();
+            assert!(state.menu.is_none());
+
+            // Outside the dialog Ctrl+C still clears the draft first, then interrupts.
+            assert!(state.key(control_c).is_none());
+            assert!(state.editor.draft().is_empty());
+            assert!(matches!(state.key(control_c), Some(InputEvent::Interrupt)));
+        }
+
+        let mut state = State::new(true, 80, 24);
+        state.prompt_enabled = true;
+        state.menu = Some(menu());
+        state.menu_focused = true;
+        assert!(
+            state.key(control_c).is_none(),
+            "a menu the user opened keeps ignoring Ctrl+C"
+        );
+        assert!(state.menu.is_some());
+    }
+
+    #[test]
     fn permission_dialog_captures_focus_and_preserves_an_existing_input_draft() {
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
@@ -17714,7 +17809,9 @@ mod tests {
         for task in &mut snapshot.tasks {
             task.was_background = true;
         }
-        console.update_shell_ticks(&snapshot).unwrap();
+        console
+            .refresh_monitor_ticks(snapshot.clone(), None)
+            .unwrap();
         let task = snapshot.tasks[4].id;
         let panel = {
             let mut state = console.state.lock().unwrap();
@@ -17805,7 +17902,9 @@ mod tests {
             let console = console_with_state(state);
             let mut snapshot = task_snapshot(chat, 1);
             snapshot.tasks[0].was_background = true;
-            console.update_shell_ticks(&snapshot).unwrap();
+            console
+                .refresh_monitor_ticks(snapshot.clone(), None)
+                .unwrap();
             let mut state = console.state.lock().unwrap();
             assert!(matches!(
                 state.key(KeyEvent::new(direction, KeyModifiers::SHIFT)),
@@ -17875,7 +17974,9 @@ mod tests {
         let console = console_with_state(state);
         let mut snapshot = task_snapshot(chat, 1);
         snapshot.tasks[0].was_background = true;
-        console.update_shell_ticks(&snapshot).unwrap();
+        console
+            .refresh_monitor_ticks(snapshot.clone(), None)
+            .unwrap();
         let mut state = console.state.lock().unwrap();
         state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
         assert!(state.key(key(KeyCode::Char('j'))).is_none());

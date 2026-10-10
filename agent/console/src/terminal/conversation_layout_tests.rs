@@ -12,8 +12,9 @@ use std::{
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
     Content, Decision, ExecutionRef, LocalMessage, ModelIdentity, ModelProvider, PermissionRule,
-    PermissionScope, Protocol, Usage,
+    PermissionScope, Protocol, QuestionAnswer, Usage,
 };
+use tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -292,8 +293,6 @@ async fn followed_and_reopened_conversations_share_one_claude_code_layout() {
             "",
             "❯ Audit the build",
             "",
-            "∴ Thinking (ctrl+o to expand)",
-            "",
             "⏺ I checked the build setup.",
             "",
             "  - First item",
@@ -345,6 +344,108 @@ async fn followed_and_reopened_conversations_share_one_claude_code_layout() {
             "Ctrl+O shows each collapsed call: {transcript}"
         );
     }
+    agent.shutdown().await;
+}
+
+/// AskUserQuestion as Claude Code draws it: no call row, the answers under one heading, and a
+/// decline as one line that stands for the run's interruption; the same rows whether a View
+/// follows the run, reopens it or shows its Ctrl+O transcript.
+#[tokio::test]
+async fn questions_show_only_their_answers_or_decline_alike() {
+    let directory = tempfile::tempdir().unwrap();
+    let call = tickloop_agent_test_support::call;
+    let option = |label: &str| serde_json::json!({"label": label, "description": label});
+    let model = tickloop_agent_test_support::ScriptedModel::new(vec![
+        call(
+            "report",
+            ASK_USER_QUESTION_TOOL_NAME,
+            serde_json::json!({"questions": [
+                {"question": "Which report?", "header": "Report",
+                 "options": [option("Weekly"), option("Monthly")]},
+                {"question": "Which sections?", "header": "Sections", "multiSelect": true,
+                 "options": [option("Summary"), option("Risks"), option("Charts")]}
+            ]}),
+        ),
+        call(
+            "scope",
+            ASK_USER_QUESTION_TOOL_NAME,
+            serde_json::json!({"questions": [
+                {"question": "Which scope?", "header": "Scope",
+                 "options": [option("Narrow"), option("Wide")]}
+            ]}),
+        ),
+    ]);
+    let agent = Agent::new_embedded(tickloop_agent_test_support::config(), Arc::new(model));
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Shorten the report".into())
+        .await
+        .unwrap();
+    let mut answered = false;
+    loop {
+        match tickloop_agent_test_support::next_event(&mut events)
+            .await
+            .kind
+        {
+            EventKind::QuestionAsked { request } if !answered => {
+                answered = true;
+                agent
+                    .answer_question(
+                        chat,
+                        request.id,
+                        vec![
+                            QuestionAnswer::option("Weekly"),
+                            QuestionAnswer {
+                                options: vec!["Summary".into(), "Charts".into()],
+                                other: None,
+                            },
+                        ],
+                    )
+                    .await
+                    .unwrap();
+            }
+            EventKind::QuestionAsked { request } => {
+                agent.decline_question(chat, request.id).await.unwrap();
+            }
+            EventKind::Completed { .. } | EventKind::Interrupted => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let snapshot = agent.snapshot(chat).await.unwrap();
+
+    let followed = followed(chat, directory.path(), &snapshot);
+    assert_eq!(
+        followed,
+        reopened(chat, &snapshot),
+        "a followed run and its reopened history draw the same rows"
+    );
+    let rows = [
+        "⏺ User answered the Agent's questions:",
+        "  ⎿  · Which report? → Weekly",
+        "     · Which sections? → Summary, Charts",
+        "",
+        "⏺ User declined to answer questions",
+    ]
+    .join("\n");
+    assert_eq!(
+        followed,
+        format!("\n❯ Shorten the report\n\n{rows}\n"),
+        "no call row and no separate interruption line"
+    );
+    let transcript = presentation::transcript_document(
+        &snapshot,
+        DisplayProfile::default(),
+        &Default::default(),
+        &Default::default(),
+    )
+    .plain_text(120);
+    assert!(transcript.contains(&rows), "{transcript}");
+    assert!(
+        !transcript.contains(ASK_USER_QUESTION_TOOL_NAME),
+        "{transcript}"
+    );
     agent.shutdown().await;
 }
 
@@ -600,16 +701,16 @@ async fn followed_and_reopened_family_conversations_show_agent_communication_ali
             "     Two keys are unused. (ctrl+o to expand)",
             "",
             "⏺ Subagent(@logs · Scan the logs)",
-            "  ⎿  Started in background",
+            "  ⎿  Backgrounded agent (ctrl+o to expand)",
             "",
             "⏺ Waiting for the logs.",
             "",
-            "✉ @logs  Found 3 errors so far.  (ctrl+o to expand)",
+            "› Message from @logs (ctrl+o to expand)",
             "",
             "⏺ Noted.",
             "",
-            &format!("⏺ @logs finished · {}", elapsed(&snapshot, "logs")),
-            "  ⎿  Scan complete: 3 errors.",
+            &format!("⏺ Teammate @logs finished · {}", elapsed(&snapshot, "logs")),
+            "  Scan complete: 3 errors.",
             "",
             "⏺ The scan is done.",
             "",
@@ -621,7 +722,7 @@ async fn followed_and_reopened_family_conversations_show_agent_communication_ali
     for hidden in [
         "delivered its report",
         "Subagent hand-back",
-        "Message from",
+        "Found 3 errors so far.",
         "Progress",
     ] {
         assert!(!text.contains(hidden), "{hidden}: {text}");
@@ -639,12 +740,27 @@ async fn followed_and_reopened_family_conversations_show_agent_communication_ali
             .flat_map(|row| &row.spans)
             .filter(|span| span.text == "@logs")
             .collect::<Vec<_>>();
-        assert_eq!(handles.len(), 3, "call, message and completion name @logs");
+        assert_eq!(handles.len(), 2, "call and completion name @logs");
         assert!(
             handles
                 .iter()
                 .all(|span| span.role == Some(Role::agent(logs_color))),
             "the handle takes the child's Agent Color"
+        );
+        let message = rows
+            .iter()
+            .find(|row| {
+                row.spans
+                    .iter()
+                    .any(|span| span.text.contains("Message from"))
+            })
+            .unwrap();
+        assert!(
+            message
+                .spans
+                .iter()
+                .all(|span| span.role == Some(Role::MutedText)),
+            "the folded message is one dim line"
         );
         let completion_dot = rows
             .iter()
@@ -663,10 +779,12 @@ async fn followed_and_reopened_family_conversations_show_agent_communication_ali
     for expanded in [
         "⏺ Subagent(@config · Check the config)",
         "One key is deprecated.",
-        "✉ @logs",
-        "Still scanning the archive.",
-        "⏺ @logs finished",
-        BACKGROUND_REPORT,
+        "⏺ Subagent(@logs · Scan the logs)\n  ⎿  Backgrounded agent\n     Prompt:\n       Scan the logs for errors\n",
+        "› Message from @logs\n  Found 3 errors so far.\n  Still scanning the archive.\n",
+        &format!(
+            "⏺ Teammate @logs finished · {}\n  {BACKGROUND_REPORT}\n",
+            elapsed(&snapshot, "logs")
+        ),
     ] {
         assert!(
             transcript.contains(expanded),
@@ -721,13 +839,13 @@ async fn a_background_child_asked_for_no_report_finishes_as_one_block_alike() {
             "❯ Scan in the background",
             "",
             "⏺ Subagent(@scan · Scan quietly in the background)",
-            "  ⎿  Started in background",
+            "  ⎿  Backgrounded agent (ctrl+o to expand)",
             "",
             "⏺ Started.",
             "",
-            &format!("⏺ @scan finished · {}", elapsed(&snapshot, "scan")),
-            "  ⎿  Background done.",
-            "     All clear. (ctrl+o to expand)",
+            &format!("⏺ Teammate @scan finished · {}", elapsed(&snapshot, "scan")),
+            "  Background done.",
+            "  All clear.…",
             "",
             "⏺ Thanks.",
             "",
@@ -735,6 +853,17 @@ async fn a_background_child_asked_for_no_report_finishes_as_one_block_alike() {
             "",
         ]
         .join("\n")
+    );
+    let transcript = presentation::transcript_document(
+        &snapshot,
+        DisplayProfile::default(),
+        &Default::default(),
+        &Default::default(),
+    )
+    .plain_text(120);
+    assert!(
+        transcript.contains("  Background done.\n  All clear.\n  Nothing else.\n"),
+        "Ctrl+O shows the whole report: {transcript}"
     );
     core.shutdown().await;
 }

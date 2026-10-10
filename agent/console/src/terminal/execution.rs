@@ -1286,6 +1286,11 @@ impl ConsoleExecution {
         Ok(())
     }
 
+    /// Whether this View follows `execution`'s feed, so its events arrive as they happen.
+    pub(super) fn follows(&self, execution: ExecutionRef) -> bool {
+        self.inner.watching.lock().unwrap().contains(&execution)
+    }
+
     pub(super) async fn pause_event_delivery(&self) -> EventRecovery {
         EventRecovery {
             covered: self.inner.event_delivery.clone().lock_owned().await,

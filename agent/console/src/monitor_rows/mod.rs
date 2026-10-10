@@ -218,7 +218,8 @@ pub struct TickDescriptor {
 }
 #[derive(Default)]
 pub struct MonitorContext {
-    pub chat: Option<ChatSnapshot>,
+    /// Shared with the View that read it; listing rows never copies the conversation.
+    pub chat: Option<Arc<ChatSnapshot>>,
     pub shells: Option<ShellTaskSnapshot>,
     pub subscriptions: Vec<TickSubscriptionStatus>,
     pub metadata: HashMap<String, Option<ArtifactMetadata>>,

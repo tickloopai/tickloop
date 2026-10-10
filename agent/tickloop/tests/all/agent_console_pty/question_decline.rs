@@ -61,7 +61,13 @@ async fn esc_declines_and_the_next_message_is_a_new_turn(fixture: &PrivateFixtur
     eprintln!("[question-decline-frame]\n{declined}\n[/question-decline-frame]");
     let body = conversation_body(&declined);
     assert_eq!(body.matches(DECLINED).count(), 1, "{body}");
+    assert!(
+        body.lines()
+            .any(|line| line.trim_end() == format!("⏺ {DECLINED}")),
+        "the decline is one line of its own: {body}"
+    );
     for absent in [
+        "AskUserQuestion",
         "question was cancelled",
         "Failed",
         "What should the Agent do instead?",

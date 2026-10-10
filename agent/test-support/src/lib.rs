@@ -42,6 +42,7 @@ pub struct ScriptedModel {
     pub requests: Mutex<Vec<ModelRequest>>,
     replies: Mutex<VecDeque<Vec<Content>>>,
     usages: Mutex<VecDeque<Usage>>,
+    rejections: Mutex<VecDeque<ModelResponseRejection>>,
 }
 
 impl ScriptedModel {
@@ -54,11 +55,18 @@ impl ScriptedModel {
             requests: Mutex::new(Vec::new()),
             replies: Mutex::new(replies.into()),
             usages: Mutex::new(usages.into()),
+            rejections: Mutex::new(VecDeque::new()),
         }
     }
 
     pub fn enqueue(&self, reply: Vec<Content>) {
         self.replies.lock().unwrap().push_back(reply);
+    }
+
+    /// Rejects the next request, which is still recorded, without consuming a scripted reply. The
+    /// error carries the response-header stage, as the HTTP clients report a rejected response.
+    pub fn reject_next(&self, rejection: ModelResponseRejection) {
+        self.rejections.lock().unwrap().push_back(rejection);
     }
 }
 
@@ -90,6 +98,10 @@ impl ModelClient for ScriptedModel {
     ) -> Result<ModelOutput, ModelError> {
         let plan_file = reminded_plan_file(&request);
         self.requests.lock().unwrap().push(request);
+        if let Some(rejection) = self.rejections.lock().unwrap().pop_front() {
+            return Err(ModelError::ResponseRejected(rejection)
+                .at_stage(ModelRequestStage::ResponseHeaders));
+        }
         let mut content = self
             .replies
             .lock()

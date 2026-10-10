@@ -305,13 +305,41 @@ fn both_reviewers_receive_identical_state_and_policy_guidance() {
 }
 
 #[test]
-fn oversized_evidence_is_not_truncated_into_an_allow() {
+fn oversized_evidence_reaches_jev_only_after_a_marked_fit() {
     for evidence_size in [MAX_REVIEW_REQUEST_BYTES, MAX_REVIEW_REQUEST_BYTES * 2] {
         let (snapshot, bookkeeping, operation) = scenario(&"x".repeat(evidence_size), "cargo test");
-        assert!(matches!(
-            review_request(&snapshot, &bookkeeping, &operation),
-            Err(AutoReview::ContextLimit)
-        ));
+        assert!(
+            matches!(
+                review_request(&snapshot, &bookkeeping, &operation),
+                Err(AutoReview::ContextLimit)
+            ),
+            "the local payload guard still rejects an unfitted snapshot"
+        );
+        let complete = crate::approval_context::capture(
+            &snapshot,
+            &bookkeeping,
+            &operation,
+            None,
+            tickloop_agent_config::AutoSettings::default().policy(),
+        )
+        .unwrap();
+        let evidence =
+            crate::approval_context::ReviewEvidence::new(&complete, review_budget_bytes());
+        let request = super::review_request(
+            evidence.snapshot(),
+            tickloop_agent_protocol::ApprovalStage::Authorization,
+        )
+        .unwrap();
+        let input = request.state["original_user_inputs"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(input.starts_with("xxx") && input.ends_with("xxx"));
+        assert!(input.contains("bytes omitted by the host to fit the review context"));
+        assert_eq!(
+            request.state["context_truncation"]["original_user_inputs"]["shortened"],
+            1
+        );
+        assert_eq!(request.state["operation"]["input"]["command"], "cargo test");
     }
 }
 

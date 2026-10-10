@@ -3,6 +3,7 @@ use std::{
     io::IsTerminal,
     os::unix::fs::MetadataExt,
     path::PathBuf,
+    sync::Arc,
 };
 
 use tickhost_connect::{
@@ -1516,6 +1517,14 @@ async fn interact(
     let mut failed = false;
     let mut status_dirty = true;
     let mut activity_dirty = false;
+    // Thinking text arrived since the activity row was last drawn; the next animation frame
+    // shows it, so a fast stream redraws at the frame rate rather than once per delta.
+    let mut thinking_frame_due = false;
+    // Monitor's subscriptions and Shell tasks are due to be read again on its own cadence.
+    let mut monitor_refresh_due = false;
+    let mut turn_snapshot = TurnSnapshot::default();
+    // The catalog's account of each family member whose snapshot this View last applied.
+    let mut applied_member_work: HashMap<uuid::Uuid, MemberWork> = HashMap::new();
     let mut running_activity: Option<RunningActivity> = None;
     // A replayed or restored run has no known start; only a live Started event begins this clock.
     let mut observed_run_starts = HashMap::new();
@@ -1616,6 +1625,7 @@ async fn interact(
         if logout.is_none()
             && let Some(succeeded) = menus.take_provider_login_result(console)?
         {
+            turn_snapshot.forget();
             if let Some(chat) = selected_chat
                 && let Err(error) = agent.refresh_configuration(chat).await
             {
@@ -1770,10 +1780,23 @@ async fn interact(
                 {
                     background_notice = None;
                 }
-                let snapshot = agent
+                let snapshot = match turn_snapshot.take_for(chat) {
+                    Some(snapshot) => snapshot,
+                    None => Arc::new(
+                        agent
+                            .snapshot(chat)
+                            .await
+                            .map_err(|error| error.to_string())?,
+                    ),
+                };
+                let task_snapshot = task_center
                     .snapshot(chat)
                     .await
                     .map_err(|error| error.to_string())?;
+                let subscriptions = agent.tick_subscriptions(chat).await.ok();
+                // Everything is read before the first change shows, and the changes reach the
+                // terminal as one frame; keys typed during the reads still draw at once.
+                let _frame_hold = console.hold_frames()?;
                 console.set_input_context(
                     Some(chat),
                     &snapshot.workdir,
@@ -1788,15 +1811,6 @@ async fn interact(
                     snapshot.highest_pasted_image_id(),
                 )?;
                 reconcile_consumed_input_echoes(console, &snapshot)?;
-                // The Chat snapshot carries Monitor membership and removals, so it applies first.
-                console.update_monitor_chat(&snapshot)?;
-                let task_snapshot = task_center
-                    .snapshot(chat)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                console
-                    .set_shell_starts(chat, task_access::shell_starts(&snapshot, &task_snapshot))?;
-                console.update_shell_ticks(&task_snapshot)?;
                 console.set_foreground_commands(
                     &task_snapshot
                         .tasks
@@ -1809,9 +1823,11 @@ async fn interact(
                         .map(|task| task.id)
                         .collect::<Vec<_>>(),
                 )?;
-                if let Ok(rows) = agent.tick_subscriptions(chat).await {
-                    console.update_subscribed_ticks(chat, &rows)?;
-                }
+                console.refresh_monitor(monitor::MonitorSources {
+                    chat: snapshot.clone(),
+                    shells: task_snapshot,
+                    subscriptions,
+                })?;
                 console.set_provider_failures(chat, &snapshot.provider_failures)?;
                 menus.note_provider_failures(chat, &snapshot.provider_failures);
                 console.set_provider_failure(
@@ -1993,11 +2009,13 @@ async fn interact(
                     &safe_text(status.trim_start_matches(" · ")),
                 )?;
             } else {
+                let draft = agent.configuration(ConfigTarget::NewDraft).await;
+                let _frame_hold = console.hold_frames()?;
                 console.set_activity(None)?;
                 console.set_background_status_notice(None)?;
                 console.set_footer_items(Vec::new())?;
                 console.set_provider_failure(None)?;
-                if let Ok(draft) = agent.configuration(ConfigTarget::NewDraft).await {
+                if let Ok(draft) = draft {
                     console.update_status_area(
                         draft.execution_mode.to_string(),
                         safe_text(&draft.model.model),
@@ -2008,6 +2026,21 @@ async fn interact(
             }
             status_dirty = false;
             activity_dirty = false;
+            thinking_frame_due = false;
+            monitor_refresh_due = false;
+        }
+        turn_snapshot.forget();
+        if interactive && monitor_refresh_due {
+            monitor_refresh_due = false;
+            if !overview_active && let Some(chat) = selected_chat {
+                // Subscriptions and Shell tasks move on while the Chat itself stays as it was,
+                // whose own changes come with its events; only they are read again.
+                let shells = task_center
+                    .snapshot(chat)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                console.refresh_monitor_ticks(shells, agent.tick_subscriptions(chat).await.ok())?;
+            }
         }
         if interactive && activity_dirty {
             if !overview_active
@@ -3588,7 +3621,7 @@ async fn interact(
                             agent.record_recovery_fact(recovery_tests::RecoveryFact::LiveRunStarted {chat:event.chat_id,run:event.run_id,overview:overview_active});
                         }
                         if matches!(event.kind,EventKind::Started|EventKind::InputMerged {..}) {
-                            let echo=show_consumed_input(console,agent,event).await?;
+                            let echo=show_consumed_input(console,agent,&mut turn_snapshot,event).await?;
                             merged_echoes.consumed_echo(event.run_id,echo);
                         }
                         if let Some((previous,current))=merged_echoes.observe(event,displayed_sequences.get(&event.chat_id).copied().unwrap_or(0)) {console.join_inputs(event.chat_id,previous,current)?;}
@@ -3609,7 +3642,7 @@ async fn interact(
                 match event {
                 Ok(event) if !overview_active && (pending.contains_key(&event.run_id) || Some(event.chat_id)==selected_chat) => {
                     if Some(event.chat_id)==selected_chat && matches!(event.kind,EventKind::Started|EventKind::InputMerged {..})
-                        && let Ok(snapshot)=agent.snapshot(event.chat_id).await {
+                        && let Ok(snapshot)=turn_snapshot.read(agent,event.chat_id).await {
                         learn_agent_colors(console,agent,&snapshot).await?;
                         show_consumed_family_input(console,&snapshot,event.run_id)?;
                     }
@@ -3630,7 +3663,7 @@ async fn interact(
                             if interactive && Some(event.chat_id) == selected_chat && !unpaced_runs.contains(&event.run_id) {
                                 let preview = thinking_previews.entry(event.run_id).or_default();
                                 preview.append(thinking);
-                                activity_dirty = true;
+                                thinking_frame_due = true;
                             }
                         },
                         EventKind::Text(_)
@@ -3652,7 +3685,7 @@ async fn interact(
                     track_run_requests(&event,&mut pending,&mut permissions,&mut questions);
                     if matches!(&event.kind,EventKind::Failed(_)) {
                         failed=true;
-                        if let Ok(snapshot) = agent.snapshot(event.chat_id).await {
+                        if let Ok(snapshot) = turn_snapshot.read(agent, event.chat_id).await {
                             menus.invalidate_failed_directory(&snapshot, event.run_id);
                         }
                     }
@@ -3663,8 +3696,8 @@ async fn interact(
                         if Some(event.chat_id) != selected_chat {
                             continue;
                         }
-                        let snapshot = agent
-                            .snapshot(event.chat_id)
+                        let snapshot = turn_snapshot
+                            .read(agent, event.chat_id)
                             .await
                             .map_err(|error| error.to_string())?;
                         displayed_sequences.insert(event.chat_id, snapshot.last_sequence);
@@ -3709,6 +3742,17 @@ async fn interact(
                         });
                     displayed_sequences.insert(event.chat_id,event.sequence);
                     let console = &console.for_message(message_id.clone());
+                    let conversation = if tools.result_reads_conversation(&event) || matches!(&event.kind, EventKind::FamilyRunCompleted { .. }) {
+                        turn_snapshot.read(agent, event.chat_id).await.ok()
+                    } else {
+                        None
+                    };
+                    if let Some(snapshot) = &conversation {
+                        learn_agent_colors(console, agent, snapshot).await?;
+                    }
+                    // The event's writes reach the terminal as one frame. The hold ends before
+                    // anything is awaited, so keys typed meanwhile still draw at once.
+                    let mut event_frame = Some(console.hold_frames()?);
                     if interactive && matches!(&event.kind,
                         EventKind::Thinking(_)
                         | EventKind::AssistantMessageCommitted { .. }
@@ -3724,22 +3768,11 @@ async fn interact(
                             reply.finish();
                             write_pending_reply_lines(console, &mut reply)?;
                     }
-                    if interactive && stopped_thinking {
-                        console.write_pieces(&[presentation::thinking_label()])?;
-                    }
                     let interrupted_by_user = matches!(&event.kind,EventKind::Completed {..} | EventKind::Failed(_) | EventKind::Interrupted)
                         && user_interrupted_runs.remove(&event.run_id)
                         && matches!(&event.kind,EventKind::Interrupted);
                     if matches!(&event.kind,EventKind::Completed {..} | EventKind::Failed(_) | EventKind::Interrupted) {
                         unpaced_runs.remove(&event.run_id);
-                    }
-                    let conversation = if tools.result_reads_conversation(&event) || matches!(&event.kind, EventKind::FamilyRunCompleted { .. }) {
-                        agent.snapshot(event.chat_id).await.ok()
-                    } else {
-                        None
-                    };
-                    if let Some(snapshot) = &conversation {
-                        learn_agent_colors(console, agent, snapshot).await?;
                     }
                     let facts = conversation.as_ref().map(|snapshot| tools.call_facts(&event, snapshot)).unwrap_or_default();
                     let interrupted_by_rejection = tools.ended_with_rejection(event.run_id);
@@ -3776,7 +3809,10 @@ async fn interact(
                                     write_next_reply_line(console, reply)?;
                                 }
                                 #[cfg(test)]
-                                agent.recovery_checkpoint().await;
+                                {
+                                    event_frame.take();
+                                    agent.recovery_checkpoint().await;
+                                }
                             } else {
                                 if follows_thinking {console.write("\nAssistant: ")?;}
                                 console.write_markdown(&safe_text(&text), starts_assistant_message)?;
@@ -3785,13 +3821,14 @@ async fn interact(
                         EventKind::Completed {usage} => {
                             #[cfg(test)]
                             agent.record_recovery_fact(recovery_tests::RecoveryFact::Completed {chat:event.chat_id,run:event.run_id,sequence:event.sequence});
+                            event_frame.take();
                             let details = if interactive {
                                 let shells = task_center.snapshot(event.chat_id).await.ok().map(|snapshot| snapshot.tasks.into_iter().filter(|task| matches!(task.state, ShellTaskState::Running | ShellTaskState::Background | ShellTaskState::Cancelling)).count()).unwrap_or_default();
                                 Some(completion_details(observed_run_starts.get(&event.run_id).map(std::time::Instant::elapsed), shells))
                             } else { None };
                             write_completion_notice(console, &usage, details.as_ref())?;
                             if suggestible_runs.remove(&event.run_id) && interactive {
-                                if let Ok(snapshot) = agent.snapshot(event.chat_id).await {
+                                if let Ok(snapshot) = turn_snapshot.read(agent, event.chat_id).await {
                                     if let Some(reason) = prompt_suggestion::suppression(&snapshot) {
                                         suggestion_diagnostics.insert(event.chat_id, (event.run_id, reason));
                                     } else if let Some(request) = console.begin_prompt_suggestion(event.chat_id)? {
@@ -3845,12 +3882,17 @@ async fn interact(
                             if suggestible_runs.remove(&event.run_id) {
                                 suggestion_diagnostics.insert(event.chat_id, (event.run_id, "suppressed: interrupted turn"));
                             }
-                            let snapshot=agent.snapshot(event.chat_id).await.map_err(|error|error.to_string())?;
+                            event_frame.take();
+                            let snapshot=turn_snapshot.read(agent,event.chat_id).await.map_err(|error|error.to_string())?;
                             let stopped=snapshot.loops.iter().any(|goal|goal.id==event.loop_id&&goal.state==tickloop_agent_protocol::LoopState::Stopped);
                             if interactive && !stopped {
                                 // A declined call's result already says the run stopped there.
                                 if !interrupted_by_rejection {
                                     console.write_response(&[(format!("{}\n", presentation::interrupted_notice(console.display_profile()?)), Some(Role::MutedText))])?;
+                                }
+                                // Taking the prompt back changes the Chat this turn has read.
+                                if interrupted_by_user {
+                                    turn_snapshot.forget();
                                 }
                                 if interrupted_by_user
                                     && let Some((restored,draft))=take_back_interrupted_prompt(agent,console,event.chat_id,event.run_id).await?
@@ -3877,12 +3919,14 @@ async fn interact(
                             if interactive {
                                 console.hide_completion_notice()?;
                             } else {
-                                let snapshot = agent.snapshot(event.chat_id).await.map_err(|error|error.to_string())?;
+                                event_frame.take();
+                                let snapshot = turn_snapshot.read(agent, event.chat_id).await.map_err(|error|error.to_string())?;
                                 outln!(console, "Goal: {} · Run: {} · Running\nModel: {} · {:?}", event.loop_id, event.run_id,safe_text(&snapshot.model.model),snapshot.model.protocol);
                             }
                         },
                         // The terminal UI asks in its request dialog, outside the conversation.
                         EventKind::PermissionRequested {request} if !interactive => {
+                            event_frame.take();
                             if request.name == EXIT_PLAN_MODE_TOOL_NAME {menus.workflow(console,Workflow::plan(agent,event.chat_id,request.loop_id).await?)?;}
                             else if request.name==ENTER_PLAN_MODE_TOOL_NAME {outln!(console, "\nEnter plan mode? Request: {}\nThe Agent wants to enter plan mode to explore and design an implementation approach.\nUse /allow {} to enter plan mode or /deny {} to stay in the current mode.", request.id, request.id, request.id);}
                             else {outln!(console, "\nPermission request: {} · {}\nOperation: {}\nUse /allow {} [once|session|persistent] or /deny {}.", request.id, safe_text(&request.name), safe_text(&request.input.to_string()), request.id, request.id);}
@@ -4098,19 +4142,30 @@ async fn interact(
                                 visible_family=family.iter().filter(|row|row.availability==ExecutionAvailability::Live).map(|row|row.chat_id).collect();
                                 console.set_agent_family(if family.len()>1 {agent_rows(&family,false)}else{Vec::new()},Some(row.execution.agent_id))?;
                                 console.set_task_title((row.parent.is_none() && row.has_work==Some(true)).then(|| safe_line(&row.title)))?;
-                                for row in family.into_iter().filter(|row|row.availability==ExecutionAvailability::Live) {
-                                    // Only the daemon's current answer can prove a run ended; a cached copy predates it.
-                                    if let Ok(snapshot)=agent.current_snapshot(row.chat_id).await {
+                                // Only the daemon's current answer can prove a run ended; a cached copy predates it.
+                                // A member is read when this View does not follow its feed yet, or when the catalog
+                                // shows its work changed since its snapshot was last applied, as a run ending
+                                // without its end event does. The reads go out together, so a quiet family costs
+                                // none and a busy one a single round trip that Thinking deltas do not wait behind.
+                                applied_member_work.retain(|member,_|visible_family.contains(member));
+                                let changed=family.into_iter().filter(|row|row.availability==ExecutionAvailability::Live
+                                    && (!agent.follows(row.execution) || applied_member_work.get(&row.chat_id)!=Some(&MemberWork::of(row))))
+                                    .collect::<Vec<_>>();
+                                let snapshots=futures_util::future::join_all(changed.iter().map(|row|agent.current_snapshot(row.chat_id))).await;
+                                for (row,snapshot) in changed.iter().zip(snapshots) {
+                                    if let Ok(snapshot)=snapshot {
                                         let in_progress=receipts_in_progress(&snapshot).map(|receipt|receipt.run_id).collect::<HashSet<_>>();
                                         // A receipt the snapshot no longer has in progress belongs to a run that ended,
                                         // including one whose end event never reached this View, such as one lost to a
                                         // lagged feed; its Loop may since wait for a trigger or run another input.
                                         let outcome_pending=pending.values().any(|receipt|receipt.chat_id==snapshot.id && !in_progress.contains(&receipt.run_id));
                                         // Events already queued for this View finish the run themselves; restoring
-                                        // from the snapshot now would print the reply a second way.
+                                        // from the snapshot now would print the reply a second way. The member is read
+                                        // again on the next refresh in case they do not.
                                         if outcome_pending && !events.is_empty() && Some(snapshot.id)==selected_chat {
                                             continue;
                                         }
+                                        applied_member_work.insert(row.chat_id,MemberWork::of(row));
                                         if outcome_pending {
                                             if !overview_active && Some(snapshot.id)==selected_chat {
                                                 let restored=restore_view(console,agent,&mut tools,snapshot.id,*displayed_sequences.get(&snapshot.id).unwrap_or(&0),&mut reply_lines,&mut message_groups).await?;
@@ -4132,6 +4187,9 @@ async fn interact(
                                             continue;
                                         }
                                         sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
+                                        if Some(snapshot.id)==selected_chat {
+                                            turn_snapshot.keep(Arc::new(snapshot));
+                                        }
                                     }
                                 }
                                 if row.availability==ExecutionAvailability::Live {
@@ -4179,7 +4237,8 @@ async fn interact(
                     }
                 }
             },
-            _ = animation_refresh.tick(), if interactive && !prefers_reduced_motion && !visual_pacing_pending && (!pending.is_empty() || !directed_summaries.is_empty()) => {
+            _ = animation_refresh.tick(), if interactive && !visual_pacing_pending && (thinking_frame_due || (!prefers_reduced_motion && (!pending.is_empty() || !directed_summaries.is_empty()))) => {
+                thinking_frame_due = false;
                 activity_dirty = true;
             },
             _ = elapsed_refresh.tick(), if interactive && !visual_pacing_pending && (todo_refresh_pending || prefers_reduced_motion && running_activity.as_ref().is_some_and(|activity| activity.started_at.is_some())) => {
@@ -4212,7 +4271,7 @@ async fn interact(
                 }
             },
             _ = subscription_refresh.tick(), if interactive && !overview_active && console.monitor_has_entries()? => {
-                status_dirty = true;
+                monitor_refresh_due = true;
             },
             _ = prompt_watchdog_refresh.tick(), if selected_chat.is_some() => {
                 let chat=selected_chat.expect("selected Chat checked above");
@@ -4577,6 +4636,64 @@ fn user_shell_is_terminal(record: &UserShellRecord) -> bool {
     )
 }
 
+/// The Chat snapshot one loop turn read, kept for the status refresh that follows the turn, so a
+/// turn reads a Chat from the daemon at most once. The refresh drops it, and so does any change
+/// this View makes to the Chat in between.
+#[derive(Default)]
+struct TurnSnapshot(Option<Arc<ChatSnapshot>>);
+
+impl TurnSnapshot {
+    async fn read(
+        &mut self,
+        agent: &Agent,
+        chat: uuid::Uuid,
+    ) -> Result<Arc<ChatSnapshot>, AccessError> {
+        if let Some(snapshot) = self.take_for(chat) {
+            self.0 = Some(snapshot.clone());
+            return Ok(snapshot);
+        }
+        let snapshot = Arc::new(agent.snapshot(chat).await?);
+        self.0 = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    fn keep(&mut self, snapshot: Arc<ChatSnapshot>) {
+        self.0 = Some(snapshot);
+    }
+
+    fn take_for(&mut self, chat: uuid::Uuid) -> Option<Arc<ChatSnapshot>> {
+        self.0.take().filter(|snapshot| snapshot.id == chat)
+    }
+
+    fn forget(&mut self) {
+        self.0 = None;
+    }
+}
+
+/// What the execution catalog says about a family member's work. Any run that starts or ends,
+/// and any request that comes or goes, changes it, so while it stays as it was when the member's
+/// snapshot was last applied, that snapshot has nothing new to tell.
+#[derive(PartialEq)]
+struct MemberWork {
+    state: tickloop_agent_protocol::LoopState,
+    run_id: Option<uuid::Uuid>,
+    updated_at: Option<u64>,
+    waiting_permissions: usize,
+    waiting_questions: usize,
+}
+
+impl MemberWork {
+    fn of(row: &AgentSummary) -> Self {
+        Self {
+            state: row.state.clone(),
+            run_id: row.run_id,
+            updated_at: row.updated_at,
+            waiting_permissions: row.waiting_permissions,
+            waiting_questions: row.waiting_questions,
+        }
+    }
+}
+
 fn sync_snapshot(
     snapshot: &tickloop_agent_protocol::ChatSnapshot,
     pending: &mut HashMap<uuid::Uuid, Receipt>,
@@ -4813,14 +4930,6 @@ fn render_restored_observation(
                         .contains(&id.replace(":assistant:", ":thinking:"))
                 });
             let console = &console.for_message(message_id.clone());
-            if matches!(event.kind, EventKind::Thinking(_)) {
-                thinking_runs.insert(event.run_id);
-            } else if ends_thinking(&event.kind)
-                && thinking_runs.remove(&event.run_id)
-                && console.is_interactive()
-            {
-                console.write_pieces(&[presentation::thinking_label()])?;
-            }
             let facts = tools.call_facts(event, &observation.snapshot);
             let interrupted_by_rejection = tools.ended_with_rejection(event.run_id);
             if tools.present_event(console, event, &facts)? {
@@ -5839,12 +5948,11 @@ fn show_consumed_family_input(
                 }
                 AgentInput::PendingResult => awaits_completion = true,
                 AgentInput::Message => {
-                    if let Some(message) = AgentMessage::of(&local, snapshot, Some(*id)) {
+                    if let Some(message) = AgentMessage::of(&local) {
                         write_block(
                             console,
                             agent_messaging::message_runs(
                                 &message,
-                                &console.agent_colors()?,
                                 presentation::OutputDetail::Preview,
                                 console.display_profile()?,
                             ),
@@ -5901,14 +6009,14 @@ fn show_family_completion(
     console.mark_input_echoes(snapshot.id, [completion.child_run_id])
 }
 
-/// A heading and the `⎿` rows under it.
+/// An Agent block: its heading and the body indented under it.
 fn write_block(
     console: &Console,
-    (heading, response): (presentation::RoleRuns, presentation::RoleRuns),
+    (heading, body): (presentation::RoleRuns, presentation::RoleRuns),
 ) -> Result<(), String> {
     let mut pieces = console::ConversationPiece::block_runs(&heading);
-    if !response.is_empty() {
-        pieces.push(console::ConversationPiece::Response(response));
+    if !body.is_empty() {
+        pieces.push(console::ConversationPiece::Body(body));
     }
     console.write_pieces(&pieces)
 }
@@ -5965,13 +6073,14 @@ async fn track_accepted_echo(
 async fn show_consumed_input(
     console: &Console,
     agent: &Agent,
+    turn_snapshot: &mut TurnSnapshot,
     event: &tickloop_agent_protocol::Event,
 ) -> Result<Option<InputEcho>, String> {
     if !console.is_interactive() || console.input_is_echoed(event.chat_id, event.run_id)? {
         return Ok(None);
     }
     console.defer_input_echo(event.chat_id, event.run_id)?;
-    let Ok(snapshot) = agent.snapshot(event.chat_id).await else {
+    let Ok(snapshot) = turn_snapshot.read(agent, event.chat_id).await else {
         return Ok(None);
     };
     consume_input_echo_from_snapshot(console, &snapshot, event.run_id)
@@ -7749,7 +7858,7 @@ mod tests {
             show_family_completion(&console, &completion, &snapshot).unwrap();
             assert_eq!(
                 console.test_conversation_text(),
-                "\n⏺ @audit finished · 2s\n  ⎿  Report line\n",
+                "\n⏺ Teammate @audit finished · 2s\n  Report line\n",
                 "report first: {report_first}"
             );
         }

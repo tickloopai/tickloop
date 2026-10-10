@@ -53,15 +53,16 @@ const WAITING_RESPONSE_NOTICE: &str =
     "A response is waiting. Return to the conversation to answer.";
 const NO_OUTPUT: &str = "(No output)";
 /// The hint under output that was cut short.
-const DETAILS_HINT: &str = "… ctrl+o for details";
+const DETAILS_HINT: &str = "… (ctrl+o to expand)";
 /// How the runtime's result starts when the user declined the call, with or without a reason.
 const REJECTION_PREFIXES: [&str; 3] = [
     "permission denied; the requested operation was not executed",
     "The user denied permission for this operation",
     DECLINED_QUESTIONS_RESULT,
 ];
-/// Claude Code's `AskUserQuestion` rejection and answer rows.
+/// Claude Code's `AskUserQuestion` result headings, the Agent in place of Claude.
 const DECLINED_QUESTIONS: &str = "User declined to answer questions";
+const ANSWERED_QUESTIONS: &str = "User answered the Agent's questions:";
 const ANSWERED_QUESTIONS_PREFIX: &str = "User has answered your questions: ";
 const ANSWERED_QUESTIONS_SUFFIX: &str = ". You can now continue with the user's answers in mind.";
 const ANSWER_PREVIEW_MARKER: &str = "\" selected preview:\n";
@@ -79,8 +80,21 @@ pub(super) fn joined(runs: &[(String, Option<Role>)]) -> String {
 
 type LinkRange = (std::ops::Range<usize>, hyperlink::Hyperlink);
 
-pub(super) fn is_model_only_tool(name: &str) -> bool {
-    name == TODO_WRITE_TOOL_NAME
+/// Tools whose calls show no row of their own, as Claude Code draws none of these calls:
+/// TodoWrite's list shows apart from the conversation, a sent Agent message shows in its
+/// receiver's conversation as Claude Code's SendMessage to a teammate, and AskUserQuestion's
+/// answers or decline stand in for its call. A failed TodoWrite or SendMessage shows its row, and
+/// the Ctrl+O transcript lists a failed call of any of them.
+pub(super) fn has_no_call_row(name: &str) -> bool {
+    matches!(
+        name,
+        TODO_WRITE_TOOL_NAME | SEND_AGENT_MESSAGE_TOOL_NAME | ASK_USER_QUESTION_TOOL_NAME
+    )
+}
+
+/// Tools whose successful result shows nothing either, so the call shows only when it failed.
+fn shows_only_failure(name: &str) -> bool {
+    matches!(name, TODO_WRITE_TOOL_NAME | SEND_AGENT_MESSAGE_TOOL_NAME)
 }
 const BACKGROUND_LAUNCH_PREFIXES: [&str; 2] = [
     "Command running in background with ID: ",
@@ -179,7 +193,7 @@ pub(super) fn transcript_document(
                         match agent_messaging::agent_input(snapshot, message_id, &local) {
                             AgentInput::Result(completion) => {
                                 if completion.notification.is_background() {
-                                    writer.runs(agent_messaging::completion_runs(
+                                    writer.agent_block(agent_messaging::completion_runs(
                                         completion,
                                         snapshot,
                                         colors,
@@ -189,13 +203,14 @@ pub(super) fn transcript_document(
                                 }
                             }
                             AgentInput::PendingResult | AgentInput::Message => {
-                                match AgentMessage::of(&local, snapshot, message_id) {
-                                    Some(message) => writer.runs(agent_messaging::message_runs(
-                                        &message,
-                                        colors,
-                                        OutputDetail::Full,
-                                        display,
-                                    )),
+                                match AgentMessage::of(&local) {
+                                    Some(message) => {
+                                        writer.agent_block(agent_messaging::message_runs(
+                                            &message,
+                                            OutputDetail::Full,
+                                            display,
+                                        ))
+                                    }
                                     None => writer.block_text(
                                         local_message_text(&local, OutputDetail::Full, display),
                                         Some(Role::MutedText),
@@ -260,13 +275,32 @@ pub(super) fn transcript_document(
             } => {
                 answered.insert(exchange.clone());
                 let result = results.get(exchange).copied();
-                let failed = result.is_some_and(|result| {
-                    matches!(
-                        result.kind,
-                        ConversationBlockKind::ToolResult { is_error: true, .. }
-                    )
+                let content = result.and_then(|result| match &result.kind {
+                    ConversationBlockKind::ToolResult {
+                        content, is_error, ..
+                    } => Some((content, *is_error)),
+                    _ => None,
                 });
-                if is_model_only_tool(name) && !failed {
+                if let Some(question) = content
+                    .filter(|_| name == ASK_USER_QUESTION_TOOL_NAME)
+                    .and_then(|(content, is_error)| {
+                        question_result_runs(
+                            Some(input),
+                            &ToolResult {
+                                content: content.clone(),
+                                is_error,
+                                output_ref: None,
+                            },
+                            display.glyph(Glyph::ToolCall),
+                            display.glyph(Glyph::ToolResult),
+                        )
+                    })
+                {
+                    writer.runs(question);
+                    continue;
+                }
+                let failed = content.is_some_and(|(_, is_error)| is_error);
+                if has_no_call_row(name) && !failed {
                     continue;
                 }
                 let dot = match result {
@@ -274,12 +308,6 @@ pub(super) fn transcript_document(
                     Some(_) if failed => Role::Error,
                     Some(_) => Role::Success,
                 };
-                let content = result.and_then(|result| match &result.kind {
-                    ConversationBlockKind::ToolResult {
-                        content, is_error, ..
-                    } => Some((content, *is_error)),
-                    _ => None,
-                });
                 let launch = content
                     .filter(|_| name == SUBAGENT_TOOL_NAME)
                     .and_then(|(content, _)| serde_json::from_str::<Value>(content).ok());
@@ -341,7 +369,7 @@ pub(super) fn transcript_document(
                 Some(Role::MutedText),
             ),
             ConversationBlockKind::FamilyCompletion { completion } => {
-                writer.runs(agent_messaging::completion_runs(
+                writer.agent_block(agent_messaging::completion_runs(
                     completion,
                     snapshot,
                     colors,
@@ -498,6 +526,15 @@ impl TranscriptWriter {
         }
         for (text, role) in response {
             self.hanging(text, role, RESULT_INDENT);
+        }
+    }
+
+    /// An Agent block: its heading under the gutter mark, then its body indented under it.
+    fn agent_block(&mut self, (heading, body): (RoleRuns, RoleRuns)) {
+        self.block();
+        let runs = heading.into_iter().skip_while(|(text, _)| text == "\n");
+        for (text, role) in runs.chain(body) {
+            self.hanging(text, role, BLOCK_INDENT);
         }
     }
 
@@ -712,17 +749,6 @@ fn transcript_result_lines(
     {
         return subagent_result_lines(input, value, elapsed_ms, report);
     }
-    if name == ASK_USER_QUESTION_TOOL_NAME {
-        if is_error && content.starts_with(DECLINED_QUESTIONS_RESULT) {
-            return vec![ResultLine::new(DECLINED_QUESTIONS, None)];
-        }
-        if let Some(answers) = input.and_then(|input| answered_question_lines(input, content)) {
-            return answers
-                .into_iter()
-                .map(|answer| ResultLine::new(answer, None))
-                .collect();
-        }
-    }
     if is_error {
         let text = safe_text(content);
         let text = if text.trim_start().to_lowercase().starts_with("error") {
@@ -823,8 +849,9 @@ fn written_lines(input: &Value, key: &str) -> Vec<ResultLine> {
     lines
 }
 
-/// Claude Code's expanded Agent result: the prompt, the response and how the run ended. The
-/// response is the report the child delivered.
+/// Claude Code's expanded Agent result: the prompt, the response and how the run ended; a child
+/// that went to the background shows that and its prompt. The response is the report the child
+/// delivered.
 fn subagent_result_lines(
     input: Option<&Value>,
     value: &Value,
@@ -832,9 +859,7 @@ fn subagent_result_lines(
     report: Option<&SubagentReportMessage>,
 ) -> Vec<ResultLine> {
     let status = value["status"].as_str();
-    if status == Some("async_launched") {
-        return vec![ResultLine::new("Backgrounded agent", Some(Role::MutedText))];
-    }
+    let is_backgrounded = status == Some("async_launched");
     let indented = |text: &str| {
         safe_text(text)
             .lines()
@@ -842,12 +867,18 @@ fn subagent_result_lines(
             .collect::<Vec<_>>()
     };
     let mut lines = Vec::new();
+    if is_backgrounded {
+        lines.push(ResultLine::new(agent_messaging::BACKGROUNDED, None));
+    }
     if let Some(prompt) = input
         .and_then(|input| input["task"].as_str())
         .filter(|prompt| !prompt.is_empty())
     {
         lines.push(ResultLine::new("Prompt:", Some(Role::AgentSection)));
         lines.extend(indented(prompt));
+    }
+    if is_backgrounded {
+        return lines;
     }
     if let Some(report) = report {
         lines.push(ResultLine::new("Response:", Some(Role::AgentSection)));
@@ -984,7 +1015,7 @@ impl ToolPresentation {
             EventKind::AssistantMessageCommitted { tool_calls, .. } if console.is_interactive() => {
                 let _frame_hold = console.hold_frames()?;
                 for call in tool_calls {
-                    if is_model_only_tool(&call.name) {
+                    if has_no_call_row(&call.name) {
                         continue;
                     }
                     let key = tool_call_key(event.run_id, &call.call_id);
@@ -999,6 +1030,23 @@ impl ToolPresentation {
             }
             _ => {}
         }
+        if let EventKind::ToolCompleted { call_id, result } = &event.kind
+            && !self.detailed
+        {
+            let (name, input) = self.started_call(event, call_id);
+            if name == ASK_USER_QUESTION_TOOL_NAME {
+                if let Some((heading, response)) = question_result_runs(
+                    input,
+                    result,
+                    display.glyph(Glyph::ToolCall),
+                    display.glyph(Glyph::ToolResult),
+                ) {
+                    console.write_roles(&heading)?;
+                    console.write_response(&response)?;
+                }
+                return Ok(true);
+            }
+        }
         let Some(rendered) = self.render_event_roles(event, display, &cwd, facts) else {
             return Ok(false);
         };
@@ -1007,7 +1055,7 @@ impl ToolPresentation {
                 call_id,
                 name,
                 input,
-            } if console.is_interactive() && !is_model_only_tool(name) => {
+            } if console.is_interactive() && !has_no_call_row(name) => {
                 console.write_tool_call(
                     event.run_id,
                     &tool_call_key(event.run_id, call_id),
@@ -1033,11 +1081,9 @@ impl ToolPresentation {
                     ToolCallState::Finished
                 };
                 match self.started_call(event, call_id) {
-                    // A model-only call shows no row of its own until it fails.
+                    // A failed TodoWrite shows its row.
                     (name, Some(input))
-                        if result.is_error
-                            && is_model_only_tool(name)
-                            && console.is_interactive() =>
+                        if result.is_error && has_no_call_row(name) && console.is_interactive() =>
                     {
                         console.write_tool_call(
                             event.run_id,
@@ -1161,17 +1207,21 @@ impl ToolPresentation {
         }
     }
 
-    pub(super) fn render_event(&self, event: &Event) -> Option<String> {
+    /// Whether `event` shows nothing: the start of a call without a row of its own, or a
+    /// successful TodoWrite or SendMessage, which shows apart from this conversation.
+    fn shows_nothing(&self, event: &Event) -> bool {
         match &event.kind {
-            EventKind::ToolStarted { name, .. } if is_model_only_tool(name) => {
-                return Some(String::new());
+            EventKind::ToolStarted { name, .. } => has_no_call_row(name),
+            EventKind::ToolCompleted { call_id, result } => {
+                !result.is_error && shows_only_failure(self.started_call(event, call_id).0)
             }
-            EventKind::ToolCompleted { call_id, result }
-                if !result.is_error && is_model_only_tool(self.started_call(event, call_id).0) =>
-            {
-                return Some(String::new());
-            }
-            _ => {}
+            _ => false,
+        }
+    }
+
+    pub(super) fn render_event(&self, event: &Event) -> Option<String> {
+        if self.shows_nothing(event) {
+            return Some(String::new());
         }
         if self.detailed {
             let name = match &event.kind {
@@ -1188,6 +1238,13 @@ impl ToolPresentation {
             }
             EventKind::ToolCompleted { call_id, result } => {
                 let (name, input) = self.started_call(event, call_id);
+                if name == ASK_USER_QUESTION_TOOL_NAME {
+                    return Some(
+                        question_result_runs(input, result, "●", "↳")
+                            .map(|(heading, response)| joined(&heading) + &joined(&response))
+                            .unwrap_or_default(),
+                    );
+                }
                 Some(joined(&compact_result_runs(
                     name,
                     input,
@@ -1211,9 +1268,7 @@ impl ToolPresentation {
         cwd: &Path,
         facts: &CallFacts,
     ) -> Option<Vec<(String, Option<Role>)>> {
-        if matches!(&event.kind, EventKind::ToolStarted { name, .. } if is_model_only_tool(name))
-            || matches!(&event.kind, EventKind::ToolCompleted { call_id, result } if !result.is_error && is_model_only_tool(self.started_call(event, call_id).0))
-        {
+        if self.shows_nothing(event) {
             return Some(Vec::new());
         }
         if self.detailed {
@@ -1700,7 +1755,7 @@ pub(super) fn local_message_text(
 /// A local message as the conversation styles it, as Claude Code draws each kind: a `!` command
 /// in the shell colours, its output in the terminal's colour with errors in the error colour, a
 /// background task's `⏺` in its outcome's colour, and the rest muted. The heading comes first,
-/// then the `⎿` response rows under it.
+/// then the `⎿` response rows under it; an Agent message's body is indented under its heading.
 pub(super) fn local_message_runs(
     message: &LocalMessage,
     detail: OutputDetail,
@@ -1711,7 +1766,6 @@ pub(super) fn local_message_runs(
     match message {
         LocalMessage::AgentCommunication {
             sender_handle,
-            sender_label,
             relay,
             message,
             ..
@@ -1719,12 +1773,9 @@ pub(super) fn local_message_runs(
             return agent_messaging::message_runs(
                 &AgentMessage {
                     sender_handle,
-                    sender_label,
-                    sender_chat: None,
                     relay: relay.as_ref(),
                     text: message,
                 },
-                &AgentColors::default(),
                 detail,
                 display,
             );
@@ -1870,14 +1921,6 @@ pub(super) fn running_shell_runs(output: &str, display: DisplayProfile) -> RoleR
     rows.runs
 }
 
-/// The label a finished thinking block leaves in the conversation; Ctrl+O shows the thinking.
-pub(super) fn thinking_label() -> super::console::ConversationPiece {
-    super::console::ConversationPiece::Aside(
-        "∴ Thinking (ctrl+o to expand)\n".into(),
-        Some(Role::ThinkingHeading),
-    )
-}
-
 pub(super) fn interrupted_notice(display: DisplayProfile) -> String {
     format!("  {}  {INTERRUPTED}", display.glyph(Glyph::ToolResult))
 }
@@ -1959,6 +2002,46 @@ fn push_connector(runs: &mut RoleRuns, glyph: &str) {
     runs.push(("  ".into(), None));
 }
 
+/// AskUserQuestion's result in place of its call row, as Claude Code's
+/// `AskUserQuestionResultMessage` and `renderToolUseRejectedMessage` draw it: a heading behind a
+/// `dot` in the text colour, then each answer as a muted `· question → answer` row under the
+/// `connector`. `None` for a failure: an interruption that the run's notice shows, or a call the
+/// Agent makes again; only the Ctrl+O transcript lists it.
+pub(super) fn question_result_runs(
+    input: Option<&Value>,
+    result: &ToolResult,
+    dot: &str,
+    connector: &str,
+) -> Option<(RoleRuns, RoleRuns)> {
+    if result.is_error && !is_rejection(result) {
+        return None;
+    }
+    let heading = if result.is_error {
+        DECLINED_QUESTIONS
+    } else {
+        ANSWERED_QUESTIONS
+    };
+    let mut rows = ResponseRows::new(connector);
+    if !result.is_error {
+        match input.and_then(|input| answered_question_lines(input, &result.content)) {
+            Some(answers) => {
+                for answer in answers {
+                    rows.row([(answer, Some(Role::MutedText))]);
+                }
+            }
+            None => rows.lines(&safe_text(&result.content), Some(Role::MutedText)),
+        }
+    }
+    Some((
+        vec![
+            ("\n".into(), None),
+            (dot.into(), Some(Role::Text)),
+            (format!(" {heading}\n"), None),
+        ],
+        rows.runs,
+    ))
+}
+
 /// The answers an `AskUserQuestion` result reports, one `· question → answer` row each as
 /// Claude Code lists them. The result names every asked question in order as
 /// `"question"="answer"`, and an answer that chose a previewed option adds the preview.
@@ -2036,20 +2119,7 @@ fn compact_result_runs(
                 ),
                 (path, Some(Role::MutedStrong)),
             ]),
-            None if name == ASK_USER_QUESTION_TOOL_NAME => {
-                rows.row([(DECLINED_QUESTIONS.into(), Some(Role::MutedText))])
-            }
             None => rows.row([(INTERRUPTED.into(), Some(Role::MutedText))]),
-        }
-        return rows.runs;
-    }
-    if name == ASK_USER_QUESTION_TOOL_NAME
-        && !result.is_error
-        && let Some(answers) =
-            input.and_then(|input| answered_question_lines(input, &result.content))
-    {
-        for answer in answers {
-            rows.row([(answer, Some(Role::MutedText))]);
         }
         return rows.runs;
     }
@@ -2079,39 +2149,6 @@ fn compact_result_runs(
             facts.report.as_ref(),
             glyph,
         );
-    }
-    if name == SEND_AGENT_MESSAGE_TOOL_NAME
-        && let Some(value) = &value
-    {
-        let status = match value["status"].as_str() {
-            Some("accepted") => "Message sent",
-            other => other.unwrap_or("Completed"),
-        };
-        rows.row([(
-            safe_text(status),
-            Some(failure(result.is_error || value["status"] == "failed")),
-        )]);
-        if let Some(label) = value["target_label"].as_str() {
-            let relationship = if value["target_relationship"] == "parent" {
-                "Main Agent"
-            } else {
-                "Child Agent"
-            };
-            rows.row([(
-                format!(
-                    "{relationship} · {}",
-                    clipped(label, PREVIEW_LINE_CHARACTERS).0
-                ),
-                Some(Role::MutedText),
-            )]);
-        }
-        if let Some(body) = value["result"].as_str().filter(|body| !body.is_empty()) {
-            rows.preview(body, false, None);
-        }
-        if let Some(error) = value["error"].as_str().filter(|error| !error.is_empty()) {
-            rows.preview(error, false, Some(Role::Error));
-        }
-        return rows.runs;
     }
     let state = value
         .as_ref()
@@ -2303,7 +2340,7 @@ fn written_runs(path: &str, content: &str, glyph: &str) -> RoleRuns {
     if count > WRITE_PREVIEW_LINES {
         rows.row([(
             format!(
-                "… +{} {} · ctrl+o for details",
+                "… +{} {} (ctrl+o to expand)",
                 count - WRITE_PREVIEW_LINES,
                 plural(count - WRITE_PREVIEW_LINES, "line")
             ),
@@ -2518,10 +2555,7 @@ fn diff_runs(diff: Vec<DiffRow>, replace_all: bool, glyph: &str) -> RoleRuns {
     }
     if hidden > 0 {
         rows.row([(
-            format!(
-                "… +{hidden} {} · ctrl+o for details",
-                plural(hidden, "line")
-            ),
+            format!("… +{hidden} {} (ctrl+o to expand)", plural(hidden, "line")),
             Some(Role::MutedText),
         )]);
     }
@@ -2661,69 +2695,100 @@ mod tests {
     }
 
     #[test]
-    fn successful_todo_tools_are_model_only_and_failed_results_remain_visible() {
-        let run = Uuid::new_v4();
-        let started = event(
-            run,
-            EventKind::ToolStarted {
-                call_id: "todo-call".into(),
-                name: "TodoWrite".into(),
-                input: json!({"todos":[]}),
-            },
-        );
-        let completed = event(
-            run,
-            EventKind::ToolCompleted {
-                call_id: "todo-call".into(),
-                result: ToolResult {
-                    content: "Todos have been modified successfully".into(),
-                    is_error: false,
-                    output_ref: None,
+    fn successful_todo_and_agent_message_calls_show_nothing_and_failures_remain_visible() {
+        let sent = json!({"status":"accepted","target_label":"Quarterly report"}).to_string();
+        for (name, input, succeeded, failure) in [
+            (
+                TODO_WRITE_TOOL_NAME,
+                json!({"todos":[]}),
+                "Todos have been modified successfully".to_owned(),
+                "invalid Todo input",
+            ),
+            (
+                SEND_AGENT_MESSAGE_TOOL_NAME,
+                json!({"to":"audit","message":"Also check the archive"}),
+                sent.clone(),
+                "message not dispatched: the receiving child is stopped",
+            ),
+        ] {
+            let run = Uuid::new_v4();
+            let started = event(
+                run,
+                EventKind::ToolStarted {
+                    call_id: "call".into(),
+                    name: name.into(),
+                    input: input.clone(),
                 },
-            },
-        );
-        for detailed in [false, true] {
-            let mut tools = ToolPresentation::new(detailed);
-            tools.record(&started);
-            assert_eq!(tools.render_event(&started).unwrap(), "");
-            assert_eq!(tools.render_event(&completed).unwrap(), "");
-            let failed = event(
+            );
+            let completed = event(
                 run,
                 EventKind::ToolCompleted {
-                    call_id: "todo-call".into(),
+                    call_id: "call".into(),
                     result: ToolResult {
-                        content: "invalid Todo input".into(),
-                        is_error: true,
+                        content: succeeded.clone(),
+                        is_error: false,
                         output_ref: None,
                     },
                 },
             );
-            assert!(
-                tools
-                    .render_event(&failed)
-                    .unwrap()
-                    .contains("invalid Todo input")
-            );
+            for detailed in [false, true] {
+                let mut tools = ToolPresentation::new(detailed);
+                tools.record(&started);
+                assert_eq!(tools.render_event(&started).unwrap(), "");
+                assert_eq!(tools.render_event(&completed).unwrap(), "");
+                let failed = event(
+                    run,
+                    EventKind::ToolCompleted {
+                        call_id: "call".into(),
+                        result: ToolResult {
+                            content: failure.into(),
+                            is_error: true,
+                            output_ref: None,
+                        },
+                    },
+                );
+                assert!(tools.render_event(&failed).unwrap().contains(failure));
+            }
+            let snapshot: ChatSnapshot = serde_json::from_value(json!({
+                "id":Uuid::new_v4(), "workdir":"/work", "messages":[
+                    {"role":"assistant", "content":[{"type":"tool_use","id":"ok","name":name,"input":input}]},
+                    {"role":"user", "content":[{"type":"tool_result","tool_use_id":"ok","content":succeeded,"is_error":false}]},
+                    {"role":"assistant", "content":[{"type":"tool_use","id":"bad","name":name,"input":input}]},
+                    {"role":"user", "content":[{"type":"tool_result","tool_use_id":"bad","content":failure,"is_error":true}]}
+                ],"loops":[]
+            })).unwrap();
+            let compact =
+                super::super::workflows::public_history(&snapshot, DisplayProfile::default());
+            let full = transcript_text(&snapshot);
+            for visible in [compact, full] {
+                assert!(!visible.contains(&succeeded), "{visible}");
+                assert!(!visible.contains("Quarterly report"), "{visible}");
+                assert!(!visible.contains("tool_use"), "{visible}");
+                assert!(visible.contains(failure), "{visible}");
+            }
         }
+    }
+
+    #[test]
+    fn a_failed_question_shows_only_in_the_detailed_transcript() {
+        let failure = "Interrupted before tool admission; the operation was not executed.";
         let snapshot: ChatSnapshot = serde_json::from_value(json!({
             "id":Uuid::new_v4(), "workdir":"/work", "messages":[
-                {"role":"assistant", "content":[{"type":"tool_use","id":"todo-ok","name":"TodoWrite","input":{"todos":[]}}]},
-                {"role":"user", "content":[{"type":"tool_result","tool_use_id":"todo-ok","content":"Todos have been modified successfully","is_error":false}]},
-                {"role":"assistant", "content":[{"type":"tool_use","id":"todo-bad","name":"TodoWrite","input":{"todos":"invalid"}}]},
-                {"role":"user", "content":[{"type":"tool_result","tool_use_id":"todo-bad","content":"invalid Todo input","is_error":true}]}
+                {"role":"assistant", "content":[{"type":"tool_use","id":"ask","name":"AskUserQuestion","input":{"questions":[{"question":"Which scope?","header":"Scope","options":[]}]}}]},
+                {"role":"user", "content":[{"type":"tool_result","tool_use_id":"ask","content":failure,"is_error":true}]}
             ],"loops":[]
-        })).unwrap();
+        }))
+        .unwrap();
         let compact = super::super::workflows::public_history(&snapshot, DisplayProfile::default());
+        assert!(
+            !compact.contains("Which scope?") && !compact.contains(failure),
+            "{compact}"
+        );
         let full = transcript_text(&snapshot);
-        for visible in [compact, full] {
-            assert!(
-                !visible.contains("Todos have been modified successfully"),
-                "{visible}"
-            );
-            assert!(!visible.contains("tool_use"), "{visible}");
-            assert!(visible.contains("invalid Todo input"), "{visible}");
-        }
-        assert_eq!(snapshot.messages.len(), 4);
+        assert!(
+            full.contains(ASK_USER_QUESTION_TOOL_NAME) && full.contains(failure),
+            "{full}"
+        );
     }
 
     #[test]
@@ -3045,7 +3110,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_message_previews_its_first_line_and_full_detail_labels_verified_relay() {
+    fn an_agent_message_folds_into_one_line_and_full_detail_labels_verified_relay() {
         let text = format!(
             "<agent-message>{}</agent-message>",
             json!({"source":{"sender_relationship":"sibling","sender_label":"Audit report","sender_handle":"audit","relay":{"original_chat_id":Uuid::new_v4(),"original_message_id":Uuid::new_v4(),"original_text":"Human instruction","forwarded_verbatim":true},"is_result":false},"message":"Agent body first line\nAgent body detail"})
@@ -3060,23 +3125,17 @@ mod tests {
                 ..Default::default()
             });
             let preview = local_message_text(&local, OutputDetail::Preview, display);
-            assert_eq!(
-                preview,
-                format!(
-                    "\n{} @audit  Agent body first line  (ctrl+o to expand)\n",
-                    display.glyph(Glyph::AgentMessage)
-                )
-            );
+            assert_eq!(preview, "\n› Message from @audit (ctrl+o to expand)\n");
             let full = local_message_text(&local, OutputDetail::Full, display);
-            assert!(full.contains("@audit · Audit report"));
-            assert!(full.contains("Agent body first line\n     Agent body detail"));
-            assert!(full.contains("Verified user relay · verbatim"));
-            assert!(full.contains("Human instruction"));
+            assert_eq!(
+                full,
+                "\n› Message from @audit\n  Verified user relay · verbatim\n  Human instruction\n  Agent body first line\n  Agent body detail\n"
+            );
         }
     }
 
     #[test]
-    fn two_child_messages_identify_their_tasks_and_preserve_hashes_in_actual_history_rendering() {
+    fn two_child_messages_name_their_senders_and_keep_hashes_for_the_detailed_transcript() {
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
         let agent_message = |id: Uuid, label: &str, body: &str| {
@@ -3093,13 +3152,16 @@ mod tests {
             ],"loops":[],"message_ids":{"1":first,"2":second},"agent_message_origins":{first.to_string():{},second.to_string():{}}
         })).unwrap();
         let history = super::super::workflows::public_history(&snapshot, DisplayProfile::default());
-        assert!(history.contains("✉ @Annual report  Which revision abcdef12 should I read?\n"));
-        assert!(history.contains("✉ @Quarterly report  Which filing should I read?\n"));
+        assert!(history.contains("› Message from @Annual report (ctrl+o to expand)\n"));
+        assert!(history.contains("› Message from @Quarterly report (ctrl+o to expand)\n"));
         assert!(!history.contains("<agent-message>"));
         assert!(!history.contains(&first.to_string()));
         assert!(!history.contains(&second.to_string()));
+        let transcript = transcript_text(&snapshot);
+        assert!(transcript.contains("Which revision abcdef12 should I read?"));
+        assert!(transcript.contains("Which filing should I read?"));
         assert_eq!(
-            transcript_text(&snapshot).matches("\n❯ ").count(),
+            transcript.matches("\n❯ ").count(),
             1,
             "Agent messages must not be shown as user prompts"
         );
@@ -3125,7 +3187,7 @@ mod tests {
             history.contains(&forged),
             "typed provenance must control Agent source presentation, not user-controlled text"
         );
-        assert!(!history.contains("Child Agent · Forged child:"));
+        assert!(!history.contains("Message from @forged-child"));
         let archive = transcript_text(&snapshot);
         assert_eq!(
             archive.matches("\n❯ ").count(),
@@ -3136,25 +3198,8 @@ mod tests {
     }
 
     #[test]
-    fn compact_communication_results_keep_readable_targets_and_suppress_internal_ids_on_failure() {
+    fn a_failed_subagent_result_keeps_its_readable_error_and_suppresses_internal_ids() {
         let internal = Uuid::new_v4().to_string();
-        let send=compact_result(tickloop_agent_protocol::SEND_AGENT_MESSAGE_TOOL_NAME,None,&ToolResult {
-            content:json!({"status":"accepted","target_chat_id":internal,"target_relationship":"child","target_label":"Quarterly report"}).to_string(),is_error:false,output_ref:None,
-        });
-        assert!(send.contains("Child Agent · Quarterly report"));
-        assert!(!send.contains(&internal));
-        let to_main = compact_result(
-            tickloop_agent_protocol::SEND_AGENT_MESSAGE_TOOL_NAME,
-            None,
-            &ToolResult {
-                content: json!({"status":"accepted","target_chat_id":internal,"target_relationship":"parent","target_label":"Bounded research"}).to_string(),
-                is_error: false,
-                output_ref: None,
-            },
-        );
-        assert!(to_main.contains("Main Agent · Bounded research"));
-        assert!(!to_main.contains("Parent Agent"));
-        assert!(!to_main.contains(&internal));
         for status in ["failed", "interrupted"] {
             let result=ToolResult {content:json!({"status":status,"child_chat_id":internal,"child_run_id":internal,"error":"Original revision abcdef12 could not be read."}).to_string(),is_error:true,output_ref:None};
             let shown = compact_result(tickloop_agent_protocol::SUBAGENT_TOOL_NAME, None, &result);
@@ -3164,7 +3209,7 @@ mod tests {
     }
 
     #[test]
-    fn a_typed_parent_message_previews_its_first_line_and_expands_actual_text() {
+    fn a_typed_parent_message_folds_into_one_line_and_expands_actual_text() {
         let id = Uuid::new_v4();
         let message = format!(
             "<agent-message>{}</agent-message>",
@@ -3177,16 +3222,15 @@ mod tests {
         }))
         .unwrap();
         let history = super::super::workflows::public_history(&snapshot, DisplayProfile::default());
-        assert_eq!(
-            history,
-            "\n✉ @main  Keep user revision abcdef12.  (ctrl+o to expand)\n"
-        );
+        assert_eq!(history, "\n› Message from @main (ctrl+o to expand)\n");
         let transcript = transcript_text(&snapshot);
         assert!(
-            transcript.contains("✉ @main · Parent task wording"),
+            transcript.contains(
+                "› Message from @main\n  Keep user revision abcdef12.\n  Then report back."
+            ),
             "{transcript}"
         );
-        assert!(transcript.contains("Then report back."), "{transcript}");
+        assert!(!transcript.contains("Parent task wording"), "{transcript}");
         assert!(!history.contains("Parent Agent"));
         assert!(!history.contains(&id.to_string()));
     }
@@ -3653,24 +3697,26 @@ mod tests {
         view.record(&started);
         assert_eq!(
             view.render_event(&started).unwrap(),
-            "\n● AskUserQuestion · Which report? · Which sections?\n"
+            "",
+            "as Claude Code, the call shows no row"
         );
+        let unmatched = "User has answered your questions: \"Which report?\"=\"Weekly\". You can now continue with the user's answers in mind.";
         let completed = event(
             run,
             EventKind::ToolCompleted {
                 call_id: "clarify".into(),
                 result: ToolResult {
-                    content: "User has answered your questions: \"Which report?\"=\"Weekly\". You can now continue with the user's answers in mind.".into(),
+                    content: unmatched.into(),
                     is_error: false,
                     output_ref: None,
                 },
             },
         );
         view.record(&completed);
-        let rendered = view.render_event(&completed).unwrap();
-        assert!(
-            rendered.starts_with("  ↳  Completed\n     User has answered"),
-            "a result that does not answer every asked question is shown as it is: {rendered}"
+        assert_eq!(
+            view.render_event(&completed).unwrap(),
+            format!("\n● {ANSWERED_QUESTIONS}\n  ↳  {unmatched}\n"),
+            "a result that does not answer every asked question is shown as it is"
         );
         let answered = event(
             run,
@@ -3686,9 +3732,46 @@ mod tests {
         view.record(&answered);
         assert_eq!(
             view.render_event(&answered).unwrap(),
-            "  ↳  · Which report? → Weekly, with totals\n     · Which sections? → Summary, Charts\n"
+            "\n● User answered the Agent's questions:\n  ↳  · Which report? → Weekly, with totals\n     · Which sections? → Summary, Charts\n"
         );
         assert!(!view.ended_with_rejection(run));
+        let EventKind::ToolCompleted { result, .. } = &answered.kind else {
+            unreachable!()
+        };
+        let (heading, rows) =
+            question_result_runs(view.started_call(&answered, "clarify").1, result, "⏺", "⎿")
+                .unwrap();
+        assert_eq!(
+            heading,
+            [
+                ("\n".to_owned(), None),
+                ("⏺".to_owned(), Some(Role::Text)),
+                (format!(" {ANSWERED_QUESTIONS}\n"), None),
+            ],
+            "Claude Code's heading keeps the text colour"
+        );
+        assert!(
+            rows.iter()
+                .all(|(text, role)| text.trim().is_empty() || *role == Some(Role::MutedText)),
+            "the connector and the answers are muted: {rows:?}"
+        );
+        let cancelled = event(
+            run,
+            EventKind::ToolCompleted {
+                call_id: "clarify".into(),
+                result: ToolResult {
+                    content: "question was cancelled".into(),
+                    is_error: true,
+                    output_ref: None,
+                },
+            },
+        );
+        view.record(&cancelled);
+        assert_eq!(
+            view.render_event(&cancelled).unwrap(),
+            "",
+            "the run's interruption notice stands for a failed question"
+        );
     }
 
     #[test]
@@ -3720,25 +3803,18 @@ mod tests {
         view.record(&declined);
         assert_eq!(
             view.render_event(&declined).unwrap(),
-            "  ↳  User declined to answer questions\n"
+            "\n● User declined to answer questions\n"
         );
         assert!(view.ended_with_rejection(run));
-        let transcript = transcript_result_lines(
-            ASK_USER_QUESTION_TOOL_NAME,
-            Some(&input),
-            &result.content,
-            true,
-            None,
-            None,
-        );
-        assert_eq!(transcript.len(), 1);
+        let denied = ToolResult {
+            content: REJECTION_PREFIXES[0].into(),
+            is_error: true,
+            output_ref: None,
+        };
         assert_eq!(
-            transcript[0]
-                .spans
-                .iter()
-                .map(|(text, _)| text.as_str())
-                .collect::<String>(),
-            "User declined to answer questions"
+            question_result_runs(Some(&input), &denied, "⏺", "⎿"),
+            question_result_runs(Some(&input), &result, "⏺", "⎿"),
+            "a denied call reads as declined, as Claude Code's rejected message"
         );
     }
 
@@ -3897,7 +3973,7 @@ mod tests {
             text.contains("value_9") && !text.contains("value_10"),
             "{text}"
         );
-        assert!(text.contains("… +4 lines · ctrl+o for details\n"), "{text}");
+        assert!(text.contains("… +4 lines (ctrl+o to expand)\n"), "{text}");
         assert!(
             runs.contains(&("let".into(), Some(Role::CodeKeyword))),
             "{runs:?}"

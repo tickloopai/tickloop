@@ -950,7 +950,7 @@ mod tests {
             }
             ShellRows
                 .list(&MonitorContext {
-                    chat: Some(chat),
+                    chat: Some(Arc::new(chat)),
                     shells: Some(tickloop_agent_protocol::ShellTaskSnapshot {
                         chat_id: shell.chat_id,
                         live_revision: 1,
@@ -1028,7 +1028,7 @@ mod tests {
         chat.monitor
             .record_opened(terminal.clone(), Some("make dev".into()));
         let context = MonitorContext {
-            chat: Some(chat),
+            chat: Some(Arc::new(chat)),
             subscriptions: vec![TickSubscriptionStatus {
                 id: Uuid::from_u128(2),
                 loop_id: Uuid::from_u128(3),
@@ -1108,7 +1108,7 @@ mod tests {
         chat.monitor.record_opened(calendar.clone(), None);
         chat.monitor.mark_taken_in(calendar.clone(), 6_000);
         let mut context = MonitorContext {
-            chat: Some(chat),
+            chat: Some(Arc::new(chat)),
             shells: Some(tickloop_agent_protocol::ShellTaskSnapshot {
                 chat_id: ended.chat_id,
                 live_revision: 1,
@@ -1132,7 +1132,7 @@ mod tests {
             assert_eq!(rows[instance], Some(Unread { count: None }), "{instance}");
         }
 
-        let chat = context.chat.as_mut().unwrap();
+        let chat = Arc::make_mut(context.chat.as_mut().unwrap());
         chat.monitor.mark_taken_in(quote.clone(), 5_000);
         chat.monitor.mark_handled(calendar.clone(), 7_500);
         chat.monitor.mark_taken_in(shell.clone(), 8_000);
@@ -1170,7 +1170,7 @@ mod tests {
         chat.monitor
             .record_opened(pane.clone(), Some("make dev".into()));
         let context = MonitorContext {
-            chat: Some(chat),
+            chat: Some(Arc::new(chat)),
             shells: Some(tickloop_agent_protocol::ShellTaskSnapshot {
                 chat_id: running.chat_id,
                 live_revision: 1,
@@ -1197,7 +1197,7 @@ mod tests {
         let mut gone_subscription = subscription(&watched, None, 0);
         gone_subscription.link = TickLinkState::InstanceGone;
         let context = |now_ms| MonitorContext {
-            chat: Some(chat.clone()),
+            chat: Some(Arc::new(chat.clone())),
             subscriptions: vec![gone_subscription.clone()],
             member_states: [
                 (plain.clone(), MemberState::Gone),

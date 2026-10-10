@@ -68,23 +68,21 @@ impl ThinkingPreview {
     }
 }
 
+/// Measures only as far as the row reaches, so a long line costs no more than a short one.
 fn truncate_to_width(text: &str, width: usize) -> String {
-    if text.width() <= width {
-        return text.to_owned();
-    }
     let available = width.saturating_sub(1);
-    let mut visible = String::new();
     let mut used = 0;
-    for grapheme in text.graphemes(true) {
-        let glyph_width = grapheme.width();
-        if used + glyph_width > available {
-            break;
+    let mut kept = 0;
+    for (offset, grapheme) in text.grapheme_indices(true) {
+        used += grapheme.width();
+        if used > width {
+            return format!("{}…", &text[..kept]);
         }
-        visible.push_str(grapheme);
-        used += glyph_width;
+        if used <= available {
+            kept = offset + grapheme.len();
+        }
     }
-    visible.push('…');
-    visible
+    text.to_owned()
 }
 
 #[cfg(test)]

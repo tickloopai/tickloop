@@ -1,7 +1,7 @@
-//! Agent communication in the conversation, as Claude Code draws an Agent call, a teammate's
-//! message and an Agent notification: a Subagent call names its child in the child's Agent
-//! Color, a finished child and the report it delivered read as one block, and any other Agent
-//! message reads as one line. Ctrl+O shows each of them in full.
+//! Agent communication in the conversation, as Claude Code draws its teammates: a Subagent call
+//! names its child in the child's Agent Color, a finished child and the report it delivered read
+//! as one `Teammate @handle finished` block, and any other Agent message folds into one dim
+//! `› Message from @handle` line. Ctrl+O shows each of them in full.
 
 use std::collections::{HashMap, HashSet};
 
@@ -28,13 +28,22 @@ pub(super) type AgentColors = HashMap<Uuid, Option<AgentColor>>;
 const REPORT_PREVIEW_LINES: usize = 2;
 /// Characters of one previewed line before the rest is left to Ctrl+O.
 const PREVIEW_LINE_CHARACTERS: usize = 160;
+/// Characters of a failed child's reason in its heading before Ctrl+O, as Claude Code's.
+const FAILURE_PREVIEW_CHARACTERS: usize = 200;
+/// Characters of a sender's handle in a folded message line, as Claude Code's.
+const MESSAGE_HANDLE_CHARACTERS: usize = 20;
 /// Characters of a Subagent call's description in its row.
 const DESCRIPTION_CHARACTERS: usize = 80;
 const EXPAND_HINT: &str = "(ctrl+o to expand)";
-const STARTED_IN_BACKGROUND: &str = "Started in background";
+/// Claude Code's result of an Agent call that went to the background.
+pub(super) const BACKGROUNDED: &str = "Backgrounded agent";
 const ENDED_WITHOUT_REPORT: &str = "Ended without a report";
-/// Between an Agent message's handle and its preview, as wide as Claude Code's gap.
-const MESSAGE_GAP: &str = "  ";
+/// Claude Code's name for a named family member: a child here has a handle and an Agent Color,
+/// takes messages and can be continued, as a Claude Code teammate.
+const TEAMMATE: &str = "Teammate";
+const MESSAGE_FROM: &str = "Message from";
+/// A block's body under its heading, as Claude Code pads a notification's or message's body.
+const BODY_INDENT: &str = "  ";
 
 /// Agent Colors as the Agent catalog reports them.
 pub(super) fn catalog_colors(rows: &[AgentSummary]) -> AgentColors {
@@ -50,26 +59,14 @@ pub(super) fn catalog_colors(rows: &[AgentSummary]) -> AgentColors {
         .collect()
 }
 
-/// Every other Agent `snapshot`'s conversation names: the children it delegated to and the
-/// members whose messages or completions reached it.
+/// Every child `snapshot`'s conversation names in its Agent Color: the children it delegated to
+/// and the ones whose completions reached it.
 pub(super) fn named_agents(snapshot: &ChatSnapshot) -> HashSet<Uuid> {
     let mut agents = snapshot
         .family_completions
         .iter()
         .map(|completion| completion.child_chat_id)
         .collect::<HashSet<_>>();
-    agents.extend(
-        snapshot
-            .agent_message_origins
-            .values()
-            .filter_map(|source| source["sender_chat_id"].as_str()?.parse::<Uuid>().ok()),
-    );
-    agents.extend(
-        snapshot
-            .pending_inputs
-            .iter()
-            .filter_map(|pending| Some(pending.agent_message.as_ref()?.sender_chat_id)),
-    );
     agents.extend(
         snapshot
             .messages
@@ -234,8 +231,9 @@ pub(super) fn subagent_report(
     })
 }
 
-/// A Subagent call's result under its row: that the child started in the background, the first
-/// lines of a foreground child's report, or how the child failed.
+/// A Subagent call's result under its row: Claude Code's `Backgrounded agent` for a child that
+/// went to the background, the first lines of a foreground child's report, or how the child
+/// failed.
 pub(super) fn subagent_result_runs(
     launch: &Value,
     is_error: bool,
@@ -245,12 +243,15 @@ pub(super) fn subagent_result_runs(
     let mut rows = Rows::new(glyph);
     let status = launch["status"].as_str();
     if status == Some("async_launched") {
-        rows.row(vec![(STARTED_IN_BACKGROUND.into(), Some(Role::MutedText))]);
+        rows.row(vec![
+            (BACKGROUNDED.into(), None),
+            (format!(" {EXPAND_HINT}"), Some(Role::MutedText)),
+        ]);
         return rows.runs;
     }
     if status == Some("completed") && !is_error {
         match report {
-            Some(report) => rows.report(report, OutputDetail::Preview),
+            Some(report) => rows.report(report),
             None => rows.row(vec![(ENDED_WITHOUT_REPORT.into(), Some(Role::MutedText))]),
         }
         return rows.runs;
@@ -266,7 +267,7 @@ pub(super) fn subagent_result_runs(
     } else {
         format!("{label}: {error}")
     };
-    rows.lines(&text, Some(Role::Error), OutputDetail::Preview);
+    rows.lines(&text, Some(Role::Error));
     rows.runs
 }
 
@@ -327,8 +328,10 @@ fn has_completion(snapshot: &ChatSnapshot, child_run: Uuid) -> bool {
         .any(|completion| completion.child_run_id == child_run)
 }
 
-/// A finished child as one block: `⏺ @handle finished · <elapsed>` with the dot in its outcome's
-/// colour, then `⎿` with the first lines of its report. Ctrl+O shows the whole report.
+/// A finished child as Claude Code draws a teammate that finished: `⏺ Teammate @handle finished`
+/// with the dot in its outcome's colour and the handle in its Agent Color, a failure's reason and
+/// the run's time dim behind it, then the report indented under it: its first lines dim, the last
+/// ending in `…` when more is left to Ctrl+O, or the whole report in full.
 pub(super) fn completion_runs(
     completion: &FamilyCompletion,
     snapshot: &ChatSnapshot,
@@ -338,45 +341,51 @@ pub(super) fn completion_runs(
 ) -> (RoleRuns, RoleRuns) {
     let (word, dot) = match completion.state {
         LoopState::Failed => ("failed", Role::Error),
-        LoopState::Interrupted => ("interrupted", Role::Warning),
-        LoopState::Stopped | LoopState::Expired => ("stopped", Role::Warning),
+        LoopState::Interrupted => ("was interrupted", Role::Warning),
+        LoopState::Stopped | LoopState::Expired => ("was stopped", Role::Warning),
         _ => ("finished", Role::Success),
     };
-    let elapsed = completion
-        .started_at
-        .map(|started| {
-            format!(
-                " · {}",
-                compact_duration(completion.finished_at.saturating_sub(started))
-            )
-        })
-        .unwrap_or_default();
-    let heading = vec![
+    let mut heading = vec![
         ("\n".into(), None),
         (display.glyph(Glyph::ToolCall).into(), Some(dot)),
-        (" ".into(), None),
+        (format!(" {TEAMMATE} "), None),
         (
             format!("@{}", safe_line(&completion.handle)),
             agent_role(colors, Some(completion.child_chat_id)),
         ),
-        (format!(" {word}{elapsed}\n"), None),
+        (format!(" {word}"), None),
     ];
-    let mut rows = Rows::new(display.glyph(Glyph::ToolResult));
+    if let Some(error) = &completion.error {
+        let reason = safe_text(&error.split_whitespace().collect::<Vec<_>>().join(" "));
+        let reason = match detail {
+            OutputDetail::Preview => clipped(&reason, FAILURE_PREVIEW_CHARACTERS).0,
+            OutputDetail::Full => reason,
+        };
+        heading.push((format!(": {reason}"), Some(Role::MutedText)));
+    }
+    if let Some(started) = completion.started_at {
+        heading.push((
+            format!(
+                " · {}",
+                compact_duration(completion.finished_at.saturating_sub(started))
+            ),
+            Some(Role::MutedText),
+        ));
+    }
+    heading.push(("\n".into(), None));
+    let mut body = Body::default();
     let report = reported(&completion.result, || {
         delivered_report(snapshot, completion.child_run_id)
     });
     match &report {
-        Some(report) => rows.report(report, detail),
+        Some(report) => body.report(report, detail),
         None if completion.error.is_none() && completion.result == SUBAGENT_MISSING_REPORT => {
-            rows.row(vec![(ENDED_WITHOUT_REPORT.into(), Some(Role::MutedText))]);
+            body.row(vec![(ENDED_WITHOUT_REPORT.into(), Some(Role::MutedText))]);
         }
         None => {}
     }
-    if let Some(error) = &completion.error {
-        rows.lines(error, Some(Role::Error), detail);
-    }
     if let SubagentNotificationDelivery::Rejected(rejection) = &completion.notification {
-        rows.row(vec![(
+        body.row(vec![(
             format!(
                 "Notification not delivered: {}",
                 safe_line(&rejection.message)
@@ -384,53 +393,40 @@ pub(super) fn completion_runs(
             Some(Role::MutedText),
         )]);
     }
-    (heading, rows.runs)
+    (heading, body.runs)
 }
 
-/// Any other Agent message: `✉ @handle  <first line>  (ctrl+o to expand)`. In full, the
-/// sender's label and any verified user relay head the whole message under a `⎿`.
+/// Any other Agent message, as Claude Code folds a teammate's message: one dim
+/// `› Message from @handle (ctrl+o to expand)` line, a long handle cut short. In full, the heading
+/// names the whole handle, and any verified user relay and the whole message sit under it.
 pub(super) fn message_runs(
     message: &AgentMessage<'_>,
-    colors: &AgentColors,
     detail: OutputDetail,
     display: DisplayProfile,
 ) -> (RoleRuns, RoleRuns) {
-    let mut heading = vec![
-        ("\n".into(), None),
-        (
-            display.glyph(Glyph::AgentMessage).into(),
-            Some(Role::MutedText),
-        ),
-        (" ".into(), None),
-        (
-            format!("@{}", safe_line(message.sender_handle)),
-            agent_role(colors, message.sender_chat),
-        ),
-    ];
-    let body = safe_text(message.text);
+    let mark = display.glyph(Glyph::AgentMessage);
+    let handle = safe_line(message.sender_handle);
     if matches!(detail, OutputDetail::Preview) {
-        let mut lines = body.lines().filter(|line| !line.trim().is_empty());
-        let (first, clipped) = clipped(
-            lines.next().unwrap_or_default().trim(),
-            PREVIEW_LINE_CHARACTERS,
-        );
-        heading.push((format!("{MESSAGE_GAP}{first}"), None));
-        if clipped || lines.next().is_some() || message.relay.is_some() {
-            heading.push((format!("{MESSAGE_GAP}{EXPAND_HINT}"), Some(Role::MutedText)));
-        }
-        heading.push(("\n".into(), None));
+        let handle = clipped(&handle, MESSAGE_HANDLE_CHARACTERS).0;
+        let heading = vec![
+            ("\n".into(), None),
+            (
+                format!("{mark} {MESSAGE_FROM} @{handle} {EXPAND_HINT}\n"),
+                Some(Role::MutedText),
+            ),
+        ];
         return (heading, RoleRuns::new());
     }
-    if !message.sender_label.is_empty() {
-        heading.push((
-            format!(" · {}", safe_line(message.sender_label)),
+    let heading = vec![
+        ("\n".into(), None),
+        (
+            format!("{mark} {MESSAGE_FROM} @{handle}\n"),
             Some(Role::MutedText),
-        ));
-    }
-    heading.push(("\n".into(), None));
-    let mut rows = Rows::new(display.glyph(Glyph::ToolResult));
+        ),
+    ];
+    let mut body = Body::default();
     if let Some(relay) = message.relay {
-        rows.row(vec![(
+        body.row(vec![(
             format!(
                 "Verified user relay · {}",
                 if relay.forwarded_verbatim {
@@ -441,31 +437,24 @@ pub(super) fn message_runs(
             ),
             Some(Role::MutedText),
         )]);
-        rows.lines(&relay.original_text, Some(Role::MutedText), detail);
+        body.lines(&relay.original_text, Some(Role::MutedText));
     }
-    rows.lines(&body, None, detail);
-    (heading, rows.runs)
+    body.lines(message.text, None);
+    (heading, body.runs)
 }
 
 /// An Agent message as [`message_runs`] reads it.
 pub(super) struct AgentMessage<'a> {
     pub(super) sender_handle: &'a str,
-    pub(super) sender_label: &'a str,
-    pub(super) sender_chat: Option<Uuid>,
     pub(super) relay: Option<&'a VerifiedUserRelay>,
     pub(super) text: &'a str,
 }
 
 impl<'a> AgentMessage<'a> {
-    /// `local` as the Agent message `message_id` of `snapshot`; `None` for another local message.
-    pub(super) fn of(
-        local: &'a LocalMessage,
-        snapshot: &ChatSnapshot,
-        message_id: Option<Uuid>,
-    ) -> Option<Self> {
+    /// `local` as an Agent message; `None` for another local message.
+    pub(super) fn of(local: &'a LocalMessage) -> Option<Self> {
         let LocalMessage::AgentCommunication {
             sender_handle,
-            sender_label,
             relay,
             message,
             ..
@@ -475,17 +464,13 @@ impl<'a> AgentMessage<'a> {
         };
         Some(Self {
             sender_handle,
-            sender_label,
-            sender_chat: message_id
-                .and_then(|id| snapshot.agent_message_origins.get(&id))
-                .and_then(|source| source["sender_chat_id"].as_str()?.parse().ok()),
             relay: relay.as_ref(),
             text: message,
         })
     }
 }
 
-/// Rows under a `⎿`, the first behind the connector and the rest under its content.
+/// Rows under a call's `⎿`, the first behind the connector and the rest under its content.
 struct Rows<'a> {
     runs: RoleRuns,
     glyph: &'a str,
@@ -511,31 +496,20 @@ impl<'a> Rows<'a> {
         self.runs.push(("\n".into(), None));
     }
 
-    fn lines(&mut self, text: &str, role: Option<Role>, detail: OutputDetail) {
-        let text = safe_text(text);
-        for line in text.lines() {
-            let line = match detail {
-                OutputDetail::Preview => clipped(line, PREVIEW_LINE_CHARACTERS).0,
-                OutputDetail::Full => line.to_owned(),
-            };
-            self.row(vec![(line, role)]);
+    fn lines(&mut self, text: &str, role: Option<Role>) {
+        for line in safe_text(text).lines() {
+            self.row(vec![(clipped(line, PREVIEW_LINE_CHARACTERS).0, role)]);
         }
     }
 
-    /// A report's note in the warning colour, then its lines: all of them in full, otherwise the
-    /// first few with the expand hint after the last when any were left out.
-    fn report(&mut self, report: &SubagentReportMessage, detail: OutputDetail) {
+    /// A foreground child's report under its call: its note in the warning colour, then its first
+    /// lines with the expand hint after the last when any were left out.
+    fn report(&mut self, report: &SubagentReportMessage) {
         if let Some(note) = &report.note {
-            self.lines(note, Some(Role::Warning), detail);
+            self.lines(note, Some(Role::Warning));
         }
         let text = safe_text(report.report.trim_end());
         let mut lines = text.lines().skip_while(|line| line.trim().is_empty());
-        if matches!(detail, OutputDetail::Full) {
-            for line in lines {
-                self.row(vec![(line.to_owned(), None)]);
-            }
-            return;
-        }
         let mut shown = Vec::new();
         let mut truncated = false;
         for line in lines.by_ref().take(REPORT_PREVIEW_LINES) {
@@ -551,6 +525,64 @@ impl<'a> Rows<'a> {
                 spans.push((format!(" {EXPAND_HINT}"), Some(Role::MutedText)));
             }
             self.row(spans);
+        }
+    }
+}
+
+/// Rows indented under a block's heading with no connector, as Claude Code pads the body of a
+/// teammate's notification or message.
+#[derive(Default)]
+struct Body {
+    runs: RoleRuns,
+}
+
+impl Body {
+    fn row(&mut self, spans: RoleRuns) {
+        self.runs.push((BODY_INDENT.into(), None));
+        self.runs.extend(spans);
+        self.runs.push(("\n".into(), None));
+    }
+
+    fn lines(&mut self, text: &str, role: Option<Role>) {
+        for line in safe_text(text).lines() {
+            self.row(vec![(line.to_owned(), role)]);
+        }
+    }
+
+    /// A report's note in the warning colour, then its lines: all of them in full, otherwise its
+    /// first lines dim, the last ending in `…` when more of the report is left to Ctrl+O.
+    fn report(&mut self, report: &SubagentReportMessage, detail: OutputDetail) {
+        let text = safe_text(report.report.trim_end());
+        if matches!(detail, OutputDetail::Full) {
+            if let Some(note) = &report.note {
+                self.lines(note, Some(Role::Warning));
+            }
+            for line in text.lines().skip_while(|line| line.trim().is_empty()) {
+                self.row(vec![(line.to_owned(), None)]);
+            }
+            return;
+        }
+        if let Some(note) = &report.note {
+            for line in safe_text(note).lines() {
+                self.row(vec![(
+                    clipped(line, PREVIEW_LINE_CHARACTERS).0,
+                    Some(Role::Warning),
+                )]);
+            }
+        }
+        let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+        let shown = lines
+            .by_ref()
+            .take(REPORT_PREVIEW_LINES)
+            .map(|line| clipped(line, PREVIEW_LINE_CHARACTERS))
+            .collect::<Vec<_>>();
+        let has_more = lines.next().is_some();
+        let last = shown.len().saturating_sub(1);
+        for (index, (mut line, was_clipped)) in shown.into_iter().enumerate() {
+            if has_more && index == last && !was_clipped {
+                line.push('…');
+            }
+            self.row(vec![(line, Some(Role::MutedText))]);
         }
     }
 }
@@ -608,40 +640,62 @@ mod tests {
     }
 
     #[test]
-    fn a_finished_child_and_its_report_read_as_one_block_in_its_outcome_colour() {
-        let finished = completion(LoopState::Completed, SUBAGENT_REPORT_RECEIPT, None);
+    fn a_finished_child_reads_as_a_teammate_block_in_its_outcome_colour() {
+        let mut finished = completion(LoopState::Completed, SUBAGENT_REPORT_RECEIPT, None);
         let warning = "SECURITY WARNING: auto review flagged this subagent's report.";
         let report = SubagentReportMessage {
             note: Some(warning.into()),
-            report: "First finding.\nSecond finding.\nThird finding.".into(),
+            report: "First finding.\n\nSecond finding.\nThird finding.".into(),
         };
         let snapshot = delivered(finished.child_run_id, &report);
-        let (heading, response) = block(&finished, &snapshot, OutputDetail::Preview);
-        assert_eq!(joined(&heading), "\n⏺ @audit finished · 1m 3s\n");
-        assert_eq!(heading[1].1, Some(Role::Success));
-        assert_eq!(
-            joined(&response),
-            format!(
-                "  ⎿  {warning}\n     First finding.\n     Second finding. (ctrl+o to expand)\n"
-            )
+        let colors = AgentColors::from([(finished.child_chat_id, Some(AgentColor::Cyan))]);
+        let (heading, body) = completion_runs(
+            &finished,
+            &snapshot,
+            &colors,
+            OutputDetail::Preview,
+            DisplayProfile::default(),
         );
-        assert!(response.contains(&(warning.into(), Some(Role::Warning))));
+        assert_eq!(joined(&heading), "\n⏺ Teammate @audit finished · 1m 3s\n");
+        assert_eq!(heading[1].1, Some(Role::Success));
+        assert!(heading.contains(&("@audit".into(), Some(Role::agent(AgentColor::Cyan)))));
+        assert!(heading.contains(&(" · 1m 3s".into(), Some(Role::MutedText))));
+        assert_eq!(
+            joined(&body),
+            format!("  {warning}\n  First finding.\n  Second finding.…\n")
+        );
+        assert!(body.contains(&(warning.into(), Some(Role::Warning))));
+        assert!(body.contains(&("Second finding.…".into(), Some(Role::MutedText))));
         let (_, full) = block(&finished, &snapshot, OutputDetail::Full);
-        assert!(joined(&full).ends_with("     Third finding.\n"));
-        assert!(!joined(&full).contains("expand"));
+        assert_eq!(
+            joined(&full),
+            format!("  {warning}\n  First finding.\n  \n  Second finding.\n  Third finding.\n")
+        );
+        assert!(full.contains(&("Third finding.".into(), None)));
+
+        finished.result = "Only line.".into();
+        let (_, whole) = block(&finished, &snapshot, OutputDetail::Preview);
+        assert_eq!(
+            joined(&whole),
+            "  Only line.\n",
+            "nothing left out, no ellipsis"
+        );
 
         for (state, word, dot) in [
             (LoopState::Failed, "failed", Role::Error),
-            (LoopState::Interrupted, "interrupted", Role::Warning),
-            (LoopState::Stopped, "stopped", Role::Warning),
-            (LoopState::Expired, "stopped", Role::Warning),
+            (LoopState::Interrupted, "was interrupted", Role::Warning),
+            (LoopState::Stopped, "was stopped", Role::Warning),
+            (LoopState::Expired, "was stopped", Role::Warning),
         ] {
-            let ended = completion(state, SUBAGENT_MISSING_REPORT, Some("Model unavailable"));
-            let (heading, response) = block(&ended, &snapshot, OutputDetail::Preview);
-            assert_eq!(joined(&heading), format!("\n⏺ @audit {word} · 1m 3s\n"));
+            let ended = completion(state, SUBAGENT_MISSING_REPORT, Some("Model\nunavailable"));
+            let (heading, body) = block(&ended, &snapshot, OutputDetail::Preview);
+            assert_eq!(
+                joined(&heading),
+                format!("\n⏺ Teammate @audit {word}: Model unavailable · 1m 3s\n")
+            );
             assert_eq!(heading[1].1, Some(dot));
-            assert_eq!(joined(&response), "  ⎿  Model unavailable\n");
-            assert_eq!(response[3].1, Some(Role::Error));
+            assert!(heading.contains(&(": Model unavailable".into(), Some(Role::MutedText))));
+            assert!(body.is_empty(), "the reason stands in the heading");
         }
     }
 
@@ -653,8 +707,8 @@ mod tests {
         };
         let snapshot = delivered(Uuid::new_v4(), &other);
         let silent = completion(LoopState::Completed, SUBAGENT_MISSING_REPORT, None);
-        let (_, response) = block(&silent, &snapshot, OutputDetail::Preview);
-        assert_eq!(joined(&response), "  ⎿  Ended without a report\n");
+        let (_, body) = block(&silent, &snapshot, OutputDetail::Preview);
+        assert_eq!(joined(&body), "  Ended without a report\n");
 
         let mut refused = completion(LoopState::Completed, "Plain reply text", None);
         refused.started_at = None;
@@ -662,12 +716,59 @@ mod tests {
             code: FamilyMessageRejectionCode::StaleTarget,
             message: "The receiving parent is stopped".into(),
         });
-        let (heading, response) = block(&refused, &snapshot, OutputDetail::Preview);
-        assert_eq!(joined(&heading), "\n⏺ @audit finished\n");
+        let (heading, body) = block(&refused, &snapshot, OutputDetail::Preview);
+        assert_eq!(joined(&heading), "\n⏺ Teammate @audit finished\n");
         assert_eq!(
-            joined(&response),
-            "  ⎿  Plain reply text\n     Notification not delivered: The receiving parent is stopped\n"
+            joined(&body),
+            "  Plain reply text\n  Notification not delivered: The receiving parent is stopped\n"
         );
+    }
+
+    #[test]
+    fn another_agent_message_folds_into_one_dim_line_and_reads_in_full() {
+        let relay = VerifiedUserRelay {
+            original_chat_id: Uuid::new_v4(),
+            original_message_id: Uuid::new_v4(),
+            original_text: "Human instruction".into(),
+            forwarded_verbatim: true,
+        };
+        let message = AgentMessage {
+            sender_handle: "feature-dev-code-reviewer",
+            relay: Some(&relay),
+            text: "First line\nSecond line",
+        };
+        for glyphs in [
+            tickloop_agent_config::GlyphSet::Unicode,
+            tickloop_agent_config::GlyphSet::NerdFont,
+        ] {
+            let display = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
+                glyph_set: glyphs,
+                ..Default::default()
+            });
+            let (heading, body) = message_runs(&message, OutputDetail::Preview, display);
+            assert_eq!(
+                joined(&heading),
+                "\n› Message from @feature-dev-code-rev… (ctrl+o to expand)\n"
+            );
+            assert!(
+                heading
+                    .iter()
+                    .all(|(text, role)| text == "\n" || *role == Some(Role::MutedText)),
+                "the whole line is dim"
+            );
+            assert!(body.is_empty());
+
+            let (heading, body) = message_runs(&message, OutputDetail::Full, display);
+            assert_eq!(
+                joined(&heading),
+                "\n› Message from @feature-dev-code-reviewer\n"
+            );
+            assert_eq!(
+                joined(&body),
+                "  Verified user relay · verbatim\n  Human instruction\n  First line\n  Second line\n"
+            );
+            assert!(body.contains(&("Second line".into(), None)));
+        }
     }
 
     #[test]
@@ -684,10 +785,12 @@ mod tests {
         let named = subagent_call_runs(&input, Some(&launch), &colors, display);
         assert_eq!(joined(&named), "\n⏺ Subagent(@audit-2 · Audit evidence)\n");
         assert!(named.contains(&("@audit-2".into(), Some(Role::agent(AgentColor::Cyan)))));
+        let backgrounded = subagent_result_runs(&launch, false, None, "⎿");
         assert_eq!(
-            joined(&subagent_result_runs(&launch, false, None, "⎿")),
-            "  ⎿  Started in background\n"
+            joined(&backgrounded),
+            "  ⎿  Backgrounded agent (ctrl+o to expand)\n"
         );
+        assert!(backgrounded.contains(&("Backgrounded agent".into(), None)));
 
         let unnamed =
             subagent_call_runs(&json!({"task":"Read\nthe   notes"}), None, &colors, display);

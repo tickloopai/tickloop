@@ -518,14 +518,8 @@ fn plan_flow_pty_cancelled_approval_stays_pending_until_plan_approves_a_continua
         approval_dialog(frame).is_some_and(|dialog| dialog.contains("Pending plan"))
     });
 
+    // As in Claude Code's `PermissionRequest`, Ctrl+C rejects the plan as Esc does.
     flow.fixture.send(b"\x03");
-    thread::sleep(Duration::from_millis(200));
-    let (frame, state) = flow.wait("Ctrl+C leaving the approval", |frame, _| {
-        frame.contains("Plan approval")
-    });
-    assert_eq!(state["permissions"], json!(["ExitPlanMode"]), "{frame}");
-
-    flow.fixture.send(b"\x1b");
     let (_, state) = flow.wait("the cancelled approval", |frame, state| {
         !frame.contains("Plan approval") && state["loops"] == json!(["Interrupted"])
     });

@@ -1,16 +1,22 @@
 use super::*;
 use tickloop_agent_protocol::{AgentAccess, ViewRef};
 
-fn family_rows_are_visible(frame: &str) -> bool {
+/// The family panel's rows under its heading; a conversation's `› Message from` lines are not
+/// among them.
+fn family_rows(frame: &str) -> Vec<&str> {
     frame
         .lines()
         .skip_while(|line| !line.contains("Subagents 2"))
         .skip(1)
-        .any(|line| {
-            [MAIN_TASK, FIRST_CHILD_TASK, SECOND_CHILD_TASK]
-                .iter()
-                .any(|title| line.contains(title))
-        })
+        .collect()
+}
+
+fn family_rows_are_visible(frame: &str) -> bool {
+    family_rows(frame).iter().any(|line| {
+        [MAIN_TASK, FIRST_CHILD_TASK, SECOND_CHILD_TASK]
+            .iter()
+            .any(|title| line.contains(title))
+    })
 }
 
 const MAIN_TASK: &str = "FAMILY-MAIN";
@@ -75,13 +81,14 @@ async fn open_family_member(
     });
     pty.send(b"\x1b[B");
     pty.wait_for("family list receives focus", |frame| {
-        family_rows_are_visible(frame) && frame.lines().any(|line| line.starts_with('›'))
+        family_rows_are_visible(frame)
+            && family_rows(frame).iter().any(|line| line.starts_with('›'))
     })
     .await;
     for _ in 0..6 {
         let frame = pty.frame();
-        if frame
-            .lines()
+        if family_rows(&frame)
+            .iter()
             .any(|line| line.starts_with('›') && line.contains(panel_title))
         {
             pty.send(b"\r");
@@ -119,11 +126,7 @@ async fn open_family_member(
             );
             return version;
         }
-        let rows = frame
-            .lines()
-            .skip_while(|line| !line.contains("Subagents 2"))
-            .skip(1)
-            .collect::<Vec<_>>();
+        let rows = family_rows(&frame);
         let selected = rows.iter().position(|line| line.starts_with('›')).unwrap();
         let target_row = rows
             .iter()
@@ -135,8 +138,8 @@ async fn open_family_member(
             .unwrap();
         pty.send(if selected < target_row { b"j" } else { b"k" });
         pty.wait_for("family selection moves to the next member", |frame| {
-            frame
-                .lines()
+            family_rows(frame)
+                .iter()
                 .any(|line| line.starts_with('›') && !line.contains(previous_title))
         })
         .await;

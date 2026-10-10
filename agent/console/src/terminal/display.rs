@@ -50,7 +50,7 @@ pub(super) enum Glyph {
     ToolCall,
     ToolResult,
     TickDelivery,
-    /// An Agent message from another family member.
+    /// Claude Code's `›` before an Agent message from another family member.
     AgentMessage,
     Success,
     TodoBranch,
@@ -127,7 +127,6 @@ impl DisplayProfile {
             (GlyphSet::Unicode, Glyph::Assistant | Glyph::Subagents | Glyph::ToolCall) => "⏺",
             (GlyphSet::Unicode, Glyph::ToolResult) => "⎿",
             (GlyphSet::Unicode, Glyph::TickDelivery) => "◉",
-            (GlyphSet::Unicode, Glyph::AgentMessage) => "✉",
             (GlyphSet::Unicode, Glyph::TodoBranch) => "⎿",
             (GlyphSet::Unicode, Glyph::TodoPending) => "◻",
             (GlyphSet::Unicode, Glyph::TodoInProgress) => "◼",
@@ -159,9 +158,9 @@ impl DisplayProfile {
             // whose colour tells assistant from tool state, so no pictogram competes with the text.
             (GlyphSet::NerdFont, Glyph::Assistant | Glyph::ToolCall) => "⏺",
             (GlyphSet::NerdFont, Glyph::ToolResult) => "⎿",
+            (_, Glyph::AgentMessage) => "›",
             (GlyphSet::NerdFont, Glyph::Subagents) => "\u{f06a9}",
             (GlyphSet::NerdFont, Glyph::TickDelivery) => "\u{f0318}",
-            (GlyphSet::NerdFont, Glyph::AgentMessage) => "\u{f01ee}",
             (GlyphSet::NerdFont, Glyph::Success) => "\u{f05e1}",
             (GlyphSet::NerdFont, Glyph::Failure) => "\u{f015a}",
             (GlyphSet::NerdFont, Glyph::Warning) => "\u{f0026}",

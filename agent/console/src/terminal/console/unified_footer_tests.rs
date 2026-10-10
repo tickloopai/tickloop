@@ -705,7 +705,9 @@ fn single_shell_activation_and_detail_updates_keep_the_exact_eligible_task() {
         1,
         vec![(TASK, "selected shell", ShellTaskState::Background)],
     );
-    console.update_shell_ticks(&snapshot).unwrap();
+    console
+        .refresh_monitor_ticks(snapshot.clone(), None)
+        .unwrap();
     console
         .state
         .lock()
@@ -759,13 +761,16 @@ fn multiple_shell_shortcut_opens_the_list_after_an_earlier_single_detail() {
     let console = fixture();
     let second = Uuid::from_u128(1012);
     console
-        .update_shell_ticks(&shell_snapshot(
-            1,
-            vec![
-                (TASK, "first shell", ShellTaskState::Background),
-                (second, "second shell", ShellTaskState::Background),
-            ],
-        ))
+        .refresh_monitor_ticks(
+            shell_snapshot(
+                1,
+                vec![
+                    (TASK, "first shell", ShellTaskState::Background),
+                    (second, "second shell", ShellTaskState::Background),
+                ],
+            ),
+            None,
+        )
         .unwrap();
     console
         .state
@@ -795,7 +800,9 @@ fn single_shell_shortcut_opens_its_exact_detail() {
         2,
         vec![(target, "sole eligible task", ShellTaskState::Background)],
     );
-    console.update_shell_ticks(&snapshot).unwrap();
+    console
+        .refresh_monitor_ticks(snapshot.clone(), None)
+        .unwrap();
     let event = console
         .state
         .lock()

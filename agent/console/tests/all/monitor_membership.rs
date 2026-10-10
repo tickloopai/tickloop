@@ -142,7 +142,7 @@ fn monitor() -> MonitorRowsRegistry {
 
 async fn monitor_rows(agent: &Agent, chat: ChatId) -> Vec<TickDescriptor> {
     monitor().list(&MonitorContext {
-        chat: Some(agent.snapshot(chat).await.unwrap()),
+        chat: Some(std::sync::Arc::new(agent.snapshot(chat).await.unwrap())),
         subscriptions: agent.tick_subscriptions(chat).await.unwrap(),
         ..Default::default()
     })
@@ -340,7 +340,7 @@ async fn one_row_merges_every_source_and_frequency_and_pages_cover_the_full_set(
     }
     let subscriptions = agent.tick_subscriptions(chat).await.unwrap();
     let context = MonitorContext {
-        chat: Some(snapshot.clone()),
+        chat: Some(std::sync::Arc::new(snapshot.clone())),
         subscriptions: subscriptions.clone(),
         ..Default::default()
     };
@@ -385,7 +385,7 @@ async fn one_row_merges_every_source_and_frequency_and_pages_cover_the_full_set(
     let first = monitor.page(&context, None, None).unwrap();
     snapshot.monitor.remove(calendar("m000"));
     let changed = MonitorContext {
-        chat: Some(snapshot),
+        chat: Some(std::sync::Arc::new(snapshot)),
         subscriptions,
         ..Default::default()
     };
@@ -490,7 +490,7 @@ async fn hosted_members_show_their_probed_state_and_sample_and_offer_close() {
         sampled_at_ms: 1,
     };
     let rows = MonitorRowsRegistry::builtin().list(&MonitorContext {
-        chat: Some(snapshot),
+        chat: Some(std::sync::Arc::new(snapshot)),
         member_states: HashMap::from([
             (running.clone(), MemberState::Live { protocol: true }),
             (gone.clone(), MemberState::Gone),

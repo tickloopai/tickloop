@@ -7,22 +7,57 @@ use super::approval_context::ApprovalSnapshot;
 use super::auto_rules::{Classification, RuleVerdict};
 use tickloop_agent_model::{
     ModelError, ModelFailureKind, ModelOutput, ModelRequest, ModelResponseRejection,
-    StructuredOutput,
+    REQUEST_OVERHEAD_TOKENS, StructuredOutput,
 };
-use tickloop_agent_protocol::{AutoPolicy, Content, Message, Role};
+use tickloop_agent_protocol::{ApprovalStage, AutoPolicy, ChatSnapshot, Content, Message, Role};
 
 pub(super) const CLASSIFIER_RESULT_NAME: &str = "classify_result";
 /// Invalid classifier output gets one further classification attempt.
 pub(super) const MAX_CLASSIFIER_ATTEMPTS: usize = 2;
 const MAX_CONSECUTIVE_DENIALS: usize = 3;
 const MAX_TOTAL_DENIALS: usize = 20;
+/// Assumed when neither the model card nor the Chat declares a window: the smallest window
+/// common to current agent-capable models, below every window in the built-in catalog (≥200k).
+/// A smaller real window still ends in the reviewer's context-limit rejection and one retry.
+const DEFAULT_REVIEWER_CONTEXT_WINDOW_TOKENS: usize = 128_000;
 const CLASSIFIER_OUTPUT_GUIDANCE: &str = "Block categories follow the supplied rule's policy kind, not how severe or alarming the action sounds. An uncleared rule with kind soft_deny yields block_soft, even for a serious destructive or adversarial action. Choose block_hard only when a rule with kind hard_deny actually applies; never promote a Soft deny to Hard deny on intuition. An explicit user boundary can yield block_user_boundary unless a Hard deny independently applies. When citing a rule_id, copy its exact ID and keep the decision consistent with its kind; otherwise use null. Do not turn a refusal into Allow merely to repair its category or citation.";
 
-/// Serializes the complete trusted snapshot for the isolated LLM reviewer.
-pub(super) fn classifier_request(
-    context: &ApprovalSnapshot,
-    stage: tickloop_agent_protocol::ApprovalStage,
-) -> ModelRequest {
+/// Bytes of approval snapshot the Chat model can review: its context window less the output
+/// reservation, request overhead and the longest classifier system prompt, using the same
+/// bytes-per-token estimate as context compaction.
+pub(super) fn review_budget_bytes(snapshot: &ChatSnapshot) -> usize {
+    let window =
+        super::context::context_window(snapshot).unwrap_or(DEFAULT_REVIEWER_CONTEXT_WINDOW_TOKENS);
+    let input_tokens = window
+        .saturating_sub(snapshot.model.max_output_tokens as usize)
+        .saturating_sub(REQUEST_OVERHEAD_TOKENS);
+    let system_prompt_bytes = [ApprovalStage::RiskScreen, ApprovalStage::Authorization]
+        .into_iter()
+        .map(|stage| system_prompt(stage, true).len())
+        .max()
+        .unwrap_or_default();
+    input_tokens
+        .saturating_mul(super::context::ESTIMATED_UTF8_BYTES_PER_TOKEN)
+        .saturating_sub(system_prompt_bytes)
+}
+
+fn system_prompt(stage: ApprovalStage, truncated: bool) -> String {
+    let mut prompt = format!(
+        "{}\n\n{}\n\nReturn exactly one JSON object with the exact lowercase field names and enum values in the output schema, in the response text. Use decision=allow with null reason and rule_id when allowed. Otherwise state the concrete blocking reason; cite its policy rule_id when applicable. No prose or Markdown fences.\n\n{}\n\n{}",
+        super::auto_rules::CLASSIFICATION_GUIDANCE,
+        super::auto_rules::OPERATION_INTERPRETATION,
+        CLASSIFIER_OUTPUT_GUIDANCE,
+        super::auto_rules::stage_guidance(stage),
+    );
+    if truncated {
+        prompt.push_str("\n\n");
+        prompt.push_str(super::auto_rules::TRUNCATION_GUIDANCE);
+    }
+    prompt
+}
+
+/// Serializes the trusted snapshot, already fitted to the reviewer, for the isolated LLM reviewer.
+pub(super) fn classifier_request(context: &ApprovalSnapshot, stage: ApprovalStage) -> ModelRequest {
     let schema = classifier_schema(&context.auto_policy);
     ModelRequest {
         history_sources: Vec::new(),
@@ -30,13 +65,7 @@ pub(super) fn classifier_request(
             Message {
                 role: Role::System,
                 content: vec![Content::Text {
-                    text: format!(
-                        "{}\n\n{}\n\nReturn exactly one JSON object with the exact lowercase field names and enum values in the output schema, in the response text. Use decision=allow with null reason and rule_id when allowed. Otherwise state the concrete blocking reason; cite its policy rule_id when applicable. No prose or Markdown fences.\n\n{}\n\n{}",
-                        super::auto_rules::CLASSIFICATION_GUIDANCE,
-                        super::auto_rules::OPERATION_INTERPRETATION,
-                        CLASSIFIER_OUTPUT_GUIDANCE,
-                        super::auto_rules::stage_guidance(stage),
-                    ),
+                    text: system_prompt(stage, context.context_truncation.is_some()),
                 }],
             },
             Message {
@@ -236,8 +265,7 @@ pub(super) fn unavailable_message(
 
 pub(super) const HEADLESS_DENIAL_LIMIT_ERROR: &str =
     "Agent aborted: too many classifier denials in headless mode";
-pub(super) const REVIEW_CONTEXT_LIMIT_MESSAGE: &str =
-    "Auto review context exceeds the model limit; review this operation manually.";
+pub(super) const REVIEW_CONTEXT_LIMIT_MESSAGE: &str = "Auto review context exceeds the model limit even after trimming; review this operation manually.";
 pub(super) const HEADLESS_CONTEXT_LIMIT_ERROR: &str =
     "Agent aborted: auto review context exceeds the model limit in headless mode";
 

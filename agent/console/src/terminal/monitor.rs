@@ -1,4 +1,7 @@
-use std::collections::{BTreeSet, HashMap};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 
 use tickhost_connect::page::{MAX_PAGE_SIZE, PageCursor, PageError};
 
@@ -115,7 +118,7 @@ pub(super) struct Monitor {
     next_page: Option<PageCursor>,
     selected: Option<InstanceRef>,
     rows: Option<MonitorRowsRegistry>,
-    pub(super) chat_snapshot: Option<ChatSnapshot>,
+    pub(super) chat_snapshot: Option<Arc<ChatSnapshot>>,
     pub(super) shell_snapshot: Option<ShellTaskSnapshot>,
     /// When each running Shell started, as far as the View knows.
     pub(super) shell_starts: HashMap<uuid::Uuid, u64>,
@@ -137,6 +140,14 @@ pub(super) struct Monitor {
     /// When an Agent turn took in each row's update while this View showed the Chat; the row
     /// flashes from then on before its fill clears.
     taken_in: HashMap<InstanceRef, u64>,
+}
+
+/// What one status refresh reads for Monitor.
+pub(super) struct MonitorSources {
+    pub(super) chat: Arc<ChatSnapshot>,
+    pub(super) shells: ShellTaskSnapshot,
+    /// `None` when they could not be read; the rows keep the previous ones.
+    pub(super) subscriptions: Option<Vec<TickSubscriptionStatus>>,
 }
 
 pub(super) struct MonitorFrame {
@@ -189,10 +200,40 @@ impl Monitor {
         self.rebuild_at(now_ms);
         true
     }
-    /// Takes the Chat's newest snapshot. An artifact title that changed in the Chat since the
-    /// previous snapshot, such as after the Agent's own rename, is newer than the one the last
-    /// metadata read cached, so it replaces that one.
-    pub(super) fn set_chat_snapshot(&mut self, snapshot: ChatSnapshot) {
+    /// Takes the Chat's newest snapshot and rebuilds the list from it.
+    pub(super) fn set_chat_snapshot(&mut self, snapshot: Arc<ChatSnapshot>) {
+        self.adopt_chat_snapshot(snapshot);
+        self.rebuild();
+    }
+    /// Takes everything one status refresh read at once, so the list is rebuilt only once. The
+    /// Chat snapshot carries Monitor membership and removals, so the Shell and subscription rows
+    /// it lists are never shown against an older one.
+    pub(super) fn refresh_sources(&mut self, sources: MonitorSources) {
+        self.adopt_chat_snapshot(sources.chat);
+        self.refresh_ticks(sources.shells, sources.subscriptions);
+    }
+    /// Takes the Chat's Shell tasks and subscriptions, which change without the Chat itself
+    /// changing, and rebuilds the list once against the Chat snapshot it already has.
+    pub(super) fn refresh_ticks(
+        &mut self,
+        shells: ShellTaskSnapshot,
+        subscriptions: Option<Vec<TickSubscriptionStatus>>,
+    ) {
+        self.shell_starts = self
+            .chat_snapshot
+            .as_deref()
+            .map(|chat| super::task_access::shell_starts(chat, &shells))
+            .unwrap_or_default();
+        self.shell_snapshot = Some(shells);
+        if let Some(subscriptions) = subscriptions {
+            self.subscriptions = subscriptions;
+        }
+        self.rebuild();
+    }
+    /// An artifact title that changed in the Chat since the previous snapshot, such as after the
+    /// Agent's own rename, is newer than the one the last metadata read cached, so it replaces
+    /// that one.
+    fn adopt_chat_snapshot(&mut self, snapshot: Arc<ChatSnapshot>) {
         let previous = self.chat_snapshot.take();
         for tick in &snapshot.artifact_ticks {
             let id = tick.instance_id();
@@ -207,7 +248,6 @@ impl Monitor {
             }
         }
         self.chat_snapshot = Some(snapshot);
-        self.rebuild();
     }
     pub(super) fn rebuild(&mut self) {
         self.rebuild_at(tickloop_agent_base::private_fs::unix_time_milliseconds());
@@ -484,7 +524,7 @@ impl Monitor {
     /// Applies a membership the Agent just confirmed, so a removed row leaves at once.
     pub(super) fn set_membership(&mut self, membership: MonitorMembership) {
         if let Some(chat) = self.chat_snapshot.as_mut() {
-            chat.monitor = membership;
+            Arc::make_mut(chat).monitor = membership;
         }
         self.rebuild();
     }
@@ -961,7 +1001,7 @@ mod unread_fill_tests {
             rows: Some(
                 MonitorRowsRegistry::new([Arc::new(Updated) as Arc<dyn MonitorRows>]).unwrap(),
             ),
-            chat_snapshot: chat,
+            chat_snapshot: chat.map(Arc::new),
             ..Default::default()
         }
     }
@@ -986,7 +1026,7 @@ mod unread_fill_tests {
     fn handled_while_listed(mark: fn(&mut MonitorMembership, InstanceRef, u64) -> bool) -> Monitor {
         let mut monitor = monitor(Some(chat()));
         monitor.rebuild_at(UPDATED_AT + 100);
-        monitor.chat_snapshot = Some(chat_handled(mark));
+        monitor.chat_snapshot = Some(Arc::new(chat_handled(mark)));
         monitor.rebuild_at(HANDLED_AT + 50);
         monitor
     }
@@ -1076,7 +1116,7 @@ mod unread_fill_tests {
         let animated = DisplayProfile::default();
         let mut opened_after = monitor(None);
         opened_after.rebuild_at(HANDLED_AT + 50);
-        opened_after.chat_snapshot = Some(chat_handled(MonitorMembership::mark_taken_in));
+        opened_after.chat_snapshot = Some(Arc::new(chat_handled(MonitorMembership::mark_taken_in)));
         opened_after.rebuild_at(HANDLED_AT + 80);
         assert_eq!(
             fill(&opened_after, animated, HANDLED_AT + 80),
@@ -1104,7 +1144,7 @@ mod unread_fill_tests {
         monitor.rebuild_at(UPDATED_AT - 1_000);
         monitor.rows =
             Some(MonitorRowsRegistry::new([Arc::new(Updated) as Arc<dyn MonitorRows>]).unwrap());
-        monitor.chat_snapshot = Some(chat_handled(MonitorMembership::mark_taken_in));
+        monitor.chat_snapshot = Some(Arc::new(chat_handled(MonitorMembership::mark_taken_in)));
         monitor.rebuild_at(HANDLED_AT + 50);
         assert_eq!(
             fill(&monitor, animated, HANDLED_AT + 50),
@@ -1116,7 +1156,7 @@ mod unread_fill_tests {
         read_again
             .monitor
             .mark_taken_in(quotes(), HANDLED_AT + 5_000);
-        monitor.chat_snapshot = Some(read_again);
+        monitor.chat_snapshot = Some(Arc::new(read_again));
         monitor.rebuild_at(HANDLED_AT + 5_050);
         assert_eq!(
             fill(&monitor, animated, HANDLED_AT + 5_050),
@@ -1136,5 +1176,69 @@ mod unread_fill_tests {
         assert_eq!(line.fill, Some(Role::Selection));
         let mark = line.spans.iter().find(|span| span.text == "●").unwrap();
         assert_eq!(mark.role, Some(Role::UnreadMark));
+    }
+}
+
+#[cfg(test)]
+mod rebuild_benchmarks {
+    use super::*;
+
+    fn chat_with_messages(count: usize) -> ChatSnapshot {
+        let messages: Vec<_> = (0..count)
+            .map(|index| {
+                serde_json::json!({
+                    "role": if index % 2 == 0 { "user" } else { "assistant" },
+                    "content": [{
+                        "type": "text",
+                        "text": format!("message {index}: {}", "conversation text ".repeat(4)),
+                    }],
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::from_u128(1),
+            "workdir": "/fixture",
+            "messages": messages,
+            "loops": [],
+        }))
+        .unwrap()
+    }
+
+    fn shells() -> ShellTaskSnapshot {
+        ShellTaskSnapshot {
+            chat_id: uuid::Uuid::from_u128(1),
+            live_revision: 1,
+            tasks: Vec::new(),
+        }
+    }
+
+    /// Mean cost of one Monitor rebuild, and of the Monitor work one status refresh does, for a
+    /// Chat of `messages` messages.
+    #[test]
+    #[ignore = "timing benchmark: cargo test --release --config profile.release.debug-assertions=true -p tickloop-agent-console --lib bench_ -- --ignored --nocapture"]
+    fn bench_monitor_rebuild_cost_by_conversation_size() {
+        const ROUNDS: u32 = 50;
+        for messages in [1_000, 10_000, 50_000] {
+            let chat = Arc::new(chat_with_messages(messages));
+            let mut monitor = Monitor::default();
+            monitor.set_chat_snapshot(chat.clone());
+            let started = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                monitor.rebuild();
+            }
+            let rebuild = started.elapsed().as_secs_f64() * 1e6 / f64::from(ROUNDS);
+            let started = std::time::Instant::now();
+            for _ in 0..ROUNDS {
+                monitor.refresh_sources(MonitorSources {
+                    chat: chat.clone(),
+                    shells: shells(),
+                    subscriptions: Some(Vec::new()),
+                });
+            }
+            let refresh = started.elapsed().as_secs_f64() * 1e6 / f64::from(ROUNDS);
+            println!(
+                "BENCH monitor messages={messages} rebuild_us={rebuild:.1} status_refresh_us={refresh:.1}"
+            );
+        }
     }
 }

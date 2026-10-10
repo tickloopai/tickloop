@@ -132,10 +132,11 @@ async fn run_family_messaging(fixture: &PrivateFixture) {
     assert!(target.conversation.messages.iter().any(|message| message.role == tickloop_agent_protocol::Role::User && message.content.iter().any(|content| matches!(content, tickloop_agent_protocol::Content::Text { text } if text == "DIRECT-HELLO"))));
     let sibling = wait_snapshot(&client, echo, "model sibling delivery completes", |current| !current.conversation.agent_message_origins.is_empty() && current.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, tickloop_agent_protocol::Content::Text { text } if text == "Sibling context received")))).await;
     pty.wait_for(
-        "the sibling's background completion as one block",
+        "the sibling's background completion as one teammate block",
         |frame| {
-            frame.contains("⏺ @echo finished · ")
-                && frame.contains("⎿  Sibling context received")
+            frame.contains("⏺ Teammate @echo finished · ")
+                && frame.contains("\n  Sibling context received")
+                && !frame.contains("⎿  Sibling context received")
                 && !frame.contains("Subagent @echo")
         },
     )

@@ -117,8 +117,8 @@ async fn agent_reports_typed_assessment_for_each_actual_reviewer() {
             snapshot.policy.revision
         );
         assert_eq!(assessment.outcome, ApprovalOutcome::Allow);
-        assert_eq!(assessment.context_version, "trusted-approval-v6");
-        assert_eq!(assessment.review_template_version, "auto-review-v17");
+        assert_eq!(assessment.context_version, "trusted-approval-v7");
+        assert_eq!(assessment.review_template_version, "auto-review-v18");
         let reviewer = assessment.reviewer.as_ref().unwrap();
         assert_eq!(
             reviewer.kind,

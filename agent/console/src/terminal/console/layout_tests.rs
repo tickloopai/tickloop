@@ -606,7 +606,9 @@ fn agent_layout_removed_footer_item_chooses_the_nearest_surviving_task() {
     for task in &mut snapshot.tasks {
         task.was_background = true;
     }
-    console.update_shell_ticks(&snapshot).unwrap();
+    console
+        .refresh_monitor_ticks(snapshot.clone(), None)
+        .unwrap();
     let selected = snapshot.tasks[12].id;
     console
         .state
@@ -615,7 +617,9 @@ fn agent_layout_removed_footer_item_chooses_the_nearest_surviving_task() {
         .monitor
         .select(&tick_protocol::InstanceRef::shell(selected));
     snapshot.tasks.retain(|task| task.id != selected);
-    console.update_shell_ticks(&snapshot).unwrap();
+    console
+        .refresh_monitor_ticks(snapshot.clone(), None)
+        .unwrap();
     let state = console.state.lock().unwrap();
     assert_eq!(state.monitor.entries().len(), 19);
     assert_ne!(

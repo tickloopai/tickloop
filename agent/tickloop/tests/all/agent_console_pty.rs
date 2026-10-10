@@ -8,6 +8,7 @@ mod auto_review;
 mod bash_background;
 mod command_feedback;
 mod daemon_shutdown;
+mod dialog_parity;
 mod family_messaging;
 mod family_navigation;
 mod hosted_monitor;
