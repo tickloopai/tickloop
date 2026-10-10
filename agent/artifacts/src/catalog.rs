@@ -13,17 +13,7 @@ pub struct ArtifactMetadata {
     #[serde(default)]
     pub publication: Option<tickloop_agent_protocol::ArtifactPublication>,
     #[serde(default)]
-    pub human_body_sequence: Option<u64>,
-    #[serde(default)]
-    pub human_body_updated_at: Option<String>,
-    #[serde(default)]
-    pub human_body_change: Option<String>,
-    #[serde(default)]
-    pub human_sequence: Option<u64>,
-    #[serde(default)]
     pub human_updated_at: Option<String>,
-    #[serde(default)]
-    pub human_change: Option<String>,
     pub id: String,
     pub title: String,
     pub format: String,

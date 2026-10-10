@@ -41,6 +41,7 @@ const HELD_DELIVERY_RETRY: Duration = Duration::from_secs(5);
 /// An item the stream or a later delivery replaces is itself one dropped Tick Update.
 const SUPERSEDED_UPDATE: u64 = 1;
 const TRUNCATION_HINT: &str = "Tick Update data was left out where `data` is null, because it was too large for this delivery or could not be read again; use the native tools for that instance type to recover it.";
+const ARTIFACT_SUBSCRIPTION_REFUSAL: &str = "an artifact takes no Tick Subscription: its association with a goal is its subscription and brings each @tickloop feedback request to that goal. An artifact a goal creates is associated with it; the user associates others by selecting them in /artifacts or with f on their Monitor row.";
 
 pub(super) fn validate(trigger: &Trigger) -> Result<(), String> {
     if trigger.subscriptions.is_empty() {
@@ -60,17 +61,21 @@ pub(super) fn validate(trigger: &Trigger) -> Result<(), String> {
 }
 
 /// The frequency a Tick type decides for every subscription to it, which no subscriber chooses:
-/// a Shell Tick is delivered as soon as it updates. Other types deliver periodically.
-fn fixed_frequency(instance: &InstanceRef) -> Option<TickSubscriptionFrequency> {
-    (instance.tick_type() == tick_protocol::SHELL_INSTANCE_TYPE)
-        .then_some(TickSubscriptionFrequency::Immediate)
+/// a Shell Tick is delivered as soon as it updates. Other types deliver periodically, except an
+/// artifact, whose association is its only subscription.
+fn fixed_frequency(instance: &InstanceRef) -> Result<Option<TickSubscriptionFrequency>, String> {
+    match instance.tick_type() {
+        tick_protocol::ARTIFACT_INSTANCE_TYPE => Err(ARTIFACT_SUBSCRIPTION_REFUSAL.into()),
+        tick_protocol::SHELL_INSTANCE_TYPE => Ok(Some(TickSubscriptionFrequency::Immediate)),
+        _ => Ok(None),
+    }
 }
 
 fn check_frequency(
     instance: &InstanceRef,
     frequency: TickSubscriptionFrequency,
 ) -> Result<(), String> {
-    match fixed_frequency(instance) {
+    match fixed_frequency(instance)? {
         Some(fixed) if fixed != frequency => Err(format!(
             "a Shell Tick Subscription is always {}",
             fixed.name()
@@ -111,7 +116,7 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: SUBSCRIBE_TICK_TOOL.into(),
             description: format!(
-                "Subscribe the current goal to a Tick Instance. A protocol or terminal Tick wakes the goal with that instance's latest Tick Update and how many updates were dropped in between at the chosen frequency: {periods}; `{}` is the default, and a period without updates wakes nothing. A Shell Tick takes no frequency: its updates are delivered as soon as they arrive. Intermediate updates are not kept, so read older data with the Tick's own query tools.",
+                "Subscribe the current goal to a Tick Instance. A protocol or terminal Tick wakes the goal with that instance's latest Tick Update and how many updates were dropped in between at the chosen frequency: {periods}; `{}` is the default, and a period without updates wakes nothing. A Shell Tick takes no frequency: it updates once, when it exits, and that update is delivered as soon as it arrives; read its output_file for progress before then. An artifact takes no Tick Subscription: its @tickloop requests reach the goal it is associated with. Intermediate updates are not kept, so read older data with the Tick's own query tools.",
                 DEFAULT_FREQUENCY.name()
             ),
             input_schema: json!({"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":3},"frequency":{"type":"string","enum":frequencies}},"required":["tick_instance_id"],"additionalProperties":false}),
@@ -132,14 +137,14 @@ struct SubscribeTickInput {
 }
 
 /// The Tick Instance a `SubscribeTick` call names and the frequency it gets: a Shell Tick is
-/// always immediate and takes no frequency, any other type gets the chosen periodic one or the
-/// default.
+/// always immediate and takes no frequency, an artifact takes no subscription, any other type
+/// gets the chosen periodic one or the default.
 pub(super) fn subscription_request(
     input: &Value,
 ) -> Result<(InstanceRef, TickSubscriptionFrequency), String> {
     let input: SubscribeTickInput = serde_json::from_value(input.clone())
         .map_err(|error| format!("invalid {SUBSCRIBE_TICK_TOOL} input: {error}"))?;
-    let frequency = match (fixed_frequency(&input.tick_instance_id), input.frequency) {
+    let frequency = match (fixed_frequency(&input.tick_instance_id)?, input.frequency) {
         (Some(_), Some(_)) => {
             return Err(
                 "a Shell Tick is delivered as soon as it updates and takes no frequency; omit frequency"
@@ -1444,7 +1449,7 @@ fn delivery_payload(items: &[DeliveryItem], truncated: bool) -> Value {
         } else if let Some(tool) = items.iter().find_map(|item| item.recover_with.as_deref()) {
             if tool.len() <= 128 {
                 format!(
-                    "Tick Update data was left out where `data` is null; recovery guidance from the instance: {tool}. Use ArtifactRead for artifacts, Read on Bash output_file for shells, or CallTickTool for a protocol Tick query."
+                    "Tick Update data was left out where `data` is null; recovery guidance from the instance: {tool}. Use Read on Bash output_file for shells, or CallTickTool for a protocol Tick query."
                 )
             } else {
                 TRUNCATION_HINT.to_owned()

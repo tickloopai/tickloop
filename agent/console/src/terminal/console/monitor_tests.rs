@@ -827,19 +827,19 @@ fn failed_artifact_refresh_retry_key_only_routes_from_the_focused_list() {
 }
 
 #[test]
-fn subscribed_artifact_routes_copy_and_feedback_to_artifact_actions() {
+fn an_artifact_row_routes_copy_and_feedback_to_artifact_actions() {
     let mut state = State::new(true, 140, 25);
     let chat = Uuid::new_v4();
     state.switch_view_chat(Some(chat));
     state.prompt_enabled = true;
     let id = Uuid::new_v4();
-    let mut entry = shell(id, "Subscribed document");
-    entry.group = TickGroup::Ticks;
+    let mut entry = shell(id, "Brief");
+    entry.group = TickGroup::Artifacts;
     entry.glyph = Glyph::ArtifactTick;
     entry.kind = "Artifact".into();
-    entry.instance = "artifact:https://docs.example/subscribed".parse().unwrap();
+    entry.instance = "artifact:https://docs.example/doc".parse().unwrap();
     entry.actions = fixture_actions(&entry.instance);
-    state.monitor.replace(TickGroup::Ticks, vec![entry]);
+    state.monitor.replace(TickGroup::Artifacts, vec![entry]);
     state.monitor.focus(false, None);
     for action in ['c', 'f'] {
         assert!(
@@ -1393,24 +1393,17 @@ fn failed_monitor_save_keeps_the_current_visibility_and_focus() {
     );
 }
 
+/// An artifact enters Monitor only as one of the Chat's artifacts: a Tick Subscription, which an
+/// artifact never takes, brings in no row of its own.
 #[test]
-fn a_subscribed_artifact_is_visible_and_merges_with_its_added_tick() {
+fn an_artifact_tick_subscription_brings_no_row() {
     let mut state = State::new(true, 140, 25);
     let chat = Uuid::new_v4();
     state.chat = Some(chat);
     let console = tests::console_with_state(state);
     let row: TickSubscriptionStatus = serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":"artifact:https://docs.example/doc","frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live","kind":"Protocol","title":"Subscribed document","updated_at_ms":1000})).unwrap();
     console.update_subscribed_ticks(chat, &[row]).unwrap();
-    let mut state = console.state.lock().unwrap();
-    assert_eq!(state.monitor.entries().len(), 1);
-    assert_eq!(state.monitor.entries()[0].kind, "Artifact");
-    assert_eq!(state.monitor.entries()[0].updated_at_ms, Some(1000));
-    let mut artifact = shell(Uuid::new_v4(), "Added document");
-    artifact.instance = "artifact:https://docs.example/doc".parse().unwrap();
-    artifact.group = TickGroup::Artifacts;
-    state.monitor.replace(TickGroup::Artifacts, vec![artifact]);
-    assert_eq!(state.monitor.entries().len(), 1);
-    assert_eq!(state.monitor.entries()[0].group, TickGroup::Artifacts);
+    assert!(console.state.lock().unwrap().monitor.entries().is_empty());
 }
 
 #[test]
@@ -2989,9 +2982,10 @@ fn an_artifact_linked_here_shows_the_subscription_marker_and_x_unlinks_it() {
     state.monitor.subscriptions = vec![subscription];
     state.monitor.rebuild();
     let text = monitor_text(&mut state);
+    let row = text.lines().find(|line| line.contains("Brief")).unwrap();
     assert!(
-        text.contains("⟳ 2 · ● 3"),
-        "the association counts with the Tick Subscription: {text}"
+        row.trim_end().ends_with('⟳') && !row.contains('●'),
+        "only the association marks an artifact, never a Tick Subscription: {row}"
     );
     assert_eq!(
         action_labels(&state),
@@ -2999,17 +2993,18 @@ fn an_artifact_linked_here_shows_the_subscription_marker_and_x_unlinks_it() {
             ('o', "open"),
             ('x', "unlink"),
             ('c', "copy"),
-            ('f', "feedback"),
-            ('w', "subscriptions"),
-            ('e', "frequency"),
-            ('u', "unsubscribe")
+            ('f', "feedback")
         ]
     );
 }
 
 #[test]
 fn a_paused_association_stays_in_words_without_the_subscription_marker() {
-    let (mut state, _) = linked_artifact_fixture(true);
+    let (mut state, artifact) = linked_artifact_fixture(true);
+    let mut subscription = tests::subscription_row(3);
+    subscription.instance = artifact;
+    state.monitor.subscriptions = vec![subscription];
+    state.monitor.rebuild();
     let text = monitor_text(&mut state);
     let row = text.lines().find(|line| line.contains("Brief")).unwrap();
     assert!(

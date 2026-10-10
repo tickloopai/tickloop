@@ -163,35 +163,18 @@ impl MonitorRows for HostedRows {
     }
 }
 
+/// The Chat's artifacts. An artifact takes no Tick Subscription: its association is its
+/// subscription and the only one its row shows.
 pub struct ArtifactRows;
 impl MonitorRows for ArtifactRows {
     fn tick_type(&self) -> &'static str {
-        "artifact"
+        tick_protocol::ARTIFACT_INSTANCE_TYPE
+    }
+    fn takes_tick_subscriptions(&self) -> bool {
+        false
     }
     fn list(&self, context: &MonitorContext) -> Vec<TickDescriptor> {
-        let mut rows =
-            super::merge_descriptors(subscriptions(context, self.tick_type()).map(|row| {
-                TickDescriptor {
-                    instance: row.instance.clone(),
-                    group: TickGroup::Artifacts,
-                    glyph: TickGlyph::Artifact,
-                    title: row
-                        .title
-                        .clone()
-                        .unwrap_or_else(|| row.instance.to_string()),
-                    kind: "Artifact".into(),
-                    status: link_status(row.link).into(),
-                    notes: Vec::new(),
-                    inherent_subscription: false,
-                    owner: ARTIFACT_OWNER,
-                    tone: link_tone(row.link),
-                    updated_at_ms: row.updated_at_ms,
-                    update: row.updated_at_ms.map(RowUpdate::new),
-                    running: false,
-                    resources: None,
-                    actions: artifact_actions(row.instance.as_str(), false),
-                }
-            }));
+        let mut rows = BTreeMap::new();
         if let Some(chat) = &context.chat {
             for tick in &chat.artifact_ticks {
                 let id = tick.instance_id();
@@ -225,20 +208,13 @@ impl MonitorRows for ArtifactRows {
                     feedback.unwrap_or_default()
                 };
                 let metadata = metadata.and_then(Option::as_ref);
-                let subscribed = rows.get(&instance);
-                let title = subscriptions(context, self.tick_type())
-                    .filter(|row| row.instance == instance && row.title.is_some())
-                    .max_by_key(|row| row.updated_at_ms)
-                    .and_then(|row| row.title.clone())
-                    .or_else(|| metadata.map(|metadata| metadata.title.clone()))
+                let title = metadata
+                    .map(|metadata| metadata.title.clone())
                     .unwrap_or_else(|| tick.title.clone());
                 let edited_at_ms = metadata
                     .and_then(|metadata| metadata.human_updated_at.as_deref())
                     .and_then(tickloop_agent_base::timestamp::parse_timestamp_ms)
-                    .map(|value| value.max(0) as u64)
-                    .into_iter()
-                    .chain(subscribed.and_then(|row| row.updated_at_ms))
-                    .max();
+                    .map(|value| value.max(0) as u64);
                 let requested_at_ms = binding.and_then(|binding| binding.last_request_at_ms);
                 let updated_at_ms = edited_at_ms.max(requested_at_ms);
                 let update = updated_at_ms.map(RowUpdate::new);
@@ -1109,6 +1085,7 @@ mod tests {
         let mut chat = empty_chat();
         chat.monitor.record_opened(calendar.clone(), None);
         chat.monitor.mark_taken_in(calendar.clone(), 6_000);
+        chat.artifact_ticks = vec![serde_json::from_value(serde_json::json!({"artifact_id":"doc-1","origin":"https://tickloop.ai","title":"Brief","format":"markdown","url":"https://tickloop.ai/a/doc-1","access_role":"owner","added_at_ms":1})).unwrap()];
         let mut context = MonitorContext {
             chat: Some(chat),
             shells: Some(tickloop_agent_protocol::ShellTaskSnapshot {
@@ -1116,10 +1093,13 @@ mod tests {
                 live_revision: 1,
                 tasks: vec![ended],
             }),
-            subscriptions: vec![
-                subscription(&quote, Some(5_000), 3),
-                subscription(&artifact, Some(4_000), 0),
-            ],
+            subscriptions: vec![subscription(&quote, Some(5_000), 3)],
+            // A human edit counts for unread without being a Tick Update.
+            metadata: [(
+                artifact.to_string(),
+                Some(serde_json::from_value(serde_json::json!({"id":"doc-1","title":"Brief","format":"markdown","access_role":"owner","human_updated_at":"1970-01-01T00:00:04.000Z"})).unwrap()),
+            )]
+            .into(),
             member_updates: [(calendar.clone(), 7_000)].into(),
             now_ms: 9_000,
             ..Default::default()

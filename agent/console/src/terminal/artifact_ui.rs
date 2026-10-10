@@ -1,7 +1,6 @@
 use super::{console::Console, execution::ConsoleExecution};
 use std::path::Path;
 use tickloop_agent_artifacts::{ArtifactClient, ArtifactError};
-use tickloop_agent_protocol::TickSubscriptionChange;
 use uuid::Uuid;
 
 pub(super) async fn refresh(
@@ -69,35 +68,8 @@ pub(super) async fn tick_action(
         .artifact_ticks(chat)
         .await
         .map_err(|error| error.to_string())?;
-    let listed = ticks.into_iter().find(|tick| tick.instance_id() == id);
-    let is_listed = listed.is_some();
-    let tick = if let Some(tick) = listed {
-        tick
-    } else {
-        let rows = agent
-            .tick_subscriptions(chat)
-            .await
-            .map_err(|error| error.to_string())?;
-        let target = rows
-            .iter()
-            .find(|row| row.instance.as_str() == id)
-            .and_then(|row| crate::monitor_rows::artifact_target(&row.instance));
-        let Some((origin, artifact_id)) = target else {
-            return Ok(());
-        };
-        let client = ArtifactClient::for_origin(
-            root.ok_or("Tickloop Artifacts configuration is unavailable")?,
-            &origin,
-        )
-        .map_err(|error| error.to_string())?;
-        client
-            .read(&artifact_id)
-            .await
-            .map_err(|error| error.to_string())?
-            .tick(
-                &origin,
-                tickloop_agent_base::private_fs::unix_time_milliseconds(),
-            )
+    let Some(tick) = ticks.into_iter().find(|tick| tick.instance_id() == id) else {
+        return Ok(());
     };
     match action {
         'o' => {
@@ -108,23 +80,9 @@ pub(super) async fn tick_action(
         'c' => console.copy_artifact_link(&tick.url)?,
         'f' => {
             agent
-                .link_artifact(chat, tick.clone())
+                .link_artifact(chat, tick)
                 .await
                 .map_err(|error| error.to_string())?;
-            // The association subscribes this Chat, so the artifact stays in Monitor until it is
-            // unlinked, also after a Tick Subscription that showed it ends.
-            if !is_listed {
-                agent
-                    .add_artifact_tick(chat, tick)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                console.update_monitor_chat(
-                    &agent
-                        .snapshot(chat)
-                        .await
-                        .map_err(|error| error.to_string())?,
-                )?;
-            }
             console.set_status("Artifact feedback linked here")?;
         }
         _ => {}
@@ -132,8 +90,8 @@ pub(super) async fn tick_action(
     Ok(())
 }
 
-/// Takes the artifact out of this Chat. While it still delivers here, through this Chat's
-/// association or a Tick Subscription, the user confirms first; unlinking ends both.
+/// Takes the artifact out of this Chat. While its association still delivers here, the user
+/// confirms first; unlinking ends it.
 async fn unlink(
     agent: &ConsoleExecution,
     console: &Console,
@@ -143,14 +101,6 @@ async fn unlink(
 ) -> Result<(), String> {
     if !is_confirmed {
         let instance = id.parse::<tick_protocol::InstanceRef>()?;
-        let subscriptions = crate::monitor_rows::subscriptions_on(
-            &agent
-                .tick_subscriptions(chat)
-                .await
-                .map_err(|error| error.to_string())?,
-            &instance,
-        )
-        .len();
         let snapshot = agent
             .snapshot(chat)
             .await
@@ -161,13 +111,8 @@ async fn unlink(
                 crate::monitor_rows::feedback_binding(&snapshot, origin, artifact_id)
             })
             .is_some_and(|binding| !binding.resume_required);
-        if is_linked_here || subscriptions > 0 {
-            return console.confirm_artifact_unlink(
-                chat,
-                id.to_owned(),
-                is_linked_here,
-                subscriptions,
-            );
+        if is_linked_here {
+            return console.confirm_artifact_unlink(chat, id.to_owned());
         }
     }
     remove_local_artifact(agent, console, chat, id).await
@@ -179,29 +124,10 @@ async fn remove_local_artifact(
     chat: Uuid,
     instance: &str,
 ) -> Result<(), String> {
-    for subscription in agent
-        .tick_subscriptions(chat)
-        .await
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter(|row| row.instance.as_str() == instance)
-    {
-        agent
-            .update_tick_subscription(chat, subscription.id, TickSubscriptionChange::Cancel)
-            .await
-            .map_err(|error| error.to_string())?;
-    }
     agent
         .remove_artifact_tick(chat, instance.to_owned())
         .await
         .map_err(|error| error.to_string())?;
-    console.update_subscribed_ticks(
-        chat,
-        &agent
-            .tick_subscriptions(chat)
-            .await
-            .map_err(|error| error.to_string())?,
-    )?;
     console.update_monitor_chat(
         &agent
             .snapshot(chat)
@@ -400,55 +326,8 @@ mod tests {
     use tickloop_agent_daemon::EmbeddedAgentAccess;
     use tickloop_agent_protocol::{
         AccessError, AgentAccess, AgentCommand, CommandEnvelope, CommandReceipt, CommandResult,
-        DisplayReceipt, DisplayUpdate, LaunchSpec, LoopAction, Observation, ObservationRequest,
-        ObservationValue, ViewRef,
+        DisplayReceipt, DisplayUpdate, LaunchSpec, Observation, ObservationRequest, ViewRef,
     };
-
-    struct SubscriptionRemote {
-        inner: EmbeddedAgentAccess,
-        rows: Mutex<Vec<tickloop_agent_protocol::TickSubscriptionStatus>>,
-        cancelled: Mutex<Vec<Uuid>>,
-    }
-    #[async_trait::async_trait]
-    impl AgentAccess for SubscriptionRemote {
-        async fn observe(&self, request: ObservationRequest) -> Result<Observation, AccessError> {
-            let mut observation = self.inner.observe(request).await?;
-            if let ObservationValue::Subscriptions(rows) = &mut observation.initial {
-                *rows = self.rows.lock().unwrap().clone();
-            }
-            Ok(observation)
-        }
-        async fn execute(&self, envelope: CommandEnvelope) -> Result<CommandReceipt, AccessError> {
-            if let AgentCommand::ManageLoop {
-                action:
-                    LoopAction::UpdateSubscription {
-                        subscription_id,
-                        change: TickSubscriptionChange::Cancel,
-                    },
-                ..
-            } = &envelope.command
-            {
-                self.cancelled.lock().unwrap().push(*subscription_id);
-                self.rows
-                    .lock()
-                    .unwrap()
-                    .retain(|row| row.id != *subscription_id);
-                let mut receipt = self
-                    .inner
-                    .execute(CommandEnvelope {
-                        command: AgentCommand::FlushTranscripts,
-                        ..envelope
-                    })
-                    .await?;
-                receipt.result = Some(CommandResult::Done);
-                return Ok(receipt);
-            }
-            self.inner.execute(envelope).await
-        }
-        async fn show_view(&self, update: DisplayUpdate) -> Result<DisplayReceipt, AccessError> {
-            self.inner.show_view(update).await
-        }
-    }
 
     async fn artifact_service() -> (String, tokio::task::JoinHandle<()>, Arc<Mutex<Vec<String>>>) {
         use tokio::{
@@ -485,7 +364,7 @@ mod tests {
                         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
                     serde_json::json!({"artifact_id":"doc","binding_id":input["binding_id"],"epoch":2})
                 } else {
-                    serde_json::json!({"id":"doc","title":"Subscribed document","format":"markdown","access_role":"owner","url":format!("{endpoint}/a/doc"),"agent_link":{"binding_id":Uuid::new_v4(),"chat_id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"epoch":1}})
+                    serde_json::json!({"id":"doc","title":"Shared document","format":"markdown","access_role":"owner","url":format!("{endpoint}/a/doc"),"agent_link":{"binding_id":Uuid::new_v4(),"chat_id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"epoch":1}})
                 };
                 let body = body.to_string();
                 socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
@@ -494,15 +373,11 @@ mod tests {
         (origin, task, requests)
     }
 
-    async fn subscribed_fixture(
+    /// A Chat of an Agent that reaches the artifact service at `origin`.
+    async fn artifact_fixture(
         directory: &Path,
         origin: &str,
-    ) -> (
-        ConsoleExecution,
-        tickloop_agent_runtime::Agent,
-        Arc<SubscriptionRemote>,
-        Uuid,
-    ) {
+    ) -> (ConsoleExecution, tickloop_agent_runtime::Agent, Uuid) {
         let core = tickloop_agent_runtime::Agent::new_embedded(
             tickloop_agent_test_support::config(),
             Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
@@ -514,15 +389,10 @@ mod tests {
             ),
         ))
         .unwrap();
-        let inner = EmbeddedAgentAccess::new(core.clone());
-        let remote = Arc::new(SubscriptionRemote {
-            inner,
-            rows: Mutex::new(Vec::new()),
-            cancelled: Mutex::new(Vec::new()),
-        });
+        let access = Arc::new(EmbeddedAgentAccess::new(core.clone()));
         let agent = ConsoleExecution::from_access_for_test(
-            remote.clone(),
-            remote.inner.daemon_epoch(),
+            access.clone(),
+            access.daemon_epoch(),
             ViewRef {
                 session_id: Uuid::new_v4(),
                 view_id: Uuid::new_v4(),
@@ -531,23 +401,29 @@ mod tests {
             None,
         );
         let chat = agent.create_chat(directory.into()).await.unwrap();
-        remote.rows.lock().unwrap().push(serde_json::from_value(serde_json::json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":tick_protocol::artifact_instance_id(origin,"doc"),"frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live","kind":"Protocol","title":"Subscribed document","updated_at_ms":1000})).unwrap());
-        (agent, core, remote, chat)
+        (agent, core, chat)
     }
 
-    #[tokio::test]
-    async fn subscribed_artifact_open_copy_and_feedback_which_keeps_it_in_monitor() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().canonicalize().unwrap();
-        let (origin, server, requests) = artifact_service().await;
-        let client = ArtifactClient::for_origin(&root, &origin).unwrap();
+    async fn sign_in(root: &Path, origin: &str) -> ArtifactClient {
+        let client = ArtifactClient::for_origin(root, origin).unwrap();
         let device = client.start_device_login().await.unwrap();
         client
             .finish_device_login(device, &tokio_util::sync::CancellationToken::new())
             .await
             .unwrap();
-        let (agent, core, remote, chat) = subscribed_fixture(directory.path(), &origin).await;
-        let id = remote.rows.lock().unwrap()[0].instance.to_string();
+        client
+    }
+
+    #[tokio::test]
+    async fn open_copy_and_feedback_act_on_the_listed_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let (origin, server, requests) = artifact_service().await;
+        let client = sign_in(&root, &origin).await;
+        let (agent, core, chat) = artifact_fixture(directory.path(), &origin).await;
+        let tick = client.read("doc").await.unwrap().tick(&origin, 1);
+        let id = tick.instance_id();
+        agent.add_artifact_tick(chat, tick).await.unwrap();
         let console = Console::test_for_chat(chat);
         tick_action(&agent, &console, Some(&root), chat, id.clone(), 'o')
             .await
@@ -564,7 +440,7 @@ mod tests {
             console.test_clipboard_contents(),
             vec![format!("{origin}/a/doc")]
         );
-        tick_action(&agent, &console, Some(&root), chat, id.clone(), 'f')
+        tick_action(&agent, &console, Some(&root), chat, id, 'f')
             .await
             .unwrap();
         assert!(
@@ -578,49 +454,30 @@ mod tests {
         let snapshot = agent.snapshot(chat).await.unwrap();
         let binding = &snapshot.loops[0].event_sources[0];
         assert_eq!((binding.artifact_id.as_str(), binding.epoch), ("doc", 2));
-        let ticks = agent.artifact_ticks(chat).await.unwrap();
-        assert_eq!(
-            ticks
-                .iter()
-                .map(|tick| tick.instance_id())
-                .collect::<Vec<_>>(),
-            [id],
-            "the association keeps the artifact in Monitor after its Tick Subscription ends"
-        );
         server.abort();
         core.shutdown().await;
     }
 
     #[tokio::test]
-    async fn list_removal_and_remote_delete_cancel_the_same_canonical_local_subscription() {
+    async fn list_removal_and_remote_delete_take_out_the_same_canonical_local_artifact() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let (origin, server, requests) = artifact_service().await;
-        let client = ArtifactClient::for_origin(&root, &origin).unwrap();
-        let device = client.start_device_login().await.unwrap();
-        client
-            .finish_device_login(device, &tokio_util::sync::CancellationToken::new())
-            .await
-            .unwrap();
+        let client = sign_in(&root, &origin).await;
         for remote_delete in [false, true] {
-            let (agent, core, remote, chat) = subscribed_fixture(directory.path(), &origin).await;
+            let (agent, core, chat) = artifact_fixture(directory.path(), &origin).await;
             let mut tick = client
                 .read("doc")
                 .await
                 .unwrap()
                 .tick(&format!("{origin}/"), 1);
             tick.origin = format!("{origin}/");
+            agent.add_artifact_tick(chat, tick.clone()).await.unwrap();
             let console = Console::test_for_chat(chat);
             console
-                .update_subscribed_ticks(chat, &remote.rows.lock().unwrap().clone())
+                .update_monitor_chat(&agent.snapshot(chat).await.unwrap())
                 .unwrap();
-            if !remote_delete {
-                agent.add_artifact_tick(chat, tick.clone()).await.unwrap();
-                console
-                    .update_monitor_chat(&agent.snapshot(chat).await.unwrap())
-                    .unwrap();
-            }
-            let subscription = remote.rows.lock().unwrap()[0].id;
+            assert!(console.monitor_has_entries().unwrap());
             if remote_delete {
                 let artifact = client.read("doc").await.unwrap();
                 apply_choice_with_client(
@@ -649,12 +506,10 @@ mod tests {
                         .any(|request| request.starts_with("DELETE"))
                 );
             }
-            assert_eq!(*remote.cancelled.lock().unwrap(), vec![subscription]);
-            assert!(agent.tick_subscriptions(chat).await.unwrap().is_empty());
             assert!(agent.artifact_ticks(chat).await.unwrap().is_empty());
             assert!(
                 !console.monitor_has_entries().unwrap(),
-                "local cleanup left a cancelled subscription visible"
+                "local cleanup left the artifact visible"
             );
             core.shutdown().await;
         }
@@ -786,14 +641,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let (origin, server, _requests) = artifact_service().await;
-        let client = ArtifactClient::for_origin(&root, &origin).unwrap();
-        let device = client.start_device_login().await.unwrap();
-        client
-            .finish_device_login(device, &tokio_util::sync::CancellationToken::new())
-            .await
-            .unwrap();
-        let (agent, core, remote, chat) = subscribed_fixture(directory.path(), &origin).await;
-        remote.rows.lock().unwrap().clear();
+        let client = sign_in(&root, &origin).await;
+        let (agent, core, chat) = artifact_fixture(directory.path(), &origin).await;
         let tick = client.read("doc").await.unwrap().tick(&origin, 1);
         let id = tick.instance_id();
         agent.add_artifact_tick(chat, tick).await.unwrap();

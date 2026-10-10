@@ -513,12 +513,7 @@ pub async fn build_runtime_with_client(
     if let Some(hosted) = &hosted {
         agent.install_hosted_ticks(hosted.clone());
     }
-    let adapters = Arc::new(TickAdapters::builtin(
-        agent.clone(),
-        launch.config_root.clone(),
-        access,
-        hosted,
-    ));
+    let adapters = Arc::new(TickAdapters::builtin(agent.clone(), access, hosted));
     agent.install_tick_stream(adapters.clone()).await;
     if let Some(root) = launch.config_root.as_ref()
         && let Ok(artifact) = tickloop_agent_artifacts::ArtifactClient::new(root)

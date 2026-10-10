@@ -550,24 +550,8 @@ fn remove_subscribed_prompt(subscriptions: usize) -> String {
         tick_subscriptions(subscriptions)
     )
 }
-/// An artifact linked here also stops its @tickloop requests; one subscribed only by Tick
-/// Subscriptions asks as any subscribed row does.
-pub(in crate::terminal) fn artifact_unlink_prompt(
-    is_linked_here: bool,
-    subscriptions: usize,
-) -> String {
-    match (is_linked_here, subscriptions) {
-        (false, subscriptions) => remove_subscribed_prompt(subscriptions),
-        (true, 0) => {
-            "Unlink this artifact and stop its @tickloop requests here? enter confirm · esc cancel"
-                .into()
-        }
-        (true, subscriptions) => format!(
-            "Unlink this artifact, stop its @tickloop requests here and cancel its {}? enter confirm · esc cancel",
-            tick_subscriptions(subscriptions)
-        ),
-    }
-}
+const ARTIFACT_UNLINK_PROMPT: &str =
+    "Unlink this artifact and stop its @tickloop requests here? enter confirm · esc cancel";
 fn tick_subscriptions(count: usize) -> String {
     format!(
         "{count} Tick {}",
@@ -924,21 +908,14 @@ impl TickDetailView for TickShell {
 }
 
 impl Console {
-    /// Asks before `x` takes out an artifact that still delivers here, through this Chat's
-    /// association or `subscriptions` Tick Subscriptions; confirming unlinks it.
+    /// Asks before `x` takes out an artifact whose association still delivers here; confirming
+    /// unlinks it.
     pub(in crate::terminal) fn confirm_artifact_unlink(
         &self,
         chat: Uuid,
         id: String,
-        is_linked_here: bool,
-        subscriptions: usize,
     ) -> Result<(), String> {
-        self.confirm_tick_action(
-            chat,
-            id.clone(),
-            artifact(&id, 'X'),
-            &artifact_unlink_prompt(is_linked_here, subscriptions),
-        )
+        self.confirm_tick_action(chat, id.clone(), artifact(&id, 'X'), ARTIFACT_UNLINK_PROMPT)
     }
 }
 impl Console {

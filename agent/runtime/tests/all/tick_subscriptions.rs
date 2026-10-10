@@ -836,6 +836,33 @@ async fn a_protocol_subscription_refuses_immediate_and_unknown_parameters() {
     agent.shutdown().await;
 }
 
+/// An artifact takes no Tick Subscription: its association with a Loop delivers its @tickloop
+/// requests, so subscribing to it is refused and points the model there.
+#[tokio::test(start_paused = true)]
+async fn subscribing_to_an_artifact_points_to_its_association() {
+    let directory = tempfile::tempdir().unwrap();
+    let artifact = InstanceRef::artifact("https://docs.example", "doc").unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "artifact",
+            "SubscribeTick",
+            json!({"tick_instance_id": artifact}),
+        ),
+        text("not watching"),
+    ]));
+    let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
+
+    let (refusal, is_error) = tool_result(&model, "artifact");
+    assert!(is_error, "{refusal}");
+    assert!(
+        refusal.contains("association") && refusal.contains("/artifacts"),
+        "{refusal}"
+    );
+    assert!(agent.tick_subscriptions(chat).await.unwrap().is_empty());
+    assert!(stream.watched().is_empty());
+    agent.shutdown().await;
+}
+
 /// A model whose call `gated_call` waits for `gate`, after telling `entered` it started.
 struct GatedModel {
     gate: Arc<tokio::sync::Notify>,
@@ -1035,11 +1062,14 @@ async fn a_trigger_rejects_subscriptions_it_cannot_honour() {
         authority: None,
     };
     let shell = InstanceRef::shell(Uuid::new_v4());
+    let artifact = InstanceRef::artifact("https://docs.example", "doc").unwrap();
     use TickSubscriptionFrequency::{High, Immediate, Low};
 
     for rejected in [
         vec![subscription(fixture_instance(1), Immediate)],
         vec![subscription(shell.clone(), High)],
+        vec![subscription(artifact.clone(), High)],
+        vec![subscription(artifact, Immediate)],
         vec![
             subscription(fixture_instance(1), High),
             subscription(fixture_instance(1), Low),
