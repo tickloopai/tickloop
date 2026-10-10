@@ -56,7 +56,7 @@ impl MonitorRows for HerdrRows {
                     row.glyph = TickGlyph::Terminal;
                 }
             }
-            Some(MemberState::Gone | MemberState::Lost) => {
+            Some(MemberState::Gone | MemberState::Lost | MemberState::Exited(_)) => {
                 row.status = link_status(TickLinkState::InstanceGone).into();
                 row.tone = link_tone(TickLinkState::InstanceGone);
             }
@@ -139,6 +139,10 @@ impl MonitorRows for HostedRows {
                 row.running = true;
                 row.status = link_status(TickLinkState::Live).into();
                 row.tone = link_tone(TickLinkState::Live);
+            }
+            Some(MemberState::Exited(status)) => {
+                row.status = status.clone();
+                row.tone = StatusTone::Neutral;
             }
             Some(MemberState::Lost) => {
                 row.status = "lost".into();
@@ -1163,6 +1167,25 @@ mod tests {
         };
         let rows = MonitorRowsRegistry::builtin().list(&context);
         assert!(rows.iter().all(|row| row.update.is_none()), "{rows:?}");
+    }
+
+    #[test]
+    fn an_exited_hosted_terminal_tick_shows_how_it_ended_and_stays_listed() {
+        let exited = InstanceRef::new("hosted", "exited-run").unwrap();
+        let mut chat = empty_chat();
+        chat.monitor.record_opened(exited.clone(), None);
+        let context = MonitorContext {
+            chat: Some(chat),
+            member_states: [(exited.clone(), MemberState::Exited("exited 3".into()))].into(),
+            gone_since: [(exited.clone(), 0)].into(),
+            now_ms: GONE_DISPLAY_MS * 10,
+            ..Default::default()
+        };
+        let rows = MonitorRowsRegistry::builtin().list(&context);
+        let row = rows.iter().find(|row| row.instance == exited).unwrap();
+        assert_eq!(row.status, "exited 3");
+        assert!(!row.running);
+        assert_eq!(row.tone, StatusTone::Neutral);
     }
 
     #[test]

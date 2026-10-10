@@ -34,8 +34,8 @@ use crate::{
 };
 use tickloop_agent_protocol::{
     ChatId, HostCallContext, HostEndpointIdentity, HostToolAuthority, HostedMember,
-    HostedMemberState, HostedResources, HostedScreenSnapshot, HostedSnapshot, HostedViewGrant,
-    ToolDefinition, ToolResult,
+    HostedMemberState, HostedProgramExit, HostedResources, HostedScreenSnapshot, HostedSnapshot,
+    HostedViewGrant, ToolDefinition, ToolResult,
 };
 
 /// How results name the Tickhost that runs a hidden Tick.
@@ -178,11 +178,21 @@ impl HostedTickTools {
                     None => false,
                     Some(protocol) => protocol.as_bool().ok_or("protocol must be a boolean")?,
                 };
+                if is_same_file(
+                    &executable,
+                    tickhost_connect::access::bundled_tickhost_executable(),
+                ) {
+                    return Err(
+                        "the Tickhost launches protocol programs itself; open the program directly with protocol: true"
+                            .into(),
+                    );
+                }
                 // The bundled tick always speaks the Tick protocol.
                 let adapter = if protocol
-                    || tickhost_connect::access::bundled_tick_executable().as_ref()
-                        == Some(&executable)
-                {
+                    || is_same_file(
+                        &executable,
+                        tickhost_connect::access::bundled_tick_executable(),
+                    ) {
                     TickAdapter::Protocol
                 } else {
                     TickAdapter::Terminal
@@ -769,6 +779,8 @@ impl HostedTickTools {
                     adapter: row.adapter,
                 };
                 let (resources, updated_at_ms) = match binding.connect(&instance).await {
+                    // An exited program has nothing left to sample.
+                    Ok(_) if row.exit.is_some() => (None, None),
                     Ok(mut connection) => {
                         let resources = connection
                             .request("resources", json!({}), CONTROL_TIMEOUT)
@@ -798,12 +810,21 @@ impl HostedTickTools {
                     .lock()
                     .await
                     .insert((chat, instance.clone()), binding);
+                let exit = row.exit.map(|exit| HostedProgramExit {
+                    code: exit.code,
+                    signal: exit.signal,
+                });
                 members.push(HostedMember {
                     instance,
                     title: row.title,
-                    state: HostedMemberState::Running,
+                    state: if exit.is_some() {
+                        HostedMemberState::Exited
+                    } else {
+                        HostedMemberState::Running
+                    },
                     resources,
                     updated_at_ms,
+                    exit,
                 });
             }
             members.extend(page.lost.into_iter().map(|lost| HostedMember {
@@ -812,16 +833,17 @@ impl HostedTickTools {
                 state: HostedMemberState::Lost,
                 resources: None,
                 updated_at_ms: None,
+                exit: None,
             }));
             match page.page.next {
                 Some(next) => cursor = Some(next),
                 None => {
-                    let running = members
+                    let listed = members
                         .iter()
-                        .filter(|member| member.state == HostedMemberState::Running)
+                        .filter(|member| member.state != HostedMemberState::Lost)
                         .map(|member| member.instance.clone())
                         .collect();
-                    self.forget_unlisted(chat, &running).await;
+                    self.forget_unlisted(chat, &listed).await;
                     return Ok(members);
                 }
             }
@@ -1055,6 +1077,17 @@ async fn described_title(
     ))
 }
 
+/// Whether `program` is the `bundled` executable, however either path names it.
+fn is_same_file(program: &Path, bundled: Option<PathBuf>) -> bool {
+    bundled
+        .and_then(|bundled| bundled.canonicalize().ok())
+        .is_some_and(|bundled| {
+            program
+                .canonicalize()
+                .is_ok_and(|program| program == bundled)
+        })
+}
+
 fn hosted_target(input: &Value) -> Result<InstanceRef, String> {
     let instance: InstanceRef = input["tick_instance_id"]
         .as_str()
@@ -1199,6 +1232,7 @@ mod tests {
                 state: TickState::Running,
                 business_pid: None,
                 views: 0,
+                exit: None,
             })
             .collect::<Vec<_>>();
         let page = HostedTickPage {
@@ -1277,6 +1311,26 @@ mod tests {
         };
         assert_eq!(command, &["/bin/echo".to_owned(), argument]);
         assert_eq!(title, &tickhost::host::display_title(&named));
+    }
+
+    #[test]
+    fn a_bundled_executable_is_recognised_through_any_path_that_names_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let bundled = directory.path().join("tick");
+        std::fs::write(&bundled, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bundled, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let linked = directory.path().join("linked-tick");
+        std::os::unix::fs::symlink(&bundled, &linked).unwrap();
+        let other = directory.path().join("other");
+        std::fs::write(&other, "#!/bin/sh\n").unwrap();
+        assert!(is_same_file(&linked, Some(bundled.clone())));
+        assert!(is_same_file(
+            &directory.path().join("./tick"),
+            Some(linked.clone())
+        ));
+        assert!(!is_same_file(&other, Some(bundled.clone())));
+        assert!(!is_same_file(&bundled, None));
     }
 
     /// A binding goes once its Tick is no longer listed running, is looked up as gone, or was

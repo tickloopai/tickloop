@@ -511,6 +511,16 @@ async fn a_terminal_program_takes_input_shows_it_and_keeps_its_exit_code() {
         listed["items"][0]["instance"], opened["instance"],
         "an exited terminal Tick stays until it is closed"
     );
+    assert_eq!(listed["items"][0]["state"], "exited");
+    assert_eq!(listed["items"][0]["exit"], json!({"code":0,"signal":null}));
+    let refused = reader
+        .request("resources", json!({}), CONTROL_TIMEOUT)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.code, "ProgramExited",
+        "an exited program has no resources to sample"
+    );
 
     let failing = fixture
         .open_terminal(&mut controller, &["/bin/sh", "-c", "echo failing; exit 7"])
@@ -536,6 +546,52 @@ async fn a_terminal_program_takes_input_shows_it_and_keeps_its_exit_code() {
     .expect("the watch ends with its Tick")
     .unwrap();
     assert_eq!(ended, Some(json!({"event":"gone"})));
+    shutdown(&fixture).await;
+}
+
+/// A terminal Tick's exit is recorded once its program ended and its terminal closed, so the
+/// screen it records is complete; whatever the program left running in its process group ends
+/// when the Tick is closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_an_exited_terminal_tick_ends_what_its_program_left_running() {
+    let fixture = Fixture::start().await;
+    let mut controller = fixture.controller().await;
+    let pid_file = fixture.directory.path().join("background.pid");
+    let script = format!(
+        "(trap '' HUP; exec sleep 600) < /dev/null > /dev/null 2>&1 & echo $! > {}; seq 1 50; exit 3",
+        pid_file.display()
+    );
+    let opened = fixture
+        .open_terminal(&mut controller, &["/bin/sh", "-c", &script])
+        .await;
+    let mut reader = fixture.reader(&opened).await;
+    let exited = terminal_read_until(&mut reader, |read| read["exit"] != Value::Null).await;
+    assert_eq!(exited["exit"], json!({"code":3,"signal":null}));
+    assert!(
+        exited["text"].as_str().unwrap().ends_with("50"),
+        "the exit comes with everything the program wrote: {exited}"
+    );
+    let background: u32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        alive(background),
+        "the program left a process running that outlives the terminal's hangup"
+    );
+    controller
+        .request(
+            "close",
+            json!({"operation":uuid::Uuid::new_v4(),"owner":fixture.owner,"instance":opened["instance"]}),
+            CONTROL_TIMEOUT + host::TERMINATE_GRACE,
+        )
+        .await
+        .unwrap();
+    assert!(
+        gone(background).await,
+        "closing the Tick ends its program's process group"
+    );
     shutdown(&fixture).await;
 }
 

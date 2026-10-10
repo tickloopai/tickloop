@@ -41,6 +41,8 @@ const INTENT_RETRY_PAUSE: Duration = Duration::from_secs(5);
 type Screens = Arc<Mutex<BTreeMap<WatchId, ScreenCursor>>>;
 
 struct ScreenCursor {
+    /// The observer that follows the watch now; only it forgets the record when it ends.
+    observer: Uuid,
     chat: Uuid,
     instance: InstanceRef,
     sent: Value,
@@ -107,12 +109,12 @@ impl HostedScope {
         self.chats.borrow().get(watch).copied()
     }
 
-    /// Forgets what `watches` last got of a terminal Tick's screen.
-    fn forget_screens(&self, watches: &BTreeSet<WatchId>) {
+    /// Forgets what the watches `observer` followed last got of a terminal Tick's screen.
+    fn forget_screens(&self, observer: Uuid) {
         self.screens
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|watch, _| !watches.contains(watch));
+            .retain(|_, cursor| cursor.observer != observer);
     }
 
     fn mark_live(&self, chat: Uuid, instance: &InstanceRef, is_live: bool) {
@@ -172,20 +174,21 @@ impl InstanceObserver for HostedScope {
         wanted: watch::Receiver<BTreeSet<WatchId>>,
         publisher: EventPublisher,
     ) {
-        let mut ready_watches = BTreeSet::new();
-        observe_hosted_instance(&self, instance, wanted, publisher, &mut ready_watches).await;
+        let observer = Uuid::new_v4();
+        observe_hosted_instance(&self, observer, instance, wanted, publisher).await;
         // A later watch of this Tick starts from the screen as it is then.
-        self.forget_screens(&ready_watches);
+        self.forget_screens(observer);
     }
 }
 
 async fn observe_hosted_instance(
     scope: &HostedScope,
+    observer: Uuid,
     instance: InstanceRef,
     mut wanted: watch::Receiver<BTreeSet<WatchId>>,
     publisher: EventPublisher,
-    ready_watches: &mut BTreeSet<WatchId>,
 ) {
+    let mut ready_watches = BTreeSet::new();
     loop {
         let requested = wanted.borrow_and_update().clone();
         let Some(chat) = requested.iter().find_map(|watch| scope.chat_of(watch)) else {
@@ -225,7 +228,7 @@ async fn observe_hosted_instance(
                             &instance,
                             &mut wanted,
                             &publisher,
-                            ready_watches,
+                            &mut ready_watches,
                             &owned,
                         )
                         .await
@@ -233,9 +236,9 @@ async fn observe_hosted_instance(
                     TickAdapter::Terminal => {
                         observe_terminal_screen(
                             &feed,
+                            observer,
                             &mut wanted,
                             &publisher,
-                            ready_watches,
                             &owned,
                             &scope.screens,
                         )
@@ -391,9 +394,9 @@ fn terminal_observation(instance: &InstanceRef, read: TerminalRead) -> TickObser
 /// for good rather than for a reconnect.
 async fn observe_terminal_screen(
     feed: &HostedFeed,
+    observer: Uuid,
     wanted: &mut watch::Receiver<BTreeSet<WatchId>>,
     publisher: &EventPublisher,
-    ready_watches: &mut BTreeSet<WatchId>,
     scope: &dyn WatchAdmission,
     screens: &Screens,
 ) -> bool {
@@ -422,15 +425,29 @@ async fn observe_terminal_screen(
         if targets.is_empty() {
             return true;
         }
-        let joining = {
+        // A watch an earlier observer of this Tick followed keeps what it last got.
+        let (joining, adopted) = {
             let mut screens = screens.lock().unwrap_or_else(PoisonError::into_inner);
-            screens.retain(|watch, _| !ready_watches.contains(watch) || targets.contains(watch));
-            targets
+            screens.retain(|watch, cursor| cursor.observer != observer || targets.contains(watch));
+            let mut adopted = Vec::new();
+            for watch in &targets {
+                if let Some(cursor) = screens.get_mut(watch)
+                    && cursor.observer != observer
+                {
+                    cursor.observer = observer;
+                    adopted.push(*watch);
+                }
+            }
+            let joining = targets
                 .iter()
                 .filter(|watch| !screens.contains_key(watch))
                 .copied()
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (joining, adopted)
         };
+        for watch in adopted {
+            publisher.ready(watch);
+        }
         if !joining.is_empty() {
             if !is_current {
                 current = match read_terminal(&feed.tools, feed.chat, instance).await {
@@ -450,13 +467,13 @@ async fn observe_terminal_screen(
                 screens.insert(
                     watch,
                     ScreenCursor {
+                        observer,
                         chat: feed.chat,
                         instance: instance.clone(),
                         sent: current.data(),
                     },
                 );
                 publisher.ready(watch);
-                ready_watches.insert(watch);
             }
         }
         publisher.metadata(
@@ -745,12 +762,13 @@ impl TickStreamPort for HostedTickStream {
     /// Reads a terminal Tick's screen for `watch` while it is still admitted, and reports it when
     /// it differs from what the watch last got, which it then becomes.
     async fn sample(&self, watch: WatchId, instance: &InstanceRef) -> Option<TickObservation> {
+        // Once a watch got the program's exit its screen never changes again.
         let chat = self
             .screens
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&watch)
-            .filter(|cursor| cursor.instance == *instance)?
+            .filter(|cursor| cursor.instance == *instance && cursor.sent["exit"].is_null())?
             .chat;
         let scope = self.scope();
         let is_admitted = scope.chat_of(&watch) == Some(chat)

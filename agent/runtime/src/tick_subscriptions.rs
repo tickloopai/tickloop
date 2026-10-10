@@ -40,6 +40,8 @@ const DEFAULT_FREQUENCY: TickSubscriptionFrequency = TickSubscriptionFrequency::
 /// How soon an immediate subscription looks again at a delivery its Loop could not take; a
 /// periodic one looks again with its next period.
 const HELD_DELIVERY_RETRY: Duration = Duration::from_secs(5);
+/// How long one sample of a Terminal Tick's screen may take before its period passes without it.
+const SAMPLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// An item the stream or a later delivery replaces is itself one dropped Tick Update.
 const SUPERSEDED_UPDATE: u64 = 1;
 const TRUNCATION_HINT: &str = "Tick Update data was left out where `data` is null, because it was too large for this delivery or could not be read again; use the native tools for that instance type to recover it.";
@@ -498,6 +500,22 @@ impl TickDeliveries {
                 subscription.due_at = Some(Instant::now());
             }
         }
+    }
+
+    /// Records a screen sampled for `watch` as its period's update, due now since its period
+    /// already elapsed; whether it was taken.
+    fn record_sample(&mut self, watch: WatchId, observation: &TickObservation) -> bool {
+        self.record(&[watch], observation);
+        let mut is_due = false;
+        for subscription in self
+            .subscriptions
+            .values_mut()
+            .filter(|subscription| subscription.watch == watch && subscription.latest.is_some())
+        {
+            subscription.due_at = Some(Instant::now());
+            is_due = true;
+        }
+        is_due
     }
 
     fn mark_gap(&mut self, instance: &InstanceRef, audience: &[WatchId]) {
@@ -1397,7 +1415,7 @@ impl Agent {
                         }
                     } => {
                         let now = Instant::now();
-                        agent.sample_due_screens(now).await;
+                        agent.sample_due_screens(now);
                         let ready = agent.tick_deliveries().collect_elapsed(now);
                         for (chat_id, loop_id) in ready {
                             agent.deliver(chat_id, loop_id).await;
@@ -1408,9 +1426,10 @@ impl Agent {
         })
     }
 
-    /// Reads the screen of every Terminal Tick whose subscription's period elapsed by `now`: a
-    /// screen that differs from what the watch last got is the update this period delivers.
-    async fn sample_due_screens(&self, now: Instant) {
+    /// Reads, side by side and away from the delivery task, the screen of every Terminal Tick
+    /// whose subscription's period elapsed by `now`: a screen that differs from what the watch last
+    /// got is that period's update, delivered as soon as it is read.
+    fn sample_due_screens(&self, now: Instant) {
         let (port, due) = {
             let deliveries = self.tick_deliveries();
             let due = deliveries
@@ -1426,14 +1445,37 @@ impl Agent {
                 .collect::<Vec<_>>();
             (deliveries.port.clone(), due)
         };
-        let Some(port) = port else {
+        let Some(port) = port.filter(|_| !due.is_empty()) else {
             return;
         };
-        for (watch, instance) in due {
-            if let Some(observation) = port.sample(watch, &instance).await {
-                self.tick_deliveries().record(&[watch], &observation);
+        let agent = self.clone();
+        tokio::spawn(async move {
+            let mut samples = tokio::task::JoinSet::new();
+            for (watch, instance) in due {
+                let port = port.clone();
+                samples.spawn(async move {
+                    tokio::time::timeout(SAMPLE_TIMEOUT, port.sample(watch, &instance))
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|observation| (watch, observation))
+                });
             }
-        }
+            loop {
+                let sampled = tokio::select! {
+                    _ = agent.inner.shutdown.cancelled() => return,
+                    sampled = samples.join_next() => match sampled {
+                        Some(sampled) => sampled,
+                        None => return,
+                    },
+                };
+                if let Ok(Some((watch, observation))) = sampled
+                    && agent.tick_deliveries().record_sample(watch, &observation)
+                {
+                    agent.inner.tick_wake.notify_one();
+                }
+            }
+        });
     }
 
     async fn apply_stream_event(&self, event: TickStreamEvent) {

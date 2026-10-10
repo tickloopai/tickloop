@@ -8,6 +8,50 @@ pub struct ProcessSample {
     pub rss_bytes: Option<u64>,
 }
 
+/// Whether child `pid` ended, and how, without waiting for it: until the host waits for it, its
+/// pid, and with it the id of the process group it leads, cannot be reused. An error means it was
+/// already waited for.
+pub fn peek_exit(pid: u32) -> std::io::Result<Option<crate::host::ProgramExit>> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let (reported, status) = siginfo_child(&info);
+    if reported == 0 {
+        return Ok(None);
+    }
+    Ok(Some(if info.si_code == libc::CLD_EXITED {
+        crate::host::ProgramExit {
+            code: Some(status),
+            signal: None,
+        }
+    } else {
+        crate::host::ProgramExit {
+            code: None,
+            signal: Some(status),
+        }
+    }))
+}
+
+/// The child a `waitid` reported, zero when none changed state, and its exit status or signal.
+#[cfg(target_os = "linux")]
+fn siginfo_child(info: &libc::siginfo_t) -> (libc::pid_t, libc::c_int) {
+    unsafe { (info.si_pid(), info.si_status()) }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn siginfo_child(info: &libc::siginfo_t) -> (libc::pid_t, libc::c_int) {
+    (info.si_pid, info.si_status)
+}
+
 #[cfg(target_os = "macos")]
 pub fn sample(pid: u32) -> Option<ProcessSample> {
     let mut bsd = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();

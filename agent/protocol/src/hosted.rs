@@ -16,14 +16,26 @@ pub struct HostedMember {
     /// this without anyone subscribing and without reading the update's content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at_ms: Option<u64>,
+    /// How an exited terminal Tick's program ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<HostedProgramExit>,
 }
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HostedMemberState {
     Running,
+    /// A terminal Tick whose program ended; its last screen stays until it is closed.
+    Exited,
     /// Its host died with it; only an explicit reopen starts a new instance in its place.
     Lost,
+}
+
+/// How a terminal Tick's program ended: its exit code, or the signal that ended it.
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct HostedProgramExit {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
 }
 
 /// A hosted Tick's screen as text when it was taken: the newest lines within the snapshot

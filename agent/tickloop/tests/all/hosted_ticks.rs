@@ -1647,6 +1647,25 @@ for line in sys.stdin:
                     .contains("hello terminal")
             );
         }
+        let member = tools
+            .members(chat)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|member| member.instance == target)
+            .unwrap();
+        assert_eq!(
+            member.state,
+            tickloop_agent_protocol::HostedMemberState::Exited
+        );
+        assert_eq!(
+            member.exit,
+            Some(tickloop_agent_protocol::HostedProgramExit {
+                code: Some(0),
+                signal: None
+            })
+        );
+        assert_eq!(member.resources, None, "an exited program is not sampled");
         let late = call_tool(
             &tools,
             chat,

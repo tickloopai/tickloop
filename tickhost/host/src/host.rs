@@ -78,6 +78,8 @@ pub const VIEW_GRANT_TIMEOUT: Duration = CONTROL_TIMEOUT;
 /// How long a terminal Tick's program may hold off input written for it before the write is
 /// abandoned, well within the reader's control timeout.
 const INPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the host looks whether a terminal Tick's program ended, without waiting for it.
+const EXIT_POLL: Duration = Duration::from_millis(50);
 /// After the host finished stopping, how long a waiting `shutdown_host` may take to answer.
 pub const SHUTDOWN_REPLY_GRACE: Duration = Duration::from_secs(1);
 /// A failed accept (such as a full descriptor table) is retried after this pause.
@@ -171,16 +173,6 @@ pub struct ProgramExit {
     pub signal: Option<i32>,
 }
 
-impl ProgramExit {
-    fn of(status: std::process::ExitStatus) -> Self {
-        use std::os::unix::process::ExitStatusExt;
-        Self {
-            code: status.code(),
-            signal: status.signal(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Receipt {
@@ -210,6 +202,8 @@ pub struct TickRow {
     pub business_pid: Option<u32>,
     /// How many views are attached to its terminal.
     pub views: usize,
+    /// How a terminal Tick's program ended, once it did.
+    pub exit: Option<ProgramExit>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -217,6 +211,8 @@ pub struct TickRow {
 pub enum TickState {
     Opening,
     Running,
+    /// A terminal Tick whose program ended; its last screen stays readable until it is closed.
+    Exited,
     Closing,
 }
 
@@ -287,9 +283,12 @@ struct HostedTick {
     data_token: String,
     pty: Pty,
     screen: std::sync::Mutex<Screen>,
-    /// Counts the changes of the screen: output parsed, a resize, the program's exit.
+    /// Counts the changes of the screen: output parsed, a resize, the program's exit. It only
+    /// changes, and is only read, under the screen's lock, so one revision shows one screen.
     screen_revision: AtomicU64,
     /// The process the host spawned: a protocol Tick's launcher, or a terminal Tick's program.
+    /// A terminal Tick's program is only waited for once it is stopped, so its process group id
+    /// stays its own until then.
     launcher: Mutex<Child>,
     launcher_pid: u32,
     lifecycle: watch::Sender<Lifecycle>,
@@ -324,8 +323,15 @@ struct ProtocolLaunch {
 struct TerminalProgram {
     command: Vec<String>,
     cwd: PathBuf,
-    /// Set once the program exited; its last screen stays readable until the Tick ends.
+    /// Set once the program exited and its terminal closed; its last screen stays readable until
+    /// the Tick ends. It only changes under the screen's lock.
     exit: std::sync::Mutex<Option<ProgramExit>>,
+}
+
+impl TerminalProgram {
+    fn exit(&self) -> Option<ProgramExit> {
+        *self.exit.lock().unwrap()
+    }
 }
 
 impl Adapter {
@@ -459,34 +465,43 @@ impl HostedTick {
         }
     }
 
-    fn screen_changed(&self) {
-        self.screen_revision.fetch_add(1, Ordering::SeqCst);
-        self.screen_changes.send_replace(());
+    /// Applies `change` to the screen and, when it says the screen changed, counts a new
+    /// revision under the same lock and tells the attached views.
+    fn change_screen(&self, change: impl FnOnce(&mut Screen) -> bool) -> bool {
+        let mut screen = self.screen.lock().unwrap();
+        let changed = change(&mut screen);
+        if changed {
+            self.screen_revision.fetch_add(1, Ordering::SeqCst);
+        }
+        drop(screen);
+        if changed {
+            self.screen_changes.send_replace(());
+        }
+        changed
     }
 
     /// Records how a terminal Tick's program ended, once; the Tick itself keeps running until it
     /// is closed or idles out, so its last screen stays readable.
     fn record_exit(&self, program: &TerminalProgram, exit: ProgramExit) {
-        let mut recorded = program.exit.lock().unwrap();
-        if recorded.is_none() {
-            *recorded = Some(exit);
-            drop(recorded);
-            self.screen_changed();
-        }
+        self.change_screen(|_| {
+            let mut recorded = program.exit.lock().unwrap();
+            let is_first = recorded.is_none();
+            if is_first {
+                *recorded = Some(exit);
+            }
+            is_first
+        });
     }
 
     fn terminal_read(&self, program: &TerminalProgram) -> TerminalRead {
-        // The revision is taken before the screen, so a change parsed in between only makes a
-        // later read count it again.
-        let seq = self.screen_revision.load(Ordering::SeqCst);
-        let exit = *program.exit.lock().unwrap();
-        let snapshot = self.screen.lock().unwrap().snapshot();
+        let screen = self.screen.lock().unwrap();
+        let snapshot = screen.snapshot();
         TerminalRead {
-            seq,
+            seq: self.screen_revision.load(Ordering::SeqCst),
             at: tick_protocol::now_rfc3339(),
             text: snapshot.lines.join("\n"),
             truncated: snapshot.truncated,
-            exit,
+            exit: program.exit(),
         }
     }
 
@@ -512,14 +527,16 @@ impl HostedTick {
         let Some(size) = views.leading_size() else {
             return Ok(());
         };
-        {
-            let mut screen = self.screen.lock().unwrap();
-            if screen.size() == size {
-                return Ok(());
+        let resized = self.change_screen(|screen| {
+            let differs = screen.size() != size;
+            if differs {
+                screen.resize(size);
             }
-            screen.resize(size);
+            differs
+        });
+        if !resized {
+            return Ok(());
         }
-        self.screen_changed();
         self.pty
             .resize(size)
             .map_err(|error| HostError::after("TerminalUnavailable", error.to_string()))
@@ -1201,26 +1218,15 @@ impl Host {
             if matches!(*tick.lifecycle.borrow(), Lifecycle::Closing) {
                 continue;
             }
-            // A wait that fails can never report the exit later, so it counts as one.
-            let exited =
-                tick.launcher
+            // A terminal Tick outlives its program: its drain records the exit.
+            let launcher_exited = matches!(tick.adapter, Adapter::Protocol(_))
+                && tick
+                    .launcher
                     .try_lock()
-                    .ok()
-                    .and_then(|mut launcher| match launcher.try_wait() {
-                        Ok(None) => None,
-                        Ok(Some(status)) => Some(ProgramExit::of(status)),
-                        Err(_) => Some(ProgramExit {
-                            code: None,
-                            signal: None,
-                        }),
-                    });
-            match (&tick.adapter, exited) {
-                (Adapter::Protocol(_), Some(_)) => {
-                    self.reap(tick.terminal, ReapReason::Exited).await;
-                    continue;
-                }
-                (Adapter::Terminal(program), Some(exit)) => tick.record_exit(program, exit),
-                (_, None) => {}
+                    .is_ok_and(|mut launcher| !matches!(launcher.try_wait(), Ok(None)));
+            if launcher_exited {
+                self.reap(tick.terminal, ReapReason::Exited).await;
+                continue;
             }
             tick.lapse_stale_intents(Self::now_ms(), self.idle_timeout);
             if tick.is_idle(Self::now_ms(), self.idle_timeout) {
@@ -1256,6 +1262,10 @@ impl Host {
             .filter(|tick| owner.is_none_or(|owner| &tick.owner == owner))
             .map(|tick| {
                 let lifecycle = tick.lifecycle.borrow().clone();
+                let exit = match &tick.adapter {
+                    Adapter::Protocol(_) => None,
+                    Adapter::Terminal(program) => program.exit(),
+                };
                 TickRow {
                     instance: lifecycle.live_instance().cloned(),
                     adapter: tick.adapter.kind(),
@@ -1266,6 +1276,7 @@ impl Host {
                     title: tick.title.clone(),
                     state: match lifecycle {
                         Lifecycle::Opening => TickState::Opening,
+                        Lifecycle::Live { .. } if exit.is_some() => TickState::Exited,
                         Lifecycle::Live { .. } => TickState::Running,
                         Lifecycle::Closing => TickState::Closing,
                     },
@@ -1274,6 +1285,7 @@ impl Host {
                         _ => None,
                     },
                     views: tick.views.lock().unwrap().len(),
+                    exit,
                 }
             })
             .collect::<Vec<_>>();
@@ -1338,10 +1350,29 @@ pub struct OwnerSnapshotChunk {
 /// a launcher this host spawned and has not yet reaped is signalled.
 async fn stop_launcher(tick: &HostedTick) {
     let mut launcher = tick.launcher.lock().await;
+    let group = tick.launcher_pid as libc::pid_t;
+    if let Adapter::Terminal(_) = tick.adapter {
+        // The program is waited for only here, so even after it exited its group id is still its
+        // own: whatever it left running in that group ends with the Tick.
+        let Ok(exited) = process::peek_exit(tick.launcher_pid) else {
+            return;
+        };
+        unsafe { libc::killpg(group, libc::SIGTERM) };
+        if exited.is_none() {
+            let _ = tokio::time::timeout(TERMINATE_GRACE, async {
+                while matches!(process::peek_exit(tick.launcher_pid), Ok(None)) {
+                    tokio::time::sleep(EXIT_POLL).await;
+                }
+            })
+            .await;
+        }
+        unsafe { libc::killpg(group, libc::SIGKILL) };
+        let _ = launcher.wait().await;
+        return;
+    }
     if !matches!(launcher.try_wait(), Ok(None)) {
         return;
     }
-    let group = tick.launcher_pid as libc::pid_t;
     unsafe { libc::killpg(group, libc::SIGTERM) };
     if tokio::time::timeout(TERMINATE_GRACE, launcher.wait())
         .await
@@ -1353,7 +1384,8 @@ async fn stop_launcher(tick: &HostedTick) {
 }
 
 /// Drains the PTY continuously so a hidden Tick never blocks on output. A protocol Tick ends
-/// with its terminal; a terminal Tick's program that closed it keeps its last screen.
+/// with its terminal. A terminal Tick keeps its last screen: once everything its program wrote
+/// was parsed and the program exited, the exit is recorded with that screen.
 async fn drain_terminal(tick: Arc<HostedTick>) {
     let mut buffer = vec![0u8; READ_CHUNK_BYTES];
     loop {
@@ -1362,15 +1394,29 @@ async fn drain_terminal(tick: Arc<HostedTick>) {
             read = tick.pty.read(&mut buffer) => match read {
                 Ok(0) | Err(_) => break,
                 Ok(count) => {
-                    tick.screen.lock().unwrap().process(&buffer[..count]);
-                    tick.screen_changed();
+                    tick.change_screen(|screen| {
+                        screen.process(&buffer[..count]);
+                        true
+                    });
                     tokio::task::yield_now().await;
                 }
             }
         }
     }
-    if let Adapter::Protocol(_) = tick.adapter {
-        tick.terminal_closed.cancel();
+    match &tick.adapter {
+        Adapter::Protocol(_) => tick.terminal_closed.cancel(),
+        Adapter::Terminal(program) => loop {
+            match process::peek_exit(tick.launcher_pid) {
+                Ok(Some(exit)) => return tick.record_exit(program, exit),
+                // Only stopping the Tick waits for its program.
+                Err(_) => return,
+                Ok(None) => {}
+            }
+            tokio::select! {
+                _ = tick.terminal_closed.cancelled() => return,
+                _ = tokio::time::sleep(EXIT_POLL) => {}
+            }
+        },
     }
 }
 
@@ -2058,6 +2104,14 @@ async fn instance_request(
             let Lifecycle::Live { business_pid, .. } = tick.lifecycle.borrow().clone() else {
                 return Err(HostError::before("TargetGone", "the Tick is not running"));
             };
+            if let Adapter::Terminal(program) = &tick.adapter
+                && program.exit().is_some()
+            {
+                return Err(HostError::before(
+                    "ProgramExited",
+                    "the program exited; it has no resources to sample",
+                ));
+            }
             let sample = process::sample(business_pid);
             Ok(json!(Resources {
                 business_pid,
@@ -2154,7 +2208,7 @@ async fn terminal_request(
                     format!("input is 1 to {ATTACH_INPUT_BYTES} bytes"),
                 ));
             }
-            if program.exit.lock().unwrap().is_some() {
+            if program.exit().is_some() {
                 return Err(HostError::before(
                     "ProgramExited",
                     "the program exited; its last screen stays readable until the Tick is closed",
@@ -2406,7 +2460,7 @@ impl ViewLease {
         }
         // A terminal Tick whose program exited only shows its last screen.
         if let Adapter::Terminal(program) = &self.tick.adapter
-            && program.exit.lock().unwrap().is_some()
+            && program.exit().is_some()
         {
             return Ok(());
         }

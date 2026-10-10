@@ -29,9 +29,10 @@ use crate::{
 };
 
 /// Business 18.0 replaces a Tick Subscription's cadence in seconds with one of four frequencies,
-/// in the subscription, its status and the change a View requests. Older business majors are
-/// refused before dispatch; the frozen daemon management protocol remains independent.
-pub const PROTOCOL_MAJOR: u16 = 18;
+/// in the subscription, its status and the change a View requests. 19.0: a hosted Monitor member
+/// can be an exited terminal Tick, with how its program ended. Older business majors are refused
+/// before dispatch; the frozen daemon management protocol remains independent.
+pub const PROTOCOL_MAJOR: u16 = 19;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
