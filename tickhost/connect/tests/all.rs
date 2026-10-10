@@ -1,9 +1,7 @@
 //! Every tickhost/connect integration test, compiled as one binary.
 
-#[path = "all/host_adapter.rs"]
-mod host_adapter;
-#[path = "all/native_identity.rs"]
-mod native_identity;
+#[path = "all/herdr_socket.rs"]
+mod herdr_socket;
 #[path = "all/placement.rs"]
 mod placement;
 #[path = "all/session.rs"]

@@ -143,7 +143,7 @@ impl TickStream {
         match environment_value(tick_protocol::INSTANCE_ID_ENV)? {
             Some(instance_id) if !tick_protocol::is_launched_instance_id(&instance_id) => {
                 Err(io::Error::other(format!(
-                    "{} needs a complete herdr: or hosted: instance identity",
+                    "{} needs a complete hosted: instance identity",
                     tick_protocol::INSTANCE_ID_ENV
                 )))
             }

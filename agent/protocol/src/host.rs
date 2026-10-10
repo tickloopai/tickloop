@@ -2,7 +2,7 @@
 //! of the host type it mirrors, so a change inside Herdr or the Tickhost reaches the Agent wire
 //! only through an explicit conversion in the runtime.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,10 +17,6 @@ pub struct HerdrPane {
     pub cwd: Option<String>,
     #[serde(default)]
     pub foreground_cwd: Option<String>,
-    #[serde(default)]
-    pub terminal_title_stripped: Option<String>,
-    #[serde(default)]
-    pub tokens: BTreeMap<String, String>,
 }
 
 /// A hosted Tick's resource sample as `tickhost::host::Resources` reports it.

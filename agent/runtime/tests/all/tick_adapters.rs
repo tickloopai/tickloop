@@ -27,7 +27,7 @@ async fn shell_subscription_preserves_its_policy_including_final_admission() {
         .unwrap();
     let instance = InstanceRef::shell(task.command_id);
     agent
-        .install_tick_stream(Arc::new(TickAdapters::builtin(agent.clone(), None, None)))
+        .install_tick_stream(Arc::new(TickAdapters::builtin(agent.clone(), None)))
         .await;
     verify_admission_policy(
         &agent,
@@ -115,7 +115,7 @@ async fn a_shell_updates_only_when_it_exits_and_a_late_watch_takes_the_exit_as_i
         }
     };
     wait_for_output("baseline".len()).await;
-    let adapters = TickAdapters::builtin(agent.clone(), None, None);
+    let adapters = TickAdapters::builtin(agent.clone(), None);
     let mut stream = adapters.open();
     let instance = InstanceRef::shell(task.command_id);
     let first = Uuid::new_v4();

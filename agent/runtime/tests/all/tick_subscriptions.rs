@@ -21,7 +21,7 @@ use uuid::Uuid;
 const HIGH_PERIOD: Duration = Duration::from_secs(60);
 
 fn fixture_instance(id: u64) -> InstanceRef {
-    InstanceRef::native(format!("fixture-run-{id}")).unwrap()
+    InstanceRef::new("calendar", &format!("fixture-run-{id}")).unwrap()
 }
 
 fn update(instance: u64, sequence: u64, phase: &str) -> TickObservation {
@@ -286,7 +286,7 @@ async fn a_high_frequency_delivers_the_latest_update_and_counts_the_ones_it_drop
     assert_eq!(after[0].accumulated, 0);
     assert_eq!(
         after[0].last_delivery.as_deref(),
-        Some("herdr:fixture-run-7 #3 · dropped 2")
+        Some("calendar:fixture-run-7 #3 · dropped 2")
     );
     assert_eq!(after[0].link, TickLinkState::Live);
     agent.shutdown().await;
@@ -1232,7 +1232,7 @@ async fn a_restored_subscription_watches_again_only_after_the_user_resumes_the_g
 #[tokio::test(start_paused = true)]
 async fn native_subscribe_tool_keeps_the_complete_run_identity() {
     let directory = tempfile::tempdir().unwrap();
-    let run = "herdr:session/workspace/pane/full-run-00000000-0000-0000-0000-000000000007";
+    let run = "calendar:session/workspace/pane/full-run-00000000-0000-0000-0000-000000000007";
     let model = Arc::new(ScriptedModel::new(vec![
         call("s1", "SubscribeTick", json!({"tick_instance_id": run})),
         text("watching that run"),
@@ -1248,7 +1248,7 @@ async fn native_subscribe_tool_keeps_the_complete_run_identity() {
         .await
         .unwrap();
     wait_for_completion(&mut events).await;
-    let native = InstanceRef::native(run).unwrap();
+    let native = run.parse::<InstanceRef>().unwrap();
     assert_eq!(stream.watched(), BTreeSet::from([native.clone()]));
     let row = &agent.tick_subscriptions(chat).await.unwrap()[0];
     assert_eq!(row.instance, native);
@@ -1271,7 +1271,7 @@ async fn native_subscribe_tool_keeps_the_complete_run_identity() {
     let Some(LocalMessage::TickDelivery { items, .. }) = LocalMessage::parse(&delivered) else {
         panic!("Native delivery must retain its structured source: {delivered}");
     };
-    assert_eq!(items[0].instance, InstanceRef::native(run).unwrap());
+    assert_eq!(items[0].instance, run.parse::<InstanceRef>().unwrap());
     agent.shutdown().await;
 }
 
@@ -1685,7 +1685,7 @@ async fn an_over_sized_delivery_blanks_its_largest_data_and_points_to_native_rec
 #[tokio::test(start_paused = true)]
 async fn a_truncated_terminal_observation_points_to_current_text_without_promising_history() {
     let directory = tempfile::tempdir().unwrap();
-    let run = "herdr:terminal:session:run-88";
+    let run = "calendar:terminal:session:run-88";
     let model = Arc::new(ScriptedModel::new(vec![
         call("s1", "SubscribeTick", json!({"tick_instance_id":run})),
         text("watching terminal"),
@@ -1702,7 +1702,7 @@ async fn a_truncated_terminal_observation_points_to_current_text_without_promisi
         .unwrap();
     wait_for_completion(&mut events).await;
     stream.push(TickObservation {
-        instance: InstanceRef::native(run).unwrap(),
+        instance: run.parse::<InstanceRef>().unwrap(),
         sequence: 1,
         observed_at: "2026-09-24T12:00:00Z".into(),
         dropped: 0,
@@ -1737,7 +1737,9 @@ async fn many_subscribed_instances_still_fit_one_loop_delivery_under_sixteen_kib
         .unwrap();
     wait_for_completion(&mut events).await;
     let instances: Vec<_> = (0..100)
-        .map(|index| InstanceRef::native(format!("bulk:{index:03}:{}", "r".repeat(60))).unwrap())
+        .map(|index| {
+            InstanceRef::new("calendar", &format!("bulk:{index:03}:{}", "r".repeat(60))).unwrap()
+        })
         .collect();
     let trigger = Trigger {
         id: Uuid::new_v4(),

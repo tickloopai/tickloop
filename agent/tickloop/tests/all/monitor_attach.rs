@@ -119,7 +119,7 @@ impl View {
         command.env("HOME", home);
         command.env("TERM", "xterm-256color");
         command.env(
-            tickloop_agent_console::terminal::attach::ATTACH_ENVIRONMENT,
+            tickloop_agent_protocol::ATTACH_ENVIRONMENT,
             serde_json::to_string(grant).unwrap(),
         );
         let child = pty.slave.spawn_command(command).unwrap();

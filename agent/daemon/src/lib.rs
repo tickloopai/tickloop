@@ -431,16 +431,19 @@ pub async fn build_runtime(
     let model = launch_model(launch);
     let client =
         model_client(model, launch.config_root.as_deref()).map_err(|error| error.to_string())?;
-    build_runtime_with_client(launch, client, control).await
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    build_runtime_with_client(launch, client, control, &executable).await
 }
 
-/// Build the same version-owned runtime with a caller-supplied model transport.
+/// Build the same version-owned runtime with a caller-supplied model transport. `executable` is
+/// the `tickloop` whose attach client a Herdr Pane showing a Tick runs.
 /// Integration fixtures use this seam without adding definition-file loading to the CLI.
 #[doc(hidden)]
 pub async fn build_runtime_with_client(
     launch: &LaunchSpec,
     client: Arc<dyn ModelClient>,
     control: Option<tickloop_agent_runtime::hosted::worker_control::WorkerControlGrant>,
+    executable: &Path,
 ) -> Result<Agent, String> {
     let model = launch_model(launch);
     let settings = launch
@@ -471,24 +474,23 @@ pub async fn build_runtime_with_client(
     }
     .map_err(|error| error.to_string())?;
     use tickloop_agent_runtime::tick_adapter::TickAdapters;
-    let access = launch.host_work_context.as_ref().map(|work| {
-        Arc::new(tickhost_connect::access::TickAccess::new(
-            tickhost_connect::herdr::HerdrContext {
-                socket: work.socket.clone(),
-                caller_pane: String::new(),
-            },
-        ))
-    });
     if let (Some(grant), Some(_)) = (&control, &launch.config_root) {
         agent.install_stopped_child_hook(Arc::new(
             tickloop_agent_runtime::hosted::lifecycle::DaemonLifecycle::new(grant.clone()),
         ));
     }
-    // Every worker the daemon granted a Tickhost opens hidden Ticks there, with its host's own
-    // authority; a worker in a Herdr View also keeps Herdr Workspaces and visible Panes. Each
-    // Tick tool call is routed by its target to one of the two.
+    // Every worker the daemon granted a Tickhost runs its Ticks there, with its host's own
+    // authority; a worker in a Herdr View can also show them in Herdr Panes.
+    let views = launch.host_work_context.as_ref().map(|work| {
+        tickloop_agent_runtime::hosted::views::HerdrViews::new(
+            tickhost_connect::layout::HerdrLayout::new(
+                tickhost_connect::herdr::HerdrContext::without_view(work.socket.clone()),
+            ),
+            executable,
+        )
+    });
     let hosted = control.map(|grant| {
-        Arc::new(tickloop_agent_runtime::hosted::tools::HostedTickTools::new(
+        let tools = tickloop_agent_runtime::hosted::tools::HostedTickTools::new(
             tickloop_agent_runtime::hosted::worker_control::DaemonControl::new(grant),
             launch
                 .environment
@@ -500,20 +502,19 @@ pub async fn build_runtime_with_client(
                     ))
                 })
                 .collect(),
-        ))
+        );
+        Arc::new(match views {
+            Some(views) => tools.with_herdr_views(views),
+            None => tools,
+        })
     });
-    let herdr = access.as_ref().map(|access| {
-        Arc::new(tickloop_agent_runtime::native_host::NativeHostToolProvider::new(access.clone()))
-    });
-    let native_host = (herdr.is_some() || hosted.is_some()).then(|| {
-        Arc::new(
-            tickloop_agent_runtime::tick_tool_router::TickToolRouter::new(herdr, hosted.clone()),
-        ) as Arc<dyn tickloop_agent_runtime::host_tools::HostToolProvider>
-    });
+    let tick_tools = hosted
+        .clone()
+        .map(|hosted| hosted as Arc<dyn tickloop_agent_runtime::host_tools::HostToolProvider>);
     if let Some(hosted) = &hosted {
         agent.install_hosted_ticks(hosted.clone());
     }
-    let adapters = Arc::new(TickAdapters::builtin(agent.clone(), access, hosted));
+    let adapters = Arc::new(TickAdapters::builtin(agent.clone(), hosted));
     agent.install_tick_stream(adapters.clone()).await;
     if let Some(root) = launch.config_root.as_ref()
         && let Ok(artifact) = tickloop_agent_artifacts::ArtifactClient::new(root)
@@ -522,13 +523,13 @@ pub async fn build_runtime_with_client(
             .install_host_tools(Arc::new(
                 tickloop_agent_runtime::mcp_tools::McpHostToolProvider::new(
                     artifact,
-                    native_host.clone(),
+                    tick_tools.clone(),
                 ),
             ))
             .map_err(|error| format!("cannot install MCP tools: {error}"))?;
-    } else if let Some(native_host) = native_host {
+    } else if let Some(tick_tools) = tick_tools {
         agent
-            .install_host_tools(native_host)
+            .install_host_tools(tick_tools)
             .map_err(|error| format!("cannot install Tick tools: {error}"))?;
     }
     Ok(agent)

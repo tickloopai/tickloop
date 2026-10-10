@@ -10,8 +10,6 @@ mod auth_ui;
 mod earnings_probe;
 #[path = "all/entry.rs"]
 mod entry;
-#[path = "all/hosted.rs"]
-mod hosted;
 #[path = "all/native_visible_stdio.rs"]
 mod native_visible_stdio;
 #[path = "all/standalone_keys.rs"]

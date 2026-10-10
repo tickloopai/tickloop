@@ -7,8 +7,9 @@ use std::path::PathBuf;
 
 use serde_json::json;
 use tick_protocol::MAX_TOOL_RESPONSE_BYTES;
-use tickhost_connect::session::{
-    SessionBackend, SessionClient, SessionError, SessionLaunch, TickSession,
+use tickhost_connect::{
+    hosted::HostedTerminal,
+    session::{SessionClient, SessionError, SessionLaunch, TickSession},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -45,10 +46,11 @@ for line in sys.stdin:
     sys.stdout.flush()
 "#;
 
-fn backend() -> SessionBackend {
-    SessionBackend::Herdr {
-        socket: PathBuf::from("/tmp/example-herdr.sock"),
-        terminal_id: "limits-pane".into(),
+fn terminal() -> HostedTerminal {
+    HostedTerminal {
+        endpoint: PathBuf::from("/tmp/example-tickhost.sock"),
+        epoch: uuid::Uuid::from_u128(1),
+        terminal: uuid::Uuid::from_u128(2),
     }
 }
 
@@ -65,14 +67,14 @@ async fn limits_tick(read_bytes: usize) -> (TickSession, SessionClient, tempfile
             GROWN_VALUES.to_string(),
         ],
         cwd: directory.path().into(),
-        backend: backend(),
+        terminal: terminal(),
         runtime_dir: Some(directory.path().join("sessions")),
     })
     .await
     .unwrap();
     let client = SessionClient::connect(
         session.instance().clone(),
-        backend(),
+        terminal(),
         Some(directory.path().join("sessions")),
     )
     .await

@@ -23,7 +23,6 @@ futures-util = "0.3"
 longbridge = { git = "https://github.com/longbridge/openapi", rev = "5929410" }
 ratatui = "0.30"
 serde_json = "1"
-tickloop-tickhost-connect = { path = "../../tickhost/connect" }
 tickloop-tick-builtin = { path = "../providers/builtin" }
 tickloop-tick-futu = { path = "../providers/futu" }
 tickloop-tick-longbridge = { path = "../providers/longbridge" }
@@ -39,6 +38,4 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signa
 async-trait = "0.1"
 libc = "0.2"
 tempfile = "3"
-tickloop-tickhost = { path = "../../tickhost/host" }
 tokio = { version = "1", features = ["test-util"] }
-uuid = { version = "1", features = ["v4"] }

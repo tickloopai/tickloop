@@ -23,13 +23,12 @@ use tickhost_connect::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::attach::ATTACH_ENVIRONMENT;
 use tickloop_agent_base::private_fs::{
     PRIVATE_FILE_MODE, create_private_directory, current_uid, replace_file_atomically,
     verify_private_directory,
 };
 use tickloop_agent_config::{MonitorPopup, UserSettings};
-use tickloop_agent_protocol::HostedViewGrant;
+use tickloop_agent_protocol::{ATTACH_ARGUMENTS, ATTACH_ENVIRONMENT, HostedViewGrant};
 
 pub(crate) const PLUGIN_ID: &str = "tickloop.monitor";
 const PLUGIN_NAME: &str = "Tickloop Monitor";
@@ -37,8 +36,6 @@ const PANE_ID: &str = "attach";
 const PANE_TITLE: &str = "Tickloop";
 const POPUP_PLACEMENT: &str = "popup";
 const POPUP_SIZE: &str = "85%";
-/// Arguments Herdr passes to this executable to open the Monitor popup pane.
-pub const ATTACH_ARGUMENTS: [&str; 2] = ["monitor", "attach"];
 const PLUGIN_DIRECTORY: &str = "herdr-popup-plugin";
 const MANIFEST_FILE: &str = "herdr-plugin.toml";
 const MIN_HERDR_VERSION: &str = "0.9.0";

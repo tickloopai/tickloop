@@ -6,33 +6,8 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use tickloop_agent_protocol::{
-    ChatId, HerdrPane, HostCallContext, HostEndpointIdentity, HostToolAuthority, ToolDefinition,
-    ToolResult,
+    ChatId, HostCallContext, HostEndpointIdentity, HostToolAuthority, ToolDefinition, ToolResult,
 };
-
-/// The Herdr Pane a wire interaction names, as the Herdr Adapter takes it.
-pub fn herdr_adapter_pane(pane: HerdrPane) -> tickhost_connect::herdr::Pane {
-    let HerdrPane {
-        pane_id,
-        terminal_id,
-        workspace_id,
-        tab_id,
-        cwd,
-        foreground_cwd,
-        terminal_title_stripped,
-        tokens,
-    } = pane;
-    tickhost_connect::herdr::Pane {
-        pane_id,
-        terminal_id,
-        workspace_id,
-        tab_id,
-        cwd,
-        foreground_cwd,
-        terminal_title_stripped,
-        tokens,
-    }
-}
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum HostToolPermission {
@@ -260,12 +235,12 @@ pub enum WorkspaceIntegration {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct WorkspaceHostContext {
     pub name: WorkspaceHostName,
-    /// Whether this Agent can operate the container's Panes.
+    /// Whether this Agent can show its Ticks in the container's Panes.
     pub integration: WorkspaceIntegration,
-    /// Whether this Agent can run Ticks hidden in the Tickhost, in any container.
+    /// Whether this Agent can run Ticks in the Tickhost, in any container.
     pub tickhost: WorkspaceIntegration,
     pub tick_executable: Option<PathBuf>,
-    /// The bundled `tickhost`, whose `open` connects a protocol program to Agents.
+    /// The bundled `tickhost`.
     pub tickhost_executable: Option<PathBuf>,
 }
 
@@ -279,16 +254,23 @@ impl WorkspaceHostContext {
         )
     }
 
-    /// The same container, where this Agent can also run hidden Ticks with the bundled `tick`
-    /// and `tickhost`.
+    /// The same container, where this Agent can also run Ticks in the Tickhost with the
+    /// bundled `tick` and `tickhost`.
     pub fn with_tickhost(mut self) -> Self {
         self.tickhost = WorkspaceIntegration::Available;
         self.tick_executable = self
             .tick_executable
-            .or_else(tickhost_connect::access::bundled_tick_executable);
+            .or_else(tickhost_connect::program::bundled_tick_executable);
         self.tickhost_executable = self
             .tickhost_executable
-            .or_else(tickhost_connect::access::bundled_tickhost_executable);
+            .or_else(tickhost_connect::program::bundled_tickhost_executable);
+        self
+    }
+
+    /// Herdr, where this Agent can also show its Ticks in Panes.
+    pub fn with_herdr_views(mut self) -> Self {
+        self.name = WorkspaceHostName::Herdr;
+        self.integration = WorkspaceIntegration::Available;
         self
     }
 
@@ -311,23 +293,9 @@ impl WorkspaceHostContext {
         }
     }
 
-    pub fn attached_herdr(
-        tick_executable: Option<PathBuf>,
-        tickhost_executable: Option<PathBuf>,
-    ) -> Self {
-        Self {
-            name: WorkspaceHostName::Herdr,
-            integration: WorkspaceIntegration::Available,
-            tickhost: WorkspaceIntegration::Unavailable,
-            tick_executable,
-            tickhost_executable,
-        }
-    }
-
     /// Whether this Agent can open or operate any Tick outside Shell and Artifact.
     pub fn runs_ticks(&self) -> bool {
-        self.integration == WorkspaceIntegration::Available
-            || self.tickhost == WorkspaceIntegration::Available
+        self.tickhost == WorkspaceIntegration::Available
     }
 }
 

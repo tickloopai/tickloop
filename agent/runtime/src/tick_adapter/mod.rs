@@ -3,7 +3,7 @@
 mod builtin;
 mod shell;
 
-pub use builtin::{HerdrAdapter, HostedAdapter, ShellAdapter};
+pub use builtin::{HostedAdapter, ShellAdapter};
 pub use shell::ShellTickStream;
 
 use crate::tick_stream::{EventPublisher, TickStreamHandle, TickStreamPort, WatchId};
@@ -37,14 +37,10 @@ impl TickAdapters {
     }
     pub fn builtin(
         agent: crate::Agent,
-        access: Option<Arc<tickhost_connect::access::TickAccess>>,
         hosted: Option<Arc<crate::hosted::tools::HostedTickTools>>,
     ) -> Self {
         Self::new([
             Arc::new(ShellAdapter::new(agent)) as Arc<dyn TickAdapter>,
-            Arc::new(HerdrAdapter::new(access.map(|access| {
-                Arc::new(crate::native_host::NativeHostToolProvider::new(access))
-            }))),
             Arc::new(HostedAdapter::new(hosted)),
         ])
         .expect("unique built-in Tick Adapters")

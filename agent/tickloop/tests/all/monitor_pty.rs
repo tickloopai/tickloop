@@ -388,8 +388,8 @@ fn a_saved_member_is_shown_detailed_and_stays_removed_across_restarts_in_a_real_
             agent
                 .record_reopened_tick(
                     chat,
-                    &"herdr:pty-lost".parse().unwrap(),
-                    "herdr:pty-member".parse().unwrap(),
+                    &"calendar:pty-lost".parse().unwrap(),
+                    "calendar:pty-member".parse().unwrap(),
                 )
                 .await
                 .unwrap();
@@ -400,11 +400,11 @@ fn a_saved_member_is_shown_detailed_and_stays_removed_across_restarts_in_a_real_
     let mut session = Session::resume(&workdir, chat);
     session.wait_for_editor();
     session.wait("Monitor 1");
-    session.wait("herdr:pty-member");
+    session.wait("calendar:pty-member");
     session.send(b"jk");
     session.wait("❯\u{a0}jk");
     assert!(
-        session.frame().contains("herdr:pty-member"),
+        session.frame().contains("calendar:pty-member"),
         "typing j/k edits the input while Monitor is not focused"
     );
     session.send(b"\x7f\x7f");
@@ -417,7 +417,7 @@ fn a_saved_member_is_shown_detailed_and_stays_removed_across_restarts_in_a_real_
     session.send(b"\x1b");
     session.wait_without("Owner     this Chat");
     session.send(b"x");
-    session.wait_without("herdr:pty-member");
+    session.wait_without("calendar:pty-member");
     session.wait_without("Monitor 1");
     session.exit();
     drop(session);
@@ -427,7 +427,7 @@ fn a_saved_member_is_shown_detailed_and_stays_removed_across_restarts_in_a_real_
     thread::sleep(Duration::from_millis(500));
     let frame = restarted.frame();
     assert!(
-        !frame.contains("Monitor 1") && !frame.contains("herdr:pty-member"),
+        !frame.contains("Monitor 1") && !frame.contains("calendar:pty-member"),
         "the removal survives a restart: {frame}"
     );
     restarted.exit();

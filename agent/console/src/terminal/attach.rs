@@ -36,8 +36,6 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 
 /// Columns and rows assumed when the terminal cannot report its size.
 const FALLBACK_TERMINAL_SIZE: (u16, u16) = (80, 24);
-/// The environment variable through which a popup's attach client receives its view grant.
-pub const ATTACH_ENVIRONMENT: &str = "TICKLOOP_MONITOR_ATTACH";
 /// At most this many key reads wait for the Tick; a busy Tick slows typing instead of losing it.
 const QUEUED_KEY_READS: usize = 16;
 /// How often the key reader looks whether its view has ended.

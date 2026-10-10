@@ -1,6 +1,6 @@
-//! Probes of a Chat's hosted Ticks for a View without Herdr: the Agent lists the Chat's running
-//! hosted Ticks with a process sample of each. Probing never reads Tick content, subscribes or
-//! keeps a Tick from idling.
+//! Probes of a Chat's hosted Ticks: the Agent lists the Chat's running hosted Ticks with a
+//! process sample of each. Probing never reads Tick content, subscribes or keeps a Tick from
+//! idling.
 
 use std::collections::HashMap;
 
@@ -47,7 +47,7 @@ impl TickProbe for HostedProbe {
                 continue;
             };
             let state = match member.state {
-                HostedMemberState::Running => MemberState::Live { protocol: true },
+                HostedMemberState::Running => MemberState::Live,
                 HostedMemberState::Exited => MemberState::Exited(match member.exit {
                     Some(HostedProgramExit {
                         code: Some(code), ..

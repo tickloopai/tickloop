@@ -163,7 +163,7 @@ async fn reading_a_running_shells_output_handles_only_what_came_before_its_end()
 async fn the_user_opening_a_row_handles_it_and_the_mark_survives_resume() {
     let directory = tempfile::tempdir().unwrap();
     let store = directory.path().join("archive");
-    let instance: InstanceRef = "herdr:quotes".parse().unwrap();
+    let instance: InstanceRef = "calendar:quotes".parse().unwrap();
     let agent = Agent::open_embedded(
         store.clone(),
         config(),

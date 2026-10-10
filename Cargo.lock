@@ -4889,12 +4889,9 @@ dependencies = [
  "tickloop-tick-protocol",
  "tickloop-tick-provider",
  "tickloop-tick-sdk",
- "tickloop-tickhost",
- "tickloop-tickhost-connect",
  "tickloop-ui",
  "time",
  "tokio",
- "uuid",
 ]
 
 [[package]]
@@ -5032,7 +5029,6 @@ name = "tickloop-tickhost-connect"
 version = "0.2.0"
 dependencies = [
  "async-trait",
- "jsonschema",
  "libc",
  "serde",
  "serde_json",

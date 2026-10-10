@@ -1724,7 +1724,7 @@ mod tests {
         let payload = json!({
             "items": [{
                 "subscription": Uuid::from_u128(700),
-                "instance": "herdr:fixture-run-3",
+                "instance": "calendar:fixture-run-3",
                 "sequence": 12,
                 "observed_at": "2026-09-21T03:15:00Z",
                 "dropped": 4,
@@ -1753,7 +1753,7 @@ mod tests {
         let history = public_history(&tick_delivery_history("quiet"), DisplayProfile::default());
 
         assert!(
-            history.contains("◉ herdr:fixture-run-3 #12 · dropped 4"),
+            history.contains("◉ calendar:fixture-run-3 #12 · dropped 4"),
             "{history}"
         );
         assert!(!history.contains("last_done"), "{history}");
@@ -1768,7 +1768,7 @@ mod tests {
         );
 
         assert!(
-            history.contains("◉ herdr:fixture-run-3 #12 · dropped 4 · truncated"),
+            history.contains("◉ calendar:fixture-run-3 #12 · dropped 4 · truncated"),
             "{history}"
         );
     }

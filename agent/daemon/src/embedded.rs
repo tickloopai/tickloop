@@ -298,8 +298,6 @@ impl EmbeddedAgentAccess {
                         .ok_or_else(|| AccessError::invalid("interaction source has no Tab"))?,
                     cwd: None,
                     foreground_cwd: None,
-                    terminal_title_stripped: None,
-                    tokens: Default::default(),
                 };
                 result = Some(HostCallContext {
                     workdir: snapshot.workdir,

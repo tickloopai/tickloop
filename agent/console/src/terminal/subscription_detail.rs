@@ -475,7 +475,7 @@ mod tests {
     use super::*;
 
     fn instance() -> InstanceRef {
-        InstanceRef::native("fixture-run").unwrap()
+        InstanceRef::new("calendar", "fixture-run").unwrap()
     }
 
     fn row(id: u128, frequency: TickSubscriptionFrequency) -> TickSubscriptionStatus {

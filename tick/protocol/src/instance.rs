@@ -1,10 +1,10 @@
-//! The complete identity of one running Tick in its Native host.
+//! The complete identity of one Tick Instance: where it runs and its identity there.
 
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{HERDR_INSTANCE_TYPE, HOSTED_INSTANCE_TYPE, SHELL_INSTANCE_TYPE};
+use crate::{HOSTED_INSTANCE_TYPE, SHELL_INSTANCE_TYPE};
 
 pub fn artifact_instance_id(origin: &str, id: &str) -> String {
     format!("artifact:{}/{id}", origin.trim_end_matches('/'))
@@ -50,23 +50,6 @@ impl InstanceRef {
     pub fn shell(task_id: impl fmt::Display) -> Self {
         Self::new(SHELL_INSTANCE_TYPE, &task_id.to_string()).expect("valid Shell task identity")
     }
-    pub fn native(run: impl AsRef<str>) -> Result<Self, &'static str> {
-        let run = run.as_ref();
-        if run.is_empty() || run.chars().any(char::is_control) {
-            return Err("a Tick Instance requires a nonempty run identity");
-        }
-        let source = format!("{HERDR_INSTANCE_TYPE}:");
-        let identity = if run.starts_with(&source) {
-            run.to_owned()
-        } else {
-            format!("{source}{run}")
-        };
-        if identity == source {
-            return Err("a Tick Instance requires a nonempty run identity");
-        }
-        Ok(Self(identity))
-    }
-
     /// A Tick running in the dedicated Tickhost. `hosted` names where it runs, not a kind of
     /// Tick: its protocol and tools are those of the program it runs.
     pub fn hosted(run: uuid::Uuid) -> Self {
@@ -145,7 +128,7 @@ mod tests {
     use super::InstanceRef;
 
     #[test]
-    fn adapter_identities_round_trip_without_becoming_herdr_instances() {
+    fn adapter_identities_round_trip_as_written() {
         for identity in ["shell:task-17", "calendar:meeting-42"] {
             let reference: InstanceRef =
                 serde_json::from_value(serde_json::json!(identity)).unwrap();
@@ -158,30 +141,23 @@ mod tests {
     }
 
     #[test]
-    fn run_identity_round_trips_without_losing_source_or_bytes() {
-        let reference =
-            InstanceRef::native("session/workspace/pane/1c6391d8-aaaa-bbbb-cccc-123456789abc")
-                .unwrap();
+    fn hosted_identity_round_trips_with_its_run() {
+        let run = uuid::Uuid::parse_str("1c6391d8-aaaa-bbbb-cccc-123456789abc").unwrap();
+        let reference = InstanceRef::hosted(run);
         let serialized = serde_json::to_string(&reference).unwrap();
         assert_eq!(
             serialized,
-            "\"herdr:session/workspace/pane/1c6391d8-aaaa-bbbb-cccc-123456789abc\""
+            "\"hosted:1c6391d8-aaaa-bbbb-cccc-123456789abc\""
         );
-        assert_eq!(
-            serde_json::from_str::<InstanceRef>(&serialized).unwrap(),
-            reference
-        );
-        assert_ne!(
-            reference,
-            InstanceRef::native("session/workspace/pane/1c6391d8-aaaa-bbbb-cccc-123456789abd")
-                .unwrap()
-        );
+        let read = serde_json::from_str::<InstanceRef>(&serialized).unwrap();
+        assert_eq!(read, reference);
+        assert_eq!(read.hosted_run(), Some(run));
     }
 
     #[test]
     fn numeric_and_unprefixed_records_cannot_be_read_as_tick_instances() {
         assert!(serde_json::from_str::<InstanceRef>("7").is_err());
         assert!(serde_json::from_str::<InstanceRef>("\"7\"").is_err());
-        assert!(InstanceRef::native("herdr:").is_err());
+        assert!(serde_json::from_str::<InstanceRef>("\"hosted:\"").is_err());
     }
 }

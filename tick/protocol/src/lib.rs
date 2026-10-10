@@ -34,26 +34,19 @@ pub const FRAME_TOO_LARGE: i64 = -32003;
 /// A `tick/call` named another revision than the Tick's current catalog, so it was not run.
 pub const REVISION_MISMATCH: i64 = -32004;
 
-/// The instance type of a Tick running in a Herdr Pane.
-pub const HERDR_INSTANCE_TYPE: &str = "herdr";
-/// The instance type of a Tick running hidden in the Tickhost. It names where the Tick runs, not
-/// a kind of Tick: its protocol and tools are those of the program it runs.
+/// The instance type of a Tick running in the Tickhost. It names where the Tick runs, not a kind
+/// of Tick: its protocol and tools are those of the program it runs.
 pub const HOSTED_INSTANCE_TYPE: &str = "hosted";
 /// The instance type of a Shell Tick: one shell command execution of an Agent.
 pub const SHELL_INSTANCE_TYPE: &str = "shell";
 /// The instance type of an artifact Tick: one artifact of the artifact service.
 pub const ARTIFACT_INSTANCE_TYPE: &str = "artifact";
-/// The instance types a host launches a protocol Tick under, as the prefix of the identity it
-/// passes in [`INSTANCE_ID_ENV`].
-const LAUNCHED_INSTANCE_TYPES: [&str; 2] = [HERDR_INSTANCE_TYPE, HOSTED_INSTANCE_TYPE];
 
-/// Whether `identity` is a complete `herdr:` or `hosted:` instance identity a host could have
-/// launched this Tick under.
+/// Whether `identity` is a complete `hosted:` instance identity the Tickhost could have launched
+/// this Tick under, as it passes it in [`INSTANCE_ID_ENV`].
 pub fn is_launched_instance_id(identity: &str) -> bool {
     identity.split_once(':').is_some_and(|(tick_type, id)| {
-        LAUNCHED_INSTANCE_TYPES.contains(&tick_type)
-            && !id.is_empty()
-            && !id.chars().any(char::is_control)
+        tick_type == HOSTED_INSTANCE_TYPE && !id.is_empty() && !id.chars().any(char::is_control)
     })
 }
 
@@ -262,16 +255,15 @@ mod tests {
     }
 
     #[test]
-    fn only_complete_herdr_and_hosted_identities_count_as_launched() {
-        for identity in ["herdr:session/w/p/1", "hosted:7f1c"] {
-            assert!(is_launched_instance_id(identity), "{identity}");
-        }
+    fn only_complete_hosted_identities_count_as_launched() {
+        assert!(is_launched_instance_id("hosted:7f1c"));
         for identity in [
-            "herdr:",
+            "herdr:session/w/p/1",
+            "hosted:",
             "hosted",
             "shell:task-1",
             "artifact:https://a/1",
-            "herdr:a\nb",
+            "hosted:a\nb",
         ] {
             assert!(!is_launched_instance_id(identity), "{identity}");
         }

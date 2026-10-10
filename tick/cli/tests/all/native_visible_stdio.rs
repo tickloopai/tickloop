@@ -46,7 +46,7 @@ fn visible_builtin() -> (
     let mut command = Command::new(env!("CARGO_BIN_EXE_tick"));
     command
         .args(["builtin", "kline", "700.HK"])
-        .env("TICKLOOP_INSTANCE_ID", "herdr:visible-kline")
+        .env("TICKLOOP_INSTANCE_ID", "hosted:visible-kline")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -443,7 +443,7 @@ fn native_terminal_restores_after_panic() {
 fn native_visible_mode_requires_a_controlling_tty() {
     let output = Command::new(env!("CARGO_BIN_EXE_tick"))
         .args(["builtin", "kline", "700.HK"])
-        .env("TICKLOOP_INSTANCE_ID", "herdr:without-tty")
+        .env("TICKLOOP_INSTANCE_ID", "hosted:without-tty")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
