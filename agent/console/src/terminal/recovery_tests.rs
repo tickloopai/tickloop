@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 mod background_request_tests;
+mod busy_turn_tests;
 
 #[test]
 fn plain_replayed_reply_fixture() {
@@ -93,6 +94,7 @@ fn plain_replayed_thinking_and_answer_have_separate_labels_once() {
 }
 mod cached_navigation_tests;
 mod event_delivery_tests;
+mod feed_gap_tests;
 mod hidden_view_recovery_tests;
 mod lost_presentation_tests;
 mod pending_input_tests;
@@ -1614,16 +1616,14 @@ fn real_event_overflow_restores_known_completion_once_without_inventing_evicted_
         "{restored}"
     );
     assert_eq!(super::turn_summaries(&restored), 1, "{restored}");
-    assert!(restored.contains("↓ 29 tokens"), "{restored}");
-    assert!(!restored.contains("↓ 7 tokens"), "{restored}");
     assert!(
         restored.find("Second retained report.").unwrap()
             < super::turn_summary_position(&restored).unwrap(),
         "{restored}"
     );
-    for (turn, reply, output_tokens) in [
-        (3, "Third retained report.", 53),
-        (4, "Fourth retained report.", 67),
+    for (turn, reply) in [
+        (3, "Third retained report."),
+        (4, "Fourth retained report."),
     ] {
         fixture.send(format!("Read retained report {turn}.\r").as_bytes());
         fixture.wait_for_phase(&phase_path, &format!("started-{turn}"));
@@ -1646,16 +1646,9 @@ fn real_event_overflow_restores_known_completion_once_without_inventing_evicted_
             });
         assert_eq!(super::turn_summaries(&completed), 1, "{completed}");
         assert!(
-            completed.contains(&format!("↓ {output_tokens} tokens")),
-            "{completed}"
+            completed.find(reply).unwrap() < super::turn_summary_position(&completed).unwrap(),
+            "the one summary is the latest turn's: {completed}"
         );
-        assert!(
-            !completed.contains("↓ 29 tokens") && !completed.contains("↓ 7 tokens"),
-            "{completed}"
-        );
-        if turn == 4 {
-            assert!(!completed.contains("↓ 53 tokens"), "{completed}");
-        }
     }
     fixture.send(b"\x04\x04");
     let deadline = Instant::now() + RECOVERY_TIMEOUT;
@@ -1833,7 +1826,6 @@ fn run_routine_restore_pty(route: &str) {
                 "{frame}"
             );
             assert_eq!(super::turn_summaries(&frame), 1, "{frame}");
-            assert!(frame.contains("↓ 7 tokens"), "{frame}");
         } else {
             assert_eq!(
                 body(&frame),

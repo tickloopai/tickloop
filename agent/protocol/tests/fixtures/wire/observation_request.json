@@ -110,5 +110,44 @@
     "kind": "receipt",
     "epoch": "00000000-0000-0000-0000-0000000000e0",
     "command_id": "00000000-0000-0000-0000-000000000081"
+  },
+  {
+    "kind": "agent",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "detail": {
+      "kind": "status"
+    },
+    "after": null
+  },
+  {
+    "kind": "agent",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "detail": {
+      "kind": "operation",
+      "run_id": "00000000-0000-0000-0000-000000000020",
+      "call_id": "call-edit"
+    },
+    "after": null
+  },
+  {
+    "kind": "agent",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "detail": {
+      "kind": "events",
+      "after": 9
+    },
+    "after": null
   }
 ]

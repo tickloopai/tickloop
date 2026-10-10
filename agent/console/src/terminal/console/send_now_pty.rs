@@ -162,7 +162,7 @@ fn send_now_pty_ctrl_enter_reaches_the_model_without_waiting_for_the_running_too
     });
     fixture.send(format!("{QUEUED_THEN_SENT}\r").as_bytes());
     let queued = fixture.wait(|frame| {
-        frame.contains(&format!("❯ {QUEUED_THEN_SENT}")) && frame.contains(SEND_NOW_HINT)
+        frame.contains(&format!("❯ {QUEUED_THEN_SENT}")) && frame.contains(QUEUED_SEND_NOW_HINT)
     });
     assert!(!queued.contains(QUEUED_REPLY), "{queued}");
     fixture.send(CTRL_ENTER);

@@ -10,12 +10,12 @@ pub(super) async fn refresh(
     root: Option<&Path>,
     chat: Uuid,
 ) -> Result<(), String> {
-    let snapshot = agent
-        .snapshot(chat)
+    let status = agent
+        .status(chat)
         .await
         .map_err(|error| error.to_string())?;
-    let artifact_ticks = snapshot.artifact_ticks.clone();
-    console.update_monitor_chat(snapshot)?;
+    let artifact_ticks = status.artifact_ticks.clone();
+    console.update_monitor_chat(status)?;
     let Some(root) = root else {
         return Ok(());
     };
@@ -121,7 +121,7 @@ pub(super) async fn tick_action(
                     .map_err(|error| error.to_string())?;
                 console.update_monitor_chat(
                     agent
-                        .snapshot(chat)
+                        .status(chat)
                         .await
                         .map_err(|error| error.to_string())?,
                 )?;
@@ -152,14 +152,14 @@ async fn unlink(
             &instance,
         )
         .len();
-        let snapshot = agent
-            .snapshot(chat)
+        let status = agent
+            .status(chat)
             .await
             .map_err(|error| error.to_string())?;
         let is_linked_here = instance
             .artifact_parts()
             .and_then(|(origin, artifact_id)| {
-                crate::monitor_rows::feedback_binding(&snapshot, origin, artifact_id)
+                crate::monitor_rows::feedback_binding(&status, origin, artifact_id)
             })
             .is_some_and(|binding| !binding.resume_required);
         if is_linked_here || subscriptions > 0 {
@@ -205,7 +205,7 @@ async fn remove_local_artifact(
     )?;
     console.update_monitor_chat(
         agent
-            .snapshot(chat)
+            .status(chat)
             .await
             .map_err(|error| error.to_string())?,
     )
@@ -331,7 +331,7 @@ async fn apply_choice_with_client(
                 .map_err(|error| error.to_string())?;
             console.update_monitor_chat(
                 agent
-                    .snapshot(chat)
+                    .status(chat)
                     .await
                     .map_err(|error| error.to_string())?,
             )?;
@@ -618,7 +618,7 @@ mod tests {
             if !remote_delete {
                 agent.add_artifact_tick(chat, tick.clone()).await.unwrap();
                 console
-                    .update_monitor_chat(agent.snapshot(chat).await.unwrap())
+                    .update_monitor_chat(agent.status(chat).await.unwrap())
                     .unwrap();
             }
             let subscription = remote.rows.lock().unwrap()[0].id;

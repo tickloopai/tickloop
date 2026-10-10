@@ -21,7 +21,7 @@ use std::{
 use tick_protocol::InstanceRef;
 use tickloop_agent_artifacts::ArtifactMetadata;
 use tickloop_agent_protocol::{
-    ChatSnapshot, LoopState, MonitorMember, MonitorMembership, ShellTaskSnapshot,
+    ChatStatus, LoopState, MonitorMember, MonitorMembership, ShellTaskSnapshot,
     TickSubscriptionStatus,
 };
 use uuid::Uuid;
@@ -219,7 +219,7 @@ pub struct TickDescriptor {
 #[derive(Default)]
 pub struct MonitorContext {
     /// Shared with the View that read it; listing rows never copies the conversation.
-    pub chat: Option<Arc<ChatSnapshot>>,
+    pub chat: Option<Arc<ChatStatus>>,
     pub shells: Option<ShellTaskSnapshot>,
     pub subscriptions: Vec<TickSubscriptionStatus>,
     pub metadata: HashMap<String, Option<ArtifactMetadata>>,

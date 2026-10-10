@@ -4,7 +4,8 @@ use crate::terminal::{
     task_surface::{TaskOutputUpdate, TaskSurfaceEffect},
 };
 use tickloop_agent_protocol::{
-    ChatSnapshot, MonitorMember, MonitorMembership, ShellTaskOutputChunk, TickSubscriptionStatus,
+    ChatSnapshot, ChatStatus, MonitorMember, MonitorMembership, ShellTaskOutputChunk,
+    TickSubscriptionStatus,
 };
 
 fn shell(id: Uuid, title: &str) -> MonitorEntry {
@@ -40,6 +41,10 @@ fn chat_snapshot(chat: Uuid) -> ChatSnapshot {
         "loops": []
     }))
     .unwrap()
+}
+
+fn chat_status(chat: Uuid) -> ChatStatus {
+    ChatStatus::of(&chat_snapshot(chat))
 }
 
 fn removed(instance: tick_protocol::InstanceRef) -> MonitorMembership {
@@ -237,7 +242,7 @@ fn shell_ticks_only_list_background_executions_and_x_removes_a_finished_one() {
             );
             assert_eq!(state.monitor.entries().len(), 1);
         }
-        console.update_monitor_chat(chat_snapshot(chat)).unwrap();
+        console.update_monitor_chat(chat_status(chat)).unwrap();
         console
             .update_monitor_membership(chat, removed(task.clone()))
             .unwrap();
@@ -895,7 +900,7 @@ async fn failed_artifact_refresh_keeps_cached_title_but_marks_the_row_and_notifi
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     console
-        .update_monitor_chat(agent.snapshot(chat).await.unwrap())
+        .update_monitor_chat(agent.status(chat).await.unwrap())
         .unwrap();
     {
         let state = console.state.lock().unwrap();
@@ -926,7 +931,7 @@ fn an_artifact_renamed_in_the_chat_replaces_its_cached_metadata_title() {
         .unwrap()
     };
     let id = tick("Plan").instance_id();
-    let mut snapshot = chat_snapshot(chat);
+    let mut snapshot = chat_status(chat);
     snapshot.artifact_ticks = vec![tick("Plan")];
     console.update_monitor_chat(snapshot.clone()).unwrap();
     console
@@ -1221,7 +1226,7 @@ fn shell_tick_renders_in_right_list_and_finished_remove_keeps_other_rows() {
         panic!("x must ask the Agent to remove the row");
     };
     assert_eq!(state.monitor.entries().len(), 1);
-    state.monitor.chat_snapshot = Some(Arc::new(chat_snapshot(state.chat.unwrap())));
+    state.monitor.chat_status = Some(Arc::new(chat_status(state.chat.unwrap())));
     state.monitor.set_membership(removed(
         serde_json::from_value(serde_json::json!(action.instance)).unwrap(),
     ));
@@ -1849,7 +1854,7 @@ fn run_probes(
 fn a_herdr_view_probes_hosted_members_beside_herdr_ones() {
     let console = Console::test_for_chat(Uuid::new_v4());
     let chat = console.state.lock().unwrap().chat.unwrap();
-    let mut snapshot = chat_snapshot(chat);
+    let mut snapshot = chat_status(chat);
     let hosted: tick_protocol::InstanceRef = "hosted:1a26e59c-a887-457d-8540-5079aea79ca0"
         .parse()
         .unwrap();
@@ -1913,14 +1918,14 @@ fn monitor_pages_hold_at_most_128_rows_while_n_counts_the_full_set() {
     let chat = Uuid::new_v4();
     state.switch_view_chat(Some(chat));
     state.prompt_enabled = true;
-    let mut snapshot = chat_snapshot(chat);
+    let mut snapshot = chat_status(chat);
     for index in 0..130 {
         snapshot.monitor.members.push(MonitorMember {
             instance: format!("herdr:member-{index:03}").parse().unwrap(),
             title: None,
         });
     }
-    state.monitor.chat_snapshot = Some(Arc::new(snapshot));
+    state.monitor.chat_status = Some(Arc::new(snapshot));
     state.monitor.rebuild();
     assert_eq!(state.monitor.entries().len(), 128);
     assert_eq!(state.monitor.total(), 130);
@@ -1949,7 +1954,7 @@ fn monitor_pages_hold_at_most_128_rows_while_n_counts_the_full_set() {
 fn probed_herdr_members_report_their_host_state_and_owner() {
     let console = Console::test_for_chat(Uuid::new_v4());
     let chat = console.state.lock().unwrap().chat.unwrap();
-    let mut snapshot = chat_snapshot(chat);
+    let mut snapshot = chat_status(chat);
     for id in ["quotes", "news"] {
         snapshot.monitor.members.push(MonitorMember {
             instance: format!("herdr:{id}").parse().unwrap(),
@@ -2005,12 +2010,12 @@ fn member_details_show_the_recorded_owner_and_no_invented_resources() {
     let chat = Uuid::new_v4();
     state.switch_view_chat(Some(chat));
     state.prompt_enabled = true;
-    let mut snapshot = chat_snapshot(chat);
+    let mut snapshot = chat_status(chat);
     snapshot.monitor.members.push(MonitorMember {
         instance: tick_protocol::InstanceRef::new("herdr", "opened").unwrap(),
         title: Some("Opened counter".into()),
     });
-    state.monitor.chat_snapshot = Some(Arc::new(snapshot));
+    state.monitor.chat_status = Some(Arc::new(snapshot));
     state.monitor.rebuild();
     assert_eq!(state.monitor.entries().len(), 1);
     state.monitor.focus(false, None);
@@ -2175,7 +2180,7 @@ fn running_background_shells_are_named_by_key_command_and_count_from_their_start
     let task = snapshot.tasks[0].id;
     console
         .refresh_monitor(crate::terminal::monitor::MonitorSources {
-            chat: Arc::new(chat_snapshot(chat)),
+            chat: Arc::new(chat_status(chat)),
             shells: snapshot,
             subscriptions: None,
         })
@@ -2236,7 +2241,7 @@ fn a_finished_background_shell_leaves_once_handled_unless_its_detail_is_open() {
         );
     }
     let handled = ended + 2_000;
-    let mut chat_snapshot = chat_snapshot(chat);
+    let mut chat_snapshot = chat_status(chat);
     chat_snapshot.monitor.mark_handled(
         tick_protocol::InstanceRef::shell(snapshot.tasks[0].id),
         handled,
@@ -2274,7 +2279,7 @@ fn a_shell_end_flashes_as_a_turn_takes_it_in_and_a_chat_switch_does_not_replay_i
     snapshot.tasks[0].updated_at_ms = Some(ended);
     snapshot.tasks[0].command = "make test".into();
     let shell = tick_protocol::InstanceRef::shell(snapshot.tasks[0].id);
-    let mut chat_snapshot = chat_snapshot(chat);
+    let mut chat_snapshot = chat_status(chat);
     console.update_monitor_chat(chat_snapshot.clone()).unwrap();
     console
         .refresh_monitor_ticks(snapshot.clone(), None)
@@ -2607,7 +2612,7 @@ async fn removing_a_subscribed_row_confirms_then_cancels_its_subscriptions() {
     let watched = tick_protocol::InstanceRef::new("cal", "watched").unwrap();
     let console = Console::test_for_chat(chat);
     console
-        .update_monitor_chat(agent.snapshot(chat).await.unwrap())
+        .update_monitor_chat(agent.status(chat).await.unwrap())
         .unwrap();
     console
         .update_subscribed_ticks(chat, &agent.tick_subscriptions(chat).await.unwrap())
@@ -2699,7 +2704,7 @@ async fn opening_a_row_handles_its_updates_and_other_keys_do_not() {
     state.prompt_enabled = true;
     let console = tests::console_with_state(state);
     console
-        .update_monitor_chat(agent.snapshot(chat).await.unwrap())
+        .update_monitor_chat(agent.status(chat).await.unwrap())
         .unwrap();
     let context = TickActionContext {
         agent: &agent,
@@ -2733,7 +2738,7 @@ async fn opening_a_row_handles_its_updates_and_other_keys_do_not() {
             .lock()
             .unwrap()
             .monitor
-            .chat_snapshot
+            .chat_status
             .as_ref()
             .unwrap()
             .monitor
@@ -2750,7 +2755,7 @@ fn a_gone_row_leaves_monitor_thirty_seconds_after_it_went() {
     let chat = Uuid::new_v4();
     let console = Console::test_for_chat(chat);
     let gone = tick_protocol::InstanceRef::native("gone-run").unwrap();
-    let mut snapshot = chat_snapshot(chat);
+    let mut snapshot = chat_status(chat);
     snapshot
         .monitor
         .record_opened(gone.clone(), Some("Quotes".into()));
@@ -2822,7 +2827,7 @@ async fn closing_the_detail_of_a_shell_stopped_from_it_marks_its_end_seen() {
     state.prompt_enabled = true;
     let console = tests::console_with_state(state);
     console
-        .update_monitor_chat(agent.snapshot(chat).await.unwrap())
+        .update_monitor_chat(agent.status(chat).await.unwrap())
         .unwrap();
     console
         .refresh_monitor_ticks(running.clone(), None)
@@ -2938,7 +2943,7 @@ fn linked_artifact_fixture(resume_required: bool) -> (State, tick_protocol::Inst
         "loops": [{"id":Uuid::from_u128(900),"goal":"Write a brief","state":"WaitingTrigger","run_id":null,"run_started_at":null,"event_sources":[{"origin":"https://docs.example","account_id":"owner","artifact_id":"doc","binding_id":Uuid::from_u128(5),"client_instance_id":Uuid::from_u128(6),"epoch":1,"resume_required":resume_required,"last_request_at_ms":null}]}]
     }))
     .unwrap();
-    state.monitor.chat_snapshot = Some(Arc::new(snapshot));
+    state.monitor.chat_status = Some(Arc::new(ChatStatus::of(&snapshot)));
     state.monitor.rebuild();
     state.monitor.focus(false, None);
     (
@@ -3039,7 +3044,7 @@ fn chat_with_messages(chat: Uuid, messages: usize) -> ChatSnapshot {
 /// what it read, half of them showing a change, as when a run moves on.
 fn refresh_status(
     console: &Console,
-    snapshot: &Arc<ChatSnapshot>,
+    snapshot: &Arc<ChatStatus>,
     tasks: &tickloop_agent_protocol::ShellTaskSnapshot,
     changed: bool,
 ) {
@@ -3058,7 +3063,7 @@ fn refresh_status(
     console.set_queued_inputs(snapshot.queued_inputs()).unwrap();
     console.set_chat_images(chat, true, None).unwrap();
     let commands = if changed {
-        vec![tasks.tasks[0].id]
+        vec![(tasks.tasks[0].id, None)]
     } else {
         Vec::new()
     };
@@ -3102,7 +3107,7 @@ fn bench_status_refresh_cost_by_conversation_size() {
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
-        let snapshot = Arc::new(chat_with_messages(chat, size));
+        let snapshot = Arc::new(ChatStatus::of(&chat_with_messages(chat, size)));
         let tasks = tests::task_snapshot(chat, 1);
         refresh_status(&console, &snapshot, &tasks, false);
         let frames = console.state.lock().unwrap().frames_drawn;

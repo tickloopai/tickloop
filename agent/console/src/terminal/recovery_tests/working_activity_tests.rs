@@ -89,7 +89,7 @@ impl AgentAccess for ActivityAccess {
         let lossy_feed = match &query {
             ObservationRequest::Agent {
                 execution,
-                detail: AgentDetailQuery::Snapshot,
+                detail: AgentDetailQuery::Snapshot | AgentDetailQuery::Status,
                 ..
             } if std::env::var(ACTIVITY_ROUTE).as_deref() == Ok(LOST_END_ROUTE) => Some(*execution),
             _ => None,

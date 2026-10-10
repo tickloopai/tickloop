@@ -115,8 +115,13 @@ use super::{
         PermissionsSurface,
     },
     renderer::{self, Renderer},
-    scrollback::{CollapsedCall, InputEcho, ScrollAction, Scrollback, ToolCallState},
-    selection::{Cell, Selection, line_width, split_columns},
+    scrollback::{
+        CollapsedCall, ForegroundCommandHint, InputEcho, ScrollAction, Scrollback, ToolCallState,
+    },
+    selection::{
+        Cell, ScrollDirection, Selection, SelectionDrag, Surface, Viewport, line_width,
+        split_columns,
+    },
     shell_input::{
         InputKind, ShellCompletionKey, ShellCompletionKind, ShellEmptyControl, ShellExecution,
         ShellInputAction, ShellInputState, UserShellSubmission,
@@ -137,7 +142,10 @@ const DIVIDER_EDGE_RULE_COLUMNS: usize = 1;
 const DIVIDER_ENTRY_GAP_COLUMNS: usize = 1;
 const CREATION_ATTACH_UNAVAILABLE_PREFIX: &str = "New Agent created; local connection unavailable";
 const EXECUTION_CONNECTION_DETAILS_HINT: &str = "ctrl+o details";
+#[cfg(test)]
 const SEND_NOW_HINT: &str = "ctrl+enter send now";
+const QUEUED_SEND_NOW_HINT: &str = "ctrl+enter to send now";
+const QUEUED_INPUT_PLACEHOLDER: &str = "Press up to edit queued messages";
 const HINT_SEGMENT_SEPARATOR: &str = " · ";
 const INTERRUPT_HINT: &str = "esc interrupt";
 /// Blank columns between the key hints and the right-aligned notice.
@@ -156,6 +164,13 @@ const MENU_WAITING_NOTICE: &str = "Menu waiting in conversation";
 /// the terminal on the alternate screen. Both directions err towards "possibly
 /// on the alternate screen", because a spurious leave is harmless while a
 /// missed one leaves the user with an unusable terminal.
+/// A foreground Bash command of the model, the call that started it, and when it was first seen.
+struct ForegroundCommand {
+    id: Uuid,
+    call_id: Option<String>,
+    seen: Instant,
+}
+
 #[derive(Clone)]
 struct TerminalSurface {
     alternate_screen: Arc<AtomicBool>,
@@ -207,6 +222,10 @@ pub(super) enum RequestPresentation {
 }
 
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Claude Code `AUTOSCROLL_INTERVAL_MS` and `AUTOSCROLL_LINES`: how often and how far content
+/// scrolls while a selection drag holds the pointer at its edge.
+const SELECTION_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
+const SELECTION_SCROLL_ROWS: usize = 2;
 const INPUT_CHANNEL_CAPACITY: usize = 128;
 const FOOTER_ROWS: usize = 3;
 const FOOTER_ITEMS_ROWS: usize = 1;
@@ -577,8 +596,7 @@ pub(super) struct State {
     synchronized_output: bool,
     clipboard: Clipboard,
     external_editor: ExternalEditorLauncher,
-    /// Plain text of the rows most recently drawn. Selection is what the user
-    /// can see, so it is taken from here rather than from the conversation.
+    /// Plain text of the rows most recently drawn, which a selection of the screen copies.
     rendered_screen: Vec<String>,
     /// Every row as it was last written, so a frame repaints only the rows
     /// that changed since.
@@ -591,6 +609,10 @@ pub(super) struct State {
     #[cfg(test)]
     frames_drawn: usize,
     selection: Option<Selection>,
+    /// Where the last frame drew the conversation or the detailed transcript, so a selection
+    /// there keeps to their content as it scrolls.
+    content_viewport: Option<Viewport>,
+    selection_drag: Option<SelectionDrag>,
     pub(super) display: DisplayProfile,
     colour_depth: ColourDepth,
     prompt_enabled: bool,
@@ -602,7 +624,7 @@ pub(super) struct State {
     foreground_shell: bool,
     /// The model's foreground Bash commands in the shown Chat, each with when this View first saw
     /// it running.
-    foreground_commands: Vec<(Uuid, Instant)>,
+    foreground_commands: Vec<ForegroundCommand>,
     shell_background_chord_started_at: Option<Instant>,
     width: usize,
     height: usize,
@@ -1319,13 +1341,13 @@ impl Console {
 
     pub(super) fn update_monitor_chat(
         &self,
-        snapshot: impl Into<Arc<tickloop_agent_protocol::ChatSnapshot>>,
+        status: impl Into<Arc<tickloop_agent_protocol::ChatStatus>>,
     ) -> Result<(), String> {
-        let snapshot = snapshot.into();
+        let status = status.into();
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state
-            .monitor_for_chat_mut(snapshot.id)
-            .set_chat_snapshot(snapshot);
+            .monitor_for_chat_mut(status.id)
+            .set_chat_status(status);
         Ok(())
     }
     /// Applies the Chat's Shell tasks and subscriptions, read again on Monitor's own cadence.
@@ -4034,8 +4056,12 @@ impl Console {
         Ok(())
     }
 
-    /// Records the model's foreground Bash commands in the shown Chat.
-    pub(super) fn set_foreground_commands(&self, commands: &[Uuid]) -> Result<(), String> {
+    /// Records the model's foreground Bash commands in the shown Chat, each with the call that
+    /// started it.
+    pub(super) fn set_foreground_commands(
+        &self,
+        commands: &[(Uuid, Option<String>)],
+    ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if state.set_foreground_commands(commands, Instant::now()) {
             state
@@ -4749,11 +4775,15 @@ fn pending_input_lines(
     width: usize,
     rows: usize,
     display: DisplayProfile,
+    send_now: bool,
 ) -> Vec<RoleLine> {
     if entries.is_empty() || rows == 0 {
         return Vec::new();
     }
-    let entry_rows = rows.saturating_sub(1).max(1);
+    // Under the newest queued entry, as Claude Code names its send-now chord there; it takes a
+    // row only while every entry still fits beside it.
+    let send_now = send_now && entries.len() + 2 <= rows;
+    let entry_rows = rows.saturating_sub(1 + usize::from(send_now)).max(1);
     let shown = if entries.len() <= entry_rows {
         entries.len()
     } else {
@@ -4783,6 +4813,11 @@ fn pending_input_lines(
         line.truncate(width);
         lines.push(line);
     }
+    if send_now {
+        let mut hint = RoleLine::role(format!("    {QUEUED_SEND_NOW_HINT}"), Role::MutedText);
+        hint.truncate(width);
+        lines.push(hint);
+    }
     if omitted > 0 && entry_rows > 1 {
         lines.push(RoleLine::role(format!("  … {omitted} more"), Role::Subtle));
     }
@@ -4802,16 +4837,20 @@ impl State {
     }
 
     /// Keeps when each still-running command was first seen; returns whether the hint changed.
-    fn set_foreground_commands(&mut self, commands: &[Uuid], now: Instant) -> bool {
+    fn set_foreground_commands(
+        &mut self,
+        commands: &[(Uuid, Option<String>)],
+        now: Instant,
+    ) -> bool {
         self.foreground_commands
-            .retain(|(command, _)| commands.contains(command));
-        for command in commands {
-            if !self
-                .foreground_commands
-                .iter()
-                .any(|(seen, _)| seen == command)
-            {
-                self.foreground_commands.push((*command, now));
+            .retain(|known| commands.iter().any(|(id, _)| *id == known.id));
+        for (id, call_id) in commands {
+            if !self.foreground_commands.iter().any(|known| known.id == *id) {
+                self.foreground_commands.push(ForegroundCommand {
+                    id: *id,
+                    call_id: call_id.clone(),
+                    seen: now,
+                });
             }
         }
         self.refresh_foreground_command_hint(now)
@@ -4820,24 +4859,27 @@ impl State {
     /// Like Claude Code, a foreground command is offered to the background once it has run past
     /// the progress threshold.
     fn backgroundable_commands(&self, now: Instant) -> impl Iterator<Item = Uuid> + '_ {
-        self.foreground_commands
-            .iter()
-            .filter(move |(_, seen)| {
-                now.saturating_duration_since(*seen) >= FOREGROUND_COMMAND_HINT_DELAY
-            })
-            .map(|(command, _)| *command)
+        self.backgroundable(now).map(|command| command.id)
     }
 
-    /// Shows the hint once a command can move to the background and hides it when none can;
-    /// returns whether it changed.
+    fn backgroundable(&self, now: Instant) -> impl Iterator<Item = &ForegroundCommand> + '_ {
+        self.foreground_commands.iter().filter(move |command| {
+            now.saturating_duration_since(command.seen) >= FOREGROUND_COMMAND_HINT_DELAY
+        })
+    }
+
+    /// Shows the hint under each command that can move to the background and hides it when none
+    /// can; returns whether it changed.
     fn refresh_foreground_command_hint(&mut self, now: Instant) -> bool {
-        let offers_background = self.backgroundable_commands(now).next().is_some();
-        if offers_background == self.scrollback.shows_foreground_command_hint() {
-            return false;
-        }
-        self.scrollback.set_foreground_command_hint(
-            offers_background.then(|| RoleLine::role(FOREGROUND_COMMAND_HINT, Role::MutedText)),
-        )
+        let calls: Vec<_> = self
+            .backgroundable(now)
+            .map(|command| command.call_id.clone())
+            .collect();
+        let hint = (!calls.is_empty()).then(|| ForegroundCommandHint {
+            line: RoleLine::role(FOREGROUND_COMMAND_HINT, Role::MutedText),
+            calls,
+        });
+        self.scrollback.set_foreground_command_hint(hint)
     }
 
     fn can_background_foreground_work(&self) -> bool {
@@ -5123,6 +5165,8 @@ impl State {
             #[cfg(test)]
             frames_drawn: 0,
             selection: None,
+            content_viewport: None,
+            selection_drag: None,
             display: DisplayProfile::new(preferences),
             colour_depth: ColourDepth::detect(
                 interactive,
@@ -5295,11 +5339,32 @@ impl State {
     /// Pointer input scrolls the conversation, selects text and activates the return control.
     /// Other events are captured so the terminal does not translate the wheel into arrow keys.
     fn pointer(&mut self, event: MouseEvent, output: &mut impl Write) -> bool {
-        if let Some((_, transcript)) = &mut self.transcript {
+        let at = Cell {
+            row: usize::from(event.row),
+            column: usize::from(event.column),
+        };
+        // A selection started in scrolling content keeps the pointer until the release, wherever
+        // the drag goes.
+        if self.selection_drag.is_some()
+            && matches!(
+                event.kind,
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+            )
+        {
+            return self.drag_selection(event.kind, at, output);
+        }
+        if self.transcript.is_some() {
             return match event.kind {
                 MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
-                    transcript.wheel(event.kind == MouseEventKind::ScrollDown);
+                    self.clear_selection();
+                    if let Some((_, transcript)) = &mut self.transcript {
+                        transcript.wheel(event.kind == MouseEventKind::ScrollDown);
+                    }
                     true
+                }
+                MouseEventKind::Down(MouseButton::Left) => self.start_selection(at),
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+                    self.drag_selection(event.kind, at, output)
                 }
                 _ => false,
             };
@@ -5341,10 +5406,6 @@ impl State {
         {
             return false;
         }
-        let at = Cell {
-            row: usize::from(event.row),
-            column: usize::from(event.column),
-        };
         if self.full_screen_detail_shown()
             && (!self.input_dialog_visible()
                 || at.row < self.height.saturating_sub(self.input_dialog_height()))
@@ -5554,27 +5615,132 @@ impl State {
                     return true;
                 }
                 self.back_to_bottom_pressed = false;
-                let had_selection = self.selection.is_some();
-                self.selection = Some(Selection::started_at(at));
-                had_selection
+                self.start_selection(at)
             }
-            MouseEventKind::Drag(MouseButton::Left) => match &mut self.selection {
-                Some(selection) => {
-                    selection.drag_to(at);
-                    true
-                }
-                None => false,
-            },
-            MouseEventKind::Up(MouseButton::Left) => {
-                // The release carries its own position, so a terminal that drops
-                // the intermediate motion reports still selects the dragged span.
-                if let Some(selection) = &mut self.selection {
-                    selection.drag_to(at);
-                }
-                self.copy_selection(output)
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+                self.drag_selection(event.kind, at, output)
             }
             _ => false,
         }
+    }
+
+    /// Starts a selection at a press: in the content of the conversation or the transcript under
+    /// it, so the selection keeps to that content as it scrolls, or else on the screen.
+    fn start_selection(&mut self, at: Cell) -> bool {
+        let had_selection = self.selection.is_some();
+        let viewport = self
+            .content_viewport
+            .as_ref()
+            .filter(|viewport| viewport.contains(at));
+        self.selection = Some(match viewport {
+            Some(viewport) => Selection::started_at(viewport.surface, viewport.content_cell(at)),
+            None => Selection::started_at(Surface::Screen, at),
+        });
+        self.selection_drag = viewport.map(|_| SelectionDrag::default());
+        had_selection
+    }
+
+    /// Moves the selection's free end to the pointer, scrolling the content while the drag holds
+    /// it at an edge, and copies the selection on release. The release carries its own position,
+    /// so a terminal that drops the intermediate motion reports still selects the dragged span.
+    fn drag_selection(&mut self, kind: MouseEventKind, at: Cell, output: &mut impl Write) -> bool {
+        let released = kind == MouseEventKind::Up(MouseButton::Left);
+        if released {
+            self.selection_drag = None;
+        } else if let Some(drag) = &mut self.selection_drag {
+            drag.pointer = Some(at);
+        }
+        if !self.extend_selection_to(at) {
+            return false;
+        }
+        if released {
+            return self.copy_selection(output);
+        }
+        self.scroll_selection(Instant::now());
+        true
+    }
+
+    /// Moves the selection's free end to the screen cell `at`, counted as the surface it selects
+    /// counts. Returns whether there is a selection.
+    fn extend_selection_to(&mut self, at: Cell) -> bool {
+        let Some(surface) = self.selection.map(Selection::surface) else {
+            return false;
+        };
+        let head = match surface {
+            Surface::Screen => Some(at),
+            surface => self
+                .viewport_of(surface)
+                .map(|viewport| viewport.content_cell(at)),
+        };
+        if let (Some(selection), Some(head)) = (&mut self.selection, head) {
+            selection.drag_to(head);
+        }
+        true
+    }
+
+    /// Scrolls the content a drag selects in while the pointer is held at or past its top or
+    /// bottom edge, a few rows each interval, and extends the selection over the rows that come
+    /// into view. Returns whether the content moved.
+    fn scroll_selection(&mut self, now: Instant) -> bool {
+        let Some(SelectionDrag {
+            pointer: Some(pointer),
+            next_scroll_at,
+        }) = self.selection_drag
+        else {
+            return false;
+        };
+        let Some(viewport) = self
+            .selection
+            .and_then(|selection| self.viewport_of(selection.surface()))
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(direction) = viewport.drag_scroll(pointer) else {
+            self.selection_drag = Some(SelectionDrag {
+                pointer: Some(pointer),
+                next_scroll_at: None,
+            });
+            return false;
+        };
+        if next_scroll_at.is_some_and(|due| now < due) {
+            return false;
+        }
+        self.selection_drag = Some(SelectionDrag {
+            pointer: Some(pointer),
+            next_scroll_at: Some(now + SELECTION_SCROLL_INTERVAL),
+        });
+        let first_row = match viewport.surface {
+            Surface::Conversation => {
+                self.scrollback.scroll(match direction {
+                    ScrollDirection::Up => ScrollAction::LinesUp(SELECTION_SCROLL_ROWS),
+                    ScrollDirection::Down => ScrollAction::LinesDown(SELECTION_SCROLL_ROWS),
+                });
+                self.scrollback.top_row()
+            }
+            Surface::Transcript => {
+                let Some((_, transcript)) = &mut self.transcript else {
+                    return false;
+                };
+                transcript.scroll(direction == ScrollDirection::Down, SELECTION_SCROLL_ROWS);
+                transcript.top_row()
+            }
+            Surface::Screen => return false,
+        };
+        if first_row == viewport.first_row {
+            return false;
+        }
+        if let Some(viewport) = &mut self.content_viewport {
+            viewport.first_row = first_row;
+        }
+        self.extend_selection_to(pointer);
+        true
+    }
+
+    fn viewport_of(&self, surface: Surface) -> Option<&Viewport> {
+        self.content_viewport
+            .as_ref()
+            .filter(|viewport| viewport.surface == surface)
     }
 
     /// Scrolls the full-screen detail by one wheel step and returns the action that needs, such as
@@ -5614,7 +5780,18 @@ impl State {
             self.selection = None;
             return false;
         }
-        let text = selection.text(&self.rendered_screen);
+        let rows = selection.rows();
+        let first_row = rows.start;
+        let text = match selection.surface() {
+            Surface::Screen => selection.text(0, &self.rendered_screen),
+            Surface::Conversation => selection.text(first_row, &self.scrollback.row_texts(rows)),
+            Surface::Transcript => self
+                .transcript
+                .as_ref()
+                .map_or_else(String::new, |(_, transcript)| {
+                    selection.text(first_row, transcript.row_texts(rows))
+                }),
+        };
         if text.is_empty() {
             self.selection = None;
             return true;
@@ -5627,6 +5804,7 @@ impl State {
 
     fn clear_selection(&mut self) -> bool {
         self.back_to_bottom_pressed = false;
+        self.selection_drag = None;
         self.selection.take().is_some()
     }
 
@@ -5795,6 +5973,7 @@ impl State {
         }
         self.monitor_row_targets.clear();
         self.monitor_separator = None;
+        self.content_viewport = None;
         self.row_clock_at =
             self.next_row_clock(tickloop_agent_base::private_fs::unix_time_milliseconds());
         if self.full_review {
@@ -5852,10 +6031,17 @@ impl State {
         if let Some((_, transcript)) = &mut self.transcript {
             transcript.set_notice(self.menu.is_some().then_some(MENU_WAITING_NOTICE));
             let frame = transcript.frame(self.width, self.height);
+            self.content_viewport = Some(Viewport {
+                surface: Surface::Transcript,
+                rows: 0..frame.content.len(),
+                columns: self.width,
+                first_row: frame.content.start,
+            });
             let rows: Vec<String> = frame
                 .lines
-                .iter()
-                .map(|line| line.render(self.colour_depth))
+                .into_iter()
+                .enumerate()
+                .map(|(row, line)| self.with_selection(row, line).render(self.colour_depth))
                 .collect();
             write!(output, "{RESET_SCROLL_REGION}")?;
             self.paint_rows(output, RenderedView::Transcript, rows, 0)?;
@@ -5945,6 +6131,17 @@ impl State {
         if monitor_lines.is_some() && !self.monitor.overlay {
             self.monitor_separator = Some((self.width.saturating_sub(side_columns), 0..start));
         }
+        let first_body_row = sticky_rows + padding;
+        self.content_viewport = Some(Viewport {
+            surface: Surface::Conversation,
+            rows: first_body_row..first_body_row + body.lines.len(),
+            columns: if monitor_lines.is_some() {
+                self.width.saturating_sub(side_columns)
+            } else {
+                content_columns
+            },
+            first_row: body.top,
+        });
         let rows: Vec<String> = (0..start)
             .map(|row| {
                 let pinned = if row == 0 {
@@ -6197,13 +6394,23 @@ impl State {
     }
 
     /// Paints the selection onto one screen row in the theme's readable
-    /// selection colours; text outside the selected columns is untouched.
+    /// selection colours; text outside the selected columns is untouched. A
+    /// selection of scrolling content paints the rows that content shows there.
     fn with_selection(&self, screen_row: usize, line: StyledLine) -> StyledLine {
         let Some(selection) = self.selection.filter(|selection| !selection.is_empty()) else {
             return line;
         };
+        let row = match selection.surface() {
+            Surface::Screen => Some(screen_row),
+            surface => self
+                .viewport_of(surface)
+                .and_then(|viewport| viewport.content_row(screen_row)),
+        };
+        let Some(row) = row else {
+            return line;
+        };
         let row_width = line.spans.iter().map(|span| line_width(&span.text)).sum();
-        let Some((first, last)) = selection.columns_on(screen_row, row_width) else {
+        let Some((first, last)) = selection.columns_on(row, row_width) else {
             return line;
         };
         let theme = self.display.theme();
@@ -6944,6 +7151,7 @@ impl State {
                 self.width,
                 MAX_PENDING_INPUT_ROWS,
                 self.display,
+                self.can_send_now(),
             )
         } else {
             Vec::new()
@@ -7178,7 +7386,13 @@ impl State {
                 break;
             }
         }
-        queue = pending_input_lines(&self.queued_inputs, self.width, queue.len(), self.display);
+        queue = pending_input_lines(
+            &self.queued_inputs,
+            self.width,
+            queue.len(),
+            self.display,
+            self.can_send_now(),
+        );
         let mut input = InputView::frame_with_prompt_and_marks(
             &draft,
             cursor,
@@ -7254,13 +7468,21 @@ impl State {
             });
         if draft.is_empty()
             && self.prompt_enabled
-            && let Some((handle, _)) = &child_badge
             && let Some(line) = input.styled_lines.first_mut()
         {
-            line.push(
-                truncate_width(&format!("Message @{handle}…"), self.width.saturating_sub(2)),
-                Some(Role::MutedText),
-            );
+            let placeholder = if !overview && !self.queued_inputs.is_empty() {
+                Some(QUEUED_INPUT_PLACEHOLDER.to_owned())
+            } else {
+                child_badge
+                    .as_ref()
+                    .map(|(handle, _)| format!("Message @{handle}…"))
+            };
+            if let Some(placeholder) = placeholder {
+                line.push(
+                    truncate_width(&placeholder, self.width.saturating_sub(2)),
+                    Some(Role::MutedText),
+                );
+            }
         }
         let mut return_control = None;
         let mut monitor_toggle = None;
@@ -7512,7 +7734,6 @@ impl State {
                 let overview_list_hint;
                 let return_hint;
                 let monitor_hint;
-                let send_now_hint;
                 let empty_input_hint;
                 let hints = if self.confirmation_hint().is_some() || self.help_open {
                     // Help is focused and draws its own close hint; only facts remain.
@@ -7567,13 +7788,8 @@ impl State {
                     } else {
                         navigation_hint.to_owned()
                     };
-                    if self.can_send_now() && self.oldest_queued_message().is_some() {
-                        send_now_hint =
-                            format!("{SEND_NOW_HINT}{HINT_SEGMENT_SEPARATOR}{empty_input_hint}");
-                        send_now_hint.as_str()
-                    } else {
-                        empty_input_hint.as_str()
-                    }
+                    // A queued message names ctrl+enter under itself, as Claude Code does.
+                    empty_input_hint.as_str()
                 } else if self.can_send_now() && !self.editor.draft().trim_start().starts_with('/')
                 {
                     "enter queue · ctrl+enter send now · ctrl+g editor · ctrl+c clear"
@@ -11054,10 +11270,14 @@ fn read_keys(
             let rows_changed =
                 state.refresh_row_clocks(tickloop_agent_base::private_fs::unix_time_milliseconds());
             let hint_changed = state.refresh_foreground_command_hint(Instant::now());
+            // Terminals report motion only when the pointer changes cell, so a drag held at an
+            // edge keeps scrolling from here.
+            let selection_scrolled = state.scroll_selection(Instant::now());
             if state.poll_clipboard_hint(Instant::now())
                 || confirmation_expired
                 || rows_changed
                 || hint_changed
+                || selection_scrolled
             {
                 state.draw(&mut io::stdout().lock())?;
             }
@@ -11875,6 +12095,7 @@ mod tests {
                     chat_id,
                     origin: ShellTaskOrigin::User,
                     owner: ShellTaskOwner::User { chat_id },
+                    call_id: None,
                     command: format!("printf task-{index}"),
                     description: None,
                     cwd: PathBuf::from("/tmp"),
@@ -12153,7 +12374,7 @@ mod tests {
         let row = state
             .rendered_screen
             .iter()
-            .position(|line| line.starts_with("history-"))
+            .position(|line| line.starts_with("history-90"))
             .expect("the conversation should be on screen");
         let expected = state.rendered_screen[row][.."history-9".len()].to_owned();
 
@@ -12197,7 +12418,7 @@ mod tests {
         let row = state
             .rendered_screen
             .iter()
-            .position(|line| line.starts_with("history-"))
+            .position(|line| line.starts_with("history-90"))
             .expect("the conversation should be on screen");
         let width = "history-9".len();
         let mut output = Vec::new();
@@ -12269,7 +12490,7 @@ mod tests {
         let row = state
             .rendered_screen
             .iter()
-            .position(|line| line.starts_with("history-"))
+            .position(|line| line.starts_with("history-90"))
             .expect("the conversation should be on screen");
         drag(&mut state, (row as u16, 0), (row as u16, 20));
         let styled = RoleLine::role("history ", Role::MutedText)
@@ -12324,7 +12545,7 @@ mod tests {
         let row = state
             .rendered_screen
             .iter()
-            .position(|line| line.starts_with("history-"))
+            .position(|line| line.starts_with("history-90"))
             .expect("the conversation should be on screen");
         let width = "history-9".len();
         let expected = state.rendered_screen[row][..width].to_owned();
@@ -12388,6 +12609,282 @@ mod tests {
         ));
         assert!(state.selection.is_none());
         assert!(copies.lock().unwrap().is_empty());
+    }
+
+    /// The numbers of the `<label>-N` rows the screen shows, top to bottom.
+    fn shown_rows(state: &State, label: &str) -> Vec<usize> {
+        state
+            .rendered_screen
+            .iter()
+            .filter_map(|line| line.trim().strip_prefix(label)?.parse().ok())
+            .collect()
+    }
+
+    fn screen_row_of(state: &State, text: &str) -> u16 {
+        state
+            .rendered_screen
+            .iter()
+            .position(|line| line.trim() == text)
+            .unwrap_or_else(|| panic!("{text} should be on screen")) as u16
+    }
+
+    fn numbered_rows(label: &str, rows: std::ops::RangeInclusive<usize>) -> String {
+        rows.map(|index| format!("{label}{index}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Text of `screen_row` that the drawn selection paints with the selection background.
+    fn highlighted_on(state: &State, screen_row: usize) -> String {
+        let line = state.rendered_screen[screen_row].clone();
+        let background = state.display.theme().style(Role::Selection).background;
+        state
+            .with_selection(screen_row, StyledLine::plain(line.as_str()))
+            .spans
+            .iter()
+            .filter(|span| span.style.background == background)
+            .map(|span| span.text.as_str())
+            .collect()
+    }
+
+    fn state_with_transcript(rows: usize) -> (State, Arc<Mutex<Vec<String>>>) {
+        let (mut state, copies) = state_with_capturing_clipboard();
+        state.start_transcript();
+        state
+            .transcript
+            .as_mut()
+            .unwrap()
+            .1
+            .update(TranscriptDocument::from(
+                (0..rows)
+                    .map(|index| format!("transcript-{index}"))
+                    .collect::<Vec<_>>(),
+            ));
+        state.draw(&mut Vec::new()).unwrap();
+        (state, copies)
+    }
+
+    #[test]
+    fn dragging_past_the_top_of_the_conversation_scrolls_it_and_copies_the_rows_above() {
+        let (mut state, copies) = state_with_capturing_clipboard();
+        let first_shown = shown_rows(&state, "history-")[0];
+        let anchor_text = format!("history-{}", first_shown + 5);
+        let anchor = screen_row_of(&state, &anchor_text);
+        let mut output = Vec::new();
+        state.pointer(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                anchor,
+                anchor_text.len() as u16,
+            ),
+            &mut output,
+        );
+        assert!(
+            !state.scroll_selection(Instant::now() + SELECTION_SCROLL_INTERVAL),
+            "a press alone does not scroll"
+        );
+
+        state.pointer(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 0, 0),
+            &mut output,
+        );
+        let mut now = Instant::now();
+        for _ in 0..2 {
+            now += SELECTION_SCROLL_INTERVAL;
+            assert!(
+                state.scroll_selection(now),
+                "a pointer held at the top edge keeps scrolling without motion"
+            );
+        }
+        state.draw(&mut output).unwrap();
+        let scrolled_to = first_shown - 3 * SELECTION_SCROLL_ROWS;
+        assert_eq!(shown_rows(&state, "history-")[0], scrolled_to);
+        assert_eq!(
+            highlighted_on(&state, usize::from(screen_row_of(&state, &anchor_text))),
+            anchor_text,
+            "the selection stays on the text it started on"
+        );
+        assert_eq!(
+            highlighted_on(&state, 0),
+            format!("history-{scrolled_to}"),
+            "the rows scrolled into view join the selection"
+        );
+
+        state.pointer(
+            mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            &mut output,
+        );
+        assert_eq!(
+            copies.lock().unwrap().as_slice(),
+            [numbered_rows("history-", scrolled_to..=first_shown + 5)]
+        );
+        assert!(
+            !state.scroll_selection(now + SELECTION_SCROLL_INTERVAL),
+            "the release ends the scrolling"
+        );
+    }
+
+    #[test]
+    fn dragging_below_the_conversation_scrolls_it_down_and_copies_the_rows_below() {
+        let (mut state, copies) = state_with_capturing_clipboard();
+        state.scroll_conversation(ScrollAction::First);
+        state.draw(&mut Vec::new()).unwrap();
+        let last_shown = *shown_rows(&state, "history-").last().unwrap();
+        let anchor = screen_row_of(&state, "history-2");
+        let input_row = (state.height - 1) as u16;
+        let mut output = Vec::new();
+        state.pointer(
+            mouse(MouseEventKind::Down(MouseButton::Left), anchor, 0),
+            &mut output,
+        );
+        state.pointer(
+            mouse(MouseEventKind::Drag(MouseButton::Left), input_row, 0),
+            &mut output,
+        );
+        let mut now = Instant::now();
+        for _ in 0..2 {
+            now += SELECTION_SCROLL_INTERVAL;
+            assert!(state.scroll_selection(now));
+        }
+        state.pointer(
+            mouse(MouseEventKind::Up(MouseButton::Left), input_row, 0),
+            &mut output,
+        );
+
+        assert_eq!(
+            copies.lock().unwrap().as_slice(),
+            [numbered_rows(
+                "history-",
+                2..=last_shown + 3 * SELECTION_SCROLL_ROWS
+            )]
+        );
+    }
+
+    #[test]
+    fn a_drag_back_inside_the_conversation_stops_scrolling() {
+        let (mut state, copies) = state_with_capturing_clipboard();
+        let anchor = screen_row_of(&state, "history-95");
+        let mut output = Vec::new();
+        state.pointer(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                anchor,
+                "history-95".len() as u16,
+            ),
+            &mut output,
+        );
+        state.pointer(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 0, 0),
+            &mut output,
+        );
+        state.draw(&mut output).unwrap();
+        let inside = screen_row_of(&state, "history-93");
+        state.pointer(
+            mouse(MouseEventKind::Drag(MouseButton::Left), inside, 0),
+            &mut output,
+        );
+        let shown = shown_rows(&state, "history-");
+
+        assert!(!state.scroll_selection(Instant::now() + SELECTION_SCROLL_INTERVAL * 4));
+        state.draw(&mut output).unwrap();
+        assert_eq!(shown_rows(&state, "history-"), shown);
+        state.pointer(
+            mouse(MouseEventKind::Up(MouseButton::Left), inside, 0),
+            &mut output,
+        );
+        assert_eq!(
+            copies.lock().unwrap().as_slice(),
+            [numbered_rows("history-", 93..=95)]
+        );
+    }
+
+    #[test]
+    fn a_conversation_selection_follows_its_text_as_new_output_scrolls_it() {
+        let (mut state, _copies) = state_with_capturing_clipboard();
+        let row = screen_row_of(&state, "history-95");
+        drag(&mut state, (row, 0), (row, "history-95".len() as u16));
+
+        state.scrollback.append("history-100\nhistory-101\n");
+        state.draw(&mut Vec::new()).unwrap();
+
+        let moved = usize::from(screen_row_of(&state, "history-95"));
+        assert_eq!(moved, usize::from(row) - 2);
+        assert_eq!(highlighted_on(&state, moved), "history-95");
+        assert_eq!(highlighted_on(&state, usize::from(row)), "");
+    }
+
+    #[test]
+    fn dragging_in_the_detailed_transcript_highlights_and_copies_like_the_conversation() {
+        let (mut state, copies) = state_with_transcript(100);
+        let row = screen_row_of(&state, "transcript-95");
+        let width = "transcript-95".len() as u16;
+        let mut output = Vec::new();
+        state.pointer(
+            mouse(MouseEventKind::Down(MouseButton::Left), row, 0),
+            &mut output,
+        );
+        assert!(state.pointer(
+            mouse(MouseEventKind::Drag(MouseButton::Left), row, width),
+            &mut output
+        ));
+        state.draw(&mut output).unwrap();
+
+        let row = usize::from(row);
+        assert_eq!(highlighted_on(&state, row), "transcript-95");
+        let (_, transcript) = state.transcript.as_mut().unwrap();
+        let drawn = transcript.frame(state.width, state.height).lines[row].clone();
+        assert_eq!(
+            state.rendered_rows[row],
+            state.with_selection(row, drawn).render(state.colour_depth),
+            "the transcript draws the selection highlight"
+        );
+
+        state.pointer(
+            mouse(MouseEventKind::Up(MouseButton::Left), row as u16, width),
+            &mut output,
+        );
+        assert_eq!(copies.lock().unwrap().as_slice(), ["transcript-95"]);
+        assert!(
+            state.transcript.is_some(),
+            "selecting keeps the transcript open"
+        );
+    }
+
+    #[test]
+    fn dragging_past_the_top_of_the_detailed_transcript_scrolls_it_and_copies_the_rows_above() {
+        let (mut state, copies) = state_with_transcript(100);
+        let first_shown = shown_rows(&state, "transcript-")[0];
+        let anchor = screen_row_of(&state, "transcript-95");
+        let mut output = Vec::new();
+        state.pointer(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                anchor,
+                "transcript-95".len() as u16,
+            ),
+            &mut output,
+        );
+        state.pointer(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 0, 0),
+            &mut output,
+        );
+        let mut now = Instant::now();
+        for _ in 0..2 {
+            now += SELECTION_SCROLL_INTERVAL;
+            assert!(state.scroll_selection(now));
+        }
+        state.draw(&mut output).unwrap();
+        let scrolled_to = first_shown - 3 * SELECTION_SCROLL_ROWS;
+        assert_eq!(shown_rows(&state, "transcript-")[0], scrolled_to);
+
+        state.pointer(
+            mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            &mut output,
+        );
+        assert_eq!(
+            copies.lock().unwrap().as_slice(),
+            [numbered_rows("transcript-", scrolled_to..=95)]
+        );
     }
 
     #[test]
@@ -18697,11 +19194,16 @@ mod tests {
         state.edit(EditorCommand::Clear);
         assert!(!hint_row(&mut state).contains(SEND_NOW_HINT));
         state.queued_inputs = vec![queued_input(QueuedInputKind::Message, "queued", 1)];
+        let screen = {
+            state.draw_frame(&mut Vec::new()).unwrap();
+            state.rendered_screen.join("\n")
+        };
         assert!(
-            hint_row(&mut state).starts_with(SEND_NOW_HINT),
-            "{}",
-            hint_row(&mut state)
+            screen.contains("    ctrl+enter to send now")
+                && !hint_row(&mut state).contains(SEND_NOW_HINT),
+            "the hint sits under the queued message, not in the hint row: {screen}"
         );
+        assert!(screen.contains(QUEUED_INPUT_PLACEHOLDER), "{screen}");
 
         state.activity_interruptible = false;
         assert!(!hint_row(&mut state).contains(SEND_NOW_HINT));
@@ -18757,8 +19259,13 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 for rows in 1..=MAX_PENDING_INPUT_ROWS {
-                    let lines =
-                        pending_input_lines(&entries, width, rows, DisplayProfile::default());
+                    let lines = pending_input_lines(
+                        &entries,
+                        width,
+                        rows,
+                        DisplayProfile::default(),
+                        false,
+                    );
                     assert!(lines.len() <= rows, "{width}/{count}/{rows}: {lines:?}");
                     let entry_rows = if rows > 1 {
                         assert!(lines.last().unwrap().text().is_empty(), "{lines:?}");

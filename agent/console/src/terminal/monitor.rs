@@ -50,7 +50,7 @@ use crate::monitor_rows::{
 };
 use tick_protocol::InstanceRef;
 use tickloop_agent_protocol::{
-    ChatSnapshot, MonitorMembership, ShellTaskSnapshot, TickSubscriptionStatus,
+    ChatStatus, MonitorMembership, ShellTaskSnapshot, TickSubscriptionStatus,
 };
 
 #[derive(Clone, Debug)]
@@ -118,7 +118,7 @@ pub(super) struct Monitor {
     next_page: Option<PageCursor>,
     selected: Option<InstanceRef>,
     rows: Option<MonitorRowsRegistry>,
-    pub(super) chat_snapshot: Option<Arc<ChatSnapshot>>,
+    pub(super) chat_status: Option<Arc<ChatStatus>>,
     pub(super) shell_snapshot: Option<ShellTaskSnapshot>,
     /// When each running Shell started, as far as the View knows.
     pub(super) shell_starts: HashMap<uuid::Uuid, u64>,
@@ -144,7 +144,7 @@ pub(super) struct Monitor {
 
 /// What one status refresh reads for Monitor.
 pub(super) struct MonitorSources {
-    pub(super) chat: Arc<ChatSnapshot>,
+    pub(super) chat: Arc<ChatStatus>,
     pub(super) shells: ShellTaskSnapshot,
     /// `None` when they could not be read; the rows keep the previous ones.
     pub(super) subscriptions: Option<Vec<TickSubscriptionStatus>>,
@@ -182,7 +182,7 @@ impl Monitor {
     }
     /// Instances this Chat opened, as opposed to rows other sources show.
     fn members(&self) -> BTreeSet<InstanceRef> {
-        self.chat_snapshot
+        self.chat_status
             .iter()
             .flat_map(|chat| &chat.monitor.members)
             .map(|member| member.instance.clone())
@@ -200,27 +200,27 @@ impl Monitor {
         self.rebuild_at(now_ms);
         true
     }
-    /// Takes the Chat's newest snapshot and rebuilds the list from it.
-    pub(super) fn set_chat_snapshot(&mut self, snapshot: Arc<ChatSnapshot>) {
-        self.adopt_chat_snapshot(snapshot);
+    /// Takes the Chat's newest status and rebuilds the list from it.
+    pub(super) fn set_chat_status(&mut self, status: Arc<ChatStatus>) {
+        self.adopt_chat_status(status);
         self.rebuild();
     }
     /// Takes everything one status refresh read at once, so the list is rebuilt only once. The
-    /// Chat snapshot carries Monitor membership and removals, so the Shell and subscription rows
-    /// it lists are never shown against an older one.
+    /// Chat status carries Monitor membership and removals, so the Shell and subscription rows it
+    /// lists are never shown against an older one.
     pub(super) fn refresh_sources(&mut self, sources: MonitorSources) {
-        self.adopt_chat_snapshot(sources.chat);
+        self.adopt_chat_status(sources.chat);
         self.refresh_ticks(sources.shells, sources.subscriptions);
     }
     /// Takes the Chat's Shell tasks and subscriptions, which change without the Chat itself
-    /// changing, and rebuilds the list once against the Chat snapshot it already has.
+    /// changing, and rebuilds the list once against the Chat status it already has.
     pub(super) fn refresh_ticks(
         &mut self,
         shells: ShellTaskSnapshot,
         subscriptions: Option<Vec<TickSubscriptionStatus>>,
     ) {
         self.shell_starts = self
-            .chat_snapshot
+            .chat_status
             .as_deref()
             .map(|chat| super::task_access::shell_starts(chat, &shells))
             .unwrap_or_default();
@@ -230,12 +230,12 @@ impl Monitor {
         }
         self.rebuild();
     }
-    /// An artifact title that changed in the Chat since the previous snapshot, such as after the
+    /// An artifact title that changed in the Chat since the previous status, such as after the
     /// Agent's own rename, is newer than the one the last metadata read cached, so it replaces
     /// that one.
-    fn adopt_chat_snapshot(&mut self, snapshot: Arc<ChatSnapshot>) {
-        let previous = self.chat_snapshot.take();
-        for tick in &snapshot.artifact_ticks {
+    fn adopt_chat_status(&mut self, status: Arc<ChatStatus>) {
+        let previous = self.chat_status.take();
+        for tick in &status.artifact_ticks {
             let id = tick.instance_id();
             let is_renamed = previous.as_ref().is_some_and(|previous| {
                 previous
@@ -247,14 +247,14 @@ impl Monitor {
                 metadata.title = tick.title.clone();
             }
         }
-        self.chat_snapshot = Some(snapshot);
+        self.chat_status = Some(status);
     }
     pub(super) fn rebuild(&mut self) {
         self.rebuild_at(tickloop_agent_base::private_fs::unix_time_milliseconds());
     }
     fn rebuild_at(&mut self, now_ms: u64) {
         let context = MonitorContext {
-            chat: self.chat_snapshot.clone(),
+            chat: self.chat_status.clone(),
             shells: self.shell_snapshot.clone(),
             subscriptions: self.subscriptions.clone(),
             metadata: self.metadata.clone(),
@@ -367,7 +367,7 @@ impl Monitor {
     /// When time alone next changes the list: the next finished Shell or gone Tick to leave.
     fn next_refresh_ms(&self, now_ms: u64) -> Option<u64> {
         let handled = |task: &tickloop_agent_protocol::ShellTask| {
-            self.chat_snapshot
+            self.chat_status
                 .as_ref()
                 .and_then(|chat| chat.monitor.handled_at(&InstanceRef::shell(task.id)))
         };
@@ -408,7 +408,7 @@ impl Monitor {
     }
     /// What each of the Chat's Loops is for, by Loop.
     pub(super) fn loop_goals(&self) -> HashMap<uuid::Uuid, String> {
-        self.chat_snapshot
+        self.chat_status
             .iter()
             .flat_map(|chat| &chat.loops)
             .map(|goal| (goal.id, goal.goal.clone()))
@@ -523,7 +523,7 @@ impl Monitor {
     }
     /// Applies a membership the Agent just confirmed, so a removed row leaves at once.
     pub(super) fn set_membership(&mut self, membership: MonitorMembership) {
-        if let Some(chat) = self.chat_snapshot.as_mut() {
+        if let Some(chat) = self.chat_status.as_mut() {
             Arc::make_mut(chat).monitor = membership;
         }
         self.rebuild();
@@ -996,27 +996,29 @@ mod unread_fill_tests {
         }
     }
 
-    fn monitor(chat: Option<ChatSnapshot>) -> Monitor {
+    fn monitor(chat: Option<ChatStatus>) -> Monitor {
         Monitor {
             rows: Some(
                 MonitorRowsRegistry::new([Arc::new(Updated) as Arc<dyn MonitorRows>]).unwrap(),
             ),
-            chat_snapshot: chat.map(Arc::new),
+            chat_status: chat.map(Arc::new),
             ..Default::default()
         }
     }
 
-    fn chat() -> ChatSnapshot {
-        serde_json::from_value(serde_json::json!({
-            "id": uuid::Uuid::from_u128(1),
-            "workdir": "/fixture",
-            "messages": [],
-            "loops": []
-        }))
-        .unwrap()
+    fn chat() -> ChatStatus {
+        ChatStatus::of(
+            &serde_json::from_value(serde_json::json!({
+                "id": uuid::Uuid::from_u128(1),
+                "workdir": "/fixture",
+                "messages": [],
+                "loops": []
+            }))
+            .unwrap(),
+        )
     }
 
-    fn chat_handled(mark: fn(&mut MonitorMembership, InstanceRef, u64) -> bool) -> ChatSnapshot {
+    fn chat_handled(mark: fn(&mut MonitorMembership, InstanceRef, u64) -> bool) -> ChatStatus {
         let mut chat = chat();
         mark(&mut chat.monitor, quotes(), HANDLED_AT);
         chat
@@ -1026,7 +1028,7 @@ mod unread_fill_tests {
     fn handled_while_listed(mark: fn(&mut MonitorMembership, InstanceRef, u64) -> bool) -> Monitor {
         let mut monitor = monitor(Some(chat()));
         monitor.rebuild_at(UPDATED_AT + 100);
-        monitor.chat_snapshot = Some(Arc::new(chat_handled(mark)));
+        monitor.chat_status = Some(Arc::new(chat_handled(mark)));
         monitor.rebuild_at(HANDLED_AT + 50);
         monitor
     }
@@ -1116,7 +1118,7 @@ mod unread_fill_tests {
         let animated = DisplayProfile::default();
         let mut opened_after = monitor(None);
         opened_after.rebuild_at(HANDLED_AT + 50);
-        opened_after.chat_snapshot = Some(Arc::new(chat_handled(MonitorMembership::mark_taken_in)));
+        opened_after.chat_status = Some(Arc::new(chat_handled(MonitorMembership::mark_taken_in)));
         opened_after.rebuild_at(HANDLED_AT + 80);
         assert_eq!(
             fill(&opened_after, animated, HANDLED_AT + 80),
@@ -1144,7 +1146,7 @@ mod unread_fill_tests {
         monitor.rebuild_at(UPDATED_AT - 1_000);
         monitor.rows =
             Some(MonitorRowsRegistry::new([Arc::new(Updated) as Arc<dyn MonitorRows>]).unwrap());
-        monitor.chat_snapshot = Some(Arc::new(chat_handled(MonitorMembership::mark_taken_in)));
+        monitor.chat_status = Some(Arc::new(chat_handled(MonitorMembership::mark_taken_in)));
         monitor.rebuild_at(HANDLED_AT + 50);
         assert_eq!(
             fill(&monitor, animated, HANDLED_AT + 50),
@@ -1156,7 +1158,7 @@ mod unread_fill_tests {
         read_again
             .monitor
             .mark_taken_in(quotes(), HANDLED_AT + 5_000);
-        monitor.chat_snapshot = Some(Arc::new(read_again));
+        monitor.chat_status = Some(Arc::new(read_again));
         monitor.rebuild_at(HANDLED_AT + 5_050);
         assert_eq!(
             fill(&monitor, animated, HANDLED_AT + 5_050),
@@ -1183,7 +1185,7 @@ mod unread_fill_tests {
 mod rebuild_benchmarks {
     use super::*;
 
-    fn chat_with_messages(count: usize) -> ChatSnapshot {
+    fn chat_with_messages(count: usize) -> tickloop_agent_protocol::ChatSnapshot {
         let messages: Vec<_> = (0..count)
             .map(|index| {
                 serde_json::json!({
@@ -1219,9 +1221,9 @@ mod rebuild_benchmarks {
     fn bench_monitor_rebuild_cost_by_conversation_size() {
         const ROUNDS: u32 = 50;
         for messages in [1_000, 10_000, 50_000] {
-            let chat = Arc::new(chat_with_messages(messages));
+            let chat = Arc::new(ChatStatus::of(&chat_with_messages(messages)));
             let mut monitor = Monitor::default();
-            monitor.set_chat_snapshot(chat.clone());
+            monitor.set_chat_status(chat.clone());
             let started = std::time::Instant::now();
             for _ in 0..ROUNDS {
                 monitor.rebuild();

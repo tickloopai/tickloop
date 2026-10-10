@@ -41,7 +41,9 @@ impl AgentAccess for LostPresentationAccess {
             && matches!(
                 query,
                 ObservationRequest::Agent {
-                    detail: AgentDetailQuery::Snapshot,
+                    detail: AgentDetailQuery::Snapshot
+                        | AgentDetailQuery::Status
+                        | AgentDetailQuery::Events { .. },
                     ..
                 }
             )

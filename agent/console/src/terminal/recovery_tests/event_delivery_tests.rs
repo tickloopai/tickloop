@@ -21,6 +21,20 @@ struct DelayedCompaction {
     release: oneshot::Receiver<()>,
 }
 
+/// Whether `query` reads the Chat itself: its snapshot, its status or its events. The View
+/// follows a Chat's feed from its first status read.
+fn reads_chat(query: &ObservationRequest) -> Option<ExecutionRef> {
+    match query {
+        ObservationRequest::Agent {
+            execution,
+            detail:
+                AgentDetailQuery::Snapshot | AgentDetailQuery::Status | AgentDetailQuery::Events { .. },
+            ..
+        } => Some(*execution),
+        _ => None,
+    }
+}
+
 #[async_trait]
 impl AgentAccess for ControlledDelivery {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
@@ -29,7 +43,7 @@ impl AgentAccess for ControlledDelivery {
             || matches!(
                 query,
                 ObservationRequest::Agent {
-                    detail: AgentDetailQuery::Snapshot,
+                    detail: AgentDetailQuery::Snapshot | AgentDetailQuery::Status,
                     ..
                 }
             ) && self.fail_snapshot.load(Ordering::Relaxed)
@@ -38,17 +52,10 @@ impl AgentAccess for ControlledDelivery {
                 "controlled recovery query failure",
             ));
         }
-        let execution = match &query {
-            ObservationRequest::Agent {
-                execution,
-                detail: AgentDetailQuery::Snapshot,
-                ..
-            } => Some(*execution),
-            _ => None,
-        };
+        let execution = reads_chat(&query);
         let (mut initial, cursor, reset, mut changes, failure) =
             self.daemon.observe(query).await?.into_parts();
-        if execution.is_some()
+        if matches!(initial, ObservationValue::Agent(_))
             && let Some(replacement) = self.replacement_snapshot.lock().unwrap().take()
         {
             initial = ObservationValue::Agent(replacement);
@@ -364,6 +371,12 @@ async fn a_delayed_reset_cannot_roll_back_the_snapshot_covered_by_recovery() {
         "a stale reset rolled the cached cursor back below the covered prefix"
     );
     assert_eq!(fallback.questions[0].id, current.questions[0].id);
+    let status = agent.status(chat).await.unwrap();
+    assert!(
+        status.last_sequence >= current.last_sequence,
+        "a stale reset rolled the cached status back below the covered prefix"
+    );
+    assert_eq!(status.questions[0].id, current.questions[0].id);
     drop(recovery);
     agent.leave_view().await.unwrap();
     core.shutdown().await;
@@ -429,6 +442,12 @@ async fn delayed_changed_and_resync_queries_cannot_roll_back_recovered_requests(
             "a delayed query rolled the cached cursor back below the covered prefix"
         );
         assert_eq!(fallback.questions[0].id, current.questions[0].id);
+        let status = agent.status(chat).await.unwrap();
+        assert!(
+            status.last_sequence >= current.last_sequence,
+            "a delayed query rolled the cached status back below the covered prefix"
+        );
+        assert_eq!(status.questions[0].id, current.questions[0].id);
         drop(recovery);
         agent.leave_view().await.unwrap();
         core.shutdown().await;

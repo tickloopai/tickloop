@@ -372,7 +372,9 @@ fn a_subscribed_instance_always_has_a_row_with_its_marker() {
     };
     let listed = |subscriptions| {
         MonitorRowsRegistry::builtin().list(&MonitorContext {
-            chat: Some(std::sync::Arc::new(chat.clone())),
+            chat: Some(std::sync::Arc::new(
+                tickloop_agent_protocol::ChatStatus::of(&chat),
+            )),
             subscriptions,
             ..Default::default()
         })
@@ -411,6 +413,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
         chat_id: chat,
         origin: ShellTaskOrigin::User,
         owner: ShellTaskOwner::User { chat_id: chat },
+        call_id: None,
         command: "sleep 30".into(),
         description: None,
         cwd: "/fixture".into(),
@@ -712,7 +715,7 @@ async fn a_titleless_artifact_subscription_preserves_joined_and_cached_titles() 
     agent.add_artifact_tick(chat, tick.clone()).await.unwrap();
     let row:tickloop_agent_protocol::TickSubscriptionStatus=serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":tick.instance_id(),"every_seconds":60,"accumulated":0,"last_delivery_ms":null,"last_delivery":null,"kind":"Protocol","title":null,"updated_at_ms":null,"link":"Disconnected"})).unwrap();
     let mut context = MonitorContext {
-        chat: Some(std::sync::Arc::new(agent.snapshot(chat).await.unwrap())),
+        chat: Some(std::sync::Arc::new(agent.status(chat).await.unwrap())),
         subscriptions: vec![row],
         ..Default::default()
     };
@@ -750,7 +753,9 @@ async fn artifact_rows_show_where_feedback_is_linked_and_the_newest_request() {
             snapshot.loops.push(serde_json::from_value(json!({"id":Uuid::new_v4(),"goal":"Feedback","state":"WaitingTrigger","run_id":null,"run_started_at":null,"event_sources":[{"origin":"https://docs.example","account_id":"owner","artifact_id":"doc","binding_id":here,"client_instance_id":Uuid::new_v4(),"epoch":2,"resume_required":resume_required,"last_request_at_ms":1_791_453_600_000_u64}]})).unwrap());
         }
         let mut context = MonitorContext {
-            chat: Some(std::sync::Arc::new(snapshot)),
+            chat: Some(std::sync::Arc::new(
+                tickloop_agent_protocol::ChatStatus::of(&snapshot),
+            )),
             ..Default::default()
         };
         context.metadata.insert(tick.instance_id(), Some(serde_json::from_value(json!({"id":"doc","title":"Linked","format":"markdown","access_role":"owner","human_updated_at":"2026-10-08T09:00:00.000Z","agent_link":remote.map(|binding_id| json!({"binding_id":binding_id,"chat_id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"epoch":2}))})).unwrap()));

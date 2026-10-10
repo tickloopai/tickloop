@@ -15,7 +15,7 @@ use tickloop_agent_model::{validate_model_config, validate_reasoning_effort};
 
 use super::completion::CHILD_AUTHORIZATION_FIXED;
 use tickloop_agent_protocol::{
-    AccessError, ChatSnapshot, ConfigurationChange, ExecutionMode, LaunchSpec, ModelConfig,
+    AccessError, ChatStatus, ConfigurationChange, ExecutionMode, LaunchSpec, ModelConfig,
     PermissionChange, PermissionRule, ReasoningEffort,
 };
 
@@ -55,15 +55,15 @@ pub(super) struct AgentConfiguration {
 }
 
 impl AgentConfiguration {
-    pub(super) fn of(snapshot: &ChatSnapshot) -> Self {
+    pub(super) fn of(status: &ChatStatus) -> Self {
         Self {
-            model: snapshot.model.clone(),
-            pending_model: snapshot.pending_model.clone(),
-            reasoning_effort: snapshot.reasoning_effort,
-            thinking_enabled: snapshot.thinking_enabled,
-            execution_mode: snapshot.policy.mode,
-            additional_directories: snapshot.additional_directories.clone(),
-            delegated: snapshot.delegation.is_some(),
+            model: status.model.clone(),
+            pending_model: status.pending_model.clone(),
+            reasoning_effort: status.reasoning_effort,
+            thinking_enabled: status.thinking_enabled,
+            execution_mode: status.policy.mode,
+            additional_directories: status.additional_directories.clone(),
+            delegated: status.delegation.is_some(),
         }
     }
 

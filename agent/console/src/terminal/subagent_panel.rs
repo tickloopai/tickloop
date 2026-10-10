@@ -16,9 +16,10 @@ fn display_width(text: &str) -> usize {
 }
 
 /// One member of the Subagents panel. The dot is filled for the member this View shows and
-/// hollow for the others; its steady colour is the member's state, as the glyph of a Monitor row
-/// except that it never blinks. The right side keeps only details: how long a working member has run,
-/// how long ago any other member last changed state, or its waiting requests.
+/// hollow for the others, and only it carries the member's Agent Color; `main` has none, so its
+/// dot keeps the row's colour, as does every name. The right side keeps only details: how long a
+/// working member has run, how long ago any other member last changed state, or its waiting
+/// requests.
 pub(super) fn family_line(
     row: &AgentRow,
     selected: bool,
@@ -33,15 +34,14 @@ pub(super) fn family_line(
     } else {
         Role::MutedText
     };
-    let identity = agent_role(row);
     let marker = if selected { "› " } else { "  " };
     let dot = display.glyph(if viewed {
         Glyph::AgentViewed
     } else {
         Glyph::AgentUnviewed
     });
-    let mut line = RoleLine::role(marker, identity.unwrap_or(role));
-    line.push(dot, Some(state_mark(row)));
+    let mut line = RoleLine::role(marker, role);
+    line.push(dot, Some(agent_role(row).unwrap_or(role)));
     line.push(" ", Some(role));
     if row.parent_id.is_none() && row.subagent.is_none() {
         line.push("main", Some(role));
@@ -81,14 +81,7 @@ pub(super) fn family_line(
             .map_or("child", |registration| registration.handle.as_str()),
         name_width,
     );
-    line.push(
-        name,
-        Some(if selected {
-            role
-        } else {
-            identity.unwrap_or(role)
-        }),
-    );
+    line.push(name, Some(role));
     if let Some(description) = row
         .subagent
         .as_ref()
@@ -116,20 +109,6 @@ pub(super) fn family_line(
     line.push(details, Some(details_role));
     line.truncate(width);
     line
-}
-
-/// The colour of a member's dot: accent while it works, warning while it needs
-/// input or after it stopped, error after it failed, success after it completed, muted otherwise.
-fn state_mark(row: &AgentRow) -> Role {
-    if row.group == AttentionGroup::Working {
-        return Role::RunningMark;
-    }
-    match row.glyph_role() {
-        Role::Success => Role::SuccessMark,
-        Role::Error => Role::ErrorMark,
-        Role::Warning => Role::WarningMark,
-        _ => Role::MutedText,
-    }
 }
 
 /// How long a working member has run, or how long ago another member last changed state.

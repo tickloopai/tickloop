@@ -678,6 +678,7 @@ fn shell_snapshot(revision: u64, tasks: Vec<(Uuid, &str, ShellTaskState)>) -> Sh
                 chat_id: CHAT,
                 origin: ShellTaskOrigin::User,
                 owner: ShellTaskOwner::User { chat_id: CHAT },
+                call_id: None,
                 command: command.into(),
                 description: None,
                 cwd: PathBuf::from("/fixture"),

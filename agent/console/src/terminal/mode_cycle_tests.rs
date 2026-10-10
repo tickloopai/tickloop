@@ -34,8 +34,8 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 const QUIET_PERIOD: Duration = Duration::from_millis(400);
 
 /// The daemon the View talks to. It appends one line to `traffic` for each whole-Chat read
-/// (`snapshot`), Tick subscription read (`subscriptions`, asked only by a status refresh) and
-/// configuration change (`configure`).
+/// (`snapshot`), Chat status read (`status`), Tick subscription read (`subscriptions`, asked only
+/// by a status refresh) and configuration change (`configure`).
 struct CountingDaemon {
     daemon: EmbeddedAgentAccess,
     directory: PathBuf,
@@ -60,6 +60,10 @@ impl AgentAccess for CountingDaemon {
                 detail: AgentDetailQuery::Snapshot,
                 ..
             } => self.note("snapshot"),
+            ObservationRequest::Agent {
+                detail: AgentDetailQuery::Status,
+                ..
+            } => self.note("status"),
             ObservationRequest::Agent {
                 detail: AgentDetailQuery::Subscriptions,
                 ..
@@ -339,8 +343,8 @@ fn shift_tab_on_a_chat_reads_it_once_and_skips_the_status_refresh() {
         .unwrap_or_else(|| panic!("the change reached the daemon: {traffic:?}"));
     assert_eq!(
         traffic[..configure],
-        ["snapshot"],
-        "one read of the Chat decides the next mode: {traffic:?}"
+        ["status"],
+        "one status read of the Chat decides the next mode: {traffic:?}"
     );
     assert!(
         !traffic.iter().any(|entry| entry == "subscriptions"),

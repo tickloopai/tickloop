@@ -34,6 +34,7 @@ pub use family::summary_state;
 mod family_mailbox;
 pub use family::{FamilyAgent, FamilyAvailability, FamilyRole};
 mod artifact_ticks;
+mod chat_reads;
 mod chat_settings;
 mod chat_title;
 #[cfg(test)]
@@ -73,6 +74,7 @@ mod triggers;
 mod user_shell;
 #[cfg(test)]
 mod user_shell_tests;
+pub use chat_reads::ChatSummary;
 pub use permission_management::PermissionChangeError;
 pub use shell_task_center::{ShellTaskCenter, ShellTaskSubscription};
 use std::{

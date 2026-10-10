@@ -502,7 +502,7 @@ fn run_thinking_restore(fixture: &mut RecoveryPty, directory: &std::path::Path) 
     let input = frame.find("Continue the same Thinking stream.").unwrap();
     let tool = frame.find("Read").unwrap();
     let text = frame.find(STREAM_REPLY).unwrap();
-    let done = frame.find("Done · ↓ 11 tokens").unwrap();
+    let done = crate::terminal::turn_summary_position(&frame).unwrap();
     assert!(
         input < tool && tool < text && text < done,
         "restored events changed order: {frame}"

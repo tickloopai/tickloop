@@ -72,19 +72,25 @@ impl ShellTaskCenter {
         chat_ids.sort_by_key(|candidate| (*candidate != chat_id, *candidate));
         let mut tasks = Vec::new();
         for candidate in chat_ids {
-            let (chat, live_agent_commands) = match (
-                self.agent.snapshot(candidate).await,
-                self.agent.commands(candidate).await,
-            ) {
-                (Ok(chat), Ok(commands)) => (chat, commands),
-                (Err(AgentError::NotFound), _) | (_, Err(AgentError::NotFound))
-                    if candidate != chat_id =>
-                {
-                    continue;
-                }
-                (Err(error), _) | (_, Err(error)) => return Err(map_chat_error(candidate, error)),
+            // The projection reads the Chat in place: copying its history for a few task rows
+            // would hold the Chat lock as long as the conversation is.
+            let projected = match self.agent.commands(candidate).await {
+                Ok(live_agent_commands) => self
+                    .agent
+                    .inner
+                    .chats
+                    .lock()
+                    .await
+                    .get(&candidate)
+                    .map(|chat| project_tasks(&chat.snapshot, live_agent_commands))
+                    .ok_or(AgentError::NotFound),
+                Err(error) => Err(error),
             };
-            tasks.extend(project_tasks(&chat, live_agent_commands));
+            match projected {
+                Ok(projected) => tasks.extend(projected),
+                Err(AgentError::NotFound) if candidate != chat_id => continue,
+                Err(error) => return Err(map_chat_error(candidate, error)),
+            }
         }
         let generated = self.agent.inner.shell_descriptions.lock().await;
         for task in tasks.iter_mut().filter(|task| task.description.is_none()) {
@@ -332,10 +338,12 @@ fn project_tasks(chat: &ChatSnapshot, live_agent_commands: Vec<CommandSnapshot>)
             let operation_position = chat
                 .operations
                 .iter()
-                .position(|operation| operation.id == command.operation_id)
-                .unwrap_or(usize::MAX);
+                .position(|operation| operation.id == command.operation_id);
+            let call_id =
+                operation_position.map(|position| chat.operations[position].call_id.clone());
+            let operation_position = operation_position.unwrap_or(usize::MAX);
             OrderedTask {
-                task: agent_task(chat.id, command),
+                task: agent_task(chat.id, command, call_id),
                 conversation_position: operation_position,
                 stable_sequence: operation_position as u64,
             }
@@ -360,7 +368,7 @@ fn project_tasks(chat: &ChatSnapshot, live_agent_commands: Vec<CommandSnapshot>)
     tasks.into_iter().map(|ordered| ordered.task).collect()
 }
 
-fn agent_task(chat_id: ChatId, command: CommandSnapshot) -> ShellTask {
+fn agent_task(chat_id: ChatId, command: CommandSnapshot, call_id: Option<String>) -> ShellTask {
     let state = map_agent_state(command.state);
     ShellTask {
         updated_at_ms: recover_shell_update_time(
@@ -376,6 +384,7 @@ fn agent_task(chat_id: ChatId, command: CommandSnapshot) -> ShellTask {
         owner: ShellTaskOwner::Agent {
             loop_id: command.loop_id,
         },
+        call_id,
         command: command.command,
         description: command
             .description
@@ -410,6 +419,7 @@ fn user_task(record: &UserShellRecord) -> ShellTask {
         owner: ShellTaskOwner::User {
             chat_id: record.chat_id,
         },
+        call_id: None,
         command: record.command.clone(),
         description: None,
         cwd: record.cwd.clone(),

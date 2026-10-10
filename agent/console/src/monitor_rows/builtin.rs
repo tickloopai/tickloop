@@ -717,7 +717,7 @@ const ARTIFACT_OWNER: TickOwner = TickOwner::Service("Artifacts");
 /// This Chat's association with the artifact: the binding a Loop that has not ended holds, live
 /// or paused.
 pub(crate) fn feedback_binding<'a>(
-    chat: &'a ChatSnapshot,
+    chat: &'a ChatStatus,
     origin: &str,
     artifact_id: &str,
 ) -> Option<&'a EventSourceBinding> {
@@ -783,6 +783,7 @@ mod tests {
             chat_id,
             origin: ShellTaskOrigin::User,
             owner: ShellTaskOwner::User { chat_id },
+            call_id: None,
             command: command.into(),
             description: description.map(Into::into),
             cwd: "/fixture".into(),
@@ -938,13 +939,15 @@ mod tests {
         );
         let instance = InstanceRef::shell(shell.id);
         let listed = |now_ms, retained: Option<InstanceRef>, handled_at: Option<u64>| {
-            let mut chat: ChatSnapshot = serde_json::from_value(serde_json::json!({
-                "id": shell.chat_id,
-                "workdir": "/fixture",
-                "messages": [],
-                "loops": []
-            }))
-            .unwrap();
+            let mut chat = ChatStatus::of(
+                &serde_json::from_value(serde_json::json!({
+                    "id": shell.chat_id,
+                    "workdir": "/fixture",
+                    "messages": [],
+                    "loops": []
+                }))
+                .unwrap(),
+            );
             if let Some(at) = handled_at {
                 chat.monitor.mark_handled(instance.clone(), at);
             }
@@ -1016,13 +1019,7 @@ mod tests {
     fn members_keep_their_names_and_programs_take_their_host_names() {
         let quote = InstanceRef::new("hosted", "quote-run").unwrap();
         let terminal = InstanceRef::native("terminal:t1:20:birth").unwrap();
-        let mut chat: ChatSnapshot = serde_json::from_value(serde_json::json!({
-            "id": Uuid::from_u128(1),
-            "workdir": "/fixture",
-            "messages": [],
-            "loops": []
-        }))
-        .unwrap();
+        let mut chat = empty_chat();
         chat.monitor
             .record_opened(quote.clone(), Some("Quote · AAPL.US".into()));
         chat.monitor
@@ -1055,14 +1052,16 @@ mod tests {
         assert_eq!(titles[&terminal], "WAF bypass review");
     }
 
-    fn empty_chat() -> ChatSnapshot {
-        serde_json::from_value(serde_json::json!({
-            "id": Uuid::from_u128(1),
-            "workdir": "/fixture",
-            "messages": [],
-            "loops": []
-        }))
-        .unwrap()
+    fn empty_chat() -> ChatStatus {
+        ChatStatus::of(
+            &serde_json::from_value(serde_json::json!({
+                "id": Uuid::from_u128(1),
+                "workdir": "/fixture",
+                "messages": [],
+                "loops": []
+            }))
+            .unwrap(),
+        )
     }
 
     fn subscription(

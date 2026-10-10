@@ -49,6 +49,9 @@ const COMPLETED_FRAME_START: &str = "\x1b[?2026h";
 const COMPLETED_FRAME_END: &str = "\x1b[?2026l";
 const CURSOR_VISIBLE: &str = "\x1b[?25h";
 const CURSOR_HIDDEN: &str = "\x1b[?25l";
+/// A finished turn's line: one of Claude Code's verbs with the run's time, or restored without it.
+static TURN_SUMMARY: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"✻ (\p{L}+ for |Done)").unwrap());
 
 /// A private CLI environment. Tests stop it with `shutdown`; dropping it after a failure stops the
 /// Tickhost and removes the directory, which ends the daemon and its workers.

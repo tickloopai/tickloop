@@ -7,6 +7,7 @@ mod auto_rules;
 mod auto_settings;
 mod auto_setup;
 mod chat;
+mod chat_status;
 pub mod daemon_management;
 mod denials;
 mod family;
@@ -45,14 +46,14 @@ pub use access::{
     CommandEnvelope, CommandReceipt, CommandResult, ConfigurationChange, Cursor,
     DEFAULT_PAGE_LIMIT, DisplayReceipt, DisplayUpdate, DisplayedView, EnvironmentValue,
     ExecutionAvailability, ExecutionRef, HistoryAction, HostLocation, HostWorkContext,
-    InteractionSource, LaunchSpec, LiveChatSnapshot, LoopAction, LoopRef, MAX_PAGE_LIMIT,
-    Observation, ObservationChange, ObservationFailure, ObservationRequest, ObservationUpdate,
-    ObservationValue, PROTOCOL_MAJOR, PROTOCOL_MINOR, Page, PendingRequestKind, PersistenceState,
-    ProtocolLimits, ProviderCredentialScope, QueuedCommandFailure, RECEIPT_CAPACITY,
-    RECEIPT_RETENTION_SECONDS, REPLAY_CAPACITY, ReceiptState, RecordedMessage, RecordedTranscript,
-    RequestRef, ResetReason, ServerHello, ServerMessage, TaskAction, TaskOrigin, TaskRef,
-    TranscriptRef, UserInput, VIEW_LEASE_SECONDS, ViewRef, bounded_update, build_identity,
-    set_build_identity,
+    InteractionSource, LaunchSpec, LiveChatSnapshot, LiveChatStatus, LoopAction, LoopRef,
+    MAX_PAGE_LIMIT, Observation, ObservationChange, ObservationFailure, ObservationRequest,
+    ObservationUpdate, ObservationValue, PROTOCOL_MAJOR, PROTOCOL_MINOR, Page, PendingRequestKind,
+    PersistenceState, ProtocolLimits, ProviderCredentialScope, QueuedCommandFailure,
+    RECEIPT_CAPACITY, RECEIPT_RETENTION_SECONDS, REPLAY_CAPACITY, ReceiptState, RecordedMessage,
+    RecordedTranscript, RequestRef, ResetReason, ServerHello, ServerMessage, TaskAction,
+    TaskOrigin, TaskRef, TranscriptRef, UserInput, VIEW_LEASE_SECONDS, ViewRef, bounded_update,
+    build_identity, set_build_identity,
 };
 pub use approvals::{
     ApprovalAssessmentDetails, ApprovalAttemptDetails, ApprovalAttemptOutcome, ApprovalDiagnostic,
@@ -76,8 +77,10 @@ pub use chat::{
     OperationRecord, OperationState, PendingCommand, PendingInput, PermissionApprovalSource,
     PermissionExecution, PermissionRequest, PromptPolicy, ProposedToolCall, QueuedInput,
     QueuedInputKind, Receipt, RunId, SavedChat, ToolCallRecovery, UserShellReceipt,
-    UserShellRecord, UserShellState, chat_display_title, short_chat_title,
+    UserShellRecord, UserShellState, chat_display_title, chat_has_work, chat_preview,
+    short_chat_title,
 };
+pub use chat_status::ChatStatus;
 pub use denials::{
     ApprovalHistoryView, ApprovalPath, ApprovalRecord, ApprovalResult, DenialAutoFinding,
     DenialAutoRuleSummary, DenialCategory, DenialPersistence, DenialRecord, DenialReference,

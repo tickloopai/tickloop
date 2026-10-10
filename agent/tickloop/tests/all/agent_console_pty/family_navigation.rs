@@ -356,7 +356,7 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
     let captured = Arc::clone(&pty.output);
     pty.wait_for("Main completed editor and family summary", |frame| {
         frame.contains(MAIN_REPLY)
-            && (frame.contains("✻ Worked for") || frame.contains("✻ Done"))
+            && TURN_SUMMARY.is_match(frame)
             && frame.contains("⏺ Subagents 2")
             && editor_has_focus(&captured)
     })

@@ -53,6 +53,10 @@ impl RunningShimmer {
         let position =
             phase / SWEEP_DURATION.as_secs_f64() * (text_width + 2.0 * half_width) - half_width;
         let mut column = 0.0;
+        // Neighbours of one shade share a span, so a frame writes a handful of colour changes
+        // instead of one per character.
+        let mut run = String::new();
+        let mut run_shade = None;
         for grapheme in text.graphemes(true) {
             let glyph_width = grapheme.width() as f64;
             let center = column + glyph_width / 2.0;
@@ -64,7 +68,14 @@ impl RunningShimmer {
                 let intensity = 0.5 * (1.0 + (std::f64::consts::PI * distance).cos());
                 (intensity * 4.0).round() as usize
             };
-            line.push(grapheme, Some(SHADES[shade]));
+            if run_shade.is_some_and(|current| current != shade) {
+                line.push(std::mem::take(&mut run), Some(SHADES[run_shade.unwrap()]));
+            }
+            run_shade = Some(shade);
+            run.push_str(grapheme);
+        }
+        if let Some(shade) = run_shade {
+            line.push(run, Some(SHADES[shade]));
         }
     }
 }

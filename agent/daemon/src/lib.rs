@@ -54,6 +54,8 @@ mod daemon_server;
 mod embedded;
 mod ipc;
 mod receipts;
+#[cfg(test)]
+mod status_cost;
 mod summary;
 mod views;
 pub mod worker_control;

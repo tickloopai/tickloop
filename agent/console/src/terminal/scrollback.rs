@@ -38,6 +38,8 @@ pub(super) enum ScrollAction {
 }
 
 pub(super) struct ScrollFrame {
+    /// The row of the conversation and its tail drawn first.
+    pub(super) top: usize,
     pub(super) lines: Vec<String>,
     /// The same rows as `lines`, described by role.
     pub(super) styled: Vec<RoleLine>,
@@ -177,6 +179,14 @@ struct Block {
 
 /// Names one input echo in one scrollback. It means nothing to any other scrollback, including
 /// the fresh one a reset or reload puts in its place.
+/// What moves the model's running Bash calls to the background, and the calls it sits under; a
+/// command whose call is unknown has `None`.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ForegroundCommandHint {
+    pub(super) line: RoleLine,
+    pub(super) calls: Vec<Option<String>>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct InputEcho {
     scrollback: u64,
@@ -207,8 +217,10 @@ pub(super) struct Scrollback {
     activity_details: Vec<RoleLine>,
     /// The latest output of a running `!` command, drawn under its echo until it ends.
     shell_preview: Vec<RoleLine>,
-    /// What moves the model's running Bash call to the background, drawn under it.
-    foreground_command_hint: Option<RoleLine>,
+    /// What moves the model's running Bash calls to the background.
+    foreground_command_hint: Option<ForegroundCommandHint>,
+    /// The hint's logical lines under the calls' rows; they are hidden once it goes.
+    foreground_command_hint_lines: Vec<usize>,
     /// Header lines of tool calls still executing, by call id.
     running_tool_calls: HashMap<String, usize>,
     tool_call_headers: HashMap<String, ToolCallHeader>,
@@ -243,6 +255,7 @@ impl Default for Scrollback {
             activity_details: Vec::new(),
             shell_preview: Vec::new(),
             foreground_command_hint: None,
+            foreground_command_hint_lines: Vec::new(),
             running_tool_calls: HashMap::new(),
             tool_call_headers: HashMap::new(),
             running_shimmer: RunningShimmer::default(),
@@ -333,10 +346,18 @@ impl Scrollback {
         }
         self.mark_last_line_dirty();
         let mut segment_start = self.lines.last().unwrap().len();
+        let mut line_started_here = false;
         for character in text.chars() {
             if character == '\n' {
+                // A blank line inside filled text keeps the fill, as Claude Code's message box
+                // paints its background behind every line it holds; a line this text did not
+                // start keeps its own.
+                if fill.is_some() && line_started_here {
+                    self.line_styles.last_mut().unwrap().fill = fill;
+                }
                 self.close_segment(segment_start, role, link);
                 self.start_line();
+                line_started_here = true;
                 segment_start = self.lines.last().unwrap().len();
                 continue;
             }
@@ -519,6 +540,9 @@ impl Scrollback {
         }
         for group in &mut self.groups {
             shift(&mut group.line);
+        }
+        for line in &mut self.foreground_command_hint_lines {
+            shift(line);
         }
         let shift_range = |range: &mut Range<usize>| {
             if range.start >= at {
@@ -855,13 +879,51 @@ impl Scrollback {
         true
     }
 
-    /// Returns whether the hint changed.
-    pub(super) fn set_foreground_command_hint(&mut self, hint: Option<RoleLine>) -> bool {
+    /// Draws the hint under the row of each call it names, after the results the call already
+    /// has, so later messages and calls stay below it; a call without a row here has it below the
+    /// conversation. Returns whether the hint changed.
+    pub(super) fn set_foreground_command_hint(
+        &mut self,
+        hint: Option<ForegroundCommandHint>,
+    ) -> bool {
         if self.foreground_command_hint == hint {
             return false;
         }
+        for line in std::mem::take(&mut self.foreground_command_hint_lines) {
+            self.hide_lines(line..line + 1);
+        }
+        if let Some(hint) = &hint {
+            let runs: Vec<_> = hint
+                .line
+                .spans
+                .iter()
+                .map(|span| (span.text.clone(), span.role))
+                .collect();
+            for call in hint.calls.iter().flatten() {
+                let Some(at) = self.call_row_end(call) else {
+                    continue;
+                };
+                let mut row = Scrollback::new();
+                row.append_response(&runs);
+                row.lines.truncate(1);
+                row.line_styles.truncate(1);
+                self.insert_lines(at, row.lines, row.line_styles);
+                if let Some(header) = self.tool_call_headers.get_mut(call) {
+                    header.results_end = at;
+                }
+                self.foreground_command_hint_lines.push(at);
+            }
+        }
         self.foreground_command_hint = hint;
         true
+    }
+
+    /// Where the next result of `call` goes, when the call has a row of its own here.
+    fn call_row_end(&self, call: &str) -> Option<usize> {
+        self.tool_call_headers
+            .get(call)
+            .filter(|header| header.collapse.is_none())
+            .map(|header| header.results_end)
     }
 
     pub(super) fn shows_foreground_command_hint(&self) -> bool {
@@ -1031,6 +1093,7 @@ impl Scrollback {
     ) -> ScrollFrame {
         if width == 0 || height == 0 {
             return ScrollFrame {
+                top: 0,
                 lines: Vec::new(),
                 styled: Vec::new(),
                 following: self.following,
@@ -1076,6 +1139,7 @@ impl Scrollback {
             self.unread = 0;
         }
         ScrollFrame {
+            top,
             lines: styled.iter().map(RoleLine::text).collect(),
             styled,
             following: self.following,
@@ -1083,14 +1147,34 @@ impl Scrollback {
         }
     }
 
+    /// Text of the rows in `range`, numbered as a frame numbers them: the conversation, then its
+    /// tail. Rows past the end are left out.
+    pub(super) fn row_texts(&mut self, range: Range<usize>) -> Vec<String> {
+        self.refresh_rows();
+        let tail = self.tail_rows();
+        range
+            .map_while(|index| match index.checked_sub(self.conversation_rows) {
+                None => Some(self.rows[index].styled.text()),
+                Some(tail_index) => Some(tail.get(tail_index)?.styled(self.width).text()),
+            })
+            .collect()
+    }
+
     /// The rows below the conversation: a running command's output under its echo and the hint
     /// for a running Bash call, the live activity and its details as a block of their own, then
     /// the blank row that keeps everything above clear of the input.
     fn tail_rows(&self) -> Vec<TailRow<'_>> {
+        let unplaced_hint = self.foreground_command_hint.as_ref().filter(|hint| {
+            hint.calls.iter().any(|call| {
+                call.as_deref()
+                    .and_then(|call| self.call_row_end(call))
+                    .is_none()
+            })
+        });
         let mut rows: Vec<TailRow> = self
             .shell_preview
             .iter()
-            .chain(&self.foreground_command_hint)
+            .chain(unplaced_hint.map(|hint| &hint.line))
             .map(TailRow::Clipped)
             .collect();
         let has_conversation = self.conversation_rows > 0 || !rows.is_empty();
@@ -1189,7 +1273,8 @@ impl Scrollback {
         self.auto_scroll
     }
 
-    fn top_row(&self) -> usize {
+    /// The row the next frame draws first.
+    pub(super) fn top_row(&self) -> usize {
         self.top_row_within(self.row_count())
     }
 

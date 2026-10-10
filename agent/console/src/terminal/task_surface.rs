@@ -1724,6 +1724,7 @@ mod tests {
                     chat_id: Uuid::from_u128(100),
                 },
             },
+            call_id: None,
             command: command.into(),
             description: None,
             cwd: "/tmp/work".into(),

@@ -320,16 +320,16 @@ impl Workflow {
         chat: Uuid,
         goal: Uuid,
     ) -> Result<(Menu, Self), String> {
-        let snapshot = agent
-            .snapshot(chat)
+        let status = agent
+            .status(chat)
             .await
             .map_err(|error| error.to_string())?;
-        let selected_goal = snapshot
+        let selected_goal = status
             .loops
             .iter()
             .find(|entry| entry.id == goal)
             .ok_or("The selected goal no longer exists.")?;
-        let plan = snapshot
+        let plan = status
             .plans
             .iter()
             .find(|plan| plan.loop_id == goal)
@@ -348,7 +348,7 @@ impl Workflow {
                 Self::PlanView { chat },
             ));
         }
-        let request = snapshot
+        let request = status
             .permissions
             .iter()
             .find(|request| {
@@ -1185,9 +1185,9 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
             event.chat_id == chat.id
                 && matches!(event.kind, EventKind::Started | EventKind::Completed { .. })
         })
-        && let EventKind::Completed { usage } = event.kind
+        && matches!(event.kind, EventKind::Completed { .. })
     {
-        super::write_completion_notice(console, &usage, None)?;
+        super::write_completion_notice(console, None)?;
     }
     console.replay_execution_losses(chat.id)?;
     Ok(())

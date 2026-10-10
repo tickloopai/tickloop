@@ -447,7 +447,7 @@ async fn text_only_reply(fixture: &PrivateFixture) {
     view.send(b"Return a text-only response\r");
     let complete = view
         .wait_for("text-only tail appears once at completion", |frame| {
-            frame.contains(REPLY) && (frame.contains("✻ Worked for") || frame.contains("✻ Done"))
+            frame.contains(REPLY) && TURN_SUMMARY.is_match(frame)
         })
         .await;
     assert_eq!(conversation_body(&complete).matches(REPLY).count(), 1);

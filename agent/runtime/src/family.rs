@@ -7,6 +7,10 @@ use tickloop_agent_protocol::{
 };
 use tickloop_agent_tools::permissions::PermissionPolicyExt;
 
+/// The Loop state an Agent row reports: the goal most in need of attention, so a later completed
+/// Loop cannot mask an earlier goal that still waits for input, plan review or its Trigger, and an
+/// active user Shell keeps the Agent working. Without Loops, the latest user Shell decides between
+/// a confirmed failure and Idle; an unknown Shell outcome is not reported as a failure.
 pub fn summary_state(loops: &[LoopSnapshot], user_shells: &[UserShellRecord]) -> LoopState {
     use tickloop_agent_protocol::{LoopState, UserShellState};
     let any_loop = |state: LoopState| loops.iter().any(|goal| goal.state == state);

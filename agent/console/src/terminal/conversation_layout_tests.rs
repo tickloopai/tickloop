@@ -11,8 +11,8 @@ use std::{
 };
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
-    Content, Decision, ExecutionRef, LocalMessage, ModelIdentity, ModelProvider, PermissionRule,
-    PermissionScope, Protocol, QuestionAnswer, Usage,
+    Content, Decision, Event, ExecutionRef, LocalMessage, ModelIdentity, ModelProvider,
+    PermissionRule, PermissionScope, ProposedToolCall, Protocol, QuestionAnswer, ToolResult, Usage,
 };
 use tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME;
 use tokio_util::sync::CancellationToken;
@@ -322,7 +322,7 @@ async fn followed_and_reopened_conversations_share_one_claude_code_layout() {
             "",
             "⏺ All set.",
             "",
-            "✻ Done · ↓ 40 tokens",
+            "✻ Done",
             "",
         ]
         .join("\n")
@@ -990,4 +990,114 @@ fn a_write_opening_with_a_newline_is_a_block_and_newlines_alone_end_a_line() {
         console.test_conversation_text(),
         "partial\nnext line\n\nA notice\n\nAnother notice\n"
     );
+}
+
+/// One assistant message with parallel calls: each row and the collapsed group settle as their
+/// own results arrive while later calls still wait, and a call the ended run never started stops.
+#[test]
+fn parallel_calls_settle_as_their_results_arrive_and_unstarted_ones_stop_with_the_run() {
+    let chat = Uuid::new_v4();
+    let run = Uuid::new_v4();
+    let loop_id = Uuid::new_v4();
+    let console = Console::test_interactive_for_chat(chat);
+    console
+        .set_input_context(Some(chat), std::path::Path::new("/work"), &[])
+        .unwrap();
+    let mut tools = ToolPresentation::new(false);
+    let mut sequence = 0;
+    let mut present = |kind: EventKind| {
+        sequence += 1;
+        let event = Event {
+            chat_id: chat,
+            loop_id,
+            run_id: run,
+            sequence,
+            kind,
+        };
+        tools
+            .present_event(&console, &event, &presentation::CallFacts::default())
+            .unwrap();
+    };
+    let calls = [
+        ("todo", "Grep", serde_json::json!({"pattern": "TODO"})),
+        ("done", "Grep", serde_json::json!({"pattern": "DONE"})),
+        (
+            "notes",
+            "Read",
+            serde_json::json!({"file_path": "/work/notes.txt"}),
+        ),
+        (
+            "print",
+            "Bash",
+            serde_json::json!({"command": "printf 'one\\n'", "description": "Print one"}),
+        ),
+        (
+            "list",
+            "Bash",
+            serde_json::json!({"command": "ls", "description": "List files"}),
+        ),
+    ];
+    present(EventKind::AssistantMessageCommitted {
+        message_id: Uuid::new_v4(),
+        tool_calls: calls
+            .iter()
+            .map(|(id, name, input)| ProposedToolCall {
+                call_id: (*id).into(),
+                name: (*name).into(),
+                input: input.clone(),
+            })
+            .collect(),
+    });
+    let mut run_call = |index: usize, output: &str| {
+        let (id, name, input) = &calls[index];
+        present(EventKind::ToolStarted {
+            call_id: (*id).into(),
+            name: (*name).into(),
+            input: input.clone(),
+        });
+        present(EventKind::ToolCompleted {
+            call_id: (*id).into(),
+            result: ToolResult {
+                content: output.into(),
+                is_error: false,
+                output_ref: None,
+            },
+        });
+    };
+    run_call(0, "notes.txt");
+    run_call(1, "notes.txt");
+    assert_eq!(
+        console.test_conversation_text(),
+        [
+            "",
+            "⏺ Searching for 2 patterns, reading 1 file… (ctrl+o to expand)",
+            "",
+            "⏺ Bash · Print one · Queued",
+            "",
+            "⏺ Bash · List files · Queued",
+            "",
+        ]
+        .join("\n"),
+        "a group whose read still waits keeps working"
+    );
+    run_call(2, "     1\tTODO: fix cache");
+    run_call(3, "one");
+    assert_eq!(
+        console.test_conversation_text(),
+        [
+            "",
+            "  Searched for 2 patterns, read 1 file (ctrl+o to expand)",
+            "",
+            "⏺ Bash · Print one",
+            "  ⎿  one",
+            "",
+            "⏺ Bash · List files · Queued",
+            "",
+        ]
+        .join("\n"),
+        "finished calls settle while a later one still waits"
+    );
+    present(EventKind::Interrupted);
+    let ended = console.test_conversation_text();
+    assert!(ended.contains("⏺ Bash · List files · Stopped"), "{ended}");
 }

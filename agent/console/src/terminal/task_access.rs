@@ -5,9 +5,9 @@ use uuid::Uuid;
 
 use super::execution::ConsoleExecution;
 use tickloop_agent_protocol::{
-    AccessError, AgentCommand, ChatSnapshot, EventKind, ExecutionAvailability, ShellTask,
-    ShellTaskAction, ShellTaskCenterError, ShellTaskOrigin, ShellTaskOutputChunk,
-    ShellTaskSnapshot, ShellTaskState, TaskAction, TaskOrigin, TaskRef, UserShellState,
+    AccessError, AgentCommand, ChatStatus, ExecutionAvailability, ShellTask, ShellTaskAction,
+    ShellTaskCenterError, ShellTaskOrigin, ShellTaskOutputChunk, ShellTaskSnapshot, ShellTaskState,
+    TaskAction, TaskOrigin, TaskRef, UserShellState,
 };
 
 #[derive(Clone)]
@@ -18,12 +18,12 @@ pub(super) struct ShellTaskCenter {
 
 /// When Shell `id` of the Chat started: its output file's creation, else its first recorded
 /// update, else when a running user Shell entered its state.
-pub(super) fn shell_started_at_ms(snapshot: &ChatSnapshot, id: Uuid) -> Option<u64> {
-    let command = snapshot
+pub(super) fn shell_started_at_ms(status: &ChatStatus, id: Uuid) -> Option<u64> {
+    let command = status
         .commands
         .iter()
         .find(|command| command.operation_id == id);
-    let shell = snapshot.user_shells.iter().find(|shell| shell.id == id);
+    let shell = status.user_shells.iter().find(|shell| shell.id == id);
     let path = command
         .map(|command| command.output_ref.as_path())
         .or_else(|| shell.and_then(|shell| shell.output_ref.as_deref()));
@@ -39,18 +39,7 @@ pub(super) fn shell_started_at_ms(snapshot: &ChatSnapshot, id: Uuid) -> Option<u
             .ok()
     });
     creation
-        .or_else(|| {
-            snapshot
-                .events
-                .iter()
-                .filter_map(|event| match &event.kind {
-                    EventKind::CommandUpdated { command } if command.operation_id == id => {
-                        command.updated_at_ms
-                    }
-                    _ => None,
-                })
-                .min()
-        })
+        .or_else(|| status.command_started_at_ms.get(&id).copied())
         .or_else(|| {
             shell
                 .filter(|shell| matches!(shell.state, UserShellState::Running))
@@ -60,10 +49,7 @@ pub(super) fn shell_started_at_ms(snapshot: &ChatSnapshot, id: Uuid) -> Option<u
 
 /// When each running background Shell in `tasks` started, for the elapsed time on its Monitor
 /// row.
-pub(super) fn shell_starts(
-    snapshot: &ChatSnapshot,
-    tasks: &ShellTaskSnapshot,
-) -> HashMap<Uuid, u64> {
+pub(super) fn shell_starts(status: &ChatStatus, tasks: &ShellTaskSnapshot) -> HashMap<Uuid, u64> {
     tasks
         .tasks
         .iter()
@@ -71,14 +57,14 @@ pub(super) fn shell_starts(
             !task.state.is_terminal()
                 && (task.was_background || task.state == ShellTaskState::Background)
         })
-        .filter_map(|task| Some((task.id, shell_started_at_ms(snapshot, task.id)?)))
+        .filter_map(|task| Some((task.id, shell_started_at_ms(status, task.id)?)))
         .collect()
 }
 
 impl ShellTaskCenter {
     pub(super) async fn started_at_ms(&self, chat: Uuid, id: Uuid) -> Option<u64> {
-        let snapshot = self.agent.snapshot(chat).await.ok()?;
-        shell_started_at_ms(&snapshot, id)
+        let status = self.agent.status(chat).await.ok()?;
+        shell_started_at_ms(&status, id)
     }
     pub(super) fn new(agent: ConsoleExecution) -> Self {
         Self {
@@ -86,35 +72,44 @@ impl ShellTaskCenter {
             revisions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
-    /// The Chat's Shell tasks. A lookup that fails because the Chat's execution was lost in the
-    /// meantime leaves the loss to the execution catalog; any other failure keeps the previous
-    /// tasks without their controls.
+    /// The Chat's Shell tasks, read from its execution directly. Only a failed read consults
+    /// the execution catalog: a Chat it no longer lists, or whose execution it confirms lost,
+    /// has no tasks; a Chat it moved to a live replacing execution is read once more; any other
+    /// failure keeps the previous tasks without their controls.
     pub(super) async fn snapshot(
         &self,
         chat: Uuid,
     ) -> Result<ShellTaskSnapshot, ShellTaskCenterError> {
-        let catalog = match self.agent.catalog().await {
-            Ok(catalog) => catalog,
-            Err(error) => return self.stale_snapshot(chat, runtime_error(error)).await,
-        };
-        let mut tasks = match catalog.into_iter().find(|entry| entry.chat_id == chat) {
-            Some(entry) if entry.availability != ExecutionAvailability::Lost => {
-                match self.agent.task_rows(chat).await {
-                    Ok(rows) => rows,
-                    Err(error) => {
-                        if !self.agent.catalog().await.is_ok_and(|rows| {
-                            rows.iter().any(|current| {
-                                current.execution == entry.execution
-                                    && current.availability == ExecutionAvailability::Lost
-                            })
-                        }) {
-                            return self.stale_snapshot(chat, runtime_error(error)).await;
-                        }
+        let queried = self.agent.reference(chat).await.ok();
+        let mut tasks = match self.agent.task_rows(chat).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                let catalog = match self.agent.catalog().await {
+                    Ok(catalog) => catalog,
+                    Err(error) => return self.stale_snapshot(chat, runtime_error(error)).await,
+                };
+                match catalog.into_iter().find(|entry| entry.chat_id == chat) {
+                    None => Vec::new(),
+                    Some(entry)
+                        if Some(entry.execution) == queried
+                            && entry.availability == ExecutionAvailability::Lost =>
+                    {
                         Vec::new()
                     }
+                    Some(entry)
+                        if Some(entry.execution) != queried
+                            && entry.availability == ExecutionAvailability::Live =>
+                    {
+                        match self.agent.task_rows(chat).await {
+                            Ok(rows) => rows,
+                            Err(error) => {
+                                return self.stale_snapshot(chat, runtime_error(error)).await;
+                            }
+                        }
+                    }
+                    Some(_) => return self.stale_snapshot(chat, runtime_error(error)).await,
                 }
             }
-            _ => Vec::new(),
         };
         tasks.retain(|task| task.chat_id == chat);
         tasks.sort_by_key(|task| (task.state.is_terminal(), task.id));

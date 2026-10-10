@@ -31,13 +31,15 @@ use super::{
 };
 use tickloop_agent_protocol::{
     ChatSnapshot, CommandState, Event, EventKind, FamilyInputRecord, LocalMessage, LoopState,
-    PermissionApprovalSource, PermissionRequest, SEND_AGENT_MESSAGE_TOOL_NAME, SUBAGENT_TOOL_NAME,
-    SubagentReportMessage, TaskNotificationStatus, TickDeliveryLine, ToolResult, UserShellRecord,
-    UserShellState,
+    OperationRecord, PermissionApprovalSource, PermissionRequest, SEND_AGENT_MESSAGE_TOOL_NAME,
+    SUBAGENT_TOOL_NAME, SubagentReportMessage, TaskNotificationStatus, TickDeliveryLine,
+    ToolResult, UserShellRecord, UserShellState,
 };
 
 const RETAINED_TOOL_EVENTS: usize = 128;
 const PREVIEW_LINES: usize = 5;
+/// Lines a failed result keeps from its start: the exit code and what ended the command.
+const FAILURE_HEAD_LINES: usize = 2;
 const PREVIEW_LINE_CHARACTERS: usize = 200;
 const TOOL_SUMMARY_CHARACTERS: usize = 160;
 const BACKGROUND_RUNNING_STATUS: &str = "Running in background";
@@ -982,6 +984,17 @@ pub(super) struct ToolPresentation {
     events: VecDeque<Event>,
 }
 
+/// Where a call's result finds what it shows beyond itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ResultSource {
+    /// The result shows only itself.
+    Itself,
+    /// An edit's change, as the operation the run recorded for the call reviewed it.
+    Operation,
+    /// The report a Subagent's child delivered into the conversation.
+    Conversation,
+}
+
 /// What a call's result shows from elsewhere in the conversation.
 #[derive(Default)]
 pub(super) struct CallFacts {
@@ -1139,18 +1152,18 @@ impl ToolPresentation {
             .unwrap_or(false)
     }
 
-    /// Whether the result `event` brings shows something from elsewhere in the conversation: an
-    /// edit's recorded change or the report a Subagent's child delivered.
-    pub(super) fn result_reads_conversation(&self, event: &Event) -> bool {
+    /// Where the result `event` brings finds what it shows beyond itself: an edit's recorded
+    /// change or the report a Subagent's child delivered.
+    pub(super) fn result_source(&self, event: &Event) -> ResultSource {
         match &event.kind {
             EventKind::ToolCompleted { call_id, result } => {
                 match self.started_call(event, call_id).0 {
-                    EDIT_TOOL_NAME => !result.is_error,
-                    SUBAGENT_TOOL_NAME => true,
-                    _ => false,
+                    EDIT_TOOL_NAME if !result.is_error => ResultSource::Operation,
+                    SUBAGENT_TOOL_NAME => ResultSource::Conversation,
+                    _ => ResultSource::Itself,
                 }
             }
-            _ => false,
+            _ => ResultSource::Itself,
         }
     }
 
@@ -1392,14 +1405,18 @@ pub(super) fn file_change_review(
     run: Uuid,
     call_id: &str,
 ) -> Option<FileChangeReview> {
-    let prepared = snapshot
-        .operations
-        .iter()
-        .rev()
-        .find(|operation| operation.run_id == run && operation.call_id == call_id)?
-        .file_change
-        .as_ref()?;
-    load_file_change_review(&prepared.artifact).ok()
+    operation_review(
+        snapshot
+            .operations
+            .iter()
+            .rev()
+            .find(|operation| operation.run_id == run && operation.call_id == call_id)?,
+    )
+}
+
+/// The change an edit's operation made, as its review recorded it.
+pub(super) fn operation_review(operation: &OperationRecord) -> Option<FileChangeReview> {
+    load_file_change_review(&operation.file_change.as_ref()?.artifact).ok()
 }
 
 pub(super) fn tool_call_states(snapshot: &ChatSnapshot) -> HashMap<(Uuid, String), ToolCallState> {
@@ -1958,9 +1975,26 @@ impl<'a> ResponseRows<'a> {
     }
 
     /// The first lines of `content`, each cut to a preview's width, then the details hint when
-    /// anything was left out.
+    /// anything was left out. A failure keeps its first lines (the exit code and what ended the
+    /// command) and its last lines instead, where a command's error message ends up.
     fn preview(&mut self, content: &str, source_truncated: bool, body: Option<Role>) {
         let sanitized = safe_text(content);
+        let all_lines = sanitized.lines().collect::<Vec<_>>();
+        if body == Some(Role::Error) && all_lines.len() > PREVIEW_LINES {
+            let tail = PREVIEW_LINES - FAILURE_HEAD_LINES;
+            let hidden = all_lines.len() - FAILURE_HEAD_LINES - tail;
+            for line in &all_lines[..FAILURE_HEAD_LINES] {
+                self.row([(clipped(line, PREVIEW_LINE_CHARACTERS).0, body)]);
+            }
+            self.row([(
+                format!("… +{hidden} {} (ctrl+o to expand)", plural(hidden, "line")),
+                Some(Role::MutedText),
+            )]);
+            for line in &all_lines[all_lines.len() - tail..] {
+                self.row([(clipped(line, PREVIEW_LINE_CHARACTERS).0, body)]);
+            }
+            return;
+        }
         let mut lines = sanitized.lines();
         let mut truncated = source_truncated;
         for line in lines.by_ref().take(PREVIEW_LINES) {
@@ -2692,6 +2726,33 @@ mod tests {
             run_id,
             kind,
         }
+    }
+
+    #[test]
+    fn a_failed_result_preview_keeps_the_exit_code_and_its_last_lines() {
+        let content = "Exit code 128\n3d2826e one\n1edc7c2 two\n580c9bf three\ncda92f1 four\nf00 five\nfatal: bad revision 'HEAD~99'";
+        let mut runs = RoleRuns::new();
+        push_response_block(
+            &mut runs,
+            content,
+            OutputDetail::Preview,
+            DisplayProfile::default(),
+            Some(Role::Error),
+        );
+        let text = runs
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<String>();
+        assert!(text.contains("Exit code 128"), "{text}");
+        assert!(text.contains("… +2 lines (ctrl+o to expand)"), "{text}");
+        assert!(
+            text.trim_end().ends_with("fatal: bad revision 'HEAD~99'"),
+            "the error that ends the output stays visible: {text}"
+        );
+        assert!(
+            text.contains("3d2826e one") && !text.contains("1edc7c2 two"),
+            "{text}"
+        );
     }
 
     #[test]

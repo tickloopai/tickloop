@@ -327,10 +327,10 @@ impl FileMentionState {
             .as_ref()
             .and_then(|index| index.complete(&self.draft, self.cursor, self.limit));
         self.completion = files;
+        // As Claude Code, every `@` offers the family; only a leading one directs the message.
         if let Some(token) = mention_token(&self.draft, self.cursor) {
             let raw = &self.draft[token.start..token.cursor];
-            let leading = self.draft[..token.start].trim().is_empty();
-            if leading && !raw.contains('/') && !raw.contains('\\') {
+            if !raw.contains('/') && !raw.contains('\\') {
                 let query = raw.trim_start_matches('@');
                 let mut agents = self
                     .family_targets
@@ -426,6 +426,11 @@ impl FileMentionState {
         }) = self.candidates().get(candidate_index)
         {
             let target = target.clone();
+            let leading = self.completion.as_ref().is_some_and(|completion| {
+                self.draft[..completion.replacement_range.start]
+                    .trim()
+                    .is_empty()
+            });
             let Some((mut draft, mut cursor)) = self
                 .completion
                 .as_ref()
@@ -439,7 +444,9 @@ impl FileMentionState {
                 draft.insert(cursor, ' ');
                 cursor += 1;
             }
-            self.accepted_family = Some(target);
+            if leading {
+                self.accepted_family = Some(target);
+            }
             self.draft.clone_from(&draft);
             self.cursor = cursor;
             self.dismiss();
@@ -1204,7 +1211,7 @@ mod tests {
     }
 
     #[test]
-    fn leading_family_targets_precede_files_and_later_or_explicit_paths_stay_files() {
+    fn every_at_offers_family_targets_before_files_and_explicit_paths_stay_files() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("audit.txt"), "file").unwrap();
         let index = FileMentionIndex::build(directory.path(), &[]).unwrap();
@@ -1219,15 +1226,16 @@ mod tests {
             description: "Audit evidence".into(),
             available: true,
         };
-        state.set_family_targets(vec![target]);
+        state.set_family_targets(vec![target.clone()]);
         state.update_at("@a", 2, 15);
         assert_eq!(state.candidates()[0].display_path, "audit");
         state.update_at("words @a", 8, 15);
-        assert!(
-            state
-                .candidates()
-                .iter()
-                .all(|row| row.display_path != "audit")
+        assert_eq!(state.candidates()[0].display_path, "audit");
+        state.update_at("@audit and @a", 13, 15);
+        assert_eq!(
+            state.candidates()[0].display_path,
+            "audit",
+            "a later `@` offers the family again"
         );
         state.update_at("@./a", 5, 15);
         assert!(
@@ -1235,6 +1243,37 @@ mod tests {
                 .candidates()
                 .iter()
                 .all(|row| row.display_path != "audit")
+        );
+    }
+
+    #[test]
+    fn only_a_leading_family_mention_directs_the_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state =
+            FileMentionState::with_index(FileMentionIndex::build(directory.path(), &[]).unwrap());
+        state.set_family_targets(vec![FamilyMentionTarget {
+            execution: tickloop_agent_protocol::ExecutionRef {
+                daemon_epoch: uuid::Uuid::new_v4(),
+                agent_id: uuid::Uuid::new_v4(),
+                generation: 1,
+            },
+            handle: "audit".into(),
+            description: "Audit evidence".into(),
+            available: true,
+        }]);
+        state.update_at("ask @a", 6, 15);
+        let FileMentionAction::ReplaceDraft { draft, cursor } =
+            state.handle_key(FileMentionKey::Complete)
+        else {
+            panic!("the later mention completes");
+        };
+        assert_eq!((draft.as_str(), cursor), ("ask @audit ", 11));
+        assert!(state.accepted_family().is_none());
+        assert!(
+            state
+                .family_target_for_submission("ask @audit to check")
+                .unwrap()
+                .is_none()
         );
     }
 
