@@ -17,10 +17,24 @@ pub const LOCK_NAME: &str = "daemon.lock";
 pub fn runtime_directory() -> PathBuf {
     std::env::var_os("TICKLOOP_DAEMON_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(format!("/tmp/tickloop-daemon-{}", unsafe {
-                libc::geteuid()
-            }))
+        .unwrap_or_else(default_runtime_directory)
+}
+
+/// The per-user runtime directory of the daemon nothing else selects.
+pub fn default_runtime_directory() -> PathBuf {
+    PathBuf::from(format!("/tmp/tickloop-daemon-{}", unsafe {
+        libc::geteuid()
+    }))
+}
+
+/// Whether `directory` is the default daemon's, however it is spelled.
+pub fn is_default_runtime_directory(directory: &Path) -> bool {
+    let default = default_runtime_directory();
+    directory == default
+        || directory.canonicalize().is_ok_and(|directory| {
+            default
+                .canonicalize()
+                .is_ok_and(|default| directory == default)
         })
 }
 

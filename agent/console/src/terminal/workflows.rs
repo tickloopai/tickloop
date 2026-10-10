@@ -1541,7 +1541,9 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let record = events.recv().await.unwrap();
-                if record.id == command_id && record.state == expected {
+                // A running command counts once the Tickhost started its process.
+                let is_started = expected != UserShellState::Running || record.pid.is_some();
+                if record.id == command_id && record.state == expected && is_started {
                     return record;
                 }
             }

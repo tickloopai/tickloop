@@ -1,7 +1,8 @@
 //! The Tickhost service: one per user by default, holding each hosted Tick's PTY master,
 //! terminal model and process: the launcher of a protocol Tick, or a terminal Tick's program
-//! itself. Only the Agent daemon controls lifecycles; data clients read through a per-instance
-//! token; launchers report through a one-time launch token.
+//! itself; and each Shell task a Worker submitted. Only the Agent daemon controls lifecycles and
+//! grants spawns; data clients read through a per-instance token; launchers report through a
+//! one-time launch token; spawners submit one task each through a one-time spawn grant.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -24,7 +25,7 @@ use tickhost_connect::{
         self, ATTACH_INPUT_BYTES, ATTACH_REQUEST_FRAME_BYTES, BUILD_VERSION, BUSINESS_CAPABILITIES,
         BUSINESS_FRAME_BYTES, BUSINESS_MAJOR, BUSINESS_MINOR, CALL_TIMEOUT, CONTROL_TIMEOUT, Hello,
         HelloReply, HostedTerminal, LaunchBinding, MANAGEMENT_FRAME_BYTES, MANAGEMENT_MAJOR,
-        MANAGEMENT_MINOR, Role, TerminalDevice, same_secret,
+        MANAGEMENT_MINOR, Role, SPAWN_DESCRIPTORS, TerminalDevice, same_secret,
     },
     session::{SessionBackend, SessionClient},
 };
@@ -45,6 +46,10 @@ use crate::{
     process,
     pty::{Pty, READ_CHUNK_BYTES, TerminalSize},
     screen::Screen,
+    shell::{
+        CANCELLED_REASON, ShellTask, SpawnBinding, SpawnGrant, SpawnGrants, SpawnRequest,
+        SpawnedShell,
+    },
 };
 
 /// A host that was never used exits after this grace.
@@ -620,6 +625,14 @@ impl Diagnostics {
 
 pub struct HostState {
     ticks: HashMap<Uuid, Arc<HostedTick>>,
+    /// Shell tasks by operation, each until it ended and its spawner left.
+    shells: HashMap<Uuid, Arc<ShellTask>>,
+    spawn_grants: SpawnGrants,
+    /// Connected spawners; each keeps the host from exiting, with or without its task yet.
+    spawners: usize,
+    /// Connections of the current controller generation; once the last one closes, every Shell
+    /// task stops.
+    controllers: usize,
     receipts: Receipts,
     pending_opens: usize,
     ever_used: bool,
@@ -636,6 +649,13 @@ pub struct HostState {
 }
 
 impl HostState {
+    /// Stops every Shell task: the daemon that granted them is gone or was replaced.
+    fn stop_shells(&self) {
+        for task in self.shells.values() {
+            task.stop(CANCELLED_REASON);
+        }
+    }
+
     fn record_receipt(&mut self, operation: Uuid, owner: &TickOwner, receipt: Receipt) {
         let ticks = &self.ticks;
         self.receipts.record(operation, owner, receipt, || {
@@ -825,6 +845,9 @@ impl Host {
             .env("TERM", "xterm-256color");
         let adapter = match request.adapter {
             TickAdapter::Protocol => {
+                self.paths
+                    .check_session_directories()
+                    .map_err(|error| HostError::before("LaunchFailed", error.to_string()))?;
                 let session_directory = self
                     .paths
                     .tick_session_directory(self.session_serial.fetch_add(1, Ordering::Relaxed));
@@ -1199,6 +1222,90 @@ impl Host {
         Ok(json!({"instance":instance,"watches":count}))
     }
 
+    /// Grants one spawn of what `binding` names, for its spawner to claim within the grant
+    /// timeout. Only the current controller's own epoch can be bound.
+    async fn allow_spawn(&self, binding: SpawnBinding) -> Result<Value, HostError> {
+        let mut state = self.state.lock().await;
+        if self.shutdown.is_cancelled() || state.exiting {
+            return Err(HostError::before(
+                "ShuttingDown",
+                "the Tickhost is stopping",
+            ));
+        }
+        if state.controller_epoch != Some(binding.identity.daemon_epoch) {
+            return Err(HostError::before(
+                "Fenced",
+                "a spawn is granted only for the current Agent daemon",
+            ));
+        }
+        state.ever_used = true;
+        let token = random_token();
+        let grant = state
+            .spawn_grants
+            .issue(binding, token.clone(), Instant::now());
+        Ok(json!(SpawnGrant {
+            grant,
+            token,
+            epoch: self.epoch,
+        }))
+    }
+
+    /// Starts the task a claimed grant admitted. The request must be exactly what the grant
+    /// binds, for the daemon that still controls this host.
+    async fn start_shell(
+        &self,
+        granted: &SpawnBinding,
+        request: SpawnRequest,
+        directory: std::os::fd::OwnedFd,
+        output: std::os::fd::OwnedFd,
+    ) -> Result<Arc<ShellTask>, HostError> {
+        if &request.binding != granted {
+            return Err(HostError::before(
+                "Forbidden",
+                "the request differs from what its spawn grant binds",
+            ));
+        }
+        let mut state = self.state.lock().await;
+        if self.shutdown.is_cancelled() || state.exiting {
+            return Err(HostError::before(
+                "ShuttingDown",
+                "the Tickhost is stopping",
+            ));
+        }
+        if state.controller_epoch != Some(granted.identity.daemon_epoch) {
+            return Err(HostError::before(
+                "Fenced",
+                "the Agent daemon that granted this spawn no longer controls this Tickhost",
+            ));
+        }
+        let operation = granted.operation;
+        if state.shells.contains_key(&operation) {
+            return Err(HostError::before(
+                "Forbidden",
+                "this operation already runs a Shell task",
+            ));
+        }
+        let task = ShellTask::start(request, directory, output, random_token())?;
+        state.shells.insert(operation, task.clone());
+        Ok(task)
+    }
+
+    /// Forgets a task once its spawner left: a task still running is stopped first.
+    async fn release_shell(&self, task: &Arc<ShellTask>) {
+        task.stop(CANCELLED_REASON);
+        task.ended().await;
+        let mut state = self.state.lock().await;
+        if state
+            .shells
+            .get(&task.binding.operation)
+            .is_some_and(|known| Arc::ptr_eq(known, task))
+        {
+            state.shells.remove(&task.binding.operation);
+        }
+        drop(state);
+        task.released.cancel();
+    }
+
     /// Reaps Ticks whose launcher exited, starts ending those that stayed idle, and reports
     /// whether the host should exit as empty. Idle Ticks stop in the background, so one that
     /// ignores SIGTERM never pauses accepting connections; until reaped it keeps the host from
@@ -1240,7 +1347,11 @@ impl Host {
             tokio::spawn(async move { host.end_ticks(idle, ReapReason::Idle).await });
         }
         let mut state = self.state.lock().await;
+        let has_pending_spawns = state.spawn_grants.has_pending(Instant::now());
         state.exiting = state.ticks.is_empty()
+            && state.shells.is_empty()
+            && state.spawners == 0
+            && !has_pending_spawns
             && state.pending_opens == 0
             && (state.ever_used || self.started.elapsed() >= INITIAL_GRACE);
         state.exiting
@@ -1306,6 +1417,7 @@ impl Host {
         json!({
             "epoch": self.epoch,
             "ticks": state.ticks.len(),
+            "shells": state.shells.len(),
             "pending_opens": state.pending_opens,
             "errors": state.diagnostics.errors,
             "last_error": state.diagnostics.last_error,
@@ -1314,14 +1426,13 @@ impl Host {
     }
 
     async fn shut_down(&self) {
-        let ticks = self
-            .state
-            .lock()
-            .await
-            .ticks
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let (ticks, shells) = {
+            let state = self.state.lock().await;
+            (
+                state.ticks.values().cloned().collect::<Vec<_>>(),
+                state.shells.values().cloned().collect::<Vec<_>>(),
+            )
+        };
         let mut closing = tokio::task::JoinSet::new();
         for tick in ticks {
             closing.spawn(async move {
@@ -1330,8 +1441,17 @@ impl Host {
                 tick.remove_session_directory();
             });
         }
+        for task in shells {
+            closing.spawn(async move {
+                task.stop(CANCELLED_REASON);
+                task.ended().await;
+                task.released.cancel();
+            });
+        }
         while closing.join_next().await.is_some() {}
-        self.state.lock().await.ticks.clear();
+        let mut state = self.state.lock().await;
+        state.ticks.clear();
+        state.shells.clear();
     }
 }
 
@@ -1475,6 +1595,15 @@ pub fn random_token() -> String {
 /// Runs the host until it is shut down or stays empty. The listener is bound only after the
 /// exclusive lock is held, so a live host is never replaced.
 pub async fn serve(paths: HostPaths, config: HostConfig) -> std::io::Result<()> {
+    serve_until(paths, config, std::future::pending()).await
+}
+
+/// [`serve`], also ending once `stop` completes, as `tickhost run` does on SIGTERM.
+pub async fn serve_until(
+    paths: HostPaths,
+    config: HostConfig,
+    stop: impl std::future::Future<Output = ()>,
+) -> std::io::Result<()> {
     paths.prepare()?;
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -1520,6 +1649,10 @@ pub async fn serve(paths: HostPaths, config: HostConfig) -> std::io::Result<()> 
         session_serial: AtomicU64::new(0),
         state: Mutex::new(HostState {
             ticks: HashMap::new(),
+            shells: HashMap::new(),
+            spawn_grants: SpawnGrants::default(),
+            spawners: 0,
+            controllers: 0,
             receipts: Receipts::default(),
             pending_opens: 0,
             ever_used: false,
@@ -1535,7 +1668,7 @@ pub async fn serve(paths: HostPaths, config: HostConfig) -> std::io::Result<()> 
         shutdown_state: watch::channel(ShutdownState::Running).0,
     });
     let mut sweep = tokio::time::interval(REAP_INTERVAL);
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::pin!(stop);
     let mut emptied = false;
     loop {
         tokio::select! {
@@ -1553,7 +1686,7 @@ pub async fn serve(paths: HostPaths, config: HostConfig) -> std::io::Result<()> 
                 }
             }
             _ = host.shutdown.cancelled() => break,
-            _ = terminate.recv() => break,
+            _ = &mut stop => break,
         }
     }
     host.shutdown.cancel();
@@ -1676,7 +1809,8 @@ async fn connection(stream: UnixStream, host: Arc<Host>) -> Result<(), HostError
                     return Err(error);
                 }
             };
-            write_within(
+            let departure = Departure::of(&session);
+            let welcomed = write_within(
                 &mut writer,
                 &hosted::ok(
                     &Value::Null,
@@ -1695,8 +1829,48 @@ async fn connection(stream: UnixStream, host: Arc<Host>) -> Result<(), HostError
                 BUSINESS_FRAME_BYTES,
                 CONTROL_TIMEOUT,
             )
-            .await?;
-            business(reader, writer, host, session).await
+            .await;
+            let result = match welcomed {
+                Ok(()) => business(reader, writer, host.clone(), session).await,
+                Err(error) => Err(error),
+            };
+            departure.leave(&host).await;
+            result
+        }
+    }
+}
+
+/// What an authenticated connection holds of the host until it ends.
+enum Departure {
+    /// A connection of the controller generation it names, one of the daemon's while it is current.
+    Controller(u64),
+    /// A spawner, which keeps the host from exiting.
+    Spawner,
+    Other,
+}
+
+impl Departure {
+    fn of(authority: &Authority) -> Self {
+        match authority {
+            Authority::Controller { generation } => Self::Controller(*generation),
+            Authority::Spawner(_) => Self::Spawner,
+            _ => Self::Other,
+        }
+    }
+
+    /// Accounts for the connection's end: the last connection of the current controller stops
+    /// every Shell task.
+    async fn leave(self, host: &Host) {
+        let mut state = host.state.lock().await;
+        match self {
+            Self::Controller(generation) if state.controller_generation == generation => {
+                state.controllers -= 1;
+                if state.controllers == 0 {
+                    state.stop_shells();
+                }
+            }
+            Self::Spawner => state.spawners -= 1,
+            Self::Controller(_) | Self::Other => {}
         }
     }
 }
@@ -1706,6 +1880,10 @@ enum Authority {
         generation: u64,
     },
     Instance(Arc<HostedTick>),
+    /// A reader of one Shell task's `shell:` instance.
+    Shell(Arc<ShellTask>),
+    /// The one connection a spawn grant admitted; the task it submits lives as long as it.
+    Spawner(SpawnBinding),
     /// A view a grant let in; it can only attach.
     Viewer(Arc<HostedTick>),
     /// The one connection of a pending launch; `verified` once it proved its foreground.
@@ -1729,14 +1907,32 @@ async fn authenticate(host: &Arc<Host>, role: Role) -> Result<Authority, HostErr
             }
             let mut state = host.state.lock().await;
             if state.controller_epoch != Some(daemon_epoch) {
-                // A new daemon fences every earlier controller connection.
+                // A new daemon fences every earlier controller connection, and the Shell tasks
+                // and spawn grants of the daemon it replaced end with them.
                 state.controller_generation += 1;
                 state.controller_epoch = Some(daemon_epoch);
+                state.controllers = 0;
+                state.spawn_grants.clear();
+                state.stop_shells();
             }
+            state.controllers += 1;
             Ok(Authority::Controller {
                 generation: state.controller_generation,
             })
         }
+        Role::Instance {
+            instance,
+            data_token,
+        } if instance.tick_type() == tick_protocol::SHELL_INSTANCE_TYPE => host
+            .state
+            .lock()
+            .await
+            .shells
+            .values()
+            .find(|task| task.instance == instance && same_secret(&data_token, &task.data_token))
+            .cloned()
+            .map(Authority::Shell)
+            .ok_or_else(|| HostError::before("Forbidden", "unknown instance or data token")),
         Role::Instance {
             instance,
             data_token,
@@ -1775,6 +1971,17 @@ async fn authenticate(host: &Arc<Host>, role: Role) -> Result<Authority, HostErr
                 verified: false,
             })
             .ok_or_else(|| HostError::before("Forbidden", "unknown or already used launch token")),
+        Role::Spawner { grant, token } => {
+            let mut state = host.state.lock().await;
+            let binding = state
+                .spawn_grants
+                .claim(grant, &token, Instant::now())
+                .ok_or_else(|| {
+                    HostError::before("Forbidden", "unknown, expired or used spawn grant")
+                })?;
+            state.spawners += 1;
+            Ok(Authority::Spawner(binding))
+        }
     }
 }
 
@@ -1843,7 +2050,20 @@ async fn management_request(host: &Host, request: Value) -> Result<Value, HostEr
     Ok(json!({"operation":operation,"state":ShutdownState::Completed}))
 }
 
+/// Serves one authenticated connection; a spawner's task ends with its connection.
 async fn business(
+    reader: BufReader<OwnedReadHalf>,
+    writer: OwnedWriteHalf,
+    host: Arc<Host>,
+    authority: Authority,
+) -> Result<(), HostError> {
+    match authority {
+        Authority::Spawner(binding) => serve_spawner(reader, writer, &host, &binding).await,
+        authority => serve_requests(reader, writer, host, authority).await,
+    }
+}
+
+async fn serve_requests(
     mut reader: BufReader<OwnedReadHalf>,
     mut writer: OwnedWriteHalf,
     host: Arc<Host>,
@@ -1852,10 +2072,11 @@ async fn business(
     // A connection bound to one Tick closes when that Tick ends, so an idle one never keeps the
     // reaped Tick's terminal; a controller's token never ends.
     let tick_ended = match &authority {
-        Authority::Controller { .. } => CancellationToken::new(),
+        Authority::Controller { .. } | Authority::Spawner(_) => CancellationToken::new(),
         Authority::Instance(tick) | Authority::Viewer(tick) | Authority::Launcher { tick, .. } => {
             tick.terminal_closed.clone()
         }
+        Authority::Shell(task) => task.released.clone(),
     };
     loop {
         let request = tokio::select! {
@@ -1881,6 +2102,11 @@ async fn business(
         let id = request["id"].clone();
         let method = request["method"].as_str().unwrap_or_default().to_owned();
         let params = request.get("params").cloned().unwrap_or(json!({}));
+        if let Authority::Shell(task) = &authority
+            && method == "watch"
+        {
+            return watch_shell(reader, writer, &host, task.clone(), &id).await;
+        }
         if let Authority::Instance(tick) | Authority::Viewer(tick) = &authority {
             match method.as_str() {
                 "watch" if matches!(authority, Authority::Instance(_)) => {
@@ -1914,6 +2140,8 @@ async fn business(
                 controller_request(&host, *generation, &method, params).await
             }
             Authority::Instance(tick) => instance_request(tick, &method, params).await,
+            Authority::Shell(task) => shell_request(task, &method),
+            Authority::Spawner(_) => unreachable!("a spawner is served on its own"),
             Authority::Viewer(_) => Err(HostError::before(
                 "MethodNotAllowed",
                 format!("a view can only attach, not {method:?}"),
@@ -2016,6 +2244,7 @@ async fn controller_request(
             host.allow_view(&owner, &instance).await
         }
         "reconcile_owners" => host.reconcile_owners(parameters(params)?).await,
+        "allow_spawn" => host.allow_spawn(parameters(params)?).await,
         "end_owner" => {
             #[derive(Deserialize)]
             struct End {
@@ -2417,6 +2646,167 @@ async fn watch_terminal(
     }
 }
 
+/// Serves one spawner: the descriptors and request its grant admits, then the task's exit, once,
+/// and its stop requests, until the spawner leaves, which stops a task still running.
+async fn serve_spawner(
+    mut reader: BufReader<OwnedReadHalf>,
+    mut writer: OwnedWriteHalf,
+    host: &Arc<Host>,
+    granted: &SpawnBinding,
+) -> Result<(), HostError> {
+    let submitted = async {
+        let descriptors = hosted::receive_descriptors(&reader, SPAWN_DESCRIPTORS).await?;
+        let request = hosted::read_frame(&mut reader, BUSINESS_FRAME_BYTES)
+            .await?
+            .ok_or_else(|| {
+                HostError::before("Disconnected", "the spawner left before its request")
+            })?;
+        Ok::<_, HostError>((descriptors, request))
+    };
+    let (descriptors, request) = tokio::time::timeout(CONTROL_TIMEOUT, submitted)
+        .await
+        .map_err(|_| HostError::before("Timeout", "no spawn request arrived"))??;
+    let id = request["id"].clone();
+    let started = async {
+        if request["method"] != "spawn" {
+            return Err(HostError::before(
+                "MethodNotAllowed",
+                "a spawner submits one spawn request",
+            ));
+        }
+        let [directory, output]: [std::os::fd::OwnedFd; SPAWN_DESCRIPTORS] = descriptors
+            .try_into()
+            .map_err(|_| HostError::before("InvalidDescriptors", "wrong descriptor count"))?;
+        let spawn: SpawnRequest = parameters(request.get("params").cloned().unwrap_or_default())?;
+        host.start_shell(granted, spawn, directory, output).await
+    };
+    let task = match started.await {
+        Ok(task) => task,
+        Err(error) => {
+            host.state
+                .lock()
+                .await
+                .diagnostics
+                .note_error(&error.message);
+            let _ = write_within(
+                &mut writer,
+                &hosted::error(&id, &error),
+                BUSINESS_FRAME_BYTES,
+                CONTROL_TIMEOUT,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    let served = async {
+        write_within(
+            &mut writer,
+            &hosted::ok(
+                &id,
+                json!(SpawnedShell {
+                    instance: task.instance.clone(),
+                    pid: task.pid,
+                    data_token: task.data_token.clone(),
+                }),
+            ),
+            BUSINESS_FRAME_BYTES,
+            CONTROL_TIMEOUT,
+        )
+        .await?;
+        #[derive(Deserialize)]
+        #[serde(tag = "method", content = "params", rename_all = "snake_case")]
+        enum SpawnerRequest {
+            Stop { reason: String },
+        }
+        let mut reported = false;
+        loop {
+            tokio::select! {
+                biased;
+                _ = host.shutdown.cancelled() => return Ok(()),
+                exit = task.ended(), if !reported => {
+                    reported = true;
+                    write_within(
+                        &mut writer,
+                        &json!({"event":"exited","exit":exit}),
+                        BUSINESS_FRAME_BYTES,
+                        STREAM_WRITE_TIMEOUT,
+                    )
+                    .await?;
+                }
+                request = hosted::read_frame(&mut reader, ATTACH_REQUEST_FRAME_BYTES) => match request? {
+                    Some(request) => match parameters(request)? {
+                        SpawnerRequest::Stop { reason } => task.stop(&reason),
+                    },
+                    None => return Ok(()),
+                },
+            }
+        }
+    };
+    let outcome = served.await;
+    host.release_shell(&task).await;
+    outcome
+}
+
+/// The Shell adapter: a task describes what it runs and reads as its state and the end of its
+/// output. It is stopped through its spawner, never called.
+fn shell_request(task: &ShellTask, method: &str) -> Result<Value, HostError> {
+    match method {
+        "describe" => Ok(json!(task.describe())),
+        "read" => Ok(json!(task.read())),
+        "call" | "input" | "status" => Err(HostError::before(
+            "UnsupportedCapability",
+            "a Shell task is stopped by its own Agent, never called",
+        )),
+        _ => Err(HostError::before(
+            "MethodNotAllowed",
+            format!("a Shell reader has no {method:?} method"),
+        )),
+    }
+}
+
+/// Watches a Shell task: the reply carries how it reads now, and its exit is pushed once, the one
+/// update of a task that was still running. The watch ends with `gone` once the host forgot the
+/// task, or with the reader's EOF or anything it sends.
+async fn watch_shell(
+    mut reader: BufReader<OwnedReadHalf>,
+    mut writer: OwnedWriteHalf,
+    host: &Arc<Host>,
+    task: Arc<ShellTask>,
+    id: &Value,
+) -> Result<(), HostError> {
+    use tokio::io::AsyncBufReadExt;
+    let read = task.read();
+    let mut has_reported = read.exit.is_some();
+    write_within(
+        &mut writer,
+        &hosted::ok(id, json!({"read":read})),
+        BUSINESS_FRAME_BYTES,
+        CONTROL_TIMEOUT,
+    )
+    .await?;
+    loop {
+        tokio::select! {
+            biased;
+            _ = host.shutdown.cancelled() => return Ok(()),
+            _ = task.ended(), if !has_reported => {
+                has_reported = true;
+                write_within(
+                    &mut writer,
+                    &json!({"event":"observation","read":task.read()}),
+                    BUSINESS_FRAME_BYTES,
+                    STREAM_WRITE_TIMEOUT,
+                )
+                .await?;
+            }
+            _ = task.released.cancelled() => {
+                let _ = write_within(&mut writer, &json!({"event":"gone"}), BUSINESS_FRAME_BYTES, STREAM_WRITE_TIMEOUT).await;
+                return Ok(());
+            }
+            _ = reader.fill_buf() => return Ok(()),
+        }
+    }
+}
+
 /// One view attached to a Tick terminal, until EOF, detach, a stalled write or the end of the
 /// Tick.
 struct ViewLease {
@@ -2713,6 +3103,14 @@ mod tests {
         }
     }
 
+    /// A directory short enough for the Session sockets of the protocol Ticks a test host runs.
+    fn session_directory_parent() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("th")
+            .tempdir_in("/private/tmp")
+            .unwrap()
+    }
+
     fn test_host(directory: &tempfile::TempDir) -> Arc<Host> {
         Arc::new(Host {
             paths: HostPaths {
@@ -2725,6 +3123,10 @@ mod tests {
             session_serial: AtomicU64::new(0),
             state: Mutex::new(HostState {
                 ticks: HashMap::new(),
+                shells: HashMap::new(),
+                spawn_grants: SpawnGrants::default(),
+                spawners: 0,
+                controllers: 0,
                 receipts: Receipts::default(),
                 pending_opens: 0,
                 ever_used: false,
@@ -2743,7 +3145,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_launcher_waits_until_its_registration_can_be_published() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = session_directory_parent();
         let host = test_host(&directory);
         let request = OpenRequest {
             operation: Uuid::new_v4(),
@@ -2783,7 +3185,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_owner_ended_while_its_launch_waits_for_the_registry_never_starts() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = session_directory_parent();
         let host = test_host(&directory);
         let request = OpenRequest {
             operation: Uuid::new_v4(),
@@ -2915,7 +3317,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_open_of_a_fenced_controller_that_reaches_the_registry_late_never_starts() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = session_directory_parent();
         let host = test_host(&directory);
         let request = OpenRequest {
             operation: Uuid::new_v4(),

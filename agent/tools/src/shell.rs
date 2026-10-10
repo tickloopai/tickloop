@@ -2,15 +2,8 @@ use std::{
     collections::HashMap,
     fs::OpenOptions,
     io::{Read, Seek, SeekFrom},
-    os::{
-        fd::AsRawFd,
-        unix::{
-            fs::OpenOptionsExt,
-            process::{CommandExt, ExitStatusExt},
-        },
-    },
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    process::Stdio,
     sync::Arc,
     time::Duration,
 };
@@ -28,6 +21,8 @@ use super::{
 use tickloop_agent_base::private_fs::PrivateDirectory;
 
 mod command_tables;
+mod host;
+pub use host::{ShellExit, ShellHost, ShellLaunch, ShellProcess};
 mod interpreter;
 mod model_result;
 mod path_constraints;
@@ -45,10 +40,10 @@ pub const TASK_STOP_TOOL_NAME: &str = "TaskStop";
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 /// Claude Code `getMaxBashTimeoutMs`.
 const MAX_TIMEOUT_MS: u64 = 600_000;
-const TERMINATION_GRACE: Duration = Duration::from_millis(200);
-const PROCESS_CHECK_INTERVAL: Duration = Duration::from_millis(10);
+/// How often a running command's output size is published.
 const OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(40);
-/// 单个任务输出文件上限。Claude Code 为 5GB；Tickloop 按工单 34 的决定保留 64 MiB。
+/// 单个任务输出文件上限。Claude Code 为 5GB；Tickloop 按工单 34 的决定保留 64 MiB，由运行命令的
+/// Tickhost 执行。
 pub(crate) const MAX_COMMAND_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 /// 命令被停止或随 Agent 关闭而终止时记录的原因。
 pub const CANCELLED_COMMAND_REASON: &str = "cancelled";
@@ -73,6 +68,26 @@ pub(super) struct ShellInput {
     pub(super) readable_directories: Vec<PathBuf>,
     #[serde(skip)]
     pub(super) editable_directory: Option<PathBuf>,
+    /// The working directory the command was prepared and approved for; it runs only in that
+    /// same directory, never in one that replaced it at its path.
+    #[serde(skip)]
+    pub(super) approved_directory: Option<DirectoryIdentity>,
+}
+
+/// A directory as its device and inode, which a rename keeps and a replacement does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl DirectoryIdentity {
+    pub(super) fn of(metadata: &std::fs::Metadata) -> Option<Self> {
+        metadata.is_dir().then(|| Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
 }
 
 impl ShellInput {
@@ -379,13 +394,6 @@ impl ProcessSnapshot {
         }
     }
 
-    fn cwd(&self) -> &Path {
-        match self {
-            Self::Agent(snapshot) => &snapshot.cwd,
-            Self::User(snapshot) => &snapshot.cwd,
-        }
-    }
-
     fn output_ref(&self) -> &Path {
         match self {
             Self::Agent(snapshot) => &snapshot.output_ref,
@@ -435,25 +443,34 @@ impl ProcessSnapshot {
         }
     }
 
-    fn finish(&mut self, exit_code: Option<i32>, signal: Option<i32>, output_bytes: u64) {
-        let is_success = exit_code == Some(0) && signal.is_none() && self.reason().is_none();
+    /// Records how the command ended, as its host reported it.
+    fn finish(&mut self, exit: ShellExit) {
+        let ShellExit {
+            exit_code,
+            signal,
+            reason,
+            state,
+        } = exit;
         match self {
             Self::Agent(snapshot) => {
                 snapshot.exit_code = exit_code;
                 snapshot.signal = signal;
-                snapshot.output_bytes = output_bytes;
             }
             Self::User(snapshot) => {
                 snapshot.exit_code = exit_code;
                 snapshot.signal = signal;
-                snapshot.output_bytes = output_bytes;
             }
         }
+        if let Some(reason) = reason {
+            self.set_reason(reason);
+        }
+        self.update_output_bytes();
         self.mark_updated();
-        self.set_state(if is_success {
-            CommandState::Completed
-        } else {
-            CommandState::Failed
+        // A command this Agent stopped never counts as completed, even when it ended first.
+        let is_stopped = self.reason().is_some();
+        self.set_state(match state {
+            CommandState::Completed if is_stopped => CommandState::Failed,
+            state => state,
         });
     }
 
@@ -546,19 +563,26 @@ pub(super) struct Registry {
     user_events: broadcast::Sender<UserCommandSnapshot>,
     /// The bash or zsh that runs every command, or why none is available.
     shell: Arc<Result<PathBuf, String>>,
+    host: Arc<dyn ShellHost>,
 }
 
 impl Registry {
-    pub(super) fn new() -> Self {
-        Self::with_shell(interpreter::selected_shell())
+    pub(super) fn new(host: Arc<dyn ShellHost>) -> Self {
+        Self::with_shell(interpreter::selected_shell(), host)
     }
 
-    fn with_shell(shell: Result<PathBuf, String>) -> Self {
+    /// A Registry that cannot run commands.
+    pub(super) fn without_host() -> Self {
+        Self::new(Arc::new(host::NoShellHost))
+    }
+
+    fn with_shell(shell: Result<PathBuf, String>, host: Arc<dyn ShellHost>) -> Self {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
             events: broadcast::channel(256).0,
             user_events: broadcast::channel(256).0,
             shell: Arc::new(shell),
+            host,
         }
     }
     pub(super) fn subscribe(&self) -> broadcast::Receiver<CommandSnapshot> {
@@ -914,6 +938,12 @@ impl Registry {
             }
         };
         let directory = open_existing(cwd, true)?;
+        let opened = directory.metadata().map_err(|error| io_error(cwd, error))?;
+        if input.approved_directory.is_none()
+            || input.approved_directory != DirectoryIdentity::of(&opened)
+        {
+            return Err(ToolError::PathChanged(cwd.into()));
+        }
         task_output_dir
             .create()
             .map_err(|error| io_error(task_output_dir.path(), error))?;
@@ -929,35 +959,19 @@ impl Registry {
             .custom_flags(libc::O_NOFOLLOW)
             .open(&output_path)
             .map_err(|error| io_error(&output_path, error))?;
-        let mut command = tokio::process::Command::new(shell);
-        command.arg("-c").arg(&input.command);
-        command
-            .stdin(Stdio::null())
-            .stdout(
-                output
-                    .try_clone()
-                    .map_err(|error| io_error(&output_path, error))?,
-            )
-            .stderr(
-                output
-                    .try_clone()
-                    .map_err(|error| io_error(&output_path, error))?,
-            )
-            .kill_on_drop(true);
-        command.as_std_mut().process_group(0);
-        unsafe {
-            command.pre_exec(move || {
-                if libc::fchdir(directory.as_raw_fd()) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = command.spawn().map_err(|error| io_error(cwd, error))?;
-        let pid = child.id().ok_or_else(|| ToolError::Io {
-            path: cwd.into(),
-            reason: "command has no process identifier".into(),
-        })?;
+        let mut process = self
+            .host
+            .start(ShellLaunch {
+                operation_id,
+                shell: shell.clone(),
+                command: input.command.clone(),
+                description: input.description.clone(),
+                cwd: cwd.into(),
+                directory,
+                output,
+            })
+            .await?;
+        let pid = process.pid();
         let initial_state = if input.run_in_background {
             CommandState::Background
         } else {
@@ -1033,15 +1047,24 @@ impl Registry {
             let mut output_poll = tokio::time::interval(OUTPUT_POLL_INTERVAL);
             output_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             output_poll.tick().await;
-            let status = loop {
+            let exit = loop {
                 tokio::select! {
-                    status=child.wait()=>break status.map_err(|error|io_error(snapshot.cwd(),error)),
-                    _=cancel.cancelled()=>{snapshot.set_reason(CANCELLED_COMMAND_REASON.into());break terminate(&mut child,pid,snapshot.cwd()).await;},
-                    _=command_cancel.cancelled()=>{snapshot.set_reason(CANCELLED_COMMAND_REASON.into());break terminate(&mut child,pid,snapshot.cwd()).await;},
-                    _=&mut timeout, if is_foreground=>{
+                    exit = process.exited() => break exit,
+                    _ = cancel.cancelled() => {
+                        snapshot.set_reason(CANCELLED_COMMAND_REASON.into());
+                        process.stop(CANCELLED_COMMAND_REASON).await;
+                        break process.exited().await;
+                    }
+                    _ = command_cancel.cancelled() => {
+                        snapshot.set_reason(CANCELLED_COMMAND_REASON.into());
+                        process.stop(CANCELLED_COMMAND_REASON).await;
+                        break process.exited().await;
+                    }
+                    _ = &mut timeout, if is_foreground => {
                         if !moves_to_background_on_timeout {
                             snapshot.set_reason(TIMED_OUT_REASON.into());
-                            break terminate(&mut child,pid,snapshot.cwd()).await;
+                            process.stop(TIMED_OUT_REASON).await;
+                            break process.exited().await;
                         }
                         is_foreground = false;
                         if let Some(shared_snapshot) = registry.background_on_timeout(operation_id).await {
@@ -1049,7 +1072,7 @@ impl Registry {
                             snapshot.merge_background_history(&shared_snapshot);
                         }
                     },
-                    _=output_poll.tick()=>{
+                    _ = output_poll.tick() => {
                         let shared_snapshot = registry
                             .entries
                             .lock()
@@ -1065,12 +1088,6 @@ impl Registry {
                         }
                         let previous_bytes = snapshot.output_bytes();
                         snapshot.update_output_bytes();
-                        if snapshot.output_bytes() > MAX_COMMAND_OUTPUT_BYTES {
-                            let _ = output.set_len(MAX_COMMAND_OUTPUT_BYTES);
-                            snapshot.update_output_bytes();
-                            snapshot.set_reason(OUTPUT_LIMIT_REASON.into());
-                            break terminate(&mut child,pid,snapshot.cwd()).await;
-                        }
                         if snapshot.output_bytes() != previous_bytes {
                             if let Some(entry) = registry.entries.lock().await.get(&operation_id) {
                                 entry.updates.send_replace(Update { snapshot: snapshot.clone(), result: None });
@@ -1080,39 +1097,9 @@ impl Registry {
                     }
                 }
             };
-            match status {
-                Ok(status) => {
-                    let output_bytes = output
-                        .metadata()
-                        .map(|metadata| metadata.len())
-                        .unwrap_or(0);
-                    snapshot.finish(status.code(), status.signal(), output_bytes);
-                }
-                Err(error) => {
-                    snapshot.set_state(CommandState::Unknown);
-                    snapshot.set_reason(error.to_string());
-                }
-            }
-            if process_group_exists(pid) {
-                snapshot.set_state(CommandState::Unknown);
-                snapshot.set_reason("shell exited while its process group still contains descendants; their result is unresolved".into());
-                terminate_process_group(pid).await;
-            }
-            if output
-                .metadata()
-                .is_ok_and(|metadata| metadata.len() > MAX_COMMAND_OUTPUT_BYTES)
-            {
-                let _ = output.set_len(MAX_COMMAND_OUTPUT_BYTES);
-                if snapshot.reason().is_none() {
-                    snapshot.set_reason(OUTPUT_LIMIT_REASON.into());
-                    snapshot.set_state(CommandState::Failed);
-                }
-            }
-            if let Err(error) = output.sync_all() {
-                snapshot.set_state(CommandState::Unknown);
-                snapshot.set_reason(format!("cannot save command output: {error}"));
-            }
-            snapshot.update_output_bytes();
+            // The host forgets the command once its exit is recorded here.
+            drop(process);
+            snapshot.finish(exit);
             let result = match &snapshot {
                 ProcessSnapshot::Agent(command) => {
                     model_result::finished(command, foreground_timeout)
@@ -1234,184 +1221,321 @@ fn process_output(
     })
 }
 
-async fn terminate(
-    child: &mut tokio::process::Child,
-    pid: u32,
-    cwd: &Path,
-) -> Result<std::process::ExitStatus, ToolError> {
-    let deadline = tokio::time::Instant::now() + TERMINATION_GRACE;
-    unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
-    let status = tokio::time::timeout_at(deadline, child.wait()).await;
-    while process_group_exists(pid) && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(PROCESS_CHECK_INTERVAL).await;
-    }
-    if process_group_exists(pid) {
-        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-    }
-    let status = match status {
-        Ok(result) => result,
-        Err(_) => tokio::time::timeout(Duration::from_secs(1), child.wait())
-            .await
-            .map_err(|_| {
-                io_error(
-                    cwd,
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "cannot confirm command termination",
-                    ),
-                )
-            })?,
-    };
-    let deadline = tokio::time::Instant::now() + TERMINATION_GRACE;
-    while process_group_exists(pid) && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(PROCESS_CHECK_INTERVAL).await;
-    }
-    status.map_err(|error| io_error(cwd, error))
-}
-
-async fn terminate_process_group(pid: u32) {
-    unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
-    let deadline = tokio::time::Instant::now() + TERMINATION_GRACE;
-    while process_group_exists(pid) && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(PROCESS_CHECK_INTERVAL).await;
-    }
-    if process_group_exists(pid) {
-        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-    }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    while process_group_exists(pid) && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(PROCESS_CHECK_INTERVAL).await;
-    }
-}
-
-fn process_group_exists(pid: u32) -> bool {
-    (unsafe { libc::kill(-(pid as i32), 0) == 0 })
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{io::Write, time::Duration};
 
-    use serde_json::Value;
     use tokio::sync::broadcast;
 
     use super::*;
 
-    fn shell_input(command: &str) -> ShellInput {
-        ShellInput {
-            command: command.into(),
-            timeout: None,
-            description: None,
-            run_in_background: false,
-            cwd: None,
-            readable_directories: Vec::new(),
-            editable_directory: None,
+    /// A host whose commands end when a test says so, or when they are stopped.
+    #[derive(Clone, Default)]
+    struct ScriptedHost {
+        launches: Arc<std::sync::Mutex<Vec<Launched>>>,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    struct Launched {
+        operation_id: Uuid,
+        shell: PathBuf,
+        command: String,
+        directory: Option<DirectoryIdentity>,
+        output: std::fs::File,
+        exit: watch::Sender<Option<ShellExit>>,
+        stops: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    struct ScriptedProcess {
+        exit: watch::Receiver<Option<ShellExit>>,
+        ends: watch::Sender<Option<ShellExit>>,
+        stops: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    /// How a shell reports a command SIGTERM ended.
+    const TERMINATED_EXIT_CODE: i32 = 143;
+
+    #[async_trait::async_trait]
+    impl ShellHost for ScriptedHost {
+        async fn start(&self, launch: ShellLaunch) -> Result<Box<dyn ShellProcess>, ToolError> {
+            let exit = watch::channel(None).0;
+            let stops = Arc::default();
+            let process = ScriptedProcess {
+                exit: exit.subscribe(),
+                ends: exit.clone(),
+                stops: Arc::clone(&stops),
+            };
+            self.launches.lock().unwrap().push(Launched {
+                operation_id: launch.operation_id,
+                shell: launch.shell,
+                command: launch.command,
+                directory: DirectoryIdentity::of(&launch.directory.metadata().unwrap()),
+                output: launch.output,
+                exit,
+                stops,
+            });
+            self.started.notify_waiters();
+            Ok(Box::new(process))
         }
     }
 
-    async fn run_agent_command(registry: &Registry, input: ShellInput) -> ToolResult {
-        let directory = tempfile::tempdir().unwrap();
-        let working_directory = directory.path().canonicalize().unwrap();
-        registry
-            .execute(
-                &working_directory,
-                input,
-                &PrivateDirectory::trusted(working_directory.join("output")),
-                Uuid::new_v4(),
-                Uuid::new_v4(),
-                CancellationToken::new(),
+    #[async_trait::async_trait]
+    impl ShellProcess for ScriptedProcess {
+        fn pid(&self) -> u32 {
+            4242
+        }
+
+        async fn exited(&mut self) -> ShellExit {
+            self.exit
+                .wait_for(Option::is_some)
+                .await
+                .unwrap()
+                .clone()
+                .unwrap()
+        }
+
+        async fn stop(&mut self, reason: &str) {
+            self.stops.lock().unwrap().push(reason.into());
+            self.ends.send_if_modified(|exit| {
+                let is_running = exit.is_none();
+                if is_running {
+                    *exit = Some(ShellExit {
+                        exit_code: Some(TERMINATED_EXIT_CODE),
+                        signal: None,
+                        reason: Some(reason.into()),
+                        state: CommandState::Failed,
+                    });
+                }
+                is_running
+            });
+        }
+    }
+
+    impl ScriptedHost {
+        fn registry(&self) -> Registry {
+            Registry::with_shell(Ok("/bin/zsh".into()), Arc::new(self.clone()))
+        }
+
+        async fn launched(&self, operation_id: Uuid) {
+            loop {
+                let started = self.started.notified();
+                if self
+                    .launches
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|launch| launch.operation_id == operation_id)
+                {
+                    return;
+                }
+                started.await;
+            }
+        }
+
+        fn with_launch<T>(&self, operation_id: Uuid, read: impl FnOnce(&Launched) -> T) -> T {
+            let launches = self.launches.lock().unwrap();
+            read(
+                launches
+                    .iter()
+                    .find(|launch| launch.operation_id == operation_id)
+                    .expect("the command was launched"),
             )
-            .await
-            .unwrap()
+        }
+
+        /// Ends a command after it wrote `output`.
+        fn finish(&self, operation_id: Uuid, output: &str, exit: ShellExit) {
+            self.with_launch(operation_id, |launch| {
+                (&launch.output).write_all(output.as_bytes()).unwrap();
+                launch.exit.send_replace(Some(exit));
+            });
+        }
+
+        fn stops(&self, operation_id: Uuid) -> Vec<String> {
+            self.with_launch(operation_id, |launch| launch.stops.lock().unwrap().clone())
+        }
+    }
+
+    fn is_terminal(state: &CommandState) -> bool {
+        matches!(
+            state,
+            CommandState::Completed | CommandState::Failed | CommandState::Unknown
+        )
+    }
+
+    fn exited_with(exit_code: i32) -> ShellExit {
+        ShellExit {
+            exit_code: Some(exit_code),
+            signal: None,
+            reason: None,
+            state: if exit_code == 0 {
+                CommandState::Completed
+            } else {
+                CommandState::Failed
+            },
+        }
+    }
+
+    struct Workdir {
+        _directory: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl Workdir {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().canonicalize().unwrap();
+            Self {
+                _directory: directory,
+                path,
+            }
+        }
+
+        fn output(&self) -> PrivateDirectory {
+            PrivateDirectory::trusted(self.path.join("output"))
+        }
+
+        /// A command approved for this directory.
+        fn input(&self, command: &str) -> ShellInput {
+            ShellInput {
+                command: command.into(),
+                timeout: None,
+                description: None,
+                run_in_background: false,
+                cwd: None,
+                readable_directories: Vec::new(),
+                editable_directory: None,
+                approved_directory: DirectoryIdentity::of(&std::fs::metadata(&self.path).unwrap()),
+            }
+        }
+    }
+
+    fn agent_command(
+        registry: &Registry,
+        workdir: &Workdir,
+        input: ShellInput,
+        operation_id: Uuid,
+    ) -> tokio::task::JoinHandle<Result<ToolResult, ToolError>> {
+        let registry = registry.clone();
+        let cwd = workdir.path.clone();
+        let output = workdir.output();
+        tokio::spawn(async move {
+            registry
+                .execute(
+                    &cwd,
+                    input,
+                    &output,
+                    operation_id,
+                    Uuid::new_v4(),
+                    CancellationToken::new(),
+                )
+                .await
+        })
     }
 
     #[tokio::test]
-    async fn commands_run_with_the_selected_shell() {
-        for (shell, version_variable) in
-            [("/bin/bash", "BASH_VERSION"), ("/bin/zsh", "ZSH_VERSION")]
-        {
-            if !Path::new(shell).exists() {
-                continue;
-            }
-            let registry = Registry::with_shell(Ok(shell.into()));
-            let result = run_agent_command(
-                &registry,
-                shell_input(&format!(
-                    "printf '%s' \"${{{version_variable}:+{version_variable}}}\""
-                )),
-            )
-            .await;
-            assert_eq!(result.content, version_variable, "{shell}");
-        }
+    async fn a_command_starts_in_its_approved_directory_with_the_selected_shell() {
+        let host = ScriptedHost::default();
+        let registry = host.registry();
+        let workdir = Workdir::new();
+        let operation_id = Uuid::new_v4();
+        let execution = agent_command(&registry, &workdir, workdir.input("pwd"), operation_id);
+        host.launched(operation_id).await;
+        host.with_launch(operation_id, |launch| {
+            assert_eq!(launch.shell, Path::new("/bin/zsh"));
+            assert_eq!(launch.command, "pwd");
+            assert_eq!(
+                launch.directory,
+                DirectoryIdentity::of(&std::fs::metadata(&workdir.path).unwrap())
+            );
+        });
+        host.finish(operation_id, "done", exited_with(0));
+        let result = execution.await.unwrap().unwrap();
+        assert_eq!(result.content, "done");
+        assert_eq!(
+            result.output_ref.unwrap(),
+            workdir
+                .path
+                .join("output")
+                .join(format!("{operation_id}.output"))
+        );
     }
 
     #[tokio::test]
     async fn a_missing_shell_explains_that_bash_or_zsh_is_required() {
-        let directory = tempfile::tempdir().unwrap();
-        let working_directory = directory.path().canonicalize().unwrap();
-        let output_directory = working_directory.join("output");
-        let registry = Registry::with_shell(Err(interpreter::NO_SUITABLE_SHELL.into()));
+        let host = ScriptedHost::default();
+        let workdir = Workdir::new();
+        let registry = Registry::with_shell(
+            Err(interpreter::NO_SUITABLE_SHELL.into()),
+            Arc::new(host.clone()),
+        );
+        let error = agent_command(&registry, &workdir, workdir.input("pwd"), Uuid::new_v4())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.to_string(), interpreter::NO_SUITABLE_SHELL);
+        assert!(!workdir.path.join("output").exists());
+        assert!(host.launches.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_directory_replaced_after_approval_is_refused_before_anything_starts() {
+        let host = ScriptedHost::default();
+        let registry = host.registry();
+        let workdir = Workdir::new();
+        let approved = workdir.path.join("approved");
+        std::fs::create_dir(&approved).unwrap();
+        let mut input = workdir.input("touch probe");
+        input.approved_directory = DirectoryIdentity::of(&std::fs::metadata(&approved).unwrap());
+        std::fs::rename(&approved, workdir.path.join("moved")).unwrap();
+        std::fs::create_dir(&approved).unwrap();
         let error = registry
             .execute(
-                &working_directory,
-                shell_input("pwd"),
-                &PrivateDirectory::trusted(output_directory.clone()),
+                &approved,
+                input,
+                &workdir.output(),
                 Uuid::new_v4(),
                 Uuid::new_v4(),
                 CancellationToken::new(),
             )
             .await
             .unwrap_err();
-        assert_eq!(error.to_string(), interpreter::NO_SUITABLE_SHELL);
-        assert!(!output_directory.exists());
+        assert!(matches!(error, ToolError::PathChanged(_)), "{error:?}");
+        assert!(host.launches.lock().unwrap().is_empty());
+        assert!(!workdir.path.join("output").exists());
     }
 
     #[tokio::test]
-    async fn the_timeout_ends_a_foreground_sleep_but_not_a_background_command() {
-        let registry = Registry::new();
-        let mut foreground = shell_input("sleep 5; printf never");
+    async fn the_timeout_stops_a_foreground_sleep_but_not_a_background_command() {
+        let host = ScriptedHost::default();
+        let registry = host.registry();
+        let workdir = Workdir::new();
+        let sleeping = Uuid::new_v4();
+        let mut foreground = workdir.input("sleep 5; printf never");
         foreground.timeout = Some(100);
-        let result = run_agent_command(&registry, foreground).await;
+        let result = agent_command(&registry, &workdir, foreground, sleeping)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result.content, "Exit code 143\nCommand timed out after 0s");
         assert!(result.is_error);
+        assert_eq!(host.stops(sleeping), [TIMED_OUT_REASON]);
 
-        let mut background = shell_input("sleep 0.3; printf finished");
+        let operation_id = Uuid::new_v4();
+        let mut background = workdir.input("sleep 0.3; printf finished");
         background.timeout = Some(100);
         background.run_in_background = true;
-        let directory = tempfile::tempdir().unwrap();
-        let working_directory = directory.path().canonicalize().unwrap();
-        let operation_id = Uuid::new_v4();
-        let mut updates = registry.subscribe();
-        let started = registry
-            .execute(
-                &working_directory,
-                background,
-                &PrivateDirectory::trusted(working_directory.join("output")),
-                operation_id,
-                Uuid::new_v4(),
-                CancellationToken::new(),
-            )
+        let started = agent_command(&registry, &workdir, background, operation_id)
             .await
+            .unwrap()
             .unwrap();
         assert!(started.content.starts_with(&format!(
             "Command running in background with ID: {operation_id}. Output is being written to: "
         )));
-        let finished = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let snapshot = updates.recv().await.unwrap();
-                if snapshot.operation_id == operation_id
-                    && matches!(
-                        snapshot.state,
-                        CommandState::Completed | CommandState::Failed
-                    )
-                {
-                    break snapshot;
-                }
-            }
-        })
-        .await
-        .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(host.stops(operation_id).is_empty());
+        let mut updates = registry.subscribe();
+        host.finish(operation_id, "finished", exited_with(0));
+        let finished = wait_for_terminal_agent_snapshot(&mut updates, operation_id).await;
         assert_eq!(finished.state, CommandState::Completed);
         assert_eq!(
             registry
@@ -1430,12 +1554,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let snapshot = updates.recv().await.unwrap();
-                if snapshot.operation_id == operation_id
-                    && matches!(
-                        snapshot.state,
-                        CommandState::Completed | CommandState::Failed | CommandState::Unknown
-                    )
-                {
+                if snapshot.operation_id == operation_id && is_terminal(&snapshot.state) {
                     break snapshot;
                 }
             }
@@ -1446,28 +1565,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_foreground_command_that_outlives_its_timeout_keeps_running_in_the_background() {
-        let directory = tempfile::tempdir().unwrap();
-        let working_directory = directory.path().canonicalize().unwrap();
-        let output_directory = working_directory.join("output");
-        let registry = Registry::new();
+        let host = ScriptedHost::default();
+        let registry = host.registry();
+        let workdir = Workdir::new();
         let mut updates = registry.subscribe();
         let operation_id = Uuid::new_v4();
-        let mut input = shell_input(
-            "printf started; while [ ! -e release ]; do sleep 0.02; done; printf ' finished'",
-        );
+        let mut input = workdir.input("while [ ! -e release ]; do sleep 0.02; done");
         input.timeout = Some(100);
-        let result = registry
-            .execute(
-                &working_directory,
-                input,
-                &PrivateDirectory::trusted(output_directory.clone()),
-                operation_id,
-                Uuid::new_v4(),
-                CancellationToken::new(),
-            )
+        let result = agent_command(&registry, &workdir, input, operation_id)
             .await
+            .unwrap()
             .unwrap();
-        let output_ref = output_directory.join(format!("{operation_id}.output"));
+        let output_ref = workdir
+            .path
+            .join("output")
+            .join(format!("{operation_id}.output"));
         assert_eq!(
             result.content,
             format!(
@@ -1484,11 +1596,13 @@ mod tests {
             .unwrap();
         assert_eq!(moved.state, CommandState::Background);
         assert!(moved.was_background && moved.backgrounded_on_timeout);
+        assert!(host.stops(operation_id).is_empty());
 
-        std::fs::write(working_directory.join("release"), "").unwrap();
+        host.finish(operation_id, "started finished", exited_with(0));
         let finished = wait_for_terminal_agent_snapshot(&mut updates, operation_id).await;
         assert_eq!(finished.state, CommandState::Completed);
         assert!(finished.was_background && finished.backgrounded_on_timeout);
+        assert_eq!(finished.output_bytes, "started finished".len() as u64);
         assert_eq!(
             registry
                 .finished_result(operation_id)
@@ -1499,30 +1613,37 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_user_command_that_outlives_its_timeout_moves_to_the_background_too() {
-        let directory = tempfile::tempdir().unwrap();
-        let working_directory = directory.path().canonicalize().unwrap();
-        let registry = Registry::new();
-        let mut updates = registry.subscribe_user();
-        let operation_id = Uuid::new_v4();
-        let chat_id = Uuid::new_v4();
-        let mut input = shell_input("while :; do sleep 0.02; done");
-        input.timeout = Some(100);
+    async fn user_command(
+        registry: &Registry,
+        workdir: &Workdir,
+        input: ShellInput,
+        operation_id: Uuid,
+        chat_id: Uuid,
+    ) {
         registry
-            .execute_process(
-                &working_directory,
+            .execute_user(
+                &workdir.path,
                 input,
-                &PrivateDirectory::trusted(working_directory.join("output")),
-                CommandOwner::User {
-                    operation_id,
-                    chat_id,
-                },
+                &workdir.output(),
+                operation_id,
+                chat_id,
                 CancellationToken::new(),
-                false,
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_user_command_that_outlives_its_timeout_moves_to_the_background_too() {
+        let host = ScriptedHost::default();
+        let registry = host.registry();
+        let workdir = Workdir::new();
+        let mut updates = registry.subscribe_user();
+        let operation_id = Uuid::new_v4();
+        let chat_id = Uuid::new_v4();
+        let mut input = workdir.input("while :; do sleep 0.02; done");
+        input.timeout = Some(100);
+        user_command(&registry, &workdir, input, operation_id, chat_id).await;
         let moved = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let snapshot = updates.recv().await.unwrap();
@@ -1538,7 +1659,96 @@ mod tests {
         assert!(moved.was_background && moved.backgrounded_on_timeout);
         let stopped = registry.stop_user(operation_id, chat_id).await.unwrap();
         assert_eq!(stopped.reason.as_deref(), Some(CANCELLED_COMMAND_REASON));
+        assert_eq!(stopped.state, CommandState::Failed);
         assert!(stopped.backgrounded_on_timeout);
+        assert_eq!(host.stops(operation_id), [CANCELLED_COMMAND_REASON]);
+    }
+
+    #[tokio::test]
+    async fn the_hosts_report_decides_how_a_command_ended() {
+        let host = ScriptedHost::default();
+        let registry = host.registry();
+        let workdir = Workdir::new();
+        let chat_id = Uuid::new_v4();
+        let mut updates = registry.subscribe_user();
+        for (exit, expected_state) in [
+            (
+                ShellExit {
+                    exit_code: Some(0),
+                    signal: None,
+                    reason: Some(
+                        "shell exited while its process group still contains descendants".into(),
+                    ),
+                    state: CommandState::Unknown,
+                },
+                CommandState::Unknown,
+            ),
+            (
+                ShellExit {
+                    exit_code: None,
+                    signal: Some(15),
+                    reason: Some(OUTPUT_LIMIT_REASON.into()),
+                    state: CommandState::Failed,
+                },
+                CommandState::Failed,
+            ),
+        ] {
+            let operation_id = Uuid::new_v4();
+            user_command(
+                &registry,
+                &workdir,
+                workdir.input("true"),
+                operation_id,
+                chat_id,
+            )
+            .await;
+            host.launched(operation_id).await;
+            host.finish(operation_id, "partial", exit.clone());
+            let finished = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let snapshot = updates.recv().await.unwrap();
+                    if snapshot.operation_id == operation_id && is_terminal(&snapshot.state) {
+                        break snapshot;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(finished.state, expected_state);
+            assert_eq!(finished.reason, exit.reason);
+            assert_eq!(finished.output_bytes, "partial".len() as u64);
+            let read = registry
+                .read_user(operation_id, chat_id, 0, DEFAULT_OUTPUT_BYTES)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_str(&read.content).unwrap();
+            assert_eq!(value["reason"], json!(exit.reason));
+            assert!(read.is_error);
+        }
+    }
+
+    #[test]
+    fn a_stopped_command_that_finished_first_still_counts_as_stopped() {
+        let workdir = Workdir::new();
+        let mut snapshot = ProcessSnapshot::User(UserCommandSnapshot {
+            operation_id: Uuid::new_v4(),
+            chat_id: Uuid::new_v4(),
+            command: "true".into(),
+            cwd: workdir.path.clone(),
+            pid: Some(1),
+            state: CommandState::Cancelling,
+            was_background: false,
+            backgrounded_on_timeout: false,
+            exit_code: None,
+            signal: None,
+            reason: Some(CANCELLED_COMMAND_REASON.into()),
+            output_ref: workdir.path.join("missing.output"),
+            output_bytes: 0,
+            updated_at_ms: None,
+        });
+        snapshot.finish(exited_with(0));
+        assert_eq!(snapshot.state(), &CommandState::Failed);
+        assert_eq!(snapshot.reason(), Some(CANCELLED_COMMAND_REASON));
     }
 
     #[test]
@@ -1558,8 +1768,9 @@ mod tests {
 
     #[test]
     fn timeouts_follow_claude_code_defaults_and_cap_at_ten_minutes() {
+        let workdir = Workdir::new();
         let timeout = |requested| {
-            let mut input = shell_input("true");
+            let mut input = workdir.input("true");
             input.timeout = requested;
             input.foreground_timeout()
         };
@@ -1574,15 +1785,18 @@ mod tests {
 
     #[test]
     fn shell_admission_follows_claude_code_read_only_and_accept_edits_rules() {
-        let directory = tempfile::tempdir().unwrap();
-        let cwd = directory.path().canonicalize().unwrap();
+        let workdir = Workdir::new();
+        let cwd = workdir.path.clone();
         let workspace = super::super::Workspace {
-            workdir: directory.path().to_path_buf(),
+            workdir: cwd.clone(),
             additional_directories: Vec::new(),
         };
-        let read_only = |command: &str| shell_input(command).is_read_only(&cwd, &workspace);
-        let accept_edits =
-            |command: &str| shell_input(command).is_allowed_in_accept_edits(&cwd, &workspace);
+        let read_only = |command: &str| workdir.input(command).is_read_only(&cwd, &workspace);
+        let accept_edits = |command: &str| {
+            workdir
+                .input(command)
+                .is_allowed_in_accept_edits(&cwd, &workspace)
+        };
 
         assert!(read_only("git diff --cached --stat | head -30"));
         assert!(read_only("ls -la && git status"));
@@ -1600,42 +1814,20 @@ mod tests {
 
     #[test]
     fn readable_internal_directories_admit_read_only_commands_only() {
-        let directory = tempfile::tempdir().unwrap();
-        let cwd = directory.path().canonicalize().unwrap();
+        let workdir = Workdir::new();
+        let cwd = workdir.path.clone();
         let internal = tempfile::tempdir().unwrap();
         let internal = internal.path().canonicalize().unwrap();
         let workspace = super::super::Workspace {
             workdir: cwd.clone(),
             additional_directories: Vec::new(),
         };
-        let mut input = shell_input(&format!("cat {}/task.output", internal.display()));
+        let mut input = workdir.input(&format!("cat {}/task.output", internal.display()));
         assert!(!input.is_read_only(&cwd, &workspace));
         input.readable_directories = vec![internal.clone()];
         assert!(input.is_read_only(&cwd, &workspace));
         input.command = format!("touch {}/task.output", internal.display());
         assert!(!input.is_allowed_in_accept_edits(&cwd, &workspace));
-    }
-
-    #[tokio::test]
-    async fn read_only_commands_run_through_the_shell() {
-        let directory = tempfile::tempdir().unwrap();
-        let working_directory = directory.path().canonicalize().unwrap();
-        let registry = Registry::new();
-        let result = registry
-            .execute(
-                &working_directory,
-                shell_input("pwd && echo via-shell"),
-                &PrivateDirectory::trusted(working_directory.join("output")),
-                Uuid::new_v4(),
-                Uuid::new_v4(),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            result.content,
-            format!("{}\nvia-shell", working_directory.display())
-        );
     }
 
     async fn wait_for_terminal_user_snapshot(
@@ -1645,12 +1837,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let snapshot = updates.recv().await.unwrap();
-                if snapshot.operation_id == operation_id
-                    && matches!(
-                        snapshot.state,
-                        CommandState::Completed | CommandState::Failed | CommandState::Unknown
-                    )
-                {
+                if snapshot.operation_id == operation_id && is_terminal(&snapshot.state) {
                     break snapshot;
                 }
             }
@@ -1670,30 +1857,17 @@ mod tests {
 
     #[tokio::test]
     async fn agent_snapshot_keeps_explicit_background_history_through_completion() {
-        let directory = tempfile::tempdir().unwrap();
-        let working_directory = directory.path().canonicalize().unwrap();
-        let output_directory = PrivateDirectory::trusted(working_directory.join("output"));
-        let registry = Registry::new();
+        let host = ScriptedHost::default();
+        let registry = host.registry();
+        let workdir = Workdir::new();
         let mut updates = registry.subscribe();
         let operation_id = Uuid::new_v4();
-        let loop_id = Uuid::new_v4();
-        let execution = {
-            let registry = registry.clone();
-            let working_directory = working_directory.clone();
-            tokio::spawn(async move {
-                registry
-                    .execute(
-                        &working_directory,
-                        shell_input("sleep 0.1"),
-                        &output_directory,
-                        operation_id,
-                        loop_id,
-                        CancellationToken::new(),
-                    )
-                    .await
-                    .unwrap()
-            })
-        };
+        let execution = agent_command(
+            &registry,
+            &workdir,
+            workdir.input("sleep 0.1"),
+            operation_id,
+        );
         loop {
             let snapshot = updates.recv().await.unwrap();
             if snapshot.operation_id == operation_id && snapshot.state == CommandState::Running {
@@ -1704,44 +1878,28 @@ mod tests {
         let background = registry.background(operation_id).await.unwrap();
         assert_eq!(background.state, CommandState::Background);
         assert!(background.was_background);
-        execution.await.unwrap();
-        let terminal = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let snapshot = updates.recv().await.unwrap();
-                if snapshot.operation_id == operation_id
-                    && matches!(
-                        snapshot.state,
-                        CommandState::Completed | CommandState::Failed
-                    )
-                {
-                    break snapshot;
-                }
-            }
-        })
-        .await
-        .unwrap();
+        execution.await.unwrap().unwrap();
+        host.finish(operation_id, "", exited_with(0));
+        let terminal = wait_for_terminal_agent_snapshot(&mut updates, operation_id).await;
         assert!(terminal.was_background);
     }
 
     #[tokio::test]
     async fn user_snapshot_keeps_explicit_background_history_through_completion() {
-        let directory = tempfile::tempdir().unwrap();
-        let working_directory = directory.path().canonicalize().unwrap();
-        let registry = Registry::new();
+        let host = ScriptedHost::default();
+        let registry = host.registry();
+        let workdir = Workdir::new();
         let mut updates = registry.subscribe_user();
         let operation_id = Uuid::new_v4();
         let chat_id = Uuid::new_v4();
-        registry
-            .execute_user(
-                &working_directory,
-                shell_input("sleep 0.1"),
-                &PrivateDirectory::trusted(working_directory.join("output")),
-                operation_id,
-                chat_id,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
+        user_command(
+            &registry,
+            &workdir,
+            workdir.input("sleep 0.1"),
+            operation_id,
+            chat_id,
+        )
+        .await;
         loop {
             let snapshot = updates.recv().await.unwrap();
             if snapshot.operation_id == operation_id && snapshot.state == CommandState::Running {
@@ -1755,104 +1913,26 @@ mod tests {
             .unwrap();
         assert_eq!(background.state, CommandState::Background);
         assert!(background.was_background);
+        host.finish(operation_id, "", exited_with(0));
         let terminal = wait_for_terminal_user_snapshot(&mut updates, operation_id).await;
         assert!(terminal.was_background);
     }
 
     #[tokio::test]
-    async fn user_shell_cleans_up_descendants_before_publishing_its_final_state() {
-        let directory = tempfile::tempdir().unwrap();
-        let working_directory = directory.path().canonicalize().unwrap();
-        let output_directory = PrivateDirectory::trusted(working_directory.join("output"));
-        let registry = Registry::new();
-        let mut updates = registry.subscribe_user();
-        let operation_id = Uuid::new_v4();
-        let chat_id = Uuid::new_v4();
-
-        registry
-            .execute_user(
-                &working_directory,
-                shell_input("/bin/sh -c 'trap \"\" TERM; echo $$ > descendant.pid; sleep 0.8; echo late > late-write' &"),
-                &output_directory,
-                operation_id,
-                chat_id,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        let finished = wait_for_terminal_user_snapshot(&mut updates, operation_id).await;
-        assert_eq!(finished.state, CommandState::Unknown);
-        assert!(finished.reason.as_deref().unwrap().contains("descendants"));
-        assert!(
-            !process_group_exists(finished.pid.unwrap()),
-            "the final state was published before the process group was gone"
-        );
-        tokio::time::sleep(Duration::from_millis(900)).await;
-        assert!(
-            !working_directory.join("late-write").exists(),
-            "a descendant produced a side effect after the final state"
-        );
-    }
-
-    #[tokio::test]
-    async fn user_shell_output_is_capped_at_sixty_four_mib() {
-        let directory = tempfile::tempdir().unwrap();
-        let working_directory = directory.path().canonicalize().unwrap();
-        let output_directory = PrivateDirectory::trusted(working_directory.join("output"));
-        let registry = Registry::new();
-        let mut updates = registry.subscribe_user();
-        let operation_id = Uuid::new_v4();
-
-        registry
-            .execute_user(
-                &working_directory,
-                shell_input("dd if=/dev/zero bs=1048576 count=65 2>/dev/null"),
-                &output_directory,
-                operation_id,
-                Uuid::new_v4(),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        let finished = wait_for_terminal_user_snapshot(&mut updates, operation_id).await;
-        assert_eq!(finished.state, CommandState::Failed);
-        assert_eq!(finished.reason.as_deref(), Some("output_limit_exceeded"));
-        assert_eq!(finished.output_bytes, MAX_COMMAND_OUTPUT_BYTES);
-        assert_eq!(
-            std::fs::metadata(&finished.output_ref).unwrap().len(),
-            MAX_COMMAND_OUTPUT_BYTES
-        );
-        let result = registry
-            .read_user(operation_id, finished.chat_id, 0, DEFAULT_OUTPUT_BYTES)
-            .await
-            .unwrap();
-        let value: Value = serde_json::from_str(&result.content).unwrap();
-        assert_eq!(value["total_bytes"], MAX_COMMAND_OUTPUT_BYTES);
-        assert_eq!(value["reason"], "output_limit_exceeded");
-        assert!(result.is_error);
-    }
-
-    #[tokio::test]
     async fn wrong_owner_endpoints_do_not_change_a_user_shell_state() {
-        let directory = tempfile::tempdir().unwrap();
-        let working_directory = directory.path().canonicalize().unwrap();
-        let registry = Registry::new();
+        let host = ScriptedHost::default();
+        let registry = host.registry();
+        let workdir = Workdir::new();
         let operation_id = Uuid::new_v4();
         let chat_id = Uuid::new_v4();
-
-        registry
-            .execute_user(
-                &working_directory,
-                shell_input("sleep 30"),
-                &PrivateDirectory::trusted(working_directory.join("output")),
-                operation_id,
-                chat_id,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
+        user_command(
+            &registry,
+            &workdir,
+            workdir.input("sleep 30"),
+            operation_id,
+            chat_id,
+        )
+        .await;
 
         assert!(registry.background(operation_id).await.is_err());
         assert_eq!(
@@ -1884,6 +1964,7 @@ mod tests {
             user_snapshot(&registry, operation_id).await.state,
             CommandState::Running
         );
+        assert!(host.stops(operation_id).is_empty());
 
         let stopped = registry.stop_user(operation_id, chat_id).await.unwrap();
         assert_eq!(stopped.reason.as_deref(), Some("cancelled"));

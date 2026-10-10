@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     Agent,
-    tick_stream::{HostedTickStream, NativeTickStream},
+    tick_stream::{HostedTickStream, NativeTickStream, ShellTickStream},
 };
 
 pub struct HerdrAdapter {
@@ -47,6 +47,7 @@ impl TickAdapter for HostedAdapter {
     }
 }
 
+/// Shell tasks, which run in the Tickhost; every Agent follows its own.
 pub struct ShellAdapter {
     stream: Arc<dyn TickStreamPort>,
 }
@@ -59,7 +60,7 @@ impl ShellAdapter {
 }
 impl TickAdapter for ShellAdapter {
     fn tick_type(&self) -> &'static str {
-        "shell"
+        tick_protocol::SHELL_INSTANCE_TYPE
     }
     fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
         Some(self.stream.clone())

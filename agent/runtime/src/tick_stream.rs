@@ -1,7 +1,9 @@
 //! Observation stream between a Tickhost and the Agent's Loop scheduler.
 
 mod hosted;
+mod shell;
 pub use hosted::HostedTickStream;
+pub use shell::ShellTickStream;
 
 use std::{
     collections::{BTreeMap, BTreeSet},

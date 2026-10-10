@@ -23,8 +23,8 @@ pub(crate) use entry::{
 };
 pub(crate) use listing::list_project;
 pub(crate) use path::{
-    locate, private_family_temp_directory, private_project_temp_directory, project_directory,
-    transcript_path,
+    TICKHOST_RUNTIME_SUBDIRECTORY, locate, private_family_temp_directory,
+    private_project_temp_directory, private_tickhost_directory, project_directory, transcript_path,
 };
 pub(crate) use reader::{
     LoadedTranscript, load, load_compaction_ancestors, load_original_user_inputs,

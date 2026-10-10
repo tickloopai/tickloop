@@ -1,6 +1,7 @@
 //! The Agent daemon's single controller of the Tickhost. The daemon starts the host on its first
-//! open, keeps the controller key in its private runtime directory so a restarted daemon fences
-//! the previous one, and never replaces a host it cannot verify.
+//! open or Shell spawn, keeps the controller key in its private runtime directory so a restarted
+//! daemon fences the previous one, and never replaces a host it cannot verify. An Agent that runs
+//! without a daemon controls a host of its own, served inside its process.
 
 use std::{
     io::Write,
@@ -17,6 +18,7 @@ use serde_json::{Value, json};
 use tickhost::{
     host::{OpenRequest, OpenedTick, OwnerSnapshotChunk, Receipt, TickAdapter, TickOwner},
     paths::HostPaths,
+    shell::{SpawnBinding, SpawnGrant},
 };
 use tickhost_connect::{
     host_error::HostError,
@@ -45,8 +47,13 @@ const DISCONNECTED: &str = "Disconnected";
 /// ([`SHARD_BYTES`](super::registry::SHARD_BYTES)).
 const SNAPSHOT_CHUNK_OWNERS: usize = 16 * 1024;
 const CONNECT_INTERVAL: Duration = Duration::from_millis(25);
-/// Only an open starts a host; other requests find that no hosted Tick exists.
+/// Only an open or a spawn starts a host; other requests find that no hosted Tick exists.
 const HOST_NOT_RUNNING: &str = "HostNotRunning";
+/// How often a spawn is asked for of a host that is exiting, which refuses it or closes the
+/// connection unanswered; each retry finds it gone and starts a new one. A grant whose answer
+/// was lost is never claimed and expires, so asking again is safe.
+const SPAWN_ATTEMPTS: u32 = 3;
+const SPAWN_RETRY_PAUSE: Duration = Duration::from_millis(100);
 
 /// One Tick's approved Watch intents as the request that hands them to the host, never larger
 /// than one registry record.
@@ -111,11 +118,20 @@ enum Start {
     Never,
 }
 
+/// How a controller starts its host.
+enum HostProgram {
+    /// The `tickhost` installed next to `tickloop`, started as its own session.
+    Executable(PathBuf),
+    /// The host library, served inside this process; it runs Shell tasks only, since a protocol
+    /// Tick's launcher is the Tickhost executable.
+    InProcess,
+}
+
 pub struct HostController {
     paths: HostPaths,
     key_file: PathBuf,
     daemon_epoch: Uuid,
-    executable: PathBuf,
+    program: HostProgram,
     /// How long a host this daemon starts lets an unused Tick idle.
     idle_timeout: Duration,
     /// Connections between requests. Each request holds its own connection, so a slow open of
@@ -123,6 +139,9 @@ pub struct HostController {
     idle: Mutex<Vec<HostConnection>>,
     /// Serializes starts so concurrent first opens start one host.
     starting: Mutex<()>,
+    /// A connection held for as long as its host runs: the host stops every Shell task once the
+    /// daemon's last connection closed, and pooled connections come and go.
+    lifeline: Mutex<Option<HostConnection>>,
 }
 
 impl HostController {
@@ -133,15 +152,47 @@ impl HostController {
         executable: PathBuf,
         idle_timeout: Duration,
     ) -> Self {
+        Self::with_program(
+            agent_runtime,
+            paths,
+            daemon_epoch,
+            HostProgram::Executable(executable),
+            idle_timeout,
+        )
+    }
+
+    /// The controller of a host served inside this process, for an Agent without a daemon.
+    pub fn in_process(agent_runtime: &Path, paths: HostPaths, daemon_epoch: Uuid) -> Self {
+        Self::with_program(
+            agent_runtime,
+            paths,
+            daemon_epoch,
+            HostProgram::InProcess,
+            tickhost::host::DEFAULT_IDLE_TIMEOUT,
+        )
+    }
+
+    fn with_program(
+        agent_runtime: &Path,
+        paths: HostPaths,
+        daemon_epoch: Uuid,
+        program: HostProgram,
+        idle_timeout: Duration,
+    ) -> Self {
         Self {
             paths,
             key_file: agent_runtime.join(KEY_FILE),
             daemon_epoch,
-            executable,
+            program,
             idle_timeout,
             idle: Mutex::new(Vec::new()),
             starting: Mutex::new(()),
+            lifeline: Mutex::new(None),
         }
+    }
+
+    pub fn daemon_epoch(&self) -> Uuid {
+        self.daemon_epoch
     }
 
     pub fn endpoint(&self) -> PathBuf {
@@ -157,9 +208,15 @@ impl HostController {
     /// `tickhost open`, which connects it through the hosted launch contract; a terminal program
     /// starts as it is.
     pub async fn open(&self, mut request: OpenRequest) -> Result<OpenedTick, HostError> {
+        let HostProgram::Executable(executable) = &self.program else {
+            return Err(HostError::before(
+                "Unsupported",
+                "hosted Ticks run in the Tickhost the Agent daemon starts",
+            ));
+        };
         if request.adapter == TickAdapter::Protocol {
             request.command = [
-                self.executable.to_string_lossy().into_owned(),
+                executable.to_string_lossy().into_owned(),
                 LAUNCHER_COMMAND.into(),
                 "--".into(),
             ]
@@ -288,6 +345,51 @@ impl HostController {
             Err(error) if error.code == HOST_NOT_RUNNING => Ok(()),
             result => result.map(|_| ()),
         }
+    }
+
+    /// Grants one spawn of what `binding` names, starting a host when none runs, and holds a
+    /// connection to that host for as long as it runs.
+    pub async fn allow_spawn(&self, binding: &SpawnBinding) -> Result<SpawnGrant, HostError> {
+        let mut attempt = 1;
+        let granted = loop {
+            match self
+                .request(
+                    "allow_spawn",
+                    json!(binding),
+                    CONTROL_TIMEOUT,
+                    Start::OnDemand,
+                )
+                .await
+            {
+                Err(error)
+                    if matches!(error.code.as_str(), "ShuttingDown" | "OutcomeUnknown")
+                        && attempt < SPAWN_ATTEMPTS =>
+                {
+                    attempt += 1;
+                    tokio::time::sleep(SPAWN_RETRY_PAUSE).await;
+                }
+                result => break result?,
+            }
+        };
+        let grant: SpawnGrant = serde_json::from_value(granted)
+            .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))?;
+        let mut lifeline = self.lifeline.lock().await;
+        if lifeline
+            .as_ref()
+            .is_none_or(|connection| connection.epoch() != grant.epoch)
+        {
+            let key = std::fs::read_to_string(&self.key_file)
+                .map_err(|error| HostError::before("HostUnavailable", error.to_string()))?;
+            let connection = self.connect(key.trim()).await?;
+            if connection.epoch() != grant.epoch {
+                return Err(HostError::before(
+                    "EpochChanged",
+                    "another Tickhost started while the spawn was granted",
+                ));
+            }
+            *lifeline = Some(connection);
+        }
+        Ok(grant)
     }
 
     /// Lets one view attach to `owner`'s Tick `instance` on the running host. The grant works
@@ -558,7 +660,10 @@ impl HostController {
 
     /// Refuses to start a Tickhost of another build: its version must be this daemon's.
     fn check_executable(&self) -> Result<(), HostError> {
-        let output = std::process::Command::new(&self.executable)
+        let HostProgram::Executable(executable) = &self.program else {
+            return Ok(());
+        };
+        let output = std::process::Command::new(executable)
             .arg("--version")
             .stdin(Stdio::null())
             .stderr(Stdio::null())
@@ -568,7 +673,7 @@ impl HostController {
                     "HostUnavailable",
                     format!(
                         "cannot run the Tickhost {}: {error}; install tickhost next to tickloop from the same build",
-                        self.executable.display()
+                        executable.display()
                     ),
                 )
             })?;
@@ -579,7 +684,7 @@ impl HostController {
                 "IncompatibleHost",
                 format!(
                     "the Tickhost {} reports {:?}, but this Agent needs {expected}; install tickloop and tickhost from the same build",
-                    self.executable.display(),
+                    executable.display(),
                     reported.trim()
                 ),
             ));
@@ -588,9 +693,22 @@ impl HostController {
     }
 
     /// Starts the host as its own session: it outlives this daemon and is reaped here only
-    /// while the daemon still runs.
+    /// while the daemon still runs. A host served in this process ends with it.
     fn spawn(&self, key: &str) -> std::io::Result<()> {
-        let mut command = std::process::Command::new(&self.executable);
+        let config = tickhost::host::HostConfig {
+            controller_key: key.to_owned(),
+            idle_timeout: self.idle_timeout,
+        };
+        let executable = match &self.program {
+            HostProgram::Executable(executable) => executable,
+            HostProgram::InProcess => {
+                // What would keep the host from serving fails this start at once.
+                self.paths.prepare()?;
+                tokio::spawn(tickhost::host::serve(self.paths.clone(), config));
+                return Ok(());
+            }
+        };
+        let mut command = std::process::Command::new(executable);
         command
             .arg(tickhost::cli::RUN_COMMAND)
             .env(tickhost::paths::RUNTIME_DIR_ENV, &self.paths.runtime)
@@ -606,10 +724,7 @@ impl HostController {
             });
         }
         let mut child = command.spawn()?;
-        let config = serde_json::to_string(&tickhost::host::HostConfig {
-            controller_key: key.to_owned(),
-            idle_timeout: self.idle_timeout,
-        })?;
+        let config = serde_json::to_string(&config)?;
         let mut stdin = child.stdin.take().expect("piped stdin");
         stdin.write_all(format!("{config}\n").as_bytes())?;
         drop(stdin);

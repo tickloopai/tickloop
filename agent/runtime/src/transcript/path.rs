@@ -15,6 +15,9 @@ const TEMP_DIRECTORY_ENV: &str = "TICKLOOP_TMPDIR";
 const DEFAULT_TEMP_DIRECTORY: &str = "/tmp";
 const PRIVATE_TEMP_DIRECTORY_PREFIX: &str = "tickloop-private-";
 const FAMILY_TEMP_SUBDIRECTORY: &str = "sessions";
+const PRIVATE_TICKHOST_PREFIX: &str = "tickhost-";
+/// Where in its directory an Agent's own Tickhost keeps its runtime files.
+pub(crate) const TICKHOST_RUNTIME_SUBDIRECTORY: &str = "host";
 
 /// `<root>/projects/<项目目录名>`。项目目录名照 Claude Code：canonical 路径做 NFC 规范化后
 /// 替换非字母数字字符；工作目录无法解析时按原路径计算。
@@ -36,6 +39,30 @@ pub(crate) fn private_family_temp_directory(root_chat_id: Uuid) -> PrivateDirect
     private_temp_root()
         .join(FAMILY_TEMP_SUBDIRECTORY)
         .join(root_chat_id.to_string())
+}
+
+/// `<临时目录>/tickloop-private-<uid>/tickhost-<随机>`：没有 daemon 的 Agent 自带 Tickhost 的私有
+/// 运行目录，每个 Agent 一个。临时目录太长、放不下其中的 socket 时改用默认的 `/tmp`。
+pub(crate) fn private_tickhost_directory() -> PrivateDirectory {
+    const NAME_CHARACTERS: usize = 8;
+    let name = format!(
+        "{PRIVATE_TICKHOST_PREFIX}{}",
+        &Uuid::new_v4().simple().to_string()[..NAME_CHARACTERS]
+    );
+    let preferred = private_temp_root().join(&name);
+    let socket = preferred
+        .path()
+        .join(TICKHOST_RUNTIME_SUBDIRECTORY)
+        .join(tickhost::paths::SOCKET_NAME);
+    if socket.as_os_str().len() <= tickhost::paths::MAX_SOCKET_PATH_BYTES {
+        return preferred;
+    }
+    let base = PathBuf::from(DEFAULT_TEMP_DIRECTORY);
+    PrivateDirectory::anchored(
+        base.canonicalize().unwrap_or(base),
+        format!("{PRIVATE_TEMP_DIRECTORY_PREFIX}{}", current_uid()),
+    )
+    .join(name)
 }
 
 fn private_temp_root() -> PrivateDirectory {

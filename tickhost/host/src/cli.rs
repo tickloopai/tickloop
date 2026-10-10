@@ -197,7 +197,11 @@ fn verified_host_pid(paths: &HostPaths) -> Result<Option<u32>, String> {
 
 async fn serve() -> Result<(), String> {
     let config = host::read_config(std::io::stdin().lock()).map_err(|error| error.to_string())?;
-    host::serve(HostPaths::from_environment(), config)
-        .await
-        .map_err(|error| format!("Tickhost: {error}"))
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|error| format!("Tickhost: {error}"))?;
+    host::serve_until(HostPaths::from_environment(), config, async move {
+        terminate.recv().await;
+    })
+    .await
+    .map_err(|error| format!("Tickhost: {error}"))
 }
