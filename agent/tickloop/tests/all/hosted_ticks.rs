@@ -361,7 +361,6 @@ mod channel {
                         .install_tick_stream(Arc::new(TickAdapters::builtin(
                             runtime.clone(),
                             None,
-                            None,
                             Some(tools),
                         )))
                         .await;

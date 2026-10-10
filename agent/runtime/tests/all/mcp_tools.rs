@@ -1313,6 +1313,55 @@ async fn linking_puts_the_account_link_and_claims_a_pending_request_into_its_loo
     agent.shutdown().await;
 }
 
+/// Feedback requests are the artifact's Tick Updates and are never merged: each one the
+/// association claims runs in the Loop on its own, in order.
+#[tokio::test]
+async fn feedback_requests_reach_the_loop_one_by_one() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    service.request_feedback("doc", "request-1");
+    service.request_feedback("doc", "request-2");
+    let done = |id| {
+        call(
+            id,
+            "ArtifactComment",
+            json!({"action":"done","artifact_id":"doc","outcome":"done","summary":"Handled."}),
+        )
+    };
+    let model = Arc::new(ScriptedModel::new(vec![
+        done("done-1"),
+        text("Handled the first."),
+        done("done-2"),
+        text("Handled the second."),
+    ]));
+    let (agent, chat, loop_id) = linked_chat(&service, directory.path(), model.clone()).await;
+    eventually(async || service.finished().len() == 2).await;
+    wait_for_loop_state(&agent, chat, loop_id, LoopState::WaitingTrigger).await;
+    assert_eq!(
+        service.finished(),
+        [
+            ("request-1".into(), "done".into()),
+            ("request-2".into(), "done".into())
+        ]
+    );
+    assert_eq!(
+        service
+            .tool_calls()
+            .iter()
+            .map(|call| call["_meta"]["tickloop.ai/event-bridge"]["event_id"].clone())
+            .collect::<Vec<_>>(),
+        ["request-1", "request-2"],
+        "each done answers the request its own run claimed"
+    );
+    let first_run = serde_json::to_string(&model.requests.lock().unwrap()[0].messages).unwrap();
+    assert!(first_run.contains("@tickloop request request-1"));
+    assert!(
+        !first_run.contains("request-2"),
+        "the second request waits for its own run"
+    );
+    agent.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_run_that_ends_without_done_fails_its_request() {
     let service = ArtifactService::start().await;

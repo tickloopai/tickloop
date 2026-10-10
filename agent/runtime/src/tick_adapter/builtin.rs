@@ -1,9 +1,8 @@
 use super::*;
 use crate::{
     Agent,
-    tick_stream::{ArtifactTickStream, HostedTickStream, NativeTickStream},
+    tick_stream::{HostedTickStream, NativeTickStream},
 };
-use std::path::PathBuf;
 
 pub struct HerdrAdapter {
     stream: Option<Arc<dyn TickStreamPort>>,
@@ -42,25 +41,6 @@ impl HostedAdapter {
 impl TickAdapter for HostedAdapter {
     fn tick_type(&self) -> &'static str {
         tick_protocol::HOSTED_INSTANCE_TYPE
-    }
-    fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
-        self.stream.clone()
-    }
-}
-
-pub struct ArtifactAdapter {
-    stream: Option<Arc<dyn TickStreamPort>>,
-}
-impl ArtifactAdapter {
-    pub fn new(root: Option<PathBuf>) -> Self {
-        let stream =
-            root.map(|root| Arc::new(ArtifactTickStream::new(root)) as Arc<dyn TickStreamPort>);
-        Self { stream }
-    }
-}
-impl TickAdapter for ArtifactAdapter {
-    fn tick_type(&self) -> &'static str {
-        "artifact"
     }
     fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
         self.stream.clone()

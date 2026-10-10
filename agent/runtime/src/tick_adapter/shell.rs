@@ -8,6 +8,8 @@ use tickloop_agent_protocol::{HostToolAuthority, ObservationKind, ShellTask};
 
 const OUTPUT_SUMMARY_BYTES: usize = 4096;
 const SHELL_OBSERVATION_INTERVAL: Duration = Duration::from_millis(250);
+/// A Shell Tick updates once, when it exits.
+const EXIT_SEQUENCE: u64 = 1;
 
 pub struct ShellTickStream {
     agent: crate::WeakAgent,
@@ -52,9 +54,19 @@ impl crate::tick_stream::TickWatchValidator for ShellWatchValidator {
         Ok(())
     }
 }
+/// A watch's baseline: the task it follows and whether that task had already ended or has ended
+/// since, after which the watch has nothing more to publish.
 struct Cursor {
-    task: ShellTask,
-    sequence: u64,
+    task: Uuid,
+    has_ended: bool,
+}
+
+/// When the task ended, which is its only update; `None` while it runs.
+fn ended_at_ms(task: &ShellTask) -> Option<u64> {
+    task.state
+        .is_terminal()
+        .then(|| task.ended_at_ms.or(task.updated_at_ms))
+        .flatten()
 }
 #[async_trait::async_trait]
 impl TickStreamPort for ShellTickStream {
@@ -123,15 +135,11 @@ impl TickStreamPort for ShellTickStream {
                 let targets = receiver.borrow_and_update().clone();
                 publisher.retain(&targets);
                 cursors.retain(|watch, cursor| {
-                    targets.get(watch) == Some(&InstanceRef::shell(cursor.task.id))
+                    targets.get(watch) == Some(&InstanceRef::shell(cursor.task))
                 });
                 let active = targets
                     .iter()
-                    .filter(|(watch, _)| {
-                        !cursors
-                            .get(watch)
-                            .is_some_and(|cursor| cursor.task.state.is_terminal())
-                    })
+                    .filter(|(watch, _)| !cursors.get(watch).is_some_and(|cursor| cursor.has_ended))
                     .collect::<Vec<_>>();
                 if !active.is_empty() {
                     let Some(agent) = weak.upgrade() else { return };
@@ -174,7 +182,7 @@ impl TickStreamPort for ShellTickStream {
                                                 .unwrap_or_default()
                                                 .into(),
                                             kind: ObservationKind::Protocol,
-                                            updated_at_ms: task.updated_at_ms,
+                                            updated_at_ms: ended_at_ms(task),
                                         },
                                     );
                                     publisher.state_to(
@@ -183,19 +191,7 @@ impl TickStreamPort for ShellTickStream {
                                         [*watch],
                                     );
                                     if let Some(cursor) = cursors.get_mut(watch) {
-                                        if (
-                                            cursor.task.state,
-                                            cursor.task.output_bytes,
-                                            cursor.task.exit_code,
-                                            cursor.task.signal,
-                                            &cursor.task.reason,
-                                        ) != (
-                                            task.state,
-                                            task.output_bytes,
-                                            task.exit_code,
-                                            task.signal,
-                                            &task.reason,
-                                        ) {
+                                        if task.state.is_terminal() {
                                             let output = if task.capabilities.can_read_output {
                                                 center
                                                     .read_output(
@@ -222,16 +218,15 @@ impl TickStreamPort for ShellTickStream {
                                                 );
                                                 continue;
                                             }
-                                            // Read the authoritative tail before advancing; a failed read remains retryable.
+                                            // Read the authoritative tail before ending the watch; a failed read remains retryable.
                                             if task.capabilities.can_read_output && output.is_none()
                                             {
                                                 continue;
                                             }
-                                            cursor.sequence = cursor.sequence.saturating_add(1);
-                                            cursor.task = task.clone();
+                                            cursor.has_ended = true;
                                             publisher.observation(&[*watch], TickObservation {
-                                                instance: instance.clone(), sequence: cursor.sequence,
-                                                observed_at: task.updated_at_ms.map(tickloop_agent_base::timestamp::format_timestamp).unwrap_or_else(tickloop_agent_base::timestamp::now_timestamp), dropped: 0,
+                                                instance: instance.clone(), sequence: EXIT_SEQUENCE,
+                                                observed_at: ended_at_ms(task).map(tickloop_agent_base::timestamp::format_timestamp).unwrap_or_else(tickloop_agent_base::timestamp::now_timestamp), dropped: 0,
                                                 data: serde_json::json!({"task_id":task.id,"status":task.status_label(),"state":task.state,"exit_code":task.exit_code,"signal":task.signal,"output_bytes":task.output_bytes,"output":output,"truncated":task.output_bytes > OUTPUT_SUMMARY_BYTES as u64}),
                                                 kind: ObservationKind::Protocol, recover_with: Some("Read the output_file returned by Bash with Read; use the Shell detail for user commands".into()), gap: false,
                                             });
@@ -240,8 +235,8 @@ impl TickStreamPort for ShellTickStream {
                                         cursors.insert(
                                             *watch,
                                             Cursor {
-                                                task: task.clone(),
-                                                sequence: 0,
+                                                task: task.id,
+                                                has_ended: task.state.is_terminal(),
                                             },
                                         );
                                         publisher.ready(*watch);

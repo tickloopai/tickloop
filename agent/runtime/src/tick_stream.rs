@@ -1,8 +1,6 @@
 //! Observation stream between a Tickhost and the Agent's Loop scheduler.
 
-mod artifact;
 mod hosted;
-pub use artifact::ArtifactTickStream;
 pub use hosted::HostedTickStream;
 
 use std::{
