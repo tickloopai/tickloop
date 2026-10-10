@@ -394,6 +394,13 @@ impl ProcessSnapshot {
         }
     }
 
+    fn set_pid(&mut self, pid: u32) {
+        match self {
+            Self::Agent(snapshot) => snapshot.pid = Some(pid),
+            Self::User(snapshot) => snapshot.pid = Some(pid),
+        }
+    }
+
     fn output_ref(&self) -> &Path {
         match self {
             Self::Agent(snapshot) => &snapshot.output_ref,
@@ -959,24 +966,13 @@ impl Registry {
             .custom_flags(libc::O_NOFOLLOW)
             .open(&output_path)
             .map_err(|error| io_error(&output_path, error))?;
-        let mut process = self
-            .host
-            .start(ShellLaunch {
-                operation_id,
-                shell: shell.clone(),
-                command: input.command.clone(),
-                description: input.description.clone(),
-                cwd: cwd.into(),
-                directory,
-                output,
-            })
-            .await?;
-        let pid = process.pid();
         let initial_state = if input.run_in_background {
             CommandState::Background
         } else {
             CommandState::Running
         };
+        // Listed from the start, without a process yet, so it can already be moved to the
+        // background or stopped while the Tickhost starts it.
         let snapshot = match owner {
             CommandOwner::Agent {
                 operation_id,
@@ -988,7 +984,7 @@ impl Registry {
                 command: input.command.clone(),
                 description: input.description.clone(),
                 cwd: cwd.into(),
-                pid: Some(pid),
+                pid: None,
                 state: initial_state,
                 was_background: input.run_in_background,
                 backgrounded_on_timeout: false,
@@ -1007,7 +1003,7 @@ impl Registry {
                 chat_id,
                 command: input.command.clone(),
                 cwd: cwd.into(),
-                pid: Some(pid),
+                pid: None,
                 state: initial_state,
                 was_background: input.run_in_background,
                 backgrounded_on_timeout: false,
@@ -1019,7 +1015,7 @@ impl Registry {
             }),
         };
         let (updates, mut receiver) = watch::channel(Update {
-            snapshot: snapshot.clone(),
+            snapshot,
             result: None,
         });
         let command_cancel = CancellationToken::new();
@@ -1031,6 +1027,37 @@ impl Registry {
                 is_stopped_by_model: false,
             },
         );
+        let started = self
+            .host
+            .start(ShellLaunch {
+                operation_id,
+                shell: shell.clone(),
+                command: input.command.clone(),
+                description: input.description.clone(),
+                cwd: cwd.into(),
+                directory,
+                output,
+            })
+            .await;
+        let mut process = match started {
+            Ok(process) => process,
+            Err(error) => {
+                self.entries.lock().await.remove(&operation_id);
+                return Err(error);
+            }
+        };
+        // The command as it started: in the background or stopping when that was asked for
+        // meanwhile.
+        let snapshot = {
+            let entries = self.entries.lock().await;
+            let entry = entries
+                .get(&operation_id)
+                .expect("a starting command stays listed");
+            let mut update = entry.updates.borrow().clone();
+            update.snapshot.set_pid(process.pid());
+            entry.updates.send_replace(update.clone());
+            update.snapshot
+        };
         self.emit(&snapshot);
         let started_snapshot = snapshot.clone();
         let input_started_in_background = input.run_in_background;
@@ -1041,7 +1068,7 @@ impl Registry {
             let mut snapshot = snapshot;
             // Like Claude Code's `ShellCommand.background`, moving to the background ends the
             // foreground timeout.
-            let mut is_foreground = !input.run_in_background;
+            let mut is_foreground = snapshot.state() == &CommandState::Running;
             let timeout = tokio::time::sleep(foreground_timeout);
             tokio::pin!(timeout);
             let mut output_poll = tokio::time::interval(OUTPUT_POLL_INTERVAL);
@@ -1234,6 +1261,8 @@ mod tests {
     struct ScriptedHost {
         launches: Arc<std::sync::Mutex<Vec<Launched>>>,
         started: Arc<tokio::sync::Notify>,
+        /// Held by a test to keep commands starting.
+        starting: Arc<Mutex<()>>,
     }
 
     struct Launched {
@@ -1258,6 +1287,7 @@ mod tests {
     #[async_trait::async_trait]
     impl ShellHost for ScriptedHost {
         async fn start(&self, launch: ShellLaunch) -> Result<Box<dyn ShellProcess>, ToolError> {
+            drop(self.starting.lock().await);
             let exit = watch::channel(None).0;
             let stops = Arc::default();
             let process = ScriptedProcess {
@@ -1725,6 +1755,79 @@ mod tests {
             assert_eq!(value["reason"], json!(exit.reason));
             assert!(read.is_error);
         }
+    }
+
+    #[tokio::test]
+    async fn a_command_is_moved_to_the_background_or_stopped_while_its_host_starts_it() {
+        let host = ScriptedHost::default();
+        let registry = host.registry();
+        let workdir = Workdir::new();
+        let chat_id = Uuid::new_v4();
+        let starting = host.starting.lock().await;
+        let backgrounded = Uuid::new_v4();
+        let stopped = Uuid::new_v4();
+        for operation_id in [backgrounded, stopped] {
+            let registry = registry.clone();
+            let input = workdir.input("sleep 30");
+            let cwd = workdir.path.clone();
+            let output = workdir.output();
+            tokio::spawn(async move {
+                registry
+                    .execute_user(
+                        &cwd,
+                        input,
+                        &output,
+                        operation_id,
+                        chat_id,
+                        CancellationToken::new(),
+                    )
+                    .await
+            });
+        }
+        let listed = |operation_id| {
+            let registry = registry.clone();
+            async move {
+                loop {
+                    if let Some(snapshot) = registry
+                        .user_snapshots()
+                        .await
+                        .into_iter()
+                        .find(|snapshot| snapshot.operation_id == operation_id)
+                    {
+                        return snapshot;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
+        assert_eq!(listed(backgrounded).await.pid, None);
+        listed(stopped).await;
+        let moved = registry
+            .background_user(backgrounded, chat_id)
+            .await
+            .unwrap();
+        assert_eq!(moved.state, CommandState::Background);
+        let stopping = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.stop_user(stopped, chat_id).await }
+        });
+        drop(starting);
+        let stopped_snapshot = stopping.await.unwrap().unwrap();
+        assert_eq!(
+            stopped_snapshot.reason.as_deref(),
+            Some(CANCELLED_COMMAND_REASON)
+        );
+        assert_eq!(host.stops(stopped), [CANCELLED_COMMAND_REASON]);
+        let running = loop {
+            let snapshot = user_snapshot(&registry, backgrounded).await;
+            if snapshot.pid.is_some() {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(running.state, CommandState::Background);
+        assert_eq!(running.pid, Some(4242));
+        assert!(host.stops(backgrounded).is_empty());
     }
 
     #[test]
