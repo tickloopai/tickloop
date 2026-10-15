@@ -118,12 +118,10 @@ impl DisplayProfile {
     pub(super) const fn glyph(self, glyph: Glyph) -> &'static str {
         match (self.preferences.glyph_set, glyph) {
             (GlyphSet::Unicode, Glyph::ShellTick) => "$",
-            (GlyphSet::Unicode, Glyph::ArtifactTick) => "⧉",
+            (_, Glyph::ArtifactTick) => "⧉",
             (GlyphSet::Unicode, Glyph::TerminalTick) => ">",
             (GlyphSet::Unicode, Glyph::ProtocolTick) => "◉",
             (GlyphSet::NerdFont, Glyph::ShellTick) => "\u{f489}",
-            // nf-fa-link: an artifact row is a link to its page.
-            (GlyphSet::NerdFont, Glyph::ArtifactTick) => "\u{f0c1}",
             (GlyphSet::NerdFont, Glyph::TerminalTick) => "\u{f120}",
             (GlyphSet::NerdFont, Glyph::ProtocolTick) => "\u{f0318}",
             (_, Glyph::Subscription) => "⟳",
@@ -365,14 +363,13 @@ mod tests {
 
     #[test]
     fn the_subscription_mark_and_the_artifact_link_take_one_column_in_both_glyph_sets() {
-        for (glyph_set, artifact) in [(GlyphSet::Unicode, "⧉"), (GlyphSet::NerdFont, "\u{f0c1}")]
-        {
+        for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
             let profile = DisplayProfile::new(DisplayPreferences {
                 glyph_set,
                 prefers_reduced_motion: false,
             });
             assert_eq!(profile.glyph(Glyph::Subscription), "⟳", "{glyph_set:?}");
-            assert_eq!(profile.glyph(Glyph::ArtifactTick), artifact);
+            assert_eq!(profile.glyph(Glyph::ArtifactTick), "⧉", "{glyph_set:?}");
             for glyph in [Glyph::Subscription, Glyph::ArtifactTick] {
                 assert_eq!(
                     unicode_width::UnicodeWidthStr::width(profile.glyph(glyph)),
