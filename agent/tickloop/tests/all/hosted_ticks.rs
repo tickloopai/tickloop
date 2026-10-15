@@ -1042,6 +1042,66 @@ for line in sys.stdin:
         );
     }
 
+    /// Declares two tools whose schema takes anything: the Tick itself refuses `strict` with
+    /// -32602 and fails `jam` with -32000.
+    const REFUSING: &str = r#"
+import json, sys
+tools = [{'name':'strict','description':'Refuse the arguments','input_schema':{'type':'object'},'mutates':True},{'name':'jam','description':'Fail to run','input_schema':{'type':'object'},'mutates':True}]
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    if method == 'tick/describe':
+        reply = {'result':{'protocol':3,'revision':'1','kind':'example.refusing','title':'Refusing','description':'Refusing','tools':tools}}
+    elif method == 'tick/read':
+        reply = {'result':{'seq':0,'data':{'value':0}}}
+    elif request['params']['tool'] == 'strict':
+        reply = {'error':{'code':-32602,'message':'amount is required'}}
+    else:
+        reply = {'error':{'code':-32000,'message':'the counter is jammed'}}
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'], **reply}), flush=True)
+"#;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_the_tick_refused_or_failed_has_a_known_outcome() {
+        let daemon = Daemon::start(1).await;
+        let chat = daemon.chats[0];
+        let tools = daemon.tools();
+        let script = daemon.root.join("refusing.py");
+        std::fs::write(&script, REFUSING).unwrap();
+        let opened = run_tool(
+            &tools,
+            chat,
+            "ModifyTick",
+            open_command(&daemon, python_program(&script, &[])),
+        )
+        .await;
+        let instance = opened["tick_instance_id"].clone();
+        let call = |tool: &str| json!({"tick_instance_id":instance,"tool":tool,"args":{}});
+        let HostCallResult::NotDispatched(refused) =
+            call_tool(&tools, chat, "CallTickTool", call("strict")).await
+        else {
+            panic!("arguments the Tick refuses leave the call unrun");
+        };
+        assert!(refused.contains("amount is required"), "{refused}");
+        let HostCallResult::Completed(failed) =
+            call_tool(&tools, chat, "CallTickTool", call("jam")).await
+        else {
+            panic!("a tool that ran and failed has a known outcome");
+        };
+        assert!(failed.is_error);
+        let failed: Value = serde_json::from_str(&failed.content).unwrap();
+        assert_eq!(failed["status"], "failed", "{failed}");
+        assert_eq!(failed["tick_instance_id"], instance);
+        assert!(failed["error"].to_string().contains("jammed"), "{failed}");
+        run_tool(
+            &tools,
+            chat,
+            "ModifyTick",
+            json!({"action":"close","tick_instance_id":instance}),
+        )
+        .await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn auto_cleanup_supplies_the_creation_exception_only_for_the_same_loop() {
         use tickloop_agent_protocol::ExecutionMode;

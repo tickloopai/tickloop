@@ -161,6 +161,34 @@ async fn a_descriptor_that_breaks_the_standard_is_refused_instead_of_answered() 
     assert_eq!(frames[0]["error"]["code"], INVALID_REQUEST);
 }
 
+/// A read answered after an update was published reports that update's seq, so writing the
+/// update first keeps both in order on the wire.
+#[tokio::test]
+async fn a_queued_update_is_written_before_the_answers_queued_with_it() {
+    let (_requests, tick_requests) = tokio::io::duplex(8 * 1024);
+    let (tick_responses, mut client_responses) = tokio::io::duplex(64 * 1024);
+    let mut stream = TickStream::duplex(Counter::with_read_tool(), tick_requests, tick_responses);
+    stream.publish(json!({"value": 1})).unwrap();
+    let read = json!({"jsonrpc": "2.0", "id": 1, "method": READ_METHOD});
+    assert!(
+        stream
+            .dispatch(InboundFrame::Line(read.to_string()))
+            .is_none()
+    );
+    stream.close().await;
+    let mut bytes = Vec::new();
+    client_responses.read_to_end(&mut bytes).await.unwrap();
+    let frames: Vec<Value> = String::from_utf8(bytes)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(frames.len(), 2, "{frames:?}");
+    assert_eq!(frames[0]["method"], UPDATE_METHOD);
+    assert_eq!(frames[1]["id"], 1);
+    assert_eq!(frames[1]["result"]["seq"], frames[0]["params"]["seq"]);
+}
+
 #[test]
 fn a_tick_update_needs_data() {
     let mut stream = TickStream::in_memory(Counter::with_read_tool());

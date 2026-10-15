@@ -176,6 +176,62 @@ async fn a_call_prepared_against_an_older_catalog_revision_is_refused_unrun() {
     session.shutdown().await.unwrap();
 }
 
+/// Answers each call with the JSON-RPC error its tool names, or with nothing at all for
+/// `garbled`.
+const ANSWERS_WITH_ERRORS: &str = r#"
+import json, sys
+errors = {'no_calls':-32601,'bad_args':-32602,'jam':-32000,'own_code':-32050}
+for line in sys.stdin:
+    request = json.loads(line)
+    reply = {}
+    if request['method'] == 'tick/describe':
+        reply['result'] = {'protocol':3,'kind':'example.failing','title':'Failing','description':'Fails','revision':'1','tools':[]}
+    elif request['method'] == 'tick/read':
+        reply['result'] = {'seq':0,'data':None}
+    elif request['params']['tool'] != 'garbled':
+        reply['error'] = {'code':errors[request['params']['tool']],'message':'refused by ' + request['params']['tool']}
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'], **reply}), flush=True)
+"#;
+
+#[tokio::test]
+async fn a_tick_error_says_whether_the_call_ran_and_only_a_garbled_answer_leaves_it_unknown() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = spawn_python(directory.path(), ANSWERS_WITH_ERRORS)
+        .await
+        .unwrap();
+    let client = session.client();
+    let call = |tool: &'static str| {
+        let client = client.clone();
+        async move {
+            client
+                .call(tool, json!({}), "1", CancellationToken::new())
+                .await
+        }
+    };
+    for refusal in ["no_calls", "bad_args"] {
+        match call(refusal).await {
+            Err(SessionError::Refused(message)) => {
+                assert!(message.contains(refusal), "{message}")
+            }
+            other => panic!("{refusal} was refused unrun: {other:?}"),
+        }
+    }
+    for failure in ["jam", "own_code"] {
+        match call(failure).await {
+            Err(SessionError::ToolFailed(message)) => {
+                assert!(message.contains(failure), "{message}")
+            }
+            other => panic!("{failure} ran and failed: {other:?}"),
+        }
+    }
+    let garbled = call("garbled").await;
+    assert!(
+        matches!(garbled, Err(SessionError::OutcomeUnknown)),
+        "an answer with neither result nor error after dispatch: {garbled:?}"
+    );
+    session.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn a_protocol_2_tick_fails_to_start_with_a_version_error() {
     let directory = tempfile::tempdir().unwrap();
@@ -199,8 +255,10 @@ for line in sys.stdin:
     }
 }
 
+/// Notifications this host does not know are counted, and the first of each method is logged
+/// next to the session's socket rather than on the Tick's terminal.
 #[tokio::test]
-async fn an_unknown_notification_is_counted_without_ending_the_tick() {
+async fn an_unknown_notification_is_counted_and_logged_without_ending_the_tick() {
     let directory = tempfile::tempdir().unwrap();
     let session = spawn_python(
         directory.path(),
@@ -213,7 +271,8 @@ for line in sys.stdin:
     elif request['method'] == 'tick/read':
         result = {'seq':0,'data':None}
     else:
-        print(json.dumps({'jsonrpc':'2.0','method':'tick/progress','params':{'done':0.5}}), flush=True)
+        for method in ['tick/progress', 'tick/progress', 'tick/later']:
+            print(json.dumps({'jsonrpc':'2.0','method':method,'params':{'done':0.5}}), flush=True)
         print(json.dumps({'jsonrpc':'2.0','method':'tick/update','params':{'seq':1,'data':{'poked':True}}}), flush=True)
         result = {'poked':True}
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
@@ -242,8 +301,96 @@ for line in sys.stdin:
     assert_eq!(observation.state, SessionLinkState::Live);
     assert_eq!(observation.update.unwrap().data, json!({"poked":true}));
     let status = client.status().await.unwrap();
-    assert_eq!(status.ignored_notifications, 1);
+    assert_eq!(status.ignored_notifications, 3);
     assert_eq!(status.received, 1);
+    let log_path = session.endpoint().with_extension("log");
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let lines: Vec<_> = log.lines().collect();
+    assert_eq!(lines.len(), 2, "one line for each unknown method: {log}");
+    assert!(lines[0].contains("\"tick/progress\""), "{log}");
+    assert!(lines[1].contains("\"tick/later\""), "{log}");
+    assert!(lines[0].contains(&session.instance().to_string()), "{log}");
+    session.shutdown().await.unwrap();
+    assert!(!log_path.exists(), "the log goes with its session");
+}
+
+/// Answers its first read with seq 0 and writes the update to seq 1 right behind it, in the same
+/// write, so the session reads both frames before the reader of the answer runs.
+const UPDATES_RIGHT_AFTER_ITS_FIRST_READ: &str = r#"
+import json, sys
+seq = 0
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['method'] == 'tick/describe':
+        result = {'protocol':3,'kind':'example.racing','title':'Racing','description':'Updates right after a read','revision':'1','tools':[]}
+    else:
+        result = {'seq':seq,'data':{'value':seq}}
+    frames = [{'jsonrpc':'2.0','id':request['id'],'result':result}]
+    if request['method'] == 'tick/read' and seq == 0:
+        seq = 1
+        frames.append({'jsonrpc':'2.0','method':'tick/update','params':{'seq':seq,'data':{'value':seq}}})
+    sys.stdout.write(''.join(json.dumps(frame) + '\n' for frame in frames))
+    sys.stdout.flush()
+"#;
+
+#[tokio::test]
+async fn a_read_answer_is_checked_before_the_update_that_arrived_after_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = spawn_python(directory.path(), UPDATES_RIGHT_AFTER_ITS_FIRST_READ)
+        .await
+        .expect("read(0) on the wire before update(1) is in order");
+    let client = session.client();
+    let (baseline, received, observations) = client.watch().await.unwrap();
+    assert_eq!(baseline.seq, 1, "the later update is the newest state");
+    assert_eq!(received, 1);
+    assert_eq!(observations.borrow().state, SessionLinkState::Live);
+    assert_eq!(client.read().await.unwrap().seq, 1);
+    session.shutdown().await.unwrap();
+}
+
+/// Has already moved to seq 1 when it starts, but writes that update only when `flush` is
+/// called: its reads answer seq 1 before the update with the same seq is on the wire.
+const ANSWERS_A_READ_BEFORE_WRITING_ITS_UPDATE: &str = r#"
+import json, sys
+state = {'seq':1,'data':{'value':1}}
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['method'] == 'tick/describe':
+        result = {'protocol':3,'kind':'example.lagging','title':'Lagging','description':'Writes its update late','revision':'1','tools':[{'name':'flush','description':'Write the pending update','input_schema':{'type':'object'},'mutates':False}]}
+    elif request['method'] == 'tick/read':
+        result = state
+    else:
+        print(json.dumps({'jsonrpc':'2.0','method':'tick/update','params':state}), flush=True)
+        result = {}
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
+"#;
+
+#[tokio::test]
+async fn an_update_may_follow_a_read_that_already_answered_its_seq() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = spawn_python(directory.path(), ANSWERS_A_READ_BEFORE_WRITING_ITS_UPDATE)
+        .await
+        .unwrap();
+    let client = session.client();
+    let (baseline, _, mut observations) = client.watch().await.unwrap();
+    assert_eq!(baseline.seq, 1);
+    client
+        .call("flush", json!({}), "1", CancellationToken::new())
+        .await
+        .expect("update(1) after read(1) is the Tick's first update, so it is in order");
+    let observation = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            observations.changed().await.unwrap();
+            let observation = observations.borrow_and_update().clone();
+            if observation.update.is_some() {
+                return observation;
+            }
+        }
+    })
+    .await
+    .expect("the update arrived");
+    assert_eq!(observation.state, SessionLinkState::Live);
+    assert_eq!(observation.update.unwrap().seq, 1);
     session.shutdown().await.unwrap();
 }
 

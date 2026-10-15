@@ -39,7 +39,7 @@ for line in sys.stdin:
     request = json.loads(line)
     method = request['method']
     if method == 'tick/describe':
-        result = {'protocol':3,'revision':'1','kind':'example.counter','title':'Counter','description':'Counter','recover_with':'current','tools':[{'name':'increment','description':'Increment','input_schema':{'type':'object'},'mutates':True},{'name':'current','description':'Read','input_schema':{'type':'object'},'mutates':False},{'name':'flood','description':'Print many lines','input_schema':{'type':'object'},'mutates':False},{'name':'slow','description':'Answer after 16 seconds','input_schema':{'type':'object'},'mutates':False},{'name':'large','description':'Answer with almost 8 MiB','input_schema':{'type':'object'},'mutates':False},{'name':'oversized_update','description':'Send an update beyond the limit','input_schema':{'type':'object'},'mutates':False}]}
+        result = {'protocol':3,'revision':'1','kind':'example.counter','title':'Counter','description':'Counter','recover_with':'current','tools':[{'name':'increment','description':'Increment','input_schema':{'type':'object'},'mutates':True},{'name':'current','description':'Read','input_schema':{'type':'object'},'mutates':False},{'name':'flood','description':'Print many lines','input_schema':{'type':'object'},'mutates':False},{'name':'slow','description':'Answer after 16 seconds','input_schema':{'type':'object'},'mutates':False},{'name':'large','description':'Answer with almost 8 MiB','input_schema':{'type':'object'},'mutates':False},{'name':'oversized_update','description':'Send an update beyond the limit','input_schema':{'type':'object'},'mutates':False},{'name':'jam','description':'Fail to run','input_schema':{'type':'object'},'mutates':True}]}
     elif method == 'tick/read':
         result = {'seq':value,'at':'2026-10-07T00:00:00Z','data':{'value':value,'note':open('note.txt').read(),'sees_launch_token':'TICKLOOP_TICKHOST_LAUNCH' in os.environ,'argument_bytes':sum(len(argument) for argument in sys.argv[1:])}}
     elif method == 'tick/call':
@@ -57,6 +57,10 @@ for line in sys.stdin:
         elif request['params']['tool'] == 'large':
             result = {'value':value,'payload':'x' * LARGE_PAYLOAD}
             print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
+            continue
+        elif request['params']['tool'] in ('jam', 'missing'):
+            error = {'code':-32000,'message':'the counter is jammed'} if request['params']['tool'] == 'jam' else {'code':-32602,'message':'unknown Tick Tool'}
+            print(json.dumps({'jsonrpc':'2.0','id':request['id'],'error':error}), flush=True)
             continue
         result = {'value':value}
     else:
@@ -393,6 +397,40 @@ async fn protocol_calls_and_the_screen_belong_to_one_counter_process() {
         read["data"]["value"], 1,
         "UI bytes never pollute protocol stdout"
     );
+    shutdown(&fixture).await;
+}
+
+/// A Tick that refuses a call says it did not run it; one whose tool fails says it ran. Neither
+/// leaves the outcome unknown.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_call_was_not_dispatched_and_a_failed_one_is_a_known_failure() {
+    let fixture = Fixture::start().await;
+    let mut controller = fixture.controller().await;
+    let (command, work) = fixture.counter();
+    let opened = fixture.open(&mut controller, command, &work).await.unwrap();
+    let mut reader = fixture.reader(&opened).await;
+    let call = |tool: &str| json!({"tool":tool,"args":{},"revision":"1"});
+    let refused = reader
+        .request("call", call("missing"), CONTROL_TIMEOUT)
+        .await
+        .unwrap_err();
+    assert!(!refused.dispatched, "{refused:?}");
+    assert!(refused.message.contains("unknown Tick Tool"), "{refused:?}");
+    let failed = reader
+        .request("call", call("jam"), CONTROL_TIMEOUT)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failed.code,
+        tickhost_connect::host_error::TOOL_FAILED,
+        "{failed:?}"
+    );
+    assert!(failed.message.contains("jammed"), "{failed:?}");
+    let called = reader
+        .request("call", call("increment"), CONTROL_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(called["value"], 1, "the Tick keeps serving");
     shutdown(&fixture).await;
 }
 

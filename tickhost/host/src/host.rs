@@ -2290,7 +2290,10 @@ fn session_error(error: tickhost_connect::session::SessionError) -> HostError {
         SessionError::CancelledBeforeSend => HostError::before("Cancelled", error.to_string()),
         SessionError::OutcomeUnknown => HostError::after("OutcomeUnknown", error.to_string()),
         SessionError::Gone => HostError::after("TargetGone", error.to_string()),
-        SessionError::ChildError(message) => HostError::after("ToolError", message),
+        SessionError::Refused(_) => HostError::before("Refused", error.to_string()),
+        SessionError::ToolFailed(message) => {
+            HostError::after(tickhost_connect::host_error::TOOL_FAILED, message)
+        }
         SessionError::RevisionMismatch => {
             HostError::before("CapabilitiesChanged", error.to_string())
         }
