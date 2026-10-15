@@ -3,7 +3,7 @@ use std::io::Write;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tickloop_ui::{icons::Icon, settings::IconTheme};
+use tickloop_ui::icons::Icon;
 
 use crate::{
     args::{OutputFormat, WatchlistArgs},
@@ -67,7 +67,7 @@ impl WatchlistView {
         json!({"group":group,"quotes":self.table().json(),"quote_times":quote_times,"market_states":self.market_states})
     }
 
-    fn display_table(&self, theme: IconTheme) -> TableData {
+    fn display_table(&self) -> TableData {
         let mut table = self.table();
         for (row, quote) in table.rows.iter_mut().zip(&self.quotes) {
             let status = self
@@ -76,9 +76,9 @@ impl WatchlistView {
                 .find(|state| Some(state.market.as_str()) == symbol_market(&quote.symbol))
                 .map_or(MarketStatus::Unknown, |state| state.status);
             let glyph = match status {
-                MarketStatus::Pre => Icon::MarketPre.glyph(theme),
-                MarketStatus::Open => Icon::MarketOpen.glyph(theme),
-                MarketStatus::Closed => Icon::MarketClosed.glyph(theme),
+                MarketStatus::Pre => Icon::MarketPre.glyph(),
+                MarketStatus::Open => Icon::MarketOpen.glyph(),
+                MarketStatus::Closed => Icon::MarketClosed.glyph(),
                 MarketStatus::Unknown => "?",
             };
             if quote.error.is_some() {
@@ -192,7 +192,7 @@ pub async fn run_once(
                 .map_or("No groups", |group| group.name.as_str())
         )
     )?;
-    view.display_table(settings.icon_theme)
+    view.display_table()
         .write(args.output.format, settings, color, output)
 }
 
@@ -360,7 +360,7 @@ impl crate::runtime::LiveView for WatchlistView {
         state: &mut crate::runtime::ViewState,
         settings: &Settings,
     ) {
-        let mut table = self.display_table(settings.icon_theme);
+        let mut table = self.display_table();
         table.headers.push("Error");
         for (row, quote) in table.rows.iter_mut().zip(&self.quotes) {
             row.push(json!(quote.error));

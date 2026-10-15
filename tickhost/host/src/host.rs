@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -25,8 +25,9 @@ use tickhost_connect::{
     hosted::{
         self, ATTACH_INPUT_BYTES, ATTACH_REQUEST_FRAME_BYTES, BUILD_VERSION, BUSINESS_CAPABILITIES,
         BUSINESS_FRAME_BYTES, BUSINESS_MAJOR, BUSINESS_MINOR, CALL_TIMEOUT, CONTROL_TIMEOUT, Hello,
-        HelloReply, HostedTerminal, LaunchBinding, MANAGEMENT_FRAME_BYTES, MANAGEMENT_MAJOR,
-        MANAGEMENT_MINOR, Role, SPAWN_DESCRIPTORS, TerminalDevice, same_secret,
+        HelloReply, HostDescription, HostOccupancy, HostedTerminal, LaunchBinding,
+        MANAGEMENT_FRAME_BYTES, MANAGEMENT_MAJOR, MANAGEMENT_MINOR, Role, SPAWN_DESCRIPTORS,
+        TerminalDevice, same_secret,
     },
     session::SessionClient,
 };
@@ -57,6 +58,9 @@ use crate::{
 /// A host that was never used exits after this grace.
 pub const INITIAL_GRACE: Duration = Duration::from_secs(5);
 pub const REAP_INTERVAL: Duration = Duration::from_millis(250);
+/// The identity of the sources this host was built from: the one the `tickloop` executable of the
+/// same build computes, which its daemon compares with the host's management hello.
+pub const BUILD_IDENTITY: &str = env!("TICKLOOP_BUILD_IDENTITY");
 /// A released Shell task nobody views for this long is forgotten. Protocol and terminal Ticks
 /// never end for idling.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -76,6 +80,8 @@ pub const DIAGNOSTIC_CHARACTERS: usize = 256;
 pub const TITLE_CHARACTERS: usize = 256;
 /// Ends a title that was cut.
 pub const TITLE_ELLIPSIS: char = '…';
+/// How the management hello names a Tick without a title that is still opening.
+const UNTITLED_TICK: &str = "an opening Tick";
 /// A stalled stream reader or attached view loses its connection; the Tick, its other views and
 /// other readers continue.
 pub const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -588,6 +594,8 @@ pub struct Host {
     started: Instant,
     /// Names each Tick's session directory.
     session_serial: AtomicU64,
+    /// Authenticated business connections; the management channel's are not counted.
+    connections: AtomicUsize,
     state: Mutex<HostState>,
     shutdown: CancellationToken,
     /// The operations that asked this host to shut down.
@@ -1186,11 +1194,11 @@ impl Host {
         state
             .shells
             .retain(|_, task| !task.is_forgotten(now_ms, self.idle_timeout));
-        let has_pending_spawns = state.spawn_grants.has_pending(Instant::now());
+        let pending_spawns = state.spawn_grants.pending(Instant::now());
         state.exiting = state.ticks.is_empty()
             && state.shells.is_empty()
             && state.spawners == 0
-            && !has_pending_spawns
+            && pending_spawns == 0
             && state.pending_opens == 0
             && (state.ever_used || self.started.elapsed() >= INITIAL_GRACE);
         state.exiting
@@ -1262,6 +1270,30 @@ impl Host {
             "last_error": state.diagnostics.last_error,
             "reaped": state.diagnostics.reaped,
         })
+    }
+
+    /// What stopping this host would end: its Ticks by title, its Shell tasks, the opens and
+    /// spawns under way that keep it from idling, and its business connections.
+    async fn occupancy(&self) -> HostOccupancy {
+        let mut state = self.state.lock().await;
+        let pending = state.pending_opens + state.spawn_grants.pending(Instant::now());
+        HostOccupancy {
+            ticks: state
+                .ticks
+                .values()
+                .map(|tick| {
+                    tick.title.clone().unwrap_or_else(|| {
+                        tick.lifecycle
+                            .borrow()
+                            .live_instance()
+                            .map_or_else(|| UNTITLED_TICK.to_owned(), ToString::to_string)
+                    })
+                })
+                .collect(),
+            shells: state.shells.len(),
+            pending: Some(pending),
+            connections: self.connections.load(Ordering::SeqCst),
+        }
     }
 
     async fn shut_down(&self) {
@@ -1483,6 +1515,7 @@ pub async fn serve_until(
         idle_timeout: config.idle_timeout,
         started: Instant::now(),
         session_serial: AtomicU64::new(0),
+        connections: AtomicUsize::new(0),
         state: Mutex::new(HostState {
             ticks: HashMap::new(),
             shells: HashMap::new(),
@@ -1598,6 +1631,13 @@ async fn connection(stream: UnixStream, host: Arc<Host>) -> Result<(), HostError
                         major: MANAGEMENT_MAJOR,
                         minor: MANAGEMENT_MINOR,
                         capabilities: Vec::new(),
+                        host: Some(HostDescription {
+                            build: BUILD_IDENTITY.to_owned(),
+                            executable: std::env::current_exe().ok(),
+                            business_major: BUSINESS_MAJOR,
+                            business_minor: BUSINESS_MINOR,
+                            occupancy: host.occupancy().await,
+                        }),
                     }),
                 ),
                 MANAGEMENT_FRAME_BYTES,
@@ -1660,17 +1700,20 @@ async fn connection(stream: UnixStream, host: Arc<Host>) -> Result<(), HostError
                             .iter()
                             .map(|value| (*value).to_owned())
                             .collect(),
+                        host: None,
                     }),
                 ),
                 BUSINESS_FRAME_BYTES,
                 CONTROL_TIMEOUT,
             )
             .await;
+            host.connections.fetch_add(1, Ordering::SeqCst);
             let result = match welcomed {
                 Ok(()) => business(reader, writer, host.clone(), session).await,
                 Err(error) => Err(error),
             };
             departure.leave(&host).await;
+            host.connections.fetch_sub(1, Ordering::SeqCst);
             result
         }
     }
@@ -2969,6 +3012,7 @@ mod tests {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             started: Instant::now(),
             session_serial: AtomicU64::new(0),
+            connections: AtomicUsize::new(0),
             state: Mutex::new(HostState {
                 ticks: HashMap::new(),
                 shells: HashMap::new(),

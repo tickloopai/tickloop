@@ -876,6 +876,9 @@ impl EmbeddedAgentAccess {
                 self.inner.agent.flush_transcripts().await;
                 Ok(CommandResult::Done)
             }
+            AgentCommand::ReplaceTickhost => Err(AccessError::invalid(
+                "only the Agent daemon replaces its Tickhost",
+            )),
         }
     }
 
@@ -1520,6 +1523,16 @@ impl AgentAccess for EmbeddedAgentAccess {
                 detail,
                 after,
             } => self.observe_agent(execution, detail, after).await,
+            // Only the Agent daemon controls a Tickhost whose build can differ from its own.
+            ObservationRequest::OtherTickhost => Ok(Observation::single(
+                ObservationValue::OtherTickhost(None),
+                Cursor {
+                    daemon_epoch: self.inner.epoch,
+                    execution: None,
+                    sequence: 0,
+                },
+                None,
+            )),
             ObservationRequest::Overview {
                 filter,
                 page,

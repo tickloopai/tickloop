@@ -84,6 +84,11 @@ impl WorkerControl {
         }
     }
 
+    /// The Tickhost this daemon controls.
+    pub fn host_controller(&self) -> &HostController {
+        &self.controller
+    }
+
     pub fn endpoint(&self) -> &Path {
         &self.endpoint
     }

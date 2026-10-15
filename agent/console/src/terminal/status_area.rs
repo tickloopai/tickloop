@@ -809,7 +809,6 @@ mod tests {
     #[test]
     fn subagent_panel_elapsed_idle_and_backgrounds_follow_the_view_clock() {
         use crate::{agent_console::AttentionGroup, terminal::style::ThemeName};
-        use tickloop_agent_config::{DisplayPreferences, GlyphSet};
         let root = Uuid::from_u128(1);
         let child = Uuid::from_u128(2);
         let row = |id, parent, title: &str| AgentRow {
@@ -840,58 +839,53 @@ mod tests {
             row(child, Some(root), "sleep-30"),
         ];
         area.update_agents(rows.clone(), Some(child));
-        for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
-            for theme in ThemeName::ALL {
-                let mut display = DisplayProfile::new(DisplayPreferences {
-                    glyph_set,
-                    prefers_reduced_motion: false,
-                });
-                display.set_theme(theme);
-                let footer = FooterFrame {
-                    items: Vec::new(),
-                    selected: None,
-                };
-                let lines = area.panel_lines_at(&footer, 80, 3, display, 161_000);
-                assert!(lines[1].text().ends_with("1m 1s"), "{lines:?}");
-                assert!(lines[1].text().contains("Run sleep 30"));
-                assert!(lines.iter().all(|line| line.fill.is_none()));
-                assert_eq!(lines[1].spans[1].role, Some(Role::AgentCyan));
-                assert_eq!(
-                    lines[1]
-                        .spans
-                        .iter()
-                        .filter(|span| span.role == Some(Role::AgentCyan))
-                        .count(),
-                    1,
-                    "only the dot wears the member's Agent Color: {:?}",
-                    lines[1]
-                );
-                assert_eq!(lines[0].spans[0].role, Some(Role::MutedText));
-                for width in [1, 8, 16, 32, 80] {
-                    assert!(
-                        area.panel_lines_at(&footer, width, 3, display, 161_000)
-                            .iter()
-                            .all(|line| UnicodeWidthStr::width(line.text().as_str()) <= width)
-                    );
-                }
-                let focused = FooterFrame {
-                    items: Vec::new(),
-                    selected: Some(FooterItemId::Agents),
-                };
-                let selected = area.panel_lines_at(&focused, 80, 3, display, 161_000);
-                assert_eq!(
-                    selected
-                        .iter()
-                        .filter(|line| line.fill == Some(Role::Selection))
-                        .count(),
-                    1
-                );
+        for theme in ThemeName::ALL {
+            let mut display = DisplayProfile::default();
+            display.set_theme(theme);
+            let footer = FooterFrame {
+                items: Vec::new(),
+                selected: None,
+            };
+            let lines = area.panel_lines_at(&footer, 80, 3, display, 161_000);
+            assert!(lines[1].text().ends_with("1m 1s"), "{lines:?}");
+            assert!(lines[1].text().contains("Run sleep 30"));
+            assert!(lines.iter().all(|line| line.fill.is_none()));
+            assert_eq!(lines[1].spans[1].role, Some(Role::AgentCyan));
+            assert_eq!(
+                lines[1]
+                    .spans
+                    .iter()
+                    .filter(|span| span.role == Some(Role::AgentCyan))
+                    .count(),
+                1,
+                "only the dot wears the member's Agent Color: {:?}",
+                lines[1]
+            );
+            assert_eq!(lines[0].spans[0].role, Some(Role::MutedText));
+            for width in [1, 8, 16, 32, 80] {
                 assert!(
-                    selected
+                    area.panel_lines_at(&footer, width, 3, display, 161_000)
                         .iter()
-                        .all(|line| line.fill.is_none() || line.fill == Some(Role::Selection))
+                        .all(|line| UnicodeWidthStr::width(line.text().as_str()) <= width)
                 );
             }
+            let focused = FooterFrame {
+                items: Vec::new(),
+                selected: Some(FooterItemId::Agents),
+            };
+            let selected = area.panel_lines_at(&focused, 80, 3, display, 161_000);
+            assert_eq!(
+                selected
+                    .iter()
+                    .filter(|line| line.fill == Some(Role::Selection))
+                    .count(),
+                1
+            );
+            assert!(
+                selected
+                    .iter()
+                    .all(|line| line.fill.is_none() || line.fill == Some(Role::Selection))
+            );
         }
         rows[1].status = "En cours".into();
         area.update_agents(rows.clone(), Some(child));
@@ -925,22 +919,17 @@ mod tests {
         rows[1].glyph = Glyph::AgentWaiting;
         rows[1].status = "Waiting · trigger".into();
         area.update_agents(rows.clone(), Some(child));
-        for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
-            let display = DisplayProfile::new(DisplayPreferences {
-                glyph_set,
-                prefers_reduced_motion: false,
-            });
-            assert_ne!(
-                display.glyph(Glyph::AgentWaiting),
-                display.glyph(Glyph::AgentIdle)
-            );
-            let waiting = &area.panel_lines_at(&unfocused, 80, 3, display, 181_000)[1];
-            assert!(
-                waiting.text().ends_with(" 1m") && !waiting.text().contains("waiting"),
-                "a waiting member shows how long ago it changed: {waiting:?}"
-            );
-            assert_eq!(waiting.spans[1].role, Some(Role::AgentCyan));
-        }
+        let display = DisplayProfile::default();
+        assert_ne!(
+            display.glyph(Glyph::AgentWaiting),
+            display.glyph(Glyph::AgentIdle)
+        );
+        let waiting = &area.panel_lines_at(&unfocused, 80, 3, display, 181_000)[1];
+        assert!(
+            waiting.text().ends_with(" 1m") && !waiting.text().contains("waiting"),
+            "a waiting member shows how long ago it changed: {waiting:?}"
+        );
+        assert_eq!(waiting.spans[1].role, Some(Role::AgentCyan));
         rows[1].group = AttentionGroup::Idle;
         rows[1].state = tickloop_agent_protocol::LoopState::Idle;
         rows[1].status = "Idle".into();
@@ -991,223 +980,189 @@ mod tests {
     }
 
     #[test]
-    fn todo_rows_use_each_glyph_set_with_a_first_row_branch_and_aligned_continuations() {
-        use tickloop_agent_config::{DisplayPreferences, GlyphSet};
-
-        for (glyph_set, expected) in [
-            (
-                GlyphSet::Unicode,
-                ["  ⎿  ◻ pending", "     ◼ active", "     ✔ done"],
-            ),
-            (
-                GlyphSet::NerdFont,
-                [
-                    "  \u{f060d}  \u{f0131} pending",
-                    "     \u{f012e} active",
-                    "     \u{f00c} done",
-                ],
-            ),
-        ] {
-            let mut area = StatusArea::default();
-            let mut todos = vec![todo("pending"), todo("active"), todo("done")];
-            for (todo, status) in todos.iter_mut().zip([
-                TodoStatus::Pending,
-                TodoStatus::InProgress,
-                TodoStatus::Completed,
-            ]) {
-                todo.status = status;
-            }
-            area.update("Auto".into(), "fixture".into(), None, todos);
-            let display = DisplayProfile::new(DisplayPreferences {
-                glyph_set,
-                prefers_reduced_motion: false,
-            });
-            let rows = area.todo_lines(80, 24, display, true, Instant::now());
+    fn todo_rows_lead_with_a_first_row_branch_and_aligned_continuations() {
+        let mut area = StatusArea::default();
+        let mut todos = vec![todo("pending"), todo("active"), todo("done")];
+        for (todo, status) in todos.iter_mut().zip([
+            TodoStatus::Pending,
+            TodoStatus::InProgress,
+            TodoStatus::Completed,
+        ]) {
+            todo.status = status;
+        }
+        area.update("Auto".into(), "fixture".into(), None, todos);
+        let rows = area.todo_lines(80, 24, DisplayProfile::default(), true, Instant::now());
+        assert_eq!(
+            rows.iter().map(RoleLine::text).collect::<Vec<_>>(),
+            ["  ⎿  ◻ pending", "     ◼ active", "     ✔ done"]
+        );
+        for row in &rows {
             assert_eq!(
-                rows.iter().map(RoleLine::text).collect::<Vec<_>>(),
-                expected
+                UnicodeWidthStr::width(row.text().as_str()),
+                7 + row.text().chars().skip(7).count()
             );
-            for row in &rows {
-                assert_eq!(
-                    UnicodeWidthStr::width(row.text().as_str()),
-                    7 + row.text().chars().skip(7).count()
-                );
-            }
         }
     }
 
     #[test]
-    fn todo_status_colours_and_decorations_follow_the_active_theme_in_both_glyph_sets() {
+    fn todo_status_colours_and_decorations_follow_the_active_theme() {
         use super::super::style::{ColourDepth, ThemeName};
-        use tickloop_agent_config::{DisplayPreferences, GlyphSet};
 
-        for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
-            let mut area = StatusArea::default();
-            let mut todos = vec![todo("pending"), todo("active"), todo("done")];
-            for (todo, status) in todos.iter_mut().zip([
-                TodoStatus::Pending,
-                TodoStatus::InProgress,
-                TodoStatus::Completed,
-            ]) {
-                todo.status = status;
-            }
-            area.update("Auto".into(), "fixture".into(), None, todos);
-            let mut display = DisplayProfile::new(DisplayPreferences {
-                glyph_set,
-                prefers_reduced_motion: false,
-            });
-            let mut themed_rows = Vec::new();
-            for name in ThemeName::ALL {
-                display.set_theme(name);
-                let theme = display.theme();
-                let rows = area.todo_lines(80, 24, display, true, Instant::now());
-                let mut rendered_rows = Vec::new();
-                // Claude Code's task list: plain while open, an orange square and bold text in
-                // progress, a green tick and muted struck-through text when done.
-                for (row, (title, glyph, icon_colour, text_colour, bold, crossed_out)) in
-                    rows.iter().zip([
-                        ("pending", Glyph::TodoPending, None, None, false, false),
-                        (
-                            "active",
-                            Glyph::TodoInProgress,
-                            Some(Role::Accent),
-                            None,
-                            true,
-                            false,
-                        ),
-                        (
-                            "done",
-                            Glyph::TodoCompleted,
-                            Some(Role::Success),
-                            Some(Role::MutedText),
-                            false,
-                            true,
-                        ),
-                    ])
-                {
-                    let resolved = row.resolve(theme, 80);
-                    let icon = resolved
-                        .spans
-                        .iter()
-                        .find(|span| span.text.contains(display.glyph(glyph)))
-                        .unwrap();
-                    let text = resolved
-                        .spans
-                        .iter()
-                        .find(|span| span.text.contains(title))
-                        .unwrap();
-                    assert_eq!(
-                        icon.style.foreground,
-                        icon_colour.and_then(|role| theme.style(role).foreground),
-                        "{glyph_set:?} {name:?} {title} icon"
-                    );
-                    assert_eq!(
-                        text.style.foreground,
-                        text_colour.and_then(|role| theme.style(role).foreground),
-                        "{glyph_set:?} {name:?} {title} text"
-                    );
-                    assert!(!icon.style.bold);
-                    assert!(!icon.style.crossed_out);
-                    assert_eq!(text.style.bold, bold);
-                    assert_eq!(text.style.crossed_out, crossed_out);
-                    assert!(!icon.style.dim && !text.style.dim);
-                    rendered_rows.push(resolved.render(ColourDepth::TrueColour));
-                }
-                let branch = rows[0].resolve(theme, 80);
+        let mut area = StatusArea::default();
+        let mut todos = vec![todo("pending"), todo("active"), todo("done")];
+        for (todo, status) in todos.iter_mut().zip([
+            TodoStatus::Pending,
+            TodoStatus::InProgress,
+            TodoStatus::Completed,
+        ]) {
+            todo.status = status;
+        }
+        area.update("Auto".into(), "fixture".into(), None, todos);
+        let mut display = DisplayProfile::default();
+        let mut themed_rows = Vec::new();
+        for name in ThemeName::ALL {
+            display.set_theme(name);
+            let theme = display.theme();
+            let rows = area.todo_lines(80, 24, display, true, Instant::now());
+            let mut rendered_rows = Vec::new();
+            // Claude Code's task list: plain while open, an orange square and bold text in
+            // progress, a green tick and muted struck-through text when done.
+            for (row, (title, glyph, icon_colour, text_colour, bold, crossed_out)) in
+                rows.iter().zip([
+                    ("pending", Glyph::TodoPending, None, None, false, false),
+                    (
+                        "active",
+                        Glyph::TodoInProgress,
+                        Some(Role::Accent),
+                        None,
+                        true,
+                        false,
+                    ),
+                    (
+                        "done",
+                        Glyph::TodoCompleted,
+                        Some(Role::Success),
+                        Some(Role::MutedText),
+                        false,
+                        true,
+                    ),
+                ])
+            {
+                let resolved = row.resolve(theme, 80);
+                let icon = resolved
+                    .spans
+                    .iter()
+                    .find(|span| span.text.contains(display.glyph(glyph)))
+                    .unwrap();
+                let text = resolved
+                    .spans
+                    .iter()
+                    .find(|span| span.text.contains(title))
+                    .unwrap();
                 assert_eq!(
-                    branch.spans[0].style.foreground,
-                    theme.style(Role::MutedText).foreground
+                    icon.style.foreground,
+                    icon_colour.and_then(|role| theme.style(role).foreground),
+                    "{name:?} {title} icon"
                 );
-                themed_rows.push(rendered_rows);
-            }
-            for rows in &themed_rows {
-                assert!(
-                    rows[0].ends_with(&format!(
-                        "\x1b[0m{} pending",
-                        display.glyph(Glyph::TodoPending)
-                    )),
-                    "an open task keeps the terminal's own colours: {:?}",
-                    rows[0]
+                assert_eq!(
+                    text.style.foreground,
+                    text_colour.and_then(|role| theme.style(role).foreground),
+                    "{name:?} {title} text"
                 );
+                assert!(!icon.style.bold);
+                assert!(!icon.style.crossed_out);
+                assert_eq!(text.style.bold, bold);
+                assert_eq!(text.style.crossed_out, crossed_out);
+                assert!(!icon.style.dim && !text.style.dim);
+                rendered_rows.push(resolved.render(ColourDepth::TrueColour));
             }
-            assert_ne!(
-                themed_rows[0][2], themed_rows[1][2],
-                "completed row must recolour when switching themes"
+            let branch = rows[0].resolve(theme, 80);
+            assert_eq!(
+                branch.spans[0].style.foreground,
+                theme.style(Role::MutedText).foreground
+            );
+            themed_rows.push(rendered_rows);
+        }
+        for rows in &themed_rows {
+            assert!(
+                rows[0].ends_with(&format!(
+                    "\x1b[0m{} pending",
+                    display.glyph(Glyph::TodoPending)
+                )),
+                "an open task keeps the terminal's own colours: {:?}",
+                rows[0]
             );
         }
+        assert_ne!(
+            themed_rows[0][2], themed_rows[1][2],
+            "completed row must recolour when switching themes"
+        );
     }
 
     #[test]
     fn narrow_todo_rows_keep_status_marks_and_truncate_subjects_by_display_columns() {
-        use tickloop_agent_config::{DisplayPreferences, GlyphSet};
-
-        for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
-            let mut area = StatusArea::default();
-            let mut todos = vec![
-                todo("中文ab中ab"),
-                todo("e\u{301}中ab"),
-                todo("done\nne\txt\r\u{1b}"),
-            ];
-            for (todo, status) in todos.iter_mut().zip([
-                TodoStatus::Pending,
-                TodoStatus::InProgress,
-                TodoStatus::Completed,
-            ]) {
-                todo.status = status;
-            }
-            area.update("Auto".into(), "fixture".into(), None, todos);
-            let display = DisplayProfile::new(DisplayPreferences {
-                glyph_set,
-                prefers_reduced_motion: false,
-            });
-            for width in 0..=40 {
-                let rows = area.todo_lines(width, 24, display, true, Instant::now());
-                assert_eq!(rows.len(), 3);
-                for row in &rows {
-                    assert!(
-                        UnicodeWidthStr::width(row.text().as_str()) <= width,
-                        "{glyph_set:?} width={width}: {row:?}"
-                    );
-                    assert!(!row.text().contains(['\n', '\t', '\r', '\u{1b}']));
-                }
-                if width > 0 {
-                    for (row, glyph) in rows.iter().zip([
-                        Glyph::TodoPending,
-                        Glyph::TodoInProgress,
-                        Glyph::TodoCompleted,
-                    ]) {
-                        assert!(
-                            row.text().contains(display.glyph(glyph)),
-                            "{glyph_set:?} width={width}: status mark must survive"
-                        );
-                    }
-                }
-            }
-            let rows = area.todo_lines(12, 24, display, true, Instant::now());
-            assert_eq!(
-                rows[0].text(),
-                format!(
-                    "  {}  {} 中文…",
-                    display.glyph(Glyph::TodoBranch),
-                    display.glyph(Glyph::TodoPending)
-                )
-            );
-            assert_eq!(
-                rows[1].text(),
-                format!("     {} e\u{301}中ab", display.glyph(Glyph::TodoInProgress))
-            );
-            assert_eq!(
-                rows[2].text(),
-                format!("     {} done…", display.glyph(Glyph::TodoCompleted))
-            );
-            let short = area.todo_lines(40, 10, display, true, Instant::now());
-            assert!(
-                short[0]
-                    .text()
-                    .contains(display.glyph(Glyph::TodoInProgress))
-            );
-            assert_eq!(short[1].text(), "     … +1 pending, 1 completed");
+        let mut area = StatusArea::default();
+        let mut todos = vec![
+            todo("中文ab中ab"),
+            todo("e\u{301}中ab"),
+            todo("done\nne\txt\r\u{1b}"),
+        ];
+        for (todo, status) in todos.iter_mut().zip([
+            TodoStatus::Pending,
+            TodoStatus::InProgress,
+            TodoStatus::Completed,
+        ]) {
+            todo.status = status;
         }
+        area.update("Auto".into(), "fixture".into(), None, todos);
+        let display = DisplayProfile::default();
+        for width in 0..=40 {
+            let rows = area.todo_lines(width, 24, display, true, Instant::now());
+            assert_eq!(rows.len(), 3);
+            for row in &rows {
+                assert!(
+                    UnicodeWidthStr::width(row.text().as_str()) <= width,
+                    "width={width}: {row:?}"
+                );
+                assert!(!row.text().contains(['\n', '\t', '\r', '\u{1b}']));
+            }
+            if width > 0 {
+                for (row, glyph) in rows.iter().zip([
+                    Glyph::TodoPending,
+                    Glyph::TodoInProgress,
+                    Glyph::TodoCompleted,
+                ]) {
+                    assert!(
+                        row.text().contains(display.glyph(glyph)),
+                        "width={width}: status mark must survive"
+                    );
+                }
+            }
+        }
+        let rows = area.todo_lines(12, 24, display, true, Instant::now());
+        assert_eq!(
+            rows[0].text(),
+            format!(
+                "  {}  {} 中文…",
+                display.glyph(Glyph::TodoBranch),
+                display.glyph(Glyph::TodoPending)
+            )
+        );
+        assert_eq!(
+            rows[1].text(),
+            format!("     {} e\u{301}中ab", display.glyph(Glyph::TodoInProgress))
+        );
+        assert_eq!(
+            rows[2].text(),
+            format!("     {} done…", display.glyph(Glyph::TodoCompleted))
+        );
+        let short = area.todo_lines(40, 10, display, true, Instant::now());
+        assert!(
+            short[0]
+                .text()
+                .contains(display.glyph(Glyph::TodoInProgress))
+        );
+        assert_eq!(short[1].text(), "     … +1 pending, 1 completed");
     }
 
     #[test]

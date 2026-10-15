@@ -43,7 +43,7 @@ use tickloop_agent_client::{
 use tickloop_agent_config::UserSettings;
 use tickloop_agent_model::{ModelClient, cards::launch_model, model_client};
 use tickloop_agent_protocol::{
-    AccessError, AccessErrorCode, AccessLimits, AgentAccess, LaunchSpec,
+    AccessError, AccessErrorCode, AccessLimits, AgentAccess, LaunchSpec, OtherTickhost,
 };
 use tickloop_agent_runtime::Agent;
 
@@ -260,6 +260,22 @@ impl WorkerFactory for ProcessWorkerFactory {
             self.control.revoke(worker).await;
         }
         exited
+    }
+
+    async fn other_tickhost(&self) -> Result<Option<OtherTickhost>, AccessError> {
+        self.control
+            .host_controller()
+            .other_tickhost()
+            .await
+            .map_err(|error| AccessError::unavailable(error.to_string()))
+    }
+
+    async fn replace_tickhost(&self) -> Result<(), AccessError> {
+        self.control
+            .host_controller()
+            .replace_other_tickhost()
+            .await
+            .map_err(|error| AccessError::unavailable(error.to_string()))
     }
 }
 

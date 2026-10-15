@@ -896,7 +896,7 @@ fn a_child_opened_in_place_refuses_root_only_changes_before_sending_and_keeps_it
     });
     view.send(b"\x1b");
     view.wait_for("the settings menu closed", |frame| {
-        !frame.contains("Glyph Set")
+        !frame.contains("Reduce motion")
     });
 
     view.send(b"x");

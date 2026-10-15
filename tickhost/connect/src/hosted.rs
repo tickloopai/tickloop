@@ -135,6 +135,102 @@ pub struct HelloReply {
     pub major: u16,
     pub minor: u16,
     pub capabilities: Vec<String>,
+    /// What the frozen management channel adds for a daemon deciding whether the host is of its
+    /// own build; absent from a business reply and from hosts older than these fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostDescription>,
+}
+
+/// The build a host runs and what it serves, as its management hello reports it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HostDescription {
+    /// The identity of the sources the host was built from, the one the `tickloop` executable of
+    /// the same build computes.
+    pub build: String,
+    pub executable: Option<PathBuf>,
+    pub business_major: u16,
+    pub business_minor: u16,
+    pub occupancy: HostOccupancy,
+}
+
+/// What stopping a host would end.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HostOccupancy {
+    /// Each Tick it holds, by its title, or its instance or command when it has none.
+    pub ticks: Vec<String>,
+    pub shells: usize,
+    /// Opens it has not answered yet and Shell spawn grants no spawner claimed yet, each about
+    /// to run something; `None` from a host older than this count, which may be starting one.
+    #[serde(default)]
+    pub pending: Option<usize>,
+    /// Its authenticated business connections, such as attached views and data clients.
+    pub connections: usize,
+}
+
+/// A connection on the frozen management channel, which any host answers whatever its build.
+pub struct ManagementConnection {
+    reader: BufReader<OwnedReadHalf>,
+    writer: OwnedWriteHalf,
+    hello: HelloReply,
+}
+
+impl ManagementConnection {
+    pub async fn connect(endpoint: &Path, controller_key: &str) -> Result<Self, HostError> {
+        let owner = verify_endpoint(endpoint)?;
+        let stream = tokio::time::timeout(CONTROL_TIMEOUT, UnixStream::connect(endpoint))
+            .await
+            .map_err(|_| HostError::before("HostUnavailable", "connect timed out"))?
+            .map_err(|error| HostError::before("HostUnavailable", error.to_string()))?;
+        if peer_uid(&stream)? != owner {
+            return Err(HostError::before(
+                "HostUnavailable",
+                "Tickhost endpoint belongs to another user",
+            ));
+        }
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let hello = Hello::Management {
+            major: MANAGEMENT_MAJOR,
+            minor: MANAGEMENT_MINOR,
+            controller_key: controller_key.to_owned(),
+        };
+        let exchange = async {
+            write_frame(&mut writer, &json!(hello), MANAGEMENT_FRAME_BYTES).await?;
+            read_frame(&mut reader, MANAGEMENT_FRAME_BYTES).await
+        };
+        let reply = tokio::time::timeout(CONTROL_TIMEOUT, exchange)
+            .await
+            .map_err(|_| HostError::before("HostUnavailable", "hello timed out"))??
+            .ok_or_else(|| HostError::before("HostUnavailable", "host closed during hello"))?;
+        let hello = serde_json::from_value(response_result(reply, None)?)
+            .map_err(|error| HostError::before("ProtocolViolation", error.to_string()))?;
+        Ok(Self {
+            reader,
+            writer,
+            hello,
+        })
+    }
+
+    pub fn hello(&self) -> &HelloReply {
+        &self.hello
+    }
+
+    /// Stops the host: it ends every Tick and Shell task, and answers once its endpoint is gone.
+    pub async fn shutdown_host(mut self, timeout: Duration) -> Result<(), HostError> {
+        let request = json!({"id":1,"method":"shutdown_host","params":{
+            "epoch":self.hello.epoch,
+            "operation":uuid::Uuid::new_v4(),
+        }});
+        write_frame(&mut self.writer, &request, MANAGEMENT_FRAME_BYTES).await?;
+        let reply = tokio::time::timeout(
+            timeout,
+            read_frame(&mut self.reader, MANAGEMENT_FRAME_BYTES),
+        )
+        .await
+        .map_err(|_| HostError::after("OutcomeUnknown", "the Tickhost did not stop in time"))??
+        .ok_or_else(|| HostError::after("OutcomeUnknown", "the Tickhost closed the connection"))?;
+        response_result(reply, Some(1)).map(|_| ())
+    }
 }
 
 /// The device identity of a terminal: what a launcher proves its terminal is.

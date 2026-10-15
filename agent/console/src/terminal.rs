@@ -39,7 +39,6 @@ mod editor;
 mod execution;
 mod external_editor;
 mod file_mentions;
-mod font_manager;
 mod footer;
 mod hosted_probe;
 mod hyperlink;
@@ -670,7 +669,165 @@ async fn await_startup_directory_trust(
     }
 }
 
+/// Connects to the Agent daemon at startup, offering at an interactive start to replace a daemon
+/// or Tickhost of another build.
 async fn connect_startup_daemon(
+    interactive: bool,
+    preferences: tickloop_agent_config::DisplayPreferences,
+    startup_console: &mut Option<(Console, mpsc::Receiver<InputEvent>)>,
+) -> Result<Option<tickloop_agent_client::LocalAgentClient>, String> {
+    let Some(client) = connect_daemon_at_startup(interactive, preferences, startup_console).await?
+    else {
+        return Ok(None);
+    };
+    if interactive {
+        offer_tickhost_replacement(&client, preferences, startup_console).await?;
+    }
+    Ok(Some(client))
+}
+
+/// Shows `menu` before the Agent starts and waits for the user's choice. Its last option cancels,
+/// as do esc, ctrl+c and the end of input.
+async fn choose_at_startup(
+    menu: console::Menu,
+    preferences: tickloop_agent_config::DisplayPreferences,
+    startup_console: &mut Option<(Console, mpsc::Receiver<InputEvent>)>,
+) -> Result<usize, String> {
+    let menu_id = menu.id;
+    let cancel_index = menu.options.len() - 1;
+    if let Some((console, _)) = startup_console.as_ref() {
+        console.set_prompt_enabled(false)?;
+        console.finish_workspace_trust()?;
+        console.show_focused_menu(menu)?;
+    } else {
+        *startup_console = Some(Console::start_with_startup_menu(preferences, menu)?);
+    }
+    let (console, input) = startup_console
+        .as_mut()
+        .expect("startup console initialized");
+    let choice = loop {
+        let event = tokio::select! {
+            event = input.recv() => event,
+            _ = tokio::signal::ctrl_c() => break cancel_index,
+        };
+        match event {
+            Some(InputEvent::Choice {
+                menu_id: id, index, ..
+            }) if id == menu_id => break index,
+            Some(InputEvent::Cancel { menu_id: id }) if id == menu_id => break cancel_index,
+            Some(InputEvent::Eof | InputEvent::Interrupt) | None => break cancel_index,
+            Some(InputEvent::Error(error)) => return Err(error),
+            _ => {}
+        }
+    };
+    console.clear_menu(menu_id)?;
+    Ok(choice)
+}
+
+/// Offers to replace a running Tickhost of another build whose Ticks, Shells or views replacing
+/// it ends; the daemon replaces one that runs nothing without asking. Cancelling leaves Ticks and
+/// Shells unavailable this session, every request saying what to do.
+async fn offer_tickhost_replacement(
+    client: &tickloop_agent_client::LocalAgentClient,
+    preferences: tickloop_agent_config::DisplayPreferences,
+    startup_console: &mut Option<(Console, mpsc::Receiver<InputEvent>)>,
+) -> Result<(), String> {
+    use tickloop_agent_protocol::{AgentAccess, ObservationRequest, ObservationValue};
+    // A Tickhost the daemon cannot read is left for the requests that need it to report.
+    let Ok(observation) = client.observe(ObservationRequest::OtherTickhost).await else {
+        return Ok(());
+    };
+    let ObservationValue::OtherTickhost(Some(other)) = observation.initial else {
+        return Ok(());
+    };
+    let mut context = vec![
+        "A different Tickhost version is running.".into(),
+        safe_text(&other.description),
+    ];
+    match &other.occupancy {
+        Some(occupancy) => {
+            if !occupancy.ticks.is_empty() {
+                context.push(format!(
+                    "Restarting it ends these Ticks: {}.",
+                    safe_text(&occupancy.ticks.join(", "))
+                ));
+            }
+            if occupancy.shells > 0 {
+                context.push(format!(
+                    "It also ends {} running {}.",
+                    occupancy.shells,
+                    if occupancy.shells == 1 {
+                        "Shell"
+                    } else {
+                        "Shells"
+                    }
+                ));
+            }
+            if occupancy.pending > 0 {
+                context.push(format!(
+                    "It also ends {} still starting.",
+                    if occupancy.pending == 1 {
+                        "1 Tick or Shell".to_owned()
+                    } else {
+                        format!("{} Ticks or Shells", occupancy.pending)
+                    }
+                ));
+            }
+            if occupancy.connections > 0 {
+                context.push(format!(
+                    "Its {} open {} close.",
+                    occupancy.connections,
+                    if occupancy.connections == 1 {
+                        "view"
+                    } else {
+                        "views"
+                    }
+                ));
+            }
+        }
+        None => context.push(
+            "It does not say what it runs; restarting it ends every Tick and Shell in it.".into(),
+        ),
+    }
+    context.push("Ended Ticks show as lost in Monitor, where enter reopens them.".into());
+    let menu_id = uuid::Uuid::new_v4();
+    let menu = console::Menu {
+        id: menu_id,
+        title: "Restart the running Tickhost?".into(),
+        context,
+        options: vec![
+            "Stop the old Tickhost and start this version".into(),
+            "Cancel — Ticks and Shells stay unavailable this session".into(),
+        ],
+        selected: 1,
+        confirmation: true,
+    };
+    let choice = choose_at_startup(menu, preferences, startup_console).await?;
+    let (console, _) = startup_console
+        .as_ref()
+        .expect("startup console initialized");
+    if choice != 0 {
+        return console.finish_menu_submission(menu_id);
+    }
+    console.set_status("Stopping the old Tickhost…")?;
+    let replaced = client
+        .execute(tickloop_agent_protocol::CommandEnvelope {
+            daemon_epoch: client.daemon_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: tickloop_agent_protocol::AgentCommand::ReplaceTickhost,
+        })
+        .await;
+    console.finish_menu_submission(menu_id)?;
+    match replaced {
+        Ok(_) => console.set_status(""),
+        Err(error) => console.set_status(&format!(
+            "Cannot restart the Tickhost: {}",
+            safe_text(&error.to_string())
+        )),
+    }
+}
+
+async fn connect_daemon_at_startup(
     interactive: bool,
     preferences: tickloop_agent_config::DisplayPreferences,
     startup_console: &mut Option<(Console, mpsc::Receiver<InputEvent>)>,
@@ -718,32 +875,7 @@ async fn connect_startup_daemon(
         selected: cancel_index,
         confirmation: true,
     };
-    if let Some((console, _)) = startup_console.as_ref() {
-        console.set_prompt_enabled(false)?;
-        console.finish_workspace_trust()?;
-        console.show_focused_menu(menu)?;
-    } else {
-        *startup_console = Some(Console::start_with_startup_menu(preferences, menu)?);
-    }
-    let (console, input) = startup_console
-        .as_mut()
-        .expect("startup console initialized");
-    let choice = loop {
-        let event = tokio::select! {
-            event = input.recv() => event,
-            _ = tokio::signal::ctrl_c() => break cancel_index,
-        };
-        match event {
-            Some(InputEvent::Choice {
-                menu_id: id, index, ..
-            }) if id == menu_id => break index,
-            Some(InputEvent::Cancel { menu_id: id }) if id == menu_id => break cancel_index,
-            Some(InputEvent::Eof | InputEvent::Interrupt) | None => break cancel_index,
-            Some(InputEvent::Error(error)) => return Err(error),
-            _ => {}
-        }
-    };
-    console.clear_menu(menu_id)?;
+    let choice = choose_at_startup(menu, preferences, startup_console).await?;
     if choice == cancel_index {
         return Ok(None);
     }
@@ -761,6 +893,9 @@ async fn connect_startup_daemon(
             running.display()
         ));
     }
+    let (console, _) = startup_console
+        .as_ref()
+        .expect("startup console initialized");
     console.set_status("Stopping the previous Agent daemon…")?;
     prepared.stop().await?;
     let client = tickloop_agent_client::connect_or_start(executable)
@@ -7738,16 +7873,9 @@ mod tests {
         };
         let row: tickloop_agent_protocol::AgentSummary = serde_json::from_value(serde_json::json!({"execution":child,"chat_id":child.agent_id,"workdir":"/test","state":"Completed","title":"Title","has_work":true,"waiting_permissions":0,"waiting_questions":0,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"subagent":{"child_chat_id":child.agent_id,"handle":"audit","description":"Check \u{001b}[2J evidence","created_at":1}})).unwrap();
         let row = super::agent_rows(&[row], false).pop().unwrap();
-        for glyph_set in tickloop_agent_config::GlyphSet::ALL {
-            let display =
-                super::display::DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
-                    glyph_set,
-                    ..Default::default()
-                });
-            let line =
-                super::subagent_panel::family_line(&row, false, false, (80, 5, display, 1000));
-            assert!(!line.text().chars().any(char::is_control));
-        }
+        let display = super::display::DisplayProfile::default();
+        let line = super::subagent_panel::family_line(&row, false, false, (80, 5, display, 1000));
+        assert!(!line.text().chars().any(char::is_control));
     }
 
     #[tokio::test]
@@ -8241,45 +8369,39 @@ mod tests {
                 ),
             ]
         );
-        for glyph_set in [
-            tickloop_agent_config::GlyphSet::Unicode,
-            tickloop_agent_config::GlyphSet::NerdFont,
-        ] {
-            let (console, _) = Console::start_with_display(
-                false,
-                tickloop_agent_config::DisplayPreferences {
-                    glyph_set,
-                    prefers_reduced_motion: true,
-                },
-            )
+        let (console, _) = Console::start_with_display(
+            false,
+            tickloop_agent_config::DisplayPreferences {
+                prefers_reduced_motion: true,
+            },
+        )
+        .unwrap();
+        let activity = super::RunningActivity {
+            chat_id: chat,
+            label: WORKING_ACTIVITY.to_owned(),
+            started_at: Some(std::time::Instant::now()),
+            interruptible: true,
+        };
+        let spans = activity
+            .spans(&console, None, &RunningShimmer::default())
             .unwrap();
-            let activity = super::RunningActivity {
-                chat_id: chat,
-                label: WORKING_ACTIVITY.to_owned(),
-                started_at: Some(std::time::Instant::now()),
-                interruptible: true,
-            };
-            let spans = activity
-                .spans(&console, None, &RunningShimmer::default())
-                .unwrap();
-            let mut row = style::RoleLine::default();
-            for (text, role) in spans {
-                row.push(text, role);
-            }
-            assert!(row.text().ends_with("s · esc to interrupt)"));
-            assert!(row.text().starts_with("• Working ("), "{row:?}");
-            assert_eq!(row.spans[0].role, Some(style::Role::MutedText));
-            assert_eq!(row.spans[1].role, Some(style::Role::RunningShade0));
-            let themed = style::ThemeName::ALL.map(|name| {
-                row.resolve(style::Theme::new(name), 80)
-                    .render(style::ColourDepth::TrueColour)
-            });
-            assert_ne!(themed[0], themed[1]);
-            for width in [0, 1, 12, 40, 80] {
-                let mut narrow = row.clone();
-                narrow.truncate(width);
-                assert!(unicode_width::UnicodeWidthStr::width(narrow.text().as_str()) <= width);
-            }
+        let mut row = style::RoleLine::default();
+        for (text, role) in spans {
+            row.push(text, role);
+        }
+        assert!(row.text().ends_with("s · esc to interrupt)"));
+        assert!(row.text().starts_with("• Working ("), "{row:?}");
+        assert_eq!(row.spans[0].role, Some(style::Role::MutedText));
+        assert_eq!(row.spans[1].role, Some(style::Role::RunningShade0));
+        let themed = style::ThemeName::ALL.map(|name| {
+            row.resolve(style::Theme::new(name), 80)
+                .render(style::ColourDepth::TrueColour)
+        });
+        assert_ne!(themed[0], themed[1]);
+        for width in [0, 1, 12, 40, 80] {
+            let mut narrow = row.clone();
+            narrow.truncate(width);
+            assert!(unicode_width::UnicodeWidthStr::width(narrow.text().as_str()) <= width);
         }
     }
 

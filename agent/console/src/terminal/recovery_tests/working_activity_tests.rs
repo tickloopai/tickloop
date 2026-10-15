@@ -273,7 +273,6 @@ fn working_activity_pty_fixture() {
                 };
                 let (console, input) = Console::start_with_display(true, tickloop_agent_config::DisplayPreferences {
                     prefers_reduced_motion: std::env::var(ACTIVITY_ROUTE).as_deref() == Ok("observe-only"),
-                    ..Default::default()
                 }).unwrap();
                 console.set_prompt_enabled(true).unwrap();
                 interact(&agent, workdir, &console, input, startup, None)

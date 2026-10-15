@@ -653,10 +653,18 @@ async fn piped_effort_controls_request_and_prints_returned_thinking() {
     assert_eq!(request["output_config"]["effort"], "max");
 }
 
+/// A `glyphSet` an earlier version saved, when Tickloop still offered a second glyph set, neither
+/// stops the CLI nor makes it warn.
 #[tokio::test]
-async fn settings_preview_requires_confirmation_before_saving_nerd_font_glyphs() {
+async fn a_glyph_set_an_earlier_version_saved_starts_without_a_warning() {
     let directory = tempfile::tempdir().unwrap();
     let config_root = directory.path().join("config-root");
+    std::fs::create_dir(&config_root).unwrap();
+    std::fs::write(
+        config_root.join("settings.json"),
+        r#"{"glyphSet": "unicode"}"#,
+    )
+    .unwrap();
     let mut child = trusted_async_agent_command()
         .env("TICKLOOP_CONFIG_DIR", &config_root)
         .arg("--cwd")
@@ -673,25 +681,23 @@ async fn settings_preview_requires_confirmation_before_saving_nerd_font_glyphs()
         .stdin
         .take()
         .unwrap()
-        .write_all(b"/settings\n10\n2\n1\n/exit\n")
+        .write_all(b"/settings\n/exit\n")
         .await
         .unwrap();
     let output = tokio::time::timeout(INTERACTION_TIMEOUT, child.wait_with_output())
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
-    let transcript = String::from_utf8(output.stdout).unwrap();
-    assert!(transcript.contains("Unicode preview:"), "{transcript}");
-    assert!(transcript.contains("Nerd Font preview:"), "{transcript}");
-    assert!(transcript.contains("Confirm glyph set"), "{transcript}");
-    let saved: Value =
-        serde_json::from_slice(&std::fs::read(config_root.join("settings.json")).unwrap()).unwrap();
-    assert_eq!(saved["glyphSet"], "nerd-font");
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("Reduce motion"), "{stdout}");
+    assert!(
+        !stdout.contains("glyphSet") && !stderr.contains("glyphSet"),
+        "no warning names the old setting: {stdout}{stderr}"
+    );
 }
 
 #[tokio::test]

@@ -3180,22 +3180,14 @@ mod tests {
             json!({"source":{"sender_relationship":"sibling","sender_label":"Audit report","sender_handle":"audit","relay":{"original_chat_id":Uuid::new_v4(),"original_message_id":Uuid::new_v4(),"original_text":"Human instruction","forwarded_verbatim":true},"is_result":false},"message":"Agent body first line\nAgent body detail"})
         );
         let local = LocalMessage::parse(&text).unwrap();
-        for glyphs in [
-            tickloop_agent_config::GlyphSet::Unicode,
-            tickloop_agent_config::GlyphSet::NerdFont,
-        ] {
-            let display = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
-                glyph_set: glyphs,
-                ..Default::default()
-            });
-            let preview = local_message_text(&local, OutputDetail::Preview, display);
-            assert_eq!(preview, "\n› Message from @audit (ctrl+o to expand)\n");
-            let full = local_message_text(&local, OutputDetail::Full, display);
-            assert_eq!(
-                full,
-                "\n› Message from @audit\n  Verified user relay · verbatim\n  Human instruction\n  Agent body first line\n  Agent body detail\n"
-            );
-        }
+        let display = DisplayProfile::default();
+        let preview = local_message_text(&local, OutputDetail::Preview, display);
+        assert_eq!(preview, "\n› Message from @audit (ctrl+o to expand)\n");
+        let full = local_message_text(&local, OutputDetail::Full, display);
+        assert_eq!(
+            full,
+            "\n› Message from @audit\n  Verified user relay · verbatim\n  Human instruction\n  Agent body first line\n  Agent body detail\n"
+        );
     }
 
     #[test]

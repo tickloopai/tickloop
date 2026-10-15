@@ -2,7 +2,7 @@ use std::{os::unix::fs::MetadataExt, path::Path, sync::Arc};
 
 use serde_json::json;
 use tickloop_agent_base::output_style::OutputStyle;
-use tickloop_agent_config::{DisplayPreferences, GlyphSet, UserSettings};
+use tickloop_agent_config::{DisplayPreferences, UserSettings};
 use tickloop_agent_model::cards::model_for_persistent_selection;
 use tickloop_agent_protocol::{
     ChatId, Content, Decision, EventKind, ModelChange, ModelConfig, PermissionRule,
@@ -49,7 +49,6 @@ fn display_preferences_round_trip_without_replacing_unrelated_settings() {
 
     settings
         .save_display_preferences(DisplayPreferences {
-            glyph_set: GlyphSet::NerdFont,
             prefers_reduced_motion: true,
         })
         .unwrap();
@@ -57,7 +56,6 @@ fn display_preferences_round_trip_without_replacing_unrelated_settings() {
     assert_eq!(
         settings.display_preferences(),
         DisplayPreferences {
-            glyph_set: GlyphSet::NerdFont,
             prefers_reduced_motion: true,
         }
     );
@@ -90,13 +88,35 @@ fn legacy_status_position_is_silently_ignored_and_preserved_on_display_save() {
         assert_eq!(settings_json(directory.path()), original);
         settings
             .save_display_preferences(DisplayPreferences {
-                glyph_set: GlyphSet::NerdFont,
                 prefers_reduced_motion: true,
             })
             .unwrap();
         let saved = settings_json(directory.path());
         assert_eq!(saved["statusLinePosition"], legacy);
         assert_eq!(saved["futureSetting"], original["futureSetting"]);
+    }
+}
+
+/// Tickloop has one glyph set; a `glyphSet` an earlier version saved is read
+/// past without a warning, as any key Tickloop does not use.
+#[test]
+fn a_glyph_set_an_earlier_version_saved_is_silently_ignored() {
+    let directory = tempfile::tempdir().unwrap();
+    let settings = UserSettings::in_root(directory.path());
+    for legacy in [json!("unicode"), json!("private-use"), json!(3)] {
+        std::fs::write(
+            directory.path().join("settings.json"),
+            json!({"glyphSet": legacy, "prefersReducedMotion": true}).to_string(),
+        )
+        .unwrap();
+        let mut loaded = settings.load();
+        assert_eq!(
+            loaded.display_preferences(),
+            DisplayPreferences {
+                prefers_reduced_motion: true,
+            }
+        );
+        assert!(loaded.warnings().is_empty(), "{:?}", loaded.warnings());
     }
 }
 

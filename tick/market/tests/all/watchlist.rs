@@ -255,60 +255,54 @@ async fn switching_groups_updates_subscriptions_and_preserves_push_and_market_ev
 }
 
 #[tokio::test]
-async fn narrow_watchlists_keep_symbol_and_change_percent_in_both_icon_themes() {
-    use tickloop_ui::settings::IconTheme;
-    for theme in [IconTheme::Unicode, IconTheme::Nerd] {
-        let (push, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let api = LiveWatchlist {
-            events: std::sync::Mutex::new(Some(receiver)),
-            subscriptions: std::sync::Mutex::new(Vec::new()),
-        };
-        let settings = Settings {
-            icon_theme: theme,
-            ..Settings::default()
-        };
-        let args = WatchlistArgs {
-            group: None,
-            output: OnceArgs::default(),
-        };
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
-            TickKind::Watchlist.minimum_panel_size().columns,
-            8,
-        ))
-        .unwrap();
-        let input = futures_util::stream::iter([Ok(crossterm::event::Event::Key(
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('q'),
-                crossterm::event::KeyModifiers::NONE,
-            ),
-        ))]);
-        watchlist::run_live(
-            &args,
-            &api,
-            &settings,
-            &mut terminal,
-            input,
-            &mut TickStream::in_memory(TickKind::Watchlist),
-        )
-        .await
-        .unwrap();
-        drop(push);
-        let screen: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-        assert!(screen.contains("700.HK"), "{screen}");
-        assert!(screen.contains("+20.00%"), "{screen}");
-        assert!(!screen.contains("Latest Price"), "{screen}");
-        assert!(!screen.contains("scroll"), "{screen}");
-        assert!(
-            screen.contains(tickloop_ui::icons::Icon::MarketOpen.glyph(theme).trim_end()),
-            "{screen}"
-        );
-    }
+async fn narrow_watchlists_keep_symbol_and_change_percent() {
+    let (push, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let api = LiveWatchlist {
+        events: std::sync::Mutex::new(Some(receiver)),
+        subscriptions: std::sync::Mutex::new(Vec::new()),
+    };
+    let settings = Settings::default();
+    let args = WatchlistArgs {
+        group: None,
+        output: OnceArgs::default(),
+    };
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+        TickKind::Watchlist.minimum_panel_size().columns,
+        8,
+    ))
+    .unwrap();
+    let input = futures_util::stream::iter([Ok(crossterm::event::Event::Key(
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('q'),
+            crossterm::event::KeyModifiers::NONE,
+        ),
+    ))]);
+    watchlist::run_live(
+        &args,
+        &api,
+        &settings,
+        &mut terminal,
+        input,
+        &mut TickStream::in_memory(TickKind::Watchlist),
+    )
+    .await
+    .unwrap();
+    drop(push);
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(screen.contains("700.HK"), "{screen}");
+    assert!(screen.contains("+20.00%"), "{screen}");
+    assert!(!screen.contains("Latest Price"), "{screen}");
+    assert!(!screen.contains("scroll"), "{screen}");
+    assert!(
+        screen.contains(tickloop_ui::icons::Icon::MarketOpen.glyph()),
+        "{screen}"
+    );
 }
 
 struct RefreshingMarkets {

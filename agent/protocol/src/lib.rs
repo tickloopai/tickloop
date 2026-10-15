@@ -48,12 +48,12 @@ pub use access::{
     ExecutionAvailability, ExecutionRef, HistoryAction, HostLocation, HostWorkContext,
     InteractionSource, LaunchSpec, LiveChatSnapshot, LiveChatStatus, LoopAction, LoopRef,
     MAX_PAGE_LIMIT, Observation, ObservationChange, ObservationFailure, ObservationRequest,
-    ObservationUpdate, ObservationValue, PROTOCOL_MAJOR, PROTOCOL_MINOR, Page, PendingRequestKind,
-    PersistenceState, ProtocolLimits, ProviderCredentialScope, QueuedCommandFailure,
-    RECEIPT_CAPACITY, RECEIPT_RETENTION_SECONDS, REPLAY_CAPACITY, ReceiptState, RecordedMessage,
-    RecordedTranscript, RequestRef, ResetReason, ServerHello, ServerMessage, TaskAction,
-    TaskOrigin, TaskRef, TranscriptRef, UserInput, VIEW_LEASE_SECONDS, ViewRef, bounded_update,
-    build_identity, set_build_identity,
+    ObservationUpdate, ObservationValue, OtherTickhost, PROTOCOL_MAJOR, PROTOCOL_MINOR, Page,
+    PendingRequestKind, PersistenceState, ProtocolLimits, ProviderCredentialScope,
+    QueuedCommandFailure, RECEIPT_CAPACITY, RECEIPT_RETENTION_SECONDS, REPLAY_CAPACITY,
+    ReceiptState, RecordedMessage, RecordedTranscript, RequestRef, ResetReason, ServerHello,
+    ServerMessage, TaskAction, TaskOrigin, TaskRef, TickhostOccupancy, TranscriptRef, UserInput,
+    VIEW_LEASE_SECONDS, ViewRef, bounded_update, build_identity, set_build_identity,
 };
 pub use approvals::{
     ApprovalAssessmentDetails, ApprovalAttemptDetails, ApprovalAttemptOutcome, ApprovalDiagnostic,

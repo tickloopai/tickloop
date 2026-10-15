@@ -13,7 +13,7 @@ use tick_provider::{
     Interface,
     preferences::{Language, Region},
 };
-use tickloop_ui::settings::{AmbiguousWidth, ColorMode, IconTheme};
+use tickloop_ui::settings::{AmbiguousWidth, ColorMode};
 
 const ABOUT: &str = "Tickloop Ticks: market, account and news views as standalone terminal commands, \
      run as `tick <provider> <tick>`";
@@ -64,9 +64,6 @@ pub struct GlobalArgs {
     /// Which direction is painted red: red-up (default) or green-up
     #[arg(long, global = true, value_name = "MODE", value_parser = parse_variant::<ColorMode>)]
     pub color_mode: Option<ColorMode>,
-    /// Status icon glyph set: unicode (default) or nerd
-    #[arg(long, global = true, value_name = "THEME", value_parser = parse_variant::<IconTheme>)]
-    pub icon_theme: Option<IconTheme>,
     /// Display language for API names and number units: zh-CN (default) or en
     #[arg(long, global = true, value_name = "LANG", value_parser = parse_variant::<Language>)]
     pub language: Option<Language>,
@@ -345,7 +342,6 @@ impl GlobalArgs {
     pub fn overrides(&self) -> Overrides {
         Overrides {
             color_mode: self.color_mode,
-            icon_theme: self.icon_theme,
             language: self.language,
             ambiguous_width: self.ambiguous_width,
             region: self.region,

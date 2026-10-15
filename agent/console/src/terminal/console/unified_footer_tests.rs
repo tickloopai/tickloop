@@ -123,73 +123,66 @@ fn command_feedback_keeps_provider_failure_visible_with_an_empty_custom_status()
 
 #[test]
 fn child_input_badge_placeholder_and_panel_background_are_display_only() {
-    use tickloop_agent_config::{DisplayPreferences, GlyphSet};
-    for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
-        for theme in ThemeName::ALL {
-            let console = fixture();
-            update(&console, vec![]);
-            console
-                .set_agent_family(
-                    vec![
-                        agent(1, None, "Root title"),
-                        agent(2, Some(Uuid::from_u128(1)), "sleep-30-2"),
-                    ],
-                    Some(Uuid::from_u128(2)),
-                )
-                .unwrap();
-            console.set_visible_delegation(true).unwrap();
-            let mut state = console.state.lock().unwrap();
-            state.editor.replace_draft(String::new(), 0);
-            state.display.set_preferences(DisplayPreferences {
-                glyph_set,
-                prefers_reduced_motion: false,
-            });
-            state.display.set_theme(theme);
-            let (lines, _, _) = state.normal_styled_frame();
-            let badge = lines
-                .iter()
-                .find(|line| line.text().contains("@sleep-30-2") && line.text().contains('─'))
-                .expect("child handle on upper divider");
-            assert!(
-                badge
-                    .text()
-                    .trim_end_matches('─')
-                    .ends_with(" @sleep-30-2 "),
-                "the handle ends the upper divider on the right: {badge:?}"
-            );
-            assert!(badge.spans.iter().any(
+    for theme in ThemeName::ALL {
+        let console = fixture();
+        update(&console, vec![]);
+        console
+            .set_agent_family(
+                vec![
+                    agent(1, None, "Root title"),
+                    agent(2, Some(Uuid::from_u128(1)), "sleep-30-2"),
+                ],
+                Some(Uuid::from_u128(2)),
+            )
+            .unwrap();
+        console.set_visible_delegation(true).unwrap();
+        let mut state = console.state.lock().unwrap();
+        state.editor.replace_draft(String::new(), 0);
+        state.display.set_theme(theme);
+        let (lines, _, _) = state.normal_styled_frame();
+        let badge = lines
+            .iter()
+            .find(|line| line.text().contains("@sleep-30-2") && line.text().contains('─'))
+            .expect("child handle on upper divider");
+        assert!(
+            badge
+                .text()
+                .trim_end_matches('─')
+                .ends_with(" @sleep-30-2 "),
+            "the handle ends the upper divider on the right: {badge:?}"
+        );
+        assert!(
+            badge.spans.iter().any(
                 |span| span.text.contains("@sleep-30-2") && span.role == Some(Role::AgentGreen)
-            ));
-            assert!(
-                badge
-                    .spans
-                    .iter()
-                    .filter(|span| span.text.contains('─'))
-                    .all(|span| span.role == Some(Role::AgentGreen)),
-                "the viewed child's colour frames its input: {badge:?}"
-            );
-            let prompt = lines
+            )
+        );
+        assert!(
+            badge
+                .spans
                 .iter()
-                .find(|line| line.text().starts_with(state.display.glyph(Glyph::Prompt)))
-                .expect("input row");
-            assert_eq!(prompt.spans[0].text, state.display.glyph(Glyph::Prompt));
-            assert_eq!(prompt.spans[0].role, Some(Role::AgentGreen));
-            assert!(
-                lines
-                    .iter()
-                    .any(|line| line.text().contains("Message @sleep-30-2…"))
-            );
-            assert!(state.editor.draft().is_empty());
-            assert_eq!(state.input_display().0, "");
-            assert!(
-                lines
-                    .iter()
-                    .filter(
-                        |line| line.text().contains("sleep-30-2") || line.text().contains(" main")
-                    )
-                    .all(|line| line.fill.is_none())
-            );
-        }
+                .filter(|span| span.text.contains('─'))
+                .all(|span| span.role == Some(Role::AgentGreen)),
+            "the viewed child's colour frames its input: {badge:?}"
+        );
+        let prompt = lines
+            .iter()
+            .find(|line| line.text().starts_with(state.display.glyph(Glyph::Prompt)))
+            .expect("input row");
+        assert_eq!(prompt.spans[0].text, state.display.glyph(Glyph::Prompt));
+        assert_eq!(prompt.spans[0].role, Some(Role::AgentGreen));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text().contains("Message @sleep-30-2…"))
+        );
+        assert!(state.editor.draft().is_empty());
+        assert_eq!(state.input_display().0, "");
+        assert!(
+            lines
+                .iter()
+                .filter(|line| line.text().contains("sleep-30-2") || line.text().contains(" main"))
+                .all(|line| line.fill.is_none())
+        );
     }
 }
 
@@ -336,17 +329,10 @@ fn expanded_subagents_start_at_the_entry_without_an_items_or_blank_summary_row()
 }
 
 #[test]
-fn subagents_robot_prefix_preserves_divider_bounds_and_hints_in_both_states_and_glyph_sets() {
-    use tickloop_agent_config::GlyphSet;
-
-    for (glyph_set, robot) in [(GlyphSet::Unicode, "⏺"), (GlyphSet::NerdFont, "\u{f06a9}")] {
+fn subagents_robot_prefix_preserves_divider_bounds_and_hints_in_both_states() {
+    let robot = "⏺";
+    {
         let console = fixture();
-        console
-            .set_display_preferences(DisplayPreferences {
-                glyph_set,
-                prefers_reduced_motion: false,
-            })
-            .unwrap();
         update(&console, vec![]);
         console
             .set_agent_family(
@@ -471,70 +457,62 @@ fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks()
 
 #[test]
 fn subagents_and_context_colors_resolve_from_theme_roles() {
-    use tickloop_agent_config::GlyphSet;
-
-    for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
-        for theme_name in ThemeName::ALL {
-            let console = fixture();
+    for theme_name in ThemeName::ALL {
+        let console = fixture();
+        console
+            .set_agent_family(
+                vec![
+                    agent(1, None, "Main theme probe"),
+                    agent(2, Some(Uuid::from_u128(1)), "child theme probe"),
+                ],
+                Some(Uuid::from_u128(1)),
+            )
+            .unwrap();
+        for (context, text, context_role) in [
+            (Some((0, 200_000)), "Context 0% used", Role::Success),
+            (None, "Context unknown", Role::MutedText),
+        ] {
             console
-                .set_agent_family(
-                    vec![
-                        agent(1, None, "Main theme probe"),
-                        agent(2, Some(Uuid::from_u128(1)), "child theme probe"),
-                    ],
-                    Some(Uuid::from_u128(1)),
-                )
+                .update_status_area("Auto".into(), "fixture".into(), context, vec![])
                 .unwrap();
-            for (context, text, context_role) in [
-                (Some((0, 200_000)), "Context 0% used", Role::Success),
-                (None, "Context unknown", Role::MutedText),
+            let mut state = console.state.lock().unwrap();
+            state.display.set_theme(theme_name);
+            let label = format!("{} Subagents 1", state.display.glyph(Glyph::Subagents));
+            for (collapsed, focused, entry_role) in [
+                (false, false, Role::Permission),
+                (true, false, Role::MutedText),
+                (false, true, Role::Suggestion),
+                (true, true, Role::Suggestion),
             ] {
-                console
-                    .update_status_area("Auto".into(), "fixture".into(), context, vec![])
+                state.status_area.agents_collapsed = collapsed;
+                state.footer.clear();
+                if focused {
+                    state.footer.select(FooterItemId::Agents);
+                }
+                let (styled, _, _) = state.normal_styled_frame();
+                let lower = styled
+                    .iter()
+                    .find(|line| line.text().contains(&label))
                     .unwrap();
-                let mut state = console.state.lock().unwrap();
-                state.display.set_preferences(DisplayPreferences {
-                    glyph_set,
-                    prefers_reduced_motion: false,
-                });
-                state.display.set_theme(theme_name);
-                let label = format!("{} Subagents 1", state.display.glyph(Glyph::Subagents));
-                for (collapsed, focused, entry_role) in [
-                    (false, false, Role::Permission),
-                    (true, false, Role::MutedText),
-                    (false, true, Role::Suggestion),
-                    (true, true, Role::Suggestion),
-                ] {
-                    state.status_area.agents_collapsed = collapsed;
-                    state.footer.clear();
-                    if focused {
-                        state.footer.select(FooterItemId::Agents);
-                    }
-                    let (styled, _, _) = state.normal_styled_frame();
-                    let lower = styled
-                        .iter()
-                        .find(|line| line.text().contains(&label))
-                        .unwrap();
-                    let resolved = lower.resolve(state.display.theme(), state.width);
-                    for (segment, role) in [(label.as_str(), entry_role), (text, context_role)] {
-                        assert!(
-                            lower
-                                .spans
-                                .iter()
-                                .any(|span| span.text.contains(segment) && span.role == Some(role)),
-                            "{lower:?}"
-                        );
-                        let style = resolved
+                let resolved = lower.resolve(state.display.theme(), state.width);
+                for (segment, role) in [(label.as_str(), entry_role), (text, context_role)] {
+                    assert!(
+                        lower
                             .spans
                             .iter()
-                            .find(|span| span.text.contains(segment))
-                            .unwrap()
-                            .style;
-                        assert_eq!(
-                            style.foreground,
-                            state.display.theme().style(role).foreground
-                        );
-                    }
+                            .any(|span| span.text.contains(segment) && span.role == Some(role)),
+                        "{lower:?}"
+                    );
+                    let style = resolved
+                        .spans
+                        .iter()
+                        .find(|span| span.text.contains(segment))
+                        .unwrap()
+                        .style;
+                    assert_eq!(
+                        style.foreground,
+                        state.display.theme().style(role).foreground
+                    );
                 }
             }
         }

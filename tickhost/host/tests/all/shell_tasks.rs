@@ -21,7 +21,7 @@ use tickhost::{
 };
 use tickhost_connect::hosted::{
     self, CAPABILITY_DATA, CAPABILITY_LIFECYCLE, CAPABILITY_SHELL, CONTROL_TIMEOUT, HostConnection,
-    Role,
+    ManagementConnection, Role,
 };
 
 struct Fixture {
@@ -138,6 +138,54 @@ async fn allow(controller: &mut HostConnection, binding: &SpawnBinding) -> Spawn
         .await
         .unwrap();
     serde_json::from_value(grant).unwrap()
+}
+
+/// A spawn grant no spawner claimed yet is a Shell about to run: what stopping the host ends
+/// counts it until a spawner claims it, so a daemon of another build never takes the host for
+/// empty in between.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spawn_grant_not_yet_claimed_counts_as_starting_until_its_spawner_connects() {
+    let fixture = Fixture::start().await;
+    let pending = || async {
+        ManagementConnection::connect(&fixture.paths.socket(), &fixture.key)
+            .await
+            .unwrap()
+            .hello()
+            .host
+            .clone()
+            .unwrap()
+            .occupancy
+            .pending
+    };
+    assert_eq!(pending().await, Some(0));
+    let mut controller = fixture.controller().await;
+    let workdir = fixture.workdir("work");
+    let grant = allow(&mut controller, &fixture.binding("sleep 30", &workdir)).await;
+    assert_eq!(pending().await, Some(1));
+
+    let _spawner = HostConnection::connect(
+        &fixture.paths.socket(),
+        Role::Spawner {
+            grant: grant.grant,
+            token: grant.token,
+        },
+        &[CAPABILITY_SHELL],
+    )
+    .await
+    .unwrap();
+    let occupancy = ManagementConnection::connect(&fixture.paths.socket(), &fixture.key)
+        .await
+        .unwrap()
+        .hello()
+        .host
+        .clone()
+        .unwrap()
+        .occupancy;
+    assert_eq!(occupancy.pending, Some(0));
+    assert!(
+        occupancy.connections >= 2,
+        "the spawner's connection counts instead: {occupancy:?}"
+    );
 }
 
 struct Started {

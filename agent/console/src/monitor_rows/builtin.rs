@@ -85,6 +85,11 @@ impl MonitorRows for HostedRows {
                 row.tone = link_tone(TickLinkState::InstanceGone);
                 HostedRun::Ended
             }
+            Some(MemberState::Unavailable) => {
+                row.status = "unavailable".into();
+                row.tone = StatusTone::Degraded;
+                HostedRun::Running
+            }
             // Until the first probe answers, the Tick this Chat opened is taken to run.
             None => HostedRun::Running,
         };
@@ -1322,5 +1327,31 @@ mod tests {
                 row.instance
             );
         }
+    }
+
+    #[test]
+    fn a_tick_of_an_unavailable_host_is_neither_running_nor_lost() {
+        let kept = InstanceRef::new("hosted", "kept-run").unwrap();
+        let mut chat = empty_chat();
+        chat.monitor.record_opened(kept.clone(), None);
+        let context = MonitorContext {
+            chat: Some(Arc::new(chat)),
+            member_states: [(kept.clone(), MemberState::Unavailable)].into(),
+            ..Default::default()
+        };
+        let rows = MonitorRowsRegistry::builtin().list(&context);
+        let row = rows.iter().find(|row| row.instance == kept).unwrap();
+        assert_eq!(row.status, "unavailable");
+        assert_eq!(row.tone, StatusTone::Degraded);
+        assert!(!row.running);
+        let actions = row
+            .actions
+            .iter()
+            .map(|action| (action.key, action.label))
+            .collect::<Vec<_>>();
+        assert!(
+            actions.starts_with(&[('o', "open"), ('x', "close")]),
+            "nothing offers to reopen a Tick that may still run: {actions:?}"
+        );
     }
 }

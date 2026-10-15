@@ -12,7 +12,6 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
 use super::{
-    display::{DisplayProfile, Glyph},
     hyperlink::Hyperlink,
     running_shimmer::RunningShimmer,
     style::{Role, RoleLine},
@@ -930,106 +929,6 @@ impl Scrollback {
         self.foreground_command_hint.is_some()
     }
 
-    pub(super) fn remap_display(&mut self, previous: DisplayProfile, next: DisplayProfile) {
-        if previous.preferences().glyph_set == next.preferences().glyph_set {
-            return;
-        }
-        let previous_lead = format!("{} ", previous.glyph(Glyph::Assistant));
-        for block in self
-            .line_styles
-            .iter_mut()
-            .filter_map(|style| style.markdown.as_mut())
-        {
-            if block.lead == previous_lead {
-                block.lead = format!("{} ", next.glyph(Glyph::Assistant));
-            }
-            block.layout = StreamingLayout::default();
-            block.row_counts.clear();
-        }
-        let previous_call_glyph = format!("{} ", previous.glyph(Glyph::ToolCall));
-        let next_call_glyph = format!("{} ", next.glyph(Glyph::ToolCall));
-        for header in self.tool_call_headers.values_mut() {
-            for (text, role) in &mut header.spans {
-                if *role == Some(Role::MutedText) && *text == previous_call_glyph {
-                    text.clone_from(&next_call_glyph);
-                }
-            }
-        }
-        for group in &mut self.groups {
-            if group.lead == previous_call_glyph {
-                group.lead.clone_from(&next_call_glyph);
-            }
-        }
-        for group in 0..self.groups.len() {
-            self.draw_group(group);
-        }
-        for (line, style) in self.lines.iter_mut().zip(&mut self.line_styles) {
-            remap_prefix(
-                line,
-                style,
-                0,
-                previous.glyph(Glyph::Assistant),
-                next.glyph(Glyph::Assistant),
-                Role::Text,
-            );
-            remap_prefix(
-                line,
-                style,
-                0,
-                previous.glyph(Glyph::ToolCall),
-                next.glyph(Glyph::ToolCall),
-                Role::MutedText,
-            );
-            remap_prefix(
-                line,
-                style,
-                2,
-                previous.glyph(Glyph::ToolResult),
-                next.glyph(Glyph::ToolResult),
-                Role::MutedText,
-            );
-            remap_prefix(
-                line,
-                style,
-                2,
-                previous.glyph(Glyph::ToolResult),
-                next.glyph(Glyph::ToolResult),
-                Role::Error,
-            );
-            for (glyph, role) in [
-                (Glyph::Success, Role::Success),
-                (Glyph::Failure, Role::Error),
-                (Glyph::Warning, Role::Warning),
-                (Glyph::Prompt, Role::Subtle),
-                // A finished background task or child: its `⏺` in its outcome's colour.
-                (Glyph::ToolCall, Role::Success),
-                (Glyph::ToolCall, Role::Error),
-                (Glyph::ToolCall, Role::Warning),
-                (Glyph::AgentMessage, Role::MutedText),
-            ] {
-                remap_prefix(
-                    line,
-                    style,
-                    0,
-                    previous.glyph(glyph),
-                    next.glyph(glyph),
-                    role,
-                );
-            }
-            remap_prefix(
-                line,
-                style,
-                0,
-                previous.glyph(Glyph::AgentRunning),
-                next.glyph(Glyph::AgentRunning),
-                Role::Accent,
-            );
-        }
-        self.rows.clear();
-        self.conversation_rows = 0;
-        self.dirty_from = Some(0);
-    }
-
     #[cfg(test)]
     /// Starts a message block: the current line wraps with `hang` columns of
     /// indent, and each later logical line begins with `lead`.
@@ -1762,43 +1661,7 @@ mod tests {
     }
 
     #[test]
-    fn display_switch_remaps_only_semantic_glyph_runs() {
-        let mut scrollback = Scrollback::new();
-        scrollback.append("literal ↑↓ and ⏺ stay text\n");
-        scrollback.append_as("⏺ assistant\n", Some(Role::Text), None);
-        scrollback.append_as("⏺ tool\n", Some(Role::MutedText), None);
-        scrollback.append_as("  ⎿ result\n", Some(Role::MutedText), None);
-        scrollback.append_as("✓ Done", Some(Role::Success), None);
-        let unicode = DisplayProfile::default();
-        let nerd_font = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
-            glyph_set: tickloop_agent_config::GlyphSet::NerdFont,
-            prefers_reduced_motion: false,
-        });
-
-        scrollback.remap_display(unicode, nerd_font);
-
-        assert_eq!(
-            scrollback.frame(80, 8).lines,
-            [
-                "literal ↑↓ and ⏺ stay text",
-                "⏺ assistant",
-                "⏺ tool",
-                "  ⎿ result",
-                "\u{f05e1} Done",
-                "",
-            ]
-        );
-        let before_reduced_motion = scrollback.frame(80, 8).lines;
-        let reduced_motion = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
-            glyph_set: tickloop_agent_config::GlyphSet::NerdFont,
-            prefers_reduced_motion: true,
-        });
-        scrollback.remap_display(nerd_font, reduced_motion);
-        assert_eq!(scrollback.frame(80, 8).lines, before_reduced_motion);
-    }
-
-    #[test]
-    fn a_link_follows_its_text_across_wrapped_rows_and_glyph_remaps() {
+    fn a_link_follows_its_text_across_wrapped_rows() {
         let link = Hyperlink::file(std::path::Path::new("/cache/1.png")).unwrap();
         let mut scrollback = Scrollback::new();
         scrollback.append_as("❯ ", Some(Role::Subtle), None);
@@ -1819,13 +1682,6 @@ mod tests {
         assert_eq!(scrollback.frame(40, 5).lines, ["❯ see [Image #1] now", ""]);
         assert_eq!(linked_text(&mut scrollback, 40), ["[Image #1]"]);
         assert_eq!(linked_text(&mut scrollback, 12), ["[Image", "#1]"]);
-
-        let nerd_font = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
-            glyph_set: tickloop_agent_config::GlyphSet::NerdFont,
-            prefers_reduced_motion: false,
-        });
-        scrollback.remap_display(DisplayProfile::default(), nerd_font);
-        assert_eq!(linked_text(&mut scrollback, 40), ["[Image #1]"]);
     }
 
     #[test]
@@ -1943,19 +1799,6 @@ mod tests {
             fresh.append_markdown(&source[..index + character.len_utf8()], "⏺ ", false);
             assert_eq!(streamed.frame(12, 40).lines, fresh.frame(12, 40).lines);
         }
-    }
-
-    #[test]
-    fn a_glyph_switch_keeps_claude_codes_mark_on_markdown_leads() {
-        let mut scrollback = Scrollback::new();
-        scrollback.append_markdown("reply", "⏺ ", true);
-        scrollback.frame(20, 4);
-        let nerd_font = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
-            glyph_set: tickloop_agent_config::GlyphSet::NerdFont,
-            prefers_reduced_motion: false,
-        });
-        scrollback.remap_display(DisplayProfile::default(), nerd_font);
-        assert_eq!(scrollback.frame(20, 4).lines, ["", "⏺ reply", ""]);
     }
 
     fn done_notice(usage: &str) -> Vec<(String, Option<Role>)> {

@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 use tickhost::{host, paths::HostPaths};
 use tickhost_connect::hosted::{
     ATTACH_INPUT_BYTES, ATTACH_REQUEST_FRAME_BYTES, BUSINESS_FRAME_BYTES, BUSINESS_MAJOR,
-    CALL_TIMEOUT, CAPABILITY_DATA, CAPABILITY_LIFECYCLE, CONTROL_TIMEOUT, HostConnection, Role,
-    read_frame, write_frame,
+    BUSINESS_MINOR, CALL_TIMEOUT, CAPABILITY_DATA, CAPABILITY_LIFECYCLE, CONTROL_TIMEOUT,
+    HostConnection, HostOccupancy, ManagementConnection, Role, read_frame, write_frame,
 };
 use tokio::{
     io::BufReader,
@@ -713,6 +713,55 @@ async fn host_shutdown_ends_every_tick_and_removes_its_endpoint() {
         );
     }
     assert!(!fixture.paths.socket().exists());
+}
+
+/// The frozen management hello tells a daemon which build the host is and what stopping it would
+/// end, so a daemon of another build replaces only a host that runs nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_management_hello_names_the_build_and_what_stopping_the_host_ends() {
+    let fixture = Fixture::start().await;
+    let describe = || async {
+        ManagementConnection::connect(&fixture.paths.socket(), &fixture.key)
+            .await
+            .unwrap()
+            .hello()
+            .host
+            .clone()
+            .expect("a host of this build describes itself")
+    };
+    let empty = describe().await;
+    assert_eq!(empty.build, host::BUILD_IDENTITY);
+    assert_eq!(
+        (empty.business_major, empty.business_minor),
+        (BUSINESS_MAJOR, BUSINESS_MINOR)
+    );
+    assert!(empty.executable.is_some());
+    assert_eq!(
+        empty.occupancy,
+        HostOccupancy {
+            pending: Some(0),
+            ..HostOccupancy::default()
+        }
+    );
+
+    let mut controller = fixture.controller().await;
+    let sleep = which("sleep");
+    fixture
+        .open_terminal(&mut controller, &[&sleep, "30"])
+        .await;
+    let occupied = describe().await.occupancy;
+    assert_eq!(occupied.ticks, [format!("{sleep} 30")], "listed by title");
+    assert_eq!(occupied.shells, 0);
+    assert_eq!(occupied.pending, Some(0), "the open was answered");
+    assert_eq!(occupied.connections, 1, "the controller's connection");
+
+    ManagementConnection::connect(&fixture.paths.socket(), &fixture.key)
+        .await
+        .unwrap()
+        .shutdown_host(CONTROL_TIMEOUT)
+        .await
+        .unwrap();
+    assert!(!fixture.paths.socket().exists(), "the host stopped");
 }
 
 /// A listed title stays within its bound however long the command it names, so a page of rows

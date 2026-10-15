@@ -370,6 +370,7 @@ impl AnswerlessHost {
                     major: hosted::BUSINESS_MAJOR,
                     minor: hosted::BUSINESS_MINOR,
                     capabilities: hosted::BUSINESS_CAPABILITIES.map(str::to_owned).to_vec(),
+                    host: None,
                 };
                 hosted::write_frame(&mut writer, &hosted::ok(&Value::Null, json!(hello)), frames)
                     .await

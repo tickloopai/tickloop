@@ -19,9 +19,9 @@ use tickloop_agent_protocol::{
     AccessError, AccessErrorCode, AgentAccess, AgentCommand, AgentDetailQuery, AgentFilter,
     AgentSummary, CommandEnvelope, CommandReceipt, CommandResult, Cursor, DisplayReceipt,
     DisplayUpdate, ExecutionAvailability, ExecutionRef, FEED_CAPACITY, LaunchSpec, MAX_PAGE_LIMIT,
-    Observation, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue, Page,
-    PersistenceState, REPLAY_CAPACITY, ResetReason, TranscriptRef, chat_display_title,
-    chat_has_work, chat_preview,
+    Observation, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue,
+    OtherTickhost, Page, PersistenceState, REPLAY_CAPACITY, ResetReason, TranscriptRef,
+    chat_display_title, chat_has_work, chat_preview,
 };
 
 #[async_trait]
@@ -34,6 +34,15 @@ pub trait WorkerFactory: Send + Sync {
     /// Whether the worker behind `worker` has positively exited. An unknown or still running
     /// worker is `false`, because a replacement must never run beside work that can still act.
     async fn exited(&self, worker: &Arc<dyn AgentAccess>) -> bool;
+    /// The running Tickhost when it is another build than this daemon's and replacing it would
+    /// end something. A daemon without a Tickhost of its own has none.
+    async fn other_tickhost(&self) -> Result<Option<OtherTickhost>, AccessError> {
+        Ok(None)
+    }
+    /// Stops the running Tickhost of another build on the user's word.
+    async fn replace_tickhost(&self) -> Result<(), AccessError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -517,6 +526,10 @@ impl DaemonServer {
                 self.execute_worker(self.start(launch).await?, envelope)
                     .await
             }
+            AgentCommand::ReplaceTickhost => {
+                self.inner.factory.replace_tickhost().await?;
+                Ok((CommandResult::Done, PersistenceState::NotApplicable))
+            }
             AgentCommand::FlushTranscripts => {
                 let mut persistence = PersistenceState::FlushObserved;
                 for worker in self.workers().await {
@@ -577,6 +590,11 @@ impl AgentAccess for DaemonServer {
             ObservationRequest::Agent { execution, .. } => {
                 self.worker(execution).await?.observe(query).await
             }
+            ObservationRequest::OtherTickhost => Ok(Observation::single(
+                ObservationValue::OtherTickhost(self.inner.factory.other_tickhost().await?),
+                self.cursor(),
+                None,
+            )),
             ObservationRequest::Overview {
                 filter,
                 page,

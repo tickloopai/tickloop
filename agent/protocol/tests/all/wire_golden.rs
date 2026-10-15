@@ -21,13 +21,13 @@ use tickloop_agent_protocol::{
     InputModality, InteractionSource, LaunchSpec, LiveChatSnapshot, LoopAction, Message,
     ModelAuthSource, ModelCard, ModelConfig, ModelDiscovery, ModelProvider, MonitorMember,
     MonitorMembership, ObservationChange, ObservationKind, ObservationRequest, ObservationUpdate,
-    ObservationValue, OperationRecord, OperationState, PROTOCOL_MAJOR, PROTOCOL_MINOR, Page,
-    PendingRequestKind, PermissionPolicy, PermissionRule, PermissionScope, PersistenceState,
-    ProductKind, Protocol, ProtocolLimits, ProviderConnection, ProviderCredentialScope,
-    ReasoningEffort, ReceiptState, RequestRef, ResetReason, Role, ServerHello, ServerMessage,
-    TakenBackPrompt, ThinkingBudgets, ThinkingControl, TickLinkState, TickSubscriptionChange,
-    TickSubscriptionFrequency, TickSubscriptionStatus, ToolResult, ToolResultBlock,
-    ToolResultContent, TranscriptRef, UserInput, ViewRef,
+    ObservationValue, OperationRecord, OperationState, OtherTickhost, PROTOCOL_MAJOR,
+    PROTOCOL_MINOR, Page, PendingRequestKind, PermissionPolicy, PermissionRule, PermissionScope,
+    PersistenceState, ProductKind, Protocol, ProtocolLimits, ProviderConnection,
+    ProviderCredentialScope, ReasoningEffort, ReceiptState, RequestRef, ResetReason, Role,
+    ServerHello, ServerMessage, TakenBackPrompt, ThinkingBudgets, ThinkingControl, TickLinkState,
+    TickSubscriptionChange, TickSubscriptionFrequency, TickSubscriptionStatus, TickhostOccupancy,
+    ToolResult, ToolResultBlock, ToolResultContent, TranscriptRef, UserInput, ViewRef,
 };
 
 const BLESS_VARIABLE: &str = "TICKLOOP_BLESS_WIRE_FIXTURES";
@@ -581,6 +581,7 @@ fn agent_commands_keep_their_recorded_wire() {
                 launch: None,
             },
             AgentCommand::FlushTranscripts,
+            AgentCommand::ReplaceTickhost,
             AgentCommand::EditHistory {
                 execution: execution(),
                 action: HistoryAction::TakeBackInterruptedPrompt { run_id: id(0x20) },
@@ -659,6 +660,7 @@ fn observation_requests_keep_their_recorded_wire() {
                 detail: AgentDetailQuery::Events { after: 9 },
                 after: None,
             },
+            ObservationRequest::OtherTickhost,
         ],
     );
 }
@@ -763,6 +765,16 @@ fn observation_values_keep_their_recorded_wire() {
                     },
                 },
             }]),
+            ObservationValue::OtherTickhost(Some(OtherTickhost {
+                description: "Running Tickhost build 0.1.0+older; this build 0.2.0+current".into(),
+                occupancy: Some(TickhostOccupancy {
+                    ticks: vec!["Quote · AAPL.US".into()],
+                    shells: 1,
+                    pending: 1,
+                    connections: 0,
+                }),
+            })),
+            ObservationValue::OtherTickhost(None),
         ],
     );
 }
