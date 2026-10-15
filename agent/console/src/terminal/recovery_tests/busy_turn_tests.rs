@@ -211,6 +211,7 @@ fn busy_turn_pty_fixture() {
                         requests: AtomicUsize::new(0),
                     }),
                 );
+                core.install_own_tickhost();
                 let workdir = std::env::current_dir().unwrap();
                 let access = Arc::new(BusyTurnAccess {
                     daemon: EmbeddedAgentAccess::new(core.clone()),

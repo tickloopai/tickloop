@@ -700,6 +700,7 @@ async fn a_reviewer_context_limit_is_retried_once_with_smaller_evidence() {
             config(),
             Arc::new(ScriptedModel::new(vec![batch, text("done")])),
         );
+        agent.install_own_tickhost();
         let llm = Arc::new(ScriptedModel::new(vec![text(
             &tickloop_agent_test_support::auto_classification(false).to_string(),
         )]));
