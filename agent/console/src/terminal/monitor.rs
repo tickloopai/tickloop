@@ -1529,8 +1529,8 @@ mod signal_tests {
         let lead = row(&monitor, DisplayProfile::default(), 70_000).spans[0].clone();
         assert_eq!(
             (lead.text.as_str(), lead.role),
-            ("⟳", Some(Role::SubscriptionHigh)),
-            "the `⟳` leads the row in its frequency's colour"
+            ("↻", Some(Role::SubscriptionHigh)),
+            "the `↻` leads the row in its frequency's colour"
         );
         assert_eq!(
             monitor.next_frame_ms(70_000, WIDTH, DisplayProfile::default()),
@@ -1562,7 +1562,7 @@ mod signal_tests {
             assert_eq!(
                 square(&monitor, DisplayProfile::default(), now),
                 Some(Role::SubscriptionSquare),
-                "the square holds the `⟳`"
+                "the square holds the `↻`"
             );
         }
         let text = monitor
@@ -1699,15 +1699,15 @@ mod signal_tests {
         let line = &monitor
             .frame(WIDTH, 10, DisplayProfile::default(), now)
             .lines[2];
-        assert_eq!(line.text().matches('⟳').count(), 1, "{line:?}");
+        assert_eq!(line.text().matches('↻').count(), 1, "{line:?}");
         assert!(
             !line.text().contains(['2', '3']),
             "no count of subscriptions: {line:?}"
         );
         assert_eq!(
             (line.spans[0].text.as_str(), line.spans[0].role),
-            ("⟳", Some(Role::SubscriptionSquare)),
-            "while a subscription waits, the `⟳` is on the square"
+            ("↻", Some(Role::SubscriptionSquare)),
+            "while a subscription waits, the `↻` is on the square"
         );
         assert_eq!(
             bar(&monitor, now),
@@ -1730,7 +1730,7 @@ mod signal_tests {
             .frame(WIDTH, 10, DisplayProfile::default(), 40_000)
             .lines[2];
         assert_eq!(line.band, None);
-        assert!(!line.text().contains(['⟳', '↯']), "{line:?}");
+        assert!(!line.text().contains(['↻', '↯']), "{line:?}");
         assert_eq!(
             monitor.next_frame_ms(40_000, WIDTH, DisplayProfile::default()),
             None

@@ -215,7 +215,7 @@ pub(super) enum Role {
     /// as an Agent turn takes its update in.
     FlashStrong,
     FlashSoft,
-    /// A Monitor row's `⟳`, one hue from the brightest for the most frequent subscription to the
+    /// A Monitor row's `↻`, one hue from the brightest for the most frequent subscription to the
     /// dimmest for the least. Marks, so a selected row keeps them.
     SubscriptionHigh,
     SubscriptionMedium,
@@ -224,7 +224,7 @@ pub(super) enum Role {
     /// the update, to the part of the period elapsed before its next check hands it to the
     /// Agent: the square's hue, dimmed, on a selected row too. A flashing square dims to it.
     UpdateProgress,
-    /// The update square of a row with periodic subscriptions, which holds their `⟳`, and its
+    /// The update square of a row with periodic subscriptions, which holds their `↻`, and its
     /// dimmed flash phase: the square's backgrounds with a foreground that stays clear on each.
     SubscriptionSquare,
     SubscriptionSquareDim,
@@ -342,7 +342,7 @@ impl Role {
     ];
 
     /// Agent Colors and marks only paint marks, such as a member dot, a row's state glyph, its
-    /// `⟳` or its update square, never the words of a row.
+    /// `↻` or its update square, never the words of a row.
     const fn is_mark(self) -> bool {
         matches!(
             self,
@@ -580,7 +580,7 @@ const DARK_PALETTE: [Style; ROLE_COUNT] = [
     fg(0, 175, 175),  // SubscriptionLow
     bg(110, 63, 48),  // UpdateProgress  <- local: claude dimmed, still clear on black terminals
     // At 256 colours the square is the lighter 173, where no foreground also clears the dimmed
-    // phase, so the `⟳` turns dark on the full square and white on the dimmed one.
+    // phase, so the `↻` turns dark on the full square and white on the dimmed one.
     on(fg(0, 0, 0), Rgb::new(215, 119, 87)), // SubscriptionSquare
     on(fg(255, 255, 255), Rgb::new(110, 63, 48)), // SubscriptionSquareDim
     ansi(AnsiColour::Blue),                  // Link            <- chalk.blue
@@ -1679,7 +1679,7 @@ mod tests {
         }
     }
 
-    /// The `⟳` on a waiting row's square stays clear on both phases of the square's flash, and
+    /// The `↻` on a waiting row's square stays clear on both phases of the square's flash, and
     /// the square keeps the colours of a square without one.
     #[test]
     fn the_mark_on_an_update_square_stays_clear_through_its_flash() {
@@ -1743,12 +1743,12 @@ mod tests {
                 .with(" ", Role::UpdateSquare)
                 .with("◉ ", Role::MutedText)
                 .with("中文", Role::MutedText)
-                .with("⟳", Role::SubscriptionLow);
+                .with("↻", Role::SubscriptionLow);
             let unselected = row
                 .clone()
                 .banded(1..5, Role::UpdateProgress)
                 .resolve(theme, 12);
-            assert_eq!(unselected.render(ColourDepth::None), "  ◉ 中文⟳");
+            assert_eq!(unselected.render(ColourDepth::None), "  ◉ 中文↻");
             assert_eq!(
                 backgrounds(&unselected),
                 [vec![None, square], vec![progress; 3], vec![None; 2]].concat(),
@@ -1784,7 +1784,7 @@ mod tests {
                 "{name:?}: the bar keeps its colour, the rest is the selection"
             );
             for span in &selected.spans {
-                if span.text == "⟳" {
+                if span.text == "↻" {
                     assert_eq!(
                         span.style.foreground,
                         theme.style(Role::SubscriptionLow).foreground,

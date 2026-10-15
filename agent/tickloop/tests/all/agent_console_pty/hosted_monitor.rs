@@ -44,7 +44,7 @@ async fn view_with_keys_ticks(
 }
 
 /// The screen line of the selected hosted row. The selection mark takes the row's first column,
-/// or its second when the first holds the update square or `⟳`.
+/// or its second when the first holds the update square or `↻`.
 fn selected_row(frame: &str) -> Option<usize> {
     frame.lines().position(|line| {
         line.contains(&format!("{SELECTED_MARK} ◉")) || line.contains(&format!("{SELECTED_MARK}◉"))
@@ -329,7 +329,7 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
             "a Tick that ended by itself keeps its launch record"
         );
 
-        select_row(&mut view, "⟳").await;
+        select_row(&mut view, "↻").await;
         view.send(b"\r");
         view.wait_for(
             "the reopen asks first, restoring its subscription",

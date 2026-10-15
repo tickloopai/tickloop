@@ -2,8 +2,8 @@
 //! colour is the row's state, the name, and right-aligned muted details. A row whose whole name
 //! does not fit beside its details continues the name on a second line, under its first, and
 //! keeps the details at the right edge there, so details line up whatever a row's height. A
-//! Monitor row leads with its periodic subscriptions' `⟳` and its update square in the first
-//! column, the `⟳` on the square while the square shows; while a periodic subscription holds the
+//! Monitor row leads with its periodic subscriptions' `↻` and its update square in the first
+//! column, the `↻` on the square while the square shows; while a periodic subscription holds the
 //! update, a bar runs from the square across the row.
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -18,7 +18,7 @@ use tickloop_agent_protocol::TickSubscriptionFrequency;
 
 /// The columns before a list row's glyph. The selection fill alone marks the selected row.
 pub(super) const ROW_INDENT: &str = "  ";
-/// What follows a Monitor row's first column before its glyph: a blank column, so a `⟳` some
+/// What follows a Monitor row's first column before its glyph: a blank column, so a `↻` some
 /// fallback font draws wider than its column never meets the glyph.
 const LEAD_GAP: &str = " ";
 const STATUS_GAP_COLUMNS: usize = 2;
@@ -36,7 +36,7 @@ pub(super) struct ListRow<'a> {
     /// The row's flash fill while it flashes; see [`flash_fill`]. It covers the update bar, and
     /// the selection fill wins over it.
     pub(super) fill: Option<Role>,
-    /// The `⟳` of the row's periodic subscriptions in its frequency's colour; see
+    /// The `↻` of the row's periodic subscriptions in its frequency's colour; see
     /// [`subscription_mark`]. On the update square it takes the square's own colours.
     pub(super) subscription: Option<(&'a str, Role)>,
     pub(super) update: Option<UpdateIndicator>,
@@ -61,7 +61,7 @@ impl ListRow<'_> {
         }
     }
 
-    /// Whether the first column holds the update square or `⟳`, which keep their own colours on
+    /// Whether the first column holds the update square or `↻`, which keep their own colours on
     /// a selected row, so the selection fill starts after them.
     fn has_lead_mark(&self) -> bool {
         self.update.is_some() || self.subscription.is_some()
@@ -198,7 +198,7 @@ pub(super) fn running_mark(display: DisplayProfile, now_ms: u64) -> Role {
 }
 
 /// A row's update square. A new update flashes it once since `flash_since`, full, dim, full,
-/// then it stays full; under Reduce motion it never flashes. A square that holds the `⟳` of a
+/// then it stays full; under Reduce motion it never flashes. A square that holds the `↻` of a
 /// periodic subscription draws it in a foreground clear on both phases.
 pub(super) fn update_square(
     flash_since: Option<u64>,
@@ -238,7 +238,7 @@ fn subscription_role(frequency: TickSubscriptionFrequency) -> Role {
     }
 }
 
-/// The `⟳` that leads a row with periodic subscriptions, in its frequency's colour.
+/// The `↻` that leads a row with periodic subscriptions, in its frequency's colour.
 pub(super) fn subscription_mark(
     subscription: Option<SubscriptionMark>,
     display: DisplayProfile,
@@ -427,7 +427,7 @@ mod tests {
             (TickSubscriptionFrequency::Low, Role::SubscriptionLow),
         ] {
             let mark = subscription_mark(periodic(frequency), DisplayProfile::default());
-            assert_eq!(mark, Some(("⟳", role)), "{frequency:?}");
+            assert_eq!(mark, Some(("↻", role)), "{frequency:?}");
             let line = ListRow {
                 subscription: mark,
                 ..row("Quotes", "exit 101")
@@ -437,7 +437,7 @@ mod tests {
             assert_eq!(
                 lead(&line, 3),
                 [
-                    ("⟳".to_owned(), Some(role)),
+                    ("↻".to_owned(), Some(role)),
                     (" ".to_owned(), Some(Role::MutedText)),
                     ("$".to_owned(), Some(Role::RunningMark))
                 ],
@@ -455,7 +455,7 @@ mod tests {
         let names = [
             row("Quotes", "").lines(20)[0].clone(),
             ListRow {
-                subscription: Some(("⟳", Role::SubscriptionLow)),
+                subscription: Some(("↻", Role::SubscriptionLow)),
                 ..row("Quotes", "")
             }
             .lines(20)[0]
@@ -474,17 +474,17 @@ mod tests {
         assert_eq!(
             names,
             [4, 6, 4],
-            "byte offsets: `⟳` takes three bytes in one column"
+            "byte offsets: `↻` takes three bytes in one column"
         );
         let narrow = ListRow {
-            subscription: Some(("⟳", Role::SubscriptionLow)),
+            subscription: Some(("↻", Role::SubscriptionLow)),
             ..row("python3 -q", "exit 101 · SIGTERM")
         };
         for width in [12, 20, 60] {
             let last = narrow.lines(width).last().unwrap().text();
             assert_eq!(last.width(), width, "{last:?}");
             assert!(
-                !last.ends_with('⟳') && !last.ends_with(' '),
+                !last.ends_with('↻') && !last.ends_with(' '),
                 "{width}: no mark or blank column at the right: {last:?}"
             );
         }
@@ -518,7 +518,7 @@ mod tests {
                 square: Role::SubscriptionSquare,
                 bar_columns: Some(10),
             }),
-            subscription: Some(("⟳", Role::SubscriptionMedium)),
+            subscription: Some(("↻", Role::SubscriptionMedium)),
             ..row("Quotes", "")
         }
         .lines(20)[0]
@@ -526,10 +526,10 @@ mod tests {
         assert_eq!(
             lead(&held, 2),
             [
-                ("⟳".to_owned(), Some(Role::SubscriptionSquare)),
+                ("↻".to_owned(), Some(Role::SubscriptionSquare)),
                 (" ".to_owned(), Some(Role::MutedText))
             ],
-            "the `⟳` sits on the square in the square's foreground"
+            "the `↻` sits on the square in the square's foreground"
         );
         assert_eq!(
             held.band.map(|band| (band.columns, band.role)),
@@ -564,7 +564,7 @@ mod tests {
         assert!(!line.text().contains('›'));
         for marked in [
             ListRow {
-                subscription: Some(("⟳", Role::SubscriptionHigh)),
+                subscription: Some(("↻", Role::SubscriptionHigh)),
                 ..selected_row()
             },
             ListRow {
@@ -585,7 +585,7 @@ mod tests {
         }
         let theme = super::super::style::Theme::new(super::super::style::ThemeName::ClaudeCodeDark);
         let resolved = ListRow {
-            subscription: Some(("⟳", Role::SubscriptionHigh)),
+            subscription: Some(("↻", Role::SubscriptionHigh)),
             ..selected_row()
         }
         .one_line(40)
@@ -609,7 +609,7 @@ mod tests {
                 square: Role::SubscriptionSquare,
                 bar_columns: Some(check.elapsed_columns(30, 130_000)),
             }),
-            subscription: Some(("⟳", Role::SubscriptionHigh)),
+            subscription: Some(("↻", Role::SubscriptionHigh)),
             ..row("Quote board for the whole watchlist", "")
         };
         let lines = waiting.lines(30);
@@ -683,7 +683,7 @@ mod tests {
                 Role::SubscriptionSquareDim,
                 Role::SubscriptionSquare
             ],
-            "a square holding a `⟳` flashes the same backgrounds"
+            "a square holding a `↻` flashes the same backgrounds"
         );
         let still = DisplayProfile::new(DisplayPreferences {
             prefers_reduced_motion: true,
