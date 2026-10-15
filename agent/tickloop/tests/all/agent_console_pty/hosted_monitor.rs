@@ -145,8 +145,7 @@ async fn actual_cli_enter_opens_a_hosted_tick_full_screen_outside_herdr_and_esc_
         view.send(CLOSE);
         back_in_monitor_quietly(&view).await;
         view.send(b"\x1b");
-        view.wait_for("input focused again", new_input_is_visible)
-            .await;
+        view.wait_for("input focused again", input_focused).await;
         assert!(
             !view
                 .frame()
@@ -236,7 +235,7 @@ async fn actual_cli_keeps_a_long_reply_streaming_while_a_hosted_tick_owns_the_te
         view.send(CLOSE);
         back_in_monitor_quietly(&view).await;
         view.send(b"\x1b");
-        view.wait_for("input focused again", new_input_is_visible)
+        view.wait_for("input focused again", input_focused)
             .await;
         view.wait_for("the attached stream tail survived reclaim", |frame| {
             frame.contains(ATTACHED_REPLY)
@@ -367,8 +366,7 @@ async fn actual_cli_enter_opens_a_hosted_tick_in_a_herdr_popup_after_a_one_key_r
             Some(()).filter(|()| !client.screen().contains("┌Tickloop"))
         });
         view.send(b"\x1b");
-        view.wait_for("input focused again", new_input_is_visible)
-            .await;
+        view.wait_for("input focused again", input_focused).await;
         view.close().await;
     })
     .catch_unwind()
@@ -471,7 +469,7 @@ async fn actual_cli_enter_re_registers_a_popup_plugin_another_tickloop_linked() 
             Some(()).filter(|()| !client.screen().contains("┌Tickloop"))
         });
         view.send(b"\x1b");
-        view.wait_for("input focused again", new_input_is_visible)
+        view.wait_for("input focused again", input_focused)
             .await;
         view.close().await;
     })
@@ -547,8 +545,7 @@ async fn actual_cli_enter_without_a_usable_popup_opens_full_screen() {
             "the foreign plugin is left linked: {plugins:?}"
         );
         view.send(b"\x1b");
-        view.wait_for("input focused again", new_input_is_visible)
-            .await;
+        view.wait_for("input focused again", input_focused).await;
         view.close().await;
     })
     .catch_unwind()
@@ -631,6 +628,14 @@ fn selected_text(frame: &str) -> Option<String> {
     frame
         .lines()
         .find_map(|line| line.split_once("› ").map(|(_, row)| row.to_owned()))
+}
+
+/// The input has the focus again: its prompt and the status bar show and no Monitor row offers
+/// its keys. Unlike the welcome header, none of these scroll away as the conversation grows.
+fn input_focused(frame: &str) -> bool {
+    frame.contains("⏵⏵ ")
+        && frame.lines().any(|line| line.starts_with('❯'))
+        && !frame.lines().any(|line| line.starts_with("enter open"))
 }
 
 /// The key hints of the selected Monitor row.
@@ -762,9 +767,9 @@ async fn actual_cli_enter_opens_terminal_ticks_and_shells_full_screen_and_a_row_
             }) && !monitor_hint(frame).contains("s stop")
         })
         .await;
+        assert!(!input_focused(&view.frame()), "{}", view.frame());
         view.send(b"\x1b");
-        view.wait_for("input focused again", new_input_is_visible)
-            .await;
+        view.wait_for("input focused again", input_focused).await;
         view.close().await;
     })
     .catch_unwind()
@@ -845,8 +850,7 @@ async fn actual_cli_enter_floats_every_local_tick_in_the_herdr_popup() {
         );
         std::fs::write(fixture.path("work/gate"), "").unwrap();
         view.send(b"\x1b");
-        view.wait_for("input focused again", new_input_is_visible)
-            .await;
+        view.wait_for("input focused again", input_focused).await;
         view.close().await;
     })
     .catch_unwind()
