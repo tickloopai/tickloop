@@ -18,7 +18,8 @@ use tokio::{
 };
 
 /// A protocol Tick whose screen shows its value, terminal size and the last line typed on its
-/// terminal, so protocol calls, attached input and resizes are all visible in one process.
+/// terminal, so protocol calls, attached input and resizes are all visible in one process. Its
+/// reads tell its terminal size as well.
 const COUNTER: &str = r#"
 import json, os, signal, sys, threading, time
 LARGE_PAYLOAD = 8 * 1024 * 1024 - 4096
@@ -41,7 +42,8 @@ for line in sys.stdin:
     if method == 'tick/describe':
         result = {'protocol':3,'revision':'1','kind':'example.counter','title':'Counter','description':'Counter','recover_with':'current','tools':[{'name':'increment','description':'Increment','input_schema':{'type':'object'},'mutates':True},{'name':'current','description':'Read','input_schema':{'type':'object'},'mutates':False},{'name':'flood','description':'Print many lines','input_schema':{'type':'object'},'mutates':False},{'name':'slow','description':'Answer after 16 seconds','input_schema':{'type':'object'},'mutates':False},{'name':'large','description':'Answer with almost 8 MiB','input_schema':{'type':'object'},'mutates':False},{'name':'oversized_update','description':'Send an update beyond the limit','input_schema':{'type':'object'},'mutates':False},{'name':'jam','description':'Fail to run','input_schema':{'type':'object'},'mutates':True}]}
     elif method == 'tick/read':
-        result = {'seq':value,'at':'2026-10-07T00:00:00Z','data':{'value':value,'note':open('note.txt').read(),'sees_launch_token':'TICKLOOP_TICKHOST_LAUNCH' in os.environ,'argument_bytes':sum(len(argument) for argument in sys.argv[1:])}}
+        size = os.get_terminal_size(sys.stderr.fileno())
+        result = {'seq':value,'at':'2026-10-07T00:00:00Z','data':{'value':value,'size':f'{size.columns}x{size.lines}','note':open('note.txt').read(),'sees_launch_token':'TICKLOOP_TICKHOST_LAUNCH' in os.environ,'argument_bytes':sum(len(argument) for argument in sys.argv[1:])}}
     elif method == 'tick/call':
         if request['params']['tool'] == 'increment':
             value += 1
@@ -224,23 +226,13 @@ fn which(program: &str) -> String {
         .into_owned()
 }
 
-async fn screen_contains(reader: &mut HostConnection, needle: &str) -> Value {
-    for _ in 0..200 {
-        let snapshot = reader
-            .request("snapshot", json!({}), CONTROL_TIMEOUT)
-            .await
-            .unwrap();
-        if snapshot["lines"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|line| line.as_str().unwrap().contains(needle))
-        {
-            return snapshot;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("the hidden screen never showed {needle:?}");
+/// The terminal size the counter `reader` reads reports, as `<columns>x<rows>`.
+async fn terminal_size(reader: &mut HostConnection) -> Value {
+    reader
+        .request("read", json!({"activity":"automatic"}), CONTROL_TIMEOUT)
+        .await
+        .unwrap()["data"]["size"]
+        .clone()
 }
 
 async fn send(requests: &mut OwnedWriteHalf, request: Value) {
@@ -366,7 +358,17 @@ async fn protocol_calls_and_the_screen_belong_to_one_counter_process() {
     let (command, work) = fixture.counter();
     let opened = fixture.open(&mut controller, command, &work).await.unwrap();
     let mut reader = fixture.reader(&opened).await;
-    screen_contains(&mut reader, "Counter 0 in work").await;
+    let refused = reader
+        .request("snapshot", json!({}), CONTROL_TIMEOUT)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.code, "MethodNotAllowed",
+        "a hidden screen is seen through a view"
+    );
+    let (mut events, _requests) = attach(&fixture, &opened, initial_size()).await.into_parts();
+    let mut view = vt100::Parser::new(30, 120, 0);
+    view_shows(&mut events, &mut view, "Counter 0 in work").await;
     let read = reader
         .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
         .await
@@ -388,7 +390,7 @@ async fn protocol_calls_and_the_screen_belong_to_one_counter_process() {
         .await
         .unwrap();
     assert_eq!(called["value"], 1);
-    screen_contains(&mut reader, "Counter 1 in work").await;
+    view_shows(&mut events, &mut view, "Counter 1 in work").await;
     let read = reader
         .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
         .await
@@ -514,7 +516,6 @@ async fn a_terminal_program_takes_input_shows_it_and_keeps_its_exit_code() {
     .await;
     assert!(echoed["seq"].as_u64() > started["seq"].as_u64(), "{echoed}");
     assert_eq!(echoed["exit"], Value::Null);
-    screen_contains(&mut reader, "hello tickhost").await;
 
     // Ctrl-D at the start of a line ends cat's input, and cat exits.
     reader
@@ -1104,8 +1105,7 @@ async fn an_invalid_resize_is_refused_and_leaves_the_terminal_and_the_tick_uncha
     let (command, work) = fixture.counter();
     let opened = fixture.open(&mut controller, command, &work).await.unwrap();
     let mut reader = fixture.reader(&opened).await;
-    screen_contains(&mut reader, "120x30").await;
-    let terminal_size = |snapshot: &Value| (snapshot["rows"].clone(), snapshot["columns"].clone());
+    assert_eq!(terminal_size(&mut reader).await, "120x30");
     let sizeless = fixture
         .reader(&opened)
         .await
@@ -1140,11 +1140,7 @@ async fn an_invalid_resize_is_refused_and_leaves_the_terminal_and_the_tick_uncha
             ended["error"]["code"], "InvalidArguments",
             "{size}: {ended}"
         );
-        let snapshot = reader
-            .request("snapshot", json!({}), CONTROL_TIMEOUT)
-            .await
-            .unwrap();
-        assert_eq!(terminal_size(&snapshot), (json!(30), json!(120)), "{size}");
+        assert_eq!(terminal_size(&mut reader).await, "120x30", "{size}");
     }
     let called = reader
         .request(
@@ -1155,8 +1151,7 @@ async fn an_invalid_resize_is_refused_and_leaves_the_terminal_and_the_tick_uncha
         .await
         .unwrap();
     assert_eq!(called["value"], 1, "the Tick keeps running");
-    let snapshot = screen_contains(&mut reader, "Counter 1 in work 120x30").await;
-    assert_eq!(terminal_size(&snapshot), (json!(30), json!(120)));
+    assert_eq!(terminal_size(&mut reader).await, "120x30");
     attach(&fixture, &opened, initial_size()).await;
     shutdown(&fixture).await;
 }
@@ -1389,9 +1384,9 @@ async fn open_for(
         .await
 }
 
-/// With a 2-second idle timeout, a Tick that is unused, or only read automatically, listed,
-/// sampled and snapshotted, is reaped; an attached one, one with any approved Watch and one read
-/// explicitly are kept. Removing the last Watch restarts the idle time, a detach does not, and
+/// With a 2-second idle timeout, a Tick that is unused, or only read automatically, listed and
+/// sampled, is reaped; an attached one, one with any approved Watch and one read explicitly are
+/// kept. Removing the last Watch restarts the idle time, a detach does not, and
 /// the emptied host exits.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_idle_tick_is_reaped_unless_attached_watched_or_explicitly_used() {
@@ -1424,7 +1419,6 @@ async fn an_idle_tick_is_reaped_unless_attached_watched_or_explicitly_used() {
     for _ in 0..8 {
         for (method, params) in [
             ("read", json!({"activity":"automatic"})),
-            ("snapshot", json!({})),
             ("resources", json!({})),
         ] {
             // Fails with TargetGone once these requests failed to keep the Tick.
@@ -1443,7 +1437,7 @@ async fn an_idle_tick_is_reaped_unless_attached_watched_or_explicitly_used() {
     assert!(gone(pid(&unused)).await, "an unused Tick idles out");
     assert!(
         gone(pid(&polled)).await,
-        "automatic reads, lists, samples and snapshots keep nothing"
+        "automatic reads, lists and samples keep nothing"
     );
     for kept in [&attached, &watched, &used] {
         assert!(alive(pid(kept)), "{kept}");

@@ -147,8 +147,8 @@ LEGACY_MODELS = {
     "deepseek-v4-pro-config.json": "DEEPSEEK_V4_PRO_CONFIG",
 }
 
-# The connection budget of a watch, which the runtime enforces and two tests count, becomes a
-# runtime constant instead of a test helper. A test that re-executes itself names its new path.
+# The connection budget of a watch, which the runtime enforces and a test counts, becomes a
+# runtime constant instead of a test helper.
 LITERAL_EDITS = {
     "agent/runtime/src/tick_stream.rs": [
         ("pub const RECONNECTS_PER_WATCH: u32 = 3;\n",
@@ -158,19 +158,10 @@ LITERAL_EDITS = {
         ("    Made(u32),", "    Made(usize),"),
         ("*made < 1 + RECONNECTS_PER_WATCH", "*made < CONNECTS_PER_WATCH"),
     ],
-    "agent/runtime/tests/all/native_observation.rs": [
-        ("use support::{CONNECTS_PER_WATCH, ScriptedModel,", "use support::{ScriptedModel,"),
-        ("        NativeTickStream, RECONNECT_PAUSE,",
-         "        CONNECTS_PER_WATCH, NativeTickStream, RECONNECT_PAUSE,"),
-    ],
     "agent/tickloop/tests/all/hosted_ticks.rs": [
         ("    use super::support::{\n        CONNECTS_PER_WATCH,\n", "    use super::support::{\n"),
         ("            HostedTickStream, RECONNECT_PAUSE,",
          "            CONNECTS_PER_WATCH, HostedTickStream, RECONNECT_PAUSE,"),
-    ],
-    "tickhost/connect/tests/all/host_adapter.rs": [
-        ('"--exact", "open_forwards_the_agents_locale_to_the_new_pane"',
-         '"--exact", "host_adapter::open_forwards_the_agents_locale_to_the_new_pane"'),
     ],
 }
 

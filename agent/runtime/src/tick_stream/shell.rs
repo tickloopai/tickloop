@@ -55,7 +55,7 @@ impl ShellTickStream {
 }
 
 fn task_of(instance: &InstanceRef) -> Option<Uuid> {
-    (instance.tick_type() == tick_protocol::SHELL_INSTANCE_TYPE)
+    (instance.access() == tick_protocol::SHELL_ACCESS)
         .then(|| Uuid::parse_str(instance.id()).ok())
         .flatten()
 }

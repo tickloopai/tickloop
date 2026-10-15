@@ -12,6 +12,9 @@ pub const SHELL_TASK_OUTPUT_MAX_BYTES: usize = 65_536;
 
 pub const SHELL_TASK_PROMPT_QUIET_PERIOD: Duration = Duration::from_secs(45);
 
+/// How long a finished background Shell keeps its Monitor row once its Chat handled its end.
+pub const FINISHED_SHELL_DISPLAY_MS: u64 = 30_000;
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShellTaskOrigin {
     Agent,
@@ -95,6 +98,37 @@ impl ShellTask {
         } else {
             "unknown".into()
         }
+    }
+
+    /// Whether its Chat's Monitor lists it by itself, apart from a Loop subscribing to it: a task
+    /// that went to the background while it runs and, once it ended, until
+    /// [`FINISHED_SHELL_DISPLAY_MS`] after the Chat handled its end at `handled_at`.
+    pub fn is_listed_in_monitor(&self, handled_at: Option<u64>, now_ms: u64) -> bool {
+        self.went_to_background()
+            && self
+                .finished_row_until(handled_at)
+                .is_none_or(|until| until > now_ms)
+    }
+
+    pub fn went_to_background(&self) -> bool {
+        self.was_background || self.state == ShellTaskState::Background
+    }
+
+    /// Until when a finished task keeps its Monitor row: [`FINISHED_SHELL_DISPLAY_MS`] after its
+    /// Chat handled its end at `handled_at`. `None` while it runs or while its end is unread, so
+    /// it stays.
+    pub fn finished_row_until(&self, handled_at: Option<u64>) -> Option<u64> {
+        let handled = handled_at?;
+        (self.state.is_terminal() && self.ended_at().is_none_or(|ended| handled >= ended))
+            .then(|| handled.saturating_add(FINISHED_SHELL_DISPLAY_MS))
+    }
+
+    /// When it ended; `None` while it runs.
+    pub fn ended_at(&self) -> Option<u64> {
+        self.state
+            .is_terminal()
+            .then(|| self.ended_at_ms.or(self.updated_at_ms))
+            .flatten()
     }
 }
 

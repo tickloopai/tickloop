@@ -161,13 +161,18 @@ impl HostController {
 
     /// The controller of a host served inside this process, for an Agent without a daemon that is
     /// given a host of its own.
-    pub fn in_process(agent_runtime: &Path, paths: HostPaths, daemon_epoch: Uuid) -> Self {
+    pub fn in_process(
+        agent_runtime: &Path,
+        paths: HostPaths,
+        daemon_epoch: Uuid,
+        idle_timeout: Duration,
+    ) -> Self {
         Self::with_program(
             agent_runtime,
             paths,
             daemon_epoch,
             HostProgram::InProcess,
-            tickhost::host::DEFAULT_IDLE_TIMEOUT,
+            idle_timeout,
         )
     }
 

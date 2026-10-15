@@ -20,7 +20,7 @@ struct CalendarAdapter {
     stream: InMemoryTickStream,
 }
 impl TickAdapter for CalendarAdapter {
-    fn tick_type(&self) -> &'static str {
+    fn access(&self) -> &'static str {
         "cal"
     }
     fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
@@ -29,7 +29,7 @@ impl TickAdapter for CalendarAdapter {
 }
 struct CalendarRows;
 impl MonitorRows for CalendarRows {
-    fn tick_type(&self) -> &'static str {
+    fn access(&self) -> &'static str {
         "cal"
     }
     fn list(&self, _: &MonitorContext) -> Vec<TickDescriptor> {
@@ -273,7 +273,7 @@ async fn a_shell_subscription_reaches_the_loop_once_when_the_shell_exits() {
     agent.shutdown().await;
 }
 
-/// A subscription never runs out of sight: its instance keeps a row even when no Tick type lists
+/// A subscription never runs out of sight: its instance keeps a row even when no access lists
 /// it or the user removed it, until the subscription itself is cancelled.
 #[test]
 fn a_subscribed_instance_always_has_a_row_with_its_marker() {

@@ -34,19 +34,19 @@ pub const FRAME_TOO_LARGE: i64 = -32003;
 /// A `tick/call` named another revision than the Tick's current catalog, so it was not run.
 pub const REVISION_MISMATCH: i64 = -32004;
 
-/// The instance type of a Tick running in the Tickhost. It names where the Tick runs, not a kind
-/// of Tick: its protocol and tools are those of the program it runs.
-pub const HOSTED_INSTANCE_TYPE: &str = "hosted";
-/// The instance type of a Shell Tick: one shell command execution of an Agent.
-pub const SHELL_INSTANCE_TYPE: &str = "shell";
-/// The instance type of an artifact Tick: one artifact of the artifact service.
-pub const ARTIFACT_INSTANCE_TYPE: &str = "artifact";
+/// The access of a Tick running in the Tickhost. It names where the Tick runs, not a kind of
+/// Tick: its protocol and tools are those of the program it runs.
+pub const HOSTED_ACCESS: &str = "hosted";
+/// The access of a Shell Tick: one shell command execution of an Agent.
+pub const SHELL_ACCESS: &str = "shell";
+/// The access of an artifact Tick: one artifact of the artifact service.
+pub const ARTIFACT_ACCESS: &str = "artifact";
 
 /// Whether `identity` is a complete `hosted:` instance identity the Tickhost could have launched
 /// this Tick under, as it passes it in [`INSTANCE_ID_ENV`].
 pub fn is_launched_instance_id(identity: &str) -> bool {
-    identity.split_once(':').is_some_and(|(tick_type, id)| {
-        tick_type == HOSTED_INSTANCE_TYPE && !id.is_empty() && !id.chars().any(char::is_control)
+    identity.split_once(':').is_some_and(|(access, id)| {
+        access == HOSTED_ACCESS && !id.is_empty() && !id.chars().any(char::is_control)
     })
 }
 

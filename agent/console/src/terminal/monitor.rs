@@ -43,7 +43,7 @@ pub(super) fn dragged_columns(width: usize, column: usize) -> Option<usize> {
 pub(super) use crate::monitor_rows::TickGroup;
 use crate::monitor_rows::{
     GONE_DISPLAY_MS, MonitorAction, MonitorContext, MonitorRowsRegistry, RowUpdate, StatusTone,
-    TickDescriptor, TickGlyph, TickOwner, TickResources, finished_shell_until, page_of,
+    TickDescriptor, TickGlyph, TickOwner, TickResources, page_of,
 };
 use tick_protocol::InstanceRef;
 use tickloop_agent_protocol::{
@@ -333,7 +333,7 @@ impl Monitor {
         self.shell_snapshot
             .iter()
             .flat_map(|snapshot| &snapshot.tasks)
-            .filter_map(|task| finished_shell_until(task, handled(task)))
+            .filter_map(|task| task.finished_row_until(handled(task)))
             .chain(
                 self.gone_since
                     .values()
@@ -488,11 +488,11 @@ impl Monitor {
         self.rebuild();
     }
     /// The members a host probe can answer for: those no subscription already reports on.
-    pub(super) fn probe_targets(&self, tick_type: &str) -> Vec<InstanceRef> {
+    pub(super) fn probe_targets(&self, access: &str) -> Vec<InstanceRef> {
         self.members()
             .into_iter()
             .filter(|instance| {
-                instance.tick_type() == tick_type
+                instance.access() == access
                     && !self
                         .subscriptions
                         .iter()
@@ -826,7 +826,7 @@ mod registered_rows_tests {
 
     struct Calendar;
     impl MonitorRows for Calendar {
-        fn tick_type(&self) -> &'static str {
+        fn access(&self) -> &'static str {
             "calendar"
         }
         fn list(&self, _: &MonitorContext) -> Vec<TickDescriptor> {
@@ -905,7 +905,7 @@ mod unread_fill_tests {
     /// One live row whose latest update came at [`UPDATED_AT`].
     struct Updated;
     impl MonitorRows for Updated {
-        fn tick_type(&self) -> &'static str {
+        fn access(&self) -> &'static str {
             "calendar"
         }
         fn list(&self, _: &MonitorContext) -> Vec<TickDescriptor> {

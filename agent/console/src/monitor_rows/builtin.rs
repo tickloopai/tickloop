@@ -3,9 +3,6 @@ use tickloop_agent_protocol::{
     EventSourceBinding, LoopState, ShellTask, ShellTaskState, TickLinkState,
 };
 
-/// How long a finished background Shell keeps its row once the Chat handled its end.
-pub const FINISHED_SHELL_DISPLAY_MS: u64 = 30_000;
-
 /// Stops a running Shell from its Monitor row after confirmation.
 pub(crate) const SHELL_STOP_KEY: char = 's';
 /// Ends a hosted Tick from its Monitor row after confirmation; the row stays until removed.
@@ -16,11 +13,11 @@ pub(crate) const HOSTED_REOPEN_KEY: char = 'n';
 /// Ticks this Chat opened in the dedicated Tickhost. They belong to the Chat that opened them.
 pub struct HostedRows;
 impl MonitorRows for HostedRows {
-    fn tick_type(&self) -> &'static str {
-        tick_protocol::HOSTED_INSTANCE_TYPE
+    fn access(&self) -> &'static str {
+        tick_protocol::HOSTED_ACCESS
     }
     fn list(&self, context: &MonitorContext) -> Vec<TickDescriptor> {
-        subscriptions(context, self.tick_type())
+        subscriptions(context, self.access())
             .map(|row| TickDescriptor {
                 instance: row.instance.clone(),
                 group: TickGroup::Ticks,
@@ -89,8 +86,8 @@ impl MonitorRows for HostedRows {
 /// subscription and the only one its row shows.
 pub struct ArtifactRows;
 impl MonitorRows for ArtifactRows {
-    fn tick_type(&self) -> &'static str {
-        tick_protocol::ARTIFACT_INSTANCE_TYPE
+    fn access(&self) -> &'static str {
+        tick_protocol::ARTIFACT_ACCESS
     }
     fn takes_tick_subscriptions(&self) -> bool {
         false
@@ -193,7 +190,7 @@ impl MonitorRows for ArtifactRows {
 
 pub struct ShellRows;
 impl MonitorRows for ShellRows {
-    fn tick_type(&self) -> &'static str {
+    fn access(&self) -> &'static str {
         "shell"
     }
     fn list(&self, context: &MonitorContext) -> Vec<TickDescriptor> {
@@ -203,13 +200,12 @@ impl MonitorRows for ShellRows {
             .flat_map(|snapshot| {
                 snapshot.tasks.iter().filter(|task| {
                     task.chat_id == snapshot.chat_id
-                        && (task.was_background || task.state == ShellTaskState::Background)
-                        && (!task.state.is_terminal()
-                            || finished_shell_until(task, handled_at(context, task))
-                                .is_none_or(|until| until > context.now_ms)
-                            || context.retained.as_ref() == Some(&InstanceRef::shell(task.id))
-                            || subscriptions(context, "shell")
-                                .any(|row| row.instance == InstanceRef::shell(task.id)))
+                        && (task.is_listed_in_monitor(handled_at(context, task), context.now_ms)
+                            || (task.went_to_background()
+                                && (context.retained.as_ref()
+                                    == Some(&InstanceRef::shell(task.id))
+                                    || subscriptions(context, "shell")
+                                        .any(|row| row.instance == InstanceRef::shell(task.id)))))
                 })
             })
             .map(|task| {
@@ -231,7 +227,7 @@ impl MonitorRows for ShellRows {
                     owner: TickOwner::ThisChat,
                     tone: shell_tone(task, context.shell_starts.get(&task.id).copied()),
                     updated_at_ms: task.updated_at_ms,
-                    update: ended_at(task).map(RowUpdate::new),
+                    update: task.ended_at().map(RowUpdate::new),
                     running: !task.state.is_terminal(),
                     resources: None,
                 }
@@ -272,22 +268,6 @@ fn open_view(instance: &InstanceRef) -> MonitorAction {
         label: "open",
         intent: TickIntent::OpenView(instance.clone()),
     }
-}
-
-/// Until when a finished Shell keeps its row: [`FINISHED_SHELL_DISPLAY_MS`] after the Chat
-/// handled its end. `None` while it runs or while its end is unread, so it stays.
-pub fn finished_shell_until(task: &ShellTask, handled_at: Option<u64>) -> Option<u64> {
-    let handled = handled_at?;
-    (task.state.is_terminal() && ended_at(task).is_none_or(|ended| handled >= ended))
-        .then(|| handled.saturating_add(FINISHED_SHELL_DISPLAY_MS))
-}
-
-/// When a finished Shell ended; `None` while it runs.
-fn ended_at(task: &ShellTask) -> Option<u64> {
-    task.state
-        .is_terminal()
-        .then(|| task.ended_at_ms.or(task.updated_at_ms))
-        .flatten()
 }
 
 /// When the Chat last handled the Shell.
@@ -612,10 +592,10 @@ pub(super) fn link_tone(link: TickLinkState) -> StatusTone {
 
 fn subscriptions<'a>(
     context: &'a MonitorContext,
-    tick_type: &'a str,
+    access: &'a str,
 ) -> impl Iterator<Item = &'a TickSubscriptionStatus> {
     context.subscriptions.iter().filter(move |row| {
-        row.instance.tick_type() == tick_type
+        row.instance.access() == access
             && !matches!(row.loop_state, LoopState::Stopped | LoopState::Expired)
     })
 }
@@ -679,8 +659,8 @@ fn hosted_subscription_actions(row: &TickSubscriptionStatus) -> Vec<MonitorActio
 mod tests {
     use super::*;
     use tickloop_agent_protocol::{
-        ObservationKind, ShellTaskCapabilities, ShellTaskOrigin, ShellTaskOwner,
-        TickSubscriptionFrequency,
+        FINISHED_SHELL_DISPLAY_MS, ObservationKind, ShellTaskCapabilities, ShellTaskOrigin,
+        ShellTaskOwner, TickSubscriptionFrequency,
     };
 
     fn task(command: &str, description: Option<&str>) -> ShellTask {
@@ -785,7 +765,7 @@ mod tests {
                 since_ms: Some(1_000)
             }
         );
-        assert_eq!(finished_shell_until(&shell, Some(5_000)), None);
+        assert_eq!(shell.finished_row_until(Some(5_000)), None);
         for (exit_code, signal, reason, state, tone) in [
             (
                 Some(0),
@@ -830,17 +810,17 @@ mod tests {
             assert_eq!(shell_tone(&shell, None), tone);
         }
         assert_eq!(
-            finished_shell_until(&shell, None),
+            shell.finished_row_until(None),
             None,
             "an unread end keeps the Shell"
         );
         assert_eq!(
-            finished_shell_until(&shell, Some(500)),
+            shell.finished_row_until(Some(500)),
             None,
             "handling before the end does not handle the end"
         );
         assert_eq!(
-            finished_shell_until(&shell, Some(4_000)),
+            shell.finished_row_until(Some(4_000)),
             Some(4_000 + FINISHED_SHELL_DISPLAY_MS)
         );
         let instance = InstanceRef::shell(shell.id);

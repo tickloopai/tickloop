@@ -68,7 +68,7 @@ struct CalendarAdapter {
     stream: InMemoryTickStream,
 }
 impl TickAdapter for CalendarAdapter {
-    fn tick_type(&self) -> &'static str {
+    fn access(&self) -> &'static str {
         "cal"
     }
     fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
@@ -79,14 +79,14 @@ impl TickAdapter for CalendarAdapter {
 /// Lists every member and subscription of its type through the shared Monitor contract.
 struct CalendarRows;
 impl MonitorRows for CalendarRows {
-    fn tick_type(&self) -> &'static str {
+    fn access(&self) -> &'static str {
         "cal"
     }
     fn list(&self, context: &MonitorContext) -> Vec<TickDescriptor> {
         context
             .subscriptions
             .iter()
-            .filter(|row| row.instance.tick_type() == "cal")
+            .filter(|row| row.instance.access() == "cal")
             .map(|row| TickDescriptor {
                 instance: row.instance.clone(),
                 group: TickGroup::Ticks,

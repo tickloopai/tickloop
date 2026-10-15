@@ -1,14 +1,12 @@
-//! The Console's Monitor rows. Each registered Tick type describes its rows, member rows, row
-//! intents and refresh from what the View already holds; the runtime's `TickAdapter` of the same
-//! `<type>` supplies the stream.
+//! The Console's Monitor rows. Each registered access (the instance prefix, such as `shell:`)
+//! describes its rows, member rows, row intents and refresh from what the View already holds; the
+//! runtime's `TickAdapter` of the same access supplies the stream.
 mod builtin;
 mod probe;
 
 #[cfg(test)]
 pub(crate) use builtin::artifact_actions;
-pub use builtin::{
-    ArtifactRows, FINISHED_SHELL_DISPLAY_MS, HostedRows, ShellRows, finished_shell_until,
-};
+pub use builtin::{ArtifactRows, HostedRows, ShellRows};
 pub(crate) use builtin::{HOSTED_CLOSE_KEY, HOSTED_REOPEN_KEY, SHELL_STOP_KEY, feedback_binding};
 pub use probe::{MemberFindings, ProbeError, TickProbe};
 
@@ -260,25 +258,25 @@ pub const SUBSCRIPTIONS_KEY: char = 'w';
 /// match what a key does.
 pub const MONITOR_KEYS: [char; 1] = [MONITOR_REFRESH_KEY];
 
-/// The Monitor half of a Tick type. Rows are computed from the View's own Chat snapshot,
+/// The Monitor half of an access. Rows are computed from the View's own Chat snapshot,
 /// subscriptions, Shell tasks, artifact metadata and host probes; they never read Tick content,
 /// subscribe or call the model.
 pub trait MonitorRows: Send + Sync + 'static {
-    fn tick_type(&self) -> &'static str;
-    /// Rows this type knows from its own sources (subscriptions, services, tasks).
+    fn access(&self) -> &'static str;
+    /// Rows this access knows from its own sources (subscriptions, services, tasks).
     fn list(&self, context: &MonitorContext) -> Vec<TickDescriptor>;
-    /// The row for a Chat member the type did not list itself. Types whose host can be probed
-    /// add the probe's state; the default shows only what the Chat recorded.
+    /// The row for a Chat member the access did not list itself. Accesses whose host can be
+    /// probed add the probe's state; the default shows only what the Chat recorded.
     fn member(&self, member: &MonitorMember, _context: &MonitorContext) -> TickDescriptor {
         member_descriptor(member)
     }
-    /// What the Monitor refresh key also reloads for this type's rows.
+    /// What the Monitor refresh key also reloads for this access's rows.
     fn refresh_intent(&self) -> Option<TickIntent> {
         None
     }
-    /// Whether Loops follow this type's instances with Tick Subscriptions. A type that subscribes
-    /// through its own relation, as an artifact does through its association, never shows a Tick
-    /// Subscription on its rows.
+    /// Whether Loops follow this access's instances with Tick Subscriptions. An access whose
+    /// instances are followed through their own relation, as an artifact is through its
+    /// association, never shows a Tick Subscription on its rows.
     fn takes_tick_subscriptions(&self) -> bool {
         true
     }
@@ -315,7 +313,7 @@ fn active_subscriptions(
     subscribed
 }
 
-/// The row of a subscribed instance no Tick type lists: what the subscription knows of it.
+/// The row of a subscribed instance no access lists: what the subscription knows of it.
 fn subscription_descriptor(row: &TickSubscriptionStatus) -> TickDescriptor {
     let terminal = matches!(
         row.kind,
@@ -495,7 +493,7 @@ pub fn remove_from_monitor(instance: &InstanceRef) -> MonitorAction {
     }
 }
 
-/// The Monitor rows of every registered Tick type, at most one per `<type>`.
+/// The Monitor rows of every registered access, at most one per access.
 #[derive(Clone)]
 pub struct MonitorRowsRegistry {
     rows: BTreeMap<&'static str, Arc<dyn MonitorRows>>,
@@ -503,13 +501,13 @@ pub struct MonitorRowsRegistry {
 impl MonitorRowsRegistry {
     pub fn new(rows: impl IntoIterator<Item = Arc<dyn MonitorRows>>) -> Result<Self, String> {
         let mut registered = BTreeMap::new();
-        for type_rows in rows {
-            InstanceRef::validate_type(type_rows.tick_type())?;
+        for access_rows in rows {
+            InstanceRef::validate_access(access_rows.access())?;
             if registered
-                .insert(type_rows.tick_type(), type_rows)
+                .insert(access_rows.access(), access_rows)
                 .is_some()
             {
-                return Err("duplicate Monitor rows type".into());
+                return Err("duplicate Monitor rows access".into());
             }
         }
         Ok(Self { rows: registered })
@@ -530,13 +528,13 @@ impl MonitorRowsRegistry {
         let mut merged = merge_descriptors(
             self.rows
                 .values()
-                .flat_map(|type_rows| type_rows.list(context)),
+                .flat_map(|access_rows| access_rows.list(context)),
         );
         let mut subscribed = active_subscriptions(context);
         subscribed.retain(|instance, _| {
             self.rows
-                .get(instance.tick_type())
-                .is_none_or(|type_rows| type_rows.takes_tick_subscriptions())
+                .get(instance.access())
+                .is_none_or(|access_rows| access_rows.takes_tick_subscriptions())
         });
         for (instance, rows) in &subscribed {
             merged
@@ -558,8 +556,8 @@ impl MonitorRowsRegistry {
                         entry.owner = TickOwner::ThisChat;
                     }
                     None => {
-                        let row = match self.rows.get(member.instance.tick_type()) {
-                            Some(type_rows) => type_rows.member(member, context),
+                        let row = match self.rows.get(member.instance.access()) {
+                            Some(access_rows) => access_rows.member(member, context),
                             None => member_descriptor(member),
                         };
                         merged.insert(member.instance.clone(), row);
@@ -617,7 +615,7 @@ impl MonitorRowsRegistry {
     pub fn refresh_intents(&self) -> Vec<TickIntent> {
         self.rows
             .values()
-            .filter_map(|type_rows| type_rows.refresh_intent())
+            .filter_map(|access_rows| access_rows.refresh_intent())
             .collect()
     }
 }

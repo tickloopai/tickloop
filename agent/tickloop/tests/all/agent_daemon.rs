@@ -652,6 +652,7 @@ fn grant_shell_spawns(directory: &Path, epoch: Uuid) -> tokio::task::JoinHandle<
             runtime: directory.join("h"),
         },
         epoch,
+        tickhost::host::DEFAULT_IDLE_TIMEOUT,
     ));
     tokio::spawn(async move {
         loop {

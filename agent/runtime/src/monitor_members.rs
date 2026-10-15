@@ -14,7 +14,10 @@ use serde_json::Value;
 use tick_protocol::InstanceRef;
 
 use super::{Agent, AgentError, Chat};
-use tickloop_agent_protocol::{ChatId, MonitorMembership, PendingInput, TICK_SUBSCRIPTION_SOURCE};
+use tickloop_agent_protocol::{
+    ChatId, LoopState, MonitorMembership, PendingInput, TICK_SUBSCRIPTION_SOURCE,
+};
+use uuid::Uuid;
 
 /// What a completed tool call read, as far as Monitor's unread updates care.
 pub(super) enum ReadTarget {
@@ -210,6 +213,42 @@ impl Agent {
             );
         }
         self.mark_taken_in(chat, instances);
+    }
+
+    /// Whether the Chat's Monitor may still list its Shell task `task`: as Monitor lists the task
+    /// by itself unless the user removed it, or while a Loop of the Chat subscribes to it. Only a
+    /// row a View keeps for its open detail is left out, which no Agent knows of.
+    pub(crate) async fn monitor_may_list_shell(&self, chat_id: ChatId, task: Uuid) -> bool {
+        let Ok(commands) = self.commands(chat_id).await else {
+            return false;
+        };
+        let chats = self.inner.chats.lock().await;
+        let Some(chat) = chats.get(&chat_id) else {
+            return false;
+        };
+        let instance = InstanceRef::shell(task);
+        let is_subscribed = chat
+            .snapshot
+            .loops
+            .iter()
+            .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
+            .flat_map(|goal| {
+                goal.trigger
+                    .iter()
+                    .flat_map(|trigger| &trigger.subscriptions)
+            })
+            .any(|subscription| subscription.instance == instance);
+        is_subscribed
+            || (!chat.snapshot.monitor.is_removed(&instance)
+                && crate::shell_task_center::project_tasks(&chat.snapshot, commands)
+                    .iter()
+                    .find(|listed| listed.id == task)
+                    .is_some_and(|listed| {
+                        listed.is_listed_in_monitor(
+                            chat.snapshot.monitor.handled_at(&instance),
+                            now_ms(),
+                        )
+                    }))
     }
 
     async fn update_monitor(

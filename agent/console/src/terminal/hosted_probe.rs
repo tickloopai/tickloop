@@ -23,8 +23,8 @@ impl HostedProbe {
 
 #[async_trait::async_trait]
 impl TickProbe for HostedProbe {
-    fn tick_type(&self) -> &'static str {
-        tick_protocol::HOSTED_INSTANCE_TYPE
+    fn access(&self) -> &'static str {
+        tick_protocol::HOSTED_ACCESS
     }
 
     async fn probe(

@@ -29,8 +29,8 @@ pub fn command_title(words: &[String]) -> String {
 /// A Tick's name: its declared title and the positional arguments of `command` (a
 /// [`command_title`]) that follow the word naming its type, such as `Quote · AAPL.US` for
 /// `tick longbridge quote AAPL.US`. A Tick without such arguments is named by its title alone.
-pub fn tick_title(title: &str, tick_type: &str, command: &str) -> String {
-    let type_names = [tick_type, tick_type.rsplit('.').next().unwrap_or(tick_type)];
+pub fn tick_title(title: &str, kind: &str, command: &str) -> String {
+    let type_names = [kind, kind.rsplit('.').next().unwrap_or(kind)];
     let names_type = |word: &&str| {
         let stem = Path::new(word)
             .file_stem()
@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn a_tick_is_named_by_its_title_and_the_arguments_after_its_type() {
-        for (title, tick_type, command, expected) in [
+        for (title, kind, command, expected) in [
             (
                 "Quote",
                 "quote",
@@ -154,7 +154,7 @@ mod tests {
                 "Weather · Paris",
             ),
         ] {
-            assert_eq!(tick_title(title, tick_type, command), expected, "{command}");
+            assert_eq!(tick_title(title, kind, command), expected, "{command}");
         }
     }
 

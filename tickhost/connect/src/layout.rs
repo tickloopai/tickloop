@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    herdr::{HerdrContext, HerdrPort, Pane, SocketHerdr, current_pane, report_view},
+    herdr::{HerdrContext, HerdrPort, Pane, SocketHerdr, report_view},
     host_error::HostError,
 };
 
@@ -88,17 +88,6 @@ impl HerdrLayout {
         std::fs::metadata(&self.context.socket)
             .ok()
             .map(|metadata| (metadata.dev(), metadata.ino()))
-    }
-
-    /// The Pane this process runs in.
-    pub async fn caller(&self) -> Result<Pane, HostError> {
-        if self.context.caller_pane.is_empty() {
-            return Err(HostError::before(
-                "MissingAnchor",
-                "this Agent has no interaction View",
-            ));
-        }
-        current_pane(self.host.as_ref(), &self.context.caller_pane).await
     }
 
     /// Every Pane of `workspace`, or of every Workspace.

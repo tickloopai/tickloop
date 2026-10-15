@@ -445,7 +445,7 @@ impl EmbeddedAgentAccess {
                 instance,
             } => {
                 let chat = self.chat(execution).await?;
-                let grant = if instance.tick_type() == tick_protocol::SHELL_INSTANCE_TYPE {
+                let grant = if instance.access() == tick_protocol::SHELL_ACCESS {
                     self.inner
                         .agent
                         .shell_tasks()

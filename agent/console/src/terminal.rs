@@ -4175,12 +4175,12 @@ async fn interact(
                         // slot is still released, so probing never stops for the session.
                         let mut results = Vec::new();
                         for typed in probe.probes {
-                            let tick_type = typed.prober.tick_type();
+                            let access = typed.prober.access();
                             let probed = tokio::spawn(async move {
                                 typed.prober.probe(chat, &typed.targets).await
                             })
                             .await;
-                            results.push((tick_type, probed.ok().and_then(Result::ok)));
+                            results.push((access, probed.ok().and_then(Result::ok)));
                         }
                         let _ = console.update_member_findings(chat, results);
                     });
