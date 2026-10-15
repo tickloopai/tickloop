@@ -112,22 +112,15 @@ pub fn visible_screen(output: &str, width: usize, height: usize) -> String {
 /// row of a list.
 pub const SELECTED_MARK: char = '▌';
 
-/// The background parameters the Agent's two themes send for the selection fill and for the
-/// deeper shade a selected row's countdown takes, at 256 colours and in true colour.
-pub const SELECTION_BACKGROUNDS: [&str; 8] = [
-    "48;5;24",
-    "48;5;153",
-    "48;2;38;79;120",
-    "48;2;180;213;255",
-    "48;5;25",
-    "48;5;111",
-    "48;2;30;100;160",
-    "48;2;140;185;245",
-];
+/// The background parameters the Agent's two themes send for the selection fill, at 256 colours
+/// and in true colour.
+pub const SELECTION_BACKGROUNDS: [&str; 4] =
+    ["48;5;24", "48;5;153", "48;2;38;79;120", "48;2;180;213;255"];
 
-/// [`visible_screen`] with the selection fill made visible: the first cell of each run painted
+/// [`visible_screen`] with the selection fill made visible: in each row, the first cell painted
 /// with the selection background shows [`SELECTED_MARK`] when that cell is blank, as the indent
-/// of a list's selected row is.
+/// of a list's selected row is. Where something else paints the middle of a selected row, such
+/// as a Monitor row's update bar, the selection that resumes after it shows no second mark.
 pub fn visible_screen_with_selection(output: &str, width: usize, height: usize) -> String {
     Screen::reconstruct(output, width, height).text(true)
 }
@@ -234,14 +227,11 @@ impl Screen {
             .into_iter()
             .zip(self.selected)
             .map(|(mut line, selected)| {
-                if marks_selection {
-                    for column in 0..line.len() {
-                        let starts_selection =
-                            selected[column] && (column == 0 || !selected[column - 1]);
-                        if starts_selection && line[column] == ' ' {
-                            line[column] = SELECTED_MARK;
-                        }
-                    }
+                if marks_selection
+                    && let Some(column) = selected.iter().position(|selected| *selected)
+                    && line[column] == ' '
+                {
+                    line[column] = SELECTED_MARK;
                 }
                 line.into_iter()
                     .filter(|character| *character != '\0')
@@ -265,6 +255,12 @@ fn the_selection_fill_shows_as_a_mark_where_its_run_begins_on_a_blank_cell() {
         visible_screen(output, 20, 4),
         "  plain\n  ◉ chosen\n❯ option\nleft   row",
         "the plain screen keeps the blank cells"
+    );
+    let banded = "\x1b[?2026h\x1b[2J\x1b[1;1H\x1b[48;5;24m \x1b[48;5;173m \x1b[48;5;239m◉ a \x1b[48;5;24m b  \x1b[0m\x1b[?2026l";
+    assert_eq!(
+        visible_screen_with_selection(banded, 20, 1),
+        "▌ ◉ a  b",
+        "the selection resuming after a band shows no second mark"
     );
 }
 

@@ -26,6 +26,8 @@ pub enum TickDetailKey {
     None,
     Back,
     Action(PreparedTickAction),
+    /// An action the Console prepares with its own state, as it prepares a row key's.
+    Prepare(Arc<dyn TickActionExecutor>),
 }
 pub struct TickConfirmationView {
     pub title: String,
@@ -71,7 +73,7 @@ impl TickActionUi<'_> {
     ) -> Result<super::subscription_detail::SubscriptionDetail, String> {
         let chat = self.chat().ok_or("No selected Chat")?;
         let monitor = &self.state.monitor;
-        let rows = crate::monitor_rows::subscriptions_on(&monitor.subscriptions, instance);
+        let rows = crate::monitor_rows::subscriptions_on(&monitor.shown_subscriptions(), instance);
         if rows.is_empty() {
             return Err("No Loop subscribes to this Tick".into());
         }
@@ -84,6 +86,25 @@ impl TickActionUi<'_> {
             operation,
             self.state.display,
         ))
+    }
+    /// The subscription on `instance` whose frequency the row's `f` cycles: the one of the
+    /// Chat's most recent Loop that subscribes to it with a periodic frequency.
+    pub(super) fn frequency_target(&self, instance: &tick_protocol::InstanceRef) -> Option<Uuid> {
+        self.state.monitor.frequency_target(instance)
+    }
+    /// Moves `subscription` on to its next periodic frequency in Monitor at once, so the next
+    /// press cycles on from it before the Agent reports the change, and says which it is now.
+    pub(super) fn cycle_frequency(
+        &mut self,
+        subscription: Uuid,
+    ) -> Option<tickloop_agent_protocol::TickSubscriptionFrequency> {
+        let frequency = self.state.monitor.request_next_frequency(subscription)?;
+        self.state.rendered_region = None;
+        self.notify(&format!(
+            "Subscription frequency: {}",
+            super::subscription_detail::frequency_label(frequency)
+        ));
+        Some(frequency)
     }
     pub(super) fn monitor_entry(
         &self,

@@ -112,6 +112,23 @@ impl Session {
     fn wait(&self, needle: &str) {
         self.wait_until_shown(needle, true);
     }
+    /// Waits until the Console paints a Monitor row's update square, which has no text of its own:
+    /// the accent background at 256 colours or in true colour.
+    fn wait_for_update_square(&self) {
+        const UPDATE_SQUARE_BACKGROUNDS: [&str; 2] = ["\x1b[48;5;173m", "\x1b[48;2;215;119;87m"];
+        let deadline = Instant::now() + TIMEOUT;
+        while !UPDATE_SQUARE_BACKGROUNDS
+            .iter()
+            .any(|background| self.output.lock().unwrap().contains(background))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "PTY never painted an update square: {}",
+                self.frame()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
     fn wait_without(&self, needle: &str) {
         self.wait_until_shown(needle, false);
     }
@@ -208,8 +225,8 @@ fn shell_tick_appears_can_be_focused_and_removed_in_an_isolated_pty() {
     session.send(b"\x02");
     session.wait("Shells (1)");
     std::fs::write(directory.path().join("finish"), "").unwrap();
-    // A clean exit adds no words or time to the row; its unread end is the accent `●`.
-    session.wait("●");
+    // A clean exit adds no words or time to the row; its unread end is the accent square.
+    session.wait_for_update_square();
     assert!(!session.frame().contains("exit 0"), "{}", session.frame());
     session.send(b"\x1b[Cx");
     session.wait_without("Shells (1)");
