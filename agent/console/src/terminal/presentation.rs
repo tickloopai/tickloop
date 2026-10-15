@@ -247,7 +247,13 @@ pub(super) fn transcript_document(
                 }
             }
             ConversationBlockKind::CompactBoundary => {
-                writer.block_text("\n✻ Conversation compacted\n", Some(Role::MutedText));
+                writer.block_text(
+                    format!(
+                        "\n{} Conversation compacted\n",
+                        display.glyph(super::display::Glyph::TurnSummary)
+                    ),
+                    Some(Role::MutedText),
+                );
             }
             ConversationBlockKind::CompactSummary { summary } => {
                 writer.block();
@@ -3342,7 +3348,7 @@ mod tests {
         let text = transcript_text(&snapshot);
         assert!(text.contains("❯ raw prompt remains"), "{text}");
         assert!(text.contains("⏺ raw answer remains"), "{text}");
-        assert!(text.contains("✻ Conversation compacted"));
+        assert!(text.contains("⏺ Conversation compacted"));
         assert!(
             text.contains("⏺ Summarized conversation\n  ⎿  public summary[2J"),
             "{text}"

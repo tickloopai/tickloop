@@ -199,7 +199,7 @@ impl RunningActivity {
     }
 }
 
-/// Claude Code's past-tense verbs for a finished turn, as in `✻ Brewed for 12s`.
+/// Claude Code's past-tense verbs for a finished turn, as in `⏺ Brewed for 12s`.
 const TURN_COMPLETION_VERBS: [&str; 8] = [
     "Baked",
     "Brewed",
@@ -218,8 +218,8 @@ const RESTORED_TURN_SUMMARY: &str = "Done";
 fn turn_summary_markers() -> impl Iterator<Item = String> {
     TURN_COMPLETION_VERBS
         .iter()
-        .map(|verb| format!("✻ {verb} for"))
-        .chain(std::iter::once(format!("✻ {RESTORED_TURN_SUMMARY}")))
+        .map(|verb| format!("⏺ {verb} for"))
+        .chain(std::iter::once(format!("⏺ {RESTORED_TURN_SUMMARY}")))
 }
 
 #[cfg(test)]
@@ -318,7 +318,7 @@ fn write_completion_notice(
         ),
         None => ("Reply completed".into(), ""),
     };
-    // Claude Code's turn summary, `✻ Worked for 12s`, is muted throughout.
+    // Claude Code's turn summary, `Worked for 12s`, is muted throughout.
     console.write_completion_notice(&[
         (heading, Some(Role::MutedText)),
         (details.into(), Some(Role::MutedText)),
@@ -6597,7 +6597,7 @@ fn show_settings_warnings(console: &Console, warnings: Vec<String>) -> Result<()
     Ok(())
 }
 
-/// A finished compaction as Claude Code marks it: one muted `✻ Conversation compacted` line, with
+/// A finished compaction as Claude Code marks it: one muted `⏺ Conversation compacted` line, with
 /// the summary left to the detailed transcript.
 fn write_compaction_notice(
     console: &Console,

@@ -59,7 +59,7 @@ pub(super) enum Glyph {
     TodoCompleted,
     Failure,
     Warning,
-    /// Claude Code's `✻` on a finished turn and on a compaction.
+    /// The mark of a finished turn and of a compaction: the reply dot, muted with its line.
     TurnSummary,
     ScrollUp,
     ScrollDown,
@@ -138,7 +138,7 @@ impl DisplayProfile {
             (GlyphSet::Unicode, Glyph::Success) => "✓",
             (GlyphSet::Unicode, Glyph::Failure) => "✗",
             (GlyphSet::Unicode, Glyph::Warning) => "!",
-            (GlyphSet::Unicode, Glyph::TurnSummary) => "✻",
+            (GlyphSet::Unicode, Glyph::TurnSummary) => "⏺",
             (GlyphSet::Unicode, Glyph::ScrollUp) => "↑",
             (GlyphSet::Unicode, Glyph::ScrollDown) => "↓",
             (GlyphSet::Unicode, Glyph::AgentNeedsInput) => "◆",
@@ -164,7 +164,7 @@ impl DisplayProfile {
             (GlyphSet::NerdFont, Glyph::Success) => "\u{f05e1}",
             (GlyphSet::NerdFont, Glyph::Failure) => "\u{f015a}",
             (GlyphSet::NerdFont, Glyph::Warning) => "\u{f0026}",
-            (GlyphSet::NerdFont, Glyph::TurnSummary) => NERD_FONT_CIRCLE_SLICE_5,
+            (GlyphSet::NerdFont, Glyph::TurnSummary) => "⏺",
             (GlyphSet::NerdFont, Glyph::ScrollUp) => "\u{f0143}",
             (GlyphSet::NerdFont, Glyph::ScrollDown) => "\u{f0140}",
             (GlyphSet::NerdFont, Glyph::AgentNeedsInput) => "\u{f173b}",

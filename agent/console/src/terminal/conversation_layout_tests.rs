@@ -322,7 +322,7 @@ async fn followed_and_reopened_conversations_share_one_claude_code_layout() {
             "",
             "⏺ All set.",
             "",
-            "✻ Done",
+            "⏺ Done",
             "",
         ]
         .join("\n")
@@ -714,7 +714,7 @@ async fn followed_and_reopened_family_conversations_show_agent_communication_ali
             "",
             "⏺ The scan is done.",
             "",
-            "✻ Done",
+            "⏺ Done",
             "",
         ]
         .join("\n")
@@ -849,7 +849,7 @@ async fn a_background_child_asked_for_no_report_finishes_as_one_block_alike() {
             "",
             "⏺ Thanks.",
             "",
-            "✻ Done",
+            "⏺ Done",
             "",
         ]
         .join("\n")
@@ -958,7 +958,7 @@ fn notices_warnings_and_compaction_are_blocks_of_their_own() {
             "",
             "! Settings could not be read",
             "",
-            "✻ Conversation compacted (ctrl+o for history)",
+            "⏺ Conversation compacted (ctrl+o for history)",
             "",
             "⏺ Background command \"make\" failed",
             "",

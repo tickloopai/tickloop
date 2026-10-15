@@ -202,7 +202,7 @@ async fn prompt_suggestion_pty_generates_ghost_without_submitting_until_accepted
         .collect();
     assert!(conversation.contains("1 shell still running"), "{frame}");
     assert!(
-        regex::Regex::new(r"✻ \p{L}+ for \d+s")
+        regex::Regex::new(r"⏺ \p{L}+ for \d+s")
             .unwrap()
             .is_match(&conversation),
         "{frame}"

@@ -2324,7 +2324,7 @@ mod tests {
         scrollback.append_tool_result("a", &result("done"));
         // Writers that open with several newlines still leave one blank row.
         scrollback.append("\n\n\n");
-        scrollback.append_completion_notice(&[("✻ Done".into(), None), ("\n".into(), None)]);
+        scrollback.append_completion_notice(&[("⏺ Done".into(), None), ("\n".into(), None)]);
         scrollback.start_block();
         scrollback.append("⚠ A warning\n");
         assert_eq!(
@@ -2338,7 +2338,7 @@ mod tests {
                 "⏺ Bash",
                 "  ⎿  done",
                 "",
-                "✻ Done",
+                "⏺ Done",
                 "",
                 "⚠ A warning",
                 "",
@@ -2351,7 +2351,7 @@ mod tests {
         let mut scrollback = Scrollback::new();
         echo(&mut scrollback, "kept");
         let withdrawn = echo(&mut scrollback, "withdrawn");
-        scrollback.append_completion_notice(&[("✻ Done".into(), None), ("\n".into(), None)]);
+        scrollback.append_completion_notice(&[("⏺ Done".into(), None), ("\n".into(), None)]);
         scrollback.hide_echo(withdrawn);
         scrollback.hide_completion_notice();
         echo(&mut scrollback, "next");
