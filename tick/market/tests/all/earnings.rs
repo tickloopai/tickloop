@@ -594,7 +594,58 @@ async fn once_json_carries_the_rows_and_the_summary_the_agent_reads() {
     );
     assert!(json["rows"][0]["day"].is_string());
     assert_eq!(updates.records().len(), 1);
-    assert_eq!(updates.records().all()[0]["data"], json);
+    let state = &updates.records().all()[0]["data"];
+    assert!(state.get("rows").is_none(), "{state}");
+    assert_eq!(state["symbol"], "TSLA.US");
+    assert_eq!(state["summary"], json["summary"]);
+    let mut latest = json["rows"][0].clone();
+    let latest_row = latest.as_object_mut().unwrap();
+    latest_row.remove("statement_items");
+    latest_row.remove("segments");
+    assert_eq!(state["latest"], latest);
+    assert_eq!(
+        state["history"],
+        serde_json::json!({"periods": 4, "newest": json["rows"][0]["period_id"],
+            "oldest": json["rows"][3]["period_id"], "tool": "history"})
+    );
+    assert_eq!(state["detail_tool"], "detail");
+}
+
+#[tokio::test]
+async fn the_earnings_state_summarises_a_table_its_history_tool_returns_in_full() {
+    let api = tick_builtin::DemoApi::new().unwrap();
+    let mut output = Vec::new();
+    let mut updates = TickStream::in_memory(TickKind::Earnings);
+    run_once(
+        &EarningsArgs {
+            symbol: "DEMO.US".into(),
+            count: None,
+            output: OnceArgs {
+                once: true,
+                format: OutputFormat::Json,
+            },
+        },
+        &api,
+        &Settings::default(),
+        false,
+        &mut output,
+        &mut updates,
+    )
+    .await
+    .unwrap();
+    let state = serde_json::to_vec(&updates.records().all()[0]["data"])
+        .unwrap()
+        .len();
+    assert!(
+        output.len() > 8 * 1024,
+        "the full table: {} bytes",
+        output.len()
+    );
+    assert!(state <= 2048, "the state: {state} bytes");
+    assert_eq!(
+        TickKind::Earnings.descriptor().recover_with,
+        updates.records().all()[0]["data"]["history"]["tool"].as_str()
+    );
 }
 
 #[tokio::test]

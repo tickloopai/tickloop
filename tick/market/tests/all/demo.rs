@@ -61,8 +61,8 @@ async fn demo_keeps_streaming_after_switching_candle_periods() {
         "switch snapshot and continuing updates: {records:?}"
     );
     assert_ne!(
-        switched[0]["data"]["candles"],
-        switched.last().unwrap()["data"]["candles"]
+        switched[0]["data"]["latest"],
+        switched.last().unwrap()["data"]["latest"]
     );
     let screen: String = terminal
         .backend()

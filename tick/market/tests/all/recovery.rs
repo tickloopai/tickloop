@@ -482,7 +482,7 @@ async fn switching_candle_periods_keeps_periodic_history_correction_with_push_av
     );
     let records = records(events);
     assert_eq!(records.len(), 4);
-    assert_eq!(records[2]["data"]["candles"][0]["close"], "102");
+    assert_eq!(records[2]["data"]["latest"]["close"], "102");
 }
 
 #[tokio::test(start_paused = true)]
@@ -547,7 +547,7 @@ async fn connection_recovery_backfills_candles_and_healthy_probes_do_not_repeat_
         let records = records(events);
         assert_eq!(records.len(), 2);
         assert_eq!(
-            records[1]["data"]["candles"][0]["close"],
+            records[1]["data"]["latest"]["close"],
             if fail_first_refresh { "102" } else { "101" }
         );
         let screen: String = terminal
