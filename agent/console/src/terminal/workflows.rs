@@ -1736,22 +1736,23 @@ mod tests {
     }
 
     fn tick_delivery_history(reply: &str) -> ChatSnapshot {
-        truncated_tick_delivery_history(reply, false)
+        delivery_history(
+            reply,
+            json!({
+                "items": [{
+                    "subscription": Uuid::from_u128(700),
+                    "instance": "calendar:fixture-run-3",
+                    "updates": 5,
+                    "seq": "8→12",
+                    "between": "2026-09-21T03:11:00Z→2026-09-21T03:15:00Z",
+                    "gap": false,
+                    "data": {"last_done": 191.2},
+                }],
+            }),
+        )
     }
 
-    fn truncated_tick_delivery_history(reply: &str, truncated: bool) -> ChatSnapshot {
-        let payload = json!({
-            "items": [{
-                "subscription": Uuid::from_u128(700),
-                "instance": "calendar:fixture-run-3",
-                "sequence": 12,
-                "observed_at": "2026-09-21T03:15:00Z",
-                "dropped": 4,
-                "gap": false,
-                "data": {"last_done": 191.2},
-            }],
-            "truncated": truncated,
-        });
+    fn delivery_history(reply: &str, payload: serde_json::Value) -> ChatSnapshot {
         serde_json::from_value(json!({
             "id": Uuid::from_u128(701),
             "workdir": "/workspace",
@@ -1772,7 +1773,7 @@ mod tests {
         let history = public_history(&tick_delivery_history("quiet"), DisplayProfile::default());
 
         assert!(
-            history.contains("◉ calendar:fixture-run-3 #12 · dropped 4"),
+            history.contains("◉ calendar:fixture-run-3 #8→12 · 5 updates\n"),
             "{history}"
         );
         assert!(!history.contains("last_done"), "{history}");
@@ -1780,16 +1781,50 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_delivery_says_so_on_its_line() {
+    fn a_trimmed_item_says_so_on_its_line_and_a_single_update_shows_no_count() {
         let history = public_history(
-            &truncated_tick_delivery_history("quiet", true),
+            &delivery_history(
+                "quiet",
+                json!({
+                    "items": [
+                        {
+                            "instance": "calendar:fixture-run-3",
+                            "updates": 60,
+                            "seq": "941→1000",
+                            "trimmed": [{"path": "/candles", "total": 1000, "kept": 25, "rule": "newest_last"}],
+                            "data": {"candles": []},
+                        },
+                        {"instance": "calendar:fixture-run-4", "updates": 1, "seq": "7", "data": {}},
+                    ],
+                }),
+            ),
             DisplayProfile::default(),
         );
 
         assert!(
-            history.contains("◉ calendar:fixture-run-3 #12 · dropped 4 · truncated"),
+            history.contains("◉ calendar:fixture-run-3 #941→1000 · 60 updates · trimmed"),
             "{history}"
         );
+        assert!(
+            history.contains("◉ calendar:fixture-run-4 #7\n"),
+            "{history}"
+        );
+    }
+
+    #[test]
+    fn a_delivery_recorded_before_update_counts_still_shows_its_instance() {
+        let history = public_history(
+            &delivery_history(
+                "quiet",
+                json!({
+                    "items": [{"instance": "calendar:fixture-run-3", "sequence": 12, "dropped": 4, "data": null}],
+                    "truncated": true,
+                }),
+            ),
+            DisplayProfile::default(),
+        );
+
+        assert!(history.contains("◉ calendar:fixture-run-3\n"), "{history}");
     }
 
     #[test]

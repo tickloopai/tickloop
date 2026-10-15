@@ -52,8 +52,15 @@ async fn the_example_counter_is_described_read_called_and_updates_through_its_st
     assert_eq!(descriptor.protocol, 3);
     assert_eq!(descriptor.kind, "example.counter");
     assert_eq!(descriptor.recover_with.as_deref(), Some("history"));
+    assert_eq!(
+        descriptor.state.unwrap().series,
+        [tick_protocol::StateSeries {
+            path: "/recent".into(),
+            newest: tick_protocol::SeriesEnd::Last,
+        }]
+    );
     let (baseline, _, mut observations) = client.watch().await.unwrap();
-    assert_eq!(baseline.data, json!({"value":0}));
+    assert_eq!(baseline.data, json!({"value":0,"recent":[]}));
 
     let result = client
         .call(
@@ -78,7 +85,10 @@ async fn the_example_counter_is_described_read_called_and_updates_through_its_st
     .expect("the increment published a Tick Update");
     let update = observation.update.unwrap();
     assert_eq!(update.seq, 1);
-    assert_eq!(update.data, json!({"value":5}));
+    assert_eq!(
+        update.data,
+        json!({"value":5,"recent":[{"seq":1,"value":5}]})
+    );
     assert!(
         update.at.is_some(),
         "the host fills in when it received the update"
@@ -97,7 +107,11 @@ async fn the_example_counter_is_described_read_called_and_updates_through_its_st
         "{stale:?}"
     );
     let read = client.read().await.unwrap();
-    assert_eq!(read.data, json!({"value":5}), "the stale call never ran");
+    assert_eq!(
+        read.data,
+        json!({"value":5,"recent":[{"seq":1,"value":5}]}),
+        "the stale call never ran"
+    );
     assert_eq!(read.seq, 1);
     session.shutdown().await.unwrap();
 }

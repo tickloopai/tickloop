@@ -73,6 +73,34 @@ pub struct TickDescriptor {
     /// updates cannot be recovered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recover_with: Option<String>,
+    /// What the Tick declares about its state beside the state itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<StateDeclaration>,
+}
+
+/// What a Tick declares about the `data` of its state.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StateDeclaration {
+    /// The arrays in `data` ordered in time, so a host that has to shorten one keeps its newest
+    /// end.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub series: Vec<StateSeries>,
+}
+
+/// An array in a state's `data` whose elements are ordered in time.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StateSeries {
+    /// JSON Pointer (RFC 6901) to the array within `data`; `""` is `data` itself.
+    pub path: String,
+    pub newest: SeriesEnd,
+}
+
+/// The end of a series that holds its newest element.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SeriesEnd {
+    First,
+    Last,
 }
 
 impl TickDescriptor {
@@ -130,6 +158,22 @@ impl TickDescriptor {
             return Err(format!(
                 "recovery tool {recovery:?} is not a declared query"
             ));
+        }
+        let series = self.state.iter().flat_map(|state| &state.series);
+        for (index, declared) in series.clone().enumerate() {
+            if !declared.path.is_empty() && !declared.path.starts_with('/') {
+                return Err(format!(
+                    "state series path {:?} is not a JSON Pointer",
+                    declared.path
+                ));
+            }
+            if series
+                .clone()
+                .take(index)
+                .any(|prior| prior.path == declared.path)
+            {
+                return Err(format!("state series {:?} declared twice", declared.path));
+            }
         }
         Ok(())
     }
@@ -404,6 +448,46 @@ mod tests {
         assert_eq!(with.recover_with.as_deref(), Some("current"));
         assert_eq!(with.kind, "example.counter");
         assert!(TickDescriptor::parse(counter(json!({"recover_with":"missing"}))).is_err());
+    }
+
+    #[test]
+    fn a_state_may_declare_which_end_of_each_series_is_newest() {
+        let without = TickDescriptor::parse(counter(json!({}))).unwrap();
+        assert_eq!(without.state, None);
+        assert!(
+            serde_json::to_value(&without)
+                .unwrap()
+                .get("state")
+                .is_none()
+        );
+        let declared = TickDescriptor::parse(counter(json!({"state":{"series":[
+            {"path":"/candles","newest":"last"},
+            {"path":"/news/items","newest":"first"}
+        ]}})))
+        .unwrap();
+        assert_eq!(
+            declared.state.unwrap().series,
+            vec![
+                StateSeries {
+                    path: "/candles".into(),
+                    newest: SeriesEnd::Last
+                },
+                StateSeries {
+                    path: "/news/items".into(),
+                    newest: SeriesEnd::First
+                },
+            ]
+        );
+        for refused in [
+            json!({"state":{"series":[{"path":"candles","newest":"last"}]}}),
+            json!({"state":{"series":[{"path":"/a","newest":"last"},{"path":"/a","newest":"first"}]}}),
+            json!({"state":{"series":[{"path":"/a","newest":"middle"}]}}),
+        ] {
+            assert!(
+                TickDescriptor::parse(counter(refused.clone())).is_err(),
+                "{refused}"
+            );
+        }
     }
 
     #[test]

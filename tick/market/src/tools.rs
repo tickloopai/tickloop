@@ -15,6 +15,7 @@ pub fn for_kind(kind: TickKind) -> Tools {
         TickKind::Earnings => crate::commands::earnings::tools(),
         TickKind::Options => crate::commands::options::tools(),
         TickKind::Reader => crate::commands::reader::tools(),
-        TickKind::Positions | TickKind::News => Tools::default(),
+        TickKind::News => Tools::default().series("/items", tick_protocol::SeriesEnd::First),
+        TickKind::Positions => Tools::default(),
     }
 }

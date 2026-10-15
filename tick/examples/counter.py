@@ -9,6 +9,8 @@ import threading
 
 MAX_REQUEST_BYTES = 512 * 1024
 HISTORY_LIMIT = 256
+# The state shows the latest changes; the history tool reads further back.
+RECENT_LIMIT = 10
 # The catalog never changes while the counter runs, so one revision names it.
 REVISION = "1"
 TOOLS = [
@@ -44,7 +46,7 @@ def send(frame):
 
 
 def state():
-    return {"seq": seq, "data": {"value": value}}
+    return {"seq": seq, "data": {"value": value, "recent": history[-RECENT_LIMIT:]}}
 
 
 def draw():
@@ -103,6 +105,8 @@ def respond(method, params):
             "revision": REVISION,
             "recover_with": "history",
             "tools": TOOLS,
+            # `recent` grows at its end, so a host that has to shorten it keeps the end.
+            "state": {"series": [{"path": "/recent", "newest": "last"}]},
         }
     if method == "tick/read":
         with STATE_LOCK:

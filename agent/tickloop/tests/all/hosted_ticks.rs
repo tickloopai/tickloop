@@ -1513,6 +1513,150 @@ for line in sys.stdin:
         );
     }
 
+    /// A Tick whose state holds a thousand candles, about 140 KiB, newest last, and whose
+    /// `advance` adds one and publishes the whole state again.
+    const CANDLES: &str = r#"
+import json, sys
+candles = [{'i': i, 'time': '2026-10-14T01:%02d:%02dZ' % (i // 60 % 60, i % 60), 'open': '512.50', 'high': '513.00', 'low': '512.00', 'close': '512.%02d' % (i % 100), 'volume': 1000 + i, 'turnover': '512500.00'} for i in range(1000)]
+seq = 0
+def state():
+    return {'seq': seq, 'data': {'symbol': '700.HK', 'candles': candles}}
+tools = [{'name':'advance','description':'Add a candle','input_schema':{'type':'object'},'mutates':True},{'name':'history','description':'All candles','input_schema':{'type':'object'},'mutates':False}]
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    if method == 'tick/describe':
+        result = {'protocol':3,'revision':'1','kind':'example.candles','title':'Candles','description':'Candles','recover_with':'history','tools':tools,'state':{'series':[{'path':'/candles','newest':'last'}]}}
+    elif method == 'tick/read':
+        result = state()
+    elif request['params']['tool'] == 'advance':
+        candles = candles[1:] + [dict(candles[-1], i=candles[-1]['i'] + 1)]
+        seq += 1
+        print(json.dumps({'jsonrpc':'2.0','method':'tick/update','params':state()}), flush=True)
+        result = {'newest': candles[-1]['i']}
+    else:
+        result = {'candles': candles}
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
+"#;
+
+    /// The Tick delivery payload in the newest user message of `messages`.
+    fn delivery_payload(messages: &[tickloop_agent_protocol::Message]) -> Value {
+        let text = messages
+            .iter()
+            .rev()
+            .filter(|message| message.role == tickloop_agent_protocol::Role::User)
+            .flat_map(|message| &message.content)
+            .find_map(|content| match content {
+                tickloop_agent_protocol::Content::Text { text }
+                    if text.contains("<tick-delivery>") =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .expect("the Loop was woken by a Tick delivery");
+        let start = text.find("<tick-delivery>").unwrap() + "<tick-delivery>".len();
+        let end = text.find("</tick-delivery>").unwrap();
+        serde_json::from_str(
+            &text[start..end]
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&"),
+        )
+        .unwrap()
+    }
+
+    /// A subscribed protocol Tick whose state is far larger than a delivery wakes its Loop with
+    /// that state trimmed by segments, never with empty data: the delivery says how many updates
+    /// it merged, their seq span, and what it trimmed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_large_tick_state_is_delivered_trimmed_never_empty() {
+        let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new()));
+        let daemon = Daemon::start_with(model.clone(), Duration::from_secs(2), 1).await;
+        let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
+        let tools = daemon.tools();
+        let script = daemon.root.join("candles.py");
+        std::fs::write(&script, CANDLES).unwrap();
+        let opened = run_tool(
+            &tools,
+            chat,
+            "ModifyTick",
+            open_command(&daemon, python_program(&script, &[])),
+        )
+        .await;
+        let instance = opened["tick_instance_id"].clone();
+        model.enqueue(tickloop_agent_test_support::call(
+            "subscribe",
+            "SubscribeTick",
+            json!({"tick_instance_id":instance}),
+        ));
+        model.enqueue(tickloop_agent_test_support::text("watching"));
+        let mut events = runtime.subscribe();
+        runtime
+            .submit(chat, None, "Watch the candles".into())
+            .await
+            .unwrap();
+        loop {
+            match tickloop_agent_test_support::next_event(&mut events)
+                .await
+                .kind
+            {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+
+        model.enqueue(tickloop_agent_test_support::text("candles noted"));
+        for _ in 0..3 {
+            run_tool(
+                &tools,
+                chat,
+                "CallTickTool",
+                json!({"tick_instance_id":instance,"tool":"advance","args":{}}),
+            )
+            .await;
+        }
+        loop {
+            let event = tokio::time::timeout(high_delivery_wait(), events.recv())
+                .await
+                .expect("the updates wake the Loop")
+                .unwrap();
+            match event.kind {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+
+        let payload = delivery_payload(&model.requests.lock().unwrap()[2].messages);
+        assert!(
+            payload.to_string().len() <= tickloop_agent_protocol::MAX_DELIVERY_PAYLOAD_BYTES,
+            "{payload}"
+        );
+        let item = &payload["items"][0];
+        assert_eq!(item["updates"], 3, "{item}");
+        assert_eq!(item["seq"], "1→3", "{item}");
+        assert_eq!(item["data"]["symbol"], "700.HK", "{item}");
+        let candles = item["data"]["candles"]
+            .as_array()
+            .expect("the candles stay");
+        assert_eq!(candles[0]["i"], 3, "the oldest candle stays");
+        assert_eq!(
+            candles.last().unwrap()["i"],
+            1002,
+            "the newest candle stays"
+        );
+        let trimmed = item["trimmed"]
+            .as_array()
+            .expect("the delivery says what it trimmed");
+        assert_eq!(trimmed.len(), 1, "{item}");
+        assert_eq!(trimmed[0]["path"], "/candles");
+        assert_eq!(trimmed[0]["total"], 1000);
+        assert_eq!(trimmed[0]["rule"], "newest_last");
+        assert_eq!(item["recover_with"], "history");
+    }
+
     /// The ModifyTick input that opens `/bin/cat` as a terminal Tick in the daemon's Tickhost.
     fn cat_command(daemon: &Daemon) -> Value {
         json!({"action":"open","command":["/bin/cat"],"cwd":daemon.root})

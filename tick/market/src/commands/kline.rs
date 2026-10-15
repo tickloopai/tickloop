@@ -182,6 +182,7 @@ pub struct EventViewArgs {
 
 pub fn tools() -> Tools {
     Tools::default()
+        .series("/candles", tick_protocol::SeriesEnd::Last)
         .query::<CandlesArgs>(
             "candles",
             "Candlesticks for a symbol between two dates, in the Kline Panel's shape.",

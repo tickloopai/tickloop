@@ -306,6 +306,7 @@ impl ShellObserver {
             title: listed.command.lines().next().unwrap_or_default().into(),
             kind: ObservationKind::Protocol,
             updated_at_ms: ended_at_ms,
+            series: Vec::new(),
         }
     }
 

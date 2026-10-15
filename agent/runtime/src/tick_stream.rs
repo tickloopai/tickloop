@@ -56,6 +56,8 @@ pub struct TickMetadata {
     pub title: String,
     pub kind: ObservationKind,
     pub updated_at_ms: Option<u64>,
+    /// The series a protocol Tick declares in its state.
+    pub series: Vec<tick_protocol::StateSeries>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -865,6 +867,10 @@ async fn observe_protocol(
             title: descriptor.title,
             kind: ObservationKind::Protocol,
             updated_at_ms: None,
+            series: descriptor
+                .state
+                .map(|state| state.series)
+                .unwrap_or_default(),
         },
     );
     let recovery = descriptor

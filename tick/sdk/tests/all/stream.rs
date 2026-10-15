@@ -1,7 +1,8 @@
 use serde_json::{Value, json};
 use tick_protocol::{
     CALL_METHOD, DESCRIBE_METHOD, INVALID_PARAMS, INVALID_REQUEST, NATIVE_PROTOCOL_VERSION,
-    READ_METHOD, REVISION_MISMATCH, TickDescriptor, TickTool, UPDATE_METHOD,
+    READ_METHOD, REVISION_MISMATCH, SeriesEnd, StateDeclaration, StateSeries, TickDescriptor,
+    TickTool, UPDATE_METHOD,
 };
 use tick_sdk::stream::{Describe, InboundFrame, TickStream, ToolRequest};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -36,6 +37,12 @@ impl Describe for Counter {
             revision: self.revision.into(),
             recover_with: Some("current".into()),
             tools: self.tools.clone(),
+            state: Some(StateDeclaration {
+                series: vec![StateSeries {
+                    path: "/history".into(),
+                    newest: SeriesEnd::Last,
+                }],
+            }),
         })
     }
 }
@@ -99,6 +106,10 @@ async fn any_tick_answers_describe_and_read_with_what_it_declares_and_publishes(
     assert_eq!(answer(1)["result"]["kind"], "example.counter");
     assert_eq!(answer(1)["result"]["revision"], "1");
     assert_eq!(answer(1)["result"]["recover_with"], "current");
+    assert_eq!(
+        answer(1)["result"]["state"],
+        json!({"series":[{"path":"/history","newest":"last"}]})
+    );
     assert_eq!(answer(2)["result"], update["params"]);
 }
 

@@ -107,6 +107,7 @@ struct EmptyArgs {}
 
 pub fn tools() -> crate::tools::Tools {
     crate::tools::Tools::default()
+        .series("/rows", tick_protocol::SeriesEnd::First)
         .query::<HistoryArgs>(
             "history",
             "Past earnings periods of any US symbol: EPS and revenue estimate, actual and surprise, and the moves before, on and after each report, in the Earnings table's shape.",
