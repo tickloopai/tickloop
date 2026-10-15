@@ -811,9 +811,9 @@ impl Agent {
         self.inner.hosted_ticks.read().unwrap().clone()
     }
 
-    /// Lets the daemon grant this worker's Shell spawns in its Tickhost.
-    pub fn install_shell_issuer(&self, issuer: Arc<dyn crate::hosted::shells::SpawnIssuer>) {
-        self.inner.shells.install_issuer(issuer);
+    /// Lets the daemon grant this worker's Shell spawns and views in its Tickhost.
+    pub fn install_shell_grants(&self, grants: Arc<dyn crate::hosted::shells::ShellGrants>) {
+        self.inner.shells.install_grants(grants);
     }
 
     pub fn shell_tasks(&self) -> Arc<crate::hosted::shells::ShellTasks> {

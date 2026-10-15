@@ -5020,6 +5020,7 @@ dependencies = [
  "tickloop-tickhost-connect",
  "tokio",
  "tokio-util",
+ "unicode-width",
  "uuid",
  "vt100",
 ]

@@ -1,10 +1,11 @@
 //! The Herdr Panes that show this worker's hosted Ticks. A view Pane runs this executable's
 //! attach client with a one-time view grant; the Tick runs in the Tickhost whatever happens to the
-//! Pane, and closing the Pane only disconnects that view. A worker knows the Panes it created by
-//! the terminal each one shows, until that Pane closes.
+//! Pane, and closing the Pane only disconnects that view. While attached, a view Pane names the
+//! Tick it shows in its own Herdr metadata, which is how a worker recognises its view Panes, also
+//! the ones an earlier worker of the Agent created.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashSet},
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::Path,
 };
@@ -18,11 +19,11 @@ use tickhost_connect::{
     layout::{CreatedView, HerdrLayout, Placement},
     page::PageCursor,
 };
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use tickloop_agent_protocol::{
-    ATTACH_ARGUMENTS, ATTACH_ENVIRONMENT, ChatId, HerdrPane, HostEndpointIdentity, HostedViewGrant,
+    ATTACH_ARGUMENTS, ATTACH_ENVIRONMENT, HerdrPane, HostEndpointIdentity, HostedViewGrant,
+    VIEW_PANE_ENVIRONMENT,
 };
 
 /// How results name Herdr.
@@ -31,8 +32,6 @@ const HERDR_HOST: &str = "herdr";
 pub struct HerdrViews {
     layout: HerdrLayout,
     attach_command: Vec<String>,
-    /// The terminal of the Pane that shows each Tick, per Chat.
-    terminals: Mutex<HashMap<(ChatId, InstanceRef), String>>,
 }
 
 /// A ReadWorkspace prepared for dispatch: the Workspace it lists, or every one, the View Pane
@@ -52,7 +51,6 @@ impl HerdrViews {
             attach_command: std::iter::once(executable.to_string_lossy().into_owned())
                 .chain(ATTACH_ARGUMENTS.map(String::from))
                 .collect(),
-            terminals: Mutex::new(HashMap::new()),
         }
     }
 
@@ -82,36 +80,30 @@ impl HerdrViews {
         }))
     }
 
-    /// The Pane that shows `chat`'s `instance` now; a Pane that closed is forgotten.
-    pub(crate) async fn pane(
-        &self,
-        chat: ChatId,
-        instance: &InstanceRef,
-    ) -> Result<Option<Pane>, HostError> {
-        let key = (chat, instance.clone());
-        let Some(terminal) = self.terminals.lock().await.get(&key).cloned() else {
-            return Ok(None);
-        };
-        let pane = self.layout.terminal_pane(&terminal).await?;
-        if pane.is_none() {
-            self.terminals.lock().await.remove(&key);
-        }
-        Ok(pane)
+    /// A Pane that shows `instance` now, in any Workspace.
+    pub(crate) async fn pane(&self, instance: &InstanceRef) -> Result<Option<Pane>, HostError> {
+        Ok(self.panes(instance).await?.into_iter().next())
     }
 
-    /// Shows `chat`'s `instance` in a new Pane at `placement`, attached with `grant`, and says
-    /// how far that got. A Pane Herdr created is never created again.
+    /// Every Pane that shows `instance` now, in any Workspace.
+    pub(crate) async fn panes(&self, instance: &InstanceRef) -> Result<Vec<Pane>, HostError> {
+        self.layout.view_panes(instance.as_str()).await
+    }
+
+    /// Shows a Tick in a new Pane at `placement`, attached with `grant`, and says how far that
+    /// got. A Pane Herdr created is never created again.
     pub(crate) async fn show(
         &self,
-        chat: ChatId,
-        instance: &InstanceRef,
         grant: &HostedViewGrant,
         workspace: &str,
         placement: &Placement,
         cancel: CancellationToken,
     ) -> Value {
         let environment = match serde_json::to_string(grant) {
-            Ok(grant) => BTreeMap::from([(ATTACH_ENVIRONMENT.to_owned(), grant)]),
+            Ok(grant) => BTreeMap::from([
+                (ATTACH_ENVIRONMENT.to_owned(), grant),
+                (VIEW_PANE_ENVIRONMENT.to_owned(), "1".to_owned()),
+            ]),
             Err(error) => {
                 return not_created(&HostError::before("InvalidGrant", error.to_string()));
             }
@@ -128,68 +120,68 @@ impl HerdrViews {
             .await;
         match created {
             Ok(CreatedView::Placed(pane)) => {
-                self.remember(chat, instance, &pane.terminal_id).await;
+                self.report(&pane.pane_id, grant.instance.as_str()).await;
                 shown(&pane, "shown")
             }
             Ok(CreatedView::NotPlaced { pane_id, error }) => {
-                if let Ok(pane) = self.layout.pane(&pane_id).await {
-                    self.remember(chat, instance, &pane.terminal_id).await;
-                }
+                self.report(&pane_id, grant.instance.as_str()).await;
                 json!({"status":"created_not_placed","host":HERDR_HOST,"pane_id":pane_id,"error":error,"diagnostic":"The view Pane was created, but its placement was not confirmed; inspect it before retrying. Do not open another view."})
             }
             Err(error) => not_created(&error),
         }
     }
 
-    /// Moves the Pane `view`, which shows `chat`'s `instance`, to `placement`.
+    /// Moves the view Pane `view` to `placement`.
     pub(crate) async fn move_view(
         &self,
-        chat: ChatId,
-        instance: &InstanceRef,
         view: &Pane,
         placement: &Placement,
         cancel: CancellationToken,
     ) -> Result<Value, HostError> {
         let moved = self.layout.move_view(view, placement, cancel).await?;
-        self.remember(chat, instance, &moved.terminal_id).await;
+        if let Some(instance) = view.view_of() {
+            self.report(&moved.pane_id, instance).await;
+        }
         Ok(shown(&moved, "moved"))
     }
 
-    /// Closes the Pane that shows `chat`'s `instance`, once the Tick ended; `None` when no Pane
-    /// of this worker showed it.
-    pub(crate) async fn close(&self, chat: ChatId, instance: &InstanceRef) -> Option<Value> {
-        let terminal = self
-            .terminals
-            .lock()
-            .await
-            .remove(&(chat, instance.clone()))?;
-        Some(match self.layout.close_view(&terminal).await {
-            Ok(()) => json!({"status":"closed","host":HERDR_HOST}),
-            Err(error) => {
-                json!({"status":"not_closed","host":HERDR_HOST,"error":error,"diagnostic":"The Tick has ended; its view Pane shows that it ended until it is closed."})
+    /// Names `instance` on a view Pane this worker just placed or moved, where a move may have
+    /// dropped what the Pane's attach client reported; that client renews it, so a refused report
+    /// only waits for the renewal.
+    async fn report(&self, pane_id: &str, instance: &str) {
+        let _ = self.layout.report_view(pane_id, instance).await;
+    }
+
+    /// Closes `views`, the Panes that showed a Tick before it ended; `None` when there were none.
+    pub(crate) async fn close(&self, views: &[Pane]) -> Option<Value> {
+        if views.is_empty() {
+            return None;
+        }
+        let mut failures = Vec::new();
+        for view in views {
+            if let Err(error) = self.layout.close_view(&view.terminal_id).await {
+                failures.push(error);
             }
+        }
+        Some(if failures.is_empty() {
+            json!({"status":"closed","host":HERDR_HOST})
+        } else {
+            json!({"status":"not_closed","host":HERDR_HOST,"error":failures[0],"diagnostic":"The Tick has ended; its view Pane shows that it ended until it is closed."})
         })
     }
 
-    /// The Panes of `listing`'s Workspace, marking each that shows one of `chat`'s Ticks, and
+    /// The Panes of `listing`'s Workspace, marking each that shows one of the Chat's Ticks, and
     /// the Chat's Ticks as the Tickhost lists them in `rows`, each with the Panes that show it.
-    /// The views of Ticks `rows` no longer lists are forgotten.
     pub(crate) async fn read_workspace(
         &self,
-        chat: ChatId,
         listing: WorkspaceListing,
         rows: Vec<TickRow>,
     ) -> Result<Value, HostError> {
         let running = rows
             .iter()
-            .filter_map(|row| row.instance.clone())
-            .collect::<std::collections::HashSet<_>>();
-        self.terminals
-            .lock()
-            .await
-            .retain(|(owner, instance), _| *owner != chat || running.contains(instance));
+            .filter_map(|row| Some(row.instance.as_ref()?.as_str().to_owned()))
+            .collect::<HashSet<_>>();
         let panes = self.layout.panes(listing.workspace.as_deref()).await?;
-        let shown = self.shown(chat, &panes).await;
         let workspaces = panes
             .iter()
             .map(|pane| pane.workspace_id.clone())
@@ -200,7 +192,7 @@ impl HerdrViews {
                 let instance = row.instance?;
                 let view_panes = panes
                     .iter()
-                    .filter(|pane| shown.get(&pane.terminal_id) == Some(&instance))
+                    .filter(|pane| view_of(pane, &running) == Some(instance.as_str()))
                     .map(|pane| pane.pane_id.clone())
                     .collect::<Vec<_>>();
                 Some(json!({
@@ -235,14 +227,14 @@ impl HerdrViews {
             None => None,
         };
         let panes = panes
-            .into_iter()
+            .iter()
             .map(|pane| {
                 json!({
                     "pane_id": pane.pane_id,
                     "tab_id": pane.tab_id,
                     "workspace_id": pane.workspace_id,
-                    "cwd": pane.foreground_cwd.or(pane.cwd),
-                    "view_of": shown.get(&pane.terminal_id),
+                    "cwd": pane.foreground_cwd.as_ref().or(pane.cwd.as_ref()),
+                    "view_of": view_of(pane, &running),
                 })
             })
             .collect::<Vec<_>>();
@@ -266,25 +258,13 @@ impl HerdrViews {
             "ticks": ticks,
         }))
     }
+}
 
-    /// The Ticks of `chat` that `panes` show, by the terminal of each Pane.
-    async fn shown(&self, chat: ChatId, panes: &[Pane]) -> HashMap<String, InstanceRef> {
-        let terminals = self.terminals.lock().await;
-        terminals
-            .iter()
-            .filter(|((owner, _), terminal)| {
-                *owner == chat && panes.iter().any(|pane| &pane.terminal_id == *terminal)
-            })
-            .map(|((_, instance), terminal)| (terminal.clone(), instance.clone()))
-            .collect()
-    }
-
-    async fn remember(&self, chat: ChatId, instance: &InstanceRef, terminal: &str) {
-        self.terminals
-            .lock()
-            .await
-            .insert((chat, instance.clone()), terminal.to_owned());
-    }
+/// The Tick of `running` that `pane` shows a view of. Only those are named; another Chat's view
+/// Pane is a plain Pane to this Chat.
+fn view_of<'pane>(pane: &'pane Pane, running: &HashSet<String>) -> Option<&'pane str> {
+    pane.view_of()
+        .filter(|instance| running.contains(*instance))
 }
 
 /// The interaction Pane a call came with, as the layout takes it.
@@ -304,6 +284,7 @@ pub(crate) fn interaction_pane(pane: HerdrPane) -> Pane {
         tab_id,
         cwd,
         foreground_cwd,
+        tokens: BTreeMap::new(),
     }
 }
 

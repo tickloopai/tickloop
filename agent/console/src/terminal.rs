@@ -40,7 +40,6 @@ mod external_editor;
 mod file_mentions;
 mod font_manager;
 mod footer;
-mod hosted_detail;
 mod hosted_probe;
 mod hyperlink;
 mod image_cache;
@@ -83,10 +82,8 @@ mod style;
 mod subagent_panel;
 mod subscription_detail;
 mod task_access;
-mod task_surface;
 mod thinking_preview;
 pub mod tick_actions;
-mod tick_shell;
 mod transcript;
 mod workflows;
 mod workspace_trust;
@@ -763,7 +760,7 @@ Click Subagents N to hide/show the list. In the list enter opens an Agent (modif
 Subagents wear the colour they were given at creation; the input takes the colour of the subagent it is viewing.
 The key hints always end the screen; notices share that row.
 shift+up/down focuses Monitor's Shells group; enter opens the selected Shell.
-enter or a click on a hosted Tick in Monitor opens it: in a Herdr popup inside Herdr (the popup plugin is offered once for registration), otherwise full screen here; a lone esc closes it and the Tick keeps running, ctrl+b esc sends esc and ctrl+b ctrl+b sends ctrl+b to the Tick; s shows a text snapshot; c closes the Tick and n reopens one lost with its host.
+enter or a click on a hosted Tick or a Shell in Monitor opens its view: in a Herdr popup inside Herdr (the popup plugin is offered once for registration), otherwise full screen here; a lone esc closes it and the Tick keeps running, ctrl+b esc sends esc and ctrl+b ctrl+b sends ctrl+b to the Tick; a Shell's view only shows it. s stops a running Shell after confirmation; c closes a hosted Tick and n reopens one lost with its host.
 Each Agent's own Todos stay below Working, including while idle, with a 30-second grace after all items complete; rewrites do not extend it.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
@@ -2069,17 +2066,6 @@ async fn interact(
                 let result = artifact_ui::load_page(&root, &request).await;
                 (request, result)
             });
-        }
-        if let Some((chat, action)) = console.poll_tick_detail()? {
-            let context = tick_actions::TickActionContext {
-                agent,
-                console,
-                root: config_root.as_deref(),
-                chat,
-            };
-            if let Err(error) = tick_actions::execute(action, context).await {
-                console.set_status(&safe_text(&error))?;
-            }
         }
         let discovery_active = menus.discovery_active();
         let active_login = login::active_login_id(&logins, console)?;

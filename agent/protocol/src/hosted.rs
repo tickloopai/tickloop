@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use tick_protocol::InstanceRef;
 use uuid::Uuid;
 
-use crate::{HostedResources, HostedScreenSnapshot};
+use crate::HostedResources;
 
 /// One hosted Tick as its Chat's Monitor shows it.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq)]
@@ -38,23 +38,18 @@ pub struct HostedProgramExit {
     pub signal: Option<i32>,
 }
 
-/// A hosted Tick's screen as text when it was taken: the newest lines within the snapshot
-/// limits, saying whether older ones were cut.
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
-pub struct HostedSnapshot {
-    pub screen: HostedScreenSnapshot,
-    pub taken_at_ms: u64,
-}
-
-/// The `tickloop` arguments that run the attach client of one hosted Tick view: a Monitor popup,
-/// or a Herdr Pane that shows the Tick.
+/// The `tickloop` arguments that run the attach client of one view of a local Tick: a Monitor
+/// popup, or a Herdr Pane that shows the Tick.
 pub const ATTACH_ARGUMENTS: [&str; 2] = ["monitor", "attach"];
 /// The environment variable through which an attach client receives its view grant as JSON.
 pub const ATTACH_ENVIRONMENT: &str = "TICKLOOP_MONITOR_ATTACH";
+/// Set for an attach client that runs as a view Pane a Worker placed in Herdr, which names the
+/// Tick it shows in that Pane's metadata while it is attached.
+pub const VIEW_PANE_ENVIRONMENT: &str = "TICKLOOP_VIEW_PANE";
 
-/// One view's permission to attach to a hosted Tick's terminal: it reaches `endpoint` as a
-/// viewer of `instance` once, and only the host process `host_epoch` honours it. It carries no
-/// data token.
+/// One view's permission to attach to a local Tick's screen, a hosted Tick's terminal or a Shell
+/// task's: it reaches `endpoint` as a viewer of `instance` once, and only the host process
+/// `host_epoch` honours it. It carries no data token.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HostedViewGrant {

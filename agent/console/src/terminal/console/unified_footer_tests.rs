@@ -1,5 +1,5 @@
 use super::*;
-use crate::{agent_console::AttentionGroup, terminal::task_surface::TaskSurfaceEffect};
+use crate::agent_console::AttentionGroup;
 use tickloop_agent_protocol::{
     LoopState, ShellTask, ShellTaskCapabilities, ShellTaskOrigin, ShellTaskOwner,
     ShellTaskSnapshot, ShellTaskState, SubagentRegistration,
@@ -699,63 +699,7 @@ fn shell_snapshot(revision: u64, tasks: Vec<(Uuid, &str, ShellTaskState)>) -> Sh
 }
 
 #[test]
-fn single_shell_activation_and_detail_updates_keep_the_exact_eligible_task() {
-    let console = fixture();
-    let snapshot = shell_snapshot(
-        1,
-        vec![(TASK, "selected shell", ShellTaskState::Background)],
-    );
-    console.update_shell_ticks(&snapshot).unwrap();
-    console
-        .state
-        .lock()
-        .unwrap()
-        .key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
-    let Some(InputEvent::TickAction { action, .. }) = key(&console, KeyCode::Enter) else {
-        panic!("Shell shortcut did not open the Tick panel");
-    };
-    assert_eq!(
-        action.instance,
-        tick_protocol::InstanceRef::shell(TASK).to_string()
-    );
-    let panel = console
-        .state
-        .lock()
-        .unwrap()
-        .monitor
-        .detail
-        .as_ref()
-        .unwrap()
-        .id();
-    console
-        .update_tick_detail::<crate::terminal::tick_shell::TickShell, _>(CHAT, panel, |detail| {
-            detail.load(snapshot, None)
-        })
-        .unwrap();
-    let mut completed =
-        shell_snapshot(2, vec![(TASK, "selected shell", ShellTaskState::Completed)]);
-    completed.tasks[0].exit_code = Some(0);
-    let effect = console.update_tick_shell(CHAT, panel, completed).unwrap();
-    assert!(matches!(
-        effect,
-        TaskSurfaceEffect::None | TaskSurfaceEffect::ReadOutput { .. }
-    ));
-    let detail = frame(&console);
-    assert!(
-        detail
-            .iter()
-            .any(|row| row.starts_with("$ selected shell") && row.ends_with("⏺ exit 0")),
-        "{detail:?}"
-    );
-    key(&console, KeyCode::Esc);
-    assert_eq!(
-        console.state.lock().unwrap().editor.draft(),
-        "keep literal jk draft"
-    );
-}
-
-#[test]
-fn multiple_shell_shortcut_opens_the_list_after_an_earlier_single_detail() {
+fn multiple_shell_shortcut_opens_the_list() {
     let console = fixture();
     let second = Uuid::from_u128(1012);
     console
@@ -787,8 +731,10 @@ fn multiple_shell_shortcut_opens_the_list_after_an_earlier_single_detail() {
     );
 }
 
+/// With one eligible Shell the shortcut selects it at once, and Enter opens that exact Shell's
+/// view without a detail inside Monitor or touching the draft.
 #[test]
-fn single_shell_shortcut_opens_its_exact_detail() {
+fn single_shell_shortcut_opens_its_exact_view() {
     let console = fixture();
     let target = TASK;
     let snapshot = shell_snapshot(
@@ -806,38 +752,16 @@ fn single_shell_shortcut_opens_its_exact_detail() {
         Some(InputEvent::TickAction { action, .. }) if action.key == 'r'
     ));
     let Some(InputEvent::TickAction { action, .. }) = key(&console, KeyCode::Enter) else {
-        panic!("Shell shortcut did not open Tick panel");
+        panic!("Shell shortcut did not open the Shell");
     };
     assert_eq!(
-        action.instance,
-        tick_protocol::InstanceRef::shell(target).to_string()
+        (action.instance, action.key),
+        (
+            tick_protocol::InstanceRef::shell(target).to_string(),
+            crate::monitor_rows::MONITOR_ENTER_KEY
+        )
     );
-    let panel = console
-        .state
-        .lock()
-        .unwrap()
-        .monitor
-        .detail
-        .as_ref()
-        .unwrap()
-        .id();
-    console
-        .update_tick_detail::<crate::terminal::tick_shell::TickShell, _>(CHAT, panel, |detail| {
-            detail.load(snapshot, None)
-        })
-        .unwrap();
-    let detail = frame(&console);
-    assert!(
-        detail.iter().any(|row| row.contains("sole eligible task")),
-        "{detail:?}"
-    );
-    assert!(
-        detail
-            .iter()
-            .any(|row| row.starts_with("$ sole eligible task") && row.ends_with("⏺ running")),
-        "{detail:?}"
-    );
-    key(&console, KeyCode::Esc);
+    assert!(console.state.lock().unwrap().monitor.detail.is_none());
     assert_eq!(
         console.state.lock().unwrap().editor.draft(),
         "keep literal jk draft"

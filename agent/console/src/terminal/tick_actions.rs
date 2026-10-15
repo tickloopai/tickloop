@@ -43,21 +43,9 @@ pub trait TickDetailView: Send + Any {
     fn instance(&self) -> Option<tick_protocol::InstanceRef> {
         None
     }
-    /// Whether the view covers the whole screen, as the detailed transcript does, instead of
-    /// Monitor's column; an input dialog still opens below it.
-    fn full_screen(&self) -> bool {
-        false
-    }
     fn lines(&mut self, width: usize, height: usize, now: u64) -> Vec<TickDetailLine>;
     fn hint(&self) -> String;
     fn key(&mut self, key: KeyEvent, width: usize, height: usize) -> TickDetailKey;
-    /// Scrolls by `lines`, up when negative, as a pointer wheel asks.
-    fn scroll(&mut self, _lines: i32, _width: usize, _height: usize) -> TickDetailKey {
-        TickDetailKey::None
-    }
-    fn poll(&mut self, _now: u64) -> Option<PreparedTickAction> {
-        None
-    }
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 

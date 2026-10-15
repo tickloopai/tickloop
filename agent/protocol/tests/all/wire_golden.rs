@@ -17,16 +17,16 @@ use tickloop_agent_protocol::{
     ConnectionRegion, Content, Cursor, Decision, DisplayReceipt, DisplayUpdate, DisplayedView,
     EnvironmentValue, ExecutionAvailability, ExecutionMode, ExecutionRef, HistoryAction,
     HostLocation, HostWorkContext, HostedMember, HostedMemberState, HostedProgramExit,
-    HostedResources, HostedScreenSnapshot, HostedSnapshot, HostedViewGrant, ImageMediaType,
-    ImageSource, InputModality, InteractionSource, LaunchSpec, LiveChatSnapshot, LoopAction,
-    Message, ModelAuthSource, ModelCard, ModelConfig, ModelDiscovery, ModelProvider, MonitorMember,
-    MonitorMembership, ObservationChange, ObservationKind, ObservationRequest, ObservationUpdate,
-    ObservationValue, PROTOCOL_MAJOR, PROTOCOL_MINOR, Page, PendingRequestKind, PermissionPolicy,
-    PermissionRule, PermissionScope, PersistenceState, ProductKind, Protocol, ProtocolLimits,
-    ProviderConnection, ProviderCredentialScope, ReasoningEffort, ReceiptState, RequestRef,
-    ResetReason, Role, ServerHello, ServerMessage, TakenBackPrompt, ThinkingBudgets,
-    ThinkingControl, TickLinkState, TickSubscriptionChange, TickSubscriptionFrequency,
-    TickSubscriptionStatus, ToolResultBlock, ToolResultContent, TranscriptRef, UserInput, ViewRef,
+    HostedResources, HostedViewGrant, ImageMediaType, ImageSource, InputModality,
+    InteractionSource, LaunchSpec, LiveChatSnapshot, LoopAction, Message, ModelAuthSource,
+    ModelCard, ModelConfig, ModelDiscovery, ModelProvider, MonitorMember, MonitorMembership,
+    ObservationChange, ObservationKind, ObservationRequest, ObservationUpdate, ObservationValue,
+    PROTOCOL_MAJOR, PROTOCOL_MINOR, Page, PendingRequestKind, PermissionPolicy, PermissionRule,
+    PermissionScope, PersistenceState, ProductKind, Protocol, ProtocolLimits, ProviderConnection,
+    ProviderCredentialScope, ReasoningEffort, ReceiptState, RequestRef, ResetReason, Role,
+    ServerHello, ServerMessage, TakenBackPrompt, ThinkingBudgets, ThinkingControl, TickLinkState,
+    TickSubscriptionChange, TickSubscriptionFrequency, TickSubscriptionStatus, ToolResultBlock,
+    ToolResultContent, TranscriptRef, UserInput, ViewRef,
 };
 
 const BLESS_VARIABLE: &str = "TICKLOOP_BLESS_WIRE_FIXTURES";
@@ -555,9 +555,9 @@ fn agent_commands_keep_their_recorded_wire() {
                 execution: execution(),
                 instance: terminal_instance(),
             },
-            AgentCommand::HostedTickSnapshot {
+            AgentCommand::AttachHostedTick {
                 execution: execution(),
-                instance: hosted_instance(),
+                instance: InstanceRef::shell(id(0x5e)),
             },
             AgentCommand::LoadRecord {
                 record: TranscriptRef {
@@ -747,16 +747,6 @@ fn command_results_keep_their_recorded_wire() {
         "command_result",
         &vec![
             CommandResult::HostedTicks(hosted_members()),
-            CommandResult::HostedTickSnapshot(HostedSnapshot {
-                screen: HostedScreenSnapshot {
-                    lines: vec!["AAPL 182.5".into(), "MSFT 401.2".into()],
-                    truncated: true,
-                    rows: 30,
-                    columns: 120,
-                    alternate_screen: false,
-                },
-                taken_at_ms: 7_000,
-            }),
             CommandResult::HostedTickReopened {
                 instance: hosted_instance(),
                 membership: monitor_membership(),

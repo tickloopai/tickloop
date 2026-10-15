@@ -440,28 +440,22 @@ impl EmbeddedAgentAccess {
                     membership,
                 })
             }
-            AgentCommand::HostedTickSnapshot {
-                execution,
-                instance,
-            } => {
-                let chat = self.chat(execution).await?;
-                Ok(CommandResult::HostedTickSnapshot(
-                    self.hosted_ticks()?
-                        .snapshot(chat, &instance)
-                        .await
-                        .map_err(hosted_access_error)?,
-                ))
-            }
             AgentCommand::AttachHostedTick {
                 execution,
                 instance,
             } => {
                 let chat = self.chat(execution).await?;
-                Ok(CommandResult::HostedTickView(
-                    self.hosted_ticks()?
+                let grant = if instance.tick_type() == tick_protocol::SHELL_INSTANCE_TYPE {
+                    self.inner
+                        .agent
+                        .shell_tasks()
                         .allow_view(chat, &instance)
                         .await
-                        .map_err(hosted_access_error)?,
+                } else {
+                    self.hosted_ticks()?.allow_view(chat, &instance).await
+                };
+                Ok(CommandResult::HostedTickView(
+                    grant.map_err(hosted_access_error)?,
                 ))
             }
             AgentCommand::RemoveMonitorMember {

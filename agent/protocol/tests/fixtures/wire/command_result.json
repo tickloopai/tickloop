@@ -32,21 +32,6 @@
     ]
   },
   {
-    "HostedTickSnapshot": {
-      "screen": {
-        "lines": [
-          "AAPL 182.5",
-          "MSFT 401.2"
-        ],
-        "truncated": true,
-        "rows": 30,
-        "columns": 120,
-        "alternate_screen": false
-      },
-      "taken_at_ms": 7000
-    }
-  },
-  {
     "HostedTickReopened": {
       "instance": "hosted:00000000-0000-0000-0000-000000000040",
       "membership": {

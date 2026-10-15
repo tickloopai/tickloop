@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
     time::Duration,
@@ -18,6 +19,15 @@ use crate::host_error::HostError;
 pub const HOST_TIMEOUT: Duration = Duration::from_secs(10);
 const HOST_RESPONSE_LIMIT: u64 = 8 * 1024 * 1024;
 const PANE_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(5);
+/// The Pane metadata token through which a view Pane names the Tick it shows, so its Worker
+/// recognises it, also after a restart.
+pub const VIEW_TOKEN: &str = "tickloop_view";
+const METADATA_SOURCE: &str = "tickloop";
+/// How long a reported view lasts unless reported again, so a view that ended without clearing
+/// it never names a Tick for long.
+pub const VIEW_TOKEN_TTL: Duration = Duration::from_secs(30);
+/// How often a view reports itself again while it shows its Tick.
+pub const VIEW_TOKEN_RENEWAL: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 pub struct HerdrContext {
@@ -61,6 +71,37 @@ pub struct Pane {
     pub cwd: Option<String>,
     #[serde(default)]
     pub foreground_cwd: Option<String>,
+    /// Display metadata programs in the Pane reported, by token name.
+    #[serde(default)]
+    pub tokens: BTreeMap<String, String>,
+}
+
+impl Pane {
+    /// The Tick this Pane shows a view of, as the view reported it.
+    pub fn view_of(&self) -> Option<&str> {
+        self.tokens.get(VIEW_TOKEN).map(String::as_str)
+    }
+}
+
+/// Reports on Pane `pane_id` the Tick `instance` it shows a view of, for [`VIEW_TOKEN_TTL`], or
+/// with `None` that it shows none.
+pub async fn report_view(
+    host: &dyn HerdrPort,
+    pane_id: &str,
+    instance: Option<&str>,
+) -> Result<(), HostError> {
+    let metadata = match instance {
+        Some(instance) => json!({
+            "pane_id": pane_id,
+            "source": METADATA_SOURCE,
+            "tokens": {VIEW_TOKEN: instance},
+            "ttl_ms": VIEW_TOKEN_TTL.as_millis() as u64,
+        }),
+        None => json!({"pane_id":pane_id,"source":METADATA_SOURCE,"tokens":{VIEW_TOKEN: null}}),
+    };
+    host.request("pane.report_metadata", metadata, CancellationToken::new())
+        .await
+        .map(drop)
 }
 
 /// Why a recorded Herdr Pane can no longer be confirmed as the same Pane.

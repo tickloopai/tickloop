@@ -1,5 +1,5 @@
-//! `tickloop monitor`: the attach client a Monitor popup runs, and the explicit commands that
-//! install or remove that popup's plugin in one Herdr session.
+//! `tickloop monitor`: the attach client a Monitor popup or a Herdr view Pane runs, and the
+//! explicit commands that install or remove that popup's plugin in one Herdr session.
 
 mod popup;
 
@@ -10,9 +10,12 @@ use std::{
 };
 
 use crossterm::style::Stylize;
+use tickhost_connect::herdr::{
+    HerdrContext, SocketHerdr, VIEW_TOKEN_RENEWAL, current_pane, report_view,
+};
 
 use crate::terminal::attach::{AttachEnd, run_view};
-use tickloop_agent_protocol::{ATTACH_ENVIRONMENT, HostedViewGrant};
+use tickloop_agent_protocol::{ATTACH_ENVIRONMENT, HostedViewGrant, VIEW_PANE_ENVIRONMENT};
 
 const MONITOR_USAGE: &str = "Usage: tickloop monitor attach
        tickloop monitor popup install --herdr-socket SOCKET
@@ -58,8 +61,9 @@ fn parse(arguments: &[OsString]) -> Result<MonitorCommand, String> {
     }
 }
 
-/// Shows the hosted Tick its popup was granted in this terminal until the user detaches. When
-/// it cannot, the reason stays on screen until a key is pressed, so the popup never just vanishes.
+/// Shows the Tick its popup or view Pane was granted in this terminal until the user detaches.
+/// When it cannot, the reason stays on screen until a key is pressed, so the view never just
+/// vanishes.
 async fn attach() -> Result<(), String> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err("tickloop monitor attach needs an interactive terminal".into());
@@ -85,11 +89,59 @@ async fn show_granted_view() -> Result<(), String> {
             serde_json::from_str(&grant)
                 .map_err(|error| format!("{ATTACH_ENVIRONMENT} is not a view grant: {error}"))
         })?;
-    match run_view(&grant).await {
+    let view_pane = ViewPane::from_environment()?;
+    let ended = match &view_pane {
+        Some(view_pane) => tokio::select! {
+            ended = run_view(&grant) => ended,
+            never = view_pane.report(grant.instance.as_str()) => match never {},
+        },
+        None => run_view(&grant).await,
+    };
+    if let Some(view_pane) = &view_pane {
+        view_pane.clear().await;
+    }
+    match ended {
         Ok(AttachEnd::Detached) => Ok(()),
         Ok(AttachEnd::Gone) => Err("the Tick has ended".to_owned()),
         Ok(AttachEnd::Lost(reason)) => Err(reason),
         Err(error) => Err(error.to_string()),
+    }
+}
+
+/// The Herdr Pane a Worker placed this attach client in as a view. While the view is attached, it
+/// names the Tick it shows in the Pane's metadata and renews that before it lapses, so the Worker
+/// recognises the Pane, also after the Worker restarted.
+struct ViewPane {
+    context: HerdrContext,
+    host: SocketHerdr,
+}
+
+impl ViewPane {
+    fn from_environment() -> Result<Option<Self>, String> {
+        if std::env::var_os(VIEW_PANE_ENVIRONMENT).is_none() {
+            return Ok(None);
+        }
+        Ok(HerdrContext::from_environment()?.map(|context| Self {
+            host: SocketHerdr::new(context.clone()),
+            context,
+        }))
+    }
+
+    /// Reports `instance` on this Pane now and at each renewal. A report Herdr refuses is only
+    /// missed; the view goes on.
+    async fn report(&self, instance: &str) -> std::convert::Infallible {
+        loop {
+            if let Ok(pane) = current_pane(&self.host, &self.context.caller_pane).await {
+                let _ = report_view(&self.host, &pane.pane_id, Some(instance)).await;
+            }
+            tokio::time::sleep(VIEW_TOKEN_RENEWAL).await;
+        }
+    }
+
+    async fn clear(&self) {
+        if let Ok(pane) = current_pane(&self.host, &self.context.caller_pane).await {
+            let _ = report_view(&self.host, &pane.pane_id, None).await;
+        }
     }
 }
 

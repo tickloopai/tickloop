@@ -1,6 +1,6 @@
 //! Shell tasks under the Tickhost library: one-time spawn grants the controller asks for, pipe
-//! mode in the passed directory and output file, stopping, and the lifetimes that end a task with
-//! its spawner or its daemon.
+//! mode in the passed directory and output file, stopping, the lifetimes that end a task with its
+//! spawner or its daemon, and the read-only views of a task.
 
 use std::{
     path::{Path, PathBuf},
@@ -8,6 +8,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use tick_protocol::InstanceRef;
 use tickhost::{
     host,
     paths::HostPaths,
@@ -18,7 +19,7 @@ use tickhost::{
     },
 };
 use tickhost_connect::hosted::{
-    CAPABILITY_DATA, CAPABILITY_LIFECYCLE, CONTROL_TIMEOUT, HostConnection, Role,
+    self, CAPABILITY_DATA, CAPABILITY_LIFECYCLE, CONTROL_TIMEOUT, HostConnection, Role,
 };
 
 struct Fixture {
@@ -33,6 +34,10 @@ struct Fixture {
 
 impl Fixture {
     async fn start() -> Self {
+        Self::start_with_idle_timeout(host::DEFAULT_IDLE_TIMEOUT).await
+    }
+
+    async fn start_with_idle_timeout(idle_timeout: Duration) -> Self {
         let directory = tempfile::Builder::new()
             .prefix("ths")
             .tempdir_in("/private/tmp")
@@ -45,7 +50,7 @@ impl Fixture {
             paths.clone(),
             host::HostConfig {
                 controller_key: key.clone(),
-                idle_timeout: host::DEFAULT_IDLE_TIMEOUT,
+                idle_timeout,
             },
         ));
         let mut fixture = Self {
@@ -562,7 +567,8 @@ async fn a_shell_instance_describes_reads_and_updates_only_when_its_task_exits()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_host_stays_while_a_grant_or_task_waits_and_exits_once_none_is_left() {
-    let fixture = Fixture::start().await;
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(1);
+    let fixture = Fixture::start_with_idle_timeout(IDLE_TIMEOUT).await;
     let workdir = fixture.workdir("idle");
     let binding = fixture.binding("sleep 0.6", &workdir);
     let mut controller = fixture.controller().await;
@@ -588,9 +594,211 @@ async fn the_host_stays_while_a_grant_or_task_waits_and_exits_once_none_is_left(
         "the spawner still holds its connection"
     );
     drop(submitted);
+    let left = tokio::time::Instant::now();
     tokio::time::timeout(Duration::from_secs(5), fixture.server)
         .await
         .expect("the empty host exits")
         .unwrap()
         .unwrap();
+    assert!(
+        left.elapsed() >= IDLE_TIMEOUT - Duration::from_millis(100),
+        "the ended task stayed viewable for the idle timeout"
+    );
+}
+
+const VIEW_ROWS: u16 = 16;
+const VIEW_COLUMNS: u16 = 60;
+
+/// A view of a Shell task, attached through a grant its daemon asked for, drawing its frames.
+struct ShellView {
+    events: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+    requests: tokio::net::unix::OwnedWriteHalf,
+    screen: vt100::Parser,
+}
+
+impl ShellView {
+    async fn grant(fixture: &Fixture, binding: &SpawnBinding, instance: &InstanceRef) -> Value {
+        fixture
+            .controller()
+            .await
+            .request(
+                "allow_shell_view",
+                json!({"identity":binding.identity,"instance":instance}),
+                CONTROL_TIMEOUT,
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn open(fixture: &Fixture, binding: &SpawnBinding, instance: &InstanceRef) -> Self {
+        let grant = Self::grant(fixture, binding, instance).await;
+        let mut connection = HostConnection::connect(
+            &fixture.paths.socket(),
+            Role::Viewer {
+                instance: instance.clone(),
+                view: serde_json::from_value(grant["view"].clone()).unwrap(),
+            },
+            &[CAPABILITY_DATA],
+        )
+        .await
+        .unwrap();
+        assert_eq!(grant["epoch"], json!(connection.epoch()));
+        connection
+            .request(
+                "attach",
+                json!({"size":{"rows":VIEW_ROWS,"columns":VIEW_COLUMNS}}),
+                CONTROL_TIMEOUT,
+            )
+            .await
+            .unwrap();
+        let (events, requests) = connection.into_parts();
+        Self {
+            events,
+            requests,
+            screen: vt100::Parser::new(VIEW_ROWS, VIEW_COLUMNS, 0),
+        }
+    }
+
+    async fn next_event(&mut self) -> Option<Value> {
+        hosted::read_frame(&mut self.events, hosted::BUSINESS_FRAME_BYTES)
+            .await
+            .unwrap()
+    }
+
+    async fn type_text(&mut self, text: &str) {
+        hosted::write_frame(
+            &mut self.requests,
+            &json!({"method":"input","params":{"data":text.as_bytes()}}),
+            hosted::ATTACH_REQUEST_FRAME_BYTES,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Draws frames until the screen shows every one of `texts`, and returns it.
+    async fn shows(&mut self, texts: &[&str]) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let contents = self.screen.screen().contents();
+            if texts.iter().all(|text| contents.contains(text)) {
+                return contents;
+            }
+            let event = tokio::time::timeout_at(deadline, self.next_event())
+                .await
+                .unwrap_or_else(|_| panic!("{texts:?} never showed:\n{contents}"))
+                .expect("the view stays attached");
+            assert_eq!(event["event"], "frame", "{event}");
+            self.screen
+                .process(event["data"].as_str().unwrap().as_bytes());
+        }
+    }
+}
+
+/// A Shell's view shows its description, full command, directory and status over its live
+/// output; it ignores what is typed into it, shows how the task ended, and stays after the
+/// task's spawner left, when a new view can still be granted while readers are refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shell_view_shows_the_task_over_its_live_output_and_then_how_it_ended() {
+    let fixture = Fixture::start().await;
+    let workdir = fixture.workdir("view");
+    let release = workdir.join("release");
+    let binding = fixture.binding(
+        &format!(
+            "printf 'out%s\\n' one; while [ ! -e {} ]; do sleep 0.02; done; printf 'out%s\\n' two; exit $((2 + 2))",
+            release.display()
+        ),
+        &workdir,
+    );
+    let mut started = start(&fixture, &binding, &[]).await;
+    let instance = started.submitted.spawned.instance.clone();
+    let mut view = ShellView::open(&fixture, &binding, &instance).await;
+    let shown = view
+        .shows(&["A task", "$ printf", "running", "outone"])
+        .await;
+    assert!(
+        shown.contains(&format!("in {}", workdir.display())),
+        "{shown}"
+    );
+    view.type_text("typed\r").await;
+    std::fs::write(&release, "").unwrap();
+    let shown = view.shows(&["outtwo", "exit 4"]).await;
+    assert!(!shown.contains("running"), "{shown}");
+    assert!(!shown.contains("typed"), "{shown}");
+    assert_eq!(exited(&mut started).await.code, Some(4));
+    let mut reader = reader(&fixture, &started).await;
+    drop(started);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), reader.next_event())
+            .await
+            .unwrap()
+            .unwrap(),
+        None,
+        "readers end once the spawner left"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), view.next_event())
+            .await
+            .is_err(),
+        "the view stays on the ended task"
+    );
+    let mut later = ShellView::open(&fixture, &binding, &instance).await;
+    later.shows(&["outone", "outtwo", "exit 4"]).await;
+}
+
+/// Only the Worker and Chat that submitted a task are granted views of it, and a released task
+/// nobody views is forgotten after the idle timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shell_view_is_granted_only_to_its_own_chat_until_the_task_is_forgotten() {
+    const IDLE_TIMEOUT: Duration = Duration::from_millis(800);
+    let fixture = Fixture::start_with_idle_timeout(IDLE_TIMEOUT).await;
+    let workdir = fixture.workdir("grants");
+    let binding = fixture.binding("printf done", &workdir);
+    let mut started = start(&fixture, &binding, &[]).await;
+    let instance = started.submitted.spawned.instance.clone();
+    let mut controller = fixture.controller().await;
+    for identity in [
+        ShellIdentity {
+            chat: uuid::Uuid::new_v4(),
+            ..binding.identity.clone()
+        },
+        ShellIdentity {
+            worker: uuid::Uuid::new_v4(),
+            ..binding.identity.clone()
+        },
+    ] {
+        assert_eq!(
+            controller
+                .request(
+                    "allow_shell_view",
+                    json!({"identity":identity,"instance":instance}),
+                    CONTROL_TIMEOUT,
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "TargetGone"
+        );
+    }
+    exited(&mut started).await;
+    drop(started);
+    let view = ShellView::open(&fixture, &binding, &instance).await;
+    tokio::time::sleep(IDLE_TIMEOUT * 2).await;
+    drop(view);
+    // Viewed until now, so its idle time starts over.
+    ShellView::grant(&fixture, &binding, &instance).await;
+    // A pending spawn grant keeps the host while the task is forgotten.
+    allow(&mut controller, &fixture.binding("true", &workdir)).await;
+    tokio::time::sleep(IDLE_TIMEOUT * 2).await;
+    assert_eq!(
+        controller
+            .request(
+                "allow_shell_view",
+                json!({"identity":binding.identity,"instance":instance}),
+                CONTROL_TIMEOUT,
+            )
+            .await
+            .unwrap_err()
+            .code,
+        "TargetGone"
+    );
 }

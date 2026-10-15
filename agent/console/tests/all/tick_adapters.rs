@@ -347,10 +347,13 @@ fn built_in_rows_describe_their_actions_as_intents() {
         ended_at_ms: None,
         capabilities: ShellTaskCapabilities::default(),
     };
-    let (running, mut finished) = (
+    let (mut running, mut finished) = (
         shell(ShellTaskState::Background),
         shell(ShellTaskState::Completed),
     );
+    running.capabilities.can_stop = true;
+    let mut unstoppable = shell(ShellTaskState::Background);
+    unstoppable.capabilities.can_stop = false;
     finished.updated_at_ms = Some(1_000);
     let subscription = |instance: &str| -> TickSubscriptionStatus {
         serde_json::from_value(json!({"id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":instance,"frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"link":"Live"})).unwrap()
@@ -365,7 +368,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
         shells: Some(ShellTaskSnapshot {
             chat_id: chat,
             live_revision: 0,
-            tasks: vec![running.clone(), finished.clone()],
+            tasks: vec![running.clone(), unstoppable.clone(), finished.clone()],
         }),
         subscriptions: vec![pane.clone(), artifact.clone()],
         // The finished Shell still shows its result.
@@ -397,22 +400,38 @@ fn built_in_rows_describe_their_actions_as_intents() {
             )
         })
     };
+    let running_instance = InstanceRef::shell(running.id);
+    let remove_running = action(
+        'x',
+        "remove",
+        TickIntent::Notify("Stop this Shell before removing it".into()),
+    );
     assert_eq!(
-        actions(&InstanceRef::shell(running.id)),
+        actions(&running_instance),
         [
-            action('o', "open", TickIntent::OpenShell { task: running.id }),
-            action(
-                'x',
-                "remove",
-                TickIntent::Notify("Open this Shell to stop it before removing it".into())
-            ),
+            action('o', "open", TickIntent::OpenView(running_instance.clone())),
+            action('s', "stop", TickIntent::StopShell { task: running.id }),
+            remove_running.clone(),
         ]
+    );
+    let unstoppable_instance = InstanceRef::shell(unstoppable.id);
+    assert_eq!(
+        actions(&unstoppable_instance),
+        [
+            action(
+                'o',
+                "open",
+                TickIntent::OpenView(unstoppable_instance.clone())
+            ),
+            remove_running,
+        ],
+        "a Shell this View may not stop offers no stop"
     );
     let finished_instance = InstanceRef::shell(finished.id);
     assert_eq!(
         actions(&finished_instance),
         [
-            action('o', "open", TickIntent::OpenShell { task: finished.id }),
+            action('o', "open", TickIntent::OpenView(finished_instance.clone())),
             action(
                 'x',
                 "remove",

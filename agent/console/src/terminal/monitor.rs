@@ -761,24 +761,6 @@ fn title_of(entries: &[MonitorEntry], instance: &InstanceRef) -> String {
         .map_or_else(|| instance.to_string(), |entry| entry.title.clone())
 }
 
-/// Breaks `text` between words so each line fits `width` columns; a longer word is cut later.
-pub(super) fn wrap_words(text: &str, width: usize) -> Vec<String> {
-    use unicode_width::UnicodeWidthStr;
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for word in text.split(' ') {
-        if !line.is_empty() && line.width() + 1 + word.width() > width {
-            lines.push(std::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-    lines.push(line);
-    lines
-}
-
 pub(super) fn relative_time(updated: Option<u64>, now: u64) -> String {
     let Some(updated) = updated else {
         return "—".into();
@@ -796,14 +778,6 @@ pub(super) fn relative_time(updated: Option<u64>, now: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn hints_break_between_words_to_fit_the_monitor() {
-        assert_eq!(
-            wrap_words("enter open · s snapshot · x remove · esc", 20),
-            ["enter open · s", "snapshot · x remove", "· esc"]
-        );
-    }
-
     #[test]
     fn elapsed_update_time_uses_the_specified_units() {
         for (updated, expected) in [
