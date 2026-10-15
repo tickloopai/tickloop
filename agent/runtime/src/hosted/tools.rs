@@ -74,7 +74,7 @@ fn hosted_resources(resources: tickhost::host::Resources) -> HostedResources {
 struct PreparedView {
     workspace: String,
     placement: Placement,
-    socket: Option<(u64, u64)>,
+    socket: (u64, u64),
 }
 
 enum Operation {
@@ -98,7 +98,7 @@ enum Operation {
     },
     ReadWorkspace {
         listing: WorkspaceListing,
-        socket: Option<(u64, u64)>,
+        socket: (u64, u64),
     },
     Close {
         operation: Uuid,
@@ -167,6 +167,14 @@ impl HostedTickTools {
             .ok_or_else(|| "UnsupportedCapability: this Agent does not run in Herdr".into())
     }
 
+    /// The Herdr serving `views`' socket now, which a call that uses the layout is frozen to.
+    fn herdr_socket(views: &HerdrViews) -> Result<(u64, u64), String> {
+        views
+            .layout()
+            .socket_identity()
+            .ok_or_else(|| "HostUnavailable: no Herdr serves the Herdr endpoint".into())
+    }
+
     /// Where a Herdr operation of `context` starts. A View Pane of another Herdr than this
     /// worker's is no anchor here.
     fn layout_context(
@@ -201,6 +209,7 @@ impl HostedTickTools {
         current: Option<&Pane>,
     ) -> Result<PreparedView, String> {
         let views = self.views()?;
+        let socket = Self::herdr_socket(views)?;
         let layout_context = Self::layout_context(views, context)?;
         let relative_to_view = input["placement"]["type"] == "current_tab"
             || (!is_open && input.get("placement").is_none());
@@ -219,7 +228,7 @@ impl HostedTickTools {
         Ok(PreparedView {
             workspace,
             placement,
-            socket: views.layout().socket_identity(),
+            socket,
         })
     }
 
@@ -237,6 +246,7 @@ impl HostedTickTools {
         let (operation, permission, summary) = match (name, input["action"].as_str()) {
             (READ_WORKSPACE, _) => {
                 let views = self.views()?;
+                let socket = Self::herdr_socket(views)?;
                 let layout_context = Self::layout_context(views, context)?;
                 let (cursor, limit) = page_request(input)?;
                 let workspace = views
@@ -263,7 +273,7 @@ impl HostedTickTools {
                             cursor,
                             limit,
                         },
-                        socket: views.layout().socket_identity(),
+                        socket,
                     },
                     HostToolPermission::ReadOnly,
                     summary,
@@ -643,9 +653,9 @@ impl HostedTickTools {
             .map_err(|error| error.to_string())
     }
 
-    /// Fails once another Herdr serves the socket a call was prepared against.
-    fn revalidate_socket(&self, prepared: Option<(u64, u64)>) -> Result<(), String> {
-        if prepared.is_some() && self.views()?.layout().socket_identity() != prepared {
+    /// Fails once another Herdr, or none, serves the socket a call was prepared against.
+    fn revalidate_socket(&self, prepared: (u64, u64)) -> Result<(), String> {
+        if self.views()?.layout().socket_identity() != Some(prepared) {
             return Err("TargetChanged: the Herdr endpoint changed after preparation".into());
         }
         Ok(())
@@ -990,7 +1000,12 @@ impl HostedTickTools {
         };
         match self.allow_view(chat, instance).await {
             Ok(grant) => views.show(&grant, workspace, placement, cancel).await,
-            Err(error) => not_created(&error),
+            // Herdr is asked for a Pane only once the grant arrived, so a grant request whose
+            // answer was lost created none.
+            Err(error) => not_created(&HostError {
+                dispatched: false,
+                ..error
+            }),
         }
     }
 
@@ -1679,6 +1694,131 @@ mod tests {
             host_endpoint: directory.join("host.sock"),
             intent_renewal: std::time::Duration::from_secs(100),
         })
+    }
+
+    /// A daemon that takes each request and closes without an answer, as when its reply is lost.
+    fn silent_daemon(directory: &Path) -> DaemonControl {
+        let endpoint = directory.join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (reader, _writer) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(reader);
+                let _ = read_frame(&mut reader, BUSINESS_FRAME_BYTES).await;
+            }
+        });
+        DaemonControl::new(WorkerControlGrant {
+            endpoint,
+            daemon_epoch: Uuid::new_v4(),
+            binding: Uuid::new_v4(),
+            capability: "capability".into(),
+            host_endpoint: directory.join("host.sock"),
+            intent_renewal: std::time::Duration::from_secs(100),
+        })
+    }
+
+    /// A Herdr whose Workspaces show no Panes, which records every other request it refuses.
+    #[derive(Default)]
+    struct EmptyHerdr {
+        refused: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl tickhost_connect::herdr::HerdrPort for EmptyHerdr {
+        async fn request(
+            &self,
+            method: &str,
+            _: Value,
+            _: CancellationToken,
+        ) -> Result<Value, HostError> {
+            if method == "pane.list" {
+                return Ok(json!({"panes":[]}));
+            }
+            self.refused.lock().unwrap().push(method.to_owned());
+            Err(HostError::before("UnknownMethod", method))
+        }
+    }
+
+    fn herdr_views(socket: &Path, herdr: std::sync::Arc<EmptyHerdr>) -> HerdrViews {
+        HerdrViews::new(
+            tickhost_connect::layout::HerdrLayout::with_host(
+                tickhost_connect::herdr::HerdrContext::without_view(socket.to_path_buf()),
+                herdr,
+            ),
+            Path::new("/private/tmp/unused/tickloop"),
+        )
+    }
+
+    /// A view grant is asked for before Herdr is: when its answer is lost, no Pane can exist, so
+    /// the view failed and a move that would only have shown it did not happen.
+    #[tokio::test]
+    async fn a_view_grant_whose_answer_was_lost_created_no_pane() {
+        let directory = tempfile::Builder::new()
+            .prefix("htv")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let _herdr_listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let herdr = std::sync::Arc::new(EmptyHerdr::default());
+        let tools = HostedTickTools::new(silent_daemon(directory.path()), Vec::new())
+            .with_herdr_views(herdr_views(&socket, herdr.clone()));
+        let instance = InstanceRef::hosted(Uuid::new_v4());
+        let moved = tools
+            .execute_operation(
+                Uuid::new_v4(),
+                HostedPrepared {
+                    operation: Operation::Move {
+                        instance,
+                        current: None,
+                        view: PreparedView {
+                            workspace: "W1".into(),
+                            placement: Placement::NewTab,
+                            socket: tools.views().unwrap().layout().socket_identity().unwrap(),
+                        },
+                    },
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        let HostCallResult::NotDispatched(result) = moved else {
+            panic!("a lost view grant leaves nothing to inspect");
+        };
+        let result: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["view"]["status"], "failed", "{result}");
+        assert!(herdr.refused.lock().unwrap().is_empty());
+    }
+
+    /// A call that uses the Herdr layout is frozen to the Herdr serving its socket; with none
+    /// serving it, there is nothing to freeze and no call is prepared.
+    #[tokio::test]
+    async fn a_herdr_call_is_not_prepared_while_no_herdr_serves_its_socket() {
+        let directory = tempfile::Builder::new()
+            .prefix("hte")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let chat = Uuid::new_v4();
+        let herdr = std::sync::Arc::new(EmptyHerdr::default());
+        let tools = HostedTickTools::new(listing_daemon(directory.path(), chat, &[]), Vec::new())
+            .with_herdr_views(herdr_views(
+                &directory.path().join("herdr.sock"),
+                herdr.clone(),
+            ));
+        for (name, input) in [
+            (READ_WORKSPACE, json!({"workspace_id":"W1"})),
+            (
+                MODIFY_TICK,
+                json!({"action":"open","command":["/bin/cat"],"cwd":directory.path(),"workspace_id":"W1","placement":{"type":"new_tab"}}),
+            ),
+        ] {
+            let refused = tools.prepare(chat, name, &input, None).await.err();
+            assert!(
+                refused
+                    .as_deref()
+                    .is_some_and(|refused| refused.contains("Herdr endpoint")),
+                "{name}: {refused:?}"
+            );
+        }
+        assert!(herdr.refused.lock().unwrap().is_empty());
     }
 
     async fn bound(tools: &HostedTickTools) -> HashSet<(ChatId, InstanceRef)> {
