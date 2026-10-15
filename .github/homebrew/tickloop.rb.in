@@ -1,0 +1,31 @@
+# frozen_string_literal: true
+
+# Rendered by .github/workflows/release.yml into tickloopai/homebrew-tap; edit the template here.
+class Tickloop < Formula
+  desc "Terminal agent with market Ticks for self-directed investors"
+  homepage "https://tickloop.ai"
+  version "@VERSION@"
+
+  depends_on :macos
+
+  on_macos do
+    on_arm do
+      url "https://github.com/tickloopai/homebrew-tap/releases/download/v@VERSION@/tickloop-aarch64-apple-darwin.tar.gz"
+      sha256 "@AARCH64_SHA256@"
+    end
+    on_intel do
+      url "https://github.com/tickloopai/homebrew-tap/releases/download/v@VERSION@/tickloop-x86_64-apple-darwin.tar.gz"
+      sha256 "@X86_64_SHA256@"
+    end
+  end
+
+  def install
+    bin.install "tickloop", "tickhost", "tick"
+  end
+
+  test do
+    assert_match(/^Usage: tickloop /, shell_output("#{bin}/tickloop --help"))
+    assert_match(/^Usage: tickhost /, shell_output("#{bin}/tickhost --help"))
+    assert_match(/^Usage: tick /, shell_output("#{bin}/tick --help"))
+  end
+end

@@ -13,7 +13,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tick_protocol::{REVISION_MISMATCH, TickDescriptor};
+use tick_protocol::{FRAME_TOO_LARGE, REVISION_MISMATCH, TickDescriptor};
 
 const VISIBLE_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const VISIBLE_FRAME_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -222,21 +222,34 @@ fn visible_kline_keyboard_and_tool_share_the_same_stdio_instance() {
     );
 
     writeln!(stdin, "not-json").unwrap();
-    let parse_error = loop {
-        let frame = next(&frames);
-        if frame["error"]["code"] == -32700 {
-            break frame;
-        }
-    };
-    assert!(parse_error["id"].is_null());
     writeln!(stdin, "{}", "x".repeat(600_000)).unwrap();
-    let oversized = loop {
-        let frame = next(&frames);
-        if frame["error"]["code"] == -32003 {
-            break frame;
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0","id":14,"method":"tick/read","params":{"padding":"x".repeat(600_000)}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc":"2.0","id":12,"method":"tick/read"})
+    )
+    .unwrap();
+    let next_answer = || {
+        loop {
+            let frame = next(&frames);
+            if frame.get("id").is_some() {
+                break frame;
+            }
         }
     };
-    assert!(oversized["id"].is_null());
+    let oversized = next_answer();
+    assert_eq!(
+        oversized["id"], 14,
+        "lines naming no request id go unanswered"
+    );
+    assert_eq!(oversized["error"]["code"], FRAME_TOO_LARGE);
+    assert_eq!(next_answer()["id"], 12);
 
     tty.write_all(b"5").unwrap();
     let switched = loop {

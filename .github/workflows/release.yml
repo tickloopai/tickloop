@@ -1,0 +1,214 @@
+name: Release
+run-name: Release ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.ref_name }}
+  # The source repository stays private until it is open-sourced, and Homebrew cannot download
+  # private release assets, so the archives are released on the public tap instead.
+  TAP_REPOSITORY: tickloopai/homebrew-tap
+  FORMULA_TEMPLATE: .github/homebrew/tickloop.rb.in
+
+# Each stage is its own job so a failed stage can be re-run alone ("Re-run failed jobs")
+# without rebuilding the archives or recreating the tap's GitHub Release.
+jobs:
+  prepare:
+    name: Check release prerequisites
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+
+      - name: Test the release script
+        run: node --test scripts/release.test.mjs
+
+      - name: Validate release tag against the workspace version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "tickloop-agent") | .version')
+          if ! [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || [ "$RELEASE_TAG" != "v$version" ]; then
+            echo "::error::Release tag $RELEASE_TAG must be v followed by the workspace version in Cargo.toml ($version)."
+            exit 1
+          fi
+
+      - name: Check the Homebrew tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Configure the HOMEBREW_TAP_TOKEN Actions secret (contents write access to $TAP_REPOSITORY) before releasing binaries."
+            exit 1
+          fi
+          if ! branches=$(gh api "repos/$TAP_REPOSITORY/branches?per_page=1" --jq length); then
+            echo "::error::HOMEBREW_TAP_TOKEN cannot read $TAP_REPOSITORY; check that the repository exists and the token covers it."
+            exit 1
+          fi
+          if [ "$branches" = 0 ]; then
+            echo "::error::$TAP_REPOSITORY has no commits, so a release tag cannot be created there; push an initial commit (for example a README) first."
+            exit 1
+          fi
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    env:
+      PACKAGE_TARGET: ${{ matrix.target }}
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install the stable Rust toolchain for the target
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+          rustup target add "$PACKAGE_TARGET"
+
+      - name: Build the archive
+        run: make package PACKAGE_TARGET="$PACKAGE_TARGET"
+
+      # `arch` runs each executable as the target's architecture, so a wrong-architecture archive
+      # fails here; the arm64 runner runs the x86_64 archive under Rosetta.
+      - name: Smoke-test the archive
+        run: |
+          case "$PACKAGE_TARGET" in
+            aarch64-apple-darwin) architecture=arm64 ;;
+            x86_64-apple-darwin) architecture=x86_64 ;;
+            *) echo "::error::No smoke test for $PACKAGE_TARGET."; exit 1 ;;
+          esac
+          if ! arch "-$architecture" /usr/bin/true 2> /dev/null; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          unpacked=$(mktemp -d)
+          tar -xzf "dist/tickloop-$PACKAGE_TARGET.tar.gz" -C "$unpacked"
+          for executable in tickloop tickhost tick; do
+            arch "-$architecture" "$unpacked/$executable" --help > /dev/null
+          done
+
+      - name: Write the checksum
+        working-directory: dist
+        run: shasum -a 256 "tickloop-$PACKAGE_TARGET.tar.gz" > "tickloop-$PACKAGE_TARGET.tar.gz.sha256"
+
+      - name: Keep the archive for the release
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tickloop-${{ matrix.target }}
+          path: |
+            dist/tickloop-${{ matrix.target }}.tar.gz
+            dist/tickloop-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish the archives on the tap
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Restore the archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: tickloop-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify the checksums
+        working-directory: dist
+        run: sha256sum --check --strict -- *.sha256
+
+      # A re-run finds the release an earlier attempt created and replaces its archives.
+      - name: Publish the release on the tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$TAP_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --repo "$TAP_REPOSITORY" --clobber
+            gh release edit "$RELEASE_TAG" --repo "$TAP_REPOSITORY" --draft=false
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --repo "$TAP_REPOSITORY" \
+              --title "Tickloop ${RELEASE_TAG#v}" \
+              --notes "Prebuilt macOS archives of Tickloop ${RELEASE_TAG#v}. Install with: brew install tickloopai/tap/tickloop"
+          fi
+
+  tap:
+    name: Update the Homebrew formula
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Restore the checksums
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: tickloop-*
+          path: dist
+          merge-multiple: true
+
+      - name: Render the formula
+        run: |
+          checksum() { cut -d ' ' -f 1 "dist/tickloop-$1.tar.gz.sha256"; }
+          sed \
+            -e "s/@VERSION@/${RELEASE_TAG#v}/g" \
+            -e "s/@AARCH64_SHA256@/$(checksum aarch64-apple-darwin)/g" \
+            -e "s/@X86_64_SHA256@/$(checksum x86_64-apple-darwin)/g" \
+            "$FORMULA_TEMPLATE" > "$RUNNER_TEMP/tickloop.rb"
+          if grep -n '@[A-Z0-9_]*@' "$RUNNER_TEMP/tickloop.rb"; then
+            echo '::error::The rendered formula still has template placeholders.'
+            exit 1
+          fi
+          ruby -c "$RUNNER_TEMP/tickloop.rb"
+
+      - name: Push the formula to the tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          tap="$RUNNER_TEMP/homebrew-tap"
+          git clone --depth 1 "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPOSITORY}.git" "$tap"
+          mkdir -p "$tap/Formula"
+          cp "$RUNNER_TEMP/tickloop.rb" "$tap/Formula/tickloop.rb"
+          git -C "$tap" add Formula/tickloop.rb
+          if git -C "$tap" diff --cached --quiet; then
+            echo "Formula/tickloop.rb already describes $RELEASE_TAG."
+            exit 0
+          fi
+          git -C "$tap" -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m "tickloop ${RELEASE_TAG#v}"
+          git -C "$tap" push origin HEAD
+
+      - name: Record release
+        run: |
+          {
+            printf '### Tickloop %s\n\n' "$RELEASE_TAG"
+            printf 'Archives: https://github.com/%s/releases/tag/%s\n\n' "$TAP_REPOSITORY" "$RELEASE_TAG"
+            printf 'Homebrew: brew install tickloopai/tap/tickloop\n'
+          } >> "$GITHUB_STEP_SUMMARY"

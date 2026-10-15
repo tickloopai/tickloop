@@ -5,8 +5,10 @@
 //!
 //! An update is handled once it enters one of this Chat's Agent turns (a subscription delivery,
 //! a read tool on the instance, a completion notification or a claimed feedback request) or the
-//! user opens the instance's row; a later update is unread. A turn taking updates in is recorded
-//! apart from the other handling, so a View can show the update going to the Agent.
+//! user opens the instance's row; a later update is unread. A turn taking updates in (all but a
+//! read) is recorded apart from the other handling, so a View can show the update going to the
+//! Agent, and so is the Agent reading or operating the instance with a tool, so a View can show
+//! the Agent using it.
 
 use std::path::{Path, PathBuf};
 
@@ -19,40 +21,58 @@ use tickloop_agent_protocol::{
 };
 use uuid::Uuid;
 
-/// What a completed tool call read, as far as Monitor's unread updates care.
-pub(super) enum ReadTarget {
+/// What a completed tool call read or operated, as far as Monitor cares.
+pub(super) struct ToolUse {
+    target: UseTarget,
+    /// Whether the call read the target, which handles its updates; an operation does not.
+    reads: bool,
+}
+
+enum UseTarget {
     Tick(InstanceRef),
     /// A file the Read tool read; a Shell's output file stands for the Shell.
     File(PathBuf),
     Artifact(String),
 }
 
-impl ReadTarget {
+impl ToolUse {
     pub(super) fn of(name: &str, input: &Value) -> Option<Self> {
-        match name {
-            crate::tick_tools::READ_TICK => input["tick_instance_id"]
+        let tick = || {
+            input["tick_instance_id"]
                 .as_str()?
                 .parse()
                 .ok()
-                .map(Self::Tick),
-            tickloop_agent_tools::READ_TOOL_NAME => input["file_path"]
+                .map(UseTarget::Tick)
+        };
+        let artifact = || {
+            input["artifact_id"]
                 .as_str()
-                .map(|path| Self::File(path.into())),
+                .map(|id| UseTarget::Artifact(id.into()))
+        };
+        let (target, reads) = match name {
+            crate::tick_tools::READ_TICK => (tick()?, true),
+            crate::tick_tools::CALL_TICK_TOOL => (tick()?, false),
+            crate::tick_tools::MODIFY_TICK if input["action"].as_str() == Some("send_input") => {
+                (tick()?, false)
+            }
+            tickloop_agent_tools::READ_TOOL_NAME => {
+                (UseTarget::File(input["file_path"].as_str()?.into()), true)
+            }
             crate::mcp_tools::ARTIFACT_READ_TOOL
                 if matches!(input["action"].as_str(), Some("read" | "threads")) =>
             {
-                input["artifact_id"]
-                    .as_str()
-                    .map(|id| Self::Artifact(id.into()))
+                (artifact()?, true)
             }
-            crate::mcp_tools::ARTIFACT_COMMENT_TOOL => input["artifact_id"]
-                .as_str()
-                .map(|id| Self::Artifact(id.into())),
-            _ => None,
-        }
+            crate::mcp_tools::ARTIFACT_COMMENT_TOOL => (artifact()?, true),
+            crate::mcp_tools::ARTIFACT_EDIT_TOOL => (artifact()?, false),
+            _ => return None,
+        };
+        Some(Self { target, reads })
     }
+}
 
-    /// The Monitor instance this read covers in `chat`, if any.
+impl UseTarget {
+    /// The Monitor instance this target stands for in `chat`, if any.
     fn instance(self, chat: &Chat) -> Option<InstanceRef> {
         match self {
             Self::Tick(instance) => Some(instance),
@@ -183,10 +203,22 @@ impl Agent {
         }
     }
 
-    /// A completed tool call whose result the turn reads next handled what it read.
-    pub(super) fn mark_read_handled(&self, chat: &mut Chat, target: ReadTarget) {
-        if let Some(instance) = target.instance(chat) {
-            self.mark_taken_in(chat, [instance]);
+    /// A tool call that completed used what it read or operated, and a read, whose result the
+    /// turn reads next, handled the updates so far without taking them in as a delivery does.
+    pub(super) fn mark_tool_use(&self, chat: &mut Chat, tool_use: ToolUse) {
+        let Some(instance) = tool_use.target.instance(chat) else {
+            return;
+        };
+        let now = now_ms();
+        let monitor = &mut chat.snapshot.monitor;
+        let is_used = monitor.mark_used(instance.clone(), now);
+        let is_handled = tool_use.reads && monitor.mark_handled(instance, now);
+        if is_used || is_handled {
+            self.record_monitor_membership(
+                chat.snapshot.id,
+                &chat.snapshot.workdir,
+                chat.snapshot.monitor.clone(),
+            );
         }
     }
 
@@ -268,4 +300,59 @@ impl Agent {
 
 pub(super) fn now_ms() -> u64 {
     tickloop_agent_base::private_fs::unix_time_milliseconds()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::mcp_tools::{ARTIFACT_COMMENT_TOOL, ARTIFACT_EDIT_TOOL, ARTIFACT_READ_TOOL};
+
+    /// Whether a call of `name` with `input` uses the artifact `doc`, and then whether it reads it.
+    fn artifact_use(name: &str, input: Value) -> Option<bool> {
+        let tool_use = ToolUse::of(name, &input)?;
+        matches!(&tool_use.target, UseTarget::Artifact(id) if id == "doc").then_some(tool_use.reads)
+    }
+
+    #[test]
+    fn artifact_tools_read_or_operate_the_artifact_they_name() {
+        for action in ["read", "threads"] {
+            assert_eq!(
+                artifact_use(
+                    ARTIFACT_READ_TOOL,
+                    json!({"action": action, "artifact_id": "doc"})
+                ),
+                Some(true),
+                "{action}"
+            );
+        }
+        assert_eq!(
+            artifact_use(ARTIFACT_READ_TOOL, json!({"action": "list"})),
+            None
+        );
+        assert_eq!(
+            artifact_use(
+                ARTIFACT_COMMENT_TOOL,
+                json!({"action": "done", "artifact_id": "doc"})
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            artifact_use(
+                ARTIFACT_EDIT_TOOL,
+                json!({"action": "patch", "artifact_id": "doc", "patches": []})
+            ),
+            Some(false),
+            "an edit operates the artifact without reading it"
+        );
+        assert_eq!(
+            artifact_use(
+                ARTIFACT_EDIT_TOOL,
+                json!({"action": "create", "title": "Doc"})
+            ),
+            None,
+            "a new artifact has no row to flash yet"
+        );
+    }
 }

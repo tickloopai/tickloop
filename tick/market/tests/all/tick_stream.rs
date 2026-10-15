@@ -17,8 +17,7 @@ use tick_market::{
     metadata::TickKind,
 };
 use tick_protocol::{
-    CALL_METHOD, INVALID_PARAMS, METHOD_NOT_FOUND, NATIVE_PROTOCOL_VERSION, PARSE_ERROR,
-    REVISION_MISMATCH,
+    CALL_METHOD, INVALID_PARAMS, METHOD_NOT_FOUND, NATIVE_PROTOCOL_VERSION, REVISION_MISMATCH,
 };
 use tick_provider::{
     api::{MarketEvent, Quote, QuoteApi},
@@ -243,8 +242,8 @@ async fn protocol_errors_are_answered_without_closing_the_stream() {
             (json!(1), METHOD_NOT_FOUND),
             (json!(2), INVALID_PARAMS),
             (json!(3), INVALID_PARAMS),
-            (Value::Null, PARSE_ERROR),
-        ]
+        ],
+        "the closing line that is not JSON goes unanswered"
     );
     assert!(
         responses(&frames)

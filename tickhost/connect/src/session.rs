@@ -128,11 +128,25 @@ struct PendingCall {
     _permit: OwnedSemaphorePermit,
 }
 
+/// A request's entry in the pending table, removed however the wait for its answer ends, so the
+/// in-flight permit it holds is never kept for an answer nobody awaits. A late answer then names
+/// no pending request and is dropped.
+struct PendingEntry<'a> {
+    core: &'a Core,
+    id: u64,
+}
+
+impl Drop for PendingEntry<'_> {
+    fn drop(&mut self) {
+        self.core.pending().remove(&self.id);
+    }
+}
+
 struct Core {
     instance: InstanceRef,
     terminal: HostedTerminal,
     stdin: Mutex<tokio::process::ChildStdin>,
-    pending: Mutex<HashMap<u64, PendingCall>>,
+    pending: std::sync::Mutex<HashMap<u64, PendingCall>>,
     next_id: AtomicU64,
     in_flight: Arc<Semaphore>,
     response_budget: Arc<Semaphore>,
@@ -230,7 +244,7 @@ impl TickSession {
             instance: instance.clone(),
             terminal: launch.terminal,
             stdin: Mutex::new(stdin),
-            pending: Mutex::new(HashMap::new()),
+            pending: std::sync::Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
             response_budget: Arc::new(Semaphore::new(RESPONSE_BUDGET_BYTES)),
@@ -359,7 +373,7 @@ impl Core {
         }
         let (sender, receiver) = oneshot::channel();
         let read_floor = self.content.lock().await.protocol.read_floor();
-        self.pending.lock().await.insert(
+        self.pending().insert(
             id,
             PendingCall {
                 reply: sender,
@@ -368,12 +382,10 @@ impl Core {
                 _permit: permit,
             },
         );
+        let _entry = PendingEntry { core: self, id };
         let mut stdin = match tokio::time::timeout_at(deadline, self.stdin.lock()).await {
             Ok(stdin) => stdin,
-            Err(_) => {
-                self.pending.lock().await.remove(&id);
-                return Err(SessionError::CancelledBeforeSend);
-            }
+            Err(_) => return Err(SessionError::CancelledBeforeSend),
         };
         let write = tokio::time::timeout_at(deadline, stdin.write_all(&bytes)).await;
         drop(stdin);
@@ -383,7 +395,6 @@ impl Core {
                 SessionLinkState::ProtocolError("Tick stdin write failed or timed out".into()),
             )
             .await;
-            self.pending.lock().await.remove(&id);
             return Err(SessionError::OutcomeUnknown);
         }
         match tokio::time::timeout_at(deadline, receiver).await {
@@ -391,6 +402,12 @@ impl Core {
             Ok(Err(_)) => Err(SessionError::Gone),
             Err(_) => Err(SessionError::OutcomeUnknown),
         }
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, HashMap<u64, PendingCall>> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The Tick's current state, as [`read_child`] checked it on arrival.
@@ -465,7 +482,7 @@ async fn read_child(stdout: tokio::process::ChildStdout, core: Arc<Core>) {
             return;
         }
         if let Some(id) = frame.get("id").and_then(Value::as_u64) {
-            let Some(pending) = core.pending.lock().await.remove(&id) else {
+            let Some(pending) = core.pending().remove(&id) else {
                 continue;
             };
             let result = match (frame.get("result"), frame.get("error")) {
@@ -550,7 +567,7 @@ async fn read_child(stdout: tokio::process::ChildStdout, core: Arc<Core>) {
         let _ = core.observations.send_replace(content.observation.clone());
     }
     link_state(&core, SessionLinkState::Gone).await;
-    for (_, pending) in core.pending.lock().await.drain() {
+    for (_, pending) in core.pending().drain() {
         let _ = pending.reply.send(Err(SessionError::Gone));
     }
 }
@@ -585,8 +602,7 @@ fn tick_error(error: &Value) -> SessionError {
     match error["code"].as_i64() {
         Some(tick_protocol::REVISION_MISMATCH) => SessionError::RevisionMismatch,
         Some(
-            tick_protocol::PARSE_ERROR
-            | tick_protocol::INVALID_REQUEST
+            tick_protocol::INVALID_REQUEST
             | tick_protocol::METHOD_NOT_FOUND
             | tick_protocol::INVALID_PARAMS
             | tick_protocol::VERSION_MISMATCH
@@ -620,7 +636,7 @@ async fn link_state(core: &Core, state: SessionLinkState) {
     let _ = core.observations.send_replace(content.observation.clone());
     drop(content);
     if state != SessionLinkState::Live {
-        for (_, pending) in core.pending.lock().await.drain() {
+        for (_, pending) in core.pending().drain() {
             let error = match &state {
                 SessionLinkState::ProtocolError(_) => SessionError::OutcomeUnknown,
                 _ => SessionError::Gone,
@@ -1134,6 +1150,26 @@ fn remove_owned_socket(path: &Path, expected: (u64, u64)) {
 mod tests {
     use super::*;
 
+    /// Runs the Python Tick `script` in `directory`, which also holds its session.
+    async fn spawn_python(directory: &Path, script: &Path) -> TickSession {
+        TickSession::spawn(SessionLaunch {
+            command: vec![
+                "python3".into(),
+                "-u".into(),
+                script.to_string_lossy().into_owned(),
+            ],
+            cwd: directory.into(),
+            terminal: HostedTerminal {
+                endpoint: PathBuf::from("/tmp/example-tickhost.sock"),
+                epoch: uuid::Uuid::new_v4(),
+                terminal: uuid::Uuid::new_v4(),
+            },
+            runtime_dir: Some(directory.join("sessions")),
+        })
+        .await
+        .unwrap()
+    }
+
     /// Answers already in flight that leave less than one largest answer of the 64 MiB response
     /// budget make the next call Busy before it reaches the Tick, though connections and
     /// in-flight slots are free.
@@ -1141,22 +1177,7 @@ mod tests {
     async fn a_call_beyond_the_response_budget_is_busy_before_dispatch() {
         let directory = tempfile::tempdir().unwrap();
         let counter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tick/examples/counter.py");
-        let session = TickSession::spawn(SessionLaunch {
-            command: vec![
-                "python3".into(),
-                "-u".into(),
-                counter.to_string_lossy().into_owned(),
-            ],
-            cwd: directory.path().into(),
-            terminal: HostedTerminal {
-                endpoint: PathBuf::from("/tmp/example-tickhost.sock"),
-                epoch: uuid::Uuid::new_v4(),
-                terminal: uuid::Uuid::new_v4(),
-            },
-            runtime_dir: Some(directory.path().join("sessions")),
-        })
-        .await
-        .unwrap();
+        let session = spawn_python(directory.path(), &counter).await;
         let in_flight = RESPONSE_BUDGET_BYTES - tick_protocol::MAX_TOOL_RESPONSE_BYTES + 1;
         let answers = Arc::clone(&session.core.response_budget)
             .try_acquire_many_owned(in_flight as u32)
@@ -1188,6 +1209,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(called["value"], 1);
+        session.shutdown().await.unwrap();
+    }
+
+    /// A Tick that never answers `hold`; `answer` first answers every held call, late, and then
+    /// itself with how many it held.
+    const LATE_ANSWERS_TICK: &str = r#"
+import json, sys
+held = []
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    if method == 'tick/describe':
+        result = {'protocol':3,'revision':'1','kind':'example.holding','title':'Holding','description':'Fixture','recover_with':'answer','tools':[{'name':'hold','description':'Hold','input_schema':{'type':'object'},'mutates':False},{'name':'answer','description':'Answer','input_schema':{'type':'object'},'mutates':False}]}
+    elif method == 'tick/read':
+        result = {'seq':0,'data':None}
+    elif request['params']['tool'] == 'hold':
+        held.append(request['id'])
+        continue
+    else:
+        for id in held:
+            print(json.dumps({'jsonrpc':'2.0','id':id,'result':{'late':True}}), flush=True)
+        result = {'held':len(held)}
+        held = []
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
+"#;
+
+    /// Calls that time out, or whose wait is abandoned, give up their in-flight slots at once:
+    /// after eight of each a further call still reaches the Tick, and the late answers to them
+    /// all reach no later request.
+    #[tokio::test]
+    async fn timed_out_calls_free_their_in_flight_slots() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("late.py");
+        std::fs::write(&script, LATE_ANSWERS_TICK).unwrap();
+        let session = spawn_python(directory.path(), &script).await;
+        let hold = |timeout| {
+            session.core.request(
+                tick_protocol::CALL_METHOD,
+                json!({"tool":"hold","args":{},"revision":"1"}),
+                timeout,
+            )
+        };
+        let short = std::time::Duration::from_millis(100);
+        for _ in 0..MAX_IN_FLIGHT {
+            let timed_out = hold(short).await;
+            assert!(
+                matches!(timed_out, Err(SessionError::OutcomeUnknown)),
+                "{timed_out:?}"
+            );
+        }
+        for _ in 0..MAX_IN_FLIGHT {
+            let abandoned = tokio::time::timeout(short, hold(TOOL_TIMEOUT)).await;
+            assert!(abandoned.is_err(), "{abandoned:?}");
+        }
+        let client = session.client();
+        let answer = || client.call("answer", json!({}), "1", CancellationToken::new());
+        assert_eq!(answer().await.unwrap(), json!({"held": 2 * MAX_IN_FLIGHT}));
+        assert_eq!(answer().await.unwrap(), json!({"held": 0}));
         session.shutdown().await.unwrap();
     }
 }

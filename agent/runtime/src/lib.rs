@@ -2710,7 +2710,7 @@ impl Agent {
                     return chat.snapshot.request_usage.run_conversation_usage(receipt.run_id).map_err(|error|error.to_string());
                 }
                 for ProposedToolCall {call_id:id,name,input} in calls {
-                    let read_target = monitor_members::ReadTarget::of(&name, &input);
+                    let tool_use = monitor_members::ToolUse::of(&name, &input);
                     let invocation = ToolInvocation::new(
                         id.clone(), name.clone(), input, registry.resolve(&name),
                     );
@@ -2767,8 +2767,8 @@ impl Agent {
                         if !matches!(operation.state,OperationState::Completed|OperationState::Failed) {operation.state=state;}
                         operation.result=Some(result.clone());
                     }
-                    if !result.is_error && let Some(target) = read_target {
-                        self.mark_read_handled(chat, target);
+                    if !result.is_error && let Some(tool_use) = tool_use {
+                        self.mark_tool_use(chat, tool_use);
                     }
                     if !result.is_error && host_call_status == Some(crate::host_tools::HostCallStatus::Completed) {
                         match &host_effect {

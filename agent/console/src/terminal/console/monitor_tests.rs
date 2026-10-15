@@ -1906,7 +1906,10 @@ fn a_shell_end_flashes_as_a_turn_takes_it_in_and_a_chat_switch_does_not_replay_i
     chat_snapshot.monitor.mark_taken_in(shell, taken_in);
     console.update_monitor_chat(chat_snapshot.clone()).unwrap();
     let mut state = console.state.lock().unwrap();
-    assert_eq!(row_fill(&state, taken_in + 100), Some(Role::FlashStrong));
+    assert_eq!(
+        row_fill(&state, taken_in + 100),
+        Some(Role::TakeInFlashStrong)
+    );
     assert_eq!(
         state.monitor.next_frame_ms(taken_in + 100, 40, display),
         Some(taken_in + 400)
@@ -1921,6 +1924,44 @@ fn a_shell_end_flashes_as_a_turn_takes_it_in_and_a_chat_switch_does_not_replay_i
         state.monitor.next_frame_ms(taken_in + 100, 40, display),
         None
     );
+}
+
+#[test]
+fn reading_a_shells_output_flashes_its_row_cold_and_a_chat_switch_does_not_replay_it() {
+    let chat = Uuid::new_v4();
+    let console = Console::test_for_chat(chat);
+    let mut snapshot = tests::task_snapshot(chat, 1);
+    snapshot.tasks[0].was_background = true;
+    snapshot.tasks[0].command = "make test".into();
+    let shell = tick_protocol::InstanceRef::shell(snapshot.tasks[0].id);
+    let mut chat_snapshot = chat_status(chat);
+    console.update_monitor_chat(chat_snapshot.clone()).unwrap();
+    console.refresh_monitor_ticks(snapshot, None).unwrap();
+    let display = DisplayProfile::default();
+    let row_fill = |state: &State, now_ms| {
+        let lines = state.monitor.frame(40, 10, display, now_ms).lines;
+        lines
+            .iter()
+            .find(|line| line.text().contains("make test"))
+            .expect("the Shell keeps its row")
+            .fill
+    };
+
+    let used = tickloop_agent_base::private_fs::unix_time_milliseconds();
+    chat_snapshot.monitor.mark_used(shell.clone(), used);
+    chat_snapshot.monitor.mark_handled(shell, used);
+    console.update_monitor_chat(chat_snapshot.clone()).unwrap();
+    let mut state = console.state.lock().unwrap();
+    assert_eq!(row_fill(&state, used + 100), Some(Role::UseFlashStrong));
+    assert_eq!(row_fill(&state, used + 500), Some(Role::UseFlashSoft));
+    // The View comes back to the Chat after the use, never in the same millisecond.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    state.switch_view_chat(Some(Uuid::new_v4()));
+    state.switch_view_chat(Some(chat));
+    drop(state);
+    console.update_monitor_chat(chat_snapshot).unwrap();
+    let state = console.state.lock().unwrap();
+    assert_eq!(row_fill(&state, used + 100), None);
 }
 
 #[test]

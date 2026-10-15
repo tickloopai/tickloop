@@ -194,14 +194,29 @@ pub(super) fn update_mark(flash_since: Option<u64>, display: DisplayProfile, now
     }
 }
 
-/// The fill of a row flashing since `since`: strong, soft, strong, then none. Under Reduce motion
-/// it never flashes.
-pub(super) fn flash_fill(since: Option<u64>, display: DisplayProfile, now_ms: u64) -> Option<Role> {
-    let strong = display.flash_strong(since?, now_ms)?;
-    Some(if strong {
-        Role::FlashStrong
-    } else {
-        Role::FlashSoft
+/// What a whole Monitor row flashes for, each in its own colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RowFlash {
+    /// An Agent turn took the row's update in: warm.
+    TakeIn,
+    /// The Agent read or operated the row's instance with a tool: cold.
+    Use,
+}
+
+/// The fill of a row flashing for `flash` since the time it holds: strong, soft, strong, then
+/// none. Under Reduce motion it never flashes.
+pub(super) fn flash_fill(
+    flash: Option<(RowFlash, u64)>,
+    display: DisplayProfile,
+    now_ms: u64,
+) -> Option<Role> {
+    let (flash, since) = flash?;
+    let strong = display.flash_strong(since, now_ms)?;
+    Some(match (flash, strong) {
+        (RowFlash::TakeIn, true) => Role::TakeInFlashStrong,
+        (RowFlash::TakeIn, false) => Role::TakeInFlashSoft,
+        (RowFlash::Use, true) => Role::UseFlashStrong,
+        (RowFlash::Use, false) => Role::UseFlashSoft,
     })
 }
 
@@ -620,11 +635,15 @@ mod tests {
             "the bar always covers the `↻`"
         );
         let flashing = ListRow {
-            fill: Some(Role::FlashStrong),
+            fill: Some(Role::UseFlashStrong),
             ..waiting
         };
         for line in flashing.lines(30) {
-            assert_eq!(line.fill, Some(Role::FlashStrong));
+            assert_eq!(
+                (line.fill, line.fill_start),
+                (Some(Role::UseFlashStrong), 1),
+                "the flash starts after the `↻`"
+            );
             assert_eq!(line.band, None, "the flash covers the bar");
         }
         let selected = ListRow {
@@ -669,14 +688,26 @@ mod tests {
     }
 
     #[test]
-    fn a_row_flashes_strong_soft_strong_for_1200_ms_unless_motion_is_reduced() {
+    fn a_row_flashes_strong_soft_strong_for_1200_ms_in_its_colour_unless_motion_is_reduced() {
         let animated = DisplayProfile::default();
+        let phases = |flash| {
+            [5_000, 5_400, 5_800, 6_200].map(|now| flash_fill(Some((flash, 5_000)), animated, now))
+        };
         assert_eq!(
-            [5_000, 5_400, 5_800, 6_200].map(|now| flash_fill(Some(5_000), animated, now)),
+            phases(RowFlash::TakeIn),
             [
-                Some(Role::FlashStrong),
-                Some(Role::FlashSoft),
-                Some(Role::FlashStrong),
+                Some(Role::TakeInFlashStrong),
+                Some(Role::TakeInFlashSoft),
+                Some(Role::TakeInFlashStrong),
+                None
+            ]
+        );
+        assert_eq!(
+            phases(RowFlash::Use),
+            [
+                Some(Role::UseFlashStrong),
+                Some(Role::UseFlashSoft),
+                Some(Role::UseFlashStrong),
                 None
             ]
         );
@@ -684,7 +715,9 @@ mod tests {
         let still = DisplayProfile::new(DisplayPreferences {
             prefers_reduced_motion: true,
         });
-        assert_eq!(flash_fill(Some(5_000), still, 5_000), None);
+        for flash in [RowFlash::TakeIn, RowFlash::Use] {
+            assert_eq!(flash_fill(Some((flash, 5_000)), still, 5_000), None);
+        }
     }
 
     #[test]

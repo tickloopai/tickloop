@@ -46,6 +46,24 @@ provider 没有实现某个 Tick 需要的接口时直接报错，并列出可�
 
 ## 安装与离线体验
 
+在 macOS 上用 Homebrew 安装预编译的二进制（Apple silicon 与 Intel），不需要本机 Rust：
+
+```sh
+brew install tickloopai/tap/tickloop
+```
+
+开发者也可以用 cargo 从源码安装（源码公开后可用），默认安装默认分支的最新提交，加 `--tag vX.Y.Z` 安装某个发布版本：
+
+```sh
+cargo install --locked --git https://github.com/tickloopai/tickloop tickloop-agent tickloop-tickhost tickloop-tick
+```
+
+两种方式都把 `tickloop`、`tickhost` 与 `tick` 装进同一目录；daemon 只拉起与自己同目录、同构建的 `tickhost`，所以三者要一起安装和升级。
+
+`make release` 先在 HEAD 的临时 worktree 里运行 `make build`（共用本仓库的 target 目录），再为 `Cargo.toml` 的 workspace 版本打 `vX.Y.Z` 标签并推送；GitHub Actions 构建两个 macOS 压缩包，发布到公开仓库 `tickloopai/homebrew-tap` 的同名 GitHub Release（源码仓库私有期间 Homebrew 下载不到它的 Release 资源），再更新该仓库的 Formula。`VERSION` 可省略，给出时必须与 workspace 版本相同。
+
+在仓库检出中可直接构建并离线体验：
+
 ```sh
 cargo build --locked --release --workspace --bins
 ./target/release/tick --help
@@ -54,7 +72,7 @@ cargo build --locked --release --workspace --bins
 ./target/release/tick builtin news --size 40x12
 ```
 
-安装入口使用 `make install`，把 `tickloop`、`tickhost` 与 `tick` 放入 PATH。交互模式要求 UTF-8 locale 和支持真彩色的终端；独立运行使用 TTY，由 Agent 打开时 Tickhost 的 launcher 保留控制终端，并把 stdin/stdout 留给协议。macOS 为当前目标环境。`--help` 和 `describe` 无需 UTF-8 locale 或登录。图标只有一套 Unicode 字形，不需要特殊字体。
+从仓库检出安装使用 `make install`，把 `tickloop`、`tickhost` 与 `tick` 放入 PATH。交互模式要求 UTF-8 locale 和支持真彩色的终端；独立运行使用 TTY，由 Agent 打开时 Tickhost 的 launcher 保留控制终端，并把 stdin/stdout 留给协议。macOS 为当前目标环境。`--help` 和 `describe` 无需 UTF-8 locale 或登录。图标只有一套 Unicode 字形，不需要特殊字体。
 
 `builtin` 的 Tick 均在真实 TUI 中运行，使用带 `Demo` 标识的模拟数据，不访问网络或读取账户。`--size` 以字符列×行限制显示区域，仍受实际终端尺寸约束，对所有 provider 都可用。用 `q` 退出；可替换为 `quote`、`watchlist`、`kline`、`positions`、`news`、`earnings`、`options`、`reader`、`community 91`。builtin 支持下述全局显示参数。验收时分别缩小窗口、滚动、打开帮助并退出，检查终端恢复。
 

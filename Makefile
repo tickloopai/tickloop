@@ -10,7 +10,7 @@ CARGO_PACKAGE := -p tickloop-agent
 PACKAGE_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
 
-.PHONY: dev build install package test check release-docs prototype-earnings-review
+.PHONY: dev build install package site test check release release-site release-docs prototype-earnings-review
 
 ## Start in the current directory with the global configuration; example: make dev ARGS="-c"
 dev:
@@ -31,6 +31,11 @@ package:
 	tar -czf "$(PACKAGE_ARCHIVE)" -C "target/$(PACKAGE_TARGET)/release" tickloop tickhost tick
 	@printf 'Package: %s\n' "$(PACKAGE_ARCHIVE)"
 
+## 在本地构建官网，输出到 site/dist
+site:
+	npm --prefix site ci
+	npm --prefix site run build
+
 test:
 	@cargo nextest --version >/dev/null 2>&1 || { echo 'make test requires cargo-nextest; install it with: cargo install --locked cargo-nextest' >&2; exit 1; }
 	@mkdir -p /tmp/tickloop-test
@@ -45,9 +50,17 @@ check:
 	cargo clippy --locked --workspace --all-targets -- -D warnings
 	$(MAKE) test
 
+## 发布已提交的二进制快照：标签取 Cargo.toml 的 workspace 版本，VERSION 只能与它相同
+release:
+	@node scripts/release.mjs binary
+
+## 发布已提交的官网快照；默认递增 patch，可用 VERSION=0.1.0 指定版本
+release-site:
+	@node scripts/release.mjs site
+
 ## 发布已提交的 Docs 快照；默认递增 patch，可用 VERSION=0.1.0 指定版本
 release-docs:
-	@node artifact/scripts/release.mjs
+	@node scripts/release.mjs docs
 
 ## 启动财报复盘原型；访问 http://127.0.0.1:8766/earnings-review.html?variant=A
 prototype-earnings-review:

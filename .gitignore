@@ -63,3 +63,6 @@ ds-bundle/
 .design-sync/.cache/
 .design-sync/learnings/
 .design-sync/node_modules
+
+# The user-wide ignore file skips a root site/ directory; this repository keeps its website there.
+!/site/

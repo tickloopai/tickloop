@@ -198,6 +198,46 @@ fn an_agent_turn_taking_updates_in_handles_them_and_says_so() {
 }
 
 #[test]
+fn used_marks_only_move_forward_stay_bounded_and_stay_with_their_chat() {
+    use tickloop_agent_protocol::MonitorMembership;
+    let mut membership = MonitorMembership::default();
+    let instance: InstanceRef = "hosted:quotes".parse().unwrap();
+    assert!(membership.mark_used(instance.clone(), 2_000));
+    assert!(!membership.mark_used(instance.clone(), 1_000));
+    assert!(!membership.mark_used(instance.clone(), 2_000));
+    assert_eq!(membership.used_at(&instance), Some(2_000));
+    assert_eq!(
+        membership.handled_at(&instance),
+        None,
+        "using an instance handles nothing by itself"
+    );
+    assert!(
+        !membership.is_empty(),
+        "a Chat whose only Monitor facts are used marks still sends them"
+    );
+    assert!(
+        membership.for_new_chat().used.is_empty(),
+        "a Branch's Agent has used nothing yet"
+    );
+    for index in 0..600_u64 {
+        membership.mark_used(
+            InstanceRef::new("hosted", &format!("run-{index}")).unwrap(),
+            10_000 + index,
+        );
+    }
+    assert_eq!(membership.used.len(), 512);
+    assert_eq!(
+        membership.used_at(&instance),
+        None,
+        "the oldest mark goes first"
+    );
+    let older: MonitorMembership =
+        serde_json::from_value(serde_json::json!({ "taken_in": { "hosted:quotes": 2000 } }))
+            .unwrap();
+    assert!(older.used.is_empty(), "20.5 membership still decodes");
+}
+
+#[test]
 fn a_membership_saved_with_member_sources_loads_every_member_as_opened() {
     use tickloop_agent_protocol::MonitorMembership;
     let saved: MonitorMembership = serde_json::from_value(serde_json::json!({

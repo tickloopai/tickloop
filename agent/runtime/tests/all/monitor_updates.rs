@@ -1,14 +1,23 @@
-//! When a Chat has handled its Monitor instances' updates: a turn takes them in, or the user opens
-//! the row. Later updates are unread.
+//! When a Chat has handled its Monitor instances' updates: a turn takes them in or reads them, or
+//! the user opens the row. Later updates are unread. Apart from that, when the Chat's Agent last
+//! used each instance with a tool.
 
 use std::{sync::Arc, time::Duration};
 
-use serde_json::json;
+use async_trait::async_trait;
+use serde_json::{Value, json};
 use tick_protocol::InstanceRef;
-use tickloop_agent_protocol::{ChatId, ChatSnapshot, Content, Event, EventKind};
-use tickloop_agent_runtime::Agent;
+use tickloop_agent_protocol::{
+    ChatId, ChatSnapshot, Content, Event, EventKind, ToolDefinition, ToolResult,
+};
+use tickloop_agent_runtime::{
+    Agent,
+    host_tools::{HostToolPermission, HostToolProvider},
+    tick_tools::{CALL_TICK_TOOL, MODIFY_TICK, READ_TICK},
+};
 use tickloop_agent_test_support::{ScriptedModel, call, config, next_event, text};
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 async fn finish_run(agent: &Agent, chat: ChatId, events: &mut broadcast::Receiver<Event>) {
     loop {
@@ -137,13 +146,20 @@ async fn reading_a_running_shells_output_handles_only_what_came_before_its_end()
         .await
         .unwrap();
     finish_run(&agent, chat, &mut events).await;
-    let read_at = agent
-        .snapshot(chat)
-        .await
-        .unwrap()
-        .monitor
+    let read = agent.snapshot(chat).await.unwrap().monitor;
+    let read_at = read
         .handled_at(&shell)
         .expect("reading the output file handled the Shell so far");
+    assert_eq!(
+        read.used_at(&shell),
+        Some(read_at),
+        "reading the output file used the Shell"
+    );
+    assert_eq!(
+        read.taken_in_at(&shell),
+        None,
+        "a read handles the Shell without taking an update in"
+    );
 
     model.enqueue(text("it finished"));
     std::fs::write(&gate, b"release").unwrap();
@@ -158,6 +174,128 @@ async fn reading_a_running_shells_output_handles_only_what_came_before_its_end()
     assert!(
         finished.monitor.handled_at(&shell).unwrap() >= ended_at,
         "the continuation that took in the notification handled the end"
+    );
+    assert_eq!(
+        finished.monitor.taken_in_at(&shell),
+        finished.monitor.handled_at(&shell)
+    );
+}
+
+/// Tick tools that answer every call, and fail the calls on `failing`.
+struct TickTools {
+    failing: InstanceRef,
+}
+
+#[async_trait]
+impl HostToolProvider for TickTools {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        [READ_TICK, CALL_TICK_TOOL, MODIFY_TICK]
+            .map(|name| ToolDefinition {
+                name: name.into(),
+                description: format!("{name} on a fixture Tick."),
+                input_schema: json!({"type": "object"}),
+            })
+            .into()
+    }
+
+    fn permission(&self, _: ChatId, _: &str, _: &Value) -> HostToolPermission {
+        HostToolPermission::Automatic
+    }
+
+    async fn execute(&self, _: ChatId, _: &str, input: Value, _: CancellationToken) -> ToolResult {
+        let is_error = input["tick_instance_id"] == self.failing.to_string();
+        ToolResult {
+            content: if is_error {
+                "InstanceGone: the Tick ended".into()
+            } else {
+                json!({"seq": 1, "data": {"price": 1}}).to_string()
+            },
+            is_error,
+            output_ref: None,
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_successful_tick_tool_use_marks_the_instance_used_and_only_a_read_handles_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let [read, called, typed, failing, closed] = ["read", "called", "typed", "failing", "closed"]
+        .map(|id| InstanceRef::new("hosted", id).unwrap());
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("read", READ_TICK, json!({"tick_instance_id": read})),
+        call(
+            "call",
+            CALL_TICK_TOOL,
+            json!({"tick_instance_id": called, "tool": "refresh", "args": {}}),
+        ),
+        call(
+            "type",
+            MODIFY_TICK,
+            json!({"action": "send_input", "tick_instance_id": typed, "text": "q"}),
+        ),
+        call(
+            "fail",
+            CALL_TICK_TOOL,
+            json!({"tick_instance_id": failing, "tool": "refresh", "args": {}}),
+        ),
+        call(
+            "close",
+            MODIFY_TICK,
+            json!({"action": "close", "tick_instance_id": closed}),
+        ),
+        text("done"),
+    ]));
+    let agent = Agent::new_embedded(config(), model);
+    agent
+        .install_host_tools(Arc::new(TickTools {
+            failing: failing.clone(),
+        }))
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let before = tickloop_agent_base::private_fs::unix_time_milliseconds();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "look at the Ticks".into())
+        .await
+        .unwrap();
+    finish_run(&agent, chat, &mut events).await;
+
+    let monitor = agent.snapshot(chat).await.unwrap().monitor;
+    let read_at = monitor.used_at(&read).expect("ReadTick used its instance");
+    assert!(read_at >= before);
+    assert_eq!(
+        monitor.handled_at(&read),
+        Some(read_at),
+        "a read handles the updates so far"
+    );
+    assert_eq!(
+        monitor.taken_in_at(&read),
+        None,
+        "a read is no hand-over to the Agent"
+    );
+    for operated in [&called, &typed] {
+        assert!(
+            monitor
+                .used_at(operated)
+                .is_some_and(|used| used >= read_at),
+            "{operated} was operated"
+        );
+        assert_eq!(
+            monitor.handled_at(operated),
+            None,
+            "operating {operated} handles nothing"
+        );
+        assert_eq!(monitor.taken_in_at(operated), None);
+    }
+    assert_eq!(
+        monitor.used_at(&failing),
+        None,
+        "a failed call uses nothing"
+    );
+    assert_eq!(
+        monitor.used_at(&closed),
+        None,
+        "closing an instance is not using it"
     );
 }
 

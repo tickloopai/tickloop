@@ -10,7 +10,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use serde_json::{Value, json};
+use serde::{
+    Deserializer as _,
+    de::{IgnoredAny, MapAccess, Visitor},
+};
+use serde_json::{Value, json, value::RawValue};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     sync::{Notify, mpsc},
@@ -19,7 +23,7 @@ use tokio::{
 
 use tick_protocol::{
     CALL_METHOD, DESCRIBE_METHOD, FRAME_TOO_LARGE, INVALID_PARAMS, INVALID_REQUEST,
-    JSON_RPC_VERSION, METHOD_NOT_FOUND, PARSE_ERROR, READ_METHOD, REVISION_MISMATCH, TOOL_FAILED,
+    JSON_RPC_VERSION, METHOD_NOT_FOUND, READ_METHOD, REVISION_MISMATCH, TOOL_FAILED,
     TickDescriptor, TickState, UPDATE_METHOD, VERSION_MISMATCH,
 };
 
@@ -112,7 +116,8 @@ impl Records {
 /// await them in the same `select!` that publishes updates.
 pub enum InboundFrame {
     Line(String),
-    TooLarge,
+    /// A request line over the request limit, with the bytes read of it up to that limit.
+    TooLarge(Vec<u8>),
 }
 
 pub struct Requests(Option<mpsc::Receiver<InboundFrame>>);
@@ -220,42 +225,31 @@ impl TickStream {
     }
 
     /// Answers everything this protocol version owns and surfaces only the
-    /// `tick/call` requests the runtime has to dispatch.
+    /// `tick/call` requests the runtime has to dispatch. A request over the limit is refused
+    /// under the `id` read from its leading bytes. A line naming no request `id` (not JSON,
+    /// without an `id` or with a null one, or over the limit with its `id` unread) cannot be
+    /// answered and is dropped without a trace.
     pub fn dispatch(&mut self, incoming: InboundFrame) -> Option<ToolRequest> {
         let line = match incoming {
             InboundFrame::Line(line) => line,
-            InboundFrame::TooLarge => {
-                self.answer(
-                    Value::Null,
-                    Err(RpcError::new(
-                        FRAME_TOO_LARGE,
-                        format!(
-                            "Tick request exceeds {} bytes",
-                            tick_protocol::MAX_REQUEST_BYTES
-                        ),
-                    )),
-                );
+            InboundFrame::TooLarge(leading) => {
+                if let Some(id) = leading_id(&leading) {
+                    self.answer(
+                        id,
+                        Err(RpcError::new(
+                            FRAME_TOO_LARGE,
+                            format!(
+                                "Tick request exceeds {} bytes",
+                                tick_protocol::MAX_REQUEST_BYTES
+                            ),
+                        )),
+                    );
+                }
                 return None;
             }
         };
-        if line.len() > tick_protocol::MAX_REQUEST_BYTES {
-            self.answer(
-                Value::Null,
-                Err(RpcError::new(FRAME_TOO_LARGE, "Tick request too large")),
-            );
-            return None;
-        }
-        let frame: Value = match serde_json::from_str(&line) {
-            Ok(frame) => frame,
-            Err(error) => {
-                self.answer(
-                    Value::Null,
-                    Err(RpcError::new(PARSE_ERROR, error.to_string())),
-                );
-                return None;
-            }
-        };
-        let id = frame.get("id").cloned().unwrap_or(Value::Null);
+        let frame: Value = serde_json::from_str(&line).ok()?;
+        let id = frame.get("id").filter(|id| !id.is_null())?.clone();
         if frame.get("jsonrpc").and_then(Value::as_str) != Some(JSON_RPC_VERSION) {
             self.answer(
                 id,
@@ -331,6 +325,8 @@ impl TickStream {
         }
     }
 
+    /// Sends the answer to request `id`. One too large to send becomes a failure of the request,
+    /// which has already run by then.
     pub fn answer(&mut self, id: Value, result: Result<Value, RpcError>) {
         let frame = match result {
             Ok(value) => json!({"jsonrpc": JSON_RPC_VERSION, "id": id.clone(), "result": value}),
@@ -338,7 +334,7 @@ impl TickStream {
         };
         let frame =
             encode_limited(&frame, tick_protocol::MAX_TOOL_RESPONSE_BYTES).unwrap_or_else(|_| {
-                encode(&RpcError::new(FRAME_TOO_LARGE, "Tick response too large").frame(id))
+                encode(&RpcError::new(TOOL_FAILED, "Tick response too large").frame(id))
                     .expect("bounded error frame")
             });
         self.outbound.enqueue_response(frame);
@@ -513,15 +509,13 @@ async fn read_requests<R: AsyncRead + Unpin>(reader: R, sender: mpsc::Sender<Inb
             .map_or(bytes.len(), |index| index + 1);
         let complete = bytes[..chunk].last() == Some(&b'\n');
         let oversized = line.len().saturating_add(chunk) > tick_protocol::MAX_REQUEST_BYTES;
-        if !oversized {
-            line.extend_from_slice(&bytes[..chunk]);
-        }
+        line.extend_from_slice(&bytes[..chunk.min(tick_protocol::MAX_REQUEST_BYTES - line.len())]);
         reader.consume(chunk);
         if oversized {
-            if sender.send(InboundFrame::TooLarge).await.is_err() {
+            let leading = std::mem::take(&mut line);
+            if sender.send(InboundFrame::TooLarge(leading)).await.is_err() {
                 return;
             }
-            line.clear();
             if !complete {
                 loop {
                     let bytes = match reader.fill_buf().await {
@@ -551,6 +545,47 @@ async fn read_requests<R: AsyncRead + Unpin>(reader: R, sender: mpsc::Sender<Inb
             }
         }
     }
+}
+
+/// The non-null `id` of a request from the leading bytes of its line. Members are read in order
+/// up to the `id`, so a line cut off at the request limit still names it when it comes first, as
+/// a host encodes it. The cut may shorten a number, so the `id` counts only when a delimiter
+/// follows it within the bytes.
+fn leading_id(leading: &[u8]) -> Option<Value> {
+    struct IdMember<'a, 'de>(&'a mut Option<&'de RawValue>);
+
+    impl<'de> Visitor<'de> for IdMember<'_, 'de> {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a JSON-RPC request object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut members: A) -> Result<(), A::Error> {
+            while let Some(name) = members.next_key::<String>()? {
+                if name == "id" {
+                    *self.0 = Some(members.next_value()?);
+                    return Ok(());
+                }
+                members.next_value::<IgnoredAny>()?;
+            }
+            Ok(())
+        }
+    }
+
+    let mut id = None;
+    // Stopping at the `id`, or the cut, leaves the object unclosed and the parse fails; the
+    // `id` read before that is kept.
+    let _ = serde_json::Deserializer::from_slice(leading).deserialize_map(IdMember(&mut id));
+    let id = id?.get();
+    // The raw `id` borrows from `leading`, so its end is where its bytes end within them.
+    let end = id.as_ptr() as usize - leading.as_ptr() as usize + id.len();
+    let delimited = leading
+        .get(end)
+        .is_some_and(|byte| matches!(byte, b',' | b'}' | b' ' | b'\t' | b'\n' | b'\r'));
+    serde_json::from_str::<Value>(id)
+        .ok()
+        .filter(|id| delimited && !id.is_null())
 }
 
 fn encode(frame: &Value) -> io::Result<Vec<u8>> {

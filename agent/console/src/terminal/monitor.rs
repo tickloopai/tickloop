@@ -7,7 +7,7 @@ use tickhost_connect::page::{MAX_PAGE_SIZE, PageCursor, PageError};
 
 use super::{
     display::{DisplayProfile, Glyph},
-    list_row::{self, ListRow},
+    list_row::{self, ListRow, RowFlash},
     style::{Role, RoleLine},
     subscription_detail::SubscriptionDetail,
 };
@@ -160,15 +160,18 @@ pub(super) struct Monitor {
     shown: bool,
     /// When time alone next changes the list: a finished Shell leaving.
     refresh_at: Option<u64>,
-    /// Since when this View has shown this Chat's Monitor; an Agent turn taking an update in
-    /// earlier never flashes its row.
+    /// Since when this View has shown this Chat's Monitor; an Agent turn taking an update in or
+    /// using an instance earlier never flashes its row.
     flashes_since: Option<u64>,
-    /// The update each row last listed as handled; taking the same update in again, such as a
-    /// second read of it, does not flash the row.
+    /// The update each row last listed as handled; taking the same update in again, such as the
+    /// completion notification of a Shell end the Agent already read, does not flash the row.
     handled_updates: HashMap<InstanceRef, u64>,
     /// When an Agent turn took in each row's update while this View showed the Chat; the row
-    /// flashes from then on.
+    /// flashes warm from then on.
     taken_in: HashMap<InstanceRef, u64>,
+    /// When the Agent last read or operated each row's instance with a tool while this View
+    /// showed the Chat; the row flashes cold from then on, anew for each later use.
+    used: HashMap<InstanceRef, u64>,
     /// The latest update of each row as this View last listed it, `None` for a row without one.
     /// A row's first listing is its baseline, so only an update that comes after it is new.
     listed_updates: HashMap<InstanceRef, Option<u64>>,
@@ -412,15 +415,22 @@ impl Monitor {
         }
         self.reconcile_selection();
     }
-    /// Notes what flashes: the glyph of a row whose new update just came, and the whole row whose
-    /// update an Agent turn has just taken in. A row the user opened does not flash, nor one taken
-    /// in before this View showed the Chat, nor an update the row already showed handled that a
-    /// turn takes in again.
+    /// Notes what flashes: the glyph of a row whose new update just came, the whole row whose
+    /// update an Agent turn has just taken in, and the whole row whose instance the Agent has just
+    /// used. A row the user opened does not flash, nor one taken in or used before this View
+    /// showed the Chat, nor an update the row already showed handled that a turn takes in again.
     fn note_flashes(&mut self, listed: &[TickDescriptor], now_ms: u64) {
         let flashes_since = *self.flashes_since.get_or_insert(now_ms);
+        let membership = self.chat_status.as_deref().map(|chat| &chat.monitor);
         let mut handled_updates = HashMap::new();
         let mut listed_updates = HashMap::new();
         for entry in listed {
+            if let Some(used) = membership
+                .and_then(|membership| membership.used_at(&entry.instance))
+                .filter(|used| *used >= flashes_since)
+            {
+                self.used.insert(entry.instance.clone(), used);
+            }
             let at_ms = entry.update.as_ref().map(|update| update.at_ms);
             if self
                 .listed_updates
@@ -447,16 +457,19 @@ impl Monitor {
         }
         self.taken_in
             .retain(|instance, _| handled_updates.contains_key(instance));
+        self.used
+            .retain(|instance, _| listed_updates.contains_key(instance));
         self.update_flashes
             .retain(|instance, _| listed_updates.contains_key(instance));
         self.handled_updates = handled_updates;
         self.listed_updates = listed_updates;
     }
-    /// Ends the flashes under way and lets only later updates and take-ins flash, as when this
-    /// Chat's Monitor comes back into view: what came or what an Agent turn took in while the View
-    /// showed another Chat does not replay.
+    /// Ends the flashes under way and lets only later updates, take-ins and uses flash, as when
+    /// this Chat's Monitor comes back into view: what came, or what an Agent turn took in or used,
+    /// while the View showed another Chat does not replay.
     pub(super) fn settle_flashes(&mut self, now_ms: u64) {
         self.taken_in.clear();
+        self.used.clear();
         self.update_flashes.clear();
         self.listed_updates.clear();
         self.flashes_since = Some(now_ms);
@@ -499,6 +512,7 @@ impl Monitor {
             .flat_map(|entry| {
                 [
                     self.taken_in.get(&entry.instance),
+                    self.used.get(&entry.instance),
                     self.update_flashes
                         .get(&entry.instance)
                         .filter(|_| entry.is_unread()),
@@ -516,6 +530,22 @@ impl Monitor {
             .chain(flashing)
             .chain(counting_down)
             .min()
+    }
+    /// What `entry`'s whole row flashes for, and since when: the later of an Agent turn taking its
+    /// update in and the Agent using its instance, so a flash that starts covers one under way.
+    fn row_flash(&self, entry: &MonitorEntry) -> Option<(RowFlash, u64)> {
+        let taken_in = self
+            .taken_in
+            .get(&entry.instance)
+            .map(|since| (RowFlash::TakeIn, *since));
+        let used = self
+            .used
+            .get(&entry.instance)
+            .map(|since| (RowFlash::Use, *since));
+        taken_in
+            .into_iter()
+            .chain(used)
+            .max_by_key(|(_, since)| *since)
     }
     /// The colour of `entry`'s glyph: the update colour, flashing for each new update, while the
     /// row holds an update the Chat has not handled, and its state colour otherwise.
@@ -748,11 +778,7 @@ impl Monitor {
                 glyph_role: self.glyph_role(entry, display, now_ms),
                 name: title,
                 details: list_row::row_details(entry.tone, &entry.notes, now_ms),
-                fill: list_row::flash_fill(
-                    self.taken_in.get(&entry.instance).copied(),
-                    display,
-                    now_ms,
-                ),
+                fill: list_row::flash_fill(self.row_flash(entry), display, now_ms),
                 subscription: list_row::subscription_mark(entry.subscription, display),
                 bar_columns: entry
                     .waiting_check()
@@ -1271,12 +1297,12 @@ mod signal_tests {
         assert_eq!(
             fills,
             [
-                Some(Role::FlashStrong),
-                Some(Role::FlashStrong),
-                Some(Role::FlashSoft),
-                Some(Role::FlashSoft),
-                Some(Role::FlashStrong),
-                Some(Role::FlashStrong),
+                Some(Role::TakeInFlashStrong),
+                Some(Role::TakeInFlashStrong),
+                Some(Role::TakeInFlashSoft),
+                Some(Role::TakeInFlashSoft),
+                Some(Role::TakeInFlashStrong),
+                Some(Role::TakeInFlashStrong),
                 None,
                 None
             ]
@@ -1391,20 +1417,194 @@ mod signal_tests {
         monitor.rebuild_at(HANDLED_AT + 50);
         assert_eq!(
             fill(&monitor, animated, HANDLED_AT + 50),
-            Some(Role::FlashStrong),
+            Some(Role::TakeInFlashStrong),
             "the turn took the update in while the View showed the Chat"
         );
 
-        let mut read_again = chat_handled(MonitorMembership::mark_taken_in);
-        read_again
+        let mut taken_in_again = chat_handled(MonitorMembership::mark_taken_in);
+        taken_in_again
             .monitor
             .mark_taken_in(quotes(), HANDLED_AT + 5_000);
-        monitor.chat_status = Some(Arc::new(read_again));
+        monitor.chat_status = Some(Arc::new(taken_in_again));
         monitor.rebuild_at(HANDLED_AT + 5_050);
         assert_eq!(
             fill(&monitor, animated, HANDLED_AT + 5_050),
             None,
-            "reading an update the row already showed handled is no hand-over"
+            "taking in an update the row already showed handled is no new hand-over"
+        );
+    }
+
+    #[test]
+    fn the_agent_using_the_instance_flashes_the_row_cold_and_leaves_the_update_unread() {
+        let monitor = handled_while_listed(MonitorMembership::mark_used);
+        let animated = DisplayProfile::default();
+        let fills = [0, 399, 400, 799, 800, 1_199, 1_200, 5_000]
+            .map(|elapsed| fill(&monitor, animated, HANDLED_AT + elapsed));
+        assert_eq!(
+            fills,
+            [
+                Some(Role::UseFlashStrong),
+                Some(Role::UseFlashStrong),
+                Some(Role::UseFlashSoft),
+                Some(Role::UseFlashSoft),
+                Some(Role::UseFlashStrong),
+                Some(Role::UseFlashStrong),
+                None,
+                None
+            ]
+        );
+        assert_eq!(
+            glyph(&monitor, animated, HANDLED_AT + 50),
+            Some(Role::UpdateMark),
+            "an operation handles nothing, so the update stays unread"
+        );
+        assert_eq!(
+            monitor.next_frame_ms(HANDLED_AT + 50, WIDTH, animated),
+            Some(HANDLED_AT + 400)
+        );
+        assert_eq!(
+            monitor.next_frame_ms(HANDLED_AT + 900, WIDTH, animated),
+            Some(HANDLED_AT + 1_200)
+        );
+        assert_eq!(
+            monitor.next_frame_ms(HANDLED_AT + 1_200, WIDTH, animated),
+            None
+        );
+        assert_eq!(
+            fill(&monitor, reduced_motion(), HANDLED_AT + 50),
+            None,
+            "under Reduce motion a use does not flash"
+        );
+        assert_eq!(
+            monitor.next_frame_ms(HANDLED_AT + 50, WIDTH, reduced_motion()),
+            None
+        );
+    }
+
+    #[test]
+    fn each_new_use_flashes_the_row_again_and_the_same_use_listed_again_does_not() {
+        let animated = DisplayProfile::default();
+        let mut monitor = handled_while_listed(MonitorMembership::mark_used);
+        monitor.rebuild_at(HANDLED_AT + 2_000);
+        assert_eq!(fill(&monitor, animated, HANDLED_AT + 2_000), None);
+        assert_eq!(
+            monitor.next_frame_ms(HANDLED_AT + 2_000, WIDTH, animated),
+            None,
+            "listing the same use again does not flash the row again"
+        );
+        for used_again in [HANDLED_AT + 3_000, HANDLED_AT + 3_500] {
+            let mut chat = chat_handled(MonitorMembership::mark_used);
+            chat.monitor.mark_used(quotes(), used_again);
+            monitor.chat_status = Some(Arc::new(chat));
+            monitor.rebuild_at(used_again + 50);
+            assert_eq!(
+                [0, 400].map(|elapsed| fill(&monitor, animated, used_again + elapsed)),
+                [Some(Role::UseFlashStrong), Some(Role::UseFlashSoft)],
+                "the use at {used_again} flashes the row from its start, also mid-flash"
+            );
+        }
+    }
+
+    #[test]
+    fn a_use_from_before_the_view_showed_the_chat_never_flashes() {
+        let animated = DisplayProfile::default();
+        let (mut opened_after, _) = updated_monitor(None);
+        opened_after.rebuild_at(HANDLED_AT + 50);
+        opened_after.chat_status = Some(Arc::new(chat_handled(MonitorMembership::mark_used)));
+        opened_after.rebuild_at(HANDLED_AT + 80);
+        assert_eq!(fill(&opened_after, animated, HANDLED_AT + 80), None);
+
+        let mut switched_back = handled_while_listed(MonitorMembership::mark_used);
+        switched_back.settle_flashes(HANDLED_AT + 60);
+        switched_back.rebuild_at(HANDLED_AT + 70);
+        assert_eq!(
+            fill(&switched_back, animated, HANDLED_AT + 70),
+            None,
+            "coming back to the Chat does not replay a use made while away"
+        );
+        assert_eq!(
+            switched_back.next_frame_ms(HANDLED_AT + 70, WIDTH, animated),
+            None
+        );
+    }
+
+    #[test]
+    fn the_later_of_a_take_in_and_a_use_covers_the_earlier_flash() {
+        let animated = DisplayProfile::default();
+        let second = HANDLED_AT + 500;
+        let flashed =
+            |first: fn(&mut MonitorMembership, InstanceRef, u64) -> bool,
+             then: fn(&mut MonitorMembership, InstanceRef, u64) -> bool| {
+                let mut monitor = handled_while_listed(first);
+                let mut chat = chat_handled(first);
+                then(&mut chat.monitor, quotes(), second);
+                monitor.chat_status = Some(Arc::new(chat));
+                monitor.rebuild_at(second + 10);
+                monitor
+            };
+        // At 500 and 900 the first flash still runs, in its soft and then its strong phase.
+        let used_later = flashed(
+            MonitorMembership::mark_taken_in,
+            MonitorMembership::mark_used,
+        );
+        assert_eq!(
+            [500, 900, 1_300, 1_700].map(|elapsed| fill(
+                &used_later,
+                animated,
+                HANDLED_AT + elapsed
+            )),
+            [
+                Some(Role::UseFlashStrong),
+                Some(Role::UseFlashSoft),
+                Some(Role::UseFlashStrong),
+                None
+            ]
+        );
+        assert_eq!(
+            used_later.next_frame_ms(HANDLED_AT + 1_300, WIDTH, animated),
+            Some(HANDLED_AT + 1_700),
+            "frames run until the later flash ends"
+        );
+        let taken_in_later = flashed(
+            MonitorMembership::mark_used,
+            MonitorMembership::mark_taken_in,
+        );
+        assert_eq!(
+            [500, 900].map(|elapsed| fill(&taken_in_later, animated, HANDLED_AT + elapsed)),
+            [Some(Role::TakeInFlashStrong), Some(Role::TakeInFlashSoft)]
+        );
+    }
+
+    #[test]
+    fn a_use_flash_starts_after_the_mark_and_a_selected_row_keeps_its_selection() {
+        let animated = DisplayProfile::default();
+        let monitor = handled_while_listed(MonitorMembership::mark_used);
+        let line = row(&monitor, animated, HANDLED_AT + 50);
+        assert_eq!(
+            (line.fill, line.fill_start),
+            (Some(Role::UseFlashStrong), 0),
+            "a row without `↻` flashes from its first column"
+        );
+
+        let mut subscribed = subscribed(
+            vec![waiting(TickSubscriptionFrequency::High, Some(70_000))],
+            UPDATED_AT + 100,
+        );
+        subscribed.chat_status = Some(Arc::new(chat_handled(MonitorMembership::mark_used)));
+        subscribed.rebuild_at(HANDLED_AT + 50);
+        let line = row(&subscribed, animated, HANDLED_AT + 50);
+        assert_eq!(
+            (line.fill, line.fill_start, line.band),
+            (Some(Role::UseFlashStrong), 1, None),
+            "the flash starts after the `↻` and covers the bar"
+        );
+
+        subscribed.focus(false, None);
+        let line = row(&subscribed, animated, HANDLED_AT + 50);
+        assert_eq!(
+            (line.fill, line.fill_start),
+            (Some(Role::Selection), 1),
+            "the selection wins over the flash"
         );
     }
 
@@ -1787,7 +1987,7 @@ mod signal_tests {
         monitor.chat_status = Some(Arc::new(chat_handled(MonitorMembership::mark_taken_in)));
         monitor.rebuild_at(HANDLED_AT + 50);
         let line = row(&monitor, animated, HANDLED_AT + 50);
-        assert_eq!(line.fill, Some(Role::FlashStrong));
+        assert_eq!(line.fill, Some(Role::TakeInFlashStrong));
         assert_eq!(line.band, None);
         let after = row(&monitor, animated, HANDLED_AT + 1_200);
         assert_eq!(after.fill, None);

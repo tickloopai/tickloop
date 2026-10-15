@@ -212,10 +212,13 @@ pub(super) enum Role {
     /// which each new update flashes once.
     UpdateMark,
     UpdateMarkDim,
-    /// A one-off flash alternates these fills: strong, soft, strong. A Monitor row flashes them
-    /// as an Agent turn takes its update in.
-    FlashStrong,
-    FlashSoft,
+    /// A one-off flash alternates these fills: strong, soft, strong. A Monitor row flashes the
+    /// warm take-in pair as an Agent turn takes its update in, and the cold use pair as the Agent
+    /// reads or operates its instance with a tool.
+    TakeInFlashStrong,
+    TakeInFlashSoft,
+    UseFlashStrong,
+    UseFlashSoft,
     /// A Monitor row's `↻`, one hue from the brightest for the most frequent subscription to the
     /// dimmest for the least. Marks, so a selected row keeps them.
     SubscriptionHigh,
@@ -225,7 +228,6 @@ pub(super) enum Role {
     /// an update, to the part of the period elapsed before its next check hands it to the Agent:
     /// the accent's hue, dimmed, on a selected row too.
     UpdateProgress,
-    /// A Monitor row's `↻` where the update bar covers it: one foreground clear on the bar.
     /// A Markdown link label: the terminal's own blue, as Claude Code's `chalk.blue`.
     Link,
     /// Inline code inside strong text or a heading: the code colour, still bold.
@@ -313,8 +315,10 @@ impl Role {
         Self::WarningMark,
         Self::UpdateMark,
         Self::UpdateMarkDim,
-        Self::FlashStrong,
-        Self::FlashSoft,
+        Self::TakeInFlashStrong,
+        Self::TakeInFlashSoft,
+        Self::UseFlashStrong,
+        Self::UseFlashSoft,
         Self::SubscriptionHigh,
         Self::SubscriptionMedium,
         Self::SubscriptionLow,
@@ -395,7 +399,7 @@ impl Role {
     }
 }
 
-const ROLE_COUNT: usize = 82;
+const ROLE_COUNT: usize = 84;
 
 /// `AgentRed` … `AgentCyan`, reproduced from Claude Code's agent palette (Tailwind 600).
 const AGENT_COLORS: [Style; 8] = [
@@ -575,19 +579,23 @@ const DARK_PALETTE: [Style; ROLE_COUNT] = [
         dim: true,
         ..fg(255, 160, 120)
     }, // UpdateMarkDim
-    bg(95, 61, 50),    // FlashStrong     <- local: claude tinted into the dark background
-    bg(58, 43, 39),    // FlashSoft       <- local: claude tinted half as strong
+    bg(95, 61, 50),    // TakeInFlashStrong <- local: claude tinted into the dark background
+    bg(58, 43, 39),    // TakeInFlashSoft <- local: claude tinted half as strong
+    // A cyan-green this dark falls to #005F5F at 256 colours, where MutedText drops under 3:1, so
+    // the cold flash is an indigo, still far from the selection's blue.
+    bg(70, 40, 130), // UseFlashStrong  <- local: indigo tinted into the dark background
+    bg(36, 24, 92),  // UseFlashSoft    <- local: indigo tinted about half as strong
     fg(175, 255, 255), // SubscriptionHigh <- local: one cyan hue, brightest
-    fg(95, 215, 215),  // SubscriptionMedium
-    fg(0, 175, 175),   // SubscriptionLow
-    bg(110, 63, 48),   // UpdateProgress  <- local: claude dimmed, still clear on black terminals
+    fg(95, 215, 215), // SubscriptionMedium
+    fg(0, 175, 175), // SubscriptionLow
+    bg(110, 63, 48), // UpdateProgress  <- local: claude dimmed, still clear on black terminals
     ansi(AnsiColour::Blue), // Link            <- chalk.blue
     strong(177, 185, 249), // StrongCode      <- permission + bold
     strong(153, 153, 153), // MutedStrong     <- inactive + bold
-    bg(2, 40, 0),      // DiffLineAdded   <- colour-diff addLine
-    bg(61, 1, 0),      // DiffLineRemoved <- colour-diff deleteLine
-    bg(4, 71, 0),      // DiffWordAdded   <- colour-diff addWord
-    bg(92, 2, 0),      // DiffWordRemoved <- colour-diff deleteWord
+    bg(2, 40, 0),    // DiffLineAdded   <- colour-diff addLine
+    bg(61, 1, 0),    // DiffLineRemoved <- colour-diff deleteLine
+    bg(4, 71, 0),    // DiffWordAdded   <- colour-diff addWord
+    bg(92, 2, 0),    // DiffWordRemoved <- colour-diff deleteWord
     on(fg(80, 200, 80), Rgb::new(2, 40, 0)), // DiffMarkerAdded <- addDecoration on addLine
     on(fg(220, 90, 90), Rgb::new(61, 1, 0)), // DiffMarkerRemoved <- deleteDecoration on deleteLine
     CODE_COLOURS[0],
@@ -675,19 +683,23 @@ const LIGHT_PALETTE: [Style; ROLE_COUNT] = [
         dim: true,
         ..fg(180, 80, 40)
     }, // UpdateMarkDim
-    bg(243, 214, 205), // FlashStrong
-    bg(250, 239, 235), // FlashSoft
-    fg(0, 95, 95),   // SubscriptionHigh: the strongest on a light background
-    fg(0, 135, 135), // SubscriptionMedium
-    fg(95, 135, 135), // SubscriptionLow
-    bg(238, 223, 215), // UpdateProgress
+    bg(243, 214, 205), // TakeInFlashStrong
+    bg(250, 239, 235), // TakeInFlashSoft
+    // The light theme's only 256-colour blue-violet sits next to the selection's blue, so the cold
+    // flash is a cyan-green here.
+    bg(180, 220, 215),                            // UseFlashStrong
+    bg(222, 246, 244),                            // UseFlashSoft
+    fg(0, 95, 95),          // SubscriptionHigh: the strongest on a light background
+    fg(0, 135, 135),        // SubscriptionMedium
+    fg(95, 135, 135),       // SubscriptionLow
+    bg(238, 223, 215),      // UpdateProgress
     ansi(AnsiColour::Blue), // Link
-    strong(87, 105, 247), // StrongCode
-    strong(102, 102, 102), // MutedStrong
-    bg(220, 255, 220), // DiffLineAdded
-    bg(255, 220, 220), // DiffLineRemoved
-    bg(178, 255, 178), // DiffWordAdded
-    bg(255, 199, 199), // DiffWordRemoved
+    strong(87, 105, 247),   // StrongCode
+    strong(102, 102, 102),  // MutedStrong
+    bg(220, 255, 220),      // DiffLineAdded
+    bg(255, 220, 220),      // DiffLineRemoved
+    bg(178, 255, 178),      // DiffWordAdded
+    bg(255, 199, 199),      // DiffWordRemoved
     on(fg(36, 138, 61), Rgb::new(220, 255, 220)), // DiffMarkerAdded
     on(fg(207, 34, 46), Rgb::new(255, 220, 220)), // DiffMarkerRemoved
     CODE_COLOURS[0],
@@ -1536,8 +1548,10 @@ mod tests {
             let foreground = |role: Role| theme.style(role).foreground.unwrap();
             for depth in [ColourDepth::Indexed256, ColourDepth::TrueColour] {
                 let fills = [
-                    Role::FlashStrong,
-                    Role::FlashSoft,
+                    Role::TakeInFlashStrong,
+                    Role::TakeInFlashSoft,
+                    Role::UseFlashStrong,
+                    Role::UseFlashSoft,
                     Role::UpdateProgress,
                     Role::Selection,
                 ];
@@ -1550,10 +1564,25 @@ mod tests {
                         );
                     }
                 }
+                // A flashing row sits beside the selected one, so the cold flash keeps clear of
+                // the selection's blue.
+                for fill in [Role::UseFlashStrong, Role::UseFlashSoft] {
+                    let distance = colour_distance(
+                        sent_colour(theme, fill, depth),
+                        sent_colour(theme, Role::Selection, depth),
+                    );
+                    assert!(
+                        distance >= 15.0,
+                        "{name:?} {depth:?} {fill:?} apart from the selection: {distance:.1}"
+                    );
+                }
                 for (text, fill, minimum) in [
-                    (Role::MutedText, Role::FlashSoft, 4.5),
-                    (Role::Text, Role::FlashStrong, 4.5),
-                    (Role::MutedText, Role::FlashStrong, 3.0),
+                    (Role::MutedText, Role::TakeInFlashSoft, 4.5),
+                    (Role::Text, Role::TakeInFlashStrong, 4.5),
+                    (Role::MutedText, Role::TakeInFlashStrong, 3.0),
+                    (Role::MutedText, Role::UseFlashSoft, 4.5),
+                    (Role::Text, Role::UseFlashStrong, 4.5),
+                    (Role::MutedText, Role::UseFlashStrong, 3.0),
                     (Role::MutedText, Role::UpdateProgress, 3.0),
                     (Role::Text, Role::UpdateProgress, 4.5),
                 ] {
@@ -1696,8 +1725,8 @@ mod tests {
     }
 
     /// A row's glyph in the update colour stays clear wherever the glyph sits: on the terminal,
-    /// the selection, the update bar and the flash of a row taken in; and it never reads as one
-    /// of the state colours it covers.
+    /// the selection, the update bar and the flash of a row taken in or used; and it never reads
+    /// as one of the state colours it covers.
     #[test]
     fn the_update_mark_stays_clear_on_every_row_background_and_apart_from_the_state_colours() {
         for name in ThemeName::ALL {
@@ -1718,8 +1747,10 @@ mod tests {
                     [
                         Role::Selection,
                         Role::UpdateProgress,
-                        Role::FlashStrong,
-                        Role::FlashSoft,
+                        Role::TakeInFlashStrong,
+                        Role::TakeInFlashSoft,
+                        Role::UseFlashStrong,
+                        Role::UseFlashSoft,
                     ]
                     .map(|fill| background(theme, fill)),
                 )

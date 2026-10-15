@@ -367,6 +367,7 @@ fn chat_snapshot() -> ChatSnapshot {
         removed: [hosted_instance()].into(),
         handled: [(terminal_instance(), 7_500)].into(),
         taken_in: [(terminal_instance(), 7_500)].into(),
+        used: [(terminal_instance(), 7_800)].into(),
     };
     snapshot.model = model_config();
     snapshot.policy = permission_policy();
@@ -461,6 +462,7 @@ fn monitor_membership() -> MonitorMembership {
         removed: [terminal_instance()].into(),
         handled: [(hosted_instance(), 8_500)].into(),
         taken_in: [(hosted_instance(), 8_500)].into(),
+        used: [(hosted_instance(), 8_800)].into(),
     }
 }
 

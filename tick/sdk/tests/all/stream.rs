@@ -1,7 +1,8 @@
 use serde_json::{Value, json};
 use tick_protocol::{
-    CALL_METHOD, DESCRIBE_METHOD, INVALID_PARAMS, INVALID_REQUEST, NATIVE_PROTOCOL_VERSION,
-    READ_METHOD, REVISION_MISMATCH, SeriesEnd, StateDeclaration, StateSeries, TickDescriptor,
+    CALL_METHOD, DESCRIBE_METHOD, FRAME_TOO_LARGE, INVALID_PARAMS, INVALID_REQUEST,
+    MAX_REQUEST_BYTES, MAX_TOOL_RESPONSE_BYTES, NATIVE_PROTOCOL_VERSION, READ_METHOD,
+    REVISION_MISMATCH, SeriesEnd, StateDeclaration, StateSeries, TOOL_FAILED, TickDescriptor,
     TickTool, UPDATE_METHOD,
 };
 use tick_sdk::stream::{Describe, InboundFrame, TickStream, ToolRequest};
@@ -54,22 +55,32 @@ async fn serve(
     requests: &[Value],
     published: Option<Value>,
 ) -> (Vec<Value>, Vec<ToolRequest>) {
+    let lines: Vec<String> = requests.iter().map(Value::to_string).collect();
+    serve_lines(tick, &lines, published).await
+}
+
+/// [`serve`] for request lines written as they are, valid or not.
+async fn serve_lines(
+    tick: Counter,
+    lines: &[String],
+    published: Option<Value>,
+) -> (Vec<Value>, Vec<ToolRequest>) {
     let (mut client_requests, tick_requests) = tokio::io::duplex(8 * 1024);
     let (tick_responses, mut client_responses) = tokio::io::duplex(64 * 1024);
     let mut stream = TickStream::duplex(tick, tick_requests, tick_responses);
     if let Some(data) = published {
         stream.publish(data).unwrap();
     }
-    for request in requests {
-        let mut line = serde_json::to_vec(request).unwrap();
-        line.push(b'\n');
-        client_requests.write_all(&line).await.unwrap();
+    for line in lines {
+        client_requests
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
     }
     client_requests.shutdown().await.unwrap();
     let mut inbound = stream.take_requests();
     let mut dispatched = Vec::new();
     while let Some(frame) = inbound.next().await {
-        assert!(matches!(&frame, InboundFrame::Line(_)));
         dispatched.extend(stream.dispatch(frame));
     }
     stream.close().await;
@@ -208,4 +219,77 @@ fn a_tick_update_needs_data() {
     stream.publish(json!({"value": 1})).unwrap();
     assert_eq!(stream.seq(), 1, "unchanged data publishes nothing");
     assert_eq!(stream.records().len(), 1);
+}
+
+/// A request over the limit is refused under the `id` read before the limit, as a host encodes
+/// it first; one whose `id` comes only after the limit, or loses digits to it, goes unanswered.
+#[tokio::test]
+async fn a_request_over_the_limit_is_refused_under_its_own_id() {
+    let padding = "x".repeat(MAX_REQUEST_BYTES);
+    // Pads a line so that the limit falls right after `before_id`.
+    let padded_to_limit = |before_id: &str, after_limit: &str| {
+        let before_padding = r#"{"jsonrpc":"2.0","params":{"padding":""#;
+        let padding = "x".repeat(MAX_REQUEST_BYTES - before_padding.len() - before_id.len());
+        format!("{before_padding}{padding}{before_id}{after_limit}")
+    };
+    let (frames, _) = serve_lines(
+        Counter::with_read_tool(),
+        &[
+            format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tick/read","params":{{"padding":"{padding}"}}}}"#),
+            format!(r#"{{"jsonrpc":"2.0","params":{{"padding":"{padding}"}},"id":2,"method":"tick/read"}}"#),
+            padded_to_limit(r#""},"id":12"#, r#"3456,"method":"tick/read"}"#),
+            padded_to_limit(r#""},"id":4,"#, r#""method":"tick/read"}"#),
+            json!({"jsonrpc": "2.0", "id": 3, "method": READ_METHOD}).to_string(),
+        ],
+        None,
+    )
+    .await;
+    let answers: Vec<_> = frames
+        .iter()
+        .map(|frame| (frame["id"].clone(), frame["error"]["code"].clone()))
+        .collect();
+    assert_eq!(
+        answers,
+        [
+            (json!(1), json!(FRAME_TOO_LARGE)),
+            (json!(4), json!(FRAME_TOO_LARGE)),
+            (json!(3), Value::Null),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_line_naming_no_request_id_goes_unanswered() {
+    let (frames, _) = serve_lines(
+        Counter::with_read_tool(),
+        &[
+            "not json".into(),
+            json!({"jsonrpc": "2.0", "method": READ_METHOD}).to_string(),
+            json!({"jsonrpc": "2.0", "id": null, "method": READ_METHOD}).to_string(),
+            json!({"jsonrpc": "2.0", "id": 4, "method": READ_METHOD}).to_string(),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(frames.len(), 1, "{frames:?}");
+    assert_eq!(frames[0]["id"], 4);
+}
+
+/// The request has run by the time its answer turns out too large, so it fails rather than
+/// being refused.
+#[tokio::test]
+async fn an_answer_over_the_limit_fails_under_the_request_id() {
+    let (_requests, tick_requests) = tokio::io::duplex(8 * 1024);
+    let (tick_responses, mut client_responses) = tokio::io::duplex(64 * 1024);
+    let mut stream = TickStream::duplex(Counter::with_read_tool(), tick_requests, tick_responses);
+    stream.answer(
+        json!(7),
+        Ok(json!({"text": "x".repeat(MAX_TOOL_RESPONSE_BYTES)})),
+    );
+    stream.close().await;
+    let mut bytes = Vec::new();
+    client_responses.read_to_end(&mut bytes).await.unwrap();
+    let frame: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(frame["id"], 7);
+    assert_eq!(frame["error"]["code"], TOOL_FAILED);
 }

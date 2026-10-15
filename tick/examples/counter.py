@@ -124,20 +124,24 @@ def main():
         line = sys.stdin.buffer.readline(MAX_REQUEST_BYTES + 1)
         if not line:
             return
+        # A line too large to read, not JSON or without an id is dropped unanswered: the
+        # protocol forbids answering with a null id, and a host never sends such a line.
         if len(line) > MAX_REQUEST_BYTES:
-            print("Tick request exceeds 512 KiB", file=sys.stderr)
-            return
-        request = {}
+            while line and not line.endswith(b"\n"):
+                line = sys.stdin.buffer.readline(MAX_REQUEST_BYTES + 1)
+            continue
         try:
             request = json.loads(line)
-            if not isinstance(request, dict) or request.get("jsonrpc") != "2.0" or "id" not in request:
-                raise TickError(-32600, "expected a JSON-RPC 2.0 request with an id")
+        except ValueError:
+            continue
+        if not isinstance(request, dict) or request.get("id") is None:
+            continue
+        try:
+            if request.get("jsonrpc") != "2.0":
+                raise TickError(-32001, "unsupported JSON-RPC version")
             send({"id": request["id"], "result": respond(request.get("method"), request.get("params", {}))})
         except TickError as error:
-            identity = request.get("id") if isinstance(request, dict) else None
-            send({"id": identity, "error": {"code": error.code, "message": str(error)}})
-        except ValueError as error:
-            send({"id": None, "error": {"code": -32700, "message": str(error)}})
+            send({"id": request["id"], "error": {"code": error.code, "message": str(error)}})
 
 
 if __name__ == "__main__":

@@ -116,6 +116,97 @@ async fn the_example_counter_is_described_read_called_and_updates_through_its_st
     session.shutdown().await.unwrap();
 }
 
+/// The example counter drops a line naming no request it could answer, prints nothing for it,
+/// and keeps serving the requests after it.
+#[test]
+fn the_example_counter_drops_lines_it_cannot_answer() {
+    let counter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tick/examples/counter.py");
+    let mut child = std::process::Command::new("python3")
+        .arg("-u")
+        .arg(counter)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let padding = "x".repeat(tick_protocol::MAX_REQUEST_BYTES);
+    let lines = [
+        "not json".to_owned(),
+        json!({"jsonrpc":"2.0","method":"tick/read"}).to_string(),
+        json!({"jsonrpc":"2.0","id":null,"method":"tick/read"}).to_string(),
+        json!({"jsonrpc":"2.0","id":1,"method":"tick/read","params":{"padding":padding}})
+            .to_string(),
+        json!({"jsonrpc":"2.0","id":2,"method":"tick/read"}).to_string(),
+    ];
+    std::io::Write::write_all(
+        &mut child.stdin.take().unwrap(),
+        format!("{}\n", lines.join("\n")).as_bytes(),
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let answers: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        answers,
+        [json!({"jsonrpc":"2.0","id":2,"result":{"seq":0,"data":{"value":0,"recent":[]}}})]
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A Tick may not answer under a null `id`, so one that does breaks the session.
+#[tokio::test]
+async fn a_response_with_a_null_id_breaks_the_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = spawn_python(
+        directory.path(),
+        r#"
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['method'] == 'tick/describe':
+        result = {'protocol':3,'revision':'1','kind':'example.nullid','title':'Null id','description':'Fixture','recover_with':'current','tools':[{'name':'increment','description':'Increment','input_schema':{'type':'object'},'mutates':True},{'name':'current','description':'Read','input_schema':{'type':'object'},'mutates':False}]}
+    elif request['method'] == 'tick/read':
+        result = {'seq':0,'at':'2026-09-24T00:00:00Z','data':{'value':0}}
+    else:
+        print(json.dumps({'jsonrpc':'2.0','id':None,'error':{'code':-32600,'message':'refused'}}), flush=True)
+        continue
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
+"#,
+    )
+    .await
+    .unwrap();
+    let (_, _, mut observations) = session.client().watch().await.unwrap();
+    let result = session
+        .client()
+        .call("increment", json!({}), "1", CancellationToken::new())
+        .await;
+    assert!(
+        matches!(result, Err(SessionError::OutcomeUnknown)),
+        "{result:?}"
+    );
+    let state = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        observations.wait_for(|observation| observation.state != SessionLinkState::Live),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .state
+    .clone();
+    assert!(
+        matches!(state, SessionLinkState::ProtocolError(_)),
+        "{state:?}"
+    );
+    let _ = session.shutdown().await;
+}
+
 /// Adds a tool, and so a new catalog revision, on `evolve`; `count` reads how often
 /// `increment` ran.
 const EVOLVING: &str = r#"

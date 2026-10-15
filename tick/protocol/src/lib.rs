@@ -23,7 +23,6 @@ pub const CALL_METHOD: &str = "tick/call";
 /// The notification a Tick sends for each Tick Update.
 pub const UPDATE_METHOD: &str = "tick/update";
 
-pub const PARSE_ERROR: i64 = -32700;
 pub const INVALID_REQUEST: i64 = -32600;
 pub const METHOD_NOT_FOUND: i64 = -32601;
 /// The arguments do not match, or the Tick declares no such tool.
