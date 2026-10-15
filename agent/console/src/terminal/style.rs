@@ -216,7 +216,7 @@ pub(super) enum Role {
     /// as an Agent turn takes its update in.
     FlashStrong,
     FlashSoft,
-    /// A Monitor row's `⟳`, one hue from the brightest for the most frequent subscription to the
+    /// A Monitor row's `↻`, one hue from the brightest for the most frequent subscription to the
     /// dimmest for the least. Marks, so a selected row keeps them.
     SubscriptionHigh,
     SubscriptionMedium,
@@ -225,8 +225,7 @@ pub(super) enum Role {
     /// an update, to the part of the period elapsed before its next check hands it to the Agent:
     /// the accent's hue, dimmed, on a selected row too.
     UpdateProgress,
-    /// A Monitor row's `⟳` where the update bar covers it: one foreground clear on the bar.
-    SubscriptionOnProgress,
+    /// A Monitor row's `↻` where the update bar covers it: one foreground clear on the bar.
     /// A Markdown link label: the terminal's own blue, as Claude Code's `chalk.blue`.
     Link,
     /// Inline code inside strong text or a heading: the code colour, still bold.
@@ -320,7 +319,6 @@ impl Role {
         Self::SubscriptionMedium,
         Self::SubscriptionLow,
         Self::UpdateProgress,
-        Self::SubscriptionOnProgress,
         Self::Link,
         Self::StrongCode,
         Self::MutedStrong,
@@ -340,7 +338,7 @@ impl Role {
         Self::CodeMeta,
     ];
 
-    /// Agent Colors and marks only paint marks, such as a member dot, a row's glyph or its `⟳`,
+    /// Agent Colors and marks only paint marks, such as a member dot, a row's glyph or its `↻`,
     /// never the words of a row.
     const fn is_mark(self) -> bool {
         matches!(
@@ -364,7 +362,6 @@ impl Role {
                 | Self::SubscriptionHigh
                 | Self::SubscriptionMedium
                 | Self::SubscriptionLow
-                | Self::SubscriptionOnProgress
         )
     }
 
@@ -398,7 +395,7 @@ impl Role {
     }
 }
 
-const ROLE_COUNT: usize = 83;
+const ROLE_COUNT: usize = 82;
 
 /// `AgentRed` … `AgentCyan`, reproduced from Claude Code's agent palette (Tailwind 600).
 const AGENT_COLORS: [Style; 8] = [
@@ -584,7 +581,6 @@ const DARK_PALETTE: [Style; ROLE_COUNT] = [
     fg(95, 215, 215),  // SubscriptionMedium
     fg(0, 175, 175),   // SubscriptionLow
     bg(110, 63, 48),   // UpdateProgress  <- local: claude dimmed, still clear on black terminals
-    fg(255, 255, 255), // SubscriptionOnProgress
     ansi(AnsiColour::Blue), // Link            <- chalk.blue
     strong(177, 185, 249), // StrongCode      <- permission + bold
     strong(153, 153, 153), // MutedStrong     <- inactive + bold
@@ -685,7 +681,6 @@ const LIGHT_PALETTE: [Style; ROLE_COUNT] = [
     fg(0, 135, 135), // SubscriptionMedium
     fg(95, 135, 135), // SubscriptionLow
     bg(238, 223, 215), // UpdateProgress
-    fg(0, 0, 0),     // SubscriptionOnProgress
     ansi(AnsiColour::Blue), // Link
     strong(87, 105, 247), // StrongCode
     strong(102, 102, 102), // MutedStrong
@@ -1612,16 +1607,17 @@ mod tests {
                         "{name:?} {depth:?} {role:?} on the bar: {ratio:.2}"
                     );
                 }
-                // A row flash covers the bar, and the `⟳` with it.
-                let mark = theme
-                    .style(Role::SubscriptionOnProgress)
-                    .foreground
-                    .unwrap();
-                for fill in [Role::UpdateProgress, Role::FlashStrong, Role::FlashSoft] {
-                    let ratio = emitted_contrast(mark, background(theme, fill), depth);
+                // The `↻` keeps its frequency's colour on the bar; a row flash starts after it.
+                for mark in [
+                    Role::SubscriptionHigh,
+                    Role::SubscriptionMedium,
+                    Role::SubscriptionLow,
+                ] {
+                    let foreground = theme.style(mark).foreground.unwrap();
+                    let ratio = emitted_contrast(foreground, progress, depth);
                     assert!(
-                        ratio >= 4.5,
-                        "{name:?} {depth:?} the `⟳` on {fill:?}: {ratio:.2}"
+                        ratio >= 3.0,
+                        "{name:?} {depth:?} {mark:?} on the bar: {ratio:.2}"
                     );
                 }
             }
@@ -1659,7 +1655,7 @@ mod tests {
                     "{name:?} {depth:?}: high stands out most, low least: {strength:?}"
                 );
                 // A selected row leaves its first column, where the mark is, off the selection,
-                // and on the update bar the mark takes `SubscriptionOnProgress`.
+                // and on the update bar the mark keeps its colour (checked with the bar).
                 for (mark, strength) in MARKS.into_iter().zip(strength) {
                     assert!(
                         strength >= 3.0,
@@ -1789,12 +1785,12 @@ mod tests {
             let row = RoleLine::role("  ", Role::MutedText)
                 .with("◉", Role::UpdateMark)
                 .with(" 中文", Role::MutedText)
-                .with("⟳", Role::SubscriptionLow);
+                .with("↻", Role::SubscriptionLow);
             let unselected = row
                 .clone()
                 .banded(1..5, Role::UpdateProgress)
                 .resolve(theme, 12);
-            assert_eq!(unselected.render(ColourDepth::None), "  ◉ 中文⟳");
+            assert_eq!(unselected.render(ColourDepth::None), "  ◉ 中文↻");
             assert_eq!(
                 backgrounds(&unselected),
                 [vec![None], vec![progress; 4], vec![None; 2]].concat(),
@@ -1824,7 +1820,7 @@ mod tests {
                 "{name:?}: the bar keeps its colour, the rest is the selection"
             );
             for span in &selected.spans {
-                if let Some(mark) = [("◉", Role::UpdateMark), ("⟳", Role::SubscriptionLow)]
+                if let Some(mark) = [("◉", Role::UpdateMark), ("↻", Role::SubscriptionLow)]
                     .into_iter()
                     .find_map(|(text, mark)| (span.text == text).then_some(mark))
                 {

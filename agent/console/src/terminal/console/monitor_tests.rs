@@ -1627,7 +1627,7 @@ fn row_details_end_at_the_monitor_edge_and_the_mark_leads_the_row_at_any_width()
         };
         let subscribed_row = monitor_rows("python3 -q").remove(0);
         assert!(
-            subscribed_row.starts_with("⟳ ") && subscribed_row.matches('⟳').count() == 1,
+            subscribed_row.starts_with("↻ ") && subscribed_row.matches('↻').count() == 1,
             "{width}: the mark leads the row, a blank column after it: {subscribed_row:?}"
         );
         let running_rows = monitor_rows("cargo nextest");
@@ -2127,7 +2127,7 @@ fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() 
     let text = monitor_text(&mut state);
     let row = text.lines().find(|line| line.contains("calendar")).unwrap();
     assert!(
-        row.rsplit_once("│ ").unwrap().1.starts_with('⟳')
+        row.rsplit_once("│ ").unwrap().1.starts_with('↻')
             && !row.contains("high")
             && !text.contains("live"),
         "the mark leads the row: {text}"
@@ -2159,17 +2159,17 @@ fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() 
     assert_eq!(requested_key(press(&mut state, KeyCode::Char('w'))), 'w');
     let text = monitor_text(&mut state);
     assert!(text.contains("Tick Subscriptions 1"), "{text}");
-    assert!(text.contains("› ⟳ high · every 1 min"), "{text}");
+    assert!(text.contains("› ↻ high · every 1 min"), "{text}");
     assert!(!state.input_dialog_visible(), "the detail stays in Monitor");
 
     assert_eq!(requested_key(press(&mut state, KeyCode::Char('f'))), 'f');
     assert!(
-        monitor_text(&mut state).contains("› ⟳ medium · every 10 min"),
+        monitor_text(&mut state).contains("› ↻ medium · every 10 min"),
         "the detail shows the new frequency at once"
     );
     assert_eq!(requested_key(press(&mut state, KeyCode::Char('f'))), 'f');
     let text = monitor_text(&mut state);
-    assert!(text.contains("› ⟳ low · every 30 min"), "{text}");
+    assert!(text.contains("› ↻ low · every 30 min"), "{text}");
     assert!(
         press(&mut state, KeyCode::Char('e')).is_none() && state.monitor.detail.is_some(),
         "e no longer changes anything"
@@ -2240,7 +2240,7 @@ fn several_subscriptions_on_one_row_show_a_summary_and_open_as_a_list() {
     let text = monitor_text(&mut state);
     let row = text.lines().find(|line| line.contains("calendar")).unwrap();
     assert!(
-        row.rsplit_once("│ ").unwrap().1.starts_with('⟳') && !row.contains('3'),
+        row.rsplit_once("│ ").unwrap().1.starts_with('↻') && !row.contains('3'),
         "several subscriptions show one mark without a count: {text}"
     );
     assert!(
@@ -2810,7 +2810,7 @@ fn an_artifact_linked_here_shows_no_subscription_mark_and_x_unlinks_it() {
     let text = monitor_text(&mut state);
     let row = text.lines().find(|line| line.contains("Brief")).unwrap();
     assert!(
-        row.trim_end().ends_with("Brief") && !row.contains('●') && !row.contains('⟳'),
+        row.trim_end().ends_with("Brief") && !row.contains('●') && !row.contains('↻'),
         "an artifact never shows a Tick Subscription: {row}"
     );
     assert_eq!(
@@ -2834,7 +2834,7 @@ fn a_paused_association_stays_in_words() {
     let text = monitor_text(&mut state);
     let row = text.lines().find(|line| line.contains("Brief")).unwrap();
     assert!(
-        row.contains("feedback paused") && !row.contains('⟳'),
+        row.contains("feedback paused") && !row.contains('↻'),
         "{row}"
     );
     assert_eq!(action_labels(&state)[1], ('x', "unlink"));

@@ -93,10 +93,10 @@ impl DisplayProfile {
     pub(super) const fn glyph(self, glyph: Glyph) -> &'static str {
         match glyph {
             Glyph::ShellTick => "$",
-            Glyph::ArtifactTick => "⧉",
+            Glyph::ArtifactTick => "↗",
             Glyph::TerminalTick => ">",
             Glyph::ProtocolTick | Glyph::TickDelivery => "◉",
-            Glyph::Subscription => "⟳",
+            Glyph::Subscription => "↻",
             Glyph::Prompt => "❯",
             Glyph::Assistant | Glyph::Subagents | Glyph::ToolCall | Glyph::TurnSummary => "⏺",
             Glyph::ToolResult | Glyph::TodoBranch => "⎿",
@@ -209,7 +209,7 @@ mod tests {
             (Glyph::ShellTick, "$"),
             (Glyph::ProtocolTick, "◉"),
             (Glyph::TerminalTick, ">"),
-            (Glyph::ArtifactTick, "⧉"),
+            (Glyph::ArtifactTick, "↗"),
         ] {
             assert_eq!(unicode.glyph(glyph), expected);
             assert_eq!(unicode_width::UnicodeWidthStr::width(expected), 1);

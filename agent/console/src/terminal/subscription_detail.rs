@@ -240,7 +240,7 @@ impl SubscriptionDetail {
             Role::MutedText
         };
         let mut frequency = format!(
-            "{}⟳ {}",
+            "{}↻ {}",
             if selected { "› " } else { "  " },
             frequency_label(row.frequency)
         );
@@ -507,10 +507,10 @@ mod tests {
 
         assert_eq!(lines[0], "Fixture run");
         assert_eq!(lines[1], "Tick Subscriptions 2");
-        assert_eq!(lines[2], "› ⟳ high · every 1 min · 4 new");
+        assert_eq!(lines[2], "› ↻ high · every 1 min · 4 new");
         assert_eq!(lines[3], "    ◉ Watch run 3");
         assert_eq!(lines[4], "    10:00:45 3 #12 · dropped 2 · live");
-        assert_eq!(lines[5], "  ⟳ medium · every 10 min");
+        assert_eq!(lines[5], "  ↻ medium · every 10 min");
         assert_eq!(lines[7], "    no delivery yet · live");
         assert_eq!(detail.hint(), "f frequency · u unsubscribe · esc back");
     }
@@ -555,7 +555,7 @@ mod tests {
             vec![row(3, TickSubscriptionFrequency::Immediate)],
             SubscriptionOperation::View,
         );
-        assert_eq!(text(&mut detail)[2], "› ⟳ immediate");
+        assert_eq!(text(&mut detail)[2], "› ↻ immediate");
         assert_eq!(detail.hint(), "u unsubscribe · esc back");
 
         assert!(matches!(
@@ -635,7 +635,7 @@ mod tests {
         );
 
         assert_eq!(detail.focus(), SubscriptionFocus::List);
-        assert_eq!(text(&mut detail)[2], "› ⟳ high · every 1 min");
+        assert_eq!(text(&mut detail)[2], "› ↻ high · every 1 min");
         assert!(
             !detail.is_done(),
             "a detail opened to view stays while one is left"

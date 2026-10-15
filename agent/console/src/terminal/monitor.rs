@@ -1519,8 +1519,8 @@ mod signal_tests {
         );
         assert_eq!(
             lead(&monitor, DisplayProfile::default(), 70_000),
-            ("⟳".to_owned(), Some(Role::SubscriptionHigh)),
-            "the `⟳` leads the row in its frequency's colour"
+            ("↻".to_owned(), Some(Role::SubscriptionHigh)),
+            "the `↻` leads the row in its frequency's colour"
         );
         assert_eq!(
             monitor.next_frame_ms(70_000, WIDTH, DisplayProfile::default()),
@@ -1555,8 +1555,8 @@ mod signal_tests {
             );
             assert_eq!(
                 lead(&monitor, DisplayProfile::default(), now),
-                ("⟳".to_owned(), Some(Role::SubscriptionOnProgress)),
-                "the `⟳` turns clear on the bar"
+                ("↻".to_owned(), Some(Role::SubscriptionHigh)),
+                "the `↻` keeps its frequency's colour on the bar"
             );
         }
         let text = monitor
@@ -1599,7 +1599,7 @@ mod signal_tests {
         );
         assert_eq!(
             lead(&monitor, DisplayProfile::default(), first_check + 100),
-            ("⟳".to_owned(), Some(Role::SubscriptionHigh))
+            ("↻".to_owned(), Some(Role::SubscriptionHigh))
         );
         assert_eq!(
             row(&monitor, DisplayProfile::default(), first_check + 100).fill,
@@ -1665,7 +1665,7 @@ mod signal_tests {
                 assert_eq!(glyph(&monitor, animated, now), Some(phase), "at {now}");
                 assert_eq!(
                     lead(&monitor, animated, now),
-                    ("⟳".to_owned(), Some(Role::SubscriptionOnProgress))
+                    ("↻".to_owned(), Some(Role::SubscriptionHigh))
                 );
             }
         }
@@ -1734,15 +1734,15 @@ mod signal_tests {
         let line = &monitor
             .frame(WIDTH, 10, DisplayProfile::default(), now)
             .lines[2];
-        assert_eq!(line.text().matches('⟳').count(), 1, "{line:?}");
+        assert_eq!(line.text().matches('↻').count(), 1, "{line:?}");
         assert!(
             !line.text().contains(['2', '3']),
             "no count of subscriptions: {line:?}"
         );
         assert_eq!(
             (line.spans[0].text.as_str(), line.spans[0].role),
-            ("⟳", Some(Role::SubscriptionOnProgress)),
-            "while a subscription waits, the `⟳` is on the bar"
+            ("↻", Some(Role::SubscriptionHigh)),
+            "on the bar the `↻` keeps the most frequent subscription's colour"
         );
         assert_eq!(
             bar(&monitor, now),
@@ -1765,7 +1765,7 @@ mod signal_tests {
             .frame(WIDTH, 10, DisplayProfile::default(), 40_000)
             .lines[2];
         assert_eq!(line.band, None);
-        assert!(!line.text().contains(['⟳', '↯']), "{line:?}");
+        assert!(!line.text().contains(['↻', '↯']), "{line:?}");
         assert_eq!(
             monitor.next_frame_ms(40_000, WIDTH, DisplayProfile::default()),
             None

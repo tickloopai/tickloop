@@ -2,7 +2,7 @@
 //! colour is the row's state, the name, and right-aligned muted details. A row whose whole name
 //! does not fit beside its details continues the name on a second line, under its first, and
 //! keeps the details at the right edge there, so details line up whatever a row's height. A
-//! Monitor row leads with its periodic subscriptions' `⟳` in the first column, and its glyph
+//! Monitor row leads with its periodic subscriptions' `↻` in the first column, and its glyph
 //! takes the update colour over its state colour while the row holds an unhandled update; while a
 //! periodic subscription holds the update, a bar runs from the first column across the row.
 
@@ -18,7 +18,7 @@ use tickloop_agent_protocol::TickSubscriptionFrequency;
 
 /// The columns before a list row's glyph. The selection fill alone marks the selected row.
 pub(super) const ROW_INDENT: &str = "  ";
-/// What follows a Monitor row's first column before its glyph: a blank column, so a `⟳` some
+/// What follows a Monitor row's first column before its glyph: a blank column, so a `↻` some
 /// fallback font draws wider than its column never meets the glyph.
 const LEAD_GAP: &str = " ";
 const STATUS_GAP_COLUMNS: usize = 2;
@@ -37,8 +37,8 @@ pub(super) struct ListRow<'a> {
     /// The row's flash fill while it flashes; see [`flash_fill`]. It covers the update bar, and
     /// the selection fill wins over it.
     pub(super) fill: Option<Role>,
-    /// The `⟳` of the row's periodic subscriptions in its frequency's colour; see
-    /// [`subscription_mark`]. On the update bar it takes a foreground clear on the bar.
+    /// The `↻` of the row's periodic subscriptions in its frequency's colour, on the update bar
+    /// too; see [`subscription_mark`].
     pub(super) subscription: Option<(&'a str, Role)>,
     /// While a periodic subscription holds an update, how many columns from the row's left the
     /// update bar reaches: the part of the period elapsed before the check that hands it to the
@@ -58,9 +58,6 @@ impl ListRow<'_> {
     fn prefix(&self) -> RoleLine {
         let role = self.role();
         let mut line = match self.subscription {
-            Some((mark, _)) if self.bar_columns.is_some() => {
-                RoleLine::role(mark, Role::SubscriptionOnProgress)
-            }
             Some((mark, mark_role)) => RoleLine::role(mark, mark_role),
             None => RoleLine::role(" ", role),
         };
@@ -124,17 +121,18 @@ impl ListRow<'_> {
         line.push(details, Some(Role::MutedText));
     }
 
-    /// Fills the line: the selection with the update bar over it, else a flash over everything,
-    /// else the update bar alone. The bar always covers the first column, so the `⟳` there keeps
-    /// one background while the bar shows. A `⟳` keeps its own colours on a selected row, so the
-    /// selection starts after it.
+    /// Fills the line: the selection with the update bar over it, else a flash over everything
+    /// else, else the update bar alone. The bar starts at the first column, where the `↻` keeps
+    /// its frequency's colour; a selection or a flash starts after a `↻`, which keeps its own
+    /// colours under both.
     fn finish(&self, mut line: RoleLine, width: usize) -> RoleLine {
         line.truncate(width);
         let bar = self.bar_columns.map(|columns| 0..columns.max(1));
+        let after_mark = usize::from(self.subscription.is_some());
         if self.selected {
-            line = line.filled_from(Role::Selection, usize::from(self.subscription.is_some()));
+            line = line.filled_from(Role::Selection, after_mark);
         } else if let Some(fill) = self.fill {
-            return line.filled(fill);
+            return line.filled_from(fill, after_mark);
         }
         match bar {
             Some(columns) => line.banded(columns, Role::UpdateProgress),
@@ -219,7 +217,7 @@ fn subscription_role(frequency: TickSubscriptionFrequency) -> Role {
     }
 }
 
-/// The `⟳` that leads a row with periodic subscriptions, in its frequency's colour.
+/// The `↻` that leads a row with periodic subscriptions, in its frequency's colour.
 pub(super) fn subscription_mark(
     subscription: Option<SubscriptionMark>,
     display: DisplayProfile,
@@ -408,7 +406,7 @@ mod tests {
             (TickSubscriptionFrequency::Low, Role::SubscriptionLow),
         ] {
             let mark = subscription_mark(periodic(frequency), DisplayProfile::default());
-            assert_eq!(mark, Some(("⟳", role)), "{frequency:?}");
+            assert_eq!(mark, Some(("↻", role)), "{frequency:?}");
             let line = ListRow {
                 subscription: mark,
                 ..row("Quotes", "exit 101")
@@ -418,7 +416,7 @@ mod tests {
             assert_eq!(
                 lead(&line, 3),
                 [
-                    ("⟳".to_owned(), Some(role)),
+                    ("↻".to_owned(), Some(role)),
                     (" ".to_owned(), Some(Role::MutedText)),
                     ("$".to_owned(), Some(Role::RunningMark))
                 ],
@@ -436,7 +434,7 @@ mod tests {
         let names = [
             row("Quotes", "").lines(20)[0].clone(),
             ListRow {
-                subscription: Some(("⟳", Role::SubscriptionLow)),
+                subscription: Some(("↻", Role::SubscriptionLow)),
                 ..row("Quotes", "")
             }
             .lines(20)[0]
@@ -446,17 +444,17 @@ mod tests {
         assert_eq!(
             names,
             [4, 6],
-            "byte offsets: `⟳` takes three bytes in one column"
+            "byte offsets: `↻` takes three bytes in one column"
         );
         let narrow = ListRow {
-            subscription: Some(("⟳", Role::SubscriptionLow)),
+            subscription: Some(("↻", Role::SubscriptionLow)),
             ..row("python3 -q", "exit 101 · SIGTERM")
         };
         for width in [12, 20, 60] {
             let last = narrow.lines(width).last().unwrap().text();
             assert_eq!(last.width(), width, "{last:?}");
             assert!(
-                !last.ends_with('⟳') && !last.ends_with(' '),
+                !last.ends_with('↻') && !last.ends_with(' '),
                 "{width}: no mark or blank column at the right: {last:?}"
             );
         }
@@ -493,7 +491,7 @@ mod tests {
         let held = ListRow {
             glyph_role: Role::UpdateMark,
             bar_columns: Some(10),
-            subscription: Some(("⟳", Role::SubscriptionMedium)),
+            subscription: Some(("↻", Role::SubscriptionMedium)),
             ..row("Quotes", "")
         }
         .lines(20)[0]
@@ -501,10 +499,10 @@ mod tests {
         assert_eq!(
             lead(&held, 2),
             [
-                ("⟳".to_owned(), Some(Role::SubscriptionOnProgress)),
+                ("↻".to_owned(), Some(Role::SubscriptionMedium)),
                 (" ".to_owned(), Some(Role::MutedText))
             ],
-            "on the bar the `⟳` takes one foreground clear on it, whatever its frequency"
+            "on the bar the `↻` keeps its frequency's colour"
         );
         assert_eq!(
             held.band.map(|band| (band.columns, band.role)),
@@ -538,7 +536,7 @@ mod tests {
         assert_eq!(status.fill, Some(Role::Selection));
         assert!(!line.text().contains('›'));
         let marked = ListRow {
-            subscription: Some(("⟳", Role::SubscriptionHigh)),
+            subscription: Some(("↻", Role::SubscriptionHigh)),
             ..selected_row()
         };
         for line in marked.lines(30) {
@@ -557,7 +555,7 @@ mod tests {
         assert_eq!(
             (unread.fill, unread.fill_start),
             (Some(Role::Selection), 0),
-            "an unread row without `⟳` fills from its first column"
+            "an unread row without `↻` fills from its first column"
         );
         let glyph = unread
             .resolve(theme, 40)
@@ -574,7 +572,7 @@ mod tests {
             "the glyph keeps the update colour on the selection"
         );
         let resolved = ListRow {
-            subscription: Some(("⟳", Role::SubscriptionHigh)),
+            subscription: Some(("↻", Role::SubscriptionHigh)),
             ..selected_row()
         }
         .one_line(40)
@@ -595,7 +593,7 @@ mod tests {
         };
         let waiting = ListRow {
             bar_columns: Some(check.elapsed_columns(30, 130_000)),
-            subscription: Some(("⟳", Role::SubscriptionHigh)),
+            subscription: Some(("↻", Role::SubscriptionHigh)),
             ..row("Quote board for the whole watchlist", "")
         };
         let lines = waiting.lines(30);
@@ -610,7 +608,7 @@ mod tests {
         }
         let just_started = ListRow {
             bar_columns: Some(0),
-            subscription: Some(("⟳", Role::SubscriptionHigh)),
+            subscription: Some(("↻", Role::SubscriptionHigh)),
             ..row("Quotes", "")
         };
         assert_eq!(
@@ -619,7 +617,7 @@ mod tests {
                 .clone()
                 .map(|band| band.columns),
             Some(0..1),
-            "the bar always covers the `⟳`"
+            "the bar always covers the `↻`"
         );
         let flashing = ListRow {
             fill: Some(Role::FlashStrong),
