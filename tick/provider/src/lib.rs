@@ -1,7 +1,9 @@
-//! The provider abstraction: the interfaces a Tick reads market, account, news and option data
-//! through, and the data they exchange. Each provider implements the interfaces it can serve.
+//! The provider abstraction: the interfaces a Tick reads market, account, news, option and
+//! community data through, and the data they exchange. Each provider implements the interfaces
+//! it can serve.
 
 pub mod api;
+pub mod community;
 pub mod dates;
 pub mod error;
 pub mod exit_code;
@@ -17,6 +19,7 @@ pub enum Interface {
     Trade,
     News,
     Options,
+    Community,
 }
 
 impl Interface {
@@ -27,6 +30,7 @@ impl Interface {
             Self::Trade => "TradeApi",
             Self::News => "NewsApi",
             Self::Options => "OptionsApi",
+            Self::Community => "CommunityApi",
         }
     }
 }

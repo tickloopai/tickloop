@@ -68,6 +68,7 @@ fn every_provider_lists_its_ticks_and_every_tick_has_its_own_help() {
         "news",
         "earnings",
         "options",
+        "community",
     ];
     for provider in ["builtin", "longbridge", "futu"] {
         let (code, stdout, _) = run(tick().args([provider, "--help"]));
@@ -222,11 +223,21 @@ fn default_configuration_path_may_be_absent() {
 
 #[test]
 fn market_commands_without_authorization_explain_how_to_log_in() {
-    for command in ["watchlist", "quote", "kline", "positions", "news"] {
+    for command in [
+        "watchlist",
+        "quote",
+        "kline",
+        "positions",
+        "news",
+        "community",
+    ] {
         let mut process = tick();
         process.args(["longbridge", command]);
         if matches!(command, "quote" | "kline") {
             process.arg("TSLA");
+        }
+        if command == "community" {
+            process.arg("91");
         }
         let (code, stdout, stderr) = run(&mut process);
         assert_eq!(code, 3, "{command}: {stderr}");

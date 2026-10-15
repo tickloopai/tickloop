@@ -47,9 +47,12 @@ For a bundled Tick, use `workspace_host.tick_executable` as the executable; if i
 | --- | --- |
 | Stock price / 行情 / 报价 | `longbridge quote SYMBOL` |
 | K-line / K线 / candlestick chart | `longbridge kline SYMBOL` |
+| A Longbridge community member's posts / 社区动态 | `longbridge community MEMBER_ID` |
 | Explicit offline chart demonstration | `builtin kline 700.HK` |
 
-Use the broker symbol format: Tesla / 特斯拉 is `TSLA.US`, Apple / 苹果 is `AAPL.US`, and Tencent / 腾讯 is `700.HK`. Clarify an ambiguous company or market before launching. For example, “打开特斯拉K线” means `command: [TICK_EXECUTABLE, "longbridge", "kline", "TSLA.US"]`. Omitted chart period uses the command's default; specify `--period` when the user asks for a period. The argv is always `PROVIDER TICK ...`: `longbridge` serves real quotes, account and news, `futu` serves option pricing from Futu OpenD, and `builtin` serves simulated data for every Tick; a provider that lacks the data a Tick needs refuses it and names the providers that have it. Use the executable's `--help`, `longbridge --help` or `longbridge kline --help` for other options and Tick types. A real stock request uses real data; the builtin demo is a separate, explicitly requested workflow.
+`MEMBER_ID` is the number in the member's profile link, such as 91 in `https://longbridge.com/zh-CN/profiles/91`; there is no nickname search, so ask for the link when the user names someone only by nickname. The community Tick's `reply` tool posts publicly as the logged-in Longbridge user.
+
+Use the broker symbol format: Tesla / 特斯拉 is `TSLA.US`, Apple / 苹果 is `AAPL.US`, and Tencent / 腾讯 is `700.HK`. Clarify an ambiguous company or market before launching. For example, “打开特斯拉K线” means `command: [TICK_EXECUTABLE, "longbridge", "kline", "TSLA.US"]`. Omitted chart period uses the command's default; specify `--period` when the user asks for a period. The argv is always `PROVIDER TICK ...`: `longbridge` serves real quotes, account, news and community posts, `futu` serves option pricing from Futu OpenD, and `builtin` serves simulated data for every Tick; a provider that lacks the data a Tick needs refuses it and names the providers that have it. Use the executable's `--help`, `longbridge --help` or `longbridge kline --help` for other options and Tick types. A real stock request uses real data; the builtin demo is a separate, explicitly requested workflow.
 
 Any other program opens with the program itself first in `command`. Pass `protocol: true` for a program that speaks the Tick protocol, such as `["python3", "tick/examples/counter.py"]`; omit `protocol` for an ordinary interactive program (a REPL, `htop`, a log viewer), which opens as a terminal Tick. The host refuses the bundled `tickhost` as a command.
 

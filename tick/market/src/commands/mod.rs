@@ -1,3 +1,4 @@
+pub mod community;
 pub mod earnings;
 pub mod kline;
 pub mod news;

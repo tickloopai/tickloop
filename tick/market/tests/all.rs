@@ -1,5 +1,7 @@
 //! Every market integration test, compiled as one binary.
 
+#[path = "all/community.rs"]
+mod community;
 #[path = "all/configuration.rs"]
 mod configuration;
 #[path = "all/demo.rs"]

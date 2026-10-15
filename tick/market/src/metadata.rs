@@ -21,6 +21,7 @@ pub enum TickKind {
     Earnings,
     Options,
     Reader,
+    Community,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -96,7 +97,7 @@ impl TickDescriptor {
 }
 
 impl TickKind {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Quote,
         Self::Watchlist,
         Self::Kline,
@@ -105,6 +106,7 @@ impl TickKind {
         Self::Earnings,
         Self::Options,
         Self::Reader,
+        Self::Community,
     ];
 
     pub fn name(self) -> &'static str {
@@ -117,6 +119,7 @@ impl TickKind {
             Self::Earnings => "earnings",
             Self::Options => "options",
             Self::Reader => "reader",
+            Self::Community => "community",
         }
     }
 
@@ -141,6 +144,8 @@ impl TickKind {
             Self::Options => (58, 14),
             // The document heading and wrapped prose.
             Self::Reader => (40, 10),
+            // A post headline of at least 22 columns beside the date and kind.
+            Self::Community => (40, 10),
         };
         MinimumPanelSize { columns, rows }
     }
@@ -153,6 +158,7 @@ impl TickKind {
             Self::News => &[Interface::Quote, Interface::News],
             Self::Options => &[Interface::Options],
             Self::Reader => &[],
+            Self::Community => &[Interface::Community],
         }
     }
 
@@ -196,6 +202,11 @@ impl TickKind {
             Self::Reader => (
                 "Reader",
                 "Read original financial documents and cite stable evidence.",
+                TickConfigurationRequirement::UserInput,
+            ),
+            Self::Community => (
+                "Community",
+                "Follow one Longbridge community member's posts and reply to them.",
                 TickConfigurationRequirement::UserInput,
             ),
         };
@@ -284,6 +295,10 @@ mod tests {
         assert_eq!(
             declared(TickKind::News),
             [("/items".to_owned(), SeriesEnd::First)]
+        );
+        assert_eq!(
+            declared(TickKind::Community),
+            [("/posts".to_owned(), SeriesEnd::First)]
         );
         // Kline, Earnings and Options publish summaries; their series stay behind their tools.
         for kind in [

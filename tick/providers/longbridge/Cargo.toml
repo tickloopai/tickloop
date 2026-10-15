@@ -1,6 +1,6 @@
 [package]
 name = "tickloop-tick-longbridge"
-description = "Longbridge quotes, trading account and news, with device-code OAuth and rate limits"
+description = "Longbridge quotes, trading account, news and community posts, with device-code OAuth and rate limits"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -17,6 +17,7 @@ longbridge = { git = "https://github.com/longbridge/openapi", rev = "5929410" }
 quick-xml = { version = "0.38", features = ["serialize"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 rust_decimal = { version = "1", features = ["serde-with-str"] }
+scraper = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

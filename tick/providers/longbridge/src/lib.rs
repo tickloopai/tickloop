@@ -1,7 +1,8 @@
-//! The Longbridge provider: quotes, the trading account and news through the Longbridge SDK, with
-//! device-code OAuth and the SDK's rate limits.
+//! The Longbridge provider: quotes, the trading account, news and community posts through the
+//! Longbridge SDK, with device-code OAuth and the SDK's rate limits.
 
 pub mod auth;
+pub mod community_api;
 pub mod news_api;
 pub mod probe;
 pub mod rate_limit;
@@ -10,4 +11,9 @@ pub mod us_positions;
 
 use tick_provider::Interface;
 
-pub const INTERFACES: &[Interface] = &[Interface::Quote, Interface::Trade, Interface::News];
+pub const INTERFACES: &[Interface] = &[
+    Interface::Quote,
+    Interface::Trade,
+    Interface::News,
+    Interface::Community,
+];

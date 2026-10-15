@@ -41,6 +41,26 @@ pub struct NewsArgs {
 
 #[derive(Args, Clone, Debug)]
 #[command(
+    after_help = "Keys: Enter opens post; Backspace returns to list; q quits; ? help.\nThe member ID is the number in a profile link such as https://longbridge.com/zh-CN/profiles/91.\nExample: tick longbridge community 91 --once --format json"
+)]
+pub struct CommunityArgs {
+    /// Longbridge community member ID
+    #[arg(value_parser = parse_member_id)]
+    pub member_id: i64,
+    #[command(flatten)]
+    pub output: OnceArgs,
+}
+
+fn parse_member_id(value: &str) -> Result<i64, String> {
+    value
+        .parse()
+        .ok()
+        .filter(|member_id| *member_id > 0)
+        .ok_or_else(|| "expected a positive numeric member ID".into())
+}
+
+#[derive(Args, Clone, Debug)]
+#[command(
     after_help = "Keys: s changes the symbol (Enter applies, Ctrl+C cancels); q quits; Backspace back; ? help; j/k or arrows move.\nExample: tick longbridge earnings TSLA.US --count 12 --once --format json"
 )]
 pub struct EarningsArgs {

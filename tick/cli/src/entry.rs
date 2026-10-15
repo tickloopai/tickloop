@@ -2,10 +2,11 @@ use std::{ffi::OsString, io::IsTerminal, process::ExitCode, sync::Arc};
 
 use clap::Parser;
 use futures_util::Stream;
-use tick_builtin::{DemoApi, DemoOptions};
+use tick_builtin::{DemoApi, DemoCommunity, DemoOptions};
 use tick_futu::FutuOptions;
 use tick_longbridge::{
     auth::{self, storage::AuthStorage},
+    community_api::SdkCommunityApi,
     news_api::SdkNewsApi,
     rate_limit::RateLimiter,
     sdk::{SdkQuoteApi, SdkTradeApi},
@@ -20,6 +21,7 @@ use tick_market::{
 };
 use tick_provider::{
     api::{QuoteServices, TradeApi},
+    community::CommunityApi,
     error::{Error, Result},
     exit_code,
     news::NewsApi,
@@ -139,6 +141,7 @@ async fn run_builtin(
                 trade: Some(&api),
                 news: Some(&api),
                 options: Some(Arc::new(DemoOptions)),
+                community: Some(Arc::new(DemoCommunity)),
             };
             let running = Running::Provider(tick, services);
             run_tick(running, &settings, size).await
@@ -186,6 +189,7 @@ async fn run_futu(
         trade: None,
         news: None,
         options: Some(api),
+        community: None,
     };
     run_tick(Running::Provider(tick, services), settings, size).await
 }
@@ -304,7 +308,21 @@ async fn run_longbridge_market(
         is_us,
     };
     let news = if matches!(tick, TickCommand::News(_)) {
-        Some(SdkNewsApi::new(config, oauth, settings.language, settings.region, limiter).await?)
+        Some(
+            SdkNewsApi::new(
+                config.clone(),
+                oauth,
+                settings.language,
+                settings.region,
+                limiter.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let community = if matches!(tick, TickCommand::Community(_)) {
+        Some(Arc::new(SdkCommunityApi::new(config, limiter)?) as Arc<dyn CommunityApi>)
     } else {
         None
     };
@@ -313,6 +331,7 @@ async fn run_longbridge_market(
         trade: Some(&trade),
         news: news.as_ref().map(|news| news as &dyn NewsApi),
         options: None,
+        community,
     };
     run_tick(Running::Provider(tick, services), settings, size).await
 }
@@ -368,6 +387,7 @@ struct Services<'a> {
     trade: Option<&'a dyn TradeApi>,
     news: Option<&'a dyn NewsApi>,
     options: Option<Arc<dyn OptionsApi>>,
+    community: Option<Arc<dyn CommunityApi>>,
 }
 
 impl<'a> Services<'a> {
@@ -387,6 +407,12 @@ impl<'a> Services<'a> {
         self.options
             .clone()
             .expect("checked provider implements OptionsApi")
+    }
+
+    fn community(&self) -> Arc<dyn CommunityApi> {
+        self.community
+            .clone()
+            .expect("checked provider implements CommunityApi")
     }
 }
 
@@ -533,6 +559,17 @@ async fn run_live<
             )
             .await
         }
+        TickCommand::Community(args) => {
+            commands::community::run_live(
+                &args,
+                services.community(),
+                settings,
+                terminal,
+                input,
+                updates,
+            )
+            .await
+        }
     }
 }
 
@@ -585,6 +622,17 @@ async fn run_once(
         TickCommand::Options(args) => {
             commands::options::run_once(&args, services.options(), settings, color, output, updates)
                 .await
+        }
+        TickCommand::Community(args) => {
+            commands::community::run_once(
+                &args,
+                services.community().as_ref(),
+                settings,
+                color,
+                output,
+                updates,
+            )
+            .await
         }
     }
 }

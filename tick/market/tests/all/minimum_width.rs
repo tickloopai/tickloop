@@ -1,11 +1,11 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
 use std::sync::Arc;
-use tick_builtin::{DemoApi, DemoOptions};
+use tick_builtin::{DemoApi, DemoCommunity, DemoOptions};
 use tick_market::{
     args::{
-        EarningsArgs, EventChartArgs, KlineArgs, NewsArgs, OnceArgs, OptionsArgs, QuoteArgs,
-        WatchlistArgs,
+        CommunityArgs, EarningsArgs, EventChartArgs, KlineArgs, NewsArgs, OnceArgs, OptionsArgs,
+        QuoteArgs, WatchlistArgs,
     },
     commands,
     config::Settings,
@@ -157,6 +157,26 @@ fn every_tick() -> Vec<Scenario> {
             TickKind::News,
             &[KeyCode::Enter],
             &["示例资讯正文", "Backspace Back · j/k Scroll · q Quit"],
+        ),
+        scenario(
+            TickKind::Community,
+            &[],
+            &[
+                "Community · Demo · 示例用户",
+                "09-10",
+                "Article",
+                "$Demo · Tesla",
+                "Enter Read  ·  ? Help  ·  q Quit",
+            ],
+        ),
+        scenario(
+            TickKind::Community,
+            &[KeyCode::Enter],
+            &[
+                "今天放量突破",
+                "09:30 · topic 1003",
+                "Backspace Back · j/k Scroll · q Quit",
+            ],
         ),
         scenario(
             TickKind::Earnings,
@@ -457,6 +477,19 @@ async fn render_keys(
         )
         .await
         .unwrap(),
+        TickKind::Community => commands::community::run_live(
+            &CommunityArgs {
+                member_id: 91,
+                output: OnceArgs::default(),
+            },
+            Arc::new(DemoCommunity),
+            &settings,
+            &mut terminal,
+            input,
+            &mut updates,
+        )
+        .await
+        .unwrap(),
     }
     cells(&terminal)
 }
@@ -488,16 +521,7 @@ async fn every_tick_shows_its_key_fields_whole_on_an_80_column_laptop() {
 
 #[test]
 fn every_minimum_width_fits_the_80_column_laptop() {
-    for kind in [
-        TickKind::Quote,
-        TickKind::Watchlist,
-        TickKind::Kline,
-        TickKind::Positions,
-        TickKind::News,
-        TickKind::Earnings,
-        TickKind::Options,
-        TickKind::Reader,
-    ] {
+    for kind in TickKind::ALL {
         assert!(kind.minimum_panel_size().columns <= LAPTOP.0, "{kind:?}");
     }
     assert!(EVENT_CHART_MINIMUM.columns <= LAPTOP.0);

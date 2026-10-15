@@ -1,6 +1,6 @@
 [package]
 name = "tickloop-tick-market"
-description = "The financial Ticks: quote, watchlist, kline, positions, news, earnings, options and reader"
+description = "The financial Ticks: quote, watchlist, kline, positions, news, earnings, options, reader and community"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

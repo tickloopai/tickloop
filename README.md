@@ -34,12 +34,12 @@ Agent 会确认运行环境，并在 Tickhost 可用时自动加载 Tick 操作�
 
 # Tick Command `tick`
 
-`tick` 是 Tickloop 的 Tick Command，提供报价、自选、K 线、持仓、资讯和财报视图。命令形式为 `tick <provider> <tick>`：provider 决定数据来源，同一个 Tick 在各 provider 上界面一致。
+`tick` 是 Tickloop 的 Tick Command，提供报价、自选、K 线、持仓、资讯、财报和社区动态视图。命令形式为 `tick <provider> <tick>`：provider 决定数据来源，同一个 Tick 在各 provider 上界面一致。
 
 | provider | 实现的接口 | 可运行的 Tick |
 | --- | --- | --- |
-| `builtin` | QuoteApi、TradeApi、NewsApi、OptionsApi | 全部 Tick 与示例原文 Reader；模拟数据，无需账户或网络 |
-| `longbridge` | QuoteApi、TradeApi、NewsApi | quote、watchlist、kline、positions、news、earnings |
+| `builtin` | QuoteApi、TradeApi、NewsApi、OptionsApi、CommunityApi | 全部 Tick 与示例原文 Reader；模拟数据，无需账户或网络 |
+| `longbridge` | QuoteApi、TradeApi、NewsApi、CommunityApi | quote、watchlist、kline、positions、news、earnings、community |
 | `futu` | OptionsApi | options |
 
 provider 没有实现某个 Tick 需要的接口时直接报错，并列出可用的 provider，例如 `tick longbridge options` 提示改用 `tick futu options`。Reader 读取本地原文缓存，不经 provider，命令为 `tick reader`。它通过 Tick Instance 流输出 Tick Update，并在同一条流上声明和执行自己的 Tick Tool；既可以独立运行，也可以由 Agent 打开为 Tick。
@@ -56,7 +56,7 @@ cargo build --locked --release --workspace --bins
 
 安装入口使用 `make install`，把 `tickloop`、`tickhost` 与 `tick` 放入 PATH。交互模式要求 UTF-8 locale 和支持真彩色的终端；独立运行使用 TTY，由 Agent 打开时 Tickhost 的 launcher 保留控制终端，并把 stdin/stdout 留给协议。macOS 为当前目标环境。`--help` 和 `describe` 无需 UTF-8 locale 或登录。图标只有一套 Unicode 字形，不需要特殊字体。
 
-`builtin` 的 Tick 均在真实 TUI 中运行，使用带 `Demo` 标识的模拟数据，不访问网络或读取账户。`--size` 以字符列×行限制显示区域，仍受实际终端尺寸约束，对所有 provider 都可用。用 `q` 退出；可替换为 `quote`、`watchlist`、`kline`、`positions`、`news`、`earnings`、`options`、`reader`。builtin 支持下述全局显示参数。验收时分别缩小窗口、滚动、打开帮助并退出，检查终端恢复。
+`builtin` 的 Tick 均在真实 TUI 中运行，使用带 `Demo` 标识的模拟数据，不访问网络或读取账户。`--size` 以字符列×行限制显示区域，仍受实际终端尺寸约束，对所有 provider 都可用。用 `q` 退出；可替换为 `quote`、`watchlist`、`kline`、`positions`、`news`、`earnings`、`options`、`reader`、`community 91`。builtin 支持下述全局显示参数。验收时分别缩小窗口、滚动、打开帮助并退出，检查终端恢复。
 
 剩余人工验收可使用临时终端向导：
 
@@ -109,10 +109,11 @@ ambiguous_width = "narrow"  # narrow / wide
 | `tick longbridge positions` | 股票持仓、按币种汇总市值和浮盈亏；只读账户，不执行交易 |
 | `tick longbridge news [700.HK] [--limit 20]` | 个股资讯；无代码时读长桥公开 RSS；数量 1–100 |
 | `tick longbridge earnings TSLA.US [--count 10]` | 已发布财报的预期、实际、意外与财报前后走势；只支持美股；期数 1–20 |
+| `tick longbridge community 91` | 一位社区用户最新的帖子，参数为个人主页链接中的数字 member_id；每 30 秒刷新。资料与动态读 longbridge.com 公开接口，Tick Tool `reply` 以当前登录账号在列出的帖子下公开回复，只发送一次，不自动重试 |
 | `tick futu options AAPL.US [--expiry YYYY-MM-DD] [--host 127.0.0.1] [--port 11111]` | 富途 OpenD 的期权链、买卖价、IV、持仓量和近平值跨式参考；支持美股/港股标的 |
 | `tick reader URL或文件 [更多URL或文件]` | 在终端阅读 HTML、Markdown、文本或 PDF 原文，搜索、章节定位和固定版本引用 |
 
-八个业务命令默认进入 TUI，均支持 `--once` 和 `--once --format json`。JSON 输出没有横幅或 ANSI；普通行情表按业务行输出，财报、期权、事件行情和原文还保留各自的来源、时间和结构。缺失值为 `null` / `--`，管道表格不输出颜色。
+九个业务命令默认进入 TUI，均支持 `--once` 和 `--once --format json`。JSON 输出没有横幅或 ANSI；普通行情表按业务行输出，财报、期权、事件行情和原文还保留各自的来源、时间和结构。缺失值为 `null` / `--`，管道表格不输出颜色。
 
 ```sh
 tick longbridge quote TSLA 700 --once --format json
@@ -121,6 +122,7 @@ tick longbridge kline 700.HK --period 5m --adjust forward
 tick longbridge positions --once
 tick longbridge news --limit 10
 tick longbridge earnings TSLA.US --count 12 --once --format json
+tick longbridge community 91 --once --format json
 tick longbridge kline AAPL.US --event-date 2026-07-30 --event-session after-hours --published-at 2026-07-30T16:05:00-04:00
 tick futu options AAPL.US --host 127.0.0.1 --port 11111
 tick reader ./earnings-release.pdf --symbol AAPL.US --fiscal-period FY2026Q3

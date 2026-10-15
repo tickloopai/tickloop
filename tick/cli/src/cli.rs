@@ -3,8 +3,8 @@ use std::{fmt, path::PathBuf, str::FromStr};
 use clap::{Args, Parser, Subcommand};
 use tick_market::{
     args::{
-        EarningsArgs, KlineArgs, NewsArgs, OnceArgs, OptionsArgs, QuoteArgs, ReaderArgs,
-        WatchlistArgs,
+        CommunityArgs, EarningsArgs, KlineArgs, NewsArgs, OnceArgs, OptionsArgs, QuoteArgs,
+        ReaderArgs, WatchlistArgs,
     },
     config::{Overrides, Settings},
     metadata::TickKind,
@@ -15,12 +15,12 @@ use tick_provider::{
 };
 use tickloop_ui::settings::{AmbiguousWidth, ColorMode};
 
-const ABOUT: &str = "Tickloop Ticks: market, account and news views as standalone terminal commands, \
-     run as `tick <provider> <tick>`";
+const ABOUT: &str = "Tickloop Ticks: market, account, news and community views as standalone \
+     terminal commands, run as `tick <provider> <tick>`";
 
 const AFTER_HELP: &str = "Providers:
   builtin     simulated data for every Tick; no account or network
-  longbridge  Longbridge quotes, account and news; log in with `tick longbridge auth`
+  longbridge  Longbridge quotes, account, news and community; log in with `tick longbridge auth`
   futu        option pricing from a running Futu OpenD
 
 Examples:
@@ -33,6 +33,7 @@ Examples:
   tick longbridge positions --once
   tick longbridge news 700.HK --limit 10
   tick longbridge earnings TSLA.US --count 12
+  tick longbridge community 91
   tick futu options AAPL.US --port 11111
   tick reader ./earnings-release.pdf
 
@@ -85,7 +86,7 @@ pub enum Command {
         #[command(subcommand)]
         command: BuiltinCommand,
     },
-    /// Run a Tick on Longbridge quotes, account and news, or manage the Longbridge login
+    /// Run a Tick on Longbridge quotes, account, news and community, or manage the Longbridge login
     Longbridge {
         #[command(subcommand)]
         command: LongbridgeCommand,
@@ -120,6 +121,8 @@ pub enum TickCommand {
     Earnings(EarningsArgs),
     /// Option pricing, IV and saved snapshots for one underlying
     Options(OptionsArgs),
+    /// One community member's newest posts, with a tool to reply to them
+    Community(CommunityArgs),
 }
 
 #[derive(Subcommand, Clone, Debug)]
@@ -279,6 +282,7 @@ impl TickCommand {
             Self::News(_) => TickKind::News,
             Self::Earnings(_) => TickKind::Earnings,
             Self::Options(_) => TickKind::Options,
+            Self::Community(_) => TickKind::Community,
         }
     }
 
@@ -291,6 +295,7 @@ impl TickCommand {
             Self::News(args) => args.output.once,
             Self::Earnings(args) => args.output.once,
             Self::Options(args) => args.output.once,
+            Self::Community(args) => args.output.once,
         }
     }
 }
@@ -415,6 +420,7 @@ mod tests {
             "news",
             "earnings",
             "options",
+            "community",
         ];
         assert_eq!(runnable(Provider::Builtin), every_provider_tick);
         assert_eq!(
@@ -425,7 +431,8 @@ mod tests {
                 "kline",
                 "positions",
                 "news",
-                "earnings"
+                "earnings",
+                "community"
             ]
         );
         assert_eq!(runnable(Provider::Futu), ["options"]);

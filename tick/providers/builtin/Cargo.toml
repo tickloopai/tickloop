@@ -1,6 +1,6 @@
 [package]
 name = "tickloop-tick-builtin"
-description = "Offline simulated quotes, account, news and options; needs no account or network"
+description = "Offline simulated quotes, account, news, options and community posts; needs no account or network"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
