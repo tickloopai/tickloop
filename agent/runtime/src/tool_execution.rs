@@ -201,8 +201,7 @@ pub(crate) fn validate_schema(schema: &Value, value: &Value, location: &str) -> 
     for field in fields.keys() {
         if !matches!(
             field.as_str(),
-            "oneOf"
-                | "const"
+            "const"
                 | "enum"
                 | "type"
                 | "properties"
@@ -223,15 +222,6 @@ pub(crate) fn validate_schema(schema: &Value, value: &Value, location: &str) -> 
             return Err(format!(
                 "{location} uses unsupported tool schema field {field}"
             ));
-        }
-    }
-    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
-        let matches = variants
-            .iter()
-            .filter(|variant| validate_schema(variant, value, location).is_ok())
-            .count();
-        if matches != 1 {
-            return Err(format!("{location} must match exactly one allowed form"));
         }
     }
     if let Some(expected) = schema.get("const")
@@ -1820,5 +1810,86 @@ impl Agent {
             .await
             .get_mut(&chat_id)
             .and_then(|chat| chat.auto_denials.record_denial())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SCHEMA_COMBINATORS: [&str; 3] = ["oneOf", "anyOf", "allOf"];
+
+    fn combinators(schema: &Value) -> Vec<String> {
+        match schema {
+            Value::Object(fields) => fields
+                .iter()
+                .flat_map(|(key, child)| {
+                    let mut found = combinators(child);
+                    if SCHEMA_COMBINATORS.contains(&key.as_str()) {
+                        found.push(key.clone());
+                    }
+                    found
+                })
+                .collect(),
+            Value::Array(items) => items.iter().flat_map(combinators).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// OpenAI-compatible models such as GLM fill nothing for a schema whose root is only a
+    /// `oneOf`, so every tool this Agent defines itself is one flat object; per-form rules
+    /// belong to the tool's own input check.
+    #[test]
+    fn every_built_in_tool_schema_is_one_flat_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let skills = tickloop_agent_config::skills::SkillRegistry::discover(directory.path(), None);
+        let definitions = tickloop_agent_tools::Tools::definitions()
+            .into_iter()
+            .chain([false, true].into_iter().flat_map(plan::definitions))
+            .chain([false, true].into_iter().flat_map(interaction::definitions))
+            .chain(delegation::definitions())
+            .chain(
+                [false, true]
+                    .into_iter()
+                    .flat_map(agent_messages::definitions),
+            )
+            .chain([crate::handback::definition()])
+            .chain(tick_subscriptions::definitions())
+            .chain(skills.tool_definition())
+            .chain(
+                [false, true]
+                    .into_iter()
+                    .flat_map(crate::tick_tools::definitions),
+            )
+            .chain([crate::mcp_tools::login_definition()])
+            .collect::<Vec<_>>();
+        for name in [
+            "Read",
+            "Skill",
+            "Subagent",
+            "SubscribeTick",
+            "ModifyTick",
+            "ArtifactLogin",
+        ] {
+            assert!(
+                definitions.iter().any(|definition| definition.name == name),
+                "{name} is not covered"
+            );
+        }
+        for definition in definitions {
+            let schema = &definition.input_schema;
+            assert_eq!(schema["type"], "object", "{}", definition.name);
+            assert!(
+                schema["properties"].is_object(),
+                "{} has no properties",
+                definition.name
+            );
+            assert_eq!(
+                combinators(schema),
+                Vec::<String>::new(),
+                "{} has schema alternatives",
+                definition.name
+            );
+        }
     }
 }

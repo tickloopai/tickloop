@@ -37,6 +37,8 @@ For an unavailable branch, briefly name what is missing in ordinary language, wi
 
 ### Open a Tick
 
+`ModifyTick` takes one flat object: `action` selects the operation, and each field's description names the actions that require or accept it. A refusal names the field to add or drop; fix that field instead of resending the same input.
+
 Call `ModifyTick` with `action: "open"`, a `command` argv array and optional `cwd`. The Tickhost runs the program: it needs no View or layout, takes no focus, joins this Chat's Monitor and is not subscribed. Omitted `cwd` uses the Agent's file work directory. Add a `placement` only when the user asks for a place (section 3).
 
 For a bundled Tick, use `workspace_host.tick_executable` as the executable; if it is null, explain that the companion `tick` is missing and needs to be built or installed (`make build` and `make install` include it) instead of searching project source for a launcher. The bundled `tick` always opens as a protocol Tick. Build the argv from the requested view:

@@ -1942,8 +1942,6 @@ fn finish_structured_response(
     }
 }
 
-const SCHEMA_COMBINATORS: [&str; 3] = ["oneOf", "anyOf", "allOf"];
-
 fn messages_tools(tools: &[ToolDefinition]) -> Value {
     json!(
         tools
@@ -1951,111 +1949,10 @@ fn messages_tools(tools: &[ToolDefinition]) -> Value {
             .map(|tool| json!({
                 "name": tool.name,
                 "description": tool.description,
-                "input_schema": messages_input_schema(&tool.input_schema),
+                "input_schema": tool.input_schema,
             }))
             .collect::<Vec<_>>()
     )
-}
-
-/// Anthropic Messages accepts only a plain object at the top of a tool's `input_schema`, so a
-/// top-level `oneOf`/`anyOf`/`allOf` (Herdr's ModifyTick has one variant per action) becomes
-/// one object: properties are merged in order, fixed values of a shared property form one
-/// `enum`, and only properties every alternative requires stay required. The tool still
-/// validates its own arguments, and other protocols receive the original schema.
-fn messages_input_schema(schema: &Value) -> Value {
-    let Some(object) = schema.as_object() else {
-        return schema.clone();
-    };
-    if !SCHEMA_COMBINATORS
-        .iter()
-        .any(|keyword| object.contains_key(*keyword))
-    {
-        return schema.clone();
-    }
-    let mut merged = object.clone();
-    let mut properties = match merged.remove("properties") {
-        Some(Value::Object(properties)) => properties,
-        _ => serde_json::Map::new(),
-    };
-    let mut required = merged
-        .remove("required")
-        .and_then(|required| required.as_array().cloned())
-        .unwrap_or_default();
-    let mut required_by_every_alternative: Option<Vec<Value>> = None;
-    let mut every_variant_closed = true;
-    for keyword in SCHEMA_COMBINATORS {
-        let Some(Value::Array(variants)) = merged.remove(keyword) else {
-            continue;
-        };
-        for variant in variants {
-            for (name, property) in variant["properties"].as_object().into_iter().flatten() {
-                merge_schema_property(&mut properties, name, property);
-            }
-            let variant_required = variant["required"].as_array().cloned().unwrap_or_default();
-            if keyword == "allOf" {
-                required.extend(variant_required);
-            } else {
-                required_by_every_alternative = Some(match required_by_every_alternative {
-                    None => variant_required,
-                    Some(previous) => previous
-                        .into_iter()
-                        .filter(|name| variant_required.contains(name))
-                        .collect(),
-                });
-            }
-            every_variant_closed &= variant["additionalProperties"] == false;
-        }
-    }
-    required.extend(required_by_every_alternative.unwrap_or_default());
-    let mut unique_required = Vec::new();
-    for name in required {
-        if !unique_required.contains(&name) {
-            unique_required.push(name);
-        }
-    }
-    merged.insert("type".into(), json!("object"));
-    merged.insert("properties".into(), Value::Object(properties));
-    if unique_required.is_empty() {
-        merged.remove("required");
-    } else {
-        merged.insert("required".into(), Value::Array(unique_required));
-    }
-    if every_variant_closed && !merged.contains_key("additionalProperties") {
-        merged.insert("additionalProperties".into(), json!(false));
-    }
-    Value::Object(merged)
-}
-
-fn merge_schema_property(
-    properties: &mut serde_json::Map<String, Value>,
-    name: &str,
-    incoming: &Value,
-) {
-    let fixed_values = |property: &Value| {
-        property
-            .get("const")
-            .map(|value| vec![value.clone()])
-            .or_else(|| property["enum"].as_array().cloned())
-    };
-    let Some(existing) = properties.get_mut(name) else {
-        properties.insert(name.into(), incoming.clone());
-        return;
-    };
-    let (Some(mut values), Some(added)) = (fixed_values(existing), fixed_values(incoming)) else {
-        return;
-    };
-    for value in added {
-        if !values.contains(&value) {
-            values.push(value);
-        }
-    }
-    if let Some(property) = existing.as_object_mut() {
-        property.remove("const");
-        property.insert("enum".into(), Value::Array(values));
-        if let Some(kind) = incoming.get("type") {
-            property.entry("type").or_insert_with(|| kind.clone());
-        }
-    }
 }
 
 fn messages_content(content: &Content) -> Value {

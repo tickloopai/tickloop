@@ -17,6 +17,7 @@ pub const MODIFY_TICK: &str = "ModifyTick";
 pub const HIDDEN_PLACEMENT: &str = "hidden";
 const PLACEMENT_DIRECTIONS: [&str; 4] = ["left", "right", "up", "down"];
 const HOSTED_REFERENCE: &str = "hosted:<instance id> from an open";
+const HERDR_UNAVAILABLE: &str = "UnsupportedCapability: this Agent does not run in Herdr, so Workspaces and Tick views in Herdr Panes are unavailable; omit placement or pass {\"type\":\"hidden\"} to open the Tick in the Tickhost alone";
 
 #[derive(Debug, thiserror::Error)]
 pub enum TickToolTargetError {
@@ -68,9 +69,7 @@ pub(crate) fn check_call(name: &str, input: &Value, views: bool) -> Result<(), S
         _ => return Err(format!("unknown Tick tool: {name}")),
     }
     if uses_herdr_layout(name, input) && !views {
-        return Err(format!(
-            "UnsupportedCapability: this Agent does not run in Herdr, so Workspaces and Tick views in Herdr Panes are unavailable; omit placement or pass {{\"type\":\"{HIDDEN_PLACEMENT}\"}} to open the Tick in the Tickhost alone"
-        ));
+        return Err(HERDR_UNAVAILABLE.into());
     }
     Ok(())
 }
@@ -150,67 +149,417 @@ fn modify_description(views: bool) -> String {
     parts.join(" ")
 }
 
-fn modify_schema(views: bool) -> Value {
-    let mut placements = vec![
-        json!({"type":"object","properties":{"type":{"const":HIDDEN_PLACEMENT}},"required":["type"],"additionalProperties":false}),
-    ];
-    if views {
-        placements.extend(herdr_placements(true));
-    }
-    let mut open = json!({"type":"object","properties":{"action":{"const":"open"},"command":{"type":"array","minItems":1,"items":{"type":"string"}},"cwd":{"type":"string","minLength":1},"protocol":{"type":"boolean"},"placement":{"type":"object","oneOf":placements}},"required":["action","command"],"additionalProperties":false});
-    if views {
-        open["properties"]["workspace_id"] = json!({"type":"string","minLength":1});
-    }
-    let mut variants = vec![open];
-    if views {
-        variants.push(json!({"type":"object","properties":{"action":{"const":"move"},"tick_instance_id":{"type":"string","minLength":1},"workspace_id":{"type":"string","minLength":1},"placement":{"type":"object","oneOf":herdr_placements(false)}},"required":["action","tick_instance_id"],"additionalProperties":false}));
-    }
-    variants.push(json!({"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":1},"action":{"type":"string","enum":["send_input","close"]},"text":{"type":"string"},"keys":{"type":"array","minItems":1,"items":{"type":"string"}}},"required":["tick_instance_id","action"],"additionalProperties":false}));
-    variants.push(json!({"type":"object","properties":{"action":{"const":"reopen"},"tick_instance_id":{"type":"string","minLength":1}},"required":["action","tick_instance_id"],"additionalProperties":false}));
-    json!({"type":"object","oneOf":variants})
+/// One accepted shape of an object, selected by the value of its discriminating field. The
+/// model sees a single flat object; these forms drive both the field descriptions it reads and
+/// the per-form check its input must pass.
+struct Form {
+    name: &'static str,
+    required: &'static [&'static str],
+    optional: &'static [&'static str],
 }
 
-fn herdr_placements(allow_new_tab: bool) -> Vec<Value> {
-    let mut variants = vec![
-        json!({"type":"object","properties":{"type":{"const":"current_tab"},"direction":{"enum":PLACEMENT_DIRECTIONS}},"required":["type"],"additionalProperties":false}),
-        json!({"type":"object","properties":{"type":{"const":"pane"},"pane_id":{"type":"string","minLength":1},"direction":{"enum":PLACEMENT_DIRECTIONS}},"required":["type","pane_id"],"additionalProperties":false}),
-    ];
-    if allow_new_tab {
-        variants.push(json!({"type":"object","properties":{"type":{"const":"new_tab"}},"required":["type"],"additionalProperties":false}));
+impl Form {
+    fn choice(&self) -> String {
+        match self.required {
+            [] => self.name.to_owned(),
+            required => format!("{} (requires {})", self.name, required.join(", ")),
+        }
     }
-    variants
+
+    fn fields(&self) -> String {
+        match (self.required, self.optional) {
+            ([], []) => "no other fields".to_owned(),
+            (required, []) => format!("only {}", required.join(", ")),
+            ([], optional) => format!("optionally {}", optional.join(", ")),
+            (required, optional) => format!(
+                "{}, and optionally {}",
+                required.join(", "),
+                optional.join(", ")
+            ),
+        }
+    }
+
+    fn check(
+        &self,
+        fields: &serde_json::Map<String, Value>,
+        selector: &str,
+        label: &str,
+    ) -> Result<(), String> {
+        if let Some(missing) = self
+            .required
+            .iter()
+            .find(|field| !fields.contains_key(**field))
+        {
+            return Err(format!("{label} requires {missing}"));
+        }
+        if let Some(extra) = fields.keys().find(|field| {
+            *field != selector
+                && !self.required.contains(&field.as_str())
+                && !self.optional.contains(&field.as_str())
+        }) {
+            return Err(format!(
+                "{extra} is not allowed for {label}; {label} takes {}",
+                self.fields()
+            ));
+        }
+        Ok(())
+    }
+}
+
+const OPEN: Form = Form {
+    name: "open",
+    required: &["command"],
+    optional: &["cwd", "protocol", "placement"],
+};
+const OPEN_IN_HERDR: Form = Form {
+    name: "open",
+    required: &["command"],
+    optional: &["cwd", "protocol", "placement", "workspace_id"],
+};
+const MOVE: Form = Form {
+    name: "move",
+    required: &["tick_instance_id"],
+    optional: &["workspace_id", "placement"],
+};
+const SEND_INPUT: Form = Form {
+    name: "send_input",
+    required: &["tick_instance_id"],
+    optional: &["text", "keys"],
+};
+const CLOSE: Form = Form {
+    name: "close",
+    required: &["tick_instance_id"],
+    optional: &[],
+};
+const REOPEN: Form = Form {
+    name: "reopen",
+    required: &["tick_instance_id"],
+    optional: &[],
+};
+
+const HIDDEN: Form = Form {
+    name: HIDDEN_PLACEMENT,
+    required: &[],
+    optional: &[],
+};
+const CURRENT_TAB: Form = Form {
+    name: "current_tab",
+    required: &[],
+    optional: &["direction"],
+};
+const PANE: Form = Form {
+    name: "pane",
+    required: &["pane_id"],
+    optional: &["direction"],
+};
+const NEW_TAB: Form = Form {
+    name: "new_tab",
+    required: &[],
+    optional: &[],
+};
+
+fn modify_forms(views: bool) -> Vec<Form> {
+    if views {
+        vec![OPEN_IN_HERDR, MOVE, SEND_INPUT, CLOSE, REOPEN]
+    } else {
+        vec![OPEN, SEND_INPUT, CLOSE, REOPEN]
+    }
+}
+
+fn placement_forms(action: &str, views: bool) -> Vec<Form> {
+    match (action, views) {
+        ("move", _) => vec![CURRENT_TAB, PANE],
+        (_, true) => vec![HIDDEN, CURRENT_TAB, PANE, NEW_TAB],
+        (_, false) => vec![HIDDEN],
+    }
+}
+
+/// Which forms require or accept `field`, leading its description so the model knows when to
+/// pass it without a schema variant per form.
+fn usage(field: &str, forms: &[Form]) -> String {
+    let names = |list: fn(&Form) -> &'static [&'static str]| {
+        forms
+            .iter()
+            .filter(|form| list(form).contains(&field))
+            .map(|form| form.name)
+            .collect::<Vec<_>>()
+    };
+    [
+        ("Required by", names(|form| form.required)),
+        ("Optional for", names(|form| form.optional)),
+    ]
+    .into_iter()
+    .filter(|(_, names)| !names.is_empty())
+    .map(|(usage, names)| format!("{usage} {}.", names.join(", ")))
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+fn select_form<'a>(
+    fields: &serde_json::Map<String, Value>,
+    selector: &str,
+    label: &str,
+    forms: &'a [Form],
+) -> Result<&'a Form, String> {
+    let Some(selected) = fields.get(selector) else {
+        let choices = forms.iter().map(Form::choice).collect::<Vec<_>>();
+        return Err(format!(
+            "{label} is required: one of {}",
+            choices.join(", ")
+        ));
+    };
+    selected
+        .as_str()
+        .and_then(|name| forms.iter().find(|form| form.name == name))
+        .ok_or_else(|| {
+            let names = forms.iter().map(|form| form.name).collect::<Vec<_>>();
+            format!("{label} must be one of {}", names.join(", "))
+        })
+}
+
+/// Checks a Tick tool input before any host is asked. ModifyTick must match the form its
+/// action selects, and its placement the form its type selects, so a refusal names the field to
+/// add or drop; the flat model schema then checks every value.
+pub(crate) fn validate_input(
+    name: &str,
+    schema: &Value,
+    input: &Value,
+    views: bool,
+) -> Result<(), String> {
+    if name == MODIFY_TICK
+        && let Some(fields) = input.as_object()
+    {
+        check_modify_form(fields, views)
+            .map_err(|reason| format!("invalid {name} input: {reason}"))?;
+    }
+    crate::validate_host_schema_input(name, schema, input)
+}
+
+fn check_modify_form(fields: &serde_json::Map<String, Value>, views: bool) -> Result<(), String> {
+    let forms = modify_forms(views);
+    let action = select_form(fields, "action", "action", &forms)?;
+    action.check(fields, "action", action.name)?;
+    let Some(placement) = fields.get("placement").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    if !views
+        && placement
+            .get("type")
+            .is_some_and(|kind| kind != HIDDEN_PLACEMENT)
+    {
+        return Err(HERDR_UNAVAILABLE.into());
+    }
+    let forms = placement_forms(action.name, views);
+    let kind = select_form(
+        placement,
+        "type",
+        &format!("placement.type for {}", action.name),
+        &forms,
+    )?;
+    kind.check(placement, "type", &format!("placement type {}", kind.name))
+}
+
+fn modify_schema(views: bool) -> Value {
+    let forms = modify_forms(views);
+    let actions = forms.iter().map(|form| form.name).collect::<Vec<_>>();
+    let mut properties = json!({
+        "action": {"type":"string","enum":actions,"description":format!("One of {}; each takes the fields whose description names it.", actions.join(", "))},
+        "command": {"type":"array","minItems":1,"items":{"type":"string"},"description":format!("{} The program's argv, executable first.", usage("command", &forms))},
+        "cwd": {"type":"string","minLength":1,"description":format!("{} The program's working directory; defaults to the Agent file work directory.", usage("cwd", &forms))},
+        "protocol": {"type":"boolean","description":format!("{} true for a program that speaks the Tick protocol; any other program runs as a terminal Tick.", usage("protocol", &forms))},
+        "placement": placement_schema(&forms, views),
+        "tick_instance_id": {"type":"string","minLength":1,"description":format!("{} The complete hosted: identity an open returned.", usage("tick_instance_id", &forms))},
+        "text": {"type":"string","description":format!("{} Text typed first; pass text, keys or both.", usage("text", &forms))},
+        "keys": {"type":"array","minItems":1,"items":{"type":"string"},"description":format!("{} Logical keys typed after text, such as Enter, Up or Ctrl-C.", usage("keys", &forms))},
+    });
+    if views {
+        properties["workspace_id"] = json!({"type":"string","minLength":1,"description":format!("{} The Herdr Workspace for the view; defaults to the Agent's Work Context.", usage("workspace_id", &forms))});
+    }
+    json!({"type":"object","properties":properties,"required":["action"],"additionalProperties":false})
+}
+
+fn placement_schema(actions: &[Form], views: bool) -> Value {
+    let forms = placement_forms(OPEN.name, views);
+    let types = forms.iter().map(|form| form.name).collect::<Vec<_>>();
+    let mut properties = json!({"type":{"type":"string","enum":types}});
+    let description = if views {
+        properties["type"]["description"] = json!(
+            "hidden shows the Tick nowhere; current_tab places it beside the View carrying this input; pane places it beside pane_id; new_tab opens a new Tab. move takes only current_tab or pane."
+        );
+        properties["direction"] = json!({"type":"string","enum":PLACEMENT_DIRECTIONS,"description":format!("{} Defaults to right.", usage("direction", &forms))});
+        properties["pane_id"] = json!({"type":"string","minLength":1,"description":format!("{} A Pane in the selected Workspace, from ReadWorkspace.", usage("pane_id", &forms))});
+        "A Herdr Pane that shows a view of the Tick; omitted, open shows it nowhere and move uses current_tab."
+    } else {
+        properties["type"]["description"] = json!("hidden is the only placement outside Herdr.");
+        "Outside Herdr it shows the Tick nowhere, the same as omitting placement."
+    };
+    json!({"type":"object","properties":properties,"required":["type"],"additionalProperties":false,"description":format!("{} {description}", usage("placement", actions))})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn validate(input: &Value, views: bool) -> Result<(), String> {
+        validate_input(MODIFY_TICK, &modify_schema(views), input, views)
+    }
+
+    fn refusal(input: &Value, views: bool) -> String {
+        validate(input, views).expect_err(&input.to_string())
+    }
+
     #[test]
-    fn herdr_placements_expose_four_directions_for_both_anchor_types() {
-        for allow_new_tab in [false, true] {
-            let variants = herdr_placements(allow_new_tab);
-            for anchor_type in ["current_tab", "pane"] {
-                let variant = variants
-                    .iter()
-                    .find(|variant| variant["properties"]["type"]["const"] == anchor_type)
-                    .unwrap();
+    fn modify_schema_is_one_flat_object_that_describes_each_field() {
+        for views in [false, true] {
+            let schema = modify_schema(views);
+            assert_eq!(schema["type"], "object");
+            assert_eq!(schema["required"], json!(["action"]));
+            assert_eq!(schema["additionalProperties"], false);
+            assert!(!schema.to_string().contains("Of\""), "{schema}");
+            let actions = if views {
+                json!(["open", "move", "send_input", "close", "reopen"])
+            } else {
+                json!(["open", "send_input", "close", "reopen"])
+            };
+            assert_eq!(schema["properties"]["action"]["enum"], actions);
+            for (field, property) in schema["properties"].as_object().unwrap() {
+                assert!(property["description"].is_string(), "{field}");
+            }
+            let described = |property: &Value, usage: &str| {
+                assert!(
+                    property["description"].as_str().unwrap().starts_with(usage),
+                    "{property}"
+                );
+            };
+            described(&schema["properties"]["command"], "Required by open.");
+            described(&schema["properties"]["text"], "Optional for send_input.");
+            assert_eq!(schema["properties"]["workspace_id"].is_object(), views);
+            let placement = &schema["properties"]["placement"];
+            assert_eq!(placement["required"], json!(["type"]));
+            assert_eq!(placement["additionalProperties"], false);
+            let placement_types = if views {
+                json!(["hidden", "current_tab", "pane", "new_tab"])
+            } else {
+                json!(["hidden"])
+            };
+            assert_eq!(placement["properties"]["type"]["enum"], placement_types);
+            if views {
                 assert_eq!(
-                    variant["properties"]["direction"]["enum"],
+                    placement["properties"]["direction"]["enum"],
                     json!(["left", "right", "up", "down"])
                 );
-                assert!(
-                    !variant["required"]
-                        .as_array()
-                        .unwrap()
-                        .contains(&json!("direction"))
-                );
+                described(&placement["properties"]["pane_id"], "Required by pane.");
             }
+        }
+    }
+
+    #[test]
+    fn modify_input_refusals_name_what_to_change() {
+        let empty = refusal(&json!({}), true);
+        assert!(
+            empty.starts_with("invalid ModifyTick input: action is required: one of "),
+            "{empty}"
+        );
+        for requirement in [
+            "open (requires command)",
+            "move (requires tick_instance_id)",
+            "close (requires tick_instance_id)",
+        ] {
+            assert!(empty.contains(requirement), "{empty}");
+        }
+        for (input, views, reason) in [
+            (json!({"action":"open"}), true, "open requires command"),
+            (
+                json!({"action":"close"}),
+                false,
+                "close requires tick_instance_id",
+            ),
+            (
+                json!({"action":"open","command":["tick"],"text":"x"}),
+                true,
+                "text is not allowed for open; open takes command, and optionally cwd, protocol, placement, workspace_id",
+            ),
+            (
+                json!({"action":"close","tick_instance_id":"hosted:1","keys":["Enter"]}),
+                true,
+                "keys is not allowed for close; close takes only tick_instance_id",
+            ),
+            (
+                json!({"action":"launch"}),
+                true,
+                "action must be one of open, move, send_input, close, reopen",
+            ),
+            (
+                json!({"action":"move","tick_instance_id":"hosted:1"}),
+                false,
+                "action must be one of open, send_input, close, reopen",
+            ),
+            (
+                json!({"action":"open","command":["tick"],"placement":{"type":"pane"}}),
+                true,
+                "placement type pane requires pane_id",
+            ),
+            (
+                json!({"action":"open","command":["tick"],"placement":{"type":"new_tab","direction":"left"}}),
+                true,
+                "direction is not allowed for placement type new_tab; placement type new_tab takes no other fields",
+            ),
+            (
+                json!({"action":"move","tick_instance_id":"hosted:1","placement":{"type":"new_tab"}}),
+                true,
+                "placement.type for move must be one of current_tab, pane",
+            ),
+            (
+                json!({"action":"open","command":["tick"],"placement":{}}),
+                true,
+                "placement.type for open is required: one of hidden, current_tab, pane (requires pane_id), new_tab",
+            ),
+            (
+                json!({"action":"open","command":[]}),
+                true,
+                "input.command has too few items",
+            ),
+        ] {
             assert_eq!(
-                variants
-                    .iter()
-                    .any(|variant| variant["properties"]["type"]["const"] == "new_tab"),
-                allow_new_tab
+                refusal(&input, views),
+                format!("invalid ModifyTick input: {reason}")
             );
+        }
+        let shown_outside_herdr = refusal(
+            &json!({"action":"open","command":["tick"],"placement":{"type":"new_tab"}}),
+            false,
+        );
+        assert!(
+            shown_outside_herdr.contains("UnsupportedCapability"),
+            "{shown_outside_herdr}"
+        );
+    }
+
+    #[test]
+    fn every_modify_form_is_accepted() {
+        for (input, views) in [
+            (
+                json!({"action":"open","command":["tick"],"cwd":"/tmp","protocol":true,"placement":{"type":"hidden"}}),
+                false,
+            ),
+            (
+                json!({"action":"open","command":["tick"],"workspace_id":"w1","placement":{"type":"pane","pane_id":"p1","direction":"up"}}),
+                true,
+            ),
+            (
+                json!({"action":"move","tick_instance_id":"hosted:1","placement":{"type":"current_tab"}}),
+                true,
+            ),
+            (
+                json!({"action":"send_input","tick_instance_id":"hosted:1","text":"q","keys":["Enter"]}),
+                false,
+            ),
+            (
+                json!({"action":"reopen","tick_instance_id":"hosted:1"}),
+                false,
+            ),
+        ] {
+            assert_eq!(validate(&input, views), Ok(()), "{input}");
         }
     }
 

@@ -962,63 +962,6 @@ async fn copilot_responses_streams_with_rotating_item_ids_are_matched_by_positio
     )));
 }
 
-/// Shaped like Herdr's ModifyTick: each action is a top-level `oneOf` variant.
-fn variant_tool() -> ToolDefinition {
-    ToolDefinition {
-        name: "ModifyTick".into(),
-        description: "Open, move, send input or close.".into(),
-        input_schema: json!({"type":"object","oneOf":[
-            {"type":"object","properties":{"action":{"const":"open"},"command":{"type":"array","items":{"type":"string"}},"placement":{"type":"object","oneOf":[{"type":"object","properties":{"type":{"const":"new_tab"}}}]}},"required":["action","command"],"additionalProperties":false},
-            {"type":"object","properties":{"action":{"const":"move"},"tick_instance_id":{"type":"string"}},"required":["action","tick_instance_id"],"additionalProperties":false},
-            {"type":"object","properties":{"tick_instance_id":{"type":"string"},"action":{"type":"string","enum":["send_input","close"]},"text":{"type":"string"}},"required":["tick_instance_id","action"],"additionalProperties":false}
-        ]}),
-    }
-}
-
-#[tokio::test]
-async fn messages_flattens_top_level_schema_variants_that_anthropic_rejects() {
-    let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().canonicalize().unwrap();
-    sign_in(&root).await;
-    let (claude_url, mut claude_requests) =
-        serve_responses(vec![(200, messages_reply("ok"))]).await;
-    let (gpt_url, mut gpt_requests) = serve_responses(vec![(
-        200,
-        responses_reply(vec![json!({"type":"message","id":"msg","role":"assistant","status":"completed","content":[{"type":"output_text","text":"ok"}]})]),
-    )])
-    .await;
-    let mut with_variants = request(vec![user("Hi")], None);
-    with_variants.tools = vec![variant_tool()];
-    complete(
-        configured("claude-haiku-4.5", &claude_url),
-        &root,
-        with_variants.clone(),
-    )
-    .await
-    .unwrap();
-    complete(configured("gpt-6-luna", &gpt_url), &root, with_variants)
-        .await
-        .unwrap();
-    let (_, claude) = claude_requests.recv().await.unwrap();
-    assert_eq!(
-        claude["tools"][0]["input_schema"],
-        json!({
-            "type":"object",
-            "properties":{
-                "action":{"type":"string","enum":["open","move","send_input","close"]},
-                "command":{"type":"array","items":{"type":"string"}},
-                "placement":{"type":"object","oneOf":[{"type":"object","properties":{"type":{"const":"new_tab"}}}]},
-                "tick_instance_id":{"type":"string"},
-                "text":{"type":"string"}
-            },
-            "required":["action"],
-            "additionalProperties":false
-        })
-    );
-    let (_, gpt) = gpt_requests.recv().await.unwrap();
-    assert_eq!(gpt["tools"][0]["parameters"], variant_tool().input_schema);
-}
-
 #[tokio::test]
 async fn budget_thinking_sends_budget_tokens_and_drops_temperature_while_thinking() {
     let directory = tempfile::tempdir().unwrap();
