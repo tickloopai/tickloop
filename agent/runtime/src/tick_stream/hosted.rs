@@ -712,7 +712,7 @@ impl TickStreamPort for HostedTickStream {
         instance: &InstanceRef,
         authority: Option<&HostToolAuthority>,
     ) -> Result<(), String> {
-        if instance.tick_type() != tick_protocol::HOSTED_INSTANCE_TYPE {
+        if instance.access() != tick_protocol::HOSTED_ACCESS {
             return Err("Hosted watch requires a hosted instance".into());
         }
         let scope = self.scope();

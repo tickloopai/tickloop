@@ -18,8 +18,8 @@ impl HostedAdapter {
     }
 }
 impl TickAdapter for HostedAdapter {
-    fn tick_type(&self) -> &'static str {
-        tick_protocol::HOSTED_INSTANCE_TYPE
+    fn access(&self) -> &'static str {
+        tick_protocol::HOSTED_ACCESS
     }
     fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
         self.stream.clone()
@@ -38,8 +38,8 @@ impl ShellAdapter {
     }
 }
 impl TickAdapter for ShellAdapter {
-    fn tick_type(&self) -> &'static str {
-        tick_protocol::SHELL_INSTANCE_TYPE
+    fn access(&self) -> &'static str {
+        tick_protocol::SHELL_ACCESS
     }
     fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
         Some(self.stream.clone())

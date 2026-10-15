@@ -68,9 +68,9 @@ pub(super) fn validate(trigger: &Trigger) -> Result<(), String> {
 /// a Shell Tick is delivered as soon as it updates. Other types deliver periodically, except an
 /// artifact, whose association is its only subscription.
 fn fixed_frequency(instance: &InstanceRef) -> Result<Option<TickSubscriptionFrequency>, String> {
-    match instance.tick_type() {
-        tick_protocol::ARTIFACT_INSTANCE_TYPE => Err(ARTIFACT_SUBSCRIPTION_REFUSAL.into()),
-        tick_protocol::SHELL_INSTANCE_TYPE => Ok(Some(TickSubscriptionFrequency::Immediate)),
+    match instance.access() {
+        tick_protocol::ARTIFACT_ACCESS => Err(ARTIFACT_SUBSCRIPTION_REFUSAL.into()),
+        tick_protocol::SHELL_ACCESS => Ok(Some(TickSubscriptionFrequency::Immediate)),
         _ => Ok(None),
     }
 }

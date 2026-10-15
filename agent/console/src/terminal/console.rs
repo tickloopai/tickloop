@@ -713,7 +713,7 @@ pub(super) struct State {
     full_screen_attach: Option<FullScreenAttach>,
     /// An attached view owns the terminal; nothing is drawn until it is taken back.
     terminal_lent: bool,
-    /// One probe per Tick type whose members' host state can be read: Herdr members inside a
+    /// One probe per access whose members' host state can be read: Herdr members inside a
     /// Herdr View and hosted Ticks in every View.
     member_probes: Vec<Arc<dyn crate::monitor_rows::TickProbe>>,
     member_probe_running: bool,
@@ -949,7 +949,7 @@ struct FooterBarTarget {
     categories: Vec<(std::ops::Range<usize>, FooterItemId)>,
 }
 
-/// One claimed probe of a Chat's members, one per Tick type; the results go back through
+/// One claimed probe of a Chat's members, one per access; the results go back through
 /// `update_member_findings`.
 pub(super) struct MemberProbe {
     pub(super) chat: Uuid,
@@ -1361,7 +1361,7 @@ impl Console {
         state.status = message.into();
         Ok(())
     }
-    /// Adds the probe of one more Tick type's members.
+    /// Adds the probe of one more access's members.
     pub(super) fn add_member_probe(
         &self,
         probe: Arc<dyn crate::monitor_rows::TickProbe>,
@@ -1384,7 +1384,7 @@ impl Console {
             .iter()
             .map(|prober| TypedProbe {
                 prober: prober.clone(),
-                targets: state.monitor.probe_targets(prober.tick_type()),
+                targets: state.monitor.probe_targets(prober.access()),
             })
             .filter(|probe| !probe.targets.is_empty())
             .collect();
@@ -1406,19 +1406,19 @@ impl Console {
         let visible = state.chat == Some(chat) && state.monitor_visible();
         let monitor = state.monitor_for_chat_mut(chat);
         let mut findings = monitor.member_findings.clone();
-        for (tick_type, probed) in results {
+        for (access, probed) in results {
             let Some(probed) = probed else {
                 continue;
             };
             findings
                 .states
-                .retain(|instance, _| instance.tick_type() != tick_type);
+                .retain(|instance, _| instance.access() != access);
             findings
                 .resources
-                .retain(|instance, _| instance.tick_type() != tick_type);
+                .retain(|instance, _| instance.access() != access);
             findings
                 .updates
-                .retain(|instance, _| instance.tick_type() != tick_type);
+                .retain(|instance, _| instance.access() != access);
             findings.states.extend(probed.states);
             findings.resources.extend(probed.resources);
             findings.updates.extend(probed.updates);

@@ -1850,7 +1850,7 @@ async fn authenticate(host: &Arc<Host>, role: Role) -> Result<Authority, HostErr
         Role::Instance {
             instance,
             data_token,
-        } if instance.tick_type() == tick_protocol::SHELL_INSTANCE_TYPE => host
+        } if instance.access() == tick_protocol::SHELL_ACCESS => host
             .state
             .lock()
             .await
@@ -1874,7 +1874,7 @@ async fn authenticate(host: &Arc<Host>, role: Role) -> Result<Authority, HostErr
             .map(Authority::Instance)
             .ok_or_else(|| HostError::before("Forbidden", "unknown instance or data token")),
         Role::Viewer { instance, view } => {
-            let viewed = if instance.tick_type() == tick_protocol::SHELL_INSTANCE_TYPE {
+            let viewed = if instance.access() == tick_protocol::SHELL_ACCESS {
                 host.state
                     .lock()
                     .await

@@ -4,7 +4,7 @@
 //! go to their native tools instead.
 
 use serde_json::{Value, json};
-use tick_protocol::HOSTED_INSTANCE_TYPE;
+use tick_protocol::HOSTED_ACCESS;
 use tickhost_connect::{hosted::ATTACH_INPUT_BYTES, page::MAX_PAGE_SIZE};
 
 use tickloop_agent_protocol::ToolDefinition;
@@ -79,7 +79,7 @@ fn check_target(name: &str, input: &Value) -> Result<(), String> {
     let operation = name.to_owned();
     let target = input["tick_instance_id"].as_str().unwrap_or_default();
     let error = match target.split_once(':').map(|(kind, _)| kind) {
-        Some(HOSTED_INSTANCE_TYPE) => return Ok(()),
+        Some(HOSTED_ACCESS) => return Ok(()),
         Some("artifact") => TickToolTargetError::Artifact { operation },
         Some("shell") => TickToolTargetError::Shell { operation },
         _ => TickToolTargetError::Invalid { operation },

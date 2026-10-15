@@ -1,10 +1,11 @@
-//! The complete identity of one Tick Instance: where it runs and its identity there.
+//! The complete identity of one Tick Instance: its access, how the instance is reached, and its
+//! identity there.
 
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{HOSTED_INSTANCE_TYPE, SHELL_INSTANCE_TYPE};
+use crate::{ARTIFACT_ACCESS, HOSTED_ACCESS, SHELL_ACCESS};
 
 pub fn artifact_instance_id(origin: &str, id: &str) -> String {
     format!("artifact:{}/{id}", origin.trim_end_matches('/'))
@@ -14,32 +15,34 @@ pub fn artifact_instance_id(origin: &str, id: &str) -> String {
 pub struct InstanceRef(String);
 
 impl InstanceRef {
-    pub fn new(tick_type: &str, id: &str) -> Result<Self, &'static str> {
-        Self::validate_type(tick_type)?;
+    pub fn new(access: &str, id: &str) -> Result<Self, &'static str> {
+        Self::validate_access(access)?;
         if id.is_empty() || id.chars().any(char::is_control) {
-            return Err("a Tick Instance requires a type and nonempty identity");
+            return Err("a Tick Instance requires an access and a nonempty identity");
         }
-        if tick_type == "artifact" {
+        if access == ARTIFACT_ACCESS {
             let (origin, artifact_id) = id
                 .rsplit_once('/')
                 .ok_or("invalid Artifact Tick identity")?;
             return Self::artifact(origin, artifact_id);
         }
-        Ok(Self(format!("{tick_type}:{id}")))
+        Ok(Self(format!("{access}:{id}")))
     }
 
-    pub fn validate_type(tick_type: &str) -> Result<(), &'static str> {
-        if tick_type.is_empty()
-            || !tick_type
+    pub fn validate_access(access: &str) -> Result<(), &'static str> {
+        if access.is_empty()
+            || !access
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
         {
-            return Err("a Tick type requires a nonempty identifier");
+            return Err("an access requires a nonempty identifier");
         }
         Ok(())
     }
 
-    pub fn tick_type(&self) -> &str {
+    /// How the instance is reached, the prefix of its identity: `hosted`, `shell` or `artifact`.
+    /// It is not the kind a program reports for itself.
+    pub fn access(&self) -> &str {
         self.0.split_once(':').expect("validated Tick identity").0
     }
 
@@ -48,18 +51,18 @@ impl InstanceRef {
     }
 
     pub fn shell(task_id: impl fmt::Display) -> Self {
-        Self::new(SHELL_INSTANCE_TYPE, &task_id.to_string()).expect("valid Shell task identity")
+        Self::new(SHELL_ACCESS, &task_id.to_string()).expect("valid Shell task identity")
     }
     /// A Tick running in the dedicated Tickhost. `hosted` names where it runs, not a kind of
     /// Tick: its protocol and tools are those of the program it runs.
     pub fn hosted(run: uuid::Uuid) -> Self {
-        Self(format!("{HOSTED_INSTANCE_TYPE}:{run}"))
+        Self(format!("{HOSTED_ACCESS}:{run}"))
     }
 
     /// The run identity of a hosted instance.
     pub fn hosted_run(&self) -> Option<uuid::Uuid> {
         self.0
-            .strip_prefix(HOSTED_INSTANCE_TYPE)?
+            .strip_prefix(HOSTED_ACCESS)?
             .strip_prefix(':')?
             .parse()
             .ok()
@@ -108,10 +111,10 @@ impl std::str::FromStr for InstanceRef {
                 .ok_or("invalid Artifact Tick identity")?;
             return Self::artifact(origin, id);
         }
-        let (tick_type, id) = identity
+        let (access, id) = identity
             .split_once(':')
-            .ok_or("Tick Instance reference requires a type prefix")?;
-        Self::new(tick_type, id)
+            .ok_or("Tick Instance reference requires an access prefix")?;
+        Self::new(access, id)
     }
 }
 

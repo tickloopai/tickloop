@@ -8,11 +8,11 @@ use super::*;
 #[error("{0}")]
 pub struct ProbeError(pub String);
 
-/// Reads the host state of a Chat's members of one Tick type.
+/// Reads the host state of a Chat's members of one access.
 #[async_trait::async_trait]
 pub trait TickProbe: Send + Sync {
-    /// The Tick type whose instances this probe reports on.
-    fn tick_type(&self) -> &'static str;
+    /// The access whose instances this probe reports on.
+    fn access(&self) -> &'static str;
     /// The current host state of `chat`'s member `instances`. A host that cannot be read reports
     /// an error, so earlier findings stay instead of being wiped.
     async fn probe(

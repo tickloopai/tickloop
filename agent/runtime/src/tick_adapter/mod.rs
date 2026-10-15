@@ -1,5 +1,6 @@
-//! Registered Tick adapters supply each Tick type's TickStreamPort; the Loop runtime consumes
-//! their common contract. The Console registers the same `<type>` for its Monitor rows.
+//! Registered Tick adapters supply the TickStreamPort of each access (the instance prefix, such as
+//! `shell:`); the Loop runtime consumes their common contract. The Console registers the same
+//! access for its Monitor rows.
 mod builtin;
 
 pub use crate::tick_stream::ShellTickStream;
@@ -13,7 +14,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 pub trait TickAdapter: Send + Sync + 'static {
-    fn tick_type(&self) -> &'static str;
+    fn access(&self) -> &'static str;
     fn stream(&self) -> Option<Arc<dyn TickStreamPort>>;
 }
 
@@ -25,9 +26,9 @@ impl TickAdapters {
     pub fn new(adapters: impl IntoIterator<Item = Arc<dyn TickAdapter>>) -> Result<Self, String> {
         let mut registered = BTreeMap::new();
         for adapter in adapters {
-            InstanceRef::validate_type(adapter.tick_type())?;
-            if registered.insert(adapter.tick_type(), adapter).is_some() {
-                return Err("duplicate Tick Adapter type".into());
+            InstanceRef::validate_access(adapter.access())?;
+            if registered.insert(adapter.access(), adapter).is_some() {
+                return Err("duplicate Tick Adapter access".into());
             }
         }
         Ok(Self {
@@ -57,9 +58,9 @@ impl TickStreamPort for TickAdapters {
     ) -> Result<Option<crate::tick_stream::PreparedTickWatch>, String> {
         let stream = self
             .adapters
-            .get(instance.tick_type())
+            .get(instance.access())
             .and_then(|adapter| adapter.stream())
-            .ok_or_else(|| format!("Tick Adapter {} is unavailable", instance.tick_type()))?;
+            .ok_or_else(|| format!("Tick Adapter {} is unavailable", instance.access()))?;
         stream.prepare_watch(chat, instance, input, cancel).await
     }
     fn set_watch_authorities(&self, authorities: BTreeMap<WatchId, HostToolAuthority>) {
@@ -79,7 +80,7 @@ impl TickStreamPort for TickAdapters {
     ) -> Result<(), String> {
         let stream = self
             .adapters
-            .get(instance.tick_type())
+            .get(instance.access())
             .and_then(|adapter| adapter.stream())
             .ok_or("Tick stream is unavailable")?;
         stream.revalidate_watch(chat, instance, authority).await
@@ -91,7 +92,7 @@ impl TickStreamPort for TickAdapters {
     ) -> Result<Option<crate::tick_stream::TickObservation>, String> {
         match self
             .adapters
-            .get(instance.tick_type())
+            .get(instance.access())
             .and_then(|adapter| adapter.stream())
         {
             Some(stream) => stream.read_current(chat, instance).await,
@@ -104,7 +105,7 @@ impl TickStreamPort for TickAdapters {
         instance: &InstanceRef,
     ) -> Option<crate::tick_stream::TickObservation> {
         self.adapters
-            .get(instance.tick_type())
+            .get(instance.access())
             .and_then(|adapter| adapter.stream())?
             .sample(watch, instance)
             .await
@@ -126,7 +127,7 @@ impl TickStreamPort for TickAdapters {
                 continue;
             };
             let stream = stream.open();
-            let tick_type = adapter.tick_type();
+            let access = adapter.access();
             let mut receiver = receiver.clone();
             let publisher = publisher.clone();
             tokio::spawn(async move {
@@ -135,7 +136,7 @@ impl TickStreamPort for TickAdapters {
                     let targets = receiver
                         .borrow_and_update()
                         .iter()
-                        .filter(|(_, instance)| instance.tick_type() == tick_type)
+                        .filter(|(_, instance)| instance.access() == access)
                         .map(|(watch, instance)| (*watch, instance.clone()))
                         .collect();
                     stream.desired.send_if_modified(|current| {
@@ -153,7 +154,7 @@ impl TickStreamPort for TickAdapters {
                 }
             });
         }
-        let types = self
+        let accesses = self
             .adapters
             .iter()
             .filter(|(_, adapter)| adapter.stream().is_some())
@@ -166,7 +167,7 @@ impl TickStreamPort for TickAdapters {
                 publisher.retain(&targets);
                 for (watch, instance) in targets
                     .iter()
-                    .filter(|(_, instance)| !types.contains(&instance.tick_type()))
+                    .filter(|(_, instance)| !accesses.contains(&instance.access()))
                 {
                     publisher.state_to(
                         instance.clone(),

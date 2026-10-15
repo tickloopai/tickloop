@@ -1114,7 +1114,7 @@ fn tick_column_spans_content_top_through_working_and_generic_todo_rows() {
 fn fixture_actions(
     instance: &tick_protocol::InstanceRef,
 ) -> Vec<crate::monitor_rows::MonitorAction> {
-    if instance.tick_type() == "artifact" {
+    if instance.access() == "artifact" {
         return crate::monitor_rows::artifact_actions(instance.as_str(), false);
     }
     vec![
@@ -1135,7 +1135,7 @@ fn a_newly_registered_row_intent_runs_through_enter_and_click() {
     use crate::monitor_rows::*;
     struct Calendar;
     impl MonitorRows for Calendar {
-        fn tick_type(&self) -> &'static str {
+        fn access(&self) -> &'static str {
             "cal"
         }
         fn list(&self, _: &MonitorContext) -> Vec<TickDescriptor> {
@@ -1215,11 +1215,11 @@ fn a_newly_registered_row_intent_runs_through_enter_and_click() {
     }
 }
 
-/// A probe of the members of one Tick type that finds every member gone.
+/// A probe of the members of one access that finds every member gone.
 struct FixtureGoneProbe(&'static str);
 #[async_trait::async_trait]
 impl crate::monitor_rows::TickProbe for FixtureGoneProbe {
-    fn tick_type(&self) -> &'static str {
+    fn access(&self) -> &'static str {
         self.0
     }
     async fn probe(
@@ -1243,8 +1243,8 @@ struct FixtureHostedProbe {
 }
 #[async_trait::async_trait]
 impl crate::monitor_rows::TickProbe for FixtureHostedProbe {
-    fn tick_type(&self) -> &'static str {
-        tick_protocol::HOSTED_INSTANCE_TYPE
+    fn access(&self) -> &'static str {
+        tick_protocol::HOSTED_ACCESS
     }
     async fn probe(
         &self,
@@ -1290,7 +1290,7 @@ fn run_probes(
         .iter()
         .map(|typed| {
             (
-                typed.prober.tick_type(),
+                typed.prober.access(),
                 runtime
                     .block_on(typed.prober.probe(probe.chat, &typed.targets))
                     .ok(),
@@ -1299,10 +1299,10 @@ fn run_probes(
         .collect()
 }
 
-/// Members of each Tick type are probed by that type's own probe; a probe that fails keeps its
+/// Members of each access are probed by that access's own probe; a probe that fails keeps its
 /// own earlier findings and never wipes the other's.
 #[test]
-fn each_tick_type_probes_its_own_members_beside_the_others() {
+fn each_access_probes_its_own_members_beside_the_others() {
     let console = Console::test_for_chat(Uuid::new_v4());
     let chat = console.state.lock().unwrap().chat.unwrap();
     let mut snapshot = chat_snapshot(chat);
@@ -1326,11 +1326,7 @@ fn each_tick_type_probes_its_own_members_beside_the_others() {
         .add_member_probe(Arc::new(FixtureHostedProbe { fails: false }))
         .unwrap();
     let probe = console.claim_member_probe().unwrap().unwrap();
-    assert_eq!(
-        probe.probes.len(),
-        2,
-        "one probe per Tick type with members"
-    );
+    assert_eq!(probe.probes.len(), 2, "one probe per access with members");
     console
         .update_member_findings(chat, run_probes(&probe))
         .unwrap();
@@ -1418,9 +1414,7 @@ fn probed_members_report_their_host_state_and_owner() {
         "nothing probes members of a type without a probe"
     );
     console
-        .add_member_probe(Arc::new(FixtureGoneProbe(
-            tick_protocol::HOSTED_INSTANCE_TYPE,
-        )))
+        .add_member_probe(Arc::new(FixtureGoneProbe(tick_protocol::HOSTED_ACCESS)))
         .unwrap();
     let probe = console.claim_member_probe().unwrap().unwrap();
     assert_eq!(probe.chat, chat);
@@ -1433,7 +1427,7 @@ fn probed_members_report_their_host_state_and_owner() {
     let findings = run_probes(&probe);
     console.update_member_findings(chat, findings).unwrap();
     console
-        .update_member_findings(chat, vec![(tick_protocol::HOSTED_INSTANCE_TYPE, None)])
+        .update_member_findings(chat, vec![(tick_protocol::HOSTED_ACCESS, None)])
         .unwrap();
     let state = console.state.lock().unwrap();
     for entry in state.monitor.entries() {
@@ -2087,7 +2081,7 @@ async fn removing_a_subscribed_row_confirms_then_cancels_its_subscriptions() {
     };
     struct Calendar(InMemoryTickStream);
     impl TickAdapter for Calendar {
-        fn tick_type(&self) -> &'static str {
+        fn access(&self) -> &'static str {
             "cal"
         }
         fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
@@ -2138,7 +2132,7 @@ async fn removing_a_subscribed_row_confirms_then_cancels_its_subscriptions() {
         .unwrap();
     assert!(
         console.monitor_has_entries().unwrap(),
-        "a subscription has a row even without a Tick type of its own"
+        "a subscription has a row even without Monitor rows of its access"
     );
     let context = TickActionContext {
         agent: &agent,
@@ -2284,7 +2278,7 @@ fn a_gone_row_leaves_monitor_thirty_seconds_after_it_went() {
         .update_member_findings(
             chat,
             vec![(
-                tick_protocol::HOSTED_INSTANCE_TYPE,
+                tick_protocol::HOSTED_ACCESS,
                 Some(MemberFindings {
                     states: [(gone.clone(), MemberState::Gone)].into(),
                     ..Default::default()

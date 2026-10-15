@@ -13,11 +13,11 @@ pub(crate) const HOSTED_REOPEN_KEY: char = 'n';
 /// Ticks this Chat opened in the dedicated Tickhost. They belong to the Chat that opened them.
 pub struct HostedRows;
 impl MonitorRows for HostedRows {
-    fn tick_type(&self) -> &'static str {
-        tick_protocol::HOSTED_INSTANCE_TYPE
+    fn access(&self) -> &'static str {
+        tick_protocol::HOSTED_ACCESS
     }
     fn list(&self, context: &MonitorContext) -> Vec<TickDescriptor> {
-        subscriptions(context, self.tick_type())
+        subscriptions(context, self.access())
             .map(|row| TickDescriptor {
                 instance: row.instance.clone(),
                 group: TickGroup::Ticks,
@@ -86,8 +86,8 @@ impl MonitorRows for HostedRows {
 /// subscription and the only one its row shows.
 pub struct ArtifactRows;
 impl MonitorRows for ArtifactRows {
-    fn tick_type(&self) -> &'static str {
-        tick_protocol::ARTIFACT_INSTANCE_TYPE
+    fn access(&self) -> &'static str {
+        tick_protocol::ARTIFACT_ACCESS
     }
     fn takes_tick_subscriptions(&self) -> bool {
         false
@@ -190,7 +190,7 @@ impl MonitorRows for ArtifactRows {
 
 pub struct ShellRows;
 impl MonitorRows for ShellRows {
-    fn tick_type(&self) -> &'static str {
+    fn access(&self) -> &'static str {
         "shell"
     }
     fn list(&self, context: &MonitorContext) -> Vec<TickDescriptor> {
@@ -592,10 +592,10 @@ pub(super) fn link_tone(link: TickLinkState) -> StatusTone {
 
 fn subscriptions<'a>(
     context: &'a MonitorContext,
-    tick_type: &'a str,
+    access: &'a str,
 ) -> impl Iterator<Item = &'a TickSubscriptionStatus> {
     context.subscriptions.iter().filter(move |row| {
-        row.instance.tick_type() == tick_type
+        row.instance.access() == access
             && !matches!(row.loop_state, LoopState::Stopped | LoopState::Expired)
     })
 }
