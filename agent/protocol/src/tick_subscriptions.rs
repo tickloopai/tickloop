@@ -40,6 +40,14 @@ impl TickSubscriptionFrequency {
         }
     }
 
+    /// The periodic frequency after this one, high again after low; `None` for an immediate one.
+    pub fn next_periodic(self) -> Option<Self> {
+        let index = Self::PERIODIC
+            .iter()
+            .position(|frequency| *frequency == self)?;
+        Some(Self::PERIODIC[(index + 1) % Self::PERIODIC.len()])
+    }
+
     /// The name the model tool and the View use.
     pub fn name(self) -> &'static str {
         match self {

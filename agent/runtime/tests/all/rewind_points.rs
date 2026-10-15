@@ -14,7 +14,8 @@ use serde_json::json;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
     ChatId, Content, Event, EventKind, ExecutionMode, InputContext, ModelIdentity, PermissionScope,
-    RewindPoint, Role, RunId, TextContext, Trigger, TriggerSource, UserShellState,
+    RewindPoint, Role, RunId, TextContext, Trigger, TriggerPromptSource, TriggerSource,
+    UserShellState,
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::{ScriptedModel, call, config, text};
@@ -450,6 +451,7 @@ async fn explicit_events_and_timer_runs_preserve_the_single_real_user_checkpoint
                 Some(Trigger {
                     id: Uuid::new_v4(),
                     prompt: "Scheduled or external observation".into(),
+                    prompt_source: TriggerPromptSource::Explicit,
                     interval_seconds: timer.then_some(1),
                     expires_at_ms: None,
                     accepts_events: !timer,

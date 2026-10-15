@@ -303,10 +303,10 @@ async fn event_navigation_does_not_publish_business_changes_and_view_does_reload
     .await
     .unwrap();
     assert_eq!(view.content()["status"], "loading");
-    assert!(view.content()["candles"].as_array().unwrap().is_empty());
+    assert_eq!(view.content()["history"]["candles"], 0);
     view.load_event(&api).await.unwrap();
     assert_eq!(view.content()["period"], "5m");
-    assert_eq!(view.content()["candles"].as_array().unwrap().len(), 2);
+    assert_eq!(view.content()["history"]["candles"], 2);
 }
 
 #[tokio::test]
@@ -323,7 +323,7 @@ async fn failed_new_event_does_not_mislabel_old_candles_and_can_retry() {
     *api.fail.lock().unwrap() = true;
     assert!(view.load_event(&api).await.is_err());
     assert_eq!(view.content()["status"], "unavailable");
-    assert!(view.content()["candles"].as_array().unwrap().is_empty());
+    assert_eq!(view.content()["history"]["candles"], 0);
     *api.fail.lock().unwrap() = false;
     view.load_event(&api).await.unwrap();
     assert_eq!(view.content()["status"], "ready");
@@ -525,6 +525,37 @@ async fn large_event_windows_publish_bounded_pages_and_expose_the_next_offset() 
     );
 }
 
+#[tokio::test]
+async fn an_event_window_publishes_a_summary_and_leaves_its_candles_to_event_history() {
+    let api = tick_builtin::DemoApi::new().unwrap();
+    let mut config = config();
+    config.range = EventRange::FiveSessions;
+    let data = load_history(&api, "DEMO.US", CandleAdjust::None, &config)
+        .await
+        .unwrap();
+    let mut view = KlineView::with_event(request(), config).unwrap();
+    view.load_event(&api).await.unwrap();
+
+    let state = view.content();
+    let bytes = serde_json::to_vec(&state).unwrap().len();
+    assert!(bytes <= 2048, "{bytes} bytes: {state}");
+    assert!(state.get("candles").is_none() && state.get("sessions").is_none());
+    assert_eq!(state["status"], "ready");
+    assert!(state["window"]["start"].is_string());
+    let latest = data.candles.last().unwrap();
+    assert_eq!(
+        state["latest"]["close"],
+        latest.close.normalize().to_string()
+    );
+    assert_eq!(
+        state["history"]["candles"],
+        json!(data.candles.len()),
+        "the summary counts the whole window, beyond one event_history page"
+    );
+    assert!(data.candles.len() > 1000);
+    assert_eq!(state["history"]["tool"], "event_history");
+}
+
 struct CappedHistory {
     demo: tick_builtin::DemoApi,
     offsets: Mutex<Vec<time::PrimitiveDateTime>>,
@@ -712,7 +743,7 @@ async fn research_context_switches_symbol_period_and_event_without_reusing_old_d
     .await
     .unwrap();
     view.load_event(&api).await.unwrap();
-    assert_eq!(view.content()["candles"].as_array().unwrap().len(), 5);
+    assert_eq!(view.content()["history"]["candles"], 5);
     let mut state = ViewState::default();
     view.on_key(KeyCode::Char('a'), &api, &mut state)
         .await
@@ -742,7 +773,7 @@ async fn research_context_switches_symbol_period_and_event_without_reusing_old_d
     .await
     .unwrap();
     assert_eq!(view.content()["status"], "loading");
-    assert!(view.content()["candles"].as_array().unwrap().is_empty());
+    assert_eq!(view.content()["history"]["candles"], 0);
     assert_eq!(view.content()["symbol"], "OTHER.US");
     view.load_event(&api).await.unwrap();
     assert!(view.content()["window"]["published_at"].is_null());
@@ -758,5 +789,5 @@ async fn research_context_switches_symbol_period_and_event_without_reusing_old_d
     view.set_research_context(missing).unwrap();
     view.refresh(&api).await.unwrap();
     assert_eq!(view.content()["status"], "unavailable");
-    assert!(view.content()["candles"].as_array().unwrap().is_empty());
+    assert_eq!(view.content()["history"]["candles"], 0);
 }

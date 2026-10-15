@@ -67,7 +67,101 @@ async fn kline_once_outputs_adjusted_candles_without_reapplying_adjustment() {
     assert_eq!(record["data"]["symbol"], "700.HK");
     assert_eq!(record["data"]["period"], "day");
     assert_eq!(record["data"]["adjust"], "forward");
-    assert_eq!(record["data"]["candles"], rows);
+    assert_eq!(record["data"]["latest"], rows[2]);
+    assert_eq!(record["data"]["history"]["candles"], 3);
+    assert!(record["data"].get("candles").is_none());
+}
+
+/// A full live window: 998 minute candles, then the two the summary reports.
+fn live_window() -> Vec<Candle> {
+    let opened = time::macros::datetime!(2026-10-13 01:30 UTC);
+    let mut candles: Vec<Candle> = (0..998)
+        .map(|minute| {
+            let price = rust_decimal::Decimal::new(47_000 + minute % 50 * 10, 2);
+            Candle {
+                timestamp: opened + time::Duration::minutes(minute),
+                open: price,
+                high: price + rust_decimal::Decimal::new(85, 2),
+                low: price - rust_decimal::Decimal::new(65, 2),
+                close: price + rust_decimal::Decimal::new(20, 2),
+                volume: 1_234_500 + minute,
+                turnover: rust_decimal::Decimal::new(59_281_234_567 + minute, 2),
+            }
+        })
+        .collect();
+    candles.extend(
+        serde_json::from_value::<Vec<Candle>>(json!([
+            {"timestamp":"2026-10-13T18:08:00Z", "open":"479.8", "high":"480.6", "low":"479.2", "close":"480.2", "volume":1210000, "turnover":"581042000.25"},
+            {"timestamp":"2026-10-13T18:09:00Z", "open":"480.2", "high":"492.4", "low":"479.6", "close":"491.8", "volume":1830000, "turnover":"897123456.5"}
+        ]))
+        .unwrap(),
+    );
+    candles
+}
+
+#[tokio::test]
+async fn kline_state_summarises_the_latest_candle_within_a_kilobyte() {
+    use tick_market::runtime::LiveView;
+    let request = CandleRequest {
+        symbol: "700.HK".into(),
+        period: CandlePeriod::OneMinute,
+        count: kline::MAX_CANDLES,
+        adjust: CandleAdjust::Forward,
+    };
+    let mut view = kline::KlineView::new(request, live_window(), true);
+    for (label, price) in [("support", 470.5), ("resistance", 495.0), ("stop", 461.25)] {
+        view.act(tick_sdk::tools::ToolCall {
+            tool: "mark".into(),
+            args: json!({"price": price, "label": label}),
+        })
+        .await
+        .unwrap();
+    }
+
+    let state = view.content();
+    let bytes = serde_json::to_vec(&state).unwrap().len();
+    assert!(bytes <= 1024, "{bytes} bytes: {state}");
+    assert_eq!(
+        state,
+        json!({
+            "symbol": "700.HK", "period": "1m", "adjust": "forward",
+            "update_source": "server_adjusted_snapshot",
+            "latest": {"timestamp":"2026-10-13T18:09:00Z", "open":"480.2", "high":"492.4", "low":"479.6", "close":"491.8", "volume":1830000, "turnover":"897123456.5"},
+            "previous_close": "480.2", "change": "11.6", "change_percent": "2.42",
+            "history": {"candles": 1000, "first": "2026-10-13T01:30:00Z", "last": "2026-10-13T18:09:00Z", "tool": "candles"},
+            "marks": [
+                {"label": "support", "price": 470.5},
+                {"label": "resistance", "price": 495.0},
+                {"label": "stop", "price": 461.25}
+            ]
+        })
+    );
+    assert_eq!(
+        TickKind::Kline.descriptor().recover_with,
+        state["history"]["tool"].as_str(),
+        "the state names the same detail tool the catalog recovers with"
+    );
+}
+
+#[test]
+fn a_kline_without_an_earlier_candle_reports_no_change() {
+    use tick_market::runtime::LiveView;
+    let request = CandleRequest {
+        symbol: "700.HK".into(),
+        period: CandlePeriod::Day,
+        count: 3,
+        adjust: CandleAdjust::None,
+    };
+    let single = kline::KlineView::new(request.clone(), candles()[2..].to_vec(), false).content();
+    assert_eq!(single["latest"]["close"], "118");
+    assert!(single["previous_close"].is_null() && single["change"].is_null());
+    assert!(single["change_percent"].is_null());
+    let empty = kline::KlineView::new(request, Vec::new(), false).content();
+    assert!(empty["latest"].is_null());
+    assert_eq!(
+        empty["history"],
+        json!({"candles": 0, "first": null, "last": null, "tool": "candles"})
+    );
 }
 
 struct LiveHistory {
@@ -184,7 +278,7 @@ async fn kline_cursor_period_and_push_updates_share_one_live_chart() {
         3,
         "snapshot, new period, changed candle; cursor and overlay are UI state"
     );
-    assert_eq!(records[2]["data"]["candles"][2]["close"], "125");
+    assert_eq!(records[2]["data"]["latest"]["close"], "125");
     assert_eq!(
         *api.subscriptions.lock().unwrap(),
         vec![
@@ -262,7 +356,7 @@ async fn periods_without_push_refresh_on_the_documented_interval() {
     assert_eq!(api.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     let records: Vec<Value> = updates.records().all();
     assert_eq!(records.len(), 2);
-    assert_eq!(records[1]["data"]["candles"][2]["close"], "119");
+    assert_eq!(records[1]["data"]["latest"]["close"], "119");
     let screen: String = terminal
         .backend()
         .buffer()
@@ -348,8 +442,8 @@ async fn forward_adjusted_history_accepts_only_complete_adjusted_updates() {
     producer.await.unwrap();
     let records: Vec<Value> = updates.records().all();
     assert_eq!(records.len(), 2);
-    assert_eq!(records[1]["data"]["candles"][0]["open"], "96");
-    assert_eq!(records[1]["data"]["candles"][2]["close"], "119");
+    assert_eq!(records[1]["data"]["latest"]["close"], "119");
+    assert_eq!(records[1]["data"]["previous_close"], "102");
     assert_eq!(
         records[1]["data"]["update_source"],
         "server_adjusted_snapshot"
@@ -708,11 +802,11 @@ async fn pushed_periods_sync_missing_history_and_reject_regressive_raw_candles()
     );
     let complete = &records[1]["data"];
     assert_eq!(complete["update_source"], "server_snapshot");
-    assert_eq!(complete["candles"].as_array().unwrap().len(), 3);
-    assert_eq!(complete["candles"][2]["high"], "130");
-    assert_eq!(complete["candles"][2]["low"], "98");
-    assert_eq!(complete["candles"][2]["volume"], 500);
-    assert_eq!(complete["candles"][2]["turnover"], "60000");
+    assert_eq!(complete["history"]["candles"], 3);
+    assert_eq!(complete["latest"]["high"], "130");
+    assert_eq!(complete["latest"]["low"], "98");
+    assert_eq!(complete["latest"]["volume"], 500);
+    assert_eq!(complete["latest"]["turnover"], "60000");
     let screen: String = terminal
         .backend()
         .buffer()
@@ -865,7 +959,7 @@ async fn assert_failed_switch_keeps_original_period(failure: SwitchFailure) {
             .iter()
             .all(|record| record["data"]["period"] == "day")
     );
-    assert_eq!(records[1]["data"]["candles"][2]["close"], "125");
+    assert_eq!(records[1]["data"]["latest"]["close"], "125");
 }
 #[tokio::test(start_paused = true)]
 async fn failed_new_period_subscription_is_rolled_back() {
@@ -933,7 +1027,7 @@ async fn delayed_server_snapshot_cannot_overwrite_a_newer_history_refresh() {
         2,
         "the delayed earlier request must not publish a rollback"
     );
-    assert_eq!(records[1]["data"]["candles"][2]["volume"], 500);
+    assert_eq!(records[1]["data"]["latest"]["volume"], 500);
     assert!(records[1]["data"].get("requested_at").is_none());
     let screen: String = terminal
         .backend()

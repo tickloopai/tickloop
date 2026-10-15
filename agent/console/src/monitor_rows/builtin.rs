@@ -1120,6 +1120,7 @@ mod tests {
             quote_row.subscription,
             Some(SubscriptionMark {
                 frequency: TickSubscriptionFrequency::High,
+                is_waiting: true,
                 next_check: None,
             }),
             "the mark counts nothing"
@@ -1128,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tick_row_marks_its_most_frequent_subscription_and_counts_down_to_its_nearest_check() {
+    fn a_tick_row_marks_its_most_frequent_subscription_and_the_nearest_check_holding_updates() {
         let quote = InstanceRef::new("hosted", "quote-run").unwrap();
         let checked = |frequency, next_check_at_ms| TickSubscriptionStatus {
             frequency,
@@ -1136,7 +1137,7 @@ mod tests {
             period_ms: frequency
                 .period()
                 .map(|period: std::time::Duration| period.as_millis() as u64),
-            ..subscription(&quote, None, 0)
+            ..subscription(&quote, None, 1)
         };
         let mark = |subscriptions: Vec<TickSubscriptionStatus>| {
             MonitorRowsRegistry::builtin()
@@ -1155,12 +1156,38 @@ mod tests {
             ]),
             Some(SubscriptionMark {
                 frequency: TickSubscriptionFrequency::High,
+                is_waiting: true,
                 next_check: Some(NextCheck {
                     at_ms: 65_000,
                     period_ms: 1_800_000,
                 }),
             }),
-            "the most frequent colours the mark and the nearest check counts down"
+            "the most frequent colours the mark and the nearest check hands the updates over"
+        );
+        assert_eq!(
+            mark(vec![
+                checked(TickSubscriptionFrequency::Low, 65_000),
+                TickSubscriptionStatus {
+                    accumulated: 0,
+                    ..checked(TickSubscriptionFrequency::High, 60_000)
+                },
+            ])
+            .and_then(|mark| mark.next_check)
+            .map(|check| check.at_ms),
+            Some(65_000),
+            "a sooner check with nothing to hand over is not the one the row waits for"
+        );
+        assert_eq!(
+            mark(vec![TickSubscriptionStatus {
+                accumulated: 0,
+                ..checked(TickSubscriptionFrequency::High, 60_000)
+            }]),
+            Some(SubscriptionMark {
+                frequency: TickSubscriptionFrequency::High,
+                is_waiting: false,
+                next_check: None,
+            }),
+            "a quiet subscription waits for nothing"
         );
         assert_eq!(
             mark(vec![TickSubscriptionStatus {
@@ -1169,6 +1196,7 @@ mod tests {
             }]),
             Some(SubscriptionMark {
                 frequency: TickSubscriptionFrequency::Medium,
+                is_waiting: true,
                 next_check: None,
             }),
             "a check without its period counts nothing down"

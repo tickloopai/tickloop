@@ -77,7 +77,8 @@ pub enum TickIntent {
     /// Starts a new instance in place of a hosted Tick that no longer runs, in its row's place;
     /// the Console asks first, offering to restore the old instance's Tick Subscriptions.
     ReopenHosted(InstanceRef),
-    /// Subscribes the Chat to a protocol or terminal Tick at the default frequency.
+    /// Subscribes the Chat to a protocol or terminal Tick at the default frequency, or, once one
+    /// of its Loops subscribes to it, cycles that subscription through high, medium and low.
     Subscribe(InstanceRef),
     /// Stops a running Shell; the Console asks for confirmation first.
     StopShell {
@@ -96,12 +97,11 @@ pub enum TickIntent {
     },
 }
 
-/// Where the subscription detail of a row starts. Editing and cancelling go straight to the one
+/// Where the subscription detail of a row starts. Cancelling goes straight to the one
 /// subscription when the row has only one; with several the user picks one first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubscriptionOperation {
     View,
-    EditFrequency,
     Cancel,
 }
 
@@ -188,12 +188,14 @@ impl RowUpdate {
 }
 
 /// How a row marks the periodic Tick Subscriptions on its instance: `⟳` in the colour of the most
-/// frequent, counting down to the nearest next check. Immediate subscriptions, which Shells and
-/// artifacts have by default, are never marked.
+/// frequent, and whether updates wait on them for a check to hand them to the Agent. Immediate
+/// subscriptions, which Shells and artifacts have by default, are never marked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubscriptionMark {
     pub frequency: TickSubscriptionFrequency,
-    /// The nearest next check, once the Agent reports one.
+    /// Whether one of them holds updates its next check hands to the Agent.
+    pub is_waiting: bool,
+    /// The nearest next check among those holding updates, once the Agent reports one.
     pub next_check: Option<NextCheck>,
 }
 
@@ -205,9 +207,11 @@ impl SubscriptionMark {
             .clone()
             .map(|row| row.frequency)
             .min_by_key(|frequency| frequency.period())?;
+        let waiting = periodic.filter(|row| row.accumulated > 0);
         Some(Self {
             frequency,
-            next_check: periodic
+            is_waiting: waiting.clone().next().is_some(),
+            next_check: waiting
                 .filter_map(|row| NextCheck::of(row))
                 .min_by_key(|check| check.at_ms),
         })
@@ -313,10 +317,10 @@ pub enum MemberState {
 /// The row action Enter and a click run.
 pub const MONITOR_ENTER_KEY: char = 'o';
 pub const MONITOR_REFRESH_KEY: char = 'r';
-/// Changes the frequency of a subscribed row's subscription.
-pub const SUBSCRIPTION_FREQUENCY_KEY: char = 'e';
 /// Cancels a subscribed row's subscription after confirmation.
 pub const UNSUBSCRIBE_KEY: char = 'u';
+/// What the subscribe key does on a row with a periodic subscription.
+const FREQUENCY_LABEL: &str = "frequency";
 /// Shows a subscribed row's Tick Subscriptions; Enter stays with opening the Tick.
 pub const SUBSCRIPTIONS_KEY: char = 'w';
 /// Keys the Monitor list itself owns. Row actions never use them, so the list's hints always
@@ -410,9 +414,10 @@ fn subscription_descriptor(row: &TickSubscriptionStatus) -> TickDescriptor {
     }
 }
 
-/// Marks the row with its periodic Tick Subscriptions and adds the keys that manage all of them;
-/// the frequency key only while one of them can change, which an immediate one cannot. Enter
-/// always opens the Tick itself; a row without its own opening shows the Tick's details.
+/// Marks the row with its periodic Tick Subscriptions and adds the keys that manage all of them.
+/// While one of them can change frequency, which an immediate one cannot, the subscribe key
+/// cycles it instead. Enter always opens the Tick itself; a row without its own opening shows the
+/// Tick's details.
 fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus]) {
     entry.subscription = SubscriptionMark::of(rows);
     let instance = entry.instance.clone();
@@ -434,7 +439,25 @@ fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus])
             },
         );
     }
-    let can_change_frequency = rows.iter().any(|row| row.frequency.period().is_some());
+    if rows.iter().any(|row| row.frequency.period().is_some()) {
+        let is_key_free = !entry
+            .actions
+            .iter()
+            .any(|action| action.key == SUBSCRIBE_KEY);
+        match entry
+            .actions
+            .iter_mut()
+            .find(|action| matches!(action.intent, TickIntent::Subscribe(_)))
+        {
+            Some(subscribe) => subscribe.label = FREQUENCY_LABEL,
+            None if is_key_free => entry.actions.push(MonitorAction {
+                key: SUBSCRIBE_KEY,
+                label: FREQUENCY_LABEL,
+                intent: TickIntent::Subscribe(instance.clone()),
+            }),
+            None => {}
+        }
+    }
     for (key, label, operation) in [
         (
             SUBSCRIPTIONS_KEY,
@@ -442,19 +465,11 @@ fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus])
             SubscriptionOperation::View,
         ),
         (
-            SUBSCRIPTION_FREQUENCY_KEY,
-            "frequency",
-            SubscriptionOperation::EditFrequency,
-        ),
-        (
             UNSUBSCRIBE_KEY,
             "unsubscribe",
             SubscriptionOperation::Cancel,
         ),
     ] {
-        if key == SUBSCRIPTION_FREQUENCY_KEY && !can_change_frequency {
-            continue;
-        }
         if !entry.actions.iter().any(|action| action.key == key) {
             entry.actions.push(MonitorAction {
                 key,

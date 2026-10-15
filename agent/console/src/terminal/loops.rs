@@ -2,7 +2,7 @@ use super::execution::ConsoleExecution as Agent;
 use uuid::Uuid;
 
 use super::{current_time_ms, safe_text};
-use tickloop_agent_protocol::Trigger;
+use tickloop_agent_protocol::{Trigger, TriggerPromptSource};
 
 pub(super) const SYNTAX: &str = "use /loops [GOAL_ID|new|trigger [GOAL_ID]|schedule GOAL_ID SECONDS [--for DURATION_SECONDS] PROMPT]";
 
@@ -134,6 +134,7 @@ impl TimerSchedule {
         let mut trigger = current.unwrap_or(Trigger {
             id: Uuid::new_v4(),
             prompt: String::new(),
+            prompt_source: TriggerPromptSource::Explicit,
             interval_seconds: None,
             expires_at_ms: None,
             accepts_events: false,
@@ -144,7 +145,7 @@ impl TimerSchedule {
         trigger.armed = true;
         trigger.interval_seconds = Some(self.interval_seconds);
         trigger.expires_at_ms = self.expires_at_ms()?;
-        trigger.prompt = self.prompt;
+        trigger.set_explicit_prompt(self.prompt);
         Ok(trigger)
     }
 }
@@ -172,7 +173,13 @@ pub(super) fn trigger_lines(trigger: Option<&Trigger>) -> Vec<String> {
                 )
             }),
         format!("Tick Subscriptions: {}", trigger.subscriptions.len()),
-        format!("Prompt: {}", safe_text(&trigger.prompt)),
+        match trigger.prompt_source {
+            TriggerPromptSource::Explicit => format!("Prompt: {}", safe_text(&trigger.prompt)),
+            TriggerPromptSource::LoopGoal => format!(
+                "Prompt: the Loop goal, delivered as background: {}",
+                safe_text(&trigger.prompt)
+            ),
+        },
     ]
 }
 
@@ -237,5 +244,24 @@ mod tests {
         ] {
             assert!(TimerSchedule::parse(invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn scheduling_over_a_goal_fallback_trigger_makes_its_prompt_explicit() {
+        let fallback = Trigger::for_loop_goal("watch 700.HK");
+        assert_eq!(
+            trigger_lines(Some(&fallback)).last().unwrap(),
+            "Prompt: the Loop goal, delivered as background: watch 700.HK"
+        );
+        let scheduled = TimerSchedule::parse("60 check the price")
+            .unwrap()
+            .prepare(Some(fallback))
+            .unwrap();
+        assert_eq!(scheduled.prompt, "check the price");
+        assert_eq!(scheduled.prompt_source, TriggerPromptSource::Explicit);
+        assert_eq!(
+            trigger_lines(Some(&scheduled)).last().unwrap(),
+            "Prompt: check the price"
+        );
     }
 }

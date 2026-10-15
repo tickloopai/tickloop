@@ -35,7 +35,7 @@ use tickloop_agent_protocol::{
 
 const SUBSCRIPTION_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const ALREADY_SUBSCRIBED: &str =
-    "a Loop of this Chat already subscribes to this Tick; e changes the frequency";
+    "a Loop of this Chat already subscribes to this Tick; f cycles its frequency";
 const NO_SUBSCRIBING_LOOP: &str = "no Loop of this Chat can take its Tick Updates";
 
 const SUBSCRIBE_TICK_TOOL: &str = "SubscribeTick";
@@ -1042,15 +1042,9 @@ impl Agent {
                 .find(|goal| goal.id == loop_id)
                 .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
                 .ok_or_else(|| AgentError::Invalid(NO_SUBSCRIBING_LOOP.into()))?;
-            goal.trigger.clone().unwrap_or_else(|| Trigger {
-                id: Uuid::new_v4(),
-                prompt: goal.goal.clone(),
-                interval_seconds: None,
-                expires_at_ms: None,
-                accepts_events: true,
-                armed: true,
-                subscriptions: Vec::new(),
-            })
+            goal.trigger
+                .clone()
+                .unwrap_or_else(|| Trigger::for_loop_goal(&goal.goal))
         };
         if trigger
             .subscriptions
@@ -1117,15 +1111,10 @@ impl Agent {
             .run_cancel(receipt.run_id)
             .cloned()
             .ok_or_else(|| "run is unavailable".to_string())?;
-        let mut trigger = goal.trigger.clone().unwrap_or_else(|| Trigger {
-            id: Uuid::new_v4(),
-            prompt: goal.goal.clone(),
-            interval_seconds: None,
-            expires_at_ms: None,
-            accepts_events: true,
-            armed: true,
-            subscriptions: Vec::new(),
-        });
+        let mut trigger = goal
+            .trigger
+            .clone()
+            .unwrap_or_else(|| Trigger::for_loop_goal(&goal.goal));
         drop(chats);
         if let Some(existing) = trigger
             .subscriptions

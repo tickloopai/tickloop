@@ -127,7 +127,7 @@ use tickloop_agent_protocol::{
     PermissionChange, PermissionRule, PermissionScope, PromptPolicy, QuestionRequest,
     ReasoningEffort, Receipt, ShellTaskNotice, ShellTaskOrigin, ShellTaskPromptWatchdog,
     ShellTaskState, TakenBackPrompt, TaskNotification, TaskNotificationStatus, TodoItem, Trigger,
-    TriggerSource, Usage, UserInput, UserShellRecord, UserShellState, ViewRef,
+    TriggerPromptSource, TriggerSource, Usage, UserInput, UserShellRecord, UserShellState, ViewRef,
 };
 use workflows::Workflow;
 
@@ -5392,6 +5392,7 @@ async fn trigger_control(
     let mut trigger = current.unwrap_or(Trigger {
         id: uuid::Uuid::new_v4(),
         prompt: String::new(),
+        prompt_source: TriggerPromptSource::Explicit,
         interval_seconds: None,
         expires_at_ms: None,
         accepts_events: false,
@@ -5401,7 +5402,7 @@ async fn trigger_control(
     trigger.id = uuid::Uuid::new_v4();
     trigger.armed = true;
     if let Some(prompt) = command.strip_prefix("/events ") {
-        trigger.prompt = prompt.trim().into();
+        trigger.set_explicit_prompt(prompt.trim().into());
         trigger.accepts_events = true;
     }
     agent
@@ -5569,6 +5570,7 @@ async fn parse_after_turn(
                 .unwrap_or(Trigger {
                     id: uuid::Uuid::new_v4(),
                     prompt: String::new(),
+                    prompt_source: TriggerPromptSource::Explicit,
                     interval_seconds: None,
                     expires_at_ms: None,
                     accepts_events: false,
@@ -5578,7 +5580,7 @@ async fn parse_after_turn(
             trigger.id = uuid::Uuid::new_v4();
             trigger.armed = true;
             trigger.accepts_events = true;
-            trigger.prompt = arguments.into();
+            trigger.set_explicit_prompt(arguments.into());
             Ok(AfterTurnAction::Loop {
                 action: LoopAction::ConfigureTrigger {
                     loop_id,

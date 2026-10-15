@@ -1757,7 +1757,7 @@ mod tests {
             "id": Uuid::from_u128(701),
             "workdir": "/workspace",
             "messages": [
-                user_text(&tickloop_agent_protocol::local_messages::tick_delivery(&payload, "watch 700.HK")),
+                user_text(&tickloop_agent_protocol::local_messages::tick_delivery(&payload, &tickloop_agent_protocol::Trigger::for_loop_goal("watch 700.HK"))),
                 Message {
                     role: Role::Assistant,
                     content: vec![Content::Text { text: reply.into() }],

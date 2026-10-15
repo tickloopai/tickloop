@@ -29,6 +29,8 @@ pub const MINIMUM_PANEL_SIZE: crate::metadata::MinimumPanelSize =
     };
 const MAX_EVENT_CANDLES: usize = 12_000;
 pub const MAX_EVENT_PAGE_CANDLES: usize = 1_000;
+/// The query Tick Tool that pages through an event window's candles.
+pub const EVENT_HISTORY_TOOL: &str = "event_history";
 type PriceVolumeBin = (f64, f64, f64, f64, i64);
 
 #[derive(
@@ -547,6 +549,41 @@ pub fn history_content(
     history_page(symbol, adjust, config, data, 0, MAX_EVENT_PAGE_CANDLES)
 }
 
+fn baseline_definition(window: &EventWindow) -> &'static str {
+    if window.baseline_date.is_some() {
+        "last regular-session close before publication"
+    } else {
+        "unavailable: release session is unknown"
+    }
+}
+
+fn data_status(data: &EventData) -> &'static str {
+    if data.candles.is_empty() {
+        "no_data"
+    } else {
+        "ready"
+    }
+}
+
+/// The event chart's Tick state: the event, its window and baseline, and a summary of the candles,
+/// which [`EVENT_HISTORY_TOOL`] pages through.
+pub fn summary_content(
+    symbol: &str,
+    adjust: CandleAdjust,
+    config: &EventChartConfig,
+    data: &EventData,
+) -> Value {
+    crate::commands::kline::with_candle_summary(
+        json!({
+            "symbol": symbol, "adjust": adjust, "event": config, "window": data.window,
+            "source": data.source, "period": config.view.period(), "baseline_close": data.baseline,
+            "baseline_definition": baseline_definition(&data.window), "status": data_status(data),
+        }),
+        &data.candles,
+        EVENT_HISTORY_TOOL,
+    )
+}
+
 pub fn history_page(
     symbol: &str,
     adjust: CandleAdjust,
@@ -565,12 +602,12 @@ pub fn history_page(
         "symbol": symbol, "adjust": adjust, "event": config, "window": data.window,
         "source": data.source,
         "period": config.view.period(), "baseline_close": data.baseline,
-        "baseline_definition": if data.window.baseline_date.is_some() { "last regular-session close before publication" } else { "unavailable: release session is unknown" },
-        "status": if data.candles.is_empty() { "no_data" } else { "ready" },
+        "baseline_definition": baseline_definition(&data.window),
+        "status": data_status(data),
         "candles": crate::commands::kline::table(candles).json(),
         "total_candles": data.candles.len(), "offset": offset, "returned_candles": candles.len(),
         "next_offset": (end < data.candles.len()).then_some(end),
-        "truncated": offset > 0 || end < data.candles.len(), "history_tool": "event_history",
+        "truncated": offset > 0 || end < data.candles.len(), "history_tool": EVENT_HISTORY_TOOL,
         "sessions": candles.iter().map(|candle| if config.view == EventChartMode::Daily { "regular" } else { clock.map(|clock| clock.session(candle.timestamp, data.window.half_trading_days.contains(&iso_date(clock.local(candle.timestamp).date())))).unwrap_or("unknown") }).collect::<Vec<_>>()
     })
 }
@@ -659,16 +696,18 @@ impl EventChart {
     pub fn content(&self, symbol: &str, adjust: CandleAdjust) -> Value {
         match &self.data {
             Some(data) => {
-                let mut content = history_content(symbol, adjust, &self.config, data);
+                let mut content = summary_content(symbol, adjust, &self.config, data);
                 if let Some(error) = &self.last_error {
                     content["status"] = json!("stale");
                     content["error"] = json!(error);
                 }
                 content
             }
-            None => {
-                json!({"symbol":symbol,"adjust":adjust,"event":self.config,"status":if self.pending {"loading"} else {"unavailable"},"error":self.last_error,"candles":[]})
-            }
+            None => crate::commands::kline::with_candle_summary(
+                json!({"symbol":symbol,"adjust":adjust,"event":self.config,"status":if self.pending {"loading"} else {"unavailable"},"error":self.last_error}),
+                &[],
+                EVENT_HISTORY_TOOL,
+            ),
         }
     }
 

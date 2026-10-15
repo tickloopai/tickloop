@@ -30,6 +30,7 @@ pub const DEFAULT_ONCE_COUNT: usize = 80;
 /// The widest date range one `candles` call may ask the market for, so that a
 /// Tick Tool call cannot turn into an unbounded history request.
 pub const MAX_HISTORY_DAYS: i64 = 1000;
+const CANDLES_TOOL: &str = "candles";
 const MARK_TOOL: &str = "mark";
 const UNMARK_TOOL: &str = "unmark";
 pub const HEADERS: &[&str] = &[
@@ -42,6 +43,13 @@ pub const HEADERS: &[&str] = &[
     "Turnover",
 ];
 
+fn timestamp(candle: &Candle) -> String {
+    candle
+        .timestamp
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
 pub fn table(candles: &[Candle]) -> TableData {
     TableData {
         headers: HEADERS.to_vec(),
@@ -49,12 +57,7 @@ pub fn table(candles: &[Candle]) -> TableData {
             .iter()
             .map(|candle| {
                 vec![
-                    json!(
-                        candle
-                            .timestamp
-                            .format(&time::format_description::well_known::Rfc3339)
-                            .unwrap_or_default()
-                    ),
+                    json!(timestamp(candle)),
                     json!(candle.open.normalize().to_string()),
                     json!(candle.high.normalize().to_string()),
                     json!(candle.low.normalize().to_string()),
@@ -76,10 +79,39 @@ pub struct PriceMark {
     pub price: f64,
 }
 
+/// Adds what an Agent needs to decide whether to act to a Tick state: the newest candle, its move
+/// from the one before and the span of the loaded window. The candles themselves stay behind
+/// `history_tool`, so the state keeps its size however long the window grows.
+pub fn with_candle_summary(mut state: Value, candles: &[Candle], history_tool: &str) -> Value {
+    let latest = candles.last();
+    let previous_close = candles.iter().rev().nth(1).map(|candle| candle.close);
+    let change = latest
+        .zip(previous_close)
+        .map(|(latest, previous_close)| latest.close - previous_close);
+    let change_percent = change
+        .zip(previous_close.filter(|close| !close.is_zero()))
+        .map(|(change, previous_close)| {
+            (change / previous_close * rust_decimal::Decimal::ONE_HUNDRED).round_dp(2)
+        });
+    state["latest"] = latest.map_or(Value::Null, |candle| {
+        table(std::slice::from_ref(candle)).json()[0].clone()
+    });
+    state["previous_close"] = json!(previous_close.map(|close| close.normalize().to_string()));
+    state["change"] = json!(change.map(|change| change.normalize().to_string()));
+    state["change_percent"] = json!(change_percent.map(|percent| percent.normalize().to_string()));
+    state["history"] = json!({"candles": candles.len(), "first": candles.first().map(timestamp),
+        "last": latest.map(timestamp), "tool": history_tool});
+    state
+}
+
 fn content(request: &CandleRequest, candles: &[Candle], marks: &[PriceMark]) -> Value {
-    json!({"symbol":request.symbol, "period":request.period, "adjust":request.adjust,
-        "update_source":match request.adjust { CandleAdjust::None => "server_snapshot", CandleAdjust::Forward => "server_adjusted_snapshot" },
-        "candles":table(candles).json(), "marks":marks})
+    with_candle_summary(
+        json!({"symbol":request.symbol, "period":request.period, "adjust":request.adjust,
+            "update_source":match request.adjust { CandleAdjust::None => "server_snapshot", CandleAdjust::Forward => "server_adjusted_snapshot" },
+            "marks":marks}),
+        candles,
+        CANDLES_TOOL,
+    )
 }
 
 /// Arguments of the `candles` Tick Tool; the schema the Agent reads is derived from it.
@@ -182,9 +214,8 @@ pub struct EventViewArgs {
 
 pub fn tools() -> Tools {
     Tools::default()
-        .series("/candles", tick_protocol::SeriesEnd::Last)
         .query::<CandlesArgs>(
-            "candles",
+            CANDLES_TOOL,
             "Candlesticks for a symbol between two dates, in the Kline Panel's shape.",
             |api: &QuoteServices, args| {
                 Box::pin(async move {
@@ -201,7 +232,7 @@ pub fn tools() -> Tools {
         )
         .action::<UnmarkArgs>(UNMARK_TOOL, "Remove a labelled price line from this Panel.")
         .query::<EventHistoryArgs>(
-            "event_history",
+            crate::event_chart::EVENT_HISTORY_TOOL,
             "Event-aware history, provider calendar, sessions and pre-release baseline; at most 1000 candles per page. Follow next_offset to recover the full window. An omitted actual publication time never becomes a guessed T=0.",
             |api: &QuoteServices, args| Box::pin(async move {
                 let symbol = normalize_symbol(&args.symbol);
@@ -217,7 +248,7 @@ pub fn tools() -> Tools {
         .action::<SetEventArgs>("set_event", "Set the publication event. Clears the old event chart and schedules history loading; status reports loading, ready or unavailable.")
         .action::<SetResearchContext>("set_context", "Follow this company and fiscal period in the same instance. Uses the supplied release date/session without inventing an exact publication time; clears previous event data and marks.")
         .action::<EventViewArgs>("set_view", "Select event line, 5-minute candles, or daily candles and optionally an event window. Reloads the requested data.")
-        .recover_with("candles")
+        .recover_with(CANDLES_TOOL)
 }
 
 fn request(args: &KlineArgs, default_count: usize) -> Result<CandleRequest> {
@@ -247,10 +278,19 @@ pub async fn run_once(
     if let Some(config) = args.event.config()? {
         let data =
             crate::event_chart::load_history(api, &request.symbol, request.adjust, &config).await?;
-        let content =
-            crate::event_chart::history_content(&request.symbol, request.adjust, &config, &data);
-        updates.publish(content.clone())?;
+        updates.publish(crate::event_chart::summary_content(
+            &request.symbol,
+            request.adjust,
+            &config,
+            &data,
+        ))?;
         if matches!(args.output.format, crate::args::OutputFormat::Json) {
+            let content = crate::event_chart::history_content(
+                &request.symbol,
+                request.adjust,
+                &config,
+                &data,
+            );
             serde_json::to_writer_pretty(&mut *output, &content)
                 .map_err(|error| Error::usage(error.to_string()))?;
             writeln!(output).map_err(|error| Error::usage(error.to_string()))?;
@@ -518,7 +558,11 @@ impl crate::runtime::LiveView for KlineView {
             return content;
         }
         if let Some(context) = &self.research {
-            return json!({"symbol":self.request.symbol,"research_context":context,"status":"unavailable","error":"Release date is unknown; event window cannot be chosen","candles":[]});
+            return with_candle_summary(
+                json!({"symbol":self.request.symbol,"research_context":context,"status":"unavailable","error":"Release date is unknown; event window cannot be chosen"}),
+                &[],
+                crate::event_chart::EVENT_HISTORY_TOOL,
+            );
         }
         content(&self.request, &self.candles, &self.marks)
     }

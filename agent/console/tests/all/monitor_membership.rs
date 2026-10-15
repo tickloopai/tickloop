@@ -593,9 +593,10 @@ async fn hosted_rows_offer_one_x_and_enter_by_what_still_runs_and_who_opened_it(
                 "remove",
                 TickIntent::RemoveFromMonitor(foreign.clone())
             ),
-            subscribe(&foreign),
+            action('f', "frequency", TickIntent::Subscribe(foreign.clone())),
         ],
-        "a Tick only this Chat's subscriptions show leaves with them and is never closed"
+        "a Tick only this Chat's subscriptions show leaves with them and is never closed; \
+         its f cycles their frequency"
     );
     assert!(
         rows.iter()

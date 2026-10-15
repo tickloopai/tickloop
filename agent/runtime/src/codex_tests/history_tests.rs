@@ -20,7 +20,7 @@ use tickloop_agent_model::{
 };
 use tickloop_agent_protocol::{
     BranchRequest, Content, Event, EventKind, ExecutionMode, LoopState, ModelConfig,
-    ModelRequestKind, RewindMode, Trigger, TriggerSource,
+    ModelRequestKind, RewindMode, Trigger, TriggerPromptSource, TriggerSource,
 };
 
 fn config() -> ModelConfig {
@@ -82,6 +82,7 @@ async fn triggered_request_after_logout(interval_seconds: Option<u64>) {
             Some(Trigger {
                 id: Uuid::new_v4(),
                 prompt: "Check fresh evidence".into(),
+                prompt_source: TriggerPromptSource::Explicit,
                 interval_seconds,
                 expires_at_ms: None,
                 accepts_events: true,

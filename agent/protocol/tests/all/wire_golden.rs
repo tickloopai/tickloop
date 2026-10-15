@@ -350,6 +350,7 @@ fn chat_snapshot() -> ChatSnapshot {
             "trigger": {
                 "id": id(0x30),
                 "prompt": "Report changes",
+                "prompt_source": "LoopGoal",
                 "interval_seconds": 60,
                 "expires_at_ms": null,
                 "accepts_events": true,

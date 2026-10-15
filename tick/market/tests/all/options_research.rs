@@ -113,6 +113,13 @@ async fn switching_historical_context_never_shows_current_chain_as_before_event(
     .await
     .unwrap();
     assert!(!view.table().rows.is_empty());
+    let published = view.content();
+    let saved_before = &published["event_history"]["before"];
+    assert!(saved_before.get("rows").is_none(), "{published}");
+    assert_eq!(saved_before["chain"]["tool"], "event_history");
+    assert_eq!(saved_before["observed_at"], "2026-08-06T19:55:00Z");
+    assert_eq!(published["current_snapshot"]["chain"]["tool"], "snapshot");
+    assert!(published["event_history"]["comparison_basis"].is_string());
     view.act(ToolCall {
         tool: "set_context".into(),
         args: json!({"context":new}),
@@ -420,7 +427,30 @@ async fn options_tick_changes_expiry_and_exposes_live_tools_without_a_longbridge
     else {
         panic!("snapshot must be query")
     };
-    assert_eq!(query.await.unwrap(), view.content());
+    let full = query.await.unwrap();
+    let published = view.content();
+    assert!(published.get("rows").is_none(), "{published}");
+    assert_eq!(published["expiry"], full["expiry"]);
+    assert_eq!(published["underlying"], full["underlying"]);
+    assert_eq!(published["atm"], full["atm"]);
+    let rows = full["rows"].as_array().unwrap();
+    assert_eq!(
+        published["chain"],
+        json!({"strikes": rows.len(), "lowest": rows[0]["strike"],
+            "highest": rows[rows.len() - 1]["strike"], "tool": "snapshot"})
+    );
+    assert_eq!(
+        published["expirations"],
+        json!({"count": full["expirations"].as_array().unwrap().len(), "tool": "expirations"})
+    );
+    let (state_bytes, full_bytes) = (
+        serde_json::to_vec(&published).unwrap().len(),
+        serde_json::to_vec(&full).unwrap().len(),
+    );
+    assert!(
+        state_bytes <= 2048 && full_bytes > 4096,
+        "state {state_bytes} bytes, full snapshot {full_bytes} bytes"
+    );
     let saved = view
         .act(ToolCall {
             tool: "save_snapshot".into(),

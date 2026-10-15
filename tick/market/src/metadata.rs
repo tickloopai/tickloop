@@ -282,21 +282,16 @@ mod tests {
                 .unwrap_or_default()
         };
         assert_eq!(
-            declared(TickKind::Kline),
-            [("/candles".to_owned(), SeriesEnd::Last)]
-        );
-        assert_eq!(
-            declared(TickKind::Earnings),
-            [("/rows".to_owned(), SeriesEnd::First)]
-        );
-        assert_eq!(
             declared(TickKind::News),
             [("/items".to_owned(), SeriesEnd::First)]
         );
+        // Kline, Earnings and Options publish summaries; their series stay behind their tools.
         for kind in [
             TickKind::Quote,
             TickKind::Watchlist,
+            TickKind::Kline,
             TickKind::Positions,
+            TickKind::Earnings,
             TickKind::Options,
             TickKind::Reader,
         ] {

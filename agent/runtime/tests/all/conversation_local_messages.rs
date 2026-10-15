@@ -9,7 +9,7 @@ use serde_json::json;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
     ChatId, ChatSnapshot, CommandState, Content, Event, EventKind, LoopState, Message, Role,
-    Trigger, UserShellState,
+    Trigger, TriggerPromptSource, UserShellState,
 };
 use tickloop_agent_runtime::{Agent, AgentError};
 use tickloop_agent_test_support::{ScriptedModel, call, config, text};
@@ -718,6 +718,7 @@ async fn an_expired_loop_cancels_its_model_request_without_interrupt_messages() 
             Some(Trigger {
                 id: uuid::Uuid::new_v4(),
                 prompt: "check".into(),
+                prompt_source: TriggerPromptSource::Explicit,
                 interval_seconds: None,
                 expires_at_ms: Some(now_ms + 100),
                 accepts_events: true,
