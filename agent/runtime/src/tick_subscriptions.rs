@@ -24,7 +24,7 @@ use super::*;
 use crate::tick_stream::{
     TickConnectionState, TickObservation, TickStreamEvent, TickStreamPort, WatchId,
 };
-use crate::tick_trim::{Trimmed, encoded_len, omitted_value, trim};
+use crate::tick_trim::{Trimmed, encoded_len, omits_values, omitted_value, trim};
 use tick_protocol::{InstanceRef, StateSeries};
 use tickloop_agent_protocol::{
     HostToolAuthority, LoopId, LoopSnapshot, LoopState, MAX_DELIVERY_ITEM_BYTES,
@@ -270,6 +270,8 @@ struct DeliveryItem {
     observed_at: String,
     /// How many updates it merges: the newest and every one that newest replaced.
     updates: u64,
+    /// When the earliest update it merges came due; the longest waiting go first.
+    waiting_since: Instant,
     gap: bool,
     kind: ObservationKind,
     recover_with: Option<String>,
@@ -288,6 +290,7 @@ impl DeliveryItem {
             first_sequence: superseded.first_sequence,
             first_observed_at: superseded.first_observed_at.clone(),
             updates: self.updates + superseded.updates,
+            waiting_since: self.waiting_since.min(superseded.waiting_since),
             gap: self.gap || superseded.gap,
             ..self
         }
@@ -313,30 +316,29 @@ impl DeliveryItem {
     }
 
     /// The item as a delivery carries it with its `header`, its data shortened so the whole
-    /// item takes at most `allowance` encoded bytes; whether its data was shortened. Data that
-    /// does not fit beside what its trimming reports gives way whole.
-    fn delivered(&self, header: Value, allowance: usize) -> (Value, bool) {
-        let mut data_allowance = allowance.saturating_sub(encoded_len(&header));
+    /// item takes at most `allowance` encoded bytes, with what was shortened. Data that does not
+    /// fit beside what its trimming reports gives way whole.
+    fn delivered(&self, header: &Value, allowance: usize) -> (Value, Vec<Trimmed>) {
+        let mut data_allowance = allowance.saturating_sub(encoded_len(header));
         for _ in 0..ITEM_FIT_ATTEMPTS {
             let mut item = header.clone();
             let mut data = self.data.clone();
             let trimmed = trim(&mut data, data_allowance, &self.series);
-            let is_trimmed = !trimmed.is_empty();
-            if is_trimmed {
+            if !trimmed.is_empty() {
                 item["trimmed"] = json!(trimmed);
             }
             item["data"] = data;
             let size = encoded_len(&item);
             if size <= allowance {
-                return (item, is_trimmed);
+                return (item, trimmed);
             }
             data_allowance = data_allowance.saturating_sub(size - allowance);
         }
         let (marker, record) = Trimmed::whole_omission(encoded_len(&self.data));
-        let mut item = header;
+        let mut item = header.clone();
         item["data"] = marker;
-        item["trimmed"] = json!([record]);
-        (item, true)
+        item["trimmed"] = json!([&record]);
+        (item, vec![record])
     }
 }
 
@@ -673,6 +675,7 @@ impl TickDeliveries {
                     sequence: update.sequence,
                     observed_at: update.observed_at,
                     updates: std::mem::take(&mut subscription.superseded) + 1,
+                    waiting_since: now,
                     gap: std::mem::take(&mut subscription.gap),
                     kind: update.kind,
                     recover_with: update.recover_with,
@@ -713,12 +716,15 @@ impl TickDeliveries {
         ready
     }
 
+    /// `owner`'s pending items, the longest waiting first, so an item a full delivery put off is
+    /// not put off again by newer ones.
     fn take_delivery(&mut self, owner: (ChatId, LoopId)) -> Option<Vec<DeliveryItem>> {
         let pending = self.pending.remove(&owner)?;
         if pending.items.is_empty() {
             return None;
         }
-        let items: Vec<_> = pending.items.into_values().collect();
+        let mut items: Vec<_> = pending.items.into_values().collect();
+        items.sort_by_key(|item| item.waiting_since);
         Some(items)
     }
 
@@ -1893,12 +1899,21 @@ fn fit_delivery(items: Vec<DeliveryItem>) -> FittedDelivery {
             deferred.push(item);
             continue;
         }
-        let (value, is_trimmed) = item.delivered(header, allowance);
-        let size = encoded_len(&value) + separator;
+        let (mut value, mut trimmed) = item.delivered(&header, allowance);
+        let mut size = encoded_len(&value) + separator;
         if size > remaining && !delivered.is_empty() {
-            deferred.push(item);
-            continue;
+            // What is left may still hold it trimmed further, unless that would replace values
+            // its full share keeps; then it waits for that share in the next turn.
+            let (smaller, smaller_trimmed) = item.delivered(&header, remaining - separator);
+            let smaller_size = encoded_len(&smaller) + separator;
+            let loses_values = omits_values(&smaller_trimmed) && !omits_values(&trimmed);
+            if smaller_size > remaining || loses_values {
+                deferred.push(item);
+                continue;
+            }
+            (value, trimmed, size) = (smaller, smaller_trimmed, smaller_size);
         }
+        let is_trimmed = !trimmed.is_empty();
         remaining = remaining.saturating_sub(size);
         let is_screen = matches!(item.kind, ObservationKind::Terminal { .. });
         notes.is_trimmed |= is_trimmed && !is_screen;

@@ -83,6 +83,13 @@ impl Trimmed {
     }
 }
 
+/// Whether `trimmed` replaced any value by its size instead of shortening it.
+pub(crate) fn omits_values(trimmed: &[Trimmed]) -> bool {
+    trimmed
+        .iter()
+        .any(|record| record.rule == TrimRule::Omitted)
+}
+
 pub(crate) fn encoded_len(value: &Value) -> usize {
     serde_json::to_vec(value).map_or(usize::MAX, |encoded| encoded.len())
 }

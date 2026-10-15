@@ -2067,6 +2067,116 @@ async fn items_that_do_not_fit_one_delivery_arrive_in_the_next_turn() {
     agent.shutdown().await;
 }
 
+/// A later item that does not fit its full share takes what the delivery has left, trimmed
+/// further, instead of waiting for the next turn.
+#[tokio::test(start_paused = true)]
+async fn a_later_item_takes_what_is_left_instead_of_waiting() {
+    let directory = tempfile::tempdir().unwrap();
+    let instances: Vec<_> = (1..=4).map(fixture_instance).collect();
+    let stream = InMemoryTickStream::new();
+    let (agent, model, chat) =
+        agent_subscribed_to(directory.path(), Arc::new(stream.clone()), &instances, 1).await;
+    let mut events = agent.subscribe();
+    for instance in &instances {
+        stream.push(TickObservation {
+            instance: instance.clone(),
+            data: json!({"history": (0..60).map(series_element).collect::<Vec<_>>()}),
+            ..update(1, 1, "unused")
+        });
+    }
+    accumulated(&agent, chat, 4).await;
+    tokio::time::advance(HIGH_PERIOD).await;
+    wait_for_completion(&mut events).await;
+
+    let payload = delivery_payload(&last_user_text(&model));
+    assert!(payload.to_string().len() <= MAX_DELIVERY_PAYLOAD_BYTES);
+    assert!(payload.get("more_next_turn").is_none(), "{payload}");
+    let items = payload["items"].as_array().unwrap();
+    assert_eq!(items.len(), 4);
+    let last = &items[3];
+    assert!(last.to_string().len() < MAX_DELIVERY_ITEM_BYTES, "{last}");
+    assert_eq!(last["trimmed"][0]["rule"], "head_and_tail");
+    assert!(
+        last["data"]["history"].as_array().unwrap().len() > 2,
+        "{last}"
+    );
+    agent.shutdown().await;
+}
+
+/// Items that waited go before newer ones, so a Tick whose item did not fit is delivered in the
+/// next turn even when the Ticks before it came due again meanwhile.
+#[tokio::test(start_paused = true)]
+async fn an_item_that_waited_goes_before_newer_ones() {
+    let directory = tempfile::tempdir().unwrap();
+    let instances: Vec<_> = (1..=5).map(fixture_instance).collect();
+    let model = Arc::new(ScriptedModel::new(vec![
+        text("ready"),
+        text("first turn"),
+        text("second turn"),
+        text("third turn"),
+    ]));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(GatedModel {
+            gate: gate.clone(),
+            entered: entered.clone(),
+            gated_call: 1,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            model: model.clone(),
+        }),
+    );
+    let stream = RefillingStream::new();
+    agent.install_tick_stream(stream.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(chat, None, "watch".into()).await.unwrap();
+    wait_for_completion(&mut events).await;
+    subscribe_loop(&agent, chat, receipt.loop_id, &instances).await;
+    // A single line no segment shortens, each item close to its full share.
+    let observed = |instance: &InstanceRef, sequence| TickObservation {
+        instance: instance.clone(),
+        data: json!({"text": "v".repeat(MAX_DELIVERY_ITEM_BYTES - 400)}),
+        ..update(1, sequence, "unused")
+    };
+    for instance in &instances {
+        stream.push(observed(instance, 1));
+    }
+    accumulated(&agent, chat, 5).await;
+    tokio::time::advance(HIGH_PERIOD).await;
+    entered.notified().await;
+    for instance in &instances[..3] {
+        stream.push(observed(instance, 2));
+    }
+    accumulated(&agent, chat, 5).await;
+    tokio::time::advance(HIGH_PERIOD).await;
+    settle().await;
+    gate.notify_one();
+    wait_for_completion(&mut events).await;
+    wait_for_completion(&mut events).await;
+
+    let delivered = |index: usize| {
+        let payload = delivery_payload(&user_text(&model, index));
+        payload["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["instance"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let first = delivered(1);
+    assert_eq!(first.len(), 3, "{first:?}");
+    let second = delivered(2);
+    for waiting in &instances[3..] {
+        assert!(
+            second.contains(&waiting.to_string()),
+            "{waiting} waited one turn and goes first: {second:?}"
+        );
+    }
+    agent.shutdown().await;
+}
+
 /// What a Tick reports cannot carry a delivery past its caps: overlong recovery guidance and
 /// observation times are replaced by their size, and data whose trimming would report too much
 /// gives way whole.
@@ -2111,10 +2221,10 @@ async fn a_tick_cannot_push_a_delivery_past_its_caps() {
     agent.shutdown().await;
 }
 
-/// An item that waits for the next turn does not hold data too large to deliver whole: it is
-/// read again from its Tick when its turn comes.
+/// An item that waits for the next turn holds no data: it is read again from its Tick when its
+/// turn comes, and merges the updates that arrived meanwhile.
 #[tokio::test(start_paused = true)]
-async fn a_deferred_item_too_large_to_deliver_whole_is_read_again_in_its_turn() {
+async fn a_deferred_item_holds_no_data_and_is_read_again_in_its_turn() {
     let directory = tempfile::tempdir().unwrap();
     let instances: Vec<_> = (1..=4).map(fixture_instance).collect();
     let stream = RefillingStream::new();
@@ -2128,9 +2238,11 @@ async fn a_deferred_item_too_large_to_deliver_whole_is_read_again_in_its_turn() 
             ..update(1, 1, "unused")
         });
     }
+    // A single line fits its full share but not what the first three leave, and no segment of
+    // it shortens.
     stream.inner.push(TickObservation {
         instance: instances[3].clone(),
-        data: json!({"history": (0..300).map(series_element).collect::<Vec<_>>()}),
+        data: json!({"text": "w".repeat(MAX_DELIVERY_ITEM_BYTES - 400)}),
         ..update(1, 1, "unused")
     });
     accumulated(&agent, chat, 4).await;
