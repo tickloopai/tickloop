@@ -2049,7 +2049,9 @@ fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() 
         "{text}"
     );
     assert!(
-        text.contains("enter open") && text.contains("w subscriptions"),
+        text.contains("enter open")
+            && text.contains("f frequency")
+            && text.contains("w subscriptions"),
         "{text}"
     );
     assert_eq!(
@@ -2064,9 +2066,8 @@ fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() 
         [
             ('o', "open"),
             ('x', "remove"),
-            ('f', "subscribe"),
+            ('f', "frequency"),
             ('w', "subscriptions"),
-            ('e', "frequency"),
             ('u', "unsubscribe")
         ]
     );
@@ -2077,17 +2078,18 @@ fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() 
     assert!(text.contains("› ⟳ high · every 1 min"), "{text}");
     assert!(!state.input_dialog_visible(), "the detail stays in Monitor");
 
-    press(&mut state, KeyCode::Char('e'));
-    press(&mut state, KeyCode::Char('j'));
-    let text = monitor_text(&mut state);
+    assert_eq!(requested_key(press(&mut state, KeyCode::Char('f'))), 'f');
     assert!(
-        text.contains("  high · every 1 min")
-            && text.contains("› medium · every 10 min")
-            && text.contains("  low · every 30 min")
-            && !text.contains("immediate"),
-        "{text}"
+        monitor_text(&mut state).contains("› ⟳ medium · every 10 min"),
+        "the detail shows the new frequency at once"
     );
-    assert_eq!(requested_key(press(&mut state, KeyCode::Enter)), 'e');
+    assert_eq!(requested_key(press(&mut state, KeyCode::Char('f'))), 'f');
+    let text = monitor_text(&mut state);
+    assert!(text.contains("› ⟳ low · every 30 min"), "{text}");
+    assert!(
+        press(&mut state, KeyCode::Char('e')).is_none() && state.monitor.detail.is_some(),
+        "e no longer changes anything"
+    );
 
     press(&mut state, KeyCode::Char('u'));
     let text = monitor_text(&mut state);
@@ -2103,25 +2105,48 @@ fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() 
 }
 
 #[test]
-fn the_row_frequency_key_saves_the_picked_frequency_on_enter_without_another_step() {
+fn the_row_f_cycles_high_medium_low_at_once_however_fast_it_is_pressed() {
+    use tickloop_agent_protocol::TickSubscriptionFrequency::{High, Low, Medium};
     let mut state = subscribed_fixture(1);
-    assert_eq!(requested_key(press(&mut state, KeyCode::Char('e'))), 'e');
-    press(&mut state, KeyCode::Char('j'));
+    let shown = |state: &State| {
+        state
+            .monitor
+            .selected()
+            .unwrap()
+            .subscription
+            .unwrap()
+            .frequency
+    };
+    for (expected, label) in [
+        (Medium, "medium · every 10 min"),
+        (Low, "low · every 30 min"),
+        (High, "high · every 1 min"),
+    ] {
+        assert_eq!(requested_key(press(&mut state, KeyCode::Char('f'))), 'f');
+        assert_eq!(
+            shown(&state),
+            expected,
+            "no reply from the Agent in between"
+        );
+        assert_eq!(state.status, format!("Subscription frequency: {label}"));
+        assert!(state.monitor.detail.is_none(), "no picker or confirmation");
+    }
 
-    assert_eq!(requested_key(press(&mut state, KeyCode::Enter)), 'e');
-    assert!(
-        state.monitor.detail.is_none(),
-        "the change applies and Monitor returns to its rows: {}",
-        monitor_text(&mut state)
+    press(&mut state, KeyCode::Char('f'));
+    state.monitor.subscriptions[0].frequency = Medium;
+    state.monitor.rebuild();
+    assert_eq!(
+        shown(&state),
+        Medium,
+        "the Agent reporting the last request lets Monitor show its report again"
     );
-    assert!(state.monitor.focused);
-    assert!(!state.input_dialog_visible());
-
-    press(&mut state, KeyCode::Char('e'));
-    assert!(press(&mut state, KeyCode::Esc).is_none());
-    assert!(
-        state.monitor.detail.is_none(),
-        "Esc returns without a change"
+    press(&mut state, KeyCode::Char('f'));
+    press(&mut state, KeyCode::Char('f'));
+    state.monitor.rebuild();
+    assert_eq!(
+        shown(&state),
+        High,
+        "a report that predates the latest request does not undo it"
     );
 }
 
@@ -2907,8 +2932,9 @@ async fn run_intent(
 }
 
 #[tokio::test]
-async fn f_subscribes_a_tick_on_the_newest_loop_and_only_tells_when_it_already_is() {
+async fn f_subscribes_a_tick_on_the_newest_loop_then_cycles_its_frequency() {
     use crate::monitor_rows::TickIntent;
+    use tickloop_agent_protocol::TickSubscriptionFrequency::{High, Medium};
     let directory = tempfile::tempdir().unwrap();
     let (core, agent, console, chat) = subscribed_calendar_chat(directory.path()).await;
     let context = crate::terminal::tick_actions::TickActionContext {
@@ -2919,41 +2945,62 @@ async fn f_subscribes_a_tick_on_the_newest_loop_and_only_tells_when_it_already_i
     };
     let other = tick_protocol::InstanceRef::new("cal", "other").unwrap();
     let loop_id = agent.tick_subscriptions(chat).await.unwrap()[0].loop_id;
+    let frequency_of_other = || async {
+        agent
+            .tick_subscriptions(chat)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.instance == other)
+            .map(|row| (row.loop_id, row.frequency))
+    };
+    let status = || console.state.lock().unwrap().status.clone();
 
     run_intent(context, TickIntent::Subscribe(other.clone()))
         .await
         .unwrap();
-    let subscriptions = agent.tick_subscriptions(chat).await.unwrap();
-    let added = subscriptions
-        .iter()
-        .find(|row| row.instance == other)
-        .expect("f subscribes the Tick");
-    assert_eq!(added.loop_id, loop_id);
+    assert_eq!(frequency_of_other().await, Some((loop_id, High)));
+    assert!(status().contains("Subscribed at high"), "{}", status());
+
+    run_intent(context, TickIntent::Subscribe(other.clone()))
+        .await
+        .unwrap();
+    assert_eq!(frequency_of_other().await, Some((loop_id, Medium)));
+    assert_eq!(status(), "Subscription frequency: medium · every 10 min");
+
+    let (first, second) = {
+        let mut state = console.state.lock().unwrap();
+        let mut press = || {
+            crate::terminal::tick_actions::builtin::executor(&TickIntent::Subscribe(other.clone()))
+                .unwrap()
+                .prepare(&mut crate::terminal::tick_actions::TickActionUi { state: &mut state })
+                .unwrap()
+        };
+        (press(), press())
+    };
+    crate::terminal::tick_actions::execute(first, context)
+        .await
+        .unwrap();
+    crate::terminal::tick_actions::execute(second, context)
+        .await
+        .unwrap();
     assert_eq!(
-        added.frequency,
-        tickloop_agent_protocol::TickSubscriptionFrequency::High
+        frequency_of_other().await,
+        Some((loop_id, High)),
+        "two presses before the Agent replies go on to low, then high again"
     );
-    assert!(
-        console
-            .state
-            .lock()
-            .unwrap()
-            .status
-            .contains("Subscribed at high")
-    );
+    assert_eq!(agent.tick_subscriptions(chat).await.unwrap().len(), 2);
 
+    console.update_subscribed_ticks(chat, &[]).unwrap();
     run_intent(context, TickIntent::Subscribe(other.clone()))
         .await
         .unwrap();
-    assert_eq!(agent.tick_subscriptions(chat).await.unwrap().len(), 2);
-    assert!(
-        console
-            .state
-            .lock()
-            .unwrap()
-            .status
-            .starts_with("Already subscribed")
+    assert_eq!(
+        agent.tick_subscriptions(chat).await.unwrap().len(),
+        2,
+        "a View that has not heard of the subscription yet subscribes nothing twice"
     );
+    assert!(status().starts_with("Already subscribed"), "{}", status());
 
     let without_loop = agent.create_chat(directory.path().into()).await.unwrap();
     let refused = run_intent(

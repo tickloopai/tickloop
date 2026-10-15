@@ -101,9 +101,6 @@ impl TickActionExecutor for OpenSubscriptions {
             crate::monitor_rows::SubscriptionOperation::View => {
                 crate::monitor_rows::SUBSCRIPTIONS_KEY
             }
-            crate::monitor_rows::SubscriptionOperation::EditFrequency => {
-                crate::monitor_rows::SUBSCRIPTION_FREQUENCY_KEY
-            }
             crate::monitor_rows::SubscriptionOperation::Cancel => {
                 crate::monitor_rows::UNSUBSCRIBE_KEY
             }
@@ -131,17 +128,17 @@ async fn refresh_subscriptions(ctx: &TickActionContext<'_>) -> Result<(), String
         .map_err(|error| format!("Cannot read Tick Subscriptions: {error}"))?;
     ctx.console.update_subscribed_ticks(ctx.chat, &rows)
 }
-/// Changes or cancels one subscription for the subscription detail `panel`, which reports a
-/// refusal, or the status line once the panel closed; either way Monitor then shows the
-/// subscriptions as the Agent holds them.
+/// Changes or cancels one subscription. A refusal shows in the subscription detail `panel` while
+/// it is open, else on the status line, and Monitor stops showing a frequency the Agent refused;
+/// either way Monitor then shows the subscriptions as the Agent holds them.
 pub(in crate::terminal) fn change_subscription(
-    panel: Uuid,
+    panel: Option<Uuid>,
     request: SubscriptionRequest,
 ) -> Arc<dyn TickActionBackend> {
     Arc::new(ChangeSubscription { panel, request })
 }
 struct ChangeSubscription {
-    panel: Uuid,
+    panel: Option<Uuid>,
     request: SubscriptionRequest,
 }
 #[async_trait]
@@ -152,19 +149,50 @@ impl TickActionBackend for ChangeSubscription {
             .update_tick_subscription(ctx.chat, self.request.subscription, self.request.change)
             .await
         {
+            ctx.console
+                .forget_requested_frequency(ctx.chat, self.request.subscription)?;
             let message = format!(
                 "Cannot update the Tick Subscription: {}",
                 safe_text(&error.to_string())
             );
-            let reported = ctx.update_detail(self.panel, |detail: &mut SubscriptionDetail| {
-                detail.report_error(message.clone());
-                Some(())
-            })?;
+            let reported = match self.panel {
+                Some(panel) => ctx.update_detail(panel, |detail: &mut SubscriptionDetail| {
+                    detail.report(message.clone());
+                    Some(())
+                })?,
+                None => None,
+            };
             if reported.is_none() {
                 ctx.notify(&message)?;
             }
         }
         refresh_subscriptions(&ctx).await
+    }
+}
+/// Moves one periodic subscription on to its next frequency, high after low, at once: Monitor
+/// shows the new frequency before the Agent confirms it, without asking. A refusal shows in the
+/// subscription detail `panel` while it is open.
+pub(in crate::terminal) struct CycleFrequency {
+    pub(in crate::terminal) instance: tick_protocol::InstanceRef,
+    pub(in crate::terminal) subscription: Uuid,
+    pub(in crate::terminal) panel: Option<Uuid>,
+}
+impl TickActionExecutor for CycleFrequency {
+    fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
+        let frequency = ui
+            .cycle_frequency(self.subscription)
+            .ok_or("This Tick Subscription has no frequency to change")?;
+        Ok(PreparedTickAction::new(
+            self.instance.to_string(),
+            SUBSCRIBE_KEY,
+            change_subscription(
+                self.panel,
+                SubscriptionRequest {
+                    subscription: self.subscription,
+                    change: tickloop_agent_protocol::TickSubscriptionChange::Frequency(frequency),
+                },
+            ),
+        ))
     }
 }
 struct DetailsOpen {
@@ -528,8 +556,7 @@ fn tick_subscriptions(count: usize) -> String {
 }
 const STOP_SHELL_PROMPT: &str = "Stop this Shell? enter confirm · esc cancel";
 const REOPEN_HOSTED_PROMPT: &str = "Open a new instance of this Tick with its command? It takes this row's place. enter confirm · esc cancel";
-const ALREADY_SUBSCRIBED_NOTICE: &str =
-    "Already subscribed · e changes the frequency, u cancels it";
+const ALREADY_SUBSCRIBED_NOTICE: &str = "Already subscribed · f cycles the frequency, u cancels it";
 
 /// What closing a hosted Tick asks before it runs.
 fn close_hosted_prompt(subscriptions: usize) -> String {
@@ -697,13 +724,22 @@ impl TickActionBackend for ReopenHosted {
     }
 }
 
-/// Subscribes the Chat to a protocol or terminal Tick at the default frequency on its user's
-/// word; one a Loop already subscribes to only says how to change that subscription.
+/// The row's `f` on a protocol or terminal Tick: subscribes the Chat at the default frequency
+/// on its user's word, or, once a Loop of the Chat subscribes to it, cycles that subscription's
+/// frequency.
 struct Subscribe {
     instance: tick_protocol::InstanceRef,
 }
 impl TickActionExecutor for Subscribe {
-    fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
+    fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
+        if let Some(subscription) = ui.frequency_target(&self.instance) {
+            return CycleFrequency {
+                instance: self.instance.clone(),
+                subscription,
+                panel: None,
+            }
+            .prepare(ui);
+        }
         Ok(PreparedTickAction::new(
             self.instance.to_string(),
             SUBSCRIBE_KEY,
@@ -729,7 +765,7 @@ impl TickActionBackend for Subscribe {
             .await
             .map_err(|error| format!("Cannot subscribe: {}", safe_text(&error.to_string())))?;
         refresh_subscriptions(&ctx).await?;
-        ctx.notify("Subscribed at high · e changes the frequency")
+        ctx.notify("Subscribed at high · f cycles the frequency")
     }
 }
 /// Stops a running Shell from its Monitor row once confirmed, under the Shell's own controls:

@@ -418,7 +418,6 @@ fn built_in_rows_describe_their_actions_as_intents() {
     let manage = |instance: &InstanceRef| {
         [
             ('w', "subscriptions", SubscriptionOperation::View),
-            ('e', "frequency", SubscriptionOperation::EditFrequency),
             ('u', "unsubscribe", SubscriptionOperation::Cancel),
         ]
         .map(|(key, label, operation)| {
@@ -483,7 +482,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
         ),
         action(
             'f',
-            "subscribe",
+            "frequency",
             TickIntent::Subscribe(pane.instance.clone()),
         ),
     ];

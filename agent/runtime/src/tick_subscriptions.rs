@@ -34,7 +34,7 @@ use tickloop_agent_protocol::{
 
 const SUBSCRIPTION_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const ALREADY_SUBSCRIBED: &str =
-    "a Loop of this Chat already subscribes to this Tick; e changes the frequency";
+    "a Loop of this Chat already subscribes to this Tick; f cycles its frequency";
 const NO_SUBSCRIBING_LOOP: &str = "no Loop of this Chat can take its Tick Updates";
 
 const SUBSCRIBE_TICK_TOOL: &str = "SubscribeTick";

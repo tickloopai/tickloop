@@ -50,7 +50,8 @@ use crate::monitor_rows::{
 };
 use tick_protocol::InstanceRef;
 use tickloop_agent_protocol::{
-    ChatStatus, MonitorMembership, ShellTaskSnapshot, TickSubscriptionStatus,
+    ChatStatus, MonitorMembership, ShellTaskSnapshot, TickSubscriptionFrequency,
+    TickSubscriptionStatus,
 };
 
 #[derive(Clone, Debug)]
@@ -154,6 +155,10 @@ pub(super) struct Monitor {
     listed_updates: HashMap<InstanceRef, Option<u64>>,
     /// Since when each row's glyph flashes for the new update this View last listed.
     update_flashes: HashMap<InstanceRef, u64>,
+    /// The frequencies the user asked for that the Agent does not report yet, by subscription.
+    /// Monitor shows them at once, and the next `f` cycles on from them rather than from a report
+    /// that predates the request.
+    requested_frequencies: HashMap<uuid::Uuid, TickSubscriptionFrequency>,
 }
 
 /// What one status refresh reads for Monitor.
@@ -266,11 +271,63 @@ impl Monitor {
     pub(super) fn rebuild(&mut self) {
         self.rebuild_at(tickloop_agent_base::private_fs::unix_time_milliseconds());
     }
+    /// The Chat's subscriptions as Monitor shows them: at the frequency the user last asked for
+    /// until the Agent reports it.
+    pub(super) fn shown_subscriptions(&self) -> Vec<TickSubscriptionStatus> {
+        self.subscriptions
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                if let Some(frequency) = self.requested_frequencies.get(&row.id) {
+                    row.frequency = *frequency;
+                }
+                row
+            })
+            .collect()
+    }
+    /// The subscription on `instance` whose frequency the row's `f` cycles: the last periodic
+    /// one, since the Agent lists subscriptions in the order their Loops began.
+    pub(super) fn frequency_target(&self, instance: &InstanceRef) -> Option<uuid::Uuid> {
+        crate::monitor_rows::subscriptions_on(&self.shown_subscriptions(), instance)
+            .iter()
+            .rev()
+            .find(|row| row.frequency.period().is_some())
+            .map(|row| row.id)
+    }
+    /// Asks for the periodic frequency after the one `subscription` shows and shows it at once;
+    /// `None` for a subscription that is gone or immediate.
+    pub(super) fn request_next_frequency(
+        &mut self,
+        subscription: uuid::Uuid,
+    ) -> Option<TickSubscriptionFrequency> {
+        let next = self
+            .shown_subscriptions()
+            .iter()
+            .find(|row| row.id == subscription)?
+            .frequency
+            .next_periodic()?;
+        self.requested_frequencies.insert(subscription, next);
+        self.rebuild();
+        Some(next)
+    }
+    /// Shows what the Agent reports for `subscription` again, after it refused the change.
+    pub(super) fn forget_requested_frequency(&mut self, subscription: uuid::Uuid) {
+        if self.requested_frequencies.remove(&subscription).is_some() {
+            self.rebuild();
+        }
+    }
     fn rebuild_at(&mut self, now_ms: u64) {
+        let subscriptions = &self.subscriptions;
+        self.requested_frequencies.retain(|id, requested| {
+            subscriptions
+                .iter()
+                .any(|row| row.id == *id && row.frequency != *requested)
+        });
+        let shown_subscriptions = self.shown_subscriptions();
         let context = MonitorContext {
             chat: self.chat_status.clone(),
             shells: self.shell_snapshot.clone(),
-            subscriptions: self.subscriptions.clone(),
+            subscriptions: shown_subscriptions.clone(),
             metadata: self.metadata.clone(),
             metadata_failures: self.metadata_failures.clone(),
             member_states: self.member_findings.states.clone(),
@@ -327,7 +384,7 @@ impl Monitor {
             let instance = detail.instance().clone();
             detail.update(
                 title_of(&self.entries, &instance),
-                crate::monitor_rows::subscriptions_on(&self.subscriptions, &instance),
+                crate::monitor_rows::subscriptions_on(&shown_subscriptions, &instance),
                 goals,
             );
         }

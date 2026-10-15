@@ -1609,6 +1609,17 @@ impl Console {
         monitor.rebuild();
         Ok(())
     }
+    pub(super) fn forget_requested_frequency(
+        &self,
+        chat: Uuid,
+        subscription: Uuid,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state
+            .monitor_for_chat_mut(chat)
+            .forget_requested_frequency(subscription);
+        Ok(())
+    }
     pub(super) fn monitor_has_entries(&self) -> Result<bool, String> {
         Ok(self
             .state
@@ -10362,10 +10373,16 @@ impl State {
                     super::tick_actions::TickDetailKey::Action(action) => {
                         Some(InputEvent::TickAction { chat, action })
                     }
-                    super::tick_actions::TickDetailKey::Finish(action) => {
-                        self.monitor.close_detail();
-                        self.rendered_region = None;
-                        Some(InputEvent::TickAction { chat, action })
+                    super::tick_actions::TickDetailKey::Prepare(executor) => {
+                        match executor
+                            .prepare(&mut super::tick_actions::TickActionUi { state: self })
+                        {
+                            Ok(action) => Some(InputEvent::TickAction { chat, action }),
+                            Err(error) => {
+                                self.hold_status(&error);
+                                None
+                            }
+                        }
                     }
                 };
             }
