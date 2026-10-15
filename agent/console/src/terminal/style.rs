@@ -224,6 +224,10 @@ pub(super) enum Role {
     /// the update, to the part of the period elapsed before its next check hands it to the
     /// Agent: the square's hue, dimmed, on a selected row too. A flashing square dims to it.
     UpdateProgress,
+    /// The update square of a row with periodic subscriptions, which holds their `⟳`, and its
+    /// dimmed flash phase: the square's backgrounds with a foreground that stays clear on each.
+    SubscriptionSquare,
+    SubscriptionSquareDim,
     /// A Markdown link label: the terminal's own blue, as Claude Code's `chalk.blue`.
     Link,
     /// Inline code inside strong text or a heading: the code colour, still bold.
@@ -316,6 +320,8 @@ impl Role {
         Self::SubscriptionMedium,
         Self::SubscriptionLow,
         Self::UpdateProgress,
+        Self::SubscriptionSquare,
+        Self::SubscriptionSquareDim,
         Self::Link,
         Self::StrongCode,
         Self::MutedStrong,
@@ -358,6 +364,8 @@ impl Role {
                 | Self::SubscriptionHigh
                 | Self::SubscriptionMedium
                 | Self::SubscriptionLow
+                | Self::SubscriptionSquare
+                | Self::SubscriptionSquareDim
         )
     }
 
@@ -391,7 +399,7 @@ impl Role {
     }
 }
 
-const ROLE_COUNT: usize = 81;
+const ROLE_COUNT: usize = 83;
 
 /// `AgentRed` … `AgentCyan`, reproduced from Claude Code's agent palette (Tailwind 600).
 const AGENT_COLORS: [Style; 8] = [
@@ -571,13 +579,17 @@ const DARK_PALETTE: [Style; ROLE_COUNT] = [
     fg(95, 215, 215), // SubscriptionMedium
     fg(0, 175, 175),  // SubscriptionLow
     bg(110, 63, 48),  // UpdateProgress  <- local: claude dimmed, still clear on black terminals
-    ansi(AnsiColour::Blue), // Link            <- chalk.blue
-    strong(177, 185, 249), // StrongCode      <- permission + bold
-    strong(153, 153, 153), // MutedStrong     <- inactive + bold
-    bg(2, 40, 0),     // DiffLineAdded   <- colour-diff addLine
-    bg(61, 1, 0),     // DiffLineRemoved <- colour-diff deleteLine
-    bg(4, 71, 0),     // DiffWordAdded   <- colour-diff addWord
-    bg(92, 2, 0),     // DiffWordRemoved <- colour-diff deleteWord
+    // At 256 colours the square is the lighter 173, where no foreground also clears the dimmed
+    // phase, so the `⟳` turns dark on the full square and white on the dimmed one.
+    on(fg(0, 0, 0), Rgb::new(215, 119, 87)), // SubscriptionSquare
+    on(fg(255, 255, 255), Rgb::new(110, 63, 48)), // SubscriptionSquareDim
+    ansi(AnsiColour::Blue),                  // Link            <- chalk.blue
+    strong(177, 185, 249),                   // StrongCode      <- permission + bold
+    strong(153, 153, 153),                   // MutedStrong     <- inactive + bold
+    bg(2, 40, 0),                            // DiffLineAdded   <- colour-diff addLine
+    bg(61, 1, 0),                            // DiffLineRemoved <- colour-diff deleteLine
+    bg(4, 71, 0),                            // DiffWordAdded   <- colour-diff addWord
+    bg(92, 2, 0),                            // DiffWordRemoved <- colour-diff deleteWord
     on(fg(80, 200, 80), Rgb::new(2, 40, 0)), // DiffMarkerAdded <- addDecoration on addLine
     on(fg(220, 90, 90), Rgb::new(61, 1, 0)), // DiffMarkerRemoved <- deleteDecoration on deleteLine
     CODE_COLOURS[0],
@@ -665,6 +677,8 @@ const LIGHT_PALETTE: [Style; ROLE_COUNT] = [
     fg(0, 135, 135),  // SubscriptionMedium
     fg(95, 135, 135), // SubscriptionLow
     bg(238, 223, 215), // UpdateProgress
+    on(fg(0, 0, 0), Rgb::new(215, 119, 87)), // SubscriptionSquare
+    on(fg(0, 0, 0), Rgb::new(238, 223, 215)), // SubscriptionSquareDim
     ansi(AnsiColour::Blue), // Link
     strong(87, 105, 247), // StrongCode
     strong(102, 102, 102), // MutedStrong
@@ -1014,6 +1028,8 @@ pub(super) struct RoleSpan {
 pub(super) struct RoleLine {
     pub(super) spans: Vec<RoleSpan>,
     pub(super) fill: Option<Role>,
+    /// The column `fill` starts at; the columns before it keep their own background.
+    pub(super) fill_start: usize,
     pub(super) band: Option<BandFill>,
     pub(super) link: Option<String>,
 }
@@ -1050,8 +1066,14 @@ impl RoleLine {
         self
     }
 
-    pub(super) fn filled(mut self, role: Role) -> Self {
+    pub(super) fn filled(self, role: Role) -> Self {
+        self.filled_from(role, 0)
+    }
+
+    /// Fills the row from column `start` on, leaving the columns before it their own background.
+    pub(super) fn filled_from(mut self, role: Role, start: usize) -> Self {
         self.fill = Some(role);
+        self.fill_start = start;
         self
     }
 
@@ -1187,12 +1209,13 @@ impl RoleLine {
             .band
             .as_ref()
             .filter(|band| band.columns.contains(&column));
+        let fill = self.fill.filter(|_| column >= self.fill_start);
         let base = band
             .map(|band| band.role)
-            .or(self.fill)
+            .or(fill)
             .map_or(Style::default(), |fill| theme.style(fill));
         let style = role.map_or(base, |role| base.patch(theme.style(role)));
-        let on_selection = self.fill == Some(Role::Selection) || role == Some(Role::Selection);
+        let on_selection = fill == Some(Role::Selection) || role == Some(Role::Selection);
         if !on_selection || role.is_some_and(Role::is_mark) {
             return style;
         }
@@ -1638,6 +1661,7 @@ mod tests {
                     strength[0] > strength[1] && strength[1] > strength[2],
                     "{name:?} {depth:?}: high stands out most, low least: {strength:?}"
                 );
+                // A selected row leaves its first column, where the mark is, off the selection.
                 for mark in MARKS {
                     for (backdrop, colour) in [
                         ("canvas", canvas(name)),
@@ -1650,6 +1674,34 @@ mod tests {
                             "{name:?} {depth:?} {mark:?} on the {backdrop}: {ratio:.2}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// The `⟳` on a waiting row's square stays clear on both phases of the square's flash, and
+    /// the square keeps the colours of a square without one.
+    #[test]
+    fn the_mark_on_an_update_square_stays_clear_through_its_flash() {
+        for name in ThemeName::ALL {
+            let theme = Theme::new(name);
+            for (held, square) in [
+                (Role::SubscriptionSquare, Role::UpdateSquare),
+                (Role::SubscriptionSquareDim, Role::UpdateProgress),
+            ] {
+                let style = theme.style(held);
+                assert_eq!(
+                    style.background,
+                    Some(background(theme, square)),
+                    "{name:?} {held:?}"
+                );
+                for depth in [ColourDepth::Indexed256, ColourDepth::TrueColour] {
+                    let ratio = emitted_contrast(
+                        style.foreground.unwrap(),
+                        style.background.unwrap(),
+                        depth,
+                    );
+                    assert!(ratio >= 3.0, "{name:?} {depth:?} {held:?}: {ratio:.2}");
                 }
             }
         }

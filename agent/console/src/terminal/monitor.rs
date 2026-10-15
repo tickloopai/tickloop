@@ -527,7 +527,12 @@ impl Monitor {
             None => None,
         };
         Some(list_row::UpdateIndicator {
-            square: list_row::update_square(flash_since, display, now_ms),
+            square: list_row::update_square(
+                flash_since,
+                entry.subscription.is_some(),
+                display,
+                now_ms,
+            ),
             bar_columns,
         })
     }
@@ -751,18 +756,13 @@ impl Monitor {
                 glyph: display.glyph(entry.glyph),
                 glyph_role: list_row::state_mark(entry.tone, display, now_ms),
                 name: title,
-                status: list_row::row_status(
-                    entry.tone,
-                    &entry.notes,
-                    entry.subscription,
-                    display,
-                    now_ms,
-                ),
+                details: list_row::row_details(entry.tone, &entry.notes, now_ms),
                 fill: list_row::flash_fill(
                     self.taken_in.get(&entry.instance).copied(),
                     display,
                     now_ms,
                 ),
+                subscription: list_row::subscription_mark(entry.subscription, display),
                 update: self.update_indicator(entry, width, display, now_ms),
             })
             .collect::<Vec<_>>();
@@ -1177,20 +1177,23 @@ mod signal_tests {
             .and_then(|span| span.role)
     }
 
-    /// The role of the row's update square, `None` without one. The square takes the second
-    /// column of the row's indent.
+    /// The role of the row's update square, `None` without one. The square takes the row's
+    /// first column.
     fn square(monitor: &Monitor, display: DisplayProfile, now_ms: u64) -> Option<Role> {
-        let mut column = 0;
         row(monitor, display, now_ms)
             .spans
             .into_iter()
-            .find_map(|span| {
-                let start = column;
-                column += span.text.chars().count();
-                (start <= 1 && 1 < column).then_some(span.role)
+            .next()
+            .and_then(|span| span.role)
+            .filter(|role| {
+                matches!(
+                    role,
+                    Role::UpdateSquare
+                        | Role::UpdateProgress
+                        | Role::SubscriptionSquare
+                        | Role::SubscriptionSquareDim
+                )
             })
-            .flatten()
-            .filter(|role| matches!(role, Role::UpdateSquare | Role::UpdateProgress))
     }
 
     fn reduced_motion() -> DisplayProfile {
@@ -1423,7 +1426,11 @@ mod signal_tests {
         monitor.rebuild_at(UPDATED_AT + 100);
         monitor.focus(false, None);
         let line = row(&monitor, DisplayProfile::default(), UPDATED_AT + 100);
-        assert_eq!(line.fill, Some(Role::Selection));
+        assert_eq!(
+            (line.fill, line.fill_start),
+            (Some(Role::Selection), 1),
+            "the selection starts after the square"
+        );
         assert!(line.text().starts_with("  ◉ Quotes"), "{line:?}");
         assert_eq!(
             square(&monitor, DisplayProfile::default(), UPDATED_AT + 100),
@@ -1518,6 +1525,12 @@ mod signal_tests {
         );
         assert_eq!(bar(&monitor, 70_000), None);
         assert_eq!(square(&monitor, DisplayProfile::default(), 70_000), None);
+        let lead = row(&monitor, DisplayProfile::default(), 70_000).spans[0].clone();
+        assert_eq!(
+            (lead.text.as_str(), lead.role),
+            ("⟳", Some(Role::SubscriptionHigh)),
+            "the `⟳` leads the row in its frequency's colour"
+        );
         assert_eq!(
             monitor.next_frame_ms(70_000, WIDTH, DisplayProfile::default()),
             None,
@@ -1534,7 +1547,7 @@ mod signal_tests {
             first_check - period,
         );
         for (now, end) in [
-            (first_check - period, 2),
+            (first_check - period, 1),
             (first_check - 45_000, 10),
             (first_check - 30_000, 20),
             (first_check, 40),
@@ -1542,12 +1555,13 @@ mod signal_tests {
         ] {
             assert_eq!(
                 bar(&monitor, now),
-                Some((1..end, Role::UpdateProgress)),
+                Some((0..end, Role::UpdateProgress)),
                 "at {now}"
             );
             assert_eq!(
                 square(&monitor, DisplayProfile::default(), now),
-                Some(Role::UpdateSquare)
+                Some(Role::SubscriptionSquare),
+                "the square holds the `⟳`"
             );
         }
         let text = monitor
@@ -1572,7 +1586,7 @@ mod signal_tests {
         monitor.focus(false, None);
         assert_eq!(
             bar(&monitor, first_check - 30_000),
-            Some((1..20, Role::UpdateProgress)),
+            Some((0..20, Role::UpdateProgress)),
             "a selected row keeps the bar's colour over the selection"
         );
 
@@ -1609,12 +1623,15 @@ mod signal_tests {
         monitor.rebuild_at(50_000);
         assert_eq!(
             square(&monitor, animated, 50_400),
-            Some(Role::UpdateProgress)
+            Some(Role::SubscriptionSquareDim)
         );
         assert_eq!(bar(&monitor, 50_400), None, "the bar waits for the flash");
         assert_eq!(monitor.next_frame_ms(50_900, WIDTH, animated), Some(51_200));
-        assert_eq!(square(&monitor, animated, 51_200), Some(Role::UpdateSquare));
-        assert_eq!(bar(&monitor, 51_200), Some((1..7, Role::UpdateProgress)));
+        assert_eq!(
+            square(&monitor, animated, 51_200),
+            Some(Role::SubscriptionSquare)
+        );
+        assert_eq!(bar(&monitor, 51_200), Some((0..7, Role::UpdateProgress)));
     }
 
     #[test]
@@ -1644,21 +1661,19 @@ mod signal_tests {
         let line = &monitor
             .frame(WIDTH, 10, DisplayProfile::default(), now)
             .lines[2];
-        assert!(line.text().trim_end().ends_with('⟳'), "{line:?}");
+        assert_eq!(line.text().matches('⟳').count(), 1, "{line:?}");
         assert!(
             !line.text().contains(['2', '3']),
             "no count of subscriptions: {line:?}"
         );
         assert_eq!(
-            line.spans
-                .iter()
-                .find(|span| span.text == "⟳")
-                .map(|span| span.role),
-            Some(Some(Role::SubscriptionHigh))
+            (line.spans[0].text.as_str(), line.spans[0].role),
+            ("⟳", Some(Role::SubscriptionSquare)),
+            "while a subscription waits, the `⟳` is on the square"
         );
         assert_eq!(
             bar(&monitor, now),
-            Some((1..39, Role::UpdateProgress)),
+            Some((0..39, Role::UpdateProgress)),
             "the low subscription checks first, with 30 s of its 30 min left"
         );
     }

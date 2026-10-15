@@ -1539,6 +1539,7 @@ fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_other
     subscribed.group = TickGroup::Ticks;
     subscribed.instance = "calendar:quotes".parse().unwrap();
     subscribed.status = "live".into();
+    subscribed.notes = vec!["feedback paused".into()];
     subscribed.subscription = Some(crate::monitor_rows::SubscriptionMark {
         frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
         is_waiting: true,
@@ -1553,8 +1554,8 @@ fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_other
     for (width, preferred, entry, details, two_lines) in [
         (140, None, &finished, "101", false),
         (80, None, &finished, "101", false),
-        (140, None, &subscribed, "⟳", true),
-        (200, Some(80), &subscribed, "⟳", false),
+        (140, None, &subscribed, "feedback paused", true),
+        (200, Some(80), &subscribed, "feedback paused", false),
     ] {
         let mut state = State::new(true, width, 25);
         state.switch_view_chat(Some(Uuid::new_v4()));
@@ -1579,7 +1580,7 @@ fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_other
 }
 
 #[test]
-fn row_details_end_with_the_mark_whole_one_column_short_of_the_monitor_edge_at_any_width() {
+fn row_details_end_at_the_monitor_edge_and_the_mark_leads_the_row_at_any_width() {
     use crate::monitor_rows::{RowUpdate, StatusTone, Unread};
     let unread = Some(RowUpdate {
         at_ms: 1000,
@@ -1613,21 +1614,41 @@ fn row_details_end_with_the_mark_whole_one_column_short_of_the_monitor_edge_at_a
             .replace(TickGroup::Shells, vec![running.clone()]);
         state.draw_frame(&mut Vec::new()).unwrap();
         let side = state.monitor_columns() - 2;
-        for (title, ending) in [("python3 -q", "⟳ "), ("cargo nextest", "1m 59s ")] {
-            let screen = &state.rendered_screen;
-            let first = screen.iter().position(|row| row.contains(title)).unwrap();
-            let row = screen[first..]
+        let screen = &state.rendered_screen;
+        let monitor_rows = |title: &str| {
+            let first = screen
                 .iter()
-                .map(|row| row.rsplit_once('│').unwrap().1.to_owned())
-                .find(|row| row.trim_end().ends_with(ending.trim_end()))
+                .position(|row| row.contains(title))
                 .unwrap_or_else(|| panic!("{width}: {screen:#?}"));
-            assert_eq!(display_width(&row), side + 1, "{width}: {row:?}");
-            assert!(
-                row.ends_with(ending) && !row.contains('●') && !row.contains("26"),
-                "{width}: the mark shows whole before a blank column, without a dot or count: \
-                 {row:?}"
-            );
-        }
+            screen[first..]
+                .iter()
+                .map_while(|row| row.rsplit_once("│ ").map(|(_, side)| side.to_owned()))
+                .collect::<Vec<_>>()
+        };
+        let subscribed_row = monitor_rows("python3 -q").remove(0);
+        assert!(
+            subscribed_row.starts_with("⟳ ") && subscribed_row.matches('⟳').count() == 1,
+            "{width}: the mark leads the row, a blank column after it: {subscribed_row:?}"
+        );
+        let running_rows = monitor_rows("cargo nextest");
+        let details_row = running_rows
+            .iter()
+            .find(|row| row.trim_end().ends_with("1m 59s"))
+            .unwrap_or_else(|| panic!("{width}: {screen:#?}"));
+        assert_eq!(display_width(details_row), side, "{width}: {details_row:?}");
+        assert!(
+            !details_row.contains('●') && !details_row.contains("26"),
+            "{width}: the details reach the edge, without a dot or count: {details_row:?}"
+        );
+        assert_eq!(
+            subscribed_row
+                .find("python3")
+                .map(|byte| display_width(&subscribed_row[..byte])),
+            running_rows[0]
+                .find("cargo")
+                .map(|byte| display_width(&running_rows[0][..byte])),
+            "{width}: names start in one column"
+        );
     }
 }
 
@@ -2106,8 +2127,10 @@ fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() 
     let text = monitor_text(&mut state);
     let row = text.lines().find(|line| line.contains("calendar")).unwrap();
     assert!(
-        row.trim_end().ends_with('⟳') && !row.contains("high") && !text.contains("live"),
-        "{text}"
+        row.rsplit_once("│ ").unwrap().1.starts_with('⟳')
+            && !row.contains("high")
+            && !text.contains("live"),
+        "the mark leads the row: {text}"
     );
     assert!(
         text.contains("enter open")
@@ -2217,7 +2240,7 @@ fn several_subscriptions_on_one_row_show_a_summary_and_open_as_a_list() {
     let text = monitor_text(&mut state);
     let row = text.lines().find(|line| line.contains("calendar")).unwrap();
     assert!(
-        row.trim_end().ends_with('⟳') && !row.contains('3'),
+        row.rsplit_once("│ ").unwrap().1.starts_with('⟳') && !row.contains('3'),
         "several subscriptions show one mark without a count: {text}"
     );
     assert!(

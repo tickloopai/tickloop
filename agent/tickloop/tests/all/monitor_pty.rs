@@ -113,9 +113,11 @@ impl Session {
         self.wait_until_shown(needle, true);
     }
     /// Waits until the Console paints a Monitor row's update square, which has no text of its own:
-    /// the accent background at 256 colours or in true colour.
+    /// the accent background at 256 colours or in true colour, in the Monitor's first column,
+    /// right after its divider.
     fn wait_for_update_square(&self) {
-        const UPDATE_SQUARE_BACKGROUNDS: [&str; 2] = ["\x1b[48;5;173m", "\x1b[48;2;215;119;87m"];
+        const UPDATE_SQUARE_BACKGROUNDS: [&str; 2] =
+            ["│ \x1b[48;5;173m", "│ \x1b[48;2;215;119;87m"];
         let deadline = Instant::now() + TIMEOUT;
         while !UPDATE_SQUARE_BACKGROUNDS
             .iter()

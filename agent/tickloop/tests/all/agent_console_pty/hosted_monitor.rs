@@ -43,11 +43,12 @@ async fn view_with_keys_ticks(
     view
 }
 
-/// The screen line of the selected hosted row.
+/// The screen line of the selected hosted row. The selection mark takes the row's first column,
+/// or its second when the first holds the update square or `⟳`.
 fn selected_row(frame: &str) -> Option<usize> {
-    frame
-        .lines()
-        .position(|line| line.contains(&format!("{SELECTED_MARK} ◉")))
+    frame.lines().position(|line| {
+        line.contains(&format!("{SELECTED_MARK} ◉")) || line.contains(&format!("{SELECTED_MARK}◉"))
+    })
 }
 
 /// Notices the Console used to show after a hosted Tick opened or closed; it now returns to the
@@ -383,7 +384,7 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
         .await;
         view.send(b"\r");
         view.wait_for("the reopened row leaves", |frame| {
-            !frame.contains("Monitor 1") && !frame.contains(" ◉ Keys")
+            !frame.contains("Monitor 1") && !frame.contains("◉ Keys")
         })
         .await;
         assert_eq!(
@@ -863,10 +864,12 @@ async fn view_with_local_ticks(
 }
 
 /// The selected Monitor row's text.
+/// The selected Monitor row's text without the selection mark, its first column included.
 fn selected_text(frame: &str) -> Option<String> {
     frame.lines().find_map(|line| {
-        line.split_once(&format!("{SELECTED_MARK} "))
-            .map(|(_, row)| row.to_owned())
+        let (before, after) = line.split_once(SELECTED_MARK)?;
+        let lead = before.rsplit_once("│ ").map_or(before, |(_, lead)| lead);
+        Some(format!("{lead}{after}"))
     })
 }
 

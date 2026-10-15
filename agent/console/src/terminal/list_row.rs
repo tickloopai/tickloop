@@ -1,9 +1,10 @@
 //! A list row in the Subagents panel's look: an indent the selection fill covers, a glyph whose
-//! colour is the row's state, the name, and right-aligned muted details and mark. A row whose
-//! whole name does not fit beside its details continues the name on a second line, under its
-//! first, and keeps the details at the right edge there, so details line up whatever a row's
-//! height. A Monitor row's update shows as a square in the indent, and while a periodic
-//! subscription holds it, as a bar that runs from the square across the row.
+//! colour is the row's state, the name, and right-aligned muted details. A row whose whole name
+//! does not fit beside its details continues the name on a second line, under its first, and
+//! keeps the details at the right edge there, so details line up whatever a row's height. A
+//! Monitor row leads with its periodic subscriptions' `⟳` and its update square in the first
+//! column, the `⟳` on the square while the square shows; while a periodic subscription holds the
+//! update, a bar runs from the square across the row.
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -17,14 +18,11 @@ use tickloop_agent_protocol::TickSubscriptionFrequency;
 
 /// The columns before a list row's glyph. The selection fill alone marks the selected row.
 pub(super) const ROW_INDENT: &str = "  ";
-/// The indent column a Monitor row's update square takes, next to the glyph. The column before it
-/// stays the row's own, so the selection fill always starts a selected row.
-const SQUARE_COLUMN: usize = 1;
+/// What follows a Monitor row's first column before its glyph: a blank column, so a `⟳` some
+/// fallback font draws wider than its column never meets the glyph.
+const LEAD_GAP: &str = " ";
 const STATUS_GAP_COLUMNS: usize = 2;
 const SEGMENT_SEPARATOR: &str = " · ";
-/// The blank column after a row's details. A mark some terminals draw wider than its one column,
-/// such as `⟳` from a fallback font, still shows whole instead of meeting the column's edge.
-const RIGHT_MARGIN: &str = " ";
 const MILLISECONDS_PER_SECOND: u64 = 1000;
 
 pub(super) struct ListRow<'a> {
@@ -33,10 +31,14 @@ pub(super) struct ListRow<'a> {
     /// The glyph's colour, which is the row's state; see [`state_mark`].
     pub(super) glyph_role: Role,
     pub(super) name: &'a str,
-    pub(super) status: RowStatus,
+    /// A running row's elapsed time and the row's notes; see [`row_details`].
+    pub(super) details: String,
     /// The row's flash fill while it flashes; see [`flash_fill`]. It covers the update bar, and
     /// the selection fill wins over it.
     pub(super) fill: Option<Role>,
+    /// The `⟳` of the row's periodic subscriptions in its frequency's colour; see
+    /// [`subscription_mark`]. On the update square it takes the square's own colours.
+    pub(super) subscription: Option<(&'a str, Role)>,
     pub(super) update: Option<UpdateIndicator>,
 }
 
@@ -59,30 +61,38 @@ impl ListRow<'_> {
         }
     }
 
+    /// Whether the first column holds the update square or `⟳`, which keep their own colours on
+    /// a selected row, so the selection fill starts after them.
+    fn has_lead_mark(&self) -> bool {
+        self.update.is_some() || self.subscription.is_some()
+    }
+
     fn prefix(&self) -> RoleLine {
         let role = self.role();
-        let (before_square, square) = ROW_INDENT.split_at(SQUARE_COLUMN);
-        let mut line = RoleLine::role(before_square, role);
-        line.push(
-            square,
-            Some(self.update.map_or(role, |update| update.square)),
-        );
+        let lead_role = self
+            .update
+            .map(|update| update.square)
+            .or(self.subscription.map(|(_, mark_role)| mark_role))
+            .unwrap_or(role);
+        let lead = self.subscription.map_or(" ", |(mark, _)| mark);
+        let mut line = RoleLine::role(lead, lead_role);
+        line.push(LEAD_GAP, Some(role));
         line.push(self.glyph, Some(self.glyph_role));
         line.push(" ", Some(role));
         line
     }
 
     /// Columns a row's details take at its right, with the gap before them.
-    fn status_reserve(&self) -> usize {
-        match self.status.columns() {
+    fn details_reserve(&self) -> usize {
+        match self.details.width() {
             0 => 0,
             columns => STATUS_GAP_COLUMNS + columns,
         }
     }
 
-    /// Columns a one-line row needs beside its name: the indent, glyph and details.
+    /// Columns a one-line row needs beside its name: the lead, glyph and details.
     fn reserved_columns(&self) -> usize {
-        self.prefix().text().width() + self.status_reserve()
+        self.prefix().text().width() + self.details_reserve()
     }
 
     /// The row's lines: one when the whole name fits beside the details, else two, with the name
@@ -99,7 +109,7 @@ impl ListRow<'_> {
         let mut line = self.prefix();
         let name_columns = width.saturating_sub(self.reserved_columns());
         line.push(ellipsize(self.name, name_columns), Some(self.role()));
-        self.push_status(&mut line, width);
+        self.push_details(&mut line, width);
         self.finish(line, width)
     }
 
@@ -109,23 +119,21 @@ impl ListRow<'_> {
         let (head, tail) = split_at_columns(self.name, width.saturating_sub(name_column));
         first.push(head, Some(self.role()));
         let mut second = RoleLine::role(" ".repeat(name_column), self.role());
-        let tail_columns = width.saturating_sub(name_column + self.status_reserve());
+        let tail_columns = width.saturating_sub(name_column + self.details_reserve());
         second.push(ellipsize(tail, tail_columns), Some(self.role()));
-        self.push_status(&mut second, width);
+        self.push_details(&mut second, width);
         [self.finish(first, width), self.finish(second, width)]
     }
 
     /// Right-aligns the details in the columns the line leaves, shortened there when they do not
     /// fit.
-    fn push_status(&self, line: &mut RoleLine, width: usize) {
-        let spans = self.status.spans(width.saturating_sub(line.text().width()));
+    fn push_details(&self, line: &mut RoleLine, width: usize) {
+        let details = ellipsize(&self.details, width.saturating_sub(line.text().width()));
         line.push(
-            " ".repeat(width.saturating_sub(line.text().width() + spans_columns(&spans))),
+            " ".repeat(width.saturating_sub(line.text().width() + details.width())),
             None,
         );
-        for (text, role) in spans {
-            line.push(text, Some(role));
-        }
+        line.push(details, Some(Role::MutedText));
     }
 
     /// Fills the line: the selection with the update bar over it, else a flash over everything,
@@ -135,9 +143,9 @@ impl ListRow<'_> {
         let bar = self
             .update
             .and_then(|update| update.bar_columns)
-            .map(|columns| SQUARE_COLUMN..columns.max(SQUARE_COLUMN + 1));
+            .map(|columns| 0..columns.max(1));
         if self.selected {
-            line = line.filled(Role::Selection);
+            line = line.filled_from(Role::Selection, usize::from(self.has_lead_mark()));
         } else if let Some(fill) = self.fill {
             return line.filled(fill);
         }
@@ -167,57 +175,6 @@ fn split_at_columns(text: &str, columns: usize) -> (&str, &str) {
     (text, "")
 }
 
-fn spans_columns(spans: &[(String, Role)]) -> usize {
-    spans.iter().map(|(text, _)| text.width()).sum()
-}
-
-/// What a row shows at its right: muted details, then its mark in its own colour.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct RowStatus {
-    /// A running row's elapsed time and the row's notes.
-    pub(super) details: String,
-    pub(super) mark: Option<(String, Role)>,
-}
-
-impl RowStatus {
-    fn is_empty(&self) -> bool {
-        self.details.is_empty() && self.mark.is_none()
-    }
-
-    /// Columns the whole status takes, its right margin included.
-    fn columns(&self) -> usize {
-        spans_columns(&self.spans(usize::MAX))
-    }
-
-    /// The status within `columns`, its right margin included: the mark always whole, the
-    /// details shortened before it when the row is too narrow for both.
-    fn spans(&self, columns: usize) -> Vec<(String, Role)> {
-        if self.is_empty() {
-            return Vec::new();
-        }
-        let mark_columns = self
-            .mark
-            .as_ref()
-            .map_or(0, |(mark, _)| mark.width() + SEGMENT_SEPARATOR.width());
-        let details = ellipsize(
-            &self.details,
-            columns.saturating_sub(mark_columns + RIGHT_MARGIN.width()),
-        );
-        let mut spans = Vec::new();
-        if !details.is_empty() {
-            spans.push((details, Role::MutedText));
-        }
-        if let Some(mark) = &self.mark {
-            if !spans.is_empty() {
-                spans.push((SEGMENT_SEPARATOR.to_owned(), Role::MutedText));
-            }
-            spans.push(mark.clone());
-        }
-        spans.push((RIGHT_MARGIN.to_owned(), Role::MutedText));
-        spans
-    }
-}
-
 /// The colour of a row's leading glyph, which carries the row's state: accent while running,
 /// success, error or warning, and muted when idle, never updated or neutral.
 pub(super) fn state_mark(tone: StatusTone, display: DisplayProfile, now_ms: u64) -> Role {
@@ -241,15 +198,20 @@ pub(super) fn running_mark(display: DisplayProfile, now_ms: u64) -> Role {
 }
 
 /// A row's update square. A new update flashes it once since `flash_since`, full, dim, full,
-/// then it stays full; under Reduce motion it never flashes.
+/// then it stays full; under Reduce motion it never flashes. A square that holds the `⟳` of a
+/// periodic subscription draws it in a foreground clear on both phases.
 pub(super) fn update_square(
     flash_since: Option<u64>,
+    holds_subscription: bool,
     display: DisplayProfile,
     now_ms: u64,
 ) -> Role {
-    match flash_since.and_then(|since| display.flash_strong(since, now_ms)) {
-        Some(false) => Role::UpdateProgress,
-        Some(true) | None => Role::UpdateSquare,
+    let is_dim = flash_since.and_then(|since| display.flash_strong(since, now_ms)) == Some(false);
+    match (holds_subscription, is_dim) {
+        (false, false) => Role::UpdateSquare,
+        (false, true) => Role::UpdateProgress,
+        (true, false) => Role::SubscriptionSquare,
+        (true, true) => Role::SubscriptionSquareDim,
     }
 }
 
@@ -276,37 +238,35 @@ fn subscription_role(frequency: TickSubscriptionFrequency) -> Role {
     }
 }
 
-/// The details at a row's right. The glyph's colour already tells the state, so no status word
-/// or result glyph repeats it: a running row's elapsed time and the row's notes, muted, then the
-/// `⟳` of its periodic subscriptions in their frequency's colour, which keeps its colour on a
-/// selected row. Nothing on the row keeps changing with each update, neither a time nor a count of
-/// waiting updates; its detail and the subscription detail tell them.
-pub(super) fn row_status(
-    tone: StatusTone,
-    notes: &[String],
+/// The `⟳` that leads a row with periodic subscriptions, in its frequency's colour.
+pub(super) fn subscription_mark(
     subscription: Option<SubscriptionMark>,
     display: DisplayProfile,
-    now_ms: u64,
-) -> RowStatus {
+) -> Option<(&'static str, Role)> {
+    subscription.map(|mark| {
+        (
+            display.glyph(Glyph::Subscription),
+            subscription_role(mark.frequency),
+        )
+    })
+}
+
+/// The details at a row's right. The glyph's colour already tells the state and the lead the
+/// subscriptions, so no status word or result glyph repeats them: a running row's elapsed time
+/// and the row's notes. Nothing on the row keeps changing with each update, neither a time nor a
+/// count of waiting updates; its detail and the subscription detail tell them.
+pub(super) fn row_details(tone: StatusTone, notes: &[String], now_ms: u64) -> String {
     let elapsed = match tone {
         StatusTone::Running {
             since_ms: Some(since),
         } => Some(format_elapsed(now_ms.saturating_sub(since))),
         _ => None,
     };
-    RowStatus {
-        details: elapsed
-            .into_iter()
-            .chain(notes.iter().cloned())
-            .collect::<Vec<_>>()
-            .join(SEGMENT_SEPARATOR),
-        mark: subscription.map(|mark| {
-            (
-                display.glyph(Glyph::Subscription).to_owned(),
-                subscription_role(mark.frequency),
-            )
-        }),
-    }
+    elapsed
+        .into_iter()
+        .chain(notes.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(SEGMENT_SEPARATOR)
 }
 
 /// Elapsed time as the Subagents panel shows it: `45s`, `2m 3s`, `1h 2m 3s`, `1d 2h 3m`.
@@ -337,33 +297,16 @@ mod tests {
     use crate::monitor_rows::NextCheck;
     use tickloop_agent_config::DisplayPreferences;
 
-    fn text(status: &RowStatus) -> String {
-        status
-            .spans(usize::MAX)
-            .iter()
-            .map(|(text, _)| text.as_str())
-            .collect()
-    }
-
     fn row<'a>(name: &'a str, details: &str) -> ListRow<'a> {
         ListRow {
             selected: false,
             glyph: "$",
             glyph_role: Role::RunningMark,
             name,
-            status: RowStatus {
-                details: details.into(),
-                mark: None,
-            },
-            fill: None,
-            update: None,
-        }
-    }
-
-    fn marked(details: &str, mark: Role) -> RowStatus {
-        RowStatus {
             details: details.into(),
-            mark: Some(("⟳".into(), mark)),
+            fill: None,
+            subscription: None,
+            update: None,
         }
     }
 
@@ -373,6 +316,19 @@ mod tests {
             is_waiting: false,
             next_check: None,
         })
+    }
+
+    /// Each column's text and role as far as `columns`.
+    fn lead(line: &RoleLine, columns: usize) -> Vec<(String, Option<Role>)> {
+        let mut cells = Vec::new();
+        for span in &line.spans {
+            for character in span.text.chars() {
+                if cells.len() < columns {
+                    cells.push((character.to_string(), span.role));
+                }
+            }
+        }
+        cells
     }
 
     #[test]
@@ -387,7 +343,7 @@ mod tests {
             lines,
             [
                 "  $ Rerun full test suite in",
-                "    background to verify  14s "
+                "    background to verify   14s"
             ]
         );
         let one_line = ListRow {
@@ -395,7 +351,7 @@ mod tests {
             ..long
         };
         let line = one_line.lines(30)[0].text();
-        assert_eq!(line, "  $ cargo test            14s ");
+        assert_eq!(line, "  $ cargo test             14s");
         assert_eq!(
             line.width(),
             lines[1].width(),
@@ -413,7 +369,7 @@ mod tests {
         assert_eq!(lines[0].text(), "  $ a b c d e f g h");
         let second = lines[1].text();
         assert!(
-            second.contains('…') && second.ends_with("  2m 3s "),
+            second.contains('…') && second.ends_with("  2m 3s"),
             "{second}"
         );
         assert_eq!(lines[1].text().width(), 20);
@@ -449,72 +405,93 @@ mod tests {
 
     #[test]
     fn running_rows_show_only_their_elapsed_time() {
-        let display = DisplayProfile::default();
-        let status = row_status(
+        let details = row_details(
             StatusTone::Running {
                 since_ms: Some(1_000),
             },
             &["SIGTERM".into()],
-            None,
-            display,
             120_000,
         );
-        assert_eq!(text(&status), "1m 59s · SIGTERM ");
+        assert_eq!(details, "1m 59s · SIGTERM");
         assert!(
-            row_status(
-                StatusTone::Running { since_ms: None },
-                &[],
-                None,
-                display,
-                0
-            )
-            .is_empty(),
+            row_details(StatusTone::Running { since_ms: None }, &[], 0).is_empty(),
             "an unknown start shows no word in its place"
         );
     }
 
     #[test]
-    fn a_subscription_shows_one_mark_coloured_by_frequency_and_never_a_word_or_count() {
+    fn a_quiet_subscription_leads_the_row_with_one_mark_coloured_by_frequency() {
         for (frequency, role) in [
             (TickSubscriptionFrequency::High, Role::SubscriptionHigh),
             (TickSubscriptionFrequency::Medium, Role::SubscriptionMedium),
             (TickSubscriptionFrequency::Low, Role::SubscriptionLow),
         ] {
+            let mark = subscription_mark(periodic(frequency), DisplayProfile::default());
+            assert_eq!(mark, Some(("⟳", role)), "{frequency:?}");
+            let line = ListRow {
+                subscription: mark,
+                ..row("Quotes", "exit 101")
+            }
+            .lines(30)[0]
+                .clone();
             assert_eq!(
-                row_status(
-                    StatusTone::Live,
-                    &[],
-                    periodic(frequency),
-                    DisplayProfile::default(),
-                    0
-                ),
-                marked("", role),
-                "{frequency:?}"
+                lead(&line, 3),
+                [
+                    ("⟳".to_owned(), Some(role)),
+                    (" ".to_owned(), Some(Role::MutedText)),
+                    ("$".to_owned(), Some(Role::RunningMark))
+                ],
+                "{frequency:?}: the mark, a blank column, then the glyph"
+            );
+            assert!(
+                line.text().ends_with("exit 101"),
+                "nothing trails the details: {line:?}"
             );
         }
     }
 
     #[test]
-    fn the_mark_stays_whole_with_a_free_column_after_it_however_narrow_the_row() {
-        for (width, details) in [(12, "ex…"), (20, "exit 101 ·…"), (60, "exit 101 · SIGTERM")]
-        {
-            let lines = ListRow {
-                status: marked("exit 101 · SIGTERM", Role::SubscriptionLow),
-                ..row("python3 -q", "")
+    fn the_name_starts_in_one_column_with_or_without_a_mark_or_square() {
+        let names = [
+            row("Quotes", "").lines(20)[0].clone(),
+            ListRow {
+                subscription: Some(("⟳", Role::SubscriptionLow)),
+                ..row("Quotes", "")
             }
-            .lines(width);
-            let last = lines.last().unwrap().text();
+            .lines(20)[0]
+                .clone(),
+            ListRow {
+                update: Some(UpdateIndicator {
+                    square: Role::UpdateSquare,
+                    bar_columns: None,
+                }),
+                ..row("Quotes", "")
+            }
+            .lines(20)[0]
+                .clone(),
+        ]
+        .map(|line| line.text().find("Quotes").unwrap());
+        assert_eq!(
+            names,
+            [4, 6, 4],
+            "byte offsets: `⟳` takes three bytes in one column"
+        );
+        let narrow = ListRow {
+            subscription: Some(("⟳", Role::SubscriptionLow)),
+            ..row("python3 -q", "exit 101 · SIGTERM")
+        };
+        for width in [12, 20, 60] {
+            let last = narrow.lines(width).last().unwrap().text();
             assert_eq!(last.width(), width, "{last:?}");
             assert!(
-                last.ends_with(&format!("{details} · ⟳ ")),
-                "{width}: the mark keeps its column and a blank one after it: {last:?}"
+                !last.ends_with('⟳') && !last.ends_with(' '),
+                "{width}: no mark or blank column at the right: {last:?}"
             );
         }
     }
 
     #[test]
-    fn a_square_takes_the_indent_column_next_to_the_glyph_and_never_moves_the_name() {
-        let plain = row("Quotes", "").lines(20)[0].clone();
+    fn a_square_takes_the_first_column_and_holds_the_mark_of_a_subscription() {
         let updated = ListRow {
             update: Some(UpdateIndicator {
                 square: Role::UpdateSquare,
@@ -524,37 +501,101 @@ mod tests {
         }
         .lines(20)[0]
             .clone();
-        assert_eq!(updated.text(), plain.text(), "the name stays where it was");
-        assert_eq!(updated.spans[0].text, " ");
+        assert_eq!(updated.text(), row("Quotes", "").lines(20)[0].text());
         assert_eq!(
-            (updated.spans[1].text.as_str(), updated.spans[1].role),
-            (" ", Some(Role::UpdateSquare))
+            lead(&updated, 2),
+            [
+                (" ".to_owned(), Some(Role::UpdateSquare)),
+                (" ".to_owned(), Some(Role::MutedText))
+            ]
         );
         assert_eq!(
             updated.band, None,
             "no bar without a subscription holding it"
         );
+        let held = ListRow {
+            update: Some(UpdateIndicator {
+                square: Role::SubscriptionSquare,
+                bar_columns: Some(10),
+            }),
+            subscription: Some(("⟳", Role::SubscriptionMedium)),
+            ..row("Quotes", "")
+        }
+        .lines(20)[0]
+            .clone();
+        assert_eq!(
+            lead(&held, 2),
+            [
+                ("⟳".to_owned(), Some(Role::SubscriptionSquare)),
+                (" ".to_owned(), Some(Role::MutedText))
+            ],
+            "the `⟳` sits on the square in the square's foreground"
+        );
+        assert_eq!(
+            held.band.map(|band| (band.columns, band.role)),
+            Some((0..10, Role::UpdateProgress)),
+            "the bar runs from the square through the blank column"
+        );
     }
 
     #[test]
-    fn one_line_and_two_line_rows_both_right_align_the_status_and_mark_the_selection_by_fill() {
-        let selected = ListRow {
+    fn a_selected_row_fills_from_its_second_column_when_its_first_holds_a_mark() {
+        let selected_row = || ListRow {
             selected: true,
             glyph_role: Role::SuccessMark,
             ..row("Run the console tests in the worktree", "12s")
         };
+        let selected = selected_row();
         let line = selected.one_line(40);
         assert_eq!(line.text().width(), 40);
         assert!(line.text().starts_with("  $ Run the console"), "{line:?}");
-        assert!(line.text().ends_with("the…   12s "), "{line:?}");
+        assert!(line.text().ends_with("the w…  12s"), "{line:?}");
         assert_eq!(line.spans[1].role, Some(Role::SuccessMark));
-        assert_eq!(line.fill, Some(Role::Selection));
+        assert_eq!(
+            (line.fill, line.fill_start),
+            (Some(Role::Selection), 0),
+            "without a mark the selection fills the whole row"
+        );
         let [name, status] = selected.two_lines(30);
         assert_eq!(name.text(), "  $ Run the console tests in");
-        assert_eq!(status.text(), "    the worktree          12s ");
+        assert_eq!(status.text(), "    the worktree           12s");
         assert_eq!(name.fill, Some(Role::Selection));
         assert_eq!(status.fill, Some(Role::Selection));
         assert!(!line.text().contains('›'));
+        for marked in [
+            ListRow {
+                subscription: Some(("⟳", Role::SubscriptionHigh)),
+                ..selected_row()
+            },
+            ListRow {
+                update: Some(UpdateIndicator {
+                    square: Role::UpdateSquare,
+                    bar_columns: None,
+                }),
+                ..selected_row()
+            },
+        ] {
+            for line in marked.lines(30) {
+                assert_eq!(
+                    (line.fill, line.fill_start),
+                    (Some(Role::Selection), 1),
+                    "the first column keeps its own colours: {line:?}"
+                );
+            }
+        }
+        let theme = super::super::style::Theme::new(super::super::style::ThemeName::ClaudeCodeDark);
+        let resolved = ListRow {
+            subscription: Some(("⟳", Role::SubscriptionHigh)),
+            ..selected_row()
+        }
+        .one_line(40)
+        .resolve(theme, 40);
+        assert_eq!(resolved.spans[0].style.background, None, "{resolved:?}");
+        assert_eq!(
+            resolved.spans[1].style.background,
+            theme.style(Role::Selection).background,
+            "the selection starts at the second column"
+        );
     }
 
     #[test]
@@ -565,10 +606,10 @@ mod tests {
         };
         let waiting = ListRow {
             update: Some(UpdateIndicator {
-                square: Role::UpdateSquare,
+                square: Role::SubscriptionSquare,
                 bar_columns: Some(check.elapsed_columns(30, 130_000)),
             }),
-            status: marked("", Role::SubscriptionHigh),
+            subscription: Some(("⟳", Role::SubscriptionHigh)),
             ..row("Quote board for the whole watchlist", "")
         };
         let lines = waiting.lines(30);
@@ -577,7 +618,7 @@ mod tests {
             assert_eq!(line.fill, None);
             assert_eq!(
                 line.band.clone().map(|band| (band.columns, band.role)),
-                Some((1..15, Role::UpdateProgress)),
+                Some((0..15, Role::UpdateProgress)),
                 "half the period fills half the row, from the square on: {line:?}"
             );
         }
@@ -593,7 +634,7 @@ mod tests {
                 .band
                 .clone()
                 .map(|band| band.columns),
-            Some(1..2),
+            Some(0..1),
             "the bar never leaves its square behind"
         );
         let flashing = ListRow {
@@ -612,7 +653,7 @@ mod tests {
             assert_eq!(line.fill, Some(Role::Selection), "the selection wins");
             assert_eq!(
                 line.band.map(|band| (band.columns, band.role)),
-                Some((1..15, Role::UpdateProgress)),
+                Some((0..15, Role::UpdateProgress)),
                 "a selected row's bar keeps its colour over the selection"
             );
         }
@@ -622,7 +663,12 @@ mod tests {
     fn a_new_update_flashes_the_square_full_dim_full_and_it_then_stays_full() {
         let animated = DisplayProfile::default();
         assert_eq!(
-            [5_000, 5_400, 5_800, 6_200].map(|now| update_square(Some(5_000), animated, now)),
+            [5_000, 5_400, 5_800, 6_200].map(|now| update_square(
+                Some(5_000),
+                false,
+                animated,
+                now
+            )),
             [
                 Role::UpdateSquare,
                 Role::UpdateProgress,
@@ -630,11 +676,20 @@ mod tests {
                 Role::UpdateSquare
             ]
         );
+        assert_eq!(
+            [5_000, 5_400, 6_200].map(|now| update_square(Some(5_000), true, animated, now)),
+            [
+                Role::SubscriptionSquare,
+                Role::SubscriptionSquareDim,
+                Role::SubscriptionSquare
+            ],
+            "a square holding a `⟳` flashes the same backgrounds"
+        );
         let still = DisplayProfile::new(DisplayPreferences {
             prefers_reduced_motion: true,
         });
         assert_eq!(
-            update_square(Some(5_000), still, 5_400),
+            update_square(Some(5_000), false, still, 5_400),
             Role::UpdateSquare,
             "under Reduce motion the square does not flash"
         );
