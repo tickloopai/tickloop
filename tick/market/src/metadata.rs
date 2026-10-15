@@ -1,5 +1,5 @@
 use serde::Serialize;
-use tick_protocol::TickTool;
+use tick_protocol::{StateDeclaration, StateSeries, TickTool};
 use tick_provider::{
     Interface,
     error::{Error, Result},
@@ -56,6 +56,8 @@ pub struct TickDescriptor {
     /// The query tool that rebuilds what the latest-only update stream dropped.
     pub recover_with: Option<&'static str>,
     pub tools: Vec<TickTool>,
+    /// The arrays in the Tick's state ordered in time.
+    pub series: Vec<StateSeries>,
 }
 
 impl TickDescriptor {
@@ -208,6 +210,7 @@ impl TickKind {
             protocol: tick_protocol::NATIVE_PROTOCOL_VERSION,
             recover_with: catalog.recover_with,
             tools: catalog.tools,
+            series: catalog.series,
         }
     }
 }
@@ -227,6 +230,9 @@ impl Describe for TickKind {
             revision: CATALOG_REVISION.to_owned(),
             recover_with: descriptor.recover_with.map(str::to_owned),
             tools: descriptor.tools,
+            state: (!descriptor.series.is_empty()).then_some(StateDeclaration {
+                series: descriptor.series,
+            }),
         })
     }
 }
@@ -256,6 +262,40 @@ mod tests {
     fn every_shipped_tick_declares_a_usable_catalog() {
         for kind in TickKind::ALL {
             kind.descriptor().validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn the_ticks_whose_state_holds_a_time_series_declare_its_newest_end() {
+        use tick_protocol::SeriesEnd;
+        let declared = |kind: TickKind| {
+            Describe::descriptor(&kind)
+                .unwrap()
+                .state
+                .map(|state| {
+                    state
+                        .series
+                        .into_iter()
+                        .map(|series| (series.path, series.newest))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            declared(TickKind::News),
+            [("/items".to_owned(), SeriesEnd::First)]
+        );
+        // Kline, Earnings and Options publish summaries; their series stay behind their tools.
+        for kind in [
+            TickKind::Quote,
+            TickKind::Watchlist,
+            TickKind::Kline,
+            TickKind::Positions,
+            TickKind::Earnings,
+            TickKind::Options,
+            TickKind::Reader,
+        ] {
+            assert!(declared(kind).is_empty(), "{kind:?}");
         }
     }
 

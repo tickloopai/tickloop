@@ -149,7 +149,6 @@ pub enum LocalMessage {
     /// Tick Instance.
     TickDelivery {
         items: Vec<TickDeliveryLine>,
-        truncated: bool,
     },
 }
 
@@ -194,11 +193,14 @@ impl SubagentReportMessage {
     }
 }
 
+/// One Tick Instance of a delivery: its seq span, how many updates the delivery merged and
+/// whether its data was trimmed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TickDeliveryLine {
     pub instance: tick_protocol::InstanceRef,
-    pub sequence: u64,
-    pub dropped: u64,
+    pub seq: Option<String>,
+    pub updates: u64,
+    pub is_trimmed: bool,
 }
 
 impl LocalMessage {
@@ -252,7 +254,6 @@ impl LocalMessage {
                     .as_array()
                     .map(|items| items.iter().filter_map(tick_delivery_line).collect())
                     .unwrap_or_default(),
-                truncated: payload["truncated"].as_bool().unwrap_or_default(),
             });
         }
         if text.starts_with(&format!("<{TASK_NOTIFICATION_TAG}>")) {
@@ -271,8 +272,11 @@ impl LocalMessage {
 fn tick_delivery_line(item: &serde_json::Value) -> Option<TickDeliveryLine> {
     Some(TickDeliveryLine {
         instance: serde_json::from_value(item["instance"].clone()).ok()?,
-        sequence: item["sequence"].as_u64().unwrap_or_default(),
-        dropped: item["dropped"].as_u64().unwrap_or_default(),
+        seq: item["seq"].as_str().map(str::to_owned),
+        updates: item["updates"].as_u64().unwrap_or_default(),
+        is_trimmed: item["trimmed"]
+            .as_array()
+            .is_some_and(|trimmed| !trimmed.is_empty()),
     })
 }
 

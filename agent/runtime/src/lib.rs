@@ -68,6 +68,7 @@ mod permission_management;
 mod plan;
 mod tick_content;
 mod tick_subscriptions;
+mod tick_trim;
 mod todo_lifecycle;
 mod triggers;
 mod user_shell;

@@ -14,7 +14,7 @@ use futures_util::future::BoxFuture;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tick_protocol::TickTool;
+use tick_protocol::{SeriesEnd, StateSeries, TickTool};
 
 type QueryHandler<S, E> = Arc<
     dyn for<'a> Fn(&'a S, Value) -> Result<BoxFuture<'a, Result<Value, E>>, String> + Send + Sync,
@@ -22,11 +22,13 @@ type QueryHandler<S, E> = Arc<
 
 type ArgumentCheck = Arc<dyn Fn(&Value) -> Result<(), String> + Send + Sync>;
 
-/// A Tick's published tools and the query tool that recovers dropped Tick Updates.
+/// A Tick's published tools, the query tool that recovers dropped Tick Updates and the series
+/// its state holds.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TickCatalog {
     pub recover_with: Option<&'static str>,
     pub tools: Vec<TickTool>,
+    pub series: Vec<StateSeries>,
 }
 
 /// An action tool call on its way to the view.
@@ -92,6 +94,7 @@ impl<S: ?Sized, E> DeclaredTool<S, E> {
 pub struct Tools<S: ?Sized, E> {
     tools: Vec<DeclaredTool<S, E>>,
     recovery_tool: Option<&'static str>,
+    series: Vec<StateSeries>,
 }
 
 impl<S: ?Sized, E> Default for Tools<S, E> {
@@ -99,6 +102,7 @@ impl<S: ?Sized, E> Default for Tools<S, E> {
         Self {
             tools: Vec::new(),
             recovery_tool: None,
+            series: Vec::new(),
         }
     }
 }
@@ -148,6 +152,16 @@ impl<S: ?Sized, E> Tools<S, E> {
         self
     }
 
+    /// Declares the array at JSON Pointer `path` in the state's `data` a series whose newest
+    /// element is at its `newest` end, so a delivery that has to shorten it keeps that end.
+    pub fn series(mut self, path: &str, newest: SeriesEnd) -> Self {
+        self.series.push(StateSeries {
+            path: path.to_owned(),
+            newest,
+        });
+        self
+    }
+
     pub fn get(&self, name: &str) -> Option<&DeclaredTool<S, E>> {
         self.tools
             .iter()
@@ -164,6 +178,7 @@ impl<S: ?Sized, E> Tools<S, E> {
                 .iter()
                 .map(|declared| declared.tool.clone())
                 .collect(),
+            series: self.series.clone(),
         }
     }
 }

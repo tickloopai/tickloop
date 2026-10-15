@@ -156,7 +156,8 @@ async fn a_shell_updates_only_when_it_exits_and_a_late_watch_takes_the_exit_as_i
 }
 
 /// The one update of a Shell Tick is the end this Agent recorded for its task, as the task's row
-/// reports it, not the Tickhost's own account of the exit.
+/// reports it, not the Tickhost's own account of the exit; a delivery that no longer holds it
+/// reads the same end again, and nothing while the task runs.
 #[tokio::test]
 async fn a_shells_exit_update_is_the_end_its_record_tells() {
     let directory = tempfile::tempdir().unwrap();
@@ -181,10 +182,21 @@ async fn a_shells_exit_update_is_the_end_its_record_tells() {
         InstanceRef::shell(task.command_id),
     )]));
     wait_until_ready(&mut stream, watch).await;
+    let instance = InstanceRef::shell(task.command_id);
+    assert_eq!(adapters.read_current(chat, &instance).await, Ok(None));
     std::fs::write(directory.path().join("finish"), "").unwrap();
     let exit = tokio::time::timeout(Duration::from_secs(5), next_update(&mut stream))
         .await
         .expect("the exit is an update");
+    let read_again = adapters
+        .read_current(chat, &instance)
+        .await
+        .unwrap()
+        .expect("an ended task reads its end again");
+    assert_eq!(
+        (read_again.sequence, &read_again.data),
+        (exit.sequence, &exit.data)
+    );
     let center = ShellTaskCenter::new(agent.clone());
     let listed = center
         .snapshot(chat)

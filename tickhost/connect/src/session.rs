@@ -1173,7 +1173,7 @@ mod tests {
         assert!(matches!(refused, Err(SessionError::Busy)), "{refused:?}");
         assert_eq!(
             session.client().read().await.unwrap().data,
-            json!({"value":0}),
+            json!({"value":0,"recent":[]}),
             "the Tick never received the call"
         );
         drop(answers);

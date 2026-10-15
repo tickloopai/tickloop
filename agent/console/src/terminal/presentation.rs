@@ -1863,34 +1863,31 @@ pub(super) fn local_message_runs(
                 }
             }
         }
-        LocalMessage::TickDelivery { items, truncated } => runs.push((
-            tick_delivery_text(items, *truncated, display),
-            Some(Role::MutedText),
-        )),
+        LocalMessage::TickDelivery { items } => {
+            runs.push((tick_delivery_text(items, display), Some(Role::MutedText)))
+        }
     }
     (runs, response)
 }
 
-/// One line per Tick Instance in a delivery: the Tick Instance, the Tick Update sequence and how
-/// many updates were dropped before it.
-pub(super) fn tick_delivery_text(
-    items: &[TickDeliveryLine],
-    truncated: bool,
-    display: DisplayProfile,
-) -> String {
+/// One line per Tick Instance in a delivery: the Tick Instance, the seq span of the updates the
+/// delivery merged, how many they are and whether their data was trimmed.
+pub(super) fn tick_delivery_text(items: &[TickDeliveryLine], display: DisplayProfile) -> String {
     let mut text = String::new();
     for item in items {
         text.push_str(&format!(
-            "\n{} {} #{}",
+            "\n{} {}",
             display.glyph(Glyph::TickDelivery),
-            item.instance,
-            item.sequence
+            item.instance
         ));
-        if item.dropped > 0 {
-            text.push_str(&format!(" · dropped {}", item.dropped));
+        if let Some(seq) = &item.seq {
+            text.push_str(&format!(" #{seq}"));
         }
-        if truncated {
-            text.push_str(" · truncated");
+        if item.updates > 1 {
+            text.push_str(&format!(" · {} updates", item.updates));
+        }
+        if item.is_trimmed {
+            text.push_str(" · trimmed");
         }
         text.push('\n');
     }

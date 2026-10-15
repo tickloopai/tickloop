@@ -4,14 +4,16 @@ use std::time::Duration;
 
 use serde_json::json;
 use tick_protocol::InstanceRef;
+use tick_protocol::{SeriesEnd, StateSeries};
 use tickloop_agent_protocol::{
-    Event, EventKind, LocalMessage, LoopState, MAX_DELIVERY_PAYLOAD_BYTES, ObservationKind,
-    QuestionAnswer, TickLinkState, TickSubscription, TickSubscriptionChange,
+    Event, EventKind, LocalMessage, LoopState, MAX_DELIVERY_ITEM_BYTES, MAX_DELIVERY_PAYLOAD_BYTES,
+    ObservationKind, QuestionAnswer, TickLinkState, TickSubscription, TickSubscriptionChange,
     TickSubscriptionFrequency, Trigger, TriggerPromptSource,
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_runtime::tick_stream::{
-    InMemoryTickStream, TickConnectionState, TickObservation, TickStreamEvent,
+    InMemoryTickStream, TickConnectionState, TickMetadata, TickObservation, TickStreamEvent,
+    TickStreamPort,
 };
 use tickloop_agent_test_support::*;
 use tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME;
@@ -312,7 +314,7 @@ async fn an_explicit_trigger_prompt_stays_the_instruction_of_each_delivery() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_high_frequency_delivers_the_latest_update_and_counts_the_ones_it_dropped() {
+async fn a_high_frequency_delivers_the_latest_update_and_counts_the_ones_it_merged() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         call(
@@ -374,29 +376,33 @@ async fn a_high_frequency_delivers_the_latest_update_and_counts_the_ones_it_drop
     );
     assert_eq!(model.requests.lock().unwrap().len(), 3);
     let delivered = last_user_text(&model);
-    assert!(delivered.contains("\"sequence\":3"), "{delivered}");
-    assert!(delivered.contains("\"dropped\":2"), "{delivered}");
+    assert!(delivered.contains("\"seq\":\"1→3\""), "{delivered}");
+    assert!(delivered.contains("\"updates\":3"), "{delivered}");
+    assert!(
+        delivered.contains("\"between\":\"2026-09-21T03:15:00Z\""),
+        "every update was observed at the same time: {delivered}"
+    );
+    assert!(!delivered.contains("dropped"), "{delivered}");
     assert!(delivered.contains("third"), "{delivered}");
     assert!(!delivered.contains("first"), "{delivered}");
     assert!(
         delivered.contains("watch the quote panel"),
         "the Trigger prompt follows the delivery: {delivered}"
     );
-    let Some(LocalMessage::TickDelivery { items, truncated }) = LocalMessage::parse(&delivered)
-    else {
+    let Some(LocalMessage::TickDelivery { items }) = LocalMessage::parse(&delivered) else {
         panic!("a delivery renders as a Tick delivery line: {delivered}");
     };
-    assert!(!truncated);
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].instance, fixture_instance(7));
-    assert_eq!(items[0].sequence, 3);
-    assert_eq!(items[0].dropped, 2);
+    assert_eq!(items[0].seq.as_deref(), Some("1→3"));
+    assert_eq!(items[0].updates, 3);
+    assert!(!items[0].is_trimmed);
 
     let after = agent.tick_subscriptions(chat).await.unwrap();
     assert_eq!(after[0].accumulated, 0);
     assert_eq!(
         after[0].last_delivery.as_deref(),
-        Some("calendar:fixture-run-7 #3 · dropped 2")
+        Some("calendar:fixture-run-7 #1→3 · 3 updates")
     );
     assert_eq!(after[0].link, TickLinkState::Live);
     agent.shutdown().await;
@@ -855,8 +861,8 @@ async fn deliveries_that_arrive_during_a_run_merge_into_the_next_one() {
 
     assert_eq!(model.requests.lock().unwrap().len(), 4);
     let merged = last_user_text(&model);
-    assert!(merged.contains("\"sequence\":3"), "{merged}");
-    assert!(merged.contains("\"dropped\":1"), "{merged}");
+    assert!(merged.contains("\"seq\":\"2→3\""), "{merged}");
+    assert!(merged.contains("\"updates\":2"), "{merged}");
     agent.shutdown().await;
 }
 
@@ -1322,8 +1328,8 @@ async fn an_immediate_subscription_delivers_at_once_and_queues_while_the_loop_ru
     assert_eq!(model.requests.lock().unwrap().len(), 4);
     assert!(user_text(&model, 2).contains("first"));
     let merged = last_user_text(&model);
-    assert!(merged.contains("\"sequence\":3"), "{merged}");
-    assert!(merged.contains("\"dropped\":1"), "{merged}");
+    assert!(merged.contains("\"seq\":\"2→3\""), "{merged}");
+    assert!(merged.contains("\"updates\":2"), "{merged}");
     assert!(!merged.contains("second"), "{merged}");
     agent.shutdown().await;
 }
@@ -1768,10 +1774,13 @@ async fn an_instance_gap_marks_only_its_next_delivery() {
 
     let delivered = last_user_text(&model);
     assert!(delivered.contains("\"gap\":true"), "{delivered}");
-    assert!(delivered.contains("\"sequence\":1"), "{delivered}");
+    assert!(
+        delivered.contains("\"seq\":\"1\""),
+        "the numbering restarts after the gap: {delivered}"
+    );
     assert!(delivered.contains("after the gap"), "{delivered}");
     assert!(!delivered.contains("before the gap"), "{delivered}");
-    assert!(delivered.contains("\"dropped\":1"), "{delivered}");
+    assert!(delivered.contains("\"updates\":2"), "{delivered}");
     agent.shutdown().await;
 }
 
@@ -1910,8 +1919,82 @@ async fn a_fresh_subscription_can_reobserve_a_stopped_instance_without_rearming_
     agent.shutdown().await;
 }
 
+/// The payload of the Tick delivery `text` carries.
+fn delivery_payload(text: &str) -> serde_json::Value {
+    let start = text.find("<tick-delivery>").expect("a Tick delivery") + "<tick-delivery>".len();
+    let end = text.find("</tick-delivery>").unwrap();
+    serde_json::from_str(
+        &text[start..end]
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&"),
+    )
+    .unwrap()
+}
+
+/// The item of `payload` for `instance`.
+fn delivered_item<'a>(
+    payload: &'a serde_json::Value,
+    instance: &InstanceRef,
+) -> &'a serde_json::Value {
+    payload["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["instance"] == instance.to_string())
+        .unwrap_or_else(|| panic!("{instance} is delivered: {payload}"))
+}
+
+/// An element of a series state, about 150 bytes once encoded.
+fn series_element(index: usize) -> serde_json::Value {
+    json!({"i": index, "close": format!("{:.2}", 400.0 + index as f64 / 100.0), "note": "c".repeat(110)})
+}
+
+fn declare_series(stream: &InMemoryTickStream, instance: u64, path: &str, newest: SeriesEnd) {
+    stream.emit(TickStreamEvent::Metadata {
+        instance: fixture_instance(instance),
+        audience: audience(stream, instance),
+        metadata: TickMetadata {
+            title: format!("fixture {instance}"),
+            kind: ObservationKind::Protocol,
+            updated_at_ms: None,
+            series: vec![StateSeries {
+                path: path.into(),
+                newest,
+            }],
+        },
+    });
+}
+
+/// A Loop of a fresh Chat subscribed at the high frequency to each of `instances` through its
+/// Trigger, with `responses` scripted for the turns that follow.
+async fn agent_subscribed_to(
+    directory: &std::path::Path,
+    stream: Arc<dyn TickStreamPort>,
+    instances: &[InstanceRef],
+    responses: usize,
+) -> (Agent, Arc<ScriptedModel>, Uuid) {
+    let mut script = vec![text("ready")];
+    script.extend((0..responses).map(|_| text("received")));
+    let model = Arc::new(ScriptedModel::new(script));
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_tick_stream(stream).await;
+    let chat = agent.create_chat(directory.into()).await.unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent
+        .submit(chat, None, "watch many ticks".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    subscribe_loop(&agent, chat, receipt.loop_id, instances).await;
+    (agent, model, chat)
+}
+
+/// A large state is no longer blanked: its largest array is trimmed by segments to the item's
+/// share, keeping its oldest element and its newest run, while a small item beside it is
+/// delivered whole.
 #[tokio::test(start_paused = true)]
-async fn an_over_sized_delivery_blanks_its_largest_data_and_points_to_native_recovery() {
+async fn an_over_sized_item_is_trimmed_by_segments_instead_of_being_blanked() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         call(
@@ -1929,10 +2012,12 @@ async fn an_over_sized_delivery_blanks_its_largest_data_and_points_to_native_rec
     ]));
     let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
     let mut events = agent.subscribe();
+    declare_series(&stream, 7, "/history", SeriesEnd::Last);
+    settle().await;
 
-    let oversized = "candle".repeat(MAX_DELIVERY_PAYLOAD_BYTES);
     stream.push(TickObservation {
-        data: json!({ "history": oversized }),
+        data: json!({"symbol": "700.HK", "history": (0..300).map(series_element).collect::<Vec<_>>()}),
+        recover_with: Some("candles".into()),
         ..update(7, 1, "unused")
     });
     stream.push(update(8, 1, "small enough to keep"));
@@ -1941,36 +2026,362 @@ async fn an_over_sized_delivery_blanks_its_largest_data_and_points_to_native_rec
     wait_for_completion(&mut events).await;
 
     let delivered = last_user_text(&model);
-    assert!(delivered.contains("\"truncated\":true"), "{delivered}");
+    let payload = delivery_payload(&delivered);
+    assert!(payload.to_string().len() <= MAX_DELIVERY_PAYLOAD_BYTES);
+    let large = delivered_item(&payload, &fixture_instance(7));
     assert!(
-        delivered.contains("native tools for that instance type"),
-        "{delivered}"
+        large.to_string().len() <= MAX_DELIVERY_ITEM_BYTES,
+        "{large}"
     );
-    assert!(delivered.contains("small enough to keep"), "{delivered}");
+    assert_eq!(large["data"]["symbol"], "700.HK", "ordinary fields stay");
+    let history = large["data"]["history"].as_array().unwrap();
+    assert_eq!(history[0]["i"], 0, "the oldest element stays");
+    assert_eq!(
+        history.last().unwrap()["i"],
+        299,
+        "the newest element stays"
+    );
     assert!(
-        !delivered.contains("candlecandle"),
-        "the largest data is blanked first"
+        history.iter().any(|value| value
+            .as_str()
+            .is_some_and(|marker| marker.ends_with(" omitted …"))),
+        "{large}"
     );
+    let kept = history.iter().filter(|value| value.is_object()).count();
+    assert_eq!(
+        large["trimmed"],
+        json!([{"path": "/history", "total": 300, "kept": kept, "rule": "newest_last"}])
+    );
+    assert_eq!(large["recover_with"], "candles");
+    let small = delivered_item(&payload, &fixture_instance(8));
+    assert_eq!(small["data"]["phase"], "small enough to keep");
+    assert!(small.get("trimmed").is_none());
     assert!(
-        delivered.len() < 2 * MAX_DELIVERY_PAYLOAD_BYTES,
-        "the delivery stays within its cap"
+        payload["recovery"].as_str().is_some_and(
+            |recovery| recovery.contains("recover_with") && recovery.contains("ReadTick")
+        ),
+        "{payload}"
     );
-    let Some(LocalMessage::TickDelivery { truncated, .. }) = LocalMessage::parse(&delivered) else {
+    let Some(LocalMessage::TickDelivery { items }) = LocalMessage::parse(&delivered) else {
         panic!("a delivery renders as a Tick delivery line: {delivered}");
     };
-    assert!(truncated, "the transcript line shows the truncation");
+    let trimmed_lines: Vec<_> = items.iter().map(|item| item.is_trimmed).collect();
+    assert_eq!(
+        trimmed_lines,
+        [true, false],
+        "the line of the trimmed item says so"
+    );
     assert!(
-        agent.tick_subscriptions(chat).await.unwrap()[0]
-            .last_delivery
-            .as_deref()
-            .is_some_and(|summary| summary.contains("truncated")),
-        "the subscription view reports the truncation"
+        agent
+            .tick_subscriptions(chat)
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row
+                .last_delivery
+                .as_deref()
+                .is_some_and(|summary| summary.contains("fixture-run-7 #1 · trimmed"))),
+        "the subscription view reports the trimming"
     );
     agent.shutdown().await;
 }
 
+/// An item delivered alone may take the whole delivery, so data larger than an item's share in
+/// a shared delivery arrives untrimmed.
 #[tokio::test(start_paused = true)]
-async fn a_truncated_terminal_tick_delivery_points_to_its_current_screen() {
+async fn a_lone_item_may_take_the_whole_delivery() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7)}),
+        ),
+        text("watching"),
+        text("handled"),
+    ]));
+    let (agent, stream, _, _) = subscribed_agent(directory.path(), model.clone()).await;
+    let mut events = agent.subscribe();
+    let history: Vec<_> = (0..60).map(series_element).collect();
+    assert!(json!(history).to_string().len() > 2 * MAX_DELIVERY_ITEM_BYTES);
+
+    stream.push(TickObservation {
+        data: json!({"history": history}),
+        ..update(7, 1, "unused")
+    });
+    settle().await;
+    tokio::time::advance(HIGH_PERIOD).await;
+    wait_for_completion(&mut events).await;
+
+    let payload = delivery_payload(&last_user_text(&model));
+    let item = delivered_item(&payload, &fixture_instance(7));
+    assert_eq!(item["data"]["history"], json!(history));
+    assert!(item.get("trimmed").is_none());
+    assert!(payload.get("recovery").is_none());
+    agent.shutdown().await;
+}
+
+/// Items that do not fit one delivery are held for the Loop's next turn, which starts as soon
+/// as the turn their delivery started ends, not a period later.
+#[tokio::test(start_paused = true)]
+async fn items_that_do_not_fit_one_delivery_arrive_in_the_next_turn() {
+    let directory = tempfile::tempdir().unwrap();
+    let instances: Vec<_> = (1..=5).map(fixture_instance).collect();
+    let stream = RefillingStream::new();
+    let (agent, model, chat) =
+        agent_subscribed_to(directory.path(), stream.clone(), &instances, 2).await;
+    let mut events = agent.subscribe();
+    let line = |index: usize| "v".repeat(MAX_DELIVERY_ITEM_BYTES - 600 + index);
+    for (index, instance) in instances.iter().enumerate() {
+        stream.push(TickObservation {
+            instance: instance.clone(),
+            data: json!({"text": line(index)}),
+            ..update(1, 1, "unused")
+        });
+    }
+    accumulated(&agent, chat, 5).await;
+
+    tokio::time::advance(HIGH_PERIOD).await;
+    wait_for_completion(&mut events).await;
+    let first = delivery_payload(&last_user_text(&model));
+    let first_items = first["items"].as_array().unwrap().len();
+    assert!((1..5).contains(&first_items), "{first}");
+    assert_eq!(first["more_next_turn"], 5 - first_items);
+    assert!(first.to_string().len() <= MAX_DELIVERY_PAYLOAD_BYTES);
+
+    let started = tokio::time::Instant::now();
+    wait_for_completion(&mut events).await;
+    assert!(
+        started.elapsed() < HIGH_PERIOD,
+        "the rest arrives in the next turn, not a period later"
+    );
+    let second = delivery_payload(&last_user_text(&model));
+    assert!(second.get("more_next_turn").is_none(), "{second}");
+    let mut delivered: Vec<_> = [&first, &second]
+        .iter()
+        .flat_map(|payload| payload["items"].as_array().unwrap().clone())
+        .map(|item| {
+            assert!(item.get("trimmed").is_none(), "each fits its share: {item}");
+            assert!(
+                item["data"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with('v')),
+                "a waiting item is read again for its turn: {item}"
+            );
+            item["instance"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    delivered.sort();
+    let mut expected: Vec<_> = instances.iter().map(ToString::to_string).collect();
+    expected.sort();
+    assert_eq!(delivered, expected);
+    agent.shutdown().await;
+}
+
+/// A later item that does not fit its full share takes what the delivery has left, trimmed
+/// further, instead of waiting for the next turn.
+#[tokio::test(start_paused = true)]
+async fn a_later_item_takes_what_is_left_instead_of_waiting() {
+    let directory = tempfile::tempdir().unwrap();
+    let instances: Vec<_> = (1..=4).map(fixture_instance).collect();
+    let stream = InMemoryTickStream::new();
+    let (agent, model, chat) =
+        agent_subscribed_to(directory.path(), Arc::new(stream.clone()), &instances, 1).await;
+    let mut events = agent.subscribe();
+    for instance in &instances {
+        stream.push(TickObservation {
+            instance: instance.clone(),
+            data: json!({"history": (0..60).map(series_element).collect::<Vec<_>>()}),
+            ..update(1, 1, "unused")
+        });
+    }
+    accumulated(&agent, chat, 4).await;
+    tokio::time::advance(HIGH_PERIOD).await;
+    wait_for_completion(&mut events).await;
+
+    let payload = delivery_payload(&last_user_text(&model));
+    assert!(payload.to_string().len() <= MAX_DELIVERY_PAYLOAD_BYTES);
+    assert!(payload.get("more_next_turn").is_none(), "{payload}");
+    let items = payload["items"].as_array().unwrap();
+    assert_eq!(items.len(), 4);
+    let last = &items[3];
+    assert!(last.to_string().len() < MAX_DELIVERY_ITEM_BYTES, "{last}");
+    assert_eq!(last["trimmed"][0]["rule"], "head_and_tail");
+    assert!(
+        last["data"]["history"].as_array().unwrap().len() > 2,
+        "{last}"
+    );
+    agent.shutdown().await;
+}
+
+/// Items that waited go before newer ones, so a Tick whose item did not fit is delivered in the
+/// next turn even when the Ticks before it came due again meanwhile.
+#[tokio::test(start_paused = true)]
+async fn an_item_that_waited_goes_before_newer_ones() {
+    let directory = tempfile::tempdir().unwrap();
+    let instances: Vec<_> = (1..=5).map(fixture_instance).collect();
+    let model = Arc::new(ScriptedModel::new(vec![
+        text("ready"),
+        text("first turn"),
+        text("second turn"),
+        text("third turn"),
+    ]));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(GatedModel {
+            gate: gate.clone(),
+            entered: entered.clone(),
+            gated_call: 1,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            model: model.clone(),
+        }),
+    );
+    let stream = RefillingStream::new();
+    agent.install_tick_stream(stream.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(chat, None, "watch".into()).await.unwrap();
+    wait_for_completion(&mut events).await;
+    subscribe_loop(&agent, chat, receipt.loop_id, &instances).await;
+    // A single line no segment shortens, each item close to its full share.
+    let observed = |instance: &InstanceRef, sequence| TickObservation {
+        instance: instance.clone(),
+        data: json!({"text": "v".repeat(MAX_DELIVERY_ITEM_BYTES - 400)}),
+        ..update(1, sequence, "unused")
+    };
+    for instance in &instances {
+        stream.push(observed(instance, 1));
+    }
+    accumulated(&agent, chat, 5).await;
+    tokio::time::advance(HIGH_PERIOD).await;
+    entered.notified().await;
+    for instance in &instances[..3] {
+        stream.push(observed(instance, 2));
+    }
+    accumulated(&agent, chat, 5).await;
+    tokio::time::advance(HIGH_PERIOD).await;
+    settle().await;
+    gate.notify_one();
+    wait_for_completion(&mut events).await;
+    wait_for_completion(&mut events).await;
+
+    let delivered = |index: usize| {
+        let payload = delivery_payload(&user_text(&model, index));
+        payload["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["instance"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let first = delivered(1);
+    assert_eq!(first.len(), 3, "{first:?}");
+    let second = delivered(2);
+    for waiting in &instances[3..] {
+        assert!(
+            second.contains(&waiting.to_string()),
+            "{waiting} waited one turn and goes first: {second:?}"
+        );
+    }
+    agent.shutdown().await;
+}
+
+/// What a Tick reports cannot carry a delivery past its caps: overlong recovery guidance and
+/// observation times are replaced by their size, and data whose trimming would report too much
+/// gives way whole.
+#[tokio::test(start_paused = true)]
+async fn a_tick_cannot_push_a_delivery_past_its_caps() {
+    let directory = tempfile::tempdir().unwrap();
+    let instances: Vec<_> = (1..=2).map(fixture_instance).collect();
+    let stream = InMemoryTickStream::new();
+    let (agent, model, chat) =
+        agent_subscribed_to(directory.path(), Arc::new(stream.clone()), &instances, 1).await;
+    let mut events = agent.subscribe();
+    // Small enough for both to stay in the content cache, with thousands of candidates.
+    let many_small_arrays: serde_json::Map<String, serde_json::Value> = (0..1_200)
+        .map(|index| (format!("k{index:04}"), json!(["x\ny", "z"])))
+        .collect();
+    for instance in &instances {
+        stream.push(TickObservation {
+            instance: instance.clone(),
+            observed_at: format!("2026-10-14T01:00:00.{}Z", "0".repeat(10_000)),
+            recover_with: Some("r".repeat(10_000)),
+            data: serde_json::Value::Object(many_small_arrays.clone()),
+            ..update(1, 1, "unused")
+        });
+    }
+    accumulated(&agent, chat, 2).await;
+    tokio::time::advance(HIGH_PERIOD).await;
+    wait_for_completion(&mut events).await;
+
+    let payload = delivery_payload(&last_user_text(&model));
+    assert!(payload.to_string().len() <= MAX_DELIVERY_PAYLOAD_BYTES);
+    let items = payload["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{payload}");
+    for item in items {
+        assert!(item.to_string().len() <= MAX_DELIVERY_ITEM_BYTES, "{item}");
+        assert_eq!(item["recover_with"], "… omitted (10000 bytes) …");
+        assert!(
+            item["between"].as_str().unwrap().starts_with("… omitted ("),
+            "{item}"
+        );
+        assert!(item["trimmed"].as_array().unwrap().len() <= 9, "{item}");
+    }
+    agent.shutdown().await;
+}
+
+/// An item that waits for the next turn holds no data: it is read again from its Tick when its
+/// turn comes, and merges the updates that arrived meanwhile.
+#[tokio::test(start_paused = true)]
+async fn a_deferred_item_holds_no_data_and_is_read_again_in_its_turn() {
+    let directory = tempfile::tempdir().unwrap();
+    let instances: Vec<_> = (1..=4).map(fixture_instance).collect();
+    let stream = RefillingStream::new();
+    let (agent, model, chat) =
+        agent_subscribed_to(directory.path(), stream.clone(), &instances, 2).await;
+    let mut events = agent.subscribe();
+    for instance in &instances[..3] {
+        stream.inner.push(TickObservation {
+            instance: instance.clone(),
+            data: json!({"text": "v".repeat(MAX_DELIVERY_ITEM_BYTES - 400)}),
+            ..update(1, 1, "unused")
+        });
+    }
+    // A single line fits its full share but not what the first three leave, and no segment of
+    // it shortens.
+    stream.inner.push(TickObservation {
+        instance: instances[3].clone(),
+        data: json!({"text": "w".repeat(MAX_DELIVERY_ITEM_BYTES - 400)}),
+        ..update(1, 1, "unused")
+    });
+    accumulated(&agent, chat, 4).await;
+    let mut current = update(1, 2, "read again");
+    current.instance = instances[3].clone();
+    stream
+        .current
+        .lock()
+        .unwrap()
+        .insert(instances[3].clone(), current);
+
+    tokio::time::advance(HIGH_PERIOD).await;
+    wait_for_completion(&mut events).await;
+    let first = delivery_payload(&last_user_text(&model));
+    assert_eq!(first["items"].as_array().unwrap().len(), 3, "{first}");
+    assert_eq!(first["more_next_turn"], 1);
+
+    wait_for_completion(&mut events).await;
+    let second = delivery_payload(&last_user_text(&model));
+    let item = delivered_item(&second, &instances[3]);
+    assert_eq!(item["data"]["phase"], "read again", "{item}");
+    assert_eq!(item["seq"], "1→2");
+    assert_eq!(item["updates"], 2);
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_trimmed_terminal_tick_screen_keeps_its_last_lines_and_points_to_read_tick() {
     let directory = tempfile::tempdir().unwrap();
     let run = "calendar:terminal:session:run-88";
     let model = Arc::new(ScriptedModel::new(vec![
@@ -1988,12 +2399,13 @@ async fn a_truncated_terminal_tick_delivery_points_to_its_current_screen() {
         .await
         .unwrap();
     wait_for_completion(&mut events).await;
+    let screen: Vec<String> = (1..=3000).map(|line| format!("log line {line}")).collect();
     stream.push(TickObservation {
         instance: run.parse::<InstanceRef>().unwrap(),
         sequence: 1,
         observed_at: "2026-09-24T12:00:00Z".into(),
         dropped: 0,
-        data: json!({"text":"log line".repeat(MAX_DELIVERY_PAYLOAD_BYTES)}),
+        data: json!({"text": screen.join("\n"), "exit": null}),
         kind: ObservationKind::Terminal { truncated: true },
         recover_with: None,
         gap: false,
@@ -2001,15 +2413,19 @@ async fn a_truncated_terminal_tick_delivery_points_to_its_current_screen() {
     settle().await;
     tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
-    let delivered = last_user_text(&model);
-    assert!(
-        delivered.contains("A Terminal Tick's screen was too large"),
-        "{delivered}"
-    );
-    assert!(delivered.contains("ReadTick"), "{delivered}");
-    assert!(delivered.contains("cannot be recovered"), "{delivered}");
-    assert!(!delivered.contains("CallTickTool"), "{delivered}");
-    assert!(delivered.len() < 2 * MAX_DELIVERY_PAYLOAD_BYTES);
+    let payload = delivery_payload(&last_user_text(&model));
+    assert!(payload.to_string().len() <= MAX_DELIVERY_PAYLOAD_BYTES);
+    let item = &payload["items"][0];
+    let text = item["data"]["text"].as_str().unwrap();
+    assert!(text.starts_with("log line 1\n… "), "{text}");
+    assert!(text.ends_with("log line 3000"), "{text}");
+    assert_eq!(item["trimmed"][0]["rule"], "lines");
+    assert_eq!(item["trimmed"][0]["total"], 3000);
+    let recovery = payload["recovery"].as_str().unwrap();
+    assert!(recovery.contains("Terminal Tick"), "{recovery}");
+    assert!(recovery.contains("ReadTick"), "{recovery}");
+    assert!(recovery.contains("cannot be recovered"), "{recovery}");
+    assert!(!recovery.contains("CallTickTool"), "{recovery}");
     agent.shutdown().await;
 }
 
@@ -2046,92 +2462,64 @@ async fn a_terminal_exit_is_delivered_when_its_screen_text_is_left_out() {
     let delivered = last_user_text(&model);
     assert!(delivered.len() < 2 * MAX_DELIVERY_PAYLOAD_BYTES);
     assert!(!delivered.contains("xxxx") && !delivered.contains("yyyy"));
-    assert!(delivered.contains("\"code\":3"), "{delivered}");
-    assert!(delivered.contains("\"code\":4"), "{delivered}");
+    let payload = delivery_payload(&delivered);
+    let kept = delivered_item(&payload, &fixture_instance(20));
+    assert_eq!(kept["data"]["exit"]["code"], 3, "{kept}");
+    assert_eq!(kept["trimmed"][0]["rule"], "omitted");
+    let unread = delivered_item(&payload, &fixture_instance(21));
+    assert_eq!(unread["data"]["exit"]["code"], 4, "{unread}");
+    assert_eq!(unread["data"]["text"], serde_json::Value::Null);
+    assert_eq!(payload["unreadable_instances"], 1);
     assert!(delivered.contains("ReadTick"), "{delivered}");
     agent.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn many_subscribed_instances_still_fit_one_loop_delivery_under_sixteen_kib() {
+async fn many_subscribed_instances_are_delivered_over_turns_of_at_most_sixteen_kib() {
     let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(ScriptedModel::new(vec![text("ready"), text("received")]));
-    let agent = Agent::new_embedded(config(), model.clone());
-    let stream = InMemoryTickStream::new();
-    agent.install_tick_stream(Arc::new(stream.clone())).await;
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "watch many ticks".into())
-        .await
-        .unwrap();
-    wait_for_completion(&mut events).await;
     let instances: Vec<_> = (0..100)
         .map(|index| {
             InstanceRef::new("calendar", &format!("bulk:{index:03}:{}", "r".repeat(60))).unwrap()
         })
         .collect();
-    let trigger = Trigger {
-        id: Uuid::new_v4(),
-        prompt: "inspect changes".into(),
-        prompt_source: TriggerPromptSource::Explicit,
-        interval_seconds: None,
-        expires_at_ms: None,
-        accepts_events: true,
-        armed: true,
-        subscriptions: instances
-            .iter()
-            .cloned()
-            .map(|instance| TickSubscription {
-                id: Uuid::new_v4(),
-                instance,
-                frequency: TickSubscriptionFrequency::High,
-                authority: None,
-            })
-            .collect(),
-    };
-    agent
-        .configure_trigger(chat, receipt.loop_id, Some(trigger))
-        .await
-        .unwrap();
-    for instance in instances {
+    let stream = RefillingStream::new();
+    let (agent, model, chat) =
+        agent_subscribed_to(directory.path(), stream.clone(), &instances, 20).await;
+    let mut events = agent.subscribe();
+    for instance in &instances {
         stream.push(TickObservation {
-            instance,
-            sequence: 1,
-            observed_at: "2026-09-24T12:00:00Z".into(),
-            dropped: 0,
+            instance: instance.clone(),
             data: json!({"text":"x".repeat(400)}),
-            kind: ObservationKind::Protocol,
-            recover_with: None,
-            gap: false,
+            ..update(1, 1, "unused")
         });
     }
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let total: u64 = agent
-                .tick_subscriptions(chat)
-                .await
-                .unwrap()
-                .iter()
-                .map(|row| row.accumulated)
-                .sum();
-            if total == 100 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    accumulated(&agent, chat, 100).await;
     tokio::time::advance(HIGH_PERIOD).await;
-    wait_for_completion(&mut events).await;
-    let delivered = last_user_text(&model);
-    assert!(delivered.contains("omitted_instances"), "{delivered}");
-    assert!(
-        delivered.len() <= MAX_DELIVERY_PAYLOAD_BYTES + 500,
-        "{} bytes",
-        delivered.len()
-    );
+    let mut delivered = BTreeSet::new();
+    let mut turns = 0;
+    while delivered.len() < instances.len() {
+        wait_for_completion(&mut events).await;
+        turns += 1;
+        let text = last_user_text(&model);
+        assert!(
+            text.len() <= MAX_DELIVERY_PAYLOAD_BYTES + 500,
+            "{} bytes",
+            text.len()
+        );
+        let payload = delivery_payload(&text);
+        for item in payload["items"].as_array().unwrap() {
+            assert!(
+                delivered.insert(item["instance"].as_str().unwrap().to_owned()),
+                "each instance is delivered once"
+            );
+        }
+        assert_eq!(
+            payload["more_next_turn"].as_u64().unwrap_or_default() as usize,
+            instances.len() - delivered.len(),
+            "{payload}"
+        );
+    }
+    assert!(turns > 1, "100 instances do not fit one delivery");
     agent.shutdown().await;
 }
 
@@ -2818,8 +3206,8 @@ async fn an_immediate_delivery_whose_watermark_failed_is_retried_until_it_lands(
         text("saw the exit"),
     ]));
     let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
-    let stream = InMemoryTickStream::new();
-    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let stream = RefillingStream::new();
+    agent.install_tick_stream(stream.clone()).await;
     let chat = agent.create_chat(workdir).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent.submit(chat, None, "watch".into()).await.unwrap();
@@ -2903,8 +3291,8 @@ async fn a_held_periodic_delivery_is_retried_before_its_next_period() {
         text("saw the second"),
     ]));
     let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
-    let stream = InMemoryTickStream::new();
-    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let stream = RefillingStream::new();
+    agent.install_tick_stream(stream.clone()).await;
     let chat = agent.create_chat(workdir).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent.submit(chat, None, "watch".into()).await.unwrap();
@@ -2944,9 +3332,29 @@ async fn a_held_periodic_delivery_is_retried_before_its_next_period() {
 
 /// Answers `read_current` with a prepared observation, otherwise behaves as the in-memory
 /// stream.
+/// An in-memory stream whose instances can be read again, as a delivery does for data it no
+/// longer holds.
 struct RefillingStream {
     inner: InMemoryTickStream,
     current: std::sync::Mutex<std::collections::HashMap<InstanceRef, TickObservation>>,
+}
+
+impl RefillingStream {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: InMemoryTickStream::new(),
+            current: Default::default(),
+        })
+    }
+
+    /// Publishes `observation`, which also becomes what reading its instance again returns.
+    fn push(&self, observation: TickObservation) {
+        self.current
+            .lock()
+            .unwrap()
+            .insert(observation.instance.clone(), observation.clone());
+        self.inner.push(observation);
+    }
 }
 
 #[async_trait::async_trait]

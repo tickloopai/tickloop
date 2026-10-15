@@ -7,9 +7,12 @@ use uuid::Uuid;
 use crate::{HostToolAuthority, LoopId, LoopState};
 
 pub const TICK_SUBSCRIPTION_SOURCE: &str = "tick_subscription";
-/// The most one delivery may add to the model's context. A larger one loses its biggest Tick
-/// Update data first and tells the model which tool brings it back.
+/// The most one delivery may add to the model's context; an item it carries alone may take all of
+/// it. Tick Update data over its item's share is trimmed by whole segments, and items that no
+/// longer fit wait for the Loop's next turn.
 pub const MAX_DELIVERY_PAYLOAD_BYTES: usize = 16 * 1024;
+/// The most one item of a delivery carrying several may take.
+pub const MAX_DELIVERY_ITEM_BYTES: usize = 4 * 1024;
 
 /// How often a Tick Subscription hands the latest Tick Update to the Agent. `Immediate` is decided
 /// by the Tick type, never chosen: a Shell Tick is delivered as soon as it updates. Protocol and

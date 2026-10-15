@@ -476,6 +476,7 @@ async fn observe_terminal_screen(
                     truncated: current.truncated,
                 },
                 updated_at_ms: None,
+                series: Vec::new(),
             },
         );
         publisher.state_to(

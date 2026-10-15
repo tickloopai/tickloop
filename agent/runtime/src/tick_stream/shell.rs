@@ -101,6 +101,47 @@ impl ShellScope {
         }
     }
 
+    /// The end of the task of `instance` as its record tells it, with the end of its output when
+    /// that can be read.
+    async fn recorded_end(&self, instance: &InstanceRef, listed: &ShellTask) -> TickObservation {
+        let output = match (listed.capabilities.can_read_output, self.center()) {
+            (true, Ok(center)) => center
+                .read_output(
+                    listed.chat_id,
+                    listed.id,
+                    listed.output_bytes.saturating_sub(OUTPUT_TAIL_BYTES as u64),
+                    OUTPUT_TAIL_BYTES,
+                )
+                .await
+                .ok()
+                .map(|chunk| chunk.output),
+            _ => None,
+        };
+        TickObservation {
+            instance: instance.clone(),
+            sequence: EXIT_SEQUENCE,
+            observed_at: ended_at_ms(listed).map_or_else(
+                tickloop_agent_base::timestamp::now_timestamp,
+                tickloop_agent_base::timestamp::format_timestamp,
+            ),
+            dropped: 0,
+            data: json!({
+                "task_id": listed.id,
+                "status": listed.status_label(),
+                "state": listed.state,
+                "exit_code": listed.exit_code,
+                "signal": listed.signal,
+                "reason": listed.reason,
+                "output_bytes": listed.output_bytes,
+                "output": output,
+                "truncated": listed.output_bytes > OUTPUT_TAIL_BYTES as u64,
+            }),
+            kind: ObservationKind::Protocol,
+            recover_with: Some(RECOVER_WITH.into()),
+            gap: false,
+        }
+    }
+
     fn chat_of(&self, watch: &WatchId) -> Option<Uuid> {
         self.chats.borrow().get(watch).copied()
     }
@@ -273,7 +314,7 @@ impl ShellObserver {
             }
             let is_ended = listed.state.is_terminal();
             if is_ended && !self.awaiting_exit.is_empty() {
-                let ended = self.recorded_end(&listed).await;
+                let ended = self.scope.recorded_end(&self.instance, &listed).await;
                 let awaiting = std::mem::take(&mut self.awaiting_exit);
                 self.publisher
                     .observation(&awaiting.into_iter().collect::<Vec<_>>(), ended);
@@ -306,6 +347,7 @@ impl ShellObserver {
             title: listed.command.lines().next().unwrap_or_default().into(),
             kind: ObservationKind::Protocol,
             updated_at_ms: ended_at_ms,
+            series: Vec::new(),
         }
     }
 
@@ -327,47 +369,6 @@ impl ShellObserver {
             if !is_ended {
                 self.awaiting_exit.insert(watch);
             }
-        }
-    }
-
-    /// The end of a task as its record tells it, with the end of its output when that can be
-    /// read.
-    async fn recorded_end(&self, listed: &ShellTask) -> TickObservation {
-        let output = match (listed.capabilities.can_read_output, self.scope.center()) {
-            (true, Ok(center)) => center
-                .read_output(
-                    listed.chat_id,
-                    listed.id,
-                    listed.output_bytes.saturating_sub(OUTPUT_TAIL_BYTES as u64),
-                    OUTPUT_TAIL_BYTES,
-                )
-                .await
-                .ok()
-                .map(|chunk| chunk.output),
-            _ => None,
-        };
-        TickObservation {
-            instance: self.instance.clone(),
-            sequence: EXIT_SEQUENCE,
-            observed_at: ended_at_ms(listed).map_or_else(
-                tickloop_agent_base::timestamp::now_timestamp,
-                tickloop_agent_base::timestamp::format_timestamp,
-            ),
-            dropped: 0,
-            data: json!({
-                "task_id": listed.id,
-                "status": listed.status_label(),
-                "state": listed.state,
-                "exit_code": listed.exit_code,
-                "signal": listed.signal,
-                "reason": listed.reason,
-                "output_bytes": listed.output_bytes,
-                "output": output,
-                "truncated": listed.output_bytes > OUTPUT_TAIL_BYTES as u64,
-            }),
-            kind: ObservationKind::Protocol,
-            recover_with: Some(RECOVER_WITH.into()),
-            gap: false,
         }
     }
 }
@@ -397,6 +398,22 @@ impl TickStreamPort for ShellTickStream {
         authority: Option<&HostToolAuthority>,
     ) -> Result<(), String> {
         self.scope().check(chat, instance, authority).await
+    }
+
+    /// The task's one update, its end, read again for a delivery; `None` while it runs.
+    async fn read_current(
+        &self,
+        chat: Uuid,
+        instance: &InstanceRef,
+    ) -> Result<Option<TickObservation>, String> {
+        let scope = self.scope();
+        let task = task_of(instance).ok_or("Shell read requires a Shell task")?;
+        match scope.task(chat, task).await? {
+            Some(listed) if listed.chat_id == chat && listed.state.is_terminal() => {
+                Ok(Some(scope.recorded_end(instance, &listed).await))
+            }
+            _ => Ok(None),
+        }
     }
 
     async fn prepare_watch(

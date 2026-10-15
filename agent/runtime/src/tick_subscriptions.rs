@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::{Duration, Instant};
 
@@ -24,12 +24,13 @@ use super::*;
 use crate::tick_stream::{
     TickConnectionState, TickObservation, TickStreamEvent, TickStreamPort, WatchId,
 };
-use tick_protocol::InstanceRef;
+use crate::tick_trim::{Trimmed, encoded_len, omits_values, omitted_value, trim};
+use tick_protocol::{InstanceRef, StateSeries};
 use tickloop_agent_protocol::{
-    HostToolAuthority, LoopId, LoopSnapshot, LoopState, MAX_DELIVERY_PAYLOAD_BYTES,
-    ObservationKind, Receipt, TICK_SUBSCRIPTION_SOURCE, TickLinkState, TickSubscription,
-    TickSubscriptionChange, TickSubscriptionFrequency, TickSubscriptionStatus, ToolDefinition,
-    ToolResult, Trigger, TriggerSource,
+    HostToolAuthority, LoopId, LoopSnapshot, LoopState, MAX_DELIVERY_ITEM_BYTES,
+    MAX_DELIVERY_PAYLOAD_BYTES, ObservationKind, Receipt, TICK_SUBSCRIPTION_SOURCE, TickLinkState,
+    TickSubscription, TickSubscriptionChange, TickSubscriptionFrequency, TickSubscriptionStatus,
+    ToolDefinition, ToolResult, Trigger, TriggerSource,
 };
 
 const SUBSCRIPTION_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -45,9 +46,17 @@ const DEFAULT_FREQUENCY: TickSubscriptionFrequency = TickSubscriptionFrequency::
 const HELD_DELIVERY_RETRY: Duration = Duration::from_secs(5);
 /// How long one sample of a Terminal Tick's screen may take before its period passes without it.
 const SAMPLE_TIMEOUT: Duration = Duration::from_secs(5);
-/// An item the stream or a later delivery replaces is itself one dropped Tick Update.
+/// An item the stream or a later delivery replaces is itself one superseded Tick Update.
 const SUPERSEDED_UPDATE: u64 = 1;
-const TRUNCATION_HINT: &str = "Tick Update data was left out where `data` is null, because it was too large for this delivery or could not be read again; use the native tools for that instance type to recover it.";
+/// How many times an item's data allowance is narrowed to make room for what its trimming adds;
+/// past that its data gives way whole.
+const ITEM_FIT_ATTEMPTS: usize = 4;
+/// The longest text a Tick reports for an item's header fields, its observation times and
+/// recovery guidance, that a delivery carries; a longer one is replaced by its size.
+const MAX_HEADER_TEXT_BYTES: usize = 128;
+const TRIMMED_HINT: &str = "Where an item lists `trimmed`, whole segments of its data were left out in place, each cut saying how many elements or lines it replaced; for the full content use that instance's `recover_with` (a protocol Tick's query tool through CallTickTool, a Shell's output file through Read) or ReadTick.";
+const TRIMMED_SCREEN_HINT: &str = "A Terminal Tick's trimmed screen text keeps its first and last lines; ReadTick returns its current screen, and output that scrolled past between periods cannot be recovered.";
+const UNREADABLE_HINT: &str = "Where `data` or a Terminal Tick's `text` is null, the update could not be read again; read that instance with the native tools for its type.";
 const ARTIFACT_SUBSCRIPTION_REFUSAL: &str = "an artifact takes no Tick Subscription: its association with a goal is its subscription and brings each @tickloop feedback request to that goal. An artifact a goal creates is associated with it; the user associates others by selecting them in /artifacts or with f on their Monitor row.";
 
 pub(super) fn validate(trigger: &Trigger) -> Result<(), String> {
@@ -123,7 +132,7 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: SUBSCRIBE_TICK_TOOL.into(),
             description: format!(
-                "Subscribe the current goal to a Tick Instance. A protocol or terminal Tick wakes the goal with that instance's latest Tick Update and how many updates were dropped in between at the chosen frequency: {periods}; `{}` is the default, and a period without updates wakes nothing. A Shell Tick takes no frequency: it updates once, when it exits, and that update is delivered as soon as it arrives; read its output_file for progress before then. An artifact takes no Tick Subscription: its @tickloop requests reach the goal it is associated with. Intermediate updates are not kept, so read older data with the Tick's own query tools.",
+                "Subscribe the current goal to a Tick Instance. A protocol or terminal Tick wakes the goal with that instance's latest Tick Update, how many updates it merges and their seq and time span, at the chosen frequency: {periods}; `{}` is the default, and a period without updates wakes nothing. A Shell Tick takes no frequency: it updates once, when it exits, and that update is delivered as soon as it arrives; read its output_file for progress before then. An artifact takes no Tick Subscription: its @tickloop requests reach the goal it is associated with. Intermediate updates are not kept, so read older data with the Tick's own query tools.",
                 DEFAULT_FREQUENCY.name()
             ),
             input_schema: json!({"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":3},"frequency":{"type":"string","enum":frequencies}},"required":["tick_instance_id"],"additionalProperties":false}),
@@ -207,7 +216,10 @@ struct SubscriptionRuntime {
     delivered: Option<DeliveredWatermark>,
     /// Where the delivered watermark is kept for a saved Chat.
     watermarks: Option<std::path::PathBuf>,
-    dropped: u64,
+    /// The first update since the last delivery; later ones only move [`Self::latest`].
+    first: Option<FirstUpdate>,
+    /// Updates since the last delivery that a newer one replaced.
+    superseded: u64,
     accumulated: u64,
     gap: bool,
     last_delivery_ms: Option<u64>,
@@ -215,6 +227,13 @@ struct SubscriptionRuntime {
     kind: Option<ObservationKind>,
     title: Option<String>,
     updated_at_ms: Option<u64>,
+    /// The series the instance declares in its state, whose newest end a trimmed delivery keeps.
+    series: Vec<StateSeries>,
+}
+
+struct FirstUpdate {
+    sequence: u64,
+    observed_at: String,
 }
 
 struct LatestUpdate {
@@ -222,8 +241,8 @@ struct LatestUpdate {
     observed_at: String,
     kind: ObservationKind,
     recover_with: Option<String>,
-    /// Its data is larger than the content budget and could never fit a delivery either; what
-    /// [`left_out`] keeps of it waits in the cache instead.
+    /// Its data is larger than the content budget, so it is read again for the delivery; what
+    /// [`left_out`] keeps of it waits in the cache meanwhile.
     is_oversized: bool,
 }
 
@@ -238,36 +257,105 @@ struct PendingDelivery {
     retry_at: Option<Instant>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone)]
 struct DeliveryItem {
     subscription: Uuid,
     watch: WatchId,
     instance: InstanceRef,
+    /// The sequence and time of the first update this item merges, and of the newest, whose data
+    /// it carries.
+    first_sequence: u64,
+    first_observed_at: String,
     sequence: u64,
     observed_at: String,
-    dropped: u64,
+    /// How many updates it merges: the newest and every one that newest replaced.
+    updates: u64,
+    /// When the earliest update it merges came due; the longest waiting go first.
+    waiting_since: Instant,
     gap: bool,
     kind: ObservationKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
     recover_with: Option<String>,
+    series: Vec<StateSeries>,
     data: Value,
-    /// The data was evicted from the content cache and is read again before delivery.
-    #[serde(skip)]
+    /// The data is not in the content cache, because it was evicted or never fit, and is read
+    /// again before delivery.
     needs_refill: bool,
-    /// The data was too large to keep or deliver; the delivery says so.
-    #[serde(skip)]
-    is_oversized: bool,
 }
 
 impl DeliveryItem {
-    /// This item takes the place of one the Loop has not received yet. That earlier item and
-    /// everything it already counted are dropped Tick Updates.
+    /// This item takes the place of one the Loop has not received yet, whose updates it now
+    /// merges too.
     fn superseding(self, superseded: &Self) -> Self {
         Self {
-            dropped: self.dropped + superseded.dropped + SUPERSEDED_UPDATE,
+            first_sequence: superseded.first_sequence,
+            first_observed_at: superseded.first_observed_at.clone(),
+            updates: self.updates + superseded.updates,
+            waiting_since: self.waiting_since.min(superseded.waiting_since),
             gap: self.gap || superseded.gap,
             ..self
         }
+    }
+
+    /// The item's fields beside its data, the text its Tick reports in them bounded.
+    fn header(&self) -> Value {
+        let mut header = json!({
+            "subscription": self.subscription,
+            "watch": self.watch,
+            "instance": self.instance,
+            "updates": self.updates,
+            "seq": span(&self.first_sequence.to_string(), &self.sequence.to_string()),
+            "between": bounded_text(&span(&self.first_observed_at, &self.observed_at)),
+            "gap": self.gap,
+            "kind": self.kind,
+            "data": Value::Null,
+        });
+        if let Some(recover_with) = &self.recover_with {
+            header["recover_with"] = json!(bounded_text(recover_with));
+        }
+        header
+    }
+
+    /// The item as a delivery carries it with its `header`, its data shortened so the whole
+    /// item takes at most `allowance` encoded bytes, with what was shortened. Data that does not
+    /// fit beside what its trimming reports gives way whole.
+    fn delivered(&self, header: &Value, allowance: usize) -> (Value, Vec<Trimmed>) {
+        let mut data_allowance = allowance.saturating_sub(encoded_len(header));
+        for _ in 0..ITEM_FIT_ATTEMPTS {
+            let mut item = header.clone();
+            let mut data = self.data.clone();
+            let trimmed = trim(&mut data, data_allowance, &self.series);
+            if !trimmed.is_empty() {
+                item["trimmed"] = json!(trimmed);
+            }
+            item["data"] = data;
+            let size = encoded_len(&item);
+            if size <= allowance {
+                return (item, trimmed);
+            }
+            data_allowance = data_allowance.saturating_sub(size - allowance);
+        }
+        let (marker, record) = Trimmed::whole_omission(encoded_len(&self.data));
+        let mut item = header.clone();
+        item["data"] = marker;
+        item["trimmed"] = json!([&record]);
+        (item, vec![record])
+    }
+}
+
+/// `text` as a delivery's header carries it: as it is, or replaced by its size when longer than
+/// [`MAX_HEADER_TEXT_BYTES`].
+fn bounded_text(text: &str) -> String {
+    match text.len() <= MAX_HEADER_TEXT_BYTES {
+        true => text.to_owned(),
+        false => omitted_value(text.len()),
+    }
+}
+
+/// `first→last`, or one value when they are the same.
+fn span(first: &str, last: &str) -> String {
+    match first == last {
+        true => last.to_owned(),
+        false => format!("{first}→{last}"),
     }
 }
 
@@ -295,6 +383,7 @@ impl TickDeliveries {
                 }) {
                     subscription.kind = Some(metadata.kind.clone());
                     subscription.title = Some(metadata.title.clone());
+                    subscription.series = metadata.series.clone();
                     subscription.updated_at_ms =
                         subscription.updated_at_ms.max(metadata.updated_at_ms);
                 }
@@ -492,6 +581,19 @@ impl TickDeliveries {
                     self.content.store(*id, remainder);
                 }
             }
+            // The updates the stream merged into this one precede it in its source's numbering,
+            // unless a gap restarted that numbering with this one.
+            if subscription.first.is_none() || observation.gap {
+                let merged = if observation.gap {
+                    0
+                } else {
+                    observation.dropped
+                };
+                subscription.first = Some(FirstUpdate {
+                    sequence: observation.sequence.saturating_sub(merged),
+                    observed_at: observation.observed_at.clone(),
+                });
+            }
             let superseded = subscription.latest.replace(LatestUpdate {
                 sequence: observation.sequence,
                 observed_at: observation.observed_at.clone(),
@@ -500,8 +602,8 @@ impl TickDeliveries {
                 is_oversized: !is_kept,
             });
             let replaced = superseded.map_or(0, |_| SUPERSEDED_UPDATE);
-            subscription.dropped = subscription
-                .dropped
+            subscription.superseded = subscription
+                .superseded
                 .saturating_add(observation.dropped)
                 .saturating_add(replaced);
             subscription.accumulated = subscription
@@ -540,9 +642,10 @@ impl TickDeliveries {
                 && subscription.blocked.is_none()
         }) {
             subscription.gap = true;
+            subscription.first = None;
             if subscription.latest.take().is_some() {
                 self.content.remove(*id);
-                subscription.dropped = subscription.dropped.saturating_add(1);
+                subscription.superseded = subscription.superseded.saturating_add(1);
             }
         }
     }
@@ -559,18 +662,25 @@ impl TickDeliveries {
             subscription.due_at = next_delivery(subscription.frequency, now);
             let item = subscription.latest.take().map(|update| {
                 let data = self.content.take(*id);
+                let first = subscription.first.take().unwrap_or(FirstUpdate {
+                    sequence: update.sequence,
+                    observed_at: update.observed_at.clone(),
+                });
                 DeliveryItem {
                     subscription: *id,
                     watch: subscription.watch,
                     instance: subscription.instance.clone(),
+                    first_sequence: first.sequence,
+                    first_observed_at: first.observed_at,
                     sequence: update.sequence,
                     observed_at: update.observed_at,
-                    dropped: std::mem::take(&mut subscription.dropped),
+                    updates: std::mem::take(&mut subscription.superseded) + 1,
+                    waiting_since: now,
                     gap: std::mem::take(&mut subscription.gap),
                     kind: update.kind,
                     recover_with: update.recover_with,
-                    needs_refill: data.is_none() && !update.is_oversized,
-                    is_oversized: update.is_oversized,
+                    series: subscription.series.clone(),
+                    needs_refill: data.is_none() || update.is_oversized,
                     data: data.unwrap_or(Value::Null),
                 }
             });
@@ -606,19 +716,37 @@ impl TickDeliveries {
         ready
     }
 
+    /// `owner`'s pending items, the longest waiting first, so an item a full delivery put off is
+    /// not put off again by newer ones.
     fn take_delivery(&mut self, owner: (ChatId, LoopId)) -> Option<Vec<DeliveryItem>> {
         let pending = self.pending.remove(&owner)?;
         if pending.items.is_empty() {
             return None;
         }
-        let items: Vec<_> = pending.items.into_values().collect();
+        let mut items: Vec<_> = pending.items.into_values().collect();
+        items.sort_by_key(|item| item.waiting_since);
         Some(items)
     }
 
+    /// Puts items back for `owner`'s next delivery; a newer item that came due meanwhile for the
+    /// same instance takes their place and merges their updates. While they wait they hold no
+    /// data: as data too large for the content cache, each keeps only what [`left_out`] keeps and
+    /// is read again before delivery.
     fn restore(&mut self, owner: (ChatId, LoopId), items: Vec<DeliveryItem>) {
         let pending = self.pending.entry(owner).or_default();
-        for item in items {
-            pending.items.entry(item.instance.clone()).or_insert(item);
+        for mut item in items {
+            item.data = left_out(&item.kind, &item.data);
+            item.needs_refill = true;
+            match pending.items.remove(&item.instance) {
+                Some(newer) => {
+                    pending
+                        .items
+                        .insert(item.instance.clone(), newer.superseding(&item));
+                }
+                None => {
+                    pending.items.insert(item.instance.clone(), item);
+                }
+            }
         }
         self.hold(owner, Instant::now());
     }
@@ -1216,7 +1344,8 @@ impl Agent {
                                 latest: None,
                                 delivered: None,
                                 watermarks,
-                                dropped: 0,
+                                first: None,
+                                superseded: 0,
                                 accumulated: 0,
                                 gap: false,
                                 last_delivery_ms: None,
@@ -1224,6 +1353,7 @@ impl Agent {
                                 kind: None,
                                 title: None,
                                 updated_at_ms: None,
+                                series: Vec::new(),
                             },
                         );
                     }
@@ -1354,7 +1484,7 @@ impl Agent {
                 if let Ok(Some(current)) = current
                     && current.sequence >= item.sequence
                 {
-                    item.dropped += current.sequence - item.sequence;
+                    item.updates += current.sequence - item.sequence;
                     item.sequence = current.sequence;
                     item.observed_at = current.observed_at;
                     item.data = current.data;
@@ -1379,7 +1509,7 @@ impl Agent {
             }
             items.push(item);
         }
-        let marks = {
+        {
             let deliveries = self.tick_deliveries();
             items.retain(|item| {
                 deliveries
@@ -1388,6 +1518,22 @@ impl Agent {
                     .and_then(|runtime| runtime.delivered)
                     .is_none_or(|delivered| item.sequence > delivered.sequence)
             });
+        }
+        if items.is_empty() {
+            return;
+        }
+        let FittedDelivery {
+            payload,
+            delivered: items,
+            deferred,
+            summary,
+        } = fit_delivery(items);
+        if !deferred.is_empty() {
+            // Held, they flush as soon as the run this delivery starts ends.
+            self.tick_deliveries().restore(owner, deferred);
+        }
+        let marks = {
+            let deliveries = self.tick_deliveries();
             let delivery = Uuid::new_v4();
             items
                 .iter()
@@ -1407,9 +1553,6 @@ impl Agent {
                 })
                 .collect::<Vec<_>>()
         };
-        if items.is_empty() {
-            return;
-        }
         // The watermark is durable before the delivery is handed on, so a repeat of this update
         // is never delivered again, even by a later process.
         let durable = marks.clone();
@@ -1439,7 +1582,6 @@ impl Agent {
                 }
             }
         }
-        let (payload, truncated) = fit_delivery_payload(&items);
         let source = TriggerSource {
             source: TICK_SUBSCRIPTION_SOURCE.into(),
             payload,
@@ -1449,7 +1591,6 @@ impl Agent {
         match outcome {
             Ok(_) => {
                 let delivered_at = tickloop_agent_base::private_fs::unix_time_milliseconds();
-                let summary = delivery_summary(&items, truncated);
                 for item in &items {
                     if let Some(runtime) = deliveries.subscriptions.get_mut(&item.subscription) {
                         runtime.accumulated = 0;
@@ -1696,50 +1837,134 @@ impl Agent {
     }
 }
 
-fn delivery_summary(items: &[DeliveryItem], truncated: bool) -> String {
-    let lines = items
-        .iter()
-        .map(|item| match item.dropped {
-            0 => format!("{} #{}", item.instance, item.sequence),
-            dropped => format!("{} #{} · dropped {dropped}", item.instance, item.sequence),
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    match truncated {
-        true => format!("{lines} · truncated"),
-        false => lines,
+/// One delivery as the Loop receives it, and the items that wait for its next turn.
+struct FittedDelivery {
+    payload: Value,
+    delivered: Vec<DeliveryItem>,
+    deferred: Vec<DeliveryItem>,
+    /// What the delivery handed over, as the subscription view shows it.
+    summary: String,
+}
+
+/// What a delivery tells the model beside its items.
+#[derive(Default)]
+struct DeliveryNotes {
+    is_trimmed: bool,
+    is_screen_trimmed: bool,
+    unreadable: usize,
+    more_next_turn: usize,
+}
+
+/// Fits a delivery within [`MAX_DELIVERY_PAYLOAD_BYTES`]: each item takes at most
+/// [`MAX_DELIVERY_ITEM_BYTES`], or the whole delivery when it is the only one, with its data
+/// trimmed by segments to fit, and an item that no longer fits waits for the next turn. The
+/// first item always goes, which still keeps the cap: its allowance is no more than what the
+/// delivery has left, and [`DeliveryItem::delivered`] keeps within it whenever its header does,
+/// which bounds every field a Tick reports.
+fn fit_delivery(items: Vec<DeliveryItem>) -> FittedDelivery {
+    let worst_notes = DeliveryNotes {
+        is_trimmed: true,
+        is_screen_trimmed: true,
+        unreadable: items.len(),
+        more_next_turn: items.len(),
+    };
+    let mut remaining = MAX_DELIVERY_PAYLOAD_BYTES
+        .saturating_sub(encoded_len(&delivery_payload(Vec::new(), &worst_notes)));
+    let allowance = match items.len() {
+        1 => remaining,
+        _ => MAX_DELIVERY_ITEM_BYTES.min(remaining),
+    };
+    let mut notes = DeliveryNotes::default();
+    let mut payload_items = Vec::new();
+    let mut delivered = Vec::new();
+    let mut deferred = Vec::new();
+    let mut lines = Vec::new();
+    for item in items {
+        let header = item.header();
+        // Each item after the first is preceded by a comma.
+        let separator = usize::from(!delivered.is_empty());
+        // One that would not fit even without its data waits untrimmed.
+        if !delivered.is_empty() && encoded_len(&header) + separator > remaining {
+            deferred.push(item);
+            continue;
+        }
+        let (mut value, mut trimmed) = item.delivered(&header, allowance);
+        let mut size = encoded_len(&value) + separator;
+        if size > remaining && !delivered.is_empty() {
+            // What is left may still hold it trimmed further, unless that would replace values
+            // its full share keeps; then it waits for that share in the next turn.
+            let (smaller, smaller_trimmed) = item.delivered(&header, remaining - separator);
+            let smaller_size = encoded_len(&smaller) + separator;
+            let loses_values = omits_values(&smaller_trimmed) && !omits_values(&trimmed);
+            if smaller_size > remaining || loses_values {
+                deferred.push(item);
+                continue;
+            }
+            (value, trimmed, size) = (smaller, smaller_trimmed, smaller_size);
+        }
+        let is_trimmed = !trimmed.is_empty();
+        remaining = remaining.saturating_sub(size);
+        let is_screen = matches!(item.kind, ObservationKind::Terminal { .. });
+        notes.is_trimmed |= is_trimmed && !is_screen;
+        notes.is_screen_trimmed |= is_trimmed && is_screen;
+        notes.unreadable += usize::from(item.needs_refill);
+        lines.push(delivery_line(&item, is_trimmed));
+        payload_items.push(value);
+        delivered.push(item);
+    }
+    notes.more_next_turn = deferred.len();
+    let payload = delivery_payload(payload_items, &notes);
+    debug_assert!(encoded_len(&payload) <= MAX_DELIVERY_PAYLOAD_BYTES);
+    FittedDelivery {
+        payload,
+        delivered,
+        deferred,
+        summary: lines.join(", "),
     }
 }
 
-fn delivery_payload(items: &[DeliveryItem], truncated: bool) -> Value {
-    let unreadable = items.iter().filter(|item| item.needs_refill).count();
-    let mut payload = json!({"items": items, "truncated": truncated});
-    if unreadable > 0 {
-        payload["unreadable_instances"] = json!(unreadable);
+/// One delivered item as the subscription view shows it: its instance and sequence, how many
+/// updates it merges and whether its data was trimmed.
+fn delivery_line(item: &DeliveryItem, is_trimmed: bool) -> String {
+    let mut line = format!(
+        "{} #{}",
+        item.instance,
+        span(&item.first_sequence.to_string(), &item.sequence.to_string())
+    );
+    if item.updates > 1 {
+        line.push_str(&format!(" · {} updates", item.updates));
     }
-    if truncated || unreadable > 0 {
-        payload["recovery"] = json!(if items
-            .iter()
-            .any(|item| matches!(item.kind, ObservationKind::Terminal { .. }))
-        {
-            "A Terminal Tick's screen was too large for this delivery; use ReadTick for its current screen. Output that scrolled past between periods cannot be recovered.".to_owned()
-        } else if let Some(tool) = items.iter().find_map(|item| item.recover_with.as_deref()) {
-            if tool.len() <= 128 {
-                format!(
-                    "Tick Update data was left out where `data` is null; recovery guidance from the instance: {tool}. Use Read on Bash output_file for shells, or CallTickTool for a protocol Tick query."
-                )
-            } else {
-                TRUNCATION_HINT.to_owned()
-            }
-        } else {
-            TRUNCATION_HINT.to_owned()
-        });
+    if is_trimmed {
+        line.push_str(" · trimmed");
+    }
+    line
+}
+
+fn delivery_payload(items: Vec<Value>, notes: &DeliveryNotes) -> Value {
+    let mut payload = json!({"items": items});
+    let hints: Vec<&str> = [
+        (notes.is_trimmed, TRIMMED_HINT),
+        (notes.is_screen_trimmed, TRIMMED_SCREEN_HINT),
+        (notes.unreadable > 0, UNREADABLE_HINT),
+    ]
+    .into_iter()
+    .filter_map(|(applies, hint)| applies.then_some(hint))
+    .collect();
+    if !hints.is_empty() {
+        payload["recovery"] = json!(hints.join(" "));
+    }
+    if notes.unreadable > 0 {
+        payload["unreadable_instances"] = json!(notes.unreadable);
+    }
+    if notes.more_next_turn > 0 {
+        payload["more_next_turn"] = json!(notes.more_next_turn);
     }
     payload
 }
 
-/// What a delivery says of Tick Update `data` it has no room for: nothing, except how a Terminal
-/// Tick's program ended, which leaving out its screen text must not lose.
+/// What the content cache keeps of Tick Update `data` too large for it until the delivery reads
+/// it again: nothing, except how a Terminal Tick's program ended, which a failed read must not
+/// lose.
 fn left_out(kind: &ObservationKind, data: &Value) -> Value {
     match kind {
         ObservationKind::Terminal { .. } if !data["exit"].is_null() => {
@@ -1747,34 +1972,4 @@ fn left_out(kind: &ObservationKind, data: &Value) -> Value {
         }
         _ => Value::Null,
     }
-}
-
-/// Keeps a delivery within [`MAX_DELIVERY_PAYLOAD_BYTES`] by blanking the largest Tick Update
-/// `data` first, so the model still learns which Tick Instances moved and can fetch the rest.
-fn fit_delivery_payload(items: &[DeliveryItem]) -> (Value, bool) {
-    let has_oversized = items.iter().any(|item| item.is_oversized);
-    let mut payload = delivery_payload(items, has_oversized);
-    if payload.to_string().len() <= MAX_DELIVERY_PAYLOAD_BYTES {
-        return (payload, has_oversized);
-    }
-    let mut delivered = items.to_vec();
-    let mut largest_first: Vec<_> = (0..delivered.len()).collect();
-    largest_first.sort_by_key(|index| std::cmp::Reverse(delivered[*index].data.to_string().len()));
-    for index in largest_first {
-        delivered[index].data = left_out(&delivered[index].kind, &delivered[index].data);
-        payload = delivery_payload(&delivered, true);
-        if payload.to_string().len() <= MAX_DELIVERY_PAYLOAD_BYTES {
-            return (payload, true);
-        }
-    }
-    let recovery = payload["recovery"].clone();
-    let mut omitted = 0;
-    while payload.to_string().len() > MAX_DELIVERY_PAYLOAD_BYTES && !delivered.is_empty() {
-        delivered.pop();
-        omitted += 1;
-        payload = delivery_payload(&delivered, true);
-        payload["recovery"] = recovery.clone();
-        payload["omitted_instances"] = json!(omitted);
-    }
-    (payload, true)
 }
