@@ -90,7 +90,7 @@ impl PreparedDelegation {
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
         name: SUBAGENT_TOOL_NAME.into(),
-        description: "Create one bounded independent child under your frozen resource and permission ceiling. Foreground waits for its final report. Set run_in_background=true to return immediately; completion arrives automatically as a task notification. Messages arrive automatically, so finish a turn after asking for clarification. Name and description identify the child separately from its task. The child has its own identity, Loop and approval/question requests. Interrupting foreground observation does not stop the child. Bash follows the parent's frozen permission authority and normal approval checks; the working directory is not an OS sandbox. Nested delegation and history rewrites are unavailable.".into(),
+        description: "Create one bounded independent child under your frozen resource and permission ceiling. Foreground waits for its final report. Set run_in_background=true to return immediately; completion arrives automatically as a task notification. Messages arrive automatically, so finish a turn after asking for clarification. Name and description identify the child separately from its task. The child has its own identity, Loop and approval/question requests. Interrupting foreground observation does not stop the child; that run's completion then arrives as a task notification, as does every later run of the child (a user follow-up or your SendMessage). Bash follows the parent's frozen permission authority and normal approval checks; the working directory is not an OS sandbox. Nested delegation and history rewrites are unavailable.".into(),
         input_schema: json!({"type":"object","properties":{
             "task":{"type":"string","minLength":1},
             "run_in_background":{"type":"boolean","default":false,"description":"Return immediately and receive the final report as an automatic task notification."},
@@ -845,16 +845,49 @@ impl Agent {
                     return Ok(result);
                 }
                 tokio::select! {
-                    _ = cancel.cancelled() => return Ok(ToolResult {
-                        content:json!({"status":"interrupted","child_chat_id":child.chat_id,"handle":registration.as_ref().map(|registration|registration.handle.as_str()),"description":registration.as_ref().map(|registration|registration.description.as_str()),"created_at":registration.as_ref().map(|registration|registration.created_at),"child_loop_id":child.loop_id,"child_run_id":child.run_id,"error":"Foreground observation interrupted; the child Agent remains independently active."}).to_string(),
-                        is_error:true,output_ref:None,
-                    }),
+                    _ = cancel.cancelled() => {
+                        return self.end_interrupted_observation(parent, call_id, &child).await;
+                    }
                     event = events.recv() => match event {
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {},
                         Err(broadcast::error::RecvError::Closed) => return Err("Agent event stream closed while observing child".into()),
                     }
                 }
             }
+        })
+    }
+
+    /// Ends an interrupted foreground observation. A child run that has already ended is still
+    /// this call's result; otherwise the call stops returning that run, so its completion
+    /// notifies the parent like background work. Deciding under the invocation lock that
+    /// classifying the run's completion also holds leaves each run either returned or notified.
+    async fn end_interrupted_observation(
+        &self,
+        parent: &Receipt,
+        call_id: &str,
+        child: &Receipt,
+    ) -> Result<ToolResult, String> {
+        let mut invocations = self.inner.subagent_invocations.lock().await;
+        let snapshot = self
+            .snapshot(child.chat_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let registration = self
+            .subagent_registration(child.chat_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(result) =
+            agent_messages::child_run_result(&snapshot, child, parent, registration.as_ref())
+        {
+            return Ok(result);
+        }
+        if let Some(invocation) = invocations.get_mut(&(parent.run_id, call_id.to_owned())) {
+            invocation.run_in_background = true;
+        }
+        Ok(ToolResult {
+            content: json!({"status":"interrupted","child_chat_id":child.chat_id,"handle":registration.as_ref().map(|registration|registration.handle.as_str()),"description":registration.as_ref().map(|registration|registration.description.as_str()),"created_at":registration.as_ref().map(|registration|registration.created_at),"child_loop_id":child.loop_id,"child_run_id":child.run_id,"error":"Foreground observation interrupted; the child Agent remains independently active and its completion arrives as a task notification."}).to_string(),
+            is_error: true,
+            output_ref: None,
         })
     }
 }

@@ -2462,11 +2462,42 @@ async fn authenticated_family_input_is_genuine_human_and_never_turns_the_source_
         serde_json::to_value(&received).unwrap()["human_family_origins"][id.to_string()]["original_submission"],
         "@audit 你好"
     );
+    let origin = wait_for_snapshot(&core, root_chat, "the directed run's notice", |snapshot| {
+        snapshot.family_completions.len() == 2
+            && matches!(
+                snapshot.family_completions[1].notification,
+                tickloop_agent_protocol::SubagentNotificationDelivery::Queued
+            )
+            && snapshot.pending_inputs.is_empty()
+            && snapshot
+                .loops
+                .iter()
+                .all(|goal| goal.state == tickloop_agent_protocol::LoopState::Completed)
+    })
+    .await;
     assert_eq!(
-        core.snapshot(root_chat).await.unwrap().messages.len(),
-        root_before.messages.len()
+        origin.family_completions[1].child_run_id,
+        target_receipt.run_id
     );
-    let origin = core.snapshot(root_chat).await.unwrap();
+    let notifications = task_notifications(&origin);
+    assert_eq!(notifications.len(), 1);
+    let (index, body) = notifications[0];
+    assert!(body.contains("<result>Direct human greeting received</result>"));
+    assert_eq!(
+        origin.agent_message_origins[&origin.message_ids[&index]]["is_result"],
+        true
+    );
+    assert_eq!(
+        origin.prompt_execution_modes, root_before.prompt_execution_modes,
+        "the directed input stays a child prompt; the root only gets an Agent-origin result"
+    );
+    assert!(
+        !origin
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|content| matches!(content, Content::Text { text } if text.contains("你好")))
+    );
     assert_eq!(origin.family_inputs.len(), 1);
     let audit = origin.family_inputs.values().next().unwrap();
     assert_eq!(audit.target_chat_id, child);
@@ -2535,7 +2566,7 @@ async fn authenticated_family_input_is_genuine_human_and_never_turns_the_source_
         Some("Direct human greeting received")
     );
     assert_eq!(loaded_target.human_family_origins.len(), 1);
-    assert_eq!(loaded_source.messages.len(), root_before.messages.len());
+    assert_eq!(loaded_source.messages.len(), origin.messages.len());
     assert!(loaded_source.pending_inputs.is_empty() && loaded_target.pending_inputs.is_empty());
     restarted.shutdown().await;
 }
@@ -3997,4 +4028,487 @@ async fn a_stopped_parent_receives_a_visible_completion_delivery_refusal() {
     ));
     assert_eq!(snapshot.loops[0].state, LoopState::Stopped);
     assert!(!snapshot.messages.iter().flat_map(|message| &message.content).any(|content| matches!(content, Content::Text {text} if text.starts_with("<task-notification>"))));
+}
+
+async fn wait_for_snapshot(
+    core: &Agent,
+    chat: Uuid,
+    awaited: &str,
+    ready: impl Fn(&tickloop_agent_protocol::ChatSnapshot) -> bool,
+) -> tickloop_agent_protocol::ChatSnapshot {
+    let mut latest = String::new();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let snapshot = core.snapshot(chat).await.unwrap();
+            if ready(&snapshot) {
+                break snapshot;
+            }
+            latest = format!(
+                "completions {:?}; loops {:?}; latest events {:?}",
+                snapshot
+                    .family_completions
+                    .iter()
+                    .map(|completion| &completion.notification)
+                    .collect::<Vec<_>>(),
+                snapshot.loops,
+                snapshot.events.iter().rev().take(6).collect::<Vec<_>>()
+            );
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {awaited}: {latest}"))
+}
+
+fn task_notifications(snapshot: &tickloop_agent_protocol::ChatSnapshot) -> Vec<(usize, &str)> {
+    snapshot
+        .messages
+        .iter()
+        .enumerate()
+        .flat_map(|(index, message)| {
+            message
+                .content
+                .iter()
+                .filter_map(move |content| match content {
+                    Content::Text { text } if text.starts_with("<task-notification>") => {
+                        Some((index, text.as_str()))
+                    }
+                    _ => None,
+                })
+        })
+        .collect()
+}
+
+/// Whether nothing settles `chat`'s only completion record within a bounded wait.
+async fn completion_stays_pending(core: &Agent, chat: Uuid) -> bool {
+    tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        loop {
+            let snapshot = core.snapshot(chat).await.unwrap();
+            if !matches!(
+                snapshot.family_completions[0].notification,
+                tickloop_agent_protocol::SubagentNotificationDelivery::Pending
+            ) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_err()
+}
+
+const CHILD_VIEW_CONTINUE: &str = "HUMAN-CONTINUE-TYPED-IN-THE-CHILD-VIEW";
+
+/// Fails every child request with a provider error until a human continues the child in its
+/// own View.
+struct QuotaLimitedChildModel {
+    routed: RoutedModel,
+}
+
+#[async_trait]
+impl ModelClient for QuotaLimitedChildModel {
+    fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
+        self.routed.identity()
+    }
+    async fn generate_title(
+        &self,
+        request: ModelRequest,
+        _: UnboundedSender<ModelDelta>,
+        _: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        Ok(tickloop_agent_test_support::title_output(request))
+    }
+    async fn complete(
+        &self,
+        request: ModelRequest,
+        events: UnboundedSender<ModelDelta>,
+        cancel: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        if !state(&request)["delegation"].is_null() && !has_text(&request, CHILD_VIEW_CONTINUE) {
+            return Err(ModelError::InvalidResponse(
+                "Controlled provider quota exhausted".into(),
+            ));
+        }
+        self.routed.complete(request, events, cancel).await
+    }
+}
+
+#[tokio::test]
+async fn a_human_continue_after_a_failed_background_child_notifies_the_parent() {
+    use tickloop_agent_protocol::{LoopState, SubagentNotificationDelivery};
+    let human = "Start a background audit of the bounded evidence";
+    let model = Arc::new(QuotaLimitedChildModel {
+        routed: RoutedModel::new(|request| {
+            if !state(request)["delegation"].is_null() {
+                tickloop_agent_test_support::text("CHILD-RESUMED-REPORT")
+            } else if !has_tool_result(request, "launch") {
+                tickloop_agent_test_support::call(
+                    "launch",
+                    "Subagent",
+                    json!({"task":"Audit the bounded evidence","name":"audit","run_in_background":true}),
+                )
+            } else if has_text(request, "CHILD-RESUMED-REPORT") && !has_tool_result(request, "tick")
+            {
+                tickloop_agent_test_support::call(
+                    "tick",
+                    "CallTickTool",
+                    json!({"workspace_id":"W1"}),
+                )
+            } else {
+                tickloop_agent_test_support::text("Parent noted the report")
+            }
+        }),
+    });
+    let reviewer = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
+        tickloop_agent_test_support::text(
+            &tickloop_agent_test_support::auto_classification(false).to_string(),
+        );
+        3
+    ]));
+    let tick = Arc::new(ReviewableTick {
+        endpoint: Uuid::new_v4(),
+        executions: Default::default(),
+    });
+    let core = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
+    core.install_host_tools(tick.clone()).unwrap();
+    core.set_auto_reviewer(reviewer.clone()).await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    core.set_host_work_context(
+        root,
+        tickloop_agent_protocol::HostCallContext {
+            workdir: directory.path().into(),
+            workspace_id: Some("W1".into()),
+            interaction: None,
+        },
+    )
+    .await
+    .unwrap();
+    core.submit(root, None, human.into()).await.unwrap();
+    let failed = wait_for_snapshot(&core, root, "the failed child's notice", |snapshot| {
+        snapshot.family_completions.len() == 1
+            && matches!(
+                snapshot.family_completions[0].notification,
+                SubagentNotificationDelivery::Queued
+            )
+            && snapshot.pending_inputs.is_empty()
+            && snapshot
+                .loops
+                .iter()
+                .all(|goal| goal.state == LoopState::Completed)
+            && task_notifications(snapshot).len() == 1
+    })
+    .await;
+    assert_eq!(failed.family_completions[0].state, LoopState::Failed);
+    assert!(
+        task_notifications(&failed)[0]
+            .1
+            .contains("<status>failed</status>")
+    );
+    let child = failed.family_completions[0].child_chat_id;
+    let child_loop = core.snapshot(child).await.unwrap().loops[0].clone();
+    assert_eq!(child_loop.state, LoopState::Failed);
+    core.set_execution_mode(root, tickloop_agent_protocol::ExecutionMode::Auto)
+        .await
+        .unwrap();
+    let mut events = core.subscribe();
+    let resumed = core
+        .submit(child, Some(child_loop.id), CHILD_VIEW_CONTINUE.into())
+        .await
+        .unwrap();
+    completed(&mut events, &resumed).await;
+    let parent = wait_for_snapshot(&core, root, "the resumed child's notice", |snapshot| {
+        snapshot.family_completions.len() == 2
+            && matches!(
+                snapshot.family_completions[1].notification,
+                SubagentNotificationDelivery::Queued
+            )
+            && snapshot.pending_inputs.is_empty()
+            && snapshot
+                .loops
+                .iter()
+                .all(|goal| goal.state == LoopState::Completed)
+            && tick.executions.load(std::sync::atomic::Ordering::SeqCst) == 1
+    })
+    .await;
+    core.shutdown().await;
+    let resumed_completion = &parent.family_completions[1];
+    assert_eq!(resumed_completion.child_run_id, resumed.run_id);
+    assert_eq!(resumed_completion.state, LoopState::Completed);
+    assert_eq!(resumed_completion.result, "CHILD-RESUMED-REPORT");
+    let notifications = task_notifications(&parent);
+    assert_eq!(notifications.len(), 2);
+    let (index, body) = notifications[1];
+    assert!(
+        body.contains("<result>CHILD-RESUMED-REPORT</result>"),
+        "{body}"
+    );
+    let id = parent.message_ids[&index];
+    assert_eq!(parent.agent_message_origins[&id]["is_result"], true);
+    assert!(
+        model
+            .routed
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| state(request)["delegation"].is_null()
+                && has_text(request, "<result>CHILD-RESUMED-REPORT</result>")),
+        "the parent model receives the resumed child's task notification"
+    );
+    assert_eq!(
+        parent.prompt_execution_modes.len(),
+        1,
+        "the notification is not a new human prompt in the parent"
+    );
+    assert!(
+        !parent
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|content| matches!(content, Content::Text { text } if text.contains(CHILD_VIEW_CONTINUE))),
+        "the human's words in the child View stay in the child"
+    );
+    let captured = reviewer.requests.lock().unwrap();
+    assert!(
+        !captured.is_empty(),
+        "the parent's Tick call is auto-reviewed"
+    );
+    for request in captured.iter() {
+        let Content::Text { text } = &request.messages[1].content[0] else {
+            panic!("review must capture typed authority")
+        };
+        let context: Value = serde_json::from_str(text).unwrap();
+        let originals = &context["original_user_inputs"];
+        assert_eq!(originals.as_array().unwrap().len(), 1, "{originals}");
+        assert_eq!(originals[0]["text"], human);
+        assert!(!context.to_string().contains(CHILD_VIEW_CONTINUE));
+    }
+    assert_eq!(tick.executions.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+const ROOT_CONTINUE: &str = "Continue the root after its provider failure";
+
+/// Holds each child request until released, and fails the root's turn once it launched its
+/// child until a human continues the root.
+struct FailingRootModel {
+    timing: SubagentTimingModel,
+}
+
+#[async_trait]
+impl ModelClient for FailingRootModel {
+    fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
+        self.timing.identity()
+    }
+    async fn generate_title(
+        &self,
+        request: ModelRequest,
+        _: UnboundedSender<ModelDelta>,
+        _: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        Ok(tickloop_agent_test_support::title_output(request))
+    }
+    async fn complete(
+        &self,
+        request: ModelRequest,
+        events: UnboundedSender<ModelDelta>,
+        cancel: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        if state(&request)["delegation"].is_null()
+            && has_tool_result(&request, "launch")
+            && !has_text(&request, ROOT_CONTINUE)
+        {
+            return Err(ModelError::InvalidResponse(
+                "Controlled root provider failure".into(),
+            ));
+        }
+        self.timing.complete(request, events, cancel).await
+    }
+}
+
+struct HeldCompletion {
+    core: Agent,
+    root: Uuid,
+    receipt: tickloop_agent_protocol::Receipt,
+    events: tokio::sync::broadcast::Receiver<tickloop_agent_protocol::Event>,
+    _directory: tempfile::TempDir,
+}
+
+/// A root whose run failed after launching a background child, holding that child's later
+/// completion pending without starting the ended root.
+async fn failed_root_holding_a_child_completion() -> HeldCompletion {
+    let model = Arc::new(FailingRootModel {
+        timing: SubagentTimingModel::new(true),
+    });
+    let core = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
+    let directory = tempfile::tempdir().unwrap();
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    let mut events = core.subscribe();
+    let receipt = core
+        .submit(root, None, "Start a background audit".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        model.timing.entered.notified(),
+    )
+    .await
+    .unwrap();
+    loop {
+        let event = tickloop_agent_test_support::next_event(&mut events).await;
+        if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Failed(_)) {
+            break;
+        }
+    }
+    let failed = core.snapshot(root).await.unwrap();
+    model.timing.release.notify_one();
+    wait_for_snapshot(&core, root, "the child's completion record", |snapshot| {
+        snapshot.family_completions.len() == 1
+    })
+    .await;
+    assert!(
+        completion_stays_pending(&core, root).await,
+        "a failed root keeps the completion pending: {:?}",
+        core.snapshot(root).await.unwrap().family_completions[0].notification
+    );
+    let waiting = core.snapshot(root).await.unwrap();
+    assert_eq!(
+        waiting.loops[0].state,
+        tickloop_agent_protocol::LoopState::Failed
+    );
+    assert_eq!(waiting.loops[0].run_id, failed.loops[0].run_id);
+    assert_eq!(waiting.messages.len(), failed.messages.len());
+    assert!(
+        waiting.pending_inputs.is_empty(),
+        "the ended root is not started"
+    );
+    HeldCompletion {
+        core,
+        root,
+        receipt,
+        events,
+        _directory: directory,
+    }
+}
+
+#[tokio::test]
+async fn a_completion_held_for_a_failed_root_is_refused_once_that_loop_stops() {
+    use tickloop_agent_protocol::SubagentNotificationDelivery;
+    let HeldCompletion {
+        core,
+        root,
+        receipt,
+        _directory,
+        ..
+    } = failed_root_holding_a_child_completion().await;
+    core.stop(root, receipt.loop_id).await.unwrap();
+    let refused = wait_for_snapshot(&core, root, "the refused notice", |snapshot| {
+        matches!(
+            snapshot.family_completions[0].notification,
+            SubagentNotificationDelivery::Rejected(_)
+        )
+    })
+    .await;
+    core.shutdown().await;
+    assert!(task_notifications(&refused).is_empty());
+    assert!(refused.pending_inputs.is_empty());
+}
+
+#[tokio::test]
+async fn a_completion_for_a_failed_root_waits_for_its_explicit_continue() {
+    use tickloop_agent_protocol::{LoopState, SubagentNotificationDelivery};
+    let HeldCompletion {
+        core,
+        root,
+        receipt,
+        mut events,
+        _directory,
+    } = failed_root_holding_a_child_completion().await;
+    let continued = core
+        .submit(root, Some(receipt.loop_id), ROOT_CONTINUE.into())
+        .await
+        .unwrap();
+    completed(&mut events, &continued).await;
+    wait_for_snapshot(&core, root, "the deferred notice", |snapshot| {
+        matches!(
+            snapshot.family_completions[0].notification,
+            SubagentNotificationDelivery::Queued
+        ) && snapshot.pending_inputs.is_empty()
+            && snapshot.loops[0].state == LoopState::Completed
+            && task_notifications(snapshot).len() == 1
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let delivered = core.snapshot(root).await.unwrap();
+    core.shutdown().await;
+    let notifications = task_notifications(&delivered);
+    assert_eq!(notifications.len(), 1, "delivered exactly once");
+    assert!(notifications[0].1.contains("CHILD-FINAL-REPORT"));
+    assert_eq!(delivered.family_completions.len(), 1);
+}
+
+#[tokio::test]
+async fn an_interrupted_foreground_observation_notifies_the_parent_when_the_child_finishes() {
+    use tickloop_agent_protocol::{LoopState, SubagentNotificationDelivery};
+    let model = Arc::new(SubagentTimingModel::new(false));
+    let core = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
+    let directory = tempfile::tempdir().unwrap();
+    let root = core.create_chat(directory.path().into()).await.unwrap();
+    let mut events = core.subscribe();
+    let parent = core
+        .submit(root, None, "Wait for a bounded foreground audit".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), model.entered.notified())
+        .await
+        .unwrap();
+    core.interrupt(root).await.unwrap();
+    loop {
+        let event = tickloop_agent_test_support::next_event(&mut events).await;
+        if event.run_id == parent.run_id && matches!(event.kind, EventKind::Interrupted) {
+            break;
+        }
+    }
+    model.release.notify_one();
+    let recorded = wait_for_snapshot(&core, root, "the child's completion record", |snapshot| {
+        snapshot.family_completions.len() == 1
+    })
+    .await;
+    assert!(
+        matches!(
+            recorded.family_completions[0].notification,
+            SubagentNotificationDelivery::Pending
+        ),
+        "no foreground call returns this run: {:?}",
+        recorded.family_completions[0].notification
+    );
+    assert_eq!(recorded.loops[0].state, LoopState::Interrupted);
+    assert_eq!(
+        tool_result(&recorded.messages, "launch").unwrap()["status"],
+        "interrupted"
+    );
+    let continued = core
+        .submit(
+            root,
+            Some(parent.loop_id),
+            "Continue after the interruption".into(),
+        )
+        .await
+        .unwrap();
+    completed(&mut events, &continued).await;
+    let delivered = wait_for_snapshot(&core, root, "the child's notice", |snapshot| {
+        matches!(
+            snapshot.family_completions[0].notification,
+            SubagentNotificationDelivery::Queued
+        ) && snapshot.pending_inputs.is_empty()
+            && snapshot.loops[0].state == LoopState::Completed
+            && task_notifications(snapshot).len() == 1
+    })
+    .await;
+    core.shutdown().await;
+    assert!(
+        task_notifications(&delivered)[0]
+            .1
+            .contains("CHILD-FINAL-REPORT")
+    );
 }

@@ -1082,6 +1082,7 @@ impl Menus {
                 let mut last_connection = None;
                 let mut row_hints = Vec::new();
                 let mut refresh_options = Vec::new();
+                let mut row_roles = Vec::new();
                 for (index, choice) in choices.iter().enumerate() {
                     let provider = self
                         .key_for_model(&choice.config)
@@ -1108,18 +1109,22 @@ impl Menus {
                     }
                     row_hints.push(
                         if supports_discovery {
-                            "p Connection · r Refresh · enter apply · esc back"
+                            "p Connection · r Refresh · / Search · enter apply · esc back"
                         } else {
-                            "p Connection · enter apply · esc back"
+                            "p Connection · / Search · enter apply · esc back"
                         }
                         .into(),
                     );
+                    row_roles.push(provider.as_ref().and_then(|provider| {
+                        providers::provider_role(&self.provider_authenticated(provider))
+                    }));
                 }
                 row_hints.extend(
                     actions
                         .iter()
                         .map(|action| format!("enter {} · esc back", action.label())),
                 );
+                row_roles.extend(actions.iter().map(|_| None));
                 console.show_presented_picker_menu(
                     menu,
                     PickerKind::Model,
@@ -1128,6 +1133,8 @@ impl Menus {
                         refresh,
                         refresh_options: Some(refresh_options),
                         row_hints,
+                        row_roles,
+                        search: Some(self.provider.model_query.clone()),
                         failure_target: selection.config_target().and_then(|target| target.agent()),
                         failure_connections: choices
                             .iter()
@@ -1141,7 +1148,7 @@ impl Menus {
                             }))
                             .collect(),
                         connection_options: Some(choices.len()),
-                        hint: "p Connection · enter apply · esc back".into(),
+                        hint: "p Connection · / Search · enter apply · esc back".into(),
                         ..Default::default()
                     },
                 )?;
@@ -1385,6 +1392,7 @@ impl Menus {
     ) -> Result<(), String> {
         self.sync_dialog_chat(console)?;
         self.provider.provider_nav = Default::default();
+        self.provider.model_query.clear();
         self.load_providers(agent, target).await?;
         self.provider.model_return = Some(providers::ModelPickerDraft {
             provider: None,
@@ -1410,6 +1418,7 @@ impl Menus {
         self.sync_dialog_chat(console)?;
         self.provider.model_return = None;
         self.provider.provider_nav = Default::default();
+        self.provider.model_query.clear();
         self.load_providers(agent, target).await?;
         self.back_to_providers(console, target)
     }
@@ -2786,6 +2795,7 @@ impl Menus {
                         }
                         if rows.is_empty() && index == 0 {
                             self.provider.provider_nav.filter = providers::ConnectionFilter::All;
+                            self.provider.provider_nav.query.clear();
                             self.back_to_providers(console, target)?;
                         } else {
                             self.provider.provider_nav.focused = None;
@@ -2950,6 +2960,7 @@ impl Menus {
                                 self.provider.provider_nav.back_stack.push(providers::ProviderPage::Models {
                                     connection: self.provider.model_provider.clone(),
                                     focused: self.provider.focused_model.clone(),
+                                    query: self.provider.model_query.clone(),
                                     action: Some(providers::ModelAction::Providers),
                                 });
                                 self.provider.provider_nav.filter = providers::ConnectionFilter::All;

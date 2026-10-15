@@ -1,4 +1,5 @@
 use super::super::login::SignInTarget;
+use super::super::style::Role;
 use super::*;
 use tickloop_agent_model::{ModelConfigExt, ReasoningEffortExt};
 use tickloop_agent_protocol::{
@@ -276,6 +277,7 @@ mod tests {
             .provider_nav
             .back_stack
             .push(ProviderPage::Directory {
+                query: String::new(),
                 filter: ConnectionFilter::Configured,
                 focused: Some(key.clone()),
             });
@@ -395,6 +397,7 @@ mod tests {
             .provider_nav
             .back_stack
             .push(ProviderPage::Directory {
+                query: String::new(),
                 filter: ConnectionFilter::Configured,
                 focused: Some(key),
             });
@@ -566,6 +569,7 @@ mod tests {
             .provider_nav
             .back_stack
             .push(ProviderPage::Directory {
+                query: String::new(),
                 filter: ConnectionFilter::All,
                 focused: Some(key),
             });
@@ -744,6 +748,119 @@ mod tests {
             menus.provider.focused_model,
             Some(("kimi-code-oauth".into(), "k3".into()))
         );
+    }
+
+    #[test]
+    fn connection_search_filters_rows_by_name_or_endpoint() {
+        let catalog = tickloop_agent_model::cards::ModelCatalog::defaults();
+        let choices = ProviderModels::group(vec![
+            catalog.get("kimi-code-oauth", "k3").unwrap(),
+            catalog.get("kimi-global-api", "kimi-k3").unwrap(),
+            catalog.get("deepseek-api", "deepseek-flash").unwrap(),
+        ]);
+        let console = Console::test_interactive_for_chat(Uuid::new_v4());
+        let mut menus = Menus::default();
+        menus.provider.provider_choices = choices.clone();
+        let id = Uuid::new_v4();
+        let rows = |menus: &mut Menus| {
+            menus
+                .show_providers(&console, ConfigTarget::NewDraft, choices.clone(), 0, id)
+                .unwrap();
+            console
+                .menu_snapshot(id)
+                .unwrap()
+                .expect("the directory is shown")
+                .options
+        };
+        let all = rows(&mut menus);
+        assert_eq!(
+            all.len(),
+            4,
+            "three connections and the action row: {all:?}"
+        );
+        assert!(all[2].contains("Code subscription"), "{all:?}");
+
+        menus.provider.provider_nav.query = "deepseek".into();
+        let filtered = rows(&mut menus);
+        assert_eq!(
+            filtered.len(),
+            2,
+            "one match and the action row: {filtered:?}"
+        );
+        assert!(filtered[0].contains("api.deepseek.com"), "{filtered:?}");
+
+        menus.provider.provider_nav.query = "kimi".into();
+        let by_vendor = rows(&mut menus);
+        assert_eq!(by_vendor.len(), 3, "both Kimi connections: {by_vendor:?}");
+        assert!(by_vendor[0].contains("api.moonshot.ai"), "{by_vendor:?}");
+        assert!(by_vendor[1].contains("api.kimi.com"), "{by_vendor:?}");
+
+        menus.provider.provider_nav.query = "kimi.com".into();
+        let by_endpoint = rows(&mut menus);
+        assert_eq!(by_endpoint.len(), 2, "{by_endpoint:?}");
+        assert!(by_endpoint[0].contains("api.kimi.com"), "{by_endpoint:?}");
+
+        menus.provider.provider_nav.query = "nothing matches this".into();
+        let empty = rows(&mut menus);
+        assert_eq!(empty.len(), 2, "{empty:?}");
+        assert!(empty[0].contains("No connections match"), "{empty:?}");
+
+        menus.provider.provider_nav.query.clear();
+        assert_eq!(rows(&mut menus), all);
+        menus.dismiss(&console).unwrap();
+    }
+
+    #[test]
+    fn connection_rows_take_the_role_of_their_authentication_state() {
+        assert_eq!(provider_role(&Ok(true)), None);
+        assert_eq!(provider_role(&Ok(false)), Some(Role::MutedText));
+        assert_eq!(provider_role(&Err("expired".into())), Some(Role::Warning));
+    }
+
+    #[test]
+    fn model_rows_name_their_connection_only_while_every_connection_is_listed() {
+        let catalog = tickloop_agent_model::cards::ModelCatalog::defaults();
+        let kimi =
+            ProviderModels::group(vec![catalog.get("kimi-code-oauth", "k3").unwrap()]).remove(0);
+        let console = Console::test_interactive_for_chat(Uuid::new_v4());
+        let mut menus = Menus::default();
+        menus.provider.provider_choices = vec![kimi.clone()];
+        menus.provider.model_providers = vec![kimi.clone()];
+        let choice = ModelChoice {
+            config: kimi.models[0].clone(),
+            thinking: None,
+            availability: ModelAvailability::Unknown {
+                reason: "test".into(),
+            },
+        };
+        let id = Uuid::new_v4();
+        menus
+            .show_model_choices(
+                &console,
+                ConfigTarget::NewDraft,
+                vec![choice.clone()],
+                0,
+                id,
+            )
+            .unwrap();
+        let options = console.menu_snapshot(id).unwrap().unwrap().options;
+        assert!(
+            options[0].contains("· Kimi Code subscription"),
+            "{}",
+            options[0]
+        );
+
+        menus.provider.model_provider = Some(kimi.key());
+        menus
+            .show_model_choices(&console, ConfigTarget::NewDraft, vec![choice], 0, id)
+            .unwrap();
+        let options = console.menu_snapshot(id).unwrap().unwrap().options;
+        assert!(
+            !options[0].contains("· Kimi Code subscription"),
+            "{}",
+            options[0]
+        );
+        menus.dismiss(&console).unwrap();
     }
 
     #[test]
@@ -993,6 +1110,31 @@ fn endpoint_label(value: &str) -> String {
         .unwrap_or_else(|_| "Custom endpoint".into())
 }
 
+/// A connection matches on its vendor, provider and directory names or its endpoint. Rows only
+/// show the product and host, so `kimi` must still find the Moonshot-hosted Kimi connections.
+fn provider_matches(provider: &ProviderModels, query: &str) -> bool {
+    let config = &provider.models[0];
+    [
+        provider_group(provider).unwrap_or_default().to_owned(),
+        config.provider_name.clone(),
+        provider.directory_name(),
+        provider.name(),
+        config.base_url.clone(),
+    ]
+    .iter()
+    .any(|candidate| candidate.to_lowercase().contains(query))
+}
+
+/// Configured connections keep the default text; the others are dimmed, and a credential that
+/// cannot be read is a warning.
+pub(super) fn provider_role(authenticated: &Result<bool, String>) -> Option<Role> {
+    match authenticated {
+        Ok(true) => None,
+        Ok(false) => Some(Role::MutedText),
+        Err(_) => Some(Role::Warning),
+    }
+}
+
 impl ProviderModels {
     fn directory_name(&self) -> String {
         let config = &self.models[0];
@@ -1204,11 +1346,13 @@ pub(super) enum ProviderPage {
     Directory {
         filter: ConnectionFilter,
         focused: Option<String>,
+        query: String,
     },
     Models {
         connection: Option<String>,
         focused: Option<(String, String)>,
         action: Option<ModelAction>,
+        query: String,
     },
     Settings,
     Details {
@@ -1232,6 +1376,9 @@ pub(super) struct ProviderNavigator {
     pub(super) focused: Option<String>,
     pub(super) back_stack: Vec<ProviderPage>,
     pub(super) credential_intent: Option<CredentialIntent>,
+    /// The `/` search over the directory rows, kept across `p`/`esc` so the list comes back where
+    /// it was left.
+    pub(super) query: String,
 }
 
 impl ProviderNavigator {
@@ -1287,6 +1434,7 @@ pub(super) struct ProviderSession {
     pub(super) model_choices: Vec<ModelChoice>,
     pub(super) model_providers: Vec<ProviderModels>,
     pub(super) model_provider: Option<String>,
+    pub(super) model_query: String,
     pub(super) current_model: Option<(String, String)>,
     pub(super) provider_scope: Option<ProviderCredentialScope>,
     pub(super) model_warmup: Option<ModelWarmup>,
@@ -1393,6 +1541,9 @@ impl Menus {
         selected: usize,
         id: Uuid,
     ) -> Result<(), String> {
+        let query =
+            super::super::conversation_picker::compact_line(&self.provider.provider_nav.query)
+                .to_lowercase();
         let rows: Vec<_> = choices
             .iter()
             .enumerate()
@@ -1400,10 +1551,12 @@ impl Menus {
                 self.provider.provider_nav.filter == ConnectionFilter::All
                     || self.provider_authenticated(provider) != Ok(false)
             })
+            .filter(|(_, provider)| query.is_empty() || provider_matches(provider, &query))
             .map(|(index, _)| ProviderRow::Provider(index))
             .collect();
         let mut headers = Vec::new();
         let mut compact_rows = Vec::new();
+        let mut row_roles = Vec::new();
         let mut last_vendor = None;
         let options: Vec<_> = rows
             .iter()
@@ -1413,9 +1566,12 @@ impl Menus {
                 let provider = &choices[*index];
                 let vendor = provider_group(provider).unwrap_or("Custom");
                 if last_vendor != Some(vendor) {
+                    // The count follows the search but not the Configured filter, which hides
+                    // exactly the rows it counts as missing.
                     let connections: Vec<_> = choices
                         .iter()
                         .filter(|candidate| provider_group(candidate).unwrap_or("Custom") == vendor)
+                        .filter(|candidate| query.is_empty() || provider_matches(candidate, &query))
                         .collect();
                     let configured = connections
                         .iter()
@@ -1445,6 +1601,7 @@ impl Menus {
                     label: label.clone(),
                     detail: detail.clone(),
                 });
+                row_roles.push(provider_role(&self.provider_authenticated(provider)));
                 safe_text(&format!("{current} {} · {detail}", provider.name()))
             })
             .collect();
@@ -1464,22 +1621,33 @@ impl Menus {
         let mut options = options;
         let empty = options.is_empty();
         if empty {
-            options.push("Add connection…".into());
+            options.push(if query.is_empty() {
+                "Add connection…".into()
+            } else {
+                safe_text(&format!("No connections match “{}”", query))
+            });
+            row_roles.push(None);
         }
         options.push("Judgment settings · Jev (TypeSafe)".into());
+        row_roles.push(None);
         let filter = match self.provider.provider_nav.filter {
             ConnectionFilter::All => "All",
             ConnectionFilter::Configured => "Configured",
         };
         let toggle = if filter == "All" { "Configured" } else { "All" };
         let escape = self.provider.provider_nav.escape_hint();
+        let searching = !query.is_empty();
         let mut row_hints =
-            vec![format!("p Connection · f Filter · enter · {escape}"); rows.len()];
+            vec![format!("p Connection · f Filter · / Search · enter · {escape}"); rows.len()];
         if empty {
-            row_hints.push(format!("f {toggle} · enter add connection · {escape}"));
+            row_hints.push(if searching {
+                format!("f {toggle} · / Search · enter clear search · {escape}")
+            } else {
+                format!("f {toggle} · / Search · enter add connection · {escape}")
+            });
         }
         row_hints.push(format!("f {toggle} · enter Judgment settings · {escape}"));
-        let context = if empty {
+        let context = if empty && !searching {
             vec!["No connections configured. Add a connection to browse models.".into()]
         } else {
             Vec::new()
@@ -1506,8 +1674,10 @@ impl Menus {
                     connection_options: Some(rows.len()),
                     row_hints,
                     compact_rows,
+                    row_roles,
+                    search: Some(self.provider.provider_nav.query.clone()),
                     hint: format!(
-                        "p Connection · f {} · enter models/setup · {escape}",
+                        "p Connection · f {} · enter models/setup · / Search · {escape}",
                         if filter == "All" { "Configured" } else { "All" }
                     ),
                     ..Default::default()
@@ -1550,6 +1720,7 @@ impl Menus {
         ProviderPage::Directory {
             filter: self.provider.provider_nav.filter,
             focused: self.provider.provider_nav.focused.clone(),
+            query: self.provider.provider_nav.query.clone(),
         }
     }
 
@@ -1683,16 +1854,23 @@ impl Menus {
             self.provider.provider_nav.credential_intent = None;
         }
         match parent {
-            Some(ProviderPage::Directory { filter, focused }) => {
+            Some(ProviderPage::Directory {
+                filter,
+                focused,
+                query,
+            }) => {
                 self.provider.provider_nav.filter = filter;
                 self.provider.provider_nav.focused = focused;
+                self.provider.provider_nav.query = query;
                 self.back_to_providers(console, target)
             }
             Some(ProviderPage::Models {
                 connection,
                 focused,
                 action,
+                query,
             }) => {
+                self.provider.model_query = query;
                 self.provider.model_return = Some(ModelPickerDraft {
                     provider: connection,
                     action,
@@ -2324,6 +2502,7 @@ impl Menus {
         target: ConfigTarget,
         provider: &str,
     ) -> Result<(), String> {
+        self.provider.model_query.clear();
         self.provider.model_return = Some(ModelPickerDraft {
             action: None,
             selected: self.provider.focused_model.clone(),
@@ -2359,6 +2538,7 @@ impl Menus {
             .push(ProviderPage::Models {
                 connection: self.provider.model_provider.clone(),
                 focused: self.provider.focused_model.clone(),
+                query: self.provider.model_query.clone(),
                 action: index
                     .checked_sub(choices.len())
                     .and_then(|index| self.model_actions(&choices).get(index).copied()),
@@ -2374,6 +2554,24 @@ impl Menus {
         selected: usize,
         id: Uuid,
     ) -> Result<(), String> {
+        let query = super::super::conversation_picker::compact_line(&self.provider.model_query)
+            .to_lowercase();
+        let browsing_all = self.provider.model_provider.is_none();
+        // `selected` indexes the unfiltered models, then the actions; keep pointing at the same
+        // model or action once the query hides some rows.
+        let unfiltered = choices.len();
+        let focused = choices.get(selected).map(|choice| choice.config.clone());
+        let choices: Vec<_> = choices
+            .into_iter()
+            .filter(|choice| query.is_empty() || self.model_choice_matches(choice, &query))
+            .collect();
+        let selected = match focused {
+            Some(config) => choices
+                .iter()
+                .position(|choice| same_model(&choice.config, &config))
+                .unwrap_or(0),
+            None => choices.len() + selected.saturating_sub(unfiltered),
+        };
         let mut options: Vec<String> = choices
             .iter()
             .map(|choice| {
@@ -2415,9 +2613,18 @@ impl Menus {
                     } else {
                         " "
                     };
+                // Browsing every connection at once, the group heading is the only other place
+                // the connection appears, so each row names it.
+                let connection = browsing_all
+                    .then(|| self.key_for_model(&choice.config))
+                    .flatten()
+                    .and_then(|key| self.connection(&key).ok())
+                    .map_or_else(String::new, |provider| {
+                        format!("  · {}", provider.models[0].provider_name)
+                    });
                 safe_text(&thinking.map_or_else(
-                    || format!("{current} {name}"),
-                    |thinking| format!("{current} {name}    Thinking ‹ {thinking} ›"),
+                    || format!("{current} {name}{connection}"),
+                    |thinking| format!("{current} {name}    Thinking ‹ {thinking} ›{connection}"),
                 ))
             })
             .collect();
@@ -2475,7 +2682,9 @@ impl Menus {
         let mut context = provider.as_ref().map_or_else(Vec::new, |provider| {
             vec![self.provider_auth_label(provider).into()]
         });
-        if choices.is_empty() {
+        if choices.is_empty() && !query.is_empty() {
+            context.push(safe_text(&format!("No models match “{query}”")));
+        } else if choices.is_empty() {
             context.push(
                 "No models available. Use /provider to sign in or configure a connection.".into(),
             );
@@ -2535,6 +2744,17 @@ impl Menus {
         Ok(())
     }
 
+    /// A model matches on its display name, service id or the connection it belongs to.
+    fn model_choice_matches(&self, choice: &ModelChoice, query: &str) -> bool {
+        [choice.config.name.clone(), choice.config.model_id.clone()]
+            .iter()
+            .any(|candidate| candidate.to_lowercase().contains(query))
+            || self
+                .key_for_model(&choice.config)
+                .and_then(|key| self.connection(&key).ok())
+                .is_some_and(|provider| provider_matches(&provider, query))
+    }
+
     pub(super) fn model_actions(&self, choices: &[ModelChoice]) -> Vec<ModelAction> {
         let mut actions = Vec::new();
         if !choices.is_empty() || self.provider.model_provider.is_some() {
@@ -2584,7 +2804,10 @@ impl Menus {
                 if let Some(provider) = &provider {
                     self.provider.provider_nav.focused = Some(provider.key());
                 }
-                if action == PickerAction::ToggleConnections {
+                if action == PickerAction::SearchQuery {
+                    self.provider.provider_nav.query = console.picker_search_query(menu_id)?;
+                    self.show_providers(console, target, choices, index, menu_id)?;
+                } else if action == PickerAction::ToggleConnections {
                     self.provider.provider_nav.filter = match self.provider.provider_nav.filter {
                         ConnectionFilter::All => ConnectionFilter::Configured,
                         ConnectionFilter::Configured => ConnectionFilter::All,
@@ -2616,7 +2839,31 @@ impl Menus {
                         choice.config.model_id.clone(),
                     )
                 });
-                if action == PickerAction::RefreshAccountModels {
+                if action == PickerAction::SearchQuery {
+                    self.provider.model_query = console.picker_search_query(menu_id)?;
+                    // The menu holds only the rows the previous query kept, so filter again from
+                    // every model of this page.
+                    self.remember_model_drafts(&choices);
+                    let focused = choices.get(index).map(|choice| choice.config.clone());
+                    let all: Vec<_> = self
+                        .provider
+                        .model_choices
+                        .iter()
+                        .filter(|choice| {
+                            self.provider.model_provider.as_ref().is_none_or(|key| {
+                                self.key_for_model(&choice.config).as_ref() == Some(key)
+                            })
+                        })
+                        .cloned()
+                        .collect();
+                    let selected = focused
+                        .and_then(|config| {
+                            all.iter()
+                                .position(|choice| same_model(&choice.config, &config))
+                        })
+                        .unwrap_or(0);
+                    self.show_model_choices(console, target, all, selected, menu_id)?;
+                } else if action == PickerAction::RefreshAccountModels {
                     let connection = choices
                         .get(index)
                         .and_then(|choice| self.key_for_model(&choice.config));

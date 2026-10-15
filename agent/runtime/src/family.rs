@@ -1,4 +1,5 @@
 use super::*;
+use crate::agent_messages::DispatchRefusal;
 use tickloop_agent_protocol::{
     ChatSnapshot, DirectedHumanSource, EventKind, FamilyCompletion, FamilyInputRecord,
     FamilyMessageRejection, FamilyMessageRejectionCode, HostCallContext, InputContext, LoopId,
@@ -254,7 +255,8 @@ impl Agent {
                         }
                         SubagentNotificationDelivery::Rejected(rejection)
                     }
-                    Err(message) => {
+                    Err(DispatchRefusal::Deferred) => continue,
+                    Err(DispatchRefusal::Refused(message)) => {
                         SubagentNotificationDelivery::Rejected(FamilyMessageRejection {
                             code: FamilyMessageRejectionCode::StaleTarget,
                             message,
@@ -317,34 +319,17 @@ impl Agent {
                 None
             }
         });
-        let background = self
-            .inner
-            .subagent_invocations
-            .lock()
-            .await
-            .values()
-            .find(|invocation| invocation.receipt.run_id == child.run_id)
-            .map_or_else(
-                || {
-                    snapshot
-                        .messages
-                        .iter()
-                        .enumerate()
-                        .find(|(index, message)| {
-                            message.role == Role::User
-                                && snapshot.message_runs.get(index) == Some(&child.run_id)
-                        })
-                        .is_none_or(|(index, _)| {
-                            !snapshot.prompt_execution_modes.contains_key(&index)
-                        })
-                },
-                |invocation| invocation.run_in_background,
-            );
+        // Held until the record is in place, so an interrupted foreground observation either
+        // returns this ended run or releases its call before the run is classified.
+        let invocations = self.inner.subagent_invocations.lock().await;
+        let is_returned_by_foreground_call = invocations.values().any(|invocation| {
+            invocation.receipt.run_id == child.run_id && !invocation.run_in_background
+        });
         let completion = FamilyCompletion {
-            notification: if background {
-                SubagentNotificationDelivery::Pending
-            } else {
+            notification: if is_returned_by_foreground_call {
                 SubagentNotificationDelivery::Foreground
+            } else {
+                SubagentNotificationDelivery::Pending
             },
             usage: snapshot
                 .request_usage
@@ -399,6 +384,7 @@ impl Agent {
                 self.save(&parent.snapshot);
             }
         }
+        drop(invocations);
         if completion.notification.is_background() {
             self.flush_subagent_notifications(delegation.parent_chat_id)
                 .await;

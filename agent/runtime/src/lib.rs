@@ -2063,6 +2063,7 @@ impl Agent {
                 return Ok(pending_receipt);
             }
         }
+        let continues_ended_loop = matches!(goal.state, LoopState::Failed | LoopState::Interrupted);
         if !matches!(
             goal.state,
             LoopState::Running | LoopState::WaitingPermission | LoopState::WaitingQuestion
@@ -2157,6 +2158,10 @@ impl Agent {
         }
         if let Some(next) = next {
             self.inner.tasks.lock().await.push(self.run_task(next));
+        }
+        // Child completions held for this failed or interrupted Loop arrive once it is continued.
+        if continues_ended_loop {
+            self.flush_subagent_notifications(chat_id).await;
         }
 
         self.inner.input_wakeup.send_replace(());

@@ -439,6 +439,9 @@ pub(super) enum PickerAction {
     ToggleConnections,
     ConfigureProvider,
     RefreshAccountModels,
+    /// The search query changed. The query itself lives on the dialog, so the menu that owns the
+    /// rows reads it back with `picker_search_query` instead of carrying the text here.
+    SearchQuery,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -454,6 +457,70 @@ pub(super) struct CompactPickerRow {
     pub(super) detail: String,
 }
 
+/// Where a picker that offers search puts the keyboard: on the rows or in the query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PickerSearchFocus {
+    List,
+    Search,
+}
+
+/// What a key did inside a picker's search. `Passthrough` leaves it to the menu, which keeps
+/// `p`/`f`/`r`/`h`/`l`/`j`/`k` working while the list has the keyboard.
+enum PickerSearchOutcome {
+    Passthrough,
+    Handled,
+    /// The query changed, so the rows must be filtered again.
+    Refilter,
+}
+
+/// The `/` search of a picker menu. Typing and the cursor belong to the dialog, so the query lives
+/// here and the menu that draws the rows filters on it through `picker_search_query`.
+struct PickerSearch {
+    id: Uuid,
+    kind: PickerKind,
+    query: Editor,
+    focus: PickerSearchFocus,
+}
+
+impl PickerSearch {
+    fn new(id: Uuid, kind: PickerKind, query: &str) -> Self {
+        let mut editor = Editor::new();
+        editor.replace_draft(query.to_owned(), query.len());
+        Self {
+            id,
+            kind,
+            query: editor,
+            focus: PickerSearchFocus::List,
+        }
+    }
+
+    /// Whether a picker shown as `id` is this search's page: the same menu, or the same kind of
+    /// picker re-shown with the query typed here, as when an account check replaces the rows
+    /// mid-typing.
+    fn continues_in(&self, id: Uuid, kind: PickerKind, query: &str) -> bool {
+        self.id == id || self.kind == kind && self.query.draft() == query
+    }
+
+    fn focused(&self) -> bool {
+        self.focus == PickerSearchFocus::Search
+    }
+
+    /// Applies an editor command and reports whether the query changed. Moving the cursor inside
+    /// the query must not refilter the rows.
+    fn edit(&mut self, command: EditorCommand) -> bool {
+        let moves_cursor = matches!(
+            command,
+            EditorCommand::MoveLeft
+                | EditorCommand::MoveRight
+                | EditorCommand::MoveLineStart
+                | EditorCommand::MoveLineEnd
+                | EditorCommand::MoveWordBackward
+                | EditorCommand::MoveWordForward
+        );
+        self.query.apply(command) == EditorOutcome::Changed && !moves_cursor
+    }
+}
+
 #[derive(Clone, Default)]
 pub(super) struct PickerPresentation {
     pub(super) headers: Vec<(usize, String)>,
@@ -465,6 +532,12 @@ pub(super) struct PickerPresentation {
     pub(super) connection_options: Option<usize>,
     pub(super) row_hints: Vec<String>,
     pub(super) compact_rows: Vec<CompactPickerRow>,
+    /// Role per option row, aligned with the option indices. `None` keeps `Role::Text`. A selected
+    /// row resolves to `Text` on top of its `Selection` fill, so a role colours only the rows that
+    /// are not selected.
+    pub(super) row_roles: Vec<Option<Role>>,
+    /// `Some` offers `/` search over the rows, starting from the query the menu filters on.
+    pub(super) search: Option<String>,
     pub(super) failure_target: Option<Uuid>,
     pub(super) failure_connections: Vec<Option<String>>,
     pub(super) failure_message: bool,
@@ -478,7 +551,7 @@ enum MenuFocus {
     MenuWithLink(String),
     Secret(String),
     Input(String),
-    Picker(PickerKind, PickerPresentation),
+    Picker(PickerKind, Box<PickerPresentation>),
     Question(QuestionMenu),
 }
 
@@ -695,6 +768,7 @@ pub(super) struct State {
     menu_rule_role: Option<Role>,
     picker_kind: Option<PickerKind>,
     picker_presentation: PickerPresentation,
+    picker_search: Option<PickerSearch>,
     /// The `/resume` picker owns input while open; the
     /// draft and conversation underneath stay untouched.
     artifacts_picker: Option<super::artifacts_picker::ArtifactsPicker>,
@@ -3539,7 +3613,7 @@ impl Console {
             None,
             MenuFocus::Picker(
                 kind,
-                PickerPresentation {
+                Box::new(PickerPresentation {
                     headers: Vec::new(),
                     refresh: false,
                     hint: match kind {
@@ -3551,7 +3625,7 @@ impl Console {
                     }
                     .into(),
                     ..Default::default()
-                },
+                }),
             ),
         )
     }
@@ -3572,6 +3646,16 @@ impl Console {
             .as_ref()
             .filter(|menu| menu.id == id)
             .map(|menu| menu.selected))
+    }
+
+    /// The query the menu owning `id` filters its rows on.
+    pub(super) fn picker_search_query(&self, id: Uuid) -> Result<String, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(state
+            .picker_search
+            .as_ref()
+            .filter(|search| search.id == id)
+            .map_or_else(String::new, |search| search.query.draft().to_owned()))
     }
 
     pub(super) fn menu_snapshot(&self, id: Uuid) -> Result<Option<Menu>, String> {
@@ -3606,6 +3690,11 @@ impl Console {
         {
             *id = restored;
         }
+        if let Some(search) = &mut state.picker_search
+            && search.id == previous
+        {
+            search.id = restored;
+        }
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())?;
@@ -3624,7 +3713,7 @@ impl Console {
             Vec::new(),
             "Comment",
             None,
-            MenuFocus::Picker(kind, presentation),
+            MenuFocus::Picker(kind, Box::new(presentation)),
         )
     }
 
@@ -3931,12 +4020,26 @@ impl Console {
             _ => None,
         };
         state.picker_presentation = match &focus {
-            MenuFocus::Picker(_, presentation) => presentation.clone(),
+            MenuFocus::Picker(_, presentation) => (**presentation).clone(),
             _ => PickerPresentation {
                 hint: "enter confirm · esc back".into(),
                 ..Default::default()
             },
         };
+        let previous_search = state.picker_search.take();
+        let kind = state.picker_kind.unwrap_or(PickerKind::Actions);
+        state.picker_search =
+            state
+                .picker_presentation
+                .search
+                .clone()
+                .map(|query| match previous_search {
+                    Some(mut search) if search.continues_in(menu.id, kind, &query) => {
+                        search.id = menu.id;
+                        search
+                    }
+                    _ => PickerSearch::new(menu.id, kind, &query),
+                });
         state.question_menu = match &focus {
             MenuFocus::Question(question) => Some(question.clone()),
             _ => None,
@@ -5232,6 +5335,7 @@ impl State {
             menu_rule_role: None,
             picker_kind: None,
             picker_presentation: Default::default(),
+            picker_search: None,
             artifacts_picker: None,
             conversation_picker: None,
             menu_link: None,
@@ -6669,6 +6773,7 @@ impl State {
             .min(capacity.saturating_sub(title_rows + hint_rows + 1));
         let picker = self.picker_kind.is_some();
         let compact = picker && self.width < COMPACT_PICKER_COLUMNS;
+        let search_rows = usize::from(self.picker_search.is_some() && capacity > 2);
         let minimum_option_rows =
             1 + usize::from(
                 compact
@@ -6684,10 +6789,12 @@ impl State {
             self.menu_context_rows(menu, capacity).min(2)
         };
         let context_reserve = capacity
-            .saturating_sub(title_rows + hint_rows + comment_rows + minimum_option_rows)
+            .saturating_sub(
+                title_rows + hint_rows + search_rows + comment_rows + minimum_option_rows,
+            )
             .min(context_rows);
-        let option_capacity =
-            capacity.saturating_sub(title_rows + hint_rows + comment_rows + context_reserve);
+        let option_capacity = capacity
+            .saturating_sub(title_rows + hint_rows + search_rows + comment_rows + context_reserve);
         let options = menu
             .options
             .iter()
@@ -6750,8 +6857,8 @@ impl State {
             option_end += 1;
         }
         option_rows += group_rows(option_start, option_end);
-        let context_capacity =
-            capacity.saturating_sub(title_rows + hint_rows + option_rows + comment_rows);
+        let context_capacity = capacity
+            .saturating_sub(title_rows + hint_rows + search_rows + option_rows + comment_rows);
         let mut lines = Vec::new();
         if capacity > 1 {
             let count = if self.request_layout.is_some() && self.request_queue_count > 1 {
@@ -6768,6 +6875,25 @@ impl State {
                 Role::DialogTitle,
             ));
         }
+        let search_cursor = if search_rows > 0 {
+            let (line, column) = super::conversation_picker::search_row(
+                self.picker_search
+                    .as_ref()
+                    .expect("search row is drawn")
+                    .query
+                    .draft(),
+                self.picker_search
+                    .as_ref()
+                    .expect("search row is drawn")
+                    .query
+                    .cursor(),
+                self.width,
+            );
+            lines.push(line);
+            Some(column)
+        } else {
+            None
+        };
         if context_capacity > 0 {
             if let Some(review) = &mut self.menu_review {
                 let viewport = DiffViewport {
@@ -6846,8 +6972,15 @@ impl State {
                 selected_row = lines.len();
             }
             let remaining = capacity.saturating_sub(hint_rows + comment_rows + lines.len());
+            let role = self
+                .picker_presentation
+                .row_roles
+                .get(index)
+                .copied()
+                .flatten()
+                .unwrap_or(Role::Text);
             lines.extend(option_lines.iter().take(remaining).map(|text| {
-                let line = RoleLine::role(text.clone(), Role::Text);
+                let line = RoleLine::role(text.clone(), role);
                 if index == selected {
                     line.filled(Role::Selection)
                 } else {
@@ -6858,6 +6991,15 @@ impl State {
                 .push((option_row..lines.len(), index));
         }
         let mut cursor = (selected_row, 0);
+        if let Some(column) = search_cursor
+            && self
+                .picker_search
+                .as_ref()
+                .is_some_and(PickerSearch::focused)
+        {
+            cursor = (1, column);
+            self.dialog_cursor_visible = true;
+        }
         if comment_rows > 0 {
             let start = comment_cursor.0.saturating_sub(comment_rows - 1);
             if editing {
@@ -8983,6 +9125,17 @@ impl State {
             if self.user_menu_submission_is_unfinished() {
                 return MENU_SUBMISSION_PENDING_HINT;
             }
+            if self
+                .picker_search
+                .as_ref()
+                .is_some_and(PickerSearch::focused)
+            {
+                return if self.picker_search_is_empty() {
+                    "enter apply · esc list"
+                } else {
+                    "enter apply · esc clear"
+                };
+            }
             self.menu
                 .as_ref()
                 .and_then(|menu| self.picker_presentation.row_hints.get(menu.selected))
@@ -9116,14 +9269,14 @@ impl State {
         true
     }
 
-    fn paste(&mut self, text: &str) {
+    fn paste(&mut self, text: &str) -> Option<InputEvent> {
         self.shell_background_chord_started_at = None;
         if let Some((_, transcript)) = &mut self.transcript {
             transcript.paste(text);
-            return;
+            return None;
         }
         if self.input_dialog_requires_resize() {
-            return;
+            return None;
         }
         if self.ordinary_input_is_visible() {
             self.clear_prompt_suggestion();
@@ -9137,56 +9290,71 @@ impl State {
                 && self.conversation_picker.is_none()
                 && self.permissions_surface.is_none()
         {
-            return;
+            return None;
         }
         if self.input_dialog_visible() && self.menu.is_some() && !self.review_focused {
             self.menu_focused = true;
         }
+        if self
+            .picker_search
+            .as_ref()
+            .is_some_and(PickerSearch::focused)
+        {
+            let query = super::conversation_picker::compact_line(text);
+            let changed = self.picker_search.as_mut().is_some_and(|search| {
+                search.query.apply(EditorCommand::InsertPasted(query)) == EditorOutcome::Changed
+            });
+            return if changed {
+                self.picker_search_refilter_event()
+            } else {
+                None
+            };
+        }
         self.last_input_edit = Some(Instant::now());
         if self.branch_submission_owns_input() {
-            return;
+            return None;
         }
         self.clear_footer_selection();
         if self.menu_submission_is_pending() {
-            return;
+            return None;
         }
         if self.menu.is_none()
             && let Some(picker) = &mut self.artifacts_picker
         {
             picker.paste(text);
-            return;
+            return None;
         }
         if self.menu.is_none()
             && let Some(picker) = &mut self.conversation_picker
         {
             picker.paste(text);
-            return;
+            return None;
         }
         if !self.input_dialog_visible() && self.monitor.focused && self.monitor_visible() {
-            return;
+            return None;
         }
         if self.input_menu_active() {
             self.paste_menu_comment(text);
-            return;
+            return None;
         }
         if self.menu.is_none() && self.foreground_shell {
-            return;
+            return None;
         }
         if self.menu.is_none()
             && let Some(surface) = &mut self.permissions_surface
         {
             surface.paste(text);
-            return;
+            return None;
         }
         if self.menu.is_none() && self.history_search.is_some() {
             self.apply_history_search(HistorySearchInput::Insert(text.into()));
-            return;
+            return None;
         }
         if self.paste_menu_comment(text) {
-            return;
+            return None;
         }
         if self.menu_focused {
-            return;
+            return None;
         }
         if self.prompt_enabled {
             self.menu_focused = false;
@@ -9208,11 +9376,11 @@ impl State {
                     if self.empty_paste_reads_clipboard_image {
                         self.paste_clipboard_image_after_empty_paste();
                     }
-                    return;
+                    return None;
                 }
                 if self.accepts_images {
                     if self.paste_with_image_paths(&text) {
-                        return;
+                        return None;
                     }
                 } else {
                     refused_image_path = find_image_paths(&text, self.working_directory())
@@ -9247,8 +9415,8 @@ impl State {
                 self.status = IMAGE_INPUT_UNSUPPORTED.into();
             }
         }
+        None
     }
-
     fn insert_pasted_text(&mut self, text: &str) {
         let start = self.editor.cursor();
         self.insert_pasted(text);
@@ -9584,6 +9752,151 @@ impl State {
             && self.transcript.is_none()
             && self.history_search.is_none()
             && !self.foreground_shell
+    }
+
+    fn picker_search_key(&mut self, key: KeyEvent) -> PickerSearchOutcome {
+        let Some(search) = self.picker_search.as_mut() else {
+            return PickerSearchOutcome::Passthrough;
+        };
+        if !search.focused() {
+            return match (key.code, key.modifiers) {
+                (KeyCode::Char('/'), modifiers)
+                    if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    search.focus = PickerSearchFocus::Search;
+                    PickerSearchOutcome::Handled
+                }
+                (KeyCode::Esc, _) if !search.query.draft().is_empty() => {
+                    self.picker_search_edit(EditorCommand::Clear)
+                }
+                _ => PickerSearchOutcome::Passthrough,
+            };
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return match key.code {
+                KeyCode::Char('g') => self.edit_picker_search_in_external_editor(),
+                KeyCode::Char('n') => self.picker_search_move(1),
+                KeyCode::Char('p') => self.picker_search_move(-1),
+                KeyCode::Char('a') => self.picker_search_edit(EditorCommand::MoveLineStart),
+                KeyCode::Char('e') => self.picker_search_edit(EditorCommand::MoveLineEnd),
+                KeyCode::Char('b') => self.picker_search_edit(EditorCommand::MoveLeft),
+                KeyCode::Char('f') => self.picker_search_edit(EditorCommand::MoveRight),
+                KeyCode::Char('u') => self.picker_search_edit(EditorCommand::KillToLineStart),
+                KeyCode::Char('k') => self.picker_search_edit(EditorCommand::KillToLineEnd),
+                KeyCode::Char('w') => {
+                    self.picker_search_edit(EditorCommand::KillToPreviousWhitespace)
+                }
+                KeyCode::Char('y') => self.picker_search_edit(EditorCommand::Yank),
+                _ => PickerSearchOutcome::Handled,
+            };
+        }
+        match key.code {
+            KeyCode::Enter => PickerSearchOutcome::Passthrough,
+            KeyCode::Up | KeyCode::Down => {
+                if let Some(search) = self.picker_search.as_mut() {
+                    search.focus = PickerSearchFocus::List;
+                }
+                PickerSearchOutcome::Handled
+            }
+            KeyCode::Esc if self.picker_search_is_empty() => {
+                if let Some(search) = self.picker_search.as_mut() {
+                    search.focus = PickerSearchFocus::List;
+                }
+                PickerSearchOutcome::Handled
+            }
+            KeyCode::Esc => self.picker_search_edit(EditorCommand::Clear),
+            KeyCode::Backspace if self.picker_search_is_empty() => {
+                if let Some(search) = self.picker_search.as_mut() {
+                    search.focus = PickerSearchFocus::List;
+                }
+                PickerSearchOutcome::Handled
+            }
+            KeyCode::Backspace => self.picker_search_edit(EditorCommand::DeleteBackward),
+            KeyCode::Delete => self.picker_search_edit(EditorCommand::DeleteForward),
+            KeyCode::Left => self.picker_search_edit(EditorCommand::MoveLeft),
+            KeyCode::Right => self.picker_search_edit(EditorCommand::MoveRight),
+            KeyCode::Home => self.picker_search_edit(EditorCommand::MoveLineStart),
+            KeyCode::End => self.picker_search_edit(EditorCommand::MoveLineEnd),
+            KeyCode::Char(character)
+                if !key.modifiers.contains(KeyModifiers::ALT) && !character.is_control() =>
+            {
+                self.picker_search_edit(EditorCommand::Insert(character.to_string()))
+            }
+            _ => PickerSearchOutcome::Passthrough,
+        }
+    }
+
+    fn picker_search_is_empty(&self) -> bool {
+        self.picker_search
+            .as_ref()
+            .is_none_or(|search| search.query.draft().is_empty())
+    }
+
+    fn picker_search_refilter_event(&self) -> Option<InputEvent> {
+        let (menu_id, index) = self.menu.as_ref().map(|menu| (menu.id, menu.selected))?;
+        Some(InputEvent::PickerAction {
+            menu_id,
+            index,
+            action: PickerAction::SearchQuery,
+        })
+    }
+
+    fn picker_search_move(&mut self, delta: isize) -> PickerSearchOutcome {
+        if let Some(menu) = &mut self.menu {
+            let last = menu.options.len().saturating_sub(1);
+            menu.selected = if delta > 0 {
+                (menu.selected + 1).min(last)
+            } else {
+                menu.selected.saturating_sub(1)
+            };
+        }
+        PickerSearchOutcome::Handled
+    }
+
+    fn picker_search_edit(&mut self, command: EditorCommand) -> PickerSearchOutcome {
+        if self
+            .picker_search
+            .as_mut()
+            .is_some_and(|search| search.edit(command))
+        {
+            PickerSearchOutcome::Refilter
+        } else {
+            PickerSearchOutcome::Handled
+        }
+    }
+
+    fn edit_picker_search_in_external_editor(&mut self) -> PickerSearchOutcome {
+        let Some(query) = self
+            .picker_search
+            .as_ref()
+            .map(|search| search.query.draft().to_owned())
+        else {
+            return PickerSearchOutcome::Handled;
+        };
+        let outcome = self.run_external_editor(&query);
+        let Some(search) = self.picker_search.as_mut() else {
+            return PickerSearchOutcome::Handled;
+        };
+        match outcome {
+            Some(ExternalEditorOutcome::Updated { content }) => {
+                let query = super::conversation_picker::compact_line(&content);
+                let cursor = query.len();
+                let changed = query != search.query.draft();
+                search.query.replace_draft(query, cursor);
+                if changed {
+                    PickerSearchOutcome::Refilter
+                } else {
+                    PickerSearchOutcome::Handled
+                }
+            }
+            Some(
+                ExternalEditorOutcome::Unchanged
+                | ExternalEditorOutcome::Cancelled { .. }
+                | ExternalEditorOutcome::Unavailable
+                | ExternalEditorOutcome::Failed(_),
+            )
+            | None => PickerSearchOutcome::Handled,
+        }
     }
 
     /// Every key belongs to the open picker, so none reaches the draft beneath it.
@@ -10559,6 +10872,17 @@ impl State {
         }
         if self.menu_focused
             && menu_is_visible
+            && self.picker_search.is_some()
+            && !self.user_menu_submission_is_unfinished()
+        {
+            match self.picker_search_key(key) {
+                PickerSearchOutcome::Passthrough => {}
+                PickerSearchOutcome::Handled => return None,
+                PickerSearchOutcome::Refilter => return self.picker_search_refilter_event(),
+            }
+        }
+        if self.menu_focused
+            && menu_is_visible
             && let Some(menu) = &mut self.menu
         {
             let picker_action = match (self.picker_kind, key.code, key.modifiers) {
@@ -11304,10 +11628,7 @@ fn read_keys(
                 state.clear_selection();
                 state.key(legacy_escape(key))
             }
-            Event::Paste(text) => {
-                state.paste(&text);
-                None
-            }
+            Event::Paste(text) => state.paste(&text),
             Event::Resize(width, height) => {
                 state.resize(width, height);
                 None
@@ -19918,6 +20239,216 @@ mod tests {
         assert!(!rendered.contains("a Adapter"));
         assert!(state.key(key(KeyCode::Char('a'))).is_none());
         assert_eq!(state.editor.draft(), "");
+    }
+
+    #[test]
+    fn picker_search_takes_slash_then_keys_the_query_and_keeps_the_shortcuts() {
+        let mut state = State::new(true, 160, 24);
+        state.prompt_enabled = true;
+        let console = console_with_state(state);
+        let selection = menu();
+        let menu_id = selection.id;
+        console
+            .show_presented_picker_menu(
+                selection,
+                PickerKind::Provider,
+                PickerPresentation {
+                    search: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut state = console.state.lock().unwrap();
+        for (code, action) in [
+            (KeyCode::Char('p'), PickerAction::ConfigureProvider),
+            (KeyCode::Char('f'), PickerAction::ToggleConnections),
+        ] {
+            assert!(matches!(
+                state.key(key(code)),
+                Some(InputEvent::PickerAction {
+                    menu_id: id,
+                    action: actual,
+                    ..
+                }) if id == menu_id && actual == action
+            ));
+        }
+        assert!(state.key(key(KeyCode::Char('k'))).is_none());
+        assert_eq!(state.menu.as_ref().unwrap().selected, 0);
+        assert!(state.key(key(KeyCode::Char('/'))).is_none());
+        for character in "kimi".chars() {
+            assert!(matches!(
+                state.key(key(KeyCode::Char(character))),
+                Some(InputEvent::PickerAction {
+                    menu_id: id,
+                    action: PickerAction::SearchQuery,
+                    ..
+                }) if id == menu_id
+            ));
+        }
+        drop(state);
+        assert_eq!(console.picker_search_query(menu_id).unwrap(), "kimi");
+        let rendered = console.state.lock().unwrap().frame().0.join("\n");
+        assert!(rendered.contains("⌕ kimi"));
+        let mut state = console.state.lock().unwrap();
+        assert!(matches!(
+            state.key(key(KeyCode::Backspace)),
+            Some(InputEvent::PickerAction {
+                action: PickerAction::SearchQuery,
+                ..
+            })
+        ));
+        assert_eq!(state.picker_search.as_ref().unwrap().query.draft(), "kim");
+        state.key(key(KeyCode::Esc));
+        assert_eq!(state.picker_search.as_ref().unwrap().query.draft(), "");
+        assert!(
+            state
+                .picker_search
+                .as_ref()
+                .is_some_and(PickerSearch::focused)
+        );
+        assert!(state.key(key(KeyCode::Backspace)).is_none());
+        assert!(
+            !state
+                .picker_search
+                .as_ref()
+                .is_some_and(PickerSearch::focused)
+        );
+        assert!(state.menu.is_some());
+    }
+
+    #[test]
+    fn a_picker_shown_under_a_new_id_starts_from_the_menu_query() {
+        let mut state = State::new(true, 160, 24);
+        state.prompt_enabled = true;
+        let console = console_with_state(state);
+        let first = menu();
+        let first_id = first.id;
+        let presentation = |query: &str| PickerPresentation {
+            search: Some(query.into()),
+            ..Default::default()
+        };
+        console
+            .show_presented_picker_menu(first, PickerKind::Provider, presentation(""))
+            .unwrap();
+        {
+            let mut state = console.state.lock().unwrap();
+            state.key(key(KeyCode::Char('/')));
+            state.key(key(KeyCode::Char('x')));
+        }
+        console
+            .show_presented_picker_menu(
+                Menu {
+                    id: first_id,
+                    ..menu()
+                },
+                PickerKind::Provider,
+                presentation(""),
+            )
+            .unwrap();
+        assert_eq!(
+            console.picker_search_query(first_id).unwrap(),
+            "x",
+            "the same menu keeps what is being typed"
+        );
+        let replaced = menu();
+        let replaced_id = replaced.id;
+        console
+            .show_presented_picker_menu(replaced, PickerKind::Provider, presentation("kimi"))
+            .unwrap();
+        assert_eq!(console.picker_search_query(replaced_id).unwrap(), "kimi");
+        let rendered = console.state.lock().unwrap().frame().0.join("\n");
+        assert!(rendered.contains("⌕ kimi"));
+        console.state.lock().unwrap().key(key(KeyCode::Char('/')));
+        let refreshed = menu();
+        let refreshed_id = refreshed.id;
+        console
+            .show_presented_picker_menu(refreshed, PickerKind::Provider, presentation("kimi"))
+            .unwrap();
+        let state = console.state.lock().unwrap();
+        let search = state.picker_search.as_ref().unwrap();
+        assert_eq!(search.id, refreshed_id);
+        assert!(
+            search.focused(),
+            "rows replaced under the same query keep the typing"
+        );
+    }
+
+    #[test]
+    fn escape_from_the_list_clears_a_query_before_it_closes_the_picker() {
+        let mut state = State::new(true, 160, 24);
+        state.prompt_enabled = true;
+        let console = console_with_state(state);
+        let selection = menu();
+        let menu_id = selection.id;
+        console
+            .show_presented_picker_menu(
+                selection,
+                PickerKind::Provider,
+                PickerPresentation {
+                    search: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut state = console.state.lock().unwrap();
+        state.key(key(KeyCode::Char('/')));
+        state.key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT));
+        assert_eq!(state.picker_search.as_ref().unwrap().query.draft(), "K");
+        assert!(state.key(key(KeyCode::Down)).is_none());
+        assert!(!state.picker_search.as_ref().unwrap().focused());
+        assert!(matches!(
+            state.key(key(KeyCode::Esc)),
+            Some(InputEvent::PickerAction {
+                menu_id: id,
+                action: PickerAction::SearchQuery,
+                ..
+            }) if id == menu_id
+        ));
+        assert_eq!(state.picker_search.as_ref().unwrap().query.draft(), "");
+        assert!(
+            state.menu.is_some(),
+            "the first escape only clears the query"
+        );
+    }
+
+    #[test]
+    fn picker_rows_take_their_state_role_and_the_selected_row_stays_text() {
+        let mut state = State::new(true, 160, 24);
+        state.prompt_enabled = true;
+        let console = console_with_state(state);
+        let mut selection = menu();
+        selection.options = vec!["Configured connection".into(), "Unconfigured one".into()];
+        console
+            .show_presented_picker_menu(
+                selection,
+                PickerKind::Provider,
+                PickerPresentation {
+                    search: Some(String::new()),
+                    row_roles: vec![None, Some(Role::MutedText)],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut state = console.state.lock().unwrap();
+        state.key(key(KeyCode::Char('/')));
+        let (lines, cursor, _) = state.styled_frame();
+        let search_row = lines
+            .iter()
+            .position(|line| line.text().contains("⌕ Search…"))
+            .expect("the search row is drawn");
+        assert_eq!(cursor, search_row, "the focused query keeps the cursor");
+        let configured = lines
+            .iter()
+            .find(|line| line.text().contains("Configured connection"))
+            .unwrap();
+        assert_eq!(configured.spans[0].role, Some(Role::Text));
+        assert_eq!(configured.fill, Some(Role::Selection));
+        let unconfigured = lines
+            .iter()
+            .find(|line| line.text().contains("Unconfigured one"))
+            .unwrap();
+        assert_eq!(unconfigured.spans[0].role, Some(Role::MutedText));
+        assert_eq!(unconfigured.fill, None);
     }
 
     #[test]
