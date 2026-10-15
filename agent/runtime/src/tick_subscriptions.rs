@@ -24,7 +24,7 @@ use super::*;
 use crate::tick_stream::{
     TickConnectionState, TickObservation, TickStreamEvent, TickStreamPort, WatchId,
 };
-use crate::tick_trim::{encoded_len, trim};
+use crate::tick_trim::{Trimmed, encoded_len, omitted_value, trim};
 use tick_protocol::{InstanceRef, StateSeries};
 use tickloop_agent_protocol::{
     HostToolAuthority, LoopId, LoopSnapshot, LoopState, MAX_DELIVERY_ITEM_BYTES,
@@ -48,8 +48,12 @@ const HELD_DELIVERY_RETRY: Duration = Duration::from_secs(5);
 const SAMPLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// An item the stream or a later delivery replaces is itself one superseded Tick Update.
 const SUPERSEDED_UPDATE: u64 = 1;
-/// How many times an item's data allowance is narrowed to make room for what its trimming adds.
+/// How many times an item's data allowance is narrowed to make room for what its trimming adds;
+/// past that its data gives way whole.
 const ITEM_FIT_ATTEMPTS: usize = 4;
+/// The longest text a Tick reports for an item's header fields, its observation times and
+/// recovery guidance, that a delivery carries; a longer one is replaced by its size.
+const MAX_HEADER_TEXT_BYTES: usize = 128;
 const TRIMMED_HINT: &str = "Where an item lists `trimmed`, whole segments of its data were left out in place, each cut saying how many elements or lines it replaced; for the full content use that instance's `recover_with` (a protocol Tick's query tool through CallTickTool, a Shell's output file through Read) or ReadTick.";
 const TRIMMED_SCREEN_HINT: &str = "A Terminal Tick's trimmed screen text keeps its first and last lines; ReadTick returns its current screen, and output that scrolled past between periods cannot be recovered.";
 const UNREADABLE_HINT: &str = "Where `data` or a Terminal Tick's `text` is null, the update could not be read again; read that instance with the native tools for its type.";
@@ -289,26 +293,31 @@ impl DeliveryItem {
         }
     }
 
-    /// The item as a delivery carries it, its data shortened so the whole item takes at most
-    /// `allowance` encoded bytes; whether any data was shortened.
-    fn delivered(&self, allowance: usize) -> (Value, bool) {
+    /// The item's fields beside its data, the text its Tick reports in them bounded.
+    fn header(&self) -> Value {
         let mut header = json!({
             "subscription": self.subscription,
             "watch": self.watch,
             "instance": self.instance,
             "updates": self.updates,
             "seq": span(&self.first_sequence.to_string(), &self.sequence.to_string()),
-            "between": span(&self.first_observed_at, &self.observed_at),
+            "between": bounded_text(&span(&self.first_observed_at, &self.observed_at)),
             "gap": self.gap,
             "kind": self.kind,
             "data": Value::Null,
         });
         if let Some(recover_with) = &self.recover_with {
-            header["recover_with"] = json!(recover_with);
+            header["recover_with"] = json!(bounded_text(recover_with));
         }
+        header
+    }
+
+    /// The item as a delivery carries it with its `header`, its data shortened so the whole
+    /// item takes at most `allowance` encoded bytes; whether its data was shortened. Data that
+    /// does not fit beside what its trimming reports gives way whole.
+    fn delivered(&self, header: Value, allowance: usize) -> (Value, bool) {
         let mut data_allowance = allowance.saturating_sub(encoded_len(&header));
-        let mut attempts = 0;
-        loop {
+        for _ in 0..ITEM_FIT_ATTEMPTS {
             let mut item = header.clone();
             let mut data = self.data.clone();
             let trimmed = trim(&mut data, data_allowance, &self.series);
@@ -318,12 +327,25 @@ impl DeliveryItem {
             }
             item["data"] = data;
             let size = encoded_len(&item);
-            attempts += 1;
-            if size <= allowance || data_allowance == 0 || attempts == ITEM_FIT_ATTEMPTS {
+            if size <= allowance {
                 return (item, is_trimmed);
             }
             data_allowance = data_allowance.saturating_sub(size - allowance);
         }
+        let (marker, record) = Trimmed::whole_omission(encoded_len(&self.data));
+        let mut item = header;
+        item["data"] = marker;
+        item["trimmed"] = json!([record]);
+        (item, true)
+    }
+}
+
+/// `text` as a delivery's header carries it: as it is, or replaced by its size when longer than
+/// [`MAX_HEADER_TEXT_BYTES`].
+fn bounded_text(text: &str) -> String {
+    match text.len() <= MAX_HEADER_TEXT_BYTES {
+        true => text.to_owned(),
+        false => omitted_value(text.len()),
     }
 }
 
@@ -701,10 +723,16 @@ impl TickDeliveries {
     }
 
     /// Puts items back for `owner`'s next delivery; a newer item that came due meanwhile for the
-    /// same instance takes their place and merges their updates.
+    /// same instance takes their place and merges their updates. Data too large to deliver whole
+    /// is not held meanwhile: as data too large for the content cache, it keeps only what
+    /// [`left_out`] keeps and is read again before delivery.
     fn restore(&mut self, owner: (ChatId, LoopId), items: Vec<DeliveryItem>) {
         let pending = self.pending.entry(owner).or_default();
-        for item in items {
+        for mut item in items {
+            if encoded_len(&item.data) > MAX_DELIVERY_PAYLOAD_BYTES {
+                item.data = left_out(&item.kind, &item.data);
+                item.needs_refill = true;
+            }
             match pending.items.remove(&item.instance) {
                 Some(newer) => {
                     pending
@@ -1856,9 +1884,16 @@ fn fit_delivery(items: Vec<DeliveryItem>) -> FittedDelivery {
     let mut deferred = Vec::new();
     let mut lines = Vec::new();
     for item in items {
-        let (value, is_trimmed) = item.delivered(allowance);
+        let header = item.header();
         // Each item after the first is preceded by a comma.
-        let size = encoded_len(&value) + usize::from(!delivered.is_empty());
+        let separator = usize::from(!delivered.is_empty());
+        // One that would not fit even without its data waits untrimmed.
+        if !delivered.is_empty() && encoded_len(&header) + separator > remaining {
+            deferred.push(item);
+            continue;
+        }
+        let (value, is_trimmed) = item.delivered(header, allowance);
+        let size = encoded_len(&value) + separator;
         if size > remaining && !delivered.is_empty() {
             deferred.push(item);
             continue;

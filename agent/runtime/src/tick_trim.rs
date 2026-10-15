@@ -5,9 +5,13 @@
 //! breaks, is shortened first, then the next largest; ordinary fields stay. A series keeps its
 //! oldest element, its newest elements in one run and older ones at doubling intervals; an array
 //! of undeclared order keeps a head and a tail; a text keeps its first line and as many last lines
-//! as fit. Each run left out is replaced in place by a marker counting it. Only when every
-//! candidate is at its shortest and the data is still over does the largest remaining value give
-//! way to a marker with its size.
+//! as fit. Each run left out is replaced in place by a marker counting it. Only when the
+//! candidates are at their shortest and the data is still over does the largest remaining value
+//! give way to a marker with its size.
+//!
+//! Every size is measured once: a candidate's subtree is disjoint from every other candidate not
+//! inside it, so cutting one changes no other's size, and the total follows by arithmetic. The
+//! work is linear in the data apart from sorting the candidates.
 
 use std::collections::BTreeSet;
 
@@ -20,6 +24,17 @@ const NEWEST_RUN_SHARE: (usize, usize) = (2, 3);
 /// The first interval between sampled older elements of a series; each next one doubles.
 const FIRST_SAMPLE_STEP: usize = 2;
 const OMITTED_VALUE_PREFIX: &str = "… omitted (";
+/// Candidates are looked for this deep into the data; deeper values only count their bytes.
+const MAX_CANDIDATE_DEPTH: usize = 32;
+/// A value whose JSON Pointer is longer is neither shortened nor omitted on its own.
+const MAX_PATH_BYTES: usize = 128;
+/// The most candidates shortened before the remaining values give way.
+const MAX_SHORTENED: usize = 4;
+/// The most values replaced by their size before the whole data is.
+const MAX_OMITTED: usize = 4;
+/// The most records one trim reports: every shortened candidate and omitted value, and the data
+/// itself when it gives way whole.
+const MAX_TRIMMED_RECORDS: usize = MAX_SHORTENED + MAX_OMITTED + 1;
 
 /// How a value was shortened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -48,86 +63,207 @@ pub(crate) struct Trimmed {
     pub(crate) rule: TrimRule,
 }
 
+impl Trimmed {
+    /// The marker that replaces data of `total` encoded bytes whole, and its record.
+    pub(crate) fn whole_omission(total: usize) -> (Value, Self) {
+        let record = Self {
+            path: String::new(),
+            total,
+            kept: 0,
+            rule: TrimRule::Omitted,
+        };
+        (json!(omitted_value(total)), record)
+    }
+
+    /// `data` replaced whole by a marker saying its size.
+    fn omit_whole(data: &mut Value) -> Self {
+        let (marker, record) = Self::whole_omission(encoded_len(data));
+        *data = marker;
+        record
+    }
+}
+
 pub(crate) fn encoded_len(value: &Value) -> usize {
     serde_json::to_vec(value).map_or(usize::MAX, |encoded| encoded.len())
 }
 
 /// Shortens `data` to at most `allowance` encoded bytes, keeping the newest end of each array
-/// `series` declares, and tells what it shortened; data already within it stays as it is.
+/// `series` declares, and tells what it shortened in at most [`MAX_TRIMMED_RECORDS`] records;
+/// data already within it stays as it is.
 pub(crate) fn trim(data: &mut Value, allowance: usize, series: &[StateSeries]) -> Vec<Trimmed> {
+    let mut candidates = Vec::new();
+    let mut size = measure(data, &mut String::new(), 0, &mut candidates);
     let mut trimmed = Vec::new();
-    let mut shortened = BTreeSet::new();
-    let mut size = encoded_len(data);
-    while size > allowance {
-        let mut candidates = Vec::new();
-        collect_candidates(data, String::new(), &shortened, &mut candidates);
-        let Some((path, candidate_size)) = candidates
-            .into_iter()
-            .max_by_key(|(_, candidate_size)| *candidate_size)
-        else {
+    if size <= allowance {
+        return trimmed;
+    }
+    // A candidate is larger than any candidate inside it, so it comes first.
+    candidates.sort_unstable_by_key(|(_, size)| std::cmp::Reverse(*size));
+    let mut shortened: Vec<String> = Vec::new();
+    for (path, candidate_size) in candidates {
+        if size <= allowance || shortened.len() == MAX_SHORTENED {
             break;
-        };
+        }
+        if shortened.iter().any(|done| is_within(&path, done)) {
+            continue;
+        }
         let target = candidate_size.saturating_sub(size - allowance);
         let newest = series
             .iter()
             .find(|declared| declared.path == path)
             .map(|declared| declared.newest);
-        if let Some(value) = data.pointer_mut(&path)
-            && let Some(record) = shorten(value, target, newest)
-        {
+        let Some(value) = data.pointer_mut(&path) else {
+            continue;
+        };
+        if let Some((record, shortened_size)) = shorten(value, candidate_size, target, newest) {
+            size = size - candidate_size + shortened_size;
             trimmed.push(Trimmed {
                 path: path.clone(),
                 ..record
             });
         }
-        shortened.insert(path);
-        size = encoded_len(data);
+        shortened.push(path);
     }
-    while size > allowance {
-        let Some(record) = omit_largest(data, size - allowance) else {
-            break;
-        };
-        trimmed.push(record);
-        size = encoded_len(data);
+    if size > allowance {
+        omit(data, size, allowance, &mut trimmed);
     }
+    debug_assert!(trimmed.len() <= MAX_TRIMMED_RECORDS);
     trimmed
 }
 
-/// Every array and multi-line string in `value` not under an already shortened path, with its
-/// encoded size.
-fn collect_candidates(
+/// The encoded size of `value` at `path`, collecting each array and multi-line string within
+/// [`MAX_CANDIDATE_DEPTH`] and [`MAX_PATH_BYTES`] with its own size.
+fn measure(
     value: &Value,
-    path: String,
-    shortened: &BTreeSet<String>,
+    path: &mut String,
+    depth: usize,
     candidates: &mut Vec<(String, usize)>,
-) {
-    if shortened.contains(&path) {
-        return;
+) -> usize {
+    if depth > MAX_CANDIDATE_DEPTH || path.len() > MAX_PATH_BYTES {
+        return encoded_len(value);
     }
-    match value {
+    let size = match value {
         Value::Array(elements) => {
-            if elements.len() > 1 {
-                candidates.push((path.clone(), encoded_len(value)));
-            }
+            let mut size = 2 + elements.len().saturating_sub(1);
             for (index, element) in elements.iter().enumerate() {
-                collect_candidates(element, format!("{path}/{index}"), shortened, candidates);
+                let length = path.len();
+                path.push_str(&format!("/{index}"));
+                size += measure(element, path, depth + 1, candidates);
+                path.truncate(length);
             }
+            size
         }
         Value::Object(fields) => {
+            let mut size = 2 + fields.len().saturating_sub(1);
             for (key, field) in fields {
-                let key = key.replace('~', "~0").replace('/', "~1");
-                collect_candidates(field, format!("{path}/{key}"), shortened, candidates);
+                let length = path.len();
+                path.push('/');
+                path.push_str(&key.replace('~', "~0").replace('/', "~1"));
+                // The key, its colon and its value.
+                size += encoded_len(&json!(key)) + 1 + measure(field, path, depth + 1, candidates);
+                path.truncate(length);
             }
+            size
         }
-        Value::String(text) if text.contains('\n') => {
-            candidates.push((path, encoded_len(value)));
+        scalar => encoded_len(scalar),
+    };
+    let is_candidate = match value {
+        Value::Array(elements) => elements.len() > 1,
+        Value::String(text) => text.contains('\n'),
+        _ => false,
+    };
+    if is_candidate {
+        candidates.push((path.clone(), size));
+    }
+    size
+}
+
+/// Whether `path` is `ancestor` or a value inside it.
+fn is_within(path: &str, ancestor: &str) -> bool {
+    path.strip_prefix(ancestor)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Brings `data` of `size` encoded bytes within `allowance` by replacing values with markers
+/// saying their size: the smallest value whose replacement alone is enough, or else the largest
+/// top-level values while at most [`MAX_OMITTED`] of them are enough, or else the data itself.
+fn omit(data: &mut Value, mut size: usize, allowance: usize, trimmed: &mut Vec<Trimmed>) {
+    let excess = size - allowance;
+    let saving = |bytes: usize| bytes.saturating_sub(encoded_len(&json!(omitted_value(bytes))));
+    let mut path = String::new();
+    while let Some((child, bytes)) = data.pointer(&path).and_then(|node| {
+        children(node, &path)
+            .into_iter()
+            .max_by_key(|(_, bytes)| *bytes)
+    }) {
+        if saving(bytes) < excess || child.len() > MAX_PATH_BYTES {
+            break;
         }
-        _ => {}
+        path = child;
+    }
+    if !path.is_empty() {
+        trimmed.push(omit_at(data, &path));
+        return;
+    }
+    let mut largest = children(data, "");
+    largest.sort_unstable_by_key(|(_, size)| std::cmp::Reverse(*size));
+    let mut needed = 0;
+    let mut saved = 0;
+    for (child, bytes) in largest.iter().take(MAX_OMITTED) {
+        if saved >= excess || saving(*bytes) == 0 || child.len() > MAX_PATH_BYTES {
+            break;
+        }
+        saved += saving(*bytes);
+        needed += 1;
+    }
+    if saved < excess {
+        trimmed.push(Trimmed::omit_whole(data));
+        return;
+    }
+    for (child, bytes) in largest.into_iter().take(needed) {
+        trimmed.push(omit_at(data, &child));
+        size -= saving(bytes);
+    }
+    debug_assert!(size <= allowance);
+}
+
+fn omit_at(data: &mut Value, path: &str) -> Trimmed {
+    let value = data
+        .pointer_mut(path)
+        .expect("an omitted value was found at its path");
+    Trimmed {
+        path: path.to_owned(),
+        ..Trimmed::omit_whole(value)
     }
 }
 
-/// Shortens one candidate toward `target` bytes; `None` when it cannot be shortened at all.
-fn shorten(value: &mut Value, target: usize, newest: Option<SeriesEnd>) -> Option<Trimmed> {
+/// Each field or element of `value` with its path and encoded size.
+fn children(value: &Value, path: &str) -> Vec<(String, usize)> {
+    match value {
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, field)| {
+                let key = key.replace('~', "~0").replace('/', "~1");
+                (format!("{path}/{key}"), encoded_len(field))
+            })
+            .collect(),
+        Value::Array(elements) => elements
+            .iter()
+            .enumerate()
+            .map(|(index, element)| (format!("{path}/{index}"), encoded_len(element)))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Shortens one candidate of `size` encoded bytes toward `target`, with its new size; `None`
+/// when no shorter form exists, and then it stays as it is.
+fn shorten(
+    value: &mut Value,
+    size: usize,
+    target: usize,
+    newest: Option<SeriesEnd>,
+) -> Option<(Trimmed, usize)> {
     match value {
         Value::Array(elements) => {
             let rule = match newest {
@@ -136,28 +272,38 @@ fn shorten(value: &mut Value, target: usize, newest: Option<SeriesEnd>) -> Optio
                 None => TrimRule::HeadAndTail,
             };
             let selection = select_elements(elements, target, rule);
-            let kept = selection.kept.len();
-            if kept == elements.len() {
+            let (kept, shortened_size) = (selection.kept.len(), selection.bytes());
+            if shortened_size >= size {
                 return None;
             }
             let total = elements.len();
             *elements = selection.into_values(std::mem::take(elements));
-            Some(Trimmed {
-                path: String::new(),
-                total,
-                kept,
-                rule,
-            })
+            Some((
+                Trimmed {
+                    path: String::new(),
+                    total,
+                    kept,
+                    rule,
+                },
+                shortened_size,
+            ))
         }
         Value::String(text) => {
             let (shortened, total, kept) = shorten_lines(text, target)?;
+            let shortened_size = encoded_len(&json!(shortened));
+            if shortened_size >= size {
+                return None;
+            }
             *text = shortened;
-            Some(Trimmed {
-                path: String::new(),
-                total,
-                kept,
-                rule: TrimRule::Lines,
-            })
+            Some((
+                Trimmed {
+                    path: String::new(),
+                    total,
+                    kept,
+                    rule: TrimRule::Lines,
+                },
+                shortened_size,
+            ))
         }
         _ => None,
     }
@@ -171,7 +317,8 @@ fn omitted_lines(count: usize) -> String {
     format!("… {count} lines omitted …")
 }
 
-fn omitted_value(bytes: usize) -> String {
+/// The marker for a value of `bytes` left out.
+pub(crate) fn omitted_value(bytes: usize) -> String {
     format!("{OMITTED_VALUE_PREFIX}{bytes} bytes) …")
 }
 
@@ -384,71 +531,6 @@ fn shorten_lines(text: &str, target: usize) -> Option<(String, usize, usize)> {
     (shortened != text).then(|| (shortened, total, 1 + total - tail_start))
 }
 
-/// Replaces the smallest value whose removal alone brings `data` `excess` bytes down, or failing
-/// that its largest top-level value, with a marker saying its size.
-fn omit_largest(data: &mut Value, excess: usize) -> Option<Trimmed> {
-    let mut path = String::new();
-    loop {
-        let current = data.pointer(&path)?;
-        let Some((child, size)) = largest_child(current, &path) else {
-            break;
-        };
-        let saves = size.saturating_sub(encoded_len(&json!(omitted_value(size))));
-        if saves >= excess {
-            path = child;
-            continue;
-        }
-        if path.is_empty() && saves > 0 {
-            path = child;
-        }
-        break;
-    }
-    let value = data.pointer_mut(&path)?;
-    if value
-        .as_str()
-        .is_some_and(|text| text.starts_with(OMITTED_VALUE_PREFIX))
-    {
-        return None;
-    }
-    let total = encoded_len(value);
-    *value = json!(omitted_value(total));
-    Some(Trimmed {
-        path,
-        total,
-        kept: 0,
-        rule: TrimRule::Omitted,
-    })
-}
-
-/// The largest field or element of `value` that is not already an omitted marker, with its path
-/// and encoded size.
-fn largest_child(value: &Value, path: &str) -> Option<(String, usize)> {
-    let children: Vec<(String, &Value)> = match value {
-        Value::Object(fields) => fields
-            .iter()
-            .map(|(key, field)| {
-                let key = key.replace('~', "~0").replace('/', "~1");
-                (format!("{path}/{key}"), field)
-            })
-            .collect(),
-        Value::Array(elements) => elements
-            .iter()
-            .enumerate()
-            .map(|(index, element)| (format!("{path}/{index}"), element))
-            .collect(),
-        _ => return None,
-    };
-    children
-        .into_iter()
-        .filter(|(_, child)| {
-            !child
-                .as_str()
-                .is_some_and(|text| text.starts_with(OMITTED_VALUE_PREFIX))
-        })
-        .map(|(child_path, child)| (child_path, encoded_len(child)))
-        .max_by_key(|(_, size)| *size)
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -657,6 +739,66 @@ mod tests {
                 rule: TrimRule::Omitted,
             }]
         );
+    }
+
+    /// Far above what a linear trim of these inputs takes even in a debug build on a loaded
+    /// machine, far below the minutes measuring every candidate again after each cut took.
+    const LINEAR_TRIM_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Trimming stays linear in its input, near the 512 KiB a Tick Update may take.
+    #[test]
+    fn trimming_the_largest_inputs_stays_within_a_time_bound() {
+        let many_small_arrays = Value::Object(
+            (0..10_000)
+                .map(|index| {
+                    (
+                        format!("k{index:05}"),
+                        json!(["x".repeat(18), "y".repeat(18)]),
+                    )
+                })
+                .collect(),
+        );
+        let many_small_texts = Value::Object(
+            (0..20_000)
+                .map(|index| (format!("t{index:05}"), json!(format!("a{index}\nb\nc"))))
+                .collect(),
+        );
+        let long_text = json!({"text": (0..50_000).map(|line| format!("line {line}")).collect::<Vec<_>>().join("\n")});
+        let many_numbers = json!({"values": (0..100_000).collect::<Vec<_>>()});
+        let mut deep = json!(vec!["leaf\nleaf"; 4]);
+        for _ in 0..200 {
+            deep = json!([deep, "x".repeat(2_000)]);
+        }
+        for (name, mut data) in [
+            ("many small arrays", many_small_arrays),
+            ("many small texts", many_small_texts),
+            ("long text", long_text),
+            ("many numbers", many_numbers),
+            ("deep nesting", deep),
+        ] {
+            let started = std::time::Instant::now();
+            let trimmed = trim(&mut data, 4096, &series("/values", SeriesEnd::Last));
+            let elapsed = started.elapsed();
+            assert!(elapsed < LINEAR_TRIM_BOUND, "{name} took {elapsed:?}");
+            assert!(encoded_len(&data) <= 4096, "{name}: {}", encoded_len(&data));
+            assert!(trimmed.len() <= MAX_TRIMMED_RECORDS, "{name}: {trimmed:?}");
+        }
+    }
+
+    #[test]
+    fn measured_sizes_match_the_encoding() {
+        let data = json!({
+            "quote\"d/key~": ["é\n\t\u{1}", 1.5e300, -0.0, 12345678901234567890u64, null, true],
+            "nested": {"a": [[], {}, [1, [2, [3]]]], "b": "plain"},
+        });
+        let mut candidates = Vec::new();
+        assert_eq!(
+            measure(&data, &mut String::new(), 0, &mut candidates),
+            encoded_len(&data)
+        );
+        for (path, size) in candidates {
+            assert_eq!(size, encoded_len(data.pointer(&path).unwrap()), "{path}");
+        }
     }
 
     #[test]
