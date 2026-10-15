@@ -188,12 +188,14 @@ impl RowUpdate {
 }
 
 /// How a row marks the periodic Tick Subscriptions on its instance: `⟳` in the colour of the most
-/// frequent, counting down to the nearest next check. Immediate subscriptions, which Shells and
-/// artifacts have by default, are never marked.
+/// frequent, and whether updates wait on them for a check to hand them to the Agent. Immediate
+/// subscriptions, which Shells and artifacts have by default, are never marked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubscriptionMark {
     pub frequency: TickSubscriptionFrequency,
-    /// The nearest next check, once the Agent reports one.
+    /// Whether one of them holds updates its next check hands to the Agent.
+    pub is_waiting: bool,
+    /// The nearest next check among those holding updates, once the Agent reports one.
     pub next_check: Option<NextCheck>,
 }
 
@@ -205,9 +207,11 @@ impl SubscriptionMark {
             .clone()
             .map(|row| row.frequency)
             .min_by_key(|frequency| frequency.period())?;
+        let waiting = periodic.filter(|row| row.accumulated > 0);
         Some(Self {
             frequency,
-            next_check: periodic
+            is_waiting: waiting.clone().next().is_some(),
+            next_check: waiting
                 .filter_map(|row| NextCheck::of(row))
                 .min_by_key(|check| check.at_ms),
         })

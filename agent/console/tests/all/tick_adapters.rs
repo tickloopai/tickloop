@@ -133,19 +133,14 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
     assert_eq!(rows[0].group.name, "Calendars");
     assert_eq!(rows[0].status, "live");
     assert!(rows[0].notes.is_empty(), "{:?}", rows[0].notes);
-    assert!(
-        matches!(
-            rows[0].subscription,
-            Some(SubscriptionMark {
-                frequency: TickSubscriptionFrequency::High,
-                next_check: Some(NextCheck {
-                    period_ms: 60_000,
-                    ..
-                }),
-            })
-        ),
-        "the row counts down to the next check the Agent reports: {:?}",
-        rows[0].subscription
+    assert_eq!(
+        rows[0].subscription,
+        Some(SubscriptionMark {
+            frequency: TickSubscriptionFrequency::High,
+            is_waiting: false,
+            next_check: None,
+        }),
+        "a quiet row waits for no check"
     );
     let period = TickSubscriptionFrequency::High.period().unwrap();
     tokio::time::advance(period).await;
@@ -168,6 +163,25 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
         });
     }
     settle().await;
+    let rows = monitor.list(&MonitorContext {
+        subscriptions: agent.tick_subscriptions(chat).await.unwrap(),
+        ..Default::default()
+    });
+    assert!(
+        matches!(
+            rows[0].subscription,
+            Some(SubscriptionMark {
+                frequency: TickSubscriptionFrequency::High,
+                is_waiting: true,
+                next_check: Some(NextCheck {
+                    period_ms: 60_000,
+                    ..
+                }),
+            })
+        ),
+        "waiting updates fill toward the next check the Agent reports: {:?}",
+        rows[0].subscription
+    );
     tokio::time::advance(period).await;
     complete(&mut events).await;
     {
@@ -328,6 +342,7 @@ fn a_subscribed_instance_always_has_a_row_with_its_marker() {
     assert_eq!(rows[0].status, "live");
     let high = Some(SubscriptionMark {
         frequency: TickSubscriptionFrequency::High,
+        is_waiting: true,
         next_check: None,
     });
     assert_eq!(rows[0].subscription, high);
@@ -557,6 +572,7 @@ fn duplicate_instance_projection_keeps_the_newest_delivery_in_any_subscription_o
             rows[0].subscription,
             Some(SubscriptionMark {
                 frequency: TickSubscriptionFrequency::High,
+                is_waiting: false,
                 next_check: None,
             }),
             "two subscriptions show as one mark in the most frequent one's colour"

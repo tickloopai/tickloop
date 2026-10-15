@@ -963,6 +963,7 @@ fn subscribed_ticks_show_live_status_and_ignore_another_chats_refresh() {
         state.monitor.entries()[0].subscription,
         Some(crate::monitor_rows::SubscriptionMark {
             frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
+            is_waiting: false,
             next_check: None,
         })
     );
@@ -1540,6 +1541,7 @@ fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_other
     subscribed.status = "live".into();
     subscribed.subscription = Some(crate::monitor_rows::SubscriptionMark {
         frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
+        is_waiting: true,
         next_check: None,
     });
     subscribed.tone = StatusTone::Live;
@@ -1551,8 +1553,8 @@ fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_other
     for (width, preferred, entry, details, two_lines) in [
         (140, None, &finished, "101", false),
         (80, None, &finished, "101", false),
-        (140, None, &subscribed, "⟳ ● 3", true),
-        (200, Some(80), &subscribed, "⟳ ● 3", false),
+        (140, None, &subscribed, "⟳", true),
+        (200, Some(80), &subscribed, "⟳", false),
     ] {
         let mut state = State::new(true, width, 25);
         state.switch_view_chat(Some(Uuid::new_v4()));
@@ -1573,6 +1575,59 @@ fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_other
                 || row.contains(&entry.status)),
             "the group names the kind and the glyph's colour the state: {screen:#?}"
         );
+    }
+}
+
+#[test]
+fn row_details_end_with_the_mark_whole_one_column_short_of_the_monitor_edge_at_any_width() {
+    use crate::monitor_rows::{RowUpdate, StatusTone, Unread};
+    let unread = Some(RowUpdate {
+        at_ms: 1000,
+        unread: Some(Unread { count: Some(26) }),
+        taken_in_at_ms: None,
+    });
+    let mut subscribed = shell(Uuid::new_v4(), "python3 -q");
+    subscribed.group = TickGroup::Ticks;
+    subscribed.instance = "hosted:python".parse().unwrap();
+    subscribed.subscription = Some(crate::monitor_rows::SubscriptionMark {
+        frequency: tickloop_agent_protocol::TickSubscriptionFrequency::Low,
+        is_waiting: true,
+        next_check: None,
+    });
+    subscribed.tone = StatusTone::Live;
+    subscribed.update = unread.clone();
+    let mut running = shell(Uuid::new_v4(), "cargo nextest run --workspace");
+    running.tone = StatusTone::Running {
+        since_ms: Some(tickloop_agent_base::private_fs::unix_time_milliseconds() - 119_000),
+    };
+    running.update = unread;
+    for width in [80, 140] {
+        let mut state = State::new(true, width, 25);
+        state.switch_view_chat(Some(Uuid::new_v4()));
+        state.prompt_enabled = true;
+        state
+            .monitor
+            .replace(TickGroup::Ticks, vec![subscribed.clone()]);
+        state
+            .monitor
+            .replace(TickGroup::Shells, vec![running.clone()]);
+        state.draw_frame(&mut Vec::new()).unwrap();
+        let side = state.monitor_columns() - 2;
+        for (title, ending) in [("python3 -q", "⟳ "), ("cargo nextest", "1m 59s ")] {
+            let screen = &state.rendered_screen;
+            let first = screen.iter().position(|row| row.contains(title)).unwrap();
+            let row = screen[first..]
+                .iter()
+                .map(|row| row.rsplit_once('│').unwrap().1.to_owned())
+                .find(|row| row.trim_end().ends_with(ending.trim_end()))
+                .unwrap_or_else(|| panic!("{width}: {screen:#?}"));
+            assert_eq!(display_width(&row), side + 1, "{width}: {row:?}");
+            assert!(
+                row.ends_with(ending) && !row.contains('●') && !row.contains("26"),
+                "{width}: the mark shows whole before a blank column, without a dot or count: \
+                 {row:?}"
+            );
+        }
     }
 }
 
@@ -1743,15 +1798,22 @@ fn a_finished_background_shell_leaves_once_handled_unless_its_detail_is_open() {
             1,
             "an end no one handled keeps its Shell"
         );
-        let text = state
+        let lines = state
             .monitor
-            .lines(60, 10, DisplayProfile::default(), ended + 1_000)
-            .iter()
-            .map(RoleLine::text)
-            .collect::<String>();
+            .lines(60, 10, DisplayProfile::default(), ended + 1_000);
+        let text = lines.iter().map(RoleLine::text).collect::<String>();
         assert!(
-            text.trim_end().ends_with('●') && !text.contains("1s"),
-            "an unread end shows its mark and no time: {text}"
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.role == Some(Role::UpdateSquare))
+                && !text.contains('●')
+                && !text.contains("1s"),
+            "an unread end shows its square and no time: {text}"
+        );
+        assert!(
+            lines.iter().all(|line| line.band.is_none()),
+            "a Shell's end comes at once, so no bar counts toward it"
         );
         assert!(
             !text.contains("ended") && !text.contains("exit"),
