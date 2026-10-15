@@ -151,6 +151,122 @@ async fn login(client: &ArtifactClient) {
 }
 
 #[tokio::test]
+async fn three_large_artifact_edits_do_not_exhaust_the_following_bash_review() {
+    use tickloop_agent_protocol::{Content, ExecutionMode};
+    use tickloop_agent_test_support::{auto_classification, next_event};
+    for use_jev in [false, true] {
+        let (origin, control) = service().await;
+        *control.publication.lock().unwrap() =
+            Some(json!({"audience":"private","membership_revision":0}));
+        control.confirm_writes.store(true, Ordering::SeqCst);
+        let directory = tempfile::tempdir().unwrap();
+        let account =
+            ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
+        login(&account).await;
+        let provider = Arc::new(McpHostToolProvider::new(account, None));
+        provider.refresh(CancellationToken::new()).await.unwrap();
+        let body = format!(
+            "<html><body>{}</body></html>",
+            "REMOTE-HTML".repeat(7 * 1024)
+        );
+        let mut batch = Vec::new();
+        for revision in 0..3 {
+            batch.extend(call(&format!("edit-{revision}"), "ArtifactEdit", json!({"action":"replace","artifact_id":"doc","expected_revision":revision,"content":body})));
+        }
+        batch.extend(call(
+            "reviewed-shell",
+            "Bash",
+            json!({"command":"env sh -c 'printf verified'","description":"OMIT-DESCRIPTION"}),
+        ));
+        let agent = Agent::new_embedded(
+            config(),
+            Arc::new(ScriptedModel::new(vec![batch, text("done")])),
+        );
+        agent.install_host_tools(provider).unwrap();
+        let llm = Arc::new(ScriptedModel::new(vec![text(
+            &auto_classification(false).to_string(),
+        )]));
+        let jev = Arc::new(super::trusted_approval_context::RecordingJudgment {
+            requests: Mutex::new(Vec::new()),
+        });
+        if use_jev {
+            agent.set_judgment_client(jev.clone()).await;
+        } else {
+            agent.set_auto_reviewer(llm.clone()).await;
+        }
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::Auto)
+            .await
+            .unwrap();
+        let mut events = agent.subscribe();
+        agent
+            .submit(
+                chat,
+                None,
+                "Update my private page three times and run the verification command".into(),
+            )
+            .await
+            .unwrap();
+        let mut attempts = 0;
+        loop {
+            match next_event(&mut events).await.kind {
+                EventKind::ApprovalAssessed { assessment } => {
+                    assert_eq!(assessment.call_id, "reviewed-shell");
+                    attempts += assessment.attempts.len();
+                }
+                EventKind::PermissionRequested { request } => {
+                    panic!("unexpected manual review: {request:?}")
+                }
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert!(attempts > 0);
+        let state = if use_jev {
+            let requests = jev.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            requests[0].state.clone()
+        } else {
+            let requests = llm.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let Content::Text { text } = &requests[0].messages[1].content[0] else {
+                panic!()
+            };
+            serde_json::from_str::<Value>(text).unwrap()
+        };
+        assert_eq!(state["tool_history"]["complete"], true);
+        let history = state["tool_history"]["calls"].as_array().unwrap();
+        assert_eq!(history.len(), 3);
+        for (revision, entry) in history.iter().enumerate() {
+            assert_eq!(entry["input"]["content_bytes"], body.len());
+            assert_eq!(entry["input"]["expected_revision"], revision);
+            assert!(entry["input"].get("content").is_none());
+            assert_eq!(entry["outcome"], "returned_success");
+        }
+        let encoded = state.to_string();
+        assert!(!encoded.contains("REMOTE-HTML"));
+        assert!(!encoded.contains("OMIT-DESCRIPTION"));
+        assert!(serde_json::to_vec(&state["tool_history"]).unwrap().len() < 2 * 1024);
+        {
+            let requests = control.requests.lock().unwrap();
+            let writes = requests
+                .iter()
+                .filter(|request| request["body"]["method"] == "tools/call")
+                .collect::<Vec<_>>();
+            assert_eq!(writes.len(), 3);
+            assert!(
+                writes
+                    .iter()
+                    .all(|request| request["body"]["params"]["arguments"]["content"] == body)
+            );
+        }
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn first_party_private_artifact_writes_skip_classifier_but_plan_and_rules_still_prompt() {
     use tickloop_agent_protocol::{ApprovalPath, ExecutionMode};
     use tickloop_agent_test_support::next_event;

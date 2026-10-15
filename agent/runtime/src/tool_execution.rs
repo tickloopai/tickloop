@@ -1731,7 +1731,20 @@ impl Agent {
                         auto_mode::REVIEW_CONTEXT_LIMIT_MESSAGE.into(),
                     )
                     .await;
-                    let reason = auto_mode::HEADLESS_CONTEXT_LIMIT_ERROR.to_owned();
+                    let mut reason = auto_mode::HEADLESS_CONTEXT_LIMIT_ERROR.to_owned();
+                    if let Some(warning) = self
+                        .log_auto_review(
+                            receipt,
+                            operation,
+                            policy,
+                            assessment,
+                            Decision::Deny,
+                            Some(&reason),
+                        )
+                        .await
+                    {
+                        reason.push_str(&format!("\n{warning}"));
+                    }
                     let record = super::denials::DenialCandidate::new(
                         operation,
                         &operation.input,
@@ -1772,7 +1785,20 @@ impl Agent {
                     Some(_)
                         if self.inner.host_options.prompt_policy == PromptPolicy::DenyOnPrompt =>
                     {
-                        let reason = auto_mode::HEADLESS_DENIAL_LIMIT_ERROR.to_owned();
+                        let mut reason = auto_mode::HEADLESS_DENIAL_LIMIT_ERROR.to_owned();
+                        if let Some(warning) = self
+                            .log_auto_review(
+                                receipt,
+                                operation,
+                                policy,
+                                assessment,
+                                Decision::Deny,
+                                Some(&reason),
+                            )
+                            .await
+                        {
+                            reason.push_str(&format!("\n{warning}"));
+                        }
                         let record = super::denials::DenialCandidate::new(
                             operation,
                             &operation.input,
@@ -1795,6 +1821,28 @@ impl Agent {
                     }
                 }
             }
+        }
+        if let Some(warning) = self
+            .log_auto_review(
+                receipt,
+                operation,
+                policy,
+                assessment,
+                decision,
+                approval_reason
+                    .as_deref()
+                    .or(auto_denial_message.as_deref()),
+            )
+            .await
+        {
+            let reason = if decision == Decision::Ask {
+                &mut approval_reason
+            } else {
+                &mut auto_denial_message
+            };
+            reason
+                .get_or_insert_with(String::new)
+                .push_str(&format!("\n{warning}"));
         }
         Ok(AutoPermissionDecision {
             decision,

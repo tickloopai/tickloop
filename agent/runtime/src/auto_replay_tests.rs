@@ -35,21 +35,78 @@ fn context(case: &Value) -> ApprovalSnapshot {
     if input.get("tick_instance_id").is_some() {
         input["tick_instance_id"] = json!(instance);
     }
+    use super::approval_context::input_projection::{InputPurpose, project_tool_input};
+    let tool = case["tool"].as_str().unwrap();
+    let calls = case
+        .get("tool_history")
+        .map(|history| {
+            serde_json::from_value::<Vec<super::approval_context::HistoricalToolCall>>(
+                history.clone(),
+            )
+            .unwrap()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|mut call| {
+            call.input = project_tool_input(&call.tool, &call.input, InputPurpose::Historical)?;
+            Some(call)
+        })
+        .collect();
+    let projected = project_tool_input(tool, &input, InputPurpose::Proposed).unwrap_or(Value::Null);
     ApprovalSnapshot {
         context_truncation: None,
         reply_history: Default::default(),
         agent_messages: Vec::new(),
         tool_history: super::approval_context::ToolHistory {
-            calls: case.get("tool_history").map(|history| serde_json::from_value(history.clone()).unwrap()).unwrap_or_default(),
+            calls,
             ..Default::default()
         },
-        context_version: "trusted-approval-v6", review_template_version: "auto-review-v15",
-        operation: ApprovalOperation { id: Uuid::nil(), call_id: "replay".into(), loop_id: Uuid::nil(), run_id: Uuid::nil(), tool: case["tool"].as_str().unwrap().into(), input: input.clone() },
+        context_version: super::approval_context::APPROVAL_CONTEXT_VERSION, review_template_version: super::approval_context::REVIEW_TEMPLATE_VERSION,
+        operation: ApprovalOperation { id: Uuid::nil(), call_id: "replay".into(), loop_id: Uuid::nil(), run_id: Uuid::nil(), tool: tool.into(), input: projected.clone() },
         original_user_inputs: vec![OriginalUserInput { chat_id: Uuid::nil(), loop_id: Uuid::nil(), run_id: Uuid::nil(), message_id: Uuid::nil(), text: case["user"].as_str().unwrap().into() }],
         working_directory: "/project".into(), additional_directories: Vec::new(), permission_policy_revision: 0, auto_policy: policy,
-        prepared_facts: Some(PreparedApprovalFacts { normalized_input: input, canonical_path: (case["tool"] == "Bash").then(|| "/project".into()), in_workspace: Some(true), tick_instance: matches!(case["tool"].as_str(), Some("ModifyTick" | "CallTickTool")).then_some(instance.clone()), closes_tick: case["tool"] == "ModifyTick", external_declaration: (case["tool"] == "CallTickTool").then(|| json!({"tools":[{"name":"place_order","description":"Place a stock order","mutates":true,"params":{"type":"object"}}]})), ..Default::default() }),
+        prepared_facts: Some(PreparedApprovalFacts { normalized_input: projected, canonical_path: (case["tool"] == "Bash").then(|| "/project".into()), in_workspace: Some(true), tick_instance: matches!(case["tool"].as_str(), Some("ModifyTick" | "CallTickTool")).then_some(instance.clone()), closes_tick: case["tool"] == "ModifyTick", external_declaration: (case["tool"] == "CallTickTool").then(|| json!({"tools":[{"name":"place_order","description":"Place a stock order","mutates":true,"params":{"type":"object"}}]})), ..Default::default() }),
         creation_receipt: owned.then_some(TickCreationReceipt { loop_id: Uuid::nil(), operation_id: Uuid::from_u128(2), instance }),
         dependency_files: Some(vec![DependencyEvidence { path: "/project/package.json".into(), unchanged_since_loop_start: true }, DependencyEvidence { path: "/project/package-lock.json".into(), unchanged_since_loop_start: true }]),
+    }
+}
+
+#[test]
+fn replay_inputs_use_the_production_projection_and_current_versions() {
+    let cases: Vec<Value> = serde_json::from_str(HISTORY_CASES).unwrap();
+    for case in &cases {
+        let context = context(case);
+        assert_eq!(
+            context.context_version,
+            super::approval_context::APPROVAL_CONTEXT_VERSION
+        );
+        assert_eq!(
+            context.review_template_version,
+            super::approval_context::REVIEW_TEMPLATE_VERSION
+        );
+        assert!(context.operation.input.get("description").is_none());
+        assert!(
+            context
+                .prepared_facts
+                .as_ref()
+                .unwrap()
+                .normalized_input
+                .get("description")
+                .is_none()
+        );
+        let encoded = serde_json::to_string(&context).unwrap();
+        assert!(!encoded.contains("OLD-TEXT-MUST-NOT-ENTER-REVIEW"));
+        for call in &context.tool_history.calls {
+            assert!(call.input.get("old_string").is_none());
+            if call.tool == "Edit" {
+                assert!(
+                    call.input["new_string"]
+                        .as_str()
+                        .unwrap()
+                        .contains("--data-binary @.env")
+                );
+            }
+        }
     }
 }
 

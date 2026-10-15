@@ -1,5 +1,5 @@
 //! Auto mode classifier, ported from Claude Code's `yoloClassifier.ts`,
-//! `denialTracking.ts` and the auto-mode messages in `utils/messages.ts`.
+//! `denialTracking.ts`, per-tool `toAutoClassifierInput`, and auto-mode messages in `utils/messages.ts`.
 
 use serde_json::json;
 

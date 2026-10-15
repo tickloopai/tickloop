@@ -11,6 +11,7 @@ use tickloop_agent_protocol::{
 pub(super) struct ApprovalAssessment {
     pub verdict: AutoReview,
     pub details: ApprovalAssessmentDetails,
+    pub context_metrics: Option<serde_json::Value>,
 }
 
 impl ApprovalAssessment {
@@ -48,7 +49,20 @@ impl ApprovalAssessment {
             outcome: facts.outcome,
             reason: facts.reason,
         };
-        Self { verdict, details }
+        let context_metrics = Some(serde_json::json!({
+            "snapshot_json_bytes": serde_json::to_vec(context).expect("context serializes").len(),
+            "tool_history_json_bytes": serde_json::to_vec(&context.tool_history).expect("history serializes").len(),
+            "tool_history_calls": context.tool_history.calls.len(),
+            "tool_history_complete": context.tool_history.complete,
+            "tool_history_compaction_gap": context.tool_history.compaction_gap,
+            "operation_input_json_bytes": serde_json::to_vec(&context.operation.input).expect("input serializes").len(),
+            "operation_input_complete": !super::approval_context::input_projection::is_incomplete(&context.operation.input),
+        }));
+        Self {
+            verdict,
+            details,
+            context_metrics,
+        }
     }
 
     pub fn missing_context(
@@ -83,7 +97,11 @@ impl ApprovalAssessment {
             outcome: ApprovalOutcome::NeedsHuman,
             reason: Some(missing_reason),
         };
-        Self { verdict, details }
+        Self {
+            verdict,
+            details,
+            context_metrics: None,
+        }
     }
 
     pub fn with_auto_settings(

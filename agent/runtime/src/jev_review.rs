@@ -8,7 +8,7 @@ use tickloop_agent_protocol::{ApprovalStage, AutoPolicy};
 
 // Bound local payload size; the provider enforces its model-specific token limits.
 const MAX_REVIEW_REQUEST_BYTES: usize = 1024 * 1024;
-pub(super) const QUESTION_VERSION: &str = "auto-jev-v14";
+pub(super) const QUESTION_VERSION: &str = "auto-jev-v15";
 /// Jev 1.13 accepts 32k tokens for the state plus its longest question
 /// (https://docs.typesafe.ai/models, checked 2026-10-13).
 const JEV_STATE_AND_QUESTION_TOKENS: usize = 32_000;
