@@ -1,5 +1,6 @@
 use super::input_dialog_pty::{FIXTURE_DIRECTORY, Fixture, TIMEOUT};
 use super::*;
+use tickloop_agent_test_support::screen;
 
 const SEND_NOW_FIXTURE_STACK_BYTES: usize = 16 * 1024 * 1024;
 /// What a terminal speaking the kitty keyboard protocol sends for ctrl+enter.
@@ -20,6 +21,43 @@ fn waiting_tool(id: &str) -> Vec<tickloop_agent_protocol::Content> {
             "description": "Wait for the fixture",
         }),
     )
+}
+
+/// How often `text` shows above the composer of `frame`: sent in the conversation, and queued.
+fn placements(frame: &str, text: &str) -> (usize, usize) {
+    let rows = frame.lines().collect::<Vec<_>>();
+    let rules = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.starts_with('─'))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let above = &rows[..rules[rules.len() - 2]];
+    let shows = |sent: bool| {
+        above
+            .iter()
+            .filter(|row| row.contains(text) && screen::is_queued_input(row) != sent)
+            .count()
+    };
+    (shows(true), shows(false))
+}
+
+/// Follows `text` through the frames drawn after `offset`: it shows at most once, queued or
+/// sent, not as sent before `taken`, and once sent it stays sent, as Claude Code moves a queued
+/// message into the conversation only when the turn takes it.
+fn assert_taken_once(fixture: &Fixture, offset: usize, taken: usize, text: &str) {
+    let mut sent = false;
+    for (end, frame) in fixture.frames_after(offset) {
+        let (echoes, entries) = placements(&frame, text);
+        assert!(echoes + entries <= 1, "{text} is shown once: {frame}");
+        assert!(
+            end > taken || echoes == 0,
+            "{text} is not sent yet: {frame}"
+        );
+        assert!(!sent || echoes == 1, "{text} stays sent: {frame}");
+        sent |= echoes == 1;
+    }
+    assert!(sent, "{text} is shown as sent in the end");
 }
 
 #[test]
@@ -154,20 +192,25 @@ fn send_now_pty_ctrl_enter_reaches_the_model_without_waiting_for_the_running_too
         .wait(|frame| frame.contains("esc to interrupt") && frame.contains("Wait for the fixture"));
     fixture.send(TYPED_NOW.as_bytes());
     fixture.wait(|frame| frame.contains("enter queue · ctrl+enter send now"));
+    let typed_at = fixture.raw_output().len();
     fixture.send(CTRL_ENTER);
     fixture.wait(|frame| frame.contains(TYPED_NOW_REPLY));
+    assert_taken_once(&fixture, typed_at, typed_at, TYPED_NOW);
 
     fixture.send(b"start the second long work\r");
     fixture.wait(|frame| {
         frame.contains("esc to interrupt") && frame.matches("Wait for the fixture").count() == 2
     });
+    let queued_at = fixture.raw_output().len();
     fixture.send(format!("{QUEUED_THEN_SENT}\r").as_bytes());
     let queued = fixture.wait(|frame| {
-        frame.contains(&format!("❯ {QUEUED_THEN_SENT}")) && frame.contains(QUEUED_SEND_NOW_HINT)
+        placements(frame, QUEUED_THEN_SENT) == (0, 1) && frame.contains(QUEUED_SEND_NOW_HINT)
     });
     assert!(!queued.contains(QUEUED_REPLY), "{queued}");
+    let promoted_at = fixture.raw_output().len();
     fixture.send(CTRL_ENTER);
     fixture.wait(|frame| frame.contains(QUEUED_REPLY));
+    assert_taken_once(&fixture, queued_at, promoted_at, QUEUED_THEN_SENT);
 
     fixture.send(b"/exit\r");
     let deadline = Instant::now() + TIMEOUT;

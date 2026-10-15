@@ -4192,10 +4192,61 @@ impl Console {
             .collect())
     }
 
-    pub fn set_queued_inputs(&self, queued_inputs: Vec<QueuedInput>) -> Result<(), String> {
+    /// Shows `chat`'s queue as the Agent reports it; another Chat's queue is read again when that
+    /// Chat is shown.
+    pub fn set_queued_inputs(
+        &self,
+        chat: Uuid,
+        queued_inputs: Vec<QueuedInput>,
+    ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        if state.queued_inputs != queued_inputs {
+        if state.chat == Some(chat) && state.queued_inputs != queued_inputs {
             state.queued_inputs = queued_inputs;
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Lists an input sent while a turn works at the end of the shown queue at once, as Claude
+    /// Code lists it, until the Agent's own queue replaces the entry; returns the entry's
+    /// provisional id.
+    pub(super) fn queue_submitted_input(
+        &self,
+        kind: QueuedInputKind,
+        text: &str,
+    ) -> Result<Option<Uuid>, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let Some(chat) = state
+            .chat
+            .filter(|_| state.interactive && !text.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        let id = Uuid::new_v4();
+        state.queued_inputs.push(QueuedInput {
+            id,
+            chat_id: chat,
+            loop_id: None,
+            kind,
+            text: text.to_owned(),
+            contexts: Vec::new(),
+            queued_sequence: 0,
+            armed: true,
+        });
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())?;
+        Ok(Some(id))
+    }
+
+    /// Takes `id` out of the shown queue: the Agent did not queue it, or its turn took it.
+    pub(super) fn withdraw_queued_input(&self, id: Uuid) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let listed = state.queued_inputs.len();
+        state.queued_inputs.retain(|entry| entry.id != id);
+        if state.queued_inputs.len() != listed {
             state
                 .draw(&mut io::stdout().lock())
                 .map_err(|error| error.to_string())?;
@@ -19353,6 +19404,63 @@ mod tests {
             .find(|line| line.contains("start fresh"))
             .unwrap();
         assert!(!row.contains(&chat), "{row}");
+    }
+
+    #[test]
+    fn an_input_sent_while_a_turn_works_is_listed_until_the_agents_queue_replaces_it() {
+        let chat = Uuid::new_v4();
+        let console = Console::test_interactive_for_chat(chat);
+        let listed = || {
+            console
+                .state
+                .lock()
+                .unwrap()
+                .frame()
+                .0
+                .into_iter()
+                .filter(|line| line.starts_with("  ❯ ") || line.starts_with("  ! "))
+                .collect::<Vec<_>>()
+        };
+        let earlier = queued_input(QueuedInputKind::Message, "earlier message", 1);
+        console
+            .set_queued_inputs(chat, vec![earlier.clone()])
+            .unwrap();
+        console
+            .set_queued_inputs(Uuid::new_v4(), Vec::new())
+            .unwrap();
+        assert_eq!(
+            listed(),
+            ["  ❯ earlier message"],
+            "another Chat's queue leaves the shown one as it is"
+        );
+
+        let shell = console
+            .queue_submitted_input(QueuedInputKind::Shell, "printf later")
+            .unwrap()
+            .unwrap();
+        assert!(
+            console
+                .queue_submitted_input(QueuedInputKind::Message, "  ")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(listed(), ["  ❯ earlier message", "  ! printf later"]);
+        console.withdraw_queued_input(shell).unwrap();
+        assert_eq!(listed(), ["  ❯ earlier message"]);
+
+        console
+            .queue_submitted_input(QueuedInputKind::Message, "later message")
+            .unwrap()
+            .unwrap();
+        let accepted = queued_input(QueuedInputKind::Message, "later message", 2);
+        console
+            .set_queued_inputs(chat, vec![earlier, accepted])
+            .unwrap();
+        assert_eq!(
+            listed(),
+            ["  ❯ earlier message", "  ❯ later message"],
+            "the Agent's entry takes the place of the provisional one"
+        );
     }
 
     const CTRL_ENTER: KeyEvent = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);

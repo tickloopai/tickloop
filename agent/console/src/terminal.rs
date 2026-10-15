@@ -125,9 +125,10 @@ use tickloop_agent_protocol::{
     ExecutionAvailability, ExecutionMode, ExecutionRef, HostLocation, HostWorkContext,
     InputContext, LaunchSpec, ModelConfig, ModelRequestKind, ObservationRequest, ObservationValue,
     PermissionChange, PermissionRule, PermissionScope, PromptPolicy, QuestionRequest,
-    ReasoningEffort, Receipt, ShellTaskNotice, ShellTaskOrigin, ShellTaskPromptWatchdog,
-    ShellTaskState, TakenBackPrompt, TaskNotification, TaskNotificationStatus, TodoItem, Trigger,
-    TriggerSource, Usage, UserInput, UserShellRecord, UserShellState, ViewRef,
+    QueuedInputKind, ReasoningEffort, Receipt, ShellTaskNotice, ShellTaskOrigin,
+    ShellTaskPromptWatchdog, ShellTaskState, TakenBackPrompt, TaskNotification,
+    TaskNotificationStatus, TodoItem, Trigger, TriggerSource, Usage, UserInput, UserShellRecord,
+    UserShellState, ViewRef,
 };
 use workflows::Workflow;
 
@@ -419,6 +420,29 @@ fn command_timing(command: &str) -> CommandTiming {
     } else {
         CommandTiming::AfterTurn
     }
+}
+
+/// How a typed input waits while a turn works: as a message, or as a command for after the turn;
+/// any other command runs at once.
+fn waiting_input_kind(line: &str) -> Option<QueuedInputKind> {
+    let input = line.trim();
+    if !input.starts_with('/') {
+        Some(QueuedInputKind::Message)
+    } else if command_timing(input) == CommandTiming::AfterTurn {
+        Some(QueuedInputKind::Command)
+    } else {
+        None
+    }
+}
+
+/// Whether an input sent to `chat` now waits behind running work, as the Agent queues it: one of
+/// its turns or its foreground Shell is running.
+fn input_waits(
+    chat: uuid::Uuid,
+    pending: &HashMap<uuid::Uuid, Receipt>,
+    foreground_shells: &HashMap<uuid::Uuid, uuid::Uuid>,
+) -> bool {
+    pending.values().any(|receipt| receipt.chat_id == chat) || foreground_shells.contains_key(&chat)
 }
 
 const TUI_SYNTAX: &str = "use /tui [inline|fullscreen]";
@@ -1557,6 +1581,8 @@ async fn interact(
     let mut user_shell_chats = HashMap::new();
     let mut deferred_shell_updates: HashMap<uuid::Uuid, UserShellRecord> = HashMap::new();
     let mut backgrounded_shells = HashSet::new();
+    // Shell commands this View sent while a turn worked, listed in the queue until they start.
+    let mut queued_shells = HashSet::new();
     match startup.chat {
         StartupChat::New => {}
         StartupChat::Resumed(snapshot, has_history) => {
@@ -1775,6 +1801,7 @@ async fn interact(
                     &mut backgrounded_shells,
                     &record,
                 );
+                show_started_shell(console, &mut queued_shells, &record)?;
                 if observation.render_in_chat {
                     render_user_shell_update(agent, console, &record, &mut user_shell_offsets)
                         .await?;
@@ -1833,7 +1860,7 @@ async fn interact(
                 )?;
                 console.set_visible_delegation(status.delegation.is_some())?;
                 console.set_foreground_shell(foreground_shells.contains_key(&chat))?;
-                console.set_queued_inputs(status.queued_inputs())?;
+                console.set_queued_inputs(chat, status.queued_inputs())?;
                 console.set_chat_images(
                     chat,
                     status.accepts_images(),
@@ -2510,13 +2537,14 @@ async fn interact(
                     match agent.take_queued_inputs(chat, draft_empty).await {
                         Ok(entries) if entries.is_empty() => {
                             let status=agent.status(chat).await.map_err(|error|error.to_string())?;
-                            console.set_queued_inputs(status.queued_inputs())?;
+                            console.set_queued_inputs(chat,status.queued_inputs())?;
                         },
                         Ok(entries) => {
                             for entry in &entries {
                                 pending.remove(&entry.id);
                                 user_shell_offsets.remove(&entry.id);
                                 user_shell_chats.remove(&entry.id);
+                                queued_shells.remove(&entry.id);
                                 foreground_shells.remove(&entry.chat_id);
                             }
                             console.restore_queued_inputs(&entries)?;
@@ -2712,8 +2740,10 @@ async fn interact(
                         Err(error)=>{console.restore_rejected_shell(submission.command(),&error)?;continue;},
                     };
                     let history_line=format!("!{}",submission.command());
-                    // Only this attempt's own echo may be withdrawn if it is held back unsent.
-                    let echo=if retry_of.is_none() {console.record_input(&history_line)?} else {None};
+                    // Only this attempt's own echo or queue entry may be withdrawn if it is held back
+                    // unsent. While a turn works, the command waits in the queue until it starts.
+                    let queue_entry=if retry_of.is_none() && input_waits(chat,&pending,&foreground_shells) {console.queue_submitted_input(QueuedInputKind::Shell,submission.command())?} else {None};
+                    let echo=if retry_of.is_none() && queue_entry.is_none() {console.record_input(&history_line)?} else {None};
                     console.record_prompt_history(&history_line)?;
                     let starts_in_background = submission.execution()==shell_input::ShellExecution::Background;
                     let sent=send_input(agent,chat,retry_of,agent.submit_user_shell_for_goal(chat,goal,submission.command().to_owned(),starts_in_background),|result|match result {
@@ -2735,31 +2765,49 @@ async fn interact(
                                     safe_text(submission.command())
                                 );
                             }
-                            let is_running = agent
+                            let status = agent
                                 .status(chat)
                                 .await
-                                .map_err(|error| error.to_string())?
+                                .map_err(|error| error.to_string())?;
+                            let shell_state = status
                                 .user_shells
                                 .iter()
-                                .any(|record| {
-                                    record.id == receipt.command_id
-                                        && record.state == UserShellState::Running
-                                });
-                            if !starts_in_background && is_running {
+                                .find(|record| record.id == receipt.command_id)
+                                .map(|record| record.state.clone());
+                            {
+                                // The command is listed where the Agent queued it, or shown as
+                                // sent once it has started, in one frame.
+                                let _frame_hold = console.hold_frames()?;
+                                console.set_queued_inputs(chat, status.queued_inputs())?;
+                                if shell_state == Some(UserShellState::Queued) {
+                                    if let Some(echo) = echo {
+                                        console.withdraw_echo(Some(chat), echo)?;
+                                    }
+                                    if retry_of.is_none() {
+                                        queued_shells.insert(receipt.command_id);
+                                    }
+                                } else if queue_entry.is_some() {
+                                    console.record_consumed_input(chat, receipt.command_id, &history_line)?;
+                                }
+                            }
+                            if !starts_in_background && shell_state == Some(UserShellState::Running) {
                                 foreground_shells.insert(chat,receipt.command_id);
                                 console.set_foreground_shell(true)?;
                             }
                         },
                         InputSend::Unknown(id, error)=>{
+                            if let Some(entry)=queue_entry {console.withdraw_queued_input(entry)?;}
                             outln!(console,"Cannot run user shell: {}",safe_text(&error.to_string()));
                             console.restore_unknown_shell(submission.command(),&safe_text(&error.to_string()),Some(id))?;
                         },
                         InputSend::Held(error)=>{
                             if let Some(echo)=echo {console.withdraw_echo(Some(chat),echo)?;}
+                            if let Some(entry)=queue_entry {console.withdraw_queued_input(entry)?;}
                             outln!(console,"Cannot run user shell: {}",safe_text(&error.to_string()));
                             console.restore_rejected_shell(submission.command(),&safe_text(&error.to_string()))?;
                         },
                         InputSend::Failed(error)=>{
+                            if let Some(entry)=queue_entry {console.withdraw_queued_input(entry)?;}
                             outln!(console,"Cannot run user shell: {}",safe_text(&error.to_string()));
                             console.restore_rejected_shell(submission.command(),&safe_text(&error.to_string()))?;
                         },
@@ -2948,8 +2996,12 @@ async fn interact(
                         }
                         status_dirty = true; continue;
                     }
-                    // Retrying an unchanged draft checks its receipt without another optimistic echo.
-                    let mut echo=if retry_of.is_none() {console.record_input(&line)?} else {None};
+                    // Retrying an unchanged draft checks its receipt without another optimistic echo
+                    // or queue entry. While a turn works, an input for a later turn waits in the queue,
+                    // as Claude Code lists it, and shows as sent only once a turn takes it.
+                    let waiting_kind=(retry_of.is_none() && is_user_prompt && selected_chat.is_some_and(|chat|input_waits(chat,&pending,&foreground_shells))).then(||waiting_input_kind(&line)).flatten();
+                    let mut queue_entry=match waiting_kind {Some(kind)=>console.queue_submitted_input(kind,&line)?,None=>None};
+                    let mut echo=if retry_of.is_none() && queue_entry.is_none() {console.record_input(&line)?} else {None};
                     let record_after_chat = is_user_prompt
                         && selected_chat.is_none()
                         && !line.trim_start().starts_with('/');
@@ -2981,21 +3033,30 @@ async fn interact(
                                 },
                                 InputSend::Unknown(id, error)=>{
                                     if let Some(echo)=echo {console.withdraw_echo(Some(chat),echo)?;}
+                                    if let Some(entry)=queue_entry {console.withdraw_queued_input(entry)?;}
                                     console.restore_unknown_prompt(restored_contexts,&safe_line(&error.to_string()),Some(id))?;
                                     report_refused_input(console,&error.to_string(),&mut failed);
                                 },
                                 InputSend::Held(error)=>{
                                     if retry_of.is_none() && let Some(echo)=echo {console.withdraw_echo(Some(chat),echo)?;}
+                                    if let Some(entry)=queue_entry {console.withdraw_queued_input(entry)?;}
                                     console.restore_unknown_prompt(restored_contexts,&safe_line(&error.to_string()),None)?;
                                     report_refused_input(console,&error.to_string(),&mut failed);
                                 },
                                 InputSend::Failed(error)=>{
+                                    if let Some(entry)=queue_entry {console.withdraw_queued_input(entry)?;}
                                     console.restore_unknown_prompt(restored_contexts,&safe_line(&error.to_string()),None)?;
                                     report_refused_input(console,&error.to_string(),&mut failed);
                                 },
                             }
                             status_dirty=true;
                             continue;
+                        }
+                        // The turn ended before the command was sent, so it runs now and shows as sent.
+                        if let Some(entry)=queue_entry.take() {
+                            let _frame_hold=console.hold_frames()?;
+                            console.withdraw_queued_input(entry)?;
+                            echo=console.record_input(&original_input)?;
                         }
                     }
                     if !interactive && let Some(menu_id)=menus.id() && !line.starts_with('/') {
@@ -3028,11 +3089,10 @@ async fn interact(
                             }
                         },
                         command if is_rewind_command(command) => {
-                            let is_busy=selected_chat.is_some_and(|chat| pending.values().any(|receipt|receipt.chat_id==chat)
+                            let is_busy=selected_chat.is_some_and(|chat| input_waits(chat,&pending,&foreground_shells)
                                 || compaction_chats.values().any(|(candidate,_)|*candidate==chat)
                                 || directed_summaries.contains(chat)
-                                || summary_recovery_required.contains(&chat)
-                                || foreground_shells.contains_key(&chat));
+                                || summary_recovery_required.contains(&chat));
                             if open_rewind(agent,console,&mut menus,selected_chat,is_busy).await?.is_some() {
                                 status_dirty=false;
                             }
@@ -3537,7 +3597,10 @@ async fn interact(
                             let directory=global.projection().dispatch_directory;
                             let chat_id = match ensure_chat_for_input(console,agent,&mut selected_chat,&directory,retry_of,&original_input,&mut echo).await? {
                                 Ok(chat)=>chat,
-                                Err(error)=>{console.restore_rejected_prompt(restored_contexts,&error)?;report_refused_input(console,&error,&mut failed);status_dirty=true;continue;},
+                                Err(error)=>{
+                                    if let Some(entry)=queue_entry {console.withdraw_queued_input(entry)?;}
+                                    console.restore_rejected_prompt(restored_contexts,&error)?;report_refused_input(console,&error,&mut failed);status_dirty=true;continue;
+                                },
                             };
                             if record_after_chat {
                                 console.record_prompt_history(&original_input)?;
@@ -3572,17 +3635,22 @@ async fn interact(
                                 },
                                 InputSend::Unknown(id, error) => {
                                     if let Some(echo)=echo {console.withdraw_echo(Some(chat_id),echo)?;}
+                                    if let Some(entry)=queue_entry {console.withdraw_queued_input(entry)?;}
                                     outln!(console, "Failed: {}", safe_text(&error.to_string()));
                                     console.restore_unknown_prompt(submitted_contexts,&safe_line(&error.to_string()),Some(id))?;
                                     failed=true;
                                 },
                                 InputSend::Held(error) => {
                                     if retry_of.is_none() && let Some(echo)=echo {console.withdraw_echo(Some(chat_id),echo)?;}
+                                    if let Some(entry)=queue_entry {console.withdraw_queued_input(entry)?;}
                                     outln!(console, "Failed: {}", safe_text(&error.to_string()));
                                     console.restore_unknown_prompt(submitted_contexts,&safe_line(&error.to_string()),None)?;
                                     failed=true;
                                 },
-                                InputSend::Failed(error) => {outln!(console, "Failed: {}", safe_text(&error.to_string())); failed=true;},
+                                InputSend::Failed(error) => {
+                                    if let Some(entry)=queue_entry {console.withdraw_queued_input(entry)?;}
+                                    outln!(console, "Failed: {}", safe_text(&error.to_string())); failed=true;
+                                },
                             }
                         },
                     }
@@ -4067,6 +4135,7 @@ async fn interact(
                     let terminal=user_shell_is_terminal(&record);
                     if !overview_active && Some(record.chat_id)==selected_chat {
                         if let Some(foreground)=observation.foreground {console.set_foreground_shell(foreground)?;}
+                        show_started_shell(console,&mut queued_shells,&record)?;
                         if observation.render_in_chat && render_user_shell_update(agent,console,&record,&mut user_shell_offsets).await? {
                             user_shell_chats.remove(&record.id);
                         }
@@ -4090,6 +4159,7 @@ async fn interact(
                             let terminal=user_shell_is_terminal(&record);
                             if !overview_active && Some(record.chat_id)==selected_chat {
                                 if let Some(foreground)=observation.foreground {console.set_foreground_shell(foreground)?;}
+                                show_started_shell(console,&mut queued_shells,&record)?;
                                 if observation.render_in_chat && render_user_shell_update(agent,console,&record,&mut user_shell_offsets).await? {
                                     user_shell_chats.remove(&record.id);
                                 }
@@ -4676,6 +4746,26 @@ fn observe_user_shell_record(
         render_in_chat,
         foreground,
     }
+}
+
+/// Shows a Shell command this View sent while a turn worked as sent once it starts, in the frame
+/// that takes it out of the queue.
+fn show_started_shell(
+    console: &Console,
+    queued_shells: &mut HashSet<uuid::Uuid>,
+    record: &UserShellRecord,
+) -> Result<(), String> {
+    if record.state == UserShellState::Queued || !queued_shells.remove(&record.id) {
+        return Ok(());
+    }
+    let _frame_hold = console.hold_frames()?;
+    console.withdraw_queued_input(record.id)?;
+    console.record_consumed_input(
+        record.chat_id,
+        record.id,
+        &safe_text(&format!("!{}", record.command)),
+    )?;
+    Ok(())
 }
 
 fn user_shell_is_terminal(record: &UserShellRecord) -> bool {
@@ -6223,14 +6313,23 @@ async fn track_accepted_echo(
     if !console.is_interactive() {
         return Ok(echo);
     }
-    if let Ok(snapshot) = agent.snapshot(receipt.chat_id).await
-        && let Some(input) = consumed_input_text(&snapshot, receipt.run_id)
-    {
-        if echo.is_some() {
-            console.mark_input_echoes(receipt.chat_id, [receipt.run_id])?;
-            return Ok(echo);
+    let snapshot = agent.snapshot(receipt.chat_id).await.ok();
+    // The input is listed where the Agent queued it, or shown as sent when its turn already took
+    // it, in one frame that also drops the provisional queue entry or echo it had.
+    let _frame_hold = console.hold_frames()?;
+    if let Some(snapshot) = &snapshot {
+        console.set_queued_inputs(receipt.chat_id, snapshot.queued_inputs())?;
+        if let Some(input) = consumed_input_text(snapshot, receipt.run_id) {
+            if echo.is_some() {
+                console.mark_input_echoes(receipt.chat_id, [receipt.run_id])?;
+                return Ok(echo);
+            }
+            return console.record_consumed_input(
+                receipt.chat_id,
+                receipt.run_id,
+                &safe_text(input),
+            );
         }
-        return console.record_consumed_input(receipt.chat_id, receipt.run_id, &safe_text(input));
     }
     if let Some(echo) = echo {
         console.withdraw_echo(Some(receipt.chat_id), echo)?;
@@ -6260,7 +6359,12 @@ fn consume_input_echo_from_snapshot(
     input: uuid::Uuid,
 ) -> Result<Option<InputEcho>, String> {
     match consumed_input_text(snapshot, input) {
-        Some(text) => console.record_consumed_input(snapshot.id, input, &safe_text(text)),
+        Some(text) => {
+            // The input leaves the queue in the frame that shows it sent.
+            let _frame_hold = console.hold_frames()?;
+            console.set_queued_inputs(snapshot.id, snapshot.queued_inputs())?;
+            console.record_consumed_input(snapshot.id, input, &safe_text(text))
+        }
         None => {
             let mut has_unshown_agent_message = false;
             for (index, id) in &snapshot.message_ids {
