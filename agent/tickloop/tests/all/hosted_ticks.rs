@@ -1701,9 +1701,11 @@ for line in sys.stdin:
     }
 
     /// A program opened without `protocol` runs as a terminal Tick: ReadTick returns its screen
-    /// text, send_input types into it, and it declares no tools. Its Watches get nothing pushed:
-    /// each starts from the screen as it is when it joins, and a sample reports the screen only
-    /// when its text, or whether the program exited, differs from what that Watch last got.
+    /// text, send_input types into it, and it declares no tools. Its Watches get no screen
+    /// pushed: each starts from the screen as it is when it joins, is told once that the screen
+    /// changed since it last got it, and a sample reports the screen only when its text, or
+    /// whether the program exited, differs from what that Watch last got. The program's exit
+    /// tells every Watch to sample at once.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_terminal_tick_is_sampled_against_what_each_watch_last_got() {
         let daemon = Daemon::start(1).await;
@@ -1776,6 +1778,15 @@ for line in sys.stdin:
         )
         .await;
         assert_eq!(typed["written"], 15, "{typed}");
+        let typed_at = seen.len();
+        wait_for(
+            &mut handle.events,
+            &mut seen,
+            typed_at,
+            "the first Watch's pending change",
+            |event| is_screen_change(event, first, true),
+        )
+        .await;
         let changed = sample_until(&stream, first, &target, |data| {
             data["text"]
                 .as_str()
@@ -1793,6 +1804,23 @@ for line in sys.stdin:
         assert!(
             stream.sample(first, &target).await.is_none(),
             "the screen it last got is no update again"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        while let Ok(event) = handle.events.try_recv() {
+            seen.push(event);
+        }
+        let last_change = seen.iter().rev().find_map(|event| match event {
+            TickStreamEvent::ScreenChange {
+                audience,
+                is_pending,
+                ..
+            } if audience.contains(&first) => Some(*is_pending),
+            _ => None,
+        });
+        assert_eq!(
+            last_change,
+            Some(false),
+            "the samples settled the change and the screen stayed as sampled: {seen:#?}"
         );
 
         handle.desired.send_replace(BTreeMap::from([
@@ -1813,6 +1841,7 @@ for line in sys.stdin:
             "a later Watch starts from the screen as it is when it joins"
         );
 
+        let exiting = seen.len();
         run_tool(
             &tools,
             chat,
@@ -1820,6 +1849,16 @@ for line in sys.stdin:
             json!({"action":"send_input","tick_instance_id":instance,"keys":["Ctrl-D"]}),
         )
         .await;
+        for watch in [first, second] {
+            wait_for(
+                &mut handle.events,
+                &mut seen,
+                exiting,
+                "the program's exit",
+                |event| matches!(event, TickStreamEvent::ProgramExited { audience, .. } if audience.contains(&watch)),
+            )
+            .await;
+        }
         for watch in [first, second] {
             let exited =
                 sample_until(&stream, watch, &target, |data| data["exit"] != Value::Null).await;
@@ -1951,6 +1990,79 @@ for line in sys.stdin:
         assert!(woken.contains("quote ready"), "{woken}");
         assert!(
             woken.contains("\\\"code\\\":0") || woken.contains("\"code\":0"),
+            "{woken}"
+        );
+    }
+
+    /// A subscribed terminal Tick whose program fails wakes the Loop at once with its last screen
+    /// and exit code, long before the subscription's period would have read it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subscribed_terminal_tick_that_fails_is_delivered_at_once() {
+        let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new()));
+        let daemon =
+            Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
+        let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
+        let tools = daemon.tools();
+        let opened = run_tool(
+            &tools,
+            chat,
+            "ModifyTick",
+            json!({"action":"open","command":["/bin/sh","-c","read symbol; echo \"no quote for $symbol\"; exit 3"],"cwd":daemon.root}),
+        )
+        .await;
+        let instance = opened["tick_instance_id"].clone();
+        model.enqueue(tickloop_agent_test_support::call(
+            "subscribe",
+            "SubscribeTick",
+            json!({"tick_instance_id":instance}),
+        ));
+        model.enqueue(tickloop_agent_test_support::text("watching"));
+        let mut events = runtime.subscribe();
+        runtime
+            .submit(chat, None, "Watch the quote script".into())
+            .await
+            .unwrap();
+        loop {
+            match tickloop_agent_test_support::next_event(&mut events)
+                .await
+                .kind
+            {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+
+        model.enqueue(tickloop_agent_test_support::text("the script failed"));
+        run_tool(
+            &tools,
+            chat,
+            "ModifyTick",
+            json!({"action":"send_input","tick_instance_id":instance,"text":"700.HK","keys":["Enter"]}),
+        )
+        .await;
+        let period = tickloop_agent_protocol::TickSubscriptionFrequency::High
+            .period()
+            .unwrap();
+        let immediately = Duration::from_secs(10);
+        assert!(immediately < period / 4);
+        loop {
+            let event = tokio::time::timeout(immediately, events.recv())
+                .await
+                .expect("the failed program wakes the Loop at once")
+                .unwrap();
+            match event.kind {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3, "one delivery");
+        let woken = serde_json::to_string(&requests[2].messages).unwrap();
+        assert!(woken.contains("no quote for 700.HK"), "{woken}");
+        assert!(
+            woken.contains("\\\"code\\\":3") || woken.contains("\"code\":3"),
             "{woken}"
         );
     }
@@ -2927,6 +3039,10 @@ for line in sys.stdin:
 
     fn is_state(event: &TickStreamEvent, watch: Uuid, wanted: TickConnectionState) -> bool {
         matches!(event, TickStreamEvent::State { state, audience, .. } if *state == wanted && audience.contains(&watch))
+    }
+
+    fn is_screen_change(event: &TickStreamEvent, watch: Uuid, pending: bool) -> bool {
+        matches!(event, TickStreamEvent::ScreenChange { audience, is_pending, .. } if *is_pending == pending && audience.contains(&watch))
     }
 
     /// An update over the 512 KiB limit once encoded, though its line is within it, is a

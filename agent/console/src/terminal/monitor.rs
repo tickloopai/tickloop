@@ -1470,6 +1470,7 @@ mod signal_tests {
             instance: quotes(),
             frequency,
             accumulated: 0,
+            has_pending_change: false,
             last_delivery_ms: None,
             last_delivery: None,
             kind: None,
@@ -1616,6 +1617,40 @@ mod signal_tests {
         assert_eq!(monitor.next_frame_ms(50_900, WIDTH, animated), Some(51_200));
         assert_eq!(square(&monitor, animated, 51_200), Some(Role::UpdateSquare));
         assert_eq!(bar(&monitor, 51_200), Some((1..7, Role::UpdateProgress)));
+    }
+
+    /// A Terminal Tick's screen that changed since its subscription last got it shows the square
+    /// with its flash and then the bar to the check that reads it; a check that finds the screen
+    /// changed back clears both, and the row does not flash.
+    #[test]
+    fn a_changed_terminal_screen_shows_the_square_and_bar_until_its_check() {
+        let animated = DisplayProfile::default();
+        let mut monitor = subscribed(
+            vec![subscription(TickSubscriptionFrequency::High, Some(100_000))],
+            40_000,
+        );
+        monitor.chat_status = Some(Arc::new(chat()));
+        let mut changed = subscription(TickSubscriptionFrequency::High, Some(100_000));
+        changed.has_pending_change = true;
+        changed.updated_at_ms = Some(50_000);
+        monitor.subscriptions = vec![changed];
+        monitor.rebuild_at(50_000);
+        assert_eq!(
+            square(&monitor, animated, 50_400),
+            Some(Role::UpdateProgress),
+            "the change flashes the square"
+        );
+        assert_eq!(bar(&monitor, 50_400), None);
+        assert_eq!(square(&monitor, animated, 51_200), Some(Role::UpdateSquare));
+        assert_eq!(bar(&monitor, 51_200), Some((1..7, Role::UpdateProgress)));
+
+        let mut settled = subscription(TickSubscriptionFrequency::High, Some(160_000));
+        settled.updated_at_ms = Some(50_000);
+        monitor.subscriptions = vec![settled];
+        monitor.rebuild_at(100_100);
+        assert_eq!(bar(&monitor, 100_100), None);
+        assert_eq!(square(&monitor, animated, 100_100), None);
+        assert_eq!(row(&monitor, animated, 100_100).fill, None);
     }
 
     #[test]

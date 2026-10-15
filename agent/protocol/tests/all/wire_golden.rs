@@ -715,6 +715,7 @@ fn observation_values_keep_their_recorded_wire() {
                 instance: hosted_instance(),
                 frequency: TickSubscriptionFrequency::High,
                 accumulated: 2,
+                has_pending_change: false,
                 last_delivery_ms: Some(6_000),
                 last_delivery: Some("hosted:00000000-0000-0000-0000-000000000040 #4".into()),
                 kind: Some(ObservationKind::Protocol),

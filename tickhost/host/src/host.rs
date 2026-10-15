@@ -2467,9 +2467,11 @@ async fn stream_observations(
     }
 }
 
-/// Registers a watch of a terminal Tick: the reply carries its screen now, and the stream then
-/// only tells when the Tick ends. Nothing is pushed in between; each subscription reads the
-/// screen again at its own frequency. The reader's EOF, or anything it sends, ends the watch.
+/// Registers a watch of a terminal Tick: the reply carries its screen now. The screen's text is
+/// never pushed: the reader reads it through the watch with `read`, and the first time the text
+/// differs from the screen the watch last read, `changed` is pushed once. The program's exit is
+/// pushed once with how it ended, and after it no change is; the Tick's end is pushed as `gone`.
+/// The reader's EOF, or anything it sends but a read, ends the watch.
 async fn watch_terminal(
     mut reader: BufReader<OwnedReadHalf>,
     mut writer: OwnedWriteHalf,
@@ -2477,28 +2479,87 @@ async fn watch_terminal(
     tick: Arc<HostedTick>,
     id: &Value,
 ) -> Result<(), HostError> {
-    use tokio::io::AsyncBufReadExt;
     let Adapter::Terminal(program) = &tick.adapter else {
         return Err(HostError::before(
             "UnsupportedCapability",
             "only a terminal Tick is watched without the Tick protocol",
         ));
     };
+    let mut changes = tick.screen_changes.subscribe();
+    let mut last_read = tick.terminal_read(program);
+    let mut has_reported_exit = last_read.exit.is_some();
     write_within(
         &mut writer,
-        &hosted::ok(id, json!({"read":tick.terminal_read(program)})),
+        &hosted::ok(id, json!({"read":last_read})),
         BUSINESS_FRAME_BYTES,
         CONTROL_TIMEOUT,
     )
     .await?;
-    tokio::select! {
-        _ = reader.fill_buf() => Ok(()),
-        _ = tick.terminal_closed.cancelled() => {
-            let _ = write_within(&mut writer, &json!({"event":"gone"}), BUSINESS_FRAME_BYTES, STREAM_WRITE_TIMEOUT).await;
-            Ok(())
+    // Requests are read on their own, so a screen change never cuts one off midway.
+    let (request_sender, mut requests) = tokio::sync::mpsc::channel::<Value>(1);
+    let incoming = async {
+        while let Some(request) =
+            hosted::read_frame(&mut reader, ATTACH_REQUEST_FRAME_BYTES).await?
+        {
+            if request["method"] != "read" || request_sender.send(request).await.is_err() {
+                break;
+            }
         }
-        _ = host.shutdown.cancelled() => Ok(()),
+        Ok::<_, HostError>(())
+    };
+    let outgoing = async {
+        let mut is_armed = !has_reported_exit;
+        loop {
+            tokio::select! {
+                Some(request) = requests.recv() => {
+                    last_read = tick.terminal_read(program);
+                    is_armed = !has_reported_exit;
+                    write_within(
+                        &mut writer,
+                        &hosted::ok(&request["id"], json!(last_read)),
+                        BUSINESS_FRAME_BYTES,
+                        CONTROL_TIMEOUT,
+                    )
+                    .await?;
+                }
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                    let event = match program.exit() {
+                        Some(exit) if !has_reported_exit => {
+                            has_reported_exit = true;
+                            is_armed = false;
+                            json!({"event":"exited","exit":exit})
+                        }
+                        _ if is_armed && tick.terminal_read(program).text != last_read.text => {
+                            is_armed = false;
+                            json!({"event":"changed"})
+                        }
+                        _ => continue,
+                    };
+                    write_within(&mut writer, &event, BUSINESS_FRAME_BYTES, STREAM_WRITE_TIMEOUT)
+                        .await?;
+                }
+            }
+        }
+    };
+    let ended = tokio::select! {
+        outcome = incoming => return outcome,
+        outcome = outgoing => return outcome,
+        _ = tick.terminal_closed.cancelled() => true,
+        _ = host.shutdown.cancelled() => false,
+    };
+    if ended {
+        let _ = write_within(
+            &mut writer,
+            &json!({"event":"gone"}),
+            BUSINESS_FRAME_BYTES,
+            STREAM_WRITE_TIMEOUT,
+        )
+        .await;
     }
+    Ok(())
 }
 
 /// Serves one spawner: the descriptors and request its grant admits, then the task's exit, once,

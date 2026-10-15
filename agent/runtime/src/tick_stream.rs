@@ -83,6 +83,19 @@ pub enum TickStreamEvent {
         instance: InstanceRef,
         audience: Vec<WatchId>,
     },
+    /// A Terminal Tick's screen text changed since these watches last got it, so their next
+    /// samples will read it; or, once not pending, a sample settled it.
+    ScreenChange {
+        instance: InstanceRef,
+        audience: Vec<WatchId>,
+        is_pending: bool,
+    },
+    /// A Terminal Tick's program exited: these watches sample its last screen now, without
+    /// waiting for their period.
+    ProgramExited {
+        instance: InstanceRef,
+        audience: Vec<WatchId>,
+    },
 }
 
 pub struct TickStreamHandle {
@@ -235,9 +248,11 @@ pub trait TickStreamPort: Send + Sync + 'static {
         Ok(None)
     }
     /// A Terminal Tick's screen, read for `watch` of `instance` because its subscription's
-    /// period elapsed: the observation when its text, or whether its program exited, differs
-    /// from what this watch last got. `None` when nothing changed, and for the Ticks whose
-    /// updates the stream pushes.
+    /// period elapsed or its program exited: the observation when its text, or whether its
+    /// program exited, differs from what this watch last got. `None` when nothing changed, and
+    /// for the Ticks whose updates the stream pushes. A sample settles the watch's
+    /// [`TickStreamEvent::ScreenChange`]: the stream reports it no longer pending unless the
+    /// screen changed again after it was read.
     async fn sample(&self, _watch: WatchId, _instance: &InstanceRef) -> Option<TickObservation> {
         None
     }
@@ -276,6 +291,9 @@ struct EventMailbox {
     states: BTreeMap<WatchId, (InstanceRef, TickConnectionState)>,
     metadata: BTreeMap<WatchId, (InstanceRef, TickMetadata)>,
     latest: BTreeMap<WatchId, TickObservation>,
+    /// Whether each watch's Terminal Tick screen changed since it last got it, latest only.
+    screen_changes: BTreeMap<WatchId, (InstanceRef, bool)>,
+    exits: BTreeMap<WatchId, InstanceRef>,
     terminal: BTreeSet<WatchId>,
 }
 
@@ -295,6 +313,14 @@ impl EventPublisher {
                 audience,
             } => self.state_to(instance, state, audience),
             TickStreamEvent::Gap { instance, audience } => self.gap_to(instance, audience),
+            TickStreamEvent::ScreenChange {
+                instance,
+                audience,
+                is_pending,
+            } => self.screen_change(instance, audience, is_pending),
+            TickStreamEvent::ProgramExited { instance, audience } => {
+                self.program_exited(instance, audience)
+            }
         }
     }
     pub fn channel() -> (Self, mpsc::Receiver<TickStreamEvent>) {
@@ -331,13 +357,27 @@ impl EventPublisher {
                             metadata,
                             audience: vec![watch],
                         })
-                    } else {
-                        mailbox.latest.pop_first().map(|(watch, value)| {
-                            TickStreamEvent::Observation {
-                                audience: vec![watch],
-                                value,
-                            }
+                    } else if let Some((watch, instance)) = mailbox.exits.pop_first() {
+                        Some(TickStreamEvent::ProgramExited {
+                            instance,
+                            audience: vec![watch],
                         })
+                    } else if let Some((watch, value)) = mailbox.latest.pop_first() {
+                        Some(TickStreamEvent::Observation {
+                            audience: vec![watch],
+                            value,
+                        })
+                    } else {
+                        mailbox
+                            .screen_changes
+                            .pop_first()
+                            .map(
+                                |(watch, (instance, is_pending))| TickStreamEvent::ScreenChange {
+                                    instance,
+                                    audience: vec![watch],
+                                    is_pending,
+                                },
+                            )
                     }
                 };
                 match event {
@@ -410,6 +450,33 @@ impl EventPublisher {
         self.wake.notify_one();
     }
 
+    pub fn screen_change(
+        &self,
+        instance: InstanceRef,
+        audience: impl IntoIterator<Item = WatchId>,
+        is_pending: bool,
+    ) {
+        let mut mailbox = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        for watch in audience {
+            mailbox
+                .screen_changes
+                .insert(watch, (instance.clone(), is_pending));
+        }
+        self.wake.notify_one();
+    }
+
+    pub fn program_exited(
+        &self,
+        instance: InstanceRef,
+        audience: impl IntoIterator<Item = WatchId>,
+    ) {
+        let mut mailbox = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        for watch in audience {
+            mailbox.exits.insert(watch, instance.clone());
+        }
+        self.wake.notify_one();
+    }
+
     pub fn observation(&self, audience: &[WatchId], value: TickObservation) {
         let mut mailbox = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         for watch in audience {
@@ -440,6 +507,10 @@ impl EventPublisher {
         mailbox
             .states
             .retain(|watch, _| desired.contains_key(watch));
+        mailbox
+            .screen_changes
+            .retain(|watch, _| desired.contains_key(watch));
+        mailbox.exits.retain(|watch, _| desired.contains_key(watch));
         mailbox.terminal.retain(|watch| desired.contains_key(watch));
     }
 
@@ -510,23 +581,7 @@ impl InMemoryTickStream {
 
     pub fn emit(&self, event: TickStreamEvent) {
         if let Some(events) = &self.state().events {
-            match event {
-                TickStreamEvent::Metadata {
-                    instance,
-                    audience,
-                    metadata,
-                } => events.metadata(instance, audience, metadata),
-                TickStreamEvent::Ready { watch } => events.ready(watch),
-                TickStreamEvent::Observation { audience, value } => {
-                    events.observation(&audience, value)
-                }
-                TickStreamEvent::State {
-                    instance,
-                    state,
-                    audience,
-                } => events.state_to(instance, state, audience),
-                TickStreamEvent::Gap { instance, audience } => events.gap_to(instance, audience),
-            }
+            events.publish(event);
         }
     }
 
@@ -538,11 +593,16 @@ impl InMemoryTickStream {
 #[async_trait::async_trait]
 impl TickStreamPort for InMemoryTickStream {
     fn set_watch_authorities(&self, _authorities: BTreeMap<WatchId, HostToolAuthority>) {}
+    /// Like a hosted Terminal Tick, a sample settles the watch's pending screen change.
     async fn sample(&self, watch: WatchId, instance: &InstanceRef) -> Option<TickObservation> {
         if self.watches().get(&watch) != Some(instance) {
             return None;
         }
-        self.state().samples.remove(instance)
+        let mut state = self.state();
+        if let Some(events) = &state.events {
+            events.screen_change(instance.clone(), [watch], false);
+        }
+        state.samples.remove(instance)
     }
     async fn revalidate_watch(
         &self,

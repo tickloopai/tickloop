@@ -1,8 +1,9 @@
 //! Tick Updates of hosted Ticks, which run in the dedicated Tickhost. A watch follows the
 //! instance through the data binding its Chat owns, so a Tick whose host was replaced or whose
-//! owner ended is never silently rebound. A protocol Tick pushes its updates; a terminal Tick's
-//! screen is read when a subscription's period elapses and compared with what that watch last
-//! got.
+//! owner ended is never silently rebound. A protocol Tick pushes its updates. A terminal Tick's
+//! screen is read through its host watch when a subscription's period elapses or its program
+//! exits, and compared with what that watch last got; between reads the host only says when the
+//! screen first changed, which marks the change pending for each watch that has not got it.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -13,10 +14,15 @@ use serde_json::{Value, json};
 use tick_protocol::TickState;
 use tickhost::host::{TerminalDescription, TerminalRead, TickAdapter};
 use tickhost_connect::{
-    hosted::{CONTROL_TIMEOUT, OBSERVATION_FRAME_BYTES},
+    hosted::{
+        self, BUSINESS_FRAME_BYTES, CONTROL_TIMEOUT, HostConnection, OBSERVATION_FRAME_BYTES,
+    },
     session::{SessionLinkState, SessionObservation},
 };
-use tokio::sync::watch;
+use tokio::{
+    net::unix::OwnedWriteHalf,
+    sync::{mpsc, oneshot, watch},
+};
 use uuid::Uuid;
 
 use super::{
@@ -28,8 +34,22 @@ use super::{
 use crate::{host_tools::HostToolProvider, hosted::tools::HostedTickTools, tick_tools::READ_TICK};
 use tickloop_agent_protocol::{HostToolAuthority, ObservationKind};
 
-/// What each watch of a terminal Tick last got of its screen: where its next sample is compared.
-type Screens = Arc<Mutex<BTreeMap<WatchId, ScreenCursor>>>;
+type Screens = Arc<Mutex<TerminalScreens>>;
+
+/// Samples waiting for one observer of a terminal Tick.
+const SAMPLE_QUEUE: usize = 16;
+/// Frames of a terminal Tick's host watch read ahead of the observer.
+const LINK_FRAMES: usize = 16;
+
+/// What each watch of a terminal Tick last got of its screen, where its next sample is compared,
+/// and the observers that read the screen for those samples.
+#[derive(Default)]
+struct TerminalScreens {
+    cursors: BTreeMap<WatchId, ScreenCursor>,
+    /// Each observer's way to its live host watch: a sample reads through it, so the host's
+    /// change signal is armed against what was read.
+    samplers: BTreeMap<Uuid, mpsc::Sender<SampleRequest>>,
+}
 
 struct ScreenCursor {
     /// The observer that follows the watch now; only it forgets the record when it ends.
@@ -37,6 +57,14 @@ struct ScreenCursor {
     chat: Uuid,
     instance: InstanceRef,
     sent: Value,
+    /// The screen changed since `sent`, as the watch was last told.
+    has_pending_change: bool,
+}
+
+/// A sample of one watch, answered with the screen when it differs from what the watch last got.
+struct SampleRequest {
+    watch: WatchId,
+    reply: oneshot::Sender<Option<TickObservation>>,
 }
 
 pub struct HostedTickStream {
@@ -105,6 +133,7 @@ impl HostedScope {
         self.screens
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .cursors
             .retain(|_, cursor| cursor.observer != observer);
     }
 
@@ -302,18 +331,11 @@ impl HostedFeed {
         self.tools.adapter(self.chat, &self.instance).await
     }
 
-    /// Registers a host watch of a terminal Tick: what it runs, its screen now, and the state it
-    /// ends in, Gone once the Tick ended or Disconnected when the watch is lost.
+    /// Registers a host watch of a terminal Tick: what it runs, its screen now, which the host's
+    /// change signal is armed against, and the watch itself.
     async fn watch_terminal(
         &self,
-    ) -> Result<
-        (
-            TerminalDescription,
-            TerminalRead,
-            tokio::sync::oneshot::Receiver<TickConnectionState>,
-        ),
-        String,
-    > {
+    ) -> Result<(TerminalDescription, TerminalRead, TerminalLink), String> {
         let mut connection = self
             .tools
             .data(self.chat, &self.instance)
@@ -331,20 +353,275 @@ impl HostedFeed {
             .map_err(|error| error.to_string())?;
         let read: TerminalRead = serde_json::from_value(registered["read"].clone())
             .map_err(|error| error.to_string())?;
-        let (sender, ended) = tokio::sync::oneshot::channel();
+        Ok((description, read, TerminalLink::new(connection)))
+    }
+}
+
+/// A terminal Tick's host watch: the frames it pushes, in order, and the reads samples make
+/// through it.
+struct TerminalLink {
+    frames: mpsc::Receiver<Value>,
+    writer: OwnedWriteHalf,
+    next_id: u64,
+}
+
+/// What a terminal Tick's host watch pushed.
+enum LinkEvent {
+    /// The screen text first changed since the last read through the watch.
+    Changed,
+    Exited,
+    Ended(TickConnectionState),
+}
+
+impl TerminalLink {
+    fn new(connection: HostConnection) -> Self {
+        let (mut reader, writer) = connection.into_parts();
+        let (sender, frames) = mpsc::channel(LINK_FRAMES);
         tokio::spawn(async move {
-            let mut sender = sender;
-            let state = tokio::select! {
-                event = connection.next_event_within(OBSERVATION_FRAME_BYTES) => match event {
-                    Ok(Some(event)) if event["event"] == "gone" => TickConnectionState::Gone,
-                    Ok(Some(_)) => TickConnectionState::IdentityUncertain,
-                    Ok(None) | Err(_) => TickConnectionState::Disconnected,
-                },
-                _ = sender.closed() => return,
-            };
-            let _ = sender.send(state);
+            loop {
+                let frame = tokio::select! {
+                    _ = sender.closed() => return,
+                    frame = hosted::read_frame(&mut reader, BUSINESS_FRAME_BYTES) => frame,
+                };
+                // The watch's end, or a frame that cannot be read, closes the channel.
+                let Ok(Some(frame)) = frame else {
+                    return;
+                };
+                if sender.send(frame).await.is_err() {
+                    return;
+                }
+            }
         });
-        Ok((description, read, ended))
+        Self {
+            frames,
+            writer,
+            next_id: 1,
+        }
+    }
+
+    async fn next_event(&mut self) -> LinkEvent {
+        match self.frames.recv().await {
+            Some(frame) => link_event(&frame),
+            None => LinkEvent::Ended(TickConnectionState::Disconnected),
+        }
+    }
+
+    /// Reads the screen through the watch, which arms the host's change signal against it.
+    /// Changes and the exit the host pushed before answering are about an earlier screen, which
+    /// the read already shows, so only the Tick's end among them counts.
+    async fn read(&mut self) -> Result<TerminalRead, TickConnectionState> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let request = json!({"id":id,"method":"read","params":{}});
+        tokio::time::timeout(
+            CONTROL_TIMEOUT,
+            hosted::write_frame(&mut self.writer, &request, BUSINESS_FRAME_BYTES),
+        )
+        .await
+        .map_err(|_| TickConnectionState::Disconnected)?
+        .map_err(|_| TickConnectionState::Disconnected)?;
+        loop {
+            let frame = tokio::time::timeout(CONTROL_TIMEOUT, self.frames.recv())
+                .await
+                .ok()
+                .flatten()
+                .ok_or(TickConnectionState::Disconnected)?;
+            if frame.get("id").is_none() {
+                match link_event(&frame) {
+                    LinkEvent::Ended(state) => return Err(state),
+                    LinkEvent::Changed | LinkEvent::Exited => continue,
+                }
+            }
+            let read = hosted::response_result(frame, Some(id))
+                .map_err(|error| connection_state(&error.code))?;
+            return serde_json::from_value(read)
+                .map_err(|_| TickConnectionState::IdentityUncertain);
+        }
+    }
+}
+
+fn link_event(frame: &Value) -> LinkEvent {
+    match frame["event"].as_str() {
+        Some("changed") => LinkEvent::Changed,
+        Some("exited") => LinkEvent::Exited,
+        Some("gone") => LinkEvent::Ended(TickConnectionState::Gone),
+        _ => LinkEvent::Ended(TickConnectionState::IdentityUncertain),
+    }
+}
+
+/// An observer's entry in [`TerminalScreens::samplers`], removed when it stops following.
+struct SamplerRegistration<'a> {
+    screens: &'a Screens,
+    observer: Uuid,
+}
+
+impl<'a> SamplerRegistration<'a> {
+    fn register(
+        screens: &'a Screens,
+        observer: Uuid,
+        sampler: mpsc::Sender<SampleRequest>,
+    ) -> Self {
+        screens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .samplers
+            .insert(observer, sampler);
+        Self { screens, observer }
+    }
+}
+
+impl Drop for SamplerRegistration<'_> {
+    fn drop(&mut self) {
+        self.screens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .samplers
+            .remove(&self.observer);
+    }
+}
+
+/// The screen of a terminal Tick as one observer's watches got it, against the screen last read
+/// through the observer's host watch.
+struct ObservedScreen<'a> {
+    observer: Uuid,
+    instance: &'a InstanceRef,
+    screens: &'a Screens,
+    publisher: &'a EventPublisher,
+    last_read: TerminalRead,
+    has_announced_exit: bool,
+}
+
+impl ObservedScreen<'_> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, TerminalScreens> {
+        self.screens.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Starts `watches` from the screen last read.
+    fn join(&self, chat: Uuid, watches: &[WatchId]) {
+        let mut screens = self.lock();
+        for watch in watches {
+            screens.cursors.insert(
+                *watch,
+                ScreenCursor {
+                    observer: self.observer,
+                    chat,
+                    instance: self.instance.clone(),
+                    sent: self.last_read.data(),
+                    has_pending_change: false,
+                },
+            );
+        }
+    }
+
+    /// Takes over `watches` an earlier observer followed: each keeps what it last got, holds a
+    /// change when the screen last read differs from it, and reads the exit it missed at once.
+    fn adopt(&self, watches: &[WatchId]) {
+        let data = self.last_read.data();
+        let (mut changed, mut exited) = (Vec::new(), Vec::new());
+        {
+            let mut screens = self.lock();
+            for watch in watches {
+                let Some(cursor) = screens.cursors.get_mut(watch) else {
+                    continue;
+                };
+                cursor.observer = self.observer;
+                if cursor.sent == data || !cursor.sent["exit"].is_null() {
+                    continue;
+                }
+                if !cursor.has_pending_change {
+                    cursor.has_pending_change = true;
+                    changed.push(*watch);
+                }
+                if self.last_read.exit.is_some() {
+                    exited.push(*watch);
+                }
+            }
+        }
+        self.publisher
+            .screen_change(self.instance.clone(), changed, true);
+        if !exited.is_empty() {
+            self.publisher.program_exited(self.instance.clone(), exited);
+        }
+    }
+
+    /// The host said the screen changed since it was last read: every watch that had got that
+    /// screen now holds a change.
+    fn changed(&self) {
+        let changed = self
+            .lock()
+            .cursors
+            .iter_mut()
+            .filter(|(_, cursor)| {
+                cursor.observer == self.observer
+                    && !cursor.has_pending_change
+                    && cursor.sent["exit"].is_null()
+            })
+            .map(|(watch, cursor)| {
+                cursor.has_pending_change = true;
+                *watch
+            })
+            .collect::<Vec<_>>();
+        self.publisher
+            .screen_change(self.instance.clone(), changed, true);
+    }
+
+    /// Settles a screen read through the host watch, for `sampled` when a sample asked for it:
+    /// that watch gets the screen when it differs from what it last got, and its change is
+    /// settled; every other watch holds a change when the screen differs from what it got.
+    fn settle(&mut self, read: TerminalRead, sampled: Option<WatchId>) -> Option<TickObservation> {
+        let data = read.data();
+        let mut observation = None;
+        let (mut changed, mut settled) = (Vec::new(), Vec::new());
+        {
+            let mut screens = self.lock();
+            for (watch, cursor) in screens
+                .cursors
+                .iter_mut()
+                .filter(|(_, cursor)| cursor.observer == self.observer)
+            {
+                if Some(*watch) == sampled {
+                    if cursor.sent != data {
+                        cursor.sent = data.clone();
+                        observation = Some(terminal_observation(self.instance, read.clone()));
+                    }
+                    if std::mem::take(&mut cursor.has_pending_change) {
+                        settled.push(*watch);
+                    }
+                } else if !cursor.has_pending_change
+                    && cursor.sent != data
+                    && cursor.sent["exit"].is_null()
+                {
+                    cursor.has_pending_change = true;
+                    changed.push(*watch);
+                }
+            }
+        }
+        self.publisher
+            .screen_change(self.instance.clone(), changed, true);
+        self.publisher
+            .screen_change(self.instance.clone(), settled, false);
+        self.last_read = read;
+        if self.last_read.exit.is_some() {
+            self.announce_exit();
+        }
+        observation
+    }
+
+    /// Tells every watch that has not got the program's exit to read it now, once.
+    fn announce_exit(&mut self) {
+        if std::mem::replace(&mut self.has_announced_exit, true) {
+            return;
+        }
+        let exited = self
+            .lock()
+            .cursors
+            .iter()
+            .filter(|(_, cursor)| cursor.observer == self.observer && cursor.sent["exit"].is_null())
+            .map(|(watch, _)| *watch)
+            .collect::<Vec<_>>();
+        if !exited.is_empty() {
+            self.publisher.program_exited(self.instance.clone(), exited);
+        }
     }
 }
 
@@ -379,10 +656,12 @@ fn terminal_observation(instance: &InstanceRef, read: TerminalRead) -> TickObser
     }
 }
 
-/// Follows a terminal Tick for the wanted watches. Nothing is pushed: each watch starts from the
-/// screen as it is when it joins, and its subscription samples the screen again at its own
-/// frequency; the host's watch only tells when the Tick ends. Returns whether following ended
-/// for good rather than for a reconnect.
+/// Follows a terminal Tick for the wanted watches. Its screen is never pushed: each watch starts
+/// from the screen as it is when it joins, and its subscription samples the screen through the
+/// host watch at its own frequency, or at once when the program exits. In between the host only
+/// says when the screen first changed since it was last read, which marks that change pending for
+/// the watches that have not got it. Returns whether following ended for good rather than for a
+/// reconnect.
 async fn observe_terminal_screen(
     feed: &HostedFeed,
     observer: Uuid,
@@ -396,7 +675,7 @@ async fn observe_terminal_screen(
     if attempted.is_empty() {
         return true;
     }
-    let (description, mut current, mut ended) = match feed.watch_terminal().await {
+    let (description, registered, mut link) = match feed.watch_terminal().await {
         Ok(watched) => watched,
         Err(_) => {
             publisher.state_to(
@@ -410,6 +689,19 @@ async fn observe_terminal_screen(
     let title = description
         .title
         .unwrap_or_else(|| tickhost_connect::naming::command_title(&description.command));
+    let (sampler, mut samples) = mpsc::channel(SAMPLE_QUEUE);
+    let _registration = SamplerRegistration::register(screens, observer, sampler);
+    let mut screen = ObservedScreen {
+        observer,
+        instance,
+        screens,
+        publisher,
+        last_read: registered.clone(),
+        has_announced_exit: false,
+    };
+    // The watches this observer followed before it reconnected hold the change, and read the
+    // exit, they missed meanwhile.
+    screen.settle(registered, None);
     let mut is_current = true;
     loop {
         let targets = scope.admitted(&wanted.borrow_and_update().clone(), instance, publisher);
@@ -419,61 +711,49 @@ async fn observe_terminal_screen(
         // A watch an earlier observer of this Tick followed keeps what it last got.
         let (joining, adopted) = {
             let mut screens = screens.lock().unwrap_or_else(PoisonError::into_inner);
-            screens.retain(|watch, cursor| cursor.observer != observer || targets.contains(watch));
-            let mut adopted = Vec::new();
-            for watch in &targets {
-                if let Some(cursor) = screens.get_mut(watch)
-                    && cursor.observer != observer
-                {
-                    cursor.observer = observer;
-                    adopted.push(*watch);
-                }
-            }
+            screens
+                .cursors
+                .retain(|watch, cursor| cursor.observer != observer || targets.contains(watch));
+            let adopted = targets
+                .iter()
+                .filter(|watch| {
+                    screens
+                        .cursors
+                        .get(watch)
+                        .is_some_and(|cursor| cursor.observer != observer)
+                })
+                .copied()
+                .collect::<Vec<_>>();
             let joining = targets
                 .iter()
-                .filter(|watch| !screens.contains_key(watch))
+                .filter(|watch| !screens.cursors.contains_key(watch))
                 .copied()
                 .collect::<Vec<_>>();
             (joining, adopted)
         };
-        for watch in adopted {
-            publisher.ready(watch);
-        }
-        if !joining.is_empty() {
-            if !is_current {
-                current = match read_terminal(&feed.tools, feed.chat, instance).await {
-                    Ok(read) => read,
-                    Err(_) => {
-                        publisher.state_to(
-                            instance.clone(),
-                            TickConnectionState::Disconnected,
-                            targets.iter().copied(),
-                        );
-                        return false;
-                    }
-                };
-            }
-            let mut screens = screens.lock().unwrap_or_else(PoisonError::into_inner);
-            for watch in joining {
-                screens.insert(
-                    watch,
-                    ScreenCursor {
-                        observer,
-                        chat: feed.chat,
-                        instance: instance.clone(),
-                        sent: current.data(),
-                    },
-                );
-                publisher.ready(watch);
+        if !joining.is_empty() && !is_current {
+            match link.read().await {
+                Ok(read) => {
+                    screen.settle(read, None);
+                }
+                Err(state) => {
+                    publisher.state_to(instance.clone(), state, targets.iter().copied());
+                    return state != TickConnectionState::Disconnected;
+                }
             }
         }
+        screen.join(feed.chat, &joining);
+        for watch in adopted.iter().chain(&joining) {
+            publisher.ready(*watch);
+        }
+        screen.adopt(&adopted);
         publisher.metadata(
             instance.clone(),
             targets.iter().copied(),
             TickMetadata {
                 title: title.clone(),
                 kind: ObservationKind::Terminal {
-                    truncated: current.truncated,
+                    truncated: screen.last_read.truncated,
                 },
                 updated_at_ms: None,
                 series: Vec::new(),
@@ -484,13 +764,32 @@ async fn observe_terminal_screen(
             TickConnectionState::Live,
             targets.iter().copied(),
         );
-        tokio::select! {
-            state = &mut ended => {
-                let state = state.unwrap_or(TickConnectionState::Disconnected);
-                publisher.state_to(instance.clone(), state, targets.iter().copied());
-                return state != TickConnectionState::Disconnected;
+        // Ends with the state the watch ended in, or with none when the wanted watches changed.
+        let ended = loop {
+            tokio::select! {
+                event = link.next_event() => match event {
+                    LinkEvent::Changed => screen.changed(),
+                    LinkEvent::Exited => screen.announce_exit(),
+                    LinkEvent::Ended(state) => break Some(state),
+                },
+                Some(request) = samples.recv() => match link.read().await {
+                    Ok(read) => {
+                        let observation = screen.settle(read, Some(request.watch));
+                        let _ = request.reply.send(observation);
+                    }
+                    Err(state) => break Some(state),
+                },
+                changed = wanted.changed() => {
+                    if changed.is_err() {
+                        return true;
+                    }
+                    break None;
+                }
             }
-            changed = wanted.changed() => if changed.is_err() { return true; },
+        };
+        if let Some(state) = ended {
+            publisher.state_to(instance.clone(), state, targets.iter().copied());
+            return state != TickConnectionState::Disconnected;
         }
         is_current = false;
     }
@@ -604,6 +903,7 @@ impl TickStreamPort for HostedTickStream {
         self.screens
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .cursors
             .retain(|watch, _| chats.contains_key(watch));
         self.chats.send_replace(chats);
     }
@@ -668,17 +968,20 @@ impl TickStreamPort for HostedTickStream {
         Ok(Some(current_observation(instance, read)))
     }
 
-    /// Reads a terminal Tick's screen for `watch` while it is still admitted, and reports it when
-    /// it differs from what the watch last got, which it then becomes.
+    /// Reads a terminal Tick's screen for `watch` while it is still admitted, through the host
+    /// watch its observer holds, and reports it when it differs from what the watch last got,
+    /// which it then becomes. A watch whose host watch is lost samples nothing until it
+    /// reconnects.
     async fn sample(&self, watch: WatchId, instance: &InstanceRef) -> Option<TickObservation> {
         // Once a watch got the program's exit its screen never changes again.
-        let chat = self
-            .screens
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&watch)
-            .filter(|cursor| cursor.instance == *instance && cursor.sent["exit"].is_null())?
-            .chat;
+        let (chat, sampler) = {
+            let screens = self.screens.lock().unwrap_or_else(PoisonError::into_inner);
+            let cursor = screens
+                .cursors
+                .get(&watch)
+                .filter(|cursor| cursor.instance == *instance && cursor.sent["exit"].is_null())?;
+            (cursor.chat, screens.samplers.get(&cursor.observer)?.clone())
+        };
         let scope = self.scope();
         let is_admitted = scope.chat_of(&watch) == Some(chat)
             && scope
@@ -687,15 +990,9 @@ impl TickStreamPort for HostedTickStream {
         if !is_admitted {
             return None;
         }
-        let read = read_terminal(&self.tools, chat, instance).await.ok()?;
-        let observation = terminal_observation(instance, read);
-        let mut screens = self.screens.lock().unwrap_or_else(PoisonError::into_inner);
-        let cursor = screens.get_mut(&watch)?;
-        if cursor.sent == observation.data {
-            return None;
-        }
-        cursor.sent = observation.data.clone();
-        Some(observation)
+        let (reply, answer) = oneshot::channel();
+        sampler.send(SampleRequest { watch, reply }).await.ok()?;
+        answer.await.ok().flatten()
     }
 
     fn open(&self) -> TickStreamHandle {

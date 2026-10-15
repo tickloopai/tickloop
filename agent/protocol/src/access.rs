@@ -37,10 +37,12 @@ use crate::{
 /// Subscription status's next check and period, so Monitor counts down to the next check, the
 /// user's own Tick Subscription from Monitor, and reopening a hosted Tick with its subscriptions.
 /// 20.3 records where a Trigger's prompt came from, so a prompt copied from the Loop goal reaches
-/// deliveries as background. Older business majors are refused before dispatch; the frozen daemon
-/// management protocol remains independent.
+/// deliveries as background. 20.4 says whether a Terminal Tick's screen changed since a Tick
+/// Subscription last got it, so Monitor shows that change waiting for the next check. Older
+/// business majors are refused before dispatch; the frozen daemon management protocol remains
+/// independent.
 pub const PROTOCOL_MAJOR: u16 = 20;
-pub const PROTOCOL_MINOR: u16 = 3;
+pub const PROTOCOL_MINOR: u16 = 4;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 

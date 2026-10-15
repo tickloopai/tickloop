@@ -40,9 +40,11 @@ pub const MANAGEMENT_FRAME_BYTES: usize = 64 * 1024;
 /// launch it passes, and the Shell adapter serves that task's `shell:` instance. 8.0: the
 /// controller grants views of a Worker's Shell task, running or ended, which attach to a screen
 /// the host draws from the task's output and take no input. 9.0: Ticks no longer idle out, so
-/// Watch-intent leases (`set_intents`) and the explicit or automatic kind of a read are gone. A
+/// Watch-intent leases (`set_intents`) and the explicit or automatic kind of a read are gone.
+/// 10.0: a terminal Tick's watch reads its screen with `read` and pushes `changed` once when the
+/// text first differs from the screen it last read, and `exited` with how the program ended. A
 /// host of any other major is refused at hello.
-pub const BUSINESS_MAJOR: u16 = 9;
+pub const BUSINESS_MAJOR: u16 = 10;
 pub const BUSINESS_MINOR: u16 = 0;
 /// A complete business frame, large enough for one legal 8 MiB Tick Tool response.
 pub const BUSINESS_FRAME_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;

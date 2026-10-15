@@ -577,14 +577,148 @@ async fn a_terminal_program_takes_input_shows_it_and_keeps_its_exit_code() {
         )
         .await
         .unwrap();
-    let ended = tokio::time::timeout(
+    let mut pushed = Vec::new();
+    let ended = loop {
+        let event = tokio::time::timeout(
+            Duration::from_secs(5),
+            watcher.next_event_within(BUSINESS_FRAME_BYTES),
+        )
+        .await
+        .expect("the watch ends with its Tick")
+        .unwrap();
+        match event {
+            Some(event) if event["event"] == "gone" => break event,
+            Some(event) => pushed.push(event),
+            None => panic!("the watch closed before its Tick's end: {pushed:?}"),
+        }
+    };
+    assert_eq!(ended, json!({"event":"gone"}));
+    assert_eq!(
+        pushed,
+        [
+            json!({"event":"changed"}),
+            json!({"event":"exited","exit":{"code":0,"signal":null}}),
+        ],
+        "the watch was told once that the screen changed, then how the program ended"
+    );
+    shutdown(&fixture).await;
+}
+
+/// The next frame on a terminal Tick's watch, within five seconds.
+async fn next_watch_frame(events: &mut BufReader<OwnedReadHalf>) -> Value {
+    tokio::time::timeout(
         Duration::from_secs(5),
-        watcher.next_event_within(BUSINESS_FRAME_BYTES),
+        read_frame(events, BUSINESS_FRAME_BYTES),
     )
     .await
-    .expect("the watch ends with its Tick")
-    .unwrap();
-    assert_eq!(ended, Some(json!({"event":"gone"})));
+    .expect("the watch pushes or answers in time")
+    .unwrap()
+    .expect("the watch is still open")
+}
+
+/// A terminal Tick's watch says once that the screen text changed after the screen it last read,
+/// and nothing more until it reads again through the watch, which arms it against that screen.
+/// The program's exit is pushed with how it ended, and no change follows it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminal_watch_tells_the_first_change_after_each_read_and_the_exit() {
+    let fixture = Fixture::start().await;
+    let mut controller = fixture.controller().await;
+    let opened = fixture
+        .open_terminal(
+            &mut controller,
+            &[
+                "/bin/sh",
+                "-c",
+                "while read line; do echo \"got $line\"; [ \"$line\" = quit ] && exit 4; done",
+            ],
+        )
+        .await;
+    let mut typist = fixture.reader(&opened).await;
+    let (mut events, mut requests) = fixture.reader(&opened).await.into_parts();
+    send(&mut requests, json!({"id":1,"method":"watch","params":{}})).await;
+    let registered = next_watch_frame(&mut events).await;
+    assert_eq!(registered["id"], 1, "{registered}");
+    assert_eq!(registered["result"]["read"]["exit"], Value::Null);
+    let shows =
+        |needle: &'static str| move |read: &Value| read["text"].as_str().unwrap().contains(needle);
+
+    typist
+        .request("input", json!({"data": b"one\r".to_vec()}), CONTROL_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(
+        next_watch_frame(&mut events).await,
+        json!({"event":"changed"})
+    );
+    typist
+        .request("input", json!({"data": b"two\r".to_vec()}), CONTROL_TIMEOUT)
+        .await
+        .unwrap();
+    terminal_read_until(&mut typist, shows("got two")).await;
+    send(&mut requests, json!({"id":2,"method":"read","params":{}})).await;
+    let read = next_watch_frame(&mut events).await;
+    assert_eq!(
+        read["id"], 2,
+        "a later change before the watch read again is not pushed: {read}"
+    );
+    assert!(read["result"]["text"].as_str().unwrap().contains("got two"));
+    assert_eq!(read["result"]["exit"], Value::Null);
+
+    let long_line = format!("three-{}\r", "x".repeat(60));
+    typist
+        .request(
+            "input",
+            json!({"data": long_line.as_bytes().to_vec()}),
+            CONTROL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        next_watch_frame(&mut events).await,
+        json!({"event":"changed"}),
+        "reading through the watch armed it again"
+    );
+    typist
+        .request(
+            "input",
+            json!({"data": b"quit\r".to_vec()}),
+            CONTROL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        next_watch_frame(&mut events).await,
+        json!({"event":"exited","exit":{"code":4,"signal":null}})
+    );
+    send(&mut requests, json!({"id":3,"method":"read","params":{}})).await;
+    let last = next_watch_frame(&mut events).await;
+    assert_eq!(last["id"], 3, "{last}");
+    assert_eq!(last["result"]["exit"], json!({"code":4,"signal":null}));
+    assert!(
+        last["result"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("got quit")
+    );
+
+    // A narrower view cuts the long line, which changes the screen text after the exit.
+    let _view = attach(&fixture, &opened, json!({"rows":8,"columns":30})).await;
+    let narrowed = terminal_read_until(&mut typist, |_| true).await;
+    assert_ne!(narrowed["text"], last["result"]["text"]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    controller
+        .request(
+            "close",
+            json!({"operation":uuid::Uuid::new_v4(),"owner":fixture.owner,"instance":opened["instance"]}),
+            CONTROL_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        next_watch_frame(&mut events).await,
+        json!({"event":"gone"}),
+        "after the exit only the Tick's end is pushed, though a view resized its screen"
+    );
     shutdown(&fixture).await;
 }
 

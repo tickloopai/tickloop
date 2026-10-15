@@ -431,6 +431,7 @@ mod tests {
             instance: instance(),
             frequency,
             accumulated: 0,
+            has_pending_change: false,
             last_delivery_ms: None,
             last_delivery: None,
             link: TickLinkState::Live,
