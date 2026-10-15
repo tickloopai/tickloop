@@ -2,6 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The code of a dispatched Tick Tool that ran and failed: unlike an unknown outcome, its result
+/// is known, and a corrected call may be made again.
+pub const TOOL_FAILED: &str = "ToolFailed";
+
 /// A native host failure. `dispatched` says whether the host may have acted: a dispatched
 /// mutation failure is OutcomeUnknown, and only the original operation can be queried.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, thiserror::Error)]

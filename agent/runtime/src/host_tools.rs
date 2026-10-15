@@ -240,8 +240,6 @@ pub struct WorkspaceHostContext {
     /// Whether this Agent can run Ticks in the Tickhost, in any container.
     pub tickhost: WorkspaceIntegration,
     pub tick_executable: Option<PathBuf>,
-    /// The bundled `tickhost`.
-    pub tickhost_executable: Option<PathBuf>,
 }
 
 impl WorkspaceHostContext {
@@ -254,16 +252,13 @@ impl WorkspaceHostContext {
         )
     }
 
-    /// The same container, where this Agent can also run Ticks in the Tickhost with the
-    /// bundled `tick` and `tickhost`.
+    /// The same container, where this Agent can also run Ticks in the Tickhost, among them the
+    /// bundled `tick`.
     pub fn with_tickhost(mut self) -> Self {
         self.tickhost = WorkspaceIntegration::Available;
         self.tick_executable = self
             .tick_executable
             .or_else(tickhost_connect::program::bundled_tick_executable);
-        self.tickhost_executable = self
-            .tickhost_executable
-            .or_else(tickhost_connect::program::bundled_tickhost_executable);
         self
     }
 
@@ -289,7 +284,6 @@ impl WorkspaceHostContext {
             integration: WorkspaceIntegration::Unavailable,
             tickhost: WorkspaceIntegration::Unavailable,
             tick_executable: None,
-            tickhost_executable: None,
         }
     }
 

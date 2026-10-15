@@ -37,8 +37,8 @@ const SUBSCRIPTION_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const SUBSCRIBE_TICK_TOOL: &str = "SubscribeTick";
 const UNSUBSCRIBE_TICK_TOOL: &str = "UnsubscribeTick";
 const DEFAULT_FREQUENCY: TickSubscriptionFrequency = TickSubscriptionFrequency::High;
-/// How soon an immediate subscription looks again at a delivery its Loop could not take; a
-/// periodic one looks again with its next period.
+/// How soon a delivery its Loop could not take is looked at again, whatever the frequency of the
+/// subscriptions it carries.
 const HELD_DELIVERY_RETRY: Duration = Duration::from_secs(5);
 /// How long one sample of a Terminal Tick's screen may take before its period passes without it.
 const SAMPLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -219,7 +219,8 @@ struct LatestUpdate {
     observed_at: String,
     kind: ObservationKind,
     recover_with: Option<String>,
-    /// Its data is larger than the content budget and could never fit a delivery either.
+    /// Its data is larger than the content budget and could never fit a delivery either; what
+    /// [`left_out`] keeps of it waits in the cache instead.
     is_oversized: bool,
 }
 
@@ -229,6 +230,9 @@ struct PendingDelivery {
     /// The delivery came due while the Loop could not take it, so it flushes when the Loop's run
     /// ends.
     due: bool,
+    /// When a held delivery is looked at again, in case the run ended before it was held or the
+    /// delivery failed.
+    retry_at: Option<Instant>,
 }
 
 #[derive(Clone, Serialize)]
@@ -413,9 +417,11 @@ impl TickDeliveries {
     }
 
     fn next_due(&self) -> Option<Instant> {
+        let retries = self.pending.values().filter_map(|pending| pending.retry_at);
         self.subscriptions
             .values()
             .filter_map(|subscription| subscription.due_at)
+            .chain(retries)
             .min()
     }
 
@@ -477,6 +483,12 @@ impl TickDeliveries {
                 continue;
             }
             let is_kept = self.content.store(*id, observation.data.clone());
+            if !is_kept {
+                let remainder = left_out(&observation.kind, &observation.data);
+                if !remainder.is_null() {
+                    self.content.store(*id, remainder);
+                }
+            }
             let superseded = subscription.latest.replace(LatestUpdate {
                 sequence: observation.sequence,
                 observed_at: observation.observed_at.clone(),
@@ -580,6 +592,14 @@ impl TickDeliveries {
                 ready.push(owner);
             }
         }
+        for (owner, pending) in &mut self.pending {
+            if pending.retry_at.is_some_and(|retry_at| retry_at <= now) {
+                pending.retry_at = None;
+                if !pending.items.is_empty() && !ready.contains(owner) {
+                    ready.push(*owner);
+                }
+            }
+        }
         ready
     }
 
@@ -601,24 +621,15 @@ impl TickDeliveries {
     }
 
     /// Keeps `owner`'s pending delivery until its Loop can take it. It flushes when the Loop's
-    /// run ends, and the Loop's immediate subscriptions, which have no period of their own to
-    /// retry with, look again shortly in case that end came first or the delivery failed.
+    /// run ends, and is looked at again shortly in case that end came before it was held or the
+    /// delivery failed; the schedules of its subscriptions stay as they are.
     fn hold(&mut self, owner: (ChatId, LoopId), now: Instant) {
         let Some(pending) = self.pending.get_mut(&owner) else {
             return;
         };
         pending.due = true;
         let retry_at = now + HELD_DELIVERY_RETRY;
-        for subscription in self.subscriptions.values_mut().filter(|subscription| {
-            (subscription.chat_id, subscription.loop_id) == owner
-                && subscription.frequency == TickSubscriptionFrequency::Immediate
-        }) {
-            subscription.due_at = Some(
-                subscription
-                    .due_at
-                    .map_or(retry_at, |due_at| due_at.min(retry_at)),
-            );
-        }
+        pending.retry_at = Some(pending.retry_at.map_or(retry_at, |at| at.min(retry_at)));
     }
 }
 
@@ -1082,20 +1093,21 @@ impl Agent {
     /// cannot take it, as when it executes or waits for the user, so it flushes once the Loop's
     /// run ends instead of bypassing the user's answer.
     async fn deliver(&self, chat_id: ChatId, loop_id: LoopId) {
-        let state = {
-            let chats = self.inner.chats.lock().await;
-            let Some(chat) = chats.get(&chat_id) else {
-                return;
-            };
-            let Some(goal) = chat.snapshot.loops.iter().find(|goal| goal.id == loop_id) else {
-                return;
-            };
-            goal.state.clone()
-        };
         let owner = (chat_id, loop_id);
+        // The end of a run sets the Loop's state and flushes a held delivery under the Chats
+        // lock, so the state is read and the delivery taken or held under it too: a run that ends
+        // meanwhile either comes first and leaves the Loop free to take it, or comes after and
+        // finds it held.
         let delivery = {
+            let chats = self.inner.chats.lock().await;
+            let Some(goal) = chats
+                .get(&chat_id)
+                .and_then(|chat| chat.snapshot.loops.iter().find(|goal| goal.id == loop_id))
+            else {
+                return;
+            };
             let mut deliveries = self.tick_deliveries();
-            match state {
+            match goal.state {
                 LoopState::WaitingTrigger | LoopState::Completed => deliveries.take_delivery(owner),
                 _ => {
                     deliveries.hold(owner, Instant::now());
@@ -1519,7 +1531,7 @@ fn delivery_payload(items: &[DeliveryItem], truncated: bool) -> Value {
             .iter()
             .any(|item| matches!(item.kind, ObservationKind::Terminal { .. }))
         {
-            "Terminal observation was too large; use ReadTick for the current text. Unobserved terminal history cannot be recovered.".to_owned()
+            "A Terminal Tick's screen was too large for this delivery; use ReadTick for its current screen. Output that scrolled past between periods cannot be recovered.".to_owned()
         } else if let Some(tool) = items.iter().find_map(|item| item.recover_with.as_deref()) {
             if tool.len() <= 128 {
                 format!(
@@ -1535,6 +1547,17 @@ fn delivery_payload(items: &[DeliveryItem], truncated: bool) -> Value {
     payload
 }
 
+/// What a delivery says of Tick Update `data` it has no room for: nothing, except how a Terminal
+/// Tick's program ended, which leaving out its screen text must not lose.
+fn left_out(kind: &ObservationKind, data: &Value) -> Value {
+    match kind {
+        ObservationKind::Terminal { .. } if !data["exit"].is_null() => {
+            json!({"text": null, "exit": data["exit"]})
+        }
+        _ => Value::Null,
+    }
+}
+
 /// Keeps a delivery within [`MAX_DELIVERY_PAYLOAD_BYTES`] by blanking the largest Tick Update
 /// `data` first, so the model still learns which Tick Instances moved and can fetch the rest.
 fn fit_delivery_payload(items: &[DeliveryItem]) -> (Value, bool) {
@@ -1547,7 +1570,7 @@ fn fit_delivery_payload(items: &[DeliveryItem]) -> (Value, bool) {
     let mut largest_first: Vec<_> = (0..delivered.len()).collect();
     largest_first.sort_by_key(|index| std::cmp::Reverse(delivered[*index].data.to_string().len()));
     for index in largest_first {
-        delivered[index].data = Value::Null;
+        delivered[index].data = left_out(&delivered[index].kind, &delivered[index].data);
         payload = delivery_payload(&delivered, true);
         if payload.to_string().len() <= MAX_DELIVERY_PAYLOAD_BYTES {
             return (payload, true);

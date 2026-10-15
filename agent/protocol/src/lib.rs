@@ -106,11 +106,11 @@ pub use history::{
 };
 pub use host::{
     HerdrInteraction, HerdrPane, HostCallContext, HostEndpointIdentity, HostToolAuthority,
-    HostedResources, HostedScreenSnapshot,
+    HostedResources,
 };
 pub use hosted::{
     ATTACH_ARGUMENTS, ATTACH_ENVIRONMENT, HostedMember, HostedMemberState, HostedProgramExit,
-    HostedSnapshot, HostedViewGrant,
+    HostedViewGrant, VIEW_PANE_ENVIRONMENT,
 };
 pub use ids::ChatId;
 pub use image::{Image, ImageMediaType};

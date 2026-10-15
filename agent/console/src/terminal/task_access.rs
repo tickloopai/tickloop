@@ -76,10 +76,6 @@ pub(super) fn shell_starts(
 }
 
 impl ShellTaskCenter {
-    pub(super) async fn started_at_ms(&self, chat: Uuid, id: Uuid) -> Option<u64> {
-        let snapshot = self.agent.snapshot(chat).await.ok()?;
-        shell_started_at_ms(&snapshot, id)
-    }
     pub(super) fn new(agent: ConsoleExecution) -> Self {
         Self {
             agent,

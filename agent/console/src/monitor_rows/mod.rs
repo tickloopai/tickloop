@@ -9,9 +9,7 @@ pub(crate) use builtin::artifact_actions;
 pub use builtin::{
     ArtifactRows, FINISHED_SHELL_DISPLAY_MS, HostedRows, ShellRows, finished_shell_until,
 };
-pub(crate) use builtin::{
-    HOSTED_CLOSE_KEY, HOSTED_REOPEN_KEY, feedback_binding, key_command, shell_tone, signal_name,
-};
+pub(crate) use builtin::{HOSTED_CLOSE_KEY, HOSTED_REOPEN_KEY, SHELL_STOP_KEY, feedback_binding};
 pub use probe::{MemberFindings, ProbeError, TickProbe};
 
 use std::{
@@ -68,14 +66,16 @@ pub enum TickIntent {
     /// Hides the row in this Chat only and keeps every other fact. A row its Loops subscribe to
     /// is hidden only after the user confirms cancelling those subscriptions.
     RemoveFromMonitor(InstanceRef),
-    OpenHosted(InstanceRef),
-    ShowHostedSnapshot(InstanceRef),
+    /// Opens the attached view of a local Tick the Tickhost runs, a hosted Tick or a Shell: a
+    /// Herdr popup inside Herdr, otherwise full screen in this terminal.
+    OpenView(InstanceRef),
     /// Ends a hosted Tick; the Console asks for confirmation first.
     CloseHosted(InstanceRef),
     /// Starts a new instance in place of a lost hosted Tick; the Console asks for confirmation
     /// first.
     ReopenHosted(InstanceRef),
-    OpenShell {
+    /// Stops a running Shell; the Console asks for confirmation first.
+    StopShell {
         task: Uuid,
     },
     /// An Artifact row action on instance `id`: open, remove, copy or feedback by its key.

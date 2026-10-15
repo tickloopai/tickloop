@@ -28,17 +28,6 @@ pub struct HostedResources {
     pub sampled_at_ms: u64,
 }
 
-/// A hosted Tick's latest visible text as `tickhost::screen::ScreenSnapshot` takes it, newest
-/// lines kept when the snapshot limits cut it.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct HostedScreenSnapshot {
-    pub lines: Vec<String>,
-    pub truncated: bool,
-    pub rows: u16,
-    pub columns: u16,
-    pub alternate_screen: bool,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HerdrInteraction {
     pub socket: PathBuf,

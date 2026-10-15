@@ -581,20 +581,12 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
         })
         .await;
     reopened.send(b"\r");
-    reopened
-        .wait_for(
-            "Tick Shell detail covers the screen with real worker output",
-            |frame| {
-                frame
-                    .lines()
-                    .next()
-                    .is_some_and(|line| line.starts_with("$ while [ ! -f finish ]"))
-                    && frame.lines().any(|line| line.trim() == "shell began")
-                    && frame.lines().any(|line| line.trim() == "s stop · esc back")
-                    && !frame.contains('│')
-            },
-        )
-        .await;
+    // The Shell's own view, drawn by the Tickhost, takes the terminal.
+    view_shows(
+        &reopened,
+        &["$ printf 'shell began'; while [ ! -f finish ]", "running"],
+    )
+    .await;
     std::fs::write(fixture.path("work/finish"), b"finish").unwrap();
     tokio::time::timeout(UI_TIMEOUT, async {
         loop {
@@ -631,33 +623,22 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     assert!(
         matches!(output.initial, ObservationValue::TaskOutput(output) if output.output == "shell beganshell ended")
     );
+    // The view follows the completion after the View detach.
+    view_shows(&reopened, &["shell beganshell ended", "exit 0"]).await;
+    reopened.send(b"\x1b");
+    tokio::time::timeout(UI_TIMEOUT, async {
+        while terminal_screen(&reopened).contains("$ printf 'shell began'") {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Esc closes the Shell's view");
     reopened
-        .wait_for(
-            "Task detail follows completion after View detach",
-            |frame| {
-                frame
-                    .lines()
-                    .next()
-                    .is_some_and(|line| line.contains("exit 0"))
-                    && frame
-                        .lines()
-                        .any(|line| line.trim() == "shell beganshell ended")
-            },
-        )
+        .wait_for("the Shell's row is selected again", |frame| {
+            frame.contains("Shells (1)")
+        })
         .await;
     let captured_output = Arc::clone(&reopened.output);
-    let close_mark = captured_output.lock().unwrap().len();
-    reopened.send(b"\x1b");
-    reopened
-        .wait_for(
-            "Task detail closes before leaving its shared list",
-            |frame| {
-                let captured = captured_output.lock().unwrap();
-                let fresh = String::from_utf8_lossy(&captured[close_mark..]);
-                fresh.contains("\x1b[?2026l") && frame.contains("Shells (1)")
-            },
-        )
-        .await;
     reopened.send(b"\x1b");
     reopened
         .wait_for("Task Esc returns to ordinary input", |frame| {
@@ -1163,6 +1144,45 @@ async fn actual_cli_sustained_daemon_loss_keeps_cached_output_draft_and_editing_
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
+}
+
+/// The screen the terminal shows now for everything the View wrote, including what an attached
+/// view drew without the Console's synchronized frames.
+fn terminal_screen(view: &PtyView) -> String {
+    let mut parser = vt100::Parser::new(view.height as u16, view.width as u16, 0);
+    parser.process(&view.output.lock().unwrap());
+    parser.screen().contents()
+}
+
+/// Waits until an attached view holds the terminal, the Console's Monitor hints gone from it,
+/// and shows every one of `texts`.
+async fn view_shows(view: &PtyView, texts: &[&str]) {
+    tokio::time::timeout(UI_TIMEOUT, async {
+        loop {
+            let screen = terminal_screen(view);
+            if !screen.contains("enter open") && texts.iter().all(|text| screen.contains(text)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{texts:?} never showed in a view:\n{}",
+            terminal_screen(view)
+        )
+    });
+}
+
+async fn terminal_shows(view: &PtyView, text: &str) {
+    tokio::time::timeout(UI_TIMEOUT, async {
+        while !terminal_screen(view).contains(text) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{text:?} never appeared:\n{}", terminal_screen(view)));
 }
 
 fn chat_reply(tool: Option<(&str, &str, Value)>, text: &str) -> String {

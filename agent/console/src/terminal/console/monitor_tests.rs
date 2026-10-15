@@ -1,10 +1,7 @@
 use super::*;
-use crate::terminal::{
-    monitor::{MonitorEntry, TickGroup},
-    task_surface::{TaskOutputUpdate, TaskSurfaceEffect},
-};
+use crate::terminal::monitor::{MonitorEntry, TickGroup};
 use tickloop_agent_protocol::{
-    ChatSnapshot, MonitorMember, MonitorMembership, ShellTaskOutputChunk, TickSubscriptionStatus,
+    ChatSnapshot, MonitorMember, MonitorMembership, TickSubscriptionStatus,
 };
 
 fn shell(id: Uuid, title: &str) -> MonitorEntry {
@@ -25,7 +22,9 @@ fn shell(id: Uuid, title: &str) -> MonitorEntry {
             crate::monitor_rows::MonitorAction {
                 key: 'o',
                 label: "open",
-                intent: crate::monitor_rows::TickIntent::OpenShell { task: id },
+                intent: crate::monitor_rows::TickIntent::OpenView(
+                    tick_protocol::InstanceRef::shell(id),
+                ),
             },
             crate::monitor_rows::remove_from_monitor(&tick_protocol::InstanceRef::shell(id)),
         ],
@@ -49,131 +48,23 @@ fn removed(instance: tick_protocol::InstanceRef) -> MonitorMembership {
     }
 }
 
+/// Monitor shows no Tick content: Enter on a Shell row asks for its view and opens no detail
+/// inside Monitor.
 #[test]
-fn shell_tick_enter_opens_inside_the_tick_panel() {
+fn shell_tick_enter_opens_its_view_and_no_monitor_detail() {
     let mut state = click_fixture(140, false, TickGroup::Shells);
-    state.monitor.focus(false, None);
-    assert!(matches!(
-        state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        Some(InputEvent::TickAction { .. })
-    ));
-    assert!(state.monitor.detail.is_some());
-}
-
-/// Opens the selected Shell row's detail and loads it with a running `make test` and 100 output
-/// lines, the last `output-99`.
-fn open_loaded_shell_detail(state: &mut State) {
-    let chat = state.chat.unwrap();
     let selected = state.monitor.selected().unwrap().instance.clone();
-    state.monitor.focus(state.monitor.overlay, None);
-    assert!(matches!(
-        state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        Some(InputEvent::TickAction { .. })
-    ));
-    let output = (0..100)
-        .map(|row| format!("output-{row}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut snapshot = tests::task_snapshot(chat, 1);
-    snapshot.tasks[0].id = Uuid::parse_str(selected.id()).unwrap();
-    snapshot.tasks[0].command = "cd /tmp && make test 2>&1 | tail -5".into();
-    snapshot.tasks[0].description = Some("Run the full suite".into());
-    snapshot.tasks[0].output_bytes = output.len() as u64;
-    snapshot.tasks[0].capabilities.can_read_output = true;
-    let detail = state
-        .monitor
-        .detail
-        .as_mut()
-        .unwrap()
-        .as_any_mut()
-        .downcast_mut::<crate::terminal::tick_shell::TickShell>()
-        .unwrap();
-    let Some(TaskSurfaceEffect::ReadOutput {
-        generation,
-        task_id,
-        ..
-    }) = detail.load(snapshot, None)
-    else {
-        panic!("missing detail output request");
-    };
-    detail.output(TaskOutputUpdate::Chunk {
-        generation,
-        chunk: ShellTaskOutputChunk {
-            task_id,
-            offset: 0,
-            confirmed_offset: output.len() as u64,
-            total_bytes: output.len() as u64,
-            next_offset: None,
-            truncated: false,
-            encoding: "utf-8".into(),
-            output,
-        },
-    });
-}
-
-#[test]
-fn a_shell_detail_covers_the_screen_and_esc_returns_to_its_selected_row() {
-    for (width, overlay) in [(140, false), (60, true)] {
-        let mut state = click_fixture(width, overlay, TickGroup::Shells);
-        let selected = state.monitor.selected().unwrap().instance.clone();
-        open_loaded_shell_detail(&mut state);
-        state.draw_frame(&mut Vec::new()).unwrap();
-        let screen = state.rendered_screen.clone();
-        assert_eq!(screen.len(), 25);
-        assert!(screen[0].starts_with("$ make test"), "{screen:#?}");
-        assert_eq!(screen[1], "Run the full suite");
-        assert!(
-            screen.iter().all(|row| !row.contains('│')),
-            "no Monitor column: {screen:#?}"
-        );
-        assert!(
-            screen
-                .iter()
-                .all(|row| display_width(row) <= width as usize)
-        );
-        assert!(screen.contains(&"output-99".to_owned()), "{screen:#?}");
-        assert!(screen[24].ends_with("esc back"), "{screen:#?}");
-
-        state.pointer(
-            MouseEvent {
-                kind: MouseEventKind::ScrollUp,
-                row: 10,
-                column: 3,
-                modifiers: KeyModifiers::NONE,
-            },
-            &mut Vec::new(),
-        );
-        state.draw_frame(&mut Vec::new()).unwrap();
-        assert_eq!(
-            state.rendered_screen[..5],
-            screen[..5],
-            "the header stays while the output scrolls"
-        );
-        assert!(!state.rendered_screen.contains(&"output-99".to_owned()));
-        assert!(state.rendered_screen.contains(&"output-96".to_owned()));
-
-        state.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
-        state.draw_frame(&mut Vec::new()).unwrap();
-        let confirming = state.rendered_screen.join("\n");
-        assert!(
-            state.rendered_screen[0].starts_with("$ make test")
-                && confirming.contains("Stop this Shell?"),
-            "{confirming}"
-        );
-        state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(state.monitor.detail.is_some(), "esc first cancels the stop");
-
-        state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        state.draw_frame(&mut Vec::new()).unwrap();
-        assert!(state.monitor.detail.is_none());
-        assert!(state.monitor.focused, "Monitor keeps the focus");
-        assert_eq!(state.monitor.selected().unwrap().instance, selected);
-        let list = state.rendered_screen.join("\n");
-        assert!(
-            list.contains("Shells (1)") && !list.contains("$ make test"),
-            "{list}"
-        );
-    }
+    state.monitor.focus(false, None);
+    let chat = state.chat.unwrap();
+    assert_eq!(
+        tick_action_signature(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))),
+        format!(
+            "{chat}/{selected}/{}",
+            crate::monitor_rows::MONITOR_ENTER_KEY
+        )
+    );
+    assert!(state.monitor.detail.is_none());
+    assert!(state.monitor.focused, "Monitor keeps the focus");
 }
 
 #[test]
@@ -250,82 +141,14 @@ fn shell_ticks_only_list_background_executions_and_x_removes_a_finished_one() {
 }
 
 #[test]
-fn tick_shell_detail_and_selection_restore_per_agent_and_ignore_obsolete_mouse_targets() {
+fn monitor_selection_restores_per_agent_and_ignores_obsolete_mouse_targets() {
     let mut state = click_fixture(140, false, TickGroup::Shells);
     let a = state.chat.unwrap();
     let selected = state.monitor.selected().unwrap().instance.clone();
     state.monitor.focus(false, None);
-    state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    let panel = state.monitor.detail.as_ref().unwrap().id();
-    state.draw_frame(&mut Vec::new()).unwrap();
-    state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-    assert_eq!(state.monitor.selected().unwrap().instance, selected);
-    state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert_ne!(state.monitor.detail.as_ref().unwrap().id(), panel);
-    let panel = state.monitor.detail.as_ref().unwrap().id();
-    let output = (0..40)
-        .map(|row| format!("cached-output-{row}\n"))
-        .collect::<String>();
-    let mut snapshot = tests::task_snapshot(a, 1);
-    snapshot.tasks[0].id = Uuid::parse_str(selected.id()).unwrap();
-    snapshot.tasks[0].output_bytes = output.len() as u64;
-    snapshot.tasks[0].capabilities.can_read_output = true;
-    let detail = state
-        .monitor
-        .detail
-        .as_mut()
-        .unwrap()
-        .as_any_mut()
-        .downcast_mut::<crate::terminal::tick_shell::TickShell>()
-        .unwrap();
-    let Some(TaskSurfaceEffect::ReadOutput {
-        generation,
-        task_id,
-        ..
-    }) = detail.load(snapshot, Some(1000))
-    else {
-        panic!("missing cached detail output request");
-    };
-    detail.output(TaskOutputUpdate::Chunk {
-        generation,
-        chunk: ShellTaskOutputChunk {
-            task_id,
-            offset: 0,
-            confirmed_offset: output.len() as u64,
-            total_bytes: output.len() as u64,
-            next_offset: None,
-            truncated: false,
-            encoding: "utf-8".into(),
-            output,
-        },
-    });
-    detail.key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), 40, 10);
-    let before = detail
-        .lines(40, 10, 2000)
-        .iter()
-        .map(RoleLine::text)
-        .collect::<Vec<_>>();
     state.switch_view_chat(Some(Uuid::new_v4()));
-    assert!(state.monitor.detail.is_none());
     state.switch_view_chat(Some(a));
-    assert_eq!(state.monitor.detail.as_ref().unwrap().id(), panel);
     assert_eq!(state.monitor.selected().unwrap().instance, selected);
-    assert_eq!(
-        state
-            .monitor
-            .detail
-            .as_mut()
-            .unwrap()
-            .as_any_mut()
-            .downcast_mut::<crate::terminal::tick_shell::TickShell>()
-            .unwrap()
-            .lines(40, 10, 2000)
-            .iter()
-            .map(RoleLine::text)
-            .collect::<Vec<_>>(),
-        before
-    );
-    state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     state.draw_frame(&mut Vec::new()).unwrap();
     let target = &state.monitor_row_targets[0];
     let (row, column) = (target.row, target.columns.start);
@@ -360,223 +183,6 @@ fn tick_shell_detail_and_selection_restore_per_agent_and_ignore_obsolete_mouse_t
     );
     assert!(state.pointer_input.is_none());
     assert!(!state.monitor.focused);
-}
-
-#[tokio::test]
-async fn shell_detail_live_updates_its_tail_over_the_whole_screen() {
-    use crate::terminal::{execution::ConsoleExecution, task_access::ShellTaskCenter};
-    let directory = tempfile::tempdir().unwrap();
-    let core = tickloop_agent_runtime::Agent::new_embedded(
-        tickloop_agent_test_support::config(),
-        Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
-    );
-    core.install_own_tickhost();
-    let agent =
-        ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let receipt = agent
-        .submit_user_shell_for_goal(
-            chat,
-            None,
-            "printf 'first\n'; while [ ! -f release ]; do sleep 0.02; done; printf 'live-tail\n'"
-                .into(),
-            true,
-        )
-        .await
-        .unwrap();
-    let center = ShellTaskCenter::new(agent.clone());
-    let initial = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let snapshot = center.snapshot(chat).await.unwrap();
-            if snapshot
-                .tasks
-                .iter()
-                .any(|task| task.id == receipt.command_id && task.output_bytes > 0)
-            {
-                break snapshot;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let started = center.started_at_ms(chat, receipt.command_id).await;
-    assert!(started.is_some());
-    let mut state = State::new(true, 140, 25);
-    state.switch_view_chat(Some(chat));
-    state.prompt_enabled = true;
-    let console = tests::console_with_state(state);
-    console.update_shell_ticks(&initial).unwrap();
-    let action = {
-        let mut state = console.state.lock().unwrap();
-        state.monitor.focus(false, None);
-        let Some(InputEvent::TickAction { action, .. }) =
-            state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        else {
-            panic!("Shell did not open in panel");
-        };
-        action
-    };
-    super::super::tick_actions::execute(
-        action,
-        super::super::tick_actions::TickActionContext {
-            agent: &agent,
-            console: &console,
-            root: Some(directory.path()),
-            chat,
-        },
-    )
-    .await
-    .unwrap();
-    std::fs::write(directory.path().join("release"), "").unwrap();
-    let updated = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let snapshot = center.snapshot(chat).await.unwrap();
-            if snapshot
-                .tasks
-                .iter()
-                .any(|task| task.id == receipt.command_id && task.output_bytes > 6)
-            {
-                break snapshot;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    console.update_shell_ticks(&updated).unwrap();
-    tokio::time::sleep(Duration::from_millis(260)).await;
-    let (owner, action) = console
-        .poll_tick_detail()
-        .unwrap()
-        .expect("production detail poll");
-    assert_eq!(owner, chat);
-    super::super::tick_actions::execute(
-        action,
-        super::super::tick_actions::TickActionContext {
-            agent: &agent,
-            console: &console,
-            root: Some(directory.path()),
-            chat,
-        },
-    )
-    .await
-    .unwrap();
-    {
-        let mut state = console.state.lock().unwrap();
-        state.draw_frame(&mut Vec::new()).unwrap();
-        let screen = &state.rendered_screen;
-        assert!(
-            screen[0].starts_with("$ printf 'first"),
-            "the first line's key command heads the screen: {screen:#?}"
-        );
-        assert!(screen.iter().any(|row| row == "live-tail"), "{screen:#?}");
-        assert!(
-            screen.iter().all(|row| !row.contains('│')),
-            "the detail covers the whole screen: {screen:#?}"
-        );
-    }
-    core.shutdown().await;
-}
-
-#[tokio::test]
-async fn shell_detail_recovers_from_an_output_error() {
-    use crate::terminal::{
-        execution::ConsoleExecution,
-        task_access::ShellTaskCenter,
-        tick_actions::{TickActionContext, execute},
-    };
-    let directory = tempfile::tempdir().unwrap();
-    let core = tickloop_agent_runtime::Agent::new_embedded(
-        tickloop_agent_test_support::config(),
-        Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
-    );
-    core.install_own_tickhost();
-    let agent =
-        ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let receipt = agent
-        .submit_user_shell_for_goal(chat, None, "printf recovered-output".into(), true)
-        .await
-        .unwrap();
-    let center = ShellTaskCenter::new(agent.clone());
-    let snapshot = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let snapshot = center.snapshot(chat).await.unwrap();
-            if snapshot
-                .tasks
-                .iter()
-                .any(|task| task.id == receipt.command_id && task.state.is_terminal())
-            {
-                break snapshot;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let path = agent
-        .snapshot(chat)
-        .await
-        .unwrap()
-        .user_shells
-        .into_iter()
-        .find(|record| record.id == receipt.command_id)
-        .unwrap()
-        .output_ref
-        .unwrap();
-    let mut state = State::new(true, 140, 25);
-    state.switch_view_chat(Some(chat));
-    state.prompt_enabled = true;
-    let console = tests::console_with_state(state);
-    console.update_shell_ticks(&snapshot).unwrap();
-    let action = {
-        let mut state = console.state.lock().unwrap();
-        state.monitor.focus(false, None);
-        let Some(InputEvent::TickAction { action, .. }) =
-            state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        else {
-            panic!("missing panel");
-        };
-        action
-    };
-    let context = TickActionContext {
-        agent: &agent,
-        console: &console,
-        root: Some(directory.path()),
-        chat,
-    };
-    let unavailable = path.with_extension("held-by-test");
-    std::fs::rename(&path, &unavailable).unwrap();
-    execute(action, context).await.unwrap();
-    {
-        let state = console.state.lock().unwrap();
-        let hint = state.monitor.detail.as_ref().unwrap().hint();
-        assert!(hint.contains("esc back"));
-        assert_ne!(
-            hint, "esc back",
-            "failed output must be surfaced in the panel"
-        );
-    }
-    std::fs::rename(&unavailable, &path).unwrap();
-    tokio::time::sleep(Duration::from_millis(260)).await;
-    let (_, action) = console
-        .poll_tick_detail()
-        .unwrap()
-        .expect("detail retry poll");
-    execute(action, context).await.unwrap();
-    {
-        let mut state = console.state.lock().unwrap();
-        state.draw_frame(&mut Vec::new()).unwrap();
-        assert!(
-            state
-                .rendered_screen
-                .iter()
-                .any(|row| row.contains("recovered-output"))
-        );
-        assert_eq!(state.monitor.detail.as_ref().unwrap().hint(), "esc back");
-    }
-    core.shutdown().await;
 }
 
 fn click_fixture(width: u16, overlay: bool, group: TickGroup) -> State {
@@ -1609,125 +1215,6 @@ fn a_newly_registered_row_intent_runs_through_enter_and_click() {
     }
 }
 
-#[tokio::test]
-async fn shell_detail_confirmation_runs_the_production_adapter_control_callback() {
-    use crate::terminal::{
-        execution::ConsoleExecution,
-        task_access::ShellTaskCenter,
-        tick_actions::{TickActionContext, execute},
-    };
-    let directory = tempfile::tempdir().unwrap();
-    let core = tickloop_agent_runtime::Agent::new_embedded(
-        tickloop_agent_test_support::config(),
-        Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![])),
-    );
-    let agent =
-        ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let task = agent
-        .submit_user_shell_for_goal(chat, None, "printf ready; sleep 30".into(), true)
-        .await
-        .unwrap();
-    let center = ShellTaskCenter::new(agent.clone());
-    let initial = center.snapshot(chat).await.unwrap();
-    let mut state = State::new(true, 140, 25);
-    state.switch_view_chat(Some(chat));
-    state.prompt_enabled = true;
-    let console = tests::console_with_state(state);
-    console.update_shell_ticks(&initial).unwrap();
-    let action = {
-        let mut state = console.state.lock().unwrap();
-        state.monitor.focus(false, None);
-        let Some(InputEvent::TickAction { action, .. }) =
-            state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        else {
-            panic!("missing detail callback");
-        };
-        action
-    };
-    let context = TickActionContext {
-        agent: &agent,
-        console: &console,
-        root: Some(directory.path()),
-        chat,
-    };
-    execute(action, context).await.unwrap();
-    let action = {
-        let mut state = console.state.lock().unwrap();
-        assert!(
-            state
-                .key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
-                .is_none()
-        );
-        assert!(
-            state
-                .monitor
-                .detail
-                .as_ref()
-                .unwrap()
-                .hint()
-                .contains("enter confirm")
-        );
-        let Some(InputEvent::TickAction { action, .. }) =
-            state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        else {
-            panic!("missing control callback");
-        };
-        action
-    };
-    assert!(
-        !center
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .tasks
-            .iter()
-            .find(|row| row.id == task.command_id)
-            .unwrap()
-            .state
-            .is_terminal()
-    );
-    execute(action, context).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if center
-                .snapshot(chat)
-                .await
-                .unwrap()
-                .tasks
-                .iter()
-                .find(|row| row.id == task.command_id)
-                .unwrap()
-                .state
-                .is_terminal()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    let (_, action) = console
-        .poll_tick_detail()
-        .unwrap()
-        .expect("production detail poll");
-    execute(action, context).await.unwrap();
-    assert_eq!(
-        console
-            .state
-            .lock()
-            .unwrap()
-            .monitor
-            .detail
-            .as_ref()
-            .unwrap()
-            .hint(),
-        "esc back"
-    );
-    core.shutdown().await;
-}
-
 /// A probe of the members of one Tick type that finds every member gone.
 struct FixtureGoneProbe(&'static str);
 #[async_trait::async_trait]
@@ -2166,6 +1653,45 @@ fn running_background_shells_are_named_by_key_command_and_count_from_their_start
     );
 }
 
+/// A detail inside Monitor about one row, such as its subscriptions.
+struct RowDetail {
+    chat: Uuid,
+    instance: tick_protocol::InstanceRef,
+}
+impl crate::terminal::tick_actions::TickDetailView for RowDetail {
+    fn id(&self) -> Uuid {
+        Uuid::nil()
+    }
+    fn chat(&self) -> Uuid {
+        self.chat
+    }
+    fn instance(&self) -> Option<tick_protocol::InstanceRef> {
+        Some(self.instance.clone())
+    }
+    fn lines(
+        &mut self,
+        _width: usize,
+        _height: usize,
+        _now: u64,
+    ) -> Vec<crate::terminal::tick_actions::TickDetailLine> {
+        Vec::new()
+    }
+    fn hint(&self) -> String {
+        "esc back".into()
+    }
+    fn key(
+        &mut self,
+        _key: KeyEvent,
+        _width: usize,
+        _height: usize,
+    ) -> crate::terminal::tick_actions::TickDetailKey {
+        crate::terminal::tick_actions::TickDetailKey::Back
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
 #[test]
 fn a_finished_background_shell_leaves_once_handled_unless_its_detail_is_open() {
     use crate::monitor_rows::FINISHED_SHELL_DISPLAY_MS;
@@ -2211,11 +1737,10 @@ fn a_finished_background_shell_leaves_once_handled_unless_its_detail_is_open() {
     let leaves = handled + FINISHED_SHELL_DISPLAY_MS;
     assert!(!state.monitor.refresh_due(leaves - 1));
     assert_eq!(state.monitor.entries().len(), 1);
-    state.monitor.detail = Some(Box::new(crate::terminal::tick_shell::TickShell::loading(
+    state.monitor.detail = Some(Box::new(RowDetail {
         chat,
-        snapshot.tasks[0].id,
-        DisplayProfile::default(),
-    )));
+        instance: tick_protocol::InstanceRef::shell(snapshot.tasks[0].id),
+    }));
     assert!(state.monitor.refresh_due(leaves));
     assert_eq!(
         state.monitor.entries().len(),
@@ -2774,8 +2299,10 @@ fn a_gone_row_leaves_monitor_thirty_seconds_after_it_went() {
     assert!(state.monitor.entries().is_empty(), "then it leaves");
 }
 
+/// A running Shell is stopped from its Monitor row: `s` asks first, Esc keeps it running, and
+/// once confirmed the Shell's own control stops it and its row shows it ended.
 #[tokio::test]
-async fn closing_the_detail_of_a_shell_stopped_from_it_marks_its_end_seen() {
+async fn a_running_shell_is_stopped_from_its_row_once_confirmed() {
     use crate::terminal::{
         execution::ConsoleExecution,
         task_access::ShellTaskCenter,
@@ -2800,6 +2327,13 @@ async fn closing_the_detail_of_a_shell_stopped_from_it_marks_its_end_seen() {
         .await
         .unwrap();
     let center = ShellTaskCenter::new(agent.clone());
+    let task_state = |snapshot: &tickloop_agent_protocol::ShellTaskSnapshot| {
+        snapshot
+            .tasks
+            .iter()
+            .find(|task| task.id == receipt.command_id)
+            .map(|task| task.state)
+    };
     let running = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let snapshot = center.snapshot(chat).await.unwrap();
@@ -2838,59 +2372,63 @@ async fn closing_the_detail_of_a_shell_stopped_from_it_marks_its_end_seen() {
             .key(KeyEvent::new(code, KeyModifiers::NONE))
     };
     console.state.lock().unwrap().monitor.focus(false, None);
-    let Some(InputEvent::TickAction { action, .. }) = press(KeyCode::Enter) else {
-        panic!("Enter did not open the Shell");
-    };
-    execute(action, context).await.unwrap();
-    console.update_shell_ticks(&running).unwrap();
-    assert!(press(KeyCode::Char('s')).is_none());
-    let Some(InputEvent::TickAction { action, .. }) = press(KeyCode::Enter) else {
-        panic!("confirming did not stop the Shell");
-    };
-    execute(action, context).await.unwrap();
-    let ended = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let snapshot = center.snapshot(chat).await.unwrap();
-            if snapshot
-                .tasks
-                .iter()
-                .any(|task| task.id == receipt.command_id && task.state.is_terminal())
-            {
-                break snapshot;
-            }
+    for confirms in [false, true] {
+        let Some(InputEvent::TickAction { action, .. }) = press(KeyCode::Char('s')) else {
+            panic!("s did not ask to stop the Shell");
+        };
+        assert_eq!(action.instance, shell.to_string());
+        execute(action, context).await.unwrap();
+        {
+            let state = console.state.lock().unwrap();
+            assert!(
+                state.status.contains("Stop this Shell?"),
+                "{}",
+                state.status
+            );
+            assert!(state.monitor.detail.is_none(), "nothing opens in Monitor");
+        }
+        assert!(
+            !task_state(&center.snapshot(chat).await.unwrap())
+                .unwrap()
+                .is_terminal(),
+            "asking stops nothing"
+        );
+        if !confirms {
+            assert!(press(KeyCode::Esc).is_none());
+            assert!(console.state.lock().unwrap().monitor.confirmation.is_none());
+            continue;
+        }
+        let Some(InputEvent::TickAction { action, .. }) = press(KeyCode::Enter) else {
+            panic!("confirming did not stop the Shell");
+        };
+        execute(action, context).await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !task_state(&center.snapshot(chat).await.unwrap())
+            .unwrap()
+            .is_terminal()
+        {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .unwrap();
+    let ended = center.snapshot(chat).await.unwrap();
     console.update_shell_ticks(&ended).unwrap();
-    let closed = {
-        let mut state = console.state.lock().unwrap();
-        assert!(state.monitor.detail.is_some());
-        let Some(InputEvent::TickAction { action, .. }) =
-            state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-        else {
-            panic!("closing the detail reports what the user saw");
-        };
-        assert!(state.monitor.detail.is_none());
-        action
-    };
-    execute(closed, context).await.unwrap();
-    let end = ended
-        .tasks
-        .iter()
-        .find(|task| task.id == receipt.command_id)
-        .and_then(|task| task.ended_at_ms)
-        .expect("a stopped Shell knows when it ended");
-    let handled = agent
-        .snapshot(chat)
-        .await
+    let actions = console
+        .state
+        .lock()
         .unwrap()
         .monitor
-        .handled_at(&shell);
+        .entries()
+        .iter()
+        .find(|entry| entry.instance == shell)
+        .expect("the stopped Shell keeps its row")
+        .actions
+        .clone();
     assert!(
-        handled.is_some_and(|handled| handled >= end),
-        "the end shown in the detail counts as seen: {handled:?} < {end}"
+        actions.iter().all(|action| action.key != 's'),
+        "an ended Shell has nothing to stop"
     );
     std::fs::write(&gate, "").unwrap();
     core.shutdown().await;

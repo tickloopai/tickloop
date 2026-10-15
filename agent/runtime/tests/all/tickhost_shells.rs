@@ -10,14 +10,15 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use tick_protocol::InstanceRef;
 use tickhost::shell::{ShellApproval, ShellIdentity, SpawnBinding, SpawnGrant};
 use tickhost_connect::{host_error::HostError, hosted};
 use tickloop_agent_base::private_fs::PrivateDirectory;
-use tickloop_agent_protocol::{CommandState, ToolResult};
+use tickloop_agent_protocol::{CommandState, HostedViewGrant, ToolResult};
 use tickloop_agent_runtime::{
     Agent,
     hosted::{
-        shells::{OwnTickhost, SpawnIssuer},
+        shells::{OwnTickhost, ShellGrants},
         worker_control::IssuedSpawn,
     },
 };
@@ -49,14 +50,14 @@ impl Fixture {
         Self::granting_with(Some(Arc::new(OwnTickhost::new())))
     }
 
-    /// An Agent whose spawns `issuer` grants, or an Agent without a daemon.
-    fn granting_with(issuer: Option<Arc<dyn SpawnIssuer>>) -> Self {
+    /// An Agent whose spawns `grants` grant, or an Agent without a daemon.
+    fn granting_with(grants: Option<Arc<dyn ShellGrants>>) -> Self {
         let agent = Agent::new(
             tickloop_agent_test_support::config(),
             Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
         );
-        if let Some(issuer) = issuer {
-            agent.install_shell_issuer(issuer);
+        if let Some(grants) = grants {
+            agent.install_shell_grants(grants);
         }
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
@@ -270,14 +271,14 @@ async fn an_agent_without_a_daemon_refuses_to_run_a_command() {
 }
 
 /// Grants spawns from a Tickhost of its own once a test lets each grant through.
-struct HeldIssuer {
+struct HeldGrants {
     host: OwnTickhost,
     asked: tokio::sync::Notify,
     released: tokio::sync::Semaphore,
 }
 
 #[async_trait::async_trait]
-impl SpawnIssuer for HeldIssuer {
+impl ShellGrants for HeldGrants {
     async fn allow_spawn(
         &self,
         chat: Uuid,
@@ -289,16 +290,24 @@ impl SpawnIssuer for HeldIssuer {
         self.released.acquire().await.unwrap().forget();
         issued
     }
+
+    async fn allow_view(
+        &self,
+        chat: Uuid,
+        instance: &InstanceRef,
+    ) -> Result<HostedViewGrant, HostError> {
+        self.host.allow_view(chat, instance).await
+    }
 }
 
 #[tokio::test]
 async fn a_command_stopped_while_its_spawn_is_granted_never_starts() {
-    let issuer = Arc::new(HeldIssuer {
+    let grants = Arc::new(HeldGrants {
         host: OwnTickhost::new(),
         asked: tokio::sync::Notify::new(),
         released: tokio::sync::Semaphore::new(0),
     });
-    let fixture = Arc::new(Fixture::granting_with(Some(issuer.clone())));
+    let fixture = Arc::new(Fixture::granting_with(Some(grants.clone())));
     let prepared = fixture
         .prepare(json!({"command":"touch probe; sleep 30"}))
         .await;
@@ -307,7 +316,7 @@ async fn a_command_stopped_while_its_spawn_is_granted_never_starts() {
         let fixture = fixture.clone();
         async move { fixture.run_as(prepared, id).await }
     });
-    issuer.asked.notified().await;
+    grants.asked.notified().await;
     let stopping = tokio::spawn({
         let fixture = fixture.clone();
         async move { fixture.tools.stop_command(id).await }
@@ -315,7 +324,7 @@ async fn a_command_stopped_while_its_spawn_is_granted_never_starts() {
     while fixture.command_state(id).await != CommandState::Cancelling {
         tokio::task::yield_now().await;
     }
-    issuer.released.add_permits(1);
+    grants.released.add_permits(1);
     let result = tokio::time::timeout(Duration::from_secs(10), running)
         .await
         .unwrap()
@@ -376,7 +385,7 @@ impl AnswerlessHost {
 }
 
 #[async_trait::async_trait]
-impl SpawnIssuer for AnswerlessHost {
+impl ShellGrants for AnswerlessHost {
     async fn allow_spawn(
         &self,
         chat: Uuid,
@@ -400,6 +409,10 @@ impl SpawnIssuer for AnswerlessHost {
             },
             endpoint: self.endpoint.clone(),
         })
+    }
+
+    async fn allow_view(&self, _: Uuid, _: &InstanceRef) -> Result<HostedViewGrant, HostError> {
+        Err(HostError::before("Unsupported", "this host shows nothing"))
     }
 }
 

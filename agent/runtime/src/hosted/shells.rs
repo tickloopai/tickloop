@@ -1,14 +1,16 @@
 //! Shell commands run in the Tickhost. After a command's approval and final check the worker asks
 //! its daemon for a one-time spawn grant, then submits the command on its own spawner connection,
 //! passing the approved directory and the output file as descriptors; the command lives as long as
-//! that connection. An Agent without a daemon runs no command, unless it is given a Tickhost of its
-//! own, served inside its process, as tests are.
+//! that connection. A View of the Chat shows a command through a one-time view grant from the same
+//! daemon. An Agent without a daemon runs no command and shows none, unless it is given a Tickhost
+//! of its own, served inside its process, as tests are.
 
 use std::{
     os::unix::ffi::OsStrExt,
     sync::{Arc, PoisonError, RwLock},
 };
 
+use tick_protocol::InstanceRef;
 use tickhost::{
     paths::HostPaths,
     shell::{
@@ -16,7 +18,7 @@ use tickhost::{
     },
 };
 use tickhost_connect::host_error::HostError;
-use tickloop_agent_protocol::CommandState;
+use tickloop_agent_protocol::{CommandState, HostedViewGrant};
 use tickloop_agent_tools::{
     ShellExit, ShellHost, ShellLaunch, ShellProcess, ShellStartError, ToolError,
 };
@@ -28,19 +30,25 @@ use super::{
     worker_control::{DaemonControl, IssuedSpawn, WorkerRequest},
 };
 
-/// Grants spawns of commands a Chat approved.
+/// Grants spawns of commands a Chat approved, and views of the commands it started.
 #[async_trait::async_trait]
-pub trait SpawnIssuer: Send + Sync {
+pub trait ShellGrants: Send + Sync {
     async fn allow_spawn(
         &self,
         chat: Uuid,
         operation: Uuid,
         approval: ShellApproval,
     ) -> Result<IssuedSpawn, HostError>;
+
+    async fn allow_view(
+        &self,
+        chat: Uuid,
+        instance: &InstanceRef,
+    ) -> Result<HostedViewGrant, HostError>;
 }
 
 #[async_trait::async_trait]
-impl SpawnIssuer for DaemonControl {
+impl ShellGrants for DaemonControl {
     async fn allow_spawn(
         &self,
         chat: Uuid,
@@ -57,29 +65,55 @@ impl SpawnIssuer for DaemonControl {
         serde_json::from_value(issued)
             .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))
     }
+
+    async fn allow_view(
+        &self,
+        chat: Uuid,
+        instance: &InstanceRef,
+    ) -> Result<HostedViewGrant, HostError> {
+        let granted = self
+            .request(WorkerRequest::AllowShellView {
+                chat,
+                instance: instance.clone(),
+            })
+            .await?;
+        serde_json::from_value(granted)
+            .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))
+    }
 }
 
-/// The issuer of an Agent without a daemon: only a daemon grants spawns, so it grants none.
+/// The grants of an Agent without a daemon: only a daemon grants spawns and views, so it grants
+/// none.
 pub(crate) struct NoDaemon;
 
+impl NoDaemon {
+    fn refusal() -> HostError {
+        HostError::before(
+            "Unsupported",
+            "shell commands run in the Tickhost of the Agent daemon, and this Agent runs without one",
+        )
+    }
+}
+
 #[async_trait::async_trait]
-impl SpawnIssuer for NoDaemon {
+impl ShellGrants for NoDaemon {
     async fn allow_spawn(
         &self,
         _: Uuid,
         _: Uuid,
         _: ShellApproval,
     ) -> Result<IssuedSpawn, HostError> {
-        Err(HostError::before(
-            "Unsupported",
-            "shell commands run in the Tickhost of the Agent daemon, and this Agent runs without one",
-        ))
+        Err(Self::refusal())
+    }
+
+    async fn allow_view(&self, _: Uuid, _: &InstanceRef) -> Result<HostedViewGrant, HostError> {
+        Err(Self::refusal())
     }
 }
 
-/// An issuer that controls a Tickhost of its own, served inside this process from a private
-/// runtime directory, under an epoch and worker identity of its own; it lets an Agent without a
-/// daemon run commands in tests.
+/// Grants that control a Tickhost of its own, served inside this process from a private runtime
+/// directory, under an epoch and worker identity of its own; they let an Agent without a daemon
+/// run and show commands in tests.
 pub struct OwnTickhost {
     directory: tickloop_agent_base::private_fs::PrivateDirectory,
     worker: Uuid,
@@ -102,16 +136,9 @@ impl Default for OwnTickhost {
     }
 }
 
-#[async_trait::async_trait]
-impl SpawnIssuer for OwnTickhost {
-    async fn allow_spawn(
-        &self,
-        chat: Uuid,
-        operation: Uuid,
-        approval: ShellApproval,
-    ) -> Result<IssuedSpawn, HostError> {
-        let controller = self
-            .controller
+impl OwnTickhost {
+    async fn controller(&self) -> Result<&HostController, HostError> {
+        self.controller
             .get_or_try_init(|| async {
                 self.directory
                     .create()
@@ -127,14 +154,30 @@ impl SpawnIssuer for OwnTickhost {
                     Uuid::new_v4(),
                 ))
             })
-            .await?;
+            .await
+    }
+
+    fn identity(&self, controller: &HostController, chat: Uuid) -> ShellIdentity {
+        ShellIdentity {
+            daemon_epoch: controller.daemon_epoch(),
+            worker: self.worker,
+            chat,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ShellGrants for OwnTickhost {
+    async fn allow_spawn(
+        &self,
+        chat: Uuid,
+        operation: Uuid,
+        approval: ShellApproval,
+    ) -> Result<IssuedSpawn, HostError> {
+        let controller = self.controller().await?;
         let binding = SpawnBinding {
             operation,
-            identity: ShellIdentity {
-                daemon_epoch: controller.daemon_epoch(),
-                worker: self.worker,
-                chat,
-            },
+            identity: self.identity(controller, chat),
             approval,
         };
         let grant = controller.allow_spawn(&binding).await?;
@@ -144,23 +187,50 @@ impl SpawnIssuer for OwnTickhost {
             endpoint: controller.endpoint(),
         })
     }
+
+    async fn allow_view(
+        &self,
+        chat: Uuid,
+        instance: &InstanceRef,
+    ) -> Result<HostedViewGrant, HostError> {
+        let controller = self.controller().await?;
+        controller
+            .allow_shell_view(&self.identity(controller, chat), instance)
+            .await
+    }
 }
 
-/// The Shell tasks of this Agent that the Tickhost runs, and who grants their spawns.
+/// The Shell tasks of this Agent that the Tickhost runs, and who grants their spawns and views.
 pub struct ShellTasks {
-    issuer: RwLock<Arc<dyn SpawnIssuer>>,
+    grants: RwLock<Arc<dyn ShellGrants>>,
 }
 
 impl ShellTasks {
-    pub fn new(issuer: Arc<dyn SpawnIssuer>) -> Arc<Self> {
+    pub fn new(grants: Arc<dyn ShellGrants>) -> Arc<Self> {
         Arc::new(Self {
-            issuer: RwLock::new(issuer),
+            grants: RwLock::new(grants),
         })
     }
 
-    /// Replaces who grants later spawns: a worker's daemon, or a test's own Tickhost.
-    pub fn install_issuer(&self, issuer: Arc<dyn SpawnIssuer>) {
-        *self.issuer.write().unwrap_or_else(PoisonError::into_inner) = issuer;
+    /// Replaces who grants later spawns and views: a worker's daemon, or a test's own Tickhost.
+    pub fn install_grants(&self, grants: Arc<dyn ShellGrants>) {
+        *self.grants.write().unwrap_or_else(PoisonError::into_inner) = grants;
+    }
+
+    /// Lets one View of `chat` show its Shell task `instance` once, running or ended.
+    pub async fn allow_view(
+        &self,
+        chat: Uuid,
+        instance: &InstanceRef,
+    ) -> Result<HostedViewGrant, HostError> {
+        self.grants().allow_view(chat, instance).await
+    }
+
+    fn grants(&self) -> Arc<dyn ShellGrants> {
+        self.grants
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The host of `chat`'s commands.
@@ -204,13 +274,9 @@ impl ShellHost for ChatShells {
             cancel,
         } = launch;
         let environment = launch_environment();
-        let issuer = self
+        let issued = self
             .tasks
-            .issuer
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        let issued = issuer
+            .grants()
             .allow_spawn(
                 self.chat,
                 operation_id,

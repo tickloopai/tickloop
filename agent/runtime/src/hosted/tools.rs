@@ -16,7 +16,7 @@ use tick_protocol::{InstanceRef, TickDescriptor};
 use tickhost::host::{Receipt, TerminalDescription, TerminalRead, TickAdapter, TickRow};
 use tickhost_connect::{
     herdr::Pane,
-    host_error::HostError,
+    host_error::{HostError, TOOL_FAILED},
     hosted::{CALL_RESPONSE_TIMEOUT, CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role},
     layout::{LayoutContext, Placement},
     page::{MAX_PAGE_SIZE, PageCursor},
@@ -39,12 +39,14 @@ use crate::{
 };
 use tickloop_agent_protocol::{
     ChatId, HostCallContext, HostEndpointIdentity, HostToolAuthority, HostedMember,
-    HostedMemberState, HostedProgramExit, HostedResources, HostedScreenSnapshot, HostedSnapshot,
-    HostedViewGrant, ToolDefinition, ToolResult,
+    HostedMemberState, HostedProgramExit, HostedResources, HostedViewGrant, ToolDefinition,
+    ToolResult,
 };
 
 /// How results name the Tickhost that runs a Tick.
 const HOSTED_HOST: &str = "tickhost";
+/// What a call the Tick ran and reported failed tells the model, unlike an unknown outcome.
+const TOOL_FAILED_DIAGNOSTIC: &str = "The Tick ran the call and reported this failure; its outcome is known. Correct the call before making it again.";
 
 #[derive(Clone)]
 struct DataBinding {
@@ -65,23 +67,6 @@ fn hosted_resources(resources: tickhost::host::Resources) -> HostedResources {
         cpu_time_ms,
         rss_bytes,
         sampled_at_ms,
-    }
-}
-
-fn hosted_screen_snapshot(screen: tickhost::screen::ScreenSnapshot) -> HostedScreenSnapshot {
-    let tickhost::screen::ScreenSnapshot {
-        lines,
-        truncated,
-        rows,
-        columns,
-        alternate_screen,
-    } = screen;
-    HostedScreenSnapshot {
-        lines,
-        truncated,
-        rows,
-        columns,
-        alternate_screen,
     }
 }
 
@@ -379,7 +364,7 @@ impl HostedTickTools {
                     .map_err(|error| error.to_string())?;
                 let current = self
                     .views()?
-                    .pane(chat, &instance)
+                    .pane(&instance)
                     .await
                     .map_err(|error| error.to_string())?;
                 let view = self
@@ -589,7 +574,7 @@ impl HostedTickTools {
     }
 
     /// Checks before dispatch that nothing the approval relied on changed.
-    async fn revalidate(&self, chat: ChatId, prepared: &HostedPrepared) -> Result<(), String> {
+    async fn revalidate(&self, prepared: &HostedPrepared) -> Result<(), String> {
         match &prepared.operation {
             Operation::Open {
                 command,
@@ -620,7 +605,7 @@ impl HostedTickTools {
                 self.revalidate_view(view).await?;
                 let now = self
                     .views()?
-                    .pane(chat, instance)
+                    .pane(instance)
                     .await
                     .map_err(|error| error.to_string())?;
                 let unchanged = match (current, &now) {
@@ -672,7 +657,7 @@ impl HostedTickTools {
         prepared: HostedPrepared,
         cancel: CancellationToken,
     ) -> HostCallResult {
-        if let Err(error) = self.revalidate(chat, &prepared).await {
+        if let Err(error) = self.revalidate(&prepared).await {
             return HostCallResult::NotDispatched(error);
         }
         match prepared.operation {
@@ -681,7 +666,7 @@ impl HostedTickTools {
                     let rows = self.running(chat).await?;
                     self.views()
                         .map_err(|error| HostError::before("UnsupportedCapability", error))?
-                        .read_workspace(chat, listing, rows)
+                        .read_workspace(listing, rows)
                         .await
                 };
                 match shown.await {
@@ -710,10 +695,7 @@ impl HostedTickTools {
                         _ => HostCallResult::OutcomeUnknown(result.to_string()),
                     };
                 };
-                match views
-                    .move_view(chat, &instance, pane, &view.placement, cancel)
-                    .await
-                {
+                match views.move_view(pane, &view.placement, cancel).await {
                     Ok(moved) => completed(
                         json!({"status":"completed","host":HOSTED_HOST,"tick_instance_id":instance,"view":moved}),
                     ),
@@ -797,12 +779,17 @@ impl HostedTickTools {
                     instance: instance.clone(),
                     admission: self.admission(),
                 };
+                // The views are found while they still name the Tick, before it ends them.
+                let shown = match &self.views {
+                    Some(views) => views.panes(&instance).await.unwrap_or_default(),
+                    None => Vec::new(),
+                };
                 match self.lifecycle(chat, operation, request).await {
                     Ok(_) => {
                         self.bindings.lock().await.remove(&(chat, instance.clone()));
                         let mut closed = json!({"status":"closed","host":HOSTED_HOST,"tick_instance_id":instance});
                         if let Some(views) = &self.views
-                            && let Some(view) = views.close(chat, &instance).await
+                            && let Some(view) = views.close(&shown).await
                         {
                             closed["view"] = view;
                         }
@@ -854,6 +841,13 @@ impl HostedTickTools {
                     Ok(result) => completed(
                         json!({"status":"completed","tick_instance_id":instance,"result":result}),
                     ),
+                    Err(error) if error.code == TOOL_FAILED => {
+                        HostCallResult::Completed(ToolResult {
+                            content: json!({"status":"failed","tick_instance_id":instance,"error":error.message,"diagnostic":TOOL_FAILED_DIAGNOSTIC}).to_string(),
+                            is_error: true,
+                            output_ref: None,
+                        })
+                    }
                     Err(error) if error.dispatched => {
                         HostCallResult::OutcomeUnknown(error.to_string())
                     }
@@ -995,11 +989,7 @@ impl HostedTickTools {
             Err(error) => return not_created(&HostError::before("UnsupportedCapability", error)),
         };
         match self.allow_view(chat, instance).await {
-            Ok(grant) => {
-                views
-                    .show(chat, instance, &grant, workspace, placement, cancel)
-                    .await
-            }
+            Ok(grant) => views.show(&grant, workspace, placement, cancel).await,
             Err(error) => not_created(&error),
         }
     }
@@ -1306,26 +1296,6 @@ impl HostedTickTools {
         self.daemon.intent_renewal()
     }
 
-    /// The current screen of one of the Chat's hosted Ticks as text. Taking it reads host state
-    /// only: it never counts as using the Tick, subscribes or calls the model.
-    pub async fn snapshot(
-        &self,
-        chat: ChatId,
-        instance: &InstanceRef,
-    ) -> Result<HostedSnapshot, HostError> {
-        let screen = self
-            .data(chat, instance)
-            .await?
-            .request("snapshot", json!({}), CONTROL_TIMEOUT)
-            .await?;
-        Ok(HostedSnapshot {
-            screen: serde_json::from_value(screen)
-                .map(hosted_screen_snapshot)
-                .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))?,
-            taken_at_ms: tickloop_agent_base::private_fs::unix_time_milliseconds(),
-        })
-    }
-
     /// Lets one View of the Chat attach to its hosted Tick once, without its data token.
     pub async fn allow_view(
         &self,
@@ -1604,7 +1574,7 @@ impl HostToolProvider for HostedTickTools {
 
     async fn revalidate_call(
         &self,
-        chat: ChatId,
+        _chat: ChatId,
         call: &PreparedHostCall,
         cancel: CancellationToken,
     ) -> Result<(), String> {
@@ -1614,7 +1584,7 @@ impl HostToolProvider for HostedTickTools {
         let prepared = call
             .payload::<HostedPrepared>()
             .ok_or("hosted Tick operation has no prepared binding")?;
-        self.revalidate(chat, prepared).await
+        self.revalidate(prepared).await
     }
 
     async fn execute_prepared(

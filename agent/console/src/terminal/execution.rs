@@ -3047,26 +3047,6 @@ impl ConsoleExecution {
             _ => Err(unexpected()),
         }
     }
-    pub(super) async fn hosted_tick_snapshot(
-        &self,
-        chat: Uuid,
-        instance: tick_protocol::InstanceRef,
-    ) -> Result<tickloop_agent_protocol::HostedSnapshot, AccessError> {
-        let execution = self.reference(chat).await?;
-        match self
-            .command(
-                AgentCommand::HostedTickSnapshot {
-                    execution,
-                    instance,
-                },
-                None,
-            )
-            .await?
-        {
-            CommandResult::HostedTickSnapshot(snapshot) => Ok(snapshot),
-            _ => Err(unexpected()),
-        }
-    }
     pub(super) async fn attach_hosted_tick(
         &self,
         chat: Uuid,
@@ -3897,6 +3877,7 @@ mod tests {
             tab_id: "tab-first".into(),
             cwd: None,
             foreground_cwd: None,
+            tokens: Default::default(),
         }));
         let served_pane = pane.clone();
         let host = tokio::spawn(async move {

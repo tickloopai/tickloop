@@ -1683,7 +1683,7 @@ async fn an_over_sized_delivery_blanks_its_largest_data_and_points_to_native_rec
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_truncated_terminal_observation_points_to_current_text_without_promising_history() {
+async fn a_truncated_terminal_tick_delivery_points_to_its_current_screen() {
     let directory = tempfile::tempdir().unwrap();
     let run = "calendar:terminal:session:run-88";
     let model = Arc::new(ScriptedModel::new(vec![
@@ -1715,10 +1715,53 @@ async fn a_truncated_terminal_observation_points_to_current_text_without_promisi
     tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
     let delivered = last_user_text(&model);
+    assert!(
+        delivered.contains("A Terminal Tick's screen was too large"),
+        "{delivered}"
+    );
     assert!(delivered.contains("ReadTick"), "{delivered}");
     assert!(delivered.contains("cannot be recovered"), "{delivered}");
     assert!(!delivered.contains("CallTickTool"), "{delivered}");
     assert!(delivered.len() < 2 * MAX_DELIVERY_PAYLOAD_BYTES);
+    agent.shutdown().await;
+}
+
+/// A screen too large for a delivery loses its text, never how its program ended: one too large
+/// for the delivery and one too large even to be kept until it is due both still say their exit.
+#[tokio::test(start_paused = true)]
+async fn a_terminal_exit_is_delivered_when_its_screen_text_is_left_out() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(20)}),
+        ),
+        call(
+            "s2",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(21)}),
+        ),
+        text("watching both terminals"),
+        text("both exited"),
+    ]));
+    let (agent, stream, _, _) = subscribed_agent(directory.path(), model.clone()).await;
+    let mut events = agent.subscribe();
+    let exited = |instance, text: String, code| TickObservation {
+        kind: ObservationKind::Terminal { truncated: true },
+        ..screen(instance, 1, &text, json!({"code":code,"signal":null}))
+    };
+    stream.push(exited(20, "x".repeat(2 * MAX_DELIVERY_PAYLOAD_BYTES), 3));
+    stream.push(exited(21, "y".repeat(8 * MAX_DELIVERY_PAYLOAD_BYTES), 4));
+    settle().await;
+    tokio::time::advance(HIGH_PERIOD).await;
+    wait_for_completion(&mut events).await;
+    let delivered = last_user_text(&model);
+    assert!(delivered.len() < 2 * MAX_DELIVERY_PAYLOAD_BYTES);
+    assert!(!delivered.contains("xxxx") && !delivered.contains("yyyy"));
+    assert!(delivered.contains("\"code\":3"), "{delivered}");
+    assert!(delivered.contains("\"code\":4"), "{delivered}");
+    assert!(delivered.contains("ReadTick"), "{delivered}");
     agent.shutdown().await;
 }
 
@@ -2553,6 +2596,59 @@ async fn an_immediate_delivery_whose_watermark_failed_is_retried_until_it_lands(
         "the held delivery is retried without another update"
     );
     assert!(last_user_text(&model).contains("exit 0"));
+    agent.shutdown().await;
+}
+
+/// A periodic delivery that came due but was held is looked at again shortly, not one period
+/// later: here its watermark could not be written, and it lands soon after writing works again.
+#[tokio::test(start_paused = true)]
+async fn a_held_periodic_delivery_is_retried_before_its_next_period() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let workdir = directory.path().join("work");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        text("ready"),
+        text("saw the first"),
+        text("saw the second"),
+    ]));
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    let stream = InMemoryTickStream::new();
+    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let chat = agent.create_chat(workdir).await.unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(chat, None, "watch".into()).await.unwrap();
+    wait_for_completion(&mut events).await;
+    subscribe_loop(&agent, chat, receipt.loop_id, &[fixture_instance(5)]).await;
+    stream.push(update(5, 1, "first"));
+    accumulated(&agent, chat, 1).await;
+    tokio::time::advance(HIGH_PERIOD).await;
+    wait_for_completion(&mut events).await;
+    let watermarks = watermark_files(&root)[0].parent().unwrap().to_path_buf();
+    let kept = watermarks.with_extension("kept");
+    std::fs::rename(&watermarks, &kept).unwrap();
+    std::fs::write(&watermarks, "a file where the watermark directory belongs").unwrap();
+
+    stream.push(update(5, 2, "second"));
+    accumulated(&agent, chat, 1).await;
+    tokio::time::advance(HIGH_PERIOD).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        2,
+        "a delivery whose watermark cannot be written is held"
+    );
+    std::fs::remove_file(&watermarks).unwrap();
+    std::fs::rename(&kept, &watermarks).unwrap();
+
+    let held_at = tokio::time::Instant::now();
+    while !matches!(
+        next_event_within(&mut events, HIGH_PERIOD / 2).await.kind,
+        EventKind::Completed { .. }
+    ) {}
+    assert!(held_at.elapsed() < HIGH_PERIOD / 2);
+    assert_eq!(model.requests.lock().unwrap().len(), 3);
+    assert!(last_user_text(&model).contains("second"));
     agent.shutdown().await;
 }
 

@@ -322,13 +322,13 @@
     "instance": "hosted:00000000-0000-0000-0000-000000000041"
   },
   {
-    "kind": "hosted_tick_snapshot",
+    "kind": "attach_hosted_tick",
     "execution": {
       "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
       "agent_id": "00000000-0000-0000-0000-0000000000a1",
       "generation": 3
     },
-    "instance": "hosted:00000000-0000-0000-0000-000000000040"
+    "instance": "shell:00000000-0000-0000-0000-00000000005e"
   },
   {
     "kind": "load_record",

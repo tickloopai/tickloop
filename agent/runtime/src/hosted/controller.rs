@@ -406,6 +406,32 @@ impl HostController {
                 Start::Never,
             )
             .await?;
+        self.view_grant(instance, &granted)
+    }
+
+    /// Lets one view attach to the Shell task `instance` that `identity` submitted, running or
+    /// ended. The grant works once and names the host process it was made by.
+    pub async fn allow_shell_view(
+        &self,
+        identity: &tickhost::shell::ShellIdentity,
+        instance: &tick_protocol::InstanceRef,
+    ) -> Result<HostedViewGrant, HostError> {
+        let granted = self
+            .request(
+                "allow_shell_view",
+                json!({"identity":identity,"instance":instance}),
+                CONTROL_TIMEOUT,
+                Start::Never,
+            )
+            .await?;
+        self.view_grant(instance, &granted)
+    }
+
+    fn view_grant(
+        &self,
+        instance: &tick_protocol::InstanceRef,
+        granted: &Value,
+    ) -> Result<HostedViewGrant, HostError> {
         let field = |name: &str| {
             serde_json::from_value(granted[name].clone())
                 .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))

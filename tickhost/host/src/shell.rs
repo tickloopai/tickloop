@@ -1,7 +1,9 @@
 //! Shell tasks: commands a Worker approved, run in pipe mode for as long as the spawner connection
 //! that submitted them. The host judges no command: it runs the one request that carries a live
 //! spawn grant and matches what that grant binds, in the directory and with the output file the
-//! request passed as descriptors, and never resolves a path of its own.
+//! request passed as descriptors, and never resolves a path of its own. Views of a task show the
+//! screen the host draws from its output; one its Worker's daemon granted can keep showing an
+//! ended task after its spawner left.
 
 use std::{
     collections::HashMap,
@@ -11,7 +13,10 @@ use std::{
     },
     path::PathBuf,
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -34,6 +39,11 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::{
+    shell_screen::ShellScreen,
+    views::{ViewGrants, Views},
+};
+
 /// How long a spawn grant waits for its spawner to connect.
 pub const SPAWN_GRANT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A stopped task's process group gets SIGTERM, then SIGKILL once this passed.
@@ -42,6 +52,8 @@ pub const SHELL_TERMINATE_GRACE: Duration = Duration::from_millis(200);
 pub const MAX_SHELL_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 /// How much of the output's end a read and the exit update carry.
 pub const OUTPUT_TAIL_BYTES: usize = 4096;
+/// How much of the output's end a view is drawn from when it starts over, as after a resize.
+pub const VIEW_OUTPUT_BYTES: u64 = 256 * 1024;
 pub const CANCELLED_REASON: &str = "cancelled";
 pub const OUTPUT_LIMIT_REASON: &str = "output_limit_exceeded";
 pub const UNRESOLVED_DESCENDANTS_REASON: &str =
@@ -350,8 +362,22 @@ pub(crate) struct ShellTask {
     /// The first reason it was asked to stop for.
     stop: watch::Sender<Option<String>>,
     exit: watch::Sender<Option<ShellExit>>,
-    /// Cancelled once the task ended and its spawner left, when the host forgets it.
+    /// Cancelled once the task ended and its spawner left: its readers end, and only views still
+    /// show it.
     pub(crate) released: CancellationToken,
+    view: std::sync::Mutex<TaskView>,
+    pub(crate) view_changes: watch::Sender<()>,
+    views: std::sync::Mutex<Views>,
+    pub(crate) view_grants: std::sync::Mutex<ViewGrants>,
+    /// When it was last released or left without views; a released task nobody views is
+    /// forgotten after the host's idle timeout.
+    unviewed_since_ms: AtomicU64,
+}
+
+/// The screen a task's views show and how far its output was read into it.
+struct TaskView {
+    screen: ShellScreen,
+    read_to: u64,
 }
 
 impl ShellTask {
@@ -410,6 +436,14 @@ impl ShellTask {
         let pid = child.id().ok_or_else(|| {
             HostError::before("LaunchFailed", "the shell exited before it started")
         })?;
+        let view = TaskView {
+            screen: ShellScreen::new(
+                description.clone(),
+                binding.approval.command.clone(),
+                binding.approval.cwd.display().to_string(),
+            ),
+            read_to: 0,
+        };
         let task = Arc::new(Self {
             instance: InstanceRef::shell(binding.operation),
             binding,
@@ -420,6 +454,11 @@ impl ShellTask {
             stop: watch::channel(None).0,
             exit: watch::channel(None).0,
             released: CancellationToken::new(),
+            view: std::sync::Mutex::new(view),
+            view_changes: watch::channel(()).0,
+            views: std::sync::Mutex::new(Views::default()),
+            view_grants: std::sync::Mutex::new(ViewGrants::default()),
+            unviewed_since_ms: AtomicU64::new(now_ms()),
         });
         tokio::spawn(supervise(task.clone(), child));
         Ok(task)
@@ -481,6 +520,96 @@ impl ShellTask {
         self.output.metadata().map_or(0, |metadata| metadata.len())
     }
 
+    /// Reads what the task wrote since its view last did into that view, starting over from the
+    /// end of the output when it fell far behind.
+    fn follow_output(&self) {
+        let length = self.output_length();
+        let mut view = self.view.lock().unwrap();
+        if length <= view.read_to {
+            return;
+        }
+        if length - view.read_to > VIEW_OUTPUT_BYTES {
+            let size = view.screen.size();
+            let (tail, read_to) = self.output_end(length);
+            view.screen.redraw(size, &tail);
+            view.read_to = read_to;
+        } else {
+            let mut added = vec![0u8; (length - view.read_to) as usize];
+            let read = self.output.read_at(&mut added, view.read_to).unwrap_or(0);
+            view.screen.append(&added[..read]);
+            view.read_to += read as u64;
+        }
+        drop(view);
+        self.view_changes.send_replace(());
+    }
+
+    /// The last [`VIEW_OUTPUT_BYTES`] of the first `length` output bytes, from the start of a
+    /// line when it was cut, and where they end.
+    fn output_end(&self, length: u64) -> (Vec<u8>, u64) {
+        let start = length.saturating_sub(VIEW_OUTPUT_BYTES);
+        let mut tail = vec![0u8; (length - start) as usize];
+        let read = self.output.read_at(&mut tail, start).unwrap_or(0);
+        tail.truncate(read);
+        if start > 0
+            && let Some(line_end) = tail.iter().position(|byte| *byte == b'\n')
+        {
+            tail.drain(..=line_end);
+        }
+        (tail, start + read as u64)
+    }
+
+    /// Shows how the task ended on its view.
+    fn show_exit(&self, exit: &ShellExit) {
+        self.view.lock().unwrap().screen.end(
+            exit.status(),
+            exit.reason.as_deref(),
+            exit.outcome == ShellOutcome::Completed,
+        );
+        self.view_changes.send_replace(());
+    }
+
+    /// The terminal output that brings a view showing `shown` to the task's screen now, with the
+    /// screen it then shows.
+    pub(crate) fn frame_since(&self, shown: Option<&vt100::Screen>) -> (Vec<u8>, vt100::Screen) {
+        self.view.lock().unwrap().screen.screen().frame_since(shown)
+    }
+
+    /// Applies `change` to the attached views and draws the screen at the size they now lead
+    /// with.
+    pub(crate) fn change_views<T>(&self, change: impl FnOnce(&mut Views) -> T) -> T {
+        let mut views = self.views.lock().unwrap();
+        let changed = change(&mut views);
+        if views.is_empty() {
+            self.unviewed_since_ms.store(now_ms(), Ordering::SeqCst);
+        }
+        let Some(size) = views.leading_size() else {
+            return changed;
+        };
+        let mut view = self.view.lock().unwrap();
+        if view.screen.size() != size {
+            let (tail, read_to) = self.output_end(self.output_length());
+            view.screen.redraw(size, &tail);
+            view.read_to = read_to;
+            drop(view);
+            self.view_changes.send_replace(());
+        }
+        changed
+    }
+
+    /// Ends its readers once its spawner left; its views keep it a while.
+    pub(crate) fn release(&self) {
+        self.unviewed_since_ms.store(now_ms(), Ordering::SeqCst);
+        self.released.cancel();
+    }
+
+    /// Whether the host can forget it: released, and nobody viewed it for `idle_timeout`.
+    pub(crate) fn is_forgotten(&self, now_ms: u64, idle_timeout: Duration) -> bool {
+        self.released.is_cancelled()
+            && self.views.lock().unwrap().is_empty()
+            && now_ms.saturating_sub(self.unviewed_since_ms.load(Ordering::SeqCst))
+                >= idle_timeout.as_millis() as u64
+    }
+
     /// Cuts the output at its limit; whether it had written more.
     fn cut_output(&self) -> bool {
         let is_over = self.output_length() > MAX_SHELL_OUTPUT_BYTES;
@@ -537,6 +666,7 @@ async fn supervise(task: Arc<ShellTask>, mut child: Child) {
                 if task.cut_output() {
                     break Ending::Stopping(OUTPUT_LIMIT_REASON.into());
                 }
+                task.follow_output();
             }
         }
     };
@@ -581,6 +711,8 @@ async fn supervise(task: Arc<ShellTask>, mut child: Child) {
         exit.reason = Some(format!("cannot save command output: {error}"));
     }
     exit.ended_at_ms = now_ms();
+    task.follow_output();
+    task.show_exit(&exit);
     task.exit.send_replace(Some(exit));
 }
 

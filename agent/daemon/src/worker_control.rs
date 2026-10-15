@@ -210,29 +210,40 @@ impl WorkerControl {
             .verify_worker_chat(chat, &worker)
             .await
             .map_err(|error| HostError::before("Forbidden", error.message))?;
-        if let WorkerRequest::AllowShellSpawn {
-            operation,
-            approval,
-            ..
-        } = envelope.request
-        {
-            // The worker approved and checked the command; the host only learns who may start
-            // which one, once.
-            let binding = SpawnBinding {
+        let shell_identity = ShellIdentity {
+            daemon_epoch: self.epoch,
+            worker: envelope.binding,
+            chat,
+        };
+        match envelope.request {
+            WorkerRequest::AllowShellSpawn {
                 operation,
-                identity: ShellIdentity {
-                    daemon_epoch: self.epoch,
-                    worker: envelope.binding,
-                    chat,
-                },
                 approval,
-            };
-            let grant = self.controller.allow_spawn(&binding).await?;
-            return Ok(json!(IssuedSpawn {
-                grant,
-                binding,
-                endpoint: self.controller.endpoint(),
-            }));
+                ..
+            } => {
+                // The worker approved and checked the command; the host only learns who may
+                // start which one, once.
+                let binding = SpawnBinding {
+                    operation,
+                    identity: shell_identity,
+                    approval,
+                };
+                let grant = self.controller.allow_spawn(&binding).await?;
+                return Ok(json!(IssuedSpawn {
+                    grant,
+                    binding,
+                    endpoint: self.controller.endpoint(),
+                }));
+            }
+            // The host admits a view only of a task this worker submitted for this Chat.
+            WorkerRequest::AllowShellView { instance, .. } => {
+                return self
+                    .controller
+                    .allow_shell_view(&shell_identity, &instance)
+                    .await
+                    .map(|grant| json!(grant));
+            }
+            _ => {}
         }
         let snapshot = match envelope.request.admission() {
             Some(admission) => Some(self.admit(&worker, execution, admission).await?),
@@ -491,8 +502,8 @@ impl WorkerControl {
                 .allow_view(&tick_owner, &instance)
                 .await
                 .map(|grant| json!(grant)),
-            WorkerRequest::AllowShellSpawn { .. } => {
-                unreachable!("Shell spawns are granted before a config root is required")
+            WorkerRequest::AllowShellSpawn { .. } | WorkerRequest::AllowShellView { .. } => {
+                unreachable!("Shell spawns and views are granted before a config root is required")
             }
             WorkerRequest::EndStoppedChild {
                 child, operation, ..

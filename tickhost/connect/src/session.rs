@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     process::ExitStatus,
     sync::{
@@ -24,7 +24,8 @@ use tick_protocol::{InstanceRef, TickDescriptor, TickProtocol, TickState};
 
 use crate::hosted::HostedTerminal;
 
-/// Where Tick Sessions put their sockets when the launch names no directory.
+/// Where Tick Sessions put their sockets, and beside each its `<run>.log`, when the launch names
+/// no directory.
 pub const RUNTIME_DIR_ENV: &str = "TICKLOOP_TICK_RUNTIME_DIR";
 const MAX_CONNECTIONS: usize = 8;
 const MAX_IN_FLIGHT: usize = 8;
@@ -34,6 +35,10 @@ const RESPONSE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// A frame between a Session and its host: one Tick response, read or update within its own
 /// limit, plus the frame's envelope.
 const SESSION_FRAME_BYTES: usize = tick_protocol::MAX_TOOL_RESPONSE_BYTES + 64 * 1024;
+/// How many unknown notification methods a session logs; later ones are only counted.
+const MAX_LOGGED_NOTIFICATION_METHODS: usize = 16;
+/// How much of an unknown notification method a log line names.
+const MAX_LOGGED_METHOD_CHARS: usize = 128;
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -49,8 +54,14 @@ pub enum SessionError {
     CancelledBeforeSend,
     #[error("Tick call outcome is unknown after dispatch")]
     OutcomeUnknown,
-    #[error("Tick rejected the dispatched call: {0}")]
-    ChildError(String),
+    /// The Tick answered that it did not run the request: it has no such method, or the
+    /// arguments or the tool are not its own.
+    #[error("the Tick refused the request: {0}")]
+    Refused(String),
+    /// The Tick ran the call and answered that it failed: the outcome is known, and a corrected
+    /// call may be made again.
+    #[error("the Tick Tool failed: {0}")]
+    ToolFailed(String),
     /// The Tick refused the call before running it: its catalog is no longer the one the call
     /// was prepared and approved against.
     #[error(
@@ -106,10 +117,14 @@ struct Content {
     observation: SessionObservation,
     updated_at_ms: Option<u64>,
     ignored_notifications: u64,
+    logged_notification_methods: HashSet<String>,
 }
 
 struct PendingCall {
     reply: oneshot::Sender<Result<Value, SessionError>>,
+    method: &'static str,
+    /// The [`TickProtocol::read_floor`] of when the request was sent.
+    read_floor: Option<u64>,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -124,27 +139,31 @@ struct Core {
     content: Mutex<Content>,
     observations: watch::Sender<SessionObservation>,
     shutdown: CancellationToken,
+    log: PathBuf,
 }
 
 pub struct TickSession {
     instance: InstanceRef,
     process_id: Option<u32>,
     socket: PathBuf,
-    _socket_lease: SocketLease,
+    _files: SessionFiles,
     core: Arc<Core>,
     child: Mutex<Child>,
     reader: JoinHandle<()>,
     listener: JoinHandle<()>,
 }
 
-struct SocketLease {
-    path: PathBuf,
-    identity: (u64, u64),
+/// The socket and the log a session keeps in its runtime directory, removed with the session.
+struct SessionFiles {
+    socket: PathBuf,
+    socket_identity: (u64, u64),
+    log: PathBuf,
 }
 
-impl Drop for SocketLease {
+impl Drop for SessionFiles {
     fn drop(&mut self) {
-        remove_owned_socket(&self.path, self.identity);
+        remove_owned_socket(&self.socket, self.socket_identity);
+        let _ = std::fs::remove_file(&self.log);
     }
 }
 
@@ -174,10 +193,10 @@ impl TickSession {
             ));
         }
         let listener = UnixListener::bind(&socket)?;
-        let socket_identity = file_identity(&socket)?;
-        let socket_lease = SocketLease {
-            path: socket.clone(),
-            identity: socket_identity,
+        let files = SessionFiles {
+            socket: socket.clone(),
+            socket_identity: file_identity(&socket)?,
+            log: runtime_dir.join(format!("{run}.log")),
         };
         private_socket(&socket)?;
         let mut child = Command::new(command);
@@ -221,9 +240,11 @@ impl TickSession {
                 observation,
                 updated_at_ms: None,
                 ignored_notifications: 0,
+                logged_notification_methods: HashSet::new(),
             }),
             observations,
             shutdown: CancellationToken::new(),
+            log: files.log.clone(),
         });
         let reader = tokio::spawn(read_child(stdout, Arc::clone(&core)));
         let server = Arc::clone(&core);
@@ -232,7 +253,7 @@ impl TickSession {
             instance,
             process_id,
             socket,
-            _socket_lease: socket_lease,
+            _files: files,
             core,
             child: Mutex::new(child),
             reader,
@@ -320,7 +341,7 @@ impl Drop for TickSession {
 impl Core {
     async fn request(
         &self,
-        method: &str,
+        method: &'static str,
         params: Value,
         timeout: std::time::Duration,
     ) -> Result<Value, SessionError> {
@@ -337,10 +358,13 @@ impl Core {
             return Err(SessionError::Protocol("Tick request too large".into()));
         }
         let (sender, receiver) = oneshot::channel();
+        let read_floor = self.content.lock().await.protocol.read_floor();
         self.pending.lock().await.insert(
             id,
             PendingCall {
                 reply: sender,
+                method,
+                read_floor,
                 _permit: permit,
             },
         );
@@ -369,17 +393,10 @@ impl Core {
         }
     }
 
-    async fn read(&self) -> Result<TickState, SessionError> {
-        let result = self
-            .request(tick_protocol::READ_METHOD, json!({}), HOST_REQUEST_TIMEOUT)
-            .await?;
-        let mut content = self.content.lock().await;
-        let read = content
-            .protocol
-            .read(result)
-            .map_err(SessionError::Protocol)?;
-        content.read = read.clone();
-        Ok(read)
+    /// The Tick's current state, as [`read_child`] checked it on arrival.
+    async fn read(&self) -> Result<Value, SessionError> {
+        self.request(tick_protocol::READ_METHOD, json!({}), HOST_REQUEST_TIMEOUT)
+            .await
     }
 
     /// Dispatches a prepared call as it is: the Tick runs it only while its catalog still has
@@ -448,36 +465,51 @@ async fn read_child(stdout: tokio::process::ChildStdout, core: Arc<Core>) {
             return;
         }
         if let Some(id) = frame.get("id").and_then(Value::as_u64) {
+            let Some(pending) = core.pending.lock().await.remove(&id) else {
+                continue;
+            };
             let result = match (frame.get("result"), frame.get("error")) {
                 // The Tick has already acted on the request, so an answer too large to forward
                 // leaves its outcome unknown rather than undone.
-                (Some(result), None) => tick_protocol::check_encoded_size(
+                (Some(result), None) => match tick_protocol::check_encoded_size(
                     result,
                     tick_protocol::MAX_TOOL_RESPONSE_BYTES,
                     "Tick response",
-                )
-                .map(|()| result.clone())
-                .map_err(|_| SessionError::OutcomeUnknown),
-                (None, Some(error))
-                    if error["code"].as_i64() == Some(tick_protocol::REVISION_MISMATCH) =>
-                {
-                    Err(SessionError::RevisionMismatch)
+                ) {
+                    Err(_) => Err(SessionError::OutcomeUnknown),
+                    Ok(()) if pending.method == tick_protocol::READ_METHOD => {
+                        read_answer(&core, result.clone(), pending.read_floor).await
+                    }
+                    Ok(()) => Ok(result.clone()),
+                },
+                (None, Some(error)) => Err(tick_error(error)),
+                // An answer with neither a result nor an error leaves what a call did unknown.
+                _ if pending.method == tick_protocol::CALL_METHOD => {
+                    Err(SessionError::OutcomeUnknown)
                 }
-                (None, Some(error)) => Err(SessionError::ChildError(error.to_string())),
                 _ => Err(SessionError::Protocol("invalid Tick response".into())),
             };
-            if let Some(pending) = core.pending.lock().await.remove(&id) {
-                let _ = pending.reply.send(result);
-            }
+            let _ = pending.reply.send(result);
             continue;
         }
         match frame.get("method").and_then(Value::as_str) {
             Some(tick_protocol::UPDATE_METHOD) => {}
             // A notification this host does not know yet is skipped, so a Tick speaking a later
-            // addition to the protocol keeps running. It is recorded in the session status, not
-            // on stderr, which is the Tick's own terminal.
-            Some(_) => {
-                core.content.lock().await.ignored_notifications += 1;
+            // addition to the protocol keeps running. It is counted in the session status, and
+            // the first one of each method is logged.
+            Some(method) => {
+                let method: String = method.chars().take(MAX_LOGGED_METHOD_CHARS).collect();
+                let is_first_of_its_method = {
+                    let mut content = core.content.lock().await;
+                    content.ignored_notifications += 1;
+                    content.logged_notification_methods.len() < MAX_LOGGED_NOTIFICATION_METHODS
+                        && content.logged_notification_methods.insert(method.clone())
+                };
+                if is_first_of_its_method {
+                    let line =
+                        format!("ignored unknown notification {method:?}; counting the rest");
+                    log(&core, &line).await;
+                }
                 continue;
             }
             None => {
@@ -509,7 +541,9 @@ async fn read_child(stdout: tokio::process::ChildStdout, core: Arc<Core>) {
                 return;
             }
         };
-        content.read = update.clone();
+        if update.seq >= content.read.seq {
+            content.read = update.clone();
+        }
         content.observation.update = Some(update);
         content.observation.received += 1;
         content.updated_at_ms = Some(now_ms());
@@ -519,6 +553,65 @@ async fn read_child(stdout: tokio::process::ChildStdout, core: Arc<Core>) {
     for (_, pending) in core.pending.lock().await.drain() {
         let _ = pending.reply.send(Err(SessionError::Gone));
     }
+}
+
+/// Appends a line to the session log beside its socket. Nothing goes to stderr: the launcher's
+/// stderr is the Tick's visible terminal. A log that cannot be written is skipped.
+async fn log(core: &Core, line: &str) {
+    let mut options = tokio::fs::OpenOptions::new();
+    options
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW);
+    if let Ok(mut file) = options.open(&core.log).await {
+        let entry = format!(
+            "{} {} {line}\n",
+            tick_protocol::now_rfc3339(),
+            core.instance
+        );
+        let _ = file.write_all(entry.as_bytes()).await;
+    }
+}
+
+/// What an explicit JSON-RPC error answer says about the request: a request-level error means
+/// the Tick did not run it, any other error that it ran and failed.
+fn tick_error(error: &Value) -> SessionError {
+    let message = match (error["message"].as_str(), error.get("data")) {
+        (Some(message), Some(data)) if !data.is_null() => format!("{message} ({data})"),
+        (Some(message), _) => message.to_owned(),
+        (None, _) => error.to_string(),
+    };
+    match error["code"].as_i64() {
+        Some(tick_protocol::REVISION_MISMATCH) => SessionError::RevisionMismatch,
+        Some(
+            tick_protocol::PARSE_ERROR
+            | tick_protocol::INVALID_REQUEST
+            | tick_protocol::METHOD_NOT_FOUND
+            | tick_protocol::INVALID_PARAMS
+            | tick_protocol::VERSION_MISMATCH
+            | tick_protocol::FRAME_TOO_LARGE,
+        ) => SessionError::Refused(message),
+        _ => SessionError::ToolFailed(message),
+    }
+}
+
+/// Checks a `tick/read` answer in the order it arrived among the updates, and keeps it as the
+/// session's state unless an update that arrived first is newer.
+async fn read_answer(
+    core: &Core,
+    answer: Value,
+    floor: Option<u64>,
+) -> Result<Value, SessionError> {
+    let mut content = core.content.lock().await;
+    let read = content
+        .protocol
+        .read(answer, floor)
+        .map_err(SessionError::Protocol)?;
+    if read.seq >= content.read.seq {
+        content.read = read.clone();
+    }
+    serde_json::to_value(read).map_err(|error| SessionError::Protocol(error.to_string()))
 }
 
 async fn link_state(core: &Core, state: SessionLinkState) {
@@ -645,12 +738,10 @@ async fn serve_connection(mut stream: UnixStream, core: Arc<Core>) -> Result<(),
                     json!({"instance_id":core.instance.to_string(),"protocol":tick_protocol::NATIVE_PROTOCOL_VERSION,"terminal":core.terminal}),
                 ),
                 tick_protocol::DESCRIBE_METHOD => {
-                    core.request(method, params, HOST_REQUEST_TIMEOUT).await
+                    core.request(tick_protocol::DESCRIBE_METHOD, params, HOST_REQUEST_TIMEOUT)
+                        .await
                 }
-                tick_protocol::READ_METHOD => core.read().await.and_then(|read| {
-                    serde_json::to_value(read)
-                        .map_err(|error| SessionError::Protocol(error.to_string()))
-                }),
+                tick_protocol::READ_METHOD => core.read().await,
                 tick_protocol::CALL_METHOD => core.call(params).await,
                 _ => Err(SessionError::Protocol(format!(
                     "unknown Session method {method:?}"
@@ -667,11 +758,16 @@ async fn serve_connection(mut stream: UnixStream, core: Arc<Core>) -> Result<(),
                     SessionError::CancelledBeforeSend => (-32011, false),
                     SessionError::OutcomeUnknown => (-32012, true),
                     SessionError::Gone => (-32013, true),
-                    SessionError::ChildError(_) => (-32015, true),
+                    SessionError::ToolFailed(_) => (-32015, true),
                     SessionError::RevisionMismatch => (-32016, false),
+                    SessionError::Refused(_) => (-32017, false),
                     _ => (tick_protocol::TOOL_FAILED, false),
                 };
-                json!({"jsonrpc":tick_protocol::JSON_RPC_VERSION,"id":id,"error":{"code":code,"message":error.to_string(),"data":{"dispatched":dispatched}}})
+                let message = match error {
+                    SessionError::Refused(message) | SessionError::ToolFailed(message) => message,
+                    other => other.to_string(),
+                };
+                json!({"jsonrpc":tick_protocol::JSON_RPC_VERSION,"id":id,"error":{"code":code,"message":message,"data":{"dispatched":dispatched}}})
             }
         };
         write_frame(&mut writer, response).await?;
@@ -740,7 +836,7 @@ impl SessionClient {
             .request(tick_protocol::READ_METHOD, json!({}), None)
             .await?;
         TickProtocol::default()
-            .read(value)
+            .read(value, None)
             .map_err(SessionError::Protocol)
     }
     /// Calls `tool` against the catalog `revision` it was prepared with; a Tick whose catalog
@@ -780,7 +876,7 @@ impl SessionClient {
             ))
         })??;
         let baseline = TickProtocol::default()
-            .read(registration["read"].clone())
+            .read(registration["read"].clone(), None)
             .map_err(SessionError::Protocol)?;
         let received = registration["received"].as_u64().ok_or_else(|| {
             SessionError::Protocol("Session watch registration has no received count".into())
@@ -947,8 +1043,9 @@ fn response_result(response: Value) -> Result<Value, SessionError> {
                 Some(-32011) => Err(SessionError::CancelledBeforeSend),
                 Some(-32012) => Err(SessionError::OutcomeUnknown),
                 Some(-32013) => Err(SessionError::Gone),
-                Some(-32015) => Err(SessionError::ChildError(message)),
+                Some(-32015) => Err(SessionError::ToolFailed(message)),
                 Some(-32016) => Err(SessionError::RevisionMismatch),
+                Some(-32017) => Err(SessionError::Refused(message)),
                 _ => Err(SessionError::Protocol(message)),
             }
         }

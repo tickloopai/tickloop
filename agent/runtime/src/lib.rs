@@ -811,15 +811,15 @@ impl Agent {
         self.inner.hosted_ticks.read().unwrap().clone()
     }
 
-    /// Lets the daemon grant this worker's Shell spawns in its Tickhost.
-    pub fn install_shell_issuer(&self, issuer: Arc<dyn crate::hosted::shells::SpawnIssuer>) {
-        self.inner.shells.install_issuer(issuer);
+    /// Lets the daemon grant this worker's Shell spawns and views in its Tickhost.
+    pub fn install_shell_grants(&self, grants: Arc<dyn crate::hosted::shells::ShellGrants>) {
+        self.inner.shells.install_grants(grants);
     }
 
-    /// Runs this Agent's shell commands in a Tickhost of its own, served inside this process,
-    /// for an Agent without a daemon such as a test's.
+    /// Runs and shows this Agent's shell commands in a Tickhost of its own, served inside this
+    /// process, for an Agent without a daemon such as a test's.
     pub fn install_own_tickhost(&self) {
-        self.install_shell_issuer(Arc::new(crate::hosted::shells::OwnTickhost::new()));
+        self.install_shell_grants(Arc::new(crate::hosted::shells::OwnTickhost::new()));
     }
 
     pub fn shell_tasks(&self) -> Arc<crate::hosted::shells::ShellTasks> {
@@ -1442,7 +1442,8 @@ impl Agent {
                 auto_health: Mutex::new(auto_health::AutoHealth::default()),
                 host_tools: std::sync::RwLock::new(None),
                 hosted_ticks: std::sync::RwLock::new(None),
-                // Until a daemon grants its spawns, an Agent runs no shell command.
+                // Until a daemon grants its spawns and views, an Agent runs and shows no shell
+                // command.
                 shells: crate::hosted::shells::ShellTasks::new(Arc::new(
                     crate::hosted::shells::NoDaemon,
                 )),

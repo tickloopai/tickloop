@@ -161,21 +161,32 @@ impl TickState {
     }
 }
 
-/// The host side of one Tick Instance's states: each `tick/update` moves `seq` forward and has
-/// content, and no `tick/read` reports a `seq` before one already seen.
+/// The host side of one Tick Instance's states, checked in the order frames arrive: each
+/// `tick/update` moves `seq` past the previous update and has content, and each `tick/read`
+/// answer is no older than the previous answer or than the updates received before it was asked.
+/// A read answer is not compared with updates that arrive around it: the Tick may write an update
+/// just before or just after answering a read with the same or an earlier state.
 #[derive(Default)]
 pub struct TickProtocol {
-    seq: Option<u64>,
+    update_seq: Option<u64>,
+    read_seq: Option<u64>,
 }
 
 impl TickProtocol {
-    /// A `tick/read` answer, bounded only by the response frame that carried it.
-    pub fn read(&mut self, result: Value) -> Result<TickState, String> {
+    /// The `seq` a `tick/read` sent now has to answer at least: the Tick wrote the latest update
+    /// received so far before it could see the request.
+    pub fn read_floor(&self) -> Option<u64> {
+        self.update_seq
+    }
+
+    /// A `tick/read` answer, bounded only by the response frame that carried it. `floor` is the
+    /// [`Self::read_floor`] of when the request was sent.
+    pub fn read(&mut self, result: Value, floor: Option<u64>) -> Result<TickState, String> {
         let state = received_state(result, "Tick read")?;
-        if self.seq.is_some_and(|seq| state.seq < seq) {
+        if self.read_seq.max(floor).is_some_and(|seq| state.seq < seq) {
             return Err("Tick read seq moved backward".into());
         }
-        self.seq = Some(state.seq);
+        self.read_seq = Some(state.seq);
         Ok(state)
     }
 
@@ -185,15 +196,11 @@ impl TickProtocol {
         if !state.is_ready() {
             return Err("Tick update needs data".into());
         }
-        if self.seq.is_some_and(|seq| state.seq <= seq) {
+        if self.update_seq.is_some_and(|seq| state.seq <= seq) {
             return Err("Tick update seq repeated or moved backward".into());
         }
-        self.seq = Some(state.seq);
+        self.update_seq = Some(state.seq);
         Ok(state)
-    }
-
-    pub fn seq(&self) -> Option<u64> {
-        self.seq
     }
 }
 
@@ -272,7 +279,7 @@ mod tests {
     #[test]
     fn a_state_with_null_data_is_not_ready_and_no_update_may_have_one() {
         let mut protocol = TickProtocol::default();
-        let read = protocol.read(json!({"seq":0,"data":null})).unwrap();
+        let read = protocol.read(json!({"seq":0,"data":null}), None).unwrap();
         assert!(!read.is_ready());
         assert!(
             protocol
@@ -280,7 +287,7 @@ mod tests {
                 .unwrap_err()
                 .contains("needs data")
         );
-        assert_eq!(protocol.seq(), Some(0));
+        assert_eq!(protocol.read_floor(), None);
         assert!(
             protocol
                 .update(json!({"seq":1,"data":{"value":1}}))
@@ -290,42 +297,45 @@ mod tests {
     }
 
     #[test]
-    fn updates_move_seq_forward_and_reads_never_move_it_back() {
+    fn updates_and_read_answers_each_move_forward_on_their_own() {
         let mut protocol = TickProtocol::default();
+        let read = |protocol: &mut TickProtocol, seq: u64, floor| {
+            protocol.read(json!({"seq":seq,"data":{"value":seq}}), floor)
+        };
+        let update = |protocol: &mut TickProtocol, seq: u64| {
+            protocol.update(json!({"seq":seq,"data":{"value":seq}}))
+        };
+        assert_eq!(read(&mut protocol, 2, None).unwrap().seq, 2);
         assert_eq!(
-            protocol
-                .read(json!({"seq":2,"data":{"value":2}}))
-                .unwrap()
-                .seq,
-            2
+            update(&mut protocol, 2).unwrap().seq,
+            2,
+            "the Tick answered the read before writing the update it had published"
+        );
+        assert!(update(&mut protocol, 2).unwrap_err().contains("repeated"));
+        assert_eq!(
+            protocol.read_floor(),
+            Some(2),
+            "a refused update keeps the seq"
+        );
+        assert_eq!(update(&mut protocol, 5).unwrap().seq, 5);
+        assert_eq!(
+            read(&mut protocol, 3, Some(2)).unwrap().seq,
+            3,
+            "a read asked before update 5 arrived may answer an earlier state"
         );
         assert!(
-            protocol
-                .update(json!({"seq":2,"data":{"value":2}}))
-                .is_err()
-        );
-        assert_eq!(protocol.seq(), Some(2), "a refused update keeps the seq");
-        assert_eq!(
-            protocol
-                .update(json!({"seq":5,"data":{"value":5}}))
-                .unwrap()
-                .seq,
-            5
-        );
-        assert!(
-            protocol
-                .read(json!({"seq":4,"data":{"value":4}}))
+            read(&mut protocol, 2, None)
                 .unwrap_err()
                 .contains("backward")
         );
-        assert_eq!(
-            protocol
-                .read(json!({"seq":5,"data":{"value":5}}))
-                .unwrap()
-                .seq,
-            5
+        assert!(
+            read(&mut protocol, 4, Some(5))
+                .unwrap_err()
+                .contains("backward"),
+            "a read asked after update 5 arrived answers at least 5"
         );
-        assert_eq!(protocol.seq(), Some(5));
+        assert_eq!(read(&mut protocol, 5, Some(5)).unwrap().seq, 5);
+        assert_eq!(protocol.read_floor(), Some(5));
     }
 
     #[test]
@@ -358,7 +368,7 @@ mod tests {
             protocol.update(params).unwrap_err(),
             format!("Tick update exceeds {MAX_UPDATE_BYTES} bytes once encoded")
         );
-        assert_eq!(protocol.seq(), None);
+        assert_eq!(protocol.read_floor(), None);
     }
 
     #[test]
