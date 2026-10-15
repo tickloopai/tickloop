@@ -1,6 +1,7 @@
-//! Derives the build identity a View compares with the running daemon's. It hashes the
-//! workspace sources and the files they embed, so two builds of the same sources share it and
-//! any change to them yields another.
+// Derives the build identity a View compares with the running daemon's, and the daemon with its
+// Tickhost's. It hashes the workspace sources and the files they embed, so two builds of the same
+// sources share it and any change to them yields another. The Tickhost's build script includes
+// this file, so plain comments stand in for module documentation.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;

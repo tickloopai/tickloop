@@ -56,3 +56,106 @@ pub fn tick_request(owner: TickOwner, cwd: &Path, program: Vec<String>) -> OpenR
 pub fn counter_request(owner: TickOwner, cwd: &Path) -> OpenRequest {
     tick_request(owner, cwd, counter_program())
 }
+
+/// A running Tickhost of another build than the tests' own, at a daemon's Tickhost endpoint. It
+/// answers the frozen management hello with `description` to the holder of `key`, refuses the
+/// business protocol as an older host does, and on `shutdown_host` gives up its endpoint and lock
+/// before it answers, as a host does once its Ticks ended.
+pub struct OtherBuildHost {
+    stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl OtherBuildHost {
+    pub fn serve(
+        paths: &tickhost::paths::HostPaths,
+        key: &str,
+        description: Option<tickhost_connect::hosted::HostDescription>,
+    ) -> Self {
+        use std::{io::Write, os::fd::AsRawFd, os::unix::fs::PermissionsExt};
+        use tickhost_connect::{host_error::HostError, hosted};
+        paths.prepare().unwrap();
+        let mut lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(paths.lock())
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        lock.write_all(std::process::id().to_string().as_bytes())
+            .unwrap();
+        let socket = paths.socket();
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+        let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reply = hosted::HelloReply {
+            epoch: Uuid::new_v4(),
+            pid: std::process::id(),
+            version: hosted::BUILD_VERSION.into(),
+            major: hosted::MANAGEMENT_MAJOR,
+            minor: hosted::MANAGEMENT_MINOR,
+            capabilities: Vec::new(),
+            host: description,
+        };
+        let key = key.to_owned();
+        let flag = stopped.clone();
+        tokio::spawn(async move {
+            let mut lock = Some(lock);
+            while let Ok((stream, _)) = listener.accept().await {
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(reader);
+                let frames = hosted::BUSINESS_FRAME_BYTES;
+                let Ok(Some(hello)) = hosted::read_frame(&mut reader, frames).await else {
+                    continue;
+                };
+                if hello["channel"] != "management" || hello["controller_key"] != key.as_str() {
+                    let refusal = HostError::before(
+                        "IncompatibleHost",
+                        "Tickhost serves business protocol 8.0",
+                    );
+                    let _ = hosted::write_frame(
+                        &mut writer,
+                        &hosted::error(&serde_json::Value::Null, &refusal),
+                        frames,
+                    )
+                    .await;
+                    continue;
+                }
+                let _ = hosted::write_frame(
+                    &mut writer,
+                    &hosted::ok(&serde_json::Value::Null, serde_json::json!(reply)),
+                    frames,
+                )
+                .await;
+                let Ok(Some(request)) = hosted::read_frame(&mut reader, frames).await else {
+                    continue;
+                };
+                if request["method"] != "shutdown_host" {
+                    continue;
+                }
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = std::fs::remove_file(&socket);
+                lock.take();
+                let _ = hosted::write_frame(
+                    &mut writer,
+                    &hosted::ok(
+                        &request["id"],
+                        serde_json::json!({"operation":request["params"]["operation"],"state":"completed"}),
+                    ),
+                    frames,
+                )
+                .await;
+                return;
+            }
+        });
+        Self { stopped }
+    }
+
+    pub fn was_stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}

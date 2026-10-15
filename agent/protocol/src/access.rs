@@ -36,10 +36,12 @@ use crate::{
 /// history, one recorded tool operation, and the events after a sequence. 20.2 adds each Tick
 /// Subscription status's next check and period, so Monitor counts down to the next check, the
 /// user's own Tick Subscription from Monitor, and reopening a hosted Tick with its subscriptions.
+/// 20.3 adds reading a running Tickhost of another build than the daemon's, with what replacing
+/// it ends, and replacing it on the user's word.
 /// Older business majors are refused before dispatch; the frozen daemon management protocol
 /// remains independent.
 pub const PROTOCOL_MAJOR: u16 = 20;
-pub const PROTOCOL_MINOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 3;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -365,6 +367,9 @@ pub enum AgentCommand {
         workdir: PathBuf,
     },
     FlushTranscripts,
+    /// Stops the running Tickhost of another build than the daemon's, ending what it runs; the
+    /// next open or Shell starts one of the daemon's build.
+    ReplaceTickhost,
 }
 
 impl AgentCommand {
@@ -641,6 +646,29 @@ pub enum ObservationRequest {
         epoch: Uuid,
         command_id: Uuid,
     },
+    /// The running Tickhost when it is another build than the daemon's and replacing it would end
+    /// something; the daemon replaces one that runs nothing at once.
+    OtherTickhost,
+}
+
+/// A running Tickhost of another build than the daemon's, which the daemon keeps until the user
+/// replaces it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct OtherTickhost {
+    /// Which build runs and which the daemon is.
+    pub description: String,
+    /// What replacing it ends; `None` from a Tickhost too old to say.
+    pub occupancy: Option<TickhostOccupancy>,
+}
+
+/// What stopping a Tickhost ends.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TickhostOccupancy {
+    /// Each Tick it holds, by its title, or its instance when it has none.
+    pub ticks: Vec<String>,
+    pub shells: usize,
+    /// Its other connections, such as attached views.
+    pub connections: usize,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -912,6 +940,7 @@ pub enum ObservationValue {
     Records(Vec<SavedChat>),
     Transcript(Box<RecordedTranscript>),
     Receipt(Option<Box<CommandReceipt>>),
+    OtherTickhost(Option<OtherTickhost>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

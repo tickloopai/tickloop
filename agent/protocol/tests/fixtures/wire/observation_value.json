@@ -1022,5 +1022,20 @@
         }
       }
     ]
+  },
+  {
+    "OtherTickhost": {
+      "description": "Running Tickhost build 0.1.0+older; this build 0.2.0+current",
+      "occupancy": {
+        "ticks": [
+          "Quote · AAPL.US"
+        ],
+        "shells": 1,
+        "connections": 0
+      }
+    }
+  },
+  {
+    "OtherTickhost": null
   }
 ]

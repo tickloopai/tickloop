@@ -156,6 +156,8 @@ mod tick_adapters;
 mod tick_subscriptions;
 #[path = "all/tickhost_shells.rs"]
 mod tickhost_shells;
+#[path = "all/tickhost_versions.rs"]
+mod tickhost_versions;
 #[path = "all/tool_results.rs"]
 mod tool_results;
 #[path = "all/transcripts.rs"]

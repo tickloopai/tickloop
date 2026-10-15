@@ -365,6 +365,9 @@
     "kind": "flush_transcripts"
   },
   {
+    "kind": "replace_tickhost"
+  },
+  {
     "kind": "edit_history",
     "execution": {
       "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
