@@ -2322,8 +2322,8 @@ async fn opening_a_row_handles_its_updates_and_other_keys_do_not() {
 }
 
 #[test]
-fn a_gone_row_leaves_monitor_thirty_seconds_after_it_went() {
-    use crate::monitor_rows::{GONE_DISPLAY_MS, MemberFindings, MemberState};
+fn a_gone_row_stays_red_until_removed_and_enter_offers_to_reopen_it() {
+    use crate::monitor_rows::{MemberFindings, MemberState, TickIntent};
     let chat = Uuid::new_v4();
     let console = Console::test_for_chat(chat);
     let gone = tick_protocol::InstanceRef::new("hosted", "gone-run").unwrap();
@@ -2346,10 +2346,31 @@ fn a_gone_row_leaves_monitor_thirty_seconds_after_it_went() {
         )
         .unwrap();
     let mut state = console.state.lock().unwrap();
-    assert_eq!(state.monitor.entries().len(), 1, "a gone Tick shows first");
-    let leaves = went + GONE_DISPLAY_MS + 1_000;
-    assert!(state.monitor.refresh_due(leaves));
-    assert!(state.monitor.entries().is_empty(), "then it leaves");
+    assert!(!state.monitor.refresh_due(went + 3_600_000));
+    let entries = state.monitor.entries();
+    assert_eq!(entries.len(), 1, "a gone Tick keeps its row");
+    assert_eq!(entries[0].tone, crate::monitor_rows::StatusTone::Gone);
+    let lines = state
+        .monitor
+        .lines(40, 10, DisplayProfile::default(), went + 3_600_000);
+    let glyph = lines[2]
+        .spans
+        .iter()
+        .find(|span| span.text == "◉")
+        .and_then(|span| span.role);
+    assert_eq!(glyph, Some(Role::ErrorMark), "the row shows red");
+    assert_eq!(
+        entries[0].actions[0].intent,
+        TickIntent::ReopenHosted(gone.clone())
+    );
+    assert_eq!(
+        entries[0].actions[1].intent,
+        TickIntent::CloseHosted {
+            instance: gone,
+            ends_process: false,
+        },
+        "x takes the row out with its launch record"
+    );
 }
 
 /// A running Shell is stopped from its Monitor row: `s` asks first, Esc keeps it running, and

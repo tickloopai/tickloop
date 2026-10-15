@@ -45,8 +45,8 @@ pub(super) fn dragged_columns(width: usize, column: usize) -> Option<usize> {
 
 pub(super) use crate::monitor_rows::TickGroup;
 use crate::monitor_rows::{
-    GONE_DISPLAY_MS, MonitorAction, MonitorContext, MonitorRowsRegistry, RowUpdate, StatusTone,
-    SubscriptionMark, TickDescriptor, TickGlyph, TickOwner, TickResources, page_of,
+    MonitorAction, MonitorContext, MonitorRowsRegistry, RowUpdate, StatusTone, SubscriptionMark,
+    TickDescriptor, TickGlyph, TickOwner, TickResources, page_of,
 };
 use tick_protocol::InstanceRef;
 use tickloop_agent_protocol::{
@@ -138,10 +138,8 @@ pub(super) struct Monitor {
     /// Whether the column has shown rows in this Chat; it then stays when empty, so the
     /// conversation does not change width each time a background Shell starts or ends.
     shown: bool,
-    /// When time alone next changes the list: a finished Shell or a gone Tick leaving.
+    /// When time alone next changes the list: a finished Shell leaving.
     refresh_at: Option<u64>,
-    /// Since when each instance has shown as gone, as this View saw it.
-    gone_since: HashMap<InstanceRef, u64>,
     /// Since when this View has shown this Chat's Monitor; an Agent turn taking an update in
     /// earlier never flashes its row.
     flashes_since: Option<u64>,
@@ -278,7 +276,6 @@ impl Monitor {
             member_states: self.member_findings.states.clone(),
             member_resources: self.member_findings.resources.clone(),
             member_updates: self.member_findings.updates.clone(),
-            gone_since: self.gone_since.clone(),
             shell_starts: self.shell_starts.clone(),
             retained: self.detail.as_ref().and_then(|detail| detail.instance()),
             now_ms,
@@ -288,16 +285,6 @@ impl Monitor {
             .get_or_insert_with(MonitorRowsRegistry::builtin)
             .list(&context);
         self.note_flashes(&listed, now_ms);
-        // A row that left as gone stays out; one that shows again as anything else starts over.
-        for entry in &listed {
-            if entry.tone == StatusTone::Gone {
-                self.gone_since
-                    .entry(entry.instance.clone())
-                    .or_insert(now_ms);
-            } else {
-                self.gone_since.remove(&entry.instance);
-            }
-        }
         self.group_totals.clear();
         for entry in &listed {
             *self.group_totals.entry(entry.group).or_default() += 1;
@@ -395,7 +382,7 @@ impl Monitor {
         self.listed_updates.clear();
         self.flashes_since = Some(now_ms);
     }
-    /// When time alone next changes the list: the next finished Shell or gone Tick to leave.
+    /// When time alone next changes the list: the next finished Shell to leave.
     fn next_refresh_ms(&self, now_ms: u64) -> Option<u64> {
         let handled = |task: &tickloop_agent_protocol::ShellTask| {
             self.chat_status
@@ -406,11 +393,6 @@ impl Monitor {
             .iter()
             .flat_map(|snapshot| &snapshot.tasks)
             .filter_map(|task| task.finished_row_until(handled(task)))
-            .chain(
-                self.gone_since
-                    .values()
-                    .map(|since| since.saturating_add(GONE_DISPLAY_MS)),
-            )
             .filter(|until| *until > now_ms)
             .min()
     }

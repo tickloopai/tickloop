@@ -539,7 +539,8 @@ fn close_hosted_prompt(subscriptions: usize) -> String {
 
 /// Ends a hosted Tick this Chat opened and takes its row out with the Tick Subscriptions on it,
 /// once confirmed where that ends a running process or cancels subscriptions. An exited
-/// terminal Tick is closed as it leaves, so its last screen does not stay behind unseen.
+/// terminal Tick is closed as it leaves, so its last screen does not stay behind unseen, and one
+/// that no longer runs takes its launch record with it.
 struct CloseHosted {
     instance: tick_protocol::InstanceRef,
     ends_process: bool,

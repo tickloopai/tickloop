@@ -168,6 +168,178 @@ async fn actual_cli_enter_opens_a_hosted_tick_full_screen_outside_herdr_and_esc_
     }
 }
 
+/// The hosted Ticks of `execution`'s Chat, as its Monitor probes them.
+async fn hosted_members(
+    client: &LocalAgentClient,
+    execution: ExecutionRef,
+) -> Vec<tickloop_agent_protocol::HostedMember> {
+    let result = client
+        .execute(CommandEnvelope {
+            daemon_epoch: client.daemon_epoch(),
+            command_id: uuid::Uuid::new_v4(),
+            command: AgentCommand::ListHostedTicks { execution },
+        })
+        .await
+        .unwrap()
+        .into_result()
+        .unwrap();
+    let CommandResult::HostedTicks(members) = result else {
+        panic!("hosted Ticks expected: {result:?}");
+    };
+    members
+}
+
+/// How many hosted Tick launch records the fixture's Chats keep.
+fn launch_record_count(fixture: &PrivateFixture) -> usize {
+    let Ok(chats) = std::fs::read_dir(fixture.path("config/tickhost/chats")) else {
+        return 0;
+    };
+    chats
+        .filter_map(Result::ok)
+        .filter_map(|chat| std::fs::read_dir(chat.path()).ok())
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("launch-"))
+        .count()
+}
+
+/// The selected Monitor row offers to reopen a hosted Tick that no longer runs.
+fn selected_row_is_gone(frame: &str) -> bool {
+    frame
+        .lines()
+        .any(|line| line.starts_with("enter reopen · x remove"))
+}
+
+/// Moves the Monitor selection to a row whose hosted Tick no longer runs.
+async fn select_gone_row(view: &mut PtyView) {
+    const SETTLE: Duration = Duration::from_millis(150);
+    for key in [b"j", b"k"] {
+        for _ in 0..4 {
+            if selected_row_is_gone(&view.frame()) {
+                return;
+            }
+            view.send(key);
+            tokio::time::sleep(SETTLE).await;
+        }
+    }
+    panic!("no gone row in Monitor: {}", view.frame());
+}
+
+/// A protocol Tick whose process ended by itself keeps its Monitor row, and its launch record,
+/// until its user removes it. Enter reopens it in its row's place from that record once
+/// confirmed; `x` takes a gone row out with its record at once, and closes a reopened one, with
+/// the record it was reopened from, once confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens_it() {
+    use tickloop_agent_protocol::HostedMemberState;
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(async {
+        let mut view = view_with_keys_ticks(&fixture, &[], 2, None).await;
+        let client = fixture.client().await;
+        let execution = catalog(&client).await[0].execution;
+        let members = hosted_members(&client, execution).await;
+        assert_eq!(members.len(), 2, "{members:?}");
+        assert_eq!(launch_record_count(&fixture), 2);
+        let first_pids = members
+            .iter()
+            .map(|member| {
+                member
+                    .resources
+                    .as_ref()
+                    .expect("a process sample")
+                    .business_pid
+            })
+            .collect::<Vec<_>>();
+        for pid in &first_pids {
+            unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+        }
+        tokio::time::timeout(UI_TIMEOUT, async {
+            while !hosted_members(&client, execution).await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("both Ticks end");
+        assert_eq!(
+            launch_record_count(&fixture),
+            2,
+            "a Tick that ended by itself keeps its launch record"
+        );
+
+        view.send(b"\x1b[C");
+        view.wait_for("the selected row turns gone", selected_row_is_gone)
+            .await;
+        view.send(b"j");
+        view.wait_for("the other row is gone too", |frame| {
+            selected_row_is_gone(frame) && frame.contains("Monitor 2")
+        })
+        .await;
+        view.send(b"\r");
+        view.wait_for("the reopen asks first", |frame| {
+            frame.contains("Open a new instance of this Tick with its command?")
+        })
+        .await;
+        view.send(b"\r");
+        let reopened = tokio::time::timeout(UI_TIMEOUT, async {
+            loop {
+                let members = hosted_members(&client, execution).await;
+                if let Some(member) = members
+                    .iter()
+                    .find(|member| member.state == HostedMemberState::Running)
+                {
+                    break member.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the reopened Tick runs");
+        let reopened_pid = reopened.resources.as_ref().unwrap().business_pid;
+        assert!(!first_pids.contains(&reopened_pid), "a new process");
+        assert_eq!(
+            launch_record_count(&fixture),
+            3,
+            "the reopened instance's record joins the one it came from and the other gone Tick's"
+        );
+
+        select_gone_row(&mut view).await;
+        view.send(b"x");
+        view.wait_for("the gone row leaves at once", |frame| {
+            frame.contains("Monitor 1") && frame.contains("enter open · x close")
+        })
+        .await;
+        assert_eq!(
+            launch_record_count(&fixture),
+            2,
+            "its launch record goes with the row"
+        );
+
+        view.send(b"x");
+        view.wait_for("closing the running Tick asks first", |frame| {
+            frame.contains("Close this Tick and end its process?")
+        })
+        .await;
+        view.send(b"\r");
+        view.wait_for("the reopened row leaves", |frame| {
+            !frame.contains("Monitor 1") && !frame.contains(" ◉ Keys")
+        })
+        .await;
+        assert_eq!(
+            launch_record_count(&fixture),
+            0,
+            "closing the reopened Tick forgets the record it was reopened from too"
+        );
+        assert!(hosted_members(&client, execution).await.is_empty());
+        view.close().await;
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 /// A long Agent stream remains live while Enter lends the terminal to the Tick. Closing the
 /// attached view restores its reply tail without an internal recovery notice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

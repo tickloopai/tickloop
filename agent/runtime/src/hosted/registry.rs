@@ -67,11 +67,20 @@ pub enum LaunchState {
         instance: InstanceRef,
         host_epoch: Uuid,
     },
-    /// Lost with host `host_epoch`, then reopened as a new instance by operation `by`.
+    /// It ended by itself, not closed; the record stays until its Monitor row is removed, so an
+    /// explicit reopen can still start a new instance.
+    Ended {
+        instance: InstanceRef,
+        host_epoch: Uuid,
+    },
+    /// Lost with host `host_epoch`, or ended by itself on it when `had_ended`, then reopened as a
+    /// new instance by operation `by`.
     Reopened {
         instance: InstanceRef,
         host_epoch: Uuid,
         by: Uuid,
+        #[serde(default)]
+        had_ended: bool,
     },
 }
 
@@ -168,6 +177,7 @@ impl LaunchRecord {
             LaunchState::Opening => None,
             LaunchState::Live { instance, .. }
             | LaunchState::Lost { instance, .. }
+            | LaunchState::Ended { instance, .. }
             | LaunchState::Reopened { instance, .. } => Some(instance),
         }
     }
@@ -678,23 +688,34 @@ impl RootRegistry {
                 LaunchState::Live {
                     instance,
                     host_epoch,
-                } => match &listing.running {
-                    Some(running) if running.epoch == *host_epoch => {
-                        if running.live.contains(instance) {
-                            continue;
+                } => {
+                    // A close forgets its record itself, so one the host no longer runs ended by
+                    // itself, or was lost with a host that died.
+                    let has_ended = match &listing.running {
+                        Some(running) if running.epoch == *host_epoch => {
+                            if running.live.contains(instance) {
+                                continue;
+                            }
+                            true
                         }
-                        Transition::Remove
-                    }
-                    _ if controller.was_emptied(*host_epoch) => Transition::Remove,
-                    _ => {
-                        next.state = LaunchState::Lost {
+                        _ => controller.was_emptied(*host_epoch),
+                    };
+                    next.state = if has_ended {
+                        LaunchState::Ended {
                             instance: instance.clone(),
                             host_epoch: *host_epoch,
-                        };
-                        Transition::Write(Box::new(next))
-                    }
-                },
-                LaunchState::Lost { .. } | LaunchState::Reopened { .. } => continue,
+                        }
+                    } else {
+                        LaunchState::Lost {
+                            instance: instance.clone(),
+                            host_epoch: *host_epoch,
+                        }
+                    };
+                    Transition::Write(Box::new(next))
+                }
+                LaunchState::Lost { .. }
+                | LaunchState::Ended { .. }
+                | LaunchState::Reopened { .. } => continue,
             };
             self.transition_launch(chat, record.operation, move |current| {
                 settled_launch_transition(record, current, transition)
@@ -818,6 +839,7 @@ mod tests {
             instance: instance.clone(),
             host_epoch,
             by: Uuid::new_v4(),
+            had_ended: false,
         };
         let committed = reopened.clone();
         root.transition_launch(chat, observed.operation, move |mut current| {

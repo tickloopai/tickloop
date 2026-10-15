@@ -3557,10 +3557,10 @@ for line in sys.stdin:
     }
 
     /// Reconciling keeps the record of a Tick nobody watches past the host's idle timeout, which
-    /// keeps running, still ends an orphan whose Chat owns no record, and drops the record of a
-    /// Tick the same host no longer runs instead of keeping it for recovery.
+    /// keeps running, still ends an orphan whose Chat owns no record, and marks the record of a
+    /// Tick the same host no longer runs as ended, kept until its Monitor row is removed.
     #[tokio::test(flavor = "multi_thread")]
-    async fn reconcile_keeps_an_unwatched_tick_ends_orphans_and_drops_closed_records() {
+    async fn reconcile_keeps_an_unwatched_tick_ends_orphans_and_marks_ended_records() {
         use tickloop_agent_runtime::hosted::registry::{LaunchRecord, LaunchState, Registry};
         let idle_timeout = Duration::from_secs(2);
         let fixture = Fixture::with_idle_timeout(idle_timeout);
@@ -3619,9 +3619,19 @@ for line in sys.stdin:
             .await
             .unwrap();
         let records = root.launches(fixture.owner.chat).await.unwrap();
-        assert_eq!(records.len(), 1, "{records:?}");
-        assert_eq!(records[0].instance(), Some(&kept.instance));
-        assert!(matches!(records[0].state, LaunchState::Live { .. }));
+        assert_eq!(records.len(), 2, "{records:?}");
+        let state_of = |instance| {
+            &records
+                .iter()
+                .find(|record| record.instance() == Some(instance))
+                .unwrap()
+                .state
+        };
+        assert!(matches!(
+            state_of(&closed.instance),
+            LaunchState::Ended { .. }
+        ));
+        assert!(matches!(state_of(&kept.instance), LaunchState::Live { .. }));
     }
 
     /// A listing settles only records older than itself: an open that completed while the

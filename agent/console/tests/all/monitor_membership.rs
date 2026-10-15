@@ -573,10 +573,14 @@ async fn hosted_rows_offer_one_x_and_enter_by_what_still_runs_and_who_opened_it(
                 action(
                     'x',
                     "remove",
-                    TickIntent::RemoveFromMonitor(instance.clone())
+                    TickIntent::CloseHosted {
+                        instance: instance.clone(),
+                        ends_process: false,
+                    },
                 ),
             ],
-            "{status}: Enter reopens it in place, and nothing that ended offers subscribing"
+            "{status}: Enter reopens it in place, x forgets its launch record with the row, and \
+             nothing that ended offers subscribing"
         );
     }
     let shared = row(&foreign);

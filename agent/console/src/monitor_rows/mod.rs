@@ -67,8 +67,9 @@ pub enum TickIntent {
     /// Opens the attached view of a local Tick the Tickhost runs, a hosted Tick or a Shell: a
     /// Herdr popup inside Herdr, otherwise full screen in this terminal.
     OpenView(InstanceRef),
-    /// Ends a hosted Tick this Chat opened and takes its row out with the Tick Subscriptions on
-    /// it. The Console asks first when that ends a running process or cancels subscriptions.
+    /// Ends a hosted Tick this Chat opened, or forgets the record of one that already ended, and
+    /// takes its row out with the Tick Subscriptions on it. The Console asks first when that ends
+    /// a running process or cancels subscriptions.
     CloseHosted {
         instance: InstanceRef,
         ends_process: bool,
@@ -250,9 +251,6 @@ impl NextCheck {
     }
 }
 
-/// How long a gone instance keeps its row before it leaves Monitor.
-pub const GONE_DISPLAY_MS: u64 = 30_000;
-
 #[derive(Clone, Debug)]
 pub struct TickDescriptor {
     pub instance: InstanceRef,
@@ -293,8 +291,6 @@ pub struct MonitorContext {
     pub member_resources: HashMap<InstanceRef, TickResources>,
     /// When protocol members last sent a Tick Update, as their hosts saw it.
     pub member_updates: HashMap<InstanceRef, u64>,
-    /// Since when each instance has shown as gone; it leaves Monitor [`GONE_DISPLAY_MS`] later.
-    pub gone_since: HashMap<InstanceRef, u64>,
     /// When each running Shell started, as far as the View knows.
     pub shell_starts: HashMap<Uuid, u64>,
     /// The row whose detail is open; it stays listed while the detail is open.
@@ -512,27 +508,6 @@ fn resolve_unread(
     }
 }
 
-/// Whether a gone Tick has had its time on screen: it leaves [`GONE_DISPLAY_MS`] after it went,
-/// unless a Loop still subscribes to it, it has an unread update, or it was lost with its host
-/// and can be reopened. Artifacts and Shells follow their own rules.
-fn has_left_as_gone(entry: &TickDescriptor, context: &MonitorContext, subscribed: bool) -> bool {
-    entry.group == TickGroup::Ticks
-        && entry.tone == StatusTone::Gone
-        && !subscribed
-        && entry
-            .update
-            .as_ref()
-            .is_none_or(|update| update.unread.is_none())
-        && !matches!(
-            context.member_states.get(&entry.instance),
-            Some(MemberState::Lost)
-        )
-        && context
-            .gone_since
-            .get(&entry.instance)
-            .is_some_and(|since| since.saturating_add(GONE_DISPLAY_MS) <= context.now_ms)
-}
-
 /// A member row with only the facts the Chat recorded: no invented status, time or resources.
 pub fn member_descriptor(member: &MonitorMember) -> TickDescriptor {
     TickDescriptor {
@@ -675,9 +650,6 @@ impl MonitorRowsRegistry {
                 accumulated,
             );
         }
-        entries.retain(|entry| {
-            !has_left_as_gone(entry, context, subscribed.contains_key(&entry.instance))
-        });
         entries.sort_by(descriptor_order);
         entries
     }

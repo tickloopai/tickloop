@@ -297,16 +297,29 @@ impl WorkerControl {
                     .ok_or_else(|| {
                         HostError::before(TARGET_GONE, "this Chat recorded no such hosted Tick")
                     })?;
-                if let LaunchState::Reopened { by, host_epoch, .. } = lost.state {
+                if let LaunchState::Reopened {
+                    by,
+                    host_epoch,
+                    had_ended,
+                    ..
+                } = lost.state
+                {
                     // A reopen whose answer was lost settles from its own receipt, so the
                     // instance is never started twice; one that certainly never started frees
                     // the lost Tick for another reopen.
                     match self.controller.receipt(by, &tick_owner).await? {
                         Some(Receipt::Opened(opened)) => return Ok(json!(opened)),
                         Some(Receipt::Failed(failure)) if !failure.dispatched => {
-                            let restored = LaunchState::Lost {
-                                instance: instance.clone(),
-                                host_epoch,
+                            let restored = if had_ended {
+                                LaunchState::Ended {
+                                    instance: instance.clone(),
+                                    host_epoch,
+                                }
+                            } else {
+                                LaunchState::Lost {
+                                    instance: instance.clone(),
+                                    host_epoch,
+                                }
                             };
                             registry
                                 .transition_launch(chat, lost.operation, move |mut current| {
@@ -341,11 +354,15 @@ impl WorkerControl {
                         }
                     }
                 }
-                let LaunchState::Lost { host_epoch, .. } = lost.state else {
-                    return Err(HostError::before(
-                        "InvalidState",
-                        "only a hosted Tick whose host was lost can be reopened",
-                    ));
+                let (host_epoch, had_ended) = match lost.state {
+                    LaunchState::Lost { host_epoch, .. } => (host_epoch, false),
+                    LaunchState::Ended { host_epoch, .. } => (host_epoch, true),
+                    _ => {
+                        return Err(HostError::before(
+                            "InvalidState",
+                            "only a hosted Tick that no longer runs can be reopened",
+                        ));
+                    }
                 };
                 let current = LaunchIdentity::of(&lost.command, &lost.cwd)
                     .map_err(|error| HostError::before("LaunchFailed", error))?;
@@ -367,6 +384,7 @@ impl WorkerControl {
                     instance: instance.clone(),
                     host_epoch,
                     by: operation,
+                    had_ended,
                 };
                 // The lost record turns Reopened only as it was judged: a settlement or another
                 // reopen in between leaves it alone and nothing starts.
@@ -426,10 +444,25 @@ impl WorkerControl {
                     .controller
                     .close(operation, &tick_owner, &instance)
                     .await?;
-                for record in registry.launches(chat).await? {
-                    if record.instance() == Some(&instance) {
-                        registry.remove_launch(chat, record.operation).await?;
-                    }
+                // The records the closed instance was reopened from go with its own, so nothing
+                // outlives its Monitor row.
+                let records = registry.launches(chat).await?;
+                let mut forgotten = records
+                    .iter()
+                    .filter(|record| record.instance() == Some(&instance))
+                    .map(|record| record.operation)
+                    .collect::<Vec<_>>();
+                let mut checked = 0;
+                while checked < forgotten.len() {
+                    let successor = forgotten[checked];
+                    checked += 1;
+                    forgotten.extend(records.iter().filter_map(|record| {
+                        matches!(record.state, LaunchState::Reopened { by, .. } if by == successor)
+                            .then_some(record.operation)
+                    }));
+                }
+                for operation in forgotten {
+                    registry.remove_launch(chat, operation).await?;
                 }
                 Ok(json!(receipt))
             }

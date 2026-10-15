@@ -105,8 +105,9 @@ enum HostedRun {
 
 /// A hosted Tick row's Enter and `x`. Enter opens the view of a Tick that still has a screen,
 /// and reopens one this Chat opened that no longer runs. `x` closes a Tick this Chat opened, so
-/// nothing it opened keeps running out of sight, and otherwise only takes the row out with this
-/// Chat's subscriptions, never ending another Chat's Tick.
+/// nothing it opened keeps running out of sight and the record of one that ended goes with its
+/// row, and otherwise only takes the row out with this Chat's subscriptions, never ending another
+/// Chat's Tick.
 fn hosted_actions(
     instance: &InstanceRef,
     is_opened_here: bool,
@@ -134,7 +135,7 @@ fn hosted_actions(
                 ends_process: true,
             },
         },
-        (HostedRun::Exited, true) => MonitorAction {
+        (HostedRun::Exited | HostedRun::Ended, true) => MonitorAction {
             key: REMOVE_KEY,
             label: "remove",
             intent: TickIntent::CloseHosted {
@@ -142,7 +143,7 @@ fn hosted_actions(
                 ends_process: false,
             },
         },
-        _ => remove_from_monitor(instance),
+        (_, false) => remove_from_monitor(instance),
     };
     vec![enter, remove]
 }
@@ -1252,8 +1253,6 @@ mod tests {
         let context = MonitorContext {
             chat: Some(Arc::new(chat)),
             member_states: [(exited.clone(), MemberState::Exited("exited 3".into()))].into(),
-            gone_since: [(exited.clone(), 0)].into(),
-            now_ms: GONE_DISPLAY_MS * 10,
             ..Default::default()
         };
         let rows = MonitorRowsRegistry::builtin().list(&context);
@@ -1264,47 +1263,36 @@ mod tests {
     }
 
     #[test]
-    fn gone_ticks_leave_after_thirty_seconds_unless_subscribed_unread_or_lost() {
-        let plain = InstanceRef::new("hosted", "plain-run").unwrap();
-        let watched = InstanceRef::new("hosted", "watched-run").unwrap();
-        let unread_gone = InstanceRef::new("hosted", "unread-run").unwrap();
+    fn ended_ticks_stay_listed_until_the_user_removes_them() {
+        let gone = InstanceRef::new("hosted", "gone-run").unwrap();
         let lost = InstanceRef::new("hosted", "lost-run").unwrap();
         let mut chat = empty_chat();
-        for instance in [&plain, &watched, &unread_gone, &lost] {
+        for instance in [&gone, &lost] {
             chat.monitor.record_opened(instance.clone(), None);
         }
-        chat.monitor.mark_handled(unread_gone.clone(), 1_000);
-        let mut gone_subscription = subscription(&watched, None, 0);
-        gone_subscription.link = TickLinkState::InstanceGone;
-        let context = |now_ms| MonitorContext {
-            chat: Some(Arc::new(chat.clone())),
-            subscriptions: vec![gone_subscription.clone()],
+        let context = MonitorContext {
+            chat: Some(Arc::new(chat)),
             member_states: [
-                (plain.clone(), MemberState::Gone),
-                (unread_gone.clone(), MemberState::Gone),
+                (gone.clone(), MemberState::Gone),
                 (lost.clone(), MemberState::Lost),
             ]
             .into(),
-            member_updates: [(unread_gone.clone(), 2_000)].into(),
-            gone_since: [&plain, &watched, &unread_gone, &lost]
-                .into_iter()
-                .map(|instance| (instance.clone(), 10_000))
-                .collect(),
-            now_ms,
+            now_ms: u64::MAX / 2,
             ..Default::default()
         };
-        let listed = |now_ms| {
-            MonitorRowsRegistry::builtin()
-                .list(&context(now_ms))
-                .into_iter()
-                .map(|row| row.instance)
-                .collect::<std::collections::BTreeSet<_>>()
-        };
-        assert_eq!(listed(10_000 + GONE_DISPLAY_MS - 1).len(), 4);
-        assert_eq!(
-            listed(10_000 + GONE_DISPLAY_MS),
-            [watched, unread_gone, lost].into(),
-            "only the plain gone Tick leaves"
-        );
+        let rows = MonitorRowsRegistry::builtin().list(&context);
+        assert_eq!(rows.len(), 2, "however long ago they ended: {rows:?}");
+        for row in rows {
+            assert_eq!(row.tone, StatusTone::Gone, "{}", row.instance);
+            assert_eq!(
+                row.actions
+                    .iter()
+                    .map(|action| (action.key, action.label))
+                    .collect::<Vec<_>>(),
+                [('o', "reopen"), ('x', "remove")],
+                "{}",
+                row.instance
+            );
+        }
     }
 }
