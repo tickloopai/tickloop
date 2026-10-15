@@ -159,6 +159,10 @@ pub struct HostOccupancy {
     /// Each Tick it holds, by its title, or its instance or command when it has none.
     pub ticks: Vec<String>,
     pub shells: usize,
+    /// Opens it has not answered yet and Shell spawn grants no spawner claimed yet, each about
+    /// to run something; `None` from a host older than this count, which may be starting one.
+    #[serde(default)]
+    pub pending: Option<usize>,
     /// Its authenticated business connections, such as attached views and data clients.
     pub connections: usize,
 }

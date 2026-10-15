@@ -1,7 +1,8 @@
 //! The daemon's controller works only with a Tickhost of its own build, which the host's frozen
 //! management hello names: one of another build that runs nothing is replaced at once, and one
-//! that runs Ticks, Shell tasks or connections, or is too old to say, stays until the user
-//! replaces it, refusing requests with what to do meanwhile.
+//! that runs or is starting Ticks, Shell tasks or connections, or is too old to say, stays until
+//! the user replaces it, refusing requests with what to do meanwhile. Refused, the daemon takes
+//! its Ticks for unknown, not lost.
 
 use std::{
     io::Write,
@@ -24,7 +25,10 @@ use tickhost_connect::{
     hosted::{self, HostDescription, HostOccupancy, ManagementConnection},
 };
 use tickloop_agent_protocol::{OtherTickhost, TickhostOccupancy};
-use tickloop_agent_runtime::hosted::controller::{HostController, OTHER_TICKHOST_BUILD};
+use tickloop_agent_runtime::hosted::{
+    controller::{HostController, OTHER_TICKHOST_BUILD},
+    registry::{LaunchRecord, LaunchState, Registry},
+};
 use uuid::Uuid;
 
 const OTHER_BUILD: &str = "0.0.0+an-older-build";
@@ -219,6 +223,14 @@ impl Fixture {
     }
 }
 
+/// What a host of another build that runs and starts nothing reports.
+fn nothing() -> HostOccupancy {
+    HostOccupancy {
+        pending: Some(0),
+        ..HostOccupancy::default()
+    }
+}
+
 fn other_build(occupancy: HostOccupancy) -> Option<HostDescription> {
     Some(HostDescription {
         build: OTHER_BUILD.into(),
@@ -231,8 +243,7 @@ fn other_build(occupancy: HostOccupancy) -> Option<HostDescription> {
 
 #[tokio::test]
 async fn an_empty_tickhost_of_another_build_is_replaced_without_asking() {
-    let fixture =
-        Fixture::with_other_build(Business::Refused, other_build(HostOccupancy::default()));
+    let fixture = Fixture::with_other_build(Business::Refused, other_build(nothing()));
 
     let grant = tokio::time::timeout(
         Duration::from_secs(20),
@@ -256,7 +267,7 @@ async fn a_tickhost_of_another_build_that_runs_something_stays_until_the_user_re
     let occupancy = HostOccupancy {
         ticks: vec!["Quote board".into()],
         shells: 1,
-        connections: 0,
+        ..nothing()
     };
     let fixture = Fixture::with_other_build(Business::Refused, other_build(occupancy.clone()));
 
@@ -282,6 +293,7 @@ async fn a_tickhost_of_another_build_that_runs_something_stays_until_the_user_re
             occupancy: Some(TickhostOccupancy {
                 ticks: occupancy.ticks,
                 shells: occupancy.shells,
+                pending: 0,
                 connections: occupancy.connections,
             }),
         })
@@ -325,9 +337,8 @@ async fn a_tickhost_of_another_build_with_this_business_protocol_is_replaced_too
     let fixture = Fixture::with_other_build(
         Business::Negotiated,
         other_build(HostOccupancy {
-            ticks: Vec::new(),
-            shells: 0,
             connections: 1,
+            ..nothing()
         }),
     );
 
@@ -341,4 +352,139 @@ async fn a_tickhost_of_another_build_with_this_business_protocol_is_replaced_too
 
     assert!(fixture.host.was_stopped());
     assert_eq!(fixture.serving_build().await, host::BUILD_IDENTITY);
+}
+
+/// An open the host has not answered or a Shell grant no spawner claimed is about to run, so a
+/// host starting one is not empty; one too old to count them may be starting something.
+#[tokio::test]
+async fn a_tickhost_of_another_build_starting_something_is_not_replaced_unasked() {
+    let starting = Fixture::with_other_build(
+        Business::Refused,
+        other_build(HostOccupancy {
+            pending: Some(2),
+            ..nothing()
+        }),
+    );
+    let refused = starting
+        .controller
+        .allow_spawn(&starting.spawn_binding())
+        .await
+        .unwrap_err();
+    assert_eq!(refused.message, OTHER_TICKHOST_BUILD);
+    assert!(!starting.host.was_stopped());
+    assert_eq!(
+        starting
+            .controller
+            .other_tickhost()
+            .await
+            .unwrap()
+            .and_then(|other| other.occupancy),
+        Some(TickhostOccupancy {
+            pending: 2,
+            ..TickhostOccupancy::default()
+        }),
+        "the user is told what stopping it ends"
+    );
+
+    let uncounted = Fixture::with_other_build(
+        Business::Refused,
+        other_build(HostOccupancy {
+            pending: None,
+            ..nothing()
+        }),
+    );
+    let refused = uncounted
+        .controller
+        .allow_spawn(&uncounted.spawn_binding())
+        .await
+        .unwrap_err();
+    assert_eq!(refused.message, OTHER_TICKHOST_BUILD);
+    assert!(!uncounted.host.was_stopped());
+    assert_eq!(
+        uncounted
+            .controller
+            .other_tickhost()
+            .await
+            .unwrap()
+            .and_then(|other| other.occupancy),
+        None,
+        "a host that cannot say what it is starting cannot say all stopping it ends"
+    );
+}
+
+/// While the user keeps a Tickhost of another build, what it runs is unknown to this daemon:
+/// reconciling a root reports the refusal and leaves every launch record as it was, so no Tick
+/// is taken for lost, no record goes and the host reaps no orphan; the requests Monitor and
+/// reopening read are refused alike instead of reading as an empty host.
+#[tokio::test]
+async fn ticks_of_a_kept_tickhost_of_another_build_are_unknown_not_lost() {
+    let fixture = Fixture::with_other_build(
+        Business::Negotiated,
+        other_build(HostOccupancy {
+            ticks: vec!["Quote board".into()],
+            ..nothing()
+        }),
+    );
+    let config_root = fixture.directory.path().join("config");
+    std::fs::create_dir(&config_root).unwrap();
+    let registry = Registry::default();
+    let root = registry.root(&config_root).await.unwrap();
+    let owner = host::TickOwner {
+        root: "root".into(),
+        chat: Uuid::new_v4(),
+    };
+    let record = |state| {
+        let mut record = LaunchRecord::opening(
+            Uuid::new_v4(),
+            owner.chat,
+            host::TickAdapter::Protocol,
+            vec!["/bin/sleep".into(), "30".into()],
+            fixture.directory.path().into(),
+            Some("Quote board".into()),
+        )
+        .unwrap();
+        record.state = state;
+        record
+    };
+    let instance = tick_protocol::InstanceRef::hosted(Uuid::new_v4());
+    root.record_launch(&record(LaunchState::Live {
+        instance: instance.clone(),
+        host_epoch: Uuid::new_v4(),
+    }))
+    .await
+    .unwrap();
+    root.record_launch(&record(LaunchState::Opening))
+        .await
+        .unwrap();
+    let before = root.launches(owner.chat).await.unwrap();
+    // The Live record is older than any listing taken from here on, so a listing could settle it.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let refused = root
+        .reconcile_with_host(&fixture.controller, &owner.root)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.message, OTHER_TICKHOST_BUILD);
+    assert_eq!(root.launches(owner.chat).await.unwrap(), before);
+    for refused in [
+        fixture.controller.owner_listing(&owner).await.err(),
+        fixture.controller.list(&owner, None).await.err(),
+        fixture
+            .controller
+            .receipt(Uuid::new_v4(), &owner)
+            .await
+            .err(),
+        fixture
+            .controller
+            .close(Uuid::new_v4(), &owner, &instance)
+            .await
+            .err(),
+    ] {
+        assert_eq!(
+            refused.map(|error| error.message).as_deref(),
+            Some(OTHER_TICKHOST_BUILD)
+        );
+    }
+    assert_eq!(root.launches(owner.chat).await.unwrap(), before);
+    assert!(!fixture.host.was_stopped());
 }

@@ -11,8 +11,8 @@ const OTHER_TICKHOST_GUIDANCE: &str = "The running Tickhost is another version; 
 /// The part of the guidance a Shell's collapsed result shows.
 const SHOWN_GUIDANCE: &str = "The running Tickhost is another version; restart tickloop and choose to restart the Tickhost at the prompt";
 
-/// The fixture's daemon key, and a Tickhost of another build that runs a Tick and a Shell at the
-/// daemon's Tickhost endpoint.
+/// The fixture's daemon key, and a Tickhost of another build that runs a Tick and a Shell and is
+/// starting one more at the daemon's Tickhost endpoint.
 fn other_build_running_a_tick(fixture: &PrivateFixture) -> (String, OtherBuildHost) {
     let key = tickhost::host::random_token();
     std::fs::write(fixture.path("runtime/tickhost.key"), &key).unwrap();
@@ -29,6 +29,7 @@ fn other_build_running_a_tick(fixture: &PrivateFixture) -> (String, OtherBuildHo
             occupancy: HostOccupancy {
                 ticks: vec!["Quote board".into()],
                 shells: 1,
+                pending: Some(1),
                 connections: 0,
             },
         }),
@@ -59,7 +60,8 @@ async fn actual_cli_restarting_a_tickhost_of_another_build_stops_it_and_runs_she
     assert!(
         menu.contains(&format!("Running Tickhost build {OTHER_BUILD}"))
             && menu.contains("Restarting it ends these Ticks: Quote board.")
-            && menu.contains("It also ends 1 running Shell."),
+            && menu.contains("It also ends 1 running Shell.")
+            && menu.contains("It also ends 1 Tick or Shell still starting."),
         "the menu names the build and what restarting ends: {menu}"
     );
     assert!(!host.was_stopped(), "nothing ends before the user chooses");

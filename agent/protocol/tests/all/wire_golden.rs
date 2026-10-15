@@ -769,6 +769,7 @@ fn observation_values_keep_their_recorded_wire() {
                 occupancy: Some(TickhostOccupancy {
                     ticks: vec!["Quote · AAPL.US".into()],
                     shells: 1,
+                    pending: 1,
                     connections: 0,
                 }),
             })),

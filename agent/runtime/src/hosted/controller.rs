@@ -763,10 +763,14 @@ impl HostController {
                     .map_or(UNNAMED_TICKHOST_BUILD, |host| host.build.as_str()),
                 tickhost::host::BUILD_IDENTITY
             ),
-            occupancy: hello.host.map(|host| TickhostOccupancy {
-                ticks: host.occupancy.ticks,
-                shells: host.occupancy.shells,
-                connections: host.occupancy.connections,
+            // A host that cannot say what it is starting cannot say all it runs.
+            occupancy: hello.host.and_then(|host| {
+                Some(TickhostOccupancy {
+                    pending: host.occupancy.pending?,
+                    ticks: host.occupancy.ticks,
+                    shells: host.occupancy.shells,
+                    connections: host.occupancy.connections,
+                })
             }),
         }))
     }
@@ -906,6 +910,7 @@ fn runs_nothing(hello: &HelloReply, own_connections: usize) -> bool {
         let occupancy = &host.occupancy;
         occupancy.ticks.is_empty()
             && occupancy.shells == 0
+            && occupancy.pending == Some(0)
             && occupancy.connections <= own_connections
     })
 }

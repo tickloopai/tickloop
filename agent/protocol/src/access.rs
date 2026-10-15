@@ -667,6 +667,8 @@ pub struct TickhostOccupancy {
     /// Each Tick it holds, by its title, or its instance when it has none.
     pub ticks: Vec<String>,
     pub shells: usize,
+    /// Ticks and Shells it is starting, which stopping it ends before they run.
+    pub pending: usize,
     /// Its other connections, such as attached views.
     pub connections: usize,
 }

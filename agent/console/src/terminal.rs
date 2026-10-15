@@ -739,6 +739,16 @@ async fn offer_tickhost_replacement(
                     }
                 ));
             }
+            if occupancy.pending > 0 {
+                context.push(format!(
+                    "It also ends {} still starting.",
+                    if occupancy.pending == 1 {
+                        "1 Tick or Shell".to_owned()
+                    } else {
+                        format!("{} Ticks or Shells", occupancy.pending)
+                    }
+                ));
+            }
             if occupancy.connections > 0 {
                 context.push(format!(
                     "Its {} open {} close.",

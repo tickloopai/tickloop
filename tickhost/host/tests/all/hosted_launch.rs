@@ -736,7 +736,13 @@ async fn the_management_hello_names_the_build_and_what_stopping_the_host_ends() 
         (BUSINESS_MAJOR, BUSINESS_MINOR)
     );
     assert!(empty.executable.is_some());
-    assert_eq!(empty.occupancy, HostOccupancy::default());
+    assert_eq!(
+        empty.occupancy,
+        HostOccupancy {
+            pending: Some(0),
+            ..HostOccupancy::default()
+        }
+    );
 
     let mut controller = fixture.controller().await;
     let sleep = which("sleep");
@@ -746,6 +752,7 @@ async fn the_management_hello_names_the_build_and_what_stopping_the_host_ends() 
     let occupied = describe().await.occupancy;
     assert_eq!(occupied.ticks, [format!("{sleep} 30")], "listed by title");
     assert_eq!(occupied.shells, 0);
+    assert_eq!(occupied.pending, Some(0), "the open was answered");
     assert_eq!(occupied.connections, 1, "the controller's connection");
 
     ManagementConnection::connect(&fixture.paths.socket(), &fixture.key)

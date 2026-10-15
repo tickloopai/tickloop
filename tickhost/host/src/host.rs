@@ -1194,11 +1194,11 @@ impl Host {
         state
             .shells
             .retain(|_, task| !task.is_forgotten(now_ms, self.idle_timeout));
-        let has_pending_spawns = state.spawn_grants.has_pending(Instant::now());
+        let pending_spawns = state.spawn_grants.pending(Instant::now());
         state.exiting = state.ticks.is_empty()
             && state.shells.is_empty()
             && state.spawners == 0
-            && !has_pending_spawns
+            && pending_spawns == 0
             && state.pending_opens == 0
             && (state.ever_used || self.started.elapsed() >= INITIAL_GRACE);
         state.exiting
@@ -1272,10 +1272,11 @@ impl Host {
         })
     }
 
-    /// What stopping this host would end: its Ticks by title, its Shell tasks and its business
-    /// connections.
+    /// What stopping this host would end: its Ticks by title, its Shell tasks, the opens and
+    /// spawns under way that keep it from idling, and its business connections.
     async fn occupancy(&self) -> HostOccupancy {
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
+        let pending = state.pending_opens + state.spawn_grants.pending(Instant::now());
         HostOccupancy {
             ticks: state
                 .ticks
@@ -1290,6 +1291,7 @@ impl Host {
                 })
                 .collect(),
             shells: state.shells.len(),
+            pending: Some(pending),
             connections: self.connections.load(Ordering::SeqCst),
         }
     }

@@ -3217,6 +3217,21 @@ impl ConsoleExecution {
             _ => Err(unexpected()),
         }
     }
+    /// The running Tickhost of another build the daemon keeps until the user replaces it.
+    pub(super) async fn other_tickhost(
+        &self,
+    ) -> Result<Option<tickloop_agent_protocol::OtherTickhost>, AccessError> {
+        match self
+            .inner
+            .access
+            .observe(ObservationRequest::OtherTickhost)
+            .await?
+            .initial
+        {
+            ObservationValue::OtherTickhost(other) => Ok(other),
+            _ => Err(unexpected()),
+        }
+    }
     pub(super) async fn hosted_ticks(&self, chat: Uuid) -> Result<Vec<HostedMember>, AccessError> {
         let execution = self.reference(chat).await?;
         match self

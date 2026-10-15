@@ -341,9 +341,10 @@ impl SpawnGrants {
             .map(|pending| pending.binding)
     }
 
-    pub(crate) fn has_pending(&mut self, now: Instant) -> bool {
+    /// How many grants no spawner claimed yet and that have not expired.
+    pub(crate) fn pending(&mut self, now: Instant) -> usize {
         self.pending.retain(|_, pending| now < pending.expires);
-        !self.pending.is_empty()
+        self.pending.len()
     }
 
     pub(crate) fn clear(&mut self) {
@@ -815,12 +816,12 @@ mod tests {
         assert_eq!(grants.claim(grant, "secret", now), None);
 
         let late = grants.issue(binding(), "secret".into(), now);
-        assert!(grants.has_pending(now));
+        assert_eq!(grants.pending(now), 1);
         assert_eq!(
             grants.claim(late, "secret", now + SPAWN_GRANT_TIMEOUT),
             None
         );
-        assert!(!grants.has_pending(now + SPAWN_GRANT_TIMEOUT));
+        assert_eq!(grants.pending(now + SPAWN_GRANT_TIMEOUT), 0);
     }
 
     #[test]

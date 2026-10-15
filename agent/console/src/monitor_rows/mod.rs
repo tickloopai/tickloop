@@ -312,6 +312,9 @@ pub enum MemberState {
     /// Its host died with it; a hosted Tick can be reopened as a new instance.
     Lost,
     Gone,
+    /// Its host runs but serves no request of this Agent, such as a Tickhost of another build
+    /// the user kept; whether it still runs is unknown, so it is neither lost nor reopened.
+    Unavailable,
 }
 
 /// The row action Enter and a click run.

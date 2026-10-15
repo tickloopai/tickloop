@@ -32,11 +32,24 @@ impl TickProbe for HostedProbe {
         chat: Uuid,
         instances: &[InstanceRef],
     ) -> Result<MemberFindings, ProbeError> {
-        let running = self
-            .agent
-            .hosted_ticks(chat)
-            .await
-            .map_err(|error| ProbeError(error.to_string()))?
+        let listed = match self.agent.hosted_ticks(chat).await {
+            Ok(listed) => listed,
+            // While the user keeps a Tickhost of another build, its Ticks may still run but
+            // serve nothing here; any other failure keeps the earlier findings.
+            Err(error) => {
+                return match self.agent.other_tickhost().await {
+                    Ok(Some(_)) => Ok(MemberFindings {
+                        states: instances
+                            .iter()
+                            .map(|instance| (instance.clone(), MemberState::Unavailable))
+                            .collect(),
+                        ..MemberFindings::default()
+                    }),
+                    _ => Err(ProbeError(error.to_string())),
+                };
+            }
+        };
+        let running = listed
             .into_iter()
             .map(|member| (member.instance.clone(), member))
             .collect::<HashMap<_, _>>();
