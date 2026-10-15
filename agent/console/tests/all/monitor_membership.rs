@@ -518,12 +518,7 @@ async fn hosted_members_show_their_probed_state_and_sample_and_offer_close() {
             MonitorAction {
                 key: 'o',
                 label: "open",
-                intent: TickIntent::OpenHosted(instance.clone()),
-            },
-            MonitorAction {
-                key: 's',
-                label: "snapshot",
-                intent: TickIntent::ShowHostedSnapshot(instance.clone()),
+                intent: TickIntent::OpenView(instance.clone()),
             },
             MonitorAction {
                 key: 'x',

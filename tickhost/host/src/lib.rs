@@ -8,3 +8,5 @@ pub mod process;
 pub mod pty;
 pub mod screen;
 pub mod shell;
+mod shell_screen;
+pub mod views;

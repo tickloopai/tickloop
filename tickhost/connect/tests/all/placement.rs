@@ -181,6 +181,7 @@ fn pane(id: &str, tab: &str, workspace: &str) -> Pane {
         tab_id: tab.into(),
         cwd: Some("/tmp".into()),
         foreground_cwd: None,
+        tokens: Default::default(),
     }
 }
 
@@ -616,4 +617,31 @@ async fn closing_a_view_finds_its_terminal_wherever_it_moved_and_a_closed_one_st
     assert_eq!(closes, [json!({"pane_id":"renamed-view"})]);
     layout.close_view("terminal-gone").await.unwrap();
     assert_eq!(host.calls("pane.close").await.len(), 1);
+}
+
+/// A view Pane is the Pane that names the Tick it shows in its metadata, in whatever Workspace
+/// it is; a Pane whose report lapsed or names another Tick is not.
+#[tokio::test]
+async fn the_view_panes_of_a_tick_are_the_panes_naming_it_in_any_workspace() {
+    let (layout, host) = fixture().await;
+    let shows = |instance: &str| {
+        let instance = instance.to_owned();
+        move |pane: &mut Pane| {
+            pane.tokens
+                .insert(tickhost_connect::herdr::VIEW_TOKEN.into(), instance);
+        }
+    };
+    host.update("view", shows("hosted:quote")).await;
+    host.insert(pane("elsewhere", "far-tab", "w2")).await;
+    host.update("elsewhere", shows("hosted:quote")).await;
+    host.update("anchor", shows("hosted:other")).await;
+    let found = layout
+        .view_panes("hosted:quote")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|pane| pane.pane_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(found, ["elsewhere".to_owned(), "view".to_owned()].into());
+    assert!(layout.view_panes("hosted:gone").await.unwrap().is_empty());
 }

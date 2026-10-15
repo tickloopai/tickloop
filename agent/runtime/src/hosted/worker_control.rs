@@ -115,6 +115,11 @@ pub enum WorkerRequest {
         operation: Uuid,
         approval: tickhost::shell::ShellApproval,
     },
+    /// Lets one View of `chat` show the Shell task `instance` this worker submitted for it once.
+    AllowShellView {
+        chat: Uuid,
+        instance: InstanceRef,
+    },
 }
 
 /// A spawn grant as the daemon hands it to its worker: what it binds, and the host to claim it at.
@@ -163,7 +168,8 @@ impl WorkerRequest {
             | Self::SetWatchIntents { .. }
             | Self::AllowHostedView { .. }
             | Self::EndStoppedChild { .. }
-            | Self::AllowShellSpawn { .. } => None,
+            | Self::AllowShellSpawn { .. }
+            | Self::AllowShellView { .. } => None,
         }
     }
 
@@ -177,7 +183,8 @@ impl WorkerRequest {
             | Self::SetWatchIntents { chat, .. }
             | Self::AllowHostedView { chat, .. }
             | Self::EndStoppedChild { chat, .. }
-            | Self::AllowShellSpawn { chat, .. } => *chat,
+            | Self::AllowShellSpawn { chat, .. }
+            | Self::AllowShellView { chat, .. } => *chat,
         }
     }
 }

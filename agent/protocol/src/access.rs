@@ -17,22 +17,24 @@ use crate::{
     AccessLimits, AccountModelDirectory, AgentHostOptions, ApprovalHistoryView, ArtifactTick,
     BranchSessionPermissionRegistration, ChatSnapshot, CodeRewind, CommandSnapshot,
     DirectedSummaryDraft, DirectedSummaryRequest, Event, ExecutionMode, FEED_CAPACITY,
-    FEED_CHANGE_BYTES, FEED_MAX_BYTES, HostedMember, HostedSnapshot, HostedViewGrant, InputContext,
-    LoopState, LoopTriggerNotice, Message, ModelChange, ModelConfig, MonitorMembership,
-    OperationRecord, PendingCommand, PendingInput, PermissionChange, PermissionPolicy,
-    PermissionRequest, PermissionRule, PermissionScope, PermissionsRevision, PermissionsView,
-    ProviderPatch, QuestionAnswer, QuestionRequest, QueuedInput, ReasoningEffort, Receipt,
-    RequestUsageLedger, RewindDraft, RewindMode, RewindPoint, RunId, SavedChat, SearchConfig,
-    ShellTask, ShellTaskOutputChunk, SubagentRegistration, SummaryDirection, TakenBackPrompt,
+    FEED_CHANGE_BYTES, FEED_MAX_BYTES, HostedMember, HostedViewGrant, InputContext, LoopState,
+    LoopTriggerNotice, Message, ModelChange, ModelConfig, MonitorMembership, OperationRecord,
+    PendingCommand, PendingInput, PermissionChange, PermissionPolicy, PermissionRequest,
+    PermissionRule, PermissionScope, PermissionsRevision, PermissionsView, ProviderPatch,
+    QuestionAnswer, QuestionRequest, QueuedInput, ReasoningEffort, Receipt, RequestUsageLedger,
+    RewindDraft, RewindMode, RewindPoint, RunId, SavedChat, SearchConfig, ShellTask,
+    ShellTaskOutputChunk, SubagentRegistration, SummaryDirection, TakenBackPrompt,
     TaskNotification, TickSubscriptionChange, TickSubscriptionStatus, ToolCallRecovery, Trigger,
     TriggerSource, UserShellReceipt, UserShellRecord,
 };
 
 /// Business 18.0 replaces a Tick Subscription's cadence in seconds with one of four frequencies,
 /// in the subscription, its status and the change a View requests. 19.0: a hosted Monitor member
-/// can be an exited terminal Tick, with how its program ended. Older business majors are refused
-/// before dispatch; the frozen daemon management protocol remains independent.
-pub const PROTOCOL_MAJOR: u16 = 19;
+/// can be an exited terminal Tick, with how its program ended. 20.0: the hosted Tick snapshot
+/// command is gone, and `AttachHostedTick` also grants views of the Chat's Shell tasks. Older
+/// business majors are refused before dispatch; the frozen daemon management protocol remains
+/// independent.
+pub const PROTOCOL_MAJOR: u16 = 20;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
@@ -272,12 +274,8 @@ pub enum AgentCommand {
         execution: ExecutionRef,
         instance: InstanceRef,
     },
-    /// The current screen of one of the Chat's hosted Ticks as text, for its Monitor detail.
-    HostedTickSnapshot {
-        execution: ExecutionRef,
-        instance: InstanceRef,
-    },
-    /// Lets the asking View attach to one of the Chat's hosted Ticks once.
+    /// Lets the asking View attach once to one of the Chat's local Ticks the Tickhost runs: a
+    /// hosted Tick's terminal, or the screen of one of its Shell tasks.
     AttachHostedTick {
         execution: ExecutionRef,
         instance: InstanceRef,
@@ -381,7 +379,6 @@ impl AgentCommand {
             | Self::ListHostedTicks { execution }
             | Self::CloseHostedTick { execution, .. }
             | Self::ReopenHostedTick { execution, .. }
-            | Self::HostedTickSnapshot { execution, .. }
             | Self::AttachHostedTick { execution, .. }
             | Self::EnqueueAfterTurn { execution, .. }
             | Self::RefreshConfiguration { execution } => Some(*execution),
@@ -897,7 +894,6 @@ pub enum CommandResult {
         instance: InstanceRef,
         membership: MonitorMembership,
     },
-    HostedTickSnapshot(HostedSnapshot),
     HostedTickView(HostedViewGrant),
     Created {
         execution: ExecutionRef,

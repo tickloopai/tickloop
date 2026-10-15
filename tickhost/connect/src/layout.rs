@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    herdr::{HerdrContext, HerdrPort, Pane, SocketHerdr, current_pane},
+    herdr::{HerdrContext, HerdrPort, Pane, SocketHerdr, current_pane, report_view},
     host_error::HostError,
 };
 
@@ -124,6 +124,23 @@ impl HerdrLayout {
             )
             .await?;
         serde_json::from_value(response["pane"].clone()).map_err(invalid_host_response)
+    }
+
+    /// The Panes in any Workspace that report showing a view of `instance`.
+    pub async fn view_panes(&self, instance: &str) -> Result<Vec<Pane>, HostError> {
+        Ok(self
+            .panes(None)
+            .await?
+            .into_iter()
+            .filter(|pane| pane.view_of() == Some(instance))
+            .collect())
+    }
+
+    /// Reports on Pane `pane_id` that it shows a view of `instance`. A Pane's metadata does not
+    /// follow it when a move gives it another id, so a view placed or moved is reported at once
+    /// rather than at its own next renewal.
+    pub async fn report_view(&self, pane_id: &str, instance: &str) -> Result<(), HostError> {
+        report_view(self.host.as_ref(), pane_id, Some(instance)).await
     }
 
     /// The Pane that shows `terminal_id` now, wherever it was moved; `None` once it closed.

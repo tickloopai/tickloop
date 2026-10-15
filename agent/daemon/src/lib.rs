@@ -496,9 +496,10 @@ pub async fn build_runtime_with_client(
             tickloop_agent_runtime::hosted::lifecycle::DaemonLifecycle::new(grant.clone()),
         ));
     }
-    // A worker's shell commands run in its daemon's Tickhost, under spawns the daemon grants.
+    // A worker's shell commands run in its daemon's Tickhost, under spawns and views the daemon
+    // grants.
     if let Some(grant) = &control {
-        agent.install_shell_issuer(Arc::new(
+        agent.install_shell_grants(Arc::new(
             tickloop_agent_runtime::hosted::worker_control::DaemonControl::new(grant.clone()),
         ));
     }

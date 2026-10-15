@@ -2133,8 +2133,9 @@ for line in sys.stdin:
     /// In a private Herdr, a Tick opened with a placement runs in the Tickhost as a `hosted:`
     /// instance, and a Pane beside the anchor shows it through the attach client. ReadWorkspace
     /// marks that Pane as the Tick's view. Moving the view keeps the instance; closing the Pane
-    /// leaves the Tick running and readable; a move without a view shows it again, and closing
-    /// the Tick ends it and its view.
+    /// leaves the Tick running and readable; a move without a view shows it again. A restarted
+    /// worker, which remembers no view, still finds that view by what its Pane reports, and its
+    /// close ends the Tick and the view.
     #[tokio::test(flavor = "multi_thread")]
     async fn herdr_panes_only_show_views_of_ticks_that_run_in_the_tickhost() {
         use tickhost_connect::{herdr::HerdrContext, layout::HerdrLayout};
@@ -2184,11 +2185,15 @@ for line in sys.stdin:
             view,
             "the view sits right of its anchor"
         );
-        let (tick, _) = listed(&tools, chat, &workspace, &instance).await;
-        assert_eq!(
-            tick["views"], 1,
-            "the Pane's attach client is the Tick's view: {tick}"
-        );
+        let mut attached = false;
+        for _ in 0..200 {
+            if listed(&tools, chat, &workspace, &instance).await.0["views"] == 1 {
+                attached = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(attached, "the Pane's attach client is the Tick's view");
         run_tool(
             &tools,
             chat,
@@ -2276,10 +2281,79 @@ for line in sys.stdin:
             "a move without a view shows one: {shown}"
         );
         let terminal = shown["view"]["terminal_id"].as_str().unwrap().to_owned();
-        assert!(terminal_pane(&herdr, &terminal).is_some());
+        let view =
+            terminal_pane(&herdr, &terminal).expect("the shown view's Pane")["pane_id"].clone();
+
+        // A view Pane names its Tick itself: one that only its attach client reports on.
+        let layout = HerdrLayout::new(HerdrContext::without_view(herdr.socket()));
+        let CommandResult::HostedTickView(grant) = daemon
+            .command(AgentCommand::AttachHostedTick {
+                execution: daemon.executions[0],
+                instance: serde_json::from_value(instance.clone()).unwrap(),
+            })
+            .await
+        else {
+            panic!("a view grant expected");
+        };
+        let attach = std::iter::once(
+            super::support::fixture_cli::executable()
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .chain(tickloop_agent_protocol::ATTACH_ARGUMENTS.map(String::from))
+        .collect::<Vec<_>>();
+        let reported = match layout
+            .create_view(
+                &attach,
+                &std::collections::BTreeMap::from([
+                    (
+                        tickloop_agent_protocol::ATTACH_ENVIRONMENT.to_owned(),
+                        serde_json::to_string(&grant).unwrap(),
+                    ),
+                    (
+                        tickloop_agent_protocol::VIEW_PANE_ENVIRONMENT.to_owned(),
+                        "1".to_owned(),
+                    ),
+                ]),
+                &workspace,
+                &tickhost_connect::layout::Placement::NewTab,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        {
+            tickhost_connect::layout::CreatedView::Placed(pane) => pane,
+            tickhost_connect::layout::CreatedView::NotPlaced { error, .. } => panic!("{error}"),
+        };
+        eventually("the attach client naming its Tick on its Pane", || {
+            herdr
+                .request("pane.get", json!({"pane_id":reported.pane_id}))
+                .unwrap()["pane"]["tokens"][tickhost_connect::herdr::VIEW_TOKEN]
+                == instance
+        })
+        .await;
+
+        // A restarted worker remembers no view, and finds both by their Panes.
+        let restarted = daemon.tools().with_herdr_views(HerdrViews::new(
+            HerdrLayout::new(HerdrContext::without_view(herdr.socket())),
+            &super::support::fixture_cli::executable(),
+        ));
+        let views = [view.clone(), json!(reported.pane_id)];
+        let (tick, panes) = listed(&restarted, chat, &workspace, &instance).await;
+        let shown = tick["view_panes"].as_array().unwrap();
+        assert!(
+            shown.len() == views.len() && views.iter().all(|view| shown.contains(view)),
+            "{tick}"
+        );
+        assert!(
+            panes
+                .iter()
+                .all(|pane| views.contains(&pane["pane_id"]) == (pane["view_of"] == instance)),
+            "only the view Panes are marked: {panes:?}"
+        );
 
         let closed = run_tool(
-            &tools,
+            &restarted,
             chat,
             "ModifyTick",
             json!({"action":"close","tick_instance_id":instance}),
@@ -2287,8 +2361,9 @@ for line in sys.stdin:
         .await;
         assert_eq!(closed["status"], "closed", "{closed}");
         assert_eq!(closed["view"]["status"], "closed", "{closed}");
-        eventually("the view Pane closing with its Tick", || {
+        eventually("the view Panes closing with their Tick", || {
             terminal_pane(&herdr, &terminal).is_none()
+                && terminal_pane(&herdr, &reported.terminal_id).is_none()
         })
         .await;
         assert!(matches!(
@@ -2973,11 +3048,10 @@ for line in sys.stdin:
         }
     }
 
-    /// A View reads its Chat's hosted Tick as a screen snapshot and attaches through a one-time
-    /// view grant from the daemon; neither hands it the Tick's data token, and another Chat's Tick
-    /// is refused.
+    /// A View attaches to its Chat's hosted Tick through a one-time view grant from the daemon,
+    /// which hands it no data token; another Chat's Tick is refused.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_view_gets_a_snapshot_and_a_one_time_attach_grant_for_its_chats_tick_only() {
+    async fn a_view_gets_a_one_time_attach_grant_for_its_chats_tick_only() {
         use tickhost_connect::hosted::{CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role};
         let daemon = Daemon::start(2).await;
         let (chat, execution, other) =
@@ -2986,43 +3060,16 @@ for line in sys.stdin:
         let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
         let instance: tick_protocol::InstanceRef =
             serde_json::from_value(opened["tick_instance_id"].clone()).unwrap();
-        let snapshot = loop {
-            let CommandResult::HostedTickSnapshot(snapshot) = daemon
-                .command(AgentCommand::HostedTickSnapshot {
-                    execution,
+        assert!(
+            daemon
+                .try_command(AgentCommand::AttachHostedTick {
+                    execution: other,
                     instance: instance.clone(),
                 })
                 .await
-            else {
-                panic!("a snapshot expected");
-            };
-            if snapshot
-                .screen
-                .lines
-                .iter()
-                .any(|line| line.contains("Counter: 0"))
-            {
-                break snapshot;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-        assert!(!snapshot.screen.truncated);
-        assert!(snapshot.taken_at_ms > 0);
-        for command in [
-            AgentCommand::HostedTickSnapshot {
-                execution: other,
-                instance: instance.clone(),
-            },
-            AgentCommand::AttachHostedTick {
-                execution: other,
-                instance: instance.clone(),
-            },
-        ] {
-            assert!(
-                daemon.try_command(command).await.is_err(),
-                "another Chat's Tick is refused"
-            );
-        }
+                .is_err(),
+            "another Chat's Tick is refused"
+        );
         let CommandResult::HostedTickView(grant) = daemon
             .command(AgentCommand::AttachHostedTick {
                 execution,

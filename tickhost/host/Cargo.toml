@@ -22,6 +22,7 @@ tickloop-tickhost-connect = { path = "../connect" }
 tickloop-tick-protocol = { path = "../../tick/protocol" }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
+unicode-width = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
 # A real terminal model for hidden TUIs: ANSI state, CJK width, alternate screen, resize and
 # bounded scrollback. Kept inside this crate; nothing else parses the PTY.

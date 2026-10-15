@@ -37,9 +37,11 @@ pub const MANAGEMENT_FRAME_BYTES: usize = 64 * 1024;
 /// its answer and the listings; a terminal Tick reads as screen text with its program's exit, is
 /// written to with `input` and is watched only until it ends. 7.0: the controller asks for
 /// one-time spawn grants, a spawner connection runs one Shell task from the descriptors and
-/// launch it passes, and the Shell adapter serves that task's `shell:` instance. A host of any
-/// other major is refused at hello.
-pub const BUSINESS_MAJOR: u16 = 7;
+/// launch it passes, and the Shell adapter serves that task's `shell:` instance. 8.0: the
+/// controller grants views of a Worker's Shell task, running or ended, which attach to a screen
+/// the host draws from the task's output and take no input. A host of any other major is
+/// refused at hello.
+pub const BUSINESS_MAJOR: u16 = 8;
 pub const BUSINESS_MINOR: u16 = 0;
 /// A complete business frame, large enough for one legal 8 MiB Tick Tool response.
 pub const BUSINESS_FRAME_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
@@ -108,8 +110,8 @@ pub enum Role {
         instance: InstanceRef,
         data_token: String,
     },
-    /// A view of one instance's terminal, holding the one-time grant its owner asked the host
-    /// for; it can only attach, so no data token leaves the Agent.
+    /// A view of one instance's screen, a Tick's terminal or a Shell task's, holding the one-time
+    /// grant its owner asked the host for; it can only attach, so no data token leaves the Agent.
     Viewer {
         instance: InstanceRef,
         view: uuid::Uuid,

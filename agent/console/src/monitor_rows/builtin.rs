@@ -6,8 +6,8 @@ use tickloop_agent_protocol::{
 /// How long a finished background Shell keeps its row once the Chat handled its end.
 pub const FINISHED_SHELL_DISPLAY_MS: u64 = 30_000;
 
-/// Shows a hosted Tick's screen as a text snapshot detail.
-pub(crate) const HOSTED_SNAPSHOT_KEY: char = 's';
+/// Stops a running Shell from its Monitor row after confirmation.
+pub(crate) const SHELL_STOP_KEY: char = 's';
 /// Ends a hosted Tick from its Monitor row after confirmation; the row stays until removed.
 pub(crate) const HOSTED_CLOSE_KEY: char = 'c';
 /// Starts a new instance in place of a hosted Tick lost with its host, after confirmation.
@@ -48,21 +48,7 @@ impl MonitorRows for HostedRows {
     fn member(&self, member: &MonitorMember, context: &MonitorContext) -> TickDescriptor {
         let mut row = super::member_descriptor(member);
         row.actions.retain(|action| action.key != MONITOR_ENTER_KEY);
-        row.actions.splice(
-            0..0,
-            [
-                MonitorAction {
-                    key: MONITOR_ENTER_KEY,
-                    label: "open",
-                    intent: TickIntent::OpenHosted(member.instance.clone()),
-                },
-                MonitorAction {
-                    key: HOSTED_SNAPSHOT_KEY,
-                    label: "snapshot",
-                    intent: TickIntent::ShowHostedSnapshot(member.instance.clone()),
-                },
-            ],
-        );
+        row.actions.insert(0, open_view(&member.instance));
         row.resources = context.member_resources.get(&member.instance).cloned();
         add_probed_update(&mut row, context);
         row.actions.push(MonitorAction {
@@ -229,24 +215,7 @@ impl MonitorRows for ShellRows {
             .map(|task| {
                 let instance = InstanceRef::shell(task.id);
                 TickDescriptor {
-                    actions: vec![
-                        MonitorAction {
-                            key: MONITOR_ENTER_KEY,
-                            label: "open",
-                            intent: TickIntent::OpenShell { task: task.id },
-                        },
-                        if task.state.is_terminal() {
-                            remove_from_monitor(&instance)
-                        } else {
-                            MonitorAction {
-                                key: 'x',
-                                label: "remove",
-                                intent: TickIntent::Notify(
-                                    "Open this Shell to stop it before removing it".into(),
-                                ),
-                            }
-                        },
-                    ],
+                    actions: shell_actions(task, &instance),
                     instance,
                     group: TickGroup::Shells,
                     glyph: TickGlyph::Shell,
@@ -270,6 +239,41 @@ impl MonitorRows for ShellRows {
             .collect()
     }
 }
+/// A Shell row opens the Shell's view; a running one can be stopped, where its owner allows it,
+/// and must be before it is removed.
+fn shell_actions(task: &ShellTask, instance: &InstanceRef) -> Vec<MonitorAction> {
+    let mut actions = vec![open_view(instance)];
+    if task.state.is_terminal() {
+        actions.push(remove_from_monitor(instance));
+        return actions;
+    }
+    if task.capabilities.can_stop {
+        actions.push(MonitorAction {
+            key: SHELL_STOP_KEY,
+            label: "stop",
+            intent: TickIntent::StopShell { task: task.id },
+        });
+    }
+    actions.push(MonitorAction {
+        key: 'x',
+        label: "remove",
+        intent: TickIntent::Notify(RUNNING_SHELL_REMOVAL.into()),
+    });
+    actions
+}
+
+/// Why `x` does not take out a running Shell.
+const RUNNING_SHELL_REMOVAL: &str = "Stop this Shell before removing it";
+
+/// Enter on a local Tick's row opens its attached view.
+fn open_view(instance: &InstanceRef) -> MonitorAction {
+    MonitorAction {
+        key: MONITOR_ENTER_KEY,
+        label: "open",
+        intent: TickIntent::OpenView(instance.clone()),
+    }
+}
+
 /// Until when a finished Shell keeps its row: [`FINISHED_SHELL_DISPLAY_MS`] after the Chat
 /// handled its end. `None` while it runs or while its end is unread, so it stays.
 pub fn finished_shell_until(task: &ShellTask, handled_at: Option<u64>) -> Option<u64> {
@@ -323,7 +327,7 @@ fn shell_notes(task: &ShellTask) -> Vec<String> {
 }
 
 /// The name of a signal that ends a process, such as `SIGTERM`.
-pub(crate) fn signal_name(signal: i32) -> Option<&'static str> {
+fn signal_name(signal: i32) -> Option<&'static str> {
     Some(match signal {
         libc::SIGHUP => "SIGHUP",
         libc::SIGINT => "SIGINT",
@@ -347,8 +351,8 @@ pub(crate) fn signal_name(signal: i32) -> Option<&'static str> {
     })
 }
 
-/// A Shell row is named by its key command, so the row says what runs; its description stays in
-/// the detail.
+/// A Shell row is named by its key command, so the row says what runs; its description, full
+/// command and directory head its view.
 fn shell_title(task: &ShellTask) -> String {
     key_command(&task.command)
 }
@@ -579,7 +583,7 @@ fn without_leading_cd(command: &str) -> &str {
 }
 
 /// The tone a Shell's glyph takes: running since `started_at_ms`, or how it ended.
-pub(crate) fn shell_tone(task: &ShellTask, started_at_ms: Option<u64>) -> StatusTone {
+fn shell_tone(task: &ShellTask, started_at_ms: Option<u64>) -> StatusTone {
     if !task.state.is_terminal() {
         StatusTone::Running {
             since_ms: started_at_ms,
@@ -665,22 +669,10 @@ pub(crate) fn artifact_actions(id: &str, holds_association: bool) -> Vec<Monitor
     .collect()
 }
 
-/// A hosted Tick known only through a subscription still opens and shows its snapshot like a
-/// member; the Monitor list adds the subscription keys.
+/// A hosted Tick known only through a subscription still opens its view like a member; the
+/// Monitor list adds the subscription keys.
 fn hosted_subscription_actions(row: &TickSubscriptionStatus) -> Vec<MonitorAction> {
-    vec![
-        MonitorAction {
-            key: MONITOR_ENTER_KEY,
-            label: "open",
-            intent: TickIntent::OpenHosted(row.instance.clone()),
-        },
-        MonitorAction {
-            key: HOSTED_SNAPSHOT_KEY,
-            label: "snapshot",
-            intent: TickIntent::ShowHostedSnapshot(row.instance.clone()),
-        },
-        remove_from_monitor(&row.instance),
-    ]
+    vec![open_view(&row.instance), remove_from_monitor(&row.instance)]
 }
 
 #[cfg(test)]

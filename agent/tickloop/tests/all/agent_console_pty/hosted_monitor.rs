@@ -46,24 +46,6 @@ fn selected_row(frame: &str) -> Option<usize> {
     frame.lines().position(|line| line.contains("› ◉"))
 }
 
-/// The screen a terminal would show for everything the View wrote, including what an attached
-/// Tick drew without the Console's synchronized frames.
-fn terminal_screen(view: &PtyView) -> String {
-    let mut parser = vt100::Parser::new(TERMINAL_HEIGHT as u16, TERMINAL_WIDTH as u16, 0);
-    parser.process(&view.output.lock().unwrap());
-    parser.screen().contents()
-}
-
-async fn terminal_shows(view: &PtyView, text: &str) {
-    tokio::time::timeout(UI_TIMEOUT, async {
-        while !terminal_screen(view).contains(text) {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("{text:?} never appeared:\n{}", terminal_screen(view)));
-}
-
 /// Notices the Console used to show after a hosted Tick opened or closed; it now returns to the
 /// Monitor list quietly.
 const RETIRED_NOTICES: [&str; 4] = [
@@ -113,7 +95,8 @@ const SEND_ESCAPE: &[u8] = b"\x02\x1b";
 /// Enter on a hosted Tick outside Herdr opens the same process full screen in this terminal at
 /// once: the Console stops reading and drawing, keys reach the Tick, Ctrl+B Esc sends Esc, and a
 /// lone Esc gives the terminal back to the Monitor list quietly with the same row selected and
-/// nothing typed left in the input. `s` opens the text snapshot detail instead.
+/// nothing typed left in the input. The Tick runs on: opening it again shows what was typed.
+/// Monitor itself shows no Tick content.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_cli_enter_opens_a_hosted_tick_full_screen_outside_herdr_and_esc_closes_it() {
     let fixture = PrivateFixture::new();
@@ -121,10 +104,9 @@ async fn actual_cli_enter_opens_a_hosted_tick_full_screen_outside_herdr_and_esc_
         let mut view = view_with_keys_ticks(&fixture, &[], 2, None).await;
         view.send(b"\x1b[C");
         let first = view
-            .wait_for("Monitor focused", |frame| {
-                frame.contains("enter open") && frame.contains("s snapshot")
-            })
+            .wait_for("Monitor focused", |frame| frame.contains("enter open"))
             .await;
+        assert!(!first.contains("snapshot"), "{first}");
         let first_row = first
             .lines()
             .position(|line| line.contains(" ◉"))
@@ -154,16 +136,14 @@ async fn actual_cli_enter_opens_a_hosted_tick_full_screen_outside_herdr_and_esc_
             "the same row is selected: {back}"
         );
 
-        view.send(b"s");
-        view.wait_for("the snapshot detail", |frame| {
-            frame.contains("keys 7a 1b") && frame.contains("r refresh")
-        })
-        .await;
-        view.send(b"\x1b");
-        view.wait_for("back in the Monitor list", |frame| {
-            frame.contains("enter open") && !frame.contains("r refresh")
-        })
-        .await;
+        assert!(
+            !back.contains("keys 7a"),
+            "Monitor shows no Tick content: {back}"
+        );
+        view.send(b"\r");
+        terminal_shows(&view, "keys 7a 1b").await;
+        view.send(CLOSE);
+        back_in_monitor_quietly(&view).await;
         view.send(b"\x1b");
         view.wait_for("input focused again", new_input_is_visible)
             .await;
@@ -186,9 +166,9 @@ async fn actual_cli_enter_opens_a_hosted_tick_full_screen_outside_herdr_and_esc_
 }
 
 /// A long Agent stream remains live while Enter lends the terminal to the Tick. Closing the
-/// attached view restores its reply tail and snapshot without an internal recovery notice.
+/// attached view restores its reply tail without an internal recovery notice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn actual_cli_monitor_shows_a_hosted_tick_snapshot_and_attaches_it_full_screen() {
+async fn actual_cli_keeps_a_long_reply_streaming_while_a_hosted_tick_owns_the_terminal() {
     const THINKING_DELTAS: usize = 8192;
     const ATTACHED_REPLY: &str = "Reply tail received while the Tick owned the terminal.";
     let fixture = PrivateFixture::new();
@@ -255,16 +235,6 @@ async fn actual_cli_monitor_shows_a_hosted_tick_snapshot_and_attaches_it_full_sc
         );
         view.send(CLOSE);
         back_in_monitor_quietly(&view).await;
-        view.send(b"s");
-        view.wait_for("the snapshot retains attached input", |frame| {
-            frame.contains("keys 7a 1b") && frame.contains("r refresh")
-        })
-        .await;
-        view.send(b"\x1b");
-        view.wait_for("back in the Monitor list", |frame| {
-            frame.contains("enter open") && !frame.contains("r refresh")
-        })
-        .await;
         view.send(b"\x1b");
         view.wait_for("input focused again", new_input_is_visible)
             .await;
@@ -584,6 +554,305 @@ async fn actual_cli_enter_without_a_usable_popup_opens_full_screen() {
     .catch_unwind()
     .await;
     fixture.shutdown().await;
+    drop(herdr);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// A background Shell's script: one line, then another once `gate` exists in its directory.
+const SHELL_VIEW_SCRIPT: &str =
+    "printf 'out%s\\n' one\nwhile [ ! -e gate ]; do sleep 0.05; done\nprintf 'out%s\\n' two\n";
+const SHELL_VIEW_COMMAND: &str = "sh shellview.sh";
+const SHELL_VIEW_DESCRIPTION: &str = "Watch the shell view";
+/// A background Shell that runs until it is stopped.
+const LONG_SHELL_COMMAND: &str = "sh sleeper.sh";
+const LOCAL_TICKS_OPENED: &str = "Local Ticks opened.";
+
+/// A View whose Agent opened a protocol Tick, a terminal Tick and a background Shell, and with
+/// `long_shell` a second Shell that runs until it is stopped, all in its Monitor.
+async fn view_with_local_ticks(
+    fixture: &PrivateFixture,
+    environment: &[(&str, &std::path::Path)],
+    long_shell: bool,
+) -> PtyView {
+    let keys = fixture.path("work/keys.py");
+    std::fs::write(&keys, include_str!("../../support/keys_tick.py")).unwrap();
+    std::fs::write(fixture.path("work/shellview.sh"), SHELL_VIEW_SCRIPT).unwrap();
+    std::fs::write(fixture.path("work/sleeper.sh"), "sleep 600\n").unwrap();
+    let mut calls = vec![
+        (
+            "ModifyTick",
+            "open-keys",
+            json!({"action":"open","command":["/usr/bin/python3", "-u", keys],"protocol":true}),
+        ),
+        (
+            "ModifyTick",
+            "open-cat",
+            json!({"action":"open","command":["/bin/cat"]}),
+        ),
+        (
+            "Bash",
+            "shell-view",
+            json!({"command":SHELL_VIEW_COMMAND,"description":SHELL_VIEW_DESCRIPTION,"run_in_background":true}),
+        ),
+    ];
+    if long_shell {
+        calls.push((
+            "Bash",
+            "long-shell",
+            json!({"command":LONG_SHELL_COMMAND,"description":"Sleep until stopped","run_in_background":true}),
+        ));
+    }
+    let rows = calls.len();
+    let mut replies = calls
+        .into_iter()
+        .map(|(tool, id, input)| (200, chat_reply(Some((tool, id, input)), "")))
+        .collect::<Vec<_>>();
+    replies.push((200, chat_reply(None, LOCAL_TICKS_OPENED)));
+    // The turns the Shells' ends start.
+    replies.extend((0..2).map(|_| (200, chat_reply(None, "Noted."))));
+    let (base_url, _requests) = model_http_support::serve_responses(replies).await;
+    fixture.set_chat_model(&base_url);
+    let mut view =
+        PtyView::start_with_environment(fixture, &["--dangerously-skip-permissions"], environment);
+    view.wait_for("input ready", new_input_is_visible).await;
+    view.send(b"Open the local Ticks.\r");
+    let members = format!("Monitor {rows}");
+    view.wait_for("the local Ticks join Monitor", |frame| {
+        frame.contains(&members) && frame.contains(LOCAL_TICKS_OPENED)
+    })
+    .await;
+    view
+}
+
+/// The selected Monitor row's text.
+fn selected_text(frame: &str) -> Option<String> {
+    frame
+        .lines()
+        .find_map(|line| line.split_once("› ").map(|(_, row)| row.to_owned()))
+}
+
+/// The key hints of the selected Monitor row.
+fn monitor_hint(frame: &str) -> &str {
+    frame
+        .lines()
+        .rfind(|line| line.starts_with("enter open"))
+        .unwrap_or_default()
+}
+
+/// Moves the Monitor selection to the row that names `needle`.
+async fn select_row(view: &mut PtyView, needle: &str) {
+    const STEPS: usize = 8;
+    const SETTLE: Duration = Duration::from_millis(150);
+    for key in [b"j", b"k"] {
+        for _ in 0..STEPS {
+            if selected_text(&view.frame()).is_some_and(|row| row.contains(needle)) {
+                return;
+            }
+            view.send(key);
+            tokio::time::sleep(SETTLE).await;
+        }
+    }
+    panic!("no Monitor row names {needle:?}: {}", view.frame());
+}
+
+/// Waits until a view took the terminal: the Console's frame is gone from the screen.
+async fn terminal_taken(view: &PtyView) {
+    tokio::time::timeout(UI_TIMEOUT, async {
+        while terminal_screen(view).contains("enter open") {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no view took the terminal:\n{}", terminal_screen(view)));
+}
+
+/// Waits until the Console took the terminal back from a view that showed `shown`.
+async fn back_from(view: &PtyView, shown: &str) {
+    tokio::time::timeout(UI_TIMEOUT, async {
+        loop {
+            let screen = terminal_screen(view);
+            if screen.contains("enter open") && !screen.contains(shown) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the Console never took the terminal back:\n{}",
+            terminal_screen(view)
+        )
+    });
+}
+
+/// Outside Herdr, Enter opens a terminal Tick and a Shell full screen too, and Esc gives the
+/// terminal back to the Monitor list while each keeps running. The terminal Tick takes keys; the
+/// Shell's view shows its description, full command, directory and status over its live output,
+/// takes no input and shows how it ended. A running Shell is stopped from its row once confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_cli_enter_opens_terminal_ticks_and_shells_full_screen_and_a_row_stops_a_shell() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(async {
+        let mut view = view_with_local_ticks(&fixture, &[], true).await;
+        view.send(b"\x1b[C");
+        view.wait_for("Monitor focused", |frame| frame.contains("enter open"))
+            .await;
+
+        select_row(&mut view, "cat").await;
+        view.send(b"\r");
+        terminal_taken(&view).await;
+        view.send(b"hello cat\r");
+        terminal_shows(&view, "hello cat").await;
+        view.send(CLOSE);
+        back_from(&view, "hello cat").await;
+        assert!(quietly_back_in_monitor(&view.frame()), "{}", view.frame());
+
+        select_row(&mut view, SHELL_VIEW_COMMAND).await;
+        view.send(b"\r");
+        terminal_taken(&view).await;
+        terminal_shows(&view, "outone").await;
+        let shown = terminal_screen(&view);
+        for expected in [
+            SHELL_VIEW_DESCRIPTION.to_owned(),
+            format!("$ {SHELL_VIEW_COMMAND}"),
+            format!(
+                "in {}",
+                fixture.path("work").canonicalize().unwrap().display()
+            ),
+            "running".to_owned(),
+            "outone".to_owned(),
+        ] {
+            assert!(shown.contains(&expected), "{expected:?} in {shown}");
+        }
+        view.send(b"typed into the view");
+        std::fs::write(fixture.path("work/gate"), "").unwrap();
+        terminal_shows(&view, "outtwo").await;
+        terminal_shows(&view, "exit 0").await;
+        let ended = terminal_screen(&view);
+        assert!(
+            !ended.contains("running") && !ended.contains("typed into the view"),
+            "{ended}"
+        );
+        view.send(CLOSE);
+        back_from(&view, "outtwo").await;
+        view.wait_for("the ended Shell keeps its row", |frame| {
+            frame.contains(SHELL_VIEW_COMMAND) && frame.contains("cat")
+        })
+        .await;
+
+        select_row(&mut view, LONG_SHELL_COMMAND).await;
+        view.wait_for("the running Shell's row offers stop", |frame| {
+            monitor_hint(frame).contains("s stop")
+        })
+        .await;
+        view.send(b"s");
+        view.wait_for("stopping asks first", |frame| {
+            frame.contains("Stop this Shell?")
+        })
+        .await;
+        view.send(b"\r");
+        view.wait_for("the stopped Shell shows how it ended", |frame| {
+            frame.lines().any(|line| {
+                line.split_once("› ").is_some_and(|(_, row)| {
+                    row.contains(LONG_SHELL_COMMAND) && row.contains("SIGTERM")
+                })
+            }) && !monitor_hint(frame).contains("s stop")
+        })
+        .await;
+        view.send(b"\x1b");
+        view.wait_for("input focused again", new_input_is_visible)
+            .await;
+        view.close().await;
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// Inside Herdr, Enter floats every local Tick in Tickloop's Herdr popup, the protocol Tick, the
+/// terminal Tick and the Shell alike, and nothing opens full screen; a lone Esc closes the popup
+/// and each Tick stays in Monitor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_cli_enter_floats_every_local_tick_in_the_herdr_popup() {
+    use support::herdr::{HerdrClient, PrivateHerdr, wait_until};
+    let herdr = PrivateHerdr::start();
+    let pane = herdr.create_workspace();
+    let mut client = HerdrClient::attach(&herdr);
+    let fixture = PrivateFixture::new();
+    let socket = herdr.socket();
+    let result = AssertUnwindSafe(async {
+        let mut view = view_with_local_ticks(
+            &fixture,
+            &[
+                ("HERDR_ENV", std::path::Path::new("1")),
+                ("HERDR_SOCKET_PATH", &socket),
+                ("HERDR_PANE_ID", std::path::Path::new(&pane)),
+            ],
+            false,
+        )
+        .await;
+        view.send(b"\x1b[C");
+        view.wait_for("Monitor focused", |frame| frame.contains("enter open"))
+            .await;
+        let popup_closes = |client: &HerdrClient| {
+            wait_until("the popup to close", || {
+                Some(()).filter(|()| !client.screen().contains("┌Tickloop"))
+            })
+        };
+
+        select_row(&mut view, "Keys").await;
+        view.send(b"\r");
+        view.wait_for("the one-key registration offer", |frame| {
+            frame.contains("Register Tickloop") && frame.contains("enter confirm")
+        })
+        .await;
+        view.send(b"\r");
+        client.shows("size ");
+        client.send(CLOSE);
+        popup_closes(&client);
+
+        select_row(&mut view, "cat").await;
+        view.send(b"\r");
+        client.shows("┌Tickloop");
+        client.send(b"hello cat\r");
+        client.shows("hello cat");
+        client.send(CLOSE);
+        popup_closes(&client);
+
+        select_row(&mut view, SHELL_VIEW_COMMAND).await;
+        view.send(b"\r");
+        let shown = client.shows(SHELL_VIEW_DESCRIPTION);
+        assert!(shown.contains("┌Tickloop"), "{shown}");
+        client.shows("outone");
+        client.send(CLOSE);
+        popup_closes(&client);
+
+        let frame = view.frame();
+        assert!(quietly_back_in_monitor(&frame), "{frame}");
+        for row in ["Keys", "cat", SHELL_VIEW_COMMAND] {
+            assert!(frame.contains(row), "{row} stays in Monitor: {frame}");
+        }
+        let screen = terminal_screen(&view);
+        assert!(
+            !screen.contains("hello cat") && !screen.contains("outone"),
+            "nothing opened full screen: {screen}"
+        );
+        std::fs::write(fixture.path("work/gate"), "").unwrap();
+        view.send(b"\x1b");
+        view.wait_for("input focused again", new_input_is_visible)
+            .await;
+        view.close().await;
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    drop(client);
     drop(herdr);
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);

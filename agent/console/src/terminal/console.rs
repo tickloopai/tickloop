@@ -780,8 +780,6 @@ enum RenderedView {
     Overview,
     Transcript,
     DiffScreen,
-    /// A full-screen Monitor detail, an input dialog below it while one is open.
-    TickDetail,
 }
 
 #[derive(Clone, Copy)]
@@ -1588,21 +1586,6 @@ impl Console {
         Ok(())
     }
 
-    pub(super) fn poll_tick_detail(
-        &self,
-    ) -> Result<Option<(Uuid, super::tick_actions::PreparedTickAction)>, String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        if !state.monitor_visible() {
-            return Ok(None);
-        }
-        let Some(detail) = state.monitor.detail.as_mut() else {
-            return Ok(None);
-        };
-        let chat = detail.chat();
-        Ok(detail
-            .poll(tickloop_agent_base::private_fs::unix_time_milliseconds())
-            .map(|action| (chat, action)))
-    }
     pub(super) fn update_tick_detail<T: super::tick_actions::TickDetailView, R>(
         &self,
         chat: Uuid,
@@ -5325,16 +5308,6 @@ impl State {
             row: usize::from(event.row),
             column: usize::from(event.column),
         };
-        if self.full_screen_detail_shown()
-            && (!self.input_dialog_visible()
-                || at.row < self.height.saturating_sub(self.input_dialog_height()))
-        {
-            if let MouseEventKind::ScrollUp | MouseEventKind::ScrollDown = event.kind {
-                self.pointer_input =
-                    self.scroll_full_screen_detail(event.kind == MouseEventKind::ScrollDown);
-            }
-            return true;
-        }
         if self.full_review {
             match event.kind {
                 MouseEventKind::ScrollUp => self.navigate_menu_review(DiffNavigationAction::Up),
@@ -5557,21 +5530,6 @@ impl State {
         }
     }
 
-    /// Scrolls the full-screen detail by one wheel step and returns the action that needs, such as
-    /// reading earlier output.
-    fn scroll_full_screen_detail(&mut self, down: bool) -> Option<InputEvent> {
-        let (width, height) = self.detail_area();
-        let detail = self.monitor.detail.as_mut()?;
-        let lines = renderer::WHEEL_SCROLL_LINES as i32;
-        match detail.scroll(if down { lines } else { -lines }, width, height) {
-            super::tick_actions::TickDetailKey::Action(action) => Some(InputEvent::TickAction {
-                chat: detail.chat(),
-                action,
-            }),
-            _ => None,
-        }
-    }
-
     fn scroll_conversation(&mut self, action: ScrollAction) -> bool {
         if self.transcript.is_some() || self.diff_screen.is_some() {
             return false;
@@ -5667,43 +5625,17 @@ impl State {
             && self.diff_screen.is_none()
             && !self.full_review
             && (self.monitor.overlay
-                || self.full_screen_detail_open()
                 || self.monitor_side_columns().is_some()
                     && self.monitor_preference == tickloop_agent_config::MonitorPreference::Auto)
     }
 
-    /// Whether the focused Monitor has a detail open that covers the whole screen, which needs no
-    /// room for Monitor's column.
-    fn full_screen_detail_open(&self) -> bool {
-        self.monitor.focused
-            && self
-                .monitor
-                .detail
-                .as_ref()
-                .is_some_and(|detail| detail.full_screen())
-    }
-
-    /// Whether this frame draws a full-screen Monitor detail in place of the conversation.
-    fn full_screen_detail_shown(&self) -> bool {
-        self.full_screen_detail_open() && self.monitor_visible()
-    }
-
-    /// The columns and rows the open Monitor detail draws in: the whole screen above any input
-    /// dialog for a full-screen detail, else Monitor's column above the input area.
+    /// The columns and rows the open Monitor detail draws in: Monitor's column above the input
+    /// area.
     fn detail_area(&mut self) -> (usize, usize) {
-        if self.full_screen_detail_shown() {
-            let dialog_rows = if self.input_dialog_visible() {
-                self.styled_frame().0.len()
-            } else {
-                0
-            };
-            (self.width, self.height.saturating_sub(dialog_rows))
-        } else {
-            (
-                self.monitor_columns().saturating_sub(2),
-                self.height.saturating_sub(self.styled_frame().0.len()),
-            )
-        }
+        (
+            self.monitor_columns().saturating_sub(2),
+            self.height.saturating_sub(self.styled_frame().0.len()),
+        )
     }
 
     #[cfg(test)]
@@ -5849,9 +5781,6 @@ impl State {
             queue!(output, Hide)?;
             self.rendered_screen = lines;
             return output.flush();
-        }
-        if self.full_screen_detail_shown() {
-            return self.draw_full_screen_detail(output);
         }
         let (lines, cursor_row, cursor_column) = self.styled_frame();
         let start = self.height - lines.len();
@@ -6044,53 +5973,6 @@ impl State {
                 && !self.dialog_cursor_visible
             || self.conversation_focused
             || self.monitor.focused && self.monitor_visible() && !self.input_dialog_visible())
-    }
-
-    /// Draws the open full-screen Monitor detail over the whole screen, as the detailed
-    /// transcript is drawn, with an input dialog below it while one is open.
-    fn draw_full_screen_detail(&mut self, output: &mut impl Write) -> io::Result<()> {
-        let (dialog, cursor_row, cursor_column) = if self.input_dialog_visible() {
-            self.styled_frame()
-        } else {
-            (Vec::new(), 0, 0)
-        };
-        let detail_height = self.height.saturating_sub(dialog.len());
-        let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
-        let mut lines = self
-            .monitor
-            .detail
-            .as_mut()
-            .map(|detail| {
-                detail
-                    .lines(self.width, detail_height, now)
-                    .into_iter()
-                    .map(|line| line.line)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        lines.resize_with(detail_height, RoleLine::default);
-        lines.extend(dialog);
-        let rows = lines
-            .iter()
-            .map(|line| {
-                line.resolve(self.display.theme(), self.width)
-                    .render(self.colour_depth)
-            })
-            .collect();
-        self.initialize_screen(output)?;
-        write!(output, "{RESET_SCROLL_REGION}")?;
-        self.paint_rows(output, RenderedView::TickDetail, rows, 0)?;
-        self.rendered_screen = lines.iter().map(RoleLine::text).collect();
-        if detail_height < self.height && self.shows_cursor() {
-            queue!(
-                output,
-                MoveTo(cursor_column as u16, (detail_height + cursor_row) as u16),
-                Show
-            )?;
-        } else {
-            queue!(output, Hide)?;
-        }
-        output.flush()
     }
 
     fn initialize_screen(&mut self, output: &mut impl Write) -> io::Result<()> {
@@ -17698,56 +17580,6 @@ mod tests {
         state.key(KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::SHIFT));
         assert_eq!(state.footer.selected(), None);
         assert_eq!(state.editor.draft(), "abciZ");
-    }
-
-    #[test]
-    fn closing_inline_task_details_returns_to_the_same_task_in_the_footer_list() {
-        let chat = Uuid::new_v4();
-        let mut state = State::new(true, 140, 24);
-        state.prompt_enabled = true;
-        state.chat = Some(chat);
-        state.insert("keep this draft");
-        let console = InteractiveConsoleFixture::new(state);
-        let snapshot = task_snapshot(chat, 6);
-        let mut snapshot = snapshot;
-        for task in &mut snapshot.tasks {
-            task.was_background = true;
-        }
-        console.update_shell_ticks(&snapshot).unwrap();
-        let task = snapshot.tasks[4].id;
-        let panel = {
-            let mut state = console.state.lock().unwrap();
-            state
-                .monitor
-                .select(&tick_protocol::InstanceRef::shell(task));
-            state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
-            state
-                .monitor
-                .select(&tick_protocol::InstanceRef::shell(task));
-            let Some(InputEvent::TickAction { action, .. }) = state.key(key(KeyCode::Enter)) else {
-                panic!("Shell did not open the Tick panel");
-            };
-            assert_eq!(
-                action.instance,
-                tick_protocol::InstanceRef::shell(task).to_string()
-            );
-            state.monitor.detail.as_ref().unwrap().id()
-        };
-        console
-            .update_tick_detail::<crate::terminal::tick_shell::TickShell, _>(
-                chat,
-                panel,
-                |detail| detail.load(snapshot, None),
-            )
-            .unwrap();
-        let mut state = console.state.lock().unwrap();
-        state.key(key(KeyCode::Esc));
-        assert!(state.monitor.detail.is_none());
-        assert_eq!(
-            state.monitor.selected().unwrap().instance,
-            tick_protocol::InstanceRef::shell(task)
-        );
-        assert_eq!(state.editor.draft(), "keep this draft");
     }
 
     #[test]

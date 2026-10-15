@@ -28,7 +28,7 @@ use crate::{
 use tickloop_agent_protocol::{HostToolAuthority, ObservationKind, ShellTask};
 
 const RECOVER_WITH: &str =
-    "Read the output_file returned by Bash with Read; use the Shell detail for user commands";
+    "Read the output_file returned by Bash with Read; a user command's output shows in its view";
 /// The one update of a Shell Tick: its end.
 const EXIT_SEQUENCE: u64 = 1;
 

@@ -6,6 +6,24 @@ const TODO_SECOND: &str = "Explain the verified layout result";
 const TODO_REPLY: &str = "FOOTER-TODO-READY";
 const TODO_DRAFT: &str = "jk-FOOTER-EDITOR-DRAFT";
 const SHELL_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Waits until the terminal no longer shows the Shell view headed by `command`.
+async fn shell_view_closed(pty: &PtyView, command: &str) {
+    tokio::time::timeout(UI_TIMEOUT, async {
+        while terminal_screen(pty).contains(&format!("$ {command}")) {
+            tokio::time::sleep(SHELL_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the Shell view never closed:\n{}", terminal_screen(pty)));
+}
+
+/// Waits until a Shell's own view holds the terminal: its full command over its output, with its
+/// status.
+async fn shell_view_shows(pty: &PtyView, command: &str, output: &str, status: &str) {
+    view_shows(pty, &[&format!("$ {command}"), output, status]).await;
+}
+
 async fn run_working_todo_list(fixture: &PrivateFixture) {
     let todos = json!({"todos":[
         {"content":TODO_FIRST,"status":"in_progress","activeForm":"Inspecting the source-owned footer behavior"},
@@ -449,15 +467,15 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     })
     .await;
     pty.send(b"\r");
-    pty.wait_for("Enter opens the exact first task detail", |frame| {
-        frame
-            .lines()
-            .next()
-            .is_some_and(|line| line.starts_with("$ while [ ! -f first-finish ]"))
-            && frame.contains("shell-first-0123456789abcdef")
-    })
+    shell_view_shows(
+        &pty,
+        "printf 'shell-first-0123456789abcdef\\n'; while",
+        "shell-first-0123456789abcdef",
+        "running",
+    )
     .await;
     pty.send(b"\x1b");
+    shell_view_closed(&pty, "printf 'shell-first-0123456789abcdef\\n'; while").await;
     pty.wait_for("Esc returns to the selected Tick row", |frame| {
         frame.contains("Shells (1)")
     })
@@ -516,15 +534,19 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     })
     .await;
     pty.send(b"\r");
-    pty.wait_for("second exact detail", |frame| {
-        frame
-            .lines()
-            .next()
-            .is_some_and(|line| line.starts_with("$ while [ ! -f second-finish ]"))
-            && frame.contains("shell-second")
-            // `s` stops only once the loaded task offers it; a key sent earlier is ignored.
-            && frame.contains("s stop")
-    })
+    shell_view_shows(
+        &pty,
+        "printf 'shell-second\\n'; while",
+        "shell-second",
+        "running",
+    )
+    .await;
+    pty.send(b"\x1b");
+    shell_view_closed(&pty, "printf 'shell-second\\n'; while").await;
+    pty.wait_for(
+        "Esc returns to the second Shell's row, which can stop it",
+        |frame| frame.contains("Shells (2)") && frame.contains("s stop"),
+    )
     .await;
     pty.send(b"s");
     pty.wait_for("Tick Shell stop is confirmed", |frame| {
@@ -556,15 +578,9 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
             .is_empty()
     );
     assert!(requests.try_recv().is_err());
-    pty.send(b"\x1b");
     pty.wait_for(
-        "closing the detail marks the stopped Shell seen; it keeps its row for now",
-        |frame| {
-            frame.contains("Shells (2)")
-                && frame
-                    .lines()
-                    .any(|line| line.contains("SIGTERM") && !line.contains('●'))
-        },
+        "the stopped Shell keeps its row with how it ended",
+        |frame| frame.contains("Shells (2)") && frame.lines().any(|line| line.contains("SIGTERM")),
     )
     .await;
     pty.send(b"\x1b");
