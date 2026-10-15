@@ -1,4 +1,5 @@
 use super::*;
+use tickloop_agent_test_support::screen::SELECTED_MARK;
 
 fn request_state(request: &Value) -> Value {
     request["messages"]
@@ -423,7 +424,7 @@ fn family_rows(frame: &str) -> Vec<&str> {
 fn selected_family_row(frame: &str) -> Option<usize> {
     family_rows(frame)
         .iter()
-        .position(|line| line.starts_with('›'))
+        .position(|line| line.starts_with(SELECTED_MARK))
 }
 
 /// Moves the family panel selection to the row naming `member` and opens it.

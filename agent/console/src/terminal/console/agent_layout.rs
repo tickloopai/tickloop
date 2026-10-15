@@ -8,6 +8,7 @@ use super::{
 };
 use crate::agent_console::AttentionGroup;
 use crate::terminal::display::{DisplayProfile, Glyph};
+use crate::terminal::list_row::ROW_INDENT;
 use tickloop_agent_protocol::{LoopState, SubagentRegistration};
 
 pub(super) const MIN_CONVERSATION_ROWS: usize = 6;
@@ -62,7 +63,6 @@ pub(in crate::terminal) struct RowExtras<'a> {
 /// The pieces of one summary line: everything before the title, the room for the title and its
 /// preview, everything after them, and the age that ends the row at its right edge.
 struct RowFrame {
-    marker: String,
     /// The state shape and its space, or nothing when a narrow row gave it up.
     glyph: String,
     title_columns: usize,
@@ -122,14 +122,13 @@ impl AgentRow {
         status_variants: &[Vec<(String, Role)>],
         min_title: usize,
     ) -> usize {
-        self.summary_frame(width, false, extras, status_variants, min_title, 0)
+        self.summary_frame(width, extras, status_variants, min_title, 0)
             .title_columns
     }
 
     pub(in crate::terminal) fn summary_line(
         &self,
         width: usize,
-        selected: bool,
         extras: &RowExtras<'_>,
         ordinal: Option<usize>,
         status_variants: &[Vec<(String, Role)>],
@@ -137,14 +136,7 @@ impl AgentRow {
     ) -> RoleLine {
         let ordinal = ordinal.map(|ordinal| format!(" ({ordinal})"));
         let ordinal_columns = ordinal.as_deref().map_or(0, display_width);
-        let frame = self.summary_frame(
-            width,
-            selected,
-            extras,
-            status_variants,
-            min_title,
-            ordinal_columns,
-        );
+        let frame = self.summary_frame(width, extras, status_variants, min_title, ordinal_columns);
         let title = display_single_line(&self.title);
         let title = match &ordinal {
             Some(ordinal) => format!(
@@ -153,7 +145,7 @@ impl AgentRow {
             ),
             None => ellipsize(&title, frame.title_columns),
         };
-        let mut line = RoleLine::role(frame.marker, Role::Text);
+        let mut line = RoleLine::role(ROW_INDENT, Role::Text);
         line.push(frame.glyph, Some(self.glyph_role()));
         line.push(title.as_str(), Some(Role::Text));
         if frame.preview_columns > 0
@@ -192,19 +184,17 @@ impl AgentRow {
     fn summary_frame(
         &self,
         width: usize,
-        selected: bool,
         extras: &RowExtras<'_>,
         status_variants: &[Vec<(String, Role)>],
         min_title: usize,
         ordinal_columns: usize,
     ) -> RowFrame {
-        let marker = if selected { "› " } else { "  " }.to_owned();
         let shape = if extras.glyph.is_empty() {
             String::new()
         } else {
             format!("{} ", extras.glyph)
         };
-        let with_glyph = format!("{marker}{shape}");
+        let with_glyph = format!("{ROW_INDENT}{shape}");
         let delimiter = |text: &str| (text.to_owned(), Role::MutedText);
         let separator = || delimiter(" · ");
         let status_segments = |separator: &str, status: &[(String, Role)]| {
@@ -302,14 +292,14 @@ impl AgentRow {
         };
         // The glyph is the first thing a narrow row gives up: the status word still names the
         // state, and status or request labels never shrink to keep the shape.
-        let (glyph, chosen) = match (choose(&with_glyph), choose(&marker)) {
+        let (glyph, chosen) = match (choose(&with_glyph), choose(ROW_INDENT)) {
             (Some((glyph_rank, _)), Some(plain)) if plain.0 < glyph_rank => {
                 (String::new(), Some(plain.1))
             }
             (None, plain) => (String::new(), plain.map(|(_, suffix)| suffix)),
             (glyph, _) => (shape, glyph.map(|(_, suffix)| suffix)),
         };
-        let prefix_columns = display_width(&marker) + display_width(&glyph);
+        let prefix_columns = display_width(ROW_INDENT) + display_width(&glyph);
         let mut suffix = chosen.unwrap_or_else(|| {
             let separator = delimiters[delimiters.len() - 1];
             let status = status_variants.last().map_or(&[][..], Vec::as_slice);
@@ -366,7 +356,6 @@ impl AgentRow {
             (free, 0)
         };
         RowFrame {
-            marker,
             glyph,
             title_columns,
             preview_columns,
@@ -1387,19 +1376,17 @@ impl OverviewState {
     fn heading_line(
         &self,
         width: usize,
-        selected: bool,
         (group, families, folded, current): (AttentionGroup, usize, bool, bool),
         (approvals, questions): (usize, usize),
         display: DisplayProfile,
     ) -> RoleLine {
-        let marker = if selected { "› " } else { "  " };
         let fold = display.glyph(if folded {
             Glyph::Collapsed
         } else {
             Glyph::Expanded
         });
         let mut line = RoleLine::role(
-            format!("{marker}{fold} {} · {families}", group.label()),
+            format!("{ROW_INDENT}{fold} {} · {families}", group.label()),
             Role::Title,
         );
         let requests = |words: bool| {
@@ -1611,20 +1598,18 @@ impl OverviewState {
                         current,
                     } => self.heading_line(
                         width,
-                        selected,
                         (*group, *families, *folded, *current),
                         (*approvals, *questions),
                         display,
                     ),
                     OverviewEntry::Agent { row } => row.summary_line(
                         width,
-                        selected,
                         &Self::row_extras(row, terminal_columns, now, display),
                         ordinals.get(&row.agent_id).copied(),
                         &self.row_status(row, terminal_columns),
                         MIN_AGENT_TITLE_COLUMNS,
                     ),
-                    OverviewEntry::CurrentDraft => current_draft_line(width, selected, display),
+                    OverviewEntry::CurrentDraft => current_draft_line(width, display),
                     OverviewEntry::Disclosure {
                         group,
                         hidden,
@@ -1635,9 +1620,8 @@ impl OverviewState {
                         } else {
                             format!("… {hidden} more {}", group.label().to_lowercase())
                         };
-                        let prefix = if selected { "› " } else { "  " };
                         RoleLine::role(
-                            truncate_width(&format!("{prefix}{label}"), width),
+                            truncate_width(&format!("{ROW_INDENT}{label}"), width),
                             Role::MutedText,
                         )
                     }
@@ -1659,11 +1643,10 @@ impl OverviewState {
 }
 
 /// The word that marks the Agent this View returns to with Esc.
-fn current_draft_line(width: usize, selected: bool, display: DisplayProfile) -> RoleLine {
-    let marker = if selected { "› " } else { "  " };
+fn current_draft_line(width: usize, display: DisplayProfile) -> RoleLine {
     let glyph = display.glyph(Glyph::AgentNeedsInput);
-    let prefix = format!("{marker}{glyph} New Agent");
-    let mut line = RoleLine::role(marker, Role::Text);
+    let prefix = format!("{ROW_INDENT}{glyph} New Agent");
+    let mut line = RoleLine::role(ROW_INDENT, Role::Text);
     line.push(glyph, Some(Role::Permission));
     line.push(" New Agent", Some(Role::Text));
     let details = [

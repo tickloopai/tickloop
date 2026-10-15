@@ -677,10 +677,22 @@ impl Agent {
             .collect();
         drop(chats);
         let deliveries = self.tick_deliveries();
+        let now = Instant::now();
+        let now_ms = tickloop_agent_base::private_fs::unix_time_milliseconds();
         Ok(configured
             .into_iter()
             .map(|(loop_id, loop_state, subscription)| {
                 let runtime = deliveries.subscriptions.get(&subscription.id);
+                let period = subscription.frequency.period();
+                // A check already due reads as now until the delivery task reschedules it.
+                let next_check_at_ms = runtime
+                    .and_then(|runtime| runtime.due_at)
+                    .filter(|_| period.is_some())
+                    .map(|due_at| {
+                        now_ms.saturating_add(
+                            due_at.saturating_duration_since(now).as_millis() as u64,
+                        )
+                    });
                 TickSubscriptionStatus {
                     id: subscription.id,
                     loop_id,
@@ -694,6 +706,8 @@ impl Agent {
                     title: runtime.and_then(|runtime| runtime.title.clone()),
                     updated_at_ms: runtime.and_then(|runtime| runtime.updated_at_ms),
                     link: runtime.map_or(TickLinkState::Initializing, |runtime| runtime.link),
+                    next_check_at_ms,
+                    period_ms: period.map(|period| period.as_millis() as u64),
                 }
             })
             .collect())

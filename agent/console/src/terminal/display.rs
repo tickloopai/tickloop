@@ -44,6 +44,8 @@ pub(super) enum Glyph {
     ArtifactTick,
     TerminalTick,
     ProtocolTick,
+    /// A Monitor row's periodic Tick Subscription; its colour tells the frequency.
+    Subscription,
     Prompt,
     Assistant,
     Subagents,
@@ -120,9 +122,11 @@ impl DisplayProfile {
             (GlyphSet::Unicode, Glyph::TerminalTick) => ">",
             (GlyphSet::Unicode, Glyph::ProtocolTick) => "◉",
             (GlyphSet::NerdFont, Glyph::ShellTick) => "\u{f489}",
-            (GlyphSet::NerdFont, Glyph::ArtifactTick) => "\u{f15c}",
+            // nf-fa-link: an artifact row is a link to its page.
+            (GlyphSet::NerdFont, Glyph::ArtifactTick) => "\u{f0c1}",
             (GlyphSet::NerdFont, Glyph::TerminalTick) => "\u{f120}",
             (GlyphSet::NerdFont, Glyph::ProtocolTick) => "\u{f0318}",
+            (_, Glyph::Subscription) => "⟳",
             (GlyphSet::Unicode, Glyph::Prompt) => "❯",
             (GlyphSet::Unicode, Glyph::Assistant | Glyph::Subagents | Glyph::ToolCall) => "⏺",
             (GlyphSet::Unicode, Glyph::ToolResult) => "⎿",
@@ -356,6 +360,26 @@ mod tests {
         ] {
             assert_eq!(unicode.glyph(glyph), expected);
             assert_eq!(unicode_width::UnicodeWidthStr::width(expected), 1);
+        }
+    }
+
+    #[test]
+    fn the_subscription_mark_and_the_artifact_link_take_one_column_in_both_glyph_sets() {
+        for (glyph_set, artifact) in [(GlyphSet::Unicode, "⧉"), (GlyphSet::NerdFont, "\u{f0c1}")]
+        {
+            let profile = DisplayProfile::new(DisplayPreferences {
+                glyph_set,
+                prefers_reduced_motion: false,
+            });
+            assert_eq!(profile.glyph(Glyph::Subscription), "⟳", "{glyph_set:?}");
+            assert_eq!(profile.glyph(Glyph::ArtifactTick), artifact);
+            for glyph in [Glyph::Subscription, Glyph::ArtifactTick] {
+                assert_eq!(
+                    unicode_width::UnicodeWidthStr::width(profile.glyph(glyph)),
+                    1,
+                    "{glyph_set:?} {glyph:?}"
+                );
+            }
         }
     }
 

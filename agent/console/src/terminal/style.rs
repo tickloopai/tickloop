@@ -201,19 +201,29 @@ pub(super) enum Role {
     AgentCyan,
     /// State marks: the glyph that leads a Monitor or Subagents row and carries its state in the
     /// accent, success, error or warning colour. A running row's mark blinks between
-    /// `RunningMark` and the dimmed `RunningMarkDim`.
+    /// `RunningMark` and the dimmed `RunningMarkDim`, and a Monitor row's mark flashes them once
+    /// for each new update.
     RunningMark,
     RunningMarkDim,
     SuccessMark,
     ErrorMark,
     WarningMark,
-    /// A Monitor row's unread update. `UnreadMark` is its `●`, a mark in the accent colour that
-    /// keeps its hue on a selected row; `UnreadRow` is the soft accent-tinted fill the row keeps
-    /// until the update is handled, and `UnreadFlash` the stronger fill it alternates with while
-    /// an Agent turn takes the update in.
+    /// A Monitor row's unread update: its `●`, a mark in the accent colour that keeps its hue on a
+    /// selected row.
     UnreadMark,
-    UnreadRow,
-    UnreadFlash,
+    /// A one-off flash alternates these fills: strong, soft, strong. A Monitor row flashes them
+    /// as an Agent turn takes its update in.
+    FlashStrong,
+    FlashSoft,
+    /// A Monitor row's `⟳`, one hue from the brightest for the most frequent subscription to the
+    /// dimmest for the least. Marks, so a selected row keeps them.
+    SubscriptionHigh,
+    SubscriptionMedium,
+    SubscriptionLow,
+    /// The elapsed part of a periodic subscription's countdown to its next check, filled from a
+    /// row's left; `SelectionProgress` is the deeper shade of `Selection` a selected row uses.
+    CheckProgress,
+    SelectionProgress,
     /// A Markdown link label: the terminal's own blue, as Claude Code's `chalk.blue`.
     Link,
     /// Inline code inside strong text or a heading: the code colour, still bold.
@@ -300,8 +310,13 @@ impl Role {
         Self::ErrorMark,
         Self::WarningMark,
         Self::UnreadMark,
-        Self::UnreadRow,
-        Self::UnreadFlash,
+        Self::FlashStrong,
+        Self::FlashSoft,
+        Self::SubscriptionHigh,
+        Self::SubscriptionMedium,
+        Self::SubscriptionLow,
+        Self::CheckProgress,
+        Self::SelectionProgress,
         Self::Link,
         Self::StrongCode,
         Self::MutedStrong,
@@ -321,8 +336,8 @@ impl Role {
         Self::CodeMeta,
     ];
 
-    /// Agent Colors and state marks only paint marks, such as the selection `›`, a member dot or a
-    /// row's state glyph, never the words of a row.
+    /// Agent Colors and marks only paint marks, such as a member dot, a row's state glyph or its
+    /// `●` and `⟳`, never the words of a row.
     const fn is_mark(self) -> bool {
         matches!(
             self,
@@ -340,6 +355,9 @@ impl Role {
                 | Self::ErrorMark
                 | Self::WarningMark
                 | Self::UnreadMark
+                | Self::SubscriptionHigh
+                | Self::SubscriptionMedium
+                | Self::SubscriptionLow
         )
     }
 
@@ -373,7 +391,7 @@ impl Role {
     }
 }
 
-const ROLE_COUNT: usize = 77;
+const ROLE_COUNT: usize = 82;
 
 /// `AgentRed` … `AgentCyan`, reproduced from Claude Code's agent palette (Tailwind 600).
 const AGENT_COLORS: [Style; 8] = [
@@ -547,8 +565,13 @@ const DARK_PALETTE: [Style; ROLE_COUNT] = [
     fg(255, 107, 128), // ErrorMark       <- error
     fg(255, 193, 7),  // WarningMark     <- warning
     fg(215, 119, 87), // UnreadMark      <- claude
-    bg(58, 43, 39),   // UnreadRow       <- local: claude tinted into the dark background
-    bg(95, 61, 50),   // UnreadFlash     <- local: claude tinted twice as strong
+    bg(95, 61, 50),   // FlashStrong     <- local: claude tinted into the dark background
+    bg(58, 43, 39),   // FlashSoft       <- local: claude tinted half as strong
+    fg(175, 255, 255), // SubscriptionHigh <- local: one cyan hue, brightest
+    fg(95, 215, 215), // SubscriptionMedium
+    fg(0, 175, 175),  // SubscriptionLow
+    bg(20, 44, 48),   // CheckProgress   <- local: the subscription hue tinted into the background
+    bg(30, 100, 160), // SelectionProgress <- local: selectionBg, deeper
     ansi(AnsiColour::Blue), // Link            <- chalk.blue
     strong(177, 185, 249), // StrongCode      <- permission + bold
     strong(153, 153, 153), // MutedStrong     <- inactive + bold
@@ -637,8 +660,13 @@ const LIGHT_PALETTE: [Style; ROLE_COUNT] = [
     fg(171, 43, 63),  // ErrorMark
     fg(150, 108, 30), // WarningMark
     fg(215, 119, 87), // UnreadMark
-    bg(250, 239, 235), // UnreadRow
-    bg(243, 214, 205), // UnreadFlash
+    bg(243, 214, 205), // FlashStrong
+    bg(250, 239, 235), // FlashSoft
+    fg(0, 95, 95),    // SubscriptionHigh: the strongest on a light background
+    fg(0, 135, 135),  // SubscriptionMedium
+    fg(95, 135, 135), // SubscriptionLow
+    bg(214, 236, 236), // CheckProgress
+    bg(140, 185, 245), // SelectionProgress
     ansi(AnsiColour::Blue), // Link
     strong(87, 105, 247), // StrongCode
     strong(102, 102, 102), // MutedStrong
@@ -982,12 +1010,22 @@ pub(super) struct RoleSpan {
 }
 
 /// One screen row described by roles. `fill` paints the whole row width with a
-/// background role, as Claude Code's message boxes do.
+/// background role, as Claude Code's message boxes do, and `lead_fill` paints its
+/// first columns over it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct RoleLine {
     pub(super) spans: Vec<RoleSpan>,
     pub(super) fill: Option<Role>,
+    pub(super) lead_fill: Option<LeadFill>,
     pub(super) link: Option<String>,
+}
+
+/// A background role over a row's first `columns` columns, such as the elapsed part of a
+/// countdown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct LeadFill {
+    pub(super) columns: usize,
+    pub(super) role: Role,
 }
 
 impl RoleLine {
@@ -1017,6 +1055,11 @@ impl RoleLine {
 
     pub(super) fn filled(mut self, role: Role) -> Self {
         self.fill = Some(role);
+        self
+    }
+
+    pub(super) fn lead_filled(mut self, columns: usize, role: Role) -> Self {
+        self.lead_fill = Some(LeadFill { columns, role });
         self
     }
 
@@ -1082,45 +1125,88 @@ impl RoleLine {
     /// Resolves roles against `theme`. A span without a role keeps the
     /// terminal's own text colour, as a Claude Code `<Text>` without a colour
     /// does; `Role::Text` is the theme's text colour where Claude Code asks for
-    /// it. A filled row is padded to `width` so its background spans the row.
-    /// Text on the selection background is restyled to stay readable; an
-    /// Agent Color or a state mark keeps its hue and dimming there, because it
-    /// only paints marks such as the selection `›`, the member dot or a row's
-    /// state glyph, never the words of a row.
+    /// it. A filled row is padded to `width` so its background spans the row, and
+    /// a row with a lead fill at least to the end of its lead. A character belongs
+    /// to the background of the column it starts in. Text on the selection
+    /// background is restyled to stay readable; an Agent Color or a mark keeps
+    /// its hue and dimming there, because it only paints marks such as the
+    /// member dot or a row's state glyph, never the words of a row.
     pub(super) fn resolve(&self, theme: Theme, width: usize) -> StyledLine {
-        let mut base = Style::default();
-        if let Some(fill) = self.fill {
-            base = base.patch(theme.style(fill));
-        }
+        let lead_columns = self.lead_fill.map_or(0, |lead| lead.columns.min(width));
         let mut line = StyledLine {
             link: self.link.clone(),
             ..Default::default()
         };
         let mut column = 0;
         for span in &self.spans {
-            let mut style = span.role.map_or(base, |role| base.patch(theme.style(role)));
-            if (self.fill == Some(Role::Selection) || span.role == Some(Role::Selection))
-                && !span.role.is_some_and(Role::is_mark)
-            {
-                style = theme.selected(style);
+            let mut rest = span.text.as_str();
+            while !rest.is_empty() {
+                let (piece, after) = if column < lead_columns {
+                    split_at_column(rest, lead_columns - column)
+                } else {
+                    (rest, "")
+                };
+                line.push(
+                    Span::styled(piece, self.style_at(theme, column, span.role))
+                        .linked(span.link.clone()),
+                );
+                column += piece
+                    .chars()
+                    .map(|character| character.width().unwrap_or(0))
+                    .sum::<usize>();
+                rest = after;
             }
-            column += span
-                .text
-                .chars()
-                .map(|character| character.width().unwrap_or(0))
-                .sum::<usize>();
-            line.push(Span::styled(span.text.clone(), style).linked(span.link.clone()));
+        }
+        if column < lead_columns {
+            line.push(Span::styled(
+                " ".repeat(lead_columns - column),
+                self.style_at(theme, column, None),
+            ));
+            column = lead_columns;
         }
         if self.fill.is_some() && column < width {
-            let padding = if self.fill == Some(Role::Selection) {
-                theme.selected(base)
-            } else {
-                base
-            };
-            line.push(Span::styled(" ".repeat(width - column), padding));
+            line.push(Span::styled(
+                " ".repeat(width - column),
+                self.style_at(theme, column, None),
+            ));
         }
         line
     }
+
+    /// The style of text in `role` starting at `column`, on the background there.
+    fn style_at(&self, theme: Theme, column: usize, role: Option<Role>) -> Style {
+        let lead = self.lead_fill.filter(|lead| column < lead.columns);
+        let base = lead
+            .map(|lead| lead.role)
+            .or(self.fill)
+            .map_or(Style::default(), |fill| theme.style(fill));
+        let style = role.map_or(base, |role| base.patch(theme.style(role)));
+        let on_selection = self.fill == Some(Role::Selection) || role == Some(Role::Selection);
+        if !on_selection || role.is_some_and(Role::is_mark) {
+            return style;
+        }
+        let selected = theme.selected(style);
+        match lead {
+            // The lead keeps its own shade of the selection under the restyled text.
+            Some(_) => Style {
+                background: style.background,
+                ..selected
+            },
+            None => selected,
+        }
+    }
+}
+
+/// Splits `text` before the first character that starts at or after `columns`.
+fn split_at_column(text: &str, columns: usize) -> (&str, &str) {
+    let mut used = 0;
+    for (index, character) in text.char_indices() {
+        if used >= columns {
+            return text.split_at(index);
+        }
+        used += character.width().unwrap_or(0);
+    }
+    (text, "")
 }
 
 /// WCAG 2 contrast ratio of the two colours the terminal is actually sent at
@@ -1357,7 +1443,7 @@ mod tests {
     fn state_marks_keep_their_hue_and_blink_on_a_selected_row() {
         for name in ThemeName::ALL {
             let theme = Theme::new(name);
-            let line = RoleLine::role("› ", Role::Text)
+            let line = RoleLine::role("  ", Role::Text)
                 .with("$", Role::RunningMarkDim)
                 .with(" tests", Role::Text)
                 .filled(Role::Selection)
@@ -1386,43 +1472,196 @@ mod tests {
         }
     }
 
+    /// The colour `role` paints, as the terminal is sent it at `depth`.
+    fn sent_colour(theme: Theme, role: Role, depth: ColourDepth) -> Rgb {
+        let style = theme.style(role);
+        let Some(Colour::Rgb(colour)) = style.background.or(style.foreground) else {
+            panic!("{role:?} is a theme colour");
+        };
+        match depth {
+            ColourDepth::Indexed256 => xterm_colour(indexed(colour)),
+            ColourDepth::TrueColour | ColourDepth::None => colour,
+        }
+    }
+
+    fn background(theme: Theme, role: Role) -> Colour {
+        let style = theme.style(role);
+        assert_eq!(
+            style.foreground, None,
+            "{role:?} paints only the background"
+        );
+        style.background.expect("a fill role paints the background")
+    }
+
     #[test]
-    fn unread_fills_stay_readable_and_apart_from_each_other_and_the_selection() {
+    fn row_fills_stay_readable_and_apart_from_each_other_and_the_selection() {
         for name in ThemeName::ALL {
             let theme = Theme::new(name);
-            let fill = |role: Role| {
-                theme
-                    .style(role)
-                    .background
-                    .expect("an unread fill paints only the background")
-            };
             let foreground = |role: Role| theme.style(role).foreground.unwrap();
-            for role in [Role::UnreadRow, Role::UnreadFlash] {
-                assert_eq!(theme.style(role).foreground, None, "{name:?} {role:?}");
-            }
             for depth in [ColourDepth::Indexed256, ColourDepth::TrueColour] {
-                let sent = |role: Role| match fill(role) {
-                    Colour::Rgb(colour) if depth == ColourDepth::Indexed256 => {
-                        xterm_colour(indexed(colour))
+                let fills = [
+                    Role::FlashStrong,
+                    Role::FlashSoft,
+                    Role::CheckProgress,
+                    Role::Selection,
+                    Role::SelectionProgress,
+                ];
+                for (index, left) in fills.iter().enumerate() {
+                    for right in &fills[index + 1..] {
+                        assert_ne!(
+                            sent_colour(theme, *left, depth),
+                            sent_colour(theme, *right, depth),
+                            "{name:?} {depth:?}: {left:?} and {right:?}"
+                        );
                     }
-                    Colour::Rgb(colour) => colour,
-                    Colour::Ansi(_) => unreachable!("unread fills are theme colours"),
-                };
-                let fills = [Role::UnreadRow, Role::UnreadFlash, Role::Selection].map(sent);
-                assert!(
-                    fills[0] != fills[1] && fills[0] != fills[2] && fills[1] != fills[2],
-                    "{name:?} {depth:?}: {fills:?}"
-                );
-                for (text, background, minimum) in [
-                    (Role::MutedText, Role::UnreadRow, 4.5),
-                    (Role::Text, Role::UnreadFlash, 4.5),
-                    (Role::MutedText, Role::UnreadFlash, 3.0),
+                }
+                for (text, fill, minimum) in [
+                    (Role::MutedText, Role::FlashSoft, 4.5),
+                    (Role::Text, Role::FlashStrong, 4.5),
+                    (Role::MutedText, Role::FlashStrong, 3.0),
+                    (Role::MutedText, Role::CheckProgress, 4.5),
+                    (Role::Text, Role::CheckProgress, 4.5),
+                    (Role::Text, Role::SelectionProgress, 4.5),
                 ] {
-                    let ratio = emitted_contrast(foreground(text), fill(background), depth);
+                    let ratio = emitted_contrast(foreground(text), background(theme, fill), depth);
                     assert!(
                         ratio >= minimum,
-                        "{name:?} {depth:?} {text:?} on {background:?}: {ratio:.2}"
+                        "{name:?} {depth:?} {text:?} on {fill:?}: {ratio:.2}"
                     );
+                }
+            }
+        }
+    }
+
+    /// The terminal background each theme is designed for.
+    fn canvas(name: ThemeName) -> Colour {
+        Colour::Rgb(match name {
+            ThemeName::ClaudeCodeDark => Rgb::new(0, 0, 0),
+            ThemeName::ClaudeCodeLight => Rgb::new(255, 255, 255),
+        })
+    }
+
+    #[test]
+    fn subscription_marks_share_one_hue_and_step_down_from_high_to_low_in_both_themes() {
+        const MARKS: [Role; 3] = [
+            Role::SubscriptionHigh,
+            Role::SubscriptionMedium,
+            Role::SubscriptionLow,
+        ];
+        for name in ThemeName::ALL {
+            let theme = Theme::new(name);
+            for depth in [ColourDepth::Indexed256, ColourDepth::TrueColour] {
+                let colours = MARKS.map(|mark| sent_colour(theme, mark, depth));
+                assert!(
+                    colours[0] != colours[1]
+                        && colours[1] != colours[2]
+                        && colours[0] != colours[2],
+                    "{name:?} {depth:?}: {colours:?}"
+                );
+                for colour in colours {
+                    assert!(
+                        colour.green == colour.blue && colour.red < colour.green,
+                        "{name:?} {depth:?}: every mark is the same cyan hue, never a state colour: {colour:?}"
+                    );
+                }
+                let strength = MARKS.map(|mark| {
+                    emitted_contrast(theme.style(mark).foreground.unwrap(), canvas(name), depth)
+                });
+                assert!(
+                    strength[0] > strength[1] && strength[1] > strength[2],
+                    "{name:?} {depth:?}: high stands out most, low least: {strength:?}"
+                );
+                for mark in MARKS {
+                    for (backdrop, colour) in [
+                        ("canvas", canvas(name)),
+                        ("countdown", background(theme, Role::CheckProgress)),
+                    ] {
+                        let ratio =
+                            emitted_contrast(theme.style(mark).foreground.unwrap(), colour, depth);
+                        assert!(
+                            ratio >= 3.0,
+                            "{name:?} {depth:?} {mark:?} on the {backdrop}: {ratio:.2}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_screens_recognise_every_selection_shade_the_themes_send() {
+        for name in ThemeName::ALL {
+            for role in [Role::Selection, Role::SelectionProgress] {
+                for depth in [ColourDepth::Indexed256, ColourDepth::TrueColour] {
+                    let sent = open(&Theme::new(name).style(role), depth);
+                    let parameters = sent
+                        .strip_prefix("\x1b[")
+                        .and_then(|sent| sent.strip_suffix('m'))
+                        .unwrap();
+                    assert!(
+                        tickloop_agent_test_support::screen::SELECTION_BACKGROUNDS
+                            .contains(&parameters),
+                        "{name:?} {role:?} {depth:?}: {sent:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_lead_fill_paints_the_first_columns_over_the_row_and_keeps_the_selection_readable() {
+        for name in ThemeName::ALL {
+            let theme = Theme::new(name);
+            let backgrounds = |line: &StyledLine| {
+                line.spans
+                    .iter()
+                    .flat_map(|span| span.text.chars().map(move |_| span.style.background))
+                    .collect::<Vec<_>>()
+            };
+            let progress = theme.style(Role::CheckProgress).background;
+            let row = RoleLine::role("  ◉ ", Role::MutedText)
+                .with("中文", Role::MutedText)
+                .with("⟳", Role::SubscriptionLow);
+            let unselected = row
+                .clone()
+                .lead_filled(5, Role::CheckProgress)
+                .resolve(theme, 12);
+            assert_eq!(unselected.render(ColourDepth::None), "  ◉ 中文⟳");
+            assert_eq!(
+                backgrounds(&unselected),
+                [vec![progress; 5], vec![None; 2]].concat(),
+                "{name:?}: the wide character that starts inside the lead stays in it"
+            );
+            let short = RoleLine::role("ab", Role::Text)
+                .lead_filled(6, Role::CheckProgress)
+                .resolve(theme, 12);
+            assert_eq!(
+                short.render(ColourDepth::None),
+                "ab    ",
+                "an unfilled row is padded only to the end of its lead"
+            );
+            assert_eq!(backgrounds(&short), vec![progress; 6]);
+
+            let selection = theme.style(Role::Selection).background;
+            let deeper = theme.style(Role::SelectionProgress).background;
+            let selected = row
+                .lead_filled(5, Role::SelectionProgress)
+                .filled(Role::Selection)
+                .resolve(theme, 12);
+            assert_eq!(
+                backgrounds(&selected),
+                [vec![deeper; 5], vec![selection; 5]].concat(),
+                "{name:?}: the elapsed part is the deeper shade, the rest the selection"
+            );
+            for span in &selected.spans {
+                if span.text == "⟳" {
+                    assert_eq!(
+                        span.style.foreground,
+                        theme.style(Role::SubscriptionLow).foreground,
+                        "a mark keeps its hue"
+                    );
+                } else if !span.text.trim().is_empty() {
+                    assert_eq!(span.style.foreground, theme.style(Role::Text).foreground);
                 }
             }
         }

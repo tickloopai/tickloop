@@ -27,7 +27,7 @@ fn todo(content: &str) -> TodoItem {
 fn frame(console: &Console) -> Vec<String> {
     let mut state = console.state.lock().unwrap();
     state.draw(&mut io::sink()).unwrap();
-    state.rendered_screen.clone()
+    super::tests::selection_marked_screen(&state)
 }
 
 fn key(console: &Console, code: KeyCode) -> Option<InputEvent> {
@@ -312,7 +312,8 @@ fn expanded_subagents_start_at_the_entry_without_an_items_or_blank_summary_row()
             .position(|row| row.contains("Subagents 1"))
             .unwrap();
         assert!(
-            focused[entry + 1].starts_with("› ") && focused[entry + 1].contains("main"),
+            focused[entry + 1].starts_with(tickloop_agent_test_support::screen::SELECTED_MARK)
+                && focused[entry + 1].contains("main"),
             "the first Down lands on a row: {focused:?}"
         );
         assert_eq!(focused.len(), rendered.len(), "{focused:?}");
@@ -411,6 +412,7 @@ fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks()
             kind: "Shell".into(),
             status: "running".into(),
             notes: Vec::new(),
+            subscription: None,
             owner: crate::monitor_rows::TickOwner::Unknown,
             tone: crate::monitor_rows::StatusTone::Neutral,
             updated_at_ms: None,

@@ -13,6 +13,7 @@ fn shell(id: Uuid, title: &str) -> MonitorEntry {
         kind: "Shell".into(),
         status: "exit 0".into(),
         notes: Vec::new(),
+        subscription: None,
         owner: crate::monitor_rows::TickOwner::Unknown,
         tone: crate::monitor_rows::StatusTone::Neutral,
         updated_at_ms: Some(1000),
@@ -180,6 +181,7 @@ fn monitor_selection_restores_per_agent_and_ignores_obsolete_mouse_targets() {
             kind: "Artifact".into(),
             status: String::new(),
             notes: Vec::new(),
+            subscription: None,
             owner: crate::monitor_rows::TickOwner::Unknown,
             tone: crate::monitor_rows::StatusTone::Neutral,
             updated_at_ms: None,
@@ -955,7 +957,14 @@ fn subscribed_ticks_show_live_status_and_ignore_another_chats_refresh() {
     assert_eq!(state.monitor.entries()[0].title, "Quote terminal");
     assert_eq!(state.monitor.entries()[0].kind, "Terminal");
     assert_eq!(state.monitor.entries()[0].status, "live");
-    assert_eq!(state.monitor.entries()[0].notes, ["⟳ high"]);
+    assert!(state.monitor.entries()[0].notes.is_empty());
+    assert_eq!(
+        state.monitor.entries()[0].subscription,
+        Some(crate::monitor_rows::SubscriptionMark {
+            frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
+            next_check: None,
+        })
+    );
     let instance = state.monitor.entries()[0].instance.clone();
     state.switch_view_chat(Some(Uuid::new_v4()));
     state.update_tick_entries(chat, TickGroup::Ticks, vec![]);
@@ -1167,7 +1176,7 @@ fn a_newly_registered_row_intent_runs_through_enter_and_click() {
                 kind: "Calendar".into(),
                 status: "live".into(),
                 notes: Vec::new(),
-                inherent_subscription: false,
+                subscription: None,
                 owner: TickOwner::Unknown,
                 tone: crate::monitor_rows::StatusTone::Neutral,
                 updated_at_ms: None,
@@ -1528,7 +1537,10 @@ fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_other
     subscribed.group = TickGroup::Ticks;
     subscribed.instance = "calendar:quotes".parse().unwrap();
     subscribed.status = "live".into();
-    subscribed.notes = vec!["⟳ high".into()];
+    subscribed.subscription = Some(crate::monitor_rows::SubscriptionMark {
+        frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
+        next_check: None,
+    });
     subscribed.tone = StatusTone::Live;
     subscribed.update = Some(crate::monitor_rows::RowUpdate {
         at_ms: 1000,
@@ -1538,8 +1550,8 @@ fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_other
     for (width, preferred, entry, details, two_lines) in [
         (140, None, &finished, "101", false),
         (80, None, &finished, "101", false),
-        (140, None, &subscribed, "⟳ high · ● 3", true),
-        (200, Some(80), &subscribed, "⟳ high · ● 3", false),
+        (140, None, &subscribed, "⟳ ● 3", true),
+        (200, Some(80), &subscribed, "⟳ ● 3", false),
     ] {
         let mut state = State::new(true, width, 25);
         state.switch_view_chat(Some(Uuid::new_v4()));
@@ -1601,7 +1613,7 @@ fn a_monitor_row_glyph_carries_its_state_and_blinks_while_it_runs() {
         glyph_role(2_500, display),
         [(true, Role::RunningMarkDim), (false, Role::ErrorMark)]
     );
-    assert_eq!(monitor.next_frame_ms(2_100, display), Some(2_500));
+    assert_eq!(monitor.next_frame_ms(2_100, 40, display), Some(2_500));
     let still = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
         prefers_reduced_motion: true,
         ..Default::default()
@@ -1611,7 +1623,7 @@ fn a_monitor_row_glyph_carries_its_state_and_blinks_while_it_runs() {
         [(true, Role::RunningMark), (false, Role::ErrorMark)]
     );
     assert_eq!(
-        monitor.next_frame_ms(2_100, still),
+        monitor.next_frame_ms(2_100, 40, still),
         Some(3_000),
         "a steady glyph still ticks its elapsed time"
     );
@@ -1736,7 +1748,10 @@ fn a_finished_background_shell_leaves_once_handled_unless_its_detail_is_open() {
             .iter()
             .map(RoleLine::text)
             .collect::<String>();
-        assert!(text.contains("● 1s"), "{text}");
+        assert!(
+            text.trim_end().ends_with('●') && !text.contains("1s"),
+            "an unread end shows its mark and no time: {text}"
+        );
         assert!(
             !text.contains("ended") && !text.contains("exit"),
             "the glyph's colour tells how it ended: {text}"
@@ -1796,17 +1811,21 @@ fn a_shell_end_flashes_as_a_turn_takes_it_in_and_a_chat_switch_does_not_replay_i
     };
     {
         let state = console.state.lock().unwrap();
-        assert_eq!(row_fill(&state, ended + 500), Some(Role::UnreadRow));
-        assert_eq!(state.monitor.next_frame_ms(ended + 500, display), None);
+        assert_eq!(
+            row_fill(&state, ended + 500),
+            None,
+            "an unread row has no fill"
+        );
+        assert_eq!(state.monitor.next_frame_ms(ended + 500, 40, display), None);
     }
 
     let taken_in = ended + 1_000;
     chat_snapshot.monitor.mark_taken_in(shell, taken_in);
     console.update_monitor_chat(chat_snapshot.clone()).unwrap();
     let mut state = console.state.lock().unwrap();
-    assert_eq!(row_fill(&state, taken_in + 100), Some(Role::UnreadFlash));
+    assert_eq!(row_fill(&state, taken_in + 100), Some(Role::FlashStrong));
     assert_eq!(
-        state.monitor.next_frame_ms(taken_in + 100, display),
+        state.monitor.next_frame_ms(taken_in + 100, 40, display),
         Some(taken_in + 400)
     );
     state.switch_view_chat(Some(Uuid::new_v4()));
@@ -1815,7 +1834,10 @@ fn a_shell_end_flashes_as_a_turn_takes_it_in_and_a_chat_switch_does_not_replay_i
     console.update_monitor_chat(chat_snapshot.clone()).unwrap();
     let state = console.state.lock().unwrap();
     assert_eq!(row_fill(&state, taken_in + 100), None);
-    assert_eq!(state.monitor.next_frame_ms(taken_in + 100, display), None);
+    assert_eq!(
+        state.monitor.next_frame_ms(taken_in + 100, 40, display),
+        None
+    );
 }
 
 #[test]
@@ -1967,10 +1989,9 @@ fn a_subscribed_shell_row_is_marked_immediate_and_offers_no_frequency() {
         .iter()
         .find(|entry| entry.instance == shell)
         .unwrap();
-    assert!(
-        row.notes.contains(&"⟳ immediate".to_owned()),
-        "{:?}",
-        row.notes
+    assert_eq!(
+        row.subscription, None,
+        "a Shell's immediate subscription shows no mark"
     );
     let keys = row
         .actions
@@ -2021,7 +2042,11 @@ fn requested_key(event: Option<InputEvent>) -> char {
 fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() {
     let mut state = subscribed_fixture(1);
     let text = monitor_text(&mut state);
-    assert!(text.contains("⟳ high") && !text.contains("live"), "{text}");
+    let row = text.lines().find(|line| line.contains("calendar")).unwrap();
+    assert!(
+        row.trim_end().ends_with('⟳') && !row.contains("high") && !text.contains("live"),
+        "{text}"
+    );
     assert!(
         text.contains("enter open") && text.contains("w subscriptions"),
         "{text}"
@@ -2079,7 +2104,11 @@ fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() 
 fn several_subscriptions_on_one_row_show_a_summary_and_open_as_a_list() {
     let mut state = subscribed_fixture(3);
     let text = monitor_text(&mut state);
-    assert!(text.contains("⟳ 3"), "{text}");
+    let row = text.lines().find(|line| line.contains("calendar")).unwrap();
+    assert!(
+        row.trim_end().ends_with('⟳') && !row.contains('3'),
+        "several subscriptions show one mark without a count: {text}"
+    );
     assert!(
         !text.contains('●'),
         "a row with no update time shows no unread mark: {text}"
@@ -2516,13 +2545,13 @@ fn action_labels(state: &State) -> Vec<(char, &'static str)> {
 }
 
 #[test]
-fn an_artifact_linked_here_shows_the_subscription_marker_and_x_unlinks_it() {
+fn an_artifact_linked_here_shows_no_subscription_mark_and_x_unlinks_it() {
     let (mut state, artifact) = linked_artifact_fixture(false);
     let text = monitor_text(&mut state);
     let row = text.lines().find(|line| line.contains("Brief")).unwrap();
     assert!(
-        row.trim_end().ends_with('⟳') && !row.contains("feedback"),
-        "{row}"
+        row.trim_end().ends_with("Brief") && !row.contains("feedback"),
+        "the association is the artifact's default subscription: {row}"
     );
     assert_eq!(
         action_labels(&state),
@@ -2544,8 +2573,8 @@ fn an_artifact_linked_here_shows_the_subscription_marker_and_x_unlinks_it() {
     let text = monitor_text(&mut state);
     let row = text.lines().find(|line| line.contains("Brief")).unwrap();
     assert!(
-        row.trim_end().ends_with('⟳') && !row.contains('●'),
-        "only the association marks an artifact, never a Tick Subscription: {row}"
+        row.trim_end().ends_with("Brief") && !row.contains('●') && !row.contains('⟳'),
+        "an artifact never shows a Tick Subscription: {row}"
     );
     assert_eq!(
         action_labels(&state),
@@ -2559,7 +2588,7 @@ fn an_artifact_linked_here_shows_the_subscription_marker_and_x_unlinks_it() {
 }
 
 #[test]
-fn a_paused_association_stays_in_words_without_the_subscription_marker() {
+fn a_paused_association_stays_in_words() {
     let (mut state, artifact) = linked_artifact_fixture(true);
     let mut subscription = tests::subscription_row(3);
     subscription.instance = artifact;

@@ -812,7 +812,13 @@ impl State {
                 });
             lines.push(RoleLine::role(title, Role::DialogTitle));
             lines.push(RoleLine::plain(message));
-            lines.push(RoleLine::role(format!("› {label}"), Role::Text).filled(Role::Selection));
+            lines.push(
+                RoleLine::role(
+                    format!("{}{label}", crate::terminal::list_row::ROW_INDENT),
+                    Role::Text,
+                )
+                .filled(Role::Selection),
+            );
             self.dialog_option_rows.push((2..3, 0));
             lines.resize(capacity.saturating_sub(1), RoleLine::default());
             lines.push(RoleLine::role("enter confirm · esc back", Role::MutedText));

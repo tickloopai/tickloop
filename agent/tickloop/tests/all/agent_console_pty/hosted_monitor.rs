@@ -1,5 +1,6 @@
 use super::*;
 use tickloop_agent_protocol::AgentAccess;
+use tickloop_agent_test_support::screen::SELECTED_MARK;
 
 /// A View whose Agent opened `count` keys Ticks hidden in the Tickhost, now in its Monitor.
 async fn view_with_keys_ticks(
@@ -43,7 +44,9 @@ async fn view_with_keys_ticks(
 
 /// The screen line of the selected hosted row.
 fn selected_row(frame: &str) -> Option<usize> {
-    frame.lines().position(|line| line.contains("› ◉"))
+    frame
+        .lines()
+        .position(|line| line.contains(&format!("{SELECTED_MARK} ◉")))
 }
 
 /// Notices the Console used to show after a hosted Tick opened or closed; it now returns to the
@@ -353,7 +356,7 @@ async fn actual_cli_enter_opens_a_hosted_tick_in_a_herdr_popup_after_a_one_key_r
             .lines()
             .enumerate()
             .find_map(|(row, line)| {
-                line.contains("› ◉")
+                line.contains(&format!("{SELECTED_MARK} ◉"))
                     .then(|| line.chars().position(|character| character == '◉'))
                     .flatten()
                     .map(|column| (row + 1, column + 1))
@@ -625,9 +628,10 @@ async fn view_with_local_ticks(
 
 /// The selected Monitor row's text.
 fn selected_text(frame: &str) -> Option<String> {
-    frame
-        .lines()
-        .find_map(|line| line.split_once("› ").map(|(_, row)| row.to_owned()))
+    frame.lines().find_map(|line| {
+        line.split_once(&format!("{SELECTED_MARK} "))
+            .map(|(_, row)| row.to_owned())
+    })
 }
 
 /// The input has the focus again: its prompt and the status bar show and no Monitor row offers
@@ -761,9 +765,10 @@ async fn actual_cli_enter_opens_terminal_ticks_and_shells_full_screen_and_a_row_
         view.send(b"\r");
         view.wait_for("the stopped Shell shows how it ended", |frame| {
             frame.lines().any(|line| {
-                line.split_once("› ").is_some_and(|(_, row)| {
-                    row.contains(LONG_SHELL_COMMAND) && row.contains("SIGTERM")
-                })
+                line.split_once(&format!("{SELECTED_MARK} "))
+                    .is_some_and(|(_, row)| {
+                        row.contains(LONG_SHELL_COMMAND) && row.contains("SIGTERM")
+                    })
             }) && !monitor_hint(frame).contains("s stop")
         })
         .await;

@@ -208,8 +208,8 @@ fn shell_tick_appears_can_be_focused_and_removed_in_an_isolated_pty() {
     session.send(b"\x02");
     session.wait("Shells (1)");
     std::fs::write(directory.path().join("finish"), "").unwrap();
-    // A clean exit adds no words to the row; its unread end is the accent `●`.
-    session.wait("● ");
+    // A clean exit adds no words or time to the row; its unread end is the accent `●`.
+    session.wait("●");
     assert!(!session.frame().contains("exit 0"), "{}", session.frame());
     session.send(b"\x1b[Cx");
     session.wait_without("Shells (1)");
@@ -321,7 +321,7 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
         session.wait("Monitor 1");
         let focus_deadline = Instant::now() + TIMEOUT;
         loop {
-            let frame = screen::visible_screen(
+            let frame = screen::visible_screen_with_selection(
                 &session.output.lock().unwrap(),
                 TERMINAL_WIDTH,
                 TERMINAL_HEIGHT,
@@ -329,7 +329,9 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
             if frame
                 .lines()
                 .filter_map(|line| line.split_once('│').map(|(_, monitor)| monitor))
-                .any(|monitor| monitor.contains('›') && monitor.contains("PTY Research"))
+                .any(|monitor| {
+                    monitor.contains(screen::SELECTED_MARK) && monitor.contains("PTY Research")
+                })
                 && frame
                     .lines()
                     .last()
@@ -354,7 +356,6 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
             std::fs::read_to_string(log).unwrap().trim(),
             "https://docs.example/a/test"
         );
-        session.wait("⟳");
         session.wait("x unlink");
         session.send(b"x");
         session.wait("Unlink this artifact and stop its @tickloop requests here?");

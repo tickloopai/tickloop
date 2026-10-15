@@ -427,7 +427,7 @@ impl ArtifactsPicker {
             rows.push(RoleLine::role(
                 format!(
                     "{}{} {}{}",
-                    if selected { "› " } else { "  " },
+                    super::list_row::ROW_INDENT,
                     display.glyph(Glyph::ArtifactTick),
                     super::safe_line(&artifact.title),
                     if self.pinned.contains(&artifact.id) {

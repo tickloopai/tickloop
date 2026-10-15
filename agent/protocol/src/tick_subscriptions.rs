@@ -97,6 +97,14 @@ pub struct TickSubscriptionStatus {
     #[serde(default)]
     pub updated_at_ms: Option<u64>,
     pub link: TickLinkState,
+    /// When a periodic subscription next checks its instance, in Unix milliseconds; `None` for an
+    /// immediate one, and before the Agent schedules it.
+    #[serde(default)]
+    pub next_check_at_ms: Option<u64>,
+    /// How long a periodic subscription waits between checks, in milliseconds; `None` for an
+    /// immediate one.
+    #[serde(default)]
+    pub period_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

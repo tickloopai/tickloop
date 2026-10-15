@@ -34,13 +34,12 @@ pub(super) fn family_line(
     } else {
         Role::MutedText
     };
-    let marker = if selected { "› " } else { "  " };
     let dot = display.glyph(if viewed {
         Glyph::AgentViewed
     } else {
         Glyph::AgentUnviewed
     });
-    let mut line = RoleLine::role(marker, role);
+    let mut line = RoleLine::role(list_row::ROW_INDENT, role);
     line.push(dot, Some(agent_role(row).unwrap_or(role)));
     line.push(" ", Some(role));
     if row.parent_id.is_none() && row.subagent.is_none() {

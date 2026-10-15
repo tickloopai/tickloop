@@ -95,7 +95,7 @@ impl MonitorRows for CalendarRows {
                 kind: "Calendar".into(),
                 status: "live".into(),
                 notes: Vec::new(),
-                inherent_subscription: false,
+                subscription: None,
                 owner: TickOwner::Unknown,
                 tone: tickloop_agent_console::monitor_rows::StatusTone::Neutral,
                 updated_at_ms: row.last_delivery_ms,
@@ -358,10 +358,11 @@ async fn one_row_merges_every_source_and_frequency_and_pages_cover_the_full_set(
         .find(|row| row.instance == calendar("shared"))
         .unwrap();
     assert_eq!(shared.title, "Shared calendar");
-    assert_eq!(
-        shared.notes,
-        ["⟳ 2"],
-        "both subscriptions show as one summary"
+    assert!(shared.notes.is_empty(), "{:?}", shared.notes);
+    assert!(
+        shared.subscription.is_some(),
+        "both subscriptions show as one mark: {:?}",
+        shared.subscription
     );
 
     let mut seen = Vec::new();

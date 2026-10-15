@@ -709,6 +709,8 @@ fn observation_values_keep_their_recorded_wire() {
                 title: Some("Quotes".into()),
                 updated_at_ms: Some(6_500),
                 link: TickLinkState::Live,
+                next_check_at_ms: Some(66_000),
+                period_ms: Some(60_000),
             }]),
             ObservationValue::Receipt(Some(Box::new(CommandReceipt {
                 daemon_epoch: id(0xe0),

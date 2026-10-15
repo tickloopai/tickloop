@@ -838,14 +838,14 @@ impl RecoveryPty {
         self.wait_for("Project");
         let deadline = Instant::now() + RECOVERY_TIMEOUT;
         loop {
-            let frame = screen::visible_screen(
+            let frame = screen::visible_screen_with_selection(
                 &String::from_utf8_lossy(&self.output.lock().unwrap()),
                 80,
                 24,
             );
             if let Some(selected) = frame
                 .lines()
-                .find(|line| line.trim_start().starts_with('›'))
+                .find(|line| line.starts_with(screen::SELECTED_MARK))
             {
                 if selected.contains(title) {
                     self.send(b"\r");
@@ -860,7 +860,7 @@ impl RecoveryPty {
                     .zip(
                         lines
                             .iter()
-                            .position(|line| line.trim_start().starts_with('›')),
+                            .position(|line| line.starts_with(screen::SELECTED_MARK)),
                     )
                     .is_some_and(|(target, cursor)| target < cursor);
                 self.send(if target_is_above {
@@ -873,7 +873,7 @@ impl RecoveryPty {
                 self.wait_until(|frame| {
                     frame
                         .lines()
-                        .find(|line| line.trim_start().starts_with('›'))
+                        .find(|line| line.starts_with(screen::SELECTED_MARK))
                         .is_some_and(|line| line != selected)
                 });
             }
@@ -900,10 +900,11 @@ impl RecoveryPty {
         );
     }
 
+    /// Waits until a frame, its selection marked, is `ready`.
     fn wait_until(&mut self, ready: impl Fn(&str) -> bool) {
         let deadline = Instant::now() + self.timeout;
         while Instant::now() < deadline {
-            let frame = screen::visible_screen(
+            let frame = screen::visible_screen_with_selection(
                 &String::from_utf8_lossy(&self.output.lock().unwrap()),
                 80,
                 24,

@@ -292,6 +292,60 @@ async fn a_high_frequency_delivers_the_latest_update_and_counts_the_ones_it_drop
     agent.shutdown().await;
 }
 
+fn unix_milliseconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_periodic_status_reports_its_next_check_on_the_wall_clock_and_restarts_after_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7)}),
+        ),
+        text("watching instance 7"),
+    ]));
+    let (agent, _stream, chat, _) = subscribed_agent(directory.path(), model).await;
+    let period_ms = HIGH_PERIOD.as_millis() as u64;
+    // The Agent's schedule runs on the paused test clock while the status reports wall-clock
+    // milliseconds, so each reading is compared as the time left until the next check.
+    let time_left = async || {
+        let row = agent.tick_subscriptions(chat).await.unwrap().remove(0);
+        assert_eq!(row.period_ms, Some(period_ms), "{row:?}");
+        let next_check = row
+            .next_check_at_ms
+            .expect("a scheduled periodic subscription knows its next check");
+        next_check.saturating_sub(unix_milliseconds())
+    };
+
+    let first = time_left().await;
+    assert!(
+        first > 0 && first <= period_ms,
+        "the next check lies within one period: {first} ms"
+    );
+
+    tokio::time::advance(Duration::from_secs(20)).await;
+    let waited = time_left().await;
+    assert!(
+        (first - waited).abs_diff(20_000) < 1_000,
+        "waiting brings the check closer: {first} ms then {waited} ms"
+    );
+
+    tokio::time::advance(Duration::from_millis(waited)).await;
+    settle().await;
+    let restarted = time_left().await;
+    assert!(
+        restarted > period_ms - 1_000,
+        "a check schedules the next one a period later: {restarted} ms"
+    );
+    agent.shutdown().await;
+}
+
 #[tokio::test]
 async fn the_subscription_tools_reach_the_model_only_with_an_installed_stream() {
     let directory = tempfile::tempdir().unwrap();
@@ -860,6 +914,11 @@ async fn a_shell_subscription_is_immediate_and_refuses_a_frequency() {
     let rows = agent.tick_subscriptions(chat).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].frequency, TickSubscriptionFrequency::Immediate);
+    assert_eq!(
+        (rows[0].next_check_at_ms, rows[0].period_ms),
+        (None, None),
+        "an immediate subscription has no check to count down to"
+    );
     assert!(
         agent
             .update_tick_subscription(

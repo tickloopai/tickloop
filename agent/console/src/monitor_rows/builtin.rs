@@ -29,7 +29,7 @@ impl MonitorRows for HostedRows {
                 kind: "Tick".into(),
                 status: link_status(row.link).into(),
                 notes: Vec::new(),
-                inherent_subscription: false,
+                subscription: None,
                 owner: TickOwner::ThisChat,
                 tone: link_tone(row.link),
                 updated_at_ms: row.updated_at_ms,
@@ -155,15 +155,15 @@ impl MonitorRows for ArtifactRows {
                         }
                         .into(),
                         status: status.into(),
-                        // An association here is the row's subscription and shows as its marker;
-                        // feedback paused or going elsewhere is not a state the glyph's colour
-                        // tells, so it stays in words.
+                        // An association here is the row's default subscription and needs no
+                        // words or mark; feedback paused or going elsewhere is not a state the
+                        // glyph's colour tells, so it stays in words.
                         notes: feedback
                             .filter(|_| !is_linked_here)
                             .map(str::to_owned)
                             .into_iter()
                             .collect(),
-                        inherent_subscription: is_linked_here,
+                        subscription: None,
                         owner: ARTIFACT_OWNER,
                         tone: if unavailable {
                             StatusTone::Gone
@@ -223,7 +223,7 @@ impl MonitorRows for ShellRows {
                         String::new()
                     },
                     notes: shell_notes(task),
-                    inherent_subscription: false,
+                    subscription: None,
                     owner: TickOwner::ThisChat,
                     tone: shell_tone(task, context.shell_starts.get(&task.id).copied()),
                     updated_at_ms: task.updated_at_ms,
@@ -926,6 +926,8 @@ mod tests {
                 title: Some("Quote".into()),
                 updated_at_ms: None,
                 link: TickLinkState::Live,
+                next_check_at_ms: None,
+                period_ms: None,
             }],
             ..Default::default()
         };
@@ -968,6 +970,8 @@ mod tests {
             title: Some("Quote".into()),
             updated_at_ms,
             link: TickLinkState::Live,
+            next_check_at_ms: None,
+            period_ms: None,
         }
     }
 
@@ -1047,8 +1051,113 @@ mod tests {
         );
         let quote_row = rows.iter().find(|row| row.instance == quote).unwrap();
         assert_eq!(quote_row.status, "live");
-        assert_eq!(quote_row.notes, ["⟳ high"], "the marker no longer counts");
+        assert!(quote_row.notes.is_empty(), "{:?}", quote_row.notes);
+        assert_eq!(
+            quote_row.subscription,
+            Some(SubscriptionMark {
+                frequency: TickSubscriptionFrequency::High,
+                next_check: None,
+            }),
+            "the mark counts nothing"
+        );
         assert_eq!(quote_row.update.as_ref().unwrap().at_ms, 5_000);
+    }
+
+    #[test]
+    fn a_tick_row_marks_its_most_frequent_subscription_and_counts_down_to_its_nearest_check() {
+        let quote = InstanceRef::new("hosted", "quote-run").unwrap();
+        let checked = |frequency, next_check_at_ms| TickSubscriptionStatus {
+            frequency,
+            next_check_at_ms: Some(next_check_at_ms),
+            period_ms: frequency
+                .period()
+                .map(|period: std::time::Duration| period.as_millis() as u64),
+            ..subscription(&quote, None, 0)
+        };
+        let mark = |subscriptions: Vec<TickSubscriptionStatus>| {
+            MonitorRowsRegistry::builtin()
+                .list(&MonitorContext {
+                    subscriptions,
+                    ..Default::default()
+                })
+                .into_iter()
+                .find(|row| row.instance == quote)
+                .and_then(|row| row.subscription)
+        };
+        assert_eq!(
+            mark(vec![
+                checked(TickSubscriptionFrequency::Low, 65_000),
+                checked(TickSubscriptionFrequency::High, 70_000),
+            ]),
+            Some(SubscriptionMark {
+                frequency: TickSubscriptionFrequency::High,
+                next_check: Some(NextCheck {
+                    at_ms: 65_000,
+                    period_ms: 1_800_000,
+                }),
+            }),
+            "the most frequent colours the mark and the nearest check counts down"
+        );
+        assert_eq!(
+            mark(vec![TickSubscriptionStatus {
+                period_ms: None,
+                ..checked(TickSubscriptionFrequency::Medium, 65_000)
+            }]),
+            Some(SubscriptionMark {
+                frequency: TickSubscriptionFrequency::Medium,
+                next_check: None,
+            }),
+            "a check without its period counts nothing down"
+        );
+
+        let shell_task = task("make", None);
+        let shell = InstanceRef::shell(shell_task.id);
+        let rows = MonitorRowsRegistry::builtin().list(&MonitorContext {
+            shells: Some(tickloop_agent_protocol::ShellTaskSnapshot {
+                chat_id: shell_task.chat_id,
+                live_revision: 1,
+                tasks: vec![shell_task],
+            }),
+            subscriptions: vec![TickSubscriptionStatus {
+                frequency: TickSubscriptionFrequency::Immediate,
+                ..subscription(&shell, None, 0)
+            }],
+            ..Default::default()
+        });
+        assert_eq!(rows[0].instance, shell);
+        assert_eq!(
+            rows[0].subscription, None,
+            "a Shell's immediate subscription is its default and shows no mark"
+        );
+    }
+
+    #[test]
+    fn a_countdown_fills_columns_as_its_period_passes_and_names_the_next_change() {
+        let check = NextCheck {
+            at_ms: 160_000,
+            period_ms: 60_000,
+        };
+        for (now, filled) in [
+            (90_000, 0),
+            (100_000, 0),
+            (101_499, 0),
+            (101_500, 1),
+            (130_000, 20),
+            (160_000, 40),
+            (200_000, 40),
+        ] {
+            assert_eq!(check.elapsed_columns(40, now), filled, "at {now}");
+        }
+        assert_eq!(check.next_column_at(40, 100_000), Some(101_500));
+        assert_eq!(check.next_column_at(40, 101_500), Some(103_000));
+        assert_eq!(check.next_column_at(40, 158_499), Some(158_500));
+        assert_eq!(check.next_column_at(40, 158_500), Some(160_000));
+        assert_eq!(
+            check.next_column_at(40, 160_000),
+            None,
+            "a due check is full"
+        );
+        assert_eq!(check.next_column_at(0, 100_000), None);
     }
 
     #[test]

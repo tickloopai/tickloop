@@ -492,6 +492,8 @@ mod tests {
             last_delivery_ms: None,
             last_delivery: None,
             link: TickLinkState::Live,
+            next_check_at_ms: None,
+            period_ms: None,
         }
     }
 

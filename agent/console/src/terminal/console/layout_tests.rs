@@ -4,7 +4,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::Read;
 
 use tickloop_agent_protocol::{AgentColor, LoopState, SubagentRegistration};
-use tickloop_agent_test_support::screen;
+use tickloop_agent_test_support::screen::{self, SELECTED_MARK};
 
 const ROOT_AGENT: Uuid = Uuid::from_u128(100);
 const CHILD_AGENT: Uuid = Uuid::from_u128(101);
@@ -1302,7 +1302,7 @@ fn agent_layout_current_draft_keeps_its_name_and_return_cue_at_supported_sizes()
             }))
             .unwrap();
         let frame = frame_lines(&console);
-        let draft = line_with(&frame, "› ◆ New Agent").unwrap();
+        let draft = line_with(&frame, &format!("{SELECTED_MARK} ◆ New Agent")).unwrap();
         assert!(draft.contains("current"), "{frame:#?}");
         if width >= 41 {
             assert!(draft.contains("current session"), "{frame:#?}");
@@ -1352,7 +1352,7 @@ fn agent_layout_new_draft_is_the_overview_return_target() {
         let draft = line_with(&frame, "New Agent").unwrap();
         assert!(draft.contains("current session"), "{frame:#?}");
         assert!(draft.contains("send a prompt to start"), "{frame:#?}");
-        assert!(draft.starts_with('›'), "{frame:#?}");
+        assert!(draft.starts_with(SELECTED_MARK), "{frame:#?}");
         assert_eq!(
             console
                 .state
@@ -1984,7 +1984,7 @@ impl PtyConsole {
     }
 
     fn frame(&self) -> String {
-        screen::visible_screen(&self.output.lock().unwrap(), self.width, self.height)
+        screen::visible_screen_with_selection(&self.output.lock().unwrap(), self.width, self.height)
     }
 
     fn wait_for(&self, label: &str, matches: impl Fn(&str) -> bool) -> String {
@@ -2796,7 +2796,7 @@ fn dispatch_overview(rows: Vec<AgentRow>, created: Option<Uuid>) -> AgentOvervie
 fn frame_lines(console: &Console) -> Vec<String> {
     let mut state = console.state.lock().unwrap();
     state.draw(&mut std::io::sink()).unwrap();
-    state.rendered_screen.clone()
+    super::tests::selection_marked_screen(&state)
 }
 
 fn line_with<'a>(frame: &'a [String], needle: &str) -> Option<&'a String> {
@@ -2840,7 +2840,7 @@ fn agent_layout_duplicate_titles_gain_reading_numbers_in_any_row_order() {
                 select_agent(&mut state, agent);
                 let selected = drawn(&mut state)
                     .into_iter()
-                    .find(|line| line.starts_with('›'))
+                    .find(|line| line.starts_with(SELECTED_MARK))
                     .unwrap();
                 assert!(selected.contains(number), "{width}: {selected}: {frame:#?}");
             }
@@ -2906,7 +2906,7 @@ fn agent_layout_reading_numbers_cover_identical_and_cut_titles() {
         let selected_number = |state: &mut State| {
             drawn(state)
                 .into_iter()
-                .find(|line| line.starts_with('›'))
+                .find(|line| line.starts_with(SELECTED_MARK))
                 .unwrap()
         };
         let mut state = console.state.lock().unwrap();
@@ -3477,9 +3477,9 @@ fn agent_layout_real_pty_accepted_dispatch_cue_keeps_the_monitored_filter_and_se
         );
         terminal.send_and_wait(b"\x1b[A");
         let frame = terminal.wait_for("list focus keeps the monitored row", |frame| {
-            frame
-                .lines()
-                .any(|line| line.starts_with('›') && row_title(line).starts_with("!printf bravo"))
+            frame.lines().any(|line| {
+                line.starts_with(SELECTED_MARK) && row_title(line).starts_with("!printf bravo")
+            })
         });
         assert!(frame.contains("Created !pwd (2)"), "{label}: {frame}");
         terminal.send_and_wait(b"p");
@@ -3669,7 +3669,7 @@ fn fleet_overview() -> AgentOverview {
 
 fn drawn(state: &mut State) -> Vec<String> {
     state.draw(&mut std::io::sink()).unwrap();
-    state.rendered_screen.clone()
+    super::tests::selection_marked_screen(state)
 }
 
 /// Group headings in screen order, without selection marker or fold glyph: `Done · 16`.
@@ -3677,9 +3677,12 @@ fn heading_order(frame: &[String]) -> Vec<String> {
     frame
         .iter()
         .filter_map(|line| {
-            line.trim_start_matches(['›', ' '])
+            line.trim_start_matches([SELECTED_MARK, ' '])
                 .strip_prefix("▸ ")
-                .or_else(|| line.trim_start_matches(['›', ' ']).strip_prefix("▾ "))
+                .or_else(|| {
+                    line.trim_start_matches([SELECTED_MARK, ' '])
+                        .strip_prefix("▾ ")
+                })
         })
         .filter(|line| {
             AttentionGroup::ALL
@@ -3804,7 +3807,7 @@ fn agent_layout_rows_arriving_above_keep_the_selection_on_its_screen_line() {
             line_with(&frame, "Needs input").is_none(),
             "the selection is in a scrolled list: {frame:#?}"
         );
-        screen_row(&frame, "› ✔ Done task 09").unwrap()
+        screen_row(&frame, &format!("{SELECTED_MARK} ✔ Done task 09")).unwrap()
     };
     let mut arrived = fleet_overview();
     let mut asking = fleet_row(
@@ -3824,7 +3827,7 @@ fn agent_layout_rows_arriving_above_keep_the_selection_on_its_screen_line() {
         Some(OverviewTarget::Agent(done_task(9)))
     );
     assert_eq!(
-        screen_row(&frame, "› ✔ Done task 09"),
+        screen_row(&frame, &format!("{SELECTED_MARK} ✔ Done task 09")),
         Some(before),
         "{frame:#?}"
     );
@@ -3838,7 +3841,7 @@ fn agent_layout_rows_arriving_above_keep_the_selection_on_its_screen_line() {
         Some(OverviewTarget::Agent(done_task(9)))
     );
     assert!(
-        line_with(&frame, "› ✔ Done task 09").is_some(),
+        line_with(&frame, &format!("{SELECTED_MARK} ✔ Done task 09")).is_some(),
         "resize keeps the selection in view: {frame:#?}"
     );
     assert!(
@@ -3879,7 +3882,10 @@ fn agent_layout_a_visited_row_that_finishes_stays_listed_while_the_cursor_moves_
     console.set_global_overview(Some(finished)).unwrap();
     let mut state = console.state.lock().unwrap();
     let frame = drawn(&mut state);
-    assert!(line_with(&frame, "› ✔ Long scan").is_some(), "{frame:#?}");
+    assert!(
+        line_with(&frame, &format!("{SELECTED_MARK} ✔ Long scan")).is_some(),
+        "{frame:#?}"
+    );
     state.key(key(KeyCode::Char('k')));
     let frame = drawn(&mut state);
     assert!(
@@ -4625,7 +4631,7 @@ fn agent_layout_overview_marks_the_agent_it_returns_to_apart_from_the_selection(
     let frame = drawn(&mut state);
     let source = line_with(&frame, "Tick 的标准化设计").expect("the source row stays listed");
     assert!(
-        !source.starts_with('›') && source.contains("current"),
+        !source.starts_with(SELECTED_MARK) && source.contains("current"),
         "the returning Agent keeps its own cue after the cursor moves on: {source}"
     );
     let selected = state.overview.selected;
@@ -4674,7 +4680,7 @@ fn agent_layout_repeated_long_titles_stay_distinguishable_without_hashes() {
         let repeats = frame
             .iter()
             .filter(|line| line.contains("这个项目"))
-            .map(|line| line.trim_start_matches(['›', ' ']).to_owned())
+            .map(|line| line.trim_start_matches([SELECTED_MARK, ' ']).to_owned())
             .collect::<Vec<_>>();
         let distinct = repeats.iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(
@@ -4727,7 +4733,7 @@ fn agent_layout_reading_numbers_stay_bound_through_arrivals_and_removals() {
         .unwrap();
     let numbered = |frame: &[String]| {
         let current_line = line_with(frame, "current").expect("the current row is listed");
-        assert!(current_line.starts_with('›'), "{frame:#?}");
+        assert!(current_line.starts_with(SELECTED_MARK), "{frame:#?}");
         assert!(current_line.contains(&format!("{TITLE} (2)")), "{frame:#?}");
         assert!(
             line_with(frame, &format!("Created {TITLE} (3)")).is_some(),
@@ -4765,7 +4771,7 @@ fn agent_layout_reading_numbers_stay_bound_through_arrivals_and_removals() {
 
 /// A listed row's text after its selection marker, indentation and state glyph.
 fn row_title(line: &str) -> &str {
-    let rest = line.trim_start_matches(['›', ' ']);
+    let rest = line.trim_start_matches([SELECTED_MARK, ' ']);
     rest.split_once(' ')
         .filter(|(glyph, _)| glyph.chars().count() == 1)
         .map_or(rest, |(_, title)| title)
@@ -4775,7 +4781,7 @@ fn row_title(line: &str) -> &str {
 fn selected_row_contains(frame: &str, text: &str) -> bool {
     frame
         .lines()
-        .any(|line| line.starts_with('›') && line.contains(text))
+        .any(|line| line.starts_with(SELECTED_MARK) && line.contains(text))
 }
 
 /// The overview list region of a frame: everything above the dispatch line.
@@ -4964,7 +4970,10 @@ fn agent_layout_filter_cycling_keeps_a_still_listed_heading_selected() {
         "project-a still lists the Done heading"
     );
     let frame = drawn(&mut state);
-    assert!(line_with(&frame, "› ▾ Done · 1").is_some(), "{frame:#?}");
+    assert!(
+        line_with(&frame, &format!("{SELECTED_MARK} ▾ Done · 1")).is_some(),
+        "{frame:#?}"
+    );
     drop(state);
 
     let console = console_selecting(OverviewTarget::Heading(AttentionGroup::Working));

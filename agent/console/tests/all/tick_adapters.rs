@@ -2,8 +2,8 @@ use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tick_protocol::InstanceRef;
 use tickloop_agent_console::monitor_rows::{
-    MonitorAction, MonitorContext, MonitorRows, MonitorRowsRegistry, SubscriptionOperation,
-    TickDescriptor, TickGlyph, TickGroup, TickIntent,
+    MonitorAction, MonitorContext, MonitorRows, MonitorRowsRegistry, NextCheck, SubscriptionMark,
+    SubscriptionOperation, TickDescriptor, TickGlyph, TickGroup, TickIntent,
 };
 use tickloop_agent_protocol::{
     EventKind, ObservationKind, TickSubscriptionChange, TickSubscriptionFrequency,
@@ -44,7 +44,7 @@ impl MonitorRows for CalendarRows {
             kind: "Calendar".into(),
             status: "live".into(),
             notes: Vec::new(),
-            inherent_subscription: false,
+            subscription: None,
             owner: tickloop_agent_console::monitor_rows::TickOwner::Unknown,
             tone: tickloop_agent_console::monitor_rows::StatusTone::Neutral,
             updated_at_ms: None,
@@ -132,7 +132,21 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].group.name, "Calendars");
     assert_eq!(rows[0].status, "live");
-    assert_eq!(rows[0].notes, ["⟳ high"]);
+    assert!(rows[0].notes.is_empty(), "{:?}", rows[0].notes);
+    assert!(
+        matches!(
+            rows[0].subscription,
+            Some(SubscriptionMark {
+                frequency: TickSubscriptionFrequency::High,
+                next_check: Some(NextCheck {
+                    period_ms: 60_000,
+                    ..
+                }),
+            })
+        ),
+        "the row counts down to the next check the Agent reports: {:?}",
+        rows[0].subscription
+    );
     let period = TickSubscriptionFrequency::High.period().unwrap();
     tokio::time::advance(period).await;
     settle().await;
@@ -258,7 +272,11 @@ async fn a_shell_subscription_reaches_the_loop_once_when_the_shell_exits() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].group.name, "Shells");
     assert_eq!(rows[0].status, "exit 7");
-    assert_eq!(rows[0].notes, ["7", "⟳ immediate"]);
+    assert_eq!(rows[0].notes, ["7"]);
+    assert_eq!(
+        rows[0].subscription, None,
+        "a Shell's immediate subscription shows no mark"
+    );
     assert!(!rows[0].running);
     tokio::time::sleep(SHELL_QUIET_WAIT).await;
     assert_eq!(
@@ -308,11 +326,19 @@ fn a_subscribed_instance_always_has_a_row_with_its_marker() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].instance, instance);
     assert_eq!(rows[0].status, "live");
-    assert_eq!(rows[0].notes, ["⟳ high"]);
+    let high = Some(SubscriptionMark {
+        frequency: TickSubscriptionFrequency::High,
+        next_check: None,
+    });
+    assert_eq!(rows[0].subscription, high);
     assert_eq!(unread(&rows), Some(2));
 
     let rows = listed(vec![subscription(0), subscription(1)]);
-    assert_eq!(rows[0].notes, ["⟳ 2"]);
+    assert_eq!(
+        rows[0].subscription, high,
+        "the mark never counts subscriptions"
+    );
+    assert!(rows[0].notes.is_empty(), "{:?}", rows[0].notes);
     assert_eq!(unread(&rows), Some(1));
 
     let mut stopped = subscription(0);
@@ -519,10 +545,14 @@ fn duplicate_instance_projection_keeps_the_newest_delivery_in_any_subscription_o
         assert_eq!(rows[0].updated_at_ms, Some(2000));
         assert_eq!(rows[0].title, "Shared Tick");
         assert_eq!(rows[0].status, "live");
+        assert!(rows[0].notes.is_empty(), "{:?}", rows[0].notes);
         assert_eq!(
-            rows[0].notes,
-            ["⟳ 2"],
-            "two subscriptions show as a summary"
+            rows[0].subscription,
+            Some(SubscriptionMark {
+                frequency: TickSubscriptionFrequency::High,
+                next_check: None,
+            }),
+            "two subscriptions show as one mark in the most frequent one's colour"
         );
     }
 }
@@ -713,15 +743,14 @@ async fn artifact_rows_show_where_feedback_is_linked_and_the_newest_request() {
         "where feedback goes stays on the row"
     );
     assert_eq!(row(Some(false), Some(elsewhere)).status, "feedback here");
-    assert_eq!(
-        row(Some(false), Some(here)).notes,
-        ["⟳"],
-        "an association here is the row's subscription and shows as its marker"
+    assert!(
+        row(Some(false), Some(here)).notes.is_empty(),
+        "an association here is the row's default subscription and needs no words"
     );
-    assert!(row(Some(false), Some(here)).inherent_subscription);
+    assert_eq!(row(Some(false), Some(here)).subscription, None);
     assert_eq!(row(Some(true), Some(here)).status, "feedback paused");
     assert_eq!(row(Some(true), Some(here)).notes, ["feedback paused"]);
-    assert!(!row(Some(true), Some(here)).inherent_subscription);
+    assert_eq!(row(Some(true), Some(here)).subscription, None);
     let x_label = |paused, remote| {
         row(paused, remote)
             .actions

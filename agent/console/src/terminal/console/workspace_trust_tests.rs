@@ -100,6 +100,7 @@ fn workspace_trust_modal_owns_input_and_keeps_choices_visible_across_sizes() {
                 kind: "Shell".into(),
                 status: "running".into(),
                 notes: Vec::new(),
+                subscription: None,
                 owner: crate::monitor_rows::TickOwner::Unknown,
                 tone: crate::monitor_rows::StatusTone::Neutral,
                 updated_at_ms: None,

@@ -1,5 +1,6 @@
 use super::*;
 use tickloop_agent_protocol::{AgentAccess, ShellTask};
+use tickloop_agent_test_support::screen::SELECTED_MARK;
 
 const TODO_FIRST: &str = "Inspect the source-owned footer behavior";
 const TODO_SECOND: &str = "Explain the verified layout result";
@@ -461,9 +462,9 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     .await;
     pty.send(b"\x1b[1;2B");
     pty.wait_for("Shift Down focuses the newest Shell", |frame| {
-        frame
-            .lines()
-            .any(|line| line.contains("›") && line.contains("while [ ! -f first-finish ]"))
+        frame.lines().any(|line| {
+            line.contains(SELECTED_MARK) && line.contains("while [ ! -f first-finish ]")
+        })
     })
     .await;
     pty.send(b"\r");
@@ -528,9 +529,9 @@ async fn run_shell_panel(fixture: &PrivateFixture) {
     .await;
     pty.send(b"\x1b[1;2B");
     pty.wait_for("newest exact Shell selected", |frame| {
-        frame
-            .lines()
-            .any(|line| line.contains("›") && line.contains("while [ ! -f second-finish ]"))
+        frame.lines().any(|line| {
+            line.contains(SELECTED_MARK) && line.contains("while [ ! -f second-finish ]")
+        })
     })
     .await;
     pty.send(b"\r");

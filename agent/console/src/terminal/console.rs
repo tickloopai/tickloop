@@ -5990,7 +5990,13 @@ impl State {
     fn next_row_clock(&self, now_ms: u64) -> Option<u64> {
         let monitor = self
             .monitor_visible()
-            .then(|| self.monitor.next_frame_ms(now_ms, self.display))
+            .then(|| {
+                self.monitor.next_frame_ms(
+                    now_ms,
+                    self.monitor_columns().saturating_sub(2),
+                    self.display,
+                )
+            })
             .flatten();
         let panel = (!self.full_review && self.transcript.is_none())
             .then(|| self.status_area.next_frame_ms(now_ms))
@@ -12333,6 +12339,8 @@ mod tests {
             last_delivery_ms: None,
             last_delivery: None,
             link: tickloop_agent_protocol::TickLinkState::Live,
+            next_check_at_ms: None,
+            period_ms: None,
         }
     }
 
@@ -12395,6 +12403,25 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    /// The last frame's rows as a terminal shows them, with the selection fill marked by the
+    /// test screen's [`SELECTED_MARK`](tickloop_agent_test_support::screen::SELECTED_MARK).
+    pub(super) fn selection_marked_screen(state: &State) -> Vec<String> {
+        let output = state
+            .rendered_rows
+            .iter()
+            .enumerate()
+            .map(|(row, rendered)| format!("\x1b[{};1H{rendered}", row + 1))
+            .collect::<String>();
+        tickloop_agent_test_support::screen::visible_screen_with_selection(
+            &output,
+            state.width,
+            state.rendered_rows.len().max(1),
+        )
+        .split('\n')
+        .map(str::to_owned)
+        .collect()
     }
 
     pub(super) fn console_with_state(state: State) -> Console {

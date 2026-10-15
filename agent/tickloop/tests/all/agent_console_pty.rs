@@ -2,6 +2,7 @@
 
 use crate::support;
 use tickloop_agent_test_support::model_http_support;
+use tickloop_agent_test_support::screen::SELECTED_MARK;
 
 mod artifact_attachment;
 mod auto_review;
@@ -247,8 +248,9 @@ impl PtyView {
         self.writer.flush().unwrap();
     }
 
+    /// The screen, with the selection fill marked by [`screen::SELECTED_MARK`].
     fn frame(&self) -> String {
-        screen::visible_screen(
+        screen::visible_screen_with_selection(
             &String::from_utf8_lossy(&self.output.lock().unwrap()),
             self.width,
             self.height,
@@ -471,7 +473,9 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
     let overview = first.frame();
     assert!(overview.contains("Needs input"), "{overview}");
     assert!(
-        overview.contains("› ◆ New Agent · current session · send a prompt to start"),
+        overview.contains(&format!(
+            "{SELECTED_MARK} ◆ New Agent · current session · send a prompt to start"
+        )),
         "{overview}"
     );
     assert!(overview.contains("approvals 0 · questions 0"), "{overview}");
@@ -486,7 +490,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
         first.send(b"\x1b[D");
         first
             .wait_for("Left selects current draft again", |frame| {
-                frame.contains("› ◆ New Agent · current session")
+                frame.contains(&format!("{SELECTED_MARK} ◆ New Agent · current session"))
             })
             .await;
     }
@@ -826,10 +830,9 @@ async fn run_working_agent_detach(fixture: &PrivateFixture) {
         .await;
     select_overview_row(&mut reopened, &rows[0].title).await;
     assert!(
-        reopened
-            .frame()
-            .lines()
-            .any(|line| { line.starts_with('›') && row_title(line).starts_with(&rows[0].title) }),
+        reopened.frame().lines().any(|line| {
+            line.starts_with(SELECTED_MARK) && row_title(line).starts_with(&rows[0].title)
+        }),
         "the running Agent row is selected: {}",
         reopened.frame()
     );
@@ -1257,18 +1260,18 @@ async fn open_family_child(pty: &mut PtyView, task: &str) {
             frame.contains("Subagents 1")
                 && frame.contains(task)
                 && frame.contains("enter open · space fold")
-                && frame.lines().any(|line| line.starts_with('›'))
+                && frame.lines().any(|line| line.starts_with(SELECTED_MARK))
         })
         .await;
     if !list
         .lines()
-        .any(|line| line.starts_with('›') && line.contains("cadence"))
+        .any(|line| line.starts_with(SELECTED_MARK) && line.contains("cadence"))
     {
         pty.send(b"j");
         pty.wait_for("child row is selected", |frame| {
             frame
                 .lines()
-                .any(|line| line.starts_with('›') && line.contains("cadence"))
+                .any(|line| line.starts_with(SELECTED_MARK) && line.contains("cadence"))
         })
         .await;
     }
@@ -1503,7 +1506,8 @@ async fn run_child_views(fixture: &PrivateFixture) {
         second
             .frame()
             .lines()
-            .any(|line| line.starts_with('›') && line.contains("Delegate bounded cadence.")),
+            .any(|line| line.starts_with(SELECTED_MARK)
+                && line.contains("Delegate bounded cadence.")),
         "the parent row is selected in the second View: {}",
         second.frame()
     );
@@ -1664,7 +1668,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
                 && frame.contains("enter open · space fold")
                 && frame
                     .lines()
-                    .any(|line| line.starts_with('›') && line.contains("cadence"))
+                    .any(|line| line.starts_with(SELECTED_MARK) && line.contains("cadence"))
         })
         .await;
     first.send(b"k\r");
@@ -2876,15 +2880,17 @@ async fn select_overview_row(view: &mut PtyView, title: &str) {
     tokio::time::sleep(Duration::from_millis(200)).await;
     for _ in 0..MAX_KEYS {
         let lines = list(&view.frame());
-        let Some(selected) = lines.iter().find(|line| line.starts_with('›')) else {
+        let Some(selected) = lines.iter().find(|line| line.starts_with(SELECTED_MARK)) else {
             view.send(b"j");
             tokio::time::sleep(Duration::from_millis(30)).await;
             continue;
         };
-        if row_title(selected).contains(title) && !selected.starts_with("› ▾ ") {
+        if row_title(selected).contains(title)
+            && !selected.starts_with(&format!("{SELECTED_MARK} ▾ "))
+        {
             return;
         }
-        view.send(if selected.starts_with("› ▸ ") {
+        view.send(if selected.starts_with(&format!("{SELECTED_MARK} ▸ ")) {
             b"\r"
         } else {
             b"j"
@@ -2902,20 +2908,20 @@ async fn open_group_heading(view: &mut PtyView, group: &str) {
         selected_row_title(frame).is_some_and(|title| title.starts_with("Needs input"))
     })
     .await;
-    let folded = format!("› ▸ {group} · ");
+    let folded = format!("{SELECTED_MARK} ▸ {group} · ");
     for _ in 0..40 {
         let frame = view.frame();
         if frame.contains(&folded) {
             view.send(b"\r");
             view.wait_for("the group heading opens", |frame| {
-                frame.contains(&format!("› ▾ {group} · "))
+                frame.contains(&format!("{SELECTED_MARK} ▾ {group} · "))
             })
             .await;
             return;
         }
         let next = frame
             .lines()
-            .skip_while(|line| !line.starts_with('›'))
+            .skip_while(|line| !line.starts_with(SELECTED_MARK))
             .nth(1)
             .map(row_title)
             .and_then(|title| title.split(" · ").next())
@@ -2934,7 +2940,7 @@ async fn open_group_heading(view: &mut PtyView, group: &str) {
 
 /// A listed row's text after its selection marker, indentation and state glyph.
 fn row_title(line: &str) -> &str {
-    let rest = line.trim_start_matches(['›', ' ']);
+    let rest = line.trim_start_matches([SELECTED_MARK, ' ']);
     rest.split_once(' ')
         .filter(|(glyph, _)| glyph.chars().count() == 1)
         .map_or(rest, |(_, title)| title)
@@ -2944,7 +2950,7 @@ fn row_title(line: &str) -> &str {
 fn selected_row_title(frame: &str) -> Option<&str> {
     frame
         .lines()
-        .find(|line| line.starts_with('›'))
+        .find(|line| line.starts_with(SELECTED_MARK))
         .map(row_title)
 }
 
@@ -3134,7 +3140,7 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
         let created = rows
             .iter()
             .position(|line| row_title(line).starts_with(&label));
-        let selected = rows.iter().position(|line| line.starts_with('›'));
+        let selected = rows.iter().position(|line| line.starts_with(SELECTED_MARK));
         (created, selected, rows.len())
     };
     let mut fresh = None;
@@ -3150,7 +3156,7 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
         };
         let previous_selection = latest
             .lines()
-            .find(|line| line.starts_with('›'))
+            .find(|line| line.starts_with(SELECTED_MARK))
             .unwrap()
             .to_owned();
         let away_from_new = selected == created;
@@ -3314,20 +3320,20 @@ async fn run_dense_overview(fixture: &PrivateFixture) {
         );
     }
     for _ in 0..8 {
-        if view.frame().contains("› ▸ Empty") {
+        if view.frame().contains(&format!("{SELECTED_MARK} ▸ Empty")) {
             break;
         }
         view.send(b"j");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     view.wait_for("the Empty heading is selected", |frame| {
-        frame.contains("› ▸ Empty · 5")
+        frame.contains(&format!("{SELECTED_MARK} ▸ Empty · 5"))
     })
     .await;
     view.send(b"\r");
     let opened = view
         .wait_for("every never-used session becomes discoverable", |frame| {
-            frame.contains("› ▾ Empty · 5")
+            frame.contains(&format!("{SELECTED_MARK} ▾ Empty · 5"))
                 && frame
                     .lines()
                     .filter(|line| line.contains("· Empty"))
@@ -3578,14 +3584,14 @@ async fn run_legacy_dense_overview(fixture: &PrivateFixture) {
         );
     }
     for _ in 0..8 {
-        if view.frame().contains("› ▸ Unknown") {
+        if view.frame().contains(&format!("{SELECTED_MARK} ▸ Unknown")) {
             break;
         }
         view.send(b"j");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     view.wait_for("the Unknown heading is selected", |frame| {
-        frame.contains("› ▸ Unknown")
+        frame.contains(&format!("{SELECTED_MARK} ▸ Unknown"))
     })
     .await;
     view.send(b"\r");

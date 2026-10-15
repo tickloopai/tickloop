@@ -364,7 +364,7 @@ impl ChildPty {
 
     fn frame(&self) -> String {
         let output = self.output.lock().unwrap();
-        screen::visible_screen(
+        screen::visible_screen_with_selection(
             completed_frames(&String::from_utf8_lossy(&output)),
             WIDTH,
             HEIGHT,
@@ -592,7 +592,7 @@ fn project_filter(frame: &str) -> Option<String> {
 fn selected_row(frame: &str) -> Option<String> {
     frame
         .lines()
-        .find(|line| line.trim_start().starts_with("› "))
+        .find(|line| line.starts_with(screen::SELECTED_MARK))
         .map(str::to_owned)
 }
 

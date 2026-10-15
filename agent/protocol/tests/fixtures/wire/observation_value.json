@@ -604,7 +604,9 @@
         "kind": "Protocol",
         "title": "Quotes",
         "updated_at_ms": 6500,
-        "link": "Live"
+        "link": "Live",
+        "next_check_at_ms": 66000,
+        "period_ms": 60000
       }
     ]
   },

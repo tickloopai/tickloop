@@ -33,10 +33,12 @@ use crate::{
 /// can be an exited terminal Tick, with how its program ended. 20.0: the hosted Tick snapshot
 /// command is gone, and `AttachHostedTick` also grants views of the Chat's Shell tasks. 20.1 names
 /// the Bash call that started each Agent Shell task, and adds reading a Chat's status without its
-/// history, one recorded tool operation, and the events after a sequence. Older business majors
-/// are refused before dispatch; the frozen daemon management protocol remains independent.
+/// history, one recorded tool operation, and the events after a sequence. 20.2 adds each Tick
+/// Subscription status's next check and period, so Monitor counts down to the next check. Older
+/// business majors are refused before dispatch; the frozen daemon management protocol remains
+/// independent.
 pub const PROTOCOL_MAJOR: u16 = 20;
-pub const PROTOCOL_MINOR: u16 = 1;
+pub const PROTOCOL_MINOR: u16 = 2;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 

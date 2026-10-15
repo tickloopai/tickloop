@@ -18,7 +18,7 @@ use tick_protocol::InstanceRef;
 use tickloop_agent_artifacts::ArtifactMetadata;
 use tickloop_agent_protocol::{
     ChatStatus, LoopState, MonitorMember, MonitorMembership, ShellTaskSnapshot,
-    TickSubscriptionStatus,
+    TickSubscriptionFrequency, TickSubscriptionStatus,
 };
 use uuid::Uuid;
 
@@ -180,6 +180,70 @@ impl RowUpdate {
     }
 }
 
+/// How a row marks the periodic Tick Subscriptions on its instance: `⟳` in the colour of the most
+/// frequent, counting down to the nearest next check. Immediate subscriptions, which Shells and
+/// artifacts have by default, are never marked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubscriptionMark {
+    pub frequency: TickSubscriptionFrequency,
+    /// The nearest next check, once the Agent reports one.
+    pub next_check: Option<NextCheck>,
+}
+
+impl SubscriptionMark {
+    /// The mark of the periodic subscriptions among `rows`, `None` without any.
+    pub fn of(rows: &[&TickSubscriptionStatus]) -> Option<Self> {
+        let periodic = rows.iter().filter(|row| row.frequency.period().is_some());
+        let frequency = periodic
+            .clone()
+            .map(|row| row.frequency)
+            .min_by_key(|frequency| frequency.period())?;
+        Some(Self {
+            frequency,
+            next_check: periodic
+                .filter_map(|row| NextCheck::of(row))
+                .min_by_key(|check| check.at_ms),
+        })
+    }
+}
+
+/// When a periodic subscription next checks its instance, and its period.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NextCheck {
+    pub at_ms: u64,
+    pub period_ms: u64,
+}
+
+impl NextCheck {
+    fn of(row: &TickSubscriptionStatus) -> Option<Self> {
+        let (at_ms, period_ms) = row.next_check_at_ms.zip(row.period_ms)?;
+        (period_ms > 0).then_some(Self { at_ms, period_ms })
+    }
+
+    fn period_started_at(self) -> u64 {
+        self.at_ms.saturating_sub(self.period_ms)
+    }
+
+    /// How many of `columns` the part of the period elapsed at `now_ms` fills; all of them once
+    /// the check is due.
+    pub fn elapsed_columns(self, columns: usize, now_ms: u64) -> usize {
+        let elapsed = now_ms
+            .saturating_sub(self.period_started_at())
+            .min(self.period_ms);
+        (u128::from(elapsed) * columns as u128 / u128::from(self.period_ms)) as usize
+    }
+
+    /// When the elapsed part next fills one more of `columns`; `None` once it fills them all.
+    pub fn next_column_at(self, columns: usize, now_ms: u64) -> Option<u64> {
+        let filled = self.elapsed_columns(columns, now_ms);
+        (filled < columns).then(|| {
+            let elapsed =
+                (u128::from(self.period_ms) * (filled as u128 + 1)).div_ceil(columns as u128);
+            self.period_started_at() + elapsed as u64
+        })
+    }
+}
+
 /// How long a gone instance keeps its row before it leaves Monitor.
 pub const GONE_DISPLAY_MS: u64 = 30_000;
 
@@ -193,14 +257,12 @@ pub struct TickDescriptor {
     /// The state in words, such as `exit 0`, `live` or `gone`, for the row's detail. The row
     /// itself tells the state only by its glyph's colour.
     pub status: String,
-    /// What the row shows at its right before its latest update: facts its glyph's colour
-    /// cannot tell, such as a non-zero exit code, a signal or the subscription marker.
+    /// What the row shows at its right before its marks: facts its glyph's colour cannot tell,
+    /// such as a non-zero exit code or a signal.
     pub notes: Vec<String>,
-    /// Whether a Loop of this Chat subscribes to the instance through its type rather than a Tick
-    /// Subscription, as an artifact's association does with its @tickloop requests. It shows as
-    /// the subscription marker without a frequency, and the row's own `x` ends it. Only a type
-    /// that takes no Tick Subscriptions sets it.
-    pub inherent_subscription: bool,
+    /// The row's subscription mark, which the Monitor list sets from the Tick Subscriptions on
+    /// the instance.
+    pub subscription: Option<SubscriptionMark>,
     pub owner: TickOwner,
     pub tone: StatusTone,
     /// The latest business update; resource and screen refreshes never set it.
@@ -335,7 +397,7 @@ fn subscription_descriptor(row: &TickSubscriptionStatus) -> TickDescriptor {
         kind: if terminal { "Terminal" } else { "Tick" }.into(),
         status: builtin::link_status(row.link).into(),
         notes: Vec::new(),
-        inherent_subscription: false,
+        subscription: None,
         tone: builtin::link_tone(row.link),
         owner: TickOwner::Unknown,
         updated_at_ms: row.updated_at_ms,
@@ -346,20 +408,11 @@ fn subscription_descriptor(row: &TickSubscriptionStatus) -> TickDescriptor {
     }
 }
 
-/// Shows the row's subscriptions as a marker, `⟳` for the type's inherent one, which has no
-/// frequency, `⟳ high` for one Tick Subscription at its frequency or `⟳ 2` for several, and adds
-/// the keys that manage Tick Subscriptions; the frequency key only while one of them can change,
-/// which an immediate one cannot. Enter always opens the Tick itself; a row without its own opening
-/// shows the Tick's details.
+/// Marks the row with its periodic Tick Subscriptions and adds the keys that manage all of them;
+/// the frequency key only while one of them can change, which an immediate one cannot. Enter
+/// always opens the Tick itself; a row without its own opening shows the Tick's details.
 fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus]) {
-    entry.notes.push(match rows {
-        [] => "⟳".into(),
-        [row] => format!("⟳ {}", row.frequency.name()),
-        rows => format!("⟳ {}", rows.len()),
-    });
-    if rows.is_empty() {
-        return;
-    }
+    entry.subscription = SubscriptionMark::of(rows);
     let instance = entry.instance.clone();
     let manage = |operation| TickIntent::ManageSubscriptions {
         instance: instance.clone(),
@@ -467,7 +520,7 @@ pub fn member_descriptor(member: &MonitorMember) -> TickDescriptor {
         kind: "Tick".into(),
         status: String::new(),
         notes: Vec::new(),
-        inherent_subscription: false,
+        subscription: None,
         owner: TickOwner::ThisChat,
         tone: StatusTone::Neutral,
         updated_at_ms: None,
@@ -583,7 +636,7 @@ impl MonitorRowsRegistry {
             let rows = subscribed
                 .get(&entry.instance)
                 .map_or(&[][..], Vec::as_slice);
-            if entry.inherent_subscription || !rows.is_empty() {
+            if !rows.is_empty() {
                 mark_subscribed(entry, rows);
             }
             let accumulated = subscribed
@@ -688,7 +741,6 @@ fn merge_descriptors(
                     lead.update = other.update.clone();
                 }
                 lead.running |= other.running;
-                lead.inherent_subscription |= other.inherent_subscription;
                 if lead.title == lead.instance.as_str() {
                     lead.title = other.title;
                 }

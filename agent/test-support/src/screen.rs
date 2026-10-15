@@ -105,88 +105,167 @@ pub fn message_flow(frame: &str) -> &str {
 
 /// Reconstructs completed Agent frames, including rows retained by differential redraws.
 pub fn visible_screen(output: &str, width: usize, height: usize) -> String {
-    let end = output
-        .rfind("\x1b[?2026l")
-        .map_or(output.len(), |end| end + "\x1b[?2026l".len());
-    static CONTROLS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let controls = CONTROLS.get_or_init(|| {
-        regex::Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*?(?:\x07|\x1b\\)").unwrap()
-    });
-    let mut rows = vec![vec![' '; width]; height];
-    let (mut row, mut column) = (0usize, 0usize);
-    let (mut top, mut bottom) = (0usize, height - 1);
-    let mut offset = 0;
-    for control in controls.find_iter(&output[..end]) {
-        for character in output[offset..control.start()].chars() {
-            match character {
-                '\r' => column = 0,
-                '\n' => row = (row + 1).min(height - 1),
-                character if !character.is_control() => {
-                    let cells = character.width().unwrap_or(0);
-                    if cells > 0 && row < height && column < width {
-                        rows[row][column] = character;
-                        rows[row][column + 1..(column + cells).min(width)].fill('\0');
-                        column += cells;
+    Screen::reconstruct(output, width, height).text(false)
+}
+
+/// What a frame shows where the selection fill begins, since the fill alone marks the selected
+/// row of a list.
+pub const SELECTED_MARK: char = '▌';
+
+/// The background parameters the Agent's two themes send for the selection fill and for the
+/// deeper shade a selected row's countdown takes, at 256 colours and in true colour.
+pub const SELECTION_BACKGROUNDS: [&str; 8] = [
+    "48;5;24",
+    "48;5;153",
+    "48;2;38;79;120",
+    "48;2;180;213;255",
+    "48;5;25",
+    "48;5;111",
+    "48;2;30;100;160",
+    "48;2;140;185;245",
+];
+
+/// [`visible_screen`] with the selection fill made visible: the first cell of each run painted
+/// with the selection background shows [`SELECTED_MARK`] when that cell is blank, as the indent
+/// of a list's selected row is.
+pub fn visible_screen_with_selection(output: &str, width: usize, height: usize) -> String {
+    Screen::reconstruct(output, width, height).text(true)
+}
+
+struct Screen {
+    rows: Vec<Vec<char>>,
+    /// Whether each cell was painted with the selection background.
+    selected: Vec<Vec<bool>>,
+}
+
+impl Screen {
+    fn reconstruct(output: &str, width: usize, height: usize) -> Self {
+        let end = output
+            .rfind("\x1b[?2026l")
+            .map_or(output.len(), |end| end + "\x1b[?2026l".len());
+        static CONTROLS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let controls = CONTROLS.get_or_init(|| {
+            regex::Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*?(?:\x07|\x1b\\)").unwrap()
+        });
+        let mut rows = vec![vec![' '; width]; height];
+        let mut selected = vec![vec![false; width]; height];
+        let (mut row, mut column) = (0usize, 0usize);
+        let (mut top, mut bottom) = (0usize, height - 1);
+        let mut on_selection = false;
+        let mut offset = 0;
+        for control in controls.find_iter(&output[..end]) {
+            for character in output[offset..control.start()].chars() {
+                match character {
+                    '\r' => column = 0,
+                    '\n' => row = (row + 1).min(height - 1),
+                    character if !character.is_control() => {
+                        let cells = character.width().unwrap_or(0);
+                        if cells > 0 && row < height && column < width {
+                            let covered = column..(column + cells).min(width);
+                            rows[row][column] = character;
+                            rows[row][column + 1..covered.end].fill('\0');
+                            selected[row][covered.clone()].fill(on_selection);
+                            column += cells;
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
-        let sequence = control.as_str();
-        if let Some(csi) = sequence.strip_prefix("\x1b[") {
-            let action = csi.as_bytes()[csi.len() - 1] as char;
-            let parameters = &csi[..csi.len() - 1];
-            let values: Vec<usize> = parameters
-                .split(';')
-                .map(|value| value.parse().unwrap_or(0))
-                .collect();
-            let first = values[0];
-            match action {
-                'H' | 'f' => {
-                    row = first.saturating_sub(1).min(height - 1);
-                    column = values
-                        .get(1)
-                        .copied()
-                        .unwrap_or(1)
-                        .saturating_sub(1)
-                        .min(width - 1);
-                }
-                'J' if first == 2 => rows.iter_mut().for_each(|line| line.fill(' ')),
-                'K' => {
-                    let start = if first == 2 { 0 } else { column.min(width) };
-                    rows[row][start..].fill(' ');
-                }
-                'r' => {
-                    top = first.saturating_sub(1).min(height - 1);
-                    bottom = values
-                        .get(1)
-                        .copied()
-                        .filter(|value| *value > 0)
-                        .unwrap_or(height)
-                        .saturating_sub(1)
-                        .min(height - 1);
-                }
-                'S' => {
-                    for _ in 0..first.max(1).min(bottom - top + 1) {
-                        rows[top..=bottom].rotate_left(1);
-                        rows[bottom].fill(' ');
+            let sequence = control.as_str();
+            if let Some(csi) = sequence.strip_prefix("\x1b[") {
+                let action = csi.as_bytes()[csi.len() - 1] as char;
+                let parameters = &csi[..csi.len() - 1];
+                let values: Vec<usize> = parameters
+                    .split(';')
+                    .map(|value| value.parse().unwrap_or(0))
+                    .collect();
+                let first = values[0];
+                match action {
+                    'm' if SELECTION_BACKGROUNDS.contains(&parameters) => on_selection = true,
+                    'm' if first == 0 || first == 49 || parameters.starts_with("48;") => {
+                        on_selection = false
                     }
+                    'H' | 'f' => {
+                        row = first.saturating_sub(1).min(height - 1);
+                        column = values
+                            .get(1)
+                            .copied()
+                            .unwrap_or(1)
+                            .saturating_sub(1)
+                            .min(width - 1);
+                    }
+                    'J' if first == 2 => {
+                        rows.iter_mut().for_each(|line| line.fill(' '));
+                        selected.iter_mut().for_each(|line| line.fill(false));
+                    }
+                    'K' => {
+                        let start = if first == 2 { 0 } else { column.min(width) };
+                        rows[row][start..].fill(' ');
+                        selected[row][start..].fill(false);
+                    }
+                    'r' => {
+                        top = first.saturating_sub(1).min(height - 1);
+                        bottom = values
+                            .get(1)
+                            .copied()
+                            .filter(|value| *value > 0)
+                            .unwrap_or(height)
+                            .saturating_sub(1)
+                            .min(height - 1);
+                    }
+                    'S' => {
+                        for _ in 0..first.max(1).min(bottom - top + 1) {
+                            rows[top..=bottom].rotate_left(1);
+                            rows[bottom].fill(' ');
+                            selected[top..=bottom].rotate_left(1);
+                            selected[bottom].fill(false);
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            offset = control.end();
         }
-        offset = control.end();
+        Self { rows, selected }
     }
-    rows.into_iter()
-        .map(|line| {
-            line.into_iter()
-                .filter(|character| *character != '\0')
-                .collect::<String>()
-                .trim_end()
-                .to_owned()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+
+    fn text(self, marks_selection: bool) -> String {
+        self.rows
+            .into_iter()
+            .zip(self.selected)
+            .map(|(mut line, selected)| {
+                if marks_selection {
+                    for column in 0..line.len() {
+                        let starts_selection =
+                            selected[column] && (column == 0 || !selected[column - 1]);
+                        if starts_selection && line[column] == ' ' {
+                            line[column] = SELECTED_MARK;
+                        }
+                    }
+                }
+                line.into_iter()
+                    .filter(|character| *character != '\0')
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+#[test]
+fn the_selection_fill_shows_as_a_mark_where_its_run_begins_on_a_blank_cell() {
+    let output = "\x1b[?2026h\x1b[2J\x1b[1;1H  plain\x1b[2;1H\x1b[48;5;24m  ◉ chosen   \x1b[0m\x1b[3;1H\x1b[48;2;180;213;255m❯ option\x1b[0m\x1b[4;1Hleft \x1b[48;5;24m  row\x1b[0m\x1b[?2026l";
+    assert_eq!(
+        visible_screen_with_selection(output, 20, 4),
+        "  plain\n▌ ◉ chosen\n❯ option\nleft ▌ row"
+    );
+    assert_eq!(
+        visible_screen(output, 20, 4),
+        "  plain\n  ◉ chosen\n❯ option\nleft   row",
+        "the plain screen keeps the blank cells"
+    );
 }
 
 #[test]

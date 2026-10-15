@@ -1,5 +1,6 @@
 use super::*;
 use tickloop_agent_protocol::{AgentAccess, ViewRef};
+use tickloop_agent_test_support::screen::SELECTED_MARK;
 
 /// The family panel's rows under its heading; a conversation's `› Message from` lines are not
 /// among them.
@@ -82,14 +83,16 @@ async fn open_family_member(
     pty.send(b"\x1b[B");
     pty.wait_for("family list receives focus", |frame| {
         family_rows_are_visible(frame)
-            && family_rows(frame).iter().any(|line| line.starts_with('›'))
+            && family_rows(frame)
+                .iter()
+                .any(|line| line.starts_with(SELECTED_MARK))
     })
     .await;
     for _ in 0..6 {
         let frame = pty.frame();
         if family_rows(&frame)
             .iter()
-            .any(|line| line.starts_with('›') && line.contains(panel_title))
+            .any(|line| line.starts_with(SELECTED_MARK) && line.contains(panel_title))
         {
             pty.send(b"\r");
             let version = displayed_version(
@@ -127,7 +130,10 @@ async fn open_family_member(
             return version;
         }
         let rows = family_rows(&frame);
-        let selected = rows.iter().position(|line| line.starts_with('›')).unwrap();
+        let selected = rows
+            .iter()
+            .position(|line| line.starts_with(SELECTED_MARK))
+            .unwrap();
         let target_row = rows
             .iter()
             .position(|line| line.contains(panel_title))
@@ -140,7 +146,7 @@ async fn open_family_member(
         pty.wait_for("family selection moves to the next member", |frame| {
             family_rows(frame)
                 .iter()
-                .any(|line| line.starts_with('›') && !line.contains(previous_title))
+                .any(|line| line.starts_with(SELECTED_MARK) && !line.contains(previous_title))
         })
         .await;
     }
@@ -377,7 +383,8 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
         .position(|line| line.contains("Subagents 2"))
         .unwrap();
     assert!(
-        rows[entry + 1].starts_with("› ") && rows[entry + 1].contains("main"),
+        rows[entry + 1].starts_with(&format!("{SELECTED_MARK} "))
+            && rows[entry + 1].contains("main"),
         "the first Down lands on the viewed member: {list_focused}"
     );
     assert!(!list_focused.contains("items"));
