@@ -11,6 +11,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tickloop_agent_artifacts::{APP_BASE_PATH, ArtifactClient, artifact_url};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -44,6 +45,11 @@ pub struct ServiceControl {
     pub hold_device_approval: AtomicBool,
     pub reject_mcp: AtomicBool,
     pub directory_unavailable: AtomicBool,
+    pub skills_enabled: AtomicBool,
+    pub tamper_skill: AtomicBool,
+    pub hold_skill_response: AtomicBool,
+    pub skill_response_started: Notify,
+    pub release_skill_response: Notify,
     pub session_unavailable: AtomicBool,
     pub hold_session_response: AtomicBool,
     pub session_response_started: Notify,
@@ -140,7 +146,7 @@ fn call_tool(control: &ServiceControl, origin: &str, params: &Value) -> Value {
                 Some("doc") if control.catalog_format_names.load(Ordering::SeqCst) => {
                     json!("markdown")
                 }
-                Some("design") if control.catalog_format_names.load(Ordering::SeqCst) => {
+                Some("page") if control.catalog_format_names.load(Ordering::SeqCst) => {
                     json!("html")
                 }
                 _ => arguments["format"].clone(),
@@ -219,13 +225,50 @@ fn mcp(control: &ServiceControl, origin: &str, body: &Value) -> Value {
         .unwrap_or_else(|| "tickloop-docs".into());
     let result = match body["method"].as_str().unwrap_or("") {
         "server/discover" => {
-            json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{"listChanged":true}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":name,"version":"1"}}})
+            let mut capabilities = json!({"tools":{"listChanged":true}});
+            if control.skills_enabled.load(Ordering::SeqCst) {
+                capabilities["resources"] = json!({});
+                capabilities["extensions"] = json!({"io.modelcontextprotocol/skills":{}});
+            }
+            json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":capabilities,"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":name,"version":"1"}}})
+        }
+        "skills/list" => {
+            json!({"resultType":"complete","skills":skill_entries(),"ttlMs":0,"cacheScope":"private"})
+        }
+        "skills/get" => {
+            json!({"resultType":"complete","skill":skill_entries().into_iter().find(|entry| entry["uri"] == body["params"]["uri"]).unwrap(),"ttlMs":0,"cacheScope":"private"})
+        }
+        "resources/read" => {
+            let uri = body["params"]["uri"].as_str().unwrap();
+            let name = uri.split('/').nth(3).unwrap();
+            let text = if control.tamper_skill.load(Ordering::SeqCst) {
+                "tampered content".into()
+            } else if uri.ends_with("SKILL.md") {
+                skill_body(name)
+            } else {
+                "Reference fixture: preserve data units".into()
+            };
+            json!({"resultType":"complete","contents":[{"uri":uri,"mimeType":"text/markdown","text":text}],"ttlMs":0,"cacheScope":"private"})
         }
         "tools/list" => tools(control),
         "tools/call" => call_tool(control, origin, &body["params"]),
         method => panic!("unexpected MCP method: {method}"),
     };
     json!({"jsonrpc":"2.0","id":body["id"],"result":result})
+}
+
+fn skill_body(name: &str) -> String {
+    format!(
+        "---\nname: {name}\ndescription: Fixture guidance for {name}\n---\nPage guidance fixture for {name}: verify the facts and preserve existing content.\n"
+    )
+}
+
+fn skill_entries() -> Vec<Value> {
+    ["artifact-design", "artifact-diagramming", "artifact-dataviz", "artifact-draft"].into_iter().map(|name| {
+        let uri = format!("skill://tickloop-docs/{name}/SKILL.md");
+        let resources = [(uri.clone(), skill_body(name)), (format!("skill://tickloop-docs/{name}/references/runtime.md"), "Reference fixture: preserve data units".into())].into_iter().map(|(uri, text)| json!({"uri":uri,"size":text.len(),"digest":format!("sha256:{:x}", Sha256::digest(text.as_bytes()))})).collect::<Vec<_>>();
+        json!({"uri":uri,"frontmatter":{"name":name,"description":format!("Fixture guidance for {name}")},"resources":resources})
+    }).collect()
 }
 
 fn lifecycle(control: &ServiceControl, method: &str, target: &str, body: &Value) -> (u16, Value) {
@@ -468,6 +511,12 @@ impl ArtifactService {
                     {
                         (400, error)
                     } else if is_mcp {
+                        if body["method"] == "resources/read"
+                            && control.hold_skill_response.load(Ordering::SeqCst)
+                        {
+                            control.skill_response_started.notify_one();
+                            control.release_skill_response.notified().await;
+                        }
                         if body["method"] == "tools/call"
                             && control.drop_call_response.load(Ordering::SeqCst)
                         {

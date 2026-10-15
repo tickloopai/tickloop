@@ -63,16 +63,7 @@ fn discovers_builtin_user_and_nearest_project_skills_in_stable_order() {
         .map(|skill| skill.name.as_str())
         .collect::<Vec<_>>();
 
-    assert_eq!(
-        names,
-        [
-            "artifact-draft",
-            "nearest",
-            "personal",
-            "root-skill",
-            "tickloop"
-        ]
-    );
+    assert_eq!(names, ["nearest", "personal", "root-skill", "tickloop"]);
     assert!(registry.warnings().is_empty());
     assert!(matches!(
         registry
@@ -306,7 +297,7 @@ async fn model_passes_skill_arguments_as_args_like_claude_code() {
             .unwrap()
             .keys()
             .collect::<Vec<_>>(),
-        ["args", "skill"]
+        ["args", "resource", "skill"]
     );
     assert_eq!(skill_tool.input_schema["required"], json!(["skill"]));
     assert!(skill_tool.description.contains("args: \""));

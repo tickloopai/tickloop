@@ -2,11 +2,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use tickloop_agent_protocol::{InvokedSkill, SkillSource, ToolDefinition};
+use tickloop_agent_protocol::{InvokedSkill, RemoteSkillDefinition, SkillSource, ToolDefinition};
 
 pub const TICKLOOP_SKILL: &str = include_str!("../skills/tickloop/SKILL.md");
-pub const ARTIFACT_DRAFT_SKILL: &str = include_str!("../skills/artifact-draft/SKILL.md");
-pub const BUILTIN_SKILLS: [&str; 2] = [TICKLOOP_SKILL, ARTIFACT_DRAFT_SKILL];
+pub const BUILTIN_SKILLS: [&str; 1] = [TICKLOOP_SKILL];
 pub const SKILL_TOOL_NAME: &str = "Skill";
 
 const SKILL_FILE_NAME: &str = "SKILL.md";
@@ -53,6 +52,8 @@ impl TryFrom<SkillExpansion> for InvokedSkill {
             name: expansion.name,
             content: expansion.content,
             source: expansion.source,
+            run_id: None,
+            references: Vec::new(),
         })
     }
 }
@@ -66,6 +67,7 @@ pub enum SkillCaller {
 #[derive(Clone, Debug, Default)]
 pub struct SkillRegistry {
     skills: BTreeMap<String, SkillDefinition>,
+    remote: BTreeMap<String, SkillDefinition>,
     warnings: Vec<String>,
 }
 
@@ -119,7 +121,7 @@ impl SkillRegistry {
     }
 
     pub fn definitions(&self) -> impl Iterator<Item = &SkillDefinition> {
-        self.skills.values()
+        self.skills.values().chain(self.remote.values())
     }
 
     pub fn warnings(&self) -> &[String] {
@@ -136,7 +138,21 @@ impl SkillRegistry {
     }
 
     pub fn model_listing_with_budget(&self, budget: usize) -> String {
-        let mut listing = String::new();
+        let mut listing = self
+            .remote
+            .values()
+            .map(|skill| {
+                format!(
+                    "- {}: {} [Tickloop Artifacts]\n",
+                    skill.name,
+                    skill
+                        .description
+                        .chars()
+                        .take(MAX_DESCRIPTION_CHARS)
+                        .collect::<String>()
+                )
+            })
+            .collect::<String>();
         for skill in self
             .skills
             .values()
@@ -154,6 +170,27 @@ impl SkillRegistry {
             listing.push_str(&entry);
         }
         listing
+    }
+
+    pub fn replace_remote(&mut self, definitions: Vec<RemoteSkillDefinition>) {
+        self.remote = definitions
+            .into_iter()
+            .map(|definition| {
+                (
+                    definition.name.clone(),
+                    SkillDefinition {
+                        name: definition.name,
+                        description: definition.description,
+                        source: definition.source,
+                        body: String::new(),
+                        allowed_tools: Vec::new(),
+                        user_invocable: false,
+                        disable_model_invocation: false,
+                        context: SkillContext::Inline,
+                    },
+                )
+            })
+            .collect();
     }
 
     /// Claude Code's `SkillTool` prompt and input schema. Claude Code lists the skills in
@@ -198,6 +235,10 @@ Available Skills:
                     "args": {
                         "type": "string",
                         "description": "Optional arguments for the skill"
+                    },
+                    "resource": {
+                        "type": "string",
+                        "description": "Read a listed relative reference file from an already activated remote Skill; mutually exclusive with args"
                     }
                 },
                 "required": ["skill"],
@@ -317,6 +358,41 @@ Available Skills:
                 .push(format!("{} is ignored: {error}", display_source(path))),
         }
     }
+}
+
+pub fn expand_remote(
+    markdown: &str,
+    definition: &RemoteSkillDefinition,
+    arguments: &str,
+) -> Result<InvokedSkill, SkillError> {
+    let skill = parse_skill(markdown, definition.source.clone())?;
+    if format!("tickloop-docs:{}", skill.name) != definition.name
+        || skill.description != definition.description
+    {
+        return Err(SkillError::Invalid(
+            "remote frontmatter does not match its directory entry".into(),
+        ));
+    }
+    if skill.disable_model_invocation
+        || skill.context != SkillContext::Inline
+        || !skill.allowed_tools.is_empty()
+    {
+        return Err(SkillError::Invalid(
+            "unsupported remote invocation or execution metadata".into(),
+        ));
+    }
+    let content = if arguments.trim().is_empty() {
+        skill.body
+    } else {
+        format!("{}\n\nTask arguments:\n{}", skill.body, arguments.trim())
+    };
+    Ok(InvokedSkill {
+        name: definition.name.clone(),
+        content,
+        source: definition.source.clone(),
+        run_id: None,
+        references: Vec::new(),
+    })
 }
 
 #[derive(Clone, Copy)]

@@ -40,10 +40,11 @@ use crate::{
 /// deliveries as background. 20.4 adds reading a running Tickhost of another build than the
 /// daemon's, with what replacing it ends, and replacing it on the user's word. 20.5 says whether a
 /// Terminal Tick's screen changed since a Tick Subscription last got it, so Monitor shows that
-/// change waiting for the next check. Older business majors are refused before dispatch; the
+/// change waiting for the next check. 21.0 adds source-bound remote Skill manifests and their
+/// Run and reference activation records. Older business majors are refused before dispatch; the
 /// frozen daemon management protocol remains independent.
-pub const PROTOCOL_MAJOR: u16 = 20;
-pub const PROTOCOL_MINOR: u16 = 5;
+pub const PROTOCOL_MAJOR: u16 = 21;
+pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 

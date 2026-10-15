@@ -341,6 +341,23 @@ pub trait HostToolProvider: Send + Sync {
         Ok(())
     }
 
+    fn remote_skills(&self) -> Vec<tickloop_agent_protocol::RemoteSkillDefinition> {
+        Vec::new()
+    }
+
+    fn remote_skill_is_current(&self, _source: &tickloop_agent_protocol::SkillSource) -> bool {
+        false
+    }
+
+    async fn read_remote_skill(
+        &self,
+        _definition: &tickloop_agent_protocol::RemoteSkillDefinition,
+        _resource: Option<&str>,
+        _cancel: CancellationToken,
+    ) -> Result<String, String> {
+        Err("remote Skills are unavailable".into())
+    }
+
     fn validate_input(&self, name: &str, schema: &Value, input: &Value) -> Result<(), String> {
         crate::validate_host_schema_input(name, schema, input)
     }

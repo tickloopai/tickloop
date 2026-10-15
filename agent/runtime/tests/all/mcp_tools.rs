@@ -31,6 +31,230 @@ use artifact_service::{ArtifactService, CREATED_ARTIFACT};
 
 const WAIT: Duration = Duration::from_secs(15);
 
+#[tokio::test]
+async fn remote_skills_are_lazy_reference_context_and_end_with_the_run() {
+    let service = ArtifactService::start().await;
+    service.control.skills_enabled.store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "load",
+            "Skill",
+            json!({"skill":"tickloop-docs:artifact-design"}),
+        ),
+        call(
+            "reference",
+            "Skill",
+            json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"}),
+        ),
+        call(
+            "reuse",
+            "Skill",
+            json!({"skill":"tickloop-docs:artifact-design"}),
+        ),
+        text("done"),
+        text("next task"),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Make a visual page").await;
+    assert!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .invoked_skills
+            .iter()
+            .all(|skill| skill.run_id.is_none())
+    );
+    submit_and_wait(&agent, chat, "Read something unrelated").await;
+    {
+        let requests = model.requests.lock().unwrap();
+        let first = requests[0]
+            .tools
+            .iter()
+            .find(|tool| tool.name == "Skill")
+            .unwrap();
+        for name in [
+            "artifact-design",
+            "artifact-diagramming",
+            "artifact-dataviz",
+            "artifact-draft",
+        ] {
+            assert!(first.description.contains(&format!("tickloop-docs:{name}")));
+        }
+        let body = "Page guidance fixture for artifact-design";
+        let serialized = |index: usize| serde_json::to_string(&requests[index].messages).unwrap();
+        assert!(!serialized(0).contains(body));
+        assert!(serialized(1).contains(body));
+        assert!(serialized(2).contains("Reference fixture: preserve data units"));
+        assert!(requests[1].messages.iter().any(|message| message.role
+            == tickloop_agent_protocol::Role::User
+            && serde_json::to_string(message).unwrap().contains(body)));
+        assert!(!requests[1].messages.iter().any(|message| message.role
+            == tickloop_agent_protocol::Role::System
+            && serde_json::to_string(message).unwrap().contains(body)));
+        assert!(!serialized(4).contains(body));
+    }
+    assert_eq!(
+        service
+            .control
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["body"]["method"] == "resources/read")
+            .count(),
+        2
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_skill_loading_drops_the_old_account_response() {
+    let service = ArtifactService::start().await;
+    service.control.skills_enabled.store(true, Ordering::SeqCst);
+    service
+        .control
+        .hold_skill_response
+        .store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "load",
+            "Skill",
+            json!({"skill":"tickloop-docs:artifact-design"}),
+        ),
+        text("done"),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .submit(chat, None, "Build a page".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, service.control.skill_response_started.notified())
+        .await
+        .unwrap();
+    service.control.other_account.store(true, Ordering::SeqCst);
+    service.login(directory.path()).await;
+    service.control.release_skill_response.notify_one();
+    wait_for_completion(&agent, chat).await;
+    {
+        let requests = model.requests.lock().unwrap();
+        let last = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+        assert!(last.contains("source changed during loading"));
+        assert!(!last.contains("Page guidance fixture for artifact-design"));
+    }
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_skill_policy_revocation_during_loading_prevents_activation() {
+    let service = ArtifactService::start().await;
+    service.control.skills_enabled.store(true, Ordering::SeqCst);
+    service
+        .control
+        .hold_skill_response
+        .store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "load",
+            "Skill",
+            json!({"skill":"tickloop-docs:artifact-design"}),
+        ),
+        text("done"),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .submit(chat, None, "Prepare a page".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, service.control.skill_response_started.notified())
+        .await
+        .unwrap();
+    agent
+        .set_permission_rules(
+            chat,
+            vec![tickloop_agent_protocol::PermissionRule {
+                id: uuid::Uuid::new_v4(),
+                decision: tickloop_agent_protocol::Decision::Deny,
+                tool: "Skill".into(),
+                specifier: None,
+                input: None,
+                loop_id: None,
+                persistent: false,
+            }],
+        )
+        .await
+        .unwrap();
+    service.control.release_skill_response.notify_one();
+    wait_for_completion(&agent, chat).await;
+    {
+        let requests = model.requests.lock().unwrap();
+        let last = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+        assert!(last.contains("permission policy changed during loading"));
+        assert!(!last.contains("Page guidance fixture for artifact-design"));
+        assert!(
+            !requests
+                .last()
+                .unwrap()
+                .tools
+                .iter()
+                .find(|tool| tool.name == "Skill")
+                .unwrap()
+                .description
+                .contains("tickloop-docs:artifact-design")
+        );
+    }
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_skill_digest_mismatch_and_unactivated_reference_never_enter_context() {
+    let service = ArtifactService::start().await;
+    service.control.skills_enabled.store(true, Ordering::SeqCst);
+    service.control.tamper_skill.store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "reference-first",
+            "Skill",
+            json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"}),
+        ),
+        call(
+            "load-tampered",
+            "Skill",
+            json!({"skill":"tickloop-docs:artifact-design"}),
+        ),
+        text("done"),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Build a page").await;
+    {
+        let requests = model.requests.lock().unwrap();
+        let content = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+        assert!(content.contains("activate the Skill before reading a reference"));
+        assert!(content.contains("size or digest mismatch"));
+        assert!(!content.contains("tampered content"));
+    }
+    assert_eq!(
+        service
+            .control
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["body"]["method"] == "resources/read")
+            .count(),
+        1
+    );
+    agent.shutdown().await;
+}
+
 fn current_host_state(request: &ModelRequest) -> Value {
     request
         .messages
@@ -1791,7 +2015,7 @@ async fn an_unlinked_artifact_no_longer_brings_its_requests_into_the_loop() {
 }
 
 #[tokio::test]
-async fn a_creation_answered_with_catalog_format_names_still_joins_monitor() {
+async fn a_creation_answered_with_retired_wire_format_does_not_bind_monitor() {
     let service = ArtifactService::start().await;
     service
         .control
@@ -1802,7 +2026,7 @@ async fn a_creation_answered_with_catalog_format_names_still_joins_monitor() {
         call(
             "create",
             "ArtifactEdit",
-            json!({"action":"create","title":"Board","format":"design","content":"<h1>Board</h1>"}),
+            json!({"action":"create","title":"Board","format":"page","content":"<h1>Board</h1>"}),
         ),
         text("Created."),
     ]));
@@ -1812,18 +2036,9 @@ async fn a_creation_answered_with_catalog_format_names_still_joins_monitor() {
         .submit(chat, None, "Mock up a board".into())
         .await
         .unwrap();
-    eventually(async || {
-        !agent
-            .snapshot(chat)
-            .await
-            .unwrap()
-            .artifact_ticks
-            .is_empty()
-    })
-    .await;
+    wait_for_completion(&agent, chat).await;
     let snapshot = agent.snapshot(chat).await.unwrap();
-    assert_eq!(snapshot.artifact_ticks[0].format, "html");
-    assert_eq!(snapshot.artifact_ticks[0].title, "Board");
+    assert!(snapshot.artifact_ticks.is_empty());
     agent.shutdown().await;
 }
 
@@ -1896,7 +2111,7 @@ async fn a_failed_creation_link_is_reported_to_the_model_and_monitor_still_shows
         call(
             "create",
             "ArtifactEdit",
-            json!({"action":"create","title":"Brief","format":"design","content":"<p>Brief</p>"}),
+            json!({"action":"create","title":"Brief","format":"page","content":"<p>Brief</p>"}),
         ),
         text("Created."),
     ]));

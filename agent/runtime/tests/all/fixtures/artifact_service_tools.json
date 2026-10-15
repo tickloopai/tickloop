@@ -2,7 +2,7 @@
   "tools": [
     {
       "name": "ArtifactRead",
-      "description": "Read Tickloop Artifacts you can access. Each artifact has format doc (writing) or design (a visual page). list: your artifacts and those shared with you; query matches titles. read: a doc as blocks, each with id, hash and text, paged by cursor; a design as its whole page source. Both include revision. threads: comment threads (open by default) with their latest messages and any @tickloop request. access_role is owner, edit or view; view can comment but not edit.",
+      "description": "Read Tickloop Artifacts you can access. Each artifact has format doc (writing) or design (a visual page). list: your artifacts and those shared with you; query matches titles. read: a doc as blocks, each with id, hash and text, paged by cursor; a page as its whole page source. Both include revision. threads: comment threads (open by default) with their latest messages and any @tickloop request. access_role is owner, edit or view; view can comment but not edit.",
       "inputSchema": {
         "type": "object",
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -52,7 +52,7 @@
     },
     {
       "name": "ArtifactEdit",
-      "description": "create: title, format, content. doc: writing (reports, notes, plans), opens with \"# <title>\". design: visual design, UI, prototypes, mockups, wireframes, dashboards, interactive pages; self-contained page, inline <style>/<script>, only https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js, fit phone widths. patch (doc): target, expected_hash from read; replace, delete or insert before/after a block. replace (design): whole page source, expected_revision from read. rename: title, expected_title from read; an H1 or <title> showing the old title follows. On content_conflict, re-read and merge, never overwrite. On unsupported_doc_syntax, simplify it. Delete, sharing, members, versions: web only.",
+      "description": "create: title, format, content. doc: writing (reports, notes, plans), opens with \"# <title>\". page: visual design, UI, prototypes, mockups, wireframes, dashboards, interactive pages; self-contained page, inline <style>/<script>, only https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js, fit phone widths. patch (doc): target, expected_hash from read; replace, delete or insert before/after a block. replace (page): whole page source, expected_revision from read. rename: title, expected_title from read; an H1 or <title> showing the old title follows. On content_conflict, re-read and merge, never overwrite. On unsupported_doc_syntax, simplify it. Delete, sharing, members, versions: web only.",
       "inputSchema": {
         "type": "object",
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -75,7 +75,7 @@
             "type": "string",
             "enum": [
               "doc",
-              "design"
+              "page"
             ]
           },
           "content": {

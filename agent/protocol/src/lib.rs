@@ -155,7 +155,7 @@ pub use shell_tasks::{
     ShellTaskPromptWatchdog, ShellTaskSnapshot, ShellTaskState, ShellTaskSubscriptionEvent,
     recover_shell_update_time,
 };
-pub use skill::{InvokedSkill, SkillSource};
+pub use skill::{InvokedSkill, RemoteSkillDefinition, RemoteSkillResource, SkillSource};
 pub use tick_subscriptions::{
     MAX_DELIVERY_ITEM_BYTES, MAX_DELIVERY_PAYLOAD_BYTES, ObservationKind, TICK_SUBSCRIPTION_SOURCE,
     TickLinkState, TickSubscription, TickSubscriptionChange, TickSubscriptionFrequency,
