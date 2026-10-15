@@ -2016,9 +2016,9 @@ async fn a_lone_item_may_take_the_whole_delivery() {
 async fn items_that_do_not_fit_one_delivery_arrive_in_the_next_turn() {
     let directory = tempfile::tempdir().unwrap();
     let instances: Vec<_> = (1..=5).map(fixture_instance).collect();
-    let stream = InMemoryTickStream::new();
+    let stream = RefillingStream::new();
     let (agent, model, chat) =
-        agent_subscribed_to(directory.path(), Arc::new(stream.clone()), &instances, 2).await;
+        agent_subscribed_to(directory.path(), stream.clone(), &instances, 2).await;
     let mut events = agent.subscribe();
     let line = |index: usize| "v".repeat(MAX_DELIVERY_ITEM_BYTES - 600 + index);
     for (index, instance) in instances.iter().enumerate() {
@@ -2051,6 +2051,12 @@ async fn items_that_do_not_fit_one_delivery_arrive_in_the_next_turn() {
         .flat_map(|payload| payload["items"].as_array().unwrap().clone())
         .map(|item| {
             assert!(item.get("trimmed").is_none(), "each fits its share: {item}");
+            assert!(
+                item["data"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with('v')),
+                "a waiting item is read again for its turn: {item}"
+            );
             item["instance"].as_str().unwrap().to_owned()
         })
         .collect();
@@ -2111,10 +2117,7 @@ async fn a_tick_cannot_push_a_delivery_past_its_caps() {
 async fn a_deferred_item_too_large_to_deliver_whole_is_read_again_in_its_turn() {
     let directory = tempfile::tempdir().unwrap();
     let instances: Vec<_> = (1..=4).map(fixture_instance).collect();
-    let stream = Arc::new(RefillingStream {
-        inner: InMemoryTickStream::new(),
-        current: Default::default(),
-    });
+    let stream = RefillingStream::new();
     let (agent, model, chat) =
         agent_subscribed_to(directory.path(), stream.clone(), &instances, 2).await;
     let mut events = agent.subscribe();
@@ -2256,9 +2259,9 @@ async fn many_subscribed_instances_are_delivered_over_turns_of_at_most_sixteen_k
             InstanceRef::new("calendar", &format!("bulk:{index:03}:{}", "r".repeat(60))).unwrap()
         })
         .collect();
-    let stream = InMemoryTickStream::new();
+    let stream = RefillingStream::new();
     let (agent, model, chat) =
-        agent_subscribed_to(directory.path(), Arc::new(stream.clone()), &instances, 20).await;
+        agent_subscribed_to(directory.path(), stream.clone(), &instances, 20).await;
     let mut events = agent.subscribe();
     for instance in &instances {
         stream.push(TickObservation {
@@ -2979,8 +2982,8 @@ async fn an_immediate_delivery_whose_watermark_failed_is_retried_until_it_lands(
         text("saw the exit"),
     ]));
     let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
-    let stream = InMemoryTickStream::new();
-    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let stream = RefillingStream::new();
+    agent.install_tick_stream(stream.clone()).await;
     let chat = agent.create_chat(workdir).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent.submit(chat, None, "watch".into()).await.unwrap();
@@ -3063,8 +3066,8 @@ async fn a_held_periodic_delivery_is_retried_before_its_next_period() {
         text("saw the second"),
     ]));
     let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
-    let stream = InMemoryTickStream::new();
-    agent.install_tick_stream(Arc::new(stream.clone())).await;
+    let stream = RefillingStream::new();
+    agent.install_tick_stream(stream.clone()).await;
     let chat = agent.create_chat(workdir).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent.submit(chat, None, "watch".into()).await.unwrap();
@@ -3104,9 +3107,29 @@ async fn a_held_periodic_delivery_is_retried_before_its_next_period() {
 
 /// Answers `read_current` with a prepared observation, otherwise behaves as the in-memory
 /// stream.
+/// An in-memory stream whose instances can be read again, as a delivery does for data it no
+/// longer holds.
 struct RefillingStream {
     inner: InMemoryTickStream,
     current: std::sync::Mutex<std::collections::HashMap<InstanceRef, TickObservation>>,
+}
+
+impl RefillingStream {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: InMemoryTickStream::new(),
+            current: Default::default(),
+        })
+    }
+
+    /// Publishes `observation`, which also becomes what reading its instance again returns.
+    fn push(&self, observation: TickObservation) {
+        self.current
+            .lock()
+            .unwrap()
+            .insert(observation.instance.clone(), observation.clone());
+        self.inner.push(observation);
+    }
 }
 
 #[async_trait::async_trait]

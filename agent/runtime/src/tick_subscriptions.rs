@@ -723,16 +723,14 @@ impl TickDeliveries {
     }
 
     /// Puts items back for `owner`'s next delivery; a newer item that came due meanwhile for the
-    /// same instance takes their place and merges their updates. Data too large to deliver whole
-    /// is not held meanwhile: as data too large for the content cache, it keeps only what
-    /// [`left_out`] keeps and is read again before delivery.
+    /// same instance takes their place and merges their updates. While they wait they hold no
+    /// data: as data too large for the content cache, each keeps only what [`left_out`] keeps and
+    /// is read again before delivery.
     fn restore(&mut self, owner: (ChatId, LoopId), items: Vec<DeliveryItem>) {
         let pending = self.pending.entry(owner).or_default();
         for mut item in items {
-            if encoded_len(&item.data) > MAX_DELIVERY_PAYLOAD_BYTES {
-                item.data = left_out(&item.kind, &item.data);
-                item.needs_refill = true;
-            }
+            item.data = left_out(&item.kind, &item.data);
+            item.needs_refill = true;
             match pending.items.remove(&item.instance) {
                 Some(newer) => {
                     pending
@@ -1864,7 +1862,10 @@ struct DeliveryNotes {
 
 /// Fits a delivery within [`MAX_DELIVERY_PAYLOAD_BYTES`]: each item takes at most
 /// [`MAX_DELIVERY_ITEM_BYTES`], or the whole delivery when it is the only one, with its data
-/// trimmed by segments to fit, and an item that no longer fits waits for the next turn.
+/// trimmed by segments to fit, and an item that no longer fits waits for the next turn. The
+/// first item always goes, which still keeps the cap: its allowance is no more than what the
+/// delivery has left, and [`DeliveryItem::delivered`] keeps within it whenever its header does,
+/// which bounds every field a Tick reports.
 fn fit_delivery(items: Vec<DeliveryItem>) -> FittedDelivery {
     let worst_notes = DeliveryNotes {
         is_trimmed: true,
@@ -1908,8 +1909,10 @@ fn fit_delivery(items: Vec<DeliveryItem>) -> FittedDelivery {
         delivered.push(item);
     }
     notes.more_next_turn = deferred.len();
+    let payload = delivery_payload(payload_items, &notes);
+    debug_assert!(encoded_len(&payload) <= MAX_DELIVERY_PAYLOAD_BYTES);
     FittedDelivery {
-        payload: delivery_payload(payload_items, &notes),
+        payload,
         delivered,
         deferred,
         summary: lines.join(", "),
