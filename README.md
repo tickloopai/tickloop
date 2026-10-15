@@ -99,7 +99,7 @@ tickloop tick uninstall longbridge
 
 清单字段：`name`（小写字母、数字和 `-`）、`version`（与工作区版本相同，测试会核对）、`description`、`executable`（包内相对路径，文件名为 `tick-<name>`）、`protocol`，以及可选的 `credentials`（程序保存数据来源凭据的位置，卸载时提示）。
 
-Agent 从同一个配置根读取已安装的包，不需要改 PATH。每个新建的 Chat（以及换工作目录时）加载各包 `skills/` 中的 Skill，名字带包前缀，如 `longbridge:longbridge`，正文中的 `${TICK_PACKAGE_ROOT}` 换成包的安装目录；包 Skill 与用户 Skill 一样不带额外权限，带前缀的名字也不会与内置、用户或项目 Skill 重名，格式错误或重名的只产生 warning。
+Agent 从同一个配置根读取已安装的包，不需要改 PATH。每个新建的 Chat（以及换工作目录时）加载各包 `skills/` 中的 Skill，名字带包前缀，如 `longbridge:usage`，正文中的 `${TICK_PACKAGE_ROOT}` 换成包的安装目录；包 Skill 与用户 Skill 一样不带额外权限，带前缀的名字也不会与内置、用户或项目 Skill 重名，格式错误或重名的只产生 warning。
 
 打开 Tick 时，裸程序名依次在 Agent 旁的自带程序（`tick-reader`、`tickhost`）、已安装包的程序（`tick-<包>`）和 PATH 中查找；清单 `protocol` 为 true 的包程序不用传 `protocol: true` 就按协议 Tick 打开，审批摘要写明来自哪个包。新装的包马上可以打开，它的 Skill 在之后新建的 Chat 中出现。打开没装的包的程序（如 `tick-longbridge`）时报告包未安装并给出 `tickloop tick install <包>`，Agent 只提示用户运行，不自己安装。`make dev` 启动的开发版 Agent 同样使用配置根中已安装的包，先用 `make install-ticks` 安装。
 

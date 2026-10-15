@@ -241,7 +241,7 @@ fn an_unusable_package_or_registry_only_warns() {
     );
 }
 
-/// The Skills the `longbridge` and `futu` packages ship load under their package names and point
+/// The `usage` Skills the `longbridge` and `futu` packages ship load as `<package>:usage` and point
 /// at the installed program.
 #[test]
 fn the_shipped_package_skills_load_from_an_installed_package() {
@@ -250,11 +250,11 @@ fn the_shipped_package_skills_load_from_an_installed_package() {
         let directory = tempfile::tempdir().unwrap();
         let config_root = directory.path().join("config");
         let shipped =
-            fs::read_to_string(repository.join(format!("ticks/{name}/skills/{name}/SKILL.md")))
+            fs::read_to_string(repository.join(format!("ticks/{name}/skills/usage/SKILL.md")))
                 .unwrap();
         let package = install(
             &config_root,
-            &package_source(directory.path(), name, &[(name, &shipped)]),
+            &package_source(directory.path(), name, &[("usage", &shipped)]),
         );
 
         let registry = SkillRegistry::discover(directory.path(), Some(&config_root));
@@ -263,11 +263,11 @@ fn the_shipped_package_skills_load_from_an_installed_package() {
         assert!(
             registry
                 .model_listing()
-                .contains(&format!("- {name}:{name}: ")),
+                .contains(&format!("- {name}:usage: ")),
             "{name}"
         );
         let content = registry
-            .expand(&format!("{name}:{name}"), "", SkillCaller::Model)
+            .expand(&format!("{name}:usage"), "", SkillCaller::Model)
             .unwrap()
             .content;
         assert!(content.contains(&format!("[\"{program}\", ")), "{content}");

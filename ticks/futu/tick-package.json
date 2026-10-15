@@ -1,7 +1,7 @@
 {
   "name": "futu",
   "version": "0.2.0",
-  "description": "Futu OpenD option chains and quotes",
+  "description": "Futu OpenD option chains, option pricing and implied volatility",
   "executable": "bin/tick-futu",
   "protocol": true
 }

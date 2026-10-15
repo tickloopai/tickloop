@@ -1,6 +1,6 @@
 ---
-name: longbridge
-description: Open Longbridge Ticks with real quotes, K-line charts, the watchlist, positions, news, earnings and community posts, such as 看看特斯拉股价 or 打开特斯拉K线. Load it before opening tick-longbridge.
+name: usage
+description: Open Longbridge Ticks with real quotes, K-line charts, the watchlist, positions, news, earnings and community posts, such as a request to see Tesla's stock price or open its K-line chart. Load it before opening tick-longbridge.
 ---
 
 # Longbridge Ticks

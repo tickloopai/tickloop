@@ -1,6 +1,6 @@
 ---
-name: futu
-description: Open the Futu options Tick with option pricing, implied volatility and saved snapshots for one US or HK underlying from a running Futu OpenD, such as 看看苹果期权. Load it before opening tick-futu.
+name: usage
+description: Open the Futu options Tick with option pricing, implied volatility and saved snapshots for one US or HK underlying from a running Futu OpenD, such as a request to see Apple's options. Load it before opening tick-futu.
 ---
 
 # Futu Options Tick

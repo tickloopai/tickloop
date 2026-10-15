@@ -1,6 +1,6 @@
 ---
 name: tickloop
-description: Show stock prices, quotes or K-line charts in Ticks, open or operate a Tick, or subscribe a Loop to Tick updates. Use for 看看特斯拉股价 and 打开K线, even without the word Tick, and for Shell or Artifact updates. Ticks run in the Tickhost and appear in this Chat's Monitor; a Herdr Pane shows one only when the user asks for a place.
+description: Show stock prices, quotes or K-line charts in Ticks, open or operate a Tick, or subscribe a Loop to Tick updates. Use it for requests such as seeing Tesla's stock price or opening a K-line chart, even without the word Tick, and for Shell or Artifact updates. Ticks run in the Tickhost and appear in this Chat's Monitor; a Herdr Pane shows one only when the user asks for a place.
 ---
 
 # Tickloop Ticks
@@ -41,7 +41,7 @@ For an unavailable branch, briefly name what is missing in ordinary language, wi
 
 Call `ModifyTick` with `action: "open"`, a `command` argv array and optional `cwd`. The Tickhost runs the program: it needs no View or layout, takes no focus, joins this Chat's Monitor and is not subscribed. Omitted `cwd` uses the Agent's file work directory. Add a `placement` only when the user asks for a place (section 3).
 
-Market data and other data sources come from the Tick packages the user installed. `workspace_host.tick_packages` lists each one's `name`, `version`, `description` and `executable`. A package brings a Skill named `<package>:<skill>` that teaches its commands, arguments and login: load it with the Skill tool before opening that package's Ticks, and build `command` as it says. Open a package's program by its bare name `tick-<package>`; a program whose package declares the Tick protocol opens as a protocol Tick without `protocol: true`. A package installed after this Chat began is listed and opens at once, but its Skill arrives only in a new Chat; until then run its `executable` with `--help` to learn its commands.
+Market data and other data sources come from the Tick packages the user installed. `workspace_host.tick_packages` lists each one's `name`, `version`, `description` and `executable`. Each package brings a Skill named `<package>:usage` that teaches its commands, arguments and login: load it with the Skill tool before opening that package's Ticks, and build `command` as it says. Any other Skill a package brings is also named `<package>:<skill>`. Open a package's program by its bare name `tick-<package>`; a program whose package declares the Tick protocol opens as a protocol Tick without `protocol: true`. A package installed after this Chat began is listed and opens at once, but its Skill arrives only in a new Chat; until then run its `executable` with `--help` to learn its commands.
 
 When the data the user wants needs a package that `workspace_host.tick_packages` does not list, or the host reports that a Tick package is not installed, tell the user to install it by running `! tickloop tick install <package>` in this Agent; `! tickloop tick list --available` shows what the Tick marketplace offers, such as `longbridge` for Longbridge quotes, K-lines and community posts and `futu` for Futu OpenD option pricing. Never install a package yourself, and never search project source for a launcher or build one.
 

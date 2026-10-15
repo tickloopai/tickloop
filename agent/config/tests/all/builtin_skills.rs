@@ -21,6 +21,7 @@ fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
         "An artifact takes no Tick Subscription",
         "`reader_executable`",
         "`tick_packages`",
+        "`<package>:usage`",
         "`<package>:<skill>`",
         "`tick-<package>`",
         "`! tickloop tick install <package>`",

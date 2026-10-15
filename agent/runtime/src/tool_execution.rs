@@ -1951,8 +1951,8 @@ mod tests {
     #[test]
     fn shipped_skills_name_only_tools_the_agent_offers() {
         const PACKAGE_SKILLS: [&str; 2] = [
-            include_str!("../../../ticks/longbridge/skills/longbridge/SKILL.md"),
-            include_str!("../../../ticks/futu/skills/futu/SKILL.md"),
+            include_str!("../../../ticks/longbridge/skills/usage/SKILL.md"),
+            include_str!("../../../ticks/futu/skills/usage/SKILL.md"),
         ];
         const NOT_TOOLS: [&str; 1] = ["OutcomeUnknown"];
         let tools = built_in_definitions()

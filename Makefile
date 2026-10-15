@@ -40,7 +40,7 @@ package-ticks:
 ## Package the Tick packages, then install each with the tickloop built from this checkout.
 install-ticks: package-ticks
 	for package in $(TICK_PACKAGES); do \
-		cargo run --locked --quiet -p tickloop-agent --bin tickloop -- tick install --path "dist/ticks/$$package" || exit 1; \
+		cargo run --locked -p tickloop-agent --bin tickloop -- tick install --path "dist/ticks/$$package" || exit 1; \
 	done
 
 ## Prepare the release of the Tick packages in the tickloopai/ticks checkout TICKS_CHECKOUT and print the commands that publish it; it publishes nothing.
