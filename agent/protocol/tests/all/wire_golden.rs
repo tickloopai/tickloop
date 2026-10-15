@@ -550,7 +550,18 @@ fn agent_commands_keep_their_recorded_wire() {
             },
             AgentCommand::ManageLoop {
                 execution: execution(),
+                action: LoopAction::SubscribeTick {
+                    instance: hosted_instance(),
+                },
+            },
+            AgentCommand::ManageLoop {
+                execution: execution(),
                 action: LoopAction::SendNow { run_id: id(0x22) },
+            },
+            AgentCommand::ReopenHostedTick {
+                execution: execution(),
+                instance: hosted_instance(),
+                restore_subscriptions: true,
             },
             AgentCommand::RemoveMonitorMember {
                 execution: execution(),
@@ -801,6 +812,9 @@ fn command_results_keep_their_recorded_wire() {
             CommandResult::HostedTickReopened {
                 instance: hosted_instance(),
                 membership: monitor_membership(),
+                restore_error: Some(
+                    "1 of its Tick Subscriptions could not follow: a Deny rule refuses it".into(),
+                ),
             },
             CommandResult::HostedTickView(HostedViewGrant {
                 endpoint: "/run/tickhost.sock".into(),

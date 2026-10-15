@@ -1,11 +1,10 @@
 //! Resource bounds of the daemon's hosted Tick registry and host controller: one registry record
-//! or Watch message is at most one 1 MiB shard, a host start gives up after its budget, and a
-//! running host the daemon cannot verify is never replaced.
+//! is at most one 1 MiB shard, a host start gives up after its budget, and a running host the
+//! daemon cannot verify is never replaced.
 
 use crate::support;
 
 use std::{
-    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -23,13 +22,10 @@ use tickhost_connect::hosted::{
     read_frame, write_frame,
 };
 use tickloop_agent_runtime::hosted::{
-    controller::{HostController, START_ATTEMPTS, START_WAIT, WatchIntents},
+    controller::{HostController, START_ATTEMPTS, START_WAIT},
     registry::{LaunchRecord, LaunchState, Registry, SHARD_BYTES},
 };
 use uuid::Uuid;
-
-/// One Watch id in a JSON array: the quoted id and its separator.
-const WATCH_JSON_BYTES: usize = 39;
 
 fn private_directory(prefix: &str) -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -72,19 +68,6 @@ fn title_for_size(record: &LaunchRecord, size: usize) -> String {
     "t".repeat(size - base)
 }
 
-/// A controller of a host that never runs: Watch changes reach no host.
-fn idle_controller(directory: &Path) -> HostController {
-    HostController::new(
-        directory,
-        HostPaths {
-            runtime: directory.join("h"),
-        },
-        Uuid::new_v4(),
-        PathBuf::from("/usr/bin/false"),
-        support::hosted::IDLE_TIMEOUT,
-    )
-}
-
 #[tokio::test]
 async fn a_registry_record_over_one_shard_is_refused_before_anything_changes() {
     assert_eq!(SHARD_BYTES, 1024 * 1024, "the production shard is 1 MiB");
@@ -117,34 +100,6 @@ async fn a_registry_record_over_one_shard_is_refused_before_anything_changes() {
             .join(unseen.to_string())
             .exists(),
         "nothing is created for a refused record"
-    );
-
-    let watched = live_record(chat, "counter".into());
-    root.record_launch(&watched).await.unwrap();
-    let path = launch_path(&config_root, chat, watched.operation);
-    let before = std::fs::read(&path).unwrap();
-    let owner = TickOwner {
-        root: "fixture-root".into(),
-        chat,
-    };
-    let watches = (0..SHARD_BYTES / WATCH_JSON_BYTES + 1)
-        .map(|_| Uuid::new_v4())
-        .collect::<BTreeSet<_>>();
-    let refused = root
-        .set_watches(
-            &idle_controller(directory.path()),
-            &owner,
-            watched.instance().unwrap(),
-            watches,
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(refused.code, "RecordTooLarge", "{refused:?}");
-    assert!(!refused.dispatched);
-    assert_eq!(
-        std::fs::read(&path).unwrap(),
-        before,
-        "the record keeps its earlier Watches"
     );
 }
 
@@ -188,23 +143,6 @@ async fn a_registry_file_over_one_shard_is_refused_and_never_read_whole() {
     let refused = root.launches(chat).await.unwrap_err();
     assert_eq!(refused.code, "RecordTooLarge", "{refused:?}");
     assert!(started.elapsed() < Duration::from_secs(5));
-}
-
-#[test]
-fn watch_intents_over_one_shard_never_reach_the_host() {
-    assert_eq!(SHARD_BYTES, 1024 * 1024, "the production shard is 1 MiB");
-    let owner = TickOwner {
-        root: "fixture-root".into(),
-        chat: Uuid::new_v4(),
-    };
-    let watches = (0..SHARD_BYTES / WATCH_JSON_BYTES + 1)
-        .map(|_| Uuid::new_v4())
-        .collect::<BTreeSet<_>>();
-    let refused = WatchIntents::new(&owner, &InstanceRef::hosted(Uuid::new_v4()), &watches)
-        .err()
-        .unwrap();
-    assert_eq!(refused.code, "RecordTooLarge", "{refused:?}");
-    assert!(!refused.dispatched);
 }
 
 /// A stand-in for the daemon's executable that records each start and never serves.

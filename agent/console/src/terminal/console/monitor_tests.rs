@@ -291,6 +291,7 @@ fn pending_tick_removal_confirmation_cannot_be_approved_by_clicking_any_row() {
                 instance: previous.clone(),
                 action: crate::terminal::tick_actions::builtin::artifact(&previous, 'X'),
                 prompt: "Remove artifact?".into(),
+                option: None,
             });
             state.monitor.focus(false, None);
             state.draw_frame(&mut Vec::new()).unwrap();
@@ -2063,6 +2064,7 @@ fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() 
         [
             ('o', "open"),
             ('x', "remove"),
+            ('f', "subscribe"),
             ('w', "subscriptions"),
             ('e', "frequency"),
             ('u', "unsubscribe")
@@ -2705,4 +2707,287 @@ fn bench_status_refresh_cost_by_conversation_size() {
             frames as f64 / f64::from(ROUNDS)
         );
     }
+}
+
+#[test]
+fn monitor_groups_list_artifacts_then_ticks_then_shells() {
+    let mut tick = shell(Uuid::new_v4(), "Quotes");
+    tick.group = TickGroup::Ticks;
+    tick.instance = "calendar:quotes".parse().unwrap();
+    let mut artifact = shell(Uuid::new_v4(), "Brief");
+    artifact.group = TickGroup::Artifacts;
+    artifact.instance = "artifact:https://docs.example/brief".parse().unwrap();
+    let mut monitor = Monitor::default();
+    for entry in [shell(Uuid::new_v4(), "make test"), tick, artifact] {
+        monitor.replace(entry.group, vec![entry]);
+    }
+    let headings = monitor
+        .lines(40, 20, DisplayProfile::default(), 0)
+        .iter()
+        .map(RoleLine::text)
+        .filter(|line| line.ends_with("(1)"))
+        .collect::<Vec<_>>();
+    assert_eq!(headings, ["Artifacts (1)", "Ticks (1)", "Shells (1)"]);
+}
+
+#[test]
+fn a_confirmation_option_shows_checked_and_space_turns_it_off_before_enter() {
+    let mut state = State::new(true, 100, 25);
+    let chat = Uuid::new_v4();
+    state.switch_view_chat(Some(chat));
+    state.prompt_enabled = true;
+    let instance = "hosted:00000000-0000-0000-0000-000000000001".to_owned();
+    state.monitor.confirmation = Some(crate::terminal::monitor::TickConfirmation {
+        instance: instance.clone(),
+        action: crate::terminal::tick_actions::builtin::artifact(&instance, 'A'),
+        prompt: "Open a new instance?".into(),
+        option: Some(crate::terminal::monitor::ConfirmationOption {
+            label: "Also restore its 1 Tick Subscription at their frequencies".into(),
+            is_chosen: true,
+            action_without: crate::terminal::tick_actions::builtin::artifact(&instance, 'B'),
+        }),
+    });
+    let screen = |state: &mut State| {
+        state.draw_frame(&mut Vec::new()).unwrap();
+        state.rendered_screen.join("\n")
+    };
+    let text = screen(&mut state);
+    assert!(
+        text.contains("  [x] Also restore its 1 Tick Subscription at their frequencies"),
+        "{text}"
+    );
+    assert!(
+        text.contains("enter confirm · space toggle · esc back"),
+        "{text}"
+    );
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .is_none()
+    );
+    let text = screen(&mut state);
+    assert!(text.contains("  [ ] Also restore"), "{text}");
+    let Some(InputEvent::TickAction { action, .. }) =
+        state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    else {
+        panic!("confirming runs an action");
+    };
+    assert_eq!(
+        action.key, 'B',
+        "the option turned off runs the action without it"
+    );
+    assert!(state.monitor.confirmation.is_none());
+}
+
+/// An embedded Agent whose Chat has one Loop subscribed to `cal:watched`, with a Console showing
+/// that Chat's Monitor.
+async fn subscribed_calendar_chat(
+    directory: &std::path::Path,
+) -> (
+    tickloop_agent_runtime::Agent,
+    crate::terminal::execution::ConsoleExecution,
+    Console,
+    Uuid,
+) {
+    use tickloop_agent_runtime::{
+        tick_adapter::{TickAdapter, TickAdapters},
+        tick_stream::{InMemoryTickStream, TickStreamPort},
+    };
+    struct Calendar(InMemoryTickStream);
+    impl TickAdapter for Calendar {
+        fn access(&self) -> &'static str {
+            "cal"
+        }
+        fn stream(&self) -> Option<Arc<dyn TickStreamPort>> {
+            Some(Arc::new(self.0.clone()))
+        }
+    }
+    let core = tickloop_agent_runtime::Agent::new_embedded(
+        tickloop_agent_test_support::config(),
+        Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
+            tickloop_agent_test_support::call(
+                "subscribe",
+                "SubscribeTick",
+                serde_json::json!({"tick_instance_id":"cal:watched"}),
+            ),
+            tickloop_agent_test_support::text("watching"),
+        ])),
+    );
+    core.install_tick_stream(Arc::new(
+        TickAdapters::new([Arc::new(Calendar(InMemoryTickStream::new())) as Arc<dyn TickAdapter>])
+            .unwrap(),
+    ))
+    .await;
+    let agent = crate::terminal::execution::ConsoleExecution::from_embedded(
+        core.clone(),
+        tickloop_agent_test_support::config(),
+    );
+    let chat = agent.create_chat(directory.into()).await.unwrap();
+    let mut events = core.subscribe();
+    core.submit(chat, None, "watch the calendar".into())
+        .await
+        .unwrap();
+    loop {
+        match tickloop_agent_test_support::next_event(&mut events)
+            .await
+            .kind
+        {
+            tickloop_agent_protocol::EventKind::Completed { .. } => break,
+            tickloop_agent_protocol::EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let console = Console::test_for_chat(chat);
+    console
+        .update_monitor_chat(agent.status(chat).await.unwrap())
+        .unwrap();
+    console
+        .update_subscribed_ticks(chat, &agent.tick_subscriptions(chat).await.unwrap())
+        .unwrap();
+    (core, agent, console, chat)
+}
+
+/// Prepares `intent` as the Console would on its key and runs it.
+async fn run_intent(
+    context: crate::terminal::tick_actions::TickActionContext<'_>,
+    intent: crate::monitor_rows::TickIntent,
+) -> Result<(), String> {
+    use crate::terminal::tick_actions::{TickActionUi, builtin, execute};
+    let action = {
+        let mut state = context.console.state.lock().unwrap();
+        builtin::executor(&intent)
+            .unwrap()
+            .prepare(&mut TickActionUi { state: &mut state })?
+    };
+    execute(action, context).await
+}
+
+#[tokio::test]
+async fn f_subscribes_a_tick_on_the_newest_loop_and_only_tells_when_it_already_is() {
+    use crate::monitor_rows::TickIntent;
+    let directory = tempfile::tempdir().unwrap();
+    let (core, agent, console, chat) = subscribed_calendar_chat(directory.path()).await;
+    let context = crate::terminal::tick_actions::TickActionContext {
+        agent: &agent,
+        console: &console,
+        root: Some(directory.path()),
+        chat,
+    };
+    let other = tick_protocol::InstanceRef::new("cal", "other").unwrap();
+    let loop_id = agent.tick_subscriptions(chat).await.unwrap()[0].loop_id;
+
+    run_intent(context, TickIntent::Subscribe(other.clone()))
+        .await
+        .unwrap();
+    let subscriptions = agent.tick_subscriptions(chat).await.unwrap();
+    let added = subscriptions
+        .iter()
+        .find(|row| row.instance == other)
+        .expect("f subscribes the Tick");
+    assert_eq!(added.loop_id, loop_id);
+    assert_eq!(
+        added.frequency,
+        tickloop_agent_protocol::TickSubscriptionFrequency::High
+    );
+    assert!(
+        console
+            .state
+            .lock()
+            .unwrap()
+            .status
+            .contains("Subscribed at high")
+    );
+
+    run_intent(context, TickIntent::Subscribe(other.clone()))
+        .await
+        .unwrap();
+    assert_eq!(agent.tick_subscriptions(chat).await.unwrap().len(), 2);
+    assert!(
+        console
+            .state
+            .lock()
+            .unwrap()
+            .status
+            .starts_with("Already subscribed")
+    );
+
+    let without_loop = agent.create_chat(directory.path().into()).await.unwrap();
+    let refused = run_intent(
+        crate::terminal::tick_actions::TickActionContext {
+            chat: without_loop,
+            ..context
+        },
+        TickIntent::Subscribe(other),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("no Loop"), "{refused}");
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn closing_and_reopening_a_hosted_tick_ask_first_and_name_its_subscriptions() {
+    use crate::monitor_rows::TickIntent;
+    let directory = tempfile::tempdir().unwrap();
+    let (core, agent, console, chat) = subscribed_calendar_chat(directory.path()).await;
+    let context = crate::terminal::tick_actions::TickActionContext {
+        agent: &agent,
+        console: &console,
+        root: Some(directory.path()),
+        chat,
+    };
+    let watched = tick_protocol::InstanceRef::new("cal", "watched").unwrap();
+    let confirmation = || {
+        let state = console.state.lock().unwrap();
+        state.monitor.confirmation.as_ref().map(|confirmation| {
+            (
+                confirmation.prompt.clone(),
+                confirmation
+                    .option
+                    .as_ref()
+                    .map(|option| (option.label.clone(), option.is_chosen)),
+            )
+        })
+    };
+
+    run_intent(
+        context,
+        TickIntent::CloseHosted {
+            instance: watched.clone(),
+            ends_process: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        confirmation(),
+        Some((
+            "Close this Tick, end its process and cancel its 1 Tick Subscription? enter confirm · esc cancel"
+                .into(),
+            None
+        ))
+    );
+    console.state.lock().unwrap().monitor.confirmation = None;
+
+    run_intent(context, TickIntent::ReopenHosted(watched.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        confirmation(),
+        Some((
+            "Open a new instance of this Tick with its command? It takes this row's place. enter confirm · esc cancel"
+                .into(),
+            Some((
+                "Also restore its 1 Tick Subscription at their frequencies".into(),
+                true
+            ))
+        )),
+        "restoring the subscriptions is offered, checked"
+    );
+    assert_eq!(
+        agent.tick_subscriptions(chat).await.unwrap().len(),
+        1,
+        "nothing changes before the user confirms"
+    );
+    core.shutdown().await;
 }

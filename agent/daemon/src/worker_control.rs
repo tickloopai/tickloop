@@ -51,8 +51,6 @@ use tickloop_agent_runtime::{
 /// A worker request is small: an open carries argv, cwd and the launch environment.
 const REQUEST_FRAME_BYTES: usize = tick_protocol::MAX_REQUEST_BYTES;
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
-/// Watch intents are renewed this many times within the idle timeout that lapses them.
-const INTENT_RENEWALS_PER_LEASE: u32 = 3;
 
 struct Grant {
     capability: String,
@@ -103,7 +101,6 @@ impl WorkerControl {
             binding: Uuid::new_v4(),
             capability: tickhost::host::random_token(),
             host_endpoint: self.controller.endpoint(),
-            intent_renewal: self.controller.idle_timeout() / INTENT_RENEWALS_PER_LEASE,
         }
     }
 
@@ -487,15 +484,6 @@ impl WorkerControl {
                     })
                     .await?;
                 Ok(json!({"operation":operation,"receipt":receipt}))
-            }
-            WorkerRequest::SetWatchIntents {
-                instance, watches, ..
-            } => {
-                let count = watches.len();
-                registry
-                    .set_watches(&self.controller, &tick_owner, &instance, watches)
-                    .await?;
-                Ok(json!({"instance":instance,"watches":count}))
             }
             WorkerRequest::AllowHostedView { instance, .. } => self
                 .controller

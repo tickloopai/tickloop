@@ -32,6 +32,8 @@ fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
         "every 5 seconds",
         "text snapshot",
         "exits that Tick",
+        "idle minutes",
+        "from idling out",
     ] {
         assert!(!TICKLOOP_SKILL.contains(retired), "{retired}");
     }

@@ -275,7 +275,6 @@ fn tick_tools(daemon: &std::path::Path) -> tickloop_agent_runtime::hosted::tools
             binding: uuid::Uuid::new_v4(),
             capability: "0".repeat(64),
             host_endpoint: daemon.with_extension("host.sock"),
-            intent_renewal: std::time::Duration::from_secs(60),
         }),
         vec![],
     )

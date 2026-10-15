@@ -2,13 +2,11 @@
 //! instance through the data binding its Chat owns, so a Tick whose host was replaced or whose
 //! owner ended is never silently rebound. A protocol Tick pushes its updates; a terminal Tick's
 //! screen is read when a subscription's period elapses and compared with what that watch last
-//! got. The approved watches of each instance reach the daemon as Watch intents, which keep the
-//! Tick from idling out.
+//! got.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     sync::{Arc, Mutex, PoisonError},
-    time::Duration,
 };
 
 use serde_json::{Value, json};
@@ -27,15 +25,8 @@ use super::{
     TickStreamHandle, TickStreamPort, WatchAdmission, WatchId, connection_state,
     current_observation, follow_instances, observe_protocol,
 };
-use crate::{
-    host_tools::HostToolProvider,
-    hosted::{registry::TARGET_GONE, tools::HostedTickTools},
-    tick_tools::READ_TICK,
-};
+use crate::{host_tools::HostToolProvider, hosted::tools::HostedTickTools, tick_tools::READ_TICK};
 use tickloop_agent_protocol::{HostToolAuthority, ObservationKind};
-
-/// How soon a Watch intent change the daemon did not take is offered again.
-const INTENT_RETRY_PAUSE: Duration = Duration::from_secs(5);
 
 /// What each watch of a terminal Tick last got of its screen: where its next sample is compared.
 type Screens = Arc<Mutex<BTreeMap<WatchId, ScreenCursor>>>;
@@ -367,7 +358,7 @@ async fn read_terminal(
         .data(chat, instance)
         .await
         .map_err(|error| error.to_string())?
-        .request("read", json!({"activity":"automatic"}), CONTROL_TIMEOUT)
+        .request("read", json!({}), CONTROL_TIMEOUT)
         .await
         .map_err(|error| error.to_string())?;
     serde_json::from_value(read).map_err(|error| error.to_string())
@@ -581,89 +572,6 @@ fn observation(event: &Value) -> Option<SessionObservation> {
     serde_json::from_value(event["observation"].clone()).ok()
 }
 
-/// Keeps the daemon's Watch intents equal to the hosted watches each Chat wants, one change at a
-/// time and in order, and renews them before they lapse. A change the daemon did not take is
-/// offered again until it is; one whose answer was lost counts as possibly applied, so an ended
-/// watch is always withdrawn and never keeps protecting its Tick.
-async fn sync_watch_intents(
-    scope: HostedScope,
-    mut desired: watch::Receiver<BTreeMap<WatchId, InstanceRef>>,
-) {
-    let mut chats = scope.chats.clone();
-    // What the daemon holds per (Chat, instance); `None` when the last report's outcome is unknown.
-    let mut sent: BTreeMap<(Uuid, InstanceRef), Option<BTreeSet<WatchId>>> = BTreeMap::new();
-    let mut renewal = tokio::time::interval(scope.tools.intent_renewal());
-    renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    renewal.tick().await;
-    let mut is_renewing = false;
-    loop {
-        let mut wanted: BTreeMap<(Uuid, InstanceRef), BTreeSet<WatchId>> = sent
-            .keys()
-            .map(|key| (key.clone(), BTreeSet::new()))
-            .collect();
-        {
-            let desired = desired.borrow_and_update();
-            let authorities = scope.authorities.borrow();
-            for (watch, instance) in desired.iter() {
-                if let Some(chat) = scope.chat_of(watch)
-                    && scope.authorizes(authorities.get(watch)).is_ok()
-                {
-                    wanted
-                        .entry((chat, instance.clone()))
-                        .or_default()
-                        .insert(*watch);
-                }
-            }
-        }
-        let mut is_pending = false;
-        for (key, watches) in wanted {
-            let is_settled = sent
-                .get(&key)
-                .is_some_and(|current| current.as_ref() == Some(&watches));
-            let needs_renewal = is_renewing && !watches.is_empty();
-            if is_settled && !needs_renewal {
-                continue;
-            }
-            match scope
-                .tools
-                .set_watch_intents(key.0, &key.1, watches.clone())
-                .await
-            {
-                // A Tick that is gone needs no protection either way.
-                Err(error) if error.code == TARGET_GONE => {
-                    sent.remove(&key);
-                }
-                Err(error) => {
-                    if error.dispatched {
-                        sent.insert(key, None);
-                    }
-                    is_pending = true;
-                }
-                Ok(()) if watches.is_empty() => {
-                    sent.remove(&key);
-                }
-                Ok(()) => {
-                    sent.insert(key, Some(watches));
-                }
-            }
-        }
-        let retry = async {
-            if is_pending {
-                tokio::time::sleep(INTENT_RETRY_PAUSE).await;
-            } else {
-                std::future::pending::<()>().await;
-            }
-        };
-        is_renewing = false;
-        tokio::select! {
-            changed = desired.changed() => if changed.is_err() { return; },
-            changed = chats.changed() => if changed.is_err() { return; },
-            () = retry => {}
-            _ = renewal.tick() => is_renewing = true,
-        }
-    }
-}
-
 #[async_trait::async_trait]
 impl TickStreamPort for HostedTickStream {
     async fn prepare_watch(
@@ -752,7 +660,7 @@ impl TickStreamPort for HostedTickStream {
             .await
             .map_err(|error| error.to_string())?;
         let read = connection
-            .request("read", json!({"activity":"automatic"}), CONTROL_TIMEOUT)
+            .request("read", json!({}), CONTROL_TIMEOUT)
             .await
             .map_err(|error| error.to_string())?;
         let read: TickState = serde_json::from_value(read).map_err(|error| error.to_string())?;
@@ -793,7 +701,6 @@ impl TickStreamPort for HostedTickStream {
         let (desired, wanted) = watch::channel(BTreeMap::new());
         let (publisher, events) = EventPublisher::channel();
         let scope = self.scope();
-        tokio::spawn(sync_watch_intents(scope.clone(), wanted.clone()));
         tokio::spawn(async move { follow_instances(scope, wanted, publisher).await });
         TickStreamHandle { desired, events }
     }

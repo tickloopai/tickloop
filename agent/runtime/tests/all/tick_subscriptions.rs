@@ -346,6 +346,123 @@ async fn a_periodic_status_reports_its_next_check_on_the_wall_clock_and_restarts
     agent.shutdown().await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn the_user_subscribes_a_tick_on_the_newest_open_loop_at_high_unless_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7)}),
+        ),
+        text("watching instance 7"),
+    ]));
+    let (agent, stream, chat, loop_id) = subscribed_agent(directory.path(), model).await;
+
+    agent
+        .subscribe_tick_for_user(chat, fixture_instance(8))
+        .await
+        .unwrap();
+    settle().await;
+    let rows = agent.tick_subscriptions(chat).await.unwrap();
+    let added = rows
+        .iter()
+        .find(|row| row.instance == fixture_instance(8))
+        .expect("the user's subscription is listed");
+    assert_eq!(added.loop_id, loop_id, "the newest open Loop takes it");
+    assert_eq!(added.frequency, TickSubscriptionFrequency::High);
+    assert!(stream.watched().contains(&fixture_instance(8)));
+
+    let again = agent
+        .subscribe_tick_for_user(chat, fixture_instance(7))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(again.contains("already subscribes"), "{again}");
+    let without_loop = agent.create_chat(directory.path().into()).await.unwrap();
+    let refused = agent
+        .subscribe_tick_for_user(without_loop, fixture_instance(8))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("no Loop"), "{refused}");
+
+    agent
+        .set_permission_rules(
+            chat,
+            vec![tickloop_agent_protocol::PermissionRule {
+                id: Uuid::new_v4(),
+                decision: tickloop_agent_protocol::Decision::Deny,
+                tool: "SubscribeTick".into(),
+                specifier: None,
+                input: None,
+                loop_id: None,
+                persistent: false,
+            }],
+        )
+        .await
+        .unwrap();
+    let denied = agent
+        .subscribe_tick_for_user(chat, fixture_instance(9))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(denied.contains("Deny"), "{denied}");
+    assert!(
+        agent
+            .tick_subscriptions(chat)
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.instance != fixture_instance(9)),
+        "a Deny rule still refuses the user's own subscription"
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reopened_instance_takes_over_the_lost_subscriptions_only_when_asked() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(7), "frequency": "medium"}),
+        ),
+        text("watching instance 7"),
+    ]));
+    let (agent, _stream, chat, loop_id) = subscribed_agent(directory.path(), model).await;
+    let instances = |rows: &[tickloop_agent_protocol::TickSubscriptionStatus]| {
+        rows.iter()
+            .map(|row| (row.instance.clone(), row.loop_id, row.frequency))
+            .collect::<Vec<_>>()
+    };
+
+    agent
+        .replace_tick_subscriptions(chat, &fixture_instance(7), &fixture_instance(70), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        instances(&agent.tick_subscriptions(chat).await.unwrap()),
+        [(
+            fixture_instance(70),
+            loop_id,
+            TickSubscriptionFrequency::Medium
+        )],
+        "the Loop follows the new instance at the frequency it had"
+    );
+
+    agent
+        .replace_tick_subscriptions(chat, &fixture_instance(70), &fixture_instance(71), false)
+        .await
+        .unwrap();
+    assert!(
+        agent.tick_subscriptions(chat).await.unwrap().is_empty(),
+        "without restoring, the lost instance's subscriptions just end"
+    );
+    agent.shutdown().await;
+}
+
 #[tokio::test]
 async fn the_subscription_tools_reach_the_model_only_with_an_installed_stream() {
     let directory = tempfile::tempdir().unwrap();

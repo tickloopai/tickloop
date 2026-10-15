@@ -3,8 +3,8 @@
 //! Each Loop that subscribes to the row's Tick Instance appears with its frequency, how many Tick
 //! Updates accumulated since the last delivery, what that delivery was, and whether the link to
 //! the instance is live. The user picks another periodic frequency or cancels a subscription
-//! here; an immediate subscription keeps the frequency its Tick type decides. Creating one stays
-//! with the Agent, which knows which Tick Instance answers the goal.
+//! here; an immediate subscription keeps the frequency its Tick type decides. The Agent creates
+//! subscriptions, and the user creates one with `f` on the row itself.
 
 use std::collections::HashMap;
 

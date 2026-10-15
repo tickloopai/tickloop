@@ -826,7 +826,6 @@ async fn model_tool_inventory_keeps_artifact_shell_and_tick_names() {
             binding: uuid::Uuid::new_v4(),
             capability: "unused".into(),
             host_endpoint: directory.path().join("unused-host.sock"),
-            intent_renewal: std::time::Duration::from_secs(100),
         }),
         Vec::new(),
     );

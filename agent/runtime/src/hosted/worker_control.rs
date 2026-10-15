@@ -5,7 +5,6 @@
 //! rights.
 
 use std::{
-    collections::BTreeSet,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -38,9 +37,6 @@ pub struct WorkerControlGrant {
     pub capability: String,
     /// The Tickhost endpoint this daemon controls: the authority of the worker's hosted tools.
     pub host_endpoint: PathBuf,
-    /// How often the worker renews its Watch intents, well within the host's idle timeout after
-    /// which unrenewed intents lapse.
-    pub intent_renewal: Duration,
 }
 
 impl std::fmt::Debug for WorkerControlGrant {
@@ -51,7 +47,6 @@ impl std::fmt::Debug for WorkerControlGrant {
             .field("daemon_epoch", &self.daemon_epoch)
             .field("binding", &self.binding)
             .field("host_endpoint", &self.host_endpoint)
-            .field("intent_renewal", &self.intent_renewal)
             .finish_non_exhaustive()
     }
 }
@@ -91,12 +86,6 @@ pub enum WorkerRequest {
         instance: InstanceRef,
         environment: Vec<(String, String)>,
         admission: HostedAdmission,
-    },
-    /// The approved Watches of `chat` on its hosted `instance`, replacing earlier ones.
-    SetWatchIntents {
-        chat: Uuid,
-        instance: InstanceRef,
-        watches: BTreeSet<Uuid>,
     },
     /// Lets one View of `chat` attach to its hosted `instance` once.
     AllowHostedView {
@@ -165,7 +154,6 @@ impl WorkerRequest {
             | Self::ReopenHostedTick { admission, .. } => Some(admission),
             Self::ListHostedTicks { .. }
             | Self::GetHostedOperationReceipt { .. }
-            | Self::SetWatchIntents { .. }
             | Self::AllowHostedView { .. }
             | Self::EndStoppedChild { .. }
             | Self::AllowShellSpawn { .. }
@@ -180,7 +168,6 @@ impl WorkerRequest {
             | Self::ReopenHostedTick { chat, .. }
             | Self::ListHostedTicks { chat, .. }
             | Self::GetHostedOperationReceipt { chat, .. }
-            | Self::SetWatchIntents { chat, .. }
             | Self::AllowHostedView { chat, .. }
             | Self::EndStoppedChild { chat, .. }
             | Self::AllowShellSpawn { chat, .. }
@@ -207,10 +194,6 @@ pub struct DaemonControl {
 impl DaemonControl {
     pub fn new(grant: WorkerControlGrant) -> Self {
         Self { grant }
-    }
-
-    pub fn intent_renewal(&self) -> Duration {
-        self.grant.intent_renewal
     }
 
     /// The Tickhost this worker's daemon controls.

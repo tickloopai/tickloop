@@ -218,4 +218,8 @@ async fn a_reopened_instance_starts_from_what_it_already_did() {
         "updates from before it joined are no news"
     );
     assert_eq!(membership.taken_in_at(&instance), None);
+    assert!(
+        membership.is_removed(&lost),
+        "the reopened instance takes the lost row's place"
+    );
 }

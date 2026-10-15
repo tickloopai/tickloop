@@ -66,7 +66,6 @@ fn hosted_tools(directory: &Path) -> HostedTickTools {
             binding: uuid::Uuid::new_v4(),
             capability: "0".repeat(64),
             host_endpoint: directory.join("unused-host.sock"),
-            intent_renewal: std::time::Duration::from_secs(60),
         }),
         Vec::new(),
     )

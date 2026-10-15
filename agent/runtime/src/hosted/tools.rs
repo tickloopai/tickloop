@@ -1035,7 +1035,7 @@ impl HostedTickTools {
             .await
             .map_err(|error| error.to_string())?;
         let read = connection
-            .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
+            .request("read", json!({}), CONTROL_TIMEOUT)
             .await
             .map_err(|error| error.to_string())?;
         let descriptor = connection
@@ -1306,11 +1306,6 @@ impl HostedTickTools {
         }
     }
 
-    /// How often Watch intents must be reported again to keep protecting their Ticks.
-    pub(crate) fn intent_renewal(&self) -> std::time::Duration {
-        self.daemon.intent_renewal()
-    }
-
     /// Lets one View of the Chat attach to its hosted Tick once, without its data token.
     pub async fn allow_view(
         &self,
@@ -1326,23 +1321,6 @@ impl HostedTickTools {
             .await?;
         serde_json::from_value(granted)
             .map_err(|error| HostError::after("ProtocolViolation", error.to_string()))
-    }
-
-    /// Tells the daemon which approved Watches of `chat` keep `instance` from idling.
-    pub(crate) async fn set_watch_intents(
-        &self,
-        chat: ChatId,
-        instance: &InstanceRef,
-        watches: BTreeSet<Uuid>,
-    ) -> Result<(), HostError> {
-        self.daemon
-            .request(WorkerRequest::SetWatchIntents {
-                chat,
-                instance: instance.clone(),
-                watches,
-            })
-            .await
-            .map(drop)
     }
 
     async fn recover_binding(
@@ -1692,7 +1670,6 @@ mod tests {
             binding: Uuid::new_v4(),
             capability: "capability".into(),
             host_endpoint: directory.join("host.sock"),
-            intent_renewal: std::time::Duration::from_secs(100),
         })
     }
 
@@ -1713,7 +1690,6 @@ mod tests {
             binding: Uuid::new_v4(),
             capability: "capability".into(),
             host_endpoint: directory.join("host.sock"),
-            intent_renewal: std::time::Duration::from_secs(100),
         })
     }
 

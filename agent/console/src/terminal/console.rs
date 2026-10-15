@@ -1478,6 +1478,17 @@ impl Console {
         action: Arc<dyn super::tick_actions::TickActionExecutor>,
         message: &str,
     ) -> Result<(), String> {
+        self.confirm_tick_action_with_option(chat, instance, action, message, None)
+    }
+    /// Asks before `action` runs, offering `option`, which space turns off and on.
+    pub(super) fn confirm_tick_action_with_option(
+        &self,
+        chat: Uuid,
+        instance: String,
+        action: Arc<dyn super::tick_actions::TickActionExecutor>,
+        message: &str,
+        option: Option<super::monitor::ConfirmationOption>,
+    ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if state.chat != Some(chat) {
             return Ok(());
@@ -1486,6 +1497,7 @@ impl Console {
             instance,
             action,
             prompt: message.into(),
+            option,
         });
         state.status = message.into();
         Ok(())
@@ -10301,11 +10313,19 @@ impl State {
         if self.menu.is_none() && self.monitor.confirmation.is_some() {
             if key.code == KeyCode::Esc {
                 self.monitor.confirmation = None;
+            } else if key.code == KeyCode::Char(' ')
+                && let Some(option) = self
+                    .monitor
+                    .confirmation
+                    .as_mut()
+                    .and_then(|confirmation| confirmation.option.as_mut())
+            {
+                option.is_chosen = !option.is_chosen;
             } else if key.code == KeyCode::Enter {
                 let confirmation = self.monitor.confirmation.take().unwrap();
                 let chat = self.chat?;
                 match confirmation
-                    .action
+                    .chosen_action()
                     .prepare(&mut super::tick_actions::TickActionUi { state: self })
                 {
                     Ok(action) => {

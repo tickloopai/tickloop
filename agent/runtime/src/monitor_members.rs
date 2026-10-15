@@ -102,7 +102,7 @@ impl Agent {
     }
 
     /// Joins the instance reopened in place of `lost` to the Chat's Monitor as one it opened,
-    /// under the lost one's title; the lost row stays until it is removed.
+    /// under the lost one's title, and takes the lost row out: one row stays.
     pub async fn record_reopened_tick(
         &self,
         chat_id: ChatId,
@@ -117,6 +117,7 @@ impl Agent {
                 .and_then(|member| member.title.clone());
             membership.record_opened(reopened.clone(), title);
             membership.mark_handled(reopened, now_ms());
+            membership.remove(lost.clone());
         })
         .await
     }

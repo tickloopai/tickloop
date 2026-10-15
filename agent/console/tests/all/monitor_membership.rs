@@ -464,10 +464,11 @@ async fn rewind_and_compaction_keep_membership_and_restart_reads_it_back() {
     restored.shutdown().await;
 }
 
-/// A hosted member shows what the latest probe found: running with its process sample, gone,
-/// or lost with its host; every row offers Close, and a lost one also Reopen as new.
+/// A hosted row shows what the latest probe found, running with its process sample, exited,
+/// gone or lost with its host, and its one `x` and Enter follow from that and from whether this
+/// Chat opened the Tick.
 #[tokio::test]
-async fn hosted_members_show_their_probed_state_and_sample_and_offer_close() {
+async fn hosted_rows_offer_one_x_and_enter_by_what_still_runs_and_who_opened_it() {
     use std::collections::HashMap;
     use tickloop_agent_console::monitor_rows::{MemberState, TickResources};
     let directory = tempfile::tempdir().unwrap();
@@ -476,13 +477,15 @@ async fn hosted_members_show_their_probed_state_and_sample_and_offer_close() {
         Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let (running, gone, lost) = (
+    let (running, exited, gone, lost, foreign) = (
+        InstanceRef::hosted(uuid::Uuid::new_v4()),
+        InstanceRef::hosted(uuid::Uuid::new_v4()),
         InstanceRef::hosted(uuid::Uuid::new_v4()),
         InstanceRef::hosted(uuid::Uuid::new_v4()),
         InstanceRef::hosted(uuid::Uuid::new_v4()),
     );
     let mut snapshot = agent.snapshot(chat).await.unwrap();
-    for instance in [&running, &gone, &lost] {
+    for instance in [&running, &exited, &gone, &lost] {
         snapshot
             .monitor
             .record_opened(instance.clone(), Some("Counter".into()));
@@ -494,12 +497,18 @@ async fn hosted_members_show_their_probed_state_and_sample_and_offer_close() {
         rss_bytes: Some(8 << 20),
         sampled_at_ms: 1,
     };
+    let only_subscribed: tickloop_agent_protocol::TickSubscriptionStatus = serde_json::from_value(
+        serde_json::json!({"id":uuid::Uuid::new_v4(),"loop_id":uuid::Uuid::new_v4(),"loop_state":"WaitingTrigger","instance":foreign,"frequency":"high","accumulated":0,"last_delivery_ms":null,"last_delivery":null,"title":"Shared","link":"Live"}),
+    )
+    .unwrap();
     let rows = MonitorRowsRegistry::builtin().list(&MonitorContext {
         chat: Some(std::sync::Arc::new(
             tickloop_agent_protocol::ChatStatus::of(&snapshot),
         )),
+        subscriptions: vec![only_subscribed],
         member_states: HashMap::from([
             (running.clone(), MemberState::Live),
+            (exited.clone(), MemberState::Exited("exit 0".into())),
             (gone.clone(), MemberState::Gone),
             (lost.clone(), MemberState::Lost),
         ]),
@@ -512,46 +521,83 @@ async fn hosted_members_show_their_probed_state_and_sample_and_offer_close() {
             .unwrap()
             .clone()
     };
+    let action = |key, label, intent| MonitorAction { key, label, intent };
+    let subscribe =
+        |instance: &InstanceRef| action('f', "subscribe", TickIntent::Subscribe(instance.clone()));
+
     let live = row(&running);
     assert!(live.running);
     assert_eq!(live.status, "live");
     assert_eq!(live.resources, Some(sample));
-    let ended = row(&gone);
-    assert!(!ended.running);
-    assert_eq!(ended.status, "gone");
-    assert_eq!(ended.resources, None);
-    let hosted_actions = |instance: &InstanceRef| {
-        vec![
-            MonitorAction {
-                key: 'o',
-                label: "open",
-                intent: TickIntent::OpenView(instance.clone()),
-            },
-            MonitorAction {
-                key: 'x',
-                label: "remove",
-                intent: TickIntent::RemoveFromMonitor(instance.clone()),
-            },
-            MonitorAction {
-                key: 'c',
-                label: "close",
-                intent: TickIntent::CloseHosted(instance.clone()),
-            },
-        ]
-    };
-    assert_eq!(live.actions, hosted_actions(&running));
-    assert_eq!(ended.actions, hosted_actions(&gone));
-    let recoverable = row(&lost);
-    assert_eq!(recoverable.status, "lost");
-    let mut reopenable = hosted_actions(&lost);
-    reopenable.push(MonitorAction {
-        key: 'n',
-        label: "reopen as new",
-        intent: TickIntent::ReopenHosted(lost.clone()),
-    });
     assert_eq!(
-        recoverable.actions, reopenable,
-        "a lost Tick can also be reopened as new"
+        live.actions,
+        [
+            action('o', "open", TickIntent::OpenView(running.clone())),
+            action(
+                'x',
+                "close",
+                TickIntent::CloseHosted {
+                    instance: running.clone(),
+                    ends_process: true,
+                },
+            ),
+            subscribe(&running),
+        ],
+        "a running Tick this Chat opened closes with x"
+    );
+    assert_eq!(
+        row(&exited).actions,
+        [
+            action('o', "open", TickIntent::OpenView(exited.clone())),
+            action(
+                'x',
+                "remove",
+                TickIntent::CloseHosted {
+                    instance: exited.clone(),
+                    ends_process: false,
+                },
+            ),
+            subscribe(&exited),
+        ],
+        "an exited terminal Tick still opens its last screen and leaves with x"
+    );
+    for (instance, status) in [(&gone, "gone"), (&lost, "lost")] {
+        let ended = row(instance);
+        assert!(!ended.running);
+        assert_eq!(ended.status, status);
+        assert_eq!(ended.resources, None);
+        assert_eq!(
+            ended.actions,
+            [
+                action('o', "reopen", TickIntent::ReopenHosted(instance.clone())),
+                action(
+                    'x',
+                    "remove",
+                    TickIntent::RemoveFromMonitor(instance.clone())
+                ),
+            ],
+            "{status}: Enter reopens it in place, and nothing that ended offers subscribing"
+        );
+    }
+    let shared = row(&foreign);
+    assert_eq!(
+        shared.actions[..3],
+        [
+            action('o', "open", TickIntent::OpenView(foreign.clone())),
+            action(
+                'x',
+                "remove",
+                TickIntent::RemoveFromMonitor(foreign.clone())
+            ),
+            subscribe(&foreign),
+        ],
+        "a Tick only this Chat's subscriptions show leaves with them and is never closed"
+    );
+    assert!(
+        rows.iter()
+            .flat_map(|row| &row.actions)
+            .all(|action| action.key != 'c' && action.key != 'n'),
+        "no separate close or reopen key"
     );
     agent.shutdown().await;
 }

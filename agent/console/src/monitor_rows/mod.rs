@@ -7,7 +7,7 @@ mod probe;
 #[cfg(test)]
 pub(crate) use builtin::artifact_actions;
 pub use builtin::{ArtifactRows, HostedRows, ShellRows};
-pub(crate) use builtin::{HOSTED_CLOSE_KEY, HOSTED_REOPEN_KEY, SHELL_STOP_KEY, feedback_binding};
+pub(crate) use builtin::{REMOVE_KEY, SHELL_STOP_KEY, SUBSCRIBE_KEY, feedback_binding};
 pub use probe::{MemberFindings, ProbeError, TickProbe};
 
 use std::{
@@ -33,13 +33,13 @@ impl TickGroup {
         order: 0,
         name: "Artifacts",
     };
-    pub const Shells: Self = Self {
-        order: 1,
-        name: "Shells",
-    };
     pub const Ticks: Self = Self {
-        order: 2,
+        order: 1,
         name: "Ticks",
+    };
+    pub const Shells: Self = Self {
+        order: 2,
+        name: "Shells",
     };
     pub fn title(self) -> &'static str {
         self.name
@@ -67,11 +67,17 @@ pub enum TickIntent {
     /// Opens the attached view of a local Tick the Tickhost runs, a hosted Tick or a Shell: a
     /// Herdr popup inside Herdr, otherwise full screen in this terminal.
     OpenView(InstanceRef),
-    /// Ends a hosted Tick; the Console asks for confirmation first.
-    CloseHosted(InstanceRef),
-    /// Starts a new instance in place of a lost hosted Tick; the Console asks for confirmation
-    /// first.
+    /// Ends a hosted Tick this Chat opened and takes its row out with the Tick Subscriptions on
+    /// it. The Console asks first when that ends a running process or cancels subscriptions.
+    CloseHosted {
+        instance: InstanceRef,
+        ends_process: bool,
+    },
+    /// Starts a new instance in place of a hosted Tick that no longer runs, in its row's place;
+    /// the Console asks first, offering to restore the old instance's Tick Subscriptions.
     ReopenHosted(InstanceRef),
+    /// Subscribes the Chat to a protocol or terminal Tick at the default frequency.
+    Subscribe(InstanceRef),
     /// Stops a running Shell; the Console asks for confirmation first.
     StopShell {
         task: Uuid,
@@ -463,6 +469,26 @@ fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus])
     }
 }
 
+/// Lets the user subscribe a protocol or terminal Tick that still exists from its row; Shells and
+/// artifacts are subscribed by default.
+fn offer_subscribing(entry: &mut TickDescriptor) {
+    let is_tick = entry.group == TickGroup::Ticks
+        && matches!(entry.glyph, TickGlyph::Protocol | TickGlyph::Terminal);
+    if is_tick
+        && entry.tone != StatusTone::Gone
+        && !entry
+            .actions
+            .iter()
+            .any(|action| action.key == SUBSCRIBE_KEY)
+    {
+        entry.actions.push(MonitorAction {
+            key: SUBSCRIBE_KEY,
+            label: "subscribe",
+            intent: TickIntent::Subscribe(entry.instance.clone()),
+        });
+    }
+}
+
 /// Settles whether the Chat still has the row's latest update to handle: handled once a turn
 /// took it in or the user opened the row at or after it, and taken in only by the turn; while
 /// unread, a subscription's count of updates waiting for delivery counts it.
@@ -541,7 +567,7 @@ pub fn member_descriptor(member: &MonitorMember) -> TickDescriptor {
 /// The shared x action: hides the row in this Chat only and keeps every other fact.
 pub fn remove_from_monitor(instance: &InstanceRef) -> MonitorAction {
     MonitorAction {
-        key: 'x',
+        key: REMOVE_KEY,
         label: "remove",
         intent: TickIntent::RemoveFromMonitor(instance.clone()),
     }
@@ -633,6 +659,7 @@ impl MonitorRowsRegistry {
                 );
                 !reserved
             });
+            offer_subscribing(entry);
             let rows = subscribed
                 .get(&entry.instance)
                 .map_or(&[][..], Vec::as_slice);

@@ -128,6 +128,7 @@ async fn input_dialog_top_rule_covers_every_surface_with_semantic_theme_roles() 
                                 'o',
                             ),
                             prompt: "Confirm fixture action?".into(),
+                            option: None,
                         });
                 }
                 _ => unreachable!(),

@@ -57,7 +57,8 @@ use crate::{
 /// A host that was never used exits after this grace.
 pub const INITIAL_GRACE: Duration = Duration::from_secs(5);
 pub const REAP_INTERVAL: Duration = Duration::from_millis(250);
-/// A Tick nobody attaches to, watches or explicitly uses for this long is reaped.
+/// A released Shell task nobody views for this long is forgotten. Protocol and terminal Ticks
+/// never end for idling.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// The start configuration the daemon writes on the host's standard input.
 const CONFIG_BYTES: u64 = 1024;
@@ -232,8 +233,6 @@ pub enum ReapReason {
     /// A complete owner snapshot no longer lists its Chat.
     Orphaned,
     OwnerEnded,
-    /// Nobody attached, watched or explicitly used it for the idle timeout.
-    Idle,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -241,15 +240,6 @@ pub struct ReapedTick {
     pub terminal: Uuid,
     pub instance: Option<InstanceRef>,
     pub reason: ReapReason,
-}
-
-/// Whether a read is someone's explicit use of the Tick, which keeps it from idling, or an
-/// automatic baseline or poll, which does not.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ReadActivity {
-    Explicit,
-    Automatic,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -297,15 +287,10 @@ struct HostedTick {
     launcher: Mutex<Child>,
     launcher_pid: u32,
     lifecycle: watch::Sender<Lifecycle>,
-    /// The last open, explicit read or call, attached input, or removal of the last Watch
-    /// intent; nothing automatic counts.
-    last_activity_ms: AtomicU64,
-    /// The views attached to its terminal; any one keeps the Tick from idling.
+    /// The views attached to its terminal.
     views: std::sync::Mutex<Views>,
     /// The views its owner allowed to attach that have not connected yet.
     view_grants: std::sync::Mutex<ViewGrants>,
-    /// The approved Watches that keep this Tick, as its owner last reported them.
-    intents: std::sync::Mutex<WatchIntents>,
     screen_changes: watch::Sender<()>,
     terminal_closed: CancellationToken,
 }
@@ -348,31 +333,7 @@ impl Adapter {
     }
 }
 
-/// Watch intents are a lease: each report renews them, and ones not renewed within the idle
-/// timeout lapse, so a Watch whose worker or Loop is gone never keeps a Tick forever.
-#[derive(Default)]
-struct WatchIntents {
-    watches: HashSet<Uuid>,
-    renewed_ms: u64,
-}
-
 impl HostedTick {
-    fn note_activity(&self) {
-        self.last_activity_ms
-            .store(Host::now_ms(), Ordering::SeqCst);
-    }
-
-    /// Drops intents that were not renewed in time; their lapse restarts the idle time.
-    fn lapse_stale_intents(&self, now_ms: u64, idle_timeout: Duration) {
-        let mut intents = self.intents.lock().unwrap();
-        if !intents.watches.is_empty()
-            && now_ms.saturating_sub(intents.renewed_ms) >= idle_timeout.as_millis() as u64
-        {
-            intents.watches.clear();
-            self.note_activity();
-        }
-    }
-
     /// Removes a protocol Tick's session directory once the launcher is gone, with any socket it
     /// could not remove itself.
     fn remove_session_directory(&self) {
@@ -397,7 +358,7 @@ impl HostedTick {
     }
 
     /// Records how a terminal Tick's program ended, once; the Tick itself keeps running until it
-    /// is closed or idles out, so its last screen stays readable.
+    /// is closed, so its last screen stays readable.
     fn record_exit(&self, program: &TerminalProgram, exit: ProgramExit) {
         self.change_screen(|_| {
             let mut recorded = program.exit.lock().unwrap();
@@ -419,14 +380,6 @@ impl HostedTick {
             truncated: snapshot.truncated,
             exit: program.exit(),
         }
-    }
-
-    fn is_idle(&self, now_ms: u64, idle_timeout: Duration) -> bool {
-        matches!(*self.lifecycle.borrow(), Lifecycle::Live { .. })
-            && self.views.lock().unwrap().is_empty()
-            && self.intents.lock().unwrap().watches.is_empty()
-            && now_ms.saturating_sub(self.last_activity_ms.load(Ordering::SeqCst))
-                >= idle_timeout.as_millis() as u64
     }
 
     /// Applies `change` to the attached views, and gives the terminal the size they now lead with.
@@ -834,10 +787,8 @@ impl Host {
             launcher: Mutex::new(launcher),
             launcher_pid,
             lifecycle: watch::channel(lifecycle).0,
-            last_activity_ms: AtomicU64::new(Self::now_ms()),
             views: std::sync::Mutex::new(Views::default()),
             view_grants: std::sync::Mutex::new(ViewGrants::default()),
-            intents: std::sync::Mutex::new(WatchIntents::default()),
             screen_changes: watch::channel(()).0,
             terminal_closed: CancellationToken::new(),
         });
@@ -1126,34 +1077,6 @@ impl Host {
         Ok(json!({"instance":instance,"view":view,"epoch":self.epoch}))
     }
 
-    /// Replaces and renews the approved Watch intents of one of `owner`'s Ticks. Removing the
-    /// last one restarts the Tick's idle time.
-    async fn set_intents(
-        &self,
-        owner: &TickOwner,
-        instance: &InstanceRef,
-        watches: HashSet<Uuid>,
-    ) -> Result<Value, HostError> {
-        let tick = self
-            .tick_by_instance(instance)
-            .await
-            .filter(|tick| &tick.owner == owner)
-            .ok_or_else(|| HostError::before("TargetGone", "no such Tick of this owner"))?;
-        let count = watches.len();
-        let previous = std::mem::replace(
-            &mut *tick.intents.lock().unwrap(),
-            WatchIntents {
-                watches,
-                renewed_ms: Self::now_ms(),
-            },
-        )
-        .watches;
-        if count == 0 && !previous.is_empty() {
-            tick.note_activity();
-        }
-        Ok(json!({"instance":instance,"watches":count}))
-    }
-
     /// Grants one spawn of what `binding` names, for its spawner to claim within the grant
     /// timeout. Only the current controller's own epoch can be bound.
     async fn allow_spawn(&self, binding: SpawnBinding) -> Result<Value, HostError> {
@@ -1231,10 +1154,9 @@ impl Host {
         task.release();
     }
 
-    /// Reaps Ticks whose launcher exited, starts ending those that stayed idle, forgets released
-    /// Shell tasks nobody viewed for the idle timeout, and reports whether the host should exit
-    /// as empty. Idle Ticks stop in the background, so one that ignores SIGTERM never pauses
-    /// accepting connections; until reaped it keeps the host from exiting.
+    /// Reaps Ticks whose launcher exited, forgets released Shell tasks nobody viewed for the idle
+    /// timeout, and reports whether the host should exit as empty. A Tick never ends for idling:
+    /// only closing it, its owner ending or the host going ends it.
     async fn sweep(self: &Arc<Self>) -> bool {
         let ticks = self
             .state
@@ -1244,7 +1166,6 @@ impl Host {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let mut idle = Vec::new();
         for tick in ticks {
             // A closing Tick is reaped by whatever is closing it, under its own reason.
             if matches!(*tick.lifecycle.borrow(), Lifecycle::Closing) {
@@ -1258,18 +1179,7 @@ impl Host {
                     .is_ok_and(|mut launcher| !matches!(launcher.try_wait(), Ok(None)));
             if launcher_exited {
                 self.reap(tick.terminal, ReapReason::Exited).await;
-                continue;
             }
-            tick.lapse_stale_intents(Self::now_ms(), self.idle_timeout);
-            if tick.is_idle(Self::now_ms(), self.idle_timeout) {
-                // Closing at once, so no later sweep picks it again while it stops.
-                tick.lifecycle.send_replace(Lifecycle::Closing);
-                idle.push(tick);
-            }
-        }
-        if !idle.is_empty() {
-            let host = Arc::clone(self);
-            tokio::spawn(async move { host.end_ticks(idle, ReapReason::Idle).await });
         }
         let mut state = self.state.lock().await;
         let now_ms = Self::now_ms();
@@ -2173,21 +2083,6 @@ async fn controller_request(
             host.list(owner.as_ref(), cursor, limit).await
         }
         "diagnostics" => Ok(host.diagnostics().await),
-        "set_intents" => {
-            #[derive(Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct Intents {
-                owner: TickOwner,
-                instance: InstanceRef,
-                watches: HashSet<Uuid>,
-            }
-            let Intents {
-                owner,
-                instance,
-                watches,
-            } = parameters(params)?;
-            host.set_intents(&owner, &instance, watches).await
-        }
         "allow_view" => {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -2279,13 +2174,8 @@ async fn instance_request(
         "read" => {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
-            struct Read {
-                activity: ReadActivity,
-            }
-            let Read { activity } = parameters(params)?;
-            if activity == ReadActivity::Explicit {
-                tick.note_activity();
-            }
+            struct Read {}
+            let Read {} = parameters(params)?;
             match &tick.adapter {
                 Adapter::Protocol(_) => session(tick)
                     .await?
@@ -2347,7 +2237,6 @@ async fn protocol_request(
                 args,
                 revision,
             } = parameters(params)?;
-            tick.note_activity();
             let client = session(tick).await?;
             tokio::time::timeout(
                 CALL_TIMEOUT,
@@ -2410,7 +2299,6 @@ async fn terminal_request(
                     "the program exited; its last screen stays readable until the Tick is closed",
                 ));
             }
-            tick.note_activity();
             tokio::time::timeout(INPUT_WRITE_TIMEOUT, tick.pty.write_all(&data))
                 .await
                 .map_err(|_| {
@@ -2881,7 +2769,6 @@ impl ViewLease {
         {
             return Ok(());
         }
-        tick.note_activity();
         tick.change_views(|views| views.typed(self.view))?;
         tick.pty
             .write_all(data)

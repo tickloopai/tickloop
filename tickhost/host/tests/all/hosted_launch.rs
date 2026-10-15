@@ -229,7 +229,7 @@ fn which(program: &str) -> String {
 /// The terminal size the counter `reader` reads reports, as `<columns>x<rows>`.
 async fn terminal_size(reader: &mut HostConnection) -> Value {
     reader
-        .request("read", json!({"activity":"automatic"}), CONTROL_TIMEOUT)
+        .request("read", json!({}), CONTROL_TIMEOUT)
         .await
         .unwrap()["data"]["size"]
         .clone()
@@ -370,7 +370,7 @@ async fn protocol_calls_and_the_screen_belong_to_one_counter_process() {
     let mut view = vt100::Parser::new(30, 120, 0);
     view_shows(&mut events, &mut view, "Counter 0 in work").await;
     let read = reader
-        .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
+        .request("read", json!({}), CONTROL_TIMEOUT)
         .await
         .unwrap();
     assert_eq!(
@@ -392,7 +392,7 @@ async fn protocol_calls_and_the_screen_belong_to_one_counter_process() {
     assert_eq!(called["value"], 1);
     view_shows(&mut events, &mut view, "Counter 1 in work").await;
     let read = reader
-        .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
+        .request("read", json!({}), CONTROL_TIMEOUT)
         .await
         .unwrap();
     assert_eq!(
@@ -441,7 +441,7 @@ async fn terminal_read_until(reader: &mut HostConnection, ready: impl Fn(&Value)
     let mut read = Value::Null;
     for _ in 0..400 {
         read = reader
-            .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
+            .request("read", json!({}), CONTROL_TIMEOUT)
             .await
             .unwrap();
         if ready(&read) {
@@ -756,7 +756,7 @@ async fn a_long_command_is_listed_under_a_bounded_title_and_launches_whole() {
     assert!(title.starts_with(kept), "{listed_title}");
     let mut reader = fixture.reader(&opened).await;
     let read = reader
-        .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
+        .request("read", json!({}), CONTROL_TIMEOUT)
         .await
         .unwrap();
     assert_eq!(
@@ -797,7 +797,7 @@ async fn an_idle_reader_connection_is_closed_once_its_tick_is_reaped() {
     assert_eq!(ended.unwrap(), None);
     let mut reader = fixture.reader(&survivor).await;
     reader
-        .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
+        .request("read", json!({}), CONTROL_TIMEOUT)
         .await
         .unwrap();
     shutdown(&fixture).await;
@@ -1197,34 +1197,36 @@ async fn a_reply_left_unread_past_the_control_bound_closes_only_its_connection()
     shutdown(&fixture).await;
 }
 
-/// Ending an idle Tick whose launcher ignores SIGTERM takes the whole 3-second grace before
-/// SIGKILL; the host keeps accepting connections meanwhile.
+/// Closing a Tick whose launcher ignores SIGTERM takes the whole 3-second grace before SIGKILL;
+/// the host keeps accepting connections meanwhile.
 #[tokio::test(flavor = "multi_thread")]
-async fn ending_a_stubborn_idle_tick_never_pauses_new_connections() {
-    let fixture = Fixture::with_idle_timeout(Duration::from_secs(2)).await;
+async fn ending_a_stubborn_tick_never_pauses_new_connections() {
+    let fixture = Fixture::start().await;
     let mut controller = fixture.controller().await;
     let (command, work) = fixture.counter();
     let stubborn = fixture
         .open(&mut controller, command.clone(), &work)
         .await
         .unwrap();
-    // An attached view keeps the other Tick, so the host never empties during the test.
-    let kept = fixture.open(&mut controller, command, &work).await.unwrap();
-    let (mut view_events, view_requests) =
-        attach(&fixture, &kept, initial_size()).await.into_parts();
-    let drain = tokio::spawn(async move {
-        while let Ok(Some(_)) = read_frame(&mut view_events, BUSINESS_FRAME_BYTES).await {}
-    });
+    // A second Tick keeps the host from emptying during the test.
+    fixture.open(&mut controller, command, &work).await.unwrap();
     let business = stubborn["business_pid"].as_u64().unwrap() as u32;
     let launcher = tickhost::process::sample(business).unwrap().parent;
     // A stopped launcher leaves SIGTERM pending, so only SIGKILL after the grace ends it.
     unsafe { libc::kill(launcher as libc::pid_t, libc::SIGSTOP) };
+    let mut closer = fixture.controller().await;
+    let close = json!({"operation":uuid::Uuid::new_v4(),"owner":fixture.owner,"instance":stubborn["instance"]});
+    let closing = tokio::spawn(async move {
+        closer
+            .request("close", close, CONTROL_TIMEOUT + Duration::from_secs(5))
+            .await
+    });
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut slowest = Duration::ZERO;
     while alive(launcher) {
         assert!(
             std::time::Instant::now() < deadline,
-            "the idle Tick never ended"
+            "the closed Tick never ended"
         );
         let connecting = std::time::Instant::now();
         drop(fixture.controller().await);
@@ -1233,25 +1235,17 @@ async fn ending_a_stubborn_idle_tick_never_pauses_new_connections() {
     }
     assert!(
         slowest < Duration::from_secs(1),
-        "a new connection waited {slowest:?} while an idle Tick was ending"
+        "a new connection waited {slowest:?} while a Tick was ending"
     );
     assert!(gone(business).await);
-    let mut reaped = Vec::new();
-    for _ in 0..200 {
-        let diagnostics = controller
-            .request("diagnostics", json!({}), CONTROL_TIMEOUT)
-            .await
-            .unwrap();
-        reaped = diagnostics["reaped"].as_array().unwrap().clone();
-        if !reaped.is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    closing.await.unwrap().unwrap();
+    let diagnostics = controller
+        .request("diagnostics", json!({}), CONTROL_TIMEOUT)
+        .await
+        .unwrap();
+    let reaped = diagnostics["reaped"].as_array().unwrap();
     assert_eq!(reaped.len(), 1, "{reaped:?}");
-    assert_eq!(reaped[0]["reason"], "idle");
-    drop(view_requests);
-    drain.abort();
+    assert_eq!(reaped[0]["reason"], "closed");
     shutdown(&fixture).await;
 }
 
@@ -1384,161 +1378,62 @@ async fn open_for(
         .await
 }
 
-/// With a 2-second idle timeout, a Tick that is unused, or only read automatically, listed and
-/// sampled, is reaped; an attached one, one with any approved Watch and one read explicitly are
-/// kept. Removing the last Watch restarts the idle time, a detach does not, and
-/// the emptied host exits.
+/// With a 2-second idle timeout, no Tick idles out: one nobody uses, one only read, listed and
+/// sampled, and one whose view detached all keep running past it. Closing them empties the host,
+/// which then exits.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_idle_tick_is_reaped_unless_attached_watched_or_explicitly_used() {
+async fn no_tick_idles_out_and_the_host_exits_once_they_are_closed() {
     let fixture = Fixture::with_idle_timeout(Duration::from_secs(2)).await;
     let mut controller = fixture.controller().await;
     let chat = uuid::Uuid::new_v4();
     let mut opened = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..3 {
         opened.push(open_for(&fixture, &mut controller, chat, 0).await.unwrap());
     }
     let pid = |tick: &Value| tick["business_pid"].as_u64().unwrap() as u32;
-    let [unused, polled, attached, watched, used] = <[Value; 5]>::try_from(opened).unwrap();
-    let (mut view_events, view_requests) = attach(&fixture, &attached, initial_size())
-        .await
-        .into_parts();
-    let drain = tokio::spawn(async move {
-        while let Ok(Some(_)) = read_frame(&mut view_events, BUSINESS_FRAME_BYTES).await {}
-    });
-    let set_intents = |watches: Vec<uuid::Uuid>| json!({"owner":{"root":"fixture-root","chat":chat},"instance":watched["instance"],"watches":watches});
-    controller
-        .request(
-            "set_intents",
-            set_intents(vec![uuid::Uuid::new_v4(), uuid::Uuid::new_v4()]),
-            CONTROL_TIMEOUT,
-        )
-        .await
-        .unwrap();
+    let [unused, polled, viewed] = <[Value; 3]>::try_from(opened).unwrap();
+    drop(attach(&fixture, &viewed, initial_size()).await);
     let mut polled_reader = fixture.reader(&polled).await;
-    let mut used_reader = fixture.reader(&used).await;
-    for _ in 0..8 {
-        for (method, params) in [
-            ("read", json!({"activity":"automatic"})),
-            ("resources", json!({})),
-        ] {
-            // Fails with TargetGone once these requests failed to keep the Tick.
-            let _ = polled_reader.request(method, params, CONTROL_TIMEOUT).await;
+    for _ in 0..6 {
+        for method in ["read", "resources"] {
+            polled_reader
+                .request(method, json!({}), CONTROL_TIMEOUT)
+                .await
+                .unwrap();
         }
         controller
             .request("list", json!({}), CONTROL_TIMEOUT)
             .await
             .unwrap();
-        used_reader
-            .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+    }
+    for tick in [&unused, &polled, &viewed] {
+        assert!(alive(pid(tick)), "past the idle timeout: {tick}");
+    }
+    let diagnostics = controller
+        .request("diagnostics", json!({}), CONTROL_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(diagnostics["reaped"], json!([]), "nothing was reaped");
+
+    for tick in [&unused, &polled, &viewed] {
+        controller
+            .request(
+                "close",
+                json!({"operation":uuid::Uuid::new_v4(),"owner":{"root":"fixture-root","chat":chat},"instance":tick["instance"]}),
+                CONTROL_TIMEOUT,
+            )
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(gone(pid(tick)).await, "closing ends it");
     }
-    assert!(gone(pid(&unused)).await, "an unused Tick idles out");
-    assert!(
-        gone(pid(&polled)).await,
-        "automatic reads, lists and samples keep nothing"
-    );
-    for kept in [&attached, &watched, &used] {
-        assert!(alive(pid(kept)), "{kept}");
-    }
-
-    controller
-        .request(
-            "set_intents",
-            set_intents(vec![uuid::Uuid::new_v4()]),
-            CONTROL_TIMEOUT,
-        )
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(2500)).await;
-    assert!(alive(pid(&watched)), "any one Watch keeps the Tick");
-    assert!(
-        gone(pid(&used)).await,
-        "explicit use protects only while it lasts"
-    );
-
-    controller
-        .request("set_intents", set_intents(Vec::new()), CONTROL_TIMEOUT)
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-    assert!(
-        alive(pid(&watched)),
-        "the last unsubscribe restarts the idle time"
-    );
-    assert!(gone(pid(&watched)).await);
-
-    let diagnostics = tokio::time::timeout(CONTROL_TIMEOUT, async {
-        loop {
-            let diagnostics = controller
-                .request("diagnostics", json!({}), CONTROL_TIMEOUT)
-                .await
-                .unwrap();
-            if diagnostics["reaped"].as_array().unwrap().len() >= 4 {
-                break diagnostics;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("every finished idle reap is recorded in diagnostics");
-    let reasons = diagnostics["reaped"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|reaped| reaped["reason"].as_str().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(reasons, vec!["idle"; 4]);
-
-    let detached = std::time::Instant::now();
-    drop(view_requests);
-    drain.abort();
-    assert!(gone(pid(&attached)).await);
-    assert!(
-        detached.elapsed() < Duration::from_millis(1500),
-        "a detach does not restart the idle time"
-    );
     drop(controller);
     drop(polled_reader);
-    drop(used_reader);
     let exited = tokio::time::timeout(Duration::from_secs(5), fixture.server)
         .await
         .expect("an emptied host exits")
         .unwrap();
     exited.unwrap();
-}
-
-/// A Watch intent is a lease: renewed in time it keeps the Tick, but one nobody renews lapses
-/// after the idle timeout, and the Tick then idles out like any other.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_unrenewed_watch_intent_lapses_and_the_tick_then_idles_out() {
-    let fixture = Fixture::with_idle_timeout(Duration::from_secs(2)).await;
-    let mut controller = fixture.controller().await;
-    let chat = uuid::Uuid::new_v4();
-    let renewed = open_for(&fixture, &mut controller, chat, 0).await.unwrap();
-    let abandoned = open_for(&fixture, &mut controller, chat, 0).await.unwrap();
-    let pid = |tick: &Value| tick["business_pid"].as_u64().unwrap() as u32;
-    let intents = |tick: &Value| json!({"owner":{"root":"fixture-root","chat":chat},"instance":tick["instance"],"watches":[uuid::Uuid::new_v4()]});
-    controller
-        .request("set_intents", intents(&abandoned), CONTROL_TIMEOUT)
-        .await
-        .unwrap();
-    let lapsed_at = std::time::Instant::now() + Duration::from_secs(2);
-    for _ in 0..12 {
-        controller
-            .request("set_intents", intents(&renewed), CONTROL_TIMEOUT)
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    assert!(alive(pid(&renewed)), "a renewed intent keeps its Tick");
-    assert!(gone(pid(&abandoned)).await, "an abandoned intent lapses");
-    assert!(
-        std::time::Instant::now() >= lapsed_at,
-        "it protected the Tick until it lapsed"
-    );
-    shutdown(&fixture).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1736,7 +1631,7 @@ async fn an_oversized_update_breaks_only_its_own_tick() {
         match fixture
             .reader(&broken)
             .await
-            .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
+            .request("read", json!({}), CONTROL_TIMEOUT)
             .await
         {
             Err(error) => {

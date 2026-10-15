@@ -50,7 +50,8 @@
         "taken_in": {
           "hosted:00000000-0000-0000-0000-000000000040": 8500
         }
-      }
+      },
+      "restore_error": "1 of its Tick Subscriptions could not follow: a Deny rule refuses it"
     }
   },
   {

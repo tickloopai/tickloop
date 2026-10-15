@@ -53,25 +53,6 @@ const HOST_NOT_RUNNING: &str = "HostNotRunning";
 const SPAWN_ATTEMPTS: u32 = 3;
 const SPAWN_RETRY_PAUSE: Duration = Duration::from_millis(100);
 
-/// One Tick's approved Watch intents as the request that hands them to the host, never larger
-/// than one registry record.
-pub struct WatchIntents(Value);
-
-impl WatchIntents {
-    pub fn new(
-        owner: &TickOwner,
-        instance: &tick_protocol::InstanceRef,
-        watches: &std::collections::BTreeSet<Uuid>,
-    ) -> Result<Self, HostError> {
-        let request = json!({"owner":owner,"instance":instance,"watches":watches});
-        super::registry::within_shard(
-            format_args!("the Watch intents of {instance}"),
-            request.to_string().len(),
-        )?;
-        Ok(Self(request))
-    }
-}
-
 /// What the host ran for an owner when a listing began.
 pub struct OwnerListing {
     pub started_ms: u64,
@@ -203,7 +184,7 @@ impl HostController {
         self.paths.socket()
     }
 
-    /// How long a host this daemon starts lets a Tick idle, and lets Watch intents go unrenewed.
+    /// How long a host this daemon starts keeps a released Shell task nobody views.
     pub fn idle_timeout(&self) -> Duration {
         self.idle_timeout
     }
@@ -332,23 +313,6 @@ impl HostController {
             }
         }
         Ok(())
-    }
-
-    /// Replaces and renews the approved Watch intents of one of an owner's Ticks. Without a
-    /// running host there is nothing to protect.
-    pub async fn set_intents(&self, intents: &WatchIntents) -> Result<(), HostError> {
-        match self
-            .request(
-                "set_intents",
-                intents.0.clone(),
-                CONTROL_TIMEOUT,
-                Start::Never,
-            )
-            .await
-        {
-            Err(error) if error.code == HOST_NOT_RUNNING => Ok(()),
-            result => result.map(|_| ()),
-        }
     }
 
     /// Grants one spawn of what `binding` names, starting a host when none runs, and holds a

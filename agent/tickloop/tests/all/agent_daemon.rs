@@ -549,7 +549,6 @@ async fn a_real_worker_keeps_shell_execution_after_ui_disconnect_and_exits_on_li
         "binding": Uuid::new_v4(),
         "capability": "0".repeat(64),
         "host_endpoint": temporary.path().join("host.sock"),
-        "intent_renewal": Duration::from_secs(100),
     });
     let mut bootstrap = serde_json::to_vec(&serde_json::json!({
         "epoch": epoch,
@@ -801,7 +800,6 @@ async fn a_real_daemon_answers_hosted_lifecycle_requests_only_for_live_grants() 
         binding: Uuid::new_v4(),
         capability: "0".repeat(64),
         host_endpoint: temporary.path().join("host.sock"),
-        intent_renewal: std::time::Duration::from_secs(100),
     };
     let list = |chat| WorkerRequest::ListHostedTicks { chat, cursor: None };
     let unknown_grant = DaemonControl::new(forged(epoch))

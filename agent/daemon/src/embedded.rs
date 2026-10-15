@@ -475,6 +475,7 @@ impl EmbeddedAgentAccess {
             AgentCommand::ReopenHostedTick {
                 execution,
                 instance,
+                restore_subscriptions,
             } => {
                 let chat = self.chat(execution).await?;
                 let reopened = self
@@ -487,9 +488,17 @@ impl EmbeddedAgentAccess {
                     .agent
                     .record_reopened_tick(chat, &instance, reopened.clone())
                     .await?;
+                let restore_error = self
+                    .inner
+                    .agent
+                    .replace_tick_subscriptions(chat, &instance, &reopened, restore_subscriptions)
+                    .await
+                    .err()
+                    .map(|error| error.to_string());
                 Ok(CommandResult::HostedTickReopened {
                     instance: reopened,
                     membership,
+                    restore_error,
                 })
             }
             AgentCommand::AttachHostedTick {
@@ -1146,6 +1155,10 @@ impl EmbeddedAgentAccess {
                 agent
                     .update_tick_subscription(chat, subscription_id, change)
                     .await?;
+                Ok(CommandResult::Done)
+            }
+            LoopAction::SubscribeTick { instance } => {
+                agent.subscribe_tick_for_user(chat, instance).await?;
                 Ok(CommandResult::Done)
             }
             LoopAction::RetryDeniedOperation { record_id } => Ok(CommandResult::Submitted(

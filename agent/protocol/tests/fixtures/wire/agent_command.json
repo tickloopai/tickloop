@@ -308,9 +308,31 @@
       "generation": 3
     },
     "action": {
+      "kind": "subscribe_tick",
+      "instance": "hosted:00000000-0000-0000-0000-000000000040"
+    }
+  },
+  {
+    "kind": "manage_loop",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "action": {
       "kind": "send_now",
       "run_id": "00000000-0000-0000-0000-000000000022"
     }
+  },
+  {
+    "kind": "reopen_hosted_tick",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "instance": "hosted:00000000-0000-0000-0000-000000000040",
+    "restore_subscriptions": true
   },
   {
     "kind": "remove_monitor_member",

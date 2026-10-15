@@ -433,17 +433,16 @@ fn built_in_rows_describe_their_actions_as_intents() {
         })
     };
     let running_instance = InstanceRef::shell(running.id);
-    let remove_running = action(
-        'x',
-        "remove",
-        TickIntent::Notify("Stop this Shell before removing it".into()),
-    );
     assert_eq!(
         actions(&running_instance),
         [
             action('o', "open", TickIntent::OpenView(running_instance.clone())),
             action('s', "stop", TickIntent::StopShell { task: running.id }),
-            remove_running.clone(),
+            action(
+                'x',
+                "remove",
+                TickIntent::Notify("Press s to stop this Shell before removing it".into()),
+            ),
         ]
     );
     let unstoppable_instance = InstanceRef::shell(unstoppable.id);
@@ -455,7 +454,11 @@ fn built_in_rows_describe_their_actions_as_intents() {
                 "open",
                 TickIntent::OpenView(unstoppable_instance.clone())
             ),
-            remove_running,
+            action(
+                'x',
+                "remove",
+                TickIntent::Notify("This Shell leaves Monitor once it ends".into()),
+            ),
         ],
         "a Shell this View may not stop offers no stop"
     );
@@ -477,6 +480,11 @@ fn built_in_rows_describe_their_actions_as_intents() {
             'x',
             "remove",
             TickIntent::RemoveFromMonitor(pane.instance.clone()),
+        ),
+        action(
+            'f',
+            "subscribe",
+            TickIntent::Subscribe(pane.instance.clone()),
         ),
     ];
     pane_actions.extend(manage(&pane.instance));

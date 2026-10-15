@@ -779,7 +779,6 @@ mod channel {
                 binding: Uuid::new_v4(),
                 capability: "0".repeat(64),
                 host_endpoint: directory.path().join("host.sock"),
-                intent_renewal: std::time::Duration::from_secs(100),
             }),
             Vec::new(),
         );
@@ -834,7 +833,6 @@ mod channel {
             binding: Uuid::new_v4(),
             capability: "0".repeat(64),
             host_endpoint: directory.path().join("host.sock"),
-            intent_renewal: std::time::Duration::from_secs(100),
         };
         let chat = Uuid::new_v4();
         let instance = tick_protocol::InstanceRef::hosted(Uuid::new_v4());
@@ -1378,89 +1376,65 @@ for line in sys.stdin:
         assert_eq!(daemon.owner_state(chat).unwrap()["state"], "active");
     }
 
-    /// A Chat's Watch intents go through its daemon, which records them with the launch and
-    /// hands them to the host: any one Watch keeps an otherwise idle Tick, the last one ending
-    /// lets it idle out, and the next complete listing drops its record. Only the Chat that owns
-    /// the instance can protect it.
+    /// A Tick never ends for idling: a protocol Tick nobody watches, views or uses, and a terminal
+    /// Tick whose program exited, both outlast the host's idle timeout, the exited one with its
+    /// last screen still readable, until each is closed.
     #[tokio::test(flavor = "multi_thread")]
-    async fn watch_intents_through_the_daemon_keep_a_tick_until_the_last_watch_ends() {
+    async fn ticks_nobody_watches_or_views_outlast_the_idle_timeout_until_closed() {
+        let idle_timeout = Duration::from_secs(2);
         let daemon = Daemon::start_with(
             Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
-            Duration::from_secs(2),
-            2,
+            idle_timeout,
+            1,
         )
         .await;
-        let (chat, other_chat) = (daemon.chats[0], daemon.chats[1]);
+        let chat = daemon.chats[0];
         let tools = daemon.tools();
-        let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
-        let instance: tick_protocol::InstanceRef =
-            serde_json::from_value(opened["tick_instance_id"].clone()).unwrap();
-        let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
-        let watches = |chat, watches: Vec<Uuid>| WorkerRequest::SetWatchIntents {
+        let counter = run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
+        let business_pid = counter["business_pid"].as_u64().unwrap() as u32;
+        let exited = run_tool(
+            &tools,
             chat,
-            instance: instance.clone(),
-            watches: watches.into_iter().collect(),
-        };
-        let (first_watch, second_watch) = (Uuid::new_v4(), Uuid::new_v4());
-        DaemonControl::new(daemon.grants[0].clone())
-            .request(watches(chat, vec![first_watch, second_watch]))
-            .await
-            .unwrap();
-        let recorded = launch_records(&daemon.root, chat);
-        assert_eq!(recorded[0]["watches"].as_array().unwrap().len(), 2);
-        let foreign = DaemonControl::new(daemon.grants[1].clone())
-            .request(watches(chat, Vec::new()))
-            .await
-            .unwrap_err();
-        assert_eq!(foreign.code, "Forbidden", "another worker's Chat");
-        let not_its_tick = DaemonControl::new(daemon.grants[1].clone())
-            .request(watches(other_chat, Vec::new()))
-            .await
-            .unwrap_err();
-        assert_eq!(not_its_tick.code, "TargetGone", "another Chat's Tick");
+            "ModifyTick",
+            json!({"action":"open","command":["/bin/sh","-c","printf finished"],"cwd":daemon.root}),
+        )
+        .await;
 
-        // A worker renews its intents well within the idle timeout, as its grant says.
-        let renewal = daemon.grants[0].intent_renewal;
-        assert!(renewal < Duration::from_secs(1));
-        let renew = |current: Vec<Uuid>, rounds: u32| {
-            let request = watches(chat, current);
-            let grant = daemon.grants[0].clone();
-            async move {
-                for _ in 0..rounds {
-                    DaemonControl::new(grant.clone())
-                        .request(request.clone())
-                        .await
-                        .unwrap();
-                    tokio::time::sleep(renewal).await;
-                }
-            }
-        };
-        renew(vec![first_watch, second_watch], 5).await;
-        assert!(super::alive(business_pid), "a Watch keeps the idle Tick");
-        renew(vec![second_watch], 5).await;
-        assert!(super::alive(business_pid), "the remaining Watch keeps it");
-        DaemonControl::new(daemon.grants[0].clone())
-            .request(watches(chat, Vec::new()))
-            .await
-            .unwrap();
+        tokio::time::sleep(idle_timeout * 2 + Duration::from_millis(500)).await;
         assert!(
-            super::gone(business_pid).await,
-            "it idles out after the last Watch"
+            super::alive(business_pid),
+            "an unwatched, unviewed Tick does not idle out"
         );
-        assert_eq!(launch_records(&daemon.root, chat).len(), 1);
-        DaemonControl::new(daemon.grants[0].clone())
-            .request(list(chat))
-            .await
-            .unwrap();
+        let read = run_tool(
+            &tools,
+            chat,
+            "ReadTick",
+            json!({"tick_instance_id":exited["tick_instance_id"]}),
+        )
+        .await;
+        assert_ne!(read["data"]["exit"], Value::Null, "{read}");
         assert!(
-            launch_records(&daemon.root, chat).is_empty(),
-            "an idled-out Tick cannot be reopened and leaves no record"
+            read["data"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("finished")),
+            "an exited terminal Tick keeps its last screen: {read}"
         );
+
+        for opened in [&counter, &exited] {
+            run_tool(
+                &tools,
+                chat,
+                "ModifyTick",
+                json!({"action":"close","tick_instance_id":opened["tick_instance_id"]}),
+            )
+            .await;
+        }
+        assert!(super::gone(business_pid).await, "closing ends it");
     }
 
-    /// A Loop subscribed to a hosted Tick: the quiet Tick costs no model call, its Watch keeps it
-    /// from idling, an update wakes the Loop with the new content, and stopping the Loop ends
-    /// the Watch so the Tick idles out.
+    /// A Loop subscribed to a hosted Tick: the quiet Tick costs no model call, an update wakes
+    /// the Loop with the new content, and stopping the Loop ends its subscription while the Tick
+    /// keeps running.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_hosted_tick_update_reaches_the_loop_subscribed_to_it() {
         let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new()));
@@ -1493,23 +1467,9 @@ for line in sys.stdin:
         }
         let subscriptions = runtime.tick_subscriptions(chat).await.unwrap();
         assert_eq!(subscriptions.len(), 1, "{subscriptions:?}");
-        let watched = async {
-            for _ in 0..200 {
-                let records = launch_records(&daemon.root, chat);
-                if records[0]["watches"]
-                    .as_array()
-                    .is_some_and(|watches| watches.len() == 1)
-                {
-                    return true;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            false
-        };
-        assert!(watched.await, "the Watch reached the daemon as an intent");
 
         tokio::time::sleep(Duration::from_millis(5500)).await;
-        assert!(super::alive(business_pid), "the Watch keeps the quiet Tick");
+        assert!(super::alive(business_pid), "the quiet Tick keeps running");
         assert_eq!(
             model.requests.lock().unwrap().len(),
             2,
@@ -1545,9 +1505,11 @@ for line in sys.stdin:
         }
 
         runtime.stop(chat, subscriptions[0].loop_id).await.unwrap();
+        assert!(runtime.tick_subscriptions(chat).await.unwrap().is_empty());
+        tokio::time::sleep(Duration::from_millis(2500)).await;
         assert!(
-            super::gone(business_pid).await,
-            "without its Watch the Tick idles out"
+            super::alive(business_pid),
+            "stopping the Loop ends its subscription, not the Tick"
         );
     }
 
@@ -2566,27 +2528,21 @@ for line in sys.stdin:
         }
         let subscriptions = runtime.tick_subscriptions(chat).await.unwrap();
         assert_eq!(subscriptions.len(), 2, "{subscriptions:?}");
-        let watch_count = |count: usize| {
-            let root = daemon.root.clone();
-            async move {
-                for _ in 0..200 {
-                    if launch_records(&root, chat)[0]["watches"]
-                        .as_array()
-                        .is_some_and(|watches| watches.len() == count)
-                    {
-                        return true;
-                    }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                false
-            }
-        };
-        assert!(watch_count(2).await);
         runtime
             .update_tick_subscription(chat, subscriptions[0].id, TickSubscriptionChange::Cancel)
             .await
             .unwrap();
-        assert!(watch_count(1).await, "only the cancelled Watch ended");
+        assert_eq!(
+            runtime
+                .tick_subscriptions(chat)
+                .await
+                .unwrap()
+                .iter()
+                .map(|subscription| subscription.id)
+                .collect::<Vec<_>>(),
+            [subscriptions[1].id],
+            "only the cancelled Watch ended"
+        );
 
         let before = model.requests.lock().unwrap().len();
         model.enqueue(tickloop_agent_test_support::text("update observed"));
@@ -3167,11 +3123,11 @@ for line in sys.stdin:
     }
 
     /// A Tick whose host died is lost: nothing reopens it on its own. Its user reopens it as a new
-    /// instance with a new process; the lost instance's subscription stays gone rather than
-    /// following it, and asking again never starts a second one.
+    /// instance with a new process in the lost row's place; its subscription follows because the
+    /// user asked for it, and asking again never starts a second one.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_tick_lost_with_its_host_reopens_only_explicitly_as_a_new_instance() {
-        use tickloop_agent_protocol::{EventKind, HostedMemberState, TickLinkState};
+        use tickloop_agent_protocol::{EventKind, HostedMemberState, TickSubscriptionFrequency};
         let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new()));
         let daemon =
             Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
@@ -3239,21 +3195,28 @@ for line in sys.stdin:
         let CommandResult::HostedTickReopened {
             instance: reopened,
             membership,
+            restore_error,
         } = daemon
             .command(AgentCommand::ReopenHostedTick {
                 execution,
                 instance: lost.clone(),
+                restore_subscriptions: true,
             })
             .await
         else {
             panic!("a reopened Tick expected");
         };
         assert_ne!(reopened, lost, "a new instance");
+        assert_eq!(restore_error, None);
         assert!(
             membership
                 .members
                 .iter()
                 .any(|member| member.instance == reopened)
+        );
+        assert!(
+            membership.is_removed(&lost),
+            "the new instance takes the lost row's place"
         );
         let CommandResult::HostedTicks(members) = daemon
             .command(AgentCommand::ListHostedTicks { execution })
@@ -3275,18 +3238,15 @@ for line in sys.stdin:
                 .any(|record| record["state"] == "reopened" && record["instance"] == json!(lost))
         );
 
-        let mut is_gone = false;
-        for _ in 0..120 {
-            let subscriptions = runtime.tick_subscriptions(chat).await.unwrap();
-            if subscriptions[0].instance == lost
-                && subscriptions[0].link == TickLinkState::InstanceGone
-            {
-                is_gone = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        assert!(is_gone, "the lost instance's subscription is not rebound");
+        let subscriptions = runtime.tick_subscriptions(chat).await.unwrap();
+        assert_eq!(
+            subscriptions
+                .iter()
+                .map(|row| (row.instance.clone(), row.frequency))
+                .collect::<Vec<_>>(),
+            [(reopened.clone(), TickSubscriptionFrequency::High)],
+            "the subscription follows the new instance at its frequency, as the user asked"
+        );
 
         let CommandResult::HostedTickReopened {
             instance: again, ..
@@ -3294,6 +3254,7 @@ for line in sys.stdin:
             .command(AgentCommand::ReopenHostedTick {
                 execution,
                 instance: lost.clone(),
+                restore_subscriptions: true,
             })
             .await
         else {
@@ -3345,6 +3306,7 @@ for line in sys.stdin:
                 command: AgentCommand::ReopenHostedTick {
                     execution,
                     instance: serde_json::from_value(opened["tick_instance_id"].clone()).unwrap(),
+                    restore_subscriptions: false,
                 },
             })
             .await
@@ -3382,7 +3344,7 @@ mod lifecycle {
         paths::HostPaths,
     };
     use tickhost_connect::hosted::{CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role};
-    use tickloop_agent_runtime::hosted::controller::{HostController, WatchIntents};
+    use tickloop_agent_runtime::hosted::controller::HostController;
     use uuid::Uuid;
 
     const FLOOD: &str = r#"
@@ -3594,32 +3556,23 @@ for line in sys.stdin:
         );
     }
 
-    /// A new daemon hands the host the Watch intents its registry committed, replacing what the
-    /// host held, and drops the records of instances the same host no longer runs instead of
-    /// keeping them for recovery.
+    /// Reconciling keeps the record of a Tick nobody watches past the host's idle timeout, which
+    /// keeps running, and drops the record of one the same host no longer runs instead of keeping
+    /// it for recovery.
     #[tokio::test(flavor = "multi_thread")]
-    async fn reconcile_hands_the_host_the_committed_watches_and_drops_idled_out_records() {
-        use std::collections::BTreeSet;
+    async fn reconcile_keeps_an_unwatched_tick_and_drops_the_record_of_a_closed_one() {
         use tickloop_agent_runtime::hosted::registry::{LaunchRecord, LaunchState, Registry};
-        let fixture = Fixture::with_idle_timeout(Duration::from_secs(2));
+        let idle_timeout = Duration::from_secs(2);
+        let fixture = Fixture::with_idle_timeout(idle_timeout);
         let controller = fixture.controller();
         let config_root = fixture.directory.path().join("state");
         std::fs::create_dir(&config_root).unwrap();
         let registry = Registry::default();
         let root = registry.root(&config_root).await.unwrap();
-        // The host still holds a Watch for both; the registry committed that the first one's
-        // Watches all ended while the daemon was away.
         let mut ticks = Vec::new();
-        for committed in [BTreeSet::new(), BTreeSet::from([Uuid::new_v4()])] {
+        for _ in 0..2 {
             let request = fixture.counter();
             let opened = controller.open(request.clone()).await.unwrap();
-            let intents = WatchIntents::new(
-                &fixture.owner,
-                &opened.instance,
-                &BTreeSet::from([Uuid::new_v4()]),
-            )
-            .unwrap();
-            controller.set_intents(&intents).await.unwrap();
             let mut record = LaunchRecord::opening(
                 request.operation,
                 fixture.owner.chat,
@@ -3633,45 +3586,30 @@ for line in sys.stdin:
                 instance: opened.instance.clone(),
                 host_epoch: opened.terminal.epoch,
             };
-            record.watches = committed;
             root.record_launch(&record).await.unwrap();
             ticks.push(opened);
         }
-        let [unwatched, watched] = <[_; 2]>::try_from(ticks).unwrap();
+        let [closed, kept] = <[_; 2]>::try_from(ticks).unwrap();
 
+        tokio::time::sleep(idle_timeout * 2 + Duration::from_millis(500)).await;
         root.reconcile_with_host(&controller, &fixture.owner.root)
             .await
             .unwrap();
-        assert!(
-            gone(unwatched.business_pid).await,
-            "the host dropped the Watch the registry no longer has"
-        );
-        assert!(alive(watched.business_pid), "the committed Watch keeps it");
+        assert!(alive(closed.business_pid) && alive(kept.business_pid));
+        assert_eq!(root.launches(fixture.owner.chat).await.unwrap().len(), 2);
+
+        controller
+            .close(Uuid::new_v4(), &fixture.owner, &closed.instance)
+            .await
+            .unwrap();
+        assert!(gone(closed.business_pid).await);
         root.reconcile_with_host(&controller, &fixture.owner.root)
             .await
             .unwrap();
         let records = root.launches(fixture.owner.chat).await.unwrap();
         assert_eq!(records.len(), 1, "{records:?}");
-        assert_eq!(records[0].instance(), Some(&watched.instance));
+        assert_eq!(records[0].instance(), Some(&kept.instance));
         assert!(matches!(records[0].state, LaunchState::Live { .. }));
-
-        root.set_watches(
-            &controller,
-            &fixture.owner,
-            &watched.instance,
-            BTreeSet::new(),
-        )
-        .await
-        .unwrap();
-        assert!(gone(watched.business_pid).await);
-        assert!(fixture.host_exits().await);
-        root.reconcile_with_host(&controller, &fixture.owner.root)
-            .await
-            .unwrap();
-        assert!(
-            root.launches(fixture.owner.chat).await.unwrap().is_empty(),
-            "a host that exited after all its Ticks ended leaves nothing to recover"
-        );
     }
 
     /// A listing settles only records older than itself: an open that completed while the
@@ -3721,52 +3659,6 @@ for line in sys.stdin:
         tokio::time::sleep(Duration::from_millis(5)).await;
         let later = controller.owner_listing(&fixture.owner).await.unwrap();
         root.settle_launches(&controller, &fixture.owner, &later)
-            .await
-            .unwrap();
-        assert!(matches!(
-            root.launches(fixture.owner.chat).await.unwrap()[0].state,
-            LaunchState::Lost { .. }
-        ));
-    }
-
-    /// A Watch change during a listing rewrites the record but not its state: the listing still
-    /// settles it, so a Tick lost with its host is never hidden by a Watch renewal.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_watch_change_during_a_listing_does_not_hide_a_lost_tick() {
-        use tickloop_agent_runtime::hosted::registry::{LaunchRecord, LaunchState, Registry};
-        let fixture = Fixture::new();
-        let controller = fixture.controller();
-        let config_root = fixture.directory.path().join("state");
-        std::fs::create_dir(&config_root).unwrap();
-        let root = Registry::default().root(&config_root).await.unwrap();
-        let request = fixture.counter();
-        let instance = tick_protocol::InstanceRef::hosted(Uuid::new_v4());
-        let mut record = LaunchRecord::opening(
-            request.operation,
-            fixture.owner.chat,
-            request.adapter,
-            request.command,
-            request.cwd,
-            None,
-        )
-        .unwrap();
-        record.state = LaunchState::Live {
-            instance: instance.clone(),
-            host_epoch: Uuid::new_v4(),
-        };
-        root.record_launch(&record).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        let listing = controller.owner_listing(&fixture.owner).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        root.set_watches(
-            &controller,
-            &fixture.owner,
-            &instance,
-            [Uuid::new_v4()].into_iter().collect(),
-        )
-        .await
-        .unwrap();
-        root.settle_launches(&controller, &fixture.owner, &listing)
             .await
             .unwrap();
         assert!(matches!(
@@ -4034,7 +3926,7 @@ for line in sys.stdin:
             last_line(&shown)
         );
         let read = reader
-            .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
+            .request("read", json!({}), CONTROL_TIMEOUT)
             .await
             .unwrap();
         assert_eq!(read["data"]["lines"], 1500);
@@ -4067,7 +3959,7 @@ for line in sys.stdin:
                 .unwrap();
         }
         let read = reader
-            .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
+            .request("read", json!({}), CONTROL_TIMEOUT)
             .await
             .unwrap();
         assert_eq!(read["data"]["value"], 200);

@@ -5,12 +5,13 @@ use tickloop_agent_protocol::{
 
 /// Stops a running Shell from its Monitor row after confirmation.
 pub(crate) const SHELL_STOP_KEY: char = 's';
-/// Ends a hosted Tick from its Monitor row after confirmation; the row stays until removed.
-pub(crate) const HOSTED_CLOSE_KEY: char = 'c';
-/// Starts a new instance in place of a hosted Tick lost with its host, after confirmation.
-pub(crate) const HOSTED_REOPEN_KEY: char = 'n';
+/// Subscribes the Chat to a protocol or terminal Tick from its Monitor row.
+pub(crate) const SUBSCRIBE_KEY: char = 'f';
+/// The one key that takes a row out, doing what its state calls for.
+pub(crate) const REMOVE_KEY: char = 'x';
 
-/// Ticks this Chat opened in the dedicated Tickhost. They belong to the Chat that opened them.
+/// Ticks in the dedicated Tickhost: those this Chat opened, which belong to it, and those only
+/// its subscriptions show.
 pub struct HostedRows;
 impl MonitorRows for HostedRows {
     fn access(&self) -> &'static str {
@@ -18,68 +19,132 @@ impl MonitorRows for HostedRows {
     }
     fn list(&self, context: &MonitorContext) -> Vec<TickDescriptor> {
         subscriptions(context, self.access())
-            .map(|row| TickDescriptor {
-                instance: row.instance.clone(),
-                group: TickGroup::Ticks,
-                glyph: TickGlyph::Protocol,
-                title: row
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| row.instance.to_string()),
-                kind: "Tick".into(),
-                status: link_status(row.link).into(),
-                notes: Vec::new(),
-                subscription: None,
-                owner: TickOwner::ThisChat,
-                tone: link_tone(row.link),
-                updated_at_ms: row.updated_at_ms,
-                update: subscription_update(row),
-                running: row.link == TickLinkState::Live,
-                resources: None,
-                actions: hosted_subscription_actions(row),
+            .map(|row| {
+                let is_opened_here = context.chat.as_ref().is_some_and(|chat| {
+                    chat.monitor
+                        .members
+                        .iter()
+                        .any(|member| member.instance == row.instance)
+                });
+                let run = if row.link == TickLinkState::InstanceGone {
+                    HostedRun::Ended
+                } else {
+                    HostedRun::Running
+                };
+                TickDescriptor {
+                    instance: row.instance.clone(),
+                    group: TickGroup::Ticks,
+                    glyph: TickGlyph::Protocol,
+                    title: row
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| row.instance.to_string()),
+                    kind: "Tick".into(),
+                    status: link_status(row.link).into(),
+                    notes: Vec::new(),
+                    subscription: None,
+                    owner: if is_opened_here {
+                        TickOwner::ThisChat
+                    } else {
+                        TickOwner::Unknown
+                    },
+                    tone: link_tone(row.link),
+                    updated_at_ms: row.updated_at_ms,
+                    update: subscription_update(row),
+                    running: row.link == TickLinkState::Live,
+                    resources: None,
+                    actions: hosted_actions(&row.instance, is_opened_here, run),
+                }
             })
             .collect()
     }
-    /// A hosted member reports its host's latest listing and process sample, and can be closed;
-    /// one lost with its host can be reopened as a new instance.
+    /// A hosted member reports its host's latest listing and process sample.
     fn member(&self, member: &MonitorMember, context: &MonitorContext) -> TickDescriptor {
         let mut row = super::member_descriptor(member);
-        row.actions.retain(|action| action.key != MONITOR_ENTER_KEY);
-        row.actions.insert(0, open_view(&member.instance));
         row.resources = context.member_resources.get(&member.instance).cloned();
         add_probed_update(&mut row, context);
-        row.actions.push(MonitorAction {
-            key: HOSTED_CLOSE_KEY,
-            label: "close",
-            intent: TickIntent::CloseHosted(member.instance.clone()),
-        });
-        match context.member_states.get(&member.instance) {
+        let run = match context.member_states.get(&member.instance) {
             Some(MemberState::Live) => {
                 row.running = true;
                 row.status = link_status(TickLinkState::Live).into();
                 row.tone = link_tone(TickLinkState::Live);
+                HostedRun::Running
             }
             Some(MemberState::Exited(status)) => {
                 row.status = status.clone();
                 row.tone = StatusTone::Neutral;
+                HostedRun::Exited
             }
             Some(MemberState::Lost) => {
                 row.status = "lost".into();
                 row.tone = StatusTone::Gone;
-                row.actions.push(MonitorAction {
-                    key: HOSTED_REOPEN_KEY,
-                    label: "reopen as new",
-                    intent: TickIntent::ReopenHosted(member.instance.clone()),
-                });
+                HostedRun::Ended
             }
             Some(MemberState::Gone) => {
                 row.status = link_status(TickLinkState::InstanceGone).into();
                 row.tone = link_tone(TickLinkState::InstanceGone);
+                HostedRun::Ended
             }
-            None => {}
-        }
+            // Until the first probe answers, the Tick this Chat opened is taken to run.
+            None => HostedRun::Running,
+        };
+        row.actions = hosted_actions(&member.instance, true, run);
         row
     }
+}
+
+/// How far a hosted Tick's process has come, as its row's actions see it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostedRun {
+    Running,
+    /// A terminal Tick whose program ended; its last screen stays readable.
+    Exited,
+    /// Gone or lost with its host: nothing runs any more.
+    Ended,
+}
+
+/// A hosted Tick row's Enter and `x`. Enter opens the view of a Tick that still has a screen,
+/// and reopens one this Chat opened that no longer runs. `x` closes a Tick this Chat opened, so
+/// nothing it opened keeps running out of sight, and otherwise only takes the row out with this
+/// Chat's subscriptions, never ending another Chat's Tick.
+fn hosted_actions(
+    instance: &InstanceRef,
+    is_opened_here: bool,
+    run: HostedRun,
+) -> Vec<MonitorAction> {
+    let enter = match (run, is_opened_here) {
+        (HostedRun::Running | HostedRun::Exited, _) => open_view(instance),
+        (HostedRun::Ended, true) => MonitorAction {
+            key: MONITOR_ENTER_KEY,
+            label: "reopen",
+            intent: TickIntent::ReopenHosted(instance.clone()),
+        },
+        (HostedRun::Ended, false) => MonitorAction {
+            key: MONITOR_ENTER_KEY,
+            label: "details",
+            intent: TickIntent::ShowDetails(instance.clone()),
+        },
+    };
+    let remove = match (run, is_opened_here) {
+        (HostedRun::Running, true) => MonitorAction {
+            key: REMOVE_KEY,
+            label: "close",
+            intent: TickIntent::CloseHosted {
+                instance: instance.clone(),
+                ends_process: true,
+            },
+        },
+        (HostedRun::Exited, true) => MonitorAction {
+            key: REMOVE_KEY,
+            label: "remove",
+            intent: TickIntent::CloseHosted {
+                instance: instance.clone(),
+                ends_process: false,
+            },
+        },
+        _ => remove_from_monitor(instance),
+    };
+    vec![enter, remove]
 }
 
 /// The Chat's artifacts. An artifact takes no Tick Subscription: its association is its
@@ -243,23 +308,27 @@ fn shell_actions(task: &ShellTask, instance: &InstanceRef) -> Vec<MonitorAction>
         actions.push(remove_from_monitor(instance));
         return actions;
     }
-    if task.capabilities.can_stop {
+    let removal = if task.capabilities.can_stop {
         actions.push(MonitorAction {
             key: SHELL_STOP_KEY,
             label: "stop",
             intent: TickIntent::StopShell { task: task.id },
         });
-    }
+        STOPPABLE_SHELL_REMOVAL
+    } else {
+        RUNNING_SHELL_REMOVAL
+    };
     actions.push(MonitorAction {
-        key: 'x',
+        key: REMOVE_KEY,
         label: "remove",
-        intent: TickIntent::Notify(RUNNING_SHELL_REMOVAL.into()),
+        intent: TickIntent::Notify(removal.into()),
     });
     actions
 }
 
 /// Why `x` does not take out a running Shell.
-const RUNNING_SHELL_REMOVAL: &str = "Stop this Shell before removing it";
+const STOPPABLE_SHELL_REMOVAL: &str = "Press s to stop this Shell before removing it";
+const RUNNING_SHELL_REMOVAL: &str = "This Shell leaves Monitor once it ends";
 
 /// Enter on a local Tick's row opens its attached view.
 fn open_view(instance: &InstanceRef) -> MonitorAction {
@@ -647,12 +716,6 @@ pub(crate) fn artifact_actions(id: &str, holds_association: bool) -> Vec<Monitor
         intent: TickIntent::Artifact { id: id.into(), key },
     })
     .collect()
-}
-
-/// A hosted Tick known only through a subscription still opens its view like a member; the
-/// Monitor list adds the subscription keys.
-fn hosted_subscription_actions(row: &TickSubscriptionStatus) -> Vec<MonitorAction> {
-    vec![open_view(&row.instance), remove_from_monitor(&row.instance)]
 }
 
 #[cfg(test)]

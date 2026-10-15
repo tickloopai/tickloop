@@ -4,7 +4,7 @@
 //! and daemon restarts so ownership, recovery and end events never depend on a live process.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     fs::File,
     io,
     os::fd::AsRawFd,
@@ -20,7 +20,7 @@ use tickhost_connect::host_error::HostError;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use super::controller::{HostController, LIFECYCLE_TIMEOUT, OwnerListing, WatchIntents};
+use super::controller::{HostController, LIFECYCLE_TIMEOUT, OwnerListing};
 
 use tickloop_agent_base::private_fs::{
     PRIVATE_FILE_MODE, create_private_directory, replace_file_atomically, unix_time_milliseconds,
@@ -134,10 +134,7 @@ pub struct LaunchRecord {
     pub title: Option<String>,
     #[serde(flatten)]
     pub state: LaunchState,
-    /// The approved Watches that keep this instance from idling, as the Chat last reported them.
-    pub watches: BTreeSet<Uuid>,
-    /// When the record was created or its state last changed. A Watch change keeps it, so a
-    /// listing that began earlier still settles the record.
+    /// When the record was created or its state last changed.
     pub updated_ms: u64,
 }
 
@@ -162,7 +159,6 @@ impl LaunchRecord {
             identity,
             title,
             state: LaunchState::Opening,
-            watches: BTreeSet::new(),
             updated_ms: 0,
         })
     }
@@ -189,22 +185,16 @@ pub enum Transition {
     Remove,
 }
 
+/// `transition` when the record is still as it was observed, else nothing.
 fn settled_launch_transition(
-    mut observed: LaunchRecord,
+    observed: LaunchRecord,
     current: LaunchRecord,
     transition: Transition,
 ) -> Transition {
-    observed.watches.clone_from(&current.watches);
     if current != observed {
         return Transition::Keep;
     }
-    match transition {
-        Transition::Write(mut record) => {
-            record.watches = current.watches;
-            Transition::Write(record)
-        }
-        transition => transition,
-    }
+    transition
 }
 
 /// The registries of every config root this daemon serves, opened on first use.
@@ -235,7 +225,6 @@ impl Registry {
             })?;
         let root = Arc::new(RootRegistry {
             files: Arc::new(files),
-            intents: Mutex::new(()),
             lifecycles: LifecycleLocks::default(),
         });
         roots.insert(canonical, root.clone());
@@ -247,8 +236,6 @@ impl Registry {
 /// written on blocking threads, never on the daemon's async workers.
 pub struct RootRegistry {
     files: Arc<RegistryFiles>,
-    /// Keeps each Watch intent change and its delivery to the host in arrival order.
-    intents: Mutex<()>,
     /// Per Chat: opens, reopens and ends take turns, so an end can never fall between an
     /// open's revision and its launch.
     lifecycles: LifecycleLocks,
@@ -600,8 +587,8 @@ impl RootRegistry {
 
     /// Reconciles this root with the host: records are settled against what the host runs,
     /// decided ends are carried out, and the host gets a complete snapshot of the Chats that
-    /// still own Ticks, so it can reap any other, and their committed Watch intents. Runs before
-    /// anything else is served for the root.
+    /// still own Ticks, so it can reap any other. Runs before anything else is served for the
+    /// root.
     pub async fn reconcile_with_host(
         &self,
         controller: &HostController,
@@ -623,35 +610,11 @@ impl RootRegistry {
                 owners.push(chat);
             }
         }
-        let Some(host_epoch) = host_epoch else {
+        if host_epoch.is_none() {
             return Ok(());
-        };
+        }
         let revision = self.next_revision().await?;
         controller.reconcile_owners(root, revision, &owners).await?;
-        for chat in owners {
-            let owner = TickOwner {
-                root: root.to_owned(),
-                chat,
-            };
-            let Ok(records) = self.launches(chat).await else {
-                continue;
-            };
-            for record in records {
-                if let LaunchState::Live {
-                    instance,
-                    host_epoch: epoch,
-                } = &record.state
-                    && *epoch == host_epoch
-                {
-                    let intents = WatchIntents::new(&owner, instance, &record.watches)?;
-                    match controller.set_intents(&intents).await {
-                        // It ended since it was listed; the next listing settles its record.
-                        Err(error) if error.code == TARGET_GONE => {}
-                        result => result?,
-                    }
-                }
-            }
-        }
         Ok(())
     }
 
@@ -733,53 +696,12 @@ impl RootRegistry {
                 },
                 LaunchState::Lost { .. } | LaunchState::Reopened { .. } => continue,
             };
-            // Watch intents change independently of the lifecycle being settled.
             self.transition_launch(chat, record.operation, move |current| {
                 settled_launch_transition(record, current, transition)
             })
             .await?;
         }
         Ok(())
-    }
-
-    /// Records the approved Watches of one of `owner`'s live instances, then tells the host.
-    pub async fn set_watches(
-        &self,
-        controller: &HostController,
-        owner: &TickOwner,
-        instance: &InstanceRef,
-        watches: BTreeSet<Uuid>,
-    ) -> Result<(), HostError> {
-        let intents = WatchIntents::new(owner, instance, &watches)?;
-        let _in_order = self.intents.lock().await;
-        let is_live = |record: &LaunchRecord| matches!(&record.state, LaunchState::Live { instance: live, .. } if live == instance);
-        let gone = || HostError::before(TARGET_GONE, "this Chat has no such live hosted Tick");
-        let record = self
-            .launches(owner.chat)
-            .await?
-            .into_iter()
-            .find(|record| is_live(record))
-            .ok_or_else(gone)?;
-        // A renewal of the same Watches changes nothing durable.
-        if record.watches != watches {
-            let committed = watches.clone();
-            let live = instance.clone();
-            let is_changed = self
-                .transition_launch(owner.chat, record.operation, move |mut current| {
-                    if matches!(&current.state, LaunchState::Live { instance, .. } if *instance == live)
-                    {
-                        current.watches = committed;
-                        Transition::Write(Box::new(current))
-                    } else {
-                        Transition::Keep
-                    }
-                })
-                .await?;
-            if !is_changed {
-                return Err(gone());
-            }
-        }
-        controller.set_intents(&intents).await
     }
 
     /// Ends the Ticks of a child Chat StopSubagent stopped. The decision is durable before the host
@@ -874,58 +796,6 @@ mod tests {
         .unwrap();
         record.state = state;
         record
-    }
-
-    #[tokio::test]
-    async fn watch_changes_during_settlement_preserve_the_lost_launch_and_latest_intents() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = Registry::default().root(directory.path()).await.unwrap();
-        let chat = Uuid::new_v4();
-        let instance = InstanceRef::hosted(Uuid::new_v4());
-        let host_epoch = Uuid::new_v4();
-        let mut live = record(
-            chat,
-            LaunchState::Live {
-                instance: instance.clone(),
-                host_epoch,
-            },
-        );
-        live.watches.insert(Uuid::new_v4());
-        root.record_launch(&live).await.unwrap();
-        let observed = root.launches(chat).await.unwrap().pop().unwrap();
-        root.transition_launch(chat, observed.operation, |mut current| {
-            current.watches.clear();
-            Transition::Write(Box::new(current))
-        })
-        .await
-        .unwrap();
-        let mut lost = observed.clone();
-        lost.state = LaunchState::Lost {
-            instance: instance.clone(),
-            host_epoch,
-        };
-        let changed = root
-            .transition_launch(chat, observed.operation, move |current| {
-                settled_launch_transition(observed, current, Transition::Write(Box::new(lost)))
-            })
-            .await
-            .unwrap();
-        assert!(
-            changed,
-            "an independent Watch change must not veto host-loss settlement"
-        );
-        let settled = root.launches(chat).await.unwrap().pop().unwrap();
-        assert_eq!(
-            settled.state,
-            LaunchState::Lost {
-                instance,
-                host_epoch
-            }
-        );
-        assert!(
-            settled.watches.is_empty(),
-            "the current Watch intents must remain authoritative"
-        );
     }
 
     #[tokio::test]
@@ -1148,7 +1018,7 @@ mod tests {
         root.remove_launch(chat, live.operation).await.unwrap();
         let changed = root
             .transition_launch(chat, live.operation, |mut current| {
-                current.watches.insert(Uuid::new_v4());
+                current.title = Some("renamed".into());
                 Transition::Write(Box::new(current))
             })
             .await

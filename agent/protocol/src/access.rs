@@ -34,9 +34,10 @@ use crate::{
 /// command is gone, and `AttachHostedTick` also grants views of the Chat's Shell tasks. 20.1 names
 /// the Bash call that started each Agent Shell task, and adds reading a Chat's status without its
 /// history, one recorded tool operation, and the events after a sequence. 20.2 adds each Tick
-/// Subscription status's next check and period, so Monitor counts down to the next check. Older
-/// business majors are refused before dispatch; the frozen daemon management protocol remains
-/// independent.
+/// Subscription status's next check and period, so Monitor counts down to the next check, the
+/// user's own Tick Subscription from Monitor, and reopening a hosted Tick with its subscriptions.
+/// Older business majors are refused before dispatch; the frozen daemon management protocol
+/// remains independent.
 pub const PROTOCOL_MAJOR: u16 = 20;
 pub const PROTOCOL_MINOR: u16 = 2;
 
@@ -272,10 +273,15 @@ pub enum AgentCommand {
         execution: ExecutionRef,
         instance: InstanceRef,
     },
-    /// Starts a new instance in place of a hosted Tick lost with its host, at the user's request.
+    /// Starts a new instance in place of a hosted Tick that no longer runs, at the user's
+    /// request. It takes the old row's place in Monitor; the old instance's Tick Subscriptions in
+    /// this Chat end, and with `restore_subscriptions` their Loops subscribe to the new instance
+    /// at the frequencies they had.
     ReopenHostedTick {
         execution: ExecutionRef,
         instance: InstanceRef,
+        #[serde(default)]
+        restore_subscriptions: bool,
     },
     /// Lets the asking View attach once to one of the Chat's local Ticks the Tickhost runs: a
     /// hosted Tick's terminal, or the screen of one of its Shell tasks.
@@ -498,6 +504,11 @@ pub enum LoopAction {
     UpdateSubscription {
         subscription_id: Uuid,
         change: TickSubscriptionChange,
+    },
+    /// Subscribes the Chat's newest Loop that has not ended to `instance` at the default
+    /// frequency, at the user's request from Monitor.
+    SubscribeTick {
+        instance: InstanceRef,
     },
     RetryDeniedOperation {
         record_id: Uuid,
@@ -974,6 +985,9 @@ pub enum CommandResult {
     HostedTickReopened {
         instance: InstanceRef,
         membership: MonitorMembership,
+        /// Why some Tick Subscriptions the user asked to restore did not follow.
+        #[serde(default)]
+        restore_error: Option<String>,
     },
     HostedTickView(HostedViewGrant),
     Created {

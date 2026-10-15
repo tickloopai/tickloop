@@ -33,6 +33,9 @@ use tickloop_agent_protocol::{
 };
 
 const SUBSCRIPTION_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const ALREADY_SUBSCRIBED: &str =
+    "a Loop of this Chat already subscribes to this Tick; e changes the frequency";
+const NO_SUBSCRIBING_LOOP: &str = "no Loop of this Chat can take its Tick Updates";
 
 const SUBSCRIBE_TICK_TOOL: &str = "SubscribeTick";
 const UNSUBSCRIBE_TICK_TOOL: &str = "UnsubscribeTick";
@@ -750,6 +753,191 @@ impl Agent {
                 }
             }
         }
+        self.configure_trigger(chat_id, loop_id, Some(trigger))
+            .await
+    }
+
+    /// Subscribes the Chat to `instance` at the default frequency because its user asked to on
+    /// the instance's Monitor row. The Chat's newest Loop that has not ended receives it; an
+    /// instance one of its Loops already subscribes to, or a Chat without such a Loop, is refused
+    /// with what to do instead.
+    pub async fn subscribe_tick_for_user(
+        &self,
+        chat_id: ChatId,
+        instance: InstanceRef,
+    ) -> Result<(), AgentError> {
+        let loop_id = {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+            let open_loops = chat
+                .snapshot
+                .loops
+                .iter()
+                .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
+                .collect::<Vec<_>>();
+            let is_subscribed = open_loops.iter().any(|goal| {
+                goal.trigger
+                    .iter()
+                    .flat_map(|trigger| &trigger.subscriptions)
+                    .any(|subscription| subscription.instance == instance)
+            });
+            if is_subscribed {
+                return Err(AgentError::Invalid(ALREADY_SUBSCRIBED.into()));
+            }
+            open_loops
+                .last()
+                .map(|goal| goal.id)
+                .ok_or_else(|| AgentError::Invalid(NO_SUBSCRIBING_LOOP.into()))?
+        };
+        self.subscribe_loop_for_user(chat_id, loop_id, instance, DEFAULT_FREQUENCY)
+            .await
+    }
+
+    /// Ends this Chat's subscriptions to `lost` once `reopened` took its place, and with
+    /// `restore` subscribes each of their Loops to `reopened` again at the frequency it had,
+    /// admitted as the user's own subscription. The error tells which could not be restored.
+    pub async fn replace_tick_subscriptions(
+        &self,
+        chat_id: ChatId,
+        lost: &InstanceRef,
+        reopened: &InstanceRef,
+        restore: bool,
+    ) -> Result<(), AgentError> {
+        let subscriptions = {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+            chat.snapshot
+                .loops
+                .iter()
+                .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
+                .flat_map(|goal| {
+                    goal.trigger
+                        .iter()
+                        .flat_map(|trigger| &trigger.subscriptions)
+                        .filter(|subscription| subscription.instance == *lost)
+                        .map(|subscription| (goal.id, subscription.id, subscription.frequency))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut refusals = Vec::new();
+        for (loop_id, subscription, frequency) in subscriptions {
+            self.update_tick_subscription(chat_id, subscription, TickSubscriptionChange::Cancel)
+                .await?;
+            if restore
+                && let Err(error) = self
+                    .subscribe_loop_for_user(chat_id, loop_id, reopened.clone(), frequency)
+                    .await
+            {
+                refusals.push(error.to_string());
+            }
+        }
+        if refusals.is_empty() {
+            return Ok(());
+        }
+        Err(AgentError::Invalid(format!(
+            "{} of its Tick Subscriptions could not follow: {}",
+            refusals.len(),
+            refusals.join("; ")
+        )))
+    }
+
+    /// Subscribes `loop_id` to `instance` at `frequency` on its user's word, as an approved
+    /// SubscribeTick would without asking: the watch is admitted under the Chat's current
+    /// authority, and a Deny rule for it still refuses it.
+    async fn subscribe_loop_for_user(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        instance: InstanceRef,
+        frequency: TickSubscriptionFrequency,
+    ) -> Result<(), AgentError> {
+        check_frequency(&instance, frequency).map_err(AgentError::Invalid)?;
+        let port = self
+            .tick_deliveries()
+            .port
+            .clone()
+            .ok_or_else(|| AgentError::Invalid("Tick Subscriptions are unavailable".into()))?;
+        let input = json!({"tick_instance_id": instance, "frequency": frequency});
+        let watch = port
+            .prepare_watch(chat_id, &instance, &input, CancellationToken::new())
+            .await
+            .map_err(AgentError::Invalid)?;
+        let (authority, admission) = match watch {
+            Some(watch) => (
+                watch
+                    .host_authority()
+                    .map_err(AgentError::Invalid)?
+                    .and_then(|binding| binding.authority),
+                Some(watch.into_admission(input.clone())),
+            ),
+            None => (None, None),
+        };
+        let (policy_name, permission_input) = admission
+            .as_ref()
+            .map_or((SUBSCRIBE_TICK_TOOL, &input), |admission| {
+                (admission.policy_name(), admission.permission_input())
+            });
+        self.refresh_project_rules(chat_id).await?;
+        let mut trigger = {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+            let session_operation = SessionPermissionOperation::from_normalized(
+                policy_name.to_owned(),
+                permission_input.clone(),
+                super::session_permissions::capture_workspace_scope(
+                    &configured_workspace_for_chat(chat),
+                )
+                .map_err(|error| AgentError::Invalid(error.to_string()))?,
+            )
+            .map_err(|error| AgentError::Invalid(error.to_string()))?;
+            let session = self.inner.session_permissions.lock().await.evaluate(
+                PermissionOwner::new(chat_id, loop_id)
+                    .map_err(|error| AgentError::Invalid(error.to_string()))?,
+                &session_operation,
+            );
+            let decision = chat.snapshot.policy.explicit_match_with_session(
+                policy_name,
+                permission_input,
+                loop_id,
+                session.decision,
+            );
+            if decision == Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Deny)
+            {
+                return Err(AgentError::Invalid(format!(
+                    "a Deny rule for {policy_name} refuses subscribing to {instance}"
+                )));
+            }
+            let goal = chat
+                .snapshot
+                .loops
+                .iter()
+                .find(|goal| goal.id == loop_id)
+                .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
+                .ok_or_else(|| AgentError::Invalid(NO_SUBSCRIBING_LOOP.into()))?;
+            goal.trigger.clone().unwrap_or_else(|| Trigger {
+                id: Uuid::new_v4(),
+                prompt: goal.goal.clone(),
+                interval_seconds: None,
+                expires_at_ms: None,
+                accepts_events: true,
+                armed: true,
+                subscriptions: Vec::new(),
+            })
+        };
+        if trigger
+            .subscriptions
+            .iter()
+            .any(|subscription| subscription.instance == instance)
+        {
+            return Err(AgentError::Invalid(ALREADY_SUBSCRIBED.into()));
+        }
+        trigger.accepts_events = true;
+        trigger.subscriptions.push(TickSubscription {
+            id: Uuid::new_v4(),
+            instance,
+            frequency,
+            authority,
+        });
         self.configure_trigger(chat_id, loop_id, Some(trigger))
             .await
     }

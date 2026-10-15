@@ -3111,6 +3111,15 @@ impl ConsoleExecution {
         .await
         .map(|_| ())
     }
+    pub(super) async fn subscribe_tick(
+        &self,
+        chat: Uuid,
+        instance: tick_protocol::InstanceRef,
+    ) -> Result<(), AccessError> {
+        self.loop_command(chat, LoopAction::SubscribeTick { instance })
+            .await
+            .map(|_| ())
+    }
     pub(super) async fn add_artifact_tick(
         &self,
         chat: Uuid,
@@ -3218,14 +3227,18 @@ impl ConsoleExecution {
             _ => Err(unexpected()),
         }
     }
+    /// Reopens a hosted Tick that no longer runs in its row's place; the result names the new
+    /// instance, the Chat's Monitor membership, and why subscriptions asked to follow did not.
     pub(super) async fn reopen_hosted_tick(
         &self,
         chat: Uuid,
         instance: tick_protocol::InstanceRef,
+        restore_subscriptions: bool,
     ) -> Result<
         (
             tick_protocol::InstanceRef,
             tickloop_agent_protocol::MonitorMembership,
+            Option<String>,
         ),
         AccessError,
     > {
@@ -3235,6 +3248,7 @@ impl ConsoleExecution {
                 AgentCommand::ReopenHostedTick {
                     execution,
                     instance,
+                    restore_subscriptions,
                 },
                 None,
             )
@@ -3243,7 +3257,8 @@ impl ConsoleExecution {
             CommandResult::HostedTickReopened {
                 instance,
                 membership,
-            } => Ok((instance, membership)),
+                restore_error,
+            } => Ok((instance, membership, restore_error)),
             _ => Err(unexpected()),
         }
     }
