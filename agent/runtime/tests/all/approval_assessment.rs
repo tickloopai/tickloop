@@ -79,6 +79,7 @@ async fn agent_reports_typed_assessment_for_each_actual_reviewer() {
             requests: Mutex::new(Vec::new()),
         });
         let agent = Agent::new_embedded(config(), model);
+        agent.install_own_tickhost();
         if use_jev {
             agent.set_judgment_client(jev.clone()).await;
         } else {

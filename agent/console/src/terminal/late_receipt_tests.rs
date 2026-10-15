@@ -233,6 +233,7 @@ async fn run_late_receipt_fixture() {
             flag: directory.join("hold-model"),
         }),
     );
+    core.install_own_tickhost();
     let workdir = std::env::current_dir().unwrap();
     let adapter = Arc::new(LateReceiptDaemon {
         daemon: EmbeddedAgentAccess::new(core.clone()),

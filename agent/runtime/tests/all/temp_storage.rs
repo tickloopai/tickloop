@@ -96,6 +96,7 @@ async fn invoke_bash() -> ToolResult {
         tickloop_agent_test_support::text("The shell worked."),
     ]));
     let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model);
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
         .set_execution_mode(chat, ExecutionMode::FullAccess)

@@ -129,6 +129,7 @@ async fn fixture(
             ..Default::default()
         },
     );
+    agent.install_own_tickhost();
     let reviewer = Arc::new(Reviewer {
         outcome,
         calls: AtomicUsize::new(0),
@@ -173,6 +174,7 @@ async fn selected_jev_configuration_failure_falls_back_to_the_conversation_model
         model.clone(),
         tickloop_agent_config::UserSettings::in_root(&root),
     );
+    agent.install_own_tickhost();
     let chat = agent.create_chat(workdir.clone()).await.unwrap();
     agent
         .set_execution_mode(chat, ExecutionMode::Auto)

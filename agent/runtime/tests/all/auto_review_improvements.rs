@@ -297,6 +297,7 @@ async fn shell_fast_paths_and_wrapped_commands_match_claude_auto_review_routing(
                     text("done"),
                 ])),
             );
+            agent.install_own_tickhost();
             agent.set_auto_reviewer(reviewer.clone()).await;
             let chat = agent.create_chat(directory.path().into()).await.unwrap();
             agent
@@ -398,6 +399,7 @@ async fn prepared_facts_and_dependency_baseline_reach_review_before_dispatch() {
         text("done"),
     ]));
     let agent = Agent::new_embedded(config(), model);
+    agent.install_own_tickhost();
     agent.set_auto_reviewer(reviewer.clone()).await;
     let chat = agent.create_chat(temp.path().into()).await.unwrap();
     agent

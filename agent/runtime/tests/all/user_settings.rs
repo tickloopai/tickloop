@@ -537,6 +537,7 @@ async fn a_saved_shell_rule_applies_immediately_to_the_current_session() {
         text("second done"),
     ]));
     let agent = Agent::open_embedded(root.clone(), config(), model).unwrap();
+    agent.install_own_tickhost();
     let first = agent.create_chat(workdir.clone()).await.unwrap();
     let second = agent.create_chat(workdir.clone()).await.unwrap();
 

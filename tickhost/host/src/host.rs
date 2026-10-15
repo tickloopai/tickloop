@@ -49,7 +49,7 @@ use crate::{
     screen::Screen,
     shell::{
         CANCELLED_REASON, ShellIdentity, ShellTask, SpawnBinding, SpawnGrant, SpawnGrants,
-        SpawnRequest, SpawnedShell,
+        SpawnRequest, SpawnedShell, environment_digest,
     },
     views::{ViewGrants, Views},
 };
@@ -809,8 +809,7 @@ impl Host {
                 "this owner was ended; it cannot open Ticks",
             ));
         }
-        let launcher = command
-            .spawn()
+        let launcher = hosted::spawn_child(|| command.spawn())
             .map_err(|error| HostError::before("LaunchFailed", error.to_string()))?;
         let launcher_pid = launcher.id().ok_or_else(|| {
             HostError::before("LaunchFailed", "the launcher exited before it started")
@@ -1183,8 +1182,8 @@ impl Host {
         }))
     }
 
-    /// Starts the task a claimed grant admitted. The request must be exactly what the grant
-    /// binds, for the daemon that still controls this host.
+    /// Starts the task a claimed grant admitted. The request, its environment included, must be
+    /// exactly what the grant binds, for the daemon that still controls this host.
     async fn start_shell(
         &self,
         granted: &SpawnBinding,
@@ -1192,7 +1191,9 @@ impl Host {
         directory: std::os::fd::OwnedFd,
         output: std::os::fd::OwnedFd,
     ) -> Result<Arc<ShellTask>, HostError> {
-        if &request.binding != granted {
+        if &request.binding != granted
+            || environment_digest(&request.environment) != granted.approval.environment
+        {
             return Err(HostError::before(
                 "Forbidden",
                 "the request differs from what its spawn grant binds",
@@ -1205,7 +1206,7 @@ impl Host {
                 "the Tickhost is stopping",
             ));
         }
-        if state.controller_epoch != Some(granted.identity.daemon_epoch) {
+        if state.controllers == 0 || state.controller_epoch != Some(granted.identity.daemon_epoch) {
             return Err(HostError::before(
                 "Fenced",
                 "the Agent daemon that granted this spawn no longer controls this Tickhost",
@@ -1369,12 +1370,9 @@ impl Host {
                 tick.remove_session_directory();
             });
         }
+        // Each task's spawner stops it, reports its exit, then lets the host forget it.
         for task in shells {
-            closing.spawn(async move {
-                task.stop(CANCELLED_REASON);
-                task.ended().await;
-                task.released.cancel();
-            });
+            closing.spawn(async move { task.released.cancelled().await });
         }
         while closing.join_next().await.is_some() {}
         let mut state = self.state.lock().await;
@@ -1787,13 +1785,14 @@ impl Departure {
     }
 
     /// Accounts for the connection's end: the last connection of the current controller stops
-    /// every Shell task.
+    /// every Shell task and withdraws the spawn grants nobody claimed yet.
     async fn leave(self, host: &Host) {
         let mut state = host.state.lock().await;
         match self {
             Self::Controller(generation) if state.controller_generation == generation => {
                 state.controllers -= 1;
                 if state.controllers == 0 {
+                    state.spawn_grants.clear();
                     state.stop_shells();
                 }
             }
@@ -2687,24 +2686,38 @@ async fn serve_spawner(
         enum SpawnerRequest {
             Stop { reason: String },
         }
-        let mut reported = false;
-        loop {
+        // A stopping host stops the task too, and still reports its exit before it leaves.
+        let mut is_stopping = false;
+        let exit = loop {
             tokio::select! {
                 biased;
-                _ = host.shutdown.cancelled() => return Ok(()),
-                exit = task.ended(), if !reported => {
-                    reported = true;
-                    write_within(
-                        &mut writer,
-                        &json!({"event":"exited","exit":exit}),
-                        BUSINESS_FRAME_BYTES,
-                        STREAM_WRITE_TIMEOUT,
-                    )
-                    .await?;
+                exit = task.ended() => break exit,
+                _ = host.shutdown.cancelled(), if !is_stopping => {
+                    is_stopping = true;
+                    task.stop(CANCELLED_REASON);
                 }
                 request = hosted::read_frame(&mut reader, ATTACH_REQUEST_FRAME_BYTES) => match request? {
                     Some(request) => match parameters(request)? {
                         SpawnerRequest::Stop { reason } => task.stop(&reason),
+                    },
+                    None => return Ok(()),
+                },
+            }
+        };
+        write_within(
+            &mut writer,
+            &json!({"event":"exited","exit":exit}),
+            BUSINESS_FRAME_BYTES,
+            STREAM_WRITE_TIMEOUT,
+        )
+        .await?;
+        loop {
+            tokio::select! {
+                biased;
+                _ = host.shutdown.cancelled() => return Ok(()),
+                request = hosted::read_frame(&mut reader, ATTACH_REQUEST_FRAME_BYTES) => match request? {
+                    Some(request) => match parameters(request)? {
+                        SpawnerRequest::Stop { .. } => {}
                     },
                     None => return Ok(()),
                 },

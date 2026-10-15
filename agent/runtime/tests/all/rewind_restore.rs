@@ -95,6 +95,7 @@ async fn code_rewind_restores_modified_created_and_deleted_files() {
         text("second answer"),
     ]));
     let agent = Agent::open_embedded(directory.path().join("state"), config(), model).unwrap();
+    agent.install_own_tickhost();
     let chat = agent.create_chat(workdir.clone()).await.unwrap();
     let mut events = agent.subscribe();
     run_prompt(&agent, &mut events, chat, None, "change three files").await;

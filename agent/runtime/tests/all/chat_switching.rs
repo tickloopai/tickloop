@@ -171,6 +171,7 @@ async fn a_scheduled_loop_in_a_background_chat_keeps_running_and_writes_only_to_
 async fn the_task_center_lists_tasks_from_every_chat_with_their_owner() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::<Vec<_>>::new())));
+    agent.install_own_tickhost();
     let background = agent.create_chat(directory.path().into()).await.unwrap();
     let foreground = agent.create_chat(directory.path().into()).await.unwrap();
     let receipt = agent

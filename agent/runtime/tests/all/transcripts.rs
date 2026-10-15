@@ -336,6 +336,7 @@ async fn killed_process_fixture() {
         },
     )
     .unwrap();
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.clone()).await.unwrap();
     agent
         .set_execution_mode(chat, ExecutionMode::AcceptEdits)

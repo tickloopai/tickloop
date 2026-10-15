@@ -22,7 +22,7 @@ use tickloop_agent_base::private_fs::PrivateDirectory;
 
 mod command_tables;
 mod host;
-pub use host::{ShellExit, ShellHost, ShellLaunch, ShellProcess};
+pub use host::{ShellExit, ShellHost, ShellLaunch, ShellProcess, ShellStartError};
 mod interpreter;
 mod model_result;
 mod path_constraints;
@@ -985,7 +985,7 @@ impl Registry {
                 description: input.description.clone(),
                 cwd: cwd.into(),
                 pid: None,
-                state: initial_state,
+                state: initial_state.clone(),
                 was_background: input.run_in_background,
                 backgrounded_on_timeout: false,
                 exit_code: None,
@@ -1004,7 +1004,7 @@ impl Registry {
                 command: input.command.clone(),
                 cwd: cwd.into(),
                 pid: None,
-                state: initial_state,
+                state: initial_state.clone(),
                 was_background: input.run_in_background,
                 backgrounded_on_timeout: false,
                 exit_code: None,
@@ -1018,7 +1018,8 @@ impl Registry {
             snapshot,
             result: None,
         });
-        let command_cancel = CancellationToken::new();
+        // Stopping the command and cancelling its operation both cancel it.
+        let command_cancel = cancel.child_token();
         self.entries.lock().await.insert(
             operation_id,
             Entry {
@@ -1037,17 +1038,86 @@ impl Registry {
                 cwd: cwd.into(),
                 directory,
                 output,
+                cancel: command_cancel.clone(),
             })
             .await;
-        let mut process = match started {
-            Ok(process) => process,
-            Err(error) => {
-                self.entries.lock().await.remove(&operation_id);
+        let foreground_timeout = input.foreground_timeout();
+        let started_snapshot = match started {
+            Ok(process) => {
+                self.follow(
+                    operation_id,
+                    process,
+                    command_cancel,
+                    foreground_timeout,
+                    allows_auto_background(&input.command),
+                )
+                .await
+            }
+            Err(ShellStartError::NotStarted(ToolError::Cancelled)) => {
+                // Nothing was dispatched, so nothing ran; it ends as a command stopped before it
+                // started, without a process, for whoever stopped it to see.
+                let exit = ShellExit {
+                    exit_code: None,
+                    signal: None,
+                    reason: Some(CANCELLED_COMMAND_REASON.into()),
+                    state: CommandState::Failed,
+                };
+                self.end_unstarted(operation_id, exit, foreground_timeout)
+                    .await
+            }
+            Err(ShellStartError::NotStarted(error)) => {
+                self.forget_unstarted(operation_id, &initial_state, &error)
+                    .await;
                 return Err(error);
             }
+            Err(ShellStartError::OutcomeUnknown(reason)) => {
+                let exit = ShellExit {
+                    exit_code: None,
+                    signal: None,
+                    reason: Some(reason),
+                    state: CommandState::Unknown,
+                };
+                self.end_unstarted(operation_id, exit, foreground_timeout)
+                    .await
+            }
         };
-        // The command as it started: in the background or stopping when that was asked for
-        // meanwhile.
+        if !wait_for_completion {
+            return process_output(&started_snapshot, 0, DEFAULT_OUTPUT_BYTES);
+        }
+        loop {
+            let update = receiver.borrow().clone();
+            if let Some(result) = update.result {
+                return Ok(result);
+            }
+            if update.snapshot.state() == &CommandState::Background {
+                return match &update.snapshot {
+                    ProcessSnapshot::Agent(command) => Ok(model_result::background_started(
+                        command,
+                        !input.run_in_background && !command.backgrounded_on_timeout,
+                    )),
+                    ProcessSnapshot::User(_) => {
+                        process_output(&update.snapshot, 0, DEFAULT_OUTPUT_BYTES)
+                    }
+                };
+            }
+            if receiver.changed().await.is_err() {
+                return Err(ToolError::InvalidInput(
+                    "command status channel closed before a result".into(),
+                ));
+            }
+        }
+    }
+
+    /// Follows a command its host started until it ends, and returns it as it started: in the
+    /// background or stopping when that was asked for while it started.
+    async fn follow(
+        &self,
+        operation_id: Uuid,
+        mut process: Box<dyn ShellProcess>,
+        cancel: CancellationToken,
+        foreground_timeout: Duration,
+        moves_to_background_on_timeout: bool,
+    ) -> ProcessSnapshot {
         let snapshot = {
             let entries = self.entries.lock().await;
             let entry = entries
@@ -1060,10 +1130,7 @@ impl Registry {
         };
         self.emit(&snapshot);
         let started_snapshot = snapshot.clone();
-        let input_started_in_background = input.run_in_background;
         let registry = self.clone();
-        let foreground_timeout = input.foreground_timeout();
-        let moves_to_background_on_timeout = allows_auto_background(&input.command);
         tokio::spawn(async move {
             let mut snapshot = snapshot;
             // Like Claude Code's `ShellCommand.background`, moving to the background ends the
@@ -1078,11 +1145,6 @@ impl Registry {
                 tokio::select! {
                     exit = process.exited() => break exit,
                     _ = cancel.cancelled() => {
-                        snapshot.set_reason(CANCELLED_COMMAND_REASON.into());
-                        process.stop(CANCELLED_COMMAND_REASON).await;
-                        break process.exited().await;
-                    }
-                    _ = command_cancel.cancelled() => {
                         snapshot.set_reason(CANCELLED_COMMAND_REASON.into());
                         process.stop(CANCELLED_COMMAND_REASON).await;
                         break process.exited().await;
@@ -1126,52 +1188,92 @@ impl Registry {
             };
             // The host forgets the command once its exit is recorded here.
             drop(process);
-            snapshot.finish(exit);
-            let result = match &snapshot {
-                ProcessSnapshot::Agent(command) => {
-                    model_result::finished(command, foreground_timeout)
-                }
-                ProcessSnapshot::User(_) => process_output(&snapshot, 0, DEFAULT_OUTPUT_BYTES)
-                    .unwrap_or_else(|error| ToolResult {
-                        content: error.to_string(),
-                        is_error: true,
-                        output_ref: Some(snapshot.output_ref().into()),
-                    }),
-            };
-            if let Some(entry) = registry.entries.lock().await.get(&operation_id) {
-                snapshot.merge_background_history(&entry.updates.borrow().snapshot);
-                entry.updates.send_replace(Update {
-                    snapshot: snapshot.clone(),
-                    result: Some(result),
-                });
-            }
-            registry.emit(&snapshot);
+            registry
+                .record_end(operation_id, snapshot, exit, foreground_timeout)
+                .await;
         });
-        if !wait_for_completion {
-            return process_output(&started_snapshot, 0, DEFAULT_OUTPUT_BYTES);
+        started_snapshot
+    }
+
+    /// Records how a command ended and publishes it with the result it gives.
+    async fn record_end(
+        &self,
+        operation_id: Uuid,
+        mut snapshot: ProcessSnapshot,
+        exit: ShellExit,
+        foreground_timeout: Duration,
+    ) -> ProcessSnapshot {
+        snapshot.finish(exit);
+        let result = match &snapshot {
+            ProcessSnapshot::Agent(command) => model_result::finished(command, foreground_timeout),
+            ProcessSnapshot::User(_) => process_output(&snapshot, 0, DEFAULT_OUTPUT_BYTES)
+                .unwrap_or_else(|error| ToolResult {
+                    content: error.to_string(),
+                    is_error: true,
+                    output_ref: Some(snapshot.output_ref().into()),
+                }),
+        };
+        if let Some(entry) = self.entries.lock().await.get(&operation_id) {
+            snapshot.merge_background_history(&entry.updates.borrow().snapshot);
+            entry.updates.send_replace(Update {
+                snapshot: snapshot.clone(),
+                result: Some(result),
+            });
         }
-        loop {
-            let update = receiver.borrow().clone();
-            if let Some(result) = update.result {
-                return Ok(result);
-            }
-            if update.snapshot.state() == &CommandState::Background {
-                return match &update.snapshot {
-                    ProcessSnapshot::Agent(command) => Ok(model_result::background_started(
-                        command,
-                        !input_started_in_background && !command.backgrounded_on_timeout,
-                    )),
-                    ProcessSnapshot::User(_) => {
-                        process_output(&update.snapshot, 0, DEFAULT_OUTPUT_BYTES)
-                    }
-                };
-            }
-            if receiver.changed().await.is_err() {
-                return Err(ToolError::InvalidInput(
-                    "command status channel closed before a result".into(),
-                ));
-            }
+        self.emit(&snapshot);
+        snapshot
+    }
+
+    /// Ends a listed command its host did not start as asked, without a process.
+    async fn end_unstarted(
+        &self,
+        operation_id: Uuid,
+        exit: ShellExit,
+        foreground_timeout: Duration,
+    ) -> ProcessSnapshot {
+        let snapshot = self
+            .entries
+            .lock()
+            .await
+            .get(&operation_id)
+            .expect("a starting command stays listed")
+            .updates
+            .borrow()
+            .snapshot
+            .clone();
+        self.record_end(operation_id, snapshot, exit, foreground_timeout)
+            .await
+    }
+
+    /// Forgets a command its host refused to start, like one refused before it was listed. A stop
+    /// or move to the background published it while it started; it is then published once more,
+    /// ended for `error`, which also answers whoever waits for its end.
+    async fn forget_unstarted(
+        &self,
+        operation_id: Uuid,
+        initial_state: &CommandState,
+        error: &ToolError,
+    ) {
+        let Some(entry) = self.entries.lock().await.remove(&operation_id) else {
+            return;
+        };
+        let mut update = entry.updates.borrow().clone();
+        if update.snapshot.state() == initial_state {
+            return;
         }
+        update.snapshot.finish(ShellExit {
+            exit_code: None,
+            signal: None,
+            reason: Some(error.to_string()),
+            state: CommandState::Failed,
+        });
+        update.result = Some(ToolResult {
+            content: error.to_string(),
+            is_error: true,
+            output_ref: Some(update.snapshot.output_ref().into()),
+        });
+        entry.updates.send_replace(update.clone());
+        self.emit(&update.snapshot);
     }
 }
 
@@ -1263,7 +1365,11 @@ mod tests {
         started: Arc<tokio::sync::Notify>,
         /// Held by a test to keep commands starting.
         starting: Arc<Mutex<()>>,
+        /// Set by a test to lose the answer to every start after dispatching it.
+        loses_answers: Arc<std::sync::atomic::AtomicBool>,
     }
+
+    const LOST_ANSWER: &str = "the host's answer was lost; the command may have run";
 
     struct Launched {
         operation_id: Uuid,
@@ -1286,8 +1392,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ShellHost for ScriptedHost {
-        async fn start(&self, launch: ShellLaunch) -> Result<Box<dyn ShellProcess>, ToolError> {
+        async fn start(
+            &self,
+            launch: ShellLaunch,
+        ) -> Result<Box<dyn ShellProcess>, ShellStartError> {
             drop(self.starting.lock().await);
+            // As the Tickhost's spawns, a launch cancelled while it waited is never dispatched.
+            if launch.cancel.is_cancelled() {
+                return Err(ShellStartError::NotStarted(ToolError::Cancelled));
+            }
+            if self.loses_answers.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ShellStartError::OutcomeUnknown(LOST_ANSWER.into()));
+            }
             let exit = watch::channel(None).0;
             let stops = Arc::default();
             let process = ScriptedProcess {
@@ -1382,6 +1498,14 @@ mod tests {
 
         fn stops(&self, operation_id: Uuid) -> Vec<String> {
             self.with_launch(operation_id, |launch| launch.stops.lock().unwrap().clone())
+        }
+
+        fn is_launched(&self, operation_id: Uuid) -> bool {
+            self.launches
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|launch| launch.operation_id == operation_id)
         }
     }
 
@@ -1758,11 +1882,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_command_is_moved_to_the_background_or_stopped_while_its_host_starts_it() {
+    async fn a_starting_command_can_move_to_the_background_but_one_stopped_meanwhile_never_starts()
+    {
         let host = ScriptedHost::default();
         let registry = host.registry();
         let workdir = Workdir::new();
         let chat_id = Uuid::new_v4();
+        let mut updates = registry.subscribe_user();
         let starting = host.starting.lock().await;
         let backgrounded = Uuid::new_v4();
         let stopped = Uuid::new_v4();
@@ -1814,10 +1940,28 @@ mod tests {
         drop(starting);
         let stopped_snapshot = stopping.await.unwrap().unwrap();
         assert_eq!(
-            stopped_snapshot.reason.as_deref(),
-            Some(CANCELLED_COMMAND_REASON)
+            (
+                stopped_snapshot.state,
+                stopped_snapshot.reason.as_deref(),
+                stopped_snapshot.pid
+            ),
+            (CommandState::Failed, Some(CANCELLED_COMMAND_REASON), None)
         );
-        assert_eq!(host.stops(stopped), [CANCELLED_COMMAND_REASON]);
+        let published_end = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = updates.recv().await.unwrap();
+                if snapshot.operation_id == stopped && is_terminal(&snapshot.state) {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .expect("the stop's published command ends");
+        assert_eq!(
+            (published_end.state, published_end.pid),
+            (CommandState::Failed, None)
+        );
+        assert!(!host.is_launched(stopped));
         let running = loop {
             let snapshot = user_snapshot(&registry, backgrounded).await;
             if snapshot.pid.is_some() {
@@ -1828,6 +1972,92 @@ mod tests {
         assert_eq!(running.state, CommandState::Background);
         assert_eq!(running.pid, Some(4242));
         assert!(host.stops(backgrounded).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_command_whose_operation_is_cancelled_while_its_host_starts_it_never_starts() {
+        let host = ScriptedHost::default();
+        let registry = host.registry();
+        let workdir = Workdir::new();
+        let operation_id = Uuid::new_v4();
+        let cancel = CancellationToken::new();
+        let starting = host.starting.lock().await;
+        let execution = tokio::spawn({
+            let registry = registry.clone();
+            let input = workdir.input("touch probe");
+            let cwd = workdir.path.clone();
+            let output = workdir.output();
+            let cancel = cancel.clone();
+            async move {
+                registry
+                    .execute(&cwd, input, &output, operation_id, Uuid::new_v4(), cancel)
+                    .await
+            }
+        });
+        while registry.state(operation_id).await.is_none() {
+            tokio::task::yield_now().await;
+        }
+        cancel.cancel();
+        drop(starting);
+        let result = execution.await.unwrap().unwrap();
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("aborted before completion"),
+            "{}",
+            result.content
+        );
+        assert!(!host.is_launched(operation_id));
+        let ended = registry
+            .snapshots()
+            .await
+            .into_iter()
+            .find(|snapshot| snapshot.operation_id == operation_id)
+            .unwrap();
+        assert_eq!(
+            (ended.state, ended.reason.as_deref(), ended.pid),
+            (CommandState::Failed, Some(CANCELLED_COMMAND_REASON), None)
+        );
+        // A stop that follows the cancel, as a user's stop of a `!` command does, finds it ended.
+        let stopped = registry.stop(operation_id).await.unwrap();
+        assert_eq!((stopped.state, stopped.pid), (CommandState::Failed, None));
+    }
+
+    #[tokio::test]
+    async fn a_start_whose_answer_was_lost_stays_listed_with_an_unknown_outcome() {
+        let host = ScriptedHost::default();
+        host.loses_answers
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let registry = host.registry();
+        let workdir = Workdir::new();
+        let mut updates = registry.subscribe();
+        let operation_id = Uuid::new_v4();
+        let result = agent_command(
+            &registry,
+            &workdir,
+            workdir.input("touch probe"),
+            operation_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.is_error);
+        assert!(result.content.contains(LOST_ANSWER), "{}", result.content);
+        let ended = wait_for_terminal_agent_snapshot(&mut updates, operation_id).await;
+        assert_eq!(
+            (ended.state, ended.reason.as_deref(), ended.pid),
+            (CommandState::Unknown, Some(LOST_ANSWER), None)
+        );
+        assert_eq!(
+            registry.state(operation_id).await,
+            Some(CommandState::Unknown)
+        );
+        assert_eq!(
+            registry
+                .finished_result(operation_id)
+                .await
+                .map(|finished| finished.content),
+            Some(result.content)
+        );
     }
 
     #[test]

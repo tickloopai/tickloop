@@ -445,7 +445,9 @@ async fn background_shell_output_of_concurrent_agents_is_written_under_each_chat
         Arc::new(ScriptedModel::new(Vec::new())),
     )
     .unwrap();
+    first.install_own_tickhost();
     let second = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
+    second.install_own_tickhost();
     let mut outputs = Vec::new();
     for (agent, marker) in [(&first, "first-output"), (&second, "second-output")] {
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -841,6 +843,7 @@ async fn task_output_is_readable_by_its_session_but_another_session_requires_app
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(Vec::new()));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let shell = agent
         .submit_user_shell_for_goal(chat, None, "printf visible".into(), true)

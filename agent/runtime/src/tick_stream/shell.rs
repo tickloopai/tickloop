@@ -1,7 +1,8 @@
 //! Tick Updates of Shell tasks, which run in the Tickhost. A Shell Tick updates once, when its
-//! task ends: the Tickhost pushes the exit of a task it runs. A watch that joins a task that
-//! already ended takes that end as its baseline. Watches stay in the Chat whose Shell tasks list
-//! the task, and need no host authority of their own.
+//! task ends, and that update is always the end this Agent recorded for the task, however the
+//! Tickhost reported it. A watch that joins a task that already ended takes that end as its
+//! baseline. Watches stay in the Chat whose Shell tasks list the task, and need no host authority
+//! of their own.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -9,10 +10,7 @@ use std::{
 };
 
 use serde_json::json;
-use tickhost::shell::{OUTPUT_TAIL_BYTES, ShellRead};
-use tickhost_connect::hosted::{
-    CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, OBSERVATION_FRAME_BYTES, Role,
-};
+use tickhost::shell::OUTPUT_TAIL_BYTES;
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -21,10 +19,7 @@ use super::{
     RECONNECT_PAUSE, TickConnectionState, TickMetadata, TickObservation, TickStreamHandle,
     TickStreamPort, WatchAdmission, WatchId, follow_instances,
 };
-use crate::{
-    Agent, ShellTaskCenter, WeakAgent,
-    hosted::shells::{ShellReader, ShellTasks},
-};
+use crate::{Agent, ShellTaskCenter, WeakAgent};
 use tickloop_agent_protocol::{HostToolAuthority, ObservationKind, ShellTask};
 
 const RECOVER_WITH: &str =
@@ -34,7 +29,6 @@ const EXIT_SEQUENCE: u64 = 1;
 
 pub struct ShellTickStream {
     agent: WeakAgent,
-    tasks: Arc<ShellTasks>,
     chats: watch::Sender<BTreeMap<WatchId, Uuid>>,
     authorities: watch::Sender<BTreeMap<WatchId, HostToolAuthority>>,
     budget: ConnectionBudget,
@@ -43,7 +37,6 @@ pub struct ShellTickStream {
 impl ShellTickStream {
     pub fn new(agent: Agent) -> Self {
         Self {
-            tasks: agent.shell_tasks(),
             agent: agent.downgrade(),
             chats: watch::channel(BTreeMap::new()).0,
             authorities: watch::channel(BTreeMap::new()).0,
@@ -54,7 +47,6 @@ impl ShellTickStream {
     fn scope(&self) -> ShellScope {
         ShellScope {
             agent: self.agent.clone(),
-            tasks: self.tasks.clone(),
             chats: self.chats.subscribe(),
             authorities: self.authorities.subscribe(),
             budget: self.budget.clone(),
@@ -71,7 +63,6 @@ fn task_of(instance: &InstanceRef) -> Option<Uuid> {
 #[derive(Clone)]
 struct ShellScope {
     agent: WeakAgent,
-    tasks: Arc<ShellTasks>,
     chats: watch::Receiver<BTreeMap<WatchId, Uuid>>,
     authorities: watch::Receiver<BTreeMap<WatchId, HostToolAuthority>>,
     budget: ConnectionBudget,
@@ -189,7 +180,6 @@ impl InstanceObserver for ShellScope {
             return;
         };
         let events = TaskEvents {
-            started: self.tasks.changes(),
             agent: agent.subscribe(),
             user_shells: agent.subscribe_user_shells(),
         };
@@ -208,10 +198,8 @@ impl InstanceObserver for ShellScope {
     }
 }
 
-/// What can change a task that does not run in the Tickhost: it starts there, or the Agent
-/// records how it ended without it ever starting.
+/// What changes the record of a task: the Agent records its commands and its user's `!` commands.
 struct TaskEvents {
-    started: watch::Receiver<()>,
     agent: tokio::sync::broadcast::Receiver<tickloop_agent_protocol::Event>,
     user_shells: tokio::sync::broadcast::Receiver<tickloop_agent_protocol::UserShellRecord>,
 }
@@ -221,23 +209,10 @@ impl TaskEvents {
     async fn changed(&mut self) -> bool {
         use tokio::sync::broadcast::error::RecvError;
         tokio::select! {
-            changed = self.started.changed() => changed.is_ok(),
             event = self.agent.recv() => !matches!(event, Err(RecvError::Closed)),
             event = self.user_shells.recv() => !matches!(event, Err(RecvError::Closed)),
         }
     }
-}
-
-/// How following a task the Tickhost runs ended.
-enum Watched {
-    /// The task ended, and every watch that saw it run was told.
-    Ended,
-    /// The Tickhost forgot the task before a watch saw it end; its record tells the end.
-    Forgotten,
-    /// The connection was lost while the task may still run.
-    Lost,
-    /// Nobody wants the task any more.
-    Unwanted,
 }
 
 /// Follows one task for the watches that want it.
@@ -255,7 +230,6 @@ struct ShellObserver {
 
 impl ShellObserver {
     async fn follow(mut self, mut events: TaskEvents) {
-        let mut has_ended = false;
         loop {
             let requested = self.wanted.borrow_and_update().clone();
             let admitted = self
@@ -297,42 +271,12 @@ impl ShellObserver {
                 }
                 continue;
             }
-            if let Some(reader) = self.scope.tasks.reader(self.task).filter(|_| !has_ended) {
-                let attempted = self
-                    .scope
-                    .budget
-                    .take(&owned, &self.instance, &self.publisher);
-                if attempted.is_empty() {
-                    if self.wanted.changed().await.is_err() {
-                        return;
-                    }
-                    continue;
-                }
-                match self.watch_running(&reader, &listed).await {
-                    Watched::Ended => has_ended = true,
-                    Watched::Forgotten => {}
-                    Watched::Unwanted => return,
-                    Watched::Lost => {
-                        self.publisher.state_to(
-                            self.instance.clone(),
-                            TickConnectionState::Disconnected,
-                            attempted,
-                        );
-                        if !self.pause().await {
-                            return;
-                        }
-                    }
-                }
-                continue;
-            }
-            let is_ended = has_ended || listed.state.is_terminal();
+            let is_ended = listed.state.is_terminal();
             if is_ended && !self.awaiting_exit.is_empty() {
-                // It ended where no Tickhost read told it; its record does.
                 let ended = self.recorded_end(&listed).await;
                 let awaiting = std::mem::take(&mut self.awaiting_exit);
                 self.publisher
                     .observation(&awaiting.into_iter().collect::<Vec<_>>(), ended);
-                has_ended = true;
             }
             self.baseline(&owned, &listed, is_ended);
             let changed = if is_ended {
@@ -386,74 +330,6 @@ impl ShellObserver {
         }
     }
 
-    /// Watches a task the Tickhost runs until it ends there.
-    async fn watch_running(&mut self, reader: &ShellReader, listed: &ShellTask) -> Watched {
-        let registered = async {
-            let mut connection = HostConnection::connect(
-                &reader.endpoint,
-                Role::Instance {
-                    instance: reader.instance.clone(),
-                    data_token: reader.data_token.clone(),
-                },
-                &[CAPABILITY_DATA],
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-            let registered = connection
-                .request("watch", json!({}), CONTROL_TIMEOUT)
-                .await
-                .map_err(|error| error.to_string())?;
-            let read: ShellRead = serde_json::from_value(registered["read"].clone())
-                .map_err(|error| error.to_string())?;
-            Ok::<_, String>((connection, read))
-        };
-        let Ok((mut connection, read)) = registered.await else {
-            return Watched::Lost;
-        };
-        let mut ended = read.exit.is_some().then_some(read);
-        loop {
-            let owned = self.scope.owned(
-                &self.wanted.borrow_and_update().clone(),
-                listed.chat_id,
-                &self.instance,
-                &self.publisher,
-            );
-            if owned.is_empty() {
-                return Watched::Unwanted;
-            }
-            if let Some(ended) = &ended {
-                let ended_at_ms = ended.exit.as_ref().map(|exit| exit.ended_at_ms);
-                self.publisher.metadata(
-                    self.instance.clone(),
-                    owned.iter().copied(),
-                    Self::metadata(listed, ended_at_ms),
-                );
-                let awaiting = std::mem::take(&mut self.awaiting_exit);
-                if !awaiting.is_empty() {
-                    self.publisher.observation(
-                        &awaiting.into_iter().collect::<Vec<_>>(),
-                        exit_observation(&self.instance, ended),
-                    );
-                }
-                return Watched::Ended;
-            }
-            self.baseline(&owned, listed, false);
-            tokio::select! {
-                event = connection.next_event_within(OBSERVATION_FRAME_BYTES) => match event {
-                    Ok(Some(event)) if event["event"] == "observation" => {
-                        match serde_json::from_value::<ShellRead>(event["read"].clone()) {
-                            Ok(read) if read.exit.is_some() => ended = Some(read),
-                            _ => return Watched::Lost,
-                        }
-                    }
-                    Ok(Some(event)) if event["event"] == "gone" => return Watched::Forgotten,
-                    _ => return Watched::Lost,
-                },
-                changed = self.wanted.changed() => if changed.is_err() { return Watched::Unwanted; },
-            }
-        }
-    }
-
     /// The end of a task as its record tells it, with the end of its output when that can be
     /// read.
     async fn recorded_end(&self, listed: &ShellTask) -> TickObservation {
@@ -502,22 +378,6 @@ fn ended_at_ms(task: &ShellTask) -> Option<u64> {
         .is_terminal()
         .then(|| task.ended_at_ms.or(task.updated_at_ms))
         .flatten()
-}
-
-fn exit_observation(instance: &InstanceRef, read: &ShellRead) -> TickObservation {
-    TickObservation {
-        instance: instance.clone(),
-        sequence: read.seq,
-        observed_at: read.exit.as_ref().map_or_else(
-            || read.at.clone(),
-            |exit| tickloop_agent_base::timestamp::format_timestamp(exit.ended_at_ms),
-        ),
-        dropped: 0,
-        data: read.data(),
-        kind: ObservationKind::Protocol,
-        recover_with: Some(RECOVER_WITH.into()),
-        gap: false,
-    }
 }
 
 #[async_trait::async_trait]

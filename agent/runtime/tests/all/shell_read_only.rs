@@ -150,6 +150,7 @@ async fn piped_git_diff_runs_without_approval_in_accept_edits_and_auto() {
                 text("Reviewed the staged diff."),
             ])),
         );
+        agent.install_own_tickhost();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         agent.set_execution_mode(chat, mode).await.unwrap();
         let mut events = agent.subscribe();

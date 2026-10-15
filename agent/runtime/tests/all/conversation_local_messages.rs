@@ -331,6 +331,7 @@ async fn user_shell_input_and_output_are_user_messages_after_restart() {
         Arc::new(ScriptedModel::new(Vec::new())),
     )
     .unwrap();
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
         .submit_user_shell_for_goal(chat, None, "printf '<ok>'; printf warn >&2".into(), false)
@@ -349,6 +350,7 @@ async fn user_shell_input_and_output_are_user_messages_after_restart() {
 
     let model = Arc::new(ScriptedModel::new(vec![text("Seen")]));
     let restored = Agent::open_embedded(archive, config(), model.clone()).unwrap();
+    restored.install_own_tickhost();
     restored.resume_chat(chat).await.unwrap();
     // 照 Claude Code：恢复时末尾是 user 消息，追加不请求回复的 assistant 哨兵。
     let mut expected = expected;
@@ -384,6 +386,7 @@ async fn user_shell_input_and_output_are_user_messages_after_restart() {
 async fn a_failing_user_shell_reports_its_output_as_standard_error() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
         .submit_user_shell_for_goal(chat, None, "printf broken; exit 3".into(), false)
@@ -404,6 +407,7 @@ async fn a_failing_user_shell_reports_its_output_as_standard_error() {
 async fn stopping_a_foreground_user_shell_replaces_its_output_with_the_interrupt_marker() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let receipt = agent
         .submit_user_shell_for_goal(chat, None, "printf started; sleep 30".into(), false)
@@ -443,6 +447,7 @@ async fn background_user_shell_completion_notifies_its_chat() {
         Arc::new(ScriptedModel::new(Vec::new())),
     )
     .unwrap();
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut notifications = agent.subscribe_task_notifications();
     let receipt = agent
@@ -487,6 +492,7 @@ async fn background_user_shell_completion_notifies_its_chat() {
 
     let restored =
         Agent::open_embedded(archive, config(), Arc::new(ScriptedModel::new(Vec::new()))).unwrap();
+    restored.install_own_tickhost();
     restored.resume_chat(chat).await.unwrap();
     let restored_snapshot = restored.snapshot(chat).await.unwrap();
     let mut expected_texts = expected_texts;
@@ -514,6 +520,7 @@ async fn background_agent_command_completion_notifies_with_its_tool_use_id() {
         text("The background command failed."),
     ]));
     let agent = Agent::new_embedded(config(), model);
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "start it".into()).await.unwrap();
@@ -598,6 +605,7 @@ async fn a_task_notification_waits_until_the_running_foreground_shell_writes_its
     let background_gate = directory.path().join("background-release");
     let foreground_gate = directory.path().join("foreground-release");
     let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let background_command = gated_command("background", &background_gate);
     let background = agent
@@ -656,6 +664,7 @@ async fn compaction_is_rejected_while_a_foreground_shell_is_running() {
     let directory = tempfile::tempdir().unwrap();
     let gate = directory.path().join("release");
     let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let command = gated_command("done", &gate);
     let receipt = agent

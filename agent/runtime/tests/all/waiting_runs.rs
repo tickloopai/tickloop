@@ -414,6 +414,7 @@ async fn an_approved_file_change_waits_until_the_other_goals_real_shell_command_
         text("The draft was written after the command."),
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     require_workspace_write_approval(&agent, chat).await;
     let mut events = agent.subscribe();

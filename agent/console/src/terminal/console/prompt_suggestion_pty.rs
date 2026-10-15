@@ -56,6 +56,7 @@ fn prompt_suggestion_pty_fixture() {
                         model.clone(),
                         scripted.clone(),
                     );
+                    core.install_own_tickhost();
                     core.set_auto_reviewer(Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
                         tickloop_agent_test_support::text(&tickloop_agent_test_support::auto_classification(false).to_string()); 3
                     ]))).await;
