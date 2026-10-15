@@ -60,6 +60,14 @@ const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_ARTIFACT_TITLE_UTF16_UNITS: usize = 200;
 const ARTIFACT_LOGIN_DESCRIPTION: &str = "Tickloop Artifacts is not signed in. Call this when the user wants a doc or design; it starts sign-in and returns a link and code for the user. After the user approves, ArtifactRead, ArtifactEdit and ArtifactComment become available automatically.";
 
+pub(crate) fn login_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: ARTIFACT_LOGIN_TOOL.into(),
+        description: ARTIFACT_LOGIN_DESCRIPTION.into(),
+        input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+    }
+}
+
 #[derive(Clone)]
 struct DiscoveredTool {
     definition: ToolDefinition,
@@ -741,11 +749,7 @@ impl HostToolProvider for McpHostToolProvider {
         if let Some(directory) = self.directory.read().unwrap().as_ref() {
             definitions.extend(directory.tools.iter().map(|tool| tool.definition.clone()));
         } else if self.offers_login() {
-            definitions.push(ToolDefinition {
-                name: ARTIFACT_LOGIN_TOOL.into(),
-                description: ARTIFACT_LOGIN_DESCRIPTION.into(),
-                input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
-            });
+            definitions.push(login_definition());
         }
         definitions
     }

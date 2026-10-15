@@ -109,8 +109,11 @@ struct Observed {
     calls: AtomicUsize,
     host_before_open: std::sync::atomic::AtomicBool,
     results: Mutex<Vec<String>>,
+    modify_schema: Mutex<Value>,
 }
 
+/// The model first sends ModifyTick with no arguments, as GLM did for a schema whose root was
+/// only a `oneOf`, and is told which fields to fill.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -135,22 +138,31 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
                 assert!(path.starts_with("POST /v1/messages "), "{path}");
                 let results = tool_results(&request);
                 *observed.results.lock().unwrap() = results.clone();
+                if let Some(modify) = request["tools"]
+                    .as_array()
+                    .and_then(|tools| tools.iter().find(|tool| tool["name"] == "ModifyTick"))
+                {
+                    *observed.modify_schema.lock().unwrap() = modify["input_schema"].clone();
+                }
                 observed.calls.fetch_add(1, Ordering::SeqCst);
                 let instance = hosted_instance(&results);
                 let block = match (results.len(), instance) {
                     (0, _) => {
+                        json!({"type":"tool_use","id":"empty","name":"ModifyTick","input":{}})
+                    }
+                    (1, _) => {
                         observed
                             .host_before_open
                             .store(host_socket.exists(), Ordering::SeqCst);
                         json!({"type":"tool_use","id":"open","name":"ModifyTick","input":{"action":"open","command":open_command,"protocol":true,"placement":{"type":"hidden"}}})
                     }
-                    (1, Some(instance)) => {
+                    (2, Some(instance)) => {
                         json!({"type":"tool_use","id":"read","name":"ReadTick","input":{"tick_instance_id":instance}})
                     }
-                    (2, Some(instance)) => {
+                    (3, Some(instance)) => {
                         json!({"type":"tool_use","id":"call","name":"CallTickTool","input":{"tick_instance_id":instance,"tool":"increment","args":{"amount":2}}})
                     }
-                    (3, Some(instance)) => {
+                    (4, Some(instance)) => {
                         json!({"type":"tool_use","id":"close","name":"ModifyTick","input":{"action":"close","tick_instance_id":instance}})
                     }
                     _ => json!({"type":"text","text":"Hosted counter finished."}),
@@ -196,7 +208,7 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(b"Open the counter.\n").await.unwrap();
     let finished = tokio::time::timeout(FIXTURE_TIMEOUT, async {
-        while observed.calls.load(Ordering::SeqCst) < 5 {
+        while observed.calls.load(Ordering::SeqCst) < 6 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -224,21 +236,29 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
         observed.calls.load(Ordering::SeqCst),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(results.len(), 4, "{results:#?}");
+    assert_eq!(results.len(), 5, "{results:#?}");
+    let modify_schema = observed.modify_schema.lock().unwrap().clone();
+    assert_eq!(modify_schema["type"], "object", "{modify_schema}");
+    assert_eq!(modify_schema["required"], json!(["action"]));
+    assert!(modify_schema.get("oneOf").is_none(), "{modify_schema}");
+    assert_eq!(
+        results[0],
+        "invalid ModifyTick input: action is required: one of open (requires command), send_input (requires tick_instance_id), close (requires tick_instance_id), reopen (requires tick_instance_id)"
+    );
     assert!(
         !observed.host_before_open.load(Ordering::SeqCst),
         "the daemon starts no host before the first open"
     );
-    let opened: Value = serde_json::from_str(&results[0]).unwrap();
+    let opened: Value = serde_json::from_str(&results[1]).unwrap();
     assert_eq!(opened["status"], "opened", "{results:#?}");
     assert_eq!(opened["host"], "tickhost");
     assert!(opened["business_pid"].as_u64().is_some());
-    let read: Value = serde_json::from_str(&results[1]).unwrap();
+    let read: Value = serde_json::from_str(&results[2]).unwrap();
     assert_eq!(read["data"]["value"], 0, "{results:#?}");
     assert!(read["tools"].to_string().contains("increment"));
-    let called: Value = serde_json::from_str(&results[2]).unwrap();
+    let called: Value = serde_json::from_str(&results[3]).unwrap();
     assert_eq!(called["result"]["value"], 2, "{results:#?}");
-    let closed: Value = serde_json::from_str(&results[3]).unwrap();
+    let closed: Value = serde_json::from_str(&results[4]).unwrap();
     assert_eq!(closed["status"], "closed", "{results:#?}");
     assert!(
         host_gone.is_ok(),

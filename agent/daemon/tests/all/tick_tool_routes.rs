@@ -284,30 +284,13 @@ fn tool<'a>(definitions: &'a [tickloop_agent_protocol::ToolDefinition], name: &s
         .input_schema
 }
 
-fn variant<'a>(schema: &'a Value, action: &str) -> Option<&'a Value> {
-    schema["oneOf"].as_array().unwrap().iter().find(|variant| {
-        variant["properties"]["action"]["const"] == action
-            || variant["properties"]["action"]["enum"]
-                .as_array()
-                .is_some_and(|actions| actions.contains(&json!(action)))
-    })
-}
-
-fn placement_types(open: &Value) -> BTreeSet<String> {
-    open["properties"]["placement"]["oneOf"]
+fn choices(property: &Value) -> BTreeSet<String> {
+    property["enum"]
         .as_array()
-        .map(|variants| {
-            variants
-                .iter()
-                .map(|variant| {
-                    variant["properties"]["type"]["const"]
-                        .as_str()
-                        .unwrap()
-                        .to_owned()
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+        .unwrap()
+        .iter()
+        .map(|choice| choice.as_str().unwrap().to_owned())
+        .collect()
 }
 
 #[test]
@@ -334,21 +317,30 @@ fn tick_tool_schemas_open_in_the_tickhost_and_place_views_only_in_herdr() {
             modify.description
         );
     }
-    let open = variant(tool(&in_herdr, "ModifyTick"), "open").unwrap();
-    assert_eq!(open["required"], json!(["action", "command"]));
+    let schema = tool(&in_herdr, "ModifyTick");
+    assert_eq!(schema["required"], json!(["action"]));
     assert_eq!(
-        placement_types(open),
+        choices(&schema["properties"]["action"]),
+        strings(&["open", "move", "send_input", "close", "reopen"])
+    );
+    assert_eq!(
+        choices(&schema["properties"]["placement"]["properties"]["type"]),
         strings(&["hidden", "current_tab", "pane", "new_tab"])
     );
-    assert_eq!(open["properties"]["protocol"], json!({"type":"boolean"}));
-    let moved = variant(tool(&in_herdr, "ModifyTick"), "move").unwrap();
-    assert_eq!(placement_types(moved), strings(&["current_tab", "pane"]));
-    for action in ["send_input", "close", "reopen"] {
-        assert!(
-            variant(tool(&in_herdr, "ModifyTick"), action).is_some(),
-            "{action}"
-        );
-    }
+    assert_eq!(schema["properties"]["protocol"]["type"], "boolean");
+    let refusal = |input: Value| {
+        tools
+            .in_herdr
+            .validate_input("ModifyTick", schema, &input)
+            .unwrap_err()
+    };
+    assert!(refusal(json!({})).starts_with("invalid ModifyTick input: action is required: one of open (requires command), move (requires tick_instance_id)"));
+    assert_eq!(
+        refusal(
+            json!({"action":"move","tick_instance_id":"hosted:1","placement":{"type":"new_tab"}})
+        ),
+        "invalid ModifyTick input: placement.type for move must be one of current_tab, pane"
+    );
 
     let hosted = tools.hosted.definitions();
     assert_eq!(
@@ -358,10 +350,23 @@ fn tick_tool_schemas_open_in_the_tickhost_and_place_views_only_in_herdr() {
             .collect::<BTreeSet<_>>(),
         strings(&["CallTickTool", "ModifyTick", "ReadTick"])
     );
-    let open = variant(tool(&hosted, "ModifyTick"), "open").unwrap();
-    assert_eq!(placement_types(open), strings(&["hidden"]));
-    assert!(open["properties"].get("workspace_id").is_none());
-    assert!(variant(tool(&hosted, "ModifyTick"), "move").is_none());
+    let schema = tool(&hosted, "ModifyTick");
+    assert_eq!(
+        choices(&schema["properties"]["action"]),
+        strings(&["open", "send_input", "close", "reopen"])
+    );
+    assert_eq!(
+        choices(&schema["properties"]["placement"]["properties"]["type"]),
+        strings(&["hidden"])
+    );
+    assert!(schema["properties"].get("workspace_id").is_none());
+    assert_eq!(
+        tools
+            .hosted
+            .validate_input("ModifyTick", schema, &json!({"action":"close"}))
+            .unwrap_err(),
+        "invalid ModifyTick input: close requires tick_instance_id"
+    );
     for definitions in [&in_herdr, &hosted] {
         let read = definitions
             .iter()

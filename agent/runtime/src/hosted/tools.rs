@@ -1486,6 +1486,10 @@ impl HostToolProvider for HostedTickTools {
         crate::tick_tools::definitions(self.views.is_some())
     }
 
+    fn validate_input(&self, name: &str, schema: &Value, input: &Value) -> Result<(), String> {
+        crate::tick_tools::validate_input(name, schema, input, self.views.is_some())
+    }
+
     fn host_endpoint(&self) -> Result<Option<HostEndpointIdentity>, String> {
         Ok(Some(self.endpoint.clone()))
     }
