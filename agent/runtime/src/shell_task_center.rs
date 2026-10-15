@@ -308,7 +308,10 @@ impl ShellTaskSubscription {
     }
 }
 
-fn project_tasks(chat: &ChatSnapshot, live_agent_commands: Vec<CommandSnapshot>) -> Vec<ShellTask> {
+pub(crate) fn project_tasks(
+    chat: &ChatSnapshot,
+    live_agent_commands: Vec<CommandSnapshot>,
+) -> Vec<ShellTask> {
     let mut agent_commands = chat
         .commands
         .iter()

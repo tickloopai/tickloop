@@ -43,7 +43,7 @@ pub(super) fn dragged_columns(width: usize, column: usize) -> Option<usize> {
 pub(super) use crate::monitor_rows::TickGroup;
 use crate::monitor_rows::{
     GONE_DISPLAY_MS, MonitorAction, MonitorContext, MonitorRowsRegistry, RowUpdate, StatusTone,
-    TickDescriptor, TickGlyph, TickOwner, TickResources, finished_shell_until, page_of,
+    TickDescriptor, TickGlyph, TickOwner, TickResources, page_of,
 };
 use tick_protocol::InstanceRef;
 use tickloop_agent_protocol::{
@@ -333,7 +333,7 @@ impl Monitor {
         self.shell_snapshot
             .iter()
             .flat_map(|snapshot| &snapshot.tasks)
-            .filter_map(|task| finished_shell_until(task, handled(task)))
+            .filter_map(|task| task.finished_row_until(handled(task)))
             .chain(
                 self.gone_since
                     .values()

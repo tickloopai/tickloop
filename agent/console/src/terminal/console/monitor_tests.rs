@@ -1694,7 +1694,7 @@ impl crate::terminal::tick_actions::TickDetailView for RowDetail {
 
 #[test]
 fn a_finished_background_shell_leaves_once_handled_unless_its_detail_is_open() {
-    use crate::monitor_rows::FINISHED_SHELL_DISPLAY_MS;
+    use tickloop_agent_protocol::FINISHED_SHELL_DISPLAY_MS;
     let chat = Uuid::new_v4();
     let console = Console::test_for_chat(chat);
     let ended = tickloop_agent_base::private_fs::unix_time_milliseconds();
@@ -1897,7 +1897,7 @@ fn dragging_the_separator_resizes_monitor_within_its_bounds_and_saves_on_release
 
 #[test]
 fn a_finished_background_shell_a_loop_subscribes_to_stays_as_its_shell_row() {
-    use crate::monitor_rows::FINISHED_SHELL_DISPLAY_MS;
+    use tickloop_agent_protocol::FINISHED_SHELL_DISPLAY_MS;
     let chat = Uuid::new_v4();
     let console = Console::test_for_chat(chat);
     let ended = tickloop_agent_base::private_fs::unix_time_milliseconds();

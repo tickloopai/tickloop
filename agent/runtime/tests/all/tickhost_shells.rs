@@ -1,7 +1,7 @@
 //! An Agent's shell commands as its Tickhost runs them: the Tools of one Chat start each command
 //! through a one-time spawn grant, follow it live, move it to the background or stop it, and read
-//! its output from the file they created. Without a daemon or a Tickhost given to it, an Agent
-//! runs no command.
+//! its output from the file they created; an ended command stays viewable while its Chat's Monitor
+//! lists it. Without a daemon or a Tickhost given to it, an Agent runs no command.
 
 use std::{
     path::{Path, PathBuf},
@@ -14,7 +14,7 @@ use tick_protocol::InstanceRef;
 use tickhost::shell::{ShellApproval, ShellIdentity, SpawnBinding, SpawnGrant};
 use tickhost_connect::{host_error::HostError, hosted};
 use tickloop_agent_base::private_fs::PrivateDirectory;
-use tickloop_agent_protocol::{CommandState, HostedViewGrant, ToolResult};
+use tickloop_agent_protocol::{CommandState, HostedViewGrant, ToolResult, UserShellState};
 use tickloop_agent_runtime::{
     Agent,
     hosted::{
@@ -434,4 +434,80 @@ async fn a_spawn_whose_answer_was_lost_is_listed_with_an_unknown_outcome_not_ref
         result.content
     );
     assert_eq!(fixture.command_state(id).await, CommandState::Unknown);
+}
+
+/// How long the Tickhost of the view tests lets an ended command nobody holds or views idle.
+const VIEW_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Runs `command` as a user Shell of `chat` and waits for it to end.
+async fn ended_user_shell(
+    agent: &Agent,
+    chat: Uuid,
+    command: &str,
+    background: bool,
+) -> InstanceRef {
+    let receipt = agent
+        .submit_user_shell_for_goal(chat, None, command.into(), background)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !agent
+        .snapshot(chat)
+        .await
+        .unwrap()
+        .user_shells
+        .iter()
+        .any(|record| record.id == receipt.command_id && record.state == UserShellState::Completed)
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{command} did not end"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    InstanceRef::shell(receipt.command_id)
+}
+
+async fn opens(agent: &Agent, chat: Uuid, instance: &InstanceRef) -> bool {
+    agent.shell_tasks().allow_view(chat, instance).await.is_ok()
+}
+
+#[tokio::test]
+async fn an_ended_background_shell_opens_for_as_long_as_monitor_lists_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new_embedded(
+        tickloop_agent_test_support::config(),
+        Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
+    );
+    agent.install_shell_grants(Arc::new(OwnTickhost::with_idle_timeout(VIEW_IDLE_TIMEOUT)));
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let background = ended_user_shell(&agent, chat, "printf background", true).await;
+    let foreground = ended_user_shell(&agent, chat, "printf foreground", false).await;
+    // Nobody views either, for far longer than the Tickhost keeps an ended command nobody holds.
+    tokio::time::sleep(VIEW_IDLE_TIMEOUT * 6).await;
+    // Its end is unread, so Monitor still lists it; a foreground command it never lists.
+    assert!(opens(&agent, chat, &background).await);
+    assert!(!opens(&agent, chat, &foreground).await);
+
+    // Once its end was handled Monitor shows it a while longer, past the worker's next check.
+    agent
+        .mark_monitor_handled(chat, background.clone())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert!(opens(&agent, chat, &background).await);
+
+    agent
+        .remove_monitor_member(chat, background.clone())
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while opens(&agent, chat, &background).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the Tickhost still keeps a Shell Monitor no longer lists"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    agent.shutdown().await;
 }

@@ -6,9 +6,7 @@ mod probe;
 
 #[cfg(test)]
 pub(crate) use builtin::artifact_actions;
-pub use builtin::{
-    ArtifactRows, FINISHED_SHELL_DISPLAY_MS, HostedRows, ShellRows, finished_shell_until,
-};
+pub use builtin::{ArtifactRows, HostedRows, ShellRows};
 pub(crate) use builtin::{HOSTED_CLOSE_KEY, HOSTED_REOPEN_KEY, SHELL_STOP_KEY, feedback_binding};
 pub use probe::{MemberFindings, ProbeError, TickProbe};
 

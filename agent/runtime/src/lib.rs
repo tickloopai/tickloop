@@ -1405,7 +1405,7 @@ impl Agent {
             .as_ref()
             .and_then(tickloop_agent_config::UserSettings::root)
             .map(|root| root.join("skills"));
-        Self {
+        let agent = Self {
             inner: Arc::new(Inner {
                 selected_model: std::sync::Mutex::new(chat_settings::SelectedModel {
                     config: model,
@@ -1458,7 +1458,9 @@ impl Agent {
                 ),
                 shutdown: CancellationToken::new(),
             }),
-        }
+        };
+        agent.inner.shells.follow_monitor(agent.downgrade());
+        agent
     }
 
     fn require_working_directory_trust(&self, workdir: &Path) -> Result<(), AgentError> {

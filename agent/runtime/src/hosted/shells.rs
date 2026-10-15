@@ -2,12 +2,14 @@
 //! its daemon for a one-time spawn grant, then submits the command on its own spawner connection,
 //! passing the approved directory and the output file as descriptors; the command lives as long as
 //! that connection. A View of the Chat shows a command through a one-time view grant from the same
-//! daemon. An Agent without a daemon runs no command and shows none, unless it is given a Tickhost
-//! of its own, served inside its process, as tests are.
+//! daemon; the worker keeps an ended command's connection while the Chat's Monitor may list it, so
+//! the Tickhost keeps showing it until then. An Agent without a daemon runs no command and shows
+//! none, unless it is given a Tickhost of its own, served inside its process, as tests are.
 
 use std::{
     os::unix::ffi::OsStrExt,
-    sync::{Arc, PoisonError, RwLock},
+    sync::{Arc, OnceLock, PoisonError, RwLock},
+    time::Duration,
 };
 
 use tick_protocol::InstanceRef;
@@ -29,6 +31,10 @@ use super::{
     controller::HostController,
     worker_control::{DaemonControl, IssuedSpawn, WorkerRequest},
 };
+use crate::WeakAgent;
+
+/// How often a worker checks whether the Monitor still lists an ended command it keeps.
+const MONITOR_LISTING_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Grants spawns of commands a Chat approved, and views of the commands it started.
 #[async_trait::async_trait]
@@ -117,14 +123,21 @@ impl ShellGrants for NoDaemon {
 pub struct OwnTickhost {
     directory: tickloop_agent_base::private_fs::PrivateDirectory,
     worker: Uuid,
+    idle_timeout: Duration,
     controller: OnceCell<HostController>,
 }
 
 impl OwnTickhost {
     pub fn new() -> Self {
+        Self::with_idle_timeout(tickhost::host::DEFAULT_IDLE_TIMEOUT)
+    }
+
+    /// A Tickhost that forgets an ended command nobody holds or views after `idle_timeout`.
+    pub fn with_idle_timeout(idle_timeout: Duration) -> Self {
         Self {
             directory: crate::transcript::private_tickhost_directory(),
             worker: Uuid::new_v4(),
+            idle_timeout,
             controller: OnceCell::new(),
         }
     }
@@ -152,6 +165,7 @@ impl OwnTickhost {
                             .join(crate::transcript::TICKHOST_RUNTIME_SUBDIRECTORY),
                     },
                     Uuid::new_v4(),
+                    self.idle_timeout,
                 ))
             })
             .await
@@ -203,13 +217,48 @@ impl ShellGrants for OwnTickhost {
 /// The Shell tasks of this Agent that the Tickhost runs, and who grants their spawns and views.
 pub struct ShellTasks {
     grants: RwLock<Arc<dyn ShellGrants>>,
+    /// The Agent whose Monitors decide how long an ended command stays viewable.
+    agent: OnceLock<WeakAgent>,
 }
 
 impl ShellTasks {
     pub fn new(grants: Arc<dyn ShellGrants>) -> Arc<Self> {
         Arc::new(Self {
             grants: RwLock::new(grants),
+            agent: OnceLock::new(),
         })
+    }
+
+    pub(crate) fn follow_monitor(&self, agent: WeakAgent) {
+        let _ = self.agent.set(agent);
+    }
+
+    /// Keeps `chat`'s ended command `task` on its spawner connection, which keeps the Tickhost
+    /// from forgetting it, for as long as the Chat's Monitor may list it. Closing the connection
+    /// leaves the command to the Tickhost, which forgets it once nobody viewed it for its idle
+    /// timeout.
+    fn keep_while_listed(&self, chat: Uuid, task: Uuid, connection: tickhost::shell::ShellStops) {
+        let Some(agent) = self.agent.get().cloned() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _connection = connection;
+            loop {
+                let Some(listing) = agent.upgrade() else {
+                    break;
+                };
+                if !listing.monitor_may_list_shell(chat, task).await {
+                    break;
+                }
+                // Waiting holds no Agent, so an Agent dropped meanwhile closes the connection.
+                let shutdown = listing.inner.shutdown.clone();
+                drop(listing);
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(MONITOR_LISTING_CHECK_INTERVAL) => {}
+                }
+            }
+        });
     }
 
     /// Replaces who grants later spawns and views: a worker's daemon, or a test's own Tickhost.
@@ -342,7 +391,10 @@ impl ShellHost for ChatShells {
         Ok(Box::new(TickhostProcess {
             pid: spawned.pid,
             exit,
-            stops,
+            stops: Some(stops),
+            tasks: self.tasks.clone(),
+            chat: self.chat,
+            task: operation_id,
         }))
     }
 }
@@ -360,12 +412,16 @@ fn command_exit(exit: tickhost::shell::ShellExit) -> ShellExit {
     }
 }
 
-/// A command the Tickhost runs on this process's spawner connection. Dropping it closes that
-/// connection, which stops the command if it still runs and lets the host forget it.
+/// A command the Tickhost runs on this process's spawner connection. Dropping it before the
+/// command ended closes that connection, which stops the command; once it ended, the connection
+/// passes to the Shell tasks, which keep it while Monitor may list the command.
 struct TickhostProcess {
     pid: u32,
     exit: watch::Receiver<Option<ShellExit>>,
-    stops: tickhost::shell::ShellStops,
+    stops: Option<tickhost::shell::ShellStops>,
+    tasks: Arc<ShellTasks>,
+    chat: Uuid,
+    task: Uuid,
 }
 
 #[async_trait::async_trait]
@@ -382,6 +438,9 @@ impl ShellProcess for TickhostProcess {
             .map(|exit| exit.clone())
             .ok()
             .flatten();
+        if let Some(stops) = self.stops.take() {
+            self.tasks.keep_while_listed(self.chat, self.task, stops);
+        }
         exit.unwrap_or_else(|| ShellExit {
             exit_code: None,
             signal: None,
@@ -391,7 +450,10 @@ impl ShellProcess for TickhostProcess {
     }
 
     async fn stop(&mut self, reason: &str) {
-        // A connection that is gone already stopped the command.
-        let _ = self.stops.stop(reason).await;
+        // A connection that is gone already stopped the command, and one passed on belongs to a
+        // command that ended.
+        if let Some(stops) = &mut self.stops {
+            let _ = stops.stop(reason).await;
+        }
     }
 }

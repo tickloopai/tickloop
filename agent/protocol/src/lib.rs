@@ -146,10 +146,11 @@ pub use projection::{HistoryCall, InvalidConversation};
 pub use provider_connection::{ConnectionRegion, ModelDiscovery, ProductKind, ProviderConnection};
 pub use provider_failure::{ProviderFailureClass, ProviderHttpFailure};
 pub use shell_tasks::{
-    SHELL_TASK_OUTPUT_MAX_BYTES, SHELL_TASK_PROMPT_QUIET_PERIOD, ShellTask, ShellTaskAction,
-    ShellTaskCapabilities, ShellTaskCenterError, ShellTaskDelta, ShellTaskNotice, ShellTaskOrigin,
-    ShellTaskOutputChunk, ShellTaskOwner, ShellTaskPromptWatchdog, ShellTaskSnapshot,
-    ShellTaskState, ShellTaskSubscriptionEvent, recover_shell_update_time,
+    FINISHED_SHELL_DISPLAY_MS, SHELL_TASK_OUTPUT_MAX_BYTES, SHELL_TASK_PROMPT_QUIET_PERIOD,
+    ShellTask, ShellTaskAction, ShellTaskCapabilities, ShellTaskCenterError, ShellTaskDelta,
+    ShellTaskNotice, ShellTaskOrigin, ShellTaskOutputChunk, ShellTaskOwner,
+    ShellTaskPromptWatchdog, ShellTaskSnapshot, ShellTaskState, ShellTaskSubscriptionEvent,
+    recover_shell_update_time,
 };
 pub use skill::{InvokedSkill, SkillSource};
 pub use tick_subscriptions::{
