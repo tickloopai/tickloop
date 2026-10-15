@@ -3558,7 +3558,9 @@ for line in sys.stdin:
 
     /// Reconciling keeps the record of a Tick nobody watches past the host's idle timeout, which
     /// keeps running, still ends an orphan whose Chat owns no record, and marks the record of a
-    /// Tick the same host no longer runs as ended, kept until its Monitor row is removed.
+    /// Tick the same host no longer runs as ended, kept until its Monitor row is removed. A kept
+    /// ended record is never taken for a running Tick: later reconciles still reap orphans,
+    /// and a host that dies leaves it ended while the Tick that did run on it is lost.
     #[tokio::test(flavor = "multi_thread")]
     async fn reconcile_keeps_an_unwatched_tick_ends_orphans_and_marks_ended_records() {
         use tickloop_agent_runtime::hosted::registry::{LaunchRecord, LaunchState, Registry};
@@ -3618,20 +3620,56 @@ for line in sys.stdin:
         root.reconcile_with_host(&controller, &fixture.owner.root)
             .await
             .unwrap();
-        let records = root.launches(fixture.owner.chat).await.unwrap();
-        assert_eq!(records.len(), 2, "{records:?}");
-        let state_of = |instance| {
-            &records
-                .iter()
-                .find(|record| record.instance() == Some(instance))
-                .unwrap()
-                .state
+        let states = || async {
+            let records = root.launches(fixture.owner.chat).await.unwrap();
+            assert_eq!(records.len(), 2, "{records:?}");
+            let state_of = |instance| {
+                records
+                    .iter()
+                    .find(|record| record.instance() == Some(instance))
+                    .unwrap()
+                    .state
+                    .clone()
+            };
+            (state_of(&closed.instance), state_of(&kept.instance))
         };
-        assert!(matches!(
-            state_of(&closed.instance),
-            LaunchState::Ended { .. }
-        ));
-        assert!(matches!(state_of(&kept.instance), LaunchState::Live { .. }));
+        let (closed_state, kept_state) = states().await;
+        assert!(matches!(closed_state, LaunchState::Ended { .. }));
+        assert!(matches!(kept_state, LaunchState::Live { .. }));
+
+        let second_orphan = controller
+            .open(counter_request(
+                TickOwner {
+                    root: fixture.owner.root.clone(),
+                    chat: Uuid::new_v4(),
+                },
+                fixture.directory.path(),
+            ))
+            .await
+            .unwrap();
+        root.reconcile_with_host(&controller, &fixture.owner.root)
+            .await
+            .unwrap();
+        assert!(
+            gone(second_orphan.business_pid).await,
+            "an ended record keeps no orphan running"
+        );
+        assert!(alive(kept.business_pid));
+        assert_eq!(states().await, (closed_state.clone(), kept_state));
+
+        let launcher = tickhost::process::sample(kept.business_pid).unwrap().parent;
+        let host = tickhost::process::sample(launcher).unwrap().parent;
+        unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
+        assert!(gone(kept.business_pid).await);
+        root.reconcile_with_host(&controller, &fixture.owner.root)
+            .await
+            .unwrap();
+        let (after_closed, after_kept) = states().await;
+        assert_eq!(
+            after_closed, closed_state,
+            "an ended Tick is never taken for lost"
+        );
+        assert!(matches!(after_kept, LaunchState::Lost { .. }));
     }
 
     /// A listing settles only records older than itself: an open that completed while the

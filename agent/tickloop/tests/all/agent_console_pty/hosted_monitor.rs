@@ -225,13 +225,53 @@ async fn select_gone_row(view: &mut PtyView) {
     panic!("no gone row in Monitor: {}", view.frame());
 }
 
+/// The Tick Subscriptions of `execution`'s Chat.
+async fn tick_subscriptions(
+    client: &LocalAgentClient,
+    execution: ExecutionRef,
+) -> Vec<tickloop_agent_protocol::TickSubscriptionStatus> {
+    let observation = client
+        .observe(ObservationRequest::Agent {
+            execution,
+            detail: AgentDetailQuery::Subscriptions,
+            after: None,
+        })
+        .await
+        .unwrap();
+    let ObservationValue::Subscriptions(rows) = observation.initial else {
+        panic!("expected Tick Subscriptions");
+    };
+    rows
+}
+
+/// Polls `probe` until it yields a value, for at most `UI_TIMEOUT`.
+async fn eventually<T, F: std::future::Future<Output = Option<T>>>(
+    what: &str,
+    mut probe: impl FnMut() -> F,
+) -> T {
+    tokio::time::timeout(UI_TIMEOUT, async {
+        loop {
+            if let Some(value) = probe().await {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what} never happened"))
+}
+
+/// How long a gone row used to stay before it left Monitor by itself.
+const RETIRED_GONE_DISPLAY: Duration = Duration::from_secs(30);
+
 /// A protocol Tick whose process ended by itself keeps its Monitor row, and its launch record,
-/// until its user removes it. Enter reopens it in its row's place from that record once
-/// confirmed; `x` takes a gone row out with its record at once, and closes a reopened one, with
-/// the record it was reopened from, once confirmed.
+/// until its user removes it, well past the 30 seconds after which a gone row used to leave.
+/// Enter reopens it in its row's place from that record once confirmed, restoring its
+/// subscription by default; `x` takes a gone row out with its record at once, and closes a
+/// reopened one, with the record it was reopened from and its subscription, once confirmed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens_it() {
-    use tickloop_agent_protocol::HostedMemberState;
+    use tickloop_agent_protocol::{HostedMemberState, TickSubscriptionFrequency};
     let fixture = PrivateFixture::new();
     let result = AssertUnwindSafe(async {
         let mut view = view_with_keys_ticks(&fixture, &[], 2, None).await;
@@ -240,6 +280,17 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
         let members = hosted_members(&client, execution).await;
         assert_eq!(members.len(), 2, "{members:?}");
         assert_eq!(launch_record_count(&fixture), 2);
+
+        view.send(b"\x1b[C");
+        view.wait_for("Monitor focused", |frame| frame.contains("enter open"))
+            .await;
+        view.send(b"f");
+        let subscribed = eventually("the subscription", || async {
+            tick_subscriptions(&client, execution).await.pop()
+        })
+        .await;
+        assert_eq!(subscribed.frequency, TickSubscriptionFrequency::High);
+
         let first_pids = members
             .iter()
             .map(|member| {
@@ -253,49 +304,60 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
         for pid in &first_pids {
             unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
         }
-        tokio::time::timeout(UI_TIMEOUT, async {
-            while !hosted_members(&client, execution).await.is_empty() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
+        eventually("both Ticks ending", || async {
+            hosted_members(&client, execution)
+                .await
+                .is_empty()
+                .then_some(())
         })
-        .await
-        .expect("both Ticks end");
+        .await;
+        view.wait_for("the selected row turns gone", selected_row_is_gone)
+            .await;
+        tokio::time::sleep(RETIRED_GONE_DISPLAY + Duration::from_secs(2)).await;
+        let later = view.frame();
+        assert!(
+            later.contains("Monitor 2") && selected_row_is_gone(&later),
+            "both gone rows stay: {later}"
+        );
+        view.send(b"j");
+        view.wait_for("the other row is gone too", selected_row_is_gone)
+            .await;
         assert_eq!(
             launch_record_count(&fixture),
             2,
             "a Tick that ended by itself keeps its launch record"
         );
 
-        view.send(b"\x1b[C");
-        view.wait_for("the selected row turns gone", selected_row_is_gone)
-            .await;
-        view.send(b"j");
-        view.wait_for("the other row is gone too", |frame| {
-            selected_row_is_gone(frame) && frame.contains("Monitor 2")
-        })
+        select_row(&mut view, "⟳").await;
+        view.send(b"\r");
+        view.wait_for(
+            "the reopen asks first, restoring its subscription",
+            |frame| {
+                frame.contains("Open a new instance of this Tick with its command?")
+                    && frame.contains("Also restore its 1 Tick Subscription")
+            },
+        )
         .await;
         view.send(b"\r");
-        view.wait_for("the reopen asks first", |frame| {
-            frame.contains("Open a new instance of this Tick with its command?")
+        let reopened = eventually("the reopened Tick running", || async {
+            hosted_members(&client, execution)
+                .await
+                .into_iter()
+                .find(|member| member.state == HostedMemberState::Running)
         })
         .await;
-        view.send(b"\r");
-        let reopened = tokio::time::timeout(UI_TIMEOUT, async {
-            loop {
-                let members = hosted_members(&client, execution).await;
-                if let Some(member) = members
-                    .iter()
-                    .find(|member| member.state == HostedMemberState::Running)
-                {
-                    break member.clone();
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("the reopened Tick runs");
         let reopened_pid = reopened.resources.as_ref().unwrap().business_pid;
         assert!(!first_pids.contains(&reopened_pid), "a new process");
+        assert_ne!(reopened.instance, subscribed.instance, "a new instance");
+        let restored = eventually("the restored subscription", || async {
+            tick_subscriptions(&client, execution)
+                .await
+                .pop()
+                .filter(|row| row.instance == reopened.instance)
+        })
+        .await;
+        assert_eq!(restored.loop_id, subscribed.loop_id);
+        assert_eq!(restored.frequency, TickSubscriptionFrequency::High);
         assert_eq!(
             launch_record_count(&fixture),
             3,
@@ -316,7 +378,7 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
 
         view.send(b"x");
         view.wait_for("closing the running Tick asks first", |frame| {
-            frame.contains("Close this Tick and end its process?")
+            frame.contains("Close this Tick, end its process and cancel its 1 Tick Subscription?")
         })
         .await;
         view.send(b"\r");
@@ -330,6 +392,7 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
             "closing the reopened Tick forgets the record it was reopened from too"
         );
         assert!(hosted_members(&client, execution).await.is_empty());
+        assert!(tick_subscriptions(&client, execution).await.is_empty());
         view.close().await;
     })
     .catch_unwind()

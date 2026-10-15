@@ -650,9 +650,9 @@ impl RootRegistry {
     }
 
     /// Settles `owner`'s records against the host. A live instance its host still runs stays;
-    /// one that host no longer runs, or whose host exited after all its Ticks ended, exited,
-    /// idled out or was closed and leaves no record; one whose host died with it is Lost and
-    /// can be reopened. An open whose answer was lost settles from its receipt once it can no
+    /// one that host no longer runs, or whose host exited after all its Ticks ended, ended by
+    /// itself and is kept as Ended until its Monitor row is removed; one whose host died with it
+    /// is Lost. Either can be reopened, and neither is ever taken for running again. An open whose answer was lost settles from its receipt once it can no
     /// longer be in progress. A record written after the listing began is newer than it and
     /// waits for the next one.
     pub async fn settle_launches(
