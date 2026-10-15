@@ -4,11 +4,13 @@
 //! [`Agent::configure_trigger`] and inherits its chain entries, resume rules and leases. The
 //! Agent keeps the union of every armed subscription's Tick Instance as the desired set of one
 //! [`TickStreamPort`]; updates arriving from that stream accumulate per subscription. A Terminal
-//! Tick pushes nothing: when its subscription's period elapses, the stream reads its screen once
-//! and reports it as an update if it differs from what that subscription last got. When a
-//! subscription's period elapses with updates pending, or as soon as an immediate one receives an
-//! update, the latest update per Tick Instance merges into the owning Loop's pending delivery and
-//! is handed to [`Agent::trigger`] as soon as the Loop can take it.
+//! Tick pushes no screen: the stream only says when its screen first changed since a subscription
+//! last got it, which marks that change pending; when the subscription's period elapses, the
+//! stream reads the screen once and reports it as an update if it differs from what that
+//! subscription last got. Its program's exit is read at once. When a subscription's period
+//! elapses with updates pending, or as soon as an immediate one receives an update, the latest
+//! update per Tick Instance merges into the owning Loop's pending delivery and is handed to
+//! [`Agent::trigger`] as soon as the Loop can take it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -132,7 +134,7 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: SUBSCRIBE_TICK_TOOL.into(),
             description: format!(
-                "Subscribe the current goal to a Tick Instance. A protocol or terminal Tick wakes the goal with that instance's latest Tick Update, how many updates it merges and their seq and time span, at the chosen frequency: {periods}; `{}` is the default, and a period without updates wakes nothing. A Shell Tick takes no frequency: it updates once, when it exits, and that update is delivered as soon as it arrives; read its output_file for progress before then. An artifact takes no Tick Subscription: its @tickloop requests reach the goal it is associated with. Intermediate updates are not kept, so read older data with the Tick's own query tools.",
+                "Subscribe the current goal to a Tick Instance. A protocol or terminal Tick wakes the goal with that instance's latest Tick Update, how many updates it merges and their seq and time span, at the chosen frequency: {periods}; `{}` is the default, and a period without updates wakes nothing. A terminal Tick's program exit is delivered as soon as it happens, with its last screen. A Shell Tick takes no frequency: it updates once, when it exits, and that update is delivered as soon as it arrives; read its output_file for progress before then. An artifact takes no Tick Subscription: its @tickloop requests reach the goal it is associated with. Intermediate updates are not kept, so read older data with the Tick's own query tools.",
                 DEFAULT_FREQUENCY.name()
             ),
             input_schema: json!({"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":3},"frequency":{"type":"string","enum":frequencies}},"required":["tick_instance_id"],"additionalProperties":false}),
@@ -221,6 +223,9 @@ struct SubscriptionRuntime {
     /// Updates since the last delivery that a newer one replaced.
     superseded: u64,
     accumulated: u64,
+    /// A Terminal Tick's screen changed since this subscription last got it; its next sample
+    /// settles it.
+    has_pending_change: bool,
     gap: bool,
     last_delivery_ms: Option<u64>,
     last_delivery: Option<String>,
@@ -401,6 +406,13 @@ impl TickDeliveries {
             }
             TickStreamEvent::Observation { audience, value } => self.record(&audience, &value),
             TickStreamEvent::Gap { instance, audience } => self.mark_gap(&instance, &audience),
+            TickStreamEvent::ScreenChange {
+                instance,
+                audience,
+                is_pending,
+            } => self.mark_screen_change(&instance, &audience, is_pending),
+            // Its watches are sampled at once by `Agent::apply_stream_event`.
+            TickStreamEvent::ProgramExited { .. } => {}
             TickStreamEvent::State {
                 instance,
                 state,
@@ -425,6 +437,7 @@ impl TickDeliveries {
                     ) {
                         subscription.blocked = Some(link);
                         subscription.latest = None;
+                        subscription.has_pending_change = false;
                         self.content.remove(*id);
                     }
                 }
@@ -619,8 +632,8 @@ impl TickDeliveries {
         }
     }
 
-    /// Records a screen sampled for `watch` as its period's update, due now since its period
-    /// already elapsed; whether it was taken.
+    /// Records a screen sampled for `watch` as an update due now, since its period elapsed or its
+    /// program exited; whether it was taken.
     fn record_sample(&mut self, watch: WatchId, observation: &TickObservation) -> bool {
         self.record(&[watch], observation);
         let mut is_due = false;
@@ -633,6 +646,48 @@ impl TickDeliveries {
             is_due = true;
         }
         is_due
+    }
+
+    /// Marks whether a Terminal Tick's screen changed since `audience` last got it. The first
+    /// change is when the instance last updated, though it is no Tick Update until a sample finds
+    /// it still there.
+    fn mark_screen_change(
+        &mut self,
+        instance: &InstanceRef,
+        audience: &[WatchId],
+        is_pending: bool,
+    ) {
+        for subscription in self.subscriptions.values_mut().filter(|subscription| {
+            subscription.ready
+                && subscription.blocked.is_none()
+                && &subscription.instance == instance
+                && audience.contains(&subscription.watch)
+        }) {
+            if is_pending && !subscription.has_pending_change {
+                subscription.updated_at_ms = subscription.updated_at_ms.max(Some(
+                    tickloop_agent_base::private_fs::unix_time_milliseconds(),
+                ));
+            }
+            subscription.has_pending_change = is_pending;
+        }
+    }
+
+    /// The watches of `instance` among `audience` that can sample its screen now.
+    fn samplable_watches(
+        &self,
+        instance: &InstanceRef,
+        audience: &[WatchId],
+    ) -> Vec<(WatchId, InstanceRef)> {
+        self.subscriptions
+            .values()
+            .filter(|subscription| {
+                subscription.ready
+                    && subscription.blocked.is_none()
+                    && &subscription.instance == instance
+                    && audience.contains(&subscription.watch)
+            })
+            .map(|subscription| (subscription.watch, subscription.instance.clone()))
+            .collect()
     }
 
     fn mark_gap(&mut self, instance: &InstanceRef, audience: &[WatchId]) {
@@ -831,6 +886,7 @@ impl Agent {
                     instance: subscription.instance.clone(),
                     frequency: subscription.frequency,
                     accumulated: runtime.map_or(0, |runtime| runtime.accumulated),
+                    has_pending_change: runtime.is_some_and(|runtime| runtime.has_pending_change),
                     last_delivery_ms: runtime.and_then(|runtime| runtime.last_delivery_ms),
                     last_delivery: runtime.and_then(|runtime| runtime.last_delivery.clone()),
                     kind: runtime.and_then(|runtime| runtime.kind.clone()),
@@ -1347,6 +1403,7 @@ impl Agent {
                                 first: None,
                                 superseded: 0,
                                 accumulated: 0,
+                                has_pending_change: false,
                                 gap: false,
                                 last_delivery_ms: None,
                                 last_delivery: None,
@@ -1770,25 +1827,28 @@ impl Agent {
         })
     }
 
-    /// Reads, side by side and away from the delivery task, the screen of every Terminal Tick
-    /// whose subscription's period elapsed by `now`: a screen that differs from what the watch last
-    /// got is that period's update, delivered as soon as it is read.
+    /// Samples the screen of every Terminal Tick whose subscription's period elapsed by `now`.
     fn sample_due_screens(&self, now: Instant) {
-        let (port, due) = {
-            let deliveries = self.tick_deliveries();
-            let due = deliveries
-                .subscriptions
-                .values()
-                .filter(|subscription| {
-                    subscription.ready
-                        && subscription.blocked.is_none()
-                        && subscription.frequency.period().is_some()
-                        && subscription.due_at.is_some_and(|due_at| due_at <= now)
-                })
-                .map(|subscription| (subscription.watch, subscription.instance.clone()))
-                .collect::<Vec<_>>();
-            (deliveries.port.clone(), due)
-        };
+        let due = self
+            .tick_deliveries()
+            .subscriptions
+            .values()
+            .filter(|subscription| {
+                subscription.ready
+                    && subscription.blocked.is_none()
+                    && subscription.frequency.period().is_some()
+                    && subscription.due_at.is_some_and(|due_at| due_at <= now)
+            })
+            .map(|subscription| (subscription.watch, subscription.instance.clone()))
+            .collect::<Vec<_>>();
+        self.sample_screens(due);
+    }
+
+    /// Reads, side by side and away from the delivery task, the screens of the `due` watches: a
+    /// screen that differs from what the watch last got is its update, delivered as soon as it is
+    /// read.
+    fn sample_screens(&self, due: Vec<(WatchId, InstanceRef)>) {
+        let port = self.tick_deliveries().port.clone();
         let Some(port) = port.filter(|_| !due.is_empty()) else {
             return;
         };
@@ -1823,6 +1883,11 @@ impl Agent {
     }
 
     async fn apply_stream_event(&self, event: TickStreamEvent) {
+        if let TickStreamEvent::ProgramExited { instance, audience } = &event {
+            let exited = self.tick_deliveries().samplable_watches(instance, audience);
+            self.sample_screens(exited);
+            return;
+        }
         let invalidates_watch = matches!(
             &event,
             TickStreamEvent::State {

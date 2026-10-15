@@ -38,10 +38,12 @@ use crate::{
 /// user's own Tick Subscription from Monitor, and reopening a hosted Tick with its subscriptions.
 /// 20.3 records where a Trigger's prompt came from, so a prompt copied from the Loop goal reaches
 /// deliveries as background. 20.4 adds reading a running Tickhost of another build than the
-/// daemon's, with what replacing it ends, and replacing it on the user's word. Older business
-/// majors are refused before dispatch; the frozen daemon management protocol remains independent.
+/// daemon's, with what replacing it ends, and replacing it on the user's word. 20.5 says whether a
+/// Terminal Tick's screen changed since a Tick Subscription last got it, so Monitor shows that
+/// change waiting for the next check. Older business majors are refused before dispatch; the
+/// frozen daemon management protocol remains independent.
 pub const PROTOCOL_MAJOR: u16 = 20;
-pub const PROTOCOL_MINOR: u16 = 4;
+pub const PROTOCOL_MINOR: u16 = 5;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 

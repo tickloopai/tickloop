@@ -96,6 +96,10 @@ pub struct TickSubscriptionStatus {
     pub frequency: TickSubscriptionFrequency,
     /// Tick Updates accumulated since the last delivery.
     pub accumulated: u64,
+    /// A Terminal Tick's screen text changed since this subscription last got it; its next check
+    /// reads it, and delivers it unless the text changed back by then.
+    #[serde(default)]
+    pub has_pending_change: bool,
     pub last_delivery_ms: Option<u64>,
     pub last_delivery: Option<String>,
     #[serde(default)]

@@ -12,7 +12,7 @@ Keep the complete `<type>:<id>` reference. Every type delivers its updates into 
 | Tick | Reference | Read and operate | Updates |
 | --- | --- | --- | --- |
 | Protocol Tick | `hosted:` | `ReadTick` returns its state and tool catalog; `CallTickTool` calls a declared tool | its business content, at the subscription's frequency |
-| Terminal Tick | `hosted:` | `ReadTick` returns its screen text and exit; `ModifyTick` `send_input` types into it | its changed screen text or exit, at the subscription's frequency |
+| Terminal Tick | `hosted:` | `ReadTick` returns its screen text and exit; `ModifyTick` `send_input` types into it | its changed screen text, at the subscription's frequency; its exit, delivered immediately |
 | Shell task | `shell:<task id>` | `Bash`, `Read` on the returned `output_file`, `TaskStop` with `task_id` | one update when it exits, delivered immediately |
 | Artifact | `artifact:<origin>/<artifact_id>` from `artifact_ticks` | `ArtifactRead`, `ArtifactEdit`, `ArtifactComment` | each @tickloop feedback request, through its association (section 4) |
 
@@ -88,7 +88,7 @@ For continued observation, call `SubscribeTick` with the selected instance. A pr
 
 Existing content supplies a baseline. At each period the Loop receives only the latest update per instance: each item says how many updates it merges (`updates`), their `seq` span (`first→last`) and when the first and last were observed (`between`); only the latest one's `data` is carried. A period without updates wakes nothing and calls no model. Busy Loops wait under existing execution rules. Stopping or disabling a Loop keeps it stopped.
 
-A protocol Tick's updates carry its business content. Read the catalog's recovery query when history matters, respecting its limits; without `recover_with`, superseded updates cannot be recovered. A terminal Tick's update is its screen text whenever it differs from what this subscription last received, or its exit; output that scrolled past between periods cannot be recovered. Reads contain at most 200 lines / 64 KiB.
+A protocol Tick's updates carry its business content. Read the catalog's recovery query when history matters, respecting its limits; without `recover_with`, superseded updates cannot be recovered. A terminal Tick's update is its screen text whenever it differs from what this subscription last received, or its exit, which arrives as soon as the program ends, with its last screen; output that scrolled past between periods cannot be recovered. Reads contain at most 200 lines / 64 KiB.
 
 A delivery takes at most 16 KiB, each item at most 4 KiB unless it is the only one. Data over its item's share is trimmed by whole segments, never sent empty: the largest arrays and multi-line texts are shortened first, a series keeps its oldest element, its newest run and older elements at doubling intervals (newest end as the Tick declares it), and a text keeps its first and last lines. Each cut is marked in place as `"… N omitted …"` or `"… N lines omitted …"`; a value no segment could shorten becomes `"… omitted (N bytes) …"`. The item's `trimmed` lists each cut as `{path, total, kept, rule}` with a JSON Pointer `path`, counting elements or lines (bytes for an omitted value). For the full content use the instance's `recover_with` or `ReadTick`. `data` is null only when an update could not be read again. Items that do not fit arrive in the Loop's next turn; `more_next_turn` says how many.
 

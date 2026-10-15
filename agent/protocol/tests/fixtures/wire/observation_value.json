@@ -600,6 +600,7 @@
         "instance": "hosted:00000000-0000-0000-0000-000000000040",
         "frequency": "high",
         "accumulated": 2,
+        "has_pending_change": false,
         "last_delivery_ms": 6000,
         "last_delivery": "hosted:00000000-0000-0000-0000-000000000040 #4",
         "kind": "Protocol",

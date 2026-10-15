@@ -739,6 +739,103 @@ async fn a_terminal_subscription_samples_the_screen_once_each_period() {
     agent.shutdown().await;
 }
 
+/// A Terminal Tick whose program exits is read at once: its last screen and exit wake the Loop
+/// without waiting for the period, and nothing is read for it afterwards.
+#[tokio::test(start_paused = true)]
+async fn a_terminal_exit_is_delivered_at_once_without_waiting_for_the_period() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(9)}),
+        ),
+        text("watching the terminal"),
+        text("the program failed"),
+    ]));
+    let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
+    let mut events = agent.subscribe();
+
+    stream.change_on_next_sample(screen(
+        9,
+        5,
+        "error: no quote",
+        json!({"code":3,"signal":null}),
+    ));
+    stream.emit(TickStreamEvent::ProgramExited {
+        instance: fixture_instance(9),
+        audience: audience(&stream, 9),
+    });
+    tokio::time::timeout(Duration::from_secs(1), wait_for_completion(&mut events))
+        .await
+        .expect("the exit is delivered before any period elapses");
+    assert_eq!(model.requests.lock().unwrap().len(), 3);
+    let delivered = last_user_text(&model);
+    assert!(delivered.contains("error: no quote"), "{delivered}");
+    assert!(delivered.contains("\"code\":3"), "{delivered}");
+    let status = &agent.tick_subscriptions(chat).await.unwrap()[0];
+    assert_eq!(status.accumulated, 0);
+    assert!(!status.has_pending_change);
+    agent.shutdown().await;
+}
+
+/// The first change of a Terminal Tick's screen since its subscription last got it marks the
+/// subscription as holding a change for its next check, without waking the Loop. A check that
+/// finds the screen changed back delivers nothing and settles the mark; one that finds it changed
+/// delivers it.
+#[tokio::test(start_paused = true)]
+async fn a_screen_change_waits_for_its_check_and_one_changed_back_delivers_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "s1",
+            "SubscribeTick",
+            json!({"tick_instance_id": fixture_instance(9)}),
+        ),
+        text("watching the terminal"),
+        text("the prompt changed"),
+    ]));
+    let (agent, stream, chat, _) = subscribed_agent(directory.path(), model.clone()).await;
+    let mut events = agent.subscribe();
+    let changed = |is_pending| TickStreamEvent::ScreenChange {
+        instance: fixture_instance(9),
+        audience: audience(&stream, 9),
+        is_pending,
+    };
+
+    stream.emit(changed(true));
+    settle().await;
+    let status = &agent.tick_subscriptions(chat).await.unwrap()[0];
+    assert!(status.has_pending_change, "{status:?}");
+    assert_eq!(status.accumulated, 0, "a change is no Tick Update yet");
+    assert!(
+        status.updated_at_ms.is_some(),
+        "the change is when the instance last updated"
+    );
+    assert_eq!(model.requests.lock().unwrap().len(), 2);
+
+    tokio::time::advance(HIGH_PERIOD).await;
+    settle().await;
+    assert_eq!(
+        model.requests.lock().unwrap().len(),
+        2,
+        "a screen changed back wakes nothing"
+    );
+    assert!(!agent.tick_subscriptions(chat).await.unwrap()[0].has_pending_change);
+
+    stream.emit(changed(true));
+    stream.change_on_next_sample(screen(9, 8, "$ quote 700.HK", serde_json::Value::Null));
+    settle().await;
+    tokio::time::advance(HIGH_PERIOD).await;
+    wait_for_completion(&mut events).await;
+    assert_eq!(model.requests.lock().unwrap().len(), 3);
+    assert!(last_user_text(&model).contains("$ quote 700.HK"));
+    let status = &agent.tick_subscriptions(chat).await.unwrap()[0];
+    assert!(!status.has_pending_change, "{status:?}");
+    assert_eq!(status.accumulated, 0);
+    agent.shutdown().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn an_update_for_an_instance_nobody_subscribed_to_never_reaches_a_loop() {
     let directory = tempfile::tempdir().unwrap();

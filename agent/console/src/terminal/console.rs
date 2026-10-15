@@ -12421,6 +12421,7 @@ mod tests {
             .unwrap(),
             frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
             accumulated: 0,
+            has_pending_change: false,
             last_delivery_ms: None,
             last_delivery: None,
             link: tickloop_agent_protocol::TickLinkState::Live,

@@ -989,6 +989,7 @@ mod tests {
                 instance: quote.clone(),
                 frequency: TickSubscriptionFrequency::High,
                 accumulated: 0,
+                has_pending_change: false,
                 last_delivery_ms: None,
                 last_delivery: None,
                 kind: Some(ObservationKind::Protocol),
@@ -1033,6 +1034,7 @@ mod tests {
             instance: instance.clone(),
             frequency: TickSubscriptionFrequency::High,
             accumulated,
+            has_pending_change: false,
             last_delivery_ms: None,
             last_delivery: None,
             kind: Some(ObservationKind::Protocol),
@@ -1193,6 +1195,22 @@ mod tests {
                 next_check: None,
             }),
             "a quiet subscription waits for nothing"
+        );
+        assert_eq!(
+            mark(vec![TickSubscriptionStatus {
+                accumulated: 0,
+                has_pending_change: true,
+                ..checked(TickSubscriptionFrequency::High, 60_000)
+            }]),
+            Some(SubscriptionMark {
+                frequency: TickSubscriptionFrequency::High,
+                is_waiting: true,
+                next_check: Some(NextCheck {
+                    at_ms: 60_000,
+                    period_ms: 60_000,
+                }),
+            }),
+            "a Terminal Tick's changed screen waits for the check that reads it"
         );
         assert_eq!(
             mark(vec![TickSubscriptionStatus {
