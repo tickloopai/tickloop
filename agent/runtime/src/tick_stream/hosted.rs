@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use tick_protocol::TickState;
 use tickhost::host::{TerminalDescription, TerminalRead, TickAdapter};
 use tickhost_connect::{
+    host_error::HostError,
     hosted::{
         self, BUSINESS_FRAME_BYTES, CONTROL_TIMEOUT, HostConnection, OBSERVATION_FRAME_BYTES,
     },
@@ -26,9 +27,9 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{
-    ConnectionBudget, EventPublisher, InstanceObserver, InstanceRef, PreparedTickWatch,
-    ProtocolFeed, RECONNECT_PAUSE, TickConnectionState, TickMetadata, TickObservation,
-    TickStreamHandle, TickStreamPort, WatchAdmission, WatchId, connection_state,
+    ConnectionBudget, DISCONNECTED_CODE, EventPublisher, InstanceObserver, InstanceRef,
+    PreparedTickWatch, ProtocolFeed, RECONNECT_PAUSE, TickConnectionState, TickMetadata,
+    TickObservation, TickStreamHandle, TickStreamPort, WatchAdmission, WatchId, connection_state,
     current_observation, follow_instances, observe_protocol,
 };
 use crate::{host_tools::HostToolProvider, hosted::tools::HostedTickTools, tick_tools::READ_TICK};
@@ -326,7 +327,7 @@ struct HostedFeed {
 impl HostedFeed {
     /// Proves the Chat still holds a current binding for the instance before anything is read,
     /// and tells which adapter serves it.
-    async fn check_binding(&self) -> Result<TickAdapter, tickhost_connect::host_error::HostError> {
+    async fn check_binding(&self) -> Result<TickAdapter, HostError> {
         self.tools.data(self.chat, &self.instance).await?;
         self.tools.adapter(self.chat, &self.instance).await
     }
@@ -797,36 +798,28 @@ async fn observe_terminal_screen(
 
 #[async_trait::async_trait]
 impl ProtocolFeed for HostedFeed {
-    async fn descriptor(&self) -> Result<tick_protocol::TickDescriptor, String> {
-        let mut connection = self
-            .tools
-            .data(self.chat, &self.instance)
-            .await
-            .map_err(|error| error.to_string())?;
+    async fn descriptor(&self) -> Result<tick_protocol::TickDescriptor, HostError> {
+        let mut connection = self.tools.data(self.chat, &self.instance).await?;
         let descriptor = connection
             .request("describe", json!({}), CONTROL_TIMEOUT)
-            .await
-            .map_err(|error| error.to_string())?;
-        serde_json::from_value(descriptor).map_err(|error| error.to_string())
+            .await?;
+        serde_json::from_value(descriptor).map_err(unreadable)
     }
 
     /// Registers a host watch: the reply carries the current content, then the host pushes
     /// latest-only observations until the Tick ends or the connection does.
-    async fn watch(&self) -> Result<(TickState, u64, watch::Receiver<SessionObservation>), String> {
-        let mut connection = self
-            .tools
-            .data(self.chat, &self.instance)
-            .await
-            .map_err(|error| error.to_string())?;
+    async fn watch(
+        &self,
+    ) -> Result<(TickState, u64, watch::Receiver<SessionObservation>), HostError> {
+        let mut connection = self.tools.data(self.chat, &self.instance).await?;
         let registered = connection
             .request("watch", json!({}), CONTROL_TIMEOUT)
-            .await
-            .map_err(|error| error.to_string())?;
-        let baseline: TickState = serde_json::from_value(registered["read"].clone())
-            .map_err(|error| error.to_string())?;
+            .await?;
+        let baseline: TickState =
+            serde_json::from_value(registered["read"].clone()).map_err(unreadable)?;
         let received = registered["received"]
             .as_u64()
-            .ok_or("the Tickhost registered no observation count")?;
+            .ok_or_else(|| unreadable("the Tickhost registered no observation count"))?;
         let (sender, receiver) = watch::channel(SessionObservation {
             update: None,
             received,
@@ -863,6 +856,11 @@ impl ProtocolFeed for HostedFeed {
         });
         Ok((baseline, received, receiver))
     }
+}
+
+/// An answer of the Tickhost this Agent could not read, which a later connection may.
+fn unreadable(error: impl std::fmt::Display) -> HostError {
+    HostError::after(DISCONNECTED_CODE, error.to_string())
 }
 
 fn observation(event: &Value) -> Option<SessionObservation> {

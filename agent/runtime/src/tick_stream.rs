@@ -745,10 +745,13 @@ impl ConnectionBudget {
 }
 
 /// A protocol Tick as a watch sees it: its declaration, which names it and its recovery tool,
-/// and a registration that yields the current content and then latest-only updates.
+/// and a registration that yields the current content and then latest-only updates. A failure
+/// keeps the host's code, which tells an ended Tick from a lost connection.
 #[async_trait::async_trait]
 trait ProtocolFeed: Send + Sync {
-    async fn descriptor(&self) -> Result<tick_protocol::TickDescriptor, String>;
+    async fn descriptor(
+        &self,
+    ) -> Result<tick_protocol::TickDescriptor, tickhost_connect::host_error::HostError>;
 
     async fn watch(
         &self,
@@ -758,7 +761,7 @@ trait ProtocolFeed: Send + Sync {
             u64,
             watch::Receiver<tickhost_connect::session::SessionObservation>,
         ),
-        String,
+        tickhost_connect::host_error::HostError,
     >;
 }
 
@@ -866,6 +869,9 @@ async fn follow_instances<O: InstanceObserver>(
     }
 }
 
+/// The code of a failure that only lost the connection to a Tick.
+const DISCONNECTED_CODE: &str = "Disconnected";
+
 fn connection_state(code: &str) -> TickConnectionState {
     match code {
         "TargetGone" => TickConnectionState::Gone,
@@ -892,28 +898,14 @@ async fn observe_protocol(
     }
     let descriptor = match feed.descriptor().await {
         Ok(descriptor) => descriptor,
-        Err(_) => {
-            publisher.state_to(
-                instance.clone(),
-                TickConnectionState::Disconnected,
-                attempted.iter().copied(),
-            );
-            return false;
-        }
+        Err(error) => return publish_failure(&error, instance, publisher, &attempted),
     };
     if scope.admitted(&attempted, instance, publisher).is_empty() {
         return true;
     }
     let (baseline, registration_received, mut updates) = match feed.watch().await {
         Ok(watch) => watch,
-        Err(_) => {
-            publisher.state_to(
-                instance.clone(),
-                TickConnectionState::Disconnected,
-                attempted.iter().copied(),
-            );
-            return false;
-        }
+        Err(error) => return publish_failure(&error, instance, publisher, &attempted),
     };
     if scope.admitted(&attempted, instance, publisher).is_empty() {
         return true;
@@ -976,12 +968,8 @@ async fn observe_protocol(
             return true;
         }
         SessionLinkState::Disconnected => {
-            publisher.state_to(
-                instance.clone(),
-                TickConnectionState::Disconnected,
-                cursors.keys().copied(),
-            );
-            return false;
+            let watches = cursors.keys().copied().collect();
+            return settle_disconnect(feed, instance, publisher, &watches).await;
         }
         SessionLinkState::ProtocolError(_) => {
             publisher.state_to(
@@ -995,12 +983,8 @@ async fn observe_protocol(
     loop {
         tokio::select! {
             changed = updates.changed() => if changed.is_err() {
-                publisher.state_to(
-                    instance.clone(),
-                    TickConnectionState::Disconnected,
-                    cursors.keys().copied(),
-                );
-                return false;
+                let watches = cursors.keys().copied().collect();
+                return settle_disconnect(feed, instance, publisher, &watches).await;
             },
             changed = wanted.changed() => if changed.is_err() { return true; },
         }
@@ -1020,12 +1004,8 @@ async fn observe_protocol(
                 return true;
             }
             SessionLinkState::Disconnected => {
-                publisher.state_to(
-                    instance.clone(),
-                    TickConnectionState::Disconnected,
-                    cursors.keys().copied(),
-                );
-                return false;
+                let watches = cursors.keys().copied().collect();
+                return settle_disconnect(feed, instance, publisher, &watches).await;
             }
             SessionLinkState::ProtocolError(_) => {
                 publisher.state_to(
@@ -1057,6 +1037,43 @@ async fn observe_protocol(
                 ready_watches.insert(watch);
             }
         }
+    }
+}
+
+/// Publishes what a failed `describe` or `watch` says of the Tick to `watches`; whether that
+/// ends observing it, as a Tick that ended or whose identity is uncertain does.
+fn publish_failure(
+    error: &tickhost_connect::host_error::HostError,
+    instance: &InstanceRef,
+    publisher: &EventPublisher,
+    watches: &BTreeSet<WatchId>,
+) -> bool {
+    let state = connection_state(&error.code);
+    publisher.state_to(instance.clone(), state, watches.iter().copied());
+    state != TickConnectionState::Disconnected
+}
+
+/// Settles a watch whose stream ended without telling how its Tick ended, as when its host
+/// closed it right as the Tick went: the host is asked at once, and still says so for an ended
+/// Tick, rather than the watch reconnecting after [`RECONNECT_PAUSE`] only to learn it then.
+/// Whether that ends observing the Tick.
+async fn settle_disconnect(
+    feed: &dyn ProtocolFeed,
+    instance: &InstanceRef,
+    publisher: &EventPublisher,
+    watches: &BTreeSet<WatchId>,
+) -> bool {
+    match feed.descriptor().await {
+        Ok(_) => publish_failure(
+            &tickhost_connect::host_error::HostError::after(
+                DISCONNECTED_CODE,
+                "the watch ended while the Tick runs",
+            ),
+            instance,
+            publisher,
+            watches,
+        ),
+        Err(error) => publish_failure(&error, instance, publisher, watches),
     }
 }
 
@@ -1110,7 +1127,118 @@ fn publish_protocol_update(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tickhost_connect::host_error::HostError;
+    use tickhost_connect::session::{SessionLinkState, SessionObservation};
+
     use super::*;
+
+    /// A protocol Tick whose watch stream ends at once without telling how, and whose host
+    /// answers `describe` until it has answered `answers` times, then says the Tick ended.
+    struct EndingFeed {
+        answers: usize,
+        described: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ProtocolFeed for EndingFeed {
+        async fn descriptor(&self) -> Result<tick_protocol::TickDescriptor, HostError> {
+            if self.described.fetch_add(1, Ordering::SeqCst) >= self.answers {
+                return Err(HostError::before("TargetGone", "the Tick has ended"));
+            }
+            Ok(tick_protocol::TickDescriptor {
+                protocol: tick_protocol::NATIVE_PROTOCOL_VERSION,
+                kind: "example.ending".into(),
+                title: "Ending".into(),
+                description: "Ends".into(),
+                revision: "1".into(),
+                tools: Vec::new(),
+                recover_with: None,
+                state: None,
+            })
+        }
+
+        async fn watch(
+            &self,
+        ) -> Result<
+            (
+                tick_protocol::TickState,
+                u64,
+                watch::Receiver<SessionObservation>,
+            ),
+            HostError,
+        > {
+            let (_ended, observations) = watch::channel(SessionObservation {
+                update: None,
+                received: 0,
+                state: SessionLinkState::Live,
+            });
+            Ok((tick_protocol::TickState::empty(), 0, observations))
+        }
+    }
+
+    struct AdmitsAll;
+
+    impl WatchAdmission for AdmitsAll {
+        fn admitted(
+            &self,
+            requested: &BTreeSet<WatchId>,
+            _instance: &InstanceRef,
+            _publisher: &EventPublisher,
+        ) -> BTreeSet<WatchId> {
+            requested.clone()
+        }
+    }
+
+    /// Whether observing an [`EndingFeed`] that answers `answers` times ended the watch, and the
+    /// last connection state it published.
+    async fn observe_ending(answers: usize) -> (bool, TickConnectionState) {
+        let (publisher, mut events) = EventPublisher::channel();
+        let instance = InstanceRef::hosted(Uuid::new_v4());
+        let watch = Uuid::new_v4();
+        let (_wanted_sender, mut wanted) = watch::channel(BTreeSet::from([watch]));
+        let feed = EndingFeed {
+            answers,
+            described: AtomicUsize::new(0),
+        };
+        let ended = observe_protocol(
+            &feed,
+            &instance,
+            &mut wanted,
+            &publisher,
+            &mut BTreeSet::new(),
+            &AdmitsAll,
+        )
+        .await;
+        let mut last = None;
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(200), events.recv()).await
+        {
+            if let TickStreamEvent::State { state, .. } = event {
+                last = Some(state);
+            }
+        }
+        (ended, last.expect("a connection state was published"))
+    }
+
+    #[tokio::test]
+    async fn a_watch_whose_stream_ends_with_its_tick_reports_it_gone_at_once() {
+        assert_eq!(observe_ending(1).await, (true, TickConnectionState::Gone));
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_that_finds_its_tick_ended_reports_it_gone() {
+        assert_eq!(observe_ending(0).await, (true, TickConnectionState::Gone));
+    }
+
+    #[tokio::test]
+    async fn a_watch_whose_tick_still_runs_stays_disconnected_until_it_reconnects() {
+        assert_eq!(
+            observe_ending(usize::MAX).await,
+            (false, TickConnectionState::Disconnected)
+        );
+    }
 
     #[tokio::test]
     async fn a_new_watch_is_not_retired_with_a_worker_that_ended_before_it_joined() {
