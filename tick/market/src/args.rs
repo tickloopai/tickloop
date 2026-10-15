@@ -1,4 +1,4 @@
-//! The arguments of each financial Tick, shared by every provider that runs it.
+//! The arguments of each financial Tick, shared by every program that runs it.
 
 use std::path::PathBuf;
 
@@ -6,7 +6,7 @@ use clap::Args;
 
 #[derive(Args, Clone, Debug)]
 #[command(
-    after_help = "Keys: q/Ctrl+C quit; ? help; j/k or arrows move; PageUp/PageDown; g/G.\nExamples: tick longbridge quote TSLA 700 --once --format json"
+    after_help = "Keys: q/Ctrl+C quit; ? help; j/k or arrows move; PageUp/PageDown; g/G.\nExamples: tick-longbridge quote TSLA 700 --once --format json"
 )]
 pub struct QuoteArgs {
     #[arg(required = true, num_args = 1..)]
@@ -17,7 +17,7 @@ pub struct QuoteArgs {
 
 #[derive(Args, Clone, Debug, Default)]
 #[command(
-    after_help = "Keys: [/] or Left/Right switch groups; q quits; ? help.\nExample: tick longbridge watchlist --group Technology --once --format json"
+    after_help = "Keys: [/] or Left/Right switch groups; q quits; ? help.\nExample: tick-longbridge watchlist --group Technology --once --format json"
 )]
 pub struct WatchlistArgs {
     /// Watchlist group ID or name (defaults to the first group)
@@ -29,7 +29,7 @@ pub struct WatchlistArgs {
 
 #[derive(Args, Clone, Debug)]
 #[command(
-    after_help = "Keys: Enter opens article; Backspace returns to list; q quits; ? help.\nExample: tick longbridge news 700.HK --limit 10 --once --format json"
+    after_help = "Keys: Enter opens article; Backspace returns to list; q quits; ? help.\nExample: tick-longbridge news 700.HK --limit 10 --once --format json"
 )]
 pub struct NewsArgs {
     pub symbol: Option<String>,
@@ -41,7 +41,7 @@ pub struct NewsArgs {
 
 #[derive(Args, Clone, Debug)]
 #[command(
-    after_help = "Keys: Enter opens post; Backspace returns to list; q quits; ? help.\nThe member ID is the number in a profile link such as https://longbridge.com/zh-CN/profiles/91.\nExample: tick longbridge community 91 --once --format json"
+    after_help = "Keys: Enter opens post; Backspace returns to list; q quits; ? help.\nThe member ID is the number in a profile link such as https://longbridge.com/zh-CN/profiles/91.\nExample: tick-longbridge community 91 --once --format json"
 )]
 pub struct CommunityArgs {
     /// Longbridge community member ID
@@ -61,7 +61,7 @@ fn parse_member_id(value: &str) -> Result<i64, String> {
 
 #[derive(Args, Clone, Debug)]
 #[command(
-    after_help = "Keys: s changes the symbol (Enter applies, Ctrl+C cancels); q quits; Backspace back; ? help; j/k or arrows move.\nExample: tick longbridge earnings TSLA.US --count 12 --once --format json"
+    after_help = "Keys: s changes the symbol (Enter applies, Ctrl+C cancels); q quits; Backspace back; ? help; j/k or arrows move.\nExample: tick-longbridge earnings TSLA.US --count 12 --once --format json"
 )]
 pub struct EarningsArgs {
     /// US symbol, for example TSLA.US
@@ -117,7 +117,7 @@ fn parse_earnings_count(value: &str) -> Result<usize, String> {
 
 #[derive(Args, Clone, Debug)]
 #[command(
-    after_help = "Keys: Left/Right select candle; 1-8 switch period; m toggles moving averages; q quits; Backspace back; ? help.\nExample: tick longbridge kline 700.HK --period 5m --count 80 --adjust forward"
+    after_help = "Keys: Left/Right select candle; 1-8 switch period; m toggles moving averages; q quits; Backspace back; ? help.\nExample: tick-longbridge kline 700.HK --period 5m --count 80 --adjust forward"
 )]
 pub struct KlineArgs {
     pub symbol: String,

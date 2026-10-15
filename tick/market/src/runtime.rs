@@ -107,10 +107,6 @@ impl ViewState {
             self.connection = ConnectionState::Disconnected;
             self.last_error = Some(error.message);
             Ok(())
-        } else if error.code == tick_provider::exit_code::NOT_AUTHORIZED
-            && !error.message.contains(tick_provider::error::AUTH_HINT)
-        {
-            Err(Error::auth(error.message))
         } else {
             Err(error)
         }
@@ -550,8 +546,8 @@ fn render<V: LiveView, B: Backend>(
     Ok(())
 }
 
-/// Draws the view with the demo heading and the status row into the frame, which is the Panel
-/// itself or, for a Panel smaller than the Tick's minimum, the canvas it scrolls over.
+/// Draws the view and the status row into the frame, which is the Panel itself or, for a Panel
+/// smaller than the Tick's minimum, the canvas it scrolls over.
 fn draw_canvas<V: LiveView>(
     view: &V,
     frame: &mut Frame<'_>,
@@ -569,48 +565,6 @@ fn draw_canvas<V: LiveView>(
     } else {
         1
     };
-    if settings.is_demo {
-        let heading_area = Rect::new(area.x, area.y, area.width, 1);
-        frame
-            .buffer_mut()
-            .set_style(heading_area, styles.panel_base());
-        write_text(
-            frame.buffer_mut(),
-            area.x,
-            area.y,
-            &" ".repeat(area.width as usize),
-            area.width as usize,
-            settings.ambiguous_width,
-            styles.panel_base(),
-        );
-        let title_width = area
-            .width
-            .saturating_sub(horizontal_padding * 2)
-            .saturating_sub(7);
-        write_text(
-            frame.buffer_mut(),
-            area.x + horizontal_padding,
-            area.y,
-            &pad(
-                &view.title(),
-                title_width as usize,
-                settings.ambiguous_width,
-                false,
-            ),
-            title_width as usize,
-            settings.ambiguous_width,
-            styles.panel_base().patch(styles.title),
-        );
-        write_text(
-            frame.buffer_mut(),
-            area.right() - horizontal_padding - 4,
-            area.y,
-            "DEMO",
-            4,
-            settings.ambiguous_width,
-            styles.panel_base().patch(styles.muted_text),
-        );
-    }
     let status_area = Rect::new(area.x, area.bottom() - 1, area.width, 1);
     let mut status_style = styles.status_base().patch(styles.muted_text);
     if state.last_error.is_some() {
@@ -626,8 +580,6 @@ fn draw_canvas<V: LiveView>(
         } else {
             format!("{icon} {} · {error}", state.availability())
         }
-    } else if settings.is_demo {
-        "Simulated data".to_owned()
     } else {
         format!("{icon} {}", state.availability())
     };

@@ -19,6 +19,12 @@ fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
         "`view.status`",
         "Esc hides the view",
         "An artifact takes no Tick Subscription",
+        "`reader_executable`",
+        "`tick_packages`",
+        "`<package>:<skill>`",
+        "`tick-<package>`",
+        "`! tickloop tick install <package>`",
+        "Never install a package yourself",
     ] {
         assert!(TICKLOOP_SKILL.contains(contract), "{contract}");
     }
@@ -34,6 +40,18 @@ fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
         "exits that Tick",
         "idle minutes",
         "from idling out",
+        "builtin",
+        "tick_executable",
+        "TICK_EXECUTABLE",
+        "PROVIDER TICK",
+        "tick-longbridge",
+        "tick-futu",
+        "\"quote\"",
+        "\"kline\"",
+        "--period",
+        "MEMBER_ID",
+        "TSLA.US",
+        "on PATH",
     ] {
         assert!(!TICKLOOP_SKILL.contains(retired), "{retired}");
     }

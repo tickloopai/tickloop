@@ -14,7 +14,6 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use support::hosted::counter_program;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -113,7 +112,9 @@ struct Observed {
 }
 
 /// The model first sends ModifyTick with no arguments, as GLM did for a schema whose root was
-/// only a `oneOf`, and is told which fields to fill.
+/// only a `oneOf`, and is told which fields to fill. It then opens the Tick package program
+/// `tick-counter` by name and without `protocol`: the worker finds the package installed in its
+/// View's config root, and the program runs as the protocol Tick its manifest declares.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -127,11 +128,11 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
     let server_observed = observed.clone();
     let host_runtime = root.join("h");
     let server_host_runtime = host_runtime.clone();
-    let open_command = json!(counter_program());
+    let config_root = root.join("state");
+    support::hosted::install_counter_package(&config_root, &root);
     let server = tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let observed = server_observed.clone();
-            let open_command = open_command.clone();
             let host_socket = server_host_runtime.join("host.sock");
             tokio::spawn(async move {
                 let (path, request) = read_request(&mut stream).await;
@@ -154,7 +155,7 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
                         observed
                             .host_before_open
                             .store(host_socket.exists(), Ordering::SeqCst);
-                        json!({"type":"tool_use","id":"open","name":"ModifyTick","input":{"action":"open","command":open_command,"protocol":true,"placement":{"type":"hidden"}}})
+                        json!({"type":"tool_use","id":"open","name":"ModifyTick","input":{"action":"open","command":["tick-counter"],"placement":{"type":"hidden"}}})
                     }
                     (2, Some(instance)) => {
                         json!({"type":"tool_use","id":"read","name":"ReadTick","input":{"tick_instance_id":instance}})
@@ -172,7 +173,6 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
             });
         }
     });
-    let config_root = root.join("state");
     let config_path = root.join("model.json");
     std::fs::write(&config_path, serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":origin,"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
     let runtime_directory = support::cli_runtime::directory();
@@ -1118,6 +1118,100 @@ for line in sys.stdin:
             json!({"action":"close","tick_instance_id":instance}),
         )
         .await;
+    }
+
+    /// A Tick package installed in the worker's config root: its program opens by its bare name
+    /// and runs as a protocol Tick because its manifest says so, without `protocol: true`; once
+    /// the package is uninstalled, the open names the install command.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_installed_package_program_opens_by_name_as_a_protocol_tick() {
+        let daemon = Daemon::start(1).await;
+        let chat = daemon.chats[0];
+        let packages =
+            super::support::hosted::install_counter_package(&daemon.config_root, &daemon.root);
+        let tools = daemon.tools().with_tick_packages(packages.clone());
+        let open = json!({"action":"open","command":["tick-counter"],"cwd":daemon.root});
+
+        let opened = run_tool(&tools, chat, "ModifyTick", open.clone()).await;
+        let instance = opened["tick_instance_id"].clone();
+        let read = run_tool(
+            &tools,
+            chat,
+            "ReadTick",
+            json!({"tick_instance_id":instance}),
+        )
+        .await;
+        assert_eq!(read["data"]["value"], 0, "{read}");
+        assert!(read["tools"].to_string().contains("increment"), "{read}");
+        let called = run_tool(
+            &tools,
+            chat,
+            "CallTickTool",
+            json!({"tick_instance_id":instance,"tool":"increment","args":{"amount":2}}),
+        )
+        .await;
+        assert_eq!(called["status"], "completed", "{called}");
+        run_tool(
+            &tools,
+            chat,
+            "ModifyTick",
+            json!({"action":"close","tick_instance_id":instance}),
+        )
+        .await;
+
+        packages.uninstall("counter").unwrap();
+        let refused = tools
+            .prepare_call(chat, "ModifyTick", &open, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("`tickloop tick install counter`"),
+            "{refused}"
+        );
+    }
+
+    /// A package Tick lost with its host: once its package is uninstalled, a reopen names the
+    /// install command; once reinstalled, its program changed and it must be opened anew.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reopening_a_lost_package_tick_after_its_package_went_names_the_install_command() {
+        let daemon = Daemon::start(1).await;
+        let chat = daemon.chats[0];
+        let packages =
+            super::support::hosted::install_counter_package(&daemon.config_root, &daemon.root);
+        let tools = daemon.tools().with_tick_packages(packages.clone());
+        let opened = run_tool(
+            &tools,
+            chat,
+            "ModifyTick",
+            json!({"action":"open","command":["tick-counter"],"cwd":daemon.root}),
+        )
+        .await;
+        let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
+        let launcher = tickhost::process::sample(business_pid).unwrap().parent;
+        let host = tickhost::process::sample(launcher).unwrap().parent;
+        unsafe { libc::kill(host as libc::pid_t, libc::SIGKILL) };
+        assert!(super::gone(business_pid).await);
+        packages.uninstall("counter").unwrap();
+        let reopen = json!({"action":"reopen","tick_instance_id":opened["tick_instance_id"]});
+
+        let HostCallResult::NotDispatched(uninstalled) =
+            call_tool(&tools, chat, "ModifyTick", reopen.clone()).await
+        else {
+            panic!("a reopen of an uninstalled package's program runs nothing");
+        };
+        assert!(
+            uninstalled.contains(
+                "executable not found: tick-counter comes from Tick package counter, which is not installed; the user installs it with `tickloop tick install counter`"
+            ),
+            "{uninstalled}"
+        );
+        super::support::hosted::install_counter_package(&daemon.config_root, &daemon.root);
+        let HostCallResult::NotDispatched(changed) =
+            call_tool(&tools, chat, "ModifyTick", reopen).await
+        else {
+            panic!("a reinstalled program is another program");
+        };
+        assert!(changed.contains("LaunchChanged"), "{changed}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

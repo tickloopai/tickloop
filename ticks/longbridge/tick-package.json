@@ -1,0 +1,8 @@
+{
+  "name": "longbridge",
+  "version": "0.2.0",
+  "description": "Longbridge quotes, watchlist, kline, positions, news, earnings and community posts",
+  "executable": "bin/tick-longbridge",
+  "protocol": true,
+  "credentials": "~/.tickloop/longbridge/"
+}

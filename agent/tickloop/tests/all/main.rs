@@ -20,4 +20,5 @@ mod monitor_popup;
 mod monitor_pty;
 mod provider_picker;
 mod terminal;
+mod tick_package_commands;
 mod workspace_trust_pty;

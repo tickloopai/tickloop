@@ -4,14 +4,14 @@
 mod community;
 #[path = "all/configuration.rs"]
 mod configuration;
-#[path = "all/demo.rs"]
-mod demo;
 #[path = "all/earnings.rs"]
 mod earnings;
 #[path = "all/event_chart.rs"]
 mod event_chart;
 #[path = "all/kline.rs"]
 mod kline;
+#[path = "all/kline_streaming.rs"]
+mod kline_streaming;
 #[path = "all/kline_tools.rs"]
 mod kline_tools;
 #[path = "all/live_quote.rs"]
@@ -20,6 +20,8 @@ mod live_quote;
 mod minimum_width;
 #[path = "all/narrow_errors.rs"]
 mod narrow_errors;
+#[path = "all/native_visible_stdio.rs"]
+mod native_visible_stdio;
 #[path = "all/news.rs"]
 mod news;
 #[path = "all/options_research.rs"]

@@ -179,17 +179,8 @@ async fn help_overlay_and_undersized_canvas_keep_the_injected_background_on_blan
 }
 
 #[tokio::test]
-async fn demo_preserves_the_tick_title_and_numeric_headers_align_with_values() {
-    let terminal = screen(
-        64,
-        14,
-        vec![KeyCode::Char('q')],
-        Settings {
-            is_demo: true,
-            ..Settings::default()
-        },
-    )
-    .await;
+async fn the_tick_title_shows_and_numeric_headers_align_with_values() {
+    let terminal = screen(64, 14, vec![KeyCode::Char('q')], Settings::default()).await;
     let lines: Vec<String> = terminal
         .backend()
         .buffer()
@@ -198,8 +189,6 @@ async fn demo_preserves_the_tick_title_and_numeric_headers_align_with_values() {
         .map(|row| row.iter().map(|cell| cell.symbol()).collect())
         .collect();
     assert!(lines[0].contains("Quotes"));
-    assert!(lines[0].contains("DEMO"));
-    assert!(lines[13].contains("Simulated data"));
     assert_eq!(
         lines[2].find("Price").unwrap() + "Price".len(),
         lines[3].find("100.00").unwrap() + "100.00".len()

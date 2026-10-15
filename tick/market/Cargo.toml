@@ -37,5 +37,5 @@ tokio-stream = { version = "0.1", features = ["signal"] }
 toml = "0.8"
 
 [dev-dependencies]
-tickloop-tick-builtin = { path = "../providers/builtin" }
+tickloop-tick-test-support = { path = "../test-support" }
 tokio = { version = "1", features = ["test-util"] }

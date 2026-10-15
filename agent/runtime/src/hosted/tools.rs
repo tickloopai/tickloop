@@ -12,6 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use tick_packages::PackageStore;
 use tick_protocol::{InstanceRef, TickDescriptor};
 use tickhost::host::{Receipt, TerminalDescription, TerminalRead, TickAdapter, TickRow};
 use tickhost_connect::{
@@ -140,6 +141,8 @@ pub struct HostedTickTools {
     bindings: Mutex<HashMap<(ChatId, InstanceRef), DataBinding>>,
     /// The Herdr Panes that show Ticks, for a worker in a Herdr View.
     views: Option<HerdrViews>,
+    /// The Tick packages installed in the worker's config root, whose programs an open finds.
+    packages: Option<PackageStore>,
 }
 
 impl HostedTickTools {
@@ -152,7 +155,15 @@ impl HostedTickTools {
             environment,
             bindings: Mutex::new(HashMap::new()),
             views: None,
+            packages: None,
         }
+    }
+
+    /// The same tools, which also open the programs of the Tick packages installed in
+    /// `packages`.
+    pub fn with_tick_packages(mut self, packages: PackageStore) -> Self {
+        self.packages = Some(packages);
+        self
     }
 
     /// The same tools, which also show Ticks in Herdr Panes and list a Workspace's Panes.
@@ -298,8 +309,13 @@ impl HostedTickTools {
                 }
                 .canonicalize()
                 .map_err(|error| format!("cannot resolve cwd: {error}"))?;
-                let executable = tickhost_connect::program::resolve_executable(&words[0], &cwd)
-                    .map_err(|error| error.to_string())?;
+                let resolved = tickhost_connect::program::resolve_executable(
+                    &words[0],
+                    &cwd,
+                    self.packages.as_ref(),
+                )
+                .map_err(|error| error.to_string())?;
+                let executable = resolved.path;
                 let protocol = match input.get("protocol") {
                     None => false,
                     Some(protocol) => protocol.as_bool().ok_or("protocol must be a boolean")?,
@@ -313,11 +329,16 @@ impl HostedTickTools {
                             .into(),
                     );
                 }
-                // The bundled tick always speaks the Tick protocol.
+                // The bundled tick-reader always speaks the Tick protocol, and so does a Tick
+                // package's program whose manifest declares it.
                 let adapter = if protocol
+                    || resolved
+                        .package
+                        .as_ref()
+                        .is_some_and(|package| package.manifest.protocol)
                     || is_same_file(
                         &executable,
-                        tickhost_connect::program::bundled_tick_executable(),
+                        tickhost_connect::program::bundled_reader_executable(),
                     ) {
                     TickAdapter::Protocol
                 } else {
@@ -326,6 +347,16 @@ impl HostedTickTools {
                 let mut command = words.clone();
                 command[0] = executable.to_string_lossy().into_owned();
                 let command_line = words.join(" ");
+                let origin = resolved
+                    .package
+                    .as_ref()
+                    .map(|package| {
+                        format!(
+                            " from Tick package {} {}",
+                            package.manifest.name, package.manifest.version
+                        )
+                    })
+                    .unwrap_or_default();
                 let command_title = tickhost_connect::naming::command_title(&words);
                 normalized_input["protocol"] = json!(adapter == TickAdapter::Protocol);
                 let view = match input["placement"]["type"].as_str() {
@@ -357,7 +388,7 @@ impl HostedTickTools {
                     },
                     HostToolPermission::Reviewable,
                     format!(
-                        "Open `{command_line}` in the Tickhost as a {} (cwd {}){shown}",
+                        "Open `{command_line}`{origin} in the Tickhost as a {} (cwd {}){shown}",
                         match adapter {
                             TickAdapter::Protocol => "protocol Tick",
                             TickAdapter::Terminal => "terminal Tick",
@@ -1527,6 +1558,10 @@ impl HostToolProvider for HostedTickTools {
 
     fn workspace_host_context(&self) -> Option<WorkspaceHostContext> {
         let context = WorkspaceHostContext::from_environment().with_tickhost();
+        let context = match &self.packages {
+            Some(packages) => context.with_tick_packages(packages),
+            None => context,
+        };
         Some(if self.views.is_some() {
             context.with_herdr_views()
         } else {
@@ -1853,16 +1888,16 @@ mod tests {
     fn a_bundled_executable_is_recognised_through_any_path_that_names_it() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
-        let bundled = directory.path().join("tick");
+        let bundled = directory.path().join("tick-reader");
         std::fs::write(&bundled, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&bundled, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let linked = directory.path().join("linked-tick");
+        let linked = directory.path().join("linked-reader");
         std::os::unix::fs::symlink(&bundled, &linked).unwrap();
         let other = directory.path().join("other");
         std::fs::write(&other, "#!/bin/sh\n").unwrap();
         assert!(is_same_file(&linked, Some(bundled.clone())));
         assert!(is_same_file(
-            &directory.path().join("./tick"),
+            &directory.path().join("./tick-reader"),
             Some(linked.clone())
         ));
         assert!(!is_same_file(&other, Some(bundled.clone())));

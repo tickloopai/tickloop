@@ -1,0 +1,23 @@
+[package]
+name = "tickloop-tick-command"
+description = "What every Tick Command shares: display flags, configuration, the locale check, describe and running a Tick standalone or as the protocol Tick its host launched"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "tick_command"
+doctest = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+futures-util = "0.3"
+ratatui = "0.30"
+serde_json = "1"
+tickloop-tick-market = { path = "../market" }
+tickloop-tick-protocol = { path = "../protocol" }
+tickloop-tick-provider = { path = "../provider" }
+tickloop-tick-sdk = { path = "../sdk" }
+tickloop-ui = { path = "../../ui" }
+tokio = { version = "1", features = ["rt-multi-thread"] }

@@ -8,3 +8,5 @@ mod builtin_skills;
 mod model_configuration;
 #[path = "all/monitor_settings.rs"]
 mod monitor_settings;
+#[path = "all/tick_package_skills.rs"]
+mod tick_package_skills;

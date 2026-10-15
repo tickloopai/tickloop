@@ -2475,21 +2475,18 @@ impl ConsoleExecution {
         name: &str,
         arguments: &str,
     ) -> Result<(), String> {
-        let user_skills = self
-            .inner
-            .launch
-            .config_root
-            .as_ref()
-            .map(|root| root.join("skills"));
-        tickloop_agent_config::skills::SkillRegistry::discover(workdir, user_skills.as_deref())
-            .expand(
-                name,
-                arguments,
-                tickloop_agent_config::skills::SkillCaller::User,
-            )
-            .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        tickloop_agent_config::skills::SkillRegistry::discover(
+            workdir,
+            self.inner.launch.config_root.as_deref(),
+        )
+        .expand(
+            name,
+            arguments,
+            tickloop_agent_config::skills::SkillCaller::User,
+        )
+        .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
     }
     /// What the worker of the first Create starts with, read the way it will read it.
     fn new_agent_defaults(&self) -> AgentConfiguration {

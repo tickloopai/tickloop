@@ -2721,7 +2721,7 @@ impl Agent {
         let tools = self.create_chat_tools(&snapshot);
         let skills = tickloop_agent_config::skills::SkillRegistry::discover(
             &snapshot.workdir,
-            self.inner.user_skills_directory.as_deref(),
+            self.inner.config_root.as_deref(),
         );
         self.inner.chats.lock().await.insert(
             chat_id,

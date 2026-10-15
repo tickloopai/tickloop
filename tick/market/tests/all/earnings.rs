@@ -613,7 +613,7 @@ async fn once_json_carries_the_rows_and_the_summary_the_agent_reads() {
 
 #[tokio::test]
 async fn the_earnings_state_summarises_a_table_its_history_tool_returns_in_full() {
-    let api = tick_builtin::DemoApi::new().unwrap();
+    let api = tick_test_support::MockApi::new().unwrap();
     let mut output = Vec::new();
     let mut updates = TickStream::in_memory(TickKind::Earnings);
     run_once(

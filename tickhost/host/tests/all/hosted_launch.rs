@@ -1791,6 +1791,31 @@ async fn launch_failures_are_reported_before_dispatch_and_the_host_continues() {
     shutdown(&fixture).await;
 }
 
+/// A program that explains on the terminal why it cannot start keeps its whole explanation in
+/// the launch failure. The launcher's own failure, written after it, is checked in
+/// `tickhost_connect::launch`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_program_that_exits_during_startup_keeps_its_whole_reason_in_the_failure() {
+    let fixture = Fixture::start().await;
+    let mut controller = fixture.controller().await;
+    let reason = "tick-sample: not authorized; run `tick-sample auth`";
+    let failed = fixture
+        .open(
+            &mut controller,
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("printf '%s\\n' '{reason}' >&2; exit 3"),
+            ],
+            fixture.directory.path(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failed.code, "LaunchFailed", "{failed:?}");
+    assert!(failed.message.contains(reason), "{failed:?}");
+    shutdown(&fixture).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_oversized_update_breaks_only_its_own_tick() {
     let fixture = Fixture::start().await;

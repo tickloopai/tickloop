@@ -277,7 +277,8 @@ struct Inner {
     /// 用户设置文件；不写设置的 Agent（测试等）为 `None`。
     settings: Option<tickloop_agent_config::UserSettings>,
     host_options: AgentHostOptions,
-    user_skills_directory: Option<PathBuf>,
+    /// 设置文件所在的配置根；用户 Skill 与已安装 Tick 包的 Skill 从这里加载。
+    config_root: Option<PathBuf>,
     /// 本进程内设置读写的次序：写入设置并同步已加载的 Chat、以及读取设置并加入新 Chat 都在
     /// 持有它时完成，保证已加载的 Chat 与设置文件一致。总在 `chats` 锁之前获取。
     settings_writes: Mutex<()>,
@@ -1437,10 +1438,10 @@ impl Agent {
         host_options: AgentHostOptions,
     ) -> Self {
         let model = tickloop_agent_model::cards::model_for_persistent_selection(model);
-        let user_skills_directory = settings
+        let config_root = settings
             .as_ref()
             .and_then(tickloop_agent_config::UserSettings::root)
-            .map(|root| root.join("skills"));
+            .map(Path::to_path_buf);
         let agent = Self {
             inner: Arc::new(Inner {
                 selected_model: std::sync::Mutex::new(chat_settings::SelectedModel {
@@ -1449,7 +1450,7 @@ impl Agent {
                 }),
                 settings,
                 host_options,
-                user_skills_directory,
+                config_root,
                 settings_writes: Mutex::new(()),
                 settings_warnings: std::sync::Mutex::new(HashMap::new()),
                 provider_failures: std::sync::Mutex::new(HashMap::new()),
@@ -1636,7 +1637,7 @@ impl Agent {
         let tools = self.create_chat_tools(&snapshot);
         let skills = tickloop_agent_config::skills::SkillRegistry::discover(
             &snapshot.workdir,
-            self.inner.user_skills_directory.as_deref(),
+            self.inner.config_root.as_deref(),
         );
         let file_history = FileHistory::new(self.file_history_directory(id, &snapshot.workdir));
         let mut chats = self.inner.chats.lock().await;
@@ -1771,7 +1772,7 @@ impl Agent {
     ) -> Result<(), AgentError> {
         tickloop_agent_config::skills::SkillRegistry::discover(
             workdir,
-            self.inner.user_skills_directory.as_deref(),
+            self.inner.config_root.as_deref(),
         )
         .expand(
             name,
@@ -3682,7 +3683,7 @@ impl Agent {
             chat.snapshot.workdir = workdir;
             chat.skills = tickloop_agent_config::skills::SkillRegistry::discover(
                 &chat.snapshot.workdir,
-                self.inner.user_skills_directory.as_deref(),
+                self.inner.config_root.as_deref(),
             );
             if let Some(saved) = saved {
                 self.replace_persistent_rules(&mut chat.snapshot, &mut chat.bookkeeping, saved);

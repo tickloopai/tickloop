@@ -165,9 +165,10 @@ async fn refresh_authentication_and_usage_errors_exit_instead_of_retrying() {
         .await
         .unwrap_err();
         assert_eq!(error.code, code);
-        if code == 3 {
-            assert!(error.message.contains("tick longbridge auth"));
-        }
+        assert_eq!(
+            error.message, "request rejected",
+            "the provider's own guidance reaches the user unchanged"
+        );
         assert_eq!(*api.calls.lock().unwrap(), 2);
         assert_eq!(records(events).len(), 1);
     }
@@ -361,7 +362,8 @@ async fn market_failure_recovers_on_connection_or_data_without_status_ticks() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn market_authentication_failure_exits_with_auth_guidance_and_cleans_up_subscription() {
+async fn market_authentication_failure_exits_with_the_provider_message_and_cleans_up_subscription()
+{
     let (push, market) = tokio::sync::mpsc::unbounded_channel();
     let api = Quotes {
         events: Mutex::new(Some(market)),
@@ -388,7 +390,7 @@ async fn market_authentication_failure_exits_with_auth_guidance_and_cleans_up_su
     .await
     .unwrap_err();
     assert_eq!(error.code, 3);
-    assert!(error.message.contains("tick longbridge auth"));
+    assert_eq!(error.message, "token expired");
     assert_eq!(*api.unsubscribed.lock().unwrap(), 1);
     assert_eq!(records(events).len(), 1);
 }
@@ -681,9 +683,7 @@ async fn article_authentication_and_usage_errors_remain_fatal() {
         .await
         .unwrap_err();
         assert_eq!(error.code, code);
-        if code == 3 {
-            assert!(error.message.contains("tick longbridge auth"));
-        }
+        assert_eq!(error.message, "article request failed");
         assert_eq!(*api.article_calls.lock().unwrap(), 1);
         assert_eq!(records(events).len(), 1);
     }

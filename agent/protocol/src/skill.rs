@@ -6,8 +6,17 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SkillSource {
     BuiltIn,
-    User { path: PathBuf },
-    Project { path: PathBuf },
+    User {
+        path: PathBuf,
+    },
+    Project {
+        path: PathBuf,
+    },
+    /// A Skill an installed Tick package brings, named `<package>:<skill>`.
+    TickPackage {
+        package: String,
+        path: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

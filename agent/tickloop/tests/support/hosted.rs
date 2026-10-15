@@ -38,6 +38,40 @@ pub fn counter_program() -> Vec<String> {
     python_program(&counter, &[])
 }
 
+/// Installs the Tick package `counter` under `config_root` from a package directory it writes in
+/// `sources`: its program `tick-counter` runs the example counter Tick, and its manifest declares
+/// the Tick protocol.
+pub fn install_counter_package(config_root: &Path, sources: &Path) -> tick_packages::PackageStore {
+    use std::os::unix::fs::PermissionsExt;
+    let source = sources.join("counter-package");
+    std::fs::create_dir_all(source.join("bin")).unwrap();
+    std::fs::write(
+        source.join(tick_packages::MANIFEST_FILE_NAME),
+        serde_json::json!({
+            "name": "counter",
+            "version": "1.0.0",
+            "description": "The example counter",
+            "executable": "bin/tick-counter",
+            "protocol": true,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let program = source.join("bin/tick-counter");
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\nexec '{}' \"$@\"\n",
+            counter_program().join("' '")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let packages = tick_packages::PackageStore::in_config_root(config_root);
+    packages.install_path(&source).unwrap();
+    packages
+}
+
 /// An open of the protocol `program` for `owner`.
 pub fn tick_request(owner: TickOwner, cwd: &Path, program: Vec<String>) -> OpenRequest {
     OpenRequest {

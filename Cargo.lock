@@ -997,6 +997,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4384,6 +4394,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4557,19 +4577,24 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "crossterm",
+ "flate2",
  "futures-util",
  "image",
  "libc",
  "percent-encoding",
  "portable-pty",
  "regex",
+ "reqwest 0.12.28",
  "rmcp",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2",
  "shell-words",
+ "tar",
  "tempfile",
  "tickloop-agent-artifacts",
+ "tickloop-agent-base",
  "tickloop-agent-client",
  "tickloop-agent-config",
  "tickloop-agent-console",
@@ -4578,6 +4603,7 @@ dependencies = [
  "tickloop-agent-protocol",
  "tickloop-agent-runtime",
  "tickloop-agent-test-support",
+ "tickloop-tick-packages",
  "tickloop-tick-protocol",
  "tickloop-tickhost",
  "tickloop-tickhost-connect",
@@ -4657,6 +4683,7 @@ dependencies = [
  "tickloop-agent-protocol",
  "tickloop-agent-test-support",
  "tickloop-agent-tools",
+ "tickloop-tick-packages",
  "time",
  "uuid",
 ]
@@ -4727,6 +4754,7 @@ dependencies = [
  "tickloop-agent-runtime",
  "tickloop-agent-test-support",
  "tickloop-agent-tools",
+ "tickloop-tick-packages",
  "tickloop-tick-protocol",
  "tickloop-tickhost",
  "tickloop-tickhost-connect",
@@ -4817,6 +4845,7 @@ dependencies = [
  "tickloop-agent-protocol",
  "tickloop-agent-test-support",
  "tickloop-agent-tools",
+ "tickloop-tick-packages",
  "tickloop-tick-protocol",
  "tickloop-tickhost",
  "tickloop-tickhost-connect",
@@ -4870,40 +4899,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "tickloop-tick"
+name = "tickloop-tick-command"
 version = "0.2.0"
 dependencies = [
- "async-trait",
  "clap",
  "crossterm",
  "futures-util",
- "libc",
- "longbridge",
  "ratatui",
  "serde_json",
- "tempfile",
- "tickloop-tick-builtin",
- "tickloop-tick-futu",
- "tickloop-tick-longbridge",
  "tickloop-tick-market",
  "tickloop-tick-protocol",
  "tickloop-tick-provider",
  "tickloop-tick-sdk",
  "tickloop-ui",
- "time",
- "tokio",
-]
-
-[[package]]
-name = "tickloop-tick-builtin"
-version = "0.2.0"
-dependencies = [
- "async-trait",
- "rust_decimal",
- "serde_json",
- "tickloop-tick-provider",
- "time",
- "time-tz",
  "tokio",
 ]
 
@@ -4912,8 +4920,14 @@ name = "tickloop-tick-futu"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "clap",
+ "libc",
  "serde_json",
  "sha1",
+ "tempfile",
+ "tickloop-tick-command",
+ "tickloop-tick-market",
+ "tickloop-tick-packages",
  "tickloop-tick-provider",
  "time",
  "tokio",
@@ -4924,17 +4938,24 @@ name = "tickloop-tick-longbridge"
 version = "0.2.0"
 dependencies = [
  "async-trait",
+ "clap",
+ "crossterm",
  "futures-util",
  "libc",
  "longbridge",
  "quick-xml 0.38.4",
+ "ratatui",
  "reqwest 0.12.28",
  "rust_decimal",
  "scraper",
  "serde",
  "serde_json",
  "tempfile",
+ "tickloop-tick-command",
+ "tickloop-tick-market",
+ "tickloop-tick-packages",
  "tickloop-tick-provider",
+ "tickloop-tick-sdk",
  "time",
  "time-tz",
  "tokio",
@@ -4959,16 +4980,30 @@ dependencies = [
  "serde_json",
  "sha1",
  "tempfile",
- "tickloop-tick-builtin",
  "tickloop-tick-protocol",
  "tickloop-tick-provider",
  "tickloop-tick-sdk",
+ "tickloop-tick-test-support",
  "tickloop-ui",
  "time",
  "time-tz",
  "tokio",
  "tokio-stream",
  "toml",
+]
+
+[[package]]
+name = "tickloop-tick-packages"
+version = "0.2.0"
+dependencies = [
+ "flate2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.20",
+ "time",
 ]
 
 [[package]]
@@ -4997,6 +5032,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tickloop-tick-reader"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tickloop-tick-command",
+ "tickloop-tick-market",
+ "tickloop-tick-provider",
+]
+
+[[package]]
 name = "tickloop-tick-sdk"
 version = "0.2.0"
 dependencies = [
@@ -5005,6 +5053,25 @@ dependencies = [
  "serde",
  "serde_json",
  "tickloop-tick-protocol",
+ "tokio",
+]
+
+[[package]]
+name = "tickloop-tick-test-support"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "libc",
+ "rust_decimal",
+ "serde_json",
+ "tempfile",
+ "tickloop-tick-command",
+ "tickloop-tick-market",
+ "tickloop-tick-protocol",
+ "tickloop-tick-provider",
+ "time",
+ "time-tz",
  "tokio",
 ]
 
@@ -5038,10 +5105,12 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.20",
+ "tickloop-tick-packages",
  "tickloop-tick-protocol",
  "tokio",
  "tokio-util",
  "uuid",
+ "vt100",
 ]
 
 [[package]]

@@ -19,7 +19,7 @@ Current Tickloop connects to an independently running Herdr through its API; it 
 - Upstream: [Longbridge Terminal](https://github.com/longbridge/longbridge-terminal).
 - Reference revision: `b834538` (2026-09-07).
 - Upstream sources: `src/utils/text.rs`, `src/utils/number.rs`, `src/openapi/rate_limiter.rs`, `src/tui/nav.rs`, `src/cli/output.rs`.
-- Adapted source: `ui/src/format.rs` (width, padding, truncation, number abbreviation), `tick/providers/longbridge/src/rate_limit.rs`, `tick/provider/src/api.rs` (symbol normalization), and `tick/market/src/output.rs` (header keys).
+- Adapted source: `ui/src/format.rs` (width, padding, truncation, number abbreviation), `ticks/longbridge/src/rate_limit.rs`, `tick/provider/src/api.rs` (symbol normalization), and `tick/market/src/output.rs` (header keys).
 - Applicable license: Apache License, Version 2.0. An unmodified copy is included in [licenses/Longbridge-Terminal-Apache-2.0.txt](./licenses/Longbridge-Terminal-Apache-2.0.txt).
 
 The adaptation adds configurable ambiguous width, grapheme-aware truncation, and Chinese units, and removes global state from the limiter. Longbridge Terminal is a source reference, not a build dependency. Other dependencies retain their own licenses.

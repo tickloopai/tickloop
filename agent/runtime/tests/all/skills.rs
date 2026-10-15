@@ -37,9 +37,9 @@ fn discovers_builtin_user_and_nearest_project_skills_in_stable_order() {
     fs::create_dir(root.path().join(".git")).unwrap();
     let workdir = root.path().join("nested/project");
     fs::create_dir_all(&workdir).unwrap();
-    let user = root.path().join("user-skills");
+    let config_root = root.path().join("config");
     write_skill(
-        &user,
+        &config_root.join("skills"),
         "personal",
         "name: personal\ndescription: Personal workflow",
         "Personal body",
@@ -57,7 +57,7 @@ fn discovers_builtin_user_and_nearest_project_skills_in_stable_order() {
         "Nearest body",
     );
 
-    let registry = SkillRegistry::discover(&workdir, Some(&user));
+    let registry = SkillRegistry::discover(&workdir, Some(&config_root));
     let names = registry
         .definitions()
         .map(|skill| skill.name.as_str())
@@ -87,13 +87,14 @@ fn discovers_builtin_user_and_nearest_project_skills_in_stable_order() {
 #[test]
 fn builtin_name_is_reserved_and_a_broken_skill_only_adds_a_warning() {
     let directory = tempfile::tempdir().unwrap();
+    let user_skills = directory.path().join("skills");
     write_skill(
-        directory.path(),
+        &user_skills,
         "tickloop",
         "name: tickloop\ndescription: Replacement",
         "Replacement body",
     );
-    write_skill(directory.path(), "broken", "name: Broken", "Broken body");
+    write_skill(&user_skills, "broken", "name: Broken", "Broken body");
 
     let registry = SkillRegistry::discover(directory.path(), Some(directory.path()));
     let expansion = registry.expand("tickloop", "", SkillCaller::User).unwrap();
@@ -107,7 +108,7 @@ fn builtin_name_is_reserved_and_a_broken_skill_only_adds_a_warning() {
 fn listing_discloses_only_model_invocable_skill_metadata() {
     let directory = tempfile::tempdir().unwrap();
     write_skill(
-        directory.path(),
+        &directory.path().join("skills"),
         "manual",
         "name: manual\ndescription: Run manually\ndisable-model-invocation: true",
         "Manual body",
@@ -138,20 +139,21 @@ fn listing_discloses_only_model_invocable_skill_metadata() {
 #[test]
 fn expansion_applies_arguments_allowed_tools_and_invocation_gates() {
     let directory = tempfile::tempdir().unwrap();
+    let user_skills = directory.path().join("skills");
     write_skill(
-        directory.path(),
+        &user_skills,
         "analyze",
         "name: analyze\ndescription: Analyze a target\nallowed-tools: [Read, Grep]",
         "Analyze $ARGUMENTS carefully.",
     );
     write_skill(
-        directory.path(),
+        &user_skills,
         "model-only",
         "name: model-only\ndescription: Model only\nuser-invocable: false",
         "Model body",
     );
     write_skill(
-        directory.path(),
+        &user_skills,
         "forked",
         "name: forked\ndescription: Forked\ncontext: fork",
         "Fork body",

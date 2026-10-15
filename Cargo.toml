@@ -3,8 +3,8 @@ members = [
     "agent/*",
     "tickhost/host", "tickhost/connect",
     "tick/protocol", "tick/sdk", "tick/provider",
-    "tick/providers/builtin", "tick/providers/longbridge", "tick/providers/futu",
-    "tick/market", "tick/cli",
+    "tick/market", "tick/command", "tick/reader", "tick/packages", "tick/test-support",
+    "ticks/longbridge", "ticks/futu",
     "ui",
 ]
 resolver = "3"

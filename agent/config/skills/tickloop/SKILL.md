@@ -18,7 +18,7 @@ Keep the complete `<type>:<id>` reference. Every type delivers its updates into 
 
 TaskStop stops only the current Loop's Agent command and retains its Ask/Deny and Plan behavior; user Shells and other Loops use explicit user UI stops. A program the user starts in a Herdr Pane or another terminal is not a Tick: to read or operate a program, open it as a Tick (section 2).
 
-Use the installed host tools as the authority for targets and capabilities. Start with `workspace_host` in Current host state; an installed multiplexer command or a repository name is not proof of the current environment. `tickhost` says whether this Agent can open Ticks, `name` and `integration` say whether a Herdr Pane can show them, and `tick_executable` is the bundled `tick` to launch.
+Use the installed host tools as the authority for targets and capabilities. Start with `workspace_host` in Current host state; an installed multiplexer command or a repository name is not proof of the current environment. `tickhost` says whether this Agent can open Ticks, `name` and `integration` say whether a Herdr Pane can show them, `reader_executable` is the bundled `tick-reader` to launch, and `tick_packages` lists the installed Tick packages.
 
 | Current host state | Action |
 | --- | --- |
@@ -33,7 +33,7 @@ For an unavailable branch, briefly name what is missing in ordinary language, wi
 
 ## 2. Open and operate Ticks
 
-“看看特斯拉股价” requests a quote Tick even though the user did not say Tick. Prefer an existing matching instance in this Chat when the user asks to see information; open one if none exists. An explicit request to open a new Tick creates a new instance. A request to see a price uses Quote; a request for K线 or a chart uses Kline. A request explicitly asking for text only can use an ordinary data lookup instead. Opening, reading or listing a Tick never subscribes; use section 4 only for continued observation.
+“看看特斯拉股价” requests a Tick that shows the price even though the user did not say Tick. Prefer an existing matching instance in this Chat when the user asks to see information; open one if none exists. An explicit request to open a new Tick creates a new instance. A request explicitly asking for text only can use an ordinary data lookup instead. Opening, reading or listing a Tick never subscribes; use section 4 only for continued observation.
 
 ### Open a Tick
 
@@ -41,22 +41,15 @@ For an unavailable branch, briefly name what is missing in ordinary language, wi
 
 Call `ModifyTick` with `action: "open"`, a `command` argv array and optional `cwd`. The Tickhost runs the program: it needs no View or layout, takes no focus, joins this Chat's Monitor and is not subscribed. Omitted `cwd` uses the Agent's file work directory. Add a `placement` only when the user asks for a place (section 3).
 
-For a bundled Tick, use `workspace_host.tick_executable` as the executable; if it is null, explain that the companion `tick` is missing and needs to be built or installed (`make build` and `make install` include it) instead of searching project source for a launcher. The bundled `tick` always opens as a protocol Tick. Build the argv from the requested view:
+Market data and other data sources come from the Tick packages the user installed. `workspace_host.tick_packages` lists each one's `name`, `version`, `description` and `executable`. A package brings a Skill named `<package>:<skill>` that teaches its commands, arguments and login: load it with the Skill tool before opening that package's Ticks, and build `command` as it says. Open a package's program by its bare name `tick-<package>`; a program whose package declares the Tick protocol opens as a protocol Tick without `protocol: true`. A package installed after this Chat began is listed and opens at once, but its Skill arrives only in a new Chat; until then run its `executable` with `--help` to learn its commands.
 
-| Requested view | Arguments after the executable |
-| --- | --- |
-| Stock price / 行情 / 报价 | `longbridge quote SYMBOL` |
-| K-line / K线 / candlestick chart | `longbridge kline SYMBOL` |
-| A Longbridge community member's posts / 社区动态 | `longbridge community MEMBER_ID` |
-| Explicit offline chart demonstration | `builtin kline 700.HK` |
+When the data the user wants needs a package that `workspace_host.tick_packages` does not list, or the host reports that a Tick package is not installed, tell the user to install it by running `! tickloop tick install <package>` in this Agent; `! tickloop tick list --available` shows what the Tick marketplace offers, such as `longbridge` for Longbridge quotes, K-lines and community posts and `futu` for Futu OpenD option pricing. Never install a package yourself, and never search project source for a launcher or build one.
 
-`MEMBER_ID` is the number in the member's profile link, such as 91 in `https://longbridge.com/zh-CN/profiles/91`; there is no nickname search, so ask for the link when the user names someone only by nickname. The community Tick's `reply` tool posts publicly as the logged-in Longbridge user.
-
-Use the broker symbol format: Tesla / 特斯拉 is `TSLA.US`, Apple / 苹果 is `AAPL.US`, and Tencent / 腾讯 is `700.HK`. Clarify an ambiguous company or market before launching. For example, “打开特斯拉K线” means `command: [TICK_EXECUTABLE, "longbridge", "kline", "TSLA.US"]`. Omitted chart period uses the command's default; specify `--period` when the user asks for a period. The argv is always `PROVIDER TICK ...`: `longbridge` serves real quotes, account, news and community posts, `futu` serves option pricing from Futu OpenD, and `builtin` serves simulated data for every Tick; a provider that lacks the data a Tick needs refuses it and names the providers that have it. Use the executable's `--help`, `longbridge --help` or `longbridge kline --help` for other options and Tick types. A real stock request uses real data; the builtin demo is a separate, explicitly requested workflow.
+To read original documents, open the bundled Reader with `workspace_host.reader_executable` as the executable, followed by URLs or local files; if it is null, explain that the companion `tick-reader` is missing and needs to be built or installed (`make build` and `make install` include it). The bundled `tick-reader` always opens as a protocol Tick.
 
 Any other program opens with the program itself first in `command`. Pass `protocol: true` for a program that speaks the Tick protocol, such as `["python3", "tick/examples/counter.py"]`; omit `protocol` for an ordinary interactive program (a REPL, `htop`, a log viewer), which opens as a terminal Tick. The host refuses the bundled `tickhost` as a command.
 
-The host checks local prerequisites before launching a bundled Tick. If authorization is missing, report the diagnostic and the authorization command (`TICK_EXECUTABLE longbridge auth`); an authorization failure is not a successful launch. Do not read credential files. After launch, read the returned `tick_instance_id` to confirm that the requested program and view are actually running, and report success only after that check. An `OutcomeUnknown` open may already have started a Tick: inspect what this Chat runs instead of opening another.
+A Tick whose data source needs a login it lacks ends with a diagnostic: report it and the login command the package's Skill names, which the user runs with `!` in this Agent or in their own terminal; an authorization failure is not a successful launch. Do not read credential files. After launch, read the returned `tick_instance_id` to confirm that the requested program and view are actually running, and report success only after that check. An `OutcomeUnknown` open may already have started a Tick: inspect what this Chat runs instead of opening another.
 
 ### Show it to the user
 

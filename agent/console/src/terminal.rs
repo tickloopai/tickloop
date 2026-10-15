@@ -920,11 +920,13 @@ Usage: tickloop [--cwd DIRECTORY]
        tickloop daemon stop
        tickloop monitor popup install|remove --herdr-socket SOCKET
        tickloop monitor attach
+       tickloop tick install PACKAGE | install --path PATH | uninstall PACKAGE | list [--available]
 
 daemon stop ends the local Agent daemon and all of its workers, which is every running Agent; saved history is kept and Ticks in the Tickhost keep running.
 Run tickloop again to start this build. TICKLOOP_DAEMON_RUNTIME_DIR selects the daemon.
 monitor popup install asks before registering Tickloop's popup plugin in that Herdr session and sets monitorPopup to enabled; remove asks before unregistering only that plugin and sets it to disabled. Running Ticks continue either way.
 monitor attach is the popup's attach client: it shows the hosted Tick its one-time view grant in TICKLOOP_MONITOR_ATTACH names until a lone esc closes it; when it cannot, it shows why until a key is pressed.
+tick installs a Tick package from the Tick marketplace or from its directory or archive, uninstalls one, or lists those installed or in the marketplace; tickloop tick --help explains them.
 
 The working directory must exist; omitting --cwd uses the current directory.
 Unknown directories require interactive trust. --working-directory-is-trusted is an explicit host assertion for externally controlled automation and does not save trust.

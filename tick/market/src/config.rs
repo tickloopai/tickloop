@@ -14,7 +14,6 @@ pub const DEFAULT_RELATIVE_PATH: &str = ".tickloop/config.toml";
 /// Effective settings after merging the file with command-line overrides.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
-    pub is_demo: bool,
     pub renderer_styles: Option<tickloop_ui::styles::RendererStyles>,
     pub color_mode: ColorMode,
     pub language: Language,
@@ -48,7 +47,6 @@ impl Settings {
     pub fn parse(text: &str) -> Result<Self, String> {
         let file: ConfigFile = toml::from_str(text).map_err(|error| error.to_string())?;
         Ok(Self {
-            is_demo: false,
             renderer_styles: None,
             color_mode: parse_field("color_mode", file.color_mode)?.unwrap_or_default(),
             language: parse_field("language", file.language)?.unwrap_or_default(),
@@ -72,7 +70,6 @@ impl Settings {
 
     pub fn with_overrides(self, overrides: Overrides) -> Self {
         Self {
-            is_demo: self.is_demo,
             renderer_styles: self.renderer_styles,
             color_mode: overrides.color_mode.unwrap_or(self.color_mode),
             language: overrides.language.unwrap_or(self.language),

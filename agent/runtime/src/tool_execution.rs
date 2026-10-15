@@ -1884,14 +1884,11 @@ mod tests {
         }
     }
 
-    /// OpenAI-compatible models such as GLM fill nothing for a schema whose root is only a
-    /// `oneOf`, so every tool this Agent defines itself is one flat object; per-form rules
-    /// belong to the tool's own input check.
-    #[test]
-    fn every_built_in_tool_schema_is_one_flat_object() {
+    /// Every tool this Agent defines itself, in each of its forms.
+    fn built_in_definitions() -> Vec<ToolDefinition> {
         let directory = tempfile::tempdir().unwrap();
         let skills = tickloop_agent_config::skills::SkillRegistry::discover(directory.path(), None);
-        let definitions = tickloop_agent_tools::Tools::definitions()
+        tickloop_agent_tools::Tools::definitions()
             .into_iter()
             .chain([false, true].into_iter().flat_map(plan::definitions))
             .chain([false, true].into_iter().flat_map(interaction::definitions))
@@ -1910,7 +1907,15 @@ mod tests {
                     .flat_map(crate::tick_tools::definitions),
             )
             .chain([crate::mcp_tools::login_definition()])
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    /// OpenAI-compatible models such as GLM fill nothing for a schema whose root is only a
+    /// `oneOf`, so every tool this Agent defines itself is one flat object; per-form rules
+    /// belong to the tool's own input check.
+    #[test]
+    fn every_built_in_tool_schema_is_one_flat_object() {
+        let definitions = built_in_definitions();
         for name in [
             "Read",
             "Skill",
@@ -1937,6 +1942,54 @@ mod tests {
                 Vec::<String>::new(),
                 "{} has schema alternatives",
                 definition.name
+            );
+        }
+    }
+
+    /// The built-in Skills and those of the Tick packages in this repository name a tool by its
+    /// compound name, such as `ModifyTick`; each such name must be a tool the model can be given.
+    #[test]
+    fn shipped_skills_name_only_tools_the_agent_offers() {
+        const PACKAGE_SKILLS: [&str; 2] = [
+            include_str!("../../../ticks/longbridge/skills/longbridge/SKILL.md"),
+            include_str!("../../../ticks/futu/skills/futu/SKILL.md"),
+        ];
+        const NOT_TOOLS: [&str; 1] = ["OutcomeUnknown"];
+        let tools = built_in_definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .chain(crate::mcp_tools::ARTIFACT_TOOL_NAMES.map(str::to_owned))
+            .collect::<HashSet<_>>();
+        let is_compound_name = |word: &&str| {
+            let mut segments = 0;
+            let mut characters = word.chars().peekable();
+            while let Some(first) = characters.next() {
+                let mut lowercase = 0;
+                while characters.next_if(char::is_ascii_lowercase).is_some() {
+                    lowercase += 1;
+                }
+                if !first.is_ascii_uppercase() || lowercase == 0 {
+                    return false;
+                }
+                segments += 1;
+            }
+            segments > 1
+        };
+        let named = tickloop_agent_config::skills::BUILTIN_SKILLS
+            .into_iter()
+            .chain(PACKAGE_SKILLS)
+            .flat_map(|skill| skill.split(|character: char| !character.is_ascii_alphanumeric()))
+            .filter(is_compound_name)
+            .collect::<HashSet<_>>();
+        assert!(named.is_superset(&HashSet::from([
+            "ModifyTick",
+            "SubscribeTick",
+            "ArtifactRead"
+        ])));
+        for word in named {
+            assert!(
+                tools.contains(word) || NOT_TOOLS.contains(&word),
+                "a shipped Skill names {word}, which is no tool"
             );
         }
     }

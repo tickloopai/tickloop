@@ -1,7 +1,6 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::TestBackend};
 use std::sync::Arc;
-use tick_builtin::{DemoApi, DemoCommunity, DemoOptions};
 use tick_market::{
     args::{
         CommunityArgs, EarningsArgs, EventChartArgs, KlineArgs, NewsArgs, OnceArgs, OptionsArgs,
@@ -14,6 +13,7 @@ use tick_market::{
 };
 use tick_provider::api::{CandleAdjust, CandlePeriod};
 use tick_sdk::stream::TickStream;
+use tick_test_support::{MockApi, MockCommunity, MockOptions, mock_library};
 
 /// The narrowest terminal every Tick is laid out for in full: a laptop at 80 columns.
 const LAPTOP: (u16, u16) = (80, 24);
@@ -265,7 +265,7 @@ fn every_tick() -> Vec<Scenario> {
             TickKind::Reader,
             &[],
             &[
-                "Reader · Original documents",
+                "Reader · 财报原文",
                 "Quarterly results",
                 "Revenue was $12.8",
                 "1/4",
@@ -320,7 +320,7 @@ fn text(cells: &[Vec<String>]) -> String {
         .join("\n")
 }
 
-/// The screen with every digit masked: the demo moves prices at random, while layout,
+/// The screen with every digit masked: the mock moves prices at random, while layout,
 /// selection and mode stay put.
 fn layout_of(cells: &[Vec<String>]) -> String {
     text(cells)
@@ -345,11 +345,8 @@ async fn render_keys(
     rows: u16,
     codes: Vec<KeyCode>,
 ) -> Vec<Vec<String>> {
-    let api = DemoApi::new().unwrap();
-    let settings = Settings {
-        is_demo: true,
-        ..Settings::default()
-    };
+    let api = MockApi::new().unwrap();
+    let settings = Settings::default();
     let mut terminal = Terminal::new(TestBackend::new(columns, rows)).unwrap();
     let mut updates = TickStream::in_memory(scenario.kind);
     let input = keys(codes);
@@ -460,7 +457,7 @@ async fn render_keys(
                 strikes: 21,
                 output: OnceArgs::default(),
             },
-            Arc::new(DemoOptions),
+            Arc::new(MockOptions),
             &settings,
             &mut terminal,
             input,
@@ -469,7 +466,7 @@ async fn render_keys(
         .await
         .unwrap(),
         TickKind::Reader => commands::reader::run_live(
-            tick_market::reader::demo_library(),
+            mock_library(),
             &settings,
             &mut terminal,
             input,
@@ -482,7 +479,7 @@ async fn render_keys(
                 member_id: 91,
                 output: OnceArgs::default(),
             },
-            Arc::new(DemoCommunity),
+            Arc::new(MockCommunity),
             &settings,
             &mut terminal,
             input,
@@ -662,7 +659,7 @@ async fn scroll_keys_reach_the_tick_when_the_panel_fits_or_an_editor_owns_the_ke
             ['<', '>', '{', '}'].map(KeyCode::Char).to_vec(),
         )
         .await;
-        // Demo prices move at random and resize their columns, so each row's leading words
+        // Mock prices move at random and resize their columns, so each row's leading words
         // (selection marker, symbol, heading) and the Kline cursor line show whether a key
         // changed the view.
         let settled = |cells: &[Vec<String>]| -> Vec<String> {

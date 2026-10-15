@@ -2,9 +2,6 @@ use std::fmt;
 
 use crate::exit_code;
 
-/// What an authorization failure asks the user to do.
-pub const AUTH_HINT: &str = "run `tick longbridge auth`";
-
 #[derive(Debug)]
 pub struct Error {
     pub code: u8,
@@ -21,10 +18,10 @@ impl Error {
         }
     }
 
-    pub fn auth(message: impl fmt::Display) -> Self {
+    pub fn auth(message: impl Into<String>) -> Self {
         Self {
             code: exit_code::NOT_AUTHORIZED,
-            message: format!("{message}; {AUTH_HINT}"),
+            message: message.into(),
         }
     }
 

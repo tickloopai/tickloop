@@ -1,0 +1,21 @@
+[package]
+name = "tickloop-tick-reader"
+description = "tick-reader: the Reader Tick for original financial documents, bundled with Tickloop"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "tick-reader"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tickloop-tick-command = { path = "../command" }
+tickloop-tick-market = { path = "../market" }
+tickloop-tick-provider = { path = "../provider" }
+
+[dev-dependencies]
+libc = "0.2"
+serde_json = "1"
+tempfile = "3"

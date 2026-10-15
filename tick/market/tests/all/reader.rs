@@ -14,6 +14,7 @@ use tick_market::{
     runtime::{LiveView, NoMarketApi, ViewState},
 };
 use tick_sdk::{stream::TickStream, tools::ToolCall};
+use tick_test_support::mock_library;
 
 #[tokio::test]
 async fn local_original_keeps_complete_sections_tables_and_source() {
@@ -111,10 +112,10 @@ fn document_queries_page_unicode_without_losing_or_duplicating_characters() {
     assert_eq!(text, "# 财报\n\n收入增长。现金流改善。");
 }
 
-/// Runs the demo Reader on `keys` until they run out and returns the last screen with how many
-/// Tick Updates it published.
+/// Runs the Reader on the mock earnings release until `keys` run out and returns the last screen
+/// with how many Tick Updates it published.
 async fn read_with(keys: Vec<KeyEvent>) -> (String, usize) {
-    let library = tick_market::reader::demo_library();
+    let library = mock_library();
     let input = futures_util::stream::iter(keys.into_iter().map(|key| Ok(Event::Key(key))));
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
     let mut updates = TickStream::in_memory(TickKind::Reader);
@@ -184,7 +185,7 @@ async fn ctrl_c_cancels_the_reader_search_and_the_tick_keeps_running() {
 
 #[tokio::test]
 async fn opening_another_document_keeps_prior_revision_and_reports_load_failures() {
-    let library = tick_market::reader::demo_library();
+    let library = mock_library();
     let original = library.read().unwrap()[0].revision.clone();
     let mut file = tempfile::NamedTempFile::new().unwrap();
     writeln!(file, "# Second report\n\nComplete original.").unwrap();

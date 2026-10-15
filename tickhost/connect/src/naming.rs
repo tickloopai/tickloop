@@ -28,7 +28,7 @@ pub fn command_title(words: &[String]) -> String {
 
 /// A Tick's name: its declared title and the positional arguments of `command` (a
 /// [`command_title`]) that follow the word naming its type, such as `Quote · AAPL.US` for
-/// `tick longbridge quote AAPL.US`. A Tick without such arguments is named by its title alone.
+/// `tick-longbridge quote AAPL.US`. A Tick without such arguments is named by its title alone.
 pub fn tick_title(title: &str, kind: &str, command: &str) -> String {
     let type_names = [kind, kind.rsplit('.').next().unwrap_or(kind)];
     let names_type = |word: &&str| {
@@ -106,8 +106,8 @@ mod tests {
     fn a_launch_command_names_its_program_and_paths_by_file_name() {
         for (command, expected) in [
             (
-                "/Users/me/tickloop/target/debug/tick longbridge quote AAPL.US",
-                "tick longbridge quote AAPL.US",
+                "/Users/me/tickloop/target/debug/tick-longbridge quote AAPL.US",
+                "tick-longbridge quote AAPL.US",
             ),
             (
                 "/usr/bin/python3 /Users/me/tick/examples/counter.py --start 3",
@@ -126,20 +126,33 @@ mod tests {
             (
                 "Quote",
                 "quote",
-                "tick longbridge quote AAPL.US",
+                "tick-longbridge quote AAPL.US",
                 "Quote · AAPL.US",
             ),
             (
                 "Quote",
                 "quote",
-                "tick longbridge quote AAPL.US 700.HK --interval 5",
+                "tick-longbridge quote AAPL.US 700.HK --interval 5",
                 "Quote · AAPL.US 700.HK",
             ),
             (
                 "Positions",
                 "positions",
-                "tick longbridge positions",
+                "tick-longbridge positions",
                 "Positions",
+            ),
+            ("Reader", "reader", "tick-reader ./a.md", "Reader · ./a.md"),
+            (
+                "Reader",
+                "reader",
+                "tick-reader ./a.md https://example.com/b.html --symbol AAPL.US",
+                "Reader · ./a.md https://example.com/b.html",
+            ),
+            (
+                "Futu Options",
+                "options",
+                "tick-futu options AAPL.US --port 11111",
+                "Futu Options · AAPL.US",
             ),
             (
                 "Counter",

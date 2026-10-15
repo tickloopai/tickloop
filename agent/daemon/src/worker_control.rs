@@ -20,6 +20,7 @@ use tickhost_connect::{
     hosted::{
         BUSINESS_FRAME_BYTES, CONTROL_TIMEOUT, peer_uid, read_frame, same_secret, write_frame,
     },
+    program,
 };
 use tokio::{
     io::BufReader,
@@ -369,8 +370,24 @@ impl WorkerControl {
                         ));
                     }
                 };
-                let current = LaunchIdentity::of(&lost.command, &lost.cwd)
-                    .map_err(|error| HostError::before("LaunchFailed", error))?;
+                let current = LaunchIdentity::of(&lost.command, &lost.cwd).map_err(|error| {
+                    // A recorded program that went with its uninstalled Tick package names it.
+                    let executable = Path::new(&lost.command[0]);
+                    let packages = tick_packages::PackageStore::in_config_root(&config_root);
+                    match program::uninstalled_package_of(executable, &packages) {
+                        Some(name)
+                            if std::fs::symlink_metadata(executable).is_err_and(|error| {
+                                error.kind() == std::io::ErrorKind::NotFound
+                            }) =>
+                        {
+                            program::package_not_installed(
+                                &executable.file_name().unwrap_or_default().to_string_lossy(),
+                                &name,
+                            )
+                        }
+                        _ => HostError::before("LaunchFailed", error),
+                    }
+                })?;
                 if current != lost.identity {
                     return Err(HostError::before(
                         "LaunchChanged",
