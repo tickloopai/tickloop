@@ -39,7 +39,6 @@ mod editor;
 mod execution;
 mod external_editor;
 mod file_mentions;
-mod font_manager;
 mod footer;
 mod hosted_probe;
 mod hyperlink;
@@ -7758,16 +7757,9 @@ mod tests {
         };
         let row: tickloop_agent_protocol::AgentSummary = serde_json::from_value(serde_json::json!({"execution":child,"chat_id":child.agent_id,"workdir":"/test","state":"Completed","title":"Title","has_work":true,"waiting_permissions":0,"waiting_questions":0,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"subagent":{"child_chat_id":child.agent_id,"handle":"audit","description":"Check \u{001b}[2J evidence","created_at":1}})).unwrap();
         let row = super::agent_rows(&[row], false).pop().unwrap();
-        for glyph_set in tickloop_agent_config::GlyphSet::ALL {
-            let display =
-                super::display::DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
-                    glyph_set,
-                    ..Default::default()
-                });
-            let line =
-                super::subagent_panel::family_line(&row, false, false, (80, 5, display, 1000));
-            assert!(!line.text().chars().any(char::is_control));
-        }
+        let display = super::display::DisplayProfile::default();
+        let line = super::subagent_panel::family_line(&row, false, false, (80, 5, display, 1000));
+        assert!(!line.text().chars().any(char::is_control));
     }
 
     #[tokio::test]
@@ -8261,45 +8253,39 @@ mod tests {
                 ),
             ]
         );
-        for glyph_set in [
-            tickloop_agent_config::GlyphSet::Unicode,
-            tickloop_agent_config::GlyphSet::NerdFont,
-        ] {
-            let (console, _) = Console::start_with_display(
-                false,
-                tickloop_agent_config::DisplayPreferences {
-                    glyph_set,
-                    prefers_reduced_motion: true,
-                },
-            )
+        let (console, _) = Console::start_with_display(
+            false,
+            tickloop_agent_config::DisplayPreferences {
+                prefers_reduced_motion: true,
+            },
+        )
+        .unwrap();
+        let activity = super::RunningActivity {
+            chat_id: chat,
+            label: WORKING_ACTIVITY.to_owned(),
+            started_at: Some(std::time::Instant::now()),
+            interruptible: true,
+        };
+        let spans = activity
+            .spans(&console, None, &RunningShimmer::default())
             .unwrap();
-            let activity = super::RunningActivity {
-                chat_id: chat,
-                label: WORKING_ACTIVITY.to_owned(),
-                started_at: Some(std::time::Instant::now()),
-                interruptible: true,
-            };
-            let spans = activity
-                .spans(&console, None, &RunningShimmer::default())
-                .unwrap();
-            let mut row = style::RoleLine::default();
-            for (text, role) in spans {
-                row.push(text, role);
-            }
-            assert!(row.text().ends_with("s · esc to interrupt)"));
-            assert!(row.text().starts_with("• Working ("), "{row:?}");
-            assert_eq!(row.spans[0].role, Some(style::Role::MutedText));
-            assert_eq!(row.spans[1].role, Some(style::Role::RunningShade0));
-            let themed = style::ThemeName::ALL.map(|name| {
-                row.resolve(style::Theme::new(name), 80)
-                    .render(style::ColourDepth::TrueColour)
-            });
-            assert_ne!(themed[0], themed[1]);
-            for width in [0, 1, 12, 40, 80] {
-                let mut narrow = row.clone();
-                narrow.truncate(width);
-                assert!(unicode_width::UnicodeWidthStr::width(narrow.text().as_str()) <= width);
-            }
+        let mut row = style::RoleLine::default();
+        for (text, role) in spans {
+            row.push(text, role);
+        }
+        assert!(row.text().ends_with("s · esc to interrupt)"));
+        assert!(row.text().starts_with("• Working ("), "{row:?}");
+        assert_eq!(row.spans[0].role, Some(style::Role::MutedText));
+        assert_eq!(row.spans[1].role, Some(style::Role::RunningShade0));
+        let themed = style::ThemeName::ALL.map(|name| {
+            row.resolve(style::Theme::new(name), 80)
+                .render(style::ColourDepth::TrueColour)
+        });
+        assert_ne!(themed[0], themed[1]);
+        for width in [0, 1, 12, 40, 80] {
+            let mut narrow = row.clone();
+            narrow.truncate(width);
+            assert!(unicode_width::UnicodeWidthStr::width(narrow.text().as_str()) <= width);
         }
     }
 

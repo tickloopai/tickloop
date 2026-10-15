@@ -1196,7 +1196,6 @@ mod signal_tests {
     fn reduced_motion() -> DisplayProfile {
         DisplayProfile::new(DisplayPreferences {
             prefers_reduced_motion: true,
-            ..Default::default()
         })
     }
 

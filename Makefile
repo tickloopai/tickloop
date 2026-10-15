@@ -10,7 +10,7 @@ CARGO_PACKAGE := -p tickloop-agent
 PACKAGE_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
 
-.PHONY: dev build install package test check release-docs prototype-glyph-set prototype-glyph-set-terminal prototype-earnings-review
+.PHONY: dev build install package test check release-docs prototype-earnings-review
 
 ## Start in the current directory with the global configuration; example: make dev ARGS="-c"
 dev:
@@ -48,14 +48,6 @@ check:
 ## 发布已提交的 Docs 快照；默认递增 patch，可用 VERSION=0.1.0 指定版本
 release-docs:
 	@node artifact/scripts/release.mjs
-
-## 启动一次性 Glyph Set 设置页原型；访问 http://127.0.0.1:8765/?variant=A
-prototype-glyph-set:
-	python3 -m http.server 8765 --directory .scratch/agent/prototypes/glyph-set-preview
-
-## 在真实终端中并排检查 Unicode 与 Nerd Font 的占格、基线和 spinner
-prototype-glyph-set-terminal:
-	python3 .scratch/agent/prototypes/glyph-set-preview/terminal_probe.py
 
 ## 启动财报复盘原型；访问 http://127.0.0.1:8766/earnings-review.html?variant=A
 prototype-earnings-review:

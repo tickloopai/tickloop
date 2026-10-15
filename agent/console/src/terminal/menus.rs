@@ -11,7 +11,7 @@ use std::{
 };
 
 use tickloop_agent_base::output_style::OutputStyle;
-use tickloop_agent_config::{DisplayPreferences, GlyphSet, UserSettings};
+use tickloop_agent_config::{DisplayPreferences, UserSettings};
 use tickloop_agent_tools::{
     ENTER_PLAN_MODE_TOOL_NAME,
     file_change::load_file_change_review,
@@ -24,8 +24,6 @@ use super::{
     console::{Console, Menu, PickerAction, PickerKind, RequestPresentation},
     conversation_picker::ConversationPicker,
     diff_view::{DiffNavigation, DiffViewport, render_diff, render_error},
-    display::DisplayProfile,
-    font_manager::{FontAction, FontOutcome, NerdFontManager, SystemFontAdapter},
     new_agent_draft::ConfigTarget,
     permissions_surface::PermissionsSubject,
     presentation::permission_context,
@@ -45,11 +43,11 @@ use tickloop_agent_protocol::{
 };
 
 const SHIFT_TAB_MODES_SETTING_INDEX: usize = 4;
-pub(super) const REDUCE_MOTION_SETTING_INDEX: usize = 10;
-pub(super) const OUTPUT_STYLE_SETTING_INDEX: usize = 11;
-pub(super) const PERMISSIONS_SETTING_INDEX: usize = 12;
-const ARTIFACT_SIGN_OUT_SETTING_INDEX: usize = 13;
-const PROMPT_SUGGESTION_SETTING_INDEX: usize = 14;
+pub(super) const REDUCE_MOTION_SETTING_INDEX: usize = 9;
+pub(super) const OUTPUT_STYLE_SETTING_INDEX: usize = 10;
+pub(super) const PERMISSIONS_SETTING_INDEX: usize = 11;
+const ARTIFACT_SIGN_OUT_SETTING_INDEX: usize = 12;
+const PROMPT_SUGGESTION_SETTING_INDEX: usize = 13;
 
 enum Selection {
     ArtifactSignOut {
@@ -128,18 +126,6 @@ enum Selection {
     Theme {
         /// Present when opened from Settings, so confirming returns there.
         settings_target: Option<ConfigTarget>,
-    },
-    GlyphSet {
-        target: ConfigTarget,
-        font_action: Option<FontAction>,
-    },
-    GlyphSetConfirmation {
-        target: ConfigTarget,
-        glyph_set: GlyphSet,
-    },
-    FontActionConfirmation {
-        target: ConfigTarget,
-        action: FontAction,
     },
     SettingsInfo {
         target: ConfigTarget,
@@ -308,21 +294,6 @@ impl Selection {
             },
             Self::OutputStyle { target } => Self::OutputStyle { target: *target },
             Self::ShiftTabModes { target } => Self::ShiftTabModes { target: *target },
-            Self::GlyphSet {
-                target,
-                font_action,
-            } => Self::GlyphSet {
-                target: *target,
-                font_action: *font_action,
-            },
-            Self::GlyphSetConfirmation { target, glyph_set } => Self::GlyphSetConfirmation {
-                target: *target,
-                glyph_set: *glyph_set,
-            },
-            Self::FontActionConfirmation { target, action } => Self::FontActionConfirmation {
-                target: *target,
-                action: *action,
-            },
             Self::ArtifactSignOut {
                 target,
                 return_to_settings,
@@ -430,9 +401,6 @@ impl Selection {
             | Self::SettingsInfo { target }
             | Self::OutputStyle { target }
             | Self::ShiftTabModes { target }
-            | Self::GlyphSet { target, .. }
-            | Self::GlyphSetConfirmation { target, .. }
-            | Self::FontActionConfirmation { target, .. }
             | Self::Mode { target, .. }
             | Self::PermissionMode { target, .. } => Some(*target),
             Self::JudgmentSettings { return_to, .. } | Self::JudgmentKey { return_to } => {
@@ -475,7 +443,6 @@ pub(super) struct Menus {
     config_root: Option<PathBuf>,
     refresh_connections: HashMap<(Option<Uuid>, String), Uuid>,
     model_discovery: tickloop_agent_model::availability::AccountModelDiscovery,
-    font_manager: Option<NerdFontManager<SystemFontAdapter>>,
     /// Where the next New Agent will be created; its saved project rules are shown before the
     /// first input.
     new_agent_directory: Option<PathBuf>,
@@ -504,10 +471,9 @@ impl Menus {
             scanned_plan_executions: HashMap::new(),
             user_settings,
             provider: Default::default(),
-            config_root: config_root.clone(),
+            config_root,
             refresh_connections: HashMap::new(),
             model_discovery: Default::default(),
-            font_manager: config_root.map(NerdFontManager::production),
             new_agent_directory: None,
         }
     }
@@ -1027,9 +993,6 @@ impl Menus {
                     | Selection::Theme { .. }
                     | Selection::OutputStyle { .. }
                     | Selection::ShiftTabModes { .. }
-                    | Selection::GlyphSet { .. }
-                    | Selection::GlyphSetConfirmation { .. }
-                    | Selection::FontActionConfirmation { .. }
                     | Selection::ArtifactSignOut { .. }
             ) {
                 let login_hint =
@@ -1517,7 +1480,7 @@ impl Menus {
             .await
             .map_err(|error| error.to_string())?;
         let mut context = vec![
-            "Model, Thinking, effort, persistent rules, shift+tab modes, output style, Glyph Set, reduced motion and prompt suggestions are saved in user settings; execution mode applies to this process.".into(),
+            "Model, Thinking, effort, persistent rules, shift+tab modes, output style, reduced motion and prompt suggestions are saved in user settings; execution mode applies to this process.".into(),
             "Auto-scroll and Theme apply to this terminal session.".into(),
             safe_text(&format!(
                 "Current model: {}",
@@ -1607,10 +1570,6 @@ impl Menus {
                         if console.auto_scroll()? { "On" } else { "Off" }
                     ),
                     format!("Theme: {}", console.theme()?.label()),
-                    format!(
-                        "Glyph Set: {}",
-                        console.display_preferences()?.glyph_set.label()
-                    ),
                     format!(
                         "Reduce motion: {}",
                         if console.display_preferences()?.prefers_reduced_motion {
@@ -1721,136 +1680,6 @@ impl Menus {
                 confirmation: false,
             },
             Selection::OutputStyle { target },
-        )
-    }
-
-    pub(super) async fn glyph_sets(
-        &mut self,
-        console: &Console,
-        target: ConfigTarget,
-    ) -> Result<(), String> {
-        self.glyph_sets_with_focus(console, target, None).await
-    }
-
-    async fn glyph_sets_with_focus(
-        &mut self,
-        console: &Console,
-        target: ConfigTarget,
-        selected: Option<usize>,
-    ) -> Result<(), String> {
-        let current = console.display_preferences()?.glyph_set;
-        let unicode = DisplayProfile::new(DisplayPreferences::default()).preview();
-        let nerd_font = DisplayProfile::new(DisplayPreferences {
-            glyph_set: GlyphSet::NerdFont,
-            prefers_reduced_motion: false,
-        })
-        .preview();
-        let mut options = GlyphSet::ALL
-            .into_iter()
-            .map(|glyph_set| {
-                if glyph_set == current {
-                    format!("Use {} · current", glyph_set.label())
-                } else {
-                    format!("Use {}", glyph_set.label())
-                }
-            })
-            .collect::<Vec<_>>();
-        let (font_status, font_action) = match &self.font_manager {
-            Some(manager) => {
-                let status = manager.status().await.map_err(|error| error.to_string())?;
-                let action = if status.can_install() {
-                    Some(FontAction::Install)
-                } else if status.can_uninstall() {
-                    Some(FontAction::Uninstall)
-                } else {
-                    None
-                };
-                (status.label().to_owned(), action)
-            }
-            None => (
-                "Automatic installation is unavailable because the settings directory is unknown"
-                    .into(),
-                None,
-            ),
-        };
-        if let Some(action) = font_action {
-            options.push(match action {
-                FontAction::Install => "Install Symbols-only Nerd Font…".into(),
-                FontAction::Uninstall => "Uninstall Tickloop-owned Symbols-only Nerd Font…".into(),
-            });
-        }
-        self.show(
-            console,
-            Menu {
-                id: Uuid::new_v4(),
-                title: "Choose Glyph Set".into(),
-                context: vec![
-                    format!("Unicode preview: {unicode}"),
-                    format!("Nerd Font preview: {nerd_font}"),
-                    format!("Font status: {font_status}"),
-                    "Choose only after the preview is aligned. Missing glyphs or boxes mean keep Unicode.".into(),
-                ],
-                options,
-                selected: selected.unwrap_or_else(|| GlyphSet::ALL
-                    .into_iter()
-                    .position(|glyph_set| glyph_set == current)
-                    .unwrap_or(0)),
-                confirmation: false,
-            },
-            Selection::GlyphSet { target, font_action },
-        )
-    }
-
-    fn confirm_glyph_set(
-        &mut self,
-        console: &Console,
-        target: ConfigTarget,
-        glyph_set: GlyphSet,
-    ) -> Result<(), String> {
-        self.show(
-            console,
-            Menu {
-                id: Uuid::new_v4(),
-                title: "Confirm glyph set".into(),
-                context: vec![format!(
-                    "Save {} for future Tickloop sessions?",
-                    glyph_set.label()
-                )],
-                options: vec!["Confirm and save".into(), "Back to preview".into()],
-                selected: 0,
-                confirmation: false,
-            },
-            Selection::GlyphSetConfirmation { target, glyph_set },
-        )
-    }
-
-    fn confirm_font_action(
-        &mut self,
-        console: &Console,
-        target: ConfigTarget,
-        action: FontAction,
-    ) -> Result<(), String> {
-        let (title, context) = match action {
-            FontAction::Install => (
-                "Confirm Nerd Font installation",
-                "Tickloop will use Homebrew when available; otherwise it downloads the fixed official v3.5.1 Symbols-only asset and verifies SHA-256. This does not enable Nerd Font.",
-            ),
-            FontAction::Uninstall => (
-                "Confirm Nerd Font uninstall",
-                "Tickloop will switch to Unicode first and remove only the installation recorded in its ownership receipt.",
-            ),
-        };
-        self.show(
-            console,
-            Menu {
-                id: Uuid::new_v4(),
-                title: title.into(),
-                context: vec![context.into()],
-                options: vec!["Confirm".into(), "Back to preview".into()],
-                selected: 1,
-                confirmation: false,
-            },
-            Selection::FontActionConfirmation { target, action },
         )
     }
 
@@ -3009,13 +2838,8 @@ impl Menus {
                 | Selection::Mode { target, .. }
                 | Selection::OutputStyle { target }
                 | Selection::ShiftTabModes { target }
-                | Selection::GlyphSet { target, .. }
                 | Selection::ArtifactSignOut { target, return_to_settings: true }
                     if index.is_none() => self.settings(agent, console, target).await?,
-                Selection::GlyphSetConfirmation { target, glyph_set }
-                    if index.is_none() => self.glyph_sets_with_focus(console, target, GlyphSet::ALL.into_iter().position(|candidate| candidate == glyph_set)).await?,
-                Selection::FontActionConfirmation { target, .. }
-                    if index.is_none() => self.glyph_sets_with_focus(console, target, Some(GlyphSet::ALL.len())).await?,
                 Selection::Theme { settings_target: Some(target) }
                     if index.is_none() => self.settings(agent, console, target).await?,
                 _ if index.is_none() => {
@@ -3079,7 +2903,6 @@ impl Menus {
                         self.settings(agent, console, target).await?;
                     }
                     Some(8) => self.themes(console, Some(target))?,
-                    Some(9) => self.glyph_sets(console, target).await?,
                     Some(REDUCE_MOTION_SETTING_INDEX) => {
                         let mut preferences = console.display_preferences()?;
                         preferences.prefers_reduced_motion = !preferences.prefers_reduced_motion;
@@ -3142,54 +2965,6 @@ impl Menus {
                         .map_err(|error| error.to_string())?;
                     console.write(&format!("Output style: {}\n", style.label()))?;
                 }
-                Selection::GlyphSet { target, font_action } => {
-                    let selected = index.unwrap();
-                    if let Some(glyph_set) = GlyphSet::ALL.get(selected).copied() {
-                        self.confirm_glyph_set(console, target, glyph_set)?;
-                    } else if selected == GlyphSet::ALL.len() {
-                        self.confirm_font_action(
-                            console,
-                            target,
-                            font_action.ok_or("font action does not exist")?,
-                        )?;
-                    } else {
-                        return Err("Glyph Set option does not exist".into());
-                    }
-                }
-                Selection::GlyphSetConfirmation { target, glyph_set } => match index {
-                    Some(0) => {
-                        let mut preferences = console.display_preferences()?;
-                        preferences.glyph_set = glyph_set;
-                        self.save_display_preferences(console, preferences)?;
-                        console.write(&format!("Glyph Set: {}\n", glyph_set.label()))?;
-                    }
-                    Some(1) => self.glyph_sets_with_focus(console, target, GlyphSet::ALL.into_iter().position(|candidate| candidate == glyph_set)).await?,
-                    _ => return Err("glyph confirmation option does not exist".into()),
-                },
-                Selection::FontActionConfirmation { target, action } => match index {
-                    Some(0) => {
-                        let mut preferences = console.display_preferences()?;
-                        if preferences.glyph_set != GlyphSet::Unicode {
-                            preferences.glyph_set = GlyphSet::Unicode;
-                            self.save_display_preferences(console, preferences)?;
-                        }
-                        let outcome = self
-                            .font_manager
-                            .as_ref()
-                            .ok_or("font manager is unavailable")?
-                            .apply(action)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        let message = match outcome {
-                            FontOutcome::ReadyForPreview { message }
-                            | FontOutcome::Removed { message } => message,
-                        };
-                        console.write(&format!("{message}\n"))?;
-                        self.glyph_sets_with_focus(console, target, Some(GlyphSet::ALL.len())).await?;
-                    }
-                    Some(1) => self.glyph_sets_with_focus(console, target, Some(GlyphSet::ALL.len())).await?,
-                    _ => return Err("font action confirmation does not exist".into()),
-                },
                 Selection::Mode { target, choices } => {
                     let mode = *choices
                         .get(index.unwrap())

@@ -1,33 +1,8 @@
-use tickloop_agent_config::{DisplayPreferences, GlyphSet};
+use tickloop_agent_config::DisplayPreferences;
 
 use super::style::{Theme, ThemeName};
 
-const UNICODE_SPINNER: [&str; 12] = ["·", "✢", "✳", "✶", "✻", "✽", "✽", "✻", "✶", "✳", "✢", "·"];
-const NERD_FONT_CIRCLE_EMPTY: &str = "\u{f0766}";
-const NERD_FONT_CIRCLE_SLICE_1: &str = "\u{f0a9e}";
-const NERD_FONT_CIRCLE_SLICE_5: &str = "\u{f0aa2}";
-/// Material Design circle slices filling from empty to full and draining back, holding each end
-/// for a frame as the Unicode spinner does.
-const NERD_FONT_SPINNER: [&str; 18] = [
-    NERD_FONT_CIRCLE_EMPTY,
-    NERD_FONT_CIRCLE_SLICE_1,
-    "\u{f0a9f}",
-    "\u{f0aa0}",
-    "\u{f0aa1}",
-    NERD_FONT_CIRCLE_SLICE_5,
-    "\u{f0aa3}",
-    "\u{f0aa4}",
-    "\u{f0aa5}",
-    "\u{f0aa5}",
-    "\u{f0aa4}",
-    "\u{f0aa3}",
-    NERD_FONT_CIRCLE_SLICE_5,
-    "\u{f0aa1}",
-    "\u{f0aa0}",
-    "\u{f0a9f}",
-    NERD_FONT_CIRCLE_SLICE_1,
-    NERD_FONT_CIRCLE_EMPTY,
-];
+const SPINNER: [&str; 12] = ["·", "✢", "✳", "✶", "✻", "✽", "✽", "✻", "✶", "✳", "✢", "·"];
 
 /// How long a blinking glyph stays in each phase. Every blinking glyph takes its phase from the
 /// same clock, so they blink together.
@@ -116,73 +91,34 @@ impl DisplayProfile {
     }
 
     pub(super) const fn glyph(self, glyph: Glyph) -> &'static str {
-        match (self.preferences.glyph_set, glyph) {
-            (GlyphSet::Unicode, Glyph::ShellTick) => "$",
-            (GlyphSet::Unicode, Glyph::ArtifactTick) => "⧉",
-            (GlyphSet::Unicode, Glyph::TerminalTick) => ">",
-            (GlyphSet::Unicode, Glyph::ProtocolTick) => "◉",
-            (GlyphSet::NerdFont, Glyph::ShellTick) => "\u{f489}",
-            // nf-fa-link: an artifact row is a link to its page.
-            (GlyphSet::NerdFont, Glyph::ArtifactTick) => "\u{f0c1}",
-            (GlyphSet::NerdFont, Glyph::TerminalTick) => "\u{f120}",
-            (GlyphSet::NerdFont, Glyph::ProtocolTick) => "\u{f0318}",
-            (_, Glyph::Subscription) => "⟳",
-            (GlyphSet::Unicode, Glyph::Prompt) => "❯",
-            (GlyphSet::Unicode, Glyph::Assistant | Glyph::Subagents | Glyph::ToolCall) => "⏺",
-            (GlyphSet::Unicode, Glyph::ToolResult) => "⎿",
-            (GlyphSet::Unicode, Glyph::TickDelivery) => "◉",
-            (GlyphSet::Unicode, Glyph::TodoBranch) => "⎿",
-            (GlyphSet::Unicode, Glyph::TodoPending) => "◻",
-            (GlyphSet::Unicode, Glyph::TodoInProgress) => "◼",
-            (GlyphSet::Unicode, Glyph::TodoCompleted) => "✔",
-            (GlyphSet::NerdFont, Glyph::TodoBranch) => "\u{f060d}",
-            (GlyphSet::NerdFont, Glyph::TodoPending) => "\u{f0131}",
-            (GlyphSet::NerdFont, Glyph::TodoInProgress) => "\u{f012e}",
-            (GlyphSet::NerdFont, Glyph::TodoCompleted) => "\u{f00c}",
-            (GlyphSet::Unicode, Glyph::Success) => "✓",
-            (GlyphSet::Unicode, Glyph::Failure) => "✗",
-            (GlyphSet::Unicode, Glyph::Warning) => "!",
-            (GlyphSet::Unicode, Glyph::TurnSummary) => "⏺",
-            (GlyphSet::Unicode, Glyph::ScrollUp) => "↑",
-            (GlyphSet::Unicode, Glyph::ScrollDown) => "↓",
-            (GlyphSet::Unicode, Glyph::AgentNeedsInput) => "◆",
-            (GlyphSet::Unicode, Glyph::AgentRunning) => UNICODE_SPINNER[0],
-            (GlyphSet::Unicode, Glyph::AgentWaiting) => "◷",
-            (GlyphSet::Unicode, Glyph::AgentIdle) => "○",
-            (GlyphSet::Unicode, Glyph::AgentCompleted) => "✔",
-            (GlyphSet::Unicode, Glyph::AgentFailed | Glyph::AgentStopped) => "✖",
-            (GlyphSet::Unicode, Glyph::AgentUnknown) => "?",
-            (GlyphSet::Unicode, Glyph::AgentEmpty) => "◦",
-            (GlyphSet::Unicode, Glyph::AgentViewed) => "●",
-            (GlyphSet::Unicode, Glyph::AgentUnviewed) => "○",
-            (GlyphSet::Unicode, Glyph::Collapsed) => "▸",
-            (GlyphSet::Unicode, Glyph::Expanded) => "▾",
-            (GlyphSet::NerdFont, Glyph::Prompt) => "\u{f0142}",
-            // The conversation's gutter keeps Claude Code's marks in every glyph set: one dot shape
-            // whose colour tells assistant from tool state, so no pictogram competes with the text.
-            (GlyphSet::NerdFont, Glyph::Assistant | Glyph::ToolCall) => "⏺",
-            (GlyphSet::NerdFont, Glyph::ToolResult) => "⎿",
-            (_, Glyph::AgentMessage) => "›",
-            (GlyphSet::NerdFont, Glyph::Subagents) => "\u{f06a9}",
-            (GlyphSet::NerdFont, Glyph::TickDelivery) => "\u{f0318}",
-            (GlyphSet::NerdFont, Glyph::Success) => "\u{f05e1}",
-            (GlyphSet::NerdFont, Glyph::Failure) => "\u{f015a}",
-            (GlyphSet::NerdFont, Glyph::Warning) => "\u{f0026}",
-            (GlyphSet::NerdFont, Glyph::TurnSummary) => "⏺",
-            (GlyphSet::NerdFont, Glyph::ScrollUp) => "\u{f0143}",
-            (GlyphSet::NerdFont, Glyph::ScrollDown) => "\u{f0140}",
-            (GlyphSet::NerdFont, Glyph::AgentNeedsInput) => "\u{f173b}",
-            (GlyphSet::NerdFont, Glyph::AgentRunning) => NERD_FONT_CIRCLE_SLICE_1,
-            (GlyphSet::NerdFont, Glyph::AgentWaiting) => "\u{f051f}",
-            (GlyphSet::NerdFont, Glyph::AgentIdle) => "\u{f03e6}",
-            (GlyphSet::NerdFont, Glyph::AgentCompleted) => "\u{f05e1}",
-            (GlyphSet::NerdFont, Glyph::AgentFailed | Glyph::AgentStopped) => "\u{f015a}",
-            (GlyphSet::NerdFont, Glyph::AgentUnknown) => "\u{f0625}",
-            (GlyphSet::NerdFont, Glyph::AgentEmpty) => "\u{f09df}",
-            (GlyphSet::NerdFont, Glyph::AgentViewed) => "\u{f111}",
-            (GlyphSet::NerdFont, Glyph::AgentUnviewed) => "\u{f10c}",
-            (GlyphSet::NerdFont, Glyph::Collapsed) => "\u{f0142}",
-            (GlyphSet::NerdFont, Glyph::Expanded) => "\u{f0140}",
+        match glyph {
+            Glyph::ShellTick => "$",
+            Glyph::ArtifactTick => "⧉",
+            Glyph::TerminalTick => ">",
+            Glyph::ProtocolTick | Glyph::TickDelivery => "◉",
+            Glyph::Subscription => "⟳",
+            Glyph::Prompt => "❯",
+            Glyph::Assistant | Glyph::Subagents | Glyph::ToolCall | Glyph::TurnSummary => "⏺",
+            Glyph::ToolResult | Glyph::TodoBranch => "⎿",
+            Glyph::AgentMessage => "›",
+            Glyph::TodoPending => "◻",
+            Glyph::TodoInProgress => "◼",
+            Glyph::TodoCompleted | Glyph::AgentCompleted => "✔",
+            Glyph::Success => "✓",
+            Glyph::Failure => "✗",
+            Glyph::Warning => "!",
+            Glyph::ScrollUp => "↑",
+            Glyph::ScrollDown => "↓",
+            Glyph::AgentNeedsInput => "◆",
+            Glyph::AgentRunning => SPINNER[0],
+            Glyph::AgentWaiting => "◷",
+            Glyph::AgentIdle | Glyph::AgentUnviewed => "○",
+            Glyph::AgentFailed | Glyph::AgentStopped => "✖",
+            Glyph::AgentUnknown => "?",
+            Glyph::AgentEmpty => "◦",
+            Glyph::AgentViewed => "●",
+            Glyph::Collapsed => "▸",
+            Glyph::Expanded => "▾",
         }
     }
 
@@ -191,15 +127,7 @@ impl DisplayProfile {
         if self.preferences.prefers_reduced_motion {
             return self.glyph(Glyph::AgentRunning);
         }
-        let frames = self.spinner_frames();
-        frames[frame % frames.len()]
-    }
-
-    fn spinner_frames(self) -> &'static [&'static str] {
-        match self.preferences.glyph_set {
-            GlyphSet::Unicode => &UNICODE_SPINNER,
-            GlyphSet::NerdFont => &NERD_FONT_SPINNER,
-        }
+        SPINNER[frame % SPINNER.len()]
     }
 
     /// Whether a blinking glyph is in its dimmed phase at `now_ms`; under Reduce motion it never
@@ -250,27 +178,6 @@ impl DisplayProfile {
             ),
         )
     }
-
-    pub(super) fn preview(self) -> String {
-        let mut glyphs = vec![
-            self.glyph(Glyph::Prompt),
-            self.glyph(Glyph::Assistant),
-            self.glyph(Glyph::ToolCall),
-            self.glyph(Glyph::ToolResult),
-            self.glyph(Glyph::TickDelivery),
-            self.glyph(Glyph::Success),
-            self.glyph(Glyph::TodoBranch),
-            self.glyph(Glyph::TodoPending),
-            self.glyph(Glyph::TodoInProgress),
-            self.glyph(Glyph::TodoCompleted),
-            self.glyph(Glyph::Failure),
-            self.glyph(Glyph::Warning),
-            self.glyph(Glyph::ScrollUp),
-            self.glyph(Glyph::ScrollDown),
-        ];
-        glyphs.extend((0..self.spinner_frames().len()).map(|frame| self.spinner_frame(frame)));
-        glyphs.join("  ")
-    }
 }
 
 #[cfg(test)]
@@ -278,75 +185,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn overview_state_icons_use_the_verified_nerd_font_names_and_unicode_fallbacks() {
-        let expected = [
-            (Glyph::AgentNeedsInput, "◆", "\u{f173b}"),
-            (Glyph::AgentCompleted, "✔", "\u{f05e1}"),
-            (Glyph::AgentFailed, "✖", "\u{f015a}"),
-            (Glyph::AgentStopped, "✖", "\u{f015a}"),
-            (Glyph::AgentIdle, "○", "\u{f03e6}"),
-            (Glyph::AgentWaiting, "◷", "\u{f051f}"),
-        ];
-        for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
-            let profile = DisplayProfile::new(DisplayPreferences {
-                glyph_set,
-                prefers_reduced_motion: false,
-            });
-            for (glyph, unicode, nerd) in expected {
-                assert_eq!(
-                    profile.glyph(glyph),
-                    if glyph_set == GlyphSet::Unicode {
-                        unicode
-                    } else {
-                        nerd
-                    }
-                );
-                assert_eq!(
-                    unicode_width::UnicodeWidthStr::width(profile.glyph(glyph)),
-                    1
-                );
-            }
-        }
-    }
-
-    #[test]
     fn display_profile_maps_semantic_glyphs_and_reduced_motion() {
-        let unicode = DisplayProfile::new(DisplayPreferences::default());
-        assert_eq!(unicode.glyph(Glyph::Prompt), "❯");
-        assert_eq!(unicode.glyph(Glyph::Assistant), "⏺");
-        assert_eq!(unicode.glyph(Glyph::ToolResult), "⎿");
-        assert_eq!(unicode.spinner_frame(0), "·");
-        assert_eq!(unicode.spinner_frame(1), "✢");
+        let animated = DisplayProfile::default();
+        assert_eq!(animated.glyph(Glyph::Prompt), "❯");
+        assert_eq!(animated.glyph(Glyph::Assistant), "⏺");
+        assert_eq!(animated.glyph(Glyph::ToolResult), "⎿");
+        assert_eq!(animated.glyph(Glyph::AgentNeedsInput), "◆");
+        assert_eq!(animated.glyph(Glyph::AgentWaiting), "◷");
+        assert_eq!(animated.spinner_frame(0), "·");
+        assert_eq!(animated.spinner_frame(1), "✢");
+        assert_eq!(animated.spinner_frame(SPINNER.len()), "·", "it loops");
 
-        let nerd_font = DisplayProfile::new(DisplayPreferences {
-            glyph_set: GlyphSet::NerdFont,
+        let still = DisplayProfile::new(DisplayPreferences {
             prefers_reduced_motion: true,
         });
-        assert_eq!(nerd_font.glyph(Glyph::Prompt), "\u{f0142}");
-        assert_eq!(nerd_font.glyph(Glyph::Assistant), "⏺");
-        assert_eq!(nerd_font.glyph(Glyph::ToolCall), "⏺");
-        assert_eq!(nerd_font.glyph(Glyph::ToolResult), "⎿");
-        assert_eq!(nerd_font.spinner_frame(7), "\u{f0a9e}");
-
-        let moving_nerd_font = DisplayProfile::new(DisplayPreferences {
-            glyph_set: GlyphSet::NerdFont,
-            prefers_reduced_motion: false,
-        });
-        let frames = (0..NERD_FONT_SPINNER.len())
-            .map(|frame| moving_nerd_font.spinner_frame(frame))
-            .collect::<Vec<_>>();
-        assert_eq!(frames.first(), Some(&"\u{f0766}"), "it starts empty");
-        assert_eq!(frames.last(), Some(&"\u{f0766}"), "it drains back to empty");
-        assert_eq!(
-            frames.iter().filter(|frame| **frame == "\u{f0aa5}").count(),
-            2,
-            "it holds the full circle for a frame"
-        );
-        assert_eq!(
-            moving_nerd_font.spinner_frame(NERD_FONT_SPINNER.len()),
-            "\u{f0766}",
-            "it loops"
-        );
+        assert_eq!(still.spinner_frame(7), "·", "the still running glyph");
     }
 
     #[test]
@@ -364,26 +217,6 @@ mod tests {
     }
 
     #[test]
-    fn the_subscription_mark_and_the_artifact_link_take_one_column_in_both_glyph_sets() {
-        for (glyph_set, artifact) in [(GlyphSet::Unicode, "⧉"), (GlyphSet::NerdFont, "\u{f0c1}")]
-        {
-            let profile = DisplayProfile::new(DisplayPreferences {
-                glyph_set,
-                prefers_reduced_motion: false,
-            });
-            assert_eq!(profile.glyph(Glyph::Subscription), "⟳", "{glyph_set:?}");
-            assert_eq!(profile.glyph(Glyph::ArtifactTick), artifact);
-            for glyph in [Glyph::Subscription, Glyph::ArtifactTick] {
-                assert_eq!(
-                    unicode_width::UnicodeWidthStr::width(profile.glyph(glyph)),
-                    1,
-                    "{glyph_set:?} {glyph:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn running_glyphs_blink_together_every_half_second_unless_motion_is_reduced() {
         let animated = DisplayProfile::default();
         assert!(!animated.blink_dimmed(1_000));
@@ -394,7 +227,6 @@ mod tests {
         assert_eq!(animated.next_running_change_ms(1_500), 2_000);
         let still = DisplayProfile::new(DisplayPreferences {
             prefers_reduced_motion: true,
-            ..Default::default()
         });
         assert!(!still.blink_dimmed(1_500));
         assert_eq!(
@@ -431,64 +263,56 @@ mod tests {
         assert_eq!(animated.next_flash_change_ms(1_000, 2_200), None);
         let still = DisplayProfile::new(DisplayPreferences {
             prefers_reduced_motion: true,
-            ..Default::default()
         });
         assert_eq!(still.flash_strong(1_000, 1_000), None);
         assert_eq!(still.next_flash_change_ms(1_000, 1_000), None);
     }
 
     #[test]
-    fn subagents_glyph_uses_the_robot_with_a_single_column_unicode_fallback() {
-        for (glyph_set, expected, expanded) in [
-            (GlyphSet::Unicode, "⏺", "▾"),
-            (GlyphSet::NerdFont, "\u{f06a9}", "\u{f0140}"),
-        ] {
-            let profile = DisplayProfile::new(DisplayPreferences {
-                glyph_set,
-                prefers_reduced_motion: false,
-            });
-            assert_eq!(profile.glyph(Glyph::Subagents), expected);
-            assert_eq!(unicode_width::UnicodeWidthStr::width(expected), 1);
-            assert_eq!(profile.glyph(Glyph::Expanded), expanded);
-        }
-    }
-
-    #[test]
-    fn agent_state_glyphs_have_single_cell_geometry_in_both_glyph_sets() {
-        let states = [
+    fn every_glyph_takes_one_column() {
+        let profile = DisplayProfile::default();
+        for glyph in [
+            Glyph::ShellTick,
+            Glyph::ArtifactTick,
+            Glyph::TerminalTick,
+            Glyph::ProtocolTick,
+            Glyph::Subscription,
+            Glyph::Prompt,
+            Glyph::Assistant,
+            Glyph::Subagents,
+            Glyph::ToolCall,
+            Glyph::ToolResult,
+            Glyph::TickDelivery,
+            Glyph::AgentMessage,
+            Glyph::Success,
+            Glyph::TodoBranch,
+            Glyph::TodoPending,
+            Glyph::TodoInProgress,
+            Glyph::TodoCompleted,
+            Glyph::Failure,
+            Glyph::Warning,
+            Glyph::TurnSummary,
+            Glyph::ScrollUp,
+            Glyph::ScrollDown,
             Glyph::AgentNeedsInput,
-            Glyph::AgentFailed,
             Glyph::AgentRunning,
             Glyph::AgentWaiting,
             Glyph::AgentIdle,
             Glyph::AgentCompleted,
+            Glyph::AgentFailed,
             Glyph::AgentStopped,
             Glyph::AgentUnknown,
             Glyph::AgentEmpty,
-        ];
-        for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
-            let profile = DisplayProfile::new(DisplayPreferences {
-                glyph_set,
-                prefers_reduced_motion: false,
-            });
-            for glyph in states.into_iter().chain([
-                Glyph::Collapsed,
-                Glyph::Expanded,
-                Glyph::ShellTick,
-                Glyph::ArtifactTick,
-                Glyph::TerminalTick,
-                Glyph::ProtocolTick,
-                Glyph::TodoBranch,
-                Glyph::TodoPending,
-                Glyph::TodoInProgress,
-                Glyph::TodoCompleted,
-            ]) {
-                assert_eq!(
-                    unicode_width::UnicodeWidthStr::width(profile.glyph(glyph)),
-                    1,
-                    "{glyph_set:?} {glyph:?}: layout calculation counts one column (unicode-width); terminal font geometry is not verified here"
-                );
-            }
+            Glyph::AgentViewed,
+            Glyph::AgentUnviewed,
+            Glyph::Collapsed,
+            Glyph::Expanded,
+        ] {
+            assert_eq!(
+                unicode_width::UnicodeWidthStr::width(profile.glyph(glyph)),
+                1,
+                "{glyph:?}: layout calculation counts one column (unicode-width); terminal font geometry is not verified here"
+            );
         }
     }
 }

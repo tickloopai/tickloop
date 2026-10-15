@@ -619,7 +619,7 @@ fn draw_canvas<V: LiveView>(
     frame
         .buffer_mut()
         .set_style(status_area, styles.status_base());
-    let icon = tickloop_ui::icons::Icon::Connection.glyph(settings.icon_theme);
+    let icon = tickloop_ui::icons::Icon::Connection.glyph();
     let status = if let Some(error) = &state.last_error {
         if state.connection == ConnectionState::Connected {
             error.clone()

@@ -2024,18 +2024,13 @@ mod tests {
     }
 
     #[test]
-    fn restored_history_uses_the_selected_glyph_set() {
-        let display = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
-            glyph_set: tickloop_agent_config::GlyphSet::NerdFont,
-            prefers_reduced_motion: false,
-        });
-
+    fn restored_history_shows_the_prompt_reply_and_tool_marks() {
         let history = public_history(
             &directed_history_fixture(SummaryDirection::FromHere),
-            display,
+            DisplayProfile::default(),
         );
 
-        assert!(history.contains("\u{f0142} prefix prompt"), "{history}");
+        assert!(history.contains("❯ prefix prompt"), "{history}");
         assert!(history.contains("⏺ prefix answer"), "{history}");
         assert!(history.contains("⏺ Read"), "{history}");
         assert!(history.contains("⎿  Completed"), "{history}");

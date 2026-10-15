@@ -49,7 +49,6 @@ const EFFORT_LEVEL_KEY: &str = "effortLevel";
 const THINKING_ENABLED_KEY: &str = "alwaysThinkingEnabled";
 const DEFAULT_MODE_KEY: &str = "defaultMode";
 const CONTEXT_WINDOW_KEY: &str = "contextWindowTokens";
-const GLYPH_SET_KEY: &str = "glyphSet";
 const PREFERS_REDUCED_MOTION_KEY: &str = "prefersReducedMotion";
 const MONITOR_KEY: &str = "monitor";
 const MONITOR_POPUP_KEY: &str = "monitorPopup";
@@ -191,28 +190,8 @@ pub struct LoadedSettings {
     read_error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum GlyphSet {
-    #[default]
-    Unicode,
-    NerdFont,
-}
-
-impl GlyphSet {
-    pub const ALL: [Self; 2] = [Self::Unicode, Self::NerdFont];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Unicode => "Unicode",
-            Self::NerdFont => "Nerd Font",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DisplayPreferences {
-    pub glyph_set: GlyphSet,
     pub prefers_reduced_motion: bool,
 }
 
@@ -453,19 +432,6 @@ impl LoadedSettings {
     }
 
     pub fn display_preferences(&mut self) -> DisplayPreferences {
-        let glyph_set = self
-            .settings
-            .get(GLYPH_SET_KEY)
-            .cloned()
-            .map(|value| {
-                serde_json::from_value(value).unwrap_or_else(|error| {
-                    self.warn(format!(
-                        "`{GLYPH_SET_KEY}` is not `unicode` or `nerd-font` and is ignored ({error})"
-                    ));
-                    GlyphSet::default()
-                })
-            })
-            .unwrap_or_default();
         let prefers_reduced_motion = self
             .settings
             .get(PREFERS_REDUCED_MOTION_KEY)
@@ -480,7 +446,6 @@ impl LoadedSettings {
             })
             .unwrap_or(false);
         DisplayPreferences {
-            glyph_set,
             prefers_reduced_motion,
         }
     }
@@ -944,10 +909,6 @@ impl UserSettings {
         preferences: DisplayPreferences,
     ) -> Result<(), SettingsError> {
         self.update(|settings| {
-            settings.insert(
-                GLYPH_SET_KEY.into(),
-                serde_json::to_value(preferences.glyph_set).expect("glyph set serializes to JSON"),
-            );
             settings.insert(
                 PREFERS_REDUCED_MOTION_KEY.into(),
                 preferences.prefers_reduced_motion.into(),

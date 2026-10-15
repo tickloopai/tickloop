@@ -737,38 +737,30 @@ mod tests {
             relay: Some(&relay),
             text: "First line\nSecond line",
         };
-        for glyphs in [
-            tickloop_agent_config::GlyphSet::Unicode,
-            tickloop_agent_config::GlyphSet::NerdFont,
-        ] {
-            let display = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
-                glyph_set: glyphs,
-                ..Default::default()
-            });
-            let (heading, body) = message_runs(&message, OutputDetail::Preview, display);
-            assert_eq!(
-                joined(&heading),
-                "\n› Message from @feature-dev-code-rev… (ctrl+o to expand)\n"
-            );
-            assert!(
-                heading
-                    .iter()
-                    .all(|(text, role)| text == "\n" || *role == Some(Role::MutedText)),
-                "the whole line is dim"
-            );
-            assert!(body.is_empty());
+        let display = DisplayProfile::default();
+        let (heading, body) = message_runs(&message, OutputDetail::Preview, display);
+        assert_eq!(
+            joined(&heading),
+            "\n› Message from @feature-dev-code-rev… (ctrl+o to expand)\n"
+        );
+        assert!(
+            heading
+                .iter()
+                .all(|(text, role)| text == "\n" || *role == Some(Role::MutedText)),
+            "the whole line is dim"
+        );
+        assert!(body.is_empty());
 
-            let (heading, body) = message_runs(&message, OutputDetail::Full, display);
-            assert_eq!(
-                joined(&heading),
-                "\n› Message from @feature-dev-code-reviewer\n"
-            );
-            assert_eq!(
-                joined(&body),
-                "  Verified user relay · verbatim\n  Human instruction\n  First line\n  Second line\n"
-            );
-            assert!(body.contains(&("Second line".into(), None)));
-        }
+        let (heading, body) = message_runs(&message, OutputDetail::Full, display);
+        assert_eq!(
+            joined(&heading),
+            "\n› Message from @feature-dev-code-reviewer\n"
+        );
+        assert_eq!(
+            joined(&body),
+            "  Verified user relay · verbatim\n  Human instruction\n  First line\n  Second line\n"
+        );
+        assert!(body.contains(&("Second line".into(), None)));
     }
 
     #[test]

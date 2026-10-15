@@ -7,7 +7,7 @@ use std::{
 
 use serde::Deserialize;
 use tick_provider::preferences::{Language, Region};
-use tickloop_ui::settings::{AmbiguousWidth, ColorMode, IconTheme};
+use tickloop_ui::settings::{AmbiguousWidth, ColorMode};
 
 pub const DEFAULT_RELATIVE_PATH: &str = ".tickloop/config.toml";
 
@@ -17,7 +17,6 @@ pub struct Settings {
     pub is_demo: bool,
     pub renderer_styles: Option<tickloop_ui::styles::RendererStyles>,
     pub color_mode: ColorMode,
-    pub icon_theme: IconTheme,
     pub language: Language,
     pub ambiguous_width: AmbiguousWidth,
     pub region: Option<Region>,
@@ -27,7 +26,6 @@ pub struct Settings {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Overrides {
     pub color_mode: Option<ColorMode>,
-    pub icon_theme: Option<IconTheme>,
     pub language: Option<Language>,
     pub ambiguous_width: Option<AmbiguousWidth>,
     pub region: Option<Region>,
@@ -37,7 +35,10 @@ pub struct Overrides {
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
     color_mode: Option<String>,
-    icon_theme: Option<String>,
+    /// The icon glyph set earlier versions offered; one set is left, so a file that still names
+    /// one loads and the value is not read.
+    #[serde(rename = "icon_theme")]
+    _icon_theme: Option<serde::de::IgnoredAny>,
     language: Option<String>,
     ambiguous_width: Option<String>,
     region: Option<String>,
@@ -50,7 +51,6 @@ impl Settings {
             is_demo: false,
             renderer_styles: None,
             color_mode: parse_field("color_mode", file.color_mode)?.unwrap_or_default(),
-            icon_theme: parse_field("icon_theme", file.icon_theme)?.unwrap_or_default(),
             language: parse_field("language", file.language)?.unwrap_or_default(),
             ambiguous_width: parse_field("ambiguous_width", file.ambiguous_width)?
                 .unwrap_or_default(),
@@ -75,7 +75,6 @@ impl Settings {
             is_demo: self.is_demo,
             renderer_styles: self.renderer_styles,
             color_mode: overrides.color_mode.unwrap_or(self.color_mode),
-            icon_theme: overrides.icon_theme.unwrap_or(self.icon_theme),
             language: overrides.language.unwrap_or(self.language),
             ambiguous_width: overrides.ambiguous_width.unwrap_or(self.ambiguous_width),
             region: overrides.region.or(self.region),

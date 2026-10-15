@@ -53,16 +53,14 @@ fn wide_ambiguous_glyphs_reserve_their_second_buffer_cell() {
 }
 
 #[test]
-fn status_icons_follow_the_two_theme_contract() {
-    use tickloop_ui::{icons::Icon, settings::IconTheme};
-    assert_eq!(Icon::Connection.glyph(IconTheme::Unicode), "●");
-    assert_eq!(Icon::Connection.glyph(IconTheme::Nerd), "\u{f0318} ");
-    assert_eq!(Icon::MarketOpen.glyph(IconTheme::Unicode), "▶");
-    for theme in [IconTheme::Unicode, IconTheme::Nerd] {
-        assert_eq!(Icon::TickUpdate.glyph(theme), "⠋");
-    }
+fn status_icons_are_single_column_unicode_symbols() {
+    use tickloop_ui::icons::Icon;
+    assert_eq!(Icon::Connection.glyph(), "●");
+    assert_eq!(Icon::MarketOpen.glyph(), "▶");
+    assert_eq!(Icon::TickUpdate.glyph(), "⠋");
     for icon in [
         Icon::Connection,
+        Icon::TickUpdate,
         Icon::MarketPre,
         Icon::MarketOpen,
         Icon::MarketClosed,
@@ -72,7 +70,11 @@ fn status_icons_follow_the_two_theme_contract() {
         Icon::Position,
         Icon::Kline,
     ] {
-        assert!(icon.glyph(IconTheme::Nerd).ends_with(' '));
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(icon.glyph()),
+            1,
+            "{icon:?}"
+        );
     }
 }
 

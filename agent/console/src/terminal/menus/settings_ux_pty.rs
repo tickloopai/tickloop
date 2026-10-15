@@ -48,8 +48,6 @@ fn settings_ux_pty_fixture() {
             console.select_chat(Some(chat)).unwrap();
             console.set_prompt_enabled(true).unwrap();
             let mut menus = Menus::new(Some(settings), Some(root));
-            // Keep navigation fixtures independent of the host's font-management tools.
-            menus.font_manager = None;
             std::fs::write(directory.join("ready"), "ready").unwrap();
             let mut login: Option<super::super::login::LoginFlow> = None;
             let mut login_sender = None;
@@ -449,7 +447,6 @@ fn settings_ux_pty_settings_escape_returns_one_page_and_omits_numbers() {
         ("Session status", "Session status"),
         ("Usage", "Usage"),
         ("Theme:", "Choose theme"),
-        ("Glyph Set:", "Choose Glyph Set"),
         ("Output style:", "Preferred output style"),
         ("Artifacts:", "Sign out of Tickloop Artifacts?"),
     ] {
@@ -465,12 +462,6 @@ fn settings_ux_pty_settings_escape_returns_one_page_and_omits_numbers() {
             frame.lines().any(|line| line.contains(title))
                 && !frame.lines().any(|line| line == "Settings")
         });
-        if title == "Choose Glyph Set" {
-            fixture.send(b"\r");
-            fixture.wait(|frame| frame.contains("Confirm glyph set"));
-            fixture.send(b"\x1b");
-            fixture.wait(|frame| frame.contains("Choose Glyph Set"));
-        }
         fixture.send(b"\x1b");
         fixture.wait(|frame| {
             frame.lines().any(|line| line == "Settings")
@@ -621,39 +612,6 @@ fn settings_ux_pty_login_completion_stays_open_until_enter_or_escape() {
     fixture.wait(|frame| frame.contains("Choose Provider · All"));
     fixture.send(b"\x1b");
     fixture.wait(|frame| frame.contains("ctrl+g editor") && !frame.contains("Choose Provider"));
-}
-
-#[test]
-fn settings_ux_pty_failed_subpage_save_keeps_confirmation_open() {
-    let mut fixture = Fixture::start();
-    fixture.send(b"/settings\r");
-    fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));
-    fixture.select("Glyph Set:");
-    fixture.send(b"\r");
-    fixture.wait(|frame| frame.contains("Choose Glyph Set"));
-    fixture.send(b"\r");
-    fixture.wait(|frame| frame.contains("Confirm glyph set"));
-    std::fs::write(
-        fixture.directory.path().join("config/settings.json"),
-        "invalid JSON",
-    )
-    .unwrap();
-    fixture.send(b"\r");
-    // Keys are ignored while a menu submission is pending, so the next key waits until the
-    // failed save has been handled.
-    let frame = fixture.wait(|frame| {
-        frame.contains("Confirm glyph set")
-            && frame.contains("Confirm and save")
-            && fixture.directory.path().join("selection-error").exists()
-    });
-    fixture.send(b"j");
-    fixture.wait(|next| {
-        next != frame
-            && next.contains("Confirm glyph set")
-            && next
-                .lines()
-                .any(|line| line.starts_with('❯') && line.contains("Back to preview"))
-    });
 }
 
 #[test]

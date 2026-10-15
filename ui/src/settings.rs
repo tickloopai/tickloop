@@ -15,16 +15,6 @@ pub enum ColorMode {
     GreenUp,
 }
 
-/// Which glyph set status icons are drawn with.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum IconTheme {
-    /// Plain Unicode symbols available in any font (default).
-    #[default]
-    Unicode,
-    /// Nerd Font private-use code points; requires a patched font.
-    Nerd,
-}
-
 /// How East Asian Ambiguous width characters are measured.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AmbiguousWidth {
@@ -85,5 +75,4 @@ macro_rules! string_variants {
 }
 
 string_variants!(ColorMode { RedUp => "red-up", GreenUp => "green-up" });
-string_variants!(IconTheme { Unicode => "unicode", Nerd => "nerd" });
 string_variants!(AmbiguousWidth { Narrow => "narrow", Wide => "wide" });

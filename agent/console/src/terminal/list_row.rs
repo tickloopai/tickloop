@@ -335,7 +335,7 @@ pub(super) fn format_elapsed(milliseconds: u64) -> String {
 mod tests {
     use super::*;
     use crate::monitor_rows::NextCheck;
-    use tickloop_agent_config::{DisplayPreferences, GlyphSet};
+    use tickloop_agent_config::DisplayPreferences;
 
     fn text(status: &RowStatus) -> String {
         status
@@ -443,7 +443,6 @@ mod tests {
         assert_eq!(state_mark(running, animated, 1_500), Role::RunningMarkDim);
         let still = DisplayProfile::new(DisplayPreferences {
             prefers_reduced_motion: true,
-            ..Default::default()
         });
         assert_eq!(state_mark(running, still, 1_500), Role::RunningMark);
     }
@@ -476,22 +475,22 @@ mod tests {
 
     #[test]
     fn a_subscription_shows_one_mark_coloured_by_frequency_and_never_a_word_or_count() {
-        for glyph_set in [GlyphSet::Unicode, GlyphSet::NerdFont] {
-            let display = DisplayProfile::new(DisplayPreferences {
-                glyph_set,
-                prefers_reduced_motion: false,
-            });
-            for (frequency, role) in [
-                (TickSubscriptionFrequency::High, Role::SubscriptionHigh),
-                (TickSubscriptionFrequency::Medium, Role::SubscriptionMedium),
-                (TickSubscriptionFrequency::Low, Role::SubscriptionLow),
-            ] {
-                assert_eq!(
-                    row_status(StatusTone::Live, &[], periodic(frequency), display, 0),
-                    marked("", role),
-                    "{glyph_set:?} {frequency:?}"
-                );
-            }
+        for (frequency, role) in [
+            (TickSubscriptionFrequency::High, Role::SubscriptionHigh),
+            (TickSubscriptionFrequency::Medium, Role::SubscriptionMedium),
+            (TickSubscriptionFrequency::Low, Role::SubscriptionLow),
+        ] {
+            assert_eq!(
+                row_status(
+                    StatusTone::Live,
+                    &[],
+                    periodic(frequency),
+                    DisplayProfile::default(),
+                    0
+                ),
+                marked("", role),
+                "{frequency:?}"
+            );
         }
     }
 
@@ -633,7 +632,6 @@ mod tests {
         );
         let still = DisplayProfile::new(DisplayPreferences {
             prefers_reduced_motion: true,
-            ..Default::default()
         });
         assert_eq!(
             update_square(Some(5_000), still, 5_400),
@@ -657,7 +655,6 @@ mod tests {
         assert_eq!(flash_fill(None, animated, 5_000), None);
         let still = DisplayProfile::new(DisplayPreferences {
             prefers_reduced_motion: true,
-            ..Default::default()
         });
         assert_eq!(flash_fill(Some(5_000), still, 5_000), None);
     }

@@ -1672,7 +1672,6 @@ fn a_monitor_row_glyph_carries_its_state_and_blinks_while_it_runs() {
     assert_eq!(monitor.next_frame_ms(2_100, 40, display), Some(2_500));
     let still = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
         prefers_reduced_motion: true,
-        ..Default::default()
     });
     assert_eq!(
         glyph_role(2_500, still),

@@ -2245,10 +2245,7 @@ impl Console {
         preferences: DisplayPreferences,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let previous = state.display;
         state.display.set_preferences(preferences);
-        let next = state.display;
-        state.scrollback.remap_display(previous, next);
         state.rendered_region = None;
         state
             .draw(&mut io::stdout().lock())
@@ -15707,54 +15704,48 @@ mod tests {
             description: "Audit evidence".into(),
             available: true,
         };
-        for glyph_set in tickloop_agent_config::GlyphSet::ALL {
-            let mut state = State::new(true, 80, 24);
-            state.prompt_enabled = true;
-            state.display = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
-                glyph_set,
-                ..Default::default()
-            });
-            state.file_mentions = FileMentionState::with_index(
-                FileMentionIndex::build(directory.path(), &[]).unwrap(),
-            );
-            state.file_mentions.set_family_targets(vec![target.clone()]);
-            state.insert("@a");
-            let candidates = state
-                .candidate_rows(6)
-                .iter()
-                .map(RoleLine::text)
-                .collect::<Vec<_>>();
-            assert_eq!(candidates[0], "Agents");
-            assert_eq!(candidates[2], "Files");
-            state.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
-            state.file_mentions.set_family_targets(vec![target.clone()]);
-            assert_eq!(state.file_mentions.selected_index(), Some(0));
-            assert!(state.key(key(KeyCode::Enter)).is_none());
-            assert_eq!(state.editor.draft(), "@audit ");
-            assert!(state.input_image_marks().contains(&(0..6, Role::Accent)));
-            state.key(key(KeyCode::Char('j')));
-            state.key(key(KeyCode::Char('k')));
-            assert_eq!(state.editor.draft(), "@audit jk");
-            assert!(
-                matches!(state.key(key(KeyCode::Enter)), Some(InputEvent::Prompt { family_target: Some(execution), .. }) if execution == target.execution)
-            );
-            assert!(state.restore_rejected_prompt(vec![]));
-            assert_eq!(state.editor.draft(), "@audit jk");
-            assert!(state.input_image_marks().contains(&(0..6, Role::Accent)));
-            state.stash_input();
-            assert!(state.editor.draft().is_empty());
-            state.stash_input();
-            assert_eq!(state.editor.draft(), "@audit jk");
-            assert_eq!(
-                state
-                    .file_mentions
-                    .family_target_for_submission(state.editor.draft())
-                    .unwrap()
-                    .unwrap()
-                    .execution,
-                target.execution
-            );
-        }
+        let mut state = State::new(true, 80, 24);
+        state.prompt_enabled = true;
+        state.display = DisplayProfile::default();
+        state.file_mentions =
+            FileMentionState::with_index(FileMentionIndex::build(directory.path(), &[]).unwrap());
+        state.file_mentions.set_family_targets(vec![target.clone()]);
+        state.insert("@a");
+        let candidates = state
+            .candidate_rows(6)
+            .iter()
+            .map(RoleLine::text)
+            .collect::<Vec<_>>();
+        assert_eq!(candidates[0], "Agents");
+        assert_eq!(candidates[2], "Files");
+        state.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        state.file_mentions.set_family_targets(vec![target.clone()]);
+        assert_eq!(state.file_mentions.selected_index(), Some(0));
+        assert!(state.key(key(KeyCode::Enter)).is_none());
+        assert_eq!(state.editor.draft(), "@audit ");
+        assert!(state.input_image_marks().contains(&(0..6, Role::Accent)));
+        state.key(key(KeyCode::Char('j')));
+        state.key(key(KeyCode::Char('k')));
+        assert_eq!(state.editor.draft(), "@audit jk");
+        assert!(
+            matches!(state.key(key(KeyCode::Enter)), Some(InputEvent::Prompt { family_target: Some(execution), .. }) if execution == target.execution)
+        );
+        assert!(state.restore_rejected_prompt(vec![]));
+        assert_eq!(state.editor.draft(), "@audit jk");
+        assert!(state.input_image_marks().contains(&(0..6, Role::Accent)));
+        state.stash_input();
+        assert!(state.editor.draft().is_empty());
+        state.stash_input();
+        assert_eq!(state.editor.draft(), "@audit jk");
+        assert_eq!(
+            state
+                .file_mentions
+                .family_target_for_submission(state.editor.draft())
+                .unwrap()
+                .unwrap()
+                .execution,
+            target.execution
+        );
     }
 
     #[test]
@@ -19908,7 +19899,6 @@ mod tests {
                         "Usage",
                         "Auto-scroll",
                         "Theme",
-                        "Glyph Set",
                         "Reduce motion",
                         "Output style",
                         "Permissions",
@@ -19930,10 +19920,6 @@ mod tests {
         assert_eq!(
             open_settings_and_choose(&mut menus, &agent, &console, chat, 8).await,
             "Choose theme"
-        );
-        assert_eq!(
-            open_settings_and_choose(&mut menus, &agent, &console, chat, 9).await,
-            "Choose Glyph Set"
         );
         assert_eq!(
             open_settings_and_choose(&mut menus, &agent, &console, chat, 4).await,

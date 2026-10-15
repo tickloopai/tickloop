@@ -54,7 +54,7 @@ cargo build --locked --release --workspace --bins
 ./target/release/tick builtin news --size 40x12
 ```
 
-安装入口使用 `make install`，把 `tickloop`、`tickhost` 与 `tick` 放入 PATH。交互模式要求 UTF-8 locale 和支持真彩色的终端；独立运行使用 TTY，由 Agent 打开时 Tickhost 的 launcher 保留控制终端，并把 stdin/stdout 留给协议。macOS 为当前目标环境。`--help` 和 `describe` 无需 UTF-8 locale 或登录。默认 Unicode 图标不需要特殊字体；`--icon-theme nerd` 需要 Nerd Font v3。
+安装入口使用 `make install`，把 `tickloop`、`tickhost` 与 `tick` 放入 PATH。交互模式要求 UTF-8 locale 和支持真彩色的终端；独立运行使用 TTY，由 Agent 打开时 Tickhost 的 launcher 保留控制终端，并把 stdin/stdout 留给协议。macOS 为当前目标环境。`--help` 和 `describe` 无需 UTF-8 locale 或登录。图标只有一套 Unicode 字形，不需要特殊字体。
 
 `builtin` 的 Tick 均在真实 TUI 中运行，使用带 `Demo` 标识的模拟数据，不访问网络或读取账户。`--size` 以字符列×行限制显示区域，仍受实际终端尺寸约束，对所有 provider 都可用。用 `q` 退出；可替换为 `quote`、`watchlist`、`kline`、`positions`、`news`、`earnings`、`options`、`reader`。builtin 支持下述全局显示参数。验收时分别缩小窗口、滚动、打开帮助并退出，检查终端恢复。
 
@@ -89,13 +89,12 @@ tick longbridge auth logout
 
 ```toml
 color_mode = "red-up"       # red-up / green-up
-icon_theme = "unicode"      # unicode / nerd
 language = "zh-CN"          # zh-CN / en
 ambiguous_width = "narrow"  # narrow / wide
 # region = "global"        # cn / global，默认未配置，授权时询问
 ```
 
-对应参数为 `--color-mode`、`--icon-theme`、`--language`、`--ambiguous-width`、`--region`。语言影响 API 名称及数字单位；不承诺将新闻原文翻译为英文。区域是接入网络选择，AP/US 数据中心由账户凭证确定。
+对应参数为 `--color-mode`、`--language`、`--ambiguous-width`、`--region`。语言影响 API 名称及数字单位；不承诺将新闻原文翻译为英文。区域是接入网络选择，AP/US 数据中心由账户凭证确定。
 
 `tick` 使用集中解析的终端渲染样式，容器外观由 Herdr 配置。
 
