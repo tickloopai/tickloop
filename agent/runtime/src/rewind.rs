@@ -859,6 +859,7 @@ mod tests {
                 Some(tickloop_agent_protocol::Trigger {
                     id: Uuid::new_v4(),
                     prompt: "scheduled check".into(),
+                    prompt_source: tickloop_agent_protocol::TriggerPromptSource::Explicit,
                     interval_seconds: Some(1),
                     expires_at_ms: None,
                     accepts_events: false,

@@ -245,6 +245,28 @@ async fn the_candles_tool_answers_a_date_range_in_the_panel_shape() {
 }
 
 #[tokio::test]
+async fn the_state_summarises_the_window_that_the_candles_tool_reads_in_full() {
+    let state = serve(&[]).await.updates().last().unwrap()["data"].clone();
+    assert!(state.get("candles").is_none(), "{state}");
+    assert_eq!(
+        state["history"],
+        json!({"candles": 3, "first": "2026-09-08T00:00:00Z", "last": "2026-09-10T00:00:00Z", "tool": "candles"})
+    );
+    let day = |field: &str| state["history"][field].as_str().unwrap()[..10].to_owned();
+
+    let served = serve(&[call(
+        1,
+        state["history"]["tool"].as_str().unwrap(),
+        json!({"symbol": state["symbol"], "from": day("first"), "to": day("last")}),
+    )])
+    .await;
+    let rows = served.answer(1)["result"]["candles"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.last(), Some(&state["latest"]));
+    assert_eq!(rows[1]["close"], state["previous_close"]);
+}
+
+#[tokio::test]
 async fn a_reversed_unbounded_or_unparsable_date_range_never_reaches_the_market() {
     let served = serve(&[
         call(

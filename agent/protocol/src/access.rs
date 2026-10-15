@@ -36,10 +36,11 @@ use crate::{
 /// history, one recorded tool operation, and the events after a sequence. 20.2 adds each Tick
 /// Subscription status's next check and period, so Monitor counts down to the next check, the
 /// user's own Tick Subscription from Monitor, and reopening a hosted Tick with its subscriptions.
-/// Older business majors are refused before dispatch; the frozen daemon management protocol
-/// remains independent.
+/// 20.3 records where a Trigger's prompt came from, so a prompt copied from the Loop goal reaches
+/// deliveries as background. Older business majors are refused before dispatch; the frozen daemon
+/// management protocol remains independent.
 pub const PROTOCOL_MAJOR: u16 = 20;
-pub const PROTOCOL_MINOR: u16 = 2;
+pub const PROTOCOL_MINOR: u16 = 3;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 

@@ -914,15 +914,9 @@ impl Agent {
                 .find(|goal| goal.id == loop_id)
                 .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
                 .ok_or_else(|| AgentError::Invalid(NO_SUBSCRIBING_LOOP.into()))?;
-            goal.trigger.clone().unwrap_or_else(|| Trigger {
-                id: Uuid::new_v4(),
-                prompt: goal.goal.clone(),
-                interval_seconds: None,
-                expires_at_ms: None,
-                accepts_events: true,
-                armed: true,
-                subscriptions: Vec::new(),
-            })
+            goal.trigger
+                .clone()
+                .unwrap_or_else(|| Trigger::for_loop_goal(&goal.goal))
         };
         if trigger
             .subscriptions
@@ -989,15 +983,10 @@ impl Agent {
             .run_cancel(receipt.run_id)
             .cloned()
             .ok_or_else(|| "run is unavailable".to_string())?;
-        let mut trigger = goal.trigger.clone().unwrap_or_else(|| Trigger {
-            id: Uuid::new_v4(),
-            prompt: goal.goal.clone(),
-            interval_seconds: None,
-            expires_at_ms: None,
-            accepts_events: true,
-            armed: true,
-            subscriptions: Vec::new(),
-        });
+        let mut trigger = goal
+            .trigger
+            .clone()
+            .unwrap_or_else(|| Trigger::for_loop_goal(&goal.goal));
         drop(chats);
         if let Some(existing) = trigger
             .subscriptions

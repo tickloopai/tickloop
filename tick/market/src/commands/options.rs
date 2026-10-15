@@ -33,6 +33,9 @@ use tick_provider::{
 use tick_sdk::{stream::TickStream, tools::ToolCall};
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const SNAPSHOT_TOOL: &str = "snapshot";
+const EXPIRATIONS_TOOL: &str = "expirations";
+const EVENT_HISTORY_TOOL: &str = "event_history";
 const TABLE_HEADER_ROWS: u16 = 1;
 const HEADERS: &[&str] = &[
     "Strike",
@@ -115,14 +118,14 @@ fn tools_for(
                 serialize(&options::load(api.as_ref(),&request).await?)
             })
         })
-        .query::<SymbolArgs>("expirations", "Read available option expiration dates from this Tick's Futu OpenD connection.",move |_: &QuoteServices,args| {
+        .query::<SymbolArgs>(EXPIRATIONS_TOOL, "Read available option expiration dates from this Tick's Futu OpenD connection.",move |_: &QuoteServices,args| {
             let api=expiration_api.clone();
             Box::pin(async move {
                 let api=api.ok_or_else(||Error::usage("Options service is not attached"))?;
                 serialize(&api.expirations(&tick_provider::options::normalize_symbol(&args.symbol)?).await?)
             })
         })
-        .query::<EmptyArgs>("snapshot", "Read the current Options Tick observation without a network request, including the original quote and observation times.",move |_: &QuoteServices,_| {
+        .query::<EmptyArgs>(SNAPSHOT_TOOL, "Read the current Options Tick observation without a network request, including the original quote and observation times.",move |_: &QuoteServices,_| {
             let current=current.clone();
             Box::pin(async move { let snapshot=current.read().map_err(|_|Error::usage("Options snapshot lock failed"))?; serialize(snapshot.as_ref().ok_or_else(||Error::usage("no Options observation is available"))?) })
         })
@@ -131,7 +134,7 @@ fn tools_for(
             Box::pin(async move { serialize(&store.ok_or_else(||Error::usage("Options snapshot store is not attached"))?.history(&args.symbol,args.limit.unwrap_or(20))?) })
         })
         .action::<ExpiryArgs>("set_expiry", "Change the running Options Tick to an expiration returned for its underlying.")
-        .query::<SetResearchContext>("event_history", "Read saved snapshots associated with this exact earnings event. Before/after is checked against original observation and quote timestamps; missing history stays missing, never reconstructed from current quotes.", move |_: &QuoteServices,args| {
+        .query::<SetResearchContext>(EVENT_HISTORY_TOOL, "Read saved snapshots associated with this exact earnings event. Before/after is checked against original observation and quote timestamps; missing history stays missing, never reconstructed from current quotes.", move |_: &QuoteServices,args| {
             let store=event_store.clone();
             Box::pin(async move { serialize(&store.ok_or_else(||Error::usage("Options snapshot store is not attached"))?.event_history(&args.context)?) })
         })
@@ -140,6 +143,34 @@ fn tools_for(
         .action::<EmptyArgs>("refresh", "Refresh this Tick's chain and quote snapshot.")
         .action::<EmptyArgs>("save_snapshot", "Save the currently observed Options snapshot locally, preserving the original timestamps for later pre/post-event research.")
         .recover_with("chain")
+}
+
+/// One observation as the Tick state carries it: the underlying, the ATM estimate and the span of
+/// the chain, whose legs stay behind `chain_tool`.
+fn snapshot_summary(snapshot: &OptionsSnapshot, chain_tool: &str) -> Value {
+    json!({
+        "schema_version": snapshot.schema_version, "source": snapshot.source,
+        "symbol": snapshot.symbol, "expiry": snapshot.expiry, "observed_at": snapshot.observed_at,
+        "quote_time_zone": snapshot.quote_time_zone, "underlying": snapshot.underlying,
+        "atm": snapshot.atm, "warnings": snapshot.warnings,
+        "research_context": snapshot.research_context,
+        "expirations": {"count": snapshot.expirations.len(), "tool": EXPIRATIONS_TOOL},
+        "chain": {"strikes": snapshot.rows.len(),
+            "lowest": snapshot.rows.first().map(|row| row.strike),
+            "highest": snapshot.rows.last().map(|row| row.strike), "tool": chain_tool},
+    })
+}
+
+fn event_history_summary(history: &options::EventSnapshotHistory) -> Value {
+    let mut summary = serialize(history).unwrap_or(Value::Null);
+    for (key, snapshot) in [("before", &history.before), ("after", &history.after)] {
+        summary[key] = json!(
+            snapshot
+                .as_ref()
+                .map(|snapshot| snapshot_summary(snapshot, EVENT_HISTORY_TOOL))
+        );
+    }
+    summary
 }
 
 fn serialize(value: &impl serde::Serialize) -> Result<Value> {
@@ -193,10 +224,9 @@ pub async fn run_once(
 ) -> Result<()> {
     let request = OptionsRequest::new(&args.symbol, args.expiry.as_deref(), args.strikes)?;
     let snapshot = options::load(api.as_ref(), &request).await?;
-    let content = serialize(&snapshot)?;
-    updates.publish(content.clone())?;
+    updates.publish(snapshot_summary(&snapshot, SNAPSHOT_TOOL))?;
     if args.output.format == OutputFormat::Json {
-        serde_json::to_writer(&mut *output, &content)
+        serde_json::to_writer(&mut *output, &serialize(&snapshot)?)
             .map_err(|error| Error::usage(error.to_string()))?;
         writeln!(output)?;
     } else {
@@ -480,9 +510,11 @@ impl LiveView for OptionsView {
     }
     fn content(&self) -> Value {
         if let Some(context) = &self.research {
-            return json!({"symbol":self.request.symbol,"research_context":context,"current_snapshot":self.current_available.then_some(&self.snapshot),"event_history":self.event_history});
+            return json!({"symbol":self.request.symbol,"research_context":context,
+                "current_snapshot":self.current_available.then(|| snapshot_summary(&self.snapshot, SNAPSHOT_TOOL)),
+                "event_history":self.event_history.as_ref().map(event_history_summary)});
         }
-        serialize(&self.snapshot).unwrap_or(Value::Null)
+        snapshot_summary(&self.snapshot, SNAPSHOT_TOOL)
     }
     fn research_context(&self) -> Option<ResearchContext> {
         self.research.clone()

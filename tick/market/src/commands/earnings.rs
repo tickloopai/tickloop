@@ -36,6 +36,8 @@ use tick_provider::{
 use tick_sdk::{stream::TickStream, tools::ToolCall};
 
 pub const MARKET: &str = "US";
+const HISTORY_TOOL: &str = "history";
+const DETAIL_TOOL: &str = "detail";
 const SYMBOL_SUFFIX: &str = ".US";
 const NON_US_SYMBOL: &str = "Earnings covers US symbols only in this version";
 const INFO_SEPARATOR: &str = " · ";
@@ -108,7 +110,7 @@ struct EmptyArgs {}
 pub fn tools() -> crate::tools::Tools {
     crate::tools::Tools::default()
         .query::<HistoryArgs>(
-            "history",
+            HISTORY_TOOL,
             "Past earnings periods of any US symbol: EPS and revenue estimate, actual and surprise, and the moves before, on and after each report, in the Earnings table's shape.",
             |api: &QuoteServices, args| {
                 Box::pin(async move {
@@ -118,7 +120,7 @@ pub fn tools() -> crate::tools::Tools {
             },
         )
         .query::<DetailArgs>(
-            "detail",
+            DETAIL_TOOL,
             "One exact released fiscal period, actuals/estimates, fiscal YoY/QoQ, statement items, business segments, source/time metadata and company filing URLs. Missing historical estimate snapshots remain missing.",
             |api: &QuoteServices, args| {
                 Box::pin(async move {
@@ -136,7 +138,7 @@ pub fn tools() -> crate::tools::Tools {
         )
         .action::<SetResearchContext>("set_context", "Select the company and exact fiscal period carried by an explicit research context.")
         .action::<EmptyArgs>("refresh", "Request a fresh provider observation, preserving the selected fiscal period.")
-        .recover_with("history")
+        .recover_with(HISTORY_TOOL)
 }
 
 fn find_period(table: &EarningsTable, period_id: &str) -> Result<usize> {
@@ -381,10 +383,9 @@ pub async fn run_once(
 ) -> Result<()> {
     let request = request(args)?;
     let table = load(api, &request, today()).await?;
-    let content = content(&table)?;
-    updates.publish(content.clone())?;
+    updates.publish(summary(&table)?)?;
     if args.output.format == OutputFormat::Json {
-        serde_json::to_writer(&mut *output, &content)
+        serde_json::to_writer(&mut *output, &content(&table)?)
             .map_err(|error| Error::usage(error.to_string()))?;
         writeln!(output)?;
         return Ok(());
@@ -394,6 +395,27 @@ pub async fn run_once(
 
 fn content(table: &EarningsTable) -> Result<serde_json::Value> {
     serde_json::to_value(table).map_err(|error| Error::usage(error.to_string()))
+}
+
+/// The Earnings Tick state: the newest released period without its statement items and segments,
+/// the reaction summary and what comes next. Every period stays behind the history tool and one
+/// period's statements and segments behind the detail tool.
+fn summary(table: &EarningsTable) -> Result<serde_json::Value> {
+    let mut latest = serde_json::to_value(table.rows.first())
+        .map_err(|error| Error::usage(error.to_string()))?;
+    if let Some(fields) = latest.as_object_mut() {
+        fields.remove("statement_items");
+        fields.remove("segments");
+    }
+    Ok(json!({
+        "symbol": table.symbol, "source": table.source, "observed_at": table.observed_at,
+        "availability": table.availability, "next_report": table.next_report,
+        "upcoming": table.upcoming, "summary": table.summary, "latest": latest,
+        "history": {"periods": table.rows.len(),
+            "newest": table.rows.first().map(|row| &row.period_id),
+            "oldest": table.rows.last().map(|row| &row.period_id), "tool": HISTORY_TOOL},
+        "detail_tool": DETAIL_TOOL,
+    }))
 }
 
 /// Duration until the next daily reload, anchored at [`DAILY_REFRESH_HOUR`] in the offset the
@@ -778,7 +800,7 @@ impl LiveView for EarningsView {
         }
     }
     fn content(&self) -> serde_json::Value {
-        content(&self.table).unwrap_or(serde_json::Value::Null)
+        summary(&self.table).unwrap_or(serde_json::Value::Null)
     }
     fn priority(&self) -> &[usize] {
         match self.mode {

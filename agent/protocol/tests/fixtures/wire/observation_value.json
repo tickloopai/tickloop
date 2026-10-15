@@ -320,6 +320,7 @@
             "trigger": {
               "id": "00000000-0000-0000-0000-000000000030",
               "prompt": "Report changes",
+              "prompt_source": "LoopGoal",
               "interval_seconds": 60,
               "expires_at_ms": null,
               "accepts_events": true,
@@ -922,6 +923,7 @@
             "trigger": {
               "id": "00000000-0000-0000-0000-000000000030",
               "prompt": "Report changes",
+              "prompt_source": "LoopGoal",
               "interval_seconds": 60,
               "expires_at_ms": null,
               "accepts_events": true,

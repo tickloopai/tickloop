@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 use tickloop_agent_model::HttpModelClient;
 use tickloop_agent_protocol::{
     Content, EventKind, InputModality, LoopState, ModelConfig, Protocol, Role, Trigger,
+    TriggerPromptSource,
 };
 use tickloop_agent_runtime::Agent;
 
@@ -110,6 +111,7 @@ async fn live_deepseek_interval_reuses_the_goal_and_stops_future_execution() {
         agent.configure_trigger(chat,initial.loop_id,Some(Trigger {
             id:uuid::Uuid::new_v4(),
             prompt:"Use Read to read tick-source.txt in the current working directory, then reply with the exact marker from that file. Do not use other tools.".into(),
+            prompt_source: TriggerPromptSource::Explicit,
             interval_seconds:Some(INTERVAL_SECONDS),
             expires_at_ms:None,
             accepts_events:false,
