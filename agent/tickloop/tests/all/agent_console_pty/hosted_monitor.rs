@@ -379,7 +379,7 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
                 frame
                     .lines()
                     .nth(*row)
-                    .is_some_and(|line| !line.contains('⟳'))
+                    .is_some_and(|line| !line.contains('↻'))
             })
             .expect("the gone row that was not reopened");
         select_line(&mut view, not_reopened).await;
