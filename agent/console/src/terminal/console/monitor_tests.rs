@@ -2776,7 +2776,9 @@ fn refresh_status(
         .unwrap();
     console.set_visible_delegation(false).unwrap();
     console.set_foreground_shell(changed).unwrap();
-    console.set_queued_inputs(snapshot.queued_inputs()).unwrap();
+    console
+        .set_queued_inputs(chat, snapshot.queued_inputs())
+        .unwrap();
     console.set_chat_images(chat, true, None).unwrap();
     let commands = if changed {
         vec![(tasks.tasks[0].id, None)]

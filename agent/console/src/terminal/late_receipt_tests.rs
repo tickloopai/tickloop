@@ -1,5 +1,7 @@
-//! Run-loop regression: an input whose reply was lost is restored, and pressing Enter on the
-//! unchanged draft adopts the original acceptance once its receipt proves it, never sending twice.
+//! Run-loop regressions against an embedded daemon: an input whose reply was lost is restored,
+//! and pressing Enter on the unchanged draft adopts the original acceptance once its receipt
+//! proves it, never sending twice; an input sent while a turn works waits in the queue until a
+//! turn takes it, and only then shows as sent, once.
 use super::*;
 use async_trait::async_trait;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -30,7 +32,8 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The daemon the View talks to: while `lose-replies`, `lose-create` or `lose-configure` exists a
 /// Submit, Create or Configure runs but its reply is lost, and while `hide-receipts` exists
-/// receipt lookups find nothing (each counted in `hidden-receipt-reads`). Submits, Shell
+/// receipt lookups find nothing (each counted in `hidden-receipt-reads`). While
+/// `finish-turn-on-submit` exists a Submit first lets the running turn end. Submits, Shell
 /// submissions and after-turn queues are counted in `submits`, `shell-submits` and
 /// `after-turn-queues`.
 struct LateReceiptDaemon {
@@ -57,6 +60,35 @@ impl LateReceiptDaemon {
         let pending = self.directory.join(format!("{name}.pending"));
         std::fs::write(&pending, value.to_string()).unwrap();
         std::fs::rename(pending, self.directory.join(name)).unwrap();
+    }
+
+    /// Releases the held model and waits until no Loop of `execution` runs, so the input about to
+    /// be submitted starts a turn of its own while the View still sees the earlier one working.
+    async fn finish_running_turn(&self, execution: ExecutionRef) {
+        let _ = std::fs::remove_file(self.directory.join("hold-model"));
+        loop {
+            let observation = self
+                .daemon
+                .observe(ObservationRequest::Agent {
+                    execution,
+                    detail: AgentDetailQuery::Snapshot,
+                    after: None,
+                })
+                .await
+                .unwrap();
+            let ObservationValue::Agent(snapshot) = observation.initial else {
+                panic!("the daemon's Agent snapshot");
+            };
+            if !snapshot
+                .conversation
+                .loops
+                .iter()
+                .any(|goal| goal.state == LoopState::Running)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 
@@ -102,6 +134,11 @@ impl AgentAccess for LateReceiptDaemon {
             } => self.count("shell-submits"),
             AgentCommand::EnqueueAfterTurn { .. } => self.count("after-turn-queues"),
             _ => {}
+        }
+        if let AgentCommand::Submit { execution, .. } = &command.command
+            && self.flag("finish-turn-on-submit")
+        {
+            self.finish_running_turn(*execution).await;
         }
         let receipt = self.daemon.execute(command).await?;
         if self.flag("lose-configure")
@@ -225,6 +262,7 @@ async fn run_late_receipt_fixture() {
     let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
         tickloop_agent_test_support::text("late reply"),
         tickloop_agent_test_support::text("edited reply"),
+        tickloop_agent_test_support::text("command reply"),
     ]));
     let core = tickloop_agent_runtime::Agent::new_embedded(
         tickloop_agent_test_support::config(),
@@ -332,6 +370,16 @@ impl LateReceiptPty {
         self.writer.flush().unwrap();
     }
 
+    fn output_len(&self) -> usize {
+        self.output.lock().unwrap().len()
+    }
+
+    /// Every frame the View completed after the first `offset` bytes of its output.
+    fn frames_after(&self, offset: usize) -> Vec<(usize, String)> {
+        let output = String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned();
+        screen::frames_after(&output, offset, WIDTH, HEIGHT)
+    }
+
     /// Waits until the screen, with wrapped rows joined, satisfies `ready`.
     fn wait_for(&mut self, label: &str, ready: impl Fn(&str) -> bool) -> String {
         let deadline = Instant::now() + TIMEOUT;
@@ -409,6 +457,37 @@ fn echoed(frame: &str, input: &str) -> usize {
             is_echo && (line.starts_with('❯') || line.starts_with("! ")) && line.contains(input)
         })
         .count()
+}
+
+/// Queue rows that list `input`.
+fn queued(frame: &str, input: &str) -> usize {
+    screen::queued_inputs(frame)
+        .iter()
+        .filter(|line| line.contains(input))
+        .count()
+}
+
+/// Follows `input` through the `frames` drawn after it was sent: it shows at most once, either
+/// queued or sent, never as sent in a frame ending before `taken`, when a turn could first take
+/// it, and once sent it stays sent. Returns whether some frame listed it in the queue.
+fn follow_waiting_input(frames: &[(usize, String)], input: &str, taken: usize) -> bool {
+    let (mut sent, mut listed) = (false, false);
+    for (end, frame) in frames {
+        let (echoes, entries) = (echoed(frame, input), queued(frame, input));
+        assert!(echoes + entries <= 1, "{input} is shown once: {frame}");
+        assert!(
+            *end > taken || echoes == 0,
+            "{input} is not shown as sent before a turn takes it: {frame}"
+        );
+        assert!(
+            !sent || echoes == 1,
+            "{input} does not leave the conversation once sent: {frame}"
+        );
+        sent |= echoes == 1;
+        listed |= entries == 1;
+    }
+    assert!(sent, "{input} is shown as sent in the end");
+    listed
 }
 
 /// The rows above the composer's upper rule; restored drafts sit in the composer, not here.
@@ -997,5 +1076,140 @@ fn a_busy_command_held_behind_an_unknown_input_is_queued_and_shown_once() {
         std::fs::read_to_string(flag("model-requests")).unwrap(),
         "2",
         "the first input once, then the queued command once"
+    );
+}
+
+/// Sends `input` while idle with the model held, and waits until its turn works; an input sent
+/// while idle shows as sent at once.
+fn start_held_turn(view: &mut LateReceiptPty, directory: &std::path::Path, input: &str) {
+    view.wait_for("the session input", |frame| frame.contains("❯"));
+    std::fs::write(directory.join("hold-model"), "").unwrap();
+    view.send(format!("{input}\r").as_bytes());
+    let frame = view.wait_for_rows("the first input working", |frame| {
+        frame.contains("esc to interrupt")
+    });
+    assert_eq!(echoed(&frame, input), 1, "{frame}");
+}
+
+#[test]
+fn inputs_sent_while_a_turn_works_wait_only_in_the_queue_until_a_turn_takes_them() {
+    const FIRST: &str = "first idle input";
+    const MESSAGE: &str = "message sent while working";
+    const COMMAND: &str = "/tickloop check the waiting work";
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let flag = |name: &str| directory.path().join(name);
+    let mut view = start_view(directory.path(), false);
+    start_held_turn(&mut view, directory.path(), FIRST);
+
+    let sent_at = view.output_len();
+    view.send(format!("{MESSAGE}\r").as_bytes());
+    view.wait_for_rows("the message in the queue", |frame| {
+        queued(frame, MESSAGE) == 1
+    });
+    view.send(format!("{COMMAND}\r").as_bytes());
+    let frame = view.wait_for_rows("the command queued behind the message", |frame| {
+        queued(frame, MESSAGE) == 1 && queued(frame, COMMAND) == 1
+    });
+    let (body, _) = screen::split_at_queue(&frame).unwrap();
+    assert!(
+        body.contains("esc to interrupt"),
+        "the queue is under the working row: {frame}"
+    );
+    assert_eq!(echoed(&frame, MESSAGE), 0, "{frame}");
+    assert_eq!(echoed(&frame, COMMAND), 0, "{frame}");
+    let waiting = daemon_state(directory.path());
+    assert_eq!(
+        (&waiting["pending_inputs"], &waiting["pending_commands"]),
+        (&serde_json::json!(1), &serde_json::json!(1)),
+        "{waiting}"
+    );
+
+    let released_at = view.output_len();
+    std::fs::remove_file(flag("hold-model")).unwrap();
+    let frame = view.wait_for_rows("both taken by turns of their own", |frame| {
+        frame.contains("command reply") && screen::queued_inputs(frame).is_empty()
+    });
+    for input in [FIRST, MESSAGE, COMMAND] {
+        assert_eq!(echoed(&frame, input), 1, "{input}: {frame}");
+    }
+    let frames = view.frames_after(sent_at);
+    follow_waiting_input(&frames, MESSAGE, released_at);
+    follow_waiting_input(&frames, COMMAND, released_at);
+    close(&mut view);
+    assert_eq!(
+        std::fs::read_to_string(flag("model-requests")).unwrap(),
+        "3",
+        "the first input, the message and the command each reached the model once"
+    );
+}
+
+#[test]
+fn a_shell_command_sent_while_a_turn_works_waits_in_the_queue_until_it_runs() {
+    const FIRST: &str = "first idle input";
+    const SHELL: &str = "printf waiting-shell-ran";
+    const OUTPUT: &str = "⎿  waiting-shell-ran";
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let flag = |name: &str| directory.path().join(name);
+    let mut view = start_view(directory.path(), false);
+    start_held_turn(&mut view, directory.path(), FIRST);
+
+    let sent_at = view.output_len();
+    view.send(format!("!{SHELL}\r").as_bytes());
+    let frame = view.wait_for_rows("the Shell command in the queue", |frame| {
+        queued(frame, SHELL) == 1
+    });
+    assert_eq!(echoed(&frame, SHELL), 0, "{frame}");
+    assert_eq!(counted(directory.path(), "shell-submits"), 1);
+
+    let released_at = view.output_len();
+    std::fs::remove_file(flag("hold-model")).unwrap();
+    let frame = view.wait_for_rows("the Shell command ran after the turn", |frame| {
+        frame.lines().any(|line| line.trim() == OUTPUT) && screen::queued_inputs(frame).is_empty()
+    });
+    let body = body_above_rules(&frame);
+    let command_row = body
+        .iter()
+        .position(|line| line.starts_with("! ") && line.contains(SHELL));
+    let output_row = body.iter().position(|line| line.trim() == OUTPUT);
+    assert!(
+        command_row.is_some() && command_row < output_row,
+        "the command shows above its output: {frame}"
+    );
+    follow_waiting_input(&view.frames_after(sent_at), SHELL, released_at);
+    close(&mut view);
+    assert_eq!(
+        std::fs::read_to_string(flag("model-requests")).unwrap(),
+        "1",
+        "the Shell command adds no model request"
+    );
+}
+
+#[test]
+fn a_message_sent_as_the_turn_ends_is_shown_once_by_the_turn_it_starts() {
+    const FIRST: &str = "first idle input";
+    const MESSAGE: &str = "message sent as the turn ends";
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let flag = |name: &str| directory.path().join(name);
+    let mut view = start_view(directory.path(), false);
+    start_held_turn(&mut view, directory.path(), FIRST);
+
+    // The turn ends while the message is on its way, before the View hears of it.
+    std::fs::write(flag("finish-turn-on-submit"), "").unwrap();
+    let sent_at = view.output_len();
+    view.send(format!("{MESSAGE}\r").as_bytes());
+    let frame = view.wait_for_rows("the message answered by its own turn", |frame| {
+        frame.contains("late reply") && frame.contains("edited reply")
+    });
+    assert_eq!(echoed(&frame, MESSAGE), 1, "{frame}");
+    assert!(screen::queued_inputs(&frame).is_empty(), "{frame}");
+    assert!(
+        follow_waiting_input(&view.frames_after(sent_at), MESSAGE, sent_at),
+        "the View listed the message while it saw the turn working"
+    );
+    close(&mut view);
+    assert_eq!(
+        std::fs::read_to_string(flag("model-requests")).unwrap(),
+        "2",
+        "each input reached the model once"
     );
 }

@@ -177,6 +177,11 @@ impl Fixture {
         String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
     }
 
+    /// Every frame the child completed after the first `offset` bytes of its output.
+    pub(super) fn frames_after(&self, offset: usize) -> Vec<(usize, String)> {
+        screen::frames_after(&self.raw_output(), offset, self.width, self.height)
+    }
+
     pub(super) fn frame(&self) -> String {
         // Copies the output first: the reader keeps draining the PTY while the screen is replayed,
         // so a long replay cannot block the child's writes.

@@ -103,9 +103,28 @@ pub fn message_flow(frame: &str) -> &str {
     }
 }
 
+/// Where the Agent ends each frame it draws.
+const FRAME_END: &str = "\x1b[?2026l";
+
 /// Reconstructs completed Agent frames, including rows retained by differential redraws.
 pub fn visible_screen(output: &str, width: usize, height: usize) -> String {
     Screen::reconstruct(output, width, height).text(false)
+}
+
+/// Every frame the Agent completed after the first `offset` bytes of `output`, in drawing order,
+/// each with the byte offset where it ends, as [`visible_screen`] shows it.
+pub fn frames_after(
+    output: &str,
+    offset: usize,
+    width: usize,
+    height: usize,
+) -> Vec<(usize, String)> {
+    output
+        .match_indices(FRAME_END)
+        .map(|(start, _)| start + FRAME_END.len())
+        .filter(|end| *end > offset)
+        .map(|end| (end, visible_screen(&output[..end], width, height)))
+        .collect()
 }
 
 /// What a frame shows where the selection fill begins, since the fill alone marks the selected
@@ -134,8 +153,8 @@ struct Screen {
 impl Screen {
     fn reconstruct(output: &str, width: usize, height: usize) -> Self {
         let end = output
-            .rfind("\x1b[?2026l")
-            .map_or(output.len(), |end| end + "\x1b[?2026l".len());
+            .rfind(FRAME_END)
+            .map_or(output.len(), |end| end + FRAME_END.len());
         static CONTROLS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         let controls = CONTROLS.get_or_init(|| {
             regex::Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*?(?:\x07|\x1b\\)").unwrap()
