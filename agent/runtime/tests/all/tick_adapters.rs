@@ -20,6 +20,7 @@ async fn shell_subscription_preserves_its_policy_including_final_admission() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![]));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let task = agent
         .submit_user_shell_for_goal(chat, None, "printf shell-body".into(), true)
@@ -84,6 +85,7 @@ async fn assert_quiet(stream: &mut TickStreamHandle, why: &str) {
 async fn a_shell_updates_only_when_it_exits_and_a_late_watch_takes_the_exit_as_its_baseline() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![])));
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let task = agent
         .submit_user_shell_for_goal(
@@ -150,5 +152,62 @@ async fn a_shell_updates_only_when_it_exits_and_a_late_watch_takes_the_exit_as_i
         "a late watch received the exit it started after",
     )
     .await;
+    agent.shutdown().await;
+}
+
+/// The one update of a Shell Tick is the end this Agent recorded for its task, as the task's row
+/// reports it, not the Tickhost's own account of the exit.
+#[tokio::test]
+async fn a_shells_exit_update_is_the_end_its_record_tells() {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![])));
+    agent.install_own_tickhost();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let task = agent
+        .submit_user_shell_for_goal(
+            chat,
+            None,
+            "printf ran; while [ ! -f finish ]; do sleep 0.02; done; exit 3".into(),
+            true,
+        )
+        .await
+        .unwrap();
+    let adapters = TickAdapters::builtin(agent.clone(), None);
+    let mut stream = adapters.open();
+    let watch = Uuid::new_v4();
+    adapters.set_watch_chats(BTreeMap::from([(watch, chat)]));
+    stream.desired.send_replace(BTreeMap::from([(
+        watch,
+        InstanceRef::shell(task.command_id),
+    )]));
+    wait_until_ready(&mut stream, watch).await;
+    std::fs::write(directory.path().join("finish"), "").unwrap();
+    let exit = tokio::time::timeout(Duration::from_secs(5), next_update(&mut stream))
+        .await
+        .expect("the exit is an update");
+    let center = ShellTaskCenter::new(agent.clone());
+    let listed = center
+        .snapshot(chat)
+        .await
+        .unwrap()
+        .tasks
+        .into_iter()
+        .find(|row| row.id == task.command_id)
+        .unwrap();
+    assert!(listed.state.is_terminal());
+    assert_eq!(
+        exit.data,
+        json!({
+            "task_id": listed.id,
+            "status": listed.status_label(),
+            "state": listed.state,
+            "exit_code": listed.exit_code,
+            "signal": listed.signal,
+            "reason": listed.reason,
+            "output_bytes": listed.output_bytes,
+            "output": "ran",
+            "truncated": false,
+        })
+    );
     agent.shutdown().await;
 }

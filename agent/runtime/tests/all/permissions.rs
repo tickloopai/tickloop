@@ -430,6 +430,7 @@ async fn an_overlong_auto_review_context_asks_the_user_once() {
     ]));
     let reviewer = Arc::new(FailingReviewer::new(ReviewerFailure::ContextLimit));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     agent.set_auto_reviewer(reviewer.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
@@ -601,6 +602,7 @@ async fn automatic_check_retries_invalid_structured_output_once() {
             text("done"),
         ])),
     );
+    agent.install_own_tickhost();
     let checker = Arc::new(ScriptedModel::new(vec![text(""), classification(false)]));
     agent.set_auto_reviewer(checker.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -648,6 +650,7 @@ async fn automatic_allow_and_block_classifications_control_real_side_effects() {
             text("done"),
         ]));
         let agent = Agent::new_embedded(config(), model.clone());
+        agent.install_own_tickhost();
         let reviewer = Arc::new(ScriptedModel::new(vec![
             classification(should_block);
             if should_block { 2 } else { 1 }
@@ -710,6 +713,7 @@ async fn explicit_legacy_reviewer_can_share_the_active_model_with_isolated_reque
         text("done"),
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     agent.set_auto_reviewer(model.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
@@ -887,6 +891,7 @@ async fn human_approval_resets_consecutive_auto_denials() {
         .collect::<Vec<_>>();
     outputs.push(text("Continue with the remaining work."));
     let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(outputs)));
+    agent.install_own_tickhost();
     agent
         .set_auto_reviewer(Arc::new(ScriptedModel::new(vec![classification(true); 8])))
         .await;
@@ -1176,6 +1181,7 @@ async fn human_escalation_preserves_total_until_twenty_and_then_restarts_countin
         outputs.push(text("Done with this step."));
     }
     let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(outputs)));
+    agent.install_own_tickhost();
     agent
         .set_auto_reviewer(Arc::new(ScriptedModel::new(vec![classification(true); 46])))
         .await;
@@ -1321,6 +1327,7 @@ async fn full_access_runs_an_ordinary_shell_without_review_and_switching_to_ask_
     ]));
     let reviewer = Arc::new(ScriptedModel::new(Vec::new()));
     let agent = Agent::new_embedded(config(), model);
+    agent.install_own_tickhost();
     agent.set_auto_reviewer(reviewer.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
@@ -1544,6 +1551,7 @@ async fn startup_unrestricted_host_policy_does_not_relabel_auto_as_full_access()
             prompt_policy: PromptPolicy::Unrestricted,
         },
     );
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     assert_eq!(
         agent.snapshot(chat).await.unwrap().policy.mode,
@@ -1742,6 +1750,7 @@ async fn hostile_tool_output_neither_forces_approval_nor_reaches_the_classifier(
     ]));
     let reviewer = Arc::new(ScriptedModel::new(vec![classification(false)]));
     let agent = Agent::new_embedded(config(), model);
+    agent.install_own_tickhost();
     agent.set_auto_reviewer(reviewer.clone()).await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
@@ -2330,6 +2339,7 @@ async fn an_allow_comment_still_reaches_the_model_after_a_failed_tool_result() {
         text("the failed result and comment were received"),
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "Run it".into()).await.unwrap();

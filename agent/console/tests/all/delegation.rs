@@ -1215,6 +1215,7 @@ async fn child_file_scope_and_denials_remain_fixed_while_full_access_shell_is_in
         text("The new parent approval restriction was honored."),
     ]));
     let agent = Agent::new_embedded(config(), model);
+    agent.install_own_tickhost();
     let parent = agent.create_chat(directory.path().into()).await.unwrap();
     agent
         .set_execution_mode(parent, ExecutionMode::FullAccess)
@@ -2063,6 +2064,7 @@ async fn a_full_access_child_can_run_an_interpreter_under_its_frozen_authority()
         text("Root finished"),
     ]));
     let core = Agent::new_embedded(config(), model);
+    core.install_own_tickhost();
     let routed = install_routed_authorities(&core, directory.path());
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.set_execution_mode(root, ExecutionMode::FullAccess)
@@ -2126,6 +2128,7 @@ async fn a_child_interpreter_asks_for_its_own_normal_permission_and_once_runs_it
         text("Root finished"),
     ]));
     let core = Agent::new_embedded(config(), model);
+    core.install_own_tickhost();
     let routed = install_routed_authorities(&core, directory.path());
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.set_execution_mode(root, ExecutionMode::AcceptEdits)
@@ -2289,6 +2292,7 @@ async fn direct_child_shell_returns_a_receipt_and_uses_the_same_child_permission
         text("Root ready"),
     ]));
     let core = Agent::new_embedded(config(), model.clone());
+    core.install_own_tickhost();
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.set_execution_mode(root, ExecutionMode::AcceptEdits)
         .await
@@ -2386,6 +2390,7 @@ async fn child_interpreters_honor_the_frozen_explicit_allow_and_deny_rules() {
             text("Root done"),
         ]));
         let core = Agent::new_embedded(config(), model);
+        core.install_own_tickhost();
         let root = core.create_chat(directory.path().into()).await.unwrap();
         core.set_execution_mode(root, ExecutionMode::AcceptEdits)
             .await
@@ -2582,6 +2587,7 @@ async fn a_child_reads_its_announced_background_output_without_permission() {
         ]),
     });
     let core = Agent::new_embedded(config(), model.clone());
+    core.install_own_tickhost();
     let routed = install_routed_authorities(&core, directory.path());
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.set_execution_mode(root, ExecutionMode::AcceptEdits)
@@ -2838,6 +2844,7 @@ async fn a_direct_child_shell_session_grant_applies_to_the_same_prepared_command
             text("Root ready"),
         ])),
     );
+    core.install_own_tickhost();
     let root = core.create_chat(directory.path().into()).await.unwrap();
     let mut events = core.subscribe();
     let receipt = core
@@ -3081,6 +3088,7 @@ async fn a_child_preserves_the_parents_frozen_persistent_shell_allow_rule() {
         text("Root done"),
     ]));
     let core = Agent::open_embedded(directory.path().join("state"), config(), model).unwrap();
+    core.install_own_tickhost();
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.set_permission_rules(
         root,

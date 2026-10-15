@@ -2,24 +2,26 @@
 //! its daemon for a one-time spawn grant, then submits the command on its own spawner connection,
 //! passing the approved directory and the output file as descriptors; the command lives as long as
 //! that connection. A View of the Chat shows a command through a one-time view grant from the same
-//! daemon. An Agent without a daemon grants its spawns and views from a Tickhost of its own,
-//! served inside its process.
+//! daemon. An Agent without a daemon runs no command and shows none, unless it is given a Tickhost
+//! of its own, served inside its process, as tests are.
 
 use std::{
-    collections::HashMap,
     os::unix::ffi::OsStrExt,
-    path::PathBuf,
-    sync::{Arc, Mutex, PoisonError, RwLock},
+    sync::{Arc, PoisonError, RwLock},
 };
 
 use tick_protocol::InstanceRef;
 use tickhost::{
     paths::HostPaths,
-    shell::{ShellApproval, ShellIdentity, ShellOutcome, SpawnBinding, SpawnRequest},
+    shell::{
+        ShellApproval, ShellIdentity, ShellOutcome, SpawnBinding, SpawnRequest, environment_digest,
+    },
 };
 use tickhost_connect::host_error::HostError;
 use tickloop_agent_protocol::{CommandState, HostedViewGrant};
-use tickloop_agent_tools::{ShellExit, ShellHost, ShellLaunch, ShellProcess, ToolError};
+use tickloop_agent_tools::{
+    ShellExit, ShellHost, ShellLaunch, ShellProcess, ShellStartError, ToolError,
+};
 use tokio::sync::{OnceCell, watch};
 use uuid::Uuid;
 
@@ -80,8 +82,38 @@ impl ShellGrants for DaemonControl {
     }
 }
 
-/// The grants of an Agent without a daemon: it controls a Tickhost of its own, served inside its
-/// process from a private runtime directory, under an epoch and worker identity of its own.
+/// The grants of an Agent without a daemon: only a daemon grants spawns and views, so it grants
+/// none.
+pub(crate) struct NoDaemon;
+
+impl NoDaemon {
+    fn refusal() -> HostError {
+        HostError::before(
+            "Unsupported",
+            "shell commands run in the Tickhost of the Agent daemon, and this Agent runs without one",
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl ShellGrants for NoDaemon {
+    async fn allow_spawn(
+        &self,
+        _: Uuid,
+        _: Uuid,
+        _: ShellApproval,
+    ) -> Result<IssuedSpawn, HostError> {
+        Err(Self::refusal())
+    }
+
+    async fn allow_view(&self, _: Uuid, _: &InstanceRef) -> Result<HostedViewGrant, HostError> {
+        Err(Self::refusal())
+    }
+}
+
+/// Grants that control a Tickhost of its own, served inside this process from a private runtime
+/// directory, under an epoch and worker identity of its own; they let an Agent without a daemon
+/// run and show commands in tests.
 pub struct OwnTickhost {
     directory: tickloop_agent_base::private_fs::PrivateDirectory,
     worker: Uuid,
@@ -89,12 +121,18 @@ pub struct OwnTickhost {
 }
 
 impl OwnTickhost {
-    pub(crate) fn new(directory: tickloop_agent_base::private_fs::PrivateDirectory) -> Self {
+    pub fn new() -> Self {
         Self {
-            directory,
+            directory: crate::transcript::private_tickhost_directory(),
             worker: Uuid::new_v4(),
             controller: OnceCell::new(),
         }
+    }
+}
+
+impl Default for OwnTickhost {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -162,33 +200,19 @@ impl ShellGrants for OwnTickhost {
     }
 }
 
-/// Where the Tickhost serves the `shell:` instance of a task, and the token that reads it.
-#[derive(Clone, Debug)]
-pub struct ShellReader {
-    pub endpoint: PathBuf,
-    pub instance: InstanceRef,
-    pub data_token: String,
-}
-
-/// The Shell tasks of this Agent that the Tickhost runs: who grants their spawns and views, and
-/// the reader of each running task, which goes once its exit is recorded and its spawner left.
+/// The Shell tasks of this Agent that the Tickhost runs, and who grants their spawns and views.
 pub struct ShellTasks {
     grants: RwLock<Arc<dyn ShellGrants>>,
-    readers: Mutex<HashMap<Uuid, ShellReader>>,
-    /// Ticks whenever a task starts or is forgotten.
-    changes: watch::Sender<()>,
 }
 
 impl ShellTasks {
     pub fn new(grants: Arc<dyn ShellGrants>) -> Arc<Self> {
         Arc::new(Self {
             grants: RwLock::new(grants),
-            readers: Mutex::default(),
-            changes: watch::channel(()).0,
         })
     }
 
-    /// Replaces who grants later spawns and views: a worker's daemon instead of an own Tickhost.
+    /// Replaces who grants later spawns and views: a worker's daemon, or a test's own Tickhost.
     pub fn install_grants(&self, grants: Arc<dyn ShellGrants>) {
         *self.grants.write().unwrap_or_else(PoisonError::into_inner) = grants;
     }
@@ -216,30 +240,6 @@ impl ShellTasks {
             chat,
         })
     }
-
-    /// The reader of task `operation` while the Tickhost runs it.
-    pub fn reader(&self, operation: Uuid) -> Option<ShellReader> {
-        self.readers().get(&operation).cloned()
-    }
-
-    /// Tells when a task started or was forgotten.
-    pub fn changes(&self) -> watch::Receiver<()> {
-        self.changes.subscribe()
-    }
-
-    fn set_reader(&self, operation: Uuid, reader: Option<ShellReader>) {
-        let mut readers = self.readers();
-        match reader {
-            Some(reader) => readers.insert(operation, reader),
-            None => readers.remove(&operation),
-        };
-        drop(readers);
-        self.changes.send_replace(());
-    }
-
-    fn readers(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, ShellReader>> {
-        self.readers.lock().unwrap_or_else(PoisonError::into_inner)
-    }
 }
 
 struct ChatShells {
@@ -257,9 +257,11 @@ fn launch_environment() -> Vec<(Vec<u8>, Vec<u8>)> {
 
 #[async_trait::async_trait]
 impl ShellHost for ChatShells {
-    async fn start(&self, launch: ShellLaunch) -> Result<Box<dyn ShellProcess>, ToolError> {
-        let unavailable = |error: HostError| {
-            ToolError::Rejected(format!("the Tickhost cannot run the command: {error}"))
+    async fn start(&self, launch: ShellLaunch) -> Result<Box<dyn ShellProcess>, ShellStartError> {
+        let refused = |error: HostError| {
+            ShellStartError::NotStarted(ToolError::Rejected(format!(
+                "the Tickhost cannot run the command: {error}"
+            )))
         };
         let ShellLaunch {
             operation_id,
@@ -269,7 +271,9 @@ impl ShellHost for ChatShells {
             cwd,
             directory,
             output,
+            cancel,
         } = launch;
+        let environment = launch_environment();
         let issued = self
             .tasks
             .grants()
@@ -280,14 +284,20 @@ impl ShellHost for ChatShells {
                     shell,
                     command,
                     cwd,
+                    environment: environment_digest(&environment),
                 },
             )
             .await
-            .map_err(unavailable)?;
+            .map_err(refused)?;
+        // A stop or cancel that came while the grant was asked for leaves the command unstarted;
+        // the grant expires unclaimed.
+        if cancel.is_cancelled() {
+            return Err(ShellStartError::NotStarted(ToolError::Cancelled));
+        }
         let request = SpawnRequest {
             binding: issued.binding,
             description,
-            environment: launch_environment(),
+            environment,
         };
         let submitted = tickhost::shell::submit(
             &issued.endpoint,
@@ -297,20 +307,22 @@ impl ShellHost for ChatShells {
             &output,
         )
         .await
-        .map_err(unavailable)?;
+        .map_err(|error| {
+            if error.dispatched {
+                ShellStartError::OutcomeUnknown(format!(
+                    "the Tickhost may have started the command before its answer was lost \
+                     ({error}); the outcome is unknown, so do not run it again before checking \
+                     what it did"
+                ))
+            } else {
+                refused(error)
+            }
+        })?;
         let tickhost::shell::SubmittedShell {
             spawned,
             mut exits,
             stops,
         } = submitted;
-        self.tasks.set_reader(
-            operation_id,
-            Some(ShellReader {
-                endpoint: issued.endpoint,
-                instance: spawned.instance,
-                data_token: spawned.data_token,
-            }),
-        );
         // The exit arrives on its own task, so waiting for it can be given up and resumed.
         let (reported, exit) = watch::channel(None);
         tokio::spawn(async move {
@@ -328,8 +340,6 @@ impl ShellHost for ChatShells {
             reported.send_replace(Some(exit));
         });
         Ok(Box::new(TickhostProcess {
-            tasks: self.tasks.clone(),
-            operation: operation_id,
             pid: spawned.pid,
             exit,
             stops,
@@ -353,8 +363,6 @@ fn command_exit(exit: tickhost::shell::ShellExit) -> ShellExit {
 /// A command the Tickhost runs on this process's spawner connection. Dropping it closes that
 /// connection, which stops the command if it still runs and lets the host forget it.
 struct TickhostProcess {
-    tasks: Arc<ShellTasks>,
-    operation: Uuid,
     pid: u32,
     exit: watch::Receiver<Option<ShellExit>>,
     stops: tickhost::shell::ShellStops,
@@ -385,11 +393,5 @@ impl ShellProcess for TickhostProcess {
     async fn stop(&mut self, reason: &str) {
         // A connection that is gone already stopped the command.
         let _ = self.stops.stop(reason).await;
-    }
-}
-
-impl Drop for TickhostProcess {
-    fn drop(&mut self) {
-        self.tasks.set_reader(self.operation, None);
     }
 }

@@ -59,6 +59,7 @@ async fn an_ended_shell_is_unread_until_a_turn_takes_in_its_notification() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(Vec::new()));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
         .submit_user_shell_for_goal(chat, None, "printf done".into(), true)
@@ -114,6 +115,7 @@ async fn reading_a_running_shells_output_handles_only_what_came_before_its_end()
         text("started"),
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "start it".into()).await.unwrap();

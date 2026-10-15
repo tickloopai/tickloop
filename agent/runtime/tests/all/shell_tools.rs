@@ -93,6 +93,7 @@ async fn a_compound_shell_command_waits_for_approval_and_reports_real_output_and
                     .into(),
         }),
     );
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
@@ -147,6 +148,7 @@ async fn a_read_only_command_uses_each_chats_own_directory_without_approval() {
             command: "pwd".into(),
         }),
     );
+    agent.install_own_tickhost();
     for directory in [&first, &second] {
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
@@ -188,6 +190,7 @@ async fn stopping_a_goal_collects_the_real_shell_cancellation_receipt() {
             command: "echo $$ > command.pid; sleep 30".into(),
         }),
     );
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
@@ -260,6 +263,7 @@ async fn large_shell_output_has_a_bounded_preview_and_complete_output_file() {
                 .into(),
         }),
     );
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
@@ -309,6 +313,7 @@ async fn a_foreground_command_moves_to_background_without_starting_a_second_proc
             command: "env sh -c 'echo started >> starts.txt; printf ready; sleep 30'".into(),
         }),
     );
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
@@ -497,6 +502,7 @@ async fn the_agent_stops_its_own_background_command_by_task_id_or_shell_id() {
                 stop_parameter: Some(parameter),
             }),
         );
+        agent.install_own_tickhost();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
         agent
@@ -564,6 +570,7 @@ async fn task_stop_runs_without_approval_even_where_other_tools_ask() {
             stop_parameter: Some("task_id"),
         }),
     );
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
         .set_execution_mode(chat, ExecutionMode::AcceptEdits)
@@ -624,6 +631,7 @@ async fn stopping_a_goal_after_its_turn_completed_still_stops_its_background_pro
             stop_parameter: None,
         }),
     );
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
@@ -677,6 +685,7 @@ async fn a_shell_that_leaves_its_process_group_running_has_an_unresolved_result(
             command: "sleep 30 & echo $! > descendant.pid".into(),
         }),
     );
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
@@ -720,6 +729,7 @@ async fn stopping_a_shell_also_terminates_descendants_that_ignore_sigterm() {
     let agent = Agent::new_embedded(config(), Arc::new(ShellModel {
         command: "/bin/sh -c 'trap \"\" TERM; echo ready > child-ready; sleep 0.8; echo late > late-write' & wait".into(),
     }));
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
@@ -874,6 +884,7 @@ async fn bash_runs_commands_with_bash_or_zsh() {
             command: r#"printf '%s' "${BASH_VERSION:+bash}${ZSH_VERSION:+zsh}""#.into(),
         }),
     );
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
@@ -1025,6 +1036,7 @@ async fn task_stop_leaves_another_goals_command_to_the_user() {
             }
         })),
     );
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let first = agent

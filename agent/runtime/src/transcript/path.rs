@@ -41,8 +41,9 @@ pub(crate) fn private_family_temp_directory(root_chat_id: Uuid) -> PrivateDirect
         .join(root_chat_id.to_string())
 }
 
-/// `<临时目录>/tickloop-private-<uid>/tickhost-<随机>`：没有 daemon 的 Agent 自带 Tickhost 的私有
-/// 运行目录，每个 Agent 一个。临时目录太长、放不下其中的 socket 时改用默认的 `/tmp`。
+/// `<临时目录>/tickloop-private-<uid>/tickhost-<随机>`：没有 daemon、被装上自带 Tickhost 的 Agent
+/// （如测试）所用 Tickhost 的私有运行目录，每次装上一个。临时目录太长、放不下其中的 socket 时
+/// 改用默认的 `/tmp`。
 pub(crate) fn private_tickhost_directory() -> PrivateDirectory {
     const NAME_CHARACTERS: usize = 8;
     let name = format!(

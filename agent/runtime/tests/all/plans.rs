@@ -839,6 +839,7 @@ async fn retirement_checkpoint_precedes_later_todo_results_in_the_same_assistant
         Arc::new(ScriptedModel::new(vec![batch, text("done")])),
     )
     .unwrap();
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
         .set_execution_mode(chat, ExecutionMode::FullAccess)
@@ -870,6 +871,7 @@ async fn retirement_checkpoint_precedes_later_todo_results_in_the_same_assistant
     drop(agent);
     let restored =
         Agent::open_embedded(store, config(), Arc::new(ScriptedModel::new(vec![]))).unwrap();
+    restored.install_own_tickhost();
     let snapshot = restored.resume_chat(chat).await.unwrap();
     assert_eq!(
         snapshot

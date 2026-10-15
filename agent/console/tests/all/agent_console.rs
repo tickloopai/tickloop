@@ -350,6 +350,7 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
             ),
         ])),
     );
+    runtime.install_own_tickhost();
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
     let epoch = access.daemon_epoch();
     let mut executions = [
@@ -1269,6 +1270,7 @@ async fn an_active_user_shell_keeps_an_agent_working_after_its_loops_finish() {
             tickloop_agent_test_support::text("done"),
         ])),
     );
+    runtime.install_own_tickhost();
     let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
     let epoch = access.daemon_epoch();
     let hold = |name: &str| {

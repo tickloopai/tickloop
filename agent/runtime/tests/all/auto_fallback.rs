@@ -322,6 +322,7 @@ async fn fixture(
         calls: AtomicUsize::new(0),
     });
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     agent.set_judgment_client(adapter.clone()).await;
     let chat = agent.create_chat(root.path().into()).await.unwrap();
     agent
@@ -591,6 +592,7 @@ async fn jev_capacity_routes_complete_policy_without_overriding_valid_denials() 
             model.clone(),
         )
         .unwrap();
+        agent.install_own_tickhost();
         let jev = Arc::new(JevAdapter {
             behavior: if provider_limit {
                 JevBehavior::ContextLimit
@@ -812,6 +814,7 @@ async fn limited_fallback_fixture(
             ..Default::default()
         },
     );
+    agent.install_own_tickhost();
     agent
         .set_judgment_client(Arc::new(JevAdapter {
             behavior: JevBehavior::Authentication,

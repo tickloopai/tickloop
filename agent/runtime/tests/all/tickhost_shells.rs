@@ -1,13 +1,27 @@
 //! An Agent's shell commands as its Tickhost runs them: the Tools of one Chat start each command
 //! through a one-time spawn grant, follow it live, move it to the background or stop it, and read
-//! its output from the file they created.
+//! its output from the file they created. Without a daemon or a Tickhost given to it, an Agent
+//! runs no command.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use serde_json::{Value, json};
+use tick_protocol::InstanceRef;
+use tickhost::shell::{ShellApproval, ShellIdentity, SpawnBinding, SpawnGrant};
+use tickhost_connect::{host_error::HostError, hosted};
 use tickloop_agent_base::private_fs::PrivateDirectory;
-use tickloop_agent_protocol::{CommandState, ToolResult};
-use tickloop_agent_runtime::Agent;
+use tickloop_agent_protocol::{CommandState, HostedViewGrant, ToolResult};
+use tickloop_agent_runtime::{
+    Agent,
+    hosted::{
+        shells::{OwnTickhost, ShellGrants},
+        worker_control::IssuedSpawn,
+    },
+};
 use tickloop_agent_tools::{
     ExecutionContext, PreparedTool, SecondaryModel, ToolError, Tools, Workspace,
 };
@@ -31,11 +45,20 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// An Agent that runs its commands in a Tickhost of its own.
     fn new() -> Self {
+        Self::granting_with(Some(Arc::new(OwnTickhost::new())))
+    }
+
+    /// An Agent whose spawns `grants` grant, or an Agent without a daemon.
+    fn granting_with(grants: Option<Arc<dyn ShellGrants>>) -> Self {
         let agent = Agent::new(
             tickloop_agent_test_support::config(),
             Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
         );
+        if let Some(grants) = grants {
+            agent.install_shell_grants(grants);
+        }
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let workdir = root.join("work");
@@ -66,12 +89,20 @@ impl Fixture {
     }
 
     async fn run(&self, prepared: PreparedTool) -> Result<ToolResult, ToolError> {
+        self.run_as(prepared, Uuid::new_v4()).await
+    }
+
+    async fn run_as(
+        &self,
+        prepared: PreparedTool,
+        operation_id: Uuid,
+    ) -> Result<ToolResult, ToolError> {
         self.tools
             .execute_with_context(
                 prepared,
                 CancellationToken::new(),
                 ExecutionContext {
-                    operation_id: Uuid::new_v4(),
+                    operation_id,
                     loop_id: Uuid::new_v4(),
                     accepts_images: false,
                 },
@@ -224,4 +255,183 @@ async fn a_directory_replaced_after_its_approval_runs_nothing() {
         assert!(!Path::new(directory).join("probe").exists());
     }
     assert!(fixture.tools.commands().await.is_empty());
+}
+
+#[tokio::test]
+async fn an_agent_without_a_daemon_refuses_to_run_a_command() {
+    let fixture = Fixture::granting_with(None);
+    let prepared = fixture.prepare(json!({"command":"touch probe"})).await;
+    let error = fixture.run(prepared).await.unwrap_err();
+    assert!(
+        matches!(&error, ToolError::Rejected(message) if message.contains("Agent daemon")),
+        "{error:?}"
+    );
+    assert!(!fixture.workspace.workdir.join("probe").exists());
+    assert!(fixture.tools.commands().await.is_empty());
+}
+
+/// Grants spawns from a Tickhost of its own once a test lets each grant through.
+struct HeldGrants {
+    host: OwnTickhost,
+    asked: tokio::sync::Notify,
+    released: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl ShellGrants for HeldGrants {
+    async fn allow_spawn(
+        &self,
+        chat: Uuid,
+        operation: Uuid,
+        approval: ShellApproval,
+    ) -> Result<IssuedSpawn, HostError> {
+        let issued = self.host.allow_spawn(chat, operation, approval).await;
+        self.asked.notify_one();
+        self.released.acquire().await.unwrap().forget();
+        issued
+    }
+
+    async fn allow_view(
+        &self,
+        chat: Uuid,
+        instance: &InstanceRef,
+    ) -> Result<HostedViewGrant, HostError> {
+        self.host.allow_view(chat, instance).await
+    }
+}
+
+#[tokio::test]
+async fn a_command_stopped_while_its_spawn_is_granted_never_starts() {
+    let grants = Arc::new(HeldGrants {
+        host: OwnTickhost::new(),
+        asked: tokio::sync::Notify::new(),
+        released: tokio::sync::Semaphore::new(0),
+    });
+    let fixture = Arc::new(Fixture::granting_with(Some(grants.clone())));
+    let prepared = fixture
+        .prepare(json!({"command":"touch probe; sleep 30"}))
+        .await;
+    let id = Uuid::new_v4();
+    let running = tokio::spawn({
+        let fixture = fixture.clone();
+        async move { fixture.run_as(prepared, id).await }
+    });
+    grants.asked.notified().await;
+    let stopping = tokio::spawn({
+        let fixture = fixture.clone();
+        async move { fixture.tools.stop_command(id).await }
+    });
+    while fixture.command_state(id).await != CommandState::Cancelling {
+        tokio::task::yield_now().await;
+    }
+    grants.released.add_permits(1);
+    let result = tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        result.content.contains("aborted before completion"),
+        "{}",
+        result.content
+    );
+    let stopped = stopping.await.unwrap().unwrap();
+    assert_eq!(
+        (stopped.state, stopped.reason.as_deref(), stopped.pid),
+        (
+            CommandState::Failed,
+            Some(tickloop_agent_tools::CANCELLED_COMMAND_REASON),
+            None
+        )
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!fixture.workspace.workdir.join("probe").exists());
+}
+
+/// Grants every spawn at a Tickhost that takes the spawn request and leaves without answering.
+struct AnswerlessHost {
+    endpoint: PathBuf,
+}
+
+impl AnswerlessHost {
+    fn serve(directory: &Path) -> Self {
+        let endpoint = directory.join("answerless.sock");
+        let listener = tokio::net::UnixListener::bind(&endpoint).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(reader);
+                let frames = hosted::BUSINESS_FRAME_BYTES;
+                hosted::read_frame(&mut reader, frames).await.unwrap();
+                let hello = hosted::HelloReply {
+                    epoch: Uuid::new_v4(),
+                    pid: std::process::id(),
+                    version: hosted::BUILD_VERSION.into(),
+                    major: hosted::BUSINESS_MAJOR,
+                    minor: hosted::BUSINESS_MINOR,
+                    capabilities: hosted::BUSINESS_CAPABILITIES.map(str::to_owned).to_vec(),
+                };
+                hosted::write_frame(&mut writer, &hosted::ok(&Value::Null, json!(hello)), frames)
+                    .await
+                    .unwrap();
+                hosted::receive_descriptors(&reader, hosted::SPAWN_DESCRIPTORS)
+                    .await
+                    .unwrap();
+                hosted::read_frame(&mut reader, frames).await.unwrap();
+            }
+        });
+        Self { endpoint }
+    }
+}
+
+#[async_trait::async_trait]
+impl ShellGrants for AnswerlessHost {
+    async fn allow_spawn(
+        &self,
+        chat: Uuid,
+        operation: Uuid,
+        approval: ShellApproval,
+    ) -> Result<IssuedSpawn, HostError> {
+        Ok(IssuedSpawn {
+            grant: SpawnGrant {
+                grant: Uuid::new_v4(),
+                token: "token".into(),
+                epoch: Uuid::new_v4(),
+            },
+            binding: SpawnBinding {
+                operation,
+                identity: ShellIdentity {
+                    daemon_epoch: Uuid::new_v4(),
+                    worker: Uuid::new_v4(),
+                    chat,
+                },
+                approval,
+            },
+            endpoint: self.endpoint.clone(),
+        })
+    }
+
+    async fn allow_view(&self, _: Uuid, _: &InstanceRef) -> Result<HostedViewGrant, HostError> {
+        Err(HostError::before("Unsupported", "this host shows nothing"))
+    }
+}
+
+#[tokio::test]
+async fn a_spawn_whose_answer_was_lost_is_listed_with_an_unknown_outcome_not_refused() {
+    let sockets = tempfile::Builder::new()
+        .prefix("ths")
+        .tempdir_in("/private/tmp")
+        .unwrap();
+    let fixture = Fixture::granting_with(Some(Arc::new(AnswerlessHost::serve(sockets.path()))));
+    let prepared = fixture.prepare(json!({"command":"touch probe"})).await;
+    let id = Uuid::new_v4();
+    let result = fixture.run_as(prepared, id).await.unwrap();
+    assert!(result.is_error);
+    assert!(
+        result.content.contains("outcome is unknown")
+            && result.content.contains("do not run it again"),
+        "{}",
+        result.content
+    );
+    assert_eq!(fixture.command_state(id).await, CommandState::Unknown);
 }

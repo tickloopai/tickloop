@@ -102,6 +102,7 @@ async fn both_reviewers_see_prior_written_code_before_executing_the_same_batch()
             config(),
             Arc::new(ScriptedModel::new(vec![batch, text("done")])),
         );
+        agent.install_own_tickhost();
         let llm = Arc::new(ScriptedModel::new(vec![text(
             &tickloop_agent_test_support::auto_classification(false).to_string(),
         )]));
@@ -409,6 +410,7 @@ async fn reused_call_ids_do_not_cut_off_current_authorization_or_misidentify_his
                 text("done"),
             ])),
         );
+        agent.install_own_tickhost();
         let llm = Arc::new(ScriptedModel::new(vec![text(
             &tickloop_agent_test_support::auto_classification(false).to_string(),
         )]));
@@ -1504,6 +1506,7 @@ async fn both_reviewers_receive_the_proposal_before_a_real_confirmation_after_re
                 Arc::new(ScriptedModel::new(replies)),
             )
             .unwrap();
+            first.install_own_tickhost();
             let chat = first.create_chat(directory.path().into()).await.unwrap();
             first
                 .set_execution_mode(chat, ExecutionMode::Auto)
@@ -1530,6 +1533,7 @@ async fn both_reviewers_receive_the_proposal_before_a_real_confirmation_after_re
                     Arc::new(ScriptedModel::new(vec![operation, text("done")])),
                 )
                 .unwrap();
+                restored.install_own_tickhost();
                 restored.resume_chat(chat).await.unwrap();
                 restored
             };

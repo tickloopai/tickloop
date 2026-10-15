@@ -123,6 +123,7 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
             scripted.clone(),
         )
         .unwrap();
+        core.install_own_tickhost();
         let mut launch = tickloop_agent_protocol::LaunchSpec::embedded(directory.clone());
         launch.model = Some(model.clone());
         launch.config_root = Some(root);
@@ -134,6 +135,7 @@ async fn run_plan_flow_fixture(directory: PathBuf) {
     } else {
         let model = tickloop_agent_test_support::config();
         let core = tickloop_agent_runtime::Agent::new_embedded(model.clone(), scripted.clone());
+        core.install_own_tickhost();
         let agent = crate::terminal::execution::ConsoleExecution::from_embedded(
             core.clone(),
             model.clone(),

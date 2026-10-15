@@ -150,6 +150,7 @@ async fn default_llm_uses_the_chat_model_even_when_a_legacy_jev_key_exists() {
     save_api_key(&root, "TYPESAFE_API_KEY", "legacy-key-fixture").unwrap();
     let model = ChatModel::new("current-chat");
     let agent = Agent::open_embedded(root.clone(), model.configuration(), model.clone()).unwrap();
+    agent.install_own_tickhost();
     let chat = agent.create_chat(temp.path().into()).await.unwrap();
     agent
         .set_execution_mode(chat, ExecutionMode::Auto)

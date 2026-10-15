@@ -181,6 +181,7 @@ async fn a_bash_description_names_the_task_from_creation_through_backgrounding()
         Some("Unused"),
     );
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let center = ShellTaskCenter::new(agent.clone());
     run_bash_call(&agent, chat).await;
@@ -213,6 +214,7 @@ async fn an_undescribed_background_bash_call_is_named_by_the_model() {
         Some("\"Sleep for thirty seconds.\""),
     );
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let center = ShellTaskCenter::new(agent.clone());
     run_bash_call(&agent, chat).await;
@@ -262,6 +264,7 @@ async fn a_user_shell_moved_to_background_gets_one_generated_description() {
     let directory = tempfile::tempdir().unwrap();
     let model = DescribingModel::new(None, Some("Print x in a loop"));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let center = ShellTaskCenter::new(agent.clone());
     let command = "while :; do printf x; sleep 0.02; done";
@@ -331,6 +334,7 @@ async fn a_failed_description_request_leaves_the_task_unnamed_without_retrying()
     let directory = tempfile::tempdir().unwrap();
     let model = DescribingModel::new(None, None);
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let center = ShellTaskCenter::new(agent.clone());
     let receipt = agent

@@ -802,6 +802,7 @@ async fn a_background_shell_notification_is_summarized_with_the_suffix_it_finish
         text("suffix summary"),
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     run_prompt(&agent, &mut events, chat, "first prompt").await;

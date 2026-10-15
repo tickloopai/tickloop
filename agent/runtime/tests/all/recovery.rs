@@ -80,6 +80,7 @@ async fn recovery_process_fixture() {
         ]]))
     };
     let agent = Agent::open_embedded(directory.join("archive"), config(), client).unwrap();
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.clone()).await.unwrap();
     let mut events = agent.subscribe();
     let completed = if mode == "queue" {

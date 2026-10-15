@@ -1,8 +1,9 @@
 //! Shell tasks under the Tickhost library: one-time spawn grants the controller asks for, pipe
 //! mode in the passed directory and output file, stopping, the lifetimes that end a task with its
-//! spawner or its daemon, and the read-only views of a task.
+//! spawner, its daemon or the host, and the read-only views of a task.
 
 use std::{
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -19,7 +20,8 @@ use tickhost::{
     },
 };
 use tickhost_connect::hosted::{
-    self, CAPABILITY_DATA, CAPABILITY_LIFECYCLE, CONTROL_TIMEOUT, HostConnection, Role,
+    self, CAPABILITY_DATA, CAPABILITY_LIFECYCLE, CAPABILITY_SHELL, CONTROL_TIMEOUT, HostConnection,
+    Role,
 };
 
 struct Fixture {
@@ -29,6 +31,8 @@ struct Fixture {
     daemon_epoch: uuid::Uuid,
     /// The connection the daemon holds for as long as it runs; Shell tasks stop without one.
     daemon: Option<HostConnection>,
+    /// Stops the host as `tickhost stop` does, once sent or dropped.
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
@@ -46,11 +50,15 @@ impl Fixture {
             runtime: directory.path().join("h"),
         };
         let key = host::random_token();
-        let server = tokio::spawn(host::serve(
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(host::serve_until(
             paths.clone(),
             host::HostConfig {
                 controller_key: key.clone(),
                 idle_timeout,
+            },
+            async move {
+                let _ = stopped.await;
             },
         ));
         let mut fixture = Self {
@@ -59,6 +67,7 @@ impl Fixture {
             key,
             daemon_epoch: uuid::Uuid::new_v4(),
             daemon: None,
+            stop: Some(stop),
             server,
         };
         let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
@@ -117,6 +126,7 @@ impl Fixture {
                 shell: "/bin/sh".into(),
                 command: command.into(),
                 cwd: cwd.to_path_buf(),
+                environment: shell::environment_digest(&[]),
             },
         }
     }
@@ -135,14 +145,18 @@ struct Started {
     output: PathBuf,
 }
 
-fn request(binding: &SpawnBinding, environment: &[(&str, &str)]) -> SpawnRequest {
+fn environment(variables: &[(&str, &str)]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    variables
+        .iter()
+        .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()))
+        .collect()
+}
+
+fn request(binding: &SpawnBinding, variables: &[(&str, &str)]) -> SpawnRequest {
     SpawnRequest {
         binding: binding.clone(),
         description: Some("A task".into()),
-        environment: environment
-            .iter()
-            .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()))
-            .collect(),
+        environment: environment(variables),
     }
 }
 
@@ -206,11 +220,13 @@ async fn group_ends(pid: u32) {
 async fn a_granted_task_runs_in_pipe_mode_in_its_passed_directory_and_reports_its_exit() {
     let fixture = Fixture::start().await;
     let workdir = fixture.workdir("pipe");
-    let binding = fixture.binding(
+    let mut binding = fixture.binding(
         r#"printf 'out|'; printf 'err|' >&2; cat; printf '%s|' "$GREETING"; pwd -P; [ -t 0 ] || printf 'no-tty|'; exit 3"#,
         &workdir,
     );
-    let mut started = start(&fixture, &binding, &[("GREETING", "hello")]).await;
+    let variables = [("GREETING", "hello")];
+    binding.approval.environment = shell::environment_digest(&environment(&variables));
+    let mut started = start(&fixture, &binding, &variables).await;
     assert_eq!(
         started.submitted.spawned.instance.as_str(),
         format!("shell:{}", binding.operation)
@@ -352,6 +368,85 @@ async fn a_new_daemon_or_the_last_controller_leaving_stops_every_task() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn no_grant_starts_a_task_once_the_daemons_last_connection_closed() {
+    let mut fixture = Fixture::start().await;
+    let workdir = fixture.workdir("withdrawn");
+    let mut running = start(&fixture, &fixture.binding("sleep 30", &workdir), &[]).await;
+    let mut controller = fixture.controller().await;
+    let touch = |name: &str| format!("touch {}", workdir.join(name).display());
+    let unclaimed_binding = fixture.binding(&touch("unclaimed"), &workdir);
+    let unclaimed = allow(&mut controller, &unclaimed_binding).await;
+    let claimed_binding = fixture.binding(&touch("claimed"), &workdir);
+    let claimed_grant = allow(&mut controller, &claimed_binding).await;
+    let mut claimed = HostConnection::connect(
+        &fixture.paths.socket(),
+        Role::Spawner {
+            grant: claimed_grant.grant,
+            token: claimed_grant.token,
+        },
+        &[CAPABILITY_SHELL],
+    )
+    .await
+    .unwrap();
+    drop(controller);
+    drop(fixture.daemon.take());
+    // The running task stopping shows the host saw the daemon's last connection close.
+    assert_eq!(
+        exited(&mut running).await.reason.as_deref(),
+        Some(CANCELLED_REASON)
+    );
+
+    let directory = std::fs::File::open(&workdir).unwrap();
+    let (output, _) = output_file(&unclaimed_binding);
+    let refused = shell::submit(
+        &fixture.paths.socket(),
+        &unclaimed,
+        &request(&unclaimed_binding, &[]),
+        &directory,
+        &output,
+    )
+    .await
+    .err()
+    .expect("an unclaimed grant was withdrawn");
+    assert_eq!(refused.code, "Forbidden");
+
+    let (output, _) = output_file(&claimed_binding);
+    claimed
+        .send_descriptors(&[directory.as_raw_fd(), output.as_raw_fd()])
+        .await
+        .unwrap();
+    let refused = claimed
+        .request(
+            "spawn",
+            json!(request(&claimed_binding, &[])),
+            CONTROL_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, "Fenced");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!workdir.join("unclaimed").exists());
+    assert!(!workdir.join("claimed").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopping_host_stops_each_task_and_reports_its_exit_before_it_leaves() {
+    let mut fixture = Fixture::start().await;
+    let workdir = fixture.workdir("shutdown");
+    let mut started = start(&fixture, &fixture.binding("sleep 30", &workdir), &[]).await;
+    let pid = started.submitted.spawned.pid;
+    fixture.stop.take().unwrap().send(()).unwrap();
+    let exit = exited(&mut started).await;
+    assert_eq!(exit.reason.as_deref(), Some(CANCELLED_REASON));
+    assert!(!group_exists(pid));
+    tokio::time::timeout(Duration::from_secs(5), fixture.server)
+        .await
+        .expect("the stopped host exits")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn only_a_live_unused_grant_and_the_request_it_binds_start_a_task() {
     let fixture = Fixture::start().await;
     let workdir = fixture.workdir("grants");
@@ -419,6 +514,13 @@ async fn only_a_live_unused_grant_and_the_request_it_binds_start_a_task() {
             "Forbidden"
         );
     }
+
+    // The environment is bound too: a request may not start with variables the grant never saw.
+    let grant = allow(&mut controller, &binding).await;
+    assert_eq!(
+        refused(attempt(grant, request(&binding, &[("PATH", "/tmp/planted")])).await),
+        "Forbidden"
+    );
 
     let grant = allow(&mut controller, &binding).await;
     let mut submitted = attempt(grant.clone(), request(&binding, &[]))

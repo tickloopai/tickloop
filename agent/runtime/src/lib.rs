@@ -816,6 +816,12 @@ impl Agent {
         self.inner.shells.install_grants(grants);
     }
 
+    /// Runs and shows this Agent's shell commands in a Tickhost of its own, served inside this
+    /// process, for an Agent without a daemon such as a test's.
+    pub fn install_own_tickhost(&self) {
+        self.install_shell_grants(Arc::new(crate::hosted::shells::OwnTickhost::new()));
+    }
+
     pub fn shell_tasks(&self) -> Arc<crate::hosted::shells::ShellTasks> {
         self.inner.shells.clone()
     }
@@ -1436,11 +1442,10 @@ impl Agent {
                 auto_health: Mutex::new(auto_health::AutoHealth::default()),
                 host_tools: std::sync::RwLock::new(None),
                 hosted_ticks: std::sync::RwLock::new(None),
-                // Until a daemon grants its spawns, an Agent runs commands in a Tickhost of its own.
+                // Until a daemon grants its spawns and views, an Agent runs and shows no shell
+                // command.
                 shells: crate::hosted::shells::ShellTasks::new(Arc::new(
-                    crate::hosted::shells::OwnTickhost::new(
-                        transcript::private_tickhost_directory(),
-                    ),
+                    crate::hosted::shells::NoDaemon,
                 )),
                 stopped_child_hook: std::sync::RwLock::new(None),
                 tick_stream_installed: AtomicBool::new(false),
