@@ -158,12 +158,6 @@ pub(super) const UNCHECKED_OPTION: &str = "[ ] ";
 const IDENTITY_LABEL_WIDTH_DIVISOR: usize = 3;
 const MENU_WAITING_NOTICE: &str = "Menu waiting in conversation";
 
-/// Pairs the escape sequences that move between screen buffers with the record
-/// of which buffer the terminal is on, so the two cannot drift apart. The record
-/// lives outside the state lock: a poisoned lock must never be able to strand
-/// the terminal on the alternate screen. Both directions err towards "possibly
-/// on the alternate screen", because a spurious leave is harmless while a
-/// missed one leaves the user with an unusable terminal.
 /// A foreground Bash command of the model, the call that started it, and when it was first seen.
 struct ForegroundCommand {
     id: Uuid,
@@ -171,6 +165,17 @@ struct ForegroundCommand {
     seen: Instant,
 }
 
+/// Pairs the escape sequences that move between screen buffers with the record
+/// of which buffer the terminal is on, so the two cannot drift apart. The record
+/// lives outside the state lock: a poisoned lock must never be able to strand
+/// the terminal on the alternate screen. Both directions err towards "possibly
+/// on the alternate screen", because a spurious leave is harmless while a
+/// missed one leaves the user with an unusable terminal.
+///
+/// Input reporting goes on once the console's screen is taken and off before it is released.
+/// Terminals keep the kitty keyboard flags on a separate stack for each screen, so flags popped
+/// on another screen would stay pushed on this one, and the next program to take it, such as an
+/// attached view, would get Esc as `CSI 27 u`.
 #[derive(Clone)]
 struct TerminalSurface {
     alternate_screen: Arc<AtomicBool>,
@@ -196,15 +201,19 @@ impl TerminalSurface {
     fn take(&self, renderer: Renderer, output: &mut impl Write) -> io::Result<()> {
         self.alternate_screen
             .store(renderer.uses_alternate_screen(), Ordering::Release);
-        renderer.enter(self.mouse, output)
+        renderer.enter(self.mouse, output)?;
+        enable_input_reporting(output)
     }
 
+    /// Leaves the screen even when input reporting cannot be turned off, so a failed write never
+    /// strands the terminal on the alternate screen.
     fn release(&self, renderer: Renderer, output: &mut impl Write) -> io::Result<()> {
+        let reporting = disable_input_reporting(output);
         let left = renderer.leave(self.mouse, output);
         if left.is_ok() {
             self.alternate_screen.store(false, Ordering::Release);
         }
-        left
+        reporting.and(left)
     }
 }
 
@@ -3021,10 +3030,7 @@ impl Console {
         if interactive {
             terminal::enable_raw_mode().map_err(|error| error.to_string())?;
             let mut output = io::stdout();
-            if let Err(error) = surface
-                .take(startup_renderer, &mut output)
-                .and_then(|()| enable_input_reporting(&mut output))
-            {
+            if let Err(error) = surface.take(startup_renderer, &mut output) {
                 let _ = restore_terminal(&mut output, &surface);
                 return Err(error.to_string());
             }
@@ -4495,7 +4501,6 @@ impl Console {
                     "{RESET_SCROLL_REGION}\r\nTickloop suspended. Run `fg` to resume.\r\n"
                 )
             })
-            .and_then(|()| disable_input_reporting(&mut output))
             .and_then(|()| execute!(output, Show))
             .and_then(|()| output.flush());
         if let Err(error) = prepared {
@@ -4505,7 +4510,6 @@ impl Console {
         }
         if let Err(error) = terminal::disable_raw_mode() {
             let _ = surface.take(renderer, &mut output);
-            let _ = enable_input_reporting(&mut output);
             let _ = execute!(output, Hide);
             drop(output);
             self.forget_rendered_rows();
@@ -4520,11 +4524,10 @@ impl Console {
         let raw_result = terminal::enable_raw_mode();
         let mut output = io::stdout();
         let screen_result = surface.take(renderer, &mut output);
-        let paste_result = enable_input_reporting(&mut output);
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.screen_initialized = false;
         state.rendered_region = None;
-        if let Err(error) = raw_result.and(screen_result).and(paste_result) {
+        if let Err(error) = raw_result.and(screen_result) {
             return Err(format!("cannot restore terminal after resume: {error}"));
         }
         state
@@ -4546,17 +4549,16 @@ impl Console {
 /// when an earlier one fails, so a single failure cannot leave the terminal
 /// half restored; the first error is reported.
 fn restore_terminal(output: &mut impl Write, surface: &TerminalSurface) -> io::Result<()> {
-    let paste = disable_input_reporting(output);
     let screen = surface.release(surface.renderer(), output);
     let cursor = execute!(output, Show);
     let mode = terminal::disable_raw_mode();
-    paste.and(screen).and(cursor).and(mode)
+    screen.and(cursor).and(mode)
 }
 
-/// Bracketed paste, focus reporting and disambiguated keys go on and off together wherever the
-/// console takes the terminal or hands it back. Disambiguated keys (the kitty keyboard protocol,
-/// also passed through by Herdr) tell ctrl+enter from enter; terminals without the protocol
-/// ignore the request and keep sending legacy keys.
+/// Bracketed paste, focus reporting and disambiguated keys go on and off together with the
+/// console's screen, wherever it takes the terminal or hands it back. Disambiguated keys (the
+/// kitty keyboard protocol, also passed through by Herdr) tell ctrl+enter from enter; terminals
+/// without the protocol ignore the request and keep sending legacy keys.
 fn enable_input_reporting(output: &mut impl Write) -> io::Result<()> {
     execute!(
         output,
@@ -9576,7 +9578,6 @@ impl State {
             .surface
             .release(self.renderer, &mut output)
             .and_then(|()| write!(output, "{RESET_SCROLL_REGION}"))
-            .and_then(|()| disable_input_reporting(&mut output))
             .and_then(|()| execute!(output, Show))
             .and_then(|()| output.flush())
         {
@@ -9587,7 +9588,6 @@ impl State {
         }
         if let Err(error) = terminal::disable_raw_mode() {
             let _ = self.surface.take(self.renderer, &mut output);
-            let _ = enable_input_reporting(&mut output);
             // Taking the alternate screen again starts it blank.
             self.rendered_region = None;
             self.status = format!("Cannot leave raw mode for editor: {error}");
@@ -9596,10 +9596,9 @@ impl State {
         let outcome = edit_prompt(draft, &working_directory);
         let raw_result = terminal::enable_raw_mode();
         let screen_result = self.surface.take(self.renderer, &mut output);
-        let paste_result = enable_input_reporting(&mut output);
         self.screen_initialized = false;
         self.rendered_region = None;
-        if let Err(error) = raw_result.and(screen_result).and(paste_result) {
+        if let Err(error) = raw_result.and(screen_result) {
             self.status = format!("Cannot restore terminal after editor: {error}");
             return None;
         }
@@ -9614,7 +9613,6 @@ impl State {
         self.surface
             .release(self.renderer, &mut output)
             .and_then(|()| write!(output, "{RESET_SCROLL_REGION}"))
-            .and_then(|()| disable_input_reporting(&mut output))
             .and_then(|()| execute!(output, Show))
             .and_then(|()| output.flush())
     }
@@ -9623,10 +9621,7 @@ impl State {
     /// `failure` when the view did not end with the user closing it.
     fn reclaim_terminal(&mut self, failure: Option<&str>) {
         let mut output = io::stdout().lock();
-        let restored = self
-            .surface
-            .take(self.renderer, &mut output)
-            .and_then(|()| enable_input_reporting(&mut output));
+        let restored = self.surface.take(self.renderer, &mut output);
         drop(output);
         self.terminal_lent = false;
         self.screen_initialized = false;
@@ -17467,6 +17462,41 @@ mod tests {
             restored.contains("\x1b[<1u"),
             "the pushed keyboard flags are popped: {restored:?}"
         );
+    }
+
+    /// Terminals such as kitty and Ghostty keep a stack of keyboard flags for each screen, so the
+    /// console pops its flags from the screen it pushed them on, and a renderer switch moves
+    /// them to the new screen.
+    #[test]
+    fn keyboard_flags_are_pushed_and_popped_on_the_screen_the_console_draws_on() {
+        use tickloop_agent_test_support::kitty_keyboard::{
+            DISAMBIGUATE_ESCAPE_CODES, KittyKeyboard,
+        };
+        for renderer in [Renderer::Fullscreen, Renderer::Inline] {
+            let surface = TerminalSurface::new(true);
+            let mut output = Vec::new();
+            surface.take(renderer, &mut output).unwrap();
+            assert_eq!(
+                KittyKeyboard::after(&output).flags(),
+                DISAMBIGUATE_ESCAPE_CODES,
+                "{renderer:?}"
+            );
+            surface.release(renderer, &mut output).unwrap();
+            let released = KittyKeyboard::after(&output);
+            assert!(
+                released.main().is_empty() && released.alternate().is_empty(),
+                "{renderer:?} leaves no flags behind: {released:?}"
+            );
+        }
+
+        let surface = TerminalSurface::new(true);
+        let mut output = Vec::new();
+        surface.take(Renderer::Fullscreen, &mut output).unwrap();
+        surface.release(Renderer::Fullscreen, &mut output).unwrap();
+        surface.take(Renderer::Inline, &mut output).unwrap();
+        let switched = KittyKeyboard::after(&output);
+        assert_eq!(switched.main(), [DISAMBIGUATE_ESCAPE_CODES]);
+        assert!(switched.alternate().is_empty(), "{switched:?}");
     }
 
     #[test]

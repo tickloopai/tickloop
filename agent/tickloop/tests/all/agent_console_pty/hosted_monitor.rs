@@ -1,5 +1,6 @@
 use super::*;
 use tickloop_agent_protocol::AgentAccess;
+use tickloop_agent_test_support::kitty_keyboard::{DISAMBIGUATE_ESCAPE_CODES, KittyKeyboard};
 use tickloop_agent_test_support::screen::SELECTED_MARK;
 
 /// A View whose Agent opened `count` keys Ticks hidden in the Tickhost, now in its Monitor.
@@ -774,6 +775,69 @@ async fn actual_cli_enter_opens_terminal_ticks_and_shells_full_screen_and_a_row_
         .await;
         assert!(!input_focused(&view.frame()), "{}", view.frame());
         view.send(b"\x1b");
+        view.wait_for("input focused again", input_focused).await;
+        view.close().await;
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// The kitty keyboard flags of a terminal that showed everything the View wrote, kept for each
+/// screen across screen switches as kitty and Ghostty keep them.
+fn kitty_keyboard(view: &PtyView) -> KittyKeyboard {
+    KittyKeyboard::after(&view.output.lock().unwrap())
+}
+
+/// In a terminal speaking the kitty keyboard protocol, every full-screen view, of a protocol
+/// Tick, a terminal Tick and a Shell alike, reads legacy keys and closes on Esc each time it
+/// opens, and Ctrl+B Esc still sends Esc. The Console gets its disambiguated keys back on its own
+/// screen, pushed once however often a view opened, with the main screen left untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_cli_full_screen_views_close_on_esc_in_a_terminal_speaking_the_kitty_keyboard_protocol()
+ {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(async {
+        let mut view = view_with_local_ticks(&fixture, &[], false).await;
+        view.send(b"\x1b[C");
+        view.wait_for("Monitor focused", |frame| frame.contains("enter open"))
+            .await;
+        for (row, typed, shown) in [
+            ("Keys", None, "size 100x32"),
+            ("cat", Some(b"meow\r".as_slice()), "meow"),
+            (SHELL_VIEW_COMMAND, None, "outone"),
+        ] {
+            for _ in 0..2 {
+                select_row(&mut view, row).await;
+                view.send(b"\r");
+                terminal_taken(&view).await;
+                if let Some(typed) = typed {
+                    view.send(typed);
+                }
+                terminal_shows(&view, shown).await;
+                let in_view = kitty_keyboard(&view);
+                if row == "Keys" {
+                    view.send(&[in_view.control_b(), in_view.escape()].concat());
+                    terminal_shows(&view, "keys 1b").await;
+                }
+                view.send(in_view.escape());
+                back_from(&view, shown).await;
+                assert_eq!(in_view.flags(), 0, "the {row} view reads legacy keys");
+                let in_console = kitty_keyboard(&view);
+                assert_eq!(
+                    in_console.alternate(),
+                    [DISAMBIGUATE_ESCAPE_CODES],
+                    "the Console's flags are back on its screen, pushed once"
+                );
+                assert!(in_console.main().is_empty(), "{in_console:?}");
+            }
+        }
+        let in_console = kitty_keyboard(&view);
+        assert_eq!(in_console.escape(), b"\x1b[27u");
+        view.send(in_console.escape());
         view.wait_for("input focused again", input_focused).await;
         view.close().await;
     })
