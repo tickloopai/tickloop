@@ -59,6 +59,9 @@ pub struct ShellTask {
     pub chat_id: ChatId,
     pub origin: ShellTaskOrigin,
     pub owner: ShellTaskOwner,
+    /// The model's Bash call that started an Agent task; a user `!` task has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
     pub command: String,
     /// What the command does: the Bash call's description, or one generated once the task moved
     /// to background without it.
@@ -474,6 +477,7 @@ mod tests {
             chat_id,
             origin: ShellTaskOrigin::User,
             owner: ShellTaskOwner::User { chat_id },
+            call_id: None,
             command: "interactive-command".into(),
             description: None,
             cwd: PathBuf::from("/tmp"),

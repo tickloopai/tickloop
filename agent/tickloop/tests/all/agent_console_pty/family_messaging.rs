@@ -132,10 +132,11 @@ async fn run_family_messaging(fixture: &PrivateFixture) {
     assert!(target.conversation.messages.iter().any(|message| message.role == tickloop_agent_protocol::Role::User && message.content.iter().any(|content| matches!(content, tickloop_agent_protocol::Content::Text { text } if text == "DIRECT-HELLO"))));
     let sibling = wait_snapshot(&client, echo, "model sibling delivery completes", |current| !current.conversation.agent_message_origins.is_empty() && current.conversation.messages.iter().any(|message| message.content.iter().any(|content| matches!(content, tickloop_agent_protocol::Content::Text { text } if text == "Sibling context received")))).await;
     pty.wait_for(
-        "the sibling's background completion as one block",
+        "the sibling's background completion as one teammate block",
         |frame| {
-            frame.contains("⏺ @echo finished · ")
-                && frame.contains("⎿  Sibling context received")
+            frame.contains("⏺ Teammate @echo finished · ")
+                && frame.contains("\n  Sibling context received")
+                && !frame.contains("⎿  Sibling context received")
                 && !frame.contains("Subagent @echo")
         },
     )
@@ -407,6 +408,170 @@ async fn run_handback_warning(fixture: &PrivateFixture) {
     assert!(!output.contains("Permission required"));
     assert!(!output.contains("Auto review: Deny"));
     pty.close().await;
+}
+
+/// The family panel's rows below its `Subagents` heading.
+fn family_rows(frame: &str) -> Vec<&str> {
+    frame
+        .lines()
+        .skip_while(|line| !line.contains("Subagents 1"))
+        .skip(1)
+        .take(2)
+        .collect()
+}
+
+fn selected_family_row(frame: &str) -> Option<usize> {
+    family_rows(frame)
+        .iter()
+        .position(|line| line.starts_with('›'))
+}
+
+/// Moves the family panel selection to the row naming `member` and opens it.
+async fn open_family_row(pty: &mut PtyView, member: &str, opened: impl Fn(&str) -> bool) {
+    pty.wait_for("the family panel lists the member", |frame| {
+        family_rows(frame).iter().any(|line| line.contains(member))
+    })
+    .await;
+    pty.send(b"\x1b[B");
+    // A provider failure notice may take the hint row, so the selection marker shows the focus.
+    let frame = pty
+        .wait_for("family list receives focus", |frame| {
+            selected_family_row(frame).is_some()
+        })
+        .await;
+    let rows = family_rows(&frame);
+    let target = rows
+        .iter()
+        .position(|line| line.contains(member))
+        .unwrap_or_else(|| panic!("family lists {member}: {frame}"));
+    let selected = selected_family_row(&frame).unwrap();
+    if selected != target {
+        pty.send(if selected < target { b"j" } else { b"k" });
+        pty.wait_for("family selection reaches the member", |frame| {
+            selected_family_row(frame) == Some(target)
+        })
+        .await;
+    }
+    pty.send(b"\r");
+    pty.wait_for("selected family member is displayed", |frame| opened(frame))
+        .await;
+}
+
+async fn run_continued_child_notice(fixture: &PrivateFixture) {
+    const CHILD_TASK: &str = "Audit quota evidence";
+    let quota =
+        json!({"error":{"message":"You exceeded your current quota","type":"insufficient_quota"}})
+            .to_string();
+    let (url, _requests) = model_http_support::serve_router_with_status(move |request| {
+        let state = request_state(request);
+        let history = request["messages"].to_string();
+        if !state["delegation"].is_null() {
+            return if history.contains("CONTINUE-THE-AUDIT") {
+                (200, chat_reply(None, "AUDIT-RESUMED-REPORT"))
+            } else {
+                (403, quota.clone())
+            };
+        }
+        if !has_result(request, "audit-delegate") {
+            return (
+                200,
+                chat_reply(
+                    Some((
+                        "Subagent",
+                        "audit-delegate",
+                        json!({"task":CHILD_TASK,"name":"audit","description":CHILD_TASK,"run_in_background":true}),
+                    )),
+                    "",
+                ),
+            );
+        }
+        let reply = if history.contains("AUDIT-RESUMED-REPORT") {
+            "Root received the resumed report"
+        } else if history.contains("task-notification") {
+            "Root saw the failed audit"
+        } else {
+            "Root launched the audit"
+        };
+        (200, chat_reply(None, reply))
+    })
+    .await;
+    fixture.set_chat_model(&url);
+    let mut pty = PtyView::start_with_flags(fixture, &["--dangerously-skip-permissions"]);
+    pty.wait_for("root input", new_input_is_visible).await;
+    let client = fixture.client().await;
+    pty.send(b"Delegate a background quota audit\r");
+    pty.wait_for("the failed child's notice reaches the root", |frame| {
+        frame.contains("⏺ Teammate @audit failed") && frame.contains("Root saw the failed audit")
+    })
+    .await;
+    let rows = catalog(&client).await;
+    let root = rows
+        .iter()
+        .find(|row| row.parent.is_none())
+        .unwrap()
+        .execution;
+    let child = rows
+        .iter()
+        .find(|row| row.parent.is_some())
+        .unwrap()
+        .execution;
+    wait_snapshot(&client, child, "the child failed", |current| {
+        current.conversation.loops[0].state == tickloop_agent_protocol::LoopState::Failed
+    })
+    .await;
+    open_family_row(&mut pty, CHILD_TASK, |frame| {
+        frame.contains(&format!("Delegated Agent · {CHILD_TASK}"))
+    })
+    .await;
+    pty.send(b"CONTINUE-THE-AUDIT\r");
+    wait_snapshot(&client, root, "the resumed child's notice is handled", |current| {
+        current.conversation.family_completions.len() == 2
+            && matches!(
+                current.conversation.family_completions[1].notification,
+                tickloop_agent_protocol::SubagentNotificationDelivery::Queued
+            )
+            && current.conversation.messages.iter().any(|message| {
+                message.content.iter().any(|content| {
+                    matches!(content, tickloop_agent_protocol::Content::Text { text } if text == "Root received the resumed report")
+                })
+            })
+    })
+    .await;
+    open_family_row(&mut pty, "main", |frame| {
+        frame.contains("Root received the resumed report")
+    })
+    .await;
+    let shown = pty
+        .wait_for(
+            "the root shows the resumed child's completion block",
+            |frame| {
+                frame.contains("⏺ Teammate @audit finished")
+                    && frame.contains("\n  AUDIT-RESUMED-REPORT")
+            },
+        )
+        .await;
+    eprintln!("[continued-child-notice]\n{shown}\n[/continued-child-notice]");
+    let root_snapshot = snapshot(&client, root).await;
+    assert!(
+        !serde_json::to_string(&root_snapshot.conversation.messages)
+            .unwrap()
+            .contains("CONTINUE-THE-AUDIT"),
+        "the human's words in the child View stay in the child"
+    );
+    assert_eq!(root_snapshot.conversation.prompt_execution_modes.len(), 1);
+    pty.close().await;
+}
+
+#[tokio::test]
+async fn actual_cli_continuing_a_failed_child_in_its_view_notifies_the_root() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(run_continued_child_notice(&fixture))
+        .catch_unwind()
+        .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[tokio::test]

@@ -255,7 +255,66 @@ pub(super) fn fixture_ticks() -> Vec<MonitorEntry> {
 }
 
 #[test]
-fn review_regression_focused_ticks_do_not_swallow_request_field_paste() {
+fn every_focus_yields_to_a_request_whose_answer_or_rejection_returns_to_the_input() {
+    for surface in ["Monitor", "Subagents", "conversation"] {
+        for reject in [false, true] {
+            let mut state = State::new(true, 120, 40);
+            state.chat = Some(Uuid::new_v4());
+            state.prompt_enabled = true;
+            state.monitor.replace(TickGroup::Artifacts, fixture_ticks());
+            state.footer.update([FooterItemId::Agents]);
+            match surface {
+                "Monitor" => state.monitor.focus(true, None),
+                "Subagents" => state.footer.select(FooterItemId::Agents),
+                _ => state.conversation_focused = true,
+            }
+            assert!(
+                state.monitor.focused
+                    || state.footer.selected().is_some()
+                    || state.conversation_focused
+            );
+            let console = tests::console_with_state(state);
+            let request = Uuid::new_v4();
+            console.set_request_layout(Some(request)).unwrap();
+            console
+                .show_focused_commentable_menu(menu(request), vec![0])
+                .unwrap();
+            let mut state = console.state.lock().unwrap();
+            assert!(
+                !state.monitor.focused
+                    && !state.monitor.overlay
+                    && state.footer.selected().is_none()
+                    && !state.conversation_focused,
+                "the request takes the keys from {surface}"
+            );
+            let event = state.key(KeyEvent::new(
+                if reject { KeyCode::Esc } else { KeyCode::Enter },
+                KeyModifiers::NONE,
+            ));
+            assert!(
+                matches!(event, Some(InputEvent::Cancel { menu_id } | InputEvent::Choice { menu_id, .. }) if menu_id == request),
+                "{surface}/{reject}: {event:?}"
+            );
+            state.mark_menu_submission_finished(request);
+            state.release_finished_submissions();
+            assert!(state.menu.is_none());
+            let hint = state.frame().0.last().unwrap().clone();
+            assert!(
+                hint.starts_with("← Agents · → Monitor · ? help"),
+                "{surface}/{reject}: {hint}"
+            );
+            assert!(
+                state
+                    .key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+                    .is_none()
+            );
+            assert_eq!(state.editor.draft(), "x", "{surface}/{reject}");
+        }
+    }
+}
+
+#[test]
+fn focused_ticks_yield_to_a_request_whose_close_returns_to_the_input() {
     for question in [false, true] {
         let mut state = State::new(true, 120, 40);
         state.chat = Some(Uuid::new_v4());
@@ -297,7 +356,10 @@ fn review_regression_focused_ticks_do_not_swallow_request_field_paste() {
                 .unwrap();
         }
         let mut state = console.state.lock().unwrap();
-        assert!(state.monitor.focused && state.monitor_visible());
+        assert!(
+            !state.monitor.focused,
+            "the request takes the keys from Monitor"
+        );
         state.key(KeyEvent::new(
             if question {
                 KeyCode::Enter
@@ -315,15 +377,19 @@ fn review_regression_focused_ticks_do_not_swallow_request_field_paste() {
         assert!(state.editor.draft().is_empty());
         state.mark_menu_submission_finished(request);
         state.release_finished_submissions();
+        assert!(!state.monitor.focused);
         assert!(
-            matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::TickAction { action, .. }) if action.key == 'o' && action.instance == "fixture-tick-0")
+            state
+                .frame()
+                .0
+                .last()
+                .unwrap()
+                .contains("→ Monitor · ? help"),
+            "the hint row offers the input's keys"
         );
-        state.paste("Monitor still owns input");
-        assert!(state.editor.draft().is_empty());
+        state.paste("the input owns the keys");
         state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
-        assert!(
-            matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::TickAction { action, .. }) if action.key == 'o' && action.instance == "fixture-tick-1")
-        );
+        assert_eq!(state.editor.draft(), "the input owns the keysj");
     }
 }
 
@@ -619,13 +685,23 @@ async fn review_regression_only_the_displayed_request_consumes_input() {
                     .iter()
                     .map(RoleLine::text)
                     .collect::<Vec<_>>();
-                assert_eq!(before, after, "{title}/{surface}");
                 if surface == "monitor" {
-                    let event = state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-                    assert!(
-                        matches!(&event, Some(InputEvent::TickAction { action, .. }) if action.key == 'o' && action.instance == "fixture-tick-0"),
-                        "{title}/{cancel}: {event:?}"
+                    // As Claude Code's prompt takes the keys back after a request, Monitor does
+                    // not get them again.
+                    assert!(!state.monitor.focused, "{title}/{cancel}");
+                    assert_eq!(
+                        after.last().map(String::as_str),
+                        Some("enter send · ctrl+g editor · ctrl+c clear"),
+                        "{title}/{cancel}"
                     );
+                    assert!(
+                        state
+                            .key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+                            .is_none()
+                    );
+                    assert_eq!(state.editor.draft(), "preserved draftx", "{title}/{cancel}");
+                } else {
+                    assert_eq!(before, after, "{title}/{surface}");
                 }
             }
         }

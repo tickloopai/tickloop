@@ -2,6 +2,8 @@
 //! conversation laid out by the conversation renderer with every block expanded, read with
 //! less-style keys and searched from the footer. Its content is fixed when it opens.
 
+use std::ops::Range;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -34,6 +36,8 @@ pub(super) struct TranscriptFrame {
     pub(super) lines: Vec<StyledLine>,
     /// The visible text of `lines`, without escape sequences.
     pub(super) texts: Vec<String>,
+    /// The content rows drawn from the top of the frame down.
+    pub(super) content: Range<usize>,
 }
 
 /// One piece of the detailed transcript, written in order into a conversation layout.
@@ -318,6 +322,7 @@ impl Transcript {
             return TranscriptFrame {
                 lines: Vec::new(),
                 texts: Vec::new(),
+                content: 0..0,
             };
         }
         if self.width != width {
@@ -366,7 +371,17 @@ impl Transcript {
                 None => resolved,
             });
         }
-        TranscriptFrame { lines, texts }
+        TranscriptFrame {
+            lines,
+            texts,
+            content: top..(top + self.body_height).min(self.rows.len()),
+        }
+    }
+
+    /// Text of the content rows in `range`; rows past the end are left out.
+    pub(super) fn row_texts(&self, range: Range<usize>) -> &[String] {
+        let end = range.end.min(self.texts.len());
+        &self.texts[range.start.min(end)..end]
     }
 
     /// The blank row, the dim rule and either the hint row or the open search bar, with the
@@ -583,7 +598,7 @@ impl Transcript {
         self.selected_match = None;
     }
 
-    fn scroll(&mut self, forward: bool, amount: usize) {
+    pub(super) fn scroll(&mut self, forward: bool, amount: usize) {
         let top = self.top_row();
         self.top = if forward {
             top.saturating_add(amount)
@@ -603,7 +618,8 @@ impl Transcript {
         self.rows.len().saturating_sub(self.body_height)
     }
 
-    fn top_row(&self) -> usize {
+    /// The content row the next frame draws first.
+    pub(super) fn top_row(&self) -> usize {
         if self.at_bottom {
             self.maximum_top()
         } else {

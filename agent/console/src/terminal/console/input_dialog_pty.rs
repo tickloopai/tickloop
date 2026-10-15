@@ -76,7 +76,7 @@ fn input_dialog_tick_paste_pty_fixture() {
         console.record_input("Pinned tick fixture prompt").unwrap();
         std::fs::write(directory.join("phase"), "ticks").unwrap();
         let mut requested = false;
-        let mut selected = false;
+        let mut answered = false;
         let mut poll = tokio::time::interval(Duration::from_millis(20));
         loop {
             tokio::select! {
@@ -88,14 +88,11 @@ fn input_dialog_tick_paste_pty_fixture() {
                         console.finish_menu_submission(REQUEST).unwrap();
                         console.clear_menu(REQUEST).unwrap();
                         while console.state.lock().unwrap().menu_submission_is_pending() { tokio::time::sleep(Duration::from_millis(10)).await; }
-                        assert!(console.state.lock().unwrap().monitor.focused);
+                        assert!(!console.state.lock().unwrap().monitor.focused);
+                        answered = true;
                         std::fs::write(directory.join("phase"), "answered").unwrap();
                     }
-                    Some(InputEvent::TickAction { action, .. }) if action.key == 'o' => {
-                        assert_eq!(action.instance, "fixture-tick-1");
-                        selected = true;
-                        std::fs::write(directory.join("phase"), "selected").unwrap();
-                    }
+                    Some(InputEvent::TickAction { action, .. }) => panic!("Monitor took a key after the request: {}", action.key),
                     Some(InputEvent::Eof | InputEvent::Error(_)) | None => panic!("fixture input ended early"),
                     _ => {}
                 },
@@ -105,7 +102,7 @@ fn input_dialog_tick_paste_pty_fixture() {
                         console.set_request_layout(Some(REQUEST)).unwrap();
                         console.show_question_menu(Menu { id: REQUEST, title: "Question fixture".into(), context: vec!["Isolated Tick focus".into()], options: vec!["Other".into()], selected: 0, confirmation: false }, QuestionMenu { entry_option: Some(0), entry_text: String::new(), multi_select: false, navigable: false }).unwrap();
                         requested = true;
-                    } else if trigger == "finish" && selected { break; }
+                    } else if trigger == "finish" && answered { break; }
                 }
             }
         }
@@ -213,7 +210,7 @@ impl Drop for Fixture {
 }
 
 #[test]
-fn input_dialog_pty_pastes_into_the_request_and_restores_tick_focus() {
+fn input_dialog_pty_pastes_into_the_request_and_returns_to_the_input() {
     for (width, height) in [(80, 24), (120, 40), (32, 10)] {
         let directory = tempfile::tempdir().unwrap();
         let mut fixture = Fixture::start(
@@ -240,13 +237,18 @@ fn input_dialog_pty_pastes_into_the_request_and_restores_tick_focus() {
         fixture.send(b"\r");
         fixture.wait(|frame| {
             !frame.contains("Question fixture")
+                && frame
+                    .lines()
+                    .last()
+                    .is_some_and(|hint| hint.starts_with("← Agents · → Monitor"))
                 && std::fs::read_to_string(directory.path().join("phase"))
                     .is_ok_and(|phase| phase == "answered")
         });
-        fixture.send(b"j\r");
-        fixture.wait(|_| {
-            std::fs::read_to_string(directory.path().join("phase"))
-                .is_ok_and(|phase| phase == "selected")
+        fixture.send(b"j");
+        fixture.wait(|frame| {
+            frame
+                .lines()
+                .any(|line| line.replace('\u{a0}', " ").trim_end() == "❯ j")
         });
         std::fs::write(directory.path().join("trigger"), "finish").unwrap();
         let deadline = Instant::now() + TIMEOUT;

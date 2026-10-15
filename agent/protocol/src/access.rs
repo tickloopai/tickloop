@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     AccessLimits, AccountModelDirectory, AgentHostOptions, ApprovalHistoryView, ArtifactTick,
-    BranchSessionPermissionRegistration, ChatSnapshot, CodeRewind, CommandSnapshot,
+    BranchSessionPermissionRegistration, ChatSnapshot, ChatStatus, CodeRewind, CommandSnapshot,
     DirectedSummaryDraft, DirectedSummaryRequest, Event, ExecutionMode, FEED_CAPACITY,
     FEED_CHANGE_BYTES, FEED_MAX_BYTES, HostedMember, HostedViewGrant, InputContext, LoopState,
     LoopTriggerNotice, Message, ModelChange, ModelConfig, MonitorMembership, OperationRecord,
@@ -25,17 +25,18 @@ use crate::{
     RewindDraft, RewindMode, RewindPoint, RunId, SavedChat, SearchConfig, ShellTask,
     ShellTaskOutputChunk, SubagentRegistration, SummaryDirection, TakenBackPrompt,
     TaskNotification, TickSubscriptionChange, TickSubscriptionStatus, ToolCallRecovery, Trigger,
-    TriggerSource, UserShellReceipt, UserShellRecord,
+    TriggerSource, UserShellReceipt, UserShellRecord, chat_status::ProcessState,
 };
 
 /// Business 18.0 replaces a Tick Subscription's cadence in seconds with one of four frequencies,
 /// in the subscription, its status and the change a View requests. 19.0: a hosted Monitor member
 /// can be an exited terminal Tick, with how its program ended. 20.0: the hosted Tick snapshot
-/// command is gone, and `AttachHostedTick` also grants views of the Chat's Shell tasks. Older
-/// business majors are refused before dispatch; the frozen daemon management protocol remains
-/// independent.
+/// command is gone, and `AttachHostedTick` also grants views of the Chat's Shell tasks. 20.1 names
+/// the Bash call that started each Agent Shell task, and adds reading a Chat's status without its
+/// history, one recorded tool operation, and the events after a sequence. Older business majors
+/// are refused before dispatch; the frozen daemon management protocol remains independent.
 pub const PROTOCOL_MAJOR: u16 = 20;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -563,7 +564,20 @@ pub struct AgentFilter {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentDetailQuery {
+    /// The Chat with its whole history.
     Snapshot,
+    /// What the Chat is doing now, without its history.
+    Status,
+    /// The tool operation a run recorded for one call.
+    Operation {
+        run_id: Uuid,
+        call_id: String,
+    },
+    /// The events still in the Chat's replay window after sequence `after`, such as one a feed
+    /// could not carry.
+    Events {
+        after: u64,
+    },
     ProviderCredentials,
     AccountModels {
         config: Box<ModelConfig>,
@@ -749,24 +763,46 @@ impl LiveChatSnapshot {
             request_usage: snapshot.request_usage.clone(),
             context_window_tokens: snapshot.context_window_tokens,
             last_model_run: snapshot.last_model_run,
-            request_refs: snapshot
-                .permissions
-                .iter()
-                .map(|request| RequestRef {
-                    execution,
-                    request_id: request.id,
-                    kind: PendingRequestKind::Permission,
-                    version: 1,
-                })
-                .chain(snapshot.questions.iter().map(|request| RequestRef {
-                    execution,
-                    request_id: request.id,
-                    kind: PendingRequestKind::Question,
-                    version: 1,
-                }))
-                .collect(),
+            request_refs: RequestRef::pending(
+                execution,
+                &snapshot.permissions,
+                &snapshot.questions,
+            ),
             conversation: snapshot,
             warnings,
+        }
+    }
+
+    /// The status this snapshot holds, as a status query would have answered at the same point.
+    pub fn status(&self) -> LiveChatStatus {
+        LiveChatStatus {
+            execution: self.execution,
+            subagent: self.subagent.clone(),
+            chat: ChatStatus::assemble(
+                &self.conversation,
+                ProcessState {
+                    model: &self.model,
+                    pending_model: &self.pending_model,
+                    reasoning_effort: self.reasoning_effort,
+                    thinking_enabled: self.thinking_enabled,
+                    policy: &self.policy,
+                    additional_directories: &self.additional_directories,
+                    permissions: &self.permissions,
+                    questions: &self.questions,
+                    pending_inputs: &self.pending_inputs,
+                    pending_commands: &self.pending_commands,
+                    user_shells: &self.user_shells,
+                    commands: &self.commands,
+                    request_usage: &self.request_usage,
+                    context_window_tokens: self.context_window_tokens,
+                    events: &self.events,
+                    last_sequence: self.last_sequence,
+                },
+            ),
+            request_refs: self.request_refs.clone(),
+            warnings: self.warnings.clone(),
+            transcript_write_error: self.transcript_write_error.clone(),
+            loop_trigger_notices: self.loop_trigger_notices.clone(),
         }
     }
 
@@ -798,6 +834,46 @@ impl LiveChatSnapshot {
     }
 }
 
+/// A live Chat's status: its `ChatStatus` with what the serving process adds, the pending
+/// requests a View answers and the notices it shows. A `LiveChatSnapshot` of the same moment
+/// derives the same value.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LiveChatStatus {
+    pub execution: ExecutionRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent: Option<SubagentRegistration>,
+    pub chat: ChatStatus,
+    pub request_refs: Vec<RequestRef>,
+    pub warnings: Vec<String>,
+    pub transcript_write_error: Option<String>,
+    pub loop_trigger_notices: Vec<LoopTriggerNotice>,
+}
+
+impl RequestRef {
+    /// The first version of each request still waiting for an answer.
+    pub fn pending(
+        execution: ExecutionRef,
+        permissions: &[PermissionRequest],
+        questions: &[QuestionRequest],
+    ) -> Vec<Self> {
+        permissions
+            .iter()
+            .map(|request| Self {
+                execution,
+                request_id: request.id,
+                kind: PendingRequestKind::Permission,
+                version: 1,
+            })
+            .chain(questions.iter().map(|request| Self {
+                execution,
+                request_id: request.id,
+                kind: PendingRequestKind::Question,
+                version: 1,
+            }))
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ObservationValue {
     AccountModelsPending,
@@ -805,6 +881,9 @@ pub enum ObservationValue {
     AccountModels(Result<AccountModelDirectory, String>),
     Overview(Vec<AgentSummary>),
     Agent(Box<LiveChatSnapshot>),
+    Status(Box<LiveChatStatus>),
+    Operation(Option<Box<OperationRecord>>),
+    Events(Vec<Event>),
     Permissions(Box<PermissionsView>),
     ApprovalHistory(ApprovalHistoryView),
     Tasks(Vec<ShellTask>),
@@ -1308,8 +1387,9 @@ pub fn bounded_update(mut update: ObservationUpdate) -> ObservationUpdate {
 }
 
 impl ChunkedResponseKind {
-    /// The chunked kind a response travels as: Agent histories and the receipts that carry one
-    /// may outgrow a frame; every other response never does.
+    /// The chunked kind a response travels as: Agent histories, the events and tool operations
+    /// they record, and the receipts that carry one may outgrow a frame; every other response
+    /// never does.
     pub fn of(response: &ServerMessage) -> Option<Self> {
         match response {
             ServerMessage::Opened { initial, .. } if carries_history(initial) => Some(Self::Opened),
@@ -1324,6 +1404,8 @@ impl ChunkedResponseKind {
 fn carries_history(value: &ObservationValue) -> bool {
     match value {
         ObservationValue::Agent(_)
+        | ObservationValue::Operation(_)
+        | ObservationValue::Events(_)
         | ObservationValue::Transcript(_)
         | ObservationValue::RewindPoints(_) => true,
         ObservationValue::Receipt(Some(receipt)) => receipt_carries_history(receipt),

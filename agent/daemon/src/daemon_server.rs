@@ -21,6 +21,7 @@ use tickloop_agent_protocol::{
     DisplayUpdate, ExecutionAvailability, ExecutionRef, FEED_CAPACITY, LaunchSpec, MAX_PAGE_LIMIT,
     Observation, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue, Page,
     PersistenceState, REPLAY_CAPACITY, ResetReason, TranscriptRef, chat_display_title,
+    chat_has_work, chat_preview,
 };
 
 #[async_trait]
@@ -326,10 +327,10 @@ impl DaemonServer {
                     workdir: snapshot.conversation.workdir.clone(),
                     run_id: super::summary::summary_run_id(&snapshot.conversation.loops, &state),
                     state,
-                    preview: super::summary::preview(&snapshot.conversation, &title),
+                    preview: chat_preview(&snapshot.conversation, &title),
                     title,
                     subagent: snapshot.subagent.clone(),
-                    has_work: Some(super::summary::has_work(
+                    has_work: Some(chat_has_work(
                         &snapshot.conversation,
                         &snapshot.user_shells,
                         snapshot.pending_inputs.len() + snapshot.pending_commands.len(),

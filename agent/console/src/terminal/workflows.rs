@@ -12,7 +12,7 @@ use super::{
         ConversationEntry, ConversationPicker, ConversationPickerPurpose, compact_line,
     },
     directed_summary,
-    display::DisplayProfile,
+    display::{DisplayProfile, Glyph},
     image_cache::ImageLinks,
     presentation, safe_text,
 };
@@ -320,16 +320,16 @@ impl Workflow {
         chat: Uuid,
         goal: Uuid,
     ) -> Result<(Menu, Self), String> {
-        let snapshot = agent
-            .snapshot(chat)
+        let status = agent
+            .status(chat)
             .await
             .map_err(|error| error.to_string())?;
-        let selected_goal = snapshot
+        let selected_goal = status
             .loops
             .iter()
             .find(|entry| entry.id == goal)
             .ok_or("The selected goal no longer exists.")?;
-        let plan = snapshot
+        let plan = status
             .plans
             .iter()
             .find(|plan| plan.loop_id == goal)
@@ -348,7 +348,7 @@ impl Workflow {
                 Self::PlanView { chat },
             ));
         }
-        let request = snapshot
+        let request = status
             .permissions
             .iter()
             .find(|request| {
@@ -959,6 +959,17 @@ impl PublicHistoryBuilder<'_> {
         }
     }
 
+    /// An Agent block: its heading and the body indented under it.
+    fn push_agent_block(
+        &mut self,
+        (heading, body): (presentation::RoleRuns, presentation::RoleRuns),
+    ) {
+        self.push_runs(&heading);
+        if !body.is_empty() {
+            self.pieces.push(ConversationPiece::Body(body));
+        }
+    }
+
     /// Prompt text of `chat`, with each cached `[Image #N]` linked to its image.
     fn push_prompt(
         &mut self,
@@ -1038,11 +1049,8 @@ fn public_history_pieces(
                 source,
                 message,
                 contexts,
-                has_thinking,
+                ..
             } => {
-                if has_thinking {
-                    history.pieces.push(presentation::thinking_label());
-                }
                 if let Some(origin) = source
                     .message_id
                     .and_then(|id| chat.human_family_origins.get(&id))
@@ -1085,15 +1093,13 @@ fn public_history_pieces(
         completion.notification.is_background()
             && !shown_completions.contains(&completion.child_run_id)
     }) {
-        let (heading, response) = agent_messaging::completion_runs(
+        history.push_agent_block(agent_messaging::completion_runs(
             completion,
             chat,
             colors,
             presentation::OutputDetail::Preview,
             display,
-        );
-        history.push_runs(&heading);
-        history.push_response(response);
+        ));
     }
     history.pieces
 }
@@ -1179,9 +1185,9 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
             event.chat_id == chat.id
                 && matches!(event.kind, EventKind::Started | EventKind::Completed { .. })
         })
-        && let EventKind::Completed { usage } = event.kind
+        && matches!(event.kind, EventKind::Completed { .. })
     {
-        super::write_completion_notice(console, &usage, None)?;
+        super::write_completion_notice(console, None)?;
     }
     console.replay_execution_losses(chat.id)?;
     Ok(())
@@ -1212,38 +1218,41 @@ fn is_folded_tick_reply(message: &tickloop_agent_protocol::Message) -> bool {
 }
 
 /// An Agent message in saved history: a background child's report or completion notice as the
-/// child's completion block, any other message as its line. `None` when it shows elsewhere: a
+/// child's completion block, any other message as its line. Nothing when it shows elsewhere: a
 /// foreground child's report under its call, or a report whose run has not ended yet.
-fn agent_input_runs(
+fn push_agent_input(
     history: &mut PublicHistoryBuilder,
     source: &BranchPublicSource,
     local: &LocalMessage,
     display: DisplayProfile,
-) -> Option<(presentation::RoleRuns, presentation::RoleRuns)> {
+) {
     let preview = presentation::OutputDetail::Preview;
     match agent_messaging::agent_input(history.chat, source.message_id, local) {
         AgentInput::Result(completion) => {
             if !completion.notification.is_background() {
-                return None;
+                return;
             }
             history.shown_completions.insert(completion.child_run_id);
-            Some(agent_messaging::completion_runs(
+            let block = agent_messaging::completion_runs(
                 completion,
                 history.chat,
                 history.colors,
                 preview,
                 display,
-            ))
+            );
+            history.push_agent_block(block);
         }
-        AgentInput::PendingResult => None,
-        AgentInput::Message => Some(
-            match AgentMessage::of(local, history.chat, source.message_id) {
-                Some(message) => {
-                    agent_messaging::message_runs(&message, history.colors, preview, display)
-                }
-                None => presentation::local_message_runs(local, preview, display),
-            },
-        ),
+        AgentInput::PendingResult => {}
+        AgentInput::Message => match AgentMessage::of(local) {
+            Some(message) => {
+                history.push_agent_block(agent_messaging::message_runs(&message, preview, display));
+            }
+            None => {
+                let (heading, response) = presentation::local_message_runs(local, preview, display);
+                history.push_runs(&heading);
+                history.push_response(response);
+            }
+        },
     }
 }
 
@@ -1280,18 +1289,15 @@ fn append_public_message(
                 if matches!(local_message, LocalMessage::Interrupted { .. }) && follows_rejection {
                     continue;
                 }
-                let (heading, response) = if source.is_agent_message {
-                    match agent_input_runs(history, source, &local_message, display) {
-                        Some(runs) => runs,
-                        None => continue,
-                    }
-                } else {
-                    presentation::local_message_runs(
-                        &local_message,
-                        presentation::OutputDetail::Preview,
-                        display,
-                    )
-                };
+                if source.is_agent_message {
+                    push_agent_input(history, source, &local_message, display);
+                    continue;
+                }
+                let (heading, response) = presentation::local_message_runs(
+                    &local_message,
+                    presentation::OutputDetail::Preview,
+                    display,
+                );
                 history.push_runs(&heading);
                 history.push_response(response);
             }
@@ -1318,7 +1324,7 @@ fn append_public_message(
                     (source_chat_id, run_id, id.clone()),
                     (name.clone(), input.clone()),
                 );
-                if presentation::is_model_only_tool(name) {
+                if presentation::has_no_call_row(name) {
                     continue;
                 }
                 if let Some(run) = run_id {
@@ -1375,8 +1381,26 @@ fn append_public_message(
                 let (name, input) = call
                     .as_ref()
                     .map_or(("tool", None), |(name, input)| (name.as_str(), Some(input)));
-                if presentation::is_model_only_tool(name) {
-                    // A model-only call shows no row of its own until it fails.
+                let result = ToolResult {
+                    content: content.text().into_owned(),
+                    is_error: *is_error,
+                    output_ref: None,
+                };
+                if name == tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME {
+                    if let Some((heading, response)) = presentation::question_result_runs(
+                        input,
+                        &result,
+                        display.glyph(Glyph::ToolCall),
+                        display.glyph(Glyph::ToolResult),
+                    ) {
+                        history.push_runs(&heading);
+                        history.push_response(response);
+                    }
+                    history.after_rejection = presentation::is_rejection(&result);
+                    continue;
+                }
+                if presentation::has_no_call_row(name) {
+                    // TodoWrite shows its call only when it fails.
                     if !*is_error {
                         continue;
                     }
@@ -1397,11 +1421,6 @@ fn append_public_message(
                         });
                     }
                 }
-                let result = ToolResult {
-                    content: content.text().into_owned(),
-                    is_error: *is_error,
-                    output_ref: None,
-                };
                 let facts = presentation::CallFacts {
                     review: run_id
                         .filter(|_| name == tickloop_agent_tools::EDIT_TOOL_NAME && !*is_error)
@@ -2092,7 +2111,7 @@ mod tests {
         let history = public_history(&before, DisplayProfile::default());
         assert!(history.contains("public answer"));
         assert_eq!(history.matches("public answer").count(), 1);
-        assert!(history.contains("\n∴ Thinking (ctrl+o to expand)\n"));
+        assert!(!history.contains("Thinking"), "{history}");
         assert!(!history.contains("private thought"));
         let mut summarized = before.clone();
         let summary = "Retained summary\nwith controls\u{1b}[31m";

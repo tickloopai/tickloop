@@ -3,25 +3,25 @@ use std::{
     io::{BufWriter, Seek, SeekFrom, Write},
 };
 
-use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use tickloop_agent_protocol::{AccessError, ServerMessage};
 
+/// A response encoded to a temporary file before it goes out in one frame or in chunks. Only a
+/// chunked response is digested, as its chunks are read, so the peer can verify the bytes it
+/// reassembles; a single frame needs no digest.
 pub(super) struct EncodedResponse {
     pub file: File,
     pub total_bytes: u64,
-    pub sha256: String,
 }
 
-struct DigestWriter {
+struct CountingWriter {
     file: File,
-    digest: Sha256,
     bytes: u64,
     cancel: CancellationToken,
 }
 
-impl Write for DigestWriter {
+impl Write for CountingWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         if self.cancel.is_cancelled() {
             return Err(std::io::Error::new(
@@ -30,7 +30,6 @@ impl Write for DigestWriter {
             ));
         }
         let written = self.file.write(bytes)?;
-        self.digest.update(&bytes[..written]);
         self.bytes += written as u64;
         Ok(written)
     }
@@ -43,9 +42,8 @@ impl Write for DigestWriter {
 impl EncodedResponse {
     pub fn new(response: ServerMessage, cancel: CancellationToken) -> Result<Self, AccessError> {
         let file = tempfile::tempfile().map_err(storage_error)?;
-        let mut writer = BufWriter::new(DigestWriter {
+        let mut writer = BufWriter::new(CountingWriter {
             file,
-            digest: Sha256::new(),
             bytes: 0,
             cancel,
         });
@@ -62,7 +60,6 @@ impl EncodedResponse {
         Ok(Self {
             file: writer.file,
             total_bytes: writer.bytes,
-            sha256: format!("{:x}", writer.digest.finalize()),
         })
     }
 }

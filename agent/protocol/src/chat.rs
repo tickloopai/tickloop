@@ -203,67 +203,15 @@ impl ChatSnapshot {
     /// The highest `[Image #N]` pasted into this conversation, sent or queued, so a resumed
     /// editor numbers new pastes after it.
     pub fn highest_pasted_image_id(&self) -> Option<u32> {
-        self.message_contexts
-            .values()
-            .chain(self.pending_inputs.iter().map(|pending| &pending.contexts))
-            .flatten()
-            .filter_map(|context| match context {
-                InputContext::Image(ImageContext {
-                    origin: ImageOrigin::Pasted { id },
-                    ..
-                }) => Some(*id),
-                _ => None,
-            })
-            .max()
+        highest_pasted_image_id(&self.message_contexts, &self.pending_inputs)
     }
 
     pub fn queued_inputs(&self) -> Vec<QueuedInput> {
-        let mut entries = self
-            .pending_inputs
-            .iter()
-            .filter(|pending| {
-                pending.trigger_source.is_none()
-                    && !pending.task_continuation
-                    && pending.agent_message.is_none()
-            })
-            .map(|pending| QueuedInput {
-                id: pending.receipt.run_id,
-                chat_id: pending.receipt.chat_id,
-                loop_id: Some(pending.receipt.loop_id),
-                kind: QueuedInputKind::Message,
-                text: pending.input.clone(),
-                contexts: pending.contexts.clone(),
-                queued_sequence: pending.queued_sequence,
-                armed: pending.armed,
-            })
-            .chain(self.pending_commands.iter().map(|command| QueuedInput {
-                id: command.id,
-                chat_id: command.chat_id,
-                loop_id: command.loop_id,
-                kind: QueuedInputKind::Command,
-                text: command.command.clone(),
-                contexts: Vec::new(),
-                queued_sequence: command.queued_sequence,
-                armed: command.armed,
-            }))
-            .chain(
-                self.user_shells
-                    .iter()
-                    .filter(|record| record.state == UserShellState::Queued)
-                    .map(|record| QueuedInput {
-                        id: record.id,
-                        chat_id: record.chat_id,
-                        loop_id: record.loop_id,
-                        kind: QueuedInputKind::Shell,
-                        text: record.command.clone(),
-                        contexts: Vec::new(),
-                        queued_sequence: record.queued_sequence,
-                        armed: record.armed,
-                    }),
-            )
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.queued_sequence);
-        entries
+        queued_inputs(
+            &self.pending_inputs,
+            &self.pending_commands,
+            &self.user_shells,
+        )
     }
 
     /// 本进程内结果未知的操作，作为宿主状态告知模型。
@@ -683,7 +631,7 @@ pub fn short_chat_title(text: &str) -> String {
 const NEW_AGENT_TITLE: &str = "New Agent";
 
 /// Provides a bounded task or Shell label until a generated or explicit Chat title exists.
-fn fallback_title(loops: &[LoopSnapshot], user_shells: &[UserShellRecord]) -> String {
+pub(crate) fn fallback_title(loops: &[LoopSnapshot], user_shells: &[UserShellRecord]) -> String {
     loops
         .first()
         .map(|goal| short_chat_title(&goal.goal))
@@ -702,4 +650,156 @@ pub fn chat_display_title(snapshot: &ChatSnapshot, user_shells: &[UserShellRecor
         .map(|origin| origin.name.clone())
         .or_else(|| snapshot.generated_title.clone())
         .unwrap_or_else(|| fallback_title(&snapshot.loops, user_shells))
+}
+
+/// Whether an execution ever received work. Configuration changes alone leave it empty.
+pub fn chat_has_work(
+    conversation: &ChatSnapshot,
+    user_shells: &[UserShellRecord],
+    queued: usize,
+) -> bool {
+    !conversation.loops.is_empty()
+        || !conversation.messages.is_empty()
+        || !user_shells.is_empty()
+        || queued > 0
+}
+
+const PREVIEW_MAX_CHARACTERS: usize = 160;
+
+/// The latest conversation content as one bounded line: the newest reply, or the newest typed
+/// prompt with its text (an image-only prompt reads as an image cue). Tool traffic, thinking and
+/// local notices are skipped; text that only repeats `title` adds nothing.
+pub fn chat_preview(conversation: &ChatSnapshot, title: &str) -> Option<String> {
+    let text = conversation
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            if conversation
+                .message_ids
+                .get(&index)
+                .is_some_and(|id| conversation.agent_message_origins.contains_key(id))
+            {
+                return None;
+            }
+            let texts = message
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    Content::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let text = match message.role {
+                Role::Assistant => texts.last().copied()?.to_owned(),
+                Role::User
+                    if message
+                        .content
+                        .iter()
+                        .any(|content| matches!(content, Content::ToolResult { .. })) =>
+                {
+                    return None;
+                }
+                Role::User if texts.iter().all(|text| text.trim().is_empty()) => {
+                    let images = message
+                        .content
+                        .iter()
+                        .filter(|content| matches!(content, Content::Image { .. }))
+                        .count();
+                    match images {
+                        0 => return None,
+                        1 => "[image]".to_owned(),
+                        images => format!("[{images} images]"),
+                    }
+                }
+                Role::User => texts.join("\n"),
+                _ => return None,
+            };
+            (!text.trim().is_empty()
+                && matches!(
+                    crate::LocalMessage::parse(&text),
+                    None | Some(crate::LocalMessage::AgentCommunication { .. })
+                ))
+            .then_some(text)
+        })?;
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line == title.split_whitespace().collect::<Vec<_>>().join(" ") {
+        return None;
+    }
+    Some(line.chars().take(PREVIEW_MAX_CHARACTERS).collect())
+}
+
+/// The highest `[Image #N]` pasted into a conversation, sent or queued, so a resumed editor
+/// numbers new pastes after it.
+pub(crate) fn highest_pasted_image_id(
+    message_contexts: &BTreeMap<usize, Vec<InputContext>>,
+    pending_inputs: &[PendingInput],
+) -> Option<u32> {
+    message_contexts
+        .values()
+        .chain(pending_inputs.iter().map(|pending| &pending.contexts))
+        .flatten()
+        .filter_map(|context| match context {
+            InputContext::Image(ImageContext {
+                origin: ImageOrigin::Pasted { id },
+                ..
+            }) => Some(*id),
+            _ => None,
+        })
+        .max()
+}
+
+/// The inputs waiting for a turn, in the order they were queued: typed messages, Agent commands
+/// and user Shells.
+pub(crate) fn queued_inputs(
+    pending_inputs: &[PendingInput],
+    pending_commands: &[PendingCommand],
+    user_shells: &[UserShellRecord],
+) -> Vec<QueuedInput> {
+    let mut entries = pending_inputs
+        .iter()
+        .filter(|pending| {
+            pending.trigger_source.is_none()
+                && !pending.task_continuation
+                && pending.agent_message.is_none()
+        })
+        .map(|pending| QueuedInput {
+            id: pending.receipt.run_id,
+            chat_id: pending.receipt.chat_id,
+            loop_id: Some(pending.receipt.loop_id),
+            kind: QueuedInputKind::Message,
+            text: pending.input.clone(),
+            contexts: pending.contexts.clone(),
+            queued_sequence: pending.queued_sequence,
+            armed: pending.armed,
+        })
+        .chain(pending_commands.iter().map(|command| QueuedInput {
+            id: command.id,
+            chat_id: command.chat_id,
+            loop_id: command.loop_id,
+            kind: QueuedInputKind::Command,
+            text: command.command.clone(),
+            contexts: Vec::new(),
+            queued_sequence: command.queued_sequence,
+            armed: command.armed,
+        }))
+        .chain(
+            user_shells
+                .iter()
+                .filter(|record| record.state == UserShellState::Queued)
+                .map(|record| QueuedInput {
+                    id: record.id,
+                    chat_id: record.chat_id,
+                    loop_id: record.loop_id,
+                    kind: QueuedInputKind::Shell,
+                    text: record.command.clone(),
+                    contexts: Vec::new(),
+                    queued_sequence: record.queued_sequence,
+                    armed: record.armed,
+                }),
+        )
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.queued_sequence);
+    entries
 }

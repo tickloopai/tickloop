@@ -585,7 +585,7 @@ fn pinned_state(snapshot: &ChatSnapshot) -> serde_json::Value {
     })
 }
 
-const ESTIMATED_UTF8_BYTES_PER_TOKEN: usize = 2;
+pub(super) const ESTIMATED_UTF8_BYTES_PER_TOKEN: usize = 2;
 const CALIBRATED_USAGE_HEADROOM_PERCENT: u128 = 20;
 /// Anthropic's image token estimate: width × height / 750.
 const IMAGE_PIXELS_PER_TOKEN: usize = 750;

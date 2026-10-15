@@ -3,6 +3,7 @@ use super::*;
 const COMMAND: Uuid = Uuid::from_u128(1);
 const LATER_COMMAND: Uuid = Uuid::from_u128(2);
 const BASH_CALL: &str = "● Bash · Run one failing PTY test";
+const BASH_CALL_ID: &str = "call-bash";
 const HINT: &str = "(ctrl+b to run in background)";
 
 fn control(character: char) -> KeyEvent {
@@ -22,8 +23,18 @@ fn running_bash_console() -> (Console, Instant) {
     state.prompt_enabled = true;
     state.chat = Some(Uuid::from_u128(100));
     let console = super::tests::console_with_state(state);
+    let (dot, call) = BASH_CALL.split_at("● ".len());
     console
-        .write_roles(&[(format!("\n{BASH_CALL}\n"), None)])
+        .write_tool_call(
+            Uuid::from_u128(200),
+            BASH_CALL_ID,
+            &[
+                (dot.to_owned(), Some(Role::MutedText)),
+                (call.to_owned(), None),
+            ],
+            ToolCallState::Running,
+            None,
+        )
         .unwrap();
     console
         .set_activity(Some(
@@ -39,7 +50,7 @@ fn running_bash_console() -> (Console, Instant) {
             .state
             .lock()
             .unwrap()
-            .set_foreground_commands(&[COMMAND], seen)
+            .set_foreground_commands(&[(COMMAND, Some(BASH_CALL_ID.to_owned()))], seen)
     );
     (console, seen)
 }
@@ -78,11 +89,66 @@ fn the_hint_appears_under_the_running_bash_call_once_it_passes_claude_codes_prog
 }
 
 #[test]
+fn the_hint_stays_under_its_bash_call_when_a_message_follows_the_call() {
+    let (console, seen) = running_bash_console();
+    console
+        .write_roles(&[("\n❯ check the logs too\n".to_owned(), None)])
+        .unwrap();
+    console
+        .state
+        .lock()
+        .unwrap()
+        .refresh_foreground_command_hint(seen + FOREGROUND_COMMAND_HINT_DELAY);
+
+    let frame = frame_lines(&console);
+    let call = frame
+        .iter()
+        .position(|line| line.contains(BASH_CALL))
+        .unwrap_or_else(|| panic!("{frame:#?}"));
+    assert_eq!(
+        frame[call + 1].trim_end(),
+        format!("     {HINT}"),
+        "{frame:#?}"
+    );
+    let message = frame
+        .iter()
+        .position(|line| line.contains("check the logs too"))
+        .unwrap_or_else(|| panic!("{frame:#?}"));
+    assert!(call + 1 < message, "{frame:#?}");
+    assert_eq!(
+        frame.iter().filter(|line| line.contains(HINT)).count(),
+        1,
+        "{frame:#?}"
+    );
+
+    assert!(
+        console
+            .state
+            .lock()
+            .unwrap()
+            .set_foreground_commands(&[], seen + FOREGROUND_COMMAND_HINT_DELAY)
+    );
+    let frame = frame_lines(&console);
+    assert!(!frame.iter().any(|line| line.contains(HINT)), "{frame:#?}");
+    let call = frame
+        .iter()
+        .position(|line| line.contains(BASH_CALL))
+        .unwrap_or_else(|| panic!("{frame:#?}"));
+    assert!(frame[call + 1].trim().is_empty(), "{frame:#?}");
+}
+
+#[test]
 fn only_commands_past_the_threshold_move_to_the_background() {
     let (console, seen) = running_bash_console();
     let mut state = console.state.lock().unwrap();
     let later = seen + Duration::from_secs(1);
-    state.set_foreground_commands(&[COMMAND, LATER_COMMAND], later);
+    state.set_foreground_commands(
+        &[
+            (COMMAND, Some(BASH_CALL_ID.to_owned())),
+            (LATER_COMMAND, None),
+        ],
+        later,
+    );
 
     let backgroundable =
         |state: &State, now| state.backgroundable_commands(now).collect::<Vec<_>>();
@@ -94,7 +160,7 @@ fn only_commands_past_the_threshold_move_to_the_background() {
         backgroundable(&state, later + FOREGROUND_COMMAND_HINT_DELAY),
         [COMMAND, LATER_COMMAND]
     );
-    state.set_foreground_commands(&[LATER_COMMAND], later);
+    state.set_foreground_commands(&[(LATER_COMMAND, None)], later);
     assert_eq!(
         backgroundable(&state, later + FOREGROUND_COMMAND_HINT_DELAY),
         [LATER_COMMAND]

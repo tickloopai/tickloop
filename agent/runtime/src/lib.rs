@@ -33,6 +33,7 @@ pub use family::summary_state;
 mod family_mailbox;
 pub use family::{FamilyAgent, FamilyAvailability, FamilyRole};
 mod artifact_ticks;
+mod chat_reads;
 mod chat_settings;
 mod chat_title;
 #[cfg(test)]
@@ -72,6 +73,7 @@ mod triggers;
 mod user_shell;
 #[cfg(test)]
 mod user_shell_tests;
+pub use chat_reads::ChatSummary;
 pub use permission_management::PermissionChangeError;
 pub use shell_task_center::{ShellTaskCenter, ShellTaskSubscription};
 use std::{
@@ -1040,14 +1042,6 @@ impl Agent {
             context.tool_history =
                 approval_context::recovered_tool_history(&snapshot, operation, Some(ancestors));
         }
-        if context.tool_history.capacity_exceeded {
-            return Ok(approval_assessment::ApprovalAssessment::new(
-                &context,
-                AutoReview::ContextLimit,
-                None,
-            )
-            .with_auto_settings(auto_settings.reviewer, &auto_revision));
-        }
         context.creation_receipt = prepared_facts
             .as_ref()
             .filter(|facts| facts.closes_tick)
@@ -1071,6 +1065,7 @@ impl Agent {
         let has_isolated_reviewer = configured_reviewer.is_some();
         let has_judgment_adapter = self.inner.judgment.lock().await.is_some();
         let llm_client = configured_reviewer.unwrap_or(chat_client);
+        let llm_budget = auto_mode::review_budget_bytes(&snapshot);
         let use_jev = preferred == tickloop_agent_protocol::AutoReviewerPreference::Jev
             || (has_judgment_adapter && !has_isolated_reviewer);
         let assess = |run: auto_approval::ReviewerRun,
@@ -1084,7 +1079,7 @@ impl Agent {
         };
         if !use_jev {
             let run = self
-                .review_with_llm(receipt, &context, llm_client, cancel)
+                .review_with_llm(receipt, &context, llm_budget, llm_client, cancel)
                 .await?;
             if emit_permission {
                 self.emit_auto_review_check(receipt, &run.review).await;
@@ -1128,8 +1123,15 @@ impl Agent {
         let mut fallback_reason = skipped_reason;
         if let Some(permit) = permit {
             let run = if let Some(client) = client {
-                self.review_with_jev(receipt, &context, client, deadline, cancel.clone())
-                    .await
+                self.review_with_jev(
+                    receipt,
+                    &context,
+                    jev_review::review_budget_bytes(),
+                    client,
+                    deadline,
+                    cancel.clone(),
+                )
+                .await
             } else {
                 let failure = bind_failure.expect("failed binding has a failure kind");
                 Ok(auto_approval::ReviewerRun::binding_failure(failure))
@@ -1166,7 +1168,7 @@ impl Agent {
             return Err(ModelError::Cancelled.into());
         }
         let mut run = self
-            .review_with_llm(receipt, &context, llm_client, cancel)
+            .review_with_llm(receipt, &context, llm_budget, llm_client, cancel)
             .await?;
         jev_attempts.append(&mut run.attempts);
         run.attempts = jev_attempts;
@@ -2080,6 +2082,7 @@ impl Agent {
                 return Ok(pending_receipt);
             }
         }
+        let continues_ended_loop = matches!(goal.state, LoopState::Failed | LoopState::Interrupted);
         if !matches!(
             goal.state,
             LoopState::Running | LoopState::WaitingPermission | LoopState::WaitingQuestion
@@ -2174,6 +2177,10 @@ impl Agent {
         }
         if let Some(next) = next {
             self.inner.tasks.lock().await.push(self.run_task(next));
+        }
+        // Child completions held for this failed or interrupted Loop arrive once it is continued.
+        if continues_ended_loop {
+            self.flush_subagent_notifications(chat_id).await;
         }
 
         self.inner.input_wakeup.send_replace(());

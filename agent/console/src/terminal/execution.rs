@@ -23,19 +23,19 @@ use tickloop_agent_model::judgment::jev_key_status_in;
 use tickloop_agent_protocol::{
     AccessError, AccessErrorCode, AfterTurnAction, AgentAccess, AgentCommand, AgentDetailQuery,
     AgentFilter, AgentSummary, ApprovalHistoryView, BranchOutcome, BranchRequest, ChatSnapshot,
-    CommandEnvelope, CommandReceipt, CommandResult, CommandSnapshot, CompactionOutcome,
+    ChatStatus, CommandEnvelope, CommandReceipt, CommandResult, CommandSnapshot, CompactionOutcome,
     ConfigurationChange, DirectedSummaryOutcome, DirectedSummaryRequest, DisplayUpdate, Event,
     ExecutionAvailability, ExecutionMode, ExecutionRef, HistoryAction, HostLocation, HostedMember,
-    InputContext, InteractionSource, LaunchSpec, LiveChatSnapshot, LoopAction, LoopState,
-    LoopTriggerNotice, MAX_PAGE_LIMIT, ModelChange, ModelConfig, MonitorMembership, Observation,
-    ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue, OperationRecord,
-    Page, PendingRequestKind, PermissionChange, PermissionRule, PermissionScope,
+    InputContext, InteractionSource, LaunchSpec, LiveChatSnapshot, LiveChatStatus, LoopAction,
+    LoopState, LoopTriggerNotice, MAX_PAGE_LIMIT, ModelChange, ModelConfig, MonitorMembership,
+    Observation, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue,
+    OperationRecord, Page, PendingRequestKind, PermissionChange, PermissionRule, PermissionScope,
     PermissionsRevision, PermissionsView, ProviderCredentialScope, QuestionAnswer, QueuedInput,
     REPLAY_CAPACITY, ReasoningEffort, Receipt, ReceiptState, RequestRef, RewindMode, RewindOutcome,
     SavedChat, ShellTask, ShellTaskOrigin, ShellTaskOutputChunk, TakenBackPrompt, TaskAction,
     TaskNotification, TaskOrigin, TaskRef, TickSubscriptionChange, TickSubscriptionStatus,
     ToolResult, TranscriptRef, Trigger, TriggerSource, UserInput, UserShellReceipt,
-    UserShellRecord, ViewRef, chat_display_title, recover_shell_update_time,
+    UserShellRecord, ViewRef, recover_shell_update_time,
 };
 use tickloop_agent_tools::permissions::{canonical_directory, rule_views, validate_rule};
 
@@ -278,9 +278,15 @@ struct Inner {
     launch: LaunchSpec,
     recovery: Option<RecoveringAgentClient>,
     references: RwLock<HashMap<Uuid, ExecutionRef>>,
+    /// The latest full snapshot of each Chat this View read, for history and for an unreachable
+    /// daemon.
     snapshots: RwLock<HashMap<Uuid, LiveChatSnapshot>>,
+    /// The latest status of each Chat, from a status read or a full snapshot, whichever is newer.
+    statuses: RwLock<HashMap<Uuid, LiveChatStatus>>,
     watching: Mutex<HashSet<ExecutionRef>>,
     events: broadcast::Sender<Event>,
+    /// Chats whose daemon feed skipped events: a Reset or a Resync stands where they would be.
+    feed_gaps: broadcast::Sender<Uuid>,
     event_delivery: Arc<tokio::sync::Mutex<HashMap<Uuid, (ExecutionRef, u64)>>>,
     shells: broadcast::Sender<UserShellRecord>,
     tasks: broadcast::Sender<TaskNotification>,
@@ -340,8 +346,155 @@ impl Inner {
             return Box::new(current.clone());
         }
         references.insert(chat, snapshot.execution);
+        self.remember_status(snapshot.status());
         snapshots.insert(chat, (*snapshot).clone());
         snapshot
+    }
+
+    /// Caches a status the daemon just reported unless the View already holds a newer one; a
+    /// status for an execution this View no longer follows yields the cached one instead.
+    fn cache_status(
+        &self,
+        status: Box<LiveChatStatus>,
+        observed_execution: Option<ExecutionRef>,
+    ) -> Box<LiveChatStatus> {
+        let chat = status.chat.id;
+        let mut references = self.references.write().unwrap();
+        if observed_execution.is_some_and(|expected| references.get(&chat) != Some(&expected)) {
+            return self
+                .statuses
+                .read()
+                .unwrap()
+                .get(&chat)
+                .cloned()
+                .map(Box::new)
+                .unwrap_or(status);
+        }
+        references.insert(chat, status.execution);
+        Box::new(self.remember_status(*status))
+    }
+
+    /// Keeps `status` unless a newer status of the same execution is cached, and returns the one
+    /// kept.
+    fn remember_status(&self, status: LiveChatStatus) -> LiveChatStatus {
+        let mut statuses = self.statuses.write().unwrap();
+        if let Some(current) = statuses.get(&status.chat.id)
+            && current.execution == status.execution
+            && current.chat.last_sequence > status.chat.last_sequence
+        {
+            return current.clone();
+        }
+        statuses.insert(status.chat.id, status.clone());
+        status
+    }
+
+    /// Reads the execution's status again after the daemon reported a change.
+    async fn refresh_status(&self, execution: ExecutionRef) {
+        match self
+            .access
+            .observe(ObservationRequest::Agent {
+                execution,
+                detail: AgentDetailQuery::Status,
+                after: None,
+            })
+            .await
+        {
+            Ok(next) => {
+                if let ObservationValue::Status(status) = next.initial {
+                    self.cache_status(status, Some(execution));
+                    #[cfg(test)]
+                    let _ = self.facts.send(());
+                }
+            }
+            Err(error) => *self.disconnected.lock().unwrap() = Some(error.to_string()),
+        }
+    }
+
+    /// The execution's events after sequence `after`, when the daemon's replay window still
+    /// holds every one of them; `None` when some are gone.
+    async fn missed_events(
+        &self,
+        execution: ExecutionRef,
+        after: u64,
+    ) -> Result<Option<Vec<Event>>, AccessError> {
+        let observation = self
+            .access
+            .observe(ObservationRequest::Agent {
+                execution,
+                detail: AgentDetailQuery::Events { after },
+                after: None,
+            })
+            .await?;
+        let ObservationValue::Events(events) = observation.initial else {
+            return Err(unexpected());
+        };
+        Ok(events
+            .first()
+            .is_none_or(|first| first.sequence <= after.saturating_add(1))
+            .then_some(events))
+    }
+}
+
+/// Forwards one execution's feed events to the View in sequence order, each at most once,
+/// whether the feed carried it or it was read after a Resync.
+struct EventForwarder {
+    execution: ExecutionRef,
+    events: broadcast::Sender<Event>,
+    event_delivery: Arc<tokio::sync::Mutex<HashMap<Uuid, (ExecutionRef, u64)>>>,
+    /// Reports to recovery tests what happened to each event.
+    #[cfg(test)]
+    weak: std::sync::Weak<Inner>,
+    /// The latest event the feed accounted for: forwarded, or reflected in its first answer.
+    forwarded_through: u64,
+}
+
+impl EventForwarder {
+    /// Forwards `event` unless it was already accounted for or a recovery covers it; `false` once
+    /// the View is closing.
+    async fn forward(&mut self, event: Event, cancel: &CancellationToken) -> bool {
+        if event.sequence <= self.forwarded_through {
+            return true;
+        }
+        self.forwarded_through = event.sequence;
+        let covered = tokio::select! {
+            _ = cancel.cancelled() => return false,
+            covered = self.event_delivery.lock() => covered,
+        };
+        if covered
+            .get(&event.chat_id)
+            .is_some_and(|(scope, sequence)| {
+                *scope == self.execution && event.sequence <= *sequence
+            })
+        {
+            #[cfg(test)]
+            if let Some(inner) = self.weak.upgrade()
+                && let Some(sender) = &*inner.recovery_probe.lock().unwrap()
+            {
+                let _ = sender.send(super::recovery_tests::RecoveryFact::Skipped {
+                    chat: event.chat_id,
+                    run: event.run_id,
+                    sequence: event.sequence,
+                    completed: matches!(
+                        event.kind,
+                        tickloop_agent_protocol::EventKind::Completed { .. }
+                    ),
+                });
+            }
+            return true;
+        }
+        #[cfg(test)]
+        let fact = super::recovery_tests::RecoveryFact::Forwarded {
+            chat: event.chat_id,
+            sequence: event.sequence,
+        };
+        let _ = self.events.send(event);
+        #[cfg(test)]
+        if let Some(inner) = self.weak.upgrade()
+            && let Some(sender) = &*inner.recovery_probe.lock().unwrap()
+        {
+            let _ = sender.send(fact);
+        }
+        true
     }
 }
 
@@ -447,8 +600,10 @@ impl ConsoleExecution {
                 recovery: None,
                 references: RwLock::new(HashMap::new()),
                 snapshots: RwLock::new(HashMap::new()),
+                statuses: RwLock::new(HashMap::new()),
                 watching: Mutex::new(HashSet::new()),
                 events: broadcast::channel(REPLAY_CAPACITY).0,
+                feed_gaps: broadcast::channel(REPLAY_CAPACITY).0,
                 event_delivery: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 shells: broadcast::channel(REPLAY_CAPACITY).0,
                 tasks: broadcast::channel(REPLAY_CAPACITY).0,
@@ -653,19 +808,17 @@ impl ConsoleExecution {
         }
     }
 
-    /// The Agent and title `chat` had in the latest snapshot this View received; `None` before any.
+    /// The Agent and title `chat` had in the latest status this View received; `None` before any.
     pub(super) fn cached_title(&self, chat: Uuid) -> Option<(Uuid, String)> {
-        let snapshots = self.inner.snapshots.read().unwrap();
-        let snapshot = snapshots.get(&chat)?;
+        let statuses = self.inner.statuses.read().unwrap();
+        let status = statuses.get(&chat)?;
         Some((
-            snapshot.execution.agent_id,
-            snapshot
+            status.execution.agent_id,
+            status
                 .subagent
                 .as_ref()
                 .map(|registration| registration.handle.clone())
-                .unwrap_or_else(|| {
-                    chat_display_title(&snapshot.conversation, &snapshot.user_shells)
-                }),
+                .unwrap_or_else(|| status.chat.display_title()),
         ))
     }
 
@@ -673,39 +826,39 @@ impl ConsoleExecution {
         self.cached_delegation(chat).unwrap_or(false)
     }
 
-    /// Whether `chat` is a delegated child, from the latest snapshot this View received; `None`
-    /// before any. A Chat stays the root or child it was created as, so any snapshot answers.
+    /// Whether `chat` is a delegated child, from the latest status this View received; `None`
+    /// before any. A Chat stays the root or child it was created as, so any status answers.
     fn cached_delegation(&self, chat: Uuid) -> Option<bool> {
         self.inner
-            .snapshots
+            .statuses
             .read()
             .unwrap()
             .get(&chat)
-            .map(|snapshot| snapshot.conversation.delegation.is_some())
+            .map(|status| status.chat.delegation.is_some())
     }
 
     pub(super) fn cached_pending_plan_approvals(
         &self,
         chat: Uuid,
     ) -> Option<(ExecutionRef, Vec<(Uuid, u64)>)> {
-        let snapshots = self.inner.snapshots.read().unwrap();
-        let snapshot = snapshots.get(&chat)?;
+        let statuses = self.inner.statuses.read().unwrap();
+        let status = statuses.get(&chat)?;
         Some((
-            snapshot.execution,
-            snapshot
-                .conversation
+            status.execution,
+            status
+                .chat
                 .plans
                 .iter()
                 .filter(|plan| {
                     plan.approval_pending
-                        && snapshot.conversation.loops.iter().any(|goal| {
+                        && status.chat.loops.iter().any(|goal| {
                             goal.id == plan.loop_id
                                 && matches!(
                                     goal.state,
                                     LoopState::WaitingPlan | LoopState::Interrupted
                                 )
                         })
-                        && !snapshot.permissions.iter().any(|request| {
+                        && !status.chat.permissions.iter().any(|request| {
                             request.name == tickloop_agent_tools::EXIT_PLAN_MODE_TOOL_NAME
                                 && request.loop_id == plan.loop_id
                         })
@@ -721,9 +874,9 @@ impl ConsoleExecution {
         loop_id: Uuid,
         version: u64,
     ) -> Option<bool> {
-        let snapshots = self.inner.snapshots.read().unwrap();
-        let snapshot = snapshots.get(&chat)?;
-        Some(snapshot.conversation.plans.iter().any(|plan| {
+        let statuses = self.inner.statuses.read().unwrap();
+        let status = statuses.get(&chat)?;
+        Some(status.chat.plans.iter().any(|plan| {
             plan.loop_id == loop_id && plan.version == version && plan.approval_pending
         }))
     }
@@ -1154,7 +1307,7 @@ impl ConsoleExecution {
             .access
             .observe(ObservationRequest::Agent {
                 execution,
-                detail: AgentDetailQuery::Snapshot,
+                detail: AgentDetailQuery::Status,
                 after: None,
             })
             .await
@@ -1165,11 +1318,21 @@ impl ConsoleExecution {
                 return Err(error);
             }
         };
-        if let ObservationValue::Agent(snapshot) = observation.initial.clone() {
-            self.inner.cache_snapshot(snapshot, Some(execution));
-        }
-        let events = self.inner.events.clone();
-        let event_delivery = self.inner.event_delivery.clone();
+        let ObservationValue::Status(status) = observation.initial.clone() else {
+            self.inner.watching.lock().unwrap().remove(&execution);
+            return Err(unexpected());
+        };
+        let chat = status.chat.id;
+        let mut forwarder = EventForwarder {
+            execution,
+            events: self.inner.events.clone(),
+            event_delivery: self.inner.event_delivery.clone(),
+            #[cfg(test)]
+            weak: Arc::downgrade(&self.inner),
+            forwarded_through: status.chat.last_sequence,
+        };
+        self.inner.cache_status(status, Some(execution));
+        let feed_gaps = self.inner.feed_gaps.clone();
         let shells = self.inner.shells.clone();
         let tasks = self.inner.tasks.clone();
         let cancel = self.inner.cancel.clone();
@@ -1182,43 +1345,8 @@ impl ConsoleExecution {
                         change: ObservationChange::Event(event),
                         ..
                     }) => {
-                        let covered = tokio::select! {
-                            _ = cancel.cancelled() => break,
-                            covered = event_delivery.lock() => covered,
-                        };
-                        if covered
-                            .get(&event.chat_id)
-                            .is_some_and(|(scope, sequence)| {
-                                *scope == execution && event.sequence <= *sequence
-                            })
-                        {
-                            #[cfg(test)]
-                            if let Some(inner) = weak.upgrade()
-                                && let Some(sender) = &*inner.recovery_probe.lock().unwrap()
-                            {
-                                let _ = sender.send(super::recovery_tests::RecoveryFact::Skipped {
-                                    chat: event.chat_id,
-                                    run: event.run_id,
-                                    sequence: event.sequence,
-                                    completed: matches!(
-                                        event.kind,
-                                        tickloop_agent_protocol::EventKind::Completed { .. }
-                                    ),
-                                });
-                            }
-                            continue;
-                        }
-                        #[cfg(test)]
-                        let fact = super::recovery_tests::RecoveryFact::Forwarded {
-                            chat: event.chat_id,
-                            sequence: event.sequence,
-                        };
-                        let _ = events.send(event);
-                        #[cfg(test)]
-                        if let Some(inner) = weak.upgrade()
-                            && let Some(sender) = &*inner.recovery_probe.lock().unwrap()
-                        {
-                            let _ = sender.send(fact);
+                        if !forwarder.forward(event, &cancel).await {
+                            break;
                         }
                     }
                     Ok(ObservationUpdate {
@@ -1233,12 +1361,17 @@ impl ConsoleExecution {
                     }) => {
                         let _ = tasks.send(task);
                     }
+                    // The events the Reset stands for never arrive; the gap is announced before
+                    // anything the feed forwards after it.
                     Ok(ObservationUpdate {
                         change: ObservationChange::Reset { snapshot, .. },
                         ..
                     }) => {
                         if let Some(inner) = weak.upgrade() {
+                            forwarder.forwarded_through =
+                                forwarder.forwarded_through.max(snapshot.last_sequence);
                             inner.cache_snapshot(snapshot, Some(execution));
+                            let _ = feed_gaps.send(chat);
                             #[cfg(test)]
                             let _ = inner.facts.send(());
                         }
@@ -1247,33 +1380,55 @@ impl ConsoleExecution {
                         change: ObservationChange::AccountModels(_),
                         ..
                     }) => {}
+                    // A Resync stands for a change too large for the feed, such as an event with
+                    // a long tool result or a Reset with its snapshot. The events it skipped are
+                    // read by sequence; only events gone from the daemon's replay window leave a
+                    // gap for the View to restore from a snapshot.
                     Ok(ObservationUpdate {
-                        change: ObservationChange::Changed | ObservationChange::Resync { .. },
+                        change: ObservationChange::Resync { .. },
                         ..
                     }) => {
                         let Some(inner) = weak.upgrade() else {
                             break;
                         };
                         match inner
-                            .access
-                            .observe(ObservationRequest::Agent {
-                                execution,
-                                detail: AgentDetailQuery::Snapshot,
-                                after: None,
-                            })
+                            .missed_events(execution, forwarder.forwarded_through)
                             .await
                         {
-                            Ok(next) => {
-                                if let ObservationValue::Agent(snapshot) = next.initial {
-                                    inner.cache_snapshot(snapshot, Some(execution));
-                                    #[cfg(test)]
-                                    let _ = inner.facts.send(());
+                            Ok(Some(missed)) => {
+                                drop(inner);
+                                let mut forwarded = true;
+                                for event in missed {
+                                    forwarded = forwarder.forward(event, &cancel).await;
+                                    if !forwarded {
+                                        break;
+                                    }
                                 }
+                                if !forwarded {
+                                    break;
+                                }
+                            }
+                            Ok(None) => {
+                                let _ = feed_gaps.send(chat);
                             }
                             Err(error) => {
                                 *inner.disconnected.lock().unwrap() = Some(error.to_string());
+                                let _ = feed_gaps.send(chat);
                             }
                         }
+                        let Some(inner) = weak.upgrade() else {
+                            break;
+                        };
+                        inner.refresh_status(execution).await;
+                    }
+                    Ok(ObservationUpdate {
+                        change: ObservationChange::Changed,
+                        ..
+                    }) => {
+                        let Some(inner) = weak.upgrade() else {
+                            break;
+                        };
+                        inner.refresh_status(execution).await;
                     }
                     Err(error) => {
                         if let Some(inner) = weak.upgrade() {
@@ -1286,6 +1441,11 @@ impl ConsoleExecution {
             }
         });
         Ok(())
+    }
+
+    /// Whether this View follows `execution`'s feed, so its events arrive as they happen.
+    pub(super) fn follows(&self, execution: ExecutionRef) -> bool {
+        self.inner.watching.lock().unwrap().contains(&execution)
     }
 
     pub(super) async fn pause_event_delivery(&self) -> EventRecovery {
@@ -1303,6 +1463,11 @@ impl ConsoleExecution {
     pub(super) fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.inner.events.subscribe()
     }
+    /// Chats whose daemon feed skipped events. Each gap arrives before any event the feed
+    /// forwards after it.
+    pub(super) fn subscribe_feed_gaps(&self) -> broadcast::Receiver<Uuid> {
+        self.inner.feed_gaps.subscribe()
+    }
     pub(super) fn subscribe_user_shells(&self) -> broadcast::Receiver<UserShellRecord> {
         self.inner.shells.subscribe()
     }
@@ -1310,24 +1475,79 @@ impl ConsoleExecution {
         self.inner.tasks.subscribe()
     }
 
+    /// The Chat with its whole history: for opening, restoring or rewinding it and for results
+    /// drawn from the conversation. State alone comes from `status`.
     pub(super) async fn snapshot(&self, chat: Uuid) -> Result<ChatSnapshot, AccessError> {
         self.live_snapshot(chat)
             .await
             .map(|snapshot| snapshot.into_snapshot())
     }
 
-    /// The snapshot the daemon reports now. Unlike `snapshot`, an unreachable daemon is an error
+    /// What the Chat is doing now, without its history. An unreachable daemon answers with the
+    /// cached status, as `snapshot` does.
+    pub(super) async fn status(&self, chat: Uuid) -> Result<ChatStatus, AccessError> {
+        match self.observed_value(chat, AgentDetailQuery::Status).await {
+            Ok((execution, value)) => self.adopt_status(execution, value).await,
+            Err(error) => {
+                *self.inner.disconnected.lock().unwrap() = Some(error.to_string());
+                self.inner
+                    .statuses
+                    .read()
+                    .unwrap()
+                    .get(&chat)
+                    .map(|status| status.chat.clone())
+                    .ok_or(error)
+            }
+        }
+    }
+
+    /// The status the daemon reports now. Unlike `status`, an unreachable daemon is an error
     /// rather than the cached copy, so the answer can prove that a run has ended.
-    pub(super) async fn current_snapshot(&self, chat: Uuid) -> Result<ChatSnapshot, AccessError> {
+    pub(super) async fn current_status(&self, chat: Uuid) -> Result<ChatStatus, AccessError> {
         let (execution, value) = self
-            .observed_value(chat, AgentDetailQuery::Snapshot)
+            .observed_value(chat, AgentDetailQuery::Status)
             .await
             .inspect_err(|error| {
                 *self.inner.disconnected.lock().unwrap() = Some(error.to_string());
             })?;
-        self.adopt_snapshot(execution, value)
-            .await
-            .map(|snapshot| snapshot.into_snapshot())
+        self.adopt_status(execution, value).await
+    }
+
+    /// Caches a status the daemon just reported and keeps following its execution.
+    async fn adopt_status(
+        &self,
+        execution: ExecutionRef,
+        value: ObservationValue,
+    ) -> Result<ChatStatus, AccessError> {
+        let ObservationValue::Status(status) = value else {
+            return Err(unexpected());
+        };
+        *self.inner.disconnected.lock().unwrap() = None;
+        let status = self.inner.cache_status(status, Some(execution));
+        self.watch(status.execution).await?;
+        Ok(status.chat)
+    }
+
+    /// The tool operation `run` recorded last for `call_id`.
+    pub(super) async fn operation(
+        &self,
+        chat: Uuid,
+        run_id: Uuid,
+        call_id: &str,
+    ) -> Result<Option<OperationRecord>, AccessError> {
+        match self
+            .value(
+                chat,
+                AgentDetailQuery::Operation {
+                    run_id,
+                    call_id: call_id.to_owned(),
+                },
+            )
+            .await?
+        {
+            ObservationValue::Operation(operation) => Ok(operation.map(|operation| *operation)),
+            _ => Err(unexpected()),
+        }
     }
 
     pub(super) async fn live_snapshot(
@@ -1639,7 +1859,7 @@ impl ConsoleExecution {
         Ok(match step {
             ReplayStep::ExecutionMode(mode) => ConfigurationChange::ExecutionMode { mode },
             ReplayStep::Directories(additional) => ConfigurationChange::Directories {
-                workdir: self.snapshot(chat).await?.workdir,
+                workdir: self.status(chat).await?.workdir,
                 additional,
             },
             ReplayStep::Rule(change) => ConfigurationChange::PermissionChange {
@@ -1735,7 +1955,7 @@ impl ConsoleExecution {
         target: ConfigTarget,
     ) -> Result<AgentConfiguration, AccessError> {
         match target {
-            ConfigTarget::Agent(chat) => Ok(AgentConfiguration::of(&self.snapshot(chat).await?)),
+            ConfigTarget::Agent(chat) => Ok(AgentConfiguration::of(&self.status(chat).await?)),
             ConfigTarget::NewDraft => {
                 let base = self.new_agent_defaults();
                 Ok(self.inner.draft.lock().unwrap().configuration(base))
@@ -2476,7 +2696,7 @@ impl ConsoleExecution {
     async fn preflight(&self, chat: Uuid, change: &ConfigurationChange) -> Result<(), AccessError> {
         let delegated = match self.cached_delegation(chat) {
             Some(delegated) => delegated,
-            None => self.snapshot(chat).await?.delegation.is_some(),
+            None => self.status(chat).await?.delegation.is_some(),
         };
         match unavailable_change(delegated, change) {
             Some(reason) => Err(AccessError::invalid(format!("Unavailable: {reason}"))),
@@ -2642,12 +2862,12 @@ impl ConsoleExecution {
         id: Uuid,
         kind: PendingRequestKind,
     ) -> Result<RequestRef, AccessError> {
-        self.snapshot(chat).await?;
-        let snapshots = self.inner.snapshots.read().unwrap();
-        snapshots
+        self.status(chat).await?;
+        let statuses = self.inner.statuses.read().unwrap();
+        statuses
             .get(&chat)
-            .and_then(|snapshot| {
-                snapshot
+            .and_then(|status| {
+                status
                     .request_refs
                     .iter()
                     .find(|request| request.request_id == id && request.kind == kind)
@@ -2792,7 +3012,7 @@ impl ConsoleExecution {
             {
                 continue;
             }
-            for goal in self.snapshot(row.chat_id).await?.loops {
+            for goal in self.status(row.chat_id).await?.loops {
                 if !goal.event_sources.is_empty() {
                     self.loop_command(
                         row.chat_id,
@@ -3393,7 +3613,7 @@ impl ConsoleExecution {
     ) -> Result<CommandSnapshot, AccessError> {
         self.control_task(chat, id, TaskOrigin::Agent, false)
             .await?;
-        self.snapshot(chat)
+        self.status(chat)
             .await?
             .commands
             .into_iter()
@@ -3406,7 +3626,7 @@ impl ConsoleExecution {
         id: Uuid,
     ) -> Result<CommandSnapshot, AccessError> {
         self.control_task(chat, id, TaskOrigin::Agent, true).await?;
-        self.snapshot(chat)
+        self.status(chat)
             .await?
             .commands
             .into_iter()
@@ -3414,7 +3634,7 @@ impl ConsoleExecution {
             .ok_or_else(|| AccessError::not_found("command does not exist"))
     }
     pub(super) async fn commands(&self, chat: Uuid) -> Result<Vec<CommandSnapshot>, AccessError> {
-        Ok(self.snapshot(chat).await?.commands)
+        Ok(self.status(chat).await?.commands)
     }
     pub(super) async fn background_user_shell(
         &self,
@@ -3422,7 +3642,7 @@ impl ConsoleExecution {
         id: Uuid,
     ) -> Result<UserShellRecord, AccessError> {
         self.control_task(chat, id, TaskOrigin::User, false).await?;
-        self.snapshot(chat)
+        self.status(chat)
             .await?
             .user_shells
             .into_iter()
@@ -3435,7 +3655,7 @@ impl ConsoleExecution {
         id: Uuid,
     ) -> Result<UserShellRecord, AccessError> {
         self.control_task(chat, id, TaskOrigin::User, true).await?;
-        self.snapshot(chat)
+        self.status(chat)
             .await?
             .user_shells
             .into_iter()
@@ -3510,7 +3730,7 @@ impl ConsoleExecution {
         match self.value(chat, AgentDetailQuery::Tasks).await? {
             ObservationValue::Tasks(mut tasks) => {
                 if tasks.iter().any(|task| task.updated_at_ms.is_none()) {
-                    let snapshot = self.snapshot(chat).await?;
+                    let snapshot = self.status(chat).await?;
                     for task in tasks.iter_mut().filter(|task| task.updated_at_ms.is_none()) {
                         task.updated_at_ms = match task.origin {
                             ShellTaskOrigin::User => snapshot
@@ -3602,11 +3822,11 @@ impl ConsoleExecution {
     }
     pub(super) fn user_settings_warnings(&self, chat: Uuid) -> Vec<String> {
         self.inner
-            .snapshots
+            .statuses
             .read()
             .unwrap()
             .get(&chat)
-            .map(|snapshot| snapshot.warnings.clone())
+            .map(|status| status.warnings.clone())
             .unwrap_or_default()
     }
     pub(super) fn transcript_load_warnings(&self, chat: Uuid) -> Vec<String> {
@@ -3614,19 +3834,19 @@ impl ConsoleExecution {
     }
     pub(super) fn transcript_write_error(&self) -> Option<String> {
         self.inner
-            .snapshots
+            .statuses
             .read()
             .unwrap()
             .values()
-            .find_map(|snapshot| snapshot.transcript_write_error.clone())
+            .find_map(|status| status.transcript_write_error.clone())
     }
     pub(super) fn loop_trigger_notices(&self) -> Vec<LoopTriggerNotice> {
         self.inner
-            .snapshots
+            .statuses
             .read()
             .unwrap()
             .values()
-            .flat_map(|snapshot| snapshot.loop_trigger_notices.clone())
+            .flat_map(|status| status.loop_trigger_notices.clone())
             .collect()
     }
     #[cfg(test)]

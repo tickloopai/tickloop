@@ -160,17 +160,24 @@ pub async fn serve_responses_with_gated_responses(
 pub async fn serve_router(
     mut reply: impl FnMut(&Value) -> String + Send + 'static,
 ) -> (String, mpsc::UnboundedReceiver<(String, Value)>) {
+    serve_router_with_status(move |request| (200, reply(request))).await
+}
+
+/// Routes each request to the status and body `reply` chooses for it.
+pub async fn serve_router_with_status(
+    mut reply: impl FnMut(&Value) -> (u16, String) + Send + 'static,
+) -> (String, mpsc::UnboundedReceiver<(String, Value)>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (sender, receiver) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         loop {
             let (mut socket, request) = accept_script_request(&listener).await;
-            let response = reply(&request.1);
+            let (status, response) = reply(&request.1);
             if sender.send(request).is_err() {
                 break;
             }
-            write_response(&mut socket, 200, "", &response).await;
+            write_response(&mut socket, status, "", &response).await;
         }
     });
     (format!("http://{address}/anthropic"), receiver)

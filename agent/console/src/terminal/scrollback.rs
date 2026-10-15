@@ -23,6 +23,8 @@ const DEFAULT_WIDTH: usize = 80;
 const DEFAULT_HEIGHT: usize = 22;
 /// Rows of a `⎿` response wrap under its content: two spaces, `⎿` and two spaces.
 const RESPONSE_HANG: usize = 5;
+/// Rows of a block's body wrap under its two-space indent.
+const BODY_HANG: usize = 2;
 const EXPAND_HINT: &str = " (ctrl+o to expand)";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,6 +38,8 @@ pub(super) enum ScrollAction {
 }
 
 pub(super) struct ScrollFrame {
+    /// The row of the conversation and its tail drawn first.
+    pub(super) top: usize,
     pub(super) lines: Vec<String>,
     /// The same rows as `lines`, described by role.
     pub(super) styled: Vec<RoleLine>,
@@ -175,6 +179,14 @@ struct Block {
 
 /// Names one input echo in one scrollback. It means nothing to any other scrollback, including
 /// the fresh one a reset or reload puts in its place.
+/// What moves the model's running Bash calls to the background, and the calls it sits under; a
+/// command whose call is unknown has `None`.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ForegroundCommandHint {
+    pub(super) line: RoleLine,
+    pub(super) calls: Vec<Option<String>>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct InputEcho {
     scrollback: u64,
@@ -189,6 +201,8 @@ pub(super) struct Scrollback {
     line_styles: Vec<LineStyle>,
     block: Option<Block>,
     rows: Vec<Row>,
+    /// Rows of the conversation itself, without the blank rows that end it; kept with `rows`.
+    conversation_rows: usize,
     dirty_from: Option<usize>,
     width: usize,
     height: usize,
@@ -203,8 +217,10 @@ pub(super) struct Scrollback {
     activity_details: Vec<RoleLine>,
     /// The latest output of a running `!` command, drawn under its echo until it ends.
     shell_preview: Vec<RoleLine>,
-    /// What moves the model's running Bash call to the background, drawn under it.
-    foreground_command_hint: Option<RoleLine>,
+    /// What moves the model's running Bash calls to the background.
+    foreground_command_hint: Option<ForegroundCommandHint>,
+    /// The hint's logical lines under the calls' rows; they are hidden once it goes.
+    foreground_command_hint_lines: Vec<usize>,
     /// Header lines of tool calls still executing, by call id.
     running_tool_calls: HashMap<String, usize>,
     tool_call_headers: HashMap<String, ToolCallHeader>,
@@ -226,6 +242,7 @@ impl Default for Scrollback {
             line_styles: vec![LineStyle::default()],
             block: None,
             rows: Vec::new(),
+            conversation_rows: 0,
             dirty_from: Some(0),
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
@@ -238,6 +255,7 @@ impl Default for Scrollback {
             activity_details: Vec::new(),
             shell_preview: Vec::new(),
             foreground_command_hint: None,
+            foreground_command_hint_lines: Vec::new(),
             running_tool_calls: HashMap::new(),
             tool_call_headers: HashMap::new(),
             running_shimmer: RunningShimmer::default(),
@@ -328,10 +346,18 @@ impl Scrollback {
         }
         self.mark_last_line_dirty();
         let mut segment_start = self.lines.last().unwrap().len();
+        let mut line_started_here = false;
         for character in text.chars() {
             if character == '\n' {
+                // A blank line inside filled text keeps the fill, as Claude Code's message box
+                // paints its background behind every line it holds; a line this text did not
+                // start keeps its own.
+                if fill.is_some() && line_started_here {
+                    self.line_styles.last_mut().unwrap().fill = fill;
+                }
                 self.close_segment(segment_start, role, link);
                 self.start_line();
+                line_started_here = true;
                 segment_start = self.lines.last().unwrap().len();
                 continue;
             }
@@ -423,15 +449,6 @@ impl Scrollback {
         self.separate_block();
     }
 
-    /// Appends `text` as a block that leaves an open read or search group open, as Claude Code
-    /// lets a thinking block pass a collapsed group without ending it.
-    pub(super) fn append_aside(&mut self, text: &str, role: Option<Role>) {
-        let open_group = self.open_group;
-        self.separate_block();
-        self.append_as(text, role, None);
-        self.open_group = open_group;
-    }
-
     fn separate_block(&mut self) {
         if !self.lines.last().unwrap().is_empty() || self.last_line_is_markdown() {
             self.start_line();
@@ -451,13 +468,22 @@ impl Scrollback {
     /// Appends `⎿` response rows at the end of the conversation, each wrapping under its
     /// content.
     pub(super) fn append_response(&mut self, runs: &[(String, Option<Role>)]) {
+        self.append_rows(runs, RESPONSE_HANG);
+    }
+
+    /// Appends a block's body rows, indented under its heading, each wrapping under its indent.
+    pub(super) fn append_body(&mut self, runs: &[(String, Option<Role>)]) {
+        self.append_rows(runs, BODY_HANG);
+    }
+
+    fn append_rows(&mut self, runs: &[(String, Option<Role>)], hang: usize) {
         let first_line = self.lines.len() - 1 + usize::from(self.last_line_is_markdown());
         for (text, role) in runs {
             self.append_linked_runs(text, *role);
         }
         let last_line = self.lines.len() - usize::from(self.lines.last().unwrap().is_empty());
         for style in &mut self.line_styles[first_line.min(last_line)..last_line] {
-            style.hang = RESPONSE_HANG;
+            style.hang = hang;
         }
     }
 
@@ -514,6 +540,9 @@ impl Scrollback {
         }
         for group in &mut self.groups {
             shift(&mut group.line);
+        }
+        for line in &mut self.foreground_command_hint_lines {
+            shift(line);
         }
         let shift_range = |range: &mut Range<usize>| {
             if range.start >= at {
@@ -850,13 +879,51 @@ impl Scrollback {
         true
     }
 
-    /// Returns whether the hint changed.
-    pub(super) fn set_foreground_command_hint(&mut self, hint: Option<RoleLine>) -> bool {
+    /// Draws the hint under the row of each call it names, after the results the call already
+    /// has, so later messages and calls stay below it; a call without a row here has it below the
+    /// conversation. Returns whether the hint changed.
+    pub(super) fn set_foreground_command_hint(
+        &mut self,
+        hint: Option<ForegroundCommandHint>,
+    ) -> bool {
         if self.foreground_command_hint == hint {
             return false;
         }
+        for line in std::mem::take(&mut self.foreground_command_hint_lines) {
+            self.hide_lines(line..line + 1);
+        }
+        if let Some(hint) = &hint {
+            let runs: Vec<_> = hint
+                .line
+                .spans
+                .iter()
+                .map(|span| (span.text.clone(), span.role))
+                .collect();
+            for call in hint.calls.iter().flatten() {
+                let Some(at) = self.call_row_end(call) else {
+                    continue;
+                };
+                let mut row = Scrollback::new();
+                row.append_response(&runs);
+                row.lines.truncate(1);
+                row.line_styles.truncate(1);
+                self.insert_lines(at, row.lines, row.line_styles);
+                if let Some(header) = self.tool_call_headers.get_mut(call) {
+                    header.results_end = at;
+                }
+                self.foreground_command_hint_lines.push(at);
+            }
+        }
         self.foreground_command_hint = hint;
         true
+    }
+
+    /// Where the next result of `call` goes, when the call has a row of its own here.
+    fn call_row_end(&self, call: &str) -> Option<usize> {
+        self.tool_call_headers
+            .get(call)
+            .filter(|header| header.collapse.is_none())
+            .map(|header| header.results_end)
     }
 
     pub(super) fn shows_foreground_command_hint(&self) -> bool {
@@ -959,6 +1026,7 @@ impl Scrollback {
             );
         }
         self.rows.clear();
+        self.conversation_rows = 0;
         self.dirty_from = Some(0);
     }
 
@@ -1025,6 +1093,7 @@ impl Scrollback {
     ) -> ScrollFrame {
         if width == 0 || height == 0 {
             return ScrollFrame {
+                top: 0,
                 lines: Vec::new(),
                 styled: Vec::new(),
                 following: self.following,
@@ -1032,17 +1101,17 @@ impl Scrollback {
             };
         }
         self.prepare_frame(width, height);
-        let top = self.top_row();
-        if top.saturating_add(height) >= self.row_count() {
-            self.unread = 0;
-        }
+        // Only the rows the window shows are copied, so a frame costs its height whatever the
+        // length of the conversation above it.
+        let tail = self.tail_rows();
+        let row_count = self.conversation_rows + tail.len();
+        let top = self.top_row_within(row_count);
+        let end = top.saturating_add(height).min(row_count);
+        let conversation_end = end.min(self.conversation_rows);
         let running_tool_rows = self.running_tool_rows();
-        let conversation_rows = self.conversation_rows();
-        let styled: Vec<RoleLine> = self.rows[..conversation_rows]
-            .iter()
-            .enumerate()
-            .map(|(index, row)| {
-                let mut styled = row.styled.clone();
+        let styled: Vec<RoleLine> = (top.min(conversation_end)..conversation_end)
+            .map(|index| {
+                let mut styled = self.rows[index].styled.clone();
                 if running_tool_rows.contains(&index) {
                     let spans = std::mem::take(&mut styled.spans);
                     for span in spans {
@@ -1059,11 +1128,18 @@ impl Scrollback {
                 }
                 styled
             })
-            .chain(self.tail_rows())
-            .skip(top)
-            .take(height)
+            .chain(
+                tail[top.saturating_sub(self.conversation_rows)
+                    ..end.saturating_sub(self.conversation_rows)]
+                    .iter()
+                    .map(|row| row.styled(self.width)),
+            )
             .collect();
+        if end == row_count {
+            self.unread = 0;
+        }
         ScrollFrame {
+            top,
             lines: styled.iter().map(RoleLine::text).collect(),
             styled,
             following: self.following,
@@ -1071,42 +1147,46 @@ impl Scrollback {
         }
     }
 
-    /// Rows of the conversation itself, without the blank rows that end it.
-    fn conversation_rows(&self) -> usize {
-        self.rows
-            .iter()
-            .rposition(|row| !row.is_blank())
-            .map_or(0, |last| last + 1)
+    /// Text of the rows in `range`, numbered as a frame numbers them: the conversation, then its
+    /// tail. Rows past the end are left out.
+    pub(super) fn row_texts(&mut self, range: Range<usize>) -> Vec<String> {
+        self.refresh_rows();
+        let tail = self.tail_rows();
+        range
+            .map_while(|index| match index.checked_sub(self.conversation_rows) {
+                None => Some(self.rows[index].styled.text()),
+                Some(tail_index) => Some(tail.get(tail_index)?.styled(self.width).text()),
+            })
+            .collect()
     }
 
     /// The rows below the conversation: a running command's output under its echo and the hint
     /// for a running Bash call, the live activity and its details as a block of their own, then
     /// the blank row that keeps everything above clear of the input.
-    fn tail_rows(&self) -> Vec<RoleLine> {
-        let mut rows: Vec<RoleLine> = self
+    fn tail_rows(&self) -> Vec<TailRow<'_>> {
+        let unplaced_hint = self.foreground_command_hint.as_ref().filter(|hint| {
+            hint.calls.iter().any(|call| {
+                call.as_deref()
+                    .and_then(|call| self.call_row_end(call))
+                    .is_none()
+            })
+        });
+        let mut rows: Vec<TailRow> = self
             .shell_preview
             .iter()
-            .chain(&self.foreground_command_hint)
-            .map(|row| {
-                let mut row = row.clone();
-                row.truncate(self.width);
-                row
-            })
+            .chain(unplaced_hint.map(|hint| &hint.line))
+            .map(TailRow::Clipped)
             .collect();
-        let has_conversation = self.conversation_rows() > 0 || !rows.is_empty();
+        let has_conversation = self.conversation_rows > 0 || !rows.is_empty();
         if self.activity.is_some() || !self.activity_details.is_empty() {
             if has_conversation {
-                rows.push(RoleLine::default());
+                rows.push(TailRow::Blank);
             }
-            if let Some(activity) = &self.activity {
-                let mut activity = activity.clone();
-                activity.truncate(self.width);
-                rows.push(activity);
-            }
-            rows.extend(self.activity_details.clone());
+            rows.extend(self.activity.as_ref().map(TailRow::Clipped));
+            rows.extend(self.activity_details.iter().map(TailRow::Whole));
         }
         if has_conversation || !rows.is_empty() {
-            rows.push(RoleLine::default());
+            rows.push(TailRow::Blank);
         }
         rows
     }
@@ -1121,7 +1201,7 @@ impl Scrollback {
     }
 
     fn row_count(&self) -> usize {
-        self.conversation_rows() + self.tail_rows().len()
+        self.conversation_rows + self.tail_rows().len()
     }
 
     fn running_tool_rows(&self) -> HashSet<usize> {
@@ -1193,8 +1273,14 @@ impl Scrollback {
         self.auto_scroll
     }
 
-    fn top_row(&self) -> usize {
-        let maximum = self.row_count().saturating_sub(self.height);
+    /// The row the next frame draws first.
+    pub(super) fn top_row(&self) -> usize {
+        self.top_row_within(self.row_count())
+    }
+
+    /// The first row shown when the conversation and its tail take `row_count` rows.
+    fn top_row_within(&self, row_count: usize) -> usize {
+        let maximum = row_count.saturating_sub(self.height);
         if self.following {
             maximum
         } else {
@@ -1242,12 +1328,39 @@ impl Scrollback {
                 }
             }
         }
+        self.conversation_rows = self
+            .rows
+            .iter()
+            .rposition(|row| !row.is_blank())
+            .map_or(0, |last| last + 1);
     }
 }
 
 impl Row {
     fn is_blank(&self) -> bool {
         self.text.is_empty() && self.styled.fill.is_none()
+    }
+}
+
+/// One row below the conversation, borrowed until a frame shows it.
+enum TailRow<'a> {
+    /// Cut to the frame's width.
+    Clipped(&'a RoleLine),
+    Whole(&'a RoleLine),
+    Blank,
+}
+
+impl TailRow<'_> {
+    fn styled(&self, width: usize) -> RoleLine {
+        match self {
+            Self::Clipped(row) => {
+                let mut row = (*row).clone();
+                row.truncate(width);
+                row
+            }
+            Self::Whole(row) => (*row).clone(),
+            Self::Blank => RoleLine::default(),
+        }
     }
 }
 
@@ -1740,6 +1853,28 @@ mod tests {
     }
 
     #[test]
+    fn a_body_wraps_under_its_indent_and_a_response_under_its_connector() {
+        let mut scrollback = Scrollback::new();
+        scrollback.append("\n⏺ Teammate @a finished\n");
+        scrollback.append_body(&[("  ".into(), None), ("one two three\n".into(), None)]);
+        scrollback.append_response(&[("  ⎿  ".into(), None), ("one two three\n".into(), None)]);
+        let frame = scrollback.frame(12, 8);
+        assert_eq!(
+            frame.lines,
+            [
+                "",
+                "⏺ Teammate",
+                "@a finished",
+                "  one two",
+                "  three",
+                "  ⎿  one two",
+                "     three",
+                "",
+            ]
+        );
+    }
+
+    #[test]
     fn streamed_markdown_hangs_under_its_lead_and_drops_markup() {
         let mut scrollback = Scrollback::new();
         scrollback.append("\n");
@@ -2189,7 +2324,7 @@ mod tests {
         scrollback.append_tool_result("a", &result("done"));
         // Writers that open with several newlines still leave one blank row.
         scrollback.append("\n\n\n");
-        scrollback.append_completion_notice(&[("✻ Done".into(), None), ("\n".into(), None)]);
+        scrollback.append_completion_notice(&[("⏺ Done".into(), None), ("\n".into(), None)]);
         scrollback.start_block();
         scrollback.append("⚠ A warning\n");
         assert_eq!(
@@ -2203,7 +2338,7 @@ mod tests {
                 "⏺ Bash",
                 "  ⎿  done",
                 "",
-                "✻ Done",
+                "⏺ Done",
                 "",
                 "⚠ A warning",
                 "",
@@ -2216,7 +2351,7 @@ mod tests {
         let mut scrollback = Scrollback::new();
         echo(&mut scrollback, "kept");
         let withdrawn = echo(&mut scrollback, "withdrawn");
-        scrollback.append_completion_notice(&[("✻ Done".into(), None), ("\n".into(), None)]);
+        scrollback.append_completion_notice(&[("⏺ Done".into(), None), ("\n".into(), None)]);
         scrollback.hide_echo(withdrawn);
         scrollback.hide_completion_notice();
         echo(&mut scrollback, "next");
@@ -2311,8 +2446,7 @@ mod tests {
         scrollback.append_tool_result("a", &result("file content"));
         scrollback.finish_tool_call(run, "a", false);
         scrollback.finish_tool_call(run, "b", false);
-        // A thinking label passes the group; the same file read again counts once.
-        scrollback.append_aside("∴ Thinking\n", None);
+        // Thinking leaves no row, so the group goes on; the same file read again counts once.
         scrollback.set_tool_call(run, "c", &read_spans, ToolCallState::Running, read("a.txt"));
         scrollback.set_tool_call(run, "d", &read_spans, ToolCallState::Running, read("b.txt"));
         scrollback.finish_tool_call(run, "c", false);
@@ -2330,8 +2464,6 @@ mod tests {
             [
                 "",
                 "  Searched for 1 pattern, read 2 files (ctrl+o to expand)",
-                "",
-                "∴ Thinking",
                 "",
                 "⏺ Text ends the group.",
                 "",
@@ -2375,5 +2507,39 @@ mod tests {
             ["  ⎿  alp", "     ha", "     bet"],
             "a word longer than the row breaks between characters"
         );
+    }
+
+    /// Mean cost of one followed frame with `rows` conversation rows above a running call and a
+    /// live activity row, as while the model thinks.
+    #[test]
+    #[ignore = "timing benchmark: cargo test --release --config profile.release.debug-assertions=true -p tickloop-agent-console --lib bench_ -- --ignored --nocapture"]
+    fn bench_followed_frame_cost_by_conversation_rows() {
+        const FRAMES: u32 = 200;
+        for rows in [1_000, 10_000, 50_000] {
+            let mut scrollback = Scrollback::new();
+            scrollback.append(&numbered_lines(rows));
+            scrollback.set_tool_call(
+                Uuid::from_u128(1),
+                "call",
+                &[
+                    ("\n".into(), None),
+                    ("⏺ ".into(), Some(Role::MutedText)),
+                    ("Shell".into(), Some(Role::ToolName)),
+                    ("\n".into(), None),
+                ],
+                ToolCallState::Running,
+                None,
+            );
+            scrollback.set_activity(Some(RoleLine::role("• Thinking…", Role::MutedText)));
+            assert!(scrollback.frame_with_motion(120, 40, false).following);
+            let started = std::time::Instant::now();
+            for _ in 0..FRAMES {
+                std::hint::black_box(scrollback.frame_with_motion(120, 40, false));
+            }
+            println!(
+                "BENCH scrollback_frame rows={rows} per_frame_us={:.1}",
+                started.elapsed().as_secs_f64() * 1e6 / f64::from(FRAMES)
+            );
+        }
     }
 }

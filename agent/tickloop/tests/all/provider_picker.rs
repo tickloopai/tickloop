@@ -477,6 +477,76 @@ fn shared_builtin_directory_keeps_region_product_headers_and_real_shortcuts_at_s
 }
 
 #[test]
+fn directory_and_model_search_filter_rows_and_escape_clears_before_closing() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    save_key(&root, TEST_KEY);
+    let mut terminal = Terminal::start(&root);
+    terminal.wait_for("deepseek-flash");
+    let mark = terminal.mark();
+    terminal.send(b"/provider\r");
+    terminal.wait_for_frame_after(mark, "directory offers search", |frame| {
+        frame.contains("Choose Provider · All") && frame.contains("⌕ Search…")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"/kimi");
+    terminal.wait_for_frame_after(mark, "directory filtered to Kimi", |frame| {
+        frame.contains("⌕ kimi")
+            && frame.contains("Kimi · 0/3 configured")
+            && frame.contains("api.kimi.com")
+            && !frame.contains("api.deepseek.com")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"\x1b[B");
+    terminal.wait_for_frame_after(mark, "down returns to the searched list", |frame| {
+        frame.contains("⌕ kimi") && !frame.contains("esc clear")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"p");
+    terminal.wait_for_frame_after(mark, "searched connection details", |frame| {
+        frame.contains("Connection · Kimi")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"\x1b");
+    terminal.wait_for_frame_after(mark, "details return to the searched directory", |frame| {
+        frame.contains("Choose Provider · All")
+            && frame.contains("⌕ kimi")
+            && !frame.contains("api.deepseek.com")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"\x1b");
+    terminal.wait_for_frame_after(mark, "escape clears the directory search", |frame| {
+        frame.contains("Choose Provider · All")
+            && frame.contains("⌕ Search…")
+            && frame.contains("api.deepseek.com")
+    });
+    terminal.close_provider_picker();
+
+    let mark = terminal.mark();
+    terminal.send(b"/model\r");
+    terminal.wait_for_frame_after(mark, "models name their connection", |frame| {
+        frame.contains("Choose model · Signed-in Providers") && frame.contains("· DeepSeek")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"/zzz");
+    terminal.wait_for_frame_after(mark, "model search without a match", |frame| {
+        frame.contains("⌕ zzz") && frame.contains("No models match “zzz”")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"\x1b");
+    terminal.wait_for_frame_after(mark, "escape clears the model search", |frame| {
+        frame.contains("⌕ Search…") && frame.contains("· DeepSeek")
+    });
+    let mark = terminal.mark();
+    terminal.send(b"\x1b");
+    terminal.wait_for_frame_after(mark, "second escape returns to the list", |frame| {
+        frame.contains("Choose model") && !frame.contains("esc list")
+    });
+    terminal.close_model_picker();
+    terminal.exit();
+}
+
+#[test]
 fn removed_model_file_command_is_rejected_and_preserves_user_files() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();

@@ -855,14 +855,15 @@ mod tests {
                 assert!(lines[1].text().ends_with("1m 1s"), "{lines:?}");
                 assert!(lines[1].text().contains("Run sleep 30"));
                 assert!(lines.iter().all(|line| line.fill.is_none()));
-                assert_eq!(lines[1].spans[0].role, Some(Role::AgentCyan));
-                assert!(
+                assert_eq!(lines[1].spans[1].role, Some(Role::AgentCyan));
+                assert_eq!(
                     lines[1]
                         .spans
                         .iter()
-                        .any(|span| span.text.contains("sleep-30")
-                            && span.role == Some(Role::AgentCyan)),
-                    "the name wears the member's Agent Color: {:?}",
+                        .filter(|span| span.role == Some(Role::AgentCyan))
+                        .count(),
+                    1,
+                    "only the dot wears the member's Agent Color: {:?}",
                     lines[1]
                 );
                 assert_eq!(lines[0].spans[0].role, Some(Role::MutedText));
@@ -908,12 +909,12 @@ mod tests {
                 .clone()
         };
         assert_eq!(dot(161_000).text, "●", "the viewed member's dot is filled");
-        assert_eq!(dot(161_000).role, Some(Role::RunningMark));
         assert_eq!(
-            dot(161_500).role,
-            Some(Role::RunningMark),
-            "it never blinks"
+            dot(161_000).role,
+            Some(Role::AgentCyan),
+            "the dot names the member, not its state"
         );
+        assert_eq!(dot(161_500).role, Some(Role::AgentCyan), "it never blinks");
         assert_eq!(
             area.next_frame_ms(161_100),
             Some(162_000),
@@ -938,7 +939,7 @@ mod tests {
                 waiting.text().ends_with(" 1m") && !waiting.text().contains("waiting"),
                 "a waiting member shows how long ago it changed: {waiting:?}"
             );
-            assert_eq!(waiting.spans[1].role, Some(Role::MutedText));
+            assert_eq!(waiting.spans[1].role, Some(Role::AgentCyan));
         }
         rows[1].group = AttentionGroup::Idle;
         rows[1].state = tickloop_agent_protocol::LoopState::Idle;
@@ -1485,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_panel_marks_finished_states_and_remembers_the_selection() {
+    fn subagent_panel_dots_wear_agent_colors_and_remember_the_selection() {
         use crate::agent_console::AttentionGroup;
         use tickloop_agent_protocol::{AgentColor, SubagentRegistration};
         let root = Uuid::from_u128(1);
@@ -1528,16 +1529,28 @@ mod tests {
             selected: None,
         };
         let lines = area.panel_lines_at(&footer, 60, 6, DisplayProfile::default(), 70_000);
-        assert_eq!(lines[0].spans[1].role, Some(Role::MutedText), "idle main");
-        for (index, dot) in [
-            (1, Role::SuccessMark),
-            (2, Role::ErrorMark),
-            (3, Role::WarningMark),
-            (4, Role::WarningMark),
-        ] {
-            let line = &lines[index];
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .all(|span| span.role == Some(Role::Title)),
+            "main's dot keeps the viewed row's colour: {:?}",
+            lines[0]
+        );
+        for (index, line) in lines.iter().enumerate().take(5).skip(1) {
             assert_eq!(line.spans[1].text, "○");
-            assert_eq!(line.spans[1].role, Some(dot), "{line:?}");
+            assert_eq!(
+                line.spans[1].role,
+                Some(Role::agent(AgentColor::ALL[(index + 1) % 8])),
+                "{line:?}"
+            );
+            assert!(
+                line.spans
+                    .iter()
+                    .filter(|span| span.text.contains("member-"))
+                    .all(|span| span.role == Some(Role::MutedText)),
+                "{line:?}"
+            );
             assert!(line.text().ends_with(" 6s"), "only the age: {line:?}");
             assert_eq!(line.spans.last().unwrap().role, Some(Role::MutedText));
             for word in ["done", "failed", "stopped", "✔", "✖"] {

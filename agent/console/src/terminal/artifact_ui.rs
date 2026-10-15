@@ -9,11 +9,12 @@ pub(super) async fn refresh(
     root: Option<&Path>,
     chat: Uuid,
 ) -> Result<(), String> {
-    let snapshot = agent
-        .snapshot(chat)
+    let status = agent
+        .status(chat)
         .await
         .map_err(|error| error.to_string())?;
-    console.update_monitor_chat(&snapshot)?;
+    let artifact_ticks = status.artifact_ticks.clone();
+    console.update_monitor_chat(status)?;
     let Some(root) = root else {
         return Ok(());
     };
@@ -22,7 +23,7 @@ pub(super) async fn refresh(
     let sink = console.artifact_metadata_sink();
     let root = root.to_path_buf();
     tokio::spawn(async move {
-        futures_util::stream::iter(snapshot.artifact_ticks)
+        futures_util::stream::iter(artifact_ticks)
             .for_each_concurrent(ARTIFACT_REFRESH_CONCURRENCY, |tick| {
                 let sink = &sink;
                 let root = &root;
@@ -101,14 +102,14 @@ async fn unlink(
 ) -> Result<(), String> {
     if !is_confirmed {
         let instance = id.parse::<tick_protocol::InstanceRef>()?;
-        let snapshot = agent
-            .snapshot(chat)
+        let status = agent
+            .status(chat)
             .await
             .map_err(|error| error.to_string())?;
         let is_linked_here = instance
             .artifact_parts()
             .and_then(|(origin, artifact_id)| {
-                crate::monitor_rows::feedback_binding(&snapshot, origin, artifact_id)
+                crate::monitor_rows::feedback_binding(&status, origin, artifact_id)
             })
             .is_some_and(|binding| !binding.resume_required);
         if is_linked_here {
@@ -129,8 +130,8 @@ async fn remove_local_artifact(
         .await
         .map_err(|error| error.to_string())?;
     console.update_monitor_chat(
-        &agent
-            .snapshot(chat)
+        agent
+            .status(chat)
             .await
             .map_err(|error| error.to_string())?,
     )
@@ -255,8 +256,8 @@ async fn apply_choice_with_client(
                 .await
                 .map_err(|error| error.to_string())?;
             console.update_monitor_chat(
-                &agent
-                    .snapshot(chat)
+                agent
+                    .status(chat)
                     .await
                     .map_err(|error| error.to_string())?,
             )?;
@@ -475,7 +476,7 @@ mod tests {
             agent.add_artifact_tick(chat, tick.clone()).await.unwrap();
             let console = Console::test_for_chat(chat);
             console
-                .update_monitor_chat(&agent.snapshot(chat).await.unwrap())
+                .update_monitor_chat(agent.status(chat).await.unwrap())
                 .unwrap();
             assert!(console.monitor_has_entries().unwrap());
             if remote_delete {

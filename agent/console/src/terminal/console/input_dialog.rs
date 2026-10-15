@@ -32,6 +32,7 @@ pub(super) struct DialogState {
     menu_rule_role: Option<Role>,
     picker_kind: Option<PickerKind>,
     picker_presentation: PickerPresentation,
+    picker_search: Option<PickerSearch>,
     artifacts_picker: Option<super::super::artifacts_picker::ArtifactsPicker>,
     conversation_picker: Option<ConversationPicker>,
     menu_link: Option<(Uuid, String)>,
@@ -88,6 +89,7 @@ impl DialogState {
         self.menu_rule_role = None;
         self.picker_kind = None;
         self.picker_presentation = Default::default();
+        self.picker_search = None;
         self.menu_link = None;
         self.menu_review = None;
         self.full_review = false;
@@ -213,6 +215,7 @@ impl State {
                 &mut self.picker_presentation,
                 next.picker_presentation,
             ),
+            picker_search: std::mem::replace(&mut self.picker_search, next.picker_search),
             artifacts_picker: std::mem::replace(&mut self.artifacts_picker, next.artifacts_picker),
             conversation_picker: std::mem::replace(
                 &mut self.conversation_picker,
@@ -568,7 +571,9 @@ impl State {
         } else {
             0
         };
-        (2 + context + options + headers + self.menu_comment_frame(selected).0.len()).min(limit)
+        let search = usize::from(self.picker_search.is_some());
+        (2 + search + context + options + headers + self.menu_comment_frame(selected).0.len())
+            .min(limit)
     }
 
     pub(super) fn input_dialog_requires_resize(&self) -> bool {
@@ -584,7 +589,8 @@ impl State {
             if self.menu_comment_is_editing() {
                 3
             } else {
-                3 + usize::from(!self.picker_presentation.headers.is_empty())
+                3 + usize::from(self.picker_search.is_some())
+                    + usize::from(!self.picker_presentation.headers.is_empty())
                     + usize::from(
                         self.width < COMPACT_PICKER_COLUMNS
                             && self

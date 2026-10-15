@@ -117,7 +117,9 @@ fn prompt_suggestion_typing_pasting_switching_and_new_turn_cancel_late_results()
                     .unwrap()
                     .key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
             }
-            "pasting" => console.state.lock().unwrap().paste("user draft"),
+            "pasting" => {
+                console.state.lock().unwrap().paste("user draft");
+            }
             "switching" => {
                 console.select_chat(Some(Uuid::from_u128(8002))).unwrap();
                 console.select_chat(Some(Uuid::from_u128(8001))).unwrap();

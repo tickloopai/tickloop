@@ -36,12 +36,12 @@ use super::{
 };
 use tickloop_agent_model::{ModelConfigExt, ReasoningEffortExt};
 use tickloop_agent_protocol::{
-    AutoReviewerPreference, ChatSnapshot, ConfigurationChange, CounterSummary, CounterTotal,
-    DirectedSummaryRequest, DisplayedView, EventKind, ExecutionMode, ExecutionRef, ModelConfig,
+    AutoReviewerPreference, ChatSnapshot, ChatStatus, ConfigurationChange, CounterSummary,
+    CounterTotal, DirectedSummaryRequest, DisplayedView, ExecutionMode, ExecutionRef, ModelConfig,
     ModelRequestKind, PermissionApprovalSource, PermissionChange, PermissionRequest,
     PermissionScope, Protocol, ProtocolFailure, QuestionRequest, ReasoningEffort, Receipt,
     RequestFailure, RequestOutcome, ResponseRejection, RewindMode, RewindOutcome, SummaryDirection,
-    UsageCounter, UsageCoverage, UsageSummary, chat_display_title,
+    UsageCounter, UsageCoverage, UsageSummary,
 };
 
 const SHIFT_TAB_MODES_SETTING_INDEX: usize = 4;
@@ -869,28 +869,19 @@ impl Menus {
         }
     }
 
-    pub(super) fn note_snapshot_requests(&mut self, snapshot: &ChatSnapshot) {
-        let pending = snapshot
+    /// Queues the Chat's pending requests: those asked before the replay window first, then
+    /// the rest in the order they were asked.
+    pub(super) fn note_status_requests(&mut self, status: &ChatStatus) {
+        let pending = status
             .permissions
             .iter()
             .map(|request| request.id)
-            .chain(snapshot.questions.iter().map(|request| request.id))
-            .collect::<Vec<_>>();
-        let retained = snapshot
-            .events
-            .iter()
-            .filter_map(|event| match &event.kind {
-                EventKind::PermissionRequested { request } => Some(request.id),
-                EventKind::QuestionAsked { request } => Some(request.id),
-                _ => None,
-            })
-            .filter(|id| pending.contains(id))
-            .collect::<Vec<_>>();
-        for id in pending.iter().filter(|id| !retained.contains(id)) {
-            self.note_request(snapshot.id, *id);
+            .chain(status.questions.iter().map(|request| request.id));
+        for id in pending.filter(|id| !status.request_order.contains(id)) {
+            self.note_request(status.id, id);
         }
-        for id in retained {
-            self.note_request(snapshot.id, id);
+        for id in &status.request_order {
+            self.note_request(status.id, *id);
         }
     }
 
@@ -1091,6 +1082,7 @@ impl Menus {
                 let mut last_connection = None;
                 let mut row_hints = Vec::new();
                 let mut refresh_options = Vec::new();
+                let mut row_roles = Vec::new();
                 for (index, choice) in choices.iter().enumerate() {
                     let provider = self
                         .key_for_model(&choice.config)
@@ -1117,18 +1109,22 @@ impl Menus {
                     }
                     row_hints.push(
                         if supports_discovery {
-                            "p Connection · r Refresh · enter apply · esc back"
+                            "p Connection · r Refresh · / Search · enter apply · esc back"
                         } else {
-                            "p Connection · enter apply · esc back"
+                            "p Connection · / Search · enter apply · esc back"
                         }
                         .into(),
                     );
+                    row_roles.push(provider.as_ref().and_then(|provider| {
+                        providers::provider_role(&self.provider_authenticated(provider))
+                    }));
                 }
                 row_hints.extend(
                     actions
                         .iter()
                         .map(|action| format!("enter {} · esc back", action.label())),
                 );
+                row_roles.extend(actions.iter().map(|_| None));
                 console.show_presented_picker_menu(
                     menu,
                     PickerKind::Model,
@@ -1137,6 +1133,8 @@ impl Menus {
                         refresh,
                         refresh_options: Some(refresh_options),
                         row_hints,
+                        row_roles,
+                        search: Some(self.provider.model_query.clone()),
                         failure_target: selection.config_target().and_then(|target| target.agent()),
                         failure_connections: choices
                             .iter()
@@ -1150,7 +1148,7 @@ impl Menus {
                             }))
                             .collect(),
                         connection_options: Some(choices.len()),
-                        hint: "p Connection · enter apply · esc back".into(),
+                        hint: "p Connection · / Search · enter apply · esc back".into(),
                         ..Default::default()
                     },
                 )?;
@@ -1394,6 +1392,7 @@ impl Menus {
     ) -> Result<(), String> {
         self.sync_dialog_chat(console)?;
         self.provider.provider_nav = Default::default();
+        self.provider.model_query.clear();
         self.load_providers(agent, target).await?;
         self.provider.model_return = Some(providers::ModelPickerDraft {
             provider: None,
@@ -1419,6 +1418,7 @@ impl Menus {
         self.sync_dialog_chat(console)?;
         self.provider.model_return = None;
         self.provider.provider_nav = Default::default();
+        self.provider.model_query.clear();
         self.load_providers(agent, target).await?;
         self.back_to_providers(console, target)
     }
@@ -2187,7 +2187,7 @@ impl Menus {
             self.dismiss(console)?;
         }
         // Only an interactive View presents requests, and only ones already tracked from their
-        // events; otherwise every family snapshot below would be read for nothing, once per event.
+        // events; otherwise every family status below would be read for nothing, once per event.
         if !console.is_interactive()
             || pending.is_empty() && questions.is_empty() && self.restored_plans.is_empty()
             || !console.can_present_request()?
@@ -2195,21 +2195,13 @@ impl Menus {
             return Ok(());
         }
         for requester in family {
-            let snapshot = agent
-                .snapshot(*requester)
+            let status = agent
+                .status(*requester)
                 .await
                 .map_err(|error| error.to_string())?;
-            for event in &snapshot.events {
-                match &event.kind {
-                    EventKind::PermissionRequested { request }
-                        if pending.contains_key(&request.id) =>
-                    {
-                        self.note_request(*requester, request.id)
-                    }
-                    EventKind::QuestionAsked { request } if questions.contains_key(&request.id) => {
-                        self.note_request(*requester, request.id)
-                    }
-                    _ => {}
+            for id in status.request_order {
+                if pending.contains_key(&id) || questions.contains_key(&id) {
+                    self.note_request(*requester, id);
                 }
             }
         }
@@ -2260,8 +2252,8 @@ impl Menus {
             return Ok(());
         }
         if let Some(chat) = chat {
-            let snapshot = agent
-                .snapshot(chat)
+            let status = agent
+                .status(chat)
                 .await
                 .map_err(|error| error.to_string())?;
             let next_request = self
@@ -2269,7 +2261,7 @@ impl Menus {
                 .iter()
                 .find(|(requester, _)| *requester == chat)
                 .map(|(_, id)| *id);
-            let requester = requester_label(agent, console, &snapshot).await;
+            let requester = requester_label(agent, console, &status).await;
             let restored_request = self
                 .restored_plans
                 .iter()
@@ -2290,7 +2282,7 @@ impl Menus {
                 }
                 return self.workflow(console, (menu, workflow));
             }
-            if let Some(request) = snapshot.permissions.iter().find(|request| {
+            if let Some(request) = status.permissions.iter().find(|request| {
                 pending.contains_key(&request.id) && next_request.is_none_or(|id| id == request.id)
             }) {
                 if request.name == tickloop_agent_tools::EXIT_PLAN_MODE_TOOL_NAME {
@@ -2300,26 +2292,17 @@ impl Menus {
                     }
                     return self.workflow(console, (menu, workflow));
                 }
-                let goal = snapshot
-                    .loops
-                    .iter()
-                    .find(|goal| goal.id == request.loop_id);
+                let goal = status.loops.iter().find(|goal| goal.id == request.loop_id);
                 let context = safe_text(&format!(
                     "{requester} · Goal: {}",
                     goal.map(|goal| goal.goal.as_str()).unwrap_or("Task"),
                 ));
-                self.permission(
-                    console,
-                    chat,
-                    request,
-                    context,
-                    snapshot.delegation.is_none(),
-                )?;
-            } else if let Some(request) = snapshot.questions.iter().find(|request| {
+                self.permission(console, chat, request, context, status.delegation.is_none())?;
+            } else if let Some(request) = status.questions.iter().find(|request| {
                 questions.contains_key(&request.id)
                     && next_request.is_none_or(|id| id == request.id)
             }) {
-                let goal = snapshot
+                let goal = status
                     .loops
                     .iter()
                     .find(|goal| goal.id == request.loop_id)
@@ -2812,6 +2795,7 @@ impl Menus {
                         }
                         if rows.is_empty() && index == 0 {
                             self.provider.provider_nav.filter = providers::ConnectionFilter::All;
+                            self.provider.provider_nav.query.clear();
                             self.back_to_providers(console, target)?;
                         } else {
                             self.provider.provider_nav.focused = None;
@@ -2976,6 +2960,7 @@ impl Menus {
                                 self.provider.provider_nav.back_stack.push(providers::ProviderPage::Models {
                                     connection: self.provider.model_provider.clone(),
                                     focused: self.provider.focused_model.clone(),
+                                    query: self.provider.model_query.clone(),
                                     action: Some(providers::ModelAction::Providers),
                                 });
                                 self.provider.provider_nav.filter = providers::ConnectionFilter::All;
@@ -3363,15 +3348,15 @@ impl Menus {
 /// Names a requester by its registered child handle or root Chat title, with a View reading
 /// number for duplicate root titles. The request itself stays bound to its
 /// execution.
-async fn requester_label(agent: &Agent, console: &Console, snapshot: &ChatSnapshot) -> String {
+async fn requester_label(agent: &Agent, console: &Console, status: &ChatStatus) -> String {
     let title = super::safe_line(
         &agent
-            .cached_title(snapshot.id)
+            .cached_title(status.id)
             .map(|(_, title)| title)
-            .unwrap_or_else(|| chat_display_title(snapshot, &snapshot.user_shells)),
+            .unwrap_or_else(|| status.display_title()),
     );
     agent
-        .reference(snapshot.id)
+        .reference(status.id)
         .await
         .ok()
         .and_then(|execution| console.agent_name(execution.agent_id, &title).ok())
@@ -3722,8 +3707,8 @@ mod tests {
             });
         snapshot.events.clear();
         let mut menus = Menus::default();
-        menus.note_snapshot_requests(&snapshot);
-        menus.note_snapshot_requests(&snapshot);
+        menus.note_status_requests(&ChatStatus::of(&snapshot));
+        menus.note_status_requests(&ChatStatus::of(&snapshot));
         assert_eq!(
             menus.request_order,
             VecDeque::from([(chat, permission), (chat, question)])

@@ -678,6 +678,7 @@ fn shell_snapshot(revision: u64, tasks: Vec<(Uuid, &str, ShellTaskState)>) -> Sh
                 chat_id: CHAT,
                 origin: ShellTaskOrigin::User,
                 owner: ShellTaskOwner::User { chat_id: CHAT },
+                call_id: None,
                 command: command.into(),
                 description: None,
                 cwd: PathBuf::from("/fixture"),
@@ -703,13 +704,16 @@ fn multiple_shell_shortcut_opens_the_list() {
     let console = fixture();
     let second = Uuid::from_u128(1012);
     console
-        .update_shell_ticks(&shell_snapshot(
-            1,
-            vec![
-                (TASK, "first shell", ShellTaskState::Background),
-                (second, "second shell", ShellTaskState::Background),
-            ],
-        ))
+        .refresh_monitor_ticks(
+            shell_snapshot(
+                1,
+                vec![
+                    (TASK, "first shell", ShellTaskState::Background),
+                    (second, "second shell", ShellTaskState::Background),
+                ],
+            ),
+            None,
+        )
         .unwrap();
     console
         .state
@@ -741,7 +745,9 @@ fn single_shell_shortcut_opens_its_exact_view() {
         2,
         vec![(target, "sole eligible task", ShellTaskState::Background)],
     );
-    console.update_shell_ticks(&snapshot).unwrap();
+    console
+        .refresh_monitor_ticks(snapshot.clone(), None)
+        .unwrap();
     let event = console
         .state
         .lock()

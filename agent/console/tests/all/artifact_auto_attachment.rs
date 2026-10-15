@@ -95,7 +95,7 @@ async fn a_created_artifact_attaches_to_its_chat_without_creating_a_subscription
     );
     let monitor = tickloop_agent_console::monitor_rows::MonitorRowsRegistry::builtin();
     let projected = monitor.list(&tickloop_agent_console::monitor_rows::MonitorContext {
-        chat: Some(agent.snapshot(chat).await.unwrap()),
+        chat: Some(std::sync::Arc::new(agent.status(chat).await.unwrap())),
         ..Default::default()
     });
     assert_eq!(projected.len(), 1);
@@ -107,7 +107,7 @@ async fn a_created_artifact_attaches_to_its_chat_without_creating_a_subscription
     assert!(
         monitor
             .list(&tickloop_agent_console::monitor_rows::MonitorContext {
-                chat: Some(agent.snapshot(other).await.unwrap()),
+                chat: Some(std::sync::Arc::new(agent.status(other).await.unwrap())),
                 ..Default::default()
             })
             .is_empty()

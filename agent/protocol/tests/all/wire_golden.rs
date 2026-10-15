@@ -15,17 +15,18 @@ use tickloop_agent_protocol::{
     AgentFilter, AgentHostOptions, AgentSummary, ArtifactTick, ChatSnapshot, ChunkedResponseKind,
     ClientMessage, CommandEnvelope, CommandReceipt, CommandResult, ConfigurationChange,
     ConnectionRegion, Content, Cursor, Decision, DisplayReceipt, DisplayUpdate, DisplayedView,
-    EnvironmentValue, ExecutionAvailability, ExecutionMode, ExecutionRef, HistoryAction,
-    HostLocation, HostWorkContext, HostedMember, HostedMemberState, HostedProgramExit,
-    HostedResources, HostedViewGrant, ImageMediaType, ImageSource, InputModality,
-    InteractionSource, LaunchSpec, LiveChatSnapshot, LoopAction, Message, ModelAuthSource,
-    ModelCard, ModelConfig, ModelDiscovery, ModelProvider, MonitorMember, MonitorMembership,
-    ObservationChange, ObservationKind, ObservationRequest, ObservationUpdate, ObservationValue,
-    PROTOCOL_MAJOR, PROTOCOL_MINOR, Page, PendingRequestKind, PermissionPolicy, PermissionRule,
-    PermissionScope, PersistenceState, ProductKind, Protocol, ProtocolLimits, ProviderConnection,
-    ProviderCredentialScope, ReasoningEffort, ReceiptState, RequestRef, ResetReason, Role,
-    ServerHello, ServerMessage, TakenBackPrompt, ThinkingBudgets, ThinkingControl, TickLinkState,
-    TickSubscriptionChange, TickSubscriptionFrequency, TickSubscriptionStatus, ToolResultBlock,
+    EnvironmentValue, Event, EventKind, ExecutionAvailability, ExecutionMode, ExecutionRef,
+    HistoryAction, HostLocation, HostWorkContext, HostedMember, HostedMemberState,
+    HostedProgramExit, HostedResources, HostedViewGrant, ImageMediaType, ImageSource,
+    InputModality, InteractionSource, LaunchSpec, LiveChatSnapshot, LoopAction, Message,
+    ModelAuthSource, ModelCard, ModelConfig, ModelDiscovery, ModelProvider, MonitorMember,
+    MonitorMembership, ObservationChange, ObservationKind, ObservationRequest, ObservationUpdate,
+    ObservationValue, OperationRecord, OperationState, PROTOCOL_MAJOR, PROTOCOL_MINOR, Page,
+    PendingRequestKind, PermissionPolicy, PermissionRule, PermissionScope, PersistenceState,
+    ProductKind, Protocol, ProtocolLimits, ProviderConnection, ProviderCredentialScope,
+    ReasoningEffort, ReceiptState, RequestRef, ResetReason, Role, ServerHello, ServerMessage,
+    TakenBackPrompt, ThinkingBudgets, ThinkingControl, TickLinkState, TickSubscriptionChange,
+    TickSubscriptionFrequency, TickSubscriptionStatus, ToolResult, ToolResultBlock,
     ToolResultContent, TranscriptRef, UserInput, ViewRef,
 };
 
@@ -628,6 +629,24 @@ fn observation_requests_keep_their_recorded_wire() {
                 epoch: id(0xe0),
                 command_id: id(0x81),
             },
+            ObservationRequest::Agent {
+                execution: execution(),
+                detail: AgentDetailQuery::Status,
+                after: None,
+            },
+            ObservationRequest::Agent {
+                execution: execution(),
+                detail: AgentDetailQuery::Operation {
+                    run_id: id(0x20),
+                    call_id: "call-edit".into(),
+                },
+                after: None,
+            },
+            ObservationRequest::Agent {
+                execution: execution(),
+                detail: AgentDetailQuery::Events { after: 9 },
+                after: None,
+            },
         ],
     );
 }
@@ -700,6 +719,36 @@ fn observation_values_keep_their_recorded_wire() {
                 error: Some(access_error()),
                 persistence: PersistenceState::WriteFailed("disk full".into()),
             }))),
+            ObservationValue::Status(Box::new(live_chat_snapshot().status())),
+            ObservationValue::Operation(Some(Box::new(OperationRecord {
+                id: id(0x50),
+                loop_id: id(0x10),
+                run_id: id(0x20),
+                call_id: "call-edit".into(),
+                name: "Edit".into(),
+                input: json!({"file_path": "src/counter.rs"}),
+                file_change: None,
+                state: OperationState::Completed,
+                result: Some(ToolResult {
+                    content: "Edited src/counter.rs".into(),
+                    is_error: false,
+                    output_ref: None,
+                }),
+            }))),
+            ObservationValue::Events(vec![Event {
+                sequence: 10,
+                chat_id: id(0xc1),
+                loop_id: id(0x10),
+                run_id: id(0x20),
+                kind: EventKind::ToolCompleted {
+                    call_id: "call-read".into(),
+                    result: ToolResult {
+                        content: "A result too long for one feed change".into(),
+                        is_error: false,
+                        output_ref: None,
+                    },
+                },
+            }]),
         ],
     );
 }

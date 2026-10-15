@@ -516,6 +516,9 @@ impl Agent {
         for command in tools.stop_loop(loop_id).await {
             self.record_command(chat_id, command).await?;
         }
+        // Child completions held for this Loop while it had failed or was interrupted are refused
+        // now that it has ended.
+        self.flush_subagent_notifications(chat_id).await;
         Ok(operations)
     }
 

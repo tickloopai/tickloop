@@ -15,13 +15,16 @@ use tickloop_agent_protocol::{
     AutoPolicy, ChatSnapshot, CompactionMarker, Content, OperationRecord, OriginalUserInput, Role,
 };
 
+mod budget;
 mod reply_history;
+pub(super) use budget::{ContextTruncation, ReviewEvidence};
 pub(super) use reply_history::ReplyHistory;
 pub(super) use reply_history::capture as capture_reply_history;
 
-pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v6";
-pub(super) const REVIEW_TEMPLATE_VERSION: &str = "auto-review-v17";
-const MAX_TOOL_HISTORY_BYTES: usize = 64 * 1024;
+pub(super) const APPROVAL_CONTEXT_VERSION: &str = "trusted-approval-v7";
+pub(super) const REVIEW_TEMPLATE_VERSION: &str = "auto-review-v18";
+/// Images carry no review evidence in serialized text; their base64 never enters the snapshot.
+const IMAGE_PLACEHOLDER: &str = "[image omitted from the approval context]";
 
 const DEPENDENCY_FILES: &[&str] = &[
     "package.json",
@@ -117,7 +120,6 @@ pub(super) struct HistoricalToolCall {
 pub(super) struct ToolHistory {
     pub complete: bool,
     pub compaction_gap: bool,
-    pub capacity_exceeded: bool,
     pub calls: Vec<HistoricalToolCall>,
 }
 
@@ -126,7 +128,6 @@ impl Default for ToolHistory {
         Self {
             complete: true,
             compaction_gap: false,
-            capacity_exceeded: false,
             calls: Vec::new(),
         }
     }
@@ -196,7 +197,6 @@ pub(super) fn recovered_tool_history(
             prepared.insert(key, None);
         }
     }
-    let mut bytes = 0usize;
     let mut observed_messages = HashSet::new();
     let recovered = ancestors
         .into_iter()
@@ -266,17 +266,6 @@ pub(super) fn recovered_tool_history(
                             .filter(|path| path.is_absolute()),
                         outcome: HistoricalToolOutcome::NotObserved,
                     };
-                    bytes = bytes.saturating_add(
-                        serde_json::to_vec(&call)
-                            .expect("tool history serializes")
-                            .len(),
-                    );
-                    if bytes > MAX_TOOL_HISTORY_BYTES {
-                        history.calls.clear();
-                        history.complete = false;
-                        history.capacity_exceeded = true;
-                        return history;
-                    }
                     let position = history.calls.len();
                     history.calls.push(call);
                     if let Some(run) = run {
@@ -335,6 +324,9 @@ pub(super) struct AgentMessageEvidence {
 #[derive(Clone, Debug, Serialize)]
 pub(super) struct ApprovalSnapshot {
     pub auto_policy: AutoPolicy,
+    /// Present only when the evidence was cut to fit the reviewer's input capacity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_truncation: Option<ContextTruncation>,
     pub tool_history: ToolHistory,
     pub reply_history: ReplyHistory,
     pub agent_messages: Vec<AgentMessageEvidence>,
@@ -570,6 +562,7 @@ pub(super) fn capture(
         return Err(ApprovalContextError::MissingOriginalUserInput);
     }
     Ok(ApprovalSnapshot {
+        context_truncation: None,
         tool_history: tool_history(snapshot, operation),
         reply_history: capture_reply_history(
             snapshot,
@@ -588,7 +581,16 @@ pub(super) fn capture(
                 Some(AgentMessageEvidence {
                     message_id,
                     source: source.clone(),
-                    content: message.content.clone(),
+                    content: message
+                        .content
+                        .iter()
+                        .map(|content| match content {
+                            Content::Image { .. } => Content::Text {
+                                text: IMAGE_PLACEHOLDER.into(),
+                            },
+                            content => content.clone(),
+                        })
+                        .collect(),
                 })
             })
             .collect(),

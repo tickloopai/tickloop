@@ -166,35 +166,99 @@ async fn both_reviewers_see_prior_written_code_before_executing_the_same_batch()
     }
 }
 
+struct RejectingJudgment(RecordingJudgment);
+
+#[async_trait::async_trait]
+impl JudgmentClient for RejectingJudgment {
+    fn model(&self) -> &str {
+        "fixture-jev"
+    }
+    async fn evaluate(
+        &self,
+        request: &EvaluationRequest,
+        cancel: CancellationToken,
+    ) -> Result<Evaluation, JudgmentError> {
+        let mut evaluation = self.0.evaluate(request, cancel).await?;
+        let Answer::Choice {
+            choice,
+            probabilities,
+            ..
+        } = evaluation.answers.get_mut("decision").unwrap()
+        else {
+            panic!()
+        };
+        *choice = "block_user_boundary".into();
+        for (option, probability) in probabilities {
+            *probability = f64::from(option == "block_user_boundary");
+        }
+        Ok(evaluation)
+    }
+}
+
+/// Rejects its first request as exceeding Jev's context, then allows.
+struct CapacityLimitedJudgment(RecordingJudgment);
+
+#[async_trait::async_trait]
+impl JudgmentClient for CapacityLimitedJudgment {
+    fn model(&self) -> &str {
+        "fixture-jev"
+    }
+    async fn evaluate(
+        &self,
+        request: &EvaluationRequest,
+        cancel: CancellationToken,
+    ) -> Result<Evaluation, JudgmentError> {
+        if self.0.requests.lock().unwrap().is_empty() {
+            self.0.requests.lock().unwrap().push(request.clone());
+            return Err(tickloop_agent_model::ModelError::ResponseRejected(
+                tickloop_agent_model::ModelResponseRejection::ContextLimit,
+            )
+            .into());
+        }
+        self.0.evaluate(request, cancel).await
+    }
+}
+
+fn recorded_states(
+    llm: &ScriptedModel,
+    jev: &RecordingJudgment,
+    use_jev: bool,
+) -> Vec<(Value, String)> {
+    if use_jev {
+        jev.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| {
+                let Question::Choice { instructions, .. } = &request.questions["decision"] else {
+                    panic!("Choice expected")
+                };
+                (
+                    request.state.clone(),
+                    instructions["context"].as_str().unwrap_or_default().into(),
+                )
+            })
+            .collect()
+    } else {
+        llm.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| {
+                let (Content::Text { text: system }, Content::Text { text: user }) = (
+                    &request.messages[0].content[0],
+                    &request.messages[1].content[0],
+                ) else {
+                    panic!("classifier messages are text")
+                };
+                (serde_json::from_str(user).unwrap(), system.clone())
+            })
+            .collect()
+    }
+}
+
 #[tokio::test]
 async fn both_reviewers_recover_written_code_after_compaction_and_restore() {
-    struct RejectingJudgment(RecordingJudgment);
-    #[async_trait::async_trait]
-    impl JudgmentClient for RejectingJudgment {
-        fn model(&self) -> &str {
-            "fixture-jev"
-        }
-        async fn evaluate(
-            &self,
-            request: &EvaluationRequest,
-            cancel: CancellationToken,
-        ) -> Result<Evaluation, JudgmentError> {
-            let mut evaluation = self.0.evaluate(request, cancel).await?;
-            let Answer::Choice {
-                choice,
-                probabilities,
-                ..
-            } = evaluation.answers.get_mut("decision").unwrap()
-            else {
-                panic!()
-            };
-            *choice = "block_user_boundary".into();
-            for (option, probability) in probabilities {
-                *probability = f64::from(option == "block_user_boundary");
-            }
-            Ok(evaluation)
-        }
-    }
     for (use_jev, ancestry) in [false, true].into_iter().flat_map(|use_jev| {
         [
             "full",
@@ -533,14 +597,15 @@ async fn repeated_call_ids_within_a_run_are_rejected_before_a_second_effect() {
 }
 
 #[tokio::test]
-async fn oversized_written_history_is_not_truncated_into_an_automatic_allow() {
-    use tickloop_agent_protocol::ApprovalOutcome;
+async fn oversized_written_history_reaches_both_reviewers_marked_as_incomplete() {
+    use tickloop_agent_protocol::{ApprovalOutcome, ApprovalReviewerKind};
+    const PROMPT: &str = "Write and run the proposed draft";
     for use_jev in [false, true] {
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("large.py");
+        let filler = format!("#{}", "x".repeat(300 * 1024));
         let body = format!(
-            "#{}\nfrom pathlib import Path\nPath('executed').write_text('must not run')",
-            "x".repeat(70 * 1024)
+            "{filler}\nfrom pathlib import Path\nPath('executed').write_text('must not run')\n{filler}\n"
         );
         let mut batch = call("write", "Write", json!({"file_path":script,"content":body}));
         batch.extend(call("run", "Bash", json!({"command":"python3 large.py"})));
@@ -548,10 +613,100 @@ async fn oversized_written_history_is_not_truncated_into_an_automatic_allow() {
             config(),
             Arc::new(ScriptedModel::new(vec![batch, text("done")])),
         );
-        let llm = Arc::new(ScriptedModel::new(Vec::new()));
-        let jev = Arc::new(RecordingJudgment {
+        let block = tickloop_agent_test_support::auto_classification(true).to_string();
+        let llm = Arc::new(ScriptedModel::new(vec![text(&block), text(&block)]));
+        let jev = Arc::new(RejectingJudgment(RecordingJudgment {
             requests: Mutex::new(Vec::new()),
-        });
+        }));
+        if use_jev {
+            agent.set_judgment_client(jev.clone()).await;
+        } else {
+            agent.set_auto_reviewer(llm.clone()).await;
+        }
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::Auto)
+            .await
+            .unwrap();
+        let mut events = agent.subscribe();
+        agent.submit(chat, None, PROMPT.into()).await.unwrap();
+        let mut assessed = false;
+        loop {
+            match next_event(&mut events).await.kind {
+                EventKind::PermissionRequested { request } => agent
+                    .answer_permission(chat, request.id, false)
+                    .await
+                    .unwrap(),
+                EventKind::ApprovalAssessed { assessment } => {
+                    assert_eq!(assessment.outcome, ApprovalOutcome::Block);
+                    let expected = if use_jev {
+                        ApprovalReviewerKind::Jev
+                    } else {
+                        ApprovalReviewerKind::Llm
+                    };
+                    assert_eq!(assessment.reviewer.unwrap().kind, expected);
+                    assessed = true;
+                }
+                EventKind::Completed { .. } | EventKind::Interrupted => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert!(assessed);
+        assert!(!directory.path().join("executed").exists());
+        let states = recorded_states(&llm, &jev.0, use_jev);
+        assert!(!states.is_empty());
+        for (state, guidance) in states {
+            assert!(
+                guidance.contains("This snapshot is incomplete"),
+                "{guidance}"
+            );
+            assert_eq!(state["context_truncation"]["tool_history"]["shortened"], 1);
+            assert_eq!(state["tool_history"]["complete"], false);
+            let written = state["tool_history"]["calls"][0]["input"]["content"]
+                .as_str()
+                .unwrap();
+            assert!(written.starts_with("#xxx") && written.ends_with("xxx\n"));
+            assert!(written.contains("bytes omitted by the host to fit the review context"));
+            assert!(!written.contains("must not run"));
+            assert_eq!(state["operation"]["input"]["command"], "python3 large.py");
+            assert_eq!(state["original_user_inputs"][0]["text"], PROMPT);
+        }
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn a_reviewer_context_limit_is_retried_once_with_smaller_evidence() {
+    use tickloop_agent_protocol::{ApprovalFailureKind, ApprovalOutcome, ApprovalReviewerKind};
+    for use_jev in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("generated.py");
+        let body = format!(
+            "#{}\nfrom pathlib import Path\nPath('executed').write_text('verified')\n",
+            "x".repeat(120 * 1024)
+        );
+        let mut batch = call(
+            "write-script",
+            "Write",
+            json!({"file_path":script,"content":body}),
+        );
+        batch.extend(call(
+            "execute-script",
+            "Bash",
+            json!({"command":"python3 generated.py"}),
+        ));
+        let agent = Agent::new_embedded(
+            config(),
+            Arc::new(ScriptedModel::new(vec![batch, text("done")])),
+        );
+        let llm = Arc::new(ScriptedModel::new(vec![text(
+            &tickloop_agent_test_support::auto_classification(false).to_string(),
+        )]));
+        llm.reject_next(tickloop_agent_model::ModelResponseRejection::ContextLimit);
+        let jev = Arc::new(CapacityLimitedJudgment(RecordingJudgment {
+            requests: Mutex::new(Vec::new()),
+        }));
         if use_jev {
             agent.set_judgment_client(jev.clone()).await;
         } else {
@@ -564,35 +719,64 @@ async fn oversized_written_history_is_not_truncated_into_an_automatic_allow() {
             .unwrap();
         let mut events = agent.subscribe();
         agent
-            .submit(chat, None, "Write and run the proposed draft".into())
+            .submit(
+                chat,
+                None,
+                "Write a local verification script and run it".into(),
+            )
             .await
             .unwrap();
-        let mut prompted = false;
-        let mut capacity = false;
+        let mut assessment = None;
         loop {
             match next_event(&mut events).await.kind {
+                EventKind::ApprovalAssessed { assessment: value } => assessment = Some(*value),
                 EventKind::PermissionRequested { request } => {
-                    prompted = true;
-                    assert!(!directory.path().join("executed").exists());
-                    agent
-                        .answer_permission(chat, request.id, false)
-                        .await
-                        .unwrap();
+                    panic!("a context limit fell back to manual approval: {request:?}")
                 }
-                EventKind::ApprovalAssessed { assessment } => {
-                    assert_eq!(assessment.outcome, ApprovalOutcome::ContextLimit);
-                    assert!(assessment.reviewer.is_none());
-                    capacity = true;
-                }
-                EventKind::Completed { .. } | EventKind::Interrupted => break,
+                EventKind::Completed { .. } => break,
                 EventKind::Failed(error) => panic!("{error}"),
                 _ => {}
             }
         }
-        assert!(prompted && capacity);
-        assert!(llm.requests.lock().unwrap().is_empty());
-        assert!(jev.requests.lock().unwrap().is_empty());
-        assert!(!directory.path().join("executed").exists());
+        let assessment = assessment.unwrap();
+        assert_eq!(assessment.outcome, ApprovalOutcome::Allow);
+        let expected = if use_jev {
+            ApprovalReviewerKind::Jev
+        } else {
+            ApprovalReviewerKind::Llm
+        };
+        assert_eq!(assessment.reviewer.unwrap().kind, expected);
+        assert_eq!(assessment.fallback_from, None);
+        let failures = assessment
+            .attempts
+            .iter()
+            .map(|attempt| attempt.failure)
+            .collect::<Vec<_>>();
+        assert_eq!(failures, [Some(ApprovalFailureKind::ContextLimit), None]);
+        let states = recorded_states(&llm, &jev.0, use_jev);
+        let [(first, _), (retry, retry_guidance)] = states.as_slice() else {
+            panic!(
+                "expected one rejected request and one retry, got {}",
+                states.len()
+            )
+        };
+        assert_eq!(
+            first.get("context_truncation").is_some(),
+            use_jev,
+            "only Jev's smaller capacity cuts the first request"
+        );
+        assert!(retry.to_string().len() < first.to_string().len());
+        assert!(retry["context_truncation"].is_object());
+        assert!(retry_guidance.contains("This snapshot is incomplete"));
+        assert_eq!(first["operation"], retry["operation"]);
+        assert_eq!(
+            retry["original_user_inputs"][0]["text"],
+            "Write a local verification script and run it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("executed")).unwrap(),
+            "verified"
+        );
         agent.shutdown().await;
     }
 }

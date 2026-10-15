@@ -115,8 +115,13 @@ use super::{
         PermissionsSurface,
     },
     renderer::{self, Renderer},
-    scrollback::{CollapsedCall, InputEcho, ScrollAction, Scrollback, ToolCallState},
-    selection::{Cell, Selection, line_width, split_columns},
+    scrollback::{
+        CollapsedCall, ForegroundCommandHint, InputEcho, ScrollAction, Scrollback, ToolCallState,
+    },
+    selection::{
+        Cell, ScrollDirection, Selection, SelectionDrag, Surface, Viewport, line_width,
+        split_columns,
+    },
     shell_input::{
         InputKind, ShellCompletionKey, ShellCompletionKind, ShellEmptyControl, ShellExecution,
         ShellInputAction, ShellInputState, UserShellSubmission,
@@ -137,7 +142,10 @@ const DIVIDER_EDGE_RULE_COLUMNS: usize = 1;
 const DIVIDER_ENTRY_GAP_COLUMNS: usize = 1;
 const CREATION_ATTACH_UNAVAILABLE_PREFIX: &str = "New Agent created; local connection unavailable";
 const EXECUTION_CONNECTION_DETAILS_HINT: &str = "ctrl+o details";
+#[cfg(test)]
 const SEND_NOW_HINT: &str = "ctrl+enter send now";
+const QUEUED_SEND_NOW_HINT: &str = "ctrl+enter to send now";
+const QUEUED_INPUT_PLACEHOLDER: &str = "Press up to edit queued messages";
 const HINT_SEGMENT_SEPARATOR: &str = " · ";
 const INTERRUPT_HINT: &str = "esc interrupt";
 /// Blank columns between the key hints and the right-aligned notice.
@@ -156,6 +164,13 @@ const MENU_WAITING_NOTICE: &str = "Menu waiting in conversation";
 /// the terminal on the alternate screen. Both directions err towards "possibly
 /// on the alternate screen", because a spurious leave is harmless while a
 /// missed one leaves the user with an unusable terminal.
+/// A foreground Bash command of the model, the call that started it, and when it was first seen.
+struct ForegroundCommand {
+    id: Uuid,
+    call_id: Option<String>,
+    seen: Instant,
+}
+
 #[derive(Clone)]
 struct TerminalSurface {
     alternate_screen: Arc<AtomicBool>,
@@ -207,6 +222,10 @@ pub(super) enum RequestPresentation {
 }
 
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Claude Code `AUTOSCROLL_INTERVAL_MS` and `AUTOSCROLL_LINES`: how often and how far content
+/// scrolls while a selection drag holds the pointer at its edge.
+const SELECTION_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
+const SELECTION_SCROLL_ROWS: usize = 2;
 const INPUT_CHANNEL_CAPACITY: usize = 128;
 const FOOTER_ROWS: usize = 3;
 const FOOTER_ITEMS_ROWS: usize = 1;
@@ -420,6 +439,9 @@ pub(super) enum PickerAction {
     ToggleConnections,
     ConfigureProvider,
     RefreshAccountModels,
+    /// The search query changed. The query itself lives on the dialog, so the menu that owns the
+    /// rows reads it back with `picker_search_query` instead of carrying the text here.
+    SearchQuery,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -435,6 +457,70 @@ pub(super) struct CompactPickerRow {
     pub(super) detail: String,
 }
 
+/// Where a picker that offers search puts the keyboard: on the rows or in the query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PickerSearchFocus {
+    List,
+    Search,
+}
+
+/// What a key did inside a picker's search. `Passthrough` leaves it to the menu, which keeps
+/// `p`/`f`/`r`/`h`/`l`/`j`/`k` working while the list has the keyboard.
+enum PickerSearchOutcome {
+    Passthrough,
+    Handled,
+    /// The query changed, so the rows must be filtered again.
+    Refilter,
+}
+
+/// The `/` search of a picker menu. Typing and the cursor belong to the dialog, so the query lives
+/// here and the menu that draws the rows filters on it through `picker_search_query`.
+struct PickerSearch {
+    id: Uuid,
+    kind: PickerKind,
+    query: Editor,
+    focus: PickerSearchFocus,
+}
+
+impl PickerSearch {
+    fn new(id: Uuid, kind: PickerKind, query: &str) -> Self {
+        let mut editor = Editor::new();
+        editor.replace_draft(query.to_owned(), query.len());
+        Self {
+            id,
+            kind,
+            query: editor,
+            focus: PickerSearchFocus::List,
+        }
+    }
+
+    /// Whether a picker shown as `id` is this search's page: the same menu, or the same kind of
+    /// picker re-shown with the query typed here, as when an account check replaces the rows
+    /// mid-typing.
+    fn continues_in(&self, id: Uuid, kind: PickerKind, query: &str) -> bool {
+        self.id == id || self.kind == kind && self.query.draft() == query
+    }
+
+    fn focused(&self) -> bool {
+        self.focus == PickerSearchFocus::Search
+    }
+
+    /// Applies an editor command and reports whether the query changed. Moving the cursor inside
+    /// the query must not refilter the rows.
+    fn edit(&mut self, command: EditorCommand) -> bool {
+        let moves_cursor = matches!(
+            command,
+            EditorCommand::MoveLeft
+                | EditorCommand::MoveRight
+                | EditorCommand::MoveLineStart
+                | EditorCommand::MoveLineEnd
+                | EditorCommand::MoveWordBackward
+                | EditorCommand::MoveWordForward
+        );
+        self.query.apply(command) == EditorOutcome::Changed && !moves_cursor
+    }
+}
+
 #[derive(Clone, Default)]
 pub(super) struct PickerPresentation {
     pub(super) headers: Vec<(usize, String)>,
@@ -446,6 +532,12 @@ pub(super) struct PickerPresentation {
     pub(super) connection_options: Option<usize>,
     pub(super) row_hints: Vec<String>,
     pub(super) compact_rows: Vec<CompactPickerRow>,
+    /// Role per option row, aligned with the option indices. `None` keeps `Role::Text`. A selected
+    /// row resolves to `Text` on top of its `Selection` fill, so a role colours only the rows that
+    /// are not selected.
+    pub(super) row_roles: Vec<Option<Role>>,
+    /// `Some` offers `/` search over the rows, starting from the query the menu filters on.
+    pub(super) search: Option<String>,
     pub(super) failure_target: Option<Uuid>,
     pub(super) failure_connections: Vec<Option<String>>,
     pub(super) failure_message: bool,
@@ -459,7 +551,7 @@ enum MenuFocus {
     MenuWithLink(String),
     Secret(String),
     Input(String),
-    Picker(PickerKind, PickerPresentation),
+    Picker(PickerKind, Box<PickerPresentation>),
     Question(QuestionMenu),
 }
 
@@ -577,8 +669,7 @@ pub(super) struct State {
     synchronized_output: bool,
     clipboard: Clipboard,
     external_editor: ExternalEditorLauncher,
-    /// Plain text of the rows most recently drawn. Selection is what the user
-    /// can see, so it is taken from here rather than from the conversation.
+    /// Plain text of the rows most recently drawn, which a selection of the screen copies.
     rendered_screen: Vec<String>,
     /// Every row as it was last written, so a frame repaints only the rows
     /// that changed since.
@@ -587,7 +678,14 @@ pub(super) struct State {
     /// asked for meanwhile is drawn when the last hold ends.
     held_frames: usize,
     frame_deferred: bool,
+    /// Frames painted, so a test can count what one refresh costs.
+    #[cfg(test)]
+    frames_drawn: usize,
     selection: Option<Selection>,
+    /// Where the last frame drew the conversation or the detailed transcript, so a selection
+    /// there keeps to their content as it scrolls.
+    content_viewport: Option<Viewport>,
+    selection_drag: Option<SelectionDrag>,
     pub(super) display: DisplayProfile,
     colour_depth: ColourDepth,
     prompt_enabled: bool,
@@ -599,7 +697,7 @@ pub(super) struct State {
     foreground_shell: bool,
     /// The model's foreground Bash commands in the shown Chat, each with when this View first saw
     /// it running.
-    foreground_commands: Vec<(Uuid, Instant)>,
+    foreground_commands: Vec<ForegroundCommand>,
     shell_background_chord_started_at: Option<Instant>,
     width: usize,
     height: usize,
@@ -670,6 +768,7 @@ pub(super) struct State {
     menu_rule_role: Option<Role>,
     picker_kind: Option<PickerKind>,
     picker_presentation: PickerPresentation,
+    picker_search: Option<PickerSearch>,
     /// The `/resume` picker owns input while open; the
     /// draft and conversation underneath stay untouched.
     artifacts_picker: Option<super::artifacts_picker::ArtifactsPicker>,
@@ -1314,12 +1413,42 @@ impl Console {
 
     pub(super) fn update_monitor_chat(
         &self,
-        snapshot: &tickloop_agent_protocol::ChatSnapshot,
+        status: impl Into<Arc<tickloop_agent_protocol::ChatStatus>>,
+    ) -> Result<(), String> {
+        let status = status.into();
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state
+            .monitor_for_chat_mut(status.id)
+            .set_chat_status(status);
+        Ok(())
+    }
+    /// Applies the Chat's Shell tasks and subscriptions, read again on Monitor's own cadence.
+    pub(super) fn refresh_monitor_ticks(
+        &self,
+        shells: tickloop_agent_protocol::ShellTaskSnapshot,
+        subscriptions: Option<Vec<TickSubscriptionStatus>>,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let chat = shells.chat_id;
+        state
+            .monitor_for_chat_mut(chat)
+            .refresh_ticks(shells, subscriptions);
+        if state.chat != Some(chat) || !state.monitor_visible() {
+            return Ok(());
+        }
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+    /// Applies what one status refresh read for the Chat's Monitor in a single rebuild.
+    pub(super) fn refresh_monitor(
+        &self,
+        sources: super::monitor::MonitorSources,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state
-            .monitor_for_chat_mut(snapshot.id)
-            .set_chat_snapshot(snapshot.clone());
+            .monitor_for_chat_mut(sources.chat.id)
+            .refresh_sources(sources);
         Ok(())
     }
     pub(super) fn update_artifact_metadata(
@@ -1557,16 +1686,6 @@ impl Console {
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
     }
-    /// Records when the Chat's running Shells started; their Monitor rows count from it.
-    pub(super) fn set_shell_starts(
-        &self,
-        chat: Uuid,
-        starts: HashMap<Uuid, u64>,
-    ) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        state.monitor_for_chat_mut(chat).shell_starts = starts;
-        Ok(())
-    }
     pub(super) fn open_monitor(&self) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.monitor.overlay = state.monitor.total() > 0 && state.monitor_side_columns().is_none();
@@ -1574,16 +1693,6 @@ impl Console {
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
-    }
-    pub(super) fn update_shell_ticks(
-        &self,
-        snapshot: &tickloop_agent_protocol::ShellTaskSnapshot,
-    ) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let monitor = state.monitor_for_chat_mut(snapshot.chat_id);
-        monitor.shell_snapshot = Some(snapshot.clone());
-        monitor.rebuild();
-        Ok(())
     }
 
     pub(super) fn update_tick_detail<T: super::tick_actions::TickDetailView, R>(
@@ -2005,6 +2114,7 @@ impl Console {
             let count = state.request_queue_count;
             state.suspend_dialog();
             state.request_queue_count = count;
+            state.yield_focus_to_request();
         }
         state.request_layout = request;
         if request.is_none() {
@@ -3482,7 +3592,7 @@ impl Console {
             None,
             MenuFocus::Picker(
                 kind,
-                PickerPresentation {
+                Box::new(PickerPresentation {
                     headers: Vec::new(),
                     refresh: false,
                     hint: match kind {
@@ -3494,7 +3604,7 @@ impl Console {
                     }
                     .into(),
                     ..Default::default()
-                },
+                }),
             ),
         )
     }
@@ -3515,6 +3625,16 @@ impl Console {
             .as_ref()
             .filter(|menu| menu.id == id)
             .map(|menu| menu.selected))
+    }
+
+    /// The query the menu owning `id` filters its rows on.
+    pub(super) fn picker_search_query(&self, id: Uuid) -> Result<String, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(state
+            .picker_search
+            .as_ref()
+            .filter(|search| search.id == id)
+            .map_or_else(String::new, |search| search.query.draft().to_owned()))
     }
 
     pub(super) fn menu_snapshot(&self, id: Uuid) -> Result<Option<Menu>, String> {
@@ -3549,6 +3669,11 @@ impl Console {
         {
             *id = restored;
         }
+        if let Some(search) = &mut state.picker_search
+            && search.id == previous
+        {
+            search.id = restored;
+        }
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())?;
@@ -3567,7 +3692,7 @@ impl Console {
             Vec::new(),
             "Comment",
             None,
-            MenuFocus::Picker(kind, presentation),
+            MenuFocus::Picker(kind, Box::new(presentation)),
         )
     }
 
@@ -3874,12 +3999,26 @@ impl Console {
             _ => None,
         };
         state.picker_presentation = match &focus {
-            MenuFocus::Picker(_, presentation) => presentation.clone(),
+            MenuFocus::Picker(_, presentation) => (**presentation).clone(),
             _ => PickerPresentation {
                 hint: "enter confirm · esc back".into(),
                 ..Default::default()
             },
         };
+        let previous_search = state.picker_search.take();
+        let kind = state.picker_kind.unwrap_or(PickerKind::Actions);
+        state.picker_search =
+            state
+                .picker_presentation
+                .search
+                .clone()
+                .map(|query| match previous_search {
+                    Some(mut search) if search.continues_in(menu.id, kind, &query) => {
+                        search.id = menu.id;
+                        search
+                    }
+                    _ => PickerSearch::new(menu.id, kind, &query),
+                });
         state.question_menu = match &focus {
             MenuFocus::Question(question) => Some(question.clone()),
             _ => None,
@@ -3999,8 +4138,12 @@ impl Console {
         Ok(())
     }
 
-    /// Records the model's foreground Bash commands in the shown Chat.
-    pub(super) fn set_foreground_commands(&self, commands: &[Uuid]) -> Result<(), String> {
+    /// Records the model's foreground Bash commands in the shown Chat, each with the call that
+    /// started it.
+    pub(super) fn set_foreground_commands(
+        &self,
+        commands: &[(Uuid, Option<String>)],
+    ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if state.set_foreground_commands(commands, Instant::now()) {
             state
@@ -4487,11 +4630,12 @@ impl Drop for Lifetime {
 pub(super) enum ConversationPiece {
     /// Starts a block one blank row below the visible content above it.
     Block,
-    /// A block that leaves an open read or search group open, such as a thinking label.
-    Aside(String, Option<Role>),
     Styled(String, Option<Role>),
     /// `⎿` response rows at the end of the conversation, each wrapping under its content.
     Response(Vec<(String, Option<Role>)>),
+    /// A block's body rows indented under its heading with no connector, as Claude Code draws
+    /// a teammate's notification or message, each wrapping under its indent.
+    Body(Vec<(String, Option<Role>)>),
     Input {
         text: String,
         spans: Vec<RoleSpan>,
@@ -4550,7 +4694,6 @@ impl ConversationPiece {
     fn append_to(&self, scrollback: &mut Scrollback, display: DisplayProfile) {
         match self {
             Self::Block => scrollback.start_block(),
-            Self::Aside(text, role) => scrollback.append_aside(text, *role),
             Self::ToolCall {
                 run_id,
                 call_key,
@@ -4561,6 +4704,7 @@ impl ConversationPiece {
             } => scrollback.set_tool_call(*run_id, call_key, spans, *state, collapse.clone()),
             Self::ToolResult { call_key, runs } => scrollback.append_tool_result(call_key, runs),
             Self::Response(runs) => scrollback.append_response(runs),
+            Self::Body(runs) => scrollback.append_body(runs),
             Self::Styled(text, role) if *role == Some(Role::Error) => {
                 let links = hyperlink::web_links(text);
                 for (run, link) in hyperlink::runs(text, &links) {
@@ -4592,12 +4736,11 @@ impl ConversationPiece {
     pub(super) fn text(&self) -> std::borrow::Cow<'_, str> {
         match self {
             Self::Block => "\n".into(),
-            Self::Aside(text, _) => format!("\n{text}").into(),
             Self::Styled(text, _)
             | Self::Input { text, .. }
             | Self::Markdown { text, .. }
             | Self::ToolCall { text, .. } => text.as_str().into(),
-            Self::Response(runs) | Self::ToolResult { runs, .. } => {
+            Self::Response(runs) | Self::Body(runs) | Self::ToolResult { runs, .. } => {
                 runs.iter().map(|(text, _)| text.as_str()).collect()
             }
         }
@@ -4714,11 +4857,15 @@ fn pending_input_lines(
     width: usize,
     rows: usize,
     display: DisplayProfile,
+    send_now: bool,
 ) -> Vec<RoleLine> {
     if entries.is_empty() || rows == 0 {
         return Vec::new();
     }
-    let entry_rows = rows.saturating_sub(1).max(1);
+    // Under the newest queued entry, as Claude Code names its send-now chord there; it takes a
+    // row only while every entry still fits beside it.
+    let send_now = send_now && entries.len() + 2 <= rows;
+    let entry_rows = rows.saturating_sub(1 + usize::from(send_now)).max(1);
     let shown = if entries.len() <= entry_rows {
         entries.len()
     } else {
@@ -4748,6 +4895,11 @@ fn pending_input_lines(
         line.truncate(width);
         lines.push(line);
     }
+    if send_now {
+        let mut hint = RoleLine::role(format!("    {QUEUED_SEND_NOW_HINT}"), Role::MutedText);
+        hint.truncate(width);
+        lines.push(hint);
+    }
     if omitted > 0 && entry_rows > 1 {
         lines.push(RoleLine::role(format!("  … {omitted} more"), Role::Subtle));
     }
@@ -4767,16 +4919,20 @@ impl State {
     }
 
     /// Keeps when each still-running command was first seen; returns whether the hint changed.
-    fn set_foreground_commands(&mut self, commands: &[Uuid], now: Instant) -> bool {
+    fn set_foreground_commands(
+        &mut self,
+        commands: &[(Uuid, Option<String>)],
+        now: Instant,
+    ) -> bool {
         self.foreground_commands
-            .retain(|(command, _)| commands.contains(command));
-        for command in commands {
-            if !self
-                .foreground_commands
-                .iter()
-                .any(|(seen, _)| seen == command)
-            {
-                self.foreground_commands.push((*command, now));
+            .retain(|known| commands.iter().any(|(id, _)| *id == known.id));
+        for (id, call_id) in commands {
+            if !self.foreground_commands.iter().any(|known| known.id == *id) {
+                self.foreground_commands.push(ForegroundCommand {
+                    id: *id,
+                    call_id: call_id.clone(),
+                    seen: now,
+                });
             }
         }
         self.refresh_foreground_command_hint(now)
@@ -4785,24 +4941,27 @@ impl State {
     /// Like Claude Code, a foreground command is offered to the background once it has run past
     /// the progress threshold.
     fn backgroundable_commands(&self, now: Instant) -> impl Iterator<Item = Uuid> + '_ {
-        self.foreground_commands
-            .iter()
-            .filter(move |(_, seen)| {
-                now.saturating_duration_since(*seen) >= FOREGROUND_COMMAND_HINT_DELAY
-            })
-            .map(|(command, _)| *command)
+        self.backgroundable(now).map(|command| command.id)
     }
 
-    /// Shows the hint once a command can move to the background and hides it when none can;
-    /// returns whether it changed.
+    fn backgroundable(&self, now: Instant) -> impl Iterator<Item = &ForegroundCommand> + '_ {
+        self.foreground_commands.iter().filter(move |command| {
+            now.saturating_duration_since(command.seen) >= FOREGROUND_COMMAND_HINT_DELAY
+        })
+    }
+
+    /// Shows the hint under each command that can move to the background and hides it when none
+    /// can; returns whether it changed.
     fn refresh_foreground_command_hint(&mut self, now: Instant) -> bool {
-        let offers_background = self.backgroundable_commands(now).next().is_some();
-        if offers_background == self.scrollback.shows_foreground_command_hint() {
-            return false;
-        }
-        self.scrollback.set_foreground_command_hint(
-            offers_background.then(|| RoleLine::role(FOREGROUND_COMMAND_HINT, Role::MutedText)),
-        )
+        let calls: Vec<_> = self
+            .backgroundable(now)
+            .map(|command| command.call_id.clone())
+            .collect();
+        let hint = (!calls.is_empty()).then(|| ForegroundCommandHint {
+            line: RoleLine::role(FOREGROUND_COMMAND_HINT, Role::MutedText),
+            calls,
+        });
+        self.scrollback.set_foreground_command_hint(hint)
     }
 
     fn can_background_foreground_work(&self) -> bool {
@@ -5085,7 +5244,11 @@ impl State {
             rendered_rows: Vec::new(),
             held_frames: 0,
             frame_deferred: false,
+            #[cfg(test)]
+            frames_drawn: 0,
             selection: None,
+            content_viewport: None,
+            selection_drag: None,
             display: DisplayProfile::new(preferences),
             colour_depth: ColourDepth::detect(
                 interactive,
@@ -5151,6 +5314,7 @@ impl State {
             menu_rule_role: None,
             picker_kind: None,
             picker_presentation: Default::default(),
+            picker_search: None,
             artifacts_picker: None,
             conversation_picker: None,
             menu_link: None,
@@ -5258,11 +5422,32 @@ impl State {
     /// Pointer input scrolls the conversation, selects text and activates the return control.
     /// Other events are captured so the terminal does not translate the wheel into arrow keys.
     fn pointer(&mut self, event: MouseEvent, output: &mut impl Write) -> bool {
-        if let Some((_, transcript)) = &mut self.transcript {
+        let at = Cell {
+            row: usize::from(event.row),
+            column: usize::from(event.column),
+        };
+        // A selection started in scrolling content keeps the pointer until the release, wherever
+        // the drag goes.
+        if self.selection_drag.is_some()
+            && matches!(
+                event.kind,
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+            )
+        {
+            return self.drag_selection(event.kind, at, output);
+        }
+        if self.transcript.is_some() {
             return match event.kind {
                 MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
-                    transcript.wheel(event.kind == MouseEventKind::ScrollDown);
+                    self.clear_selection();
+                    if let Some((_, transcript)) = &mut self.transcript {
+                        transcript.wheel(event.kind == MouseEventKind::ScrollDown);
+                    }
                     true
+                }
+                MouseEventKind::Down(MouseButton::Left) => self.start_selection(at),
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+                    self.drag_selection(event.kind, at, output)
                 }
                 _ => false,
             };
@@ -5304,10 +5489,6 @@ impl State {
         {
             return false;
         }
-        let at = Cell {
-            row: usize::from(event.row),
-            column: usize::from(event.column),
-        };
         if self.full_review {
             match event.kind {
                 MouseEventKind::ScrollUp => self.navigate_menu_review(DiffNavigationAction::Up),
@@ -5507,27 +5688,132 @@ impl State {
                     return true;
                 }
                 self.back_to_bottom_pressed = false;
-                let had_selection = self.selection.is_some();
-                self.selection = Some(Selection::started_at(at));
-                had_selection
+                self.start_selection(at)
             }
-            MouseEventKind::Drag(MouseButton::Left) => match &mut self.selection {
-                Some(selection) => {
-                    selection.drag_to(at);
-                    true
-                }
-                None => false,
-            },
-            MouseEventKind::Up(MouseButton::Left) => {
-                // The release carries its own position, so a terminal that drops
-                // the intermediate motion reports still selects the dragged span.
-                if let Some(selection) = &mut self.selection {
-                    selection.drag_to(at);
-                }
-                self.copy_selection(output)
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+                self.drag_selection(event.kind, at, output)
             }
             _ => false,
         }
+    }
+
+    /// Starts a selection at a press: in the content of the conversation or the transcript under
+    /// it, so the selection keeps to that content as it scrolls, or else on the screen.
+    fn start_selection(&mut self, at: Cell) -> bool {
+        let had_selection = self.selection.is_some();
+        let viewport = self
+            .content_viewport
+            .as_ref()
+            .filter(|viewport| viewport.contains(at));
+        self.selection = Some(match viewport {
+            Some(viewport) => Selection::started_at(viewport.surface, viewport.content_cell(at)),
+            None => Selection::started_at(Surface::Screen, at),
+        });
+        self.selection_drag = viewport.map(|_| SelectionDrag::default());
+        had_selection
+    }
+
+    /// Moves the selection's free end to the pointer, scrolling the content while the drag holds
+    /// it at an edge, and copies the selection on release. The release carries its own position,
+    /// so a terminal that drops the intermediate motion reports still selects the dragged span.
+    fn drag_selection(&mut self, kind: MouseEventKind, at: Cell, output: &mut impl Write) -> bool {
+        let released = kind == MouseEventKind::Up(MouseButton::Left);
+        if released {
+            self.selection_drag = None;
+        } else if let Some(drag) = &mut self.selection_drag {
+            drag.pointer = Some(at);
+        }
+        if !self.extend_selection_to(at) {
+            return false;
+        }
+        if released {
+            return self.copy_selection(output);
+        }
+        self.scroll_selection(Instant::now());
+        true
+    }
+
+    /// Moves the selection's free end to the screen cell `at`, counted as the surface it selects
+    /// counts. Returns whether there is a selection.
+    fn extend_selection_to(&mut self, at: Cell) -> bool {
+        let Some(surface) = self.selection.map(Selection::surface) else {
+            return false;
+        };
+        let head = match surface {
+            Surface::Screen => Some(at),
+            surface => self
+                .viewport_of(surface)
+                .map(|viewport| viewport.content_cell(at)),
+        };
+        if let (Some(selection), Some(head)) = (&mut self.selection, head) {
+            selection.drag_to(head);
+        }
+        true
+    }
+
+    /// Scrolls the content a drag selects in while the pointer is held at or past its top or
+    /// bottom edge, a few rows each interval, and extends the selection over the rows that come
+    /// into view. Returns whether the content moved.
+    fn scroll_selection(&mut self, now: Instant) -> bool {
+        let Some(SelectionDrag {
+            pointer: Some(pointer),
+            next_scroll_at,
+        }) = self.selection_drag
+        else {
+            return false;
+        };
+        let Some(viewport) = self
+            .selection
+            .and_then(|selection| self.viewport_of(selection.surface()))
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(direction) = viewport.drag_scroll(pointer) else {
+            self.selection_drag = Some(SelectionDrag {
+                pointer: Some(pointer),
+                next_scroll_at: None,
+            });
+            return false;
+        };
+        if next_scroll_at.is_some_and(|due| now < due) {
+            return false;
+        }
+        self.selection_drag = Some(SelectionDrag {
+            pointer: Some(pointer),
+            next_scroll_at: Some(now + SELECTION_SCROLL_INTERVAL),
+        });
+        let first_row = match viewport.surface {
+            Surface::Conversation => {
+                self.scrollback.scroll(match direction {
+                    ScrollDirection::Up => ScrollAction::LinesUp(SELECTION_SCROLL_ROWS),
+                    ScrollDirection::Down => ScrollAction::LinesDown(SELECTION_SCROLL_ROWS),
+                });
+                self.scrollback.top_row()
+            }
+            Surface::Transcript => {
+                let Some((_, transcript)) = &mut self.transcript else {
+                    return false;
+                };
+                transcript.scroll(direction == ScrollDirection::Down, SELECTION_SCROLL_ROWS);
+                transcript.top_row()
+            }
+            Surface::Screen => return false,
+        };
+        if first_row == viewport.first_row {
+            return false;
+        }
+        if let Some(viewport) = &mut self.content_viewport {
+            viewport.first_row = first_row;
+        }
+        self.extend_selection_to(pointer);
+        true
+    }
+
+    fn viewport_of(&self, surface: Surface) -> Option<&Viewport> {
+        self.content_viewport
+            .as_ref()
+            .filter(|viewport| viewport.surface == surface)
     }
 
     fn scroll_conversation(&mut self, action: ScrollAction) -> bool {
@@ -5552,7 +5838,18 @@ impl State {
             self.selection = None;
             return false;
         }
-        let text = selection.text(&self.rendered_screen);
+        let rows = selection.rows();
+        let first_row = rows.start;
+        let text = match selection.surface() {
+            Surface::Screen => selection.text(0, &self.rendered_screen),
+            Surface::Conversation => selection.text(first_row, &self.scrollback.row_texts(rows)),
+            Surface::Transcript => self
+                .transcript
+                .as_ref()
+                .map_or_else(String::new, |(_, transcript)| {
+                    selection.text(first_row, transcript.row_texts(rows))
+                }),
+        };
         if text.is_empty() {
             self.selection = None;
             return true;
@@ -5565,6 +5862,7 @@ impl State {
 
     fn clear_selection(&mut self) -> bool {
         self.back_to_bottom_pressed = false;
+        self.selection_drag = None;
         self.selection.take().is_some()
     }
 
@@ -5701,8 +5999,13 @@ impl State {
     }
 
     fn draw_frame(&mut self, output: &mut impl Write) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            self.frames_drawn += 1;
+        }
         self.monitor_row_targets.clear();
         self.monitor_separator = None;
+        self.content_viewport = None;
         self.row_clock_at =
             self.next_row_clock(tickloop_agent_base::private_fs::unix_time_milliseconds());
         if self.full_review {
@@ -5760,10 +6063,17 @@ impl State {
         if let Some((_, transcript)) = &mut self.transcript {
             transcript.set_notice(self.menu.is_some().then_some(MENU_WAITING_NOTICE));
             let frame = transcript.frame(self.width, self.height);
+            self.content_viewport = Some(Viewport {
+                surface: Surface::Transcript,
+                rows: 0..frame.content.len(),
+                columns: self.width,
+                first_row: frame.content.start,
+            });
             let rows: Vec<String> = frame
                 .lines
-                .iter()
-                .map(|line| line.render(self.colour_depth))
+                .into_iter()
+                .enumerate()
+                .map(|(row, line)| self.with_selection(row, line).render(self.colour_depth))
                 .collect();
             write!(output, "{RESET_SCROLL_REGION}")?;
             self.paint_rows(output, RenderedView::Transcript, rows, 0)?;
@@ -5850,6 +6160,17 @@ impl State {
         if monitor_lines.is_some() && !self.monitor.overlay {
             self.monitor_separator = Some((self.width.saturating_sub(side_columns), 0..start));
         }
+        let first_body_row = sticky_rows + padding;
+        self.content_viewport = Some(Viewport {
+            surface: Surface::Conversation,
+            rows: first_body_row..first_body_row + body.lines.len(),
+            columns: if monitor_lines.is_some() {
+                self.width.saturating_sub(side_columns)
+            } else {
+                content_columns
+            },
+            first_row: body.top,
+        });
         let rows: Vec<String> = (0..start)
             .map(|row| {
                 let pinned = if row == 0 {
@@ -6055,13 +6376,23 @@ impl State {
     }
 
     /// Paints the selection onto one screen row in the theme's readable
-    /// selection colours; text outside the selected columns is untouched.
+    /// selection colours; text outside the selected columns is untouched. A
+    /// selection of scrolling content paints the rows that content shows there.
     fn with_selection(&self, screen_row: usize, line: StyledLine) -> StyledLine {
         let Some(selection) = self.selection.filter(|selection| !selection.is_empty()) else {
             return line;
         };
+        let row = match selection.surface() {
+            Surface::Screen => Some(screen_row),
+            surface => self
+                .viewport_of(surface)
+                .and_then(|viewport| viewport.content_row(screen_row)),
+        };
+        let Some(row) = row else {
+            return line;
+        };
         let row_width = line.spans.iter().map(|span| line_width(&span.text)).sum();
-        let Some((first, last)) = selection.columns_on(screen_row, row_width) else {
+        let Some((first, last)) = selection.columns_on(row, row_width) else {
             return line;
         };
         let theme = self.display.theme();
@@ -6320,6 +6651,7 @@ impl State {
             .min(capacity.saturating_sub(title_rows + hint_rows + 1));
         let picker = self.picker_kind.is_some();
         let compact = picker && self.width < COMPACT_PICKER_COLUMNS;
+        let search_rows = usize::from(self.picker_search.is_some() && capacity > 2);
         let minimum_option_rows =
             1 + usize::from(
                 compact
@@ -6335,10 +6667,12 @@ impl State {
             self.menu_context_rows(menu, capacity).min(2)
         };
         let context_reserve = capacity
-            .saturating_sub(title_rows + hint_rows + comment_rows + minimum_option_rows)
+            .saturating_sub(
+                title_rows + hint_rows + search_rows + comment_rows + minimum_option_rows,
+            )
             .min(context_rows);
-        let option_capacity =
-            capacity.saturating_sub(title_rows + hint_rows + comment_rows + context_reserve);
+        let option_capacity = capacity
+            .saturating_sub(title_rows + hint_rows + search_rows + comment_rows + context_reserve);
         let options = menu
             .options
             .iter()
@@ -6401,8 +6735,8 @@ impl State {
             option_end += 1;
         }
         option_rows += group_rows(option_start, option_end);
-        let context_capacity =
-            capacity.saturating_sub(title_rows + hint_rows + option_rows + comment_rows);
+        let context_capacity = capacity
+            .saturating_sub(title_rows + hint_rows + search_rows + option_rows + comment_rows);
         let mut lines = Vec::new();
         if capacity > 1 {
             let count = if self.request_layout.is_some() && self.request_queue_count > 1 {
@@ -6419,6 +6753,25 @@ impl State {
                 Role::DialogTitle,
             ));
         }
+        let search_cursor = if search_rows > 0 {
+            let (line, column) = super::conversation_picker::search_row(
+                self.picker_search
+                    .as_ref()
+                    .expect("search row is drawn")
+                    .query
+                    .draft(),
+                self.picker_search
+                    .as_ref()
+                    .expect("search row is drawn")
+                    .query
+                    .cursor(),
+                self.width,
+            );
+            lines.push(line);
+            Some(column)
+        } else {
+            None
+        };
         if context_capacity > 0 {
             if let Some(review) = &mut self.menu_review {
                 let viewport = DiffViewport {
@@ -6497,8 +6850,15 @@ impl State {
                 selected_row = lines.len();
             }
             let remaining = capacity.saturating_sub(hint_rows + comment_rows + lines.len());
+            let role = self
+                .picker_presentation
+                .row_roles
+                .get(index)
+                .copied()
+                .flatten()
+                .unwrap_or(Role::Text);
             lines.extend(option_lines.iter().take(remaining).map(|text| {
-                let line = RoleLine::role(text.clone(), Role::Text);
+                let line = RoleLine::role(text.clone(), role);
                 if index == selected {
                     line.filled(Role::Selection)
                 } else {
@@ -6509,6 +6869,15 @@ impl State {
                 .push((option_row..lines.len(), index));
         }
         let mut cursor = (selected_row, 0);
+        if let Some(column) = search_cursor
+            && self
+                .picker_search
+                .as_ref()
+                .is_some_and(PickerSearch::focused)
+        {
+            cursor = (1, column);
+            self.dialog_cursor_visible = true;
+        }
         if comment_rows > 0 {
             let start = comment_cursor.0.saturating_sub(comment_rows - 1);
             if editing {
@@ -6802,6 +7171,7 @@ impl State {
                 self.width,
                 MAX_PENDING_INPUT_ROWS,
                 self.display,
+                self.can_send_now(),
             )
         } else {
             Vec::new()
@@ -7036,7 +7406,13 @@ impl State {
                 break;
             }
         }
-        queue = pending_input_lines(&self.queued_inputs, self.width, queue.len(), self.display);
+        queue = pending_input_lines(
+            &self.queued_inputs,
+            self.width,
+            queue.len(),
+            self.display,
+            self.can_send_now(),
+        );
         let mut input = InputView::frame_with_prompt_and_marks(
             &draft,
             cursor,
@@ -7112,13 +7488,21 @@ impl State {
             });
         if draft.is_empty()
             && self.prompt_enabled
-            && let Some((handle, _)) = &child_badge
             && let Some(line) = input.styled_lines.first_mut()
         {
-            line.push(
-                truncate_width(&format!("Message @{handle}…"), self.width.saturating_sub(2)),
-                Some(Role::MutedText),
-            );
+            let placeholder = if !overview && !self.queued_inputs.is_empty() {
+                Some(QUEUED_INPUT_PLACEHOLDER.to_owned())
+            } else {
+                child_badge
+                    .as_ref()
+                    .map(|(handle, _)| format!("Message @{handle}…"))
+            };
+            if let Some(placeholder) = placeholder {
+                line.push(
+                    truncate_width(&placeholder, self.width.saturating_sub(2)),
+                    Some(Role::MutedText),
+                );
+            }
         }
         let mut return_control = None;
         let mut monitor_toggle = None;
@@ -7370,7 +7754,6 @@ impl State {
                 let overview_list_hint;
                 let return_hint;
                 let monitor_hint;
-                let send_now_hint;
                 let empty_input_hint;
                 let hints = if self.confirmation_hint().is_some() || self.help_open {
                     // Help is focused and draws its own close hint; only facts remain.
@@ -7425,13 +7808,8 @@ impl State {
                     } else {
                         navigation_hint.to_owned()
                     };
-                    if self.can_send_now() && self.oldest_queued_message().is_some() {
-                        send_now_hint =
-                            format!("{SEND_NOW_HINT}{HINT_SEGMENT_SEPARATOR}{empty_input_hint}");
-                        send_now_hint.as_str()
-                    } else {
-                        empty_input_hint.as_str()
-                    }
+                    // A queued message names ctrl+enter under itself, as Claude Code does.
+                    empty_input_hint.as_str()
                 } else if self.can_send_now() && !self.editor.draft().trim_start().starts_with('/')
                 {
                     "enter queue · ctrl+enter send now · ctrl+g editor · ctrl+c clear"
@@ -8369,6 +8747,19 @@ impl State {
         self.footer.clear();
     }
 
+    /// Takes the keys from Monitor, the Subagents list and the conversation for an Agent request,
+    /// so its dialog closes back to the input, as Claude Code's prompt takes the keys back after a
+    /// permission, question or plan dialog.
+    fn yield_focus_to_request(&mut self) {
+        if self.monitor.focused || self.monitor.overlay {
+            self.monitor.focused = false;
+            self.monitor.overlay = false;
+            self.rendered_region = None;
+        }
+        self.clear_footer_selection();
+        self.conversation_focused = false;
+    }
+
     fn clear_footer_selection_if_hidden(&mut self) {
         if !self.help_open && !self.footer_can_own_focus() {
             self.clear_footer_selection();
@@ -8591,6 +8982,12 @@ impl State {
         }
     }
 
+    /// The open menu when it is the Agent's permission, question or plan request.
+    fn agent_request_menu(&self) -> Option<Uuid> {
+        let menu = self.menu.as_ref()?;
+        (self.question_menu.is_some() || self.request_menu == Some(menu.id)).then_some(menu.id)
+    }
+
     fn selected_menu_accepts_comment(&self) -> bool {
         let Some(selected) = self.menu.as_ref().map(|menu| menu.selected) else {
             return false;
@@ -8605,6 +9002,17 @@ impl State {
             // Keys are ignored until the submitted choice finishes, so no key hint is offered.
             if self.user_menu_submission_is_unfinished() {
                 return MENU_SUBMISSION_PENDING_HINT;
+            }
+            if self
+                .picker_search
+                .as_ref()
+                .is_some_and(PickerSearch::focused)
+            {
+                return if self.picker_search_is_empty() {
+                    "enter apply · esc list"
+                } else {
+                    "enter apply · esc clear"
+                };
             }
             self.menu
                 .as_ref()
@@ -8739,14 +9147,14 @@ impl State {
         true
     }
 
-    fn paste(&mut self, text: &str) {
+    fn paste(&mut self, text: &str) -> Option<InputEvent> {
         self.shell_background_chord_started_at = None;
         if let Some((_, transcript)) = &mut self.transcript {
             transcript.paste(text);
-            return;
+            return None;
         }
         if self.input_dialog_requires_resize() {
-            return;
+            return None;
         }
         if self.ordinary_input_is_visible() {
             self.clear_prompt_suggestion();
@@ -8760,56 +9168,71 @@ impl State {
                 && self.conversation_picker.is_none()
                 && self.permissions_surface.is_none()
         {
-            return;
+            return None;
         }
         if self.input_dialog_visible() && self.menu.is_some() && !self.review_focused {
             self.menu_focused = true;
         }
+        if self
+            .picker_search
+            .as_ref()
+            .is_some_and(PickerSearch::focused)
+        {
+            let query = super::conversation_picker::compact_line(text);
+            let changed = self.picker_search.as_mut().is_some_and(|search| {
+                search.query.apply(EditorCommand::InsertPasted(query)) == EditorOutcome::Changed
+            });
+            return if changed {
+                self.picker_search_refilter_event()
+            } else {
+                None
+            };
+        }
         self.last_input_edit = Some(Instant::now());
         if self.branch_submission_owns_input() {
-            return;
+            return None;
         }
         self.clear_footer_selection();
         if self.menu_submission_is_pending() {
-            return;
+            return None;
         }
         if self.menu.is_none()
             && let Some(picker) = &mut self.artifacts_picker
         {
             picker.paste(text);
-            return;
+            return None;
         }
         if self.menu.is_none()
             && let Some(picker) = &mut self.conversation_picker
         {
             picker.paste(text);
-            return;
+            return None;
         }
         if !self.input_dialog_visible() && self.monitor.focused && self.monitor_visible() {
-            return;
+            return None;
         }
         if self.input_menu_active() {
             self.paste_menu_comment(text);
-            return;
+            return None;
         }
         if self.menu.is_none() && self.foreground_shell {
-            return;
+            return None;
         }
         if self.menu.is_none()
             && let Some(surface) = &mut self.permissions_surface
         {
             surface.paste(text);
-            return;
+            return None;
         }
         if self.menu.is_none() && self.history_search.is_some() {
             self.apply_history_search(HistorySearchInput::Insert(text.into()));
-            return;
+            return None;
         }
         if self.paste_menu_comment(text) {
-            return;
+            return None;
         }
         if self.menu_focused {
-            return;
+            return None;
         }
         if self.prompt_enabled {
             self.menu_focused = false;
@@ -8831,11 +9254,11 @@ impl State {
                     if self.empty_paste_reads_clipboard_image {
                         self.paste_clipboard_image_after_empty_paste();
                     }
-                    return;
+                    return None;
                 }
                 if self.accepts_images {
                     if self.paste_with_image_paths(&text) {
-                        return;
+                        return None;
                     }
                 } else {
                     refused_image_path = find_image_paths(&text, self.working_directory())
@@ -8870,8 +9293,8 @@ impl State {
                 self.status = IMAGE_INPUT_UNSUPPORTED.into();
             }
         }
+        None
     }
-
     fn insert_pasted_text(&mut self, text: &str) {
         let start = self.editor.cursor();
         self.insert_pasted(text);
@@ -9207,6 +9630,151 @@ impl State {
             && self.transcript.is_none()
             && self.history_search.is_none()
             && !self.foreground_shell
+    }
+
+    fn picker_search_key(&mut self, key: KeyEvent) -> PickerSearchOutcome {
+        let Some(search) = self.picker_search.as_mut() else {
+            return PickerSearchOutcome::Passthrough;
+        };
+        if !search.focused() {
+            return match (key.code, key.modifiers) {
+                (KeyCode::Char('/'), modifiers)
+                    if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    search.focus = PickerSearchFocus::Search;
+                    PickerSearchOutcome::Handled
+                }
+                (KeyCode::Esc, _) if !search.query.draft().is_empty() => {
+                    self.picker_search_edit(EditorCommand::Clear)
+                }
+                _ => PickerSearchOutcome::Passthrough,
+            };
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return match key.code {
+                KeyCode::Char('g') => self.edit_picker_search_in_external_editor(),
+                KeyCode::Char('n') => self.picker_search_move(1),
+                KeyCode::Char('p') => self.picker_search_move(-1),
+                KeyCode::Char('a') => self.picker_search_edit(EditorCommand::MoveLineStart),
+                KeyCode::Char('e') => self.picker_search_edit(EditorCommand::MoveLineEnd),
+                KeyCode::Char('b') => self.picker_search_edit(EditorCommand::MoveLeft),
+                KeyCode::Char('f') => self.picker_search_edit(EditorCommand::MoveRight),
+                KeyCode::Char('u') => self.picker_search_edit(EditorCommand::KillToLineStart),
+                KeyCode::Char('k') => self.picker_search_edit(EditorCommand::KillToLineEnd),
+                KeyCode::Char('w') => {
+                    self.picker_search_edit(EditorCommand::KillToPreviousWhitespace)
+                }
+                KeyCode::Char('y') => self.picker_search_edit(EditorCommand::Yank),
+                _ => PickerSearchOutcome::Handled,
+            };
+        }
+        match key.code {
+            KeyCode::Enter => PickerSearchOutcome::Passthrough,
+            KeyCode::Up | KeyCode::Down => {
+                if let Some(search) = self.picker_search.as_mut() {
+                    search.focus = PickerSearchFocus::List;
+                }
+                PickerSearchOutcome::Handled
+            }
+            KeyCode::Esc if self.picker_search_is_empty() => {
+                if let Some(search) = self.picker_search.as_mut() {
+                    search.focus = PickerSearchFocus::List;
+                }
+                PickerSearchOutcome::Handled
+            }
+            KeyCode::Esc => self.picker_search_edit(EditorCommand::Clear),
+            KeyCode::Backspace if self.picker_search_is_empty() => {
+                if let Some(search) = self.picker_search.as_mut() {
+                    search.focus = PickerSearchFocus::List;
+                }
+                PickerSearchOutcome::Handled
+            }
+            KeyCode::Backspace => self.picker_search_edit(EditorCommand::DeleteBackward),
+            KeyCode::Delete => self.picker_search_edit(EditorCommand::DeleteForward),
+            KeyCode::Left => self.picker_search_edit(EditorCommand::MoveLeft),
+            KeyCode::Right => self.picker_search_edit(EditorCommand::MoveRight),
+            KeyCode::Home => self.picker_search_edit(EditorCommand::MoveLineStart),
+            KeyCode::End => self.picker_search_edit(EditorCommand::MoveLineEnd),
+            KeyCode::Char(character)
+                if !key.modifiers.contains(KeyModifiers::ALT) && !character.is_control() =>
+            {
+                self.picker_search_edit(EditorCommand::Insert(character.to_string()))
+            }
+            _ => PickerSearchOutcome::Passthrough,
+        }
+    }
+
+    fn picker_search_is_empty(&self) -> bool {
+        self.picker_search
+            .as_ref()
+            .is_none_or(|search| search.query.draft().is_empty())
+    }
+
+    fn picker_search_refilter_event(&self) -> Option<InputEvent> {
+        let (menu_id, index) = self.menu.as_ref().map(|menu| (menu.id, menu.selected))?;
+        Some(InputEvent::PickerAction {
+            menu_id,
+            index,
+            action: PickerAction::SearchQuery,
+        })
+    }
+
+    fn picker_search_move(&mut self, delta: isize) -> PickerSearchOutcome {
+        if let Some(menu) = &mut self.menu {
+            let last = menu.options.len().saturating_sub(1);
+            menu.selected = if delta > 0 {
+                (menu.selected + 1).min(last)
+            } else {
+                menu.selected.saturating_sub(1)
+            };
+        }
+        PickerSearchOutcome::Handled
+    }
+
+    fn picker_search_edit(&mut self, command: EditorCommand) -> PickerSearchOutcome {
+        if self
+            .picker_search
+            .as_mut()
+            .is_some_and(|search| search.edit(command))
+        {
+            PickerSearchOutcome::Refilter
+        } else {
+            PickerSearchOutcome::Handled
+        }
+    }
+
+    fn edit_picker_search_in_external_editor(&mut self) -> PickerSearchOutcome {
+        let Some(query) = self
+            .picker_search
+            .as_ref()
+            .map(|search| search.query.draft().to_owned())
+        else {
+            return PickerSearchOutcome::Handled;
+        };
+        let outcome = self.run_external_editor(&query);
+        let Some(search) = self.picker_search.as_mut() else {
+            return PickerSearchOutcome::Handled;
+        };
+        match outcome {
+            Some(ExternalEditorOutcome::Updated { content }) => {
+                let query = super::conversation_picker::compact_line(&content);
+                let cursor = query.len();
+                let changed = query != search.query.draft();
+                search.query.replace_draft(query, cursor);
+                if changed {
+                    PickerSearchOutcome::Refilter
+                } else {
+                    PickerSearchOutcome::Handled
+                }
+            }
+            Some(
+                ExternalEditorOutcome::Unchanged
+                | ExternalEditorOutcome::Cancelled { .. }
+                | ExternalEditorOutcome::Unavailable
+                | ExternalEditorOutcome::Failed(_),
+            )
+            | None => PickerSearchOutcome::Handled,
+        }
     }
 
     /// Every key belongs to the open picker, so none reaches the draft beneath it.
@@ -10035,6 +10603,18 @@ impl State {
             self.history_search_key(key);
             return None;
         }
+        // Claude Code's `PermissionRequest` binds Ctrl+C in its permission, plan and question
+        // dialogs to the same rejection as Esc, also from a comment field or the diff.
+        if (self.menu_focused || self.review_focused)
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('c')
+            && let Some(menu_id) = self.agent_request_menu()
+        {
+            self.escape_confirmation = None;
+            self.exit_confirmation = None;
+            self.begin_menu_submission(menu_id);
+            return Some(InputEvent::Cancel { menu_id });
+        }
         if self.review_focused {
             let action = match (key.code, key.modifiers) {
                 (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => {
@@ -10064,17 +10644,6 @@ impl State {
             && matches!(key.code, KeyCode::Char('c' | 'd')))
         {
             self.exit_confirmation = None;
-        }
-        // Claude Code binds Ctrl+C in its question dialog to the same cancel as Esc, also from the
-        // Other field.
-        if self.menu_focused
-            && self.question_menu.is_some()
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && key.code == KeyCode::Char('c')
-            && let Some(menu_id) = self.menu.as_ref().map(|menu| menu.id)
-        {
-            self.begin_menu_submission(menu_id);
-            return Some(InputEvent::Cancel { menu_id });
         }
         if (self.menu_focused || self.review_focused)
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -10178,6 +10747,17 @@ impl State {
             && let Some(event) = self.question_menu_key(key)
         {
             return event;
+        }
+        if self.menu_focused
+            && menu_is_visible
+            && self.picker_search.is_some()
+            && !self.user_menu_submission_is_unfinished()
+        {
+            match self.picker_search_key(key) {
+                PickerSearchOutcome::Passthrough => {}
+                PickerSearchOutcome::Handled => return None,
+                PickerSearchOutcome::Refilter => return self.picker_search_refilter_event(),
+            }
         }
         if self.menu_focused
             && menu_is_visible
@@ -10892,10 +11472,14 @@ fn read_keys(
             let rows_changed =
                 state.refresh_row_clocks(tickloop_agent_base::private_fs::unix_time_milliseconds());
             let hint_changed = state.refresh_foreground_command_hint(Instant::now());
+            // Terminals report motion only when the pointer changes cell, so a drag held at an
+            // edge keeps scrolling from here.
+            let selection_scrolled = state.scroll_selection(Instant::now());
             if state.poll_clipboard_hint(Instant::now())
                 || confirmation_expired
                 || rows_changed
                 || hint_changed
+                || selection_scrolled
             {
                 state.draw(&mut io::stdout().lock())?;
             }
@@ -10922,10 +11506,7 @@ fn read_keys(
                 state.clear_selection();
                 state.key(legacy_escape(key))
             }
-            Event::Paste(text) => {
-                state.paste(&text);
-                None
-            }
+            Event::Paste(text) => state.paste(&text),
             Event::Resize(width, height) => {
                 state.resize(width, height);
                 None
@@ -11713,6 +12294,7 @@ mod tests {
                     chat_id,
                     origin: ShellTaskOrigin::User,
                     owner: ShellTaskOwner::User { chat_id },
+                    call_id: None,
                     command: format!("printf task-{index}"),
                     description: None,
                     cwd: PathBuf::from("/tmp"),
@@ -11994,7 +12576,7 @@ mod tests {
         let row = state
             .rendered_screen
             .iter()
-            .position(|line| line.starts_with("history-"))
+            .position(|line| line.starts_with("history-90"))
             .expect("the conversation should be on screen");
         let expected = state.rendered_screen[row][.."history-9".len()].to_owned();
 
@@ -12038,7 +12620,7 @@ mod tests {
         let row = state
             .rendered_screen
             .iter()
-            .position(|line| line.starts_with("history-"))
+            .position(|line| line.starts_with("history-90"))
             .expect("the conversation should be on screen");
         let width = "history-9".len();
         let mut output = Vec::new();
@@ -12110,7 +12692,7 @@ mod tests {
         let row = state
             .rendered_screen
             .iter()
-            .position(|line| line.starts_with("history-"))
+            .position(|line| line.starts_with("history-90"))
             .expect("the conversation should be on screen");
         drag(&mut state, (row as u16, 0), (row as u16, 20));
         let styled = RoleLine::role("history ", Role::MutedText)
@@ -12165,7 +12747,7 @@ mod tests {
         let row = state
             .rendered_screen
             .iter()
-            .position(|line| line.starts_with("history-"))
+            .position(|line| line.starts_with("history-90"))
             .expect("the conversation should be on screen");
         let width = "history-9".len();
         let expected = state.rendered_screen[row][..width].to_owned();
@@ -12229,6 +12811,282 @@ mod tests {
         ));
         assert!(state.selection.is_none());
         assert!(copies.lock().unwrap().is_empty());
+    }
+
+    /// The numbers of the `<label>-N` rows the screen shows, top to bottom.
+    fn shown_rows(state: &State, label: &str) -> Vec<usize> {
+        state
+            .rendered_screen
+            .iter()
+            .filter_map(|line| line.trim().strip_prefix(label)?.parse().ok())
+            .collect()
+    }
+
+    fn screen_row_of(state: &State, text: &str) -> u16 {
+        state
+            .rendered_screen
+            .iter()
+            .position(|line| line.trim() == text)
+            .unwrap_or_else(|| panic!("{text} should be on screen")) as u16
+    }
+
+    fn numbered_rows(label: &str, rows: std::ops::RangeInclusive<usize>) -> String {
+        rows.map(|index| format!("{label}{index}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Text of `screen_row` that the drawn selection paints with the selection background.
+    fn highlighted_on(state: &State, screen_row: usize) -> String {
+        let line = state.rendered_screen[screen_row].clone();
+        let background = state.display.theme().style(Role::Selection).background;
+        state
+            .with_selection(screen_row, StyledLine::plain(line.as_str()))
+            .spans
+            .iter()
+            .filter(|span| span.style.background == background)
+            .map(|span| span.text.as_str())
+            .collect()
+    }
+
+    fn state_with_transcript(rows: usize) -> (State, Arc<Mutex<Vec<String>>>) {
+        let (mut state, copies) = state_with_capturing_clipboard();
+        state.start_transcript();
+        state
+            .transcript
+            .as_mut()
+            .unwrap()
+            .1
+            .update(TranscriptDocument::from(
+                (0..rows)
+                    .map(|index| format!("transcript-{index}"))
+                    .collect::<Vec<_>>(),
+            ));
+        state.draw(&mut Vec::new()).unwrap();
+        (state, copies)
+    }
+
+    #[test]
+    fn dragging_past_the_top_of_the_conversation_scrolls_it_and_copies_the_rows_above() {
+        let (mut state, copies) = state_with_capturing_clipboard();
+        let first_shown = shown_rows(&state, "history-")[0];
+        let anchor_text = format!("history-{}", first_shown + 5);
+        let anchor = screen_row_of(&state, &anchor_text);
+        let mut output = Vec::new();
+        state.pointer(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                anchor,
+                anchor_text.len() as u16,
+            ),
+            &mut output,
+        );
+        assert!(
+            !state.scroll_selection(Instant::now() + SELECTION_SCROLL_INTERVAL),
+            "a press alone does not scroll"
+        );
+
+        state.pointer(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 0, 0),
+            &mut output,
+        );
+        let mut now = Instant::now();
+        for _ in 0..2 {
+            now += SELECTION_SCROLL_INTERVAL;
+            assert!(
+                state.scroll_selection(now),
+                "a pointer held at the top edge keeps scrolling without motion"
+            );
+        }
+        state.draw(&mut output).unwrap();
+        let scrolled_to = first_shown - 3 * SELECTION_SCROLL_ROWS;
+        assert_eq!(shown_rows(&state, "history-")[0], scrolled_to);
+        assert_eq!(
+            highlighted_on(&state, usize::from(screen_row_of(&state, &anchor_text))),
+            anchor_text,
+            "the selection stays on the text it started on"
+        );
+        assert_eq!(
+            highlighted_on(&state, 0),
+            format!("history-{scrolled_to}"),
+            "the rows scrolled into view join the selection"
+        );
+
+        state.pointer(
+            mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            &mut output,
+        );
+        assert_eq!(
+            copies.lock().unwrap().as_slice(),
+            [numbered_rows("history-", scrolled_to..=first_shown + 5)]
+        );
+        assert!(
+            !state.scroll_selection(now + SELECTION_SCROLL_INTERVAL),
+            "the release ends the scrolling"
+        );
+    }
+
+    #[test]
+    fn dragging_below_the_conversation_scrolls_it_down_and_copies_the_rows_below() {
+        let (mut state, copies) = state_with_capturing_clipboard();
+        state.scroll_conversation(ScrollAction::First);
+        state.draw(&mut Vec::new()).unwrap();
+        let last_shown = *shown_rows(&state, "history-").last().unwrap();
+        let anchor = screen_row_of(&state, "history-2");
+        let input_row = (state.height - 1) as u16;
+        let mut output = Vec::new();
+        state.pointer(
+            mouse(MouseEventKind::Down(MouseButton::Left), anchor, 0),
+            &mut output,
+        );
+        state.pointer(
+            mouse(MouseEventKind::Drag(MouseButton::Left), input_row, 0),
+            &mut output,
+        );
+        let mut now = Instant::now();
+        for _ in 0..2 {
+            now += SELECTION_SCROLL_INTERVAL;
+            assert!(state.scroll_selection(now));
+        }
+        state.pointer(
+            mouse(MouseEventKind::Up(MouseButton::Left), input_row, 0),
+            &mut output,
+        );
+
+        assert_eq!(
+            copies.lock().unwrap().as_slice(),
+            [numbered_rows(
+                "history-",
+                2..=last_shown + 3 * SELECTION_SCROLL_ROWS
+            )]
+        );
+    }
+
+    #[test]
+    fn a_drag_back_inside_the_conversation_stops_scrolling() {
+        let (mut state, copies) = state_with_capturing_clipboard();
+        let anchor = screen_row_of(&state, "history-95");
+        let mut output = Vec::new();
+        state.pointer(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                anchor,
+                "history-95".len() as u16,
+            ),
+            &mut output,
+        );
+        state.pointer(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 0, 0),
+            &mut output,
+        );
+        state.draw(&mut output).unwrap();
+        let inside = screen_row_of(&state, "history-93");
+        state.pointer(
+            mouse(MouseEventKind::Drag(MouseButton::Left), inside, 0),
+            &mut output,
+        );
+        let shown = shown_rows(&state, "history-");
+
+        assert!(!state.scroll_selection(Instant::now() + SELECTION_SCROLL_INTERVAL * 4));
+        state.draw(&mut output).unwrap();
+        assert_eq!(shown_rows(&state, "history-"), shown);
+        state.pointer(
+            mouse(MouseEventKind::Up(MouseButton::Left), inside, 0),
+            &mut output,
+        );
+        assert_eq!(
+            copies.lock().unwrap().as_slice(),
+            [numbered_rows("history-", 93..=95)]
+        );
+    }
+
+    #[test]
+    fn a_conversation_selection_follows_its_text_as_new_output_scrolls_it() {
+        let (mut state, _copies) = state_with_capturing_clipboard();
+        let row = screen_row_of(&state, "history-95");
+        drag(&mut state, (row, 0), (row, "history-95".len() as u16));
+
+        state.scrollback.append("history-100\nhistory-101\n");
+        state.draw(&mut Vec::new()).unwrap();
+
+        let moved = usize::from(screen_row_of(&state, "history-95"));
+        assert_eq!(moved, usize::from(row) - 2);
+        assert_eq!(highlighted_on(&state, moved), "history-95");
+        assert_eq!(highlighted_on(&state, usize::from(row)), "");
+    }
+
+    #[test]
+    fn dragging_in_the_detailed_transcript_highlights_and_copies_like_the_conversation() {
+        let (mut state, copies) = state_with_transcript(100);
+        let row = screen_row_of(&state, "transcript-95");
+        let width = "transcript-95".len() as u16;
+        let mut output = Vec::new();
+        state.pointer(
+            mouse(MouseEventKind::Down(MouseButton::Left), row, 0),
+            &mut output,
+        );
+        assert!(state.pointer(
+            mouse(MouseEventKind::Drag(MouseButton::Left), row, width),
+            &mut output
+        ));
+        state.draw(&mut output).unwrap();
+
+        let row = usize::from(row);
+        assert_eq!(highlighted_on(&state, row), "transcript-95");
+        let (_, transcript) = state.transcript.as_mut().unwrap();
+        let drawn = transcript.frame(state.width, state.height).lines[row].clone();
+        assert_eq!(
+            state.rendered_rows[row],
+            state.with_selection(row, drawn).render(state.colour_depth),
+            "the transcript draws the selection highlight"
+        );
+
+        state.pointer(
+            mouse(MouseEventKind::Up(MouseButton::Left), row as u16, width),
+            &mut output,
+        );
+        assert_eq!(copies.lock().unwrap().as_slice(), ["transcript-95"]);
+        assert!(
+            state.transcript.is_some(),
+            "selecting keeps the transcript open"
+        );
+    }
+
+    #[test]
+    fn dragging_past_the_top_of_the_detailed_transcript_scrolls_it_and_copies_the_rows_above() {
+        let (mut state, copies) = state_with_transcript(100);
+        let first_shown = shown_rows(&state, "transcript-")[0];
+        let anchor = screen_row_of(&state, "transcript-95");
+        let mut output = Vec::new();
+        state.pointer(
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                anchor,
+                "transcript-95".len() as u16,
+            ),
+            &mut output,
+        );
+        state.pointer(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 0, 0),
+            &mut output,
+        );
+        let mut now = Instant::now();
+        for _ in 0..2 {
+            now += SELECTION_SCROLL_INTERVAL;
+            assert!(state.scroll_selection(now));
+        }
+        state.draw(&mut output).unwrap();
+        let scrolled_to = first_shown - 3 * SELECTION_SCROLL_ROWS;
+        assert_eq!(shown_rows(&state, "transcript-")[0], scrolled_to);
+
+        state.pointer(
+            mouse(MouseEventKind::Up(MouseButton::Left), 0, 0),
+            &mut output,
+        );
+        assert_eq!(
+            copies.lock().unwrap().as_slice(),
+            [numbered_rows("transcript-", scrolled_to..=95)]
+        );
     }
 
     #[test]
@@ -14370,6 +15228,61 @@ mod tests {
             state.key(key(KeyCode::Esc)),
             Some(InputEvent::Cancel { .. })
         ));
+    }
+
+    #[test]
+    fn control_c_rejects_an_agent_request_as_escape_and_keeps_its_meaning_elsewhere() {
+        let control_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        for plan in [false, true] {
+            let mut state = State::new(true, 80, 24);
+            state.prompt_enabled = true;
+            state.insert("kept draft");
+            let console = console_with_state(state);
+            let request = menu();
+            let id = request.id;
+            console.set_request_layout(Some(id)).unwrap();
+            if plan {
+                console.show_plan_menu(request, true).unwrap();
+            } else {
+                console.show_commentable_menu(request, vec![0, 2]).unwrap();
+            }
+            let mut state = console.state.lock().unwrap();
+            state.exit_confirmation = Some(ExitConfirmation {
+                control: 'C',
+                requested_at: Instant::now(),
+            });
+            if !plan {
+                state.key(key(KeyCode::Tab));
+                assert!(state.menu_comment_is_editing());
+            }
+            assert!(
+                matches!(state.key(control_c), Some(InputEvent::Cancel { menu_id }) if menu_id == id),
+                "plan: {plan}"
+            );
+            assert_eq!(
+                state.pending_exit_control(),
+                None,
+                "rejecting a request does not count toward quitting"
+            );
+            state.mark_menu_submission_finished(id);
+            state.release_finished_submissions();
+            assert!(state.menu.is_none());
+
+            // Outside the dialog Ctrl+C still clears the draft first, then interrupts.
+            assert!(state.key(control_c).is_none());
+            assert!(state.editor.draft().is_empty());
+            assert!(matches!(state.key(control_c), Some(InputEvent::Interrupt)));
+        }
+
+        let mut state = State::new(true, 80, 24);
+        state.prompt_enabled = true;
+        state.menu = Some(menu());
+        state.menu_focused = true;
+        assert!(
+            state.key(control_c).is_none(),
+            "a menu the user opened keeps ignoring Ctrl+C"
+        );
+        assert!(state.menu.is_some());
     }
 
     #[test]
@@ -17636,7 +18549,9 @@ mod tests {
             let console = console_with_state(state);
             let mut snapshot = task_snapshot(chat, 1);
             snapshot.tasks[0].was_background = true;
-            console.update_shell_ticks(&snapshot).unwrap();
+            console
+                .refresh_monitor_ticks(snapshot.clone(), None)
+                .unwrap();
             let mut state = console.state.lock().unwrap();
             assert!(matches!(
                 state.key(KeyEvent::new(direction, KeyModifiers::SHIFT)),
@@ -17706,7 +18621,9 @@ mod tests {
         let console = console_with_state(state);
         let mut snapshot = task_snapshot(chat, 1);
         snapshot.tasks[0].was_background = true;
-        console.update_shell_ticks(&snapshot).unwrap();
+        console
+            .refresh_monitor_ticks(snapshot.clone(), None)
+            .unwrap();
         let mut state = console.state.lock().unwrap();
         state.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
         assert!(state.key(key(KeyCode::Char('j'))).is_none());
@@ -18427,11 +19344,16 @@ mod tests {
         state.edit(EditorCommand::Clear);
         assert!(!hint_row(&mut state).contains(SEND_NOW_HINT));
         state.queued_inputs = vec![queued_input(QueuedInputKind::Message, "queued", 1)];
+        let screen = {
+            state.draw_frame(&mut Vec::new()).unwrap();
+            state.rendered_screen.join("\n")
+        };
         assert!(
-            hint_row(&mut state).starts_with(SEND_NOW_HINT),
-            "{}",
-            hint_row(&mut state)
+            screen.contains("    ctrl+enter to send now")
+                && !hint_row(&mut state).contains(SEND_NOW_HINT),
+            "the hint sits under the queued message, not in the hint row: {screen}"
         );
+        assert!(screen.contains(QUEUED_INPUT_PLACEHOLDER), "{screen}");
 
         state.activity_interruptible = false;
         assert!(!hint_row(&mut state).contains(SEND_NOW_HINT));
@@ -18487,8 +19409,13 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 for rows in 1..=MAX_PENDING_INPUT_ROWS {
-                    let lines =
-                        pending_input_lines(&entries, width, rows, DisplayProfile::default());
+                    let lines = pending_input_lines(
+                        &entries,
+                        width,
+                        rows,
+                        DisplayProfile::default(),
+                        false,
+                    );
                     assert!(lines.len() <= rows, "{width}/{count}/{rows}: {lines:?}");
                     let entry_rows = if rows > 1 {
                         assert!(lines.last().unwrap().text().is_empty(), "{lines:?}");
@@ -19141,6 +20068,216 @@ mod tests {
         assert!(!rendered.contains("a Adapter"));
         assert!(state.key(key(KeyCode::Char('a'))).is_none());
         assert_eq!(state.editor.draft(), "");
+    }
+
+    #[test]
+    fn picker_search_takes_slash_then_keys_the_query_and_keeps_the_shortcuts() {
+        let mut state = State::new(true, 160, 24);
+        state.prompt_enabled = true;
+        let console = console_with_state(state);
+        let selection = menu();
+        let menu_id = selection.id;
+        console
+            .show_presented_picker_menu(
+                selection,
+                PickerKind::Provider,
+                PickerPresentation {
+                    search: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut state = console.state.lock().unwrap();
+        for (code, action) in [
+            (KeyCode::Char('p'), PickerAction::ConfigureProvider),
+            (KeyCode::Char('f'), PickerAction::ToggleConnections),
+        ] {
+            assert!(matches!(
+                state.key(key(code)),
+                Some(InputEvent::PickerAction {
+                    menu_id: id,
+                    action: actual,
+                    ..
+                }) if id == menu_id && actual == action
+            ));
+        }
+        assert!(state.key(key(KeyCode::Char('k'))).is_none());
+        assert_eq!(state.menu.as_ref().unwrap().selected, 0);
+        assert!(state.key(key(KeyCode::Char('/'))).is_none());
+        for character in "kimi".chars() {
+            assert!(matches!(
+                state.key(key(KeyCode::Char(character))),
+                Some(InputEvent::PickerAction {
+                    menu_id: id,
+                    action: PickerAction::SearchQuery,
+                    ..
+                }) if id == menu_id
+            ));
+        }
+        drop(state);
+        assert_eq!(console.picker_search_query(menu_id).unwrap(), "kimi");
+        let rendered = console.state.lock().unwrap().frame().0.join("\n");
+        assert!(rendered.contains("⌕ kimi"));
+        let mut state = console.state.lock().unwrap();
+        assert!(matches!(
+            state.key(key(KeyCode::Backspace)),
+            Some(InputEvent::PickerAction {
+                action: PickerAction::SearchQuery,
+                ..
+            })
+        ));
+        assert_eq!(state.picker_search.as_ref().unwrap().query.draft(), "kim");
+        state.key(key(KeyCode::Esc));
+        assert_eq!(state.picker_search.as_ref().unwrap().query.draft(), "");
+        assert!(
+            state
+                .picker_search
+                .as_ref()
+                .is_some_and(PickerSearch::focused)
+        );
+        assert!(state.key(key(KeyCode::Backspace)).is_none());
+        assert!(
+            !state
+                .picker_search
+                .as_ref()
+                .is_some_and(PickerSearch::focused)
+        );
+        assert!(state.menu.is_some());
+    }
+
+    #[test]
+    fn a_picker_shown_under_a_new_id_starts_from_the_menu_query() {
+        let mut state = State::new(true, 160, 24);
+        state.prompt_enabled = true;
+        let console = console_with_state(state);
+        let first = menu();
+        let first_id = first.id;
+        let presentation = |query: &str| PickerPresentation {
+            search: Some(query.into()),
+            ..Default::default()
+        };
+        console
+            .show_presented_picker_menu(first, PickerKind::Provider, presentation(""))
+            .unwrap();
+        {
+            let mut state = console.state.lock().unwrap();
+            state.key(key(KeyCode::Char('/')));
+            state.key(key(KeyCode::Char('x')));
+        }
+        console
+            .show_presented_picker_menu(
+                Menu {
+                    id: first_id,
+                    ..menu()
+                },
+                PickerKind::Provider,
+                presentation(""),
+            )
+            .unwrap();
+        assert_eq!(
+            console.picker_search_query(first_id).unwrap(),
+            "x",
+            "the same menu keeps what is being typed"
+        );
+        let replaced = menu();
+        let replaced_id = replaced.id;
+        console
+            .show_presented_picker_menu(replaced, PickerKind::Provider, presentation("kimi"))
+            .unwrap();
+        assert_eq!(console.picker_search_query(replaced_id).unwrap(), "kimi");
+        let rendered = console.state.lock().unwrap().frame().0.join("\n");
+        assert!(rendered.contains("⌕ kimi"));
+        console.state.lock().unwrap().key(key(KeyCode::Char('/')));
+        let refreshed = menu();
+        let refreshed_id = refreshed.id;
+        console
+            .show_presented_picker_menu(refreshed, PickerKind::Provider, presentation("kimi"))
+            .unwrap();
+        let state = console.state.lock().unwrap();
+        let search = state.picker_search.as_ref().unwrap();
+        assert_eq!(search.id, refreshed_id);
+        assert!(
+            search.focused(),
+            "rows replaced under the same query keep the typing"
+        );
+    }
+
+    #[test]
+    fn escape_from_the_list_clears_a_query_before_it_closes_the_picker() {
+        let mut state = State::new(true, 160, 24);
+        state.prompt_enabled = true;
+        let console = console_with_state(state);
+        let selection = menu();
+        let menu_id = selection.id;
+        console
+            .show_presented_picker_menu(
+                selection,
+                PickerKind::Provider,
+                PickerPresentation {
+                    search: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut state = console.state.lock().unwrap();
+        state.key(key(KeyCode::Char('/')));
+        state.key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT));
+        assert_eq!(state.picker_search.as_ref().unwrap().query.draft(), "K");
+        assert!(state.key(key(KeyCode::Down)).is_none());
+        assert!(!state.picker_search.as_ref().unwrap().focused());
+        assert!(matches!(
+            state.key(key(KeyCode::Esc)),
+            Some(InputEvent::PickerAction {
+                menu_id: id,
+                action: PickerAction::SearchQuery,
+                ..
+            }) if id == menu_id
+        ));
+        assert_eq!(state.picker_search.as_ref().unwrap().query.draft(), "");
+        assert!(
+            state.menu.is_some(),
+            "the first escape only clears the query"
+        );
+    }
+
+    #[test]
+    fn picker_rows_take_their_state_role_and_the_selected_row_stays_text() {
+        let mut state = State::new(true, 160, 24);
+        state.prompt_enabled = true;
+        let console = console_with_state(state);
+        let mut selection = menu();
+        selection.options = vec!["Configured connection".into(), "Unconfigured one".into()];
+        console
+            .show_presented_picker_menu(
+                selection,
+                PickerKind::Provider,
+                PickerPresentation {
+                    search: Some(String::new()),
+                    row_roles: vec![None, Some(Role::MutedText)],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut state = console.state.lock().unwrap();
+        state.key(key(KeyCode::Char('/')));
+        let (lines, cursor, _) = state.styled_frame();
+        let search_row = lines
+            .iter()
+            .position(|line| line.text().contains("⌕ Search…"))
+            .expect("the search row is drawn");
+        assert_eq!(cursor, search_row, "the focused query keeps the cursor");
+        let configured = lines
+            .iter()
+            .find(|line| line.text().contains("Configured connection"))
+            .unwrap();
+        assert_eq!(configured.spans[0].role, Some(Role::Text));
+        assert_eq!(configured.fill, Some(Role::Selection));
+        let unconfigured = lines
+            .iter()
+            .find(|line| line.text().contains("Unconfigured one"))
+            .unwrap();
+        assert_eq!(unconfigured.spans[0].role, Some(Role::MutedText));
+        assert_eq!(unconfigured.fill, None);
     }
 
     #[test]

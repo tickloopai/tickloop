@@ -3,6 +3,7 @@ use std::{
     io::IsTerminal,
     os::unix::fs::MetadataExt,
     path::PathBuf,
+    sync::Arc,
 };
 
 use tickhost_connect::herdr::{HerdrContext, SocketHerdr, current_pane, endpoint_instance};
@@ -119,14 +120,14 @@ use thinking_preview::ThinkingPreview;
 use tickloop_agent_model::{ModelConfigExt, ReasoningEffortExt};
 use tickloop_agent_protocol::{
     AccessError, AccessErrorCode, AfterTurnAction, AgentDetailQuery, AgentHostOptions,
-    AgentSummary, BranchOutcome, BranchRequest, ChatSnapshot, CommandResult, ConfigurationChange,
-    Decision, DirectoryTrustPolicy, EnvironmentValue, EventKind, ExecutionAvailability,
-    ExecutionMode, ExecutionRef, HostLocation, HostWorkContext, InputContext, LaunchSpec,
-    ModelConfig, ModelRequestKind, ObservationRequest, ObservationValue, PermissionChange,
-    PermissionRule, PermissionScope, PromptPolicy, QuestionRequest, ReasoningEffort, Receipt,
-    RequestOutcome, ShellTaskNotice, ShellTaskOrigin, ShellTaskPromptWatchdog, ShellTaskState,
-    TakenBackPrompt, TaskNotification, TaskNotificationStatus, TodoItem, Trigger, TriggerSource,
-    Usage, UserInput, UserShellRecord, UserShellState, ViewRef,
+    AgentSummary, BranchOutcome, BranchRequest, ChatSnapshot, ChatStatus, CommandResult,
+    ConfigurationChange, Decision, DirectoryTrustPolicy, EnvironmentValue, EventKind,
+    ExecutionAvailability, ExecutionMode, ExecutionRef, HostLocation, HostWorkContext,
+    InputContext, LaunchSpec, ModelConfig, ModelRequestKind, ObservationRequest, ObservationValue,
+    PermissionChange, PermissionRule, PermissionScope, PromptPolicy, QuestionRequest,
+    ReasoningEffort, Receipt, ShellTaskNotice, ShellTaskOrigin, ShellTaskPromptWatchdog,
+    ShellTaskState, TakenBackPrompt, TaskNotification, TaskNotificationStatus, TodoItem, Trigger,
+    TriggerSource, Usage, UserInput, UserShellRecord, UserShellState, ViewRef,
 };
 use workflows::Workflow;
 
@@ -192,9 +193,28 @@ impl RunningActivity {
     }
 }
 
+/// Claude Code's past-tense verbs for a finished turn, as in `⏺ Brewed for 12s`.
+const TURN_COMPLETION_VERBS: [&str; 8] = [
+    "Baked",
+    "Brewed",
+    "Churned",
+    "Cogitated",
+    "Cooked",
+    "Crunched",
+    "Sautéed",
+    "Worked",
+];
+/// A finished turn's line restored without its duration.
+const RESTORED_TURN_SUMMARY: &str = "Done";
+
 /// What a finished turn's line starts with, live with its duration or restored without it.
 #[cfg(test)]
-const TURN_SUMMARY_MARKERS: [&str; 2] = ["✻ Worked for", "✻ Done"];
+fn turn_summary_markers() -> impl Iterator<Item = String> {
+    TURN_COMPLETION_VERBS
+        .iter()
+        .map(|verb| format!("⏺ {verb} for"))
+        .chain(std::iter::once(format!("⏺ {RESTORED_TURN_SUMMARY}")))
+}
 
 #[cfg(test)]
 fn shows_turn_summary(frame: &str) -> bool {
@@ -203,17 +223,15 @@ fn shows_turn_summary(frame: &str) -> bool {
 
 #[cfg(test)]
 fn turn_summaries(frame: &str) -> usize {
-    TURN_SUMMARY_MARKERS
-        .iter()
-        .map(|marker| frame.matches(marker).count())
+    turn_summary_markers()
+        .map(|marker| frame.matches(&marker).count())
         .sum()
 }
 
 #[cfg(test)]
 fn turn_summary_position(frame: &str) -> Option<usize> {
-    TURN_SUMMARY_MARKERS
-        .iter()
-        .filter_map(|marker| frame.find(marker))
+    turn_summary_markers()
+        .filter_map(|marker| frame.find(&marker))
         .min()
 }
 
@@ -275,7 +293,6 @@ fn write_next_reply_line(console: &Console, reply: &mut ReplyLines) -> Result<()
 
 fn write_completion_notice(
     console: &Console,
-    usage: &Usage,
     details: Option<&CompletionDetails>,
 ) -> Result<(), String> {
     let display = console.display_profile()?;
@@ -286,28 +303,42 @@ fn write_completion_notice(
             details.rest.as_str(),
         ),
         Some(details) => ("Reply completed".into(), details.rest.as_str()),
-        None if interactive => (format!("{} Done", display.glyph(Glyph::TurnSummary)), ""),
+        None if interactive => (
+            format!(
+                "{} {RESTORED_TURN_SUMMARY}",
+                display.glyph(Glyph::TurnSummary)
+            ),
+            "",
+        ),
         None => ("Reply completed".into(), ""),
     };
-    // Claude Code's turn summary, `✻ Worked for 12s`, is muted throughout.
+    // Claude Code's turn summary, `Worked for 12s`, is muted throughout.
     console.write_completion_notice(&[
         (heading, Some(Role::MutedText)),
         (details.into(), Some(Role::MutedText)),
-        (usage_text(usage), Some(Role::MutedText)),
         ("\n".into(), None),
     ])
 }
 
-/// What a finished run reports: how long it worked, then what still runs.
+/// What a finished run reports: how long it worked, in one of Claude Code's verbs that the run
+/// keeps across redraws, then what still runs.
 struct CompletionDetails {
     heading: String,
     rest: String,
 }
 
-fn completion_details(elapsed: Option<std::time::Duration>, shells: usize) -> CompletionDetails {
+fn completion_details(
+    run: uuid::Uuid,
+    elapsed: Option<std::time::Duration>,
+    shells: usize,
+) -> CompletionDetails {
     let heading = elapsed.map_or_else(
-        || "Done".to_owned(),
-        |elapsed| format!("Worked for {}", format_activity_elapsed(elapsed)),
+        || RESTORED_TURN_SUMMARY.to_owned(),
+        |elapsed| {
+            let verb = TURN_COMPLETION_VERBS
+                [(run.as_u128() % TURN_COMPLETION_VERBS.len() as u128) as usize];
+            format!("{verb} for {}", format_activity_elapsed(elapsed))
+        },
     );
     CompletionDetails {
         heading,
@@ -1426,6 +1457,7 @@ async fn interact(
     }
     agent.use_user_settings(user_settings.clone());
     let mut events = agent.subscribe();
+    let mut feed_gaps = agent.subscribe_feed_gaps();
     let mut user_shell_events = agent.subscribe_user_shells();
     let mut task_notifications = agent.subscribe_task_notifications();
     let interactive = console.is_interactive();
@@ -1502,6 +1534,17 @@ async fn interact(
     let mut failed = false;
     let mut status_dirty = true;
     let mut activity_dirty = false;
+    // Thinking text arrived since the activity row was last drawn; the next animation frame
+    // shows it, so a fast stream redraws at the frame rate rather than once per delta.
+    let mut thinking_frame_due = false;
+    // Monitor's subscriptions and Shell tasks are due to be read again on its own cadence.
+    let mut monitor_refresh_due = false;
+    let mut turn_snapshot = TurnSnapshot::default();
+    // The inputs of each Chat still waiting for their echo after the conversation was last read
+    // for them; the same waits are not read for again until they change.
+    let mut unsettled_echoes: HashMap<uuid::Uuid, Vec<uuid::Uuid>> = HashMap::new();
+    // The catalog's account of each family member whose snapshot this View last applied.
+    let mut applied_member_work: HashMap<uuid::Uuid, MemberWork> = HashMap::new();
     let mut running_activity: Option<RunningActivity> = None;
     // A replayed or restored run has no known start; only a live Started event begins this clock.
     let mut observed_run_starts = HashMap::new();
@@ -1602,6 +1645,7 @@ async fn interact(
         if logout.is_none()
             && let Some(succeeded) = menus.take_provider_login_result(console)?
         {
+            turn_snapshot.forget();
             if let Some(chat) = selected_chat
                 && let Err(error) = agent.refresh_configuration(chat).await
             {
@@ -1756,33 +1800,55 @@ async fn interact(
                 {
                     background_notice = None;
                 }
-                let snapshot = agent
-                    .snapshot(chat)
+                // An input waits for its echo after a turn that read the conversation for it, and
+                // that turn's conversation settles it. Only waits that read could not settle, as
+                // when the conversation was unreachable at their event, are read for here.
+                let mut awaiting = console.awaiting_input_echoes(chat)?;
+                awaiting.sort();
+                let reconciling = match turn_snapshot.conversation_of(chat) {
+                    Some(conversation) => Some(conversation),
+                    None if !awaiting.is_empty()
+                        && unsettled_echoes.get(&chat) != Some(&awaiting) =>
+                    {
+                        turn_snapshot.read(agent, chat).await.ok()
+                    }
+                    None => None,
+                };
+                let status = turn_snapshot
+                    .status(agent, chat)
                     .await
                     .map_err(|error| error.to_string())?;
-                console.set_input_context(
-                    Some(chat),
-                    &snapshot.workdir,
-                    &snapshot.additional_directories,
-                )?;
-                console.set_visible_delegation(snapshot.delegation.is_some())?;
-                console.set_foreground_shell(foreground_shells.contains_key(&chat))?;
-                console.set_queued_inputs(snapshot.queued_inputs())?;
-                console.set_chat_images(
-                    chat,
-                    snapshot.accepts_images(),
-                    snapshot.highest_pasted_image_id(),
-                )?;
-                reconcile_consumed_input_echoes(console, &snapshot)?;
-                // The Chat snapshot carries Monitor membership and removals, so it applies first.
-                console.update_monitor_chat(&snapshot)?;
                 let task_snapshot = task_center
                     .snapshot(chat)
                     .await
                     .map_err(|error| error.to_string())?;
-                console
-                    .set_shell_starts(chat, task_access::shell_starts(&snapshot, &task_snapshot))?;
-                console.update_shell_ticks(&task_snapshot)?;
+                let subscriptions = agent.tick_subscriptions(chat).await.ok();
+                // Everything is read before the first change shows, and the changes reach the
+                // terminal as one frame; keys typed during the reads still draw at once.
+                let _frame_hold = console.hold_frames()?;
+                console.set_input_context(
+                    Some(chat),
+                    &status.workdir,
+                    &status.additional_directories,
+                )?;
+                console.set_visible_delegation(status.delegation.is_some())?;
+                console.set_foreground_shell(foreground_shells.contains_key(&chat))?;
+                console.set_queued_inputs(status.queued_inputs())?;
+                console.set_chat_images(
+                    chat,
+                    status.accepts_images(),
+                    status.highest_pasted_image_id,
+                )?;
+                if let Some(conversation) = &reconciling {
+                    reconcile_consumed_input_echoes(console, conversation)?;
+                    // A cached conversation, read while the daemon is unreachable, settles
+                    // nothing for good; the waits are read for again once it answers.
+                    if agent.disconnected().is_none() {
+                        let mut unsettled = console.awaiting_input_echoes(chat)?;
+                        unsettled.sort();
+                        unsettled_echoes.insert(chat, unsettled);
+                    }
+                }
                 console.set_foreground_commands(
                     &task_snapshot
                         .tasks
@@ -1792,31 +1858,33 @@ async fn interact(
                                 && task.origin == ShellTaskOrigin::Agent
                                 && task.capabilities.can_background
                         })
-                        .map(|task| task.id)
+                        .map(|task| (task.id, task.call_id.clone()))
                         .collect::<Vec<_>>(),
                 )?;
-                if let Ok(rows) = agent.tick_subscriptions(chat).await {
-                    console.update_subscribed_ticks(chat, &rows)?;
-                }
-                console.set_provider_failures(chat, &snapshot.provider_failures)?;
-                menus.note_provider_failures(chat, &snapshot.provider_failures);
+                console.refresh_monitor(monitor::MonitorSources {
+                    chat: status.clone(),
+                    shells: task_snapshot,
+                    subscriptions,
+                })?;
+                console.set_provider_failures(chat, &status.provider_failures)?;
+                menus.note_provider_failures(chat, &status.provider_failures);
                 console.set_provider_failure(
-                    snapshot
+                    status
                         .provider_failures
-                        .get(&snapshot.model.provider_id)
+                        .get(&status.model.provider_id)
                         .map(|failure| failure.summary()),
                 )?;
                 console.update_status_area(
-                    snapshot.policy.mode.to_string(),
-                    safe_text(&snapshot.model.model),
-                    context_usage(&snapshot),
-                    current_loop_todos(&snapshot, goal),
+                    status.policy.mode.to_string(),
+                    safe_text(&status.model.model),
+                    context_usage(&status),
+                    current_loop_todos(&status, goal),
                 )?;
                 let running_receipt = pending
                     .values()
                     .find(|receipt| {
                         receipt.chat_id == chat
-                            && snapshot.loops.iter().any(|goal| {
+                            && status.loops.iter().any(|goal| {
                                 goal.run_id == Some(receipt.run_id)
                                     && goal.state == tickloop_agent_protocol::LoopState::Running
                             })
@@ -1829,14 +1897,14 @@ async fn interact(
                     &global.projection().rows,
                     chat,
                     agent.disconnected().is_some(),
-                    !snapshot.loops.is_empty()
-                        && snapshot.loops.iter().all(|goal| {
+                    !status.loops.is_empty()
+                        && status.loops.iter().all(|goal| {
                             goal.state == tickloop_agent_protocol::LoopState::Completed
                         })
                         && !pending.values().any(|receipt| receipt.chat_id == chat)
                         && agent.unknown_input(chat).is_none()
-                        && snapshot.queued_inputs().is_empty()
-                        && snapshot.user_shells.iter().all(|record| {
+                        && status.queued_inputs().is_empty()
+                        && status.user_shells.iter().all(|record| {
                             matches!(
                                 record.state,
                                 UserShellState::Completed | UserShellState::Failed
@@ -1860,9 +1928,9 @@ async fn interact(
                     String::new()
                 } else if logout.is_some() {
                     "Removing Codex login · esc cancels".to_owned()
-                } else if !snapshot.permissions.is_empty() {
+                } else if !status.permissions.is_empty() {
                     "Waiting for approval".to_owned()
-                } else if !snapshot.questions.is_empty() {
+                } else if !status.questions.is_empty() {
                     "Waiting for your answer".to_owned()
                 } else if compaction_chats
                     .values()
@@ -1909,7 +1977,7 @@ async fn interact(
                     } else {
                         state.as_str()
                     },
-                    if snapshot.pending_model.is_some() {
+                    if status.pending_model.is_some() {
                         " · model change pending"
                     } else {
                         ""
@@ -1979,11 +2047,13 @@ async fn interact(
                     &safe_text(status.trim_start_matches(" · ")),
                 )?;
             } else {
+                let draft = agent.configuration(ConfigTarget::NewDraft).await;
+                let _frame_hold = console.hold_frames()?;
                 console.set_activity(None)?;
                 console.set_background_status_notice(None)?;
                 console.set_footer_items(Vec::new())?;
                 console.set_provider_failure(None)?;
-                if let Ok(draft) = agent.configuration(ConfigTarget::NewDraft).await {
+                if let Ok(draft) = draft {
                     console.update_status_area(
                         draft.execution_mode.to_string(),
                         safe_text(&draft.model.model),
@@ -1994,6 +2064,21 @@ async fn interact(
             }
             status_dirty = false;
             activity_dirty = false;
+            thinking_frame_due = false;
+            monitor_refresh_due = false;
+        }
+        turn_snapshot.forget();
+        if interactive && monitor_refresh_due {
+            monitor_refresh_due = false;
+            if !overview_active && let Some(chat) = selected_chat {
+                // Subscriptions and Shell tasks move on while the Chat itself stays as it was,
+                // whose own changes come with its events; only they are read again.
+                let shells = task_center
+                    .snapshot(chat)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                console.refresh_monitor_ticks(shells, agent.tick_subscriptions(chat).await.ok())?;
+            }
         }
         if interactive && activity_dirty {
             if !overview_active
@@ -2088,8 +2173,8 @@ async fn interact(
                     let suppression = if selected_chat != Some(request.chat) || overview_active {
                         Some("discarded: Agent View changed")
                     } else {
-                        match agent.snapshot(request.chat).await {
-                            Ok(snapshot) => prompt_suggestion::suppression(&snapshot)
+                        match agent.status(request.chat).await {
+                            Ok(status) => prompt_suggestion::suppression(&status)
                                 .or(console.prompt_suggestion_suppression()?),
                             Err(_) => Some("discarded: Agent unavailable"),
                         }
@@ -2424,8 +2509,8 @@ async fn interact(
                     };
                     match agent.take_queued_inputs(chat, draft_empty).await {
                         Ok(entries) if entries.is_empty() => {
-                            let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
-                            console.set_queued_inputs(snapshot.queued_inputs())?;
+                            let status=agent.status(chat).await.map_err(|error|error.to_string())?;
+                            console.set_queued_inputs(status.queued_inputs())?;
                         },
                         Ok(entries) => {
                             for entry in &entries {
@@ -2651,7 +2736,7 @@ async fn interact(
                                 );
                             }
                             let is_running = agent
-                                .snapshot(chat)
+                                .status(chat)
                                 .await
                                 .map_err(|error| error.to_string())?
                                 .user_shells
@@ -2882,8 +2967,8 @@ async fn interact(
                         && command_timing(&line) == CommandTiming::AfterTurn
                         && let Some(chat) = selected_chat
                     {
-                        let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
-                        let is_busy=snapshot.loops.iter().any(|goal|matches!(goal.state,tickloop_agent_protocol::LoopState::Running|tickloop_agent_protocol::LoopState::WaitingPermission|tickloop_agent_protocol::LoopState::WaitingQuestion));
+                        let status=agent.status(chat).await.map_err(|error|error.to_string())?;
+                        let is_busy=status.loops.iter().any(|goal|matches!(goal.state,tickloop_agent_protocol::LoopState::Running|tickloop_agent_protocol::LoopState::WaitingPermission|tickloop_agent_protocol::LoopState::WaitingQuestion));
                         if is_busy {
                             let queued=agent.queue_command(chat,goal,original_input.clone());
                             match send_input(agent,chat,retry_of,queued,|result|match result {
@@ -2954,8 +3039,8 @@ async fn interact(
                         },
                         "/clear" => {
                             if let Some(chat)=selected_chat {
-                                let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
-                                if snapshot.delegation.is_some() {
+                                let status=agent.status(chat).await.map_err(|error|error.to_string())?;
+                                if status.delegation.is_some() {
                                     console.hold_status(&completion::command_refusal(completion::CommandScope::Child,"/clear",completion::CHILD_HISTORY_FIXED))?;
                                     continue;
                                 }
@@ -2981,10 +3066,10 @@ async fn interact(
                         },
                         "/status" => {
                             if let Some(chat)=selected_chat {
-                                let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
-                                outln!(console,"Chat {} · {} · {:?} · {} · {} queued",chat,safe_text(&snapshot.model.model),snapshot.model.protocol,snapshot.policy.mode,snapshot.queued_inputs().len());
+                                let status=agent.status(chat).await.map_err(|error|error.to_string())?;
+                                outln!(console,"Chat {} · {} · {:?} · {} · {} queued",chat,safe_text(&status.model.model),status.model.protocol,status.policy.mode,status.queued_inputs().len());
                                 if console.prompt_suggestion_enabled()? {
-                                    let diagnostic = prompt_suggestion::suppression(&snapshot)
+                                    let diagnostic = prompt_suggestion::suppression(&status)
                                         .map(str::to_owned)
                                         .unwrap_or_else(|| format!("last: {}", suggestion_diagnostics.get(&chat).map_or("not generated in this View", |(_, reason)| *reason)));
                                     outln!(console, "Prompt suggestions: On · {diagnostic}");
@@ -3284,15 +3369,15 @@ async fn interact(
                         },
                         "/loops" => {
                             if let Some(chat) = selected_chat {
-                                let snapshot = agent.snapshot(chat).await.map_err(|error|error.to_string())?;
-                                for goal in snapshot.loops { outln!(console, "Goal: {} · {:?} · {}",goal.id,goal.state,safe_text(&goal.goal)); }
+                                let status = agent.status(chat).await.map_err(|error|error.to_string())?;
+                                for goal in status.loops { outln!(console, "Goal: {} · {:?} · {}",goal.id,goal.state,safe_text(&goal.goal)); }
                             } else { outln!(console, "No Chat is selected."); }
                         },
                         _ if line.starts_with("/plan ") => {
                             if let Some(chat) = selected_chat {
-                                let snapshot = agent.snapshot(chat).await.map_err(|error|error.to_string())?;
+                                let status = agent.status(chat).await.map_err(|error|error.to_string())?;
                                 let selected_goal = if let Some(value)=line.strip_prefix("/plan ") {value.trim().parse().ok()} else {goal};
-                                if let Some(plan)=snapshot.plans.iter().find(|plan|Some(plan.loop_id)==selected_goal) {
+                                if let Some(plan)=status.plans.iter().find(|plan|Some(plan.loop_id)==selected_goal) {
                                     if interactive || plan.approval_pending { menus.workflow(console, Workflow::plan(agent,chat,plan.loop_id).await?)?; } else { outln!(console, "Plan: {} · version {} · approved mode {:?}\n{}",plan.loop_id,plan.version,plan.approved_execution_mode,safe_text(&plan.markdown)); }
                                 } else {outln!(console, "The selected goal has no saved plan.");}
                             } else { outln!(console, "No Chat is selected."); }
@@ -3332,15 +3417,15 @@ async fn interact(
                                         let result = async {
                                             match action {
                                                 loops::LoopCommand::Select(id) => {
-                                                    let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
-                                                    if !snapshot.loops.iter().any(|item|item.id==id) {return Err("Goal does not belong to the current Chat; use /loops.".to_string());}
+                                                    let status=agent.status(chat).await.map_err(|error|error.to_string())?;
+                                                    if !status.loops.iter().any(|item|item.id==id) {return Err("Goal does not belong to the current Chat; use /loops.".to_string());}
                                                     goal=Some(id);
                                                     outln!(console,"Selected goal {id}.");
                                                 },
                                                 loops::LoopCommand::Trigger(id) => {
                                                     let id=id.or(goal).ok_or("Select a goal first; use /loops.")?;
-                                                    let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
-                                                    let selected=snapshot.loops.iter().find(|item|item.id==id).ok_or("Goal does not belong to the current Chat; use /loops.")?;
+                                                    let status=agent.status(chat).await.map_err(|error|error.to_string())?;
+                                                    let selected=status.loops.iter().find(|item|item.id==id).ok_or("Goal does not belong to the current Chat; use /loops.")?;
                                                     outln!(console,"Goal: {id}\n{}",loops::trigger_lines(selected.trigger.as_ref()).join("\n"));
                                                 },
                                                 loops::LoopCommand::Schedule {goal, arguments} => {
@@ -3529,13 +3614,7 @@ async fn interact(
                     }
                 }
             }},
-            event = async {
-                if !visual_pacing_pending && let Some(event) = deferred_events.pop_front() {
-                    Ok(event)
-                } else {
-                    events.recv().await
-                }
-            } => {
+            event = next_event(&mut events, &mut feed_gaps, &mut deferred_events, visual_pacing_pending) => {
                 if matches!(&event, Ok(event) if Some(event.chat_id) == selected_chat && matches!(event.kind, EventKind::Started | EventKind::InputMerged { .. } | EventKind::ConversationRewound { .. })) {
                     console.clear_prompt_suggestion()?;
                 }
@@ -3563,7 +3642,7 @@ async fn interact(
                             agent.record_recovery_fact(recovery_tests::RecoveryFact::LiveRunStarted {chat:event.chat_id,run:event.run_id,overview:overview_active});
                         }
                         if matches!(event.kind,EventKind::Started|EventKind::InputMerged {..}) {
-                            let echo=show_consumed_input(console,agent,event).await?;
+                            let echo=show_consumed_input(console,agent,&mut turn_snapshot,event).await?;
                             merged_echoes.consumed_echo(event.run_id,echo);
                         }
                         if let Some((previous,current))=merged_echoes.observe(event,displayed_sequences.get(&event.chat_id).copied().unwrap_or(0)) {console.join_inputs(event.chat_id,previous,current)?;}
@@ -3583,8 +3662,10 @@ async fn interact(
                 }
                 match event {
                 Ok(event) if !overview_active && (pending.contains_key(&event.run_id) || Some(event.chat_id)==selected_chat) => {
+                    // Only a run that took in a family message has one to show from the conversation.
                     if Some(event.chat_id)==selected_chat && matches!(event.kind,EventKind::Started|EventKind::InputMerged {..})
-                        && let Ok(snapshot)=agent.snapshot(event.chat_id).await {
+                        && turn_snapshot.status(agent,event.chat_id).await.is_ok_and(|status|status.family_input_runs.contains(&event.run_id))
+                        && let Ok(snapshot)=turn_snapshot.read(agent,event.chat_id).await {
                         learn_agent_colors(console,agent,&snapshot).await?;
                         show_consumed_family_input(console,&snapshot,event.run_id)?;
                     }
@@ -3605,7 +3686,7 @@ async fn interact(
                             if interactive && Some(event.chat_id) == selected_chat && !unpaced_runs.contains(&event.run_id) {
                                 let preview = thinking_previews.entry(event.run_id).or_default();
                                 preview.append(thinking);
-                                activity_dirty = true;
+                                thinking_frame_due = true;
                             }
                         },
                         EventKind::Text(_)
@@ -3627,7 +3708,7 @@ async fn interact(
                     track_run_requests(&event,&mut pending,&mut permissions,&mut questions);
                     if matches!(&event.kind,EventKind::Failed(_)) {
                         failed=true;
-                        if let Ok(snapshot) = agent.snapshot(event.chat_id).await {
+                        if let Ok(snapshot) = turn_snapshot.read(agent, event.chat_id).await {
                             menus.invalidate_failed_directory(&snapshot, event.run_id);
                         }
                     }
@@ -3638,8 +3719,8 @@ async fn interact(
                         if Some(event.chat_id) != selected_chat {
                             continue;
                         }
-                        let snapshot = agent
-                            .snapshot(event.chat_id)
+                        let snapshot = turn_snapshot
+                            .read(agent, event.chat_id)
                             .await
                             .map_err(|error| error.to_string())?;
                         displayed_sequences.insert(event.chat_id, snapshot.last_sequence);
@@ -3684,6 +3765,24 @@ async fn interact(
                         });
                     displayed_sequences.insert(event.chat_id,event.sequence);
                     let console = &console.for_message(message_id.clone());
+                    let result_source = tools.result_source(&event);
+                    let conversation = if result_source == presentation::ResultSource::Conversation || matches!(&event.kind, EventKind::FamilyRunCompleted { .. }) {
+                        turn_snapshot.read(agent, event.chat_id).await.ok()
+                    } else {
+                        None
+                    };
+                    let operation = match &event.kind {
+                        EventKind::ToolCompleted { call_id, .. } if result_source == presentation::ResultSource::Operation => {
+                            agent.operation(event.chat_id, event.run_id, call_id).await.ok().flatten()
+                        },
+                        _ => None,
+                    };
+                    if let Some(snapshot) = &conversation {
+                        learn_agent_colors(console, agent, snapshot).await?;
+                    }
+                    // The event's writes reach the terminal as one frame. The hold ends before
+                    // anything is awaited, so keys typed meanwhile still draw at once.
+                    let mut event_frame = Some(console.hold_frames()?);
                     if interactive && matches!(&event.kind,
                         EventKind::Thinking(_)
                         | EventKind::AssistantMessageCommitted { .. }
@@ -3699,24 +3798,16 @@ async fn interact(
                             reply.finish();
                             write_pending_reply_lines(console, &mut reply)?;
                     }
-                    if interactive && stopped_thinking {
-                        console.write_pieces(&[presentation::thinking_label()])?;
-                    }
                     let interrupted_by_user = matches!(&event.kind,EventKind::Completed {..} | EventKind::Failed(_) | EventKind::Interrupted)
                         && user_interrupted_runs.remove(&event.run_id)
                         && matches!(&event.kind,EventKind::Interrupted);
                     if matches!(&event.kind,EventKind::Completed {..} | EventKind::Failed(_) | EventKind::Interrupted) {
                         unpaced_runs.remove(&event.run_id);
                     }
-                    let conversation = if tools.result_reads_conversation(&event) || matches!(&event.kind, EventKind::FamilyRunCompleted { .. }) {
-                        agent.snapshot(event.chat_id).await.ok()
-                    } else {
-                        None
+                    let facts = match &operation {
+                        Some(operation) => presentation::CallFacts { review: presentation::operation_review(operation), report: None },
+                        None => conversation.as_ref().map(|snapshot| tools.call_facts(&event, snapshot)).unwrap_or_default(),
                     };
-                    if let Some(snapshot) = &conversation {
-                        learn_agent_colors(console, agent, snapshot).await?;
-                    }
-                    let facts = conversation.as_ref().map(|snapshot| tools.call_facts(&event, snapshot)).unwrap_or_default();
                     let interrupted_by_rejection = tools.ended_with_rejection(event.run_id);
                     if tools.present_event(console,&event,&facts)? { continue; }
                     match event.kind {
@@ -3751,29 +3842,38 @@ async fn interact(
                                     write_next_reply_line(console, reply)?;
                                 }
                                 #[cfg(test)]
-                                agent.recovery_checkpoint().await;
+                                {
+                                    event_frame.take();
+                                    agent.recovery_checkpoint().await;
+                                }
                             } else {
                                 if follows_thinking {console.write("\nAssistant: ")?;}
                                 console.write_markdown(&safe_text(&text), starts_assistant_message)?;
                             }
                         },
-                        EventKind::Completed {usage} => {
+                        EventKind::Completed { .. } => {
                             #[cfg(test)]
                             agent.record_recovery_fact(recovery_tests::RecoveryFact::Completed {chat:event.chat_id,run:event.run_id,sequence:event.sequence});
+                            event_frame.take();
                             let details = if interactive {
                                 let shells = task_center.snapshot(event.chat_id).await.ok().map(|snapshot| snapshot.tasks.into_iter().filter(|task| matches!(task.state, ShellTaskState::Running | ShellTaskState::Background | ShellTaskState::Cancelling)).count()).unwrap_or_default();
-                                Some(completion_details(observed_run_starts.get(&event.run_id).map(std::time::Instant::elapsed), shells))
+                                Some(completion_details(event.run_id, observed_run_starts.get(&event.run_id).map(std::time::Instant::elapsed), shells))
                             } else { None };
-                            write_completion_notice(console, &usage, details.as_ref())?;
+                            write_completion_notice(console, details.as_ref())?;
                             if suggestible_runs.remove(&event.run_id) && interactive {
-                                if let Ok(snapshot) = agent.snapshot(event.chat_id).await {
-                                    if let Some(reason) = prompt_suggestion::suppression(&snapshot) {
+                                if let Ok(status) = turn_snapshot.status(agent, event.chat_id).await {
+                                    if let Some(reason) = prompt_suggestion::suppression(&status) {
                                         suggestion_diagnostics.insert(event.chat_id, (event.run_id, reason));
                                     } else if let Some(request) = console.begin_prompt_suggestion(event.chat_id)? {
                                         suggestion_diagnostics.insert(event.chat_id, (request.id, "generating"));
                                         let root = config_root.clone();
+                                        // A suggestion is drawn from the conversation it follows.
+                                        let conversation = turn_snapshot.read(agent, event.chat_id).await;
                                         suggestions.spawn(async move {
-                                            let result = prompt_suggestion::generate(&request, &snapshot, root).await;
+                                            let result = match conversation {
+                                                Ok(snapshot) => prompt_suggestion::generate(&request, &snapshot, root).await,
+                                                Err(_) => prompt_suggestion::SuggestionResult::empty("suppressed: Agent unavailable"),
+                                            };
                                             (request, result)
                                         });
                                     } else {
@@ -3820,12 +3920,17 @@ async fn interact(
                             if suggestible_runs.remove(&event.run_id) {
                                 suggestion_diagnostics.insert(event.chat_id, (event.run_id, "suppressed: interrupted turn"));
                             }
-                            let snapshot=agent.snapshot(event.chat_id).await.map_err(|error|error.to_string())?;
-                            let stopped=snapshot.loops.iter().any(|goal|goal.id==event.loop_id&&goal.state==tickloop_agent_protocol::LoopState::Stopped);
+                            event_frame.take();
+                            let status=turn_snapshot.status(agent,event.chat_id).await.map_err(|error|error.to_string())?;
+                            let stopped=status.loops.iter().any(|goal|goal.id==event.loop_id&&goal.state==tickloop_agent_protocol::LoopState::Stopped);
                             if interactive && !stopped {
                                 // A declined call's result already says the run stopped there.
                                 if !interrupted_by_rejection {
                                     console.write_response(&[(format!("{}\n", presentation::interrupted_notice(console.display_profile()?)), Some(Role::MutedText))])?;
+                                }
+                                // Taking the prompt back changes the Chat this turn has read.
+                                if interrupted_by_user {
+                                    turn_snapshot.forget();
                                 }
                                 if interrupted_by_user
                                     && let Some((restored,draft))=take_back_interrupted_prompt(agent,console,event.chat_id,event.run_id).await?
@@ -3852,12 +3957,14 @@ async fn interact(
                             if interactive {
                                 console.hide_completion_notice()?;
                             } else {
-                                let snapshot = agent.snapshot(event.chat_id).await.map_err(|error|error.to_string())?;
-                                outln!(console, "Goal: {} · Run: {} · Running\nModel: {} · {:?}", event.loop_id, event.run_id,safe_text(&snapshot.model.model),snapshot.model.protocol);
+                                event_frame.take();
+                                let status = turn_snapshot.status(agent, event.chat_id).await.map_err(|error|error.to_string())?;
+                                outln!(console, "Goal: {} · Run: {} · Running\nModel: {} · {:?}", event.loop_id, event.run_id,safe_text(&status.model.model),status.model.protocol);
                             }
                         },
                         // The terminal UI asks in its request dialog, outside the conversation.
                         EventKind::PermissionRequested {request} if !interactive => {
+                            event_frame.take();
                             if request.name == EXIT_PLAN_MODE_TOOL_NAME {menus.workflow(console,Workflow::plan(agent,event.chat_id,request.loop_id).await?)?;}
                             else if request.name==ENTER_PLAN_MODE_TOOL_NAME {outln!(console, "\nEnter plan mode? Request: {}\nThe Agent wants to enter plan mode to explore and design an implementation approach.\nUse /allow {} to enter plan mode or /deny {} to stay in the current mode.", request.id, request.id, request.id);}
                             else {outln!(console, "\nPermission request: {} · {}\nOperation: {}\nUse /allow {} [once|session|persistent] or /deny {}.", request.id, safe_text(&request.name), safe_text(&request.input.to_string()), request.id, request.id);}
@@ -3893,26 +4000,36 @@ async fn interact(
                     track_run_requests(&event,&mut pending,&mut permissions,&mut questions);
                     status_dirty |= announce_background_event(console,&event,&background_label(agent,console,event.chat_id),&mut background_notice)?;
                 },
-                Err(broadcast::error::RecvError::Lagged(_)) => {
+                Err(EventInterruption::Lost(lost)) => {
                     let mut recovery = agent.pause_event_delivery().await;
                     #[cfg(test)]
-                    agent.record_recovery_fact(recovery_tests::RecoveryFact::Lagged);
+                    if matches!(lost, LostEvents::AnyChat) {
+                        agent.record_recovery_fact(recovery_tests::RecoveryFact::Lagged);
+                    }
                     thinking_previews.clear();
                     status_dirty = true;
-                    if !overview_active && let Some(chat)=selected_chat {
+                    let visible_chat = selected_chat.filter(|_| !overview_active);
+                    if let Some(chat)=visible_chat.filter(|chat|lost.includes(*chat)) {
                         let frame_hold=console.hold_frames()?;
                         let observation=restore_view(console, agent,&mut tools,chat,*displayed_sequences.get(&chat).unwrap_or(&0),&mut reply_lines,&mut message_groups).await?;
                         drop(frame_hold);
                         failed |= observation.snapshot.loops.iter().any(|goal|goal.state==tickloop_agent_protocol::LoopState::Failed);
                         displayed_sequences.insert(chat,observation.snapshot.last_sequence);
-                        sync_snapshot(&observation.snapshot,&mut pending,&mut permissions,&mut questions);
-                        menus.note_snapshot_requests(&observation.snapshot);
+                        let status=ChatStatus::of(&observation.snapshot);
+                        sync_status(&status,&mut pending,&mut permissions,&mut questions);
+                        menus.note_status_requests(&status);
                         recovery.cover(observation.execution, &observation.snapshot);
                     }
-                    let mut background_snapshots=agent.list_chats().await.into_iter().filter(|snapshot|overview_active || Some(snapshot.conversation.id)!=selected_chat).collect::<Vec<_>>();
-                    let unlisted_chats=pending.values().map(|receipt|receipt.chat_id)
-                        .filter(|chat|(overview_active || Some(*chat)!=selected_chat)&&!background_snapshots.iter().any(|snapshot|snapshot.conversation.id==*chat))
-                        .collect::<HashSet<_>>();
+                    let (mut background_snapshots, unlisted_chats) = match &lost {
+                        LostEvents::AnyChat => {
+                            let listed=agent.list_chats().await.into_iter().filter(|snapshot|Some(snapshot.conversation.id)!=visible_chat).collect::<Vec<_>>();
+                            let unlisted=pending.values().map(|receipt|receipt.chat_id)
+                                .filter(|chat|Some(*chat)!=visible_chat&&!listed.iter().any(|snapshot|snapshot.conversation.id==*chat))
+                                .collect::<HashSet<_>>();
+                            (listed, unlisted)
+                        },
+                        LostEvents::Chats(chats) => (Vec::new(), chats.iter().copied().filter(|chat|Some(*chat)!=visible_chat).collect()),
+                    };
                     for chat in unlisted_chats {
                         match agent.live_snapshot(chat).await {
                             Ok(snapshot)=>background_snapshots.push(snapshot),
@@ -3927,9 +4044,10 @@ async fn interact(
                     for live in background_snapshots {
                         let execution = live.execution;
                         let snapshot = live.into_snapshot();
-                        menus.note_snapshot_requests(&snapshot);
+                        let status = ChatStatus::of(&snapshot);
+                        menus.note_status_requests(&status);
                         recovery.cover(execution, &snapshot);
-                        let recovery=recover_background_chat(&snapshot,&background_label(agent,console,snapshot.id),&mut pending,&mut permissions,&mut questions);
+                        let recovery=recover_background_chat(&status,&background_label(agent,console,snapshot.id),&mut pending,&mut permissions,&mut questions);
                         failed |= recovery.failed;
                         if !interactive {
                             for notice in &recovery.run_notices {outln!(console,"Background {}",notice.text(&background_label(agent,console,snapshot.id)));}
@@ -3939,7 +4057,7 @@ async fn interact(
                     }
                     recovery.retain_uncovered(&mut events, &mut deferred_events);
                 },
-                Err(broadcast::error::RecvError::Closed) => return Err("agent event stream closed".into()),
+                Err(EventInterruption::Closed) => return Err("agent event stream closed".into()),
                 }
             },
             event = user_shell_events.recv() => match event {
@@ -3965,8 +4083,8 @@ async fn interact(
                     status_dirty=true;
                     let tracked_chats=user_shell_chats.values().copied().collect::<HashSet<_>>();
                     for chat in tracked_chats {
-                        let snapshot=agent.snapshot(chat).await.map_err(|error|error.to_string())?;
-                        let tracked_records=snapshot.user_shells.into_iter().filter(|record|user_shell_offsets.contains_key(&record.id)).collect::<Vec<_>>();
+                        let status=agent.status(chat).await.map_err(|error|error.to_string())?;
+                        let tracked_records=status.user_shells.into_iter().filter(|record|user_shell_offsets.contains_key(&record.id)).collect::<Vec<_>>();
                         for record in tracked_records {
                             let observation=observe_user_shell_record(&mut foreground_shells,&mut backgrounded_shells,&record);
                             let terminal=user_shell_is_terminal(&record);
@@ -4073,32 +4191,43 @@ async fn interact(
                                 visible_family=family.iter().filter(|row|row.availability==ExecutionAvailability::Live).map(|row|row.chat_id).collect();
                                 console.set_agent_family(if family.len()>1 {agent_rows(&family,false)}else{Vec::new()},Some(row.execution.agent_id))?;
                                 console.set_task_title((row.parent.is_none() && row.has_work==Some(true)).then(|| safe_line(&row.title)))?;
-                                for row in family.into_iter().filter(|row|row.availability==ExecutionAvailability::Live) {
-                                    // Only the daemon's current answer can prove a run ended; a cached copy predates it.
-                                    if let Ok(snapshot)=agent.current_snapshot(row.chat_id).await {
-                                        let in_progress=receipts_in_progress(&snapshot).map(|receipt|receipt.run_id).collect::<HashSet<_>>();
-                                        // A receipt the snapshot no longer has in progress belongs to a run that ended,
+                                // Only the daemon's current answer can prove a run ended; a cached copy predates it.
+                                // A member is read when this View does not follow its feed yet, or when the catalog
+                                // shows its work changed since its snapshot was last applied, as a run ending
+                                // without its end event does. The reads go out together, so a quiet family costs
+                                // none and a busy one a single round trip that Thinking deltas do not wait behind.
+                                applied_member_work.retain(|member,_|visible_family.contains(member));
+                                let changed=family.into_iter().filter(|row|row.availability==ExecutionAvailability::Live
+                                    && (!agent.follows(row.execution) || applied_member_work.get(&row.chat_id)!=Some(&MemberWork::of(row))))
+                                    .collect::<Vec<_>>();
+                                let statuses=futures_util::future::join_all(changed.iter().map(|row|agent.current_status(row.chat_id))).await;
+                                for (row,status) in changed.iter().zip(statuses) {
+                                    if let Ok(status)=status {
+                                        let in_progress=receipts_in_progress(&status).map(|receipt|receipt.run_id).collect::<HashSet<_>>();
+                                        // A receipt the status no longer has in progress belongs to a run that ended,
                                         // including one whose end event never reached this View, such as one lost to a
                                         // lagged feed; its Loop may since wait for a trigger or run another input.
-                                        let outcome_pending=pending.values().any(|receipt|receipt.chat_id==snapshot.id && !in_progress.contains(&receipt.run_id));
+                                        let outcome_pending=pending.values().any(|receipt|receipt.chat_id==status.id && !in_progress.contains(&receipt.run_id));
                                         // Events already queued for this View finish the run themselves; restoring
-                                        // from the snapshot now would print the reply a second way.
-                                        if outcome_pending && !events.is_empty() && Some(snapshot.id)==selected_chat {
+                                        // from a snapshot now would print the reply a second way. The member is read
+                                        // again on the next refresh in case they do not.
+                                        if outcome_pending && !events.is_empty() && Some(status.id)==selected_chat {
                                             continue;
                                         }
+                                        applied_member_work.insert(row.chat_id,MemberWork::of(row));
                                         if outcome_pending {
-                                            if !overview_active && Some(snapshot.id)==selected_chat {
-                                                let restored=restore_view(console,agent,&mut tools,snapshot.id,*displayed_sequences.get(&snapshot.id).unwrap_or(&0),&mut reply_lines,&mut message_groups).await?;
+                                            if !overview_active && Some(status.id)==selected_chat {
+                                                let restored=restore_view(console,agent,&mut tools,status.id,*displayed_sequences.get(&status.id).unwrap_or(&0),&mut reply_lines,&mut message_groups).await?;
                                                 failed |= restored.snapshot.loops.iter().any(|goal|goal.state==tickloop_agent_protocol::LoopState::Failed);
-                                                displayed_sequences.insert(snapshot.id,restored.snapshot.last_sequence);
+                                                displayed_sequences.insert(status.id,restored.snapshot.last_sequence);
                                                 merged_echoes.close_all();
                                                 sync_snapshot(&restored.snapshot,&mut pending,&mut permissions,&mut questions);
                                             } else {
-                                                let recovery=recover_background_chat(&snapshot,&background_label(agent,console,snapshot.id),&mut pending,&mut permissions,&mut questions);
+                                                let recovery=recover_background_chat(&status,&background_label(agent,console,status.id),&mut pending,&mut permissions,&mut questions);
                                                 failed |= recovery.failed;
                                                 for notice in recovery.run_notices {
-                                                    if !interactive {outln!(console,"Background {}",notice.text(&background_label(agent,console,snapshot.id)));}
-                                                    background_notice=Some((snapshot.id,notice));
+                                                    if !interactive {outln!(console,"Background {}",notice.text(&background_label(agent,console,status.id)));}
+                                                    background_notice=Some((status.id,notice));
                                                 }
                                                 for notice in recovery.request_notices {
                                                     if !interactive {outln!(console,"Background {notice}");}
@@ -4106,7 +4235,10 @@ async fn interact(
                                             }
                                             continue;
                                         }
-                                        sync_snapshot(&snapshot,&mut pending,&mut permissions,&mut questions);
+                                        sync_status(&status,&mut pending,&mut permissions,&mut questions);
+                                        if Some(status.id)==selected_chat {
+                                            turn_snapshot.keep_status(Arc::new(status));
+                                        }
                                     }
                                 }
                                 if row.availability==ExecutionAvailability::Live {
@@ -4124,11 +4256,11 @@ async fn interact(
                             // A cached snapshot cannot prove that another View resolved a request.
                             if let Ok(execution)=agent.reference(chat).await
                                 && let Ok(observation)=agent.access().observe(ObservationRequest::Agent {
-                                    execution,detail:AgentDetailQuery::Snapshot,after:None,
+                                    execution,detail:AgentDetailQuery::Status,after:None,
                                 }).await
-                                && let ObservationValue::Agent(snapshot)=observation.initial
+                                && let ObservationValue::Status(status)=observation.initial
                             {
-                                sync_snapshot_requests(&snapshot.conversation,&mut permissions,&mut questions);
+                                sync_status_requests(&status.chat,&mut permissions,&mut questions);
                             }
                         }
                         let live_visible=selected_chat.filter(|chat|visible_rows.iter().any(|row|row.chat_id==*chat && row.availability==ExecutionAvailability::Live));
@@ -4154,7 +4286,8 @@ async fn interact(
                     }
                 }
             },
-            _ = animation_refresh.tick(), if interactive && !prefers_reduced_motion && !visual_pacing_pending && (!pending.is_empty() || !directed_summaries.is_empty()) => {
+            _ = animation_refresh.tick(), if interactive && !visual_pacing_pending && (thinking_frame_due || (!prefers_reduced_motion && (!pending.is_empty() || !directed_summaries.is_empty()))) => {
+                thinking_frame_due = false;
                 activity_dirty = true;
             },
             _ = elapsed_refresh.tick(), if interactive && !visual_pacing_pending && (todo_refresh_pending || prefers_reduced_motion && running_activity.as_ref().is_some_and(|activity| activity.started_at.is_some())) => {
@@ -4187,7 +4320,7 @@ async fn interact(
                 }
             },
             _ = subscription_refresh.tick(), if interactive && !overview_active && console.monitor_has_entries()? => {
-                status_dirty = true;
+                monitor_refresh_due = true;
             },
             _ = prompt_watchdog_refresh.tick(), if selected_chat.is_some() => {
                 let chat=selected_chat.expect("selected Chat checked above");
@@ -4552,31 +4685,124 @@ fn user_shell_is_terminal(record: &UserShellRecord) -> bool {
     )
 }
 
+/// What one loop turn read about a Chat, kept for the status refresh that follows the turn, so a
+/// turn reads each from the daemon at most once: the conversation, which only a turn that shows
+/// part of the history reads, and the status, which every refresh needs and which a conversation
+/// read in the same turn also answers. The refresh drops both, and so does any change this View
+/// makes to the Chat in between.
+#[derive(Default)]
+struct TurnSnapshot {
+    conversation: Option<Arc<ChatSnapshot>>,
+    status: Option<Arc<ChatStatus>>,
+}
+
+impl TurnSnapshot {
+    /// The Chat with its history.
+    async fn read(
+        &mut self,
+        agent: &Agent,
+        chat: uuid::Uuid,
+    ) -> Result<Arc<ChatSnapshot>, AccessError> {
+        if let Some(snapshot) = self.conversation_of(chat) {
+            return Ok(snapshot);
+        }
+        let snapshot = Arc::new(agent.snapshot(chat).await?);
+        self.status = None;
+        self.conversation = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    /// What the Chat is doing now: from this turn's conversation when it read one.
+    async fn status(
+        &mut self,
+        agent: &Agent,
+        chat: uuid::Uuid,
+    ) -> Result<Arc<ChatStatus>, AccessError> {
+        if let Some(status) = self.status.as_ref().filter(|status| status.id == chat) {
+            return Ok(status.clone());
+        }
+        let status = Arc::new(match self.conversation_of(chat) {
+            Some(snapshot) => ChatStatus::of(&snapshot),
+            None => agent.status(chat).await?,
+        });
+        self.status = Some(status.clone());
+        Ok(status)
+    }
+
+    /// This turn's conversation of `chat`, when the turn read one.
+    fn conversation_of(&self, chat: uuid::Uuid) -> Option<Arc<ChatSnapshot>> {
+        self.conversation
+            .clone()
+            .filter(|snapshot| snapshot.id == chat)
+    }
+
+    fn keep_status(&mut self, status: Arc<ChatStatus>) {
+        self.status = Some(status);
+    }
+
+    fn forget(&mut self) {
+        self.conversation = None;
+        self.status = None;
+    }
+}
+
+/// What the execution catalog says about a family member's work. Any run that starts or ends,
+/// and any request that comes or goes, changes it, so while it stays as it was when the member's
+/// snapshot was last applied, that snapshot has nothing new to tell.
+#[derive(PartialEq)]
+struct MemberWork {
+    state: tickloop_agent_protocol::LoopState,
+    run_id: Option<uuid::Uuid>,
+    updated_at: Option<u64>,
+    waiting_permissions: usize,
+    waiting_questions: usize,
+}
+
+impl MemberWork {
+    fn of(row: &AgentSummary) -> Self {
+        Self {
+            state: row.state.clone(),
+            run_id: row.run_id,
+            updated_at: row.updated_at,
+            waiting_permissions: row.waiting_permissions,
+            waiting_questions: row.waiting_questions,
+        }
+    }
+}
+
+/// Tracks the runs and requests of a Chat this View just read in full, as opened or restored.
 fn sync_snapshot(
-    snapshot: &tickloop_agent_protocol::ChatSnapshot,
+    snapshot: &ChatSnapshot,
     pending: &mut HashMap<uuid::Uuid, Receipt>,
     permissions: &mut HashMap<uuid::Uuid, PermissionRequestOwner>,
     questions: &mut HashMap<uuid::Uuid, QuestionRequest>,
 ) {
-    sync_snapshot_requests(snapshot, permissions, questions);
-    pending.retain(|_, receipt| receipt.chat_id != snapshot.id);
-    for receipt in receipts_in_progress(snapshot) {
+    sync_status(&ChatStatus::of(snapshot), pending, permissions, questions);
+}
+
+fn sync_status(
+    status: &ChatStatus,
+    pending: &mut HashMap<uuid::Uuid, Receipt>,
+    permissions: &mut HashMap<uuid::Uuid, PermissionRequestOwner>,
+    questions: &mut HashMap<uuid::Uuid, QuestionRequest>,
+) {
+    sync_status_requests(status, permissions, questions);
+    pending.retain(|_, receipt| receipt.chat_id != status.id);
+    for receipt in receipts_in_progress(status) {
         pending.insert(receipt.run_id, receipt);
     }
 }
 
-/// The runs `snapshot` still has in progress: each armed queued input and each Loop running or
+/// The runs `status` still has in progress: each armed queued input and each Loop running or
 /// waiting on the user. A run outside them has ended, whether or not its end event arrived.
-fn receipts_in_progress(
-    snapshot: &tickloop_agent_protocol::ChatSnapshot,
-) -> impl Iterator<Item = Receipt> + '_ {
+fn receipts_in_progress(status: &ChatStatus) -> impl Iterator<Item = Receipt> + '_ {
     use tickloop_agent_protocol::LoopState;
-    let queued = snapshot
+    let queued = status
         .pending_inputs
         .iter()
         .filter(|input| input.armed)
         .map(|input| input.receipt.clone());
-    let running = snapshot.loops.iter().filter_map(|goal| {
+    let running = status.loops.iter().filter_map(|goal| {
         let run_id = goal.run_id.filter(|_| {
             matches!(
                 goal.state,
@@ -4584,7 +4810,7 @@ fn receipts_in_progress(
             )
         })?;
         Some(Receipt {
-            chat_id: snapshot.id,
+            chat_id: status.id,
             loop_id: goal.id,
             run_id,
         })
@@ -4609,21 +4835,105 @@ impl PermissionRequestOwner {
     }
 }
 
-fn sync_snapshot_requests(
-    snapshot: &tickloop_agent_protocol::ChatSnapshot,
+fn sync_status_requests(
+    status: &ChatStatus,
     permissions: &mut HashMap<uuid::Uuid, PermissionRequestOwner>,
     questions: &mut HashMap<uuid::Uuid, QuestionRequest>,
 ) {
-    permissions.retain(|_, request| request.chat_id != snapshot.id);
-    for request in &snapshot.permissions {
-        permissions.insert(
-            request.id,
-            PermissionRequestOwner::new(snapshot.id, request),
-        );
+    permissions.retain(|_, request| request.chat_id != status.id);
+    for request in &status.permissions {
+        permissions.insert(request.id, PermissionRequestOwner::new(status.id, request));
     }
-    questions.retain(|_, question| question.chat_id != snapshot.id);
-    for request in &snapshot.questions {
+    questions.retain(|_, question| question.chat_id != status.id);
+    for request in &status.questions {
         questions.insert(request.id, request.clone());
+    }
+}
+
+/// The Chats whose events this View lost before showing them.
+enum LostEvents {
+    /// The View's own event queue overflowed, so any Chat may have lost events.
+    AnyChat,
+    /// The daemon's feed of these Chats skipped events.
+    Chats(HashSet<uuid::Uuid>),
+}
+
+impl LostEvents {
+    fn includes(&self, chat: uuid::Uuid) -> bool {
+        match self {
+            Self::AnyChat => true,
+            Self::Chats(chats) => chats.contains(&chat),
+        }
+    }
+
+    /// `lost` widened by a gap in `chat`'s feed; `None` when so many gaps were announced that
+    /// some of their Chats are no longer known.
+    fn with_gap(lost: Option<Self>, chat: Option<uuid::Uuid>) -> Self {
+        match (lost, chat) {
+            (Some(Self::Chats(mut chats)), Some(chat)) => {
+                chats.insert(chat);
+                Self::Chats(chats)
+            }
+            (None, Some(chat)) => Self::Chats(HashSet::from([chat])),
+            _ => Self::AnyChat,
+        }
+    }
+}
+
+/// Why the View has no event to show next.
+enum EventInterruption {
+    /// Events were lost; the View restores them from the daemon's snapshots before showing more.
+    Lost(LostEvents),
+    Closed,
+}
+
+/// `lost` widened by every feed gap announced since the View last read them.
+fn announced_feed_gaps(
+    feed_gaps: &mut broadcast::Receiver<uuid::Uuid>,
+    mut lost: Option<LostEvents>,
+) -> Option<LostEvents> {
+    loop {
+        let chat = match feed_gaps.try_recv() {
+            Ok(chat) => Some(chat),
+            Err(broadcast::error::TryRecvError::Lagged(_)) => None,
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                return lost;
+            }
+        };
+        lost = Some(LostEvents::with_gap(lost, chat));
+    }
+}
+
+/// The next event to show: a deferred one first unless reply lines are still pacing out.
+/// A feed announces its gap before it forwards the events after the gap, so a gap announced by
+/// the time an event arrives is restored first and no later event shows ahead of the lost ones.
+async fn next_event(
+    events: &mut broadcast::Receiver<tickloop_agent_protocol::Event>,
+    feed_gaps: &mut broadcast::Receiver<uuid::Uuid>,
+    deferred_events: &mut VecDeque<tickloop_agent_protocol::Event>,
+    visual_pacing_pending: bool,
+) -> Result<tickloop_agent_protocol::Event, EventInterruption> {
+    let mut lost = None;
+    loop {
+        lost = announced_feed_gaps(feed_gaps, lost);
+        if let Some(lost) = lost {
+            return Err(EventInterruption::Lost(lost));
+        }
+        if !visual_pacing_pending && let Some(event) = deferred_events.pop_front() {
+            return Ok(event);
+        }
+        tokio::select! {
+            biased;
+            gap @ (Ok(_) | Err(broadcast::error::RecvError::Lagged(_))) = feed_gaps.recv() => {
+                lost = Some(LostEvents::with_gap(None, gap.ok()));
+            }
+            received = events.recv() => match received {
+                Ok(event) if feed_gaps.is_empty() => return Ok(event),
+                Ok(event) => deferred_events.push_back(event),
+                Err(broadcast::error::RecvError::Lagged(_)) => lost = Some(LostEvents::AnyChat),
+                Err(broadcast::error::RecvError::Closed) => return Err(EventInterruption::Closed),
+            },
+        }
     }
 }
 
@@ -4788,14 +5098,6 @@ fn render_restored_observation(
                         .contains(&id.replace(":assistant:", ":thinking:"))
                 });
             let console = &console.for_message(message_id.clone());
-            if matches!(event.kind, EventKind::Thinking(_)) {
-                thinking_runs.insert(event.run_id);
-            } else if ends_thinking(&event.kind)
-                && thinking_runs.remove(&event.run_id)
-                && console.is_interactive()
-            {
-                console.write_pieces(&[presentation::thinking_label()])?;
-            }
             let facts = tools.call_facts(event, &observation.snapshot);
             let interrupted_by_rejection = tools.ended_with_rejection(event.run_id);
             if tools.present_event(console, event, &facts)? {
@@ -4830,8 +5132,8 @@ fn render_restored_observation(
                         console.write_markdown(&safe_text(text), starts_assistant_message)?;
                     }
                 }
-                EventKind::Completed { usage } => {
-                    write_completion_notice(console, usage, None)?;
+                EventKind::Completed { .. } => {
+                    write_completion_notice(console, None)?;
                 }
                 EventKind::Started if console.is_interactive() => {
                     console.hide_completion_notice()?;
@@ -5814,12 +6116,11 @@ fn show_consumed_family_input(
                 }
                 AgentInput::PendingResult => awaits_completion = true,
                 AgentInput::Message => {
-                    if let Some(message) = AgentMessage::of(&local, snapshot, Some(*id)) {
+                    if let Some(message) = AgentMessage::of(&local) {
                         write_block(
                             console,
                             agent_messaging::message_runs(
                                 &message,
-                                &console.agent_colors()?,
                                 presentation::OutputDetail::Preview,
                                 console.display_profile()?,
                             ),
@@ -5876,14 +6177,14 @@ fn show_family_completion(
     console.mark_input_echoes(snapshot.id, [completion.child_run_id])
 }
 
-/// A heading and the `⎿` rows under it.
+/// An Agent block: its heading and the body indented under it.
 fn write_block(
     console: &Console,
-    (heading, response): (presentation::RoleRuns, presentation::RoleRuns),
+    (heading, body): (presentation::RoleRuns, presentation::RoleRuns),
 ) -> Result<(), String> {
     let mut pieces = console::ConversationPiece::block_runs(&heading);
-    if !response.is_empty() {
-        pieces.push(console::ConversationPiece::Response(response));
+    if !body.is_empty() {
+        pieces.push(console::ConversationPiece::Body(body));
     }
     console.write_pieces(&pieces)
 }
@@ -5940,13 +6241,14 @@ async fn track_accepted_echo(
 async fn show_consumed_input(
     console: &Console,
     agent: &Agent,
+    turn_snapshot: &mut TurnSnapshot,
     event: &tickloop_agent_protocol::Event,
 ) -> Result<Option<InputEcho>, String> {
     if !console.is_interactive() || console.input_is_echoed(event.chat_id, event.run_id)? {
         return Ok(None);
     }
     console.defer_input_echo(event.chat_id, event.run_id)?;
-    let Ok(snapshot) = agent.snapshot(event.chat_id).await else {
+    let Ok(snapshot) = turn_snapshot.read(agent, event.chat_id).await else {
         return Ok(None);
     };
     consume_input_echo_from_snapshot(console, &snapshot, event.run_id)
@@ -6270,7 +6572,7 @@ fn show_settings_warnings(console: &Console, warnings: Vec<String>) -> Result<()
     Ok(())
 }
 
-/// A finished compaction as Claude Code marks it: one muted `✻ Conversation compacted` line, with
+/// A finished compaction as Claude Code marks it: one muted `⏺ Conversation compacted` line, with
 /// the summary left to the detailed transcript.
 fn write_compaction_notice(
     console: &Console,
@@ -6630,7 +6932,7 @@ struct BackgroundRecovery {
 
 /// 事件流滞后后按快照校正一个后台 Chat 的待完成运行与请求，并补回丢失的结束与请求提示。
 fn recover_background_chat(
-    snapshot: &tickloop_agent_protocol::ChatSnapshot,
+    status: &ChatStatus,
     label: &str,
     pending: &mut HashMap<uuid::Uuid, Receipt>,
     permissions: &mut HashMap<uuid::Uuid, PermissionRequestOwner>,
@@ -6639,19 +6941,19 @@ fn recover_background_chat(
     use tickloop_agent_protocol::LoopState;
     let runs_before = pending
         .values()
-        .filter(|receipt| receipt.chat_id == snapshot.id)
+        .filter(|receipt| receipt.chat_id == status.id)
         .cloned()
         .collect::<Vec<_>>();
     let known_permissions = permissions.keys().copied().collect::<HashSet<_>>();
     let known_questions = questions.keys().copied().collect::<HashSet<_>>();
-    sync_snapshot(snapshot, pending, permissions, questions);
+    sync_status(status, pending, permissions, questions);
     let mut recovery = BackgroundRecovery::default();
     let mut ended_loops = HashSet::new();
     for receipt in runs_before {
         if pending.contains_key(&receipt.run_id) || !ended_loops.insert(receipt.loop_id) {
             continue;
         }
-        let state = snapshot
+        let state = status
             .loops
             .iter()
             .find(|goal| goal.id == receipt.loop_id)
@@ -6676,14 +6978,14 @@ fn recover_background_chat(
             necessary: outcome == "failed",
         });
     }
-    for request in &snapshot.permissions {
+    for request in &status.permissions {
         if !known_permissions.contains(&request.id) {
             recovery
                 .request_notices
                 .push(format!("{label} · permission request {}", request.id));
         }
     }
-    for request in &snapshot.questions {
+    for request in &status.questions {
         if !known_questions.contains(&request.id) {
             recovery
                 .request_notices
@@ -6693,8 +6995,8 @@ fn recover_background_chat(
     recovery
 }
 
-fn current_loop_todos(snapshot: &ChatSnapshot, current_loop: Option<uuid::Uuid>) -> Vec<TodoItem> {
-    snapshot
+fn current_loop_todos(status: &ChatStatus, current_loop: Option<uuid::Uuid>) -> Vec<TodoItem> {
+    status
         .progress
         .iter()
         .find(|progress| Some(progress.loop_id) == current_loop)
@@ -6709,31 +7011,13 @@ fn initial_context_usage(model: &ModelConfig) -> Option<(u64, usize)> {
         .map(|limit| (0, limit))
 }
 
-fn context_usage(snapshot: &ChatSnapshot) -> Option<(u64, usize)> {
-    let limit = snapshot
+fn context_usage(status: &ChatStatus) -> Option<(u64, usize)> {
+    let limit = status
         .model
         .maximum_context_window_tokens()
-        .or(snapshot.context_window_tokens)
+        .or(status.context_window_tokens)
         .filter(|limit| *limit > 0)?;
-    let matching_entries = snapshot
-        .request_usage
-        .entries()
-        .iter()
-        .rev()
-        .filter(|entry| {
-            entry.kind == ModelRequestKind::Conversation && entry.model == snapshot.model.identity()
-        })
-        .collect::<Vec<_>>();
-    let reported_usage = matching_entries
-        .iter()
-        .find_map(|entry| entry.context_input_tokens());
-    let used = if matching_entries.is_empty() {
-        0
-    } else {
-        reported_usage
-            .or_else(|| (matching_entries[0].outcome == RequestOutcome::InFlight).then_some(0))?
-    };
-    Some((used, limit))
+    Some((status.context_tokens?, limit))
 }
 
 /// A model retry as Claude Code reports it: what failed, then the retry and its attempt, which
@@ -7724,7 +8008,7 @@ mod tests {
             show_family_completion(&console, &completion, &snapshot).unwrap();
             assert_eq!(
                 console.test_conversation_text(),
-                "\n⏺ @audit finished · 2s\n  ⎿  Report line\n",
+                "\n⏺ Teammate @audit finished · 2s\n  Report line\n",
                 "report first: {report_first}"
             );
         }
@@ -7826,7 +8110,10 @@ mod tests {
         }
         let snapshot = agent.snapshot(chat).await.unwrap();
 
-        let todos = current_loop_todos(&snapshot, Some(receipt.loop_id));
+        let todos = current_loop_todos(
+            &tickloop_agent_protocol::ChatStatus::of(&snapshot),
+            Some(receipt.loop_id),
+        );
         assert_eq!(todos[1].active_form, "Drafting\tthe\nreport");
         assert_eq!(
             todos
@@ -7964,7 +8251,10 @@ mod tests {
                 ],
             ),
         ] {
-            let todos = current_loop_todos(&snapshot, Some(goal));
+            let todos = current_loop_todos(
+                &tickloop_agent_protocol::ChatStatus::of(&snapshot),
+                Some(goal),
+            );
             assert_eq!(
                 todos
                     .iter()
@@ -7973,9 +8263,16 @@ mod tests {
                 expected
             );
         }
-        assert!(current_loop_todos(&snapshot, None).is_empty());
         assert!(
-            current_loop_todos(&snapshot, Some(Uuid::new_v4())).is_empty(),
+            current_loop_todos(&tickloop_agent_protocol::ChatStatus::of(&snapshot), None)
+                .is_empty()
+        );
+        assert!(
+            current_loop_todos(
+                &tickloop_agent_protocol::ChatStatus::of(&snapshot),
+                Some(Uuid::new_v4())
+            )
+            .is_empty(),
             "a Todo-free selected Loop must not borrow another Loop's list"
         );
         agent.shutdown().await;
@@ -7989,11 +8286,17 @@ mod tests {
         );
         let chat_id = agent.create_chat(PathBuf::from("/tmp")).await.unwrap();
         let mut snapshot = agent.snapshot(chat_id).await.unwrap();
-        assert_eq!(context_usage(&snapshot), None);
+        assert_eq!(
+            context_usage(&tickloop_agent_protocol::ChatStatus::of(&snapshot)),
+            None
+        );
         snapshot.model = tickloop_agent_model::cards::ModelCatalog::defaults()
             .get("deepseek-api", "deepseek-flash-messages")
             .unwrap();
-        assert_eq!(context_usage(&snapshot), Some((0, 1_000_000)));
+        assert_eq!(
+            context_usage(&tickloop_agent_protocol::ChatStatus::of(&snapshot)),
+            Some((0, 1_000_000))
+        );
 
         let request = snapshot
             .request_usage
@@ -8007,13 +8310,19 @@ mod tests {
                 snapshot.model.identity(),
             )
             .unwrap();
-        assert_eq!(context_usage(&snapshot), Some((0, 1_000_000)));
+        assert_eq!(
+            context_usage(&tickloop_agent_protocol::ChatStatus::of(&snapshot)),
+            Some((0, 1_000_000))
+        );
         let mut without_report = snapshot.clone();
         without_report
             .request_usage
             .finish(request, RequestOutcome::Accepted)
             .unwrap();
-        assert_eq!(context_usage(&without_report), None);
+        assert_eq!(
+            context_usage(&tickloop_agent_protocol::ChatStatus::of(&without_report)),
+            None
+        );
         snapshot
             .request_usage
             .observe(
@@ -8026,7 +8335,10 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(context_usage(&snapshot), Some((12_500, 1_000_000)));
+        assert_eq!(
+            context_usage(&tickloop_agent_protocol::ChatStatus::of(&snapshot)),
+            Some((12_500, 1_000_000))
+        );
         snapshot
             .request_usage
             .finish(request, RequestOutcome::Accepted)
@@ -8043,7 +8355,10 @@ mod tests {
                 snapshot.model.identity(),
             )
             .unwrap();
-        assert_eq!(context_usage(&snapshot), Some((12_500, 1_000_000)));
+        assert_eq!(
+            context_usage(&tickloop_agent_protocol::ChatStatus::of(&snapshot)),
+            Some((12_500, 1_000_000))
+        );
     }
 
     fn user_shell_record(
@@ -8725,7 +9040,7 @@ mod tests {
         let mut questions = HashMap::new();
         let snapshot = agent.snapshot(background_chat).await.unwrap();
         let recovery = recover_background_chat(
-            &snapshot,
+            &tickloop_agent_protocol::ChatStatus::of(&snapshot),
             &label,
             &mut pending,
             &mut permissions,
@@ -8776,7 +9091,7 @@ mod tests {
         // 滞后又丢失了运行结束事件：残留的请求与待完成运行按快照清理并补回结束提示。
         let snapshot = agent.snapshot(background_chat).await.unwrap();
         let recovery = recover_background_chat(
-            &snapshot,
+            &tickloop_agent_protocol::ChatStatus::of(&snapshot),
             &label,
             &mut pending,
             &mut permissions,
@@ -8949,7 +9264,11 @@ mod tests {
         );
         let other = core.create_chat(directory.path().into()).await.unwrap();
         let mut snapshot = core.snapshot(other).await.unwrap();
-        super::sync_snapshot_requests(&snapshot, &mut permissions, &mut questions);
+        super::sync_status_requests(
+            &tickloop_agent_protocol::ChatStatus::of(&snapshot),
+            &mut permissions,
+            &mut questions,
+        );
         assert!(permissions.contains_key(&request.id));
         let lost = tickloop_agent_protocol::AgentSummary {
             availability: tickloop_agent_protocol::ExecutionAvailability::Lost,
@@ -8989,7 +9308,11 @@ mod tests {
             "lost direct Shell approval must not remain actionable"
         );
         snapshot.id = chat;
-        super::sync_snapshot_requests(&snapshot, &mut permissions, &mut questions);
+        super::sync_status_requests(
+            &tickloop_agent_protocol::ChatStatus::of(&snapshot),
+            &mut permissions,
+            &mut questions,
+        );
         assert!(permissions.is_empty());
         core.shutdown().await;
     }

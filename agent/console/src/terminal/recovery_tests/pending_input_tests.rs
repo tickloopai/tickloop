@@ -27,7 +27,7 @@ impl AgentAccess for QueueAccess {
             && matches!(
                 query,
                 ObservationRequest::Agent {
-                    detail: AgentDetailQuery::Snapshot,
+                    detail: AgentDetailQuery::Snapshot | AgentDetailQuery::Status,
                     ..
                 }
             )

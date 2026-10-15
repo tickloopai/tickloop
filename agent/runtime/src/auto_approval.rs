@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use tokio_util::sync::CancellationToken;
 
-use super::approval_context::ApprovalSnapshot;
+use super::approval_context::{ApprovalSnapshot, ReviewEvidence};
 use super::auto_rules::RuleVerdict;
 use super::jev_review::{review_request, verdict};
 use super::{Agent, AgentError, AutoReview, auto_mode, model_request};
@@ -21,10 +21,21 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(10);
 pub(super) const JEV_REVIEW_BUDGET: Duration = Duration::from_secs(20);
 const LLM_REVIEW_BUDGET: Duration = Duration::from_secs(45);
 
+#[derive(Clone, Copy)]
 struct StageRequest {
     stage: ApprovalStage,
     max_attempts: usize,
     deadline: tokio::time::Instant,
+}
+
+/// Attempts left for the authorization stage after screening. The one retry with smaller
+/// evidence after a context-limit rejection does not use the shared allowance.
+fn remaining_attempts(allowance: usize, screen: &[ApprovalAttemptDetails]) -> usize {
+    let used = screen
+        .iter()
+        .filter(|attempt| attempt.failure != Some(ApprovalFailureKind::ContextLimit))
+        .count();
+    allowance.saturating_sub(used).max(1)
 }
 
 pub(super) fn review_from_rule_verdict(verdict: RuleVerdict) -> AutoReview {
@@ -91,18 +102,21 @@ impl Agent {
         Ok((Arc::new(client), version))
     }
 
+    /// Reviews `context` fitted to `budget_bytes`, Jev's estimated snapshot capacity.
     pub(super) async fn review_with_jev(
         &self,
         receipt: &Receipt,
         context: &ApprovalSnapshot,
+        budget_bytes: usize,
         client: Arc<dyn JudgmentClient>,
         deadline: tokio::time::Instant,
         cancel: CancellationToken,
     ) -> Result<ReviewerRun, AgentError> {
+        let mut evidence = ReviewEvidence::new(context, budget_bytes);
         let screen = self
             .review_jev_stage(
                 receipt,
-                context,
+                &mut evidence,
                 client.clone(),
                 cancel.clone(),
                 StageRequest {
@@ -120,12 +134,12 @@ impl Agent {
         let final_review = self
             .review_jev_stage(
                 receipt,
-                context,
+                &mut evidence,
                 client,
                 cancel,
                 StageRequest {
                     stage: ApprovalStage::Authorization,
-                    max_attempts: MAX_ATTEMPTS + 1 - screen.attempts.len(),
+                    max_attempts: remaining_attempts(MAX_ATTEMPTS + 1, &screen.attempts),
                     deadline,
                 },
             )
@@ -133,18 +147,21 @@ impl Agent {
         Ok(final_review.with_prior_attempts(screen.attempts))
     }
 
+    /// Reviews `context` fitted to `budget_bytes`, the LLM's estimated snapshot capacity.
     pub(super) async fn review_with_llm(
         &self,
         receipt: &Receipt,
         context: &ApprovalSnapshot,
+        budget_bytes: usize,
         client: Arc<dyn ModelClient>,
         cancel: CancellationToken,
     ) -> Result<ReviewerRun, AgentError> {
         let deadline = tokio::time::Instant::now() + LLM_REVIEW_BUDGET;
+        let mut evidence = ReviewEvidence::new(context, budget_bytes);
         let screen = self
             .review_llm_stage(
                 receipt,
-                context,
+                &mut evidence,
                 client.clone(),
                 cancel.clone(),
                 StageRequest {
@@ -160,12 +177,15 @@ impl Agent {
         let final_review = self
             .review_llm_stage(
                 receipt,
-                context,
+                &mut evidence,
                 client,
                 cancel,
                 StageRequest {
                     stage: ApprovalStage::Authorization,
-                    max_attempts: auto_mode::MAX_CLASSIFIER_ATTEMPTS + 1 - screen.attempts.len(),
+                    max_attempts: remaining_attempts(
+                        auto_mode::MAX_CLASSIFIER_ATTEMPTS + 1,
+                        &screen.attempts,
+                    ),
                     deadline,
                 },
             )
@@ -173,7 +193,61 @@ impl Agent {
         Ok(final_review.with_prior_attempts(screen.attempts))
     }
 
+    /// One Jev stage; a context-limit rejection retries it once with smaller evidence.
     async fn review_jev_stage(
+        &self,
+        receipt: &Receipt,
+        evidence: &mut ReviewEvidence<'_>,
+        client: Arc<dyn JudgmentClient>,
+        cancel: CancellationToken,
+        stage_request: StageRequest,
+    ) -> Result<ReviewerRun, AgentError> {
+        let run = self
+            .review_jev_attempts(
+                receipt,
+                evidence.snapshot(),
+                client.clone(),
+                cancel.clone(),
+                stage_request,
+            )
+            .await?;
+        if !matches!(run.review, AutoReview::ContextLimit) || !evidence.shrink() {
+            return Ok(run);
+        }
+        let retry = self
+            .review_jev_attempts(receipt, evidence.snapshot(), client, cancel, stage_request)
+            .await?;
+        Ok(retry.with_prior_attempts(run.attempts))
+    }
+
+    /// One LLM stage; a context-limit rejection retries it once with smaller evidence.
+    async fn review_llm_stage(
+        &self,
+        receipt: &Receipt,
+        evidence: &mut ReviewEvidence<'_>,
+        client: Arc<dyn ModelClient>,
+        cancel: CancellationToken,
+        stage_request: StageRequest,
+    ) -> Result<ReviewerRun, AgentError> {
+        let run = self
+            .review_llm_attempts(
+                receipt,
+                evidence.snapshot(),
+                client.clone(),
+                cancel.clone(),
+                stage_request,
+            )
+            .await?;
+        if !matches!(run.review, AutoReview::ContextLimit) || !evidence.shrink() {
+            return Ok(run);
+        }
+        let retry = self
+            .review_llm_attempts(receipt, evidence.snapshot(), client, cancel, stage_request)
+            .await?;
+        Ok(retry.with_prior_attempts(run.attempts))
+    }
+
+    async fn review_jev_attempts(
         &self,
         receipt: &Receipt,
         context: &ApprovalSnapshot,
@@ -384,7 +458,7 @@ impl Agent {
         unreachable!()
     }
 
-    async fn review_llm_stage(
+    async fn review_llm_attempts(
         &self,
         receipt: &Receipt,
         context: &ApprovalSnapshot,
@@ -463,10 +537,7 @@ impl Agent {
                             attempts,
                         ));
                     }
-                    let review = if matches!(
-                        error,
-                        ModelError::ResponseRejected(ModelResponseRejection::ContextLimit)
-                    ) {
+                    let review = if failure == ApprovalFailureKind::ContextLimit {
                         AutoReview::ContextLimit
                     } else {
                         AutoReview::Unavailable {
@@ -632,16 +703,20 @@ pub(super) fn failure_kind(error: &ModelError) -> ApprovalFailureKind {
         }
         ModelFailureKind::Timeout => ApprovalFailureKind::Timeout,
         ModelFailureKind::InvalidResponse => ApprovalFailureKind::InvalidResponse,
-        ModelFailureKind::ResponseRejected
-            if matches!(
-                error,
-                ModelError::ResponseRejected(
-                    tickloop_agent_model::ModelResponseRejection::ContextLimit
-                )
-            ) =>
-        {
+        ModelFailureKind::ResponseRejected if is_context_limit(error) => {
             ApprovalFailureKind::ContextLimit
         }
         _ => ApprovalFailureKind::Service,
+    }
+}
+
+/// HTTP clients report a context-limit response through the stage that read it.
+fn is_context_limit(error: &ModelError) -> bool {
+    match error {
+        ModelError::AtStage { error, .. } => is_context_limit(error),
+        error => matches!(
+            error,
+            ModelError::ResponseRejected(ModelResponseRejection::ContextLimit)
+        ),
     }
 }

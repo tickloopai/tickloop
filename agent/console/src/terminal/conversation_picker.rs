@@ -508,27 +508,7 @@ impl ConversationPicker {
     /// The search row and the column of the cursor in it. A query wider than the row scrolls
     /// so the cursor stays in view.
     pub(super) fn search_line(&self, width: usize) -> (RoleLine, usize) {
-        let query = self.query();
-        let cursor = self.query_editor.cursor();
-        let mut line = RoleLine::default();
-        let prefix = truncate_width(SEARCH_PREFIX, width);
-        let available = width.saturating_sub(display_width(&prefix));
-        line.push(prefix.clone(), Some(Role::MutedText));
-        if query.is_empty() {
-            line.push(
-                truncate_width(SEARCH_PLACEHOLDER, available),
-                Some(Role::MutedText),
-            );
-            return (line, display_width(&prefix).min(width.saturating_sub(1)));
-        }
-        let mut start = 0;
-        while start < cursor && display_width(&query[start..cursor]) >= available.max(1) {
-            start = next_boundary(query, start);
-        }
-        let visible = truncate_width(&query[start..], available);
-        let column = display_width(&prefix) + display_width(&query[start..cursor]);
-        line.push(visible, Some(Role::Text));
-        (line, column.min(width.saturating_sub(1)))
+        search_row(self.query(), self.query_editor.cursor(), width)
     }
 
     fn list_lines(&mut self, width: usize, rows: usize, display: DisplayProfile) -> Vec<RoleLine> {
@@ -662,6 +642,30 @@ fn display_width(text: &str) -> usize {
     text.chars()
         .map(|character| character.width().unwrap_or(0))
         .sum()
+}
+
+/// The shared search row: its glyph, the query or the placeholder, and the cursor column. A query
+/// wider than the row scrolls so the cursor stays in view.
+pub(super) fn search_row(query: &str, cursor: usize, width: usize) -> (RoleLine, usize) {
+    let mut line = RoleLine::default();
+    let prefix = truncate_width(SEARCH_PREFIX, width);
+    let available = width.saturating_sub(display_width(&prefix));
+    line.push(prefix.clone(), Some(Role::MutedText));
+    if query.is_empty() {
+        line.push(
+            truncate_width(SEARCH_PLACEHOLDER, available),
+            Some(Role::MutedText),
+        );
+        return (line, display_width(&prefix).min(width.saturating_sub(1)));
+    }
+    let mut start = 0;
+    while start < cursor && display_width(&query[start..cursor]) >= available.max(1) {
+        start = next_boundary(query, start);
+    }
+    let visible = truncate_width(&query[start..], available);
+    let column = display_width(&prefix) + display_width(&query[start..cursor]);
+    line.push(visible, Some(Role::Text));
+    (line, column.min(width.saturating_sub(1)))
 }
 
 /// `text` cut to `width` columns, ending in `…` when anything was cut. A space left at the

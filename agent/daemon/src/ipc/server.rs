@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
@@ -733,7 +734,6 @@ async fn write_chunked_response<W: AsyncWrite + Unpin>(
 ) -> Result<(), AccessError> {
     let transfer_id = Uuid::new_v4();
     let total_bytes = encoded.total_bytes;
-    let sha256 = encoded.sha256;
     let frame_bytes = limits.frame_bytes();
     let chunk_bytes = limits.chunk_bytes();
     let mut file = tokio::fs::File::from_std(encoded.file);
@@ -752,11 +752,13 @@ async fn write_chunked_response<W: AsyncWrite + Unpin>(
         .await?;
         let mut offset = 0;
         let mut bytes = vec![0; chunk_bytes];
+        let mut digest = Sha256::new();
         while offset < total_bytes {
             let length = (total_bytes - offset).min(chunk_bytes as u64) as usize;
             file.read_exact(&mut bytes[..length])
                 .await
                 .map_err(|error| AccessError::unavailable(error.to_string()))?;
+            digest.update(&bytes[..length]);
             write_frame(
                 writer,
                 &ServerMessage::ResponseChunk {
@@ -774,7 +776,7 @@ async fn write_chunked_response<W: AsyncWrite + Unpin>(
             &ServerMessage::ResponseEnd {
                 transfer_id,
                 total_bytes,
-                sha256,
+                sha256: format!("{:x}", digest.finalize()),
             },
             frame_bytes,
         )

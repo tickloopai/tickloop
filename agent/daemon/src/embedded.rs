@@ -22,11 +22,12 @@ use tickloop_agent_protocol::{
     AgentSummary, BranchRequest, CommandEnvelope, CommandReceipt, CommandResult,
     ConfigurationChange, Cursor, DirectedHumanSource, DisplayReceipt, DisplayUpdate, Event,
     ExecutionAvailability, ExecutionRef, FEED_CAPACITY, HerdrInteraction, HistoryAction,
-    HostCallContext, InteractionSource, LaunchSpec, LiveChatSnapshot, LoopAction, ModelConfig,
-    Observation, ObservationChange, ObservationRequest, ObservationUpdate, ObservationValue,
-    PendingRequestKind, PersistenceState, QueuedCommandFailure, REPLAY_CAPACITY, RequestRef,
-    ResetReason, ShellTaskAction, ShellTaskOrigin, TaskAction, TaskNotification, TaskOrigin,
-    TaskRef, TranscriptRef, UserInput, UserShellRecord, bounded_update, chat_display_title,
+    HostCallContext, InteractionSource, LaunchSpec, LiveChatSnapshot, LiveChatStatus, LoopAction,
+    LoopTriggerNotice, ModelConfig, Observation, ObservationChange, ObservationRequest,
+    ObservationUpdate, ObservationValue, PendingRequestKind, PersistenceState,
+    QueuedCommandFailure, REPLAY_CAPACITY, RequestRef, ResetReason, ShellTaskAction,
+    ShellTaskOrigin, SubagentRegistration, TaskAction, TaskNotification, TaskOrigin, TaskRef,
+    TranscriptRef, UserInput, UserShellRecord, bounded_update,
 };
 use tickloop_agent_runtime::{Agent, ShellTaskCenter};
 
@@ -62,6 +63,15 @@ struct Inner {
     changes: broadcast::Sender<ObservationUpdate>,
     publishing: Mutex<()>,
     cancel: CancellationToken,
+}
+
+/// What the serving process knows about a Chat beyond the Chat's own state.
+struct LiveFacts {
+    subagent: Option<SubagentRegistration>,
+    loop_trigger_notices: Vec<LoopTriggerNotice>,
+    transcript_write_error: Option<String>,
+    warnings: Vec<String>,
+    queue_failures: Vec<QueuedCommandFailure>,
 }
 
 #[derive(Default)]
@@ -204,22 +214,45 @@ impl EmbeddedAgentAccess {
     async fn snapshot(&self, execution: ExecutionRef) -> Result<LiveChatSnapshot, AccessError> {
         let chat = self.chat(execution).await?;
         let snapshot = self.inner.agent.snapshot(chat).await?;
-        let mut warnings = self.inner.agent.user_settings_warnings(chat);
-        warnings.extend(self.inner.agent.transcript_load_warnings(chat));
-        if let Some(error) = self.inner.agent.transcript_write_error() {
-            warnings.push(error);
-        }
-        let mut snapshot = LiveChatSnapshot::from_snapshot(execution, snapshot, warnings);
-        snapshot.subagent = self.inner.agent.subagent_registration(chat).await?;
-        snapshot.transcript_write_error = self.inner.agent.transcript_write_error();
-        snapshot.loop_trigger_notices = self
-            .inner
-            .agent
-            .loop_trigger_notices()
-            .into_iter()
-            .filter(|notice| notice.chat_id == chat)
-            .collect();
-        snapshot.queue_failures = self
+        let mut snapshot = LiveChatSnapshot::from_snapshot(execution, snapshot, Vec::new());
+        let live = self.live_facts(execution, chat).await?;
+        snapshot.subagent = live.subagent;
+        snapshot.transcript_write_error = live.transcript_write_error;
+        snapshot.loop_trigger_notices = live.loop_trigger_notices;
+        snapshot.warnings = live.warnings;
+        snapshot.queue_failures = live.queue_failures;
+        self.version_requests(execution, &mut snapshot.request_refs)
+            .await;
+        Ok(snapshot)
+    }
+
+    /// What a status query answers; the same facts a snapshot of this moment carries.
+    async fn status(&self, execution: ExecutionRef) -> Result<LiveChatStatus, AccessError> {
+        let chat = self.chat(execution).await?;
+        let status = self.inner.agent.status(chat).await?;
+        let live = self.live_facts(execution, chat).await?;
+        let mut request_refs =
+            RequestRef::pending(execution, &status.permissions, &status.questions);
+        self.version_requests(execution, &mut request_refs).await;
+        Ok(LiveChatStatus {
+            execution,
+            subagent: live.subagent,
+            chat: status,
+            request_refs,
+            warnings: live.warnings,
+            transcript_write_error: live.transcript_write_error,
+            loop_trigger_notices: live.loop_trigger_notices,
+        })
+    }
+
+    /// What this process adds to a Chat's own state for its Views.
+    async fn live_facts(
+        &self,
+        execution: ExecutionRef,
+        chat: Uuid,
+    ) -> Result<LiveFacts, AccessError> {
+        let transcript_write_error = self.inner.agent.transcript_write_error();
+        let queue_failures = self
             .inner
             .queue_failures
             .lock()
@@ -227,25 +260,44 @@ impl EmbeddedAgentAccess {
             .iter()
             .filter(|failure| failure.execution == execution)
             .cloned()
-            .collect();
-        snapshot.warnings.extend(
-            snapshot.queue_failures.iter().map(|failure| {
+            .collect::<Vec<_>>();
+        let mut warnings = self.inner.agent.user_settings_warnings(chat);
+        warnings.extend(self.inner.agent.transcript_load_warnings(chat));
+        warnings.extend(transcript_write_error.clone());
+        warnings.extend(
+            queue_failures.iter().map(|failure| {
                 format!("Queued command {} failed: {}", failure.label, failure.error)
             }),
         );
+        Ok(LiveFacts {
+            subagent: self.inner.agent.subagent_registration(chat).await?,
+            loop_trigger_notices: self
+                .inner
+                .agent
+                .loop_trigger_notices()
+                .into_iter()
+                .filter(|notice| notice.chat_id == chat)
+                .collect(),
+            transcript_write_error,
+            warnings,
+            queue_failures,
+        })
+    }
+
+    /// Gives each pending request the version its answers reached, and forgets the answers of
+    /// requests no longer pending.
+    async fn version_requests(&self, execution: ExecutionRef, requests: &mut [RequestRef]) {
         let mut answers = self.inner.answers.lock().await;
-        let pending = snapshot
-            .request_refs
+        let pending = requests
             .iter()
             .map(|request| (request.execution, request.request_id, request.kind))
             .collect::<std::collections::HashSet<_>>();
         answers.retain(|key, _| key.0 != execution || pending.contains(key));
-        for request in &mut snapshot.request_refs {
+        for request in requests {
             request.version = answers
                 .get(&(request.execution, request.request_id, request.kind))
                 .map_or(1, |state| state.version);
         }
-        Ok(snapshot)
     }
 
     async fn host_context(
@@ -1258,23 +1310,14 @@ impl EmbeddedAgentAccess {
         ))
     }
 
-    async fn observe_agent(
+    /// The answer to an Agent query other than the Chat itself.
+    async fn detail_value(
         &self,
         execution: ExecutionRef,
+        chat: Uuid,
         detail: AgentDetailQuery,
-        after: Option<Cursor>,
-    ) -> Result<Observation, AccessError> {
-        if let AgentDetailQuery::AccountModels { config, refresh } = &detail {
-            return self
-                .observe_account_models(execution, *config.clone(), *refresh)
-                .await;
-        }
-        let mut receiver = self.inner.changes.subscribe();
-        let sequence = self.inner.sequence.load(Ordering::SeqCst);
-        let chat = self.chat(execution).await?;
-        let snapshot = self.snapshot(execution).await?;
-        let watermark = snapshot.last_sequence;
-        let initial = match detail {
+    ) -> Result<ObservationValue, AccessError> {
+        Ok(match detail {
             AgentDetailQuery::ProviderCredentials => {
                 let launches = self.inner.launches.lock().await;
                 let launch = launches.get(&execution);
@@ -1287,7 +1330,19 @@ impl EmbeddedAgentAccess {
             AgentDetailQuery::AccountModels { .. } => {
                 unreachable!("account queries return their own observation")
             }
-            AgentDetailQuery::Snapshot => ObservationValue::Agent(Box::new(snapshot)),
+            AgentDetailQuery::Snapshot | AgentDetailQuery::Status => {
+                unreachable!("Chat answers are read with their feed watermark")
+            }
+            AgentDetailQuery::Operation { run_id, call_id } => ObservationValue::Operation(
+                self.inner
+                    .agent
+                    .operation(chat, run_id, &call_id)
+                    .await?
+                    .map(Box::new),
+            ),
+            AgentDetailQuery::Events { after } => {
+                ObservationValue::Events(self.inner.agent.events_after(chat, after).await?)
+            }
             AgentDetailQuery::Permissions => ObservationValue::Permissions(Box::new(
                 self.inner.agent.permissions_view(chat).await?,
             )),
@@ -1322,9 +1377,9 @@ impl EmbeddedAgentAccess {
             AgentDetailQuery::Subscriptions => {
                 ObservationValue::Subscriptions(self.inner.agent.tick_subscriptions(chat).await?)
             }
-            AgentDetailQuery::RewindPoints => {
-                ObservationValue::RewindPoints(snapshot.conversation.rewind_points())
-            }
+            AgentDetailQuery::RewindPoints => ObservationValue::RewindPoints(
+                self.inner.agent.snapshot(chat).await?.rewind_points(),
+            ),
             AgentDetailQuery::RewindFiles { message_id } => ObservationValue::RewindFiles(
                 self.inner
                     .agent
@@ -1338,7 +1393,43 @@ impl EmbeddedAgentAccess {
                 },
                 warnings: self.inner.agent.skill_warnings(chat).await?,
             },
-            AgentDetailQuery::Warnings => ObservationValue::Warnings(snapshot.warnings),
+            AgentDetailQuery::Warnings => {
+                ObservationValue::Warnings(self.live_facts(execution, chat).await?.warnings)
+            }
+        })
+    }
+
+    async fn observe_agent(
+        &self,
+        execution: ExecutionRef,
+        detail: AgentDetailQuery,
+        after: Option<Cursor>,
+    ) -> Result<Observation, AccessError> {
+        if let AgentDetailQuery::AccountModels { config, refresh } = &detail {
+            return self
+                .observe_account_models(execution, *config.clone(), *refresh)
+                .await;
+        }
+        let mut receiver = self.inner.changes.subscribe();
+        let sequence = self.inner.sequence.load(Ordering::SeqCst);
+        let chat = self.chat(execution).await?;
+        // The feed carries the events after the ones the answer reflects. Only the two Chat
+        // answers read the Chat's state; every other answer goes by the Chat's sequence now.
+        let (initial, watermark) = match detail {
+            AgentDetailQuery::Snapshot => {
+                let snapshot = self.snapshot(execution).await?;
+                let watermark = snapshot.last_sequence;
+                (ObservationValue::Agent(Box::new(snapshot)), watermark)
+            }
+            AgentDetailQuery::Status => {
+                let status = self.status(execution).await?;
+                let watermark = status.chat.last_sequence;
+                (ObservationValue::Status(Box::new(status)), watermark)
+            }
+            detail => (
+                self.detail_value(execution, chat, detail).await?,
+                self.inner.agent.last_sequence(chat).await?,
+            ),
         };
         let cursor = Cursor {
             daemon_epoch: self.inner.epoch,
@@ -1431,18 +1522,16 @@ impl AgentAccess for EmbeddedAgentAccess {
                 let views = self.inner.views.displayed().await;
                 let mut entries = Vec::new();
                 for (chat, execution) in references {
-                    let snapshot = self.inner.agent.snapshot(chat).await?;
+                    let summary = self.inner.agent.summary(chat).await?;
                     if filter
                         .workdir
                         .as_ref()
-                        .is_some_and(|path| path != &snapshot.workdir)
+                        .is_some_and(|path| path != &summary.workdir)
                     {
                         continue;
                     }
-                    let state = tickloop_agent_runtime::summary_state(
-                        &snapshot.loops,
-                        &snapshot.user_shells,
-                    );
+                    let state =
+                        tickloop_agent_runtime::summary_state(&summary.loops, &summary.user_shells);
                     let launch = self.inner.launches.lock().await.get(&execution).cloned();
                     let workspace = launch
                         .as_ref()
@@ -1463,43 +1552,33 @@ impl AgentAccess for EmbeddedAgentAccess {
                             store_root,
                             chat_id: chat,
                         });
-                    let has_work = super::summary::has_work(
-                        &snapshot,
-                        &snapshot.user_shells,
-                        snapshot.pending_inputs.len() + snapshot.pending_commands.len(),
-                    );
-                    let title = chat_display_title(&snapshot, &snapshot.user_shells);
                     let registration = self.inner.agent.subagent_registration(chat).await?;
                     entries.push(AgentSummary {
                         availability: ExecutionAvailability::Live,
                         execution,
                         chat_id: chat,
-                        preview: super::summary::preview(&snapshot, &title),
+                        preview: summary.preview,
                         updated_at: super::summary::updated_at(
-                            &snapshot.loops,
-                            &snapshot.user_shells,
+                            &summary.loops,
+                            &summary.user_shells,
                         ),
-                        workdir: snapshot.workdir,
-                        run_id: super::summary::summary_run_id(&snapshot.loops, &state),
+                        workdir: summary.workdir,
+                        run_id: super::summary::summary_run_id(&summary.loops, &state),
                         state,
-                        title,
+                        title: summary.title,
                         subagent: registration,
-                        has_work: Some(has_work),
-                        waiting_permissions: snapshot.permissions.len(),
-                        waiting_questions: snapshot.questions.len(),
-                        parent: match &snapshot.delegation {
-                            Some(delegation) => self
-                                .inner
-                                .references
-                                .lock()
-                                .await
-                                .get(&delegation.parent_chat_id)
-                                .copied(),
+                        has_work: Some(summary.has_work),
+                        waiting_permissions: summary.waiting_permissions,
+                        waiting_questions: summary.waiting_questions,
+                        parent: match summary.parent_chat {
+                            Some(parent) => {
+                                self.inner.references.lock().await.get(&parent).copied()
+                            }
                             None => None,
                         },
                         record,
                         workspace,
-                        capabilities: if snapshot.delegation.is_some() {
+                        capabilities: if summary.parent_chat.is_some() {
                             vec![
                                 "submit".into(),
                                 "scoped_shell".into(),

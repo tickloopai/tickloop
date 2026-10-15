@@ -4,74 +4,51 @@ use super::auto_rules::{Classification, ClassificationDecision, RuleVerdict};
 use serde_json::json;
 use std::collections::BTreeMap;
 use tickloop_agent_model::judgment::{Answer, Evaluation, EvaluationRequest, Question};
-use tickloop_agent_protocol::AutoPolicy;
+use tickloop_agent_protocol::{ApprovalStage, AutoPolicy};
 
 // Bound local payload size; the provider enforces its model-specific token limits.
 const MAX_REVIEW_REQUEST_BYTES: usize = 1024 * 1024;
-pub(super) const QUESTION_VERSION: &str = "auto-jev-v13";
+pub(super) const QUESTION_VERSION: &str = "auto-jev-v14";
+/// Jev 1.13 accepts 32k tokens for the state plus its longest question
+/// (https://docs.typesafe.ai/models, checked 2026-10-13).
+const JEV_STATE_AND_QUESTION_TOKENS: usize = 32_000;
+/// Jev's tokenizer is not published. The production builder's full-policy request measured
+/// 96,621 bytes as 25,000 reported input tokens (ADR 0009); budgets use that observed ratio,
+/// because two bytes per token would already put the default policy over Jev's limit.
+const JEV_MEASURED_REQUEST_BYTES: usize = 96_621;
+const JEV_MEASURED_INPUT_TOKENS: usize = 25_000;
 
 #[cfg(test)]
 #[path = "jev_review_tests.rs"]
 mod tests;
 
+/// Bytes of approval snapshot Jev can review beside its longest question.
+pub(super) fn review_budget_bytes() -> usize {
+    let request_bytes =
+        JEV_STATE_AND_QUESTION_TOKENS * JEV_MEASURED_REQUEST_BYTES / JEV_MEASURED_INPUT_TOKENS;
+    let framing_bytes = [ApprovalStage::RiskScreen, ApprovalStage::Authorization]
+        .into_iter()
+        .map(|stage| {
+            let without_state = EvaluationRequest {
+                state: serde_json::Value::Null,
+                questions: questions(stage, true),
+            };
+            serde_json::to_vec(&without_state)
+                .expect("Jev request serializes")
+                .len()
+                - "null".len()
+        })
+        .max()
+        .unwrap_or_default();
+    request_bytes.saturating_sub(framing_bytes)
+}
+
 pub(super) fn review_request(
     context: &ApprovalSnapshot,
-    stage: tickloop_agent_protocol::ApprovalStage,
+    stage: ApprovalStage,
 ) -> Result<EvaluationRequest, AutoReview> {
     let state = serde_json::to_value(context).expect("approval context serializes");
-    let questions = BTreeMap::from([(
-        "decision".into(),
-        Question::Choice {
-            instructions: json!({
-                "version": QUESTION_VERSION,
-                "question": if stage == tickloop_agent_protocol::ApprovalStage::RiskScreen {
-                    "Could a Hard deny or Soft deny rule apply to this operation, before considering user consent or Soft allow exceptions? Choose one overall screening result."
-                } else {
-                    "Should the proposed operation be blocked after applying the full policy and genuine user authorization? Choose the final overall decision."
-                },
-                "policy": super::auto_rules::CLASSIFICATION_GUIDANCE,
-                "operation": super::auto_rules::OPERATION_INTERPRETATION,
-                "stage": stage,
-                "stage_guidance": super::auto_rules::stage_guidance(stage),
-            }),
-            criteria: BTreeMap::from([
-                (
-                    "allow".into(),
-                    json!(
-                        if stage == tickloop_agent_protocol::ApprovalStage::RiskScreen {
-                            "No Hard deny or Soft deny rule could apply to the operation's effects."
-                        } else {
-                            "No Hard deny or genuine-user boundary is violated, and either no Soft deny applies or every applicable Soft deny is cleared by a matching Soft allow exception or genuine user consent meeting its stated must-name requirements. A cleared Soft deny is an Allow, not a block."
-                        }
-                    ),
-                ),
-                (
-                    "block_soft".into(),
-                    json!(
-                        if stage == tickloop_agent_protocol::ApprovalStage::RiskScreen {
-                            "A Soft deny could apply, before considering user consent or Soft allow exceptions."
-                        } else {
-                            "At least one concrete Soft deny applies and remains uncleared: neither a matching Soft allow exception nor genuine user consent meeting that rule's stated requirements covers it. Do not choose this merely because a rule initially matched; sufficient authorization clears that Soft deny."
-                        }
-                    ),
-                ),
-                (
-                    "block_hard".into(),
-                    json!(
-                        if stage == tickloop_agent_protocol::ApprovalStage::RiskScreen {
-                            "A Hard deny could apply to the operation's effects."
-                        } else {
-                            "A concrete Hard deny applies; user consent and exceptions cannot clear it."
-                        }
-                    ),
-                ),
-                (
-                    "block_user_boundary".into(),
-                    json!("The operation crosses an explicit boundary in the genuine user inputs."),
-                ),
-            ]),
-        },
-    )]);
+    let questions = questions(stage, context.context_truncation.is_some());
     let request = EvaluationRequest { state, questions };
     if serde_json::to_vec(&request)
         .expect("Jev request serializes")
@@ -81,6 +58,60 @@ pub(super) fn review_request(
         return Err(AutoReview::ContextLimit);
     }
     Ok(request)
+}
+
+fn questions(stage: ApprovalStage, truncated: bool) -> BTreeMap<String, Question> {
+    let mut instructions = json!({
+        "version": QUESTION_VERSION,
+        "question": if stage == ApprovalStage::RiskScreen {
+            "Could a Hard deny or Soft deny rule apply to this operation, before considering user consent or Soft allow exceptions? Choose one overall screening result."
+        } else {
+            "Should the proposed operation be blocked after applying the full policy and genuine user authorization? Choose the final overall decision."
+        },
+        "policy": super::auto_rules::CLASSIFICATION_GUIDANCE,
+        "operation": super::auto_rules::OPERATION_INTERPRETATION,
+        "stage": stage,
+        "stage_guidance": super::auto_rules::stage_guidance(stage),
+    });
+    if truncated {
+        instructions["context"] = json!(super::auto_rules::TRUNCATION_GUIDANCE);
+    }
+    BTreeMap::from([(
+        "decision".into(),
+        Question::Choice {
+            instructions,
+            criteria: BTreeMap::from([
+                (
+                    "allow".into(),
+                    json!(if stage == ApprovalStage::RiskScreen {
+                        "No Hard deny or Soft deny rule could apply to the operation's effects."
+                    } else {
+                        "No Hard deny or genuine-user boundary is violated, and either no Soft deny applies or every applicable Soft deny is cleared by a matching Soft allow exception or genuine user consent meeting its stated must-name requirements. A cleared Soft deny is an Allow, not a block."
+                    }),
+                ),
+                (
+                    "block_soft".into(),
+                    json!(if stage == ApprovalStage::RiskScreen {
+                        "A Soft deny could apply, before considering user consent or Soft allow exceptions."
+                    } else {
+                        "At least one concrete Soft deny applies and remains uncleared: neither a matching Soft allow exception nor genuine user consent meeting that rule's stated requirements covers it. Do not choose this merely because a rule initially matched; sufficient authorization clears that Soft deny."
+                    }),
+                ),
+                (
+                    "block_hard".into(),
+                    json!(if stage == ApprovalStage::RiskScreen {
+                        "A Hard deny could apply to the operation's effects."
+                    } else {
+                        "A concrete Hard deny applies; user consent and exceptions cannot clear it."
+                    }),
+                ),
+                (
+                    "block_user_boundary".into(),
+                    json!("The operation crosses an explicit boundary in the genuine user inputs."),
+                ),
+            ]),
+        },
+    )])
 }
 
 pub(super) fn verdict(evaluation: &Evaluation, policy: &AutoPolicy) -> Result<RuleVerdict, String> {

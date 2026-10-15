@@ -794,7 +794,7 @@ fn failure_label(failure: ApprovalFailureKind) -> &'static str {
         ApprovalFailureKind::Service => "service error",
         ApprovalFailureKind::Timeout => "time budget exhausted",
         ApprovalFailureKind::InvalidResponse => "invalid response",
-        ApprovalFailureKind::ContextLimit => "complete context exceeds capacity",
+        ApprovalFailureKind::ContextLimit => "context exceeds capacity",
     }
 }
 

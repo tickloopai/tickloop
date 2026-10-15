@@ -651,7 +651,7 @@ impl TickActionBackend for StopShell {
             .snapshot(ctx.chat)
             .await
             .map_err(|error| error.to_string())?;
-        ctx.console.update_shell_ticks(&snapshot)
+        ctx.console.refresh_monitor_ticks(snapshot, None)
     }
 }
 struct Refresh {

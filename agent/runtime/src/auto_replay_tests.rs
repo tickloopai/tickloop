@@ -36,6 +36,7 @@ fn context(case: &Value) -> ApprovalSnapshot {
         input["tick_instance_id"] = json!(instance);
     }
     ApprovalSnapshot {
+        context_truncation: None,
         reply_history: Default::default(),
         agent_messages: Vec::new(),
         tool_history: super::approval_context::ToolHistory {

@@ -613,7 +613,7 @@ const ARTIFACT_OWNER: TickOwner = TickOwner::Service("Artifacts");
 /// This Chat's association with the artifact: the binding a Loop that has not ended holds, live
 /// or paused.
 pub(crate) fn feedback_binding<'a>(
-    chat: &'a ChatSnapshot,
+    chat: &'a ChatStatus,
     origin: &str,
     artifact_id: &str,
 ) -> Option<&'a EventSourceBinding> {
@@ -670,6 +670,7 @@ mod tests {
             chat_id,
             origin: ShellTaskOrigin::User,
             owner: ShellTaskOwner::User { chat_id },
+            call_id: None,
             command: command.into(),
             description: description.map(Into::into),
             cwd: "/fixture".into(),
@@ -825,19 +826,21 @@ mod tests {
         );
         let instance = InstanceRef::shell(shell.id);
         let listed = |now_ms, retained: Option<InstanceRef>, handled_at: Option<u64>| {
-            let mut chat: ChatSnapshot = serde_json::from_value(serde_json::json!({
-                "id": shell.chat_id,
-                "workdir": "/fixture",
-                "messages": [],
-                "loops": []
-            }))
-            .unwrap();
+            let mut chat = ChatStatus::of(
+                &serde_json::from_value(serde_json::json!({
+                    "id": shell.chat_id,
+                    "workdir": "/fixture",
+                    "messages": [],
+                    "loops": []
+                }))
+                .unwrap(),
+            );
             if let Some(at) = handled_at {
                 chat.monitor.mark_handled(instance.clone(), at);
             }
             ShellRows
                 .list(&MonitorContext {
-                    chat: Some(chat),
+                    chat: Some(Arc::new(chat)),
                     shells: Some(tickloop_agent_protocol::ShellTaskSnapshot {
                         chat_id: shell.chat_id,
                         live_revision: 1,
@@ -903,19 +906,13 @@ mod tests {
     fn members_keep_the_names_they_were_opened_under() {
         let quote = InstanceRef::new("hosted", "quote-run").unwrap();
         let terminal = InstanceRef::new("hosted", "terminal-run").unwrap();
-        let mut chat: ChatSnapshot = serde_json::from_value(serde_json::json!({
-            "id": Uuid::from_u128(1),
-            "workdir": "/fixture",
-            "messages": [],
-            "loops": []
-        }))
-        .unwrap();
+        let mut chat = empty_chat();
         chat.monitor
             .record_opened(quote.clone(), Some("Quote · AAPL.US".into()));
         chat.monitor
             .record_opened(terminal.clone(), Some("make dev".into()));
         let context = MonitorContext {
-            chat: Some(chat),
+            chat: Some(Arc::new(chat)),
             subscriptions: vec![TickSubscriptionStatus {
                 id: Uuid::from_u128(2),
                 loop_id: Uuid::from_u128(3),
@@ -941,14 +938,16 @@ mod tests {
         assert_eq!(titles[&terminal], "make dev");
     }
 
-    fn empty_chat() -> ChatSnapshot {
-        serde_json::from_value(serde_json::json!({
-            "id": Uuid::from_u128(1),
-            "workdir": "/fixture",
-            "messages": [],
-            "loops": []
-        }))
-        .unwrap()
+    fn empty_chat() -> ChatStatus {
+        ChatStatus::of(
+            &serde_json::from_value(serde_json::json!({
+                "id": Uuid::from_u128(1),
+                "workdir": "/fixture",
+                "messages": [],
+                "loops": []
+            }))
+            .unwrap(),
+        )
     }
 
     fn subscription(
@@ -995,7 +994,7 @@ mod tests {
         chat.monitor.mark_taken_in(calendar.clone(), 6_000);
         chat.artifact_ticks = vec![serde_json::from_value(serde_json::json!({"artifact_id":"doc-1","origin":"https://tickloop.ai","title":"Brief","format":"markdown","url":"https://tickloop.ai/a/doc-1","access_role":"owner","added_at_ms":1})).unwrap()];
         let mut context = MonitorContext {
-            chat: Some(chat),
+            chat: Some(Arc::new(chat)),
             shells: Some(tickloop_agent_protocol::ShellTaskSnapshot {
                 chat_id: ended.chat_id,
                 live_revision: 1,
@@ -1022,7 +1021,7 @@ mod tests {
             assert_eq!(rows[instance], Some(Unread { count: None }), "{instance}");
         }
 
-        let chat = context.chat.as_mut().unwrap();
+        let chat = Arc::make_mut(context.chat.as_mut().unwrap());
         chat.monitor.mark_taken_in(quote.clone(), 5_000);
         chat.monitor.mark_handled(calendar.clone(), 7_500);
         chat.monitor.mark_taken_in(shell.clone(), 8_000);
@@ -1060,7 +1059,7 @@ mod tests {
         chat.monitor
             .record_opened(pane.clone(), Some("make dev".into()));
         let context = MonitorContext {
-            chat: Some(chat),
+            chat: Some(Arc::new(chat)),
             shells: Some(tickloop_agent_protocol::ShellTaskSnapshot {
                 chat_id: running.chat_id,
                 live_revision: 1,
@@ -1079,7 +1078,7 @@ mod tests {
         let mut chat = empty_chat();
         chat.monitor.record_opened(exited.clone(), None);
         let context = MonitorContext {
-            chat: Some(chat),
+            chat: Some(Arc::new(chat)),
             member_states: [(exited.clone(), MemberState::Exited("exited 3".into()))].into(),
             gone_since: [(exited.clone(), 0)].into(),
             now_ms: GONE_DISPLAY_MS * 10,
@@ -1106,7 +1105,7 @@ mod tests {
         let mut gone_subscription = subscription(&watched, None, 0);
         gone_subscription.link = TickLinkState::InstanceGone;
         let context = |now_ms| MonitorContext {
-            chat: Some(chat.clone()),
+            chat: Some(Arc::new(chat.clone())),
             subscriptions: vec![gone_subscription.clone()],
             member_states: [
                 (plain.clone(), MemberState::Gone),
