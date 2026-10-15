@@ -1,4 +1,4 @@
-//! The Tickhost: a local service that runs Agent-opened protocol Ticks in private PTYs and the
+//! The Tickhost: a local service that runs Agent-opened extension Ticks in private PTYs and the
 //! Shell tasks Workers submit in pipe mode, independent of any layout host.
 
 pub mod cli;

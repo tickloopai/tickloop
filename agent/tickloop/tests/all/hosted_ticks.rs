@@ -1396,7 +1396,7 @@ for line in sys.stdin:
         assert_eq!(daemon.owner_state(chat).unwrap()["state"], "active");
     }
 
-    /// A Tick never ends for idling: a protocol Tick nobody watches, views or uses, and a terminal
+    /// A Tick never ends for idling: an extension Tick nobody watches, views or uses, and a terminal
     /// Tick whose program exited, both outlast the host's idle timeout, the exited one with its
     /// last screen still readable, until each is closed.
     #[tokio::test(flavor = "multi_thread")]
@@ -1586,7 +1586,7 @@ for line in sys.stdin:
         .unwrap()
     }
 
-    /// A subscribed protocol Tick whose state is far larger than a delivery wakes its Loop with
+    /// A subscribed extension Tick whose state is far larger than a delivery wakes its Loop with
     /// that state trimmed by segments, never with empty data: the delivery says how many updates
     /// it merged, their seq span, and what it trimmed.
     #[tokio::test(flavor = "multi_thread")]

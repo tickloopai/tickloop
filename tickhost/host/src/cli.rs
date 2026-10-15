@@ -39,7 +39,7 @@ enum Command {
     /// Serve Ticks with the configuration the Agent daemon writes on standard input
     #[command(hide = true)]
     Run,
-    /// Run PROGRAM as the protocol Tick of a launch the Tickhost started
+    /// Run PROGRAM as the extension Tick of a launch the Tickhost started
     #[command(name = LAUNCH_COMMAND, hide = true)]
     Launch {
         #[arg(last = true, required = true, num_args = 1.., value_name = "PROGRAM")]

@@ -5,7 +5,7 @@ use tickloop_agent_protocol::{
 
 /// Stops a running Shell from its Monitor row after confirmation.
 pub(crate) const SHELL_STOP_KEY: char = 's';
-/// Subscribes the Chat to a protocol or terminal Tick from its Monitor row.
+/// Subscribes the Chat to an extension or terminal Tick from its Monitor row.
 pub(crate) const SUBSCRIBE_KEY: char = 'f';
 /// The one key that takes a row out, doing what its state calls for.
 pub(crate) const REMOVE_KEY: char = 'x';
@@ -968,7 +968,7 @@ mod tests {
         );
     }
 
-    /// A protocol Tick keeps the name it was opened under, its declared title plus the arguments
+    /// An extension Tick keeps the name it was opened under, its declared title plus the arguments
     /// that tell instances apart, over the bare title its subscription reports; a terminal Tick
     /// keeps the command it was opened with.
     #[test]

@@ -1,4 +1,4 @@
-# A protocol Tick whose terminal is raw and shows its size, the last bytes it received and how
+# An extension Tick whose terminal is raw and shows its size, the last bytes it received and how
 # many it received; every byte is also appended to `received` in its working directory.
 import fcntl, json, os, signal, struct, sys, termios, threading, tty
 received = []

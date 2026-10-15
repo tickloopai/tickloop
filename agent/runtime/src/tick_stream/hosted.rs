@@ -1,6 +1,6 @@
 //! Tick Updates of hosted Ticks, which run in the dedicated Tickhost. A watch follows the
 //! instance through the data binding its Chat owns, so a Tick whose host was replaced or whose
-//! owner ended is never silently rebound. A protocol Tick pushes its updates. A terminal Tick's
+//! owner ended is never silently rebound. An extension Tick pushes its updates. A terminal Tick's
 //! screen is read through its host watch when a subscription's period elapses or its program
 //! exits, and compared with what that watch last got; between reads the host only says when the
 //! screen first changed, which marks the change pending for each watch that has not got it.

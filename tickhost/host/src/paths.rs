@@ -157,8 +157,8 @@ impl HostPaths {
         Ok(())
     }
 
-    /// Checks that every protocol Tick's Session socket fits under its session directory; only
-    /// protocol Ticks have one.
+    /// Checks that every extension Tick's Session socket fits under its session directory; only
+    /// extension Ticks have one.
     pub fn check_session_directories(&self) -> io::Result<()> {
         use std::os::unix::ffi::OsStrExt;
         let longest_tick_session_directory = self.tick_session_directory(u64::MAX);
@@ -232,7 +232,7 @@ mod tests {
         };
         let fitting = runtime_of(fitting_bytes);
         assert!(fitting.prepare().is_ok() && fitting.check_session_directories().is_ok());
-        // A longer runtime still serves Shell tasks, but no protocol Tick.
+        // A longer runtime still serves Shell tasks, but no extension Tick.
         let longer = runtime_of(fitting_bytes + 1);
         assert!(longer.prepare().is_ok() && longer.check_session_directories().is_err());
     }

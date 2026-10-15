@@ -77,7 +77,7 @@ pub enum TickIntent {
     /// Starts a new instance in place of a hosted Tick that no longer runs, in its row's place;
     /// the Console asks first, offering to restore the old instance's Tick Subscriptions.
     ReopenHosted(InstanceRef),
-    /// Subscribes the Chat to a protocol or terminal Tick at the default frequency, or, once one
+    /// Subscribes the Chat to an extension or terminal Tick at the default frequency, or, once one
     /// of its Loops subscribes to it, cycles that subscription through high, medium and low.
     Subscribe(InstanceRef),
     /// Stops a running Shell; the Console asks for confirmation first.
@@ -484,7 +484,7 @@ fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus])
     }
 }
 
-/// Lets the user subscribe a protocol or terminal Tick that still exists from its row; Shells and
+/// Lets the user subscribe an extension or terminal Tick that still exists from its row; Shells and
 /// artifacts are subscribed by default.
 fn offer_subscribing(entry: &mut TickDescriptor) {
     let is_tick = entry.group == TickGroup::Ticks
@@ -619,7 +619,7 @@ impl MonitorRowsRegistry {
             for member in &chat.monitor.members {
                 match merged.get_mut(&member.instance) {
                     Some(entry) => {
-                        // A subscription knows a protocol Tick only by its declared title; the
+                        // A subscription knows an extension Tick only by its declared title; the
                         // member's name adds the arguments that tell its instances apart.
                         if let Some(title) = &member.title
                             && (entry.title == entry.instance.as_str()

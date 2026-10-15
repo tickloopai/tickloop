@@ -1,4 +1,4 @@
-//! The launch contract of a protocol Tick in the Tickhost. The host starts its launcher on the
+//! The launch contract of an extension Tick in the Tickhost. The host starts its launcher on the
 //! terminal it holds; the launcher runs the business Tick under a TickSession only after proving
 //! it is the foreground process group of that terminal, and reports the running instance back.
 

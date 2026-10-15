@@ -1,7 +1,7 @@
-//! The native Tick tools: the Ticks a Chat opened in the Tickhost, protocol Ticks and terminal
+//! The native Tick tools: the Ticks a Chat opened in the Tickhost, extension Ticks and terminal
 //! Ticks, and, for a worker in a Herdr View, the Herdr Panes that show them. Opening, reopening
-//! and closing go through the daemon, which alone controls the Tickhost; reading, calling a
-//! protocol Tick and typing into a terminal Tick use the instance's data binding directly. Each
+//! and closing go through the daemon, which alone controls the Tickhost; reading, calling an
+//! extension Tick and typing into a terminal Tick use the instance's data binding directly. Each
 //! call is prepared once — target, catalog revision, executable, working directory, placement,
 //! input and operation id frozen — and the same preparation is approved and dispatched.
 
@@ -357,10 +357,10 @@ impl HostedTickTools {
                     },
                     HostToolPermission::Reviewable,
                     format!(
-                        "Open `{command_line}` in the Tickhost as a {} (cwd {}){shown}",
+                        "Open `{command_line}` in the Tickhost as {} (cwd {}){shown}",
                         match adapter {
-                            TickAdapter::Protocol => "protocol Tick",
-                            TickAdapter::Terminal => "terminal Tick",
+                            TickAdapter::Protocol => "an extension Tick",
+                            TickAdapter::Terminal => "a terminal Tick",
                         },
                         cwd.display()
                     ),
@@ -459,7 +459,7 @@ impl HostedTickTools {
                     == TickAdapter::Protocol
                 {
                     return Err(format!(
-                        "UnsupportedCapability: {instance} is a protocol Tick; operate it with CallTickTool and the tools it declares"
+                        "UnsupportedCapability: {instance} is an extension Tick; operate it with CallTickTool and the tools it declares"
                     ));
                 }
                 let text = match input.get("text") {
@@ -959,7 +959,7 @@ impl HostedTickTools {
                 bindings.insert((chat, instance.clone()), binding.clone());
             }
         }
-        // The command named the Tick until now; a protocol Tick's declaration names it from here
+        // The command named the Tick until now; an extension Tick's declaration names it from here
         // on. Only the binding this open received is asked, so naming never costs a lookup of the
         // daemon.
         let title = match (title, &binding) {

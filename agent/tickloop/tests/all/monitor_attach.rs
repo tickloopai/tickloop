@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 
-/// A protocol Tick whose terminal is raw and shows its size and the last bytes it received; it
+/// An extension Tick whose terminal is raw and shows its size and the last bytes it received; it
 /// logs every byte it receives to `received`.
 const KEYS_TICK: &str = include_str!("../support/keys_tick.py");
 

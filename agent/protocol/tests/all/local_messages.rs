@@ -30,7 +30,7 @@ fn subscription_trigger(prompt_source: TriggerPromptSource, prompt: &str) -> Tri
 #[test]
 fn a_delivery_presents_a_goal_fallback_as_background_and_an_explicit_prompt_as_the_instruction() {
     let payload = serde_json::json!({"items": []});
-    let goal = "打开 builtin kline 700.HK（协议 Tick）";
+    let goal = "打开 builtin kline 700.HK（扩展 Tick）";
     let background = local_messages::tick_delivery(&payload, &Trigger::for_loop_goal(goal));
     assert_eq!(
         background,

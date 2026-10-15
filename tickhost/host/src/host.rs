@@ -1,5 +1,5 @@
 //! The Tickhost service: one per user by default, holding each hosted Tick's PTY master,
-//! terminal model and process: the launcher of a protocol Tick, or a terminal Tick's program
+//! terminal model and process: the launcher of an extension Tick, or a terminal Tick's program
 //! itself; and each Shell task a Worker submitted. Only the Agent daemon controls lifecycles and
 //! grants spawns; data clients read through a per-instance token; launchers report through a
 //! one-time launch token; spawners submit one task each through a one-time spawn grant; views
@@ -61,7 +61,7 @@ pub const REAP_INTERVAL: Duration = Duration::from_millis(250);
 /// The identity of the sources this host was built from: the one the `tickloop` executable of the
 /// same build computes, which its daemon compares with the host's management hello.
 pub const BUILD_IDENTITY: &str = env!("TICKLOOP_BUILD_IDENTITY");
-/// A released Shell task nobody views for this long is forgotten. Protocol and terminal Ticks
+/// A released Shell task nobody views for this long is forgotten. Extension and terminal Ticks
 /// never end for idling.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// The start configuration the daemon writes on the host's standard input.
@@ -287,7 +287,7 @@ struct HostedTick {
     /// Counts the changes of the screen: output parsed, a resize, the program's exit. It only
     /// changes, and is only read, under the screen's lock, so one revision shows one screen.
     screen_revision: AtomicU64,
-    /// The process the host spawned: a protocol Tick's launcher, or a terminal Tick's program.
+    /// The process the host spawned: an extension Tick's launcher, or a terminal Tick's program.
     /// A terminal Tick's program is only waited for once it is stopped, so its process group id
     /// stays its own until then.
     launcher: Mutex<Child>,
@@ -340,7 +340,7 @@ impl Adapter {
 }
 
 impl HostedTick {
-    /// Removes a protocol Tick's session directory once the launcher is gone, with any socket it
+    /// Removes an extension Tick's session directory once the launcher is gone, with any socket it
     /// could not remove itself.
     fn remove_session_directory(&self) {
         if let Adapter::Protocol(launch) = &self.adapter {
@@ -690,7 +690,7 @@ impl Host {
     }
 
     /// Starts `request` on a private terminal. A terminal program is Live as soon as it runs; a
-    /// protocol Tick only once its launcher registered it, within the control timeout.
+    /// extension Tick only once its launcher registered it, within the control timeout.
     async fn launch(
         self: &Arc<Self>,
         request: &OpenRequest,
@@ -1371,7 +1371,7 @@ async fn stop_launcher(tick: &HostedTick) {
     }
 }
 
-/// Drains the PTY continuously so a hidden Tick never blocks on output. A protocol Tick ends
+/// Drains the PTY continuously so a hidden Tick never blocks on output. An extension Tick ends
 /// with its terminal. A terminal Tick keeps its last screen: once everything its program wrote
 /// was parsed and the program exited, the exit is recorded with that screen.
 async fn drain_terminal(tick: Arc<HostedTick>) {
@@ -2300,7 +2300,7 @@ async fn protocol_request(
             .map_err(session_error),
         "input" => Err(HostError::before(
             "UnsupportedCapability",
-            "a protocol Tick is operated through its declared Tick Tools",
+            "an extension Tick is operated through its declared Tick Tools",
         )),
         _ => Err(HostError::before(
             "MethodNotAllowed",
@@ -2432,7 +2432,7 @@ async fn launcher_request(
             let Adapter::Protocol(launch) = &tick.adapter else {
                 return Err(HostError::before(
                     "Forbidden",
-                    "only a protocol Tick has a launcher",
+                    "only an extension Tick has a launcher",
                 ));
             };
             let client = SessionClient::connect(
@@ -3055,7 +3055,7 @@ mod tests {
         }
     }
 
-    /// A directory short enough for the Session sockets of the protocol Ticks a test host runs.
+    /// A directory short enough for the Session sockets of the extension Ticks a test host runs.
     fn session_directory_parent() -> tempfile::TempDir {
         tempfile::Builder::new()
             .prefix("th")

@@ -7,7 +7,7 @@ Tickloop 提供完整的终端 Agent 和 example Tick。Tick 由 Tickhost 运行
 | 成员 | 二进制 | 内容 |
 | --- | --- | --- |
 | `agent/tickloop` | `tickloop` | 完整 Agent Console、工具、权限、Transcript 和 Loop（由 `agent/` 下 console、client、daemon、runtime 等 crate 组成） |
-| `tickhost/host` | `tickhost` | Tick 宿主服务（`tickhost run`，由 daemon 按需拉起，运行协议、终端与 Shell Tick）与 `tickhost stop` |
+| `tickhost/host` | `tickhost` | Tick 宿主服务（`tickhost run`，由 daemon 按需拉起，运行扩展、终端与 Shell Tick）与 `tickhost stop` |
 | `tick/cli` | `tick` | `tick <provider> <tick>` 与 Reader |
 | `tick/market` | — | 金融 Tick 本体，只经 provider 接口读取数据 |
 | `tick/provider`、`tick/providers/*` | — | provider 接口，以及 builtin（离线模拟）、longbridge、futu 实现 |
@@ -185,9 +185,9 @@ US 账户目前读取 US 资产持仓接口；该响应不能确认可用数量�
 
 ## Tick Instance 流、Tick Tool 与 Tick Subscription
 
-协议 Tick 使用真实 stdin/stdout 上按行 JSON-RPC 2.0 的 Tick 协议 3：`tick/describe` 返回 `kind`、`revision` 与工具目录，`tick/read` 返回当前状态 `{seq, data, at?}`，`tick/call` 带审批时的 `revision` 操作同一实例，`tick/update` 推送业务变化。可见示例在同一业务进程的控制终端上绘制，stdout 专用于协议。
+扩展 Tick 使用真实 stdin/stdout 上按行 JSON-RPC 2.0 的 Tick 协议 3：`tick/describe` 返回 `kind`、`revision` 与工具目录，`tick/read` 返回当前状态 `{seq, data, at?}`，`tick/call` 带审批时的 `revision` 操作同一实例，`tick/update` 推送业务变化。可见示例在同一业务进程的控制终端上绘制，stdout 专用于协议。
 
-Agent 通过一个 `CallTickTool` 调用声明的能力。`SubscribeTick` 属于当前 Loop：协议 Tick 与 Terminal Tick 选高频（每分钟，默认）、中频（每 10 分钟）或低频（每 30 分钟），到期投递最新内容；Shell 固定及时，只在退出时投递；产物不接受订阅，经产物关联逐条交付 @tickloop 请求。打开、读取和发现不会自动订阅。Terminal Tick 到期读一次屏幕并与上次送出的文字比较，不保证完整输出或即时响应。
+Agent 通过一个 `CallTickTool` 调用声明的能力。`SubscribeTick` 属于当前 Loop：扩展 Tick 与 Terminal Tick 选高频（每分钟，默认）、中频（每 10 分钟）或低频（每 30 分钟），到期投递最新内容；Shell 固定及时，只在退出时投递；产物不接受订阅，经产物关联逐条交付 @tickloop 请求。打开、读取和发现不会自动订阅。Terminal Tick 到期读一次屏幕并与上次送出的文字比较，不保证完整输出或即时响应。
 
 外部接入示例见 [Counter](tick/examples/counter.py)，协议约束见 [Tickhost 与 Herdr 视图](docs/design/native-herdr.md#tick-协议-3)。
 

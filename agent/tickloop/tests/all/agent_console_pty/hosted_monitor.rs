@@ -262,7 +262,7 @@ async fn eventually<T, F: std::future::Future<Output = Option<T>>>(
 /// here it outlasts the Console's next probe.
 const MEMBER_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// A protocol Tick whose process ended by itself keeps its Monitor row, and its launch record,
+/// An extension Tick whose process ended by itself keeps its Monitor row, and its launch record,
 /// until its user removes it, across the Console's later probes and refreshes.
 /// Enter reopens it in its row's place from that record once confirmed, restoring its
 /// subscription by default; `x` takes a gone row out with its record at once, and closes a
@@ -824,7 +824,7 @@ const SHELL_VIEW_DESCRIPTION: &str = "Watch the shell view";
 const LONG_SHELL_COMMAND: &str = "sh sleeper.sh";
 const LOCAL_TICKS_OPENED: &str = "Local Ticks opened.";
 
-/// A View whose Agent opened a protocol Tick, a terminal Tick and a background Shell, and with
+/// A View whose Agent opened an extension Tick, a terminal Tick and a background Shell, and with
 /// `long_shell` a second Shell that runs until it is stopped, all in its Monitor.
 async fn view_with_local_ticks(
     fixture: &PrivateFixture,
@@ -1119,7 +1119,7 @@ async fn actual_cli_full_screen_views_close_on_esc_in_a_terminal_speaking_the_ki
     }
 }
 
-/// Inside Herdr, Enter floats every local Tick in Tickloop's Herdr popup, the protocol Tick, the
+/// Inside Herdr, Enter floats every local Tick in Tickloop's Herdr popup, the extension Tick, the
 /// terminal Tick and the Shell alike, and nothing opens full screen; a lone Esc closes the popup
 /// and each Tick stays in Monitor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

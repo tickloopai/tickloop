@@ -1,4 +1,4 @@
-<!-- source-sha256: 90812869b19aabfef5eb2eb6f480acce0af172627122e3ed86be296ea6582330 -->
+<!-- source-sha256: 2b59c24aa11505c2368daa9063387a0858e6d0c7a85e66e751719a5245cc7358 -->
 
 # Tick Protocol Specification
 
@@ -13,9 +13,9 @@
 
 ### 1.1 Purpose
 
-The Tick protocol defines how a terminal program exposes its state, callable operations, and business changes to a host. An AI Agent can read the program, call its tools, and resume work when new information arrives. A program implementing this protocol is a **protocol Tick**.
+The Tick protocol defines how a terminal program exposes its state, callable operations, and business changes to a host. An AI Agent can read the program, call its tools, and resume work when new information arrives. A program implementing this protocol is a **extension Tick**.
 
-A protocol Tick serves two participants: a person using its terminal interface, and an Agent using the protocol through the host. Both interact with the same process and the same state.
+An extension Tick serves two participants: a person using its terminal interface, and an Agent using the protocol through the host. Both interact with the same process and the same state.
 
 ### 1.2 Roles
 

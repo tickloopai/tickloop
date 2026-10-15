@@ -1,6 +1,6 @@
 [package]
 name = "tickloop-tickhost"
-description = "The tickhost executable and library: runs Agent-opened protocol Ticks in private PTYs and connects protocol programs to Agents"
+description = "The tickhost executable and library: runs Agent-opened extension Ticks in private PTYs and connects protocol programs to Agents"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

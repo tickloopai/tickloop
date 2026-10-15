@@ -56,7 +56,7 @@ pub struct TickMetadata {
     pub title: String,
     pub kind: ObservationKind,
     pub updated_at_ms: Option<u64>,
-    /// The series a protocol Tick declares in its state.
+    /// The series an extension Tick declares in its state.
     pub series: Vec<tick_protocol::StateSeries>,
 }
 
@@ -258,11 +258,11 @@ pub trait TickStreamPort: Send + Sync + 'static {
     }
 }
 
-/// What a protocol Tick that declares no recovery query tells the Agent instead.
+/// What an extension Tick that declares no recovery query tells the Agent instead.
 const NO_RECOVERY: &str =
     "none: dropped Tick Updates cannot be recovered; ReadTick returns only the current state";
 
-/// A protocol Tick's current content as an observation, for a delivery read again.
+/// An extension Tick's current content as an observation, for a delivery read again.
 fn current_observation(instance: &InstanceRef, read: tick_protocol::TickState) -> TickObservation {
     TickObservation {
         instance: instance.clone(),
@@ -744,7 +744,7 @@ impl ConnectionBudget {
     }
 }
 
-/// A protocol Tick as a watch sees it: its declaration, which names it and its recovery tool,
+/// An extension Tick as a watch sees it: its declaration, which names it and its recovery tool,
 /// and a registration that yields the current content and then latest-only updates. A failure
 /// keeps the host's code, which tells an ended Tick from a lost connection.
 #[async_trait::async_trait]
@@ -880,7 +880,7 @@ fn connection_state(code: &str) -> TickConnectionState {
     }
 }
 
-/// Follows a protocol Tick for the wanted watches: a baseline for each, then latest-only
+/// Follows an extension Tick for the wanted watches: a baseline for each, then latest-only
 /// updates. Returns whether following ended for good rather than for a reconnect.
 async fn observe_protocol(
     feed: &dyn ProtocolFeed,
@@ -1134,7 +1134,7 @@ mod tests {
 
     use super::*;
 
-    /// A protocol Tick whose watch stream ends at once without telling how, and whose host
+    /// An extension Tick whose watch stream ends at once without telling how, and whose host
     /// answers `describe` until it has answered `answers` times, then says the Tick ended.
     struct EndingFeed {
         answers: usize,

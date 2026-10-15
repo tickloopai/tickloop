@@ -17,7 +17,7 @@ use tokio::{
     net::unix::{OwnedReadHalf, OwnedWriteHalf},
 };
 
-/// A protocol Tick whose screen shows its value, terminal size and the last line typed on its
+/// An extension Tick whose screen shows its value, terminal size and the last line typed on its
 /// terminal, so protocol calls, attached input and resizes are all visible in one process. Its
 /// reads tell its terminal size as well.
 const COUNTER: &str = r#"

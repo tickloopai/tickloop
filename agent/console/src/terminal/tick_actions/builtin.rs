@@ -724,7 +724,7 @@ impl TickActionBackend for ReopenHosted {
     }
 }
 
-/// The row's `f` on a protocol or terminal Tick: subscribes the Chat at the default frequency
+/// The row's `f` on an extension or terminal Tick: subscribes the Chat at the default frequency
 /// on its user's word, or, once a Loop of the Chat subscribes to it, cycles that subscription's
 /// frequency.
 struct Subscribe {

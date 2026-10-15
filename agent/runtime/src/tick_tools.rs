@@ -99,7 +99,7 @@ pub(crate) fn definitions(views: bool) -> Vec<ToolDefinition> {
     let target = json!({"tick_instance_id":{"type":"string","minLength":1}});
     definitions.push(ToolDefinition {
         name: READ_TICK.into(),
-        description: "Read a Tick this Chat opened using its complete hosted: instance identity. Protocol Ticks return their state (seq, at, and data, which is null until the Tick has content) and their declared tool catalog. Terminal Ticks return their screen as plain text (data.text, at most 200 lines and 64 KiB) and data.exit, null while the program runs and its exit code or signal once it ended. Reading never subscribes. For artifacts use ArtifactRead; for Shell tasks use Read on Bash's output_file.".into(),
+        description: "Read a Tick this Chat opened using its complete hosted: instance identity. Extension Ticks return their state (seq, at, and data, which is null until the Tick has content) and their declared tool catalog. Terminal Ticks return their screen as plain text (data.text, at most 200 lines and 64 KiB) and data.exit, null while the program runs and its exit code or signal once it ended. Reading never subscribes. For artifacts use ArtifactRead; for Shell tasks use Read on Bash's output_file.".into(),
         input_schema: json!({"type":"object","properties":target,"required":["tick_instance_id"],"additionalProperties":false}),
     });
     let mut call_properties = target.clone();
@@ -107,7 +107,7 @@ pub(crate) fn definitions(views: bool) -> Vec<ToolDefinition> {
     call_properties["args"] = json!({"type":"object"});
     definitions.push(ToolDefinition {
         name: CALL_TICK_TOOL.into(),
-        description: "Call one tool declared by a protocol Tick using its complete hosted: instance identity. Read that Tick's catalog first; query tools read content, while modifying tools require permission. Use ArtifactRead/ArtifactEdit/ArtifactComment for artifacts and Bash/Read/TaskStop for Shell tasks.".into(),
+        description: "Call one tool declared by an extension Tick using its complete hosted: instance identity. Read that Tick's catalog first; query tools read content, while modifying tools require permission. Use ArtifactRead/ArtifactEdit/ArtifactComment for artifacts and Bash/Read/TaskStop for Shell tasks.".into(),
         input_schema: json!({"type":"object","properties":call_properties,"required":["tick_instance_id","tool","args"],"additionalProperties":false}),
     });
     definitions.push(ToolDefinition {
@@ -126,7 +126,7 @@ fn modify_description(views: bool) -> String {
         parts.push("Omit placement, or pass {\"type\":\"hidden\"}, to show the Tick nowhere. An explicit placement also shows it in a new Herdr Pane as a view of the Tick: current_tab places relative to the View captured for this input, which must still be valid; pane places relative to the named Pane in the selected Workspace; new_tab opens a new Tab. Explicit Pane targets and new_tab work without an Agent View. Direction accepts left, right, up, or down and defaults to right. Placement is frozen before approval and never follows UI focus. move moves the Herdr Pane that shows the Tick, or shows the Tick in a new Pane when none does, and defaults to current_tab; for an explicit relative direction, invoke move even when the view is already in the target Tab. Closing a view Pane closes only that view; moving or closing views never changes the Tick, its identity or its subscriptions.".into());
     }
     parts.push(format!(
-        "send_input types text, then logical keys ({}), into a terminal Tick, at most {ATTACH_INPUT_BYTES} bytes; a protocol Tick is operated with CallTickTool.",
+        "send_input types text, then logical keys ({}), into a terminal Tick, at most {ATTACH_INPUT_BYTES} bytes; an extension Tick is operated with CallTickTool.",
         crate::hosted::terminal_input::KEY_NAMES
     ));
     parts.push(
