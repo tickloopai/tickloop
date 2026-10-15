@@ -179,6 +179,8 @@ pub enum HostEffect {
     /// A confirmed `ArtifactEdit` create; the new artifact joins Monitor and is linked to the
     /// calling Loop.
     CreatedArtifact(tickloop_agent_protocol::ArtifactTick),
+    /// A verified body read joins Monitor without linking the artifact to a Loop.
+    ReadArtifact(tickloop_agent_protocol::ArtifactTick),
     /// A confirmed `ArtifactEdit` rename; Monitor shows the artifact's new title without waiting
     /// for its metadata to be read again.
     RenamedArtifact {

@@ -32,7 +32,7 @@ use artifact_service::{ArtifactService, CREATED_ARTIFACT};
 const WAIT: Duration = Duration::from_secs(15);
 
 #[tokio::test]
-async fn remote_skills_are_lazy_reference_context_and_end_with_the_run() {
+async fn remote_skills_are_lazy_reference_context_and_persist_across_turns() {
     let service = ArtifactService::start().await;
     service.control.skills_enabled.store(true, Ordering::SeqCst);
     let directory = tempfile::tempdir().unwrap();
@@ -65,7 +65,7 @@ async fn remote_skills_are_lazy_reference_context_and_end_with_the_run() {
             .unwrap()
             .invoked_skills
             .iter()
-            .all(|skill| skill.run_id.is_none())
+            .any(|skill| skill.name == "tickloop-docs:artifact-design")
     );
     submit_and_wait(&agent, chat, "Read something unrelated").await;
     {
@@ -94,7 +94,8 @@ async fn remote_skills_are_lazy_reference_context_and_end_with_the_run() {
         assert!(!requests[1].messages.iter().any(|message| message.role
             == tickloop_agent_protocol::Role::System
             && serde_json::to_string(message).unwrap().contains(body)));
-        assert!(!serialized(4).contains(body));
+        assert!(serialized(4).contains(body));
+        assert!(serialized(4).contains("Reference fixture: preserve data units"));
     }
     assert_eq!(
         service
@@ -108,6 +109,228 @@ async fn remote_skills_are_lazy_reference_context_and_end_with_the_run() {
         2
     );
     agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_skill_changed_arguments_preserve_loaded_references_and_identical_repeats_are_elided()
+ {
+    let service = ArtifactService::start().await;
+    service.control.skills_enabled.store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "load",
+            "Skill",
+            json!({"skill":"tickloop-docs:artifact-design","args":"first target"}),
+        ),
+        call(
+            "reference",
+            "Skill",
+            json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"}),
+        ),
+        call(
+            "changed",
+            "Skill",
+            json!({"skill":"tickloop-docs:artifact-design","args":"second target"}),
+        ),
+        call(
+            "same",
+            "Skill",
+            json!({"skill":"tickloop-docs:artifact-design","args":"second target"}),
+        ),
+        text("done"),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Prepare both targets").await;
+    {
+        let requests = model.requests.lock().unwrap();
+        let changed = requests[3]
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|block| match block {
+                Content::Text { text }
+                    if text
+                        .starts_with("Reference guidance from tickloop-docs:artifact-design") =>
+                {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(changed.contains("second target"));
+        assert!(!changed.contains("first target"));
+        assert!(changed.contains("Reference fixture: preserve data units"));
+        let last = serde_json::to_string(&requests[4].messages).unwrap();
+        assert!(last.contains("Already loaded tickloop-docs:artifact-design"));
+    }
+    assert_eq!(
+        service
+            .control
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["body"]["method"] == "resources/read")
+            .count(),
+        2
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_skill_session_activation_is_invalidated_before_the_next_model_request() {
+    for change in [
+        "account",
+        "manifest",
+        "policy",
+        "reference_policy",
+        "revoked",
+        "source",
+    ] {
+        let service = ArtifactService::start().await;
+        service.control.skills_enabled.store(true, Ordering::SeqCst);
+        let directory = tempfile::tempdir().unwrap();
+        let model = Arc::new(ScriptedModel::new(vec![
+            call(
+                "load",
+                "Skill",
+                json!({"skill":"tickloop-docs:artifact-design"}),
+            ),
+            call(
+                "reference",
+                "Skill",
+                json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"}),
+            ),
+            text("done"),
+            text("next"),
+        ]));
+        let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        submit_and_wait(&agent, chat, "Prepare a page").await;
+        assert!(
+            agent
+                .snapshot(chat)
+                .await
+                .unwrap()
+                .invoked_skills
+                .iter()
+                .any(|skill| skill.name == "tickloop-docs:artifact-design")
+        );
+        match change {
+            "account" => {
+                service.control.other_account.store(true, Ordering::SeqCst);
+                service.login(directory.path()).await;
+            }
+            "manifest" => {
+                service.control.skill_revision.store(1, Ordering::SeqCst);
+            }
+            "policy" | "reference_policy" => {
+                agent.set_permission_rules(chat, vec![tickloop_agent_protocol::PermissionRule { id:uuid::Uuid::new_v4(), decision:tickloop_agent_protocol::Decision::Deny, tool:"Skill".into(), specifier:None, input:(change == "reference_policy").then(|| json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"})), loop_id:None, persistent:false }]).await.unwrap();
+            }
+            "revoked" => {
+                service
+                    .control
+                    .skills_enabled
+                    .store(false, Ordering::SeqCst);
+            }
+            "source" => {
+                *service.control.server_name.lock().unwrap() = Some("different-source".into());
+            }
+            _ => unreachable!(),
+        }
+        submit_and_wait(&agent, chat, "Continue with a new task").await;
+        {
+            let requests = model.requests.lock().unwrap();
+            assert!(
+                !serde_json::to_string(&requests.last().unwrap().messages)
+                    .unwrap()
+                    .contains("Page guidance fixture for artifact-design"),
+                "{change}"
+            );
+        }
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn resumed_remote_skills_are_revalidated_before_the_first_model_request() {
+    for change in [
+        "unchanged",
+        "account",
+        "manifest",
+        "policy",
+        "reference_policy",
+        "revoked",
+    ] {
+        let service = ArtifactService::start().await;
+        service.control.skills_enabled.store(true, Ordering::SeqCst);
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("state");
+        let account = service.login(directory.path()).await;
+        let agent = Agent::open_embedded(root.clone(), config(), Arc::new(ScriptedModel::new(vec![call("load", "Skill", json!({"skill":"tickloop-docs:artifact-design"})), call("reference", "Skill", json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"})), text("done")]))).unwrap();
+        agent
+            .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
+            .unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        submit_and_wait(&agent, chat, "Prepare a page").await;
+        agent.shutdown().await;
+        drop(agent);
+        match change {
+            "account" => {
+                service.control.other_account.store(true, Ordering::SeqCst);
+                service.login(directory.path()).await;
+            }
+            "manifest" => {
+                service.control.skill_revision.store(1, Ordering::SeqCst);
+            }
+            "revoked" => {
+                service
+                    .control
+                    .skills_enabled
+                    .store(false, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+        let model = Arc::new(ScriptedModel::new(vec![text("resumed")]));
+        let restored = Agent::open_embedded(root, config(), model.clone()).unwrap();
+        restored
+            .install_host_tools(Arc::new(McpHostToolProvider::new(
+                service.client(directory.path()),
+                None,
+            )))
+            .unwrap();
+        let snapshot = restored.resume_chat(chat).await.unwrap();
+        if change == "policy" || change == "reference_policy" {
+            restored.set_permission_rules(chat, vec![tickloop_agent_protocol::PermissionRule { id:uuid::Uuid::new_v4(), decision:tickloop_agent_protocol::Decision::Deny, tool:"Skill".into(), specifier:None, input:(change == "reference_policy").then(|| json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"})), loop_id:None, persistent:false }]).await.unwrap();
+        }
+
+        restored
+            .submit(
+                chat,
+                Some(snapshot.loops.last().unwrap().id),
+                "Continue the work".into(),
+            )
+            .await
+            .unwrap();
+        wait_for_completion(&restored, chat).await;
+        {
+            let requests = model.requests.lock().unwrap();
+            let first = serde_json::to_string(&requests[0].messages).unwrap();
+            assert_eq!(
+                first.contains("Page guidance fixture for artifact-design"),
+                change == "unchanged",
+                "{change}"
+            );
+            assert_eq!(
+                first.contains("Reference fixture: preserve data units"),
+                change == "unchanged",
+                "{change}"
+            );
+        }
+        restored.shutdown().await;
+    }
 }
 
 #[tokio::test]
@@ -1089,9 +1312,10 @@ async fn model_tool_inventory_keeps_artifact_shell_and_tick_names() {
     );
     assert!(prompt.contains("authentication is signed_out, call ArtifactLogin"));
     assert!(
-        prompt.contains("a doc, for writing")
-            && prompt.contains("a design, for anything visual: a prototype")
-            && prompt.contains("create a design artifact with ArtifactEdit")
+        prompt.contains("a doc for writing")
+            && prompt.contains("a page for visual explanations")
+            && prompt.contains("use ArtifactEdit to create the matching type")
+            && prompt.contains("Honor an explicit local-file or chat-only destination")
     );
     assert!(!tool_names(&requests[0]).contains(&"ArtifactLogin"));
     for name in ["CallTickTool", "ReadTick"] {
@@ -2043,6 +2267,277 @@ async fn a_creation_answered_with_retired_wire_format_does_not_bind_monitor() {
 }
 
 #[tokio::test]
+async fn a_read_artifact_joins_monitor_without_linking_to_feedback() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "read",
+            "ArtifactRead",
+            json!({"action":"read","artifact_id":"doc"}),
+        ),
+        text("Read."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Summarize this document").await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert_eq!(snapshot.artifact_ticks.len(), 1);
+    let tick = &snapshot.artifact_ticks[0];
+    assert_eq!(tick.artifact_id, "doc");
+    assert_eq!(tick.origin, service.origin);
+    assert_eq!(tick.title, "Fixture");
+    assert_eq!(tick.format, "markdown");
+    assert_eq!(tick.access_role, "owner");
+    assert!(
+        snapshot
+            .loops
+            .iter()
+            .all(|goal| goal.event_sources.is_empty())
+    );
+    assert!(service.link("doc").is_none());
+    assert!(
+        service
+            .lifecycle_requests("PUT /artifact/api/v1/agent/links/")
+            .is_empty()
+    );
+    assert_eq!(service.tool_calls().len(), 1);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_read_artifact_has_one_canonical_monitor_row_across_pages_and_restore() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    let canonical_id = "e1b85a39-a57b-4c28-a8a5-ae9233aead3e";
+    let short_id = "6rvWPvOnhVABug7llbHb26";
+    let body = json!({"artifact_id":canonical_id,"title":"Fixture","format":"doc","url":tickloop_agent_artifacts::artifact_url(&service.origin, canonical_id),"access_role":"owner","revision":3,"blocks":[{"id":"b1","hash":"h1","text":"# Fixture"}],"next_cursor":"1"});
+    *service.control.read_result.lock().unwrap() = Some(
+        json!({"content":[{"type":"text","text":body.to_string()}],"structuredContent":body,"isError":false}),
+    );
+    let account = service.login(directory.path()).await;
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "short",
+            "ArtifactRead",
+            json!({"action":"read","artifact_id":short_id}),
+        ),
+        text("First page."),
+        call(
+            "next",
+            "ArtifactRead",
+            json!({"action":"read","artifact_id":canonical_id,"cursor":"1"}),
+        ),
+        call(
+            "repeat",
+            "ArtifactRead",
+            json!({"action":"read","artifact_id":short_id}),
+        ),
+        text("Read."),
+        call(
+            "removed",
+            "ArtifactRead",
+            json!({"action":"read","artifact_id":short_id}),
+        ),
+        text("Still removed."),
+    ]));
+    let agent = Agent::open_embedded(root.clone(), config(), model.clone()).unwrap();
+    agent
+        .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Read this document").await;
+    let first = agent.snapshot(chat).await.unwrap();
+    assert_eq!(first.artifact_ticks.len(), 1);
+    assert_eq!(first.artifact_ticks[0].artifact_id, canonical_id);
+    submit_and_wait(&agent, chat, "Read the next page and reread the document").await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert_eq!(snapshot.artifact_ticks, first.artifact_ticks);
+    assert!(
+        snapshot
+            .loops
+            .iter()
+            .all(|goal| goal.event_sources.is_empty())
+    );
+    assert!(
+        snapshot
+            .monitor
+            .taken_in_at(&snapshot.artifact_ticks[0].instance_id().parse().unwrap())
+            .is_some()
+    );
+    agent.shutdown().await;
+
+    let restored = Agent::open_embedded(root, config(), model).unwrap();
+    restored
+        .install_host_tools(Arc::new(McpHostToolProvider::new(
+            service.client(directory.path()),
+            None,
+        )))
+        .unwrap();
+    let resumed = restored.resume_chat(chat).await.unwrap();
+    assert_eq!(resumed.artifact_ticks, snapshot.artifact_ticks);
+    restored
+        .remove_artifact_tick(chat, &resumed.artifact_ticks[0].instance_id())
+        .await
+        .unwrap();
+    submit_and_wait(
+        &restored,
+        chat,
+        "Read it again without restoring it to Monitor",
+    )
+    .await;
+    assert!(
+        restored
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .artifact_ticks
+            .is_empty()
+    );
+    assert!(
+        service
+            .lifecycle_requests("PUT /artifact/api/v1/agent/links/")
+            .is_empty()
+    );
+    assert!(
+        service
+            .tool_calls()
+            .iter()
+            .all(|call| call["name"] == "ArtifactRead")
+    );
+    restored.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_read_artifact_preserves_response_roles_and_supported_formats() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    for (format, role, stored_format, stored_role) in [
+        ("page", "edit", "html", "editor"),
+        ("page", "view", "html", "viewer"),
+        ("doc", "view", "markdown", "viewer"),
+    ] {
+        *service.control.read_result.lock().unwrap() =
+            Some(artifact_body_result(&service, format, role));
+        model.enqueue(call(
+            "read",
+            "ArtifactRead",
+            json!({"action":"read","artifact_id":"doc"}),
+        ));
+        model.enqueue(text("Read."));
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        submit_and_wait(&agent, chat, "Read this artifact").await;
+        let snapshot = agent.snapshot(chat).await.unwrap();
+        assert_eq!(snapshot.artifact_ticks.len(), 1);
+        assert_eq!(snapshot.artifact_ticks[0].format, stored_format);
+        assert_eq!(snapshot.artifact_ticks[0].access_role, stored_role);
+        assert!(
+            snapshot
+                .loops
+                .iter()
+                .all(|goal| goal.event_sources.is_empty())
+        );
+    }
+    assert!(
+        service
+            .lifecycle_requests("PUT /artifact/api/v1/agent/links/")
+            .is_empty()
+    );
+    agent.shutdown().await;
+}
+
+fn artifact_body_result(service: &ArtifactService, format: &str, role: &str) -> Value {
+    let mut body = json!({"artifact_id":"doc","title":"Fixture","format":format,"url":tickloop_agent_artifacts::artifact_url(&service.origin, "doc"),"access_role":role,"revision":3});
+    if format == "doc" {
+        body["blocks"] = json!([{"id":"b1","hash":"h1","text":"# Fixture"}]);
+        body["next_cursor"] = Value::Null;
+    } else {
+        body["source"] = json!("<h1>Fixture</h1>");
+    }
+    json!({"content":[{"type":"text","text":body.to_string()}],"structuredContent":body,"isError":false})
+}
+
+#[tokio::test]
+async fn artifact_reads_attach_only_valid_matching_body_receipts() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    for (field, value) in [
+        ("artifact_id", json!("another-artifact")),
+        ("url", json!("https://another.example/artifact/doc")),
+        (
+            "url",
+            json!(format!("{}/artifact/another-artifact", service.origin)),
+        ),
+        ("format", json!("markdown")),
+        ("access_role", json!("admin")),
+        ("title", json!("")),
+        ("revision", Value::Null),
+        ("blocks", Value::Null),
+        ("isError", json!(true)),
+    ] {
+        let mut result = artifact_body_result(&service, "doc", "owner");
+        if field == "isError" {
+            result[field] = value;
+        } else {
+            result["structuredContent"][field] = value;
+        }
+        *service.control.read_result.lock().unwrap() = Some(result);
+        model.enqueue(call(
+            "read",
+            "ArtifactRead",
+            json!({"action":"read","artifact_id":"doc"}),
+        ));
+        model.enqueue(text("Read checked."));
+        submit_and_wait(&agent, chat, "Read this document").await;
+        assert!(
+            agent
+                .snapshot(chat)
+                .await
+                .unwrap()
+                .artifact_ticks
+                .is_empty(),
+            "invalid {field} receipt attached an artifact"
+        );
+    }
+    *service.control.read_result.lock().unwrap() =
+        Some(artifact_body_result(&service, "doc", "owner"));
+    model.enqueue(call("list", "ArtifactRead", json!({"action":"list"})));
+    model.enqueue(call(
+        "threads",
+        "ArtifactRead",
+        json!({"action":"threads","artifact_id":"doc"}),
+    ));
+    model.enqueue(text("Listed."));
+    submit_and_wait(&agent, chat, "List artifacts and read comments").await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(snapshot.artifact_ticks.is_empty());
+    assert!(
+        snapshot
+            .loops
+            .iter()
+            .all(|goal| goal.event_sources.is_empty())
+    );
+    assert!(
+        service
+            .lifecycle_requests("PUT /artifact/api/v1/agent/links/")
+            .is_empty()
+    );
+    assert!(
+        service
+            .tool_calls()
+            .iter()
+            .all(|call| call["name"] == "ArtifactRead")
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_created_artifact_joins_monitor_and_links_to_the_creating_loop() {
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
@@ -2673,4 +3168,318 @@ async fn a_request_after_compaction_still_carries_the_tool_notice() {
         "{}",
         notices[0]
     );
+}
+
+#[tokio::test]
+async fn remote_skills_survive_compaction_but_changed_manifests_do_not() {
+    for changed in [false, true] {
+        let service = ArtifactService::start().await;
+        service.control.skills_enabled.store(true, Ordering::SeqCst);
+        let directory = tempfile::tempdir().unwrap();
+        let model = Arc::new(ScriptedModel::new(vec![
+            call(
+                "load",
+                "Skill",
+                json!({"skill":"tickloop-docs:artifact-design","args":"keep these arguments"}),
+            ),
+            call(
+                "reference",
+                "Skill",
+                json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"}),
+            ),
+            text("done"),
+            text("A compact summary"),
+            text("continued"),
+        ]));
+        let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        submit_and_wait(&agent, chat, "Build a page").await;
+        agent.compact(chat).await.unwrap();
+        if changed {
+            service.control.skill_revision.store(1, Ordering::SeqCst);
+        }
+        submit_and_wait(&agent, chat, "Continue the page").await;
+        {
+            let requests = model.requests.lock().unwrap();
+            let last = &requests.last().unwrap().messages;
+            let guidance = last
+                .iter()
+                .flat_map(|message| &message.content)
+                .find_map(|block| match block {
+                    Content::Text { text }
+                        if text.starts_with(
+                            "Reference guidance from tickloop-docs:artifact-design",
+                        ) =>
+                    {
+                        Some(text)
+                    }
+                    _ => None,
+                });
+            assert_eq!(guidance.is_some(), !changed);
+            if let Some(guidance) = guidance {
+                assert!(guidance.contains("keep these arguments"));
+                assert!(guidance.contains("Reference fixture: preserve data units"));
+            }
+        }
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn remote_skill_reference_requested_after_compaction_reloads_truncated_guidance() {
+    let service = ArtifactService::start().await;
+    service.control.skills_enabled.store(true, Ordering::SeqCst);
+    service
+        .control
+        .skill_reference_bytes
+        .store(50_000, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "load",
+            "Skill",
+            json!({"skill":"tickloop-docs:artifact-design","args":"preserve these arguments"}),
+        ),
+        call(
+            "reference",
+            "Skill",
+            json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"}),
+        ),
+        text("done"),
+        text("A compact summary"),
+        call(
+            "reload",
+            "Skill",
+            json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"}),
+        ),
+        text("continued"),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Build a page").await;
+    agent.compact(chat).await.unwrap();
+    submit_and_wait(&agent, chat, "Use the complete runtime reference").await;
+    {
+        let requests = model.requests.lock().unwrap();
+        let guidance = |index: usize| {
+            requests[index]
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .find_map(|block| match block {
+                    Content::Text { text }
+                        if text.starts_with(
+                            "Reference guidance from tickloop-docs:artifact-design",
+                        ) =>
+                    {
+                        Some(text)
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert!(!guidance(4).contains("REFERENCE_END"));
+        assert!(guidance(5).contains("REFERENCE_END"));
+        assert!(guidance(5).contains("preserve these arguments"));
+        assert_eq!(
+            guidance(5)
+                .matches("Reference file: references/runtime.md")
+                .count(),
+            1
+        );
+    }
+    assert_eq!(
+        service
+            .control
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["body"]["method"] == "resources/read")
+            .count(),
+        2
+    );
+    agent.shutdown().await;
+}
+
+struct CompactionGateModel {
+    inner: ScriptedModel,
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl ModelClient for CompactionGateModel {
+    fn identity(&self) -> ModelIdentity {
+        self.inner.identity()
+    }
+    async fn generate_title(
+        &self,
+        request: ModelRequest,
+        events: tokio::sync::mpsc::UnboundedSender<ModelDelta>,
+        cancel: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        self.inner.generate_title(request, events, cancel).await
+    }
+    async fn complete(
+        &self,
+        request: ModelRequest,
+        events: tokio::sync::mpsc::UnboundedSender<ModelDelta>,
+        cancel: CancellationToken,
+    ) -> Result<ModelOutput, ModelError> {
+        if request.tools.is_empty() {
+            self.started.notify_one();
+            tokio::select! {
+                () = cancel.cancelled() => return Err(ModelError::Cancelled),
+                () = self.release.notified() => {},
+            }
+        }
+        self.inner.complete(request, events, cancel).await
+    }
+}
+
+#[tokio::test]
+async fn remote_skill_source_or_policy_change_during_compaction_refreshes_the_effective_context_and_catalog()
+ {
+    for change in ["policy", "manifest", "account", "revoked"] {
+        let service = ArtifactService::start().await;
+        service.control.skills_enabled.store(true, Ordering::SeqCst);
+        let directory = tempfile::tempdir().unwrap();
+        let model = Arc::new(CompactionGateModel {
+            inner: ScriptedModel::new(vec![
+                call(
+                    "load",
+                    "Skill",
+                    json!({"skill":"tickloop-docs:artifact-design"}),
+                ),
+                text(&"older material ".repeat(2000)),
+                text("A compact summary"),
+                text("continued"),
+            ]),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        submit_and_wait(&agent, chat, "Build a page").await;
+        agent.set_context_window(chat, 20_000).await.unwrap();
+        agent
+            .submit(chat, None, "Continue with the page".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(WAIT, model.started.notified())
+            .await
+            .unwrap();
+        match change {
+            "policy" => {
+                agent
+                    .set_permission_rules(
+                        chat,
+                        vec![tickloop_agent_protocol::PermissionRule {
+                            id: uuid::Uuid::new_v4(),
+                            decision: tickloop_agent_protocol::Decision::Deny,
+                            tool: "Skill".into(),
+                            specifier: None,
+                            input: None,
+                            loop_id: None,
+                            persistent: false,
+                        }],
+                    )
+                    .await
+                    .unwrap();
+            }
+            "manifest" => {
+                service.control.skill_revision.store(1, Ordering::SeqCst);
+            }
+            "account" => {
+                service.control.other_account.store(true, Ordering::SeqCst);
+                service.login(directory.path()).await;
+            }
+            "revoked" => {
+                service
+                    .control
+                    .skills_enabled
+                    .store(false, Ordering::SeqCst);
+            }
+            _ => unreachable!(),
+        }
+        model.release.notify_one();
+        wait_for_completion(&agent, chat).await;
+        {
+            let requests = model.inner.requests.lock().unwrap();
+            let request = requests.last().unwrap();
+            assert_eq!(
+                request
+                    .tools
+                    .iter()
+                    .find(|tool| tool.name == "Skill")
+                    .unwrap()
+                    .description
+                    .contains("tickloop-docs:artifact-design"),
+                matches!(change, "manifest" | "account"),
+                "{change}"
+            );
+            assert!(
+                !serde_json::to_string(&request.messages)
+                    .unwrap()
+                    .contains("Page guidance fixture for artifact-design"),
+                "{change}"
+            );
+        }
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn remote_skill_post_compaction_refresh_can_be_cancelled_while_the_server_is_blocked() {
+    let service = ArtifactService::start().await;
+    service.control.skills_enabled.store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(CompactionGateModel {
+        inner: ScriptedModel::new(vec![
+            call(
+                "load",
+                "Skill",
+                json!({"skill":"tickloop-docs:artifact-design"}),
+            ),
+            text(&"older material ".repeat(2000)),
+            text("A compact summary"),
+            text("must not run"),
+        ]),
+        started: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Build a page").await;
+    agent.set_context_window(chat, 20_000).await.unwrap();
+    let receipt = agent
+        .submit(chat, None, "Continue with the page".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, model.started.notified())
+        .await
+        .unwrap();
+    service
+        .control
+        .hold_status_response
+        .store(true, Ordering::SeqCst);
+    model.release.notify_one();
+    tokio::time::timeout(WAIT, service.control.status_response_started.notified())
+        .await
+        .unwrap();
+    agent.interrupt(chat).await.unwrap();
+    let cancelled = tokio::time::timeout(
+        Duration::from_secs(5),
+        wait_for_loop_state(&agent, chat, receipt.loop_id, LoopState::Interrupted),
+    )
+    .await;
+    service
+        .control
+        .hold_status_response
+        .store(false, Ordering::SeqCst);
+    service.control.release_status_response.notify_one();
+    cancelled.expect("cancellation waited for the blocked service refresh");
+    assert_eq!(model.inner.requests.lock().unwrap().len(), 3);
+    agent.shutdown().await;
 }

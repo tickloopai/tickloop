@@ -57,12 +57,9 @@ fn artifact(title: &str) -> ArtifactTick {
     }
 }
 
-async fn create(agent: &Agent, chat: ChatId) {
+async fn run_artifact_tool(agent: &Agent, chat: ChatId, prompt: &str) {
     let mut events = agent.subscribe();
-    agent
-        .submit(chat, None, "Create the document".into())
-        .await
-        .unwrap();
+    agent.submit(chat, None, prompt.into()).await.unwrap();
     loop {
         match tickloop_agent_test_support::next_event(&mut events)
             .await
@@ -88,7 +85,7 @@ async fn a_created_artifact_attaches_to_its_chat_without_creating_a_subscription
         .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let other = agent.create_chat(directory.path().into()).await.unwrap();
-    create(&agent, chat).await;
+    run_artifact_tool(&agent, chat, "Create the document").await;
     assert_eq!(
         agent.artifact_ticks(chat).await.unwrap(),
         vec![artifact("Created title")]
@@ -137,7 +134,7 @@ async fn manual_removal_prevents_a_later_creation_effect_after_restart_and_branc
         .install_host_tools(Arc::new(CreatingArtifact))
         .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    create(&agent, chat).await;
+    run_artifact_tool(&agent, chat, "Create the document").await;
     agent
         .remove_artifact_tick(chat, &artifact("title").instance_id())
         .await
@@ -156,7 +153,7 @@ async fn manual_removal_prevents_a_later_creation_effect_after_restart_and_branc
         .install_host_tools(Arc::new(CreatingArtifact))
         .unwrap();
     restored.resume_chat(chat).await.unwrap();
-    create(&restored, chat).await;
+    run_artifact_tool(&restored, chat, "Create the document").await;
     assert!(restored.artifact_ticks(chat).await.unwrap().is_empty());
     let branch = restored
         .branch_chat(tickloop_agent_protocol::BranchRequest {
@@ -167,7 +164,7 @@ async fn manual_removal_prevents_a_later_creation_effect_after_restart_and_branc
         })
         .await
         .unwrap();
-    create(&restored, branch.child_chat_id).await;
+    run_artifact_tool(&restored, branch.child_chat_id, "Create the document").await;
     assert!(
         restored
             .artifact_ticks(branch.child_chat_id)
@@ -179,7 +176,7 @@ async fn manual_removal_prevents_a_later_creation_effect_after_restart_and_branc
         .add_artifact_tick(chat, artifact("Explicit re-add"))
         .await
         .unwrap();
-    create(&restored, chat).await;
+    run_artifact_tool(&restored, chat, "Create the document").await;
     assert_eq!(restored.artifact_ticks(chat).await.unwrap().len(), 1);
     restored.shutdown().await;
 }
@@ -188,7 +185,13 @@ struct ArtifactEffects(std::sync::Mutex<std::collections::VecDeque<HostCallResul
 #[async_trait]
 impl HostToolProvider for ArtifactEffects {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        CreatingArtifact.definitions()
+        let mut definitions = CreatingArtifact.definitions();
+        definitions.push(ToolDefinition {
+            name: "read_custom_document".into(),
+            description: "Read an existing document".into(),
+            input_schema: json!({"type":"object"}),
+        });
+        definitions
     }
     fn permission(&self, _: ChatId, _: &str, _: &Value) -> HostToolPermission {
         HostToolPermission::Automatic
@@ -251,17 +254,96 @@ async fn repeated_confirmed_effects_refresh_metadata_but_failure_and_unknown_do_
         ))))
         .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    create(&agent, chat).await;
+    run_artifact_tool(&agent, chat, "Create the document").await;
     assert_eq!(agent.artifact_ticks(chat).await.unwrap(), vec![created]);
-    create(&agent, chat).await;
+    run_artifact_tool(&agent, chat, "Create the document").await;
     refreshed.added_at_ms = 17;
     assert_eq!(
         agent.artifact_ticks(chat).await.unwrap(),
         vec![refreshed.clone()]
     );
-    create(&agent, chat).await;
-    create(&agent, chat).await;
+    run_artifact_tool(&agent, chat, "Create the document").await;
+    run_artifact_tool(&agent, chat, "Create the document").await;
     assert_eq!(agent.artifact_ticks(chat).await.unwrap(), vec![refreshed]);
+    assert!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .loops
+            .iter()
+            .all(|goal| goal.event_sources.is_empty())
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn repeated_body_reads_show_one_monitor_row_without_feedback_or_subscriptions() {
+    use tickloop_agent_console::monitor_rows::{
+        MonitorContext, MonitorRowsRegistry, TickGlyph, TickGroup,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(
+        (0..2)
+            .flat_map(|index| {
+                vec![
+                    tickloop_agent_test_support::call(
+                        &format!("read-{index}"),
+                        "read_custom_document",
+                        json!({"action":"read","artifact_id":"document-one"}),
+                    ),
+                    tickloop_agent_test_support::text("Read."),
+                ]
+            })
+            .collect(),
+    ));
+    let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model);
+    let read = |title| {
+        let mut tick = artifact(title);
+        tick.access_role = "viewer".into();
+        tick.url = "https://docs.example/artifact/document-one".into();
+        HostCallResult::CompletedWithEffect(
+            ToolResult {
+                content: "Document body".into(),
+                is_error: false,
+                output_ref: None,
+            },
+            Box::new(HostEffect::ReadArtifact(tick)),
+        )
+    };
+    agent
+        .install_host_tools(Arc::new(ArtifactEffects(std::sync::Mutex::new(
+            [read("Read title"), read("Updated read title")].into(),
+        ))))
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let other = agent.create_chat(directory.path().into()).await.unwrap();
+    let monitor = MonitorRowsRegistry::builtin();
+    for title in ["Read title", "Updated read title"] {
+        run_artifact_tool(&agent, chat, "What does this document say?").await;
+        let rows = monitor.list(&MonitorContext {
+            chat: Some(Arc::new(agent.status(chat).await.unwrap())),
+            ..Default::default()
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, title);
+        assert_eq!(rows[0].instance.as_str(), artifact(title).instance_id());
+        assert_eq!(rows[0].group, TickGroup::Artifacts);
+        assert_eq!(rows[0].glyph, TickGlyph::Artifact);
+        assert!(rows[0].subscription.is_none());
+        assert!(rows[0].status.is_empty());
+        assert!(rows[0].notes.is_empty());
+    }
+    assert!(
+        monitor
+            .list(&MonitorContext {
+                chat: Some(Arc::new(agent.status(other).await.unwrap())),
+                ..Default::default()
+            })
+            .is_empty()
+    );
+    assert!(agent.tick_subscriptions(chat).await.unwrap().is_empty());
     assert!(
         agent
             .snapshot(chat)

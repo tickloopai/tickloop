@@ -1,6 +1,6 @@
 ---
 name: tickloop
-description: Show stock prices, quotes or K-line charts in Ticks, open or operate a Tick, or subscribe a Loop to Tick updates. Use for 看看特斯拉股价 and 打开K线, even without the word Tick, and for Shell or Artifact updates. Ticks run in the Tickhost and appear in this Chat's Monitor; a Herdr Pane shows one only when the user asks for a place.
+description: Open, read or operate Ticks for stock quotes, candlestick charts and other live views, or subscribe a Loop to their updates. Use for price/chart requests without requiring the word Tick, and for Shell or Artifact update workflows.
 ---
 
 # Tickloop Ticks
@@ -33,7 +33,7 @@ For an unavailable branch, briefly name what is missing in ordinary language, wi
 
 ## 2. Open and operate Ticks
 
-“看看特斯拉股价” requests a quote Tick even though the user did not say Tick. Prefer an existing matching instance in this Chat when the user asks to see information; open one if none exists. An explicit request to open a new Tick creates a new instance. A request to see a price uses Quote; a request for K线 or a chart uses Kline. A request explicitly asking for text only can use an ordinary data lookup instead. Opening, reading or listing a Tick never subscribes; use section 4 only for continued observation.
+"Show Tesla stock prices" requests a quote Tick even though the user did not say Tick. Prefer an existing matching instance in this Chat when the user asks to see information; open one if none exists. An explicit request to open a new Tick creates a new instance. A request to see a price uses Quote; a request for candlesticks or a chart uses Kline. A request explicitly asking for text only can use an ordinary data lookup instead. Opening, reading or listing a Tick never subscribes; use section 4 only for continued observation.
 
 ### Open a Tick
 
@@ -45,14 +45,14 @@ For a bundled Tick, use `workspace_host.tick_executable` as the executable; if i
 
 | Requested view | Arguments after the executable |
 | --- | --- |
-| Stock price / 行情 / 报价 | `longbridge quote SYMBOL` |
-| K-line / K线 / candlestick chart | `longbridge kline SYMBOL` |
-| A Longbridge community member's posts / 社区动态 | `longbridge community MEMBER_ID` |
+| Stock price / market quote | `longbridge quote SYMBOL` |
+| K-line / candlestick chart | `longbridge kline SYMBOL` |
+| A Longbridge community member's posts | `longbridge community MEMBER_ID` |
 | Explicit offline chart demonstration | `builtin kline 700.HK` |
 
 `MEMBER_ID` is the number in the member's profile link, such as 91 in `https://longbridge.com/zh-CN/profiles/91`; there is no nickname search, so ask for the link when the user names someone only by nickname. The community Tick's `reply` tool posts publicly as the logged-in Longbridge user.
 
-Use the broker symbol format: Tesla / 特斯拉 is `TSLA.US`, Apple / 苹果 is `AAPL.US`, and Tencent / 腾讯 is `700.HK`. Clarify an ambiguous company or market before launching. For example, “打开特斯拉K线” means `command: [TICK_EXECUTABLE, "longbridge", "kline", "TSLA.US"]`. Omitted chart period uses the command's default; specify `--period` when the user asks for a period. The argv is always `PROVIDER TICK ...`: `longbridge` serves real quotes, account, news and community posts, `futu` serves option pricing from Futu OpenD, and `builtin` serves simulated data for every Tick; a provider that lacks the data a Tick needs refuses it and names the providers that have it. Use the executable's `--help`, `longbridge --help` or `longbridge kline --help` for other options and Tick types. A real stock request uses real data; the builtin demo is a separate, explicitly requested workflow.
+Use the broker symbol format: Tesla is `TSLA.US`, Apple is `AAPL.US`, and Tencent is `700.HK`. Clarify an ambiguous company or market before launching. For example, "Open a Tesla candlestick chart" means `command: [TICK_EXECUTABLE, "longbridge", "kline", "TSLA.US"]`. Omitted chart period uses the command's default; specify `--period` when the user asks for a period. The argv is always `PROVIDER TICK ...`: `longbridge` serves real quotes, account, news and community posts, `futu` serves option pricing from Futu OpenD, and `builtin` serves simulated data for every Tick; a provider that lacks the data a Tick needs refuses it and names the providers that have it. Use the executable's `--help`, `longbridge --help` or `longbridge kline --help` for other options and Tick types. A real stock request uses real data; the builtin demo is a separate, explicitly requested workflow.
 
 Any other program opens with the program itself first in `command`. Pass `protocol: true` for a program that speaks the Tick protocol, such as `["python3", "tick/examples/counter.py"]`; omit `protocol` for an ordinary interactive program (a REPL, `htop`, a log viewer), which opens as a terminal Tick. The host refuses the bundled `tickhost` as a command.
 
@@ -74,7 +74,7 @@ Use this only when Herdr integration is available. Herdr owns Workspace → Tab 
 
 ### Open or move a view where the user asks
 
-Show a Tick in a Pane only when the user asks for a place, such as “就在这个Tab里打开” or “放在你左边”; otherwise open it without placement (section 2). `ReadWorkspace` returns an optional `caller` for the View carrying this interaction. “这个 Tab”, “你所在的 Tab” and “在你旁边” refer to that interaction location, independent of other clients' focus. The tool freezes this source for the accepted input; a background Trigger or task continuation may have no interaction source, and then only explicit targets apply. Select `placement` from the request:
+Show a Tick in a Pane only when the user asks for a place, such as "open it in this Tab" or "place it to your left"; otherwise open it without placement (section 2). `ReadWorkspace` returns an optional `caller` for the View carrying this interaction. "this Tab", "your Tab" and "next to you" refer to that interaction location, independent of other clients' focus. The tool freezes this source for the accepted input; a background Trigger or task continuation may have no interaction source, and then only explicit targets apply. Select `placement` from the request:
 
 | Requested location | `placement` |
 | --- | --- |
@@ -97,7 +97,7 @@ A delivery takes at most 16 KiB, each item at most 4 KiB unless it is the only o
 
 A subscription whose link stays `Disconnected` has used its three reconnects; retry it only when the user wants to, by `UnsubscribeTick` and then `SubscribeTick` again, which checks the target anew. Moving or hiding a view, or closing a Pane that shows it, never changes a Tick's reference or subscriptions. A replaced, restarted or reopened program has a new identity: retain the old subscription's state and select the new target explicitly. Only the user's reopen from Monitor moves a lost Tick's subscriptions to the new instance, when they keep that choice. Closing an Agent Pane closes its View while the daemon-owned Agent continues. Stop a Loop explicitly when requested.
 
-Current host state `artifact_ticks` lists artifacts joined to this Chat. An artifact the user picks in `/artifacts`, or one created with `ArtifactEdit`, joins Monitor and is associated with a Loop for the user's own @tickloop requests; each request reaches that Loop one at a time, and the association grants no extra permissions. Human edits of the body are not updates: read the body with `ArtifactRead` when the task needs it. While Tickloop Artifacts is signed out, `ArtifactLogin` replaces the Artifact tools: call it when the user wants a doc or page and give the user the returned link and code; after approval the Artifact tools appear on a later request.
+Current host state `artifact_ticks` lists artifacts joined to this Chat. A successful `ArtifactRead read` joins its artifact to Monitor once per service origin and canonical ID, unless the user explicitly removed it; reading alone does not create or move a feedback association. An artifact the user picks in `/artifacts`, or one created with `ArtifactEdit`, joins Monitor and is associated with a Loop for the user's own @tickloop requests; each request reaches that Loop one at a time, and the association grants no extra permissions. Human edits of the body are not updates: read the body with `ArtifactRead` when the task needs it. While Tickloop Artifacts is signed out, `ArtifactLogin` replaces the Artifact tools: call it when the user wants a doc or page and give the user the returned link and code; after approval the Artifact tools appear on a later request.
 
 ## 5. Coordinate a bounded Agent family
 

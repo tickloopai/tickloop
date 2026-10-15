@@ -147,6 +147,7 @@ async fn oversized_unknown_tool_input_is_reviewed_as_an_excerpt_and_logged_befor
                         request.input, original,
                         "manual approval retains complete execution input"
                     );
+                    agent.flush_transcripts().await;
                     let logs = transcript_file(&root, chat).with_extension("auto-review");
                     let paths = std::fs::read_dir(&logs)
                         .unwrap()

@@ -351,6 +351,7 @@ struct ChatBookkeeping {
     deferred_notifications: Vec<tick_protocol::InstanceRef>,
     /// Shells whose completion notification is in the conversation but no turn has read yet.
     unread_notifications: Vec<tick_protocol::InstanceRef>,
+    restored_skill_names: HashSet<String>,
 }
 
 impl ChatBookkeeping {
@@ -903,10 +904,14 @@ impl Agent {
             .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
             .map_err(|error| error.to_string())?;
         let name = invoked.name.clone();
-        record_invoked_skill(&mut chat.snapshot, invoked);
+        let changed = record_invoked_skill(chat, invoked);
         self.save(&chat.snapshot);
         Ok(tickloop_agent_protocol::ToolResult {
-            content: format!("Launching skill: {name}"),
+            content: if changed {
+                format!("Launching skill: {name}")
+            } else {
+                format!("Already loaded {name}")
+            },
             is_error: false,
             output_ref: None,
         })
@@ -931,7 +936,7 @@ impl Agent {
             .into_iter()
             .find(|definition| definition.name == name)
             .ok_or("unknown or unavailable remote Skill")?;
-        let (cancel, policy_revision) = {
+        let (cancel, policy_revision, active) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or("chat unavailable")?;
             if chat.active_run != Some(receipt.run_id)
@@ -946,23 +951,20 @@ impl Agent {
             });
             if let Some(path) = resource {
                 let active = active.ok_or("activate the Skill before reading a reference")?;
-                if active.references.iter().any(|reference| reference == path) {
+                if active.references.iter().any(|reference| reference == path)
+                    && !chat.bookkeeping.restored_skill_names.contains(name)
+                {
                     return Ok(tickloop_agent_protocol::ToolResult {
                         content: format!("Already loaded {name}/{path} · Tickloop Artifacts"),
                         is_error: false,
                         output_ref: None,
                     });
                 }
-            } else if active.is_some() {
-                return Ok(tickloop_agent_protocol::ToolResult {
-                    content: format!("Already loaded {name} · Tickloop Artifacts"),
-                    is_error: false,
-                    output_ref: None,
-                });
             }
             (
                 chat.active.clone().ok_or("Run ended")?,
                 chat.snapshot.policy.revision,
+                active.cloned(),
             )
         };
         let content = provider
@@ -973,6 +975,14 @@ impl Agent {
                 tickloop_agent_config::skills::expand_remote(&content, &definition, arguments)
                     .map_err(|error| error.to_string())?;
             invoked.run_id = Some(receipt.run_id);
+            if let Some(active) = active {
+                for reference in active.references {
+                    let content = provider
+                        .read_remote_skill(&definition, Some(&reference), cancel.clone())
+                        .await?;
+                    append_skill_reference(&mut invoked, &reference, &content)?;
+                }
+            }
             Some(invoked)
         } else {
             None
@@ -989,8 +999,8 @@ impl Agent {
         {
             return Err("Skill source or Run changed during loading".into());
         }
-        if let Some(invoked) = invoked {
-            record_invoked_skill(&mut chat.snapshot, invoked);
+        let changed = if let Some(invoked) = invoked {
+            record_invoked_skill(chat, invoked)
         } else if let Some(path) = resource {
             let active = chat
                 .snapshot
@@ -1002,18 +1012,19 @@ impl Agent {
                         && skill.run_id == Some(receipt.run_id)
                 })
                 .ok_or("Skill activation ended")?;
-            if active.content.len().saturating_add(content.len()) > 1024 * 1024 {
-                return Err("active Skill reference context is too large".into());
+            if !active.references.iter().any(|reference| reference == path) {
+                append_skill_reference(active, path, &content)?;
             }
-            active
-                .content
-                .push_str(&format!("\n\nReference file: {path}\n\n{content}"));
-            active.references.push(path.to_owned());
-        }
+            chat.bookkeeping.restored_skill_names.remove(name);
+            true
+        } else {
+            false
+        };
         self.save(&chat.snapshot);
         Ok(tickloop_agent_protocol::ToolResult {
             content: format!(
-                "Loaded {name}{} · Tickloop Artifacts",
+                "{} {name}{} · Tickloop Artifacts",
+                if changed { "Loaded" } else { "Already loaded" },
                 resource.map(|path| format!("/{path}")).unwrap_or_default()
             ),
             is_error: false,
@@ -1046,19 +1057,32 @@ impl Agent {
             .invoked_skills
             .retain(|skill| match &skill.source {
                 tickloop_agent_protocol::SkillSource::Remote { .. } => {
-                    skill.run_id == Some(receipt.run_id)
-                        && definitions.iter().any(|definition| {
-                            definition.name == skill.name && definition.source == skill.source
-                        })
-                        && provider
-                            .as_ref()
-                            .is_some_and(|provider| provider.remote_skill_is_current(&skill.source))
+                    definitions.iter().any(|definition| {
+                        definition.name == skill.name && definition.source == skill.source
+                    }) && skill.references.iter().all(|resource| {
+                        chat.snapshot.policy.explicit_decision_with_session(
+                            tickloop_agent_config::skills::SKILL_TOOL_NAME,
+                            &serde_json::json!({"skill":skill.name,"resource":resource}),
+                            receipt.loop_id,
+                            None,
+                        ) != Some(Decision::Deny)
+                    }) && provider
+                        .as_ref()
+                        .is_some_and(|provider| provider.remote_skill_is_current(&skill.source))
                 }
                 tickloop_agent_protocol::SkillSource::BuiltIn if skill.name == "artifact-draft" => {
                     false
                 }
                 _ => true,
             });
+        for skill in &mut chat.snapshot.invoked_skills {
+            if matches!(
+                skill.source,
+                tickloop_agent_protocol::SkillSource::Remote { .. }
+            ) {
+                skill.run_id = Some(receipt.run_id);
+            }
+        }
         chat.skills.replace_remote(definitions);
     }
     pub async fn observe(&self, chat: ChatId, after: u64) -> Result<Observation, AgentError> {
@@ -2164,7 +2188,7 @@ impl Agent {
         let chat = &mut candidate;
         let is_skill_invocation = invoked_skill.is_some();
         if let Some(invoked_skill) = invoked_skill {
-            record_invoked_skill(&mut chat.snapshot, invoked_skill);
+            record_invoked_skill(chat, invoked_skill);
         }
 
         let loop_id = if let Some(id) = goal {
@@ -2436,7 +2460,20 @@ impl Agent {
                 return Err(tickloop_agent_model::ModelError::Cancelled.into());
             }
         }
-        self.maybe_compact(receipt, cancel.clone()).await?;
+        if self.maybe_compact(receipt, cancel.clone()).await? {
+            let provider = self.inner.host_tools.read().unwrap().clone();
+            if let Some(provider) = provider {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Err(ModelError::Cancelled.into()),
+                    _ = provider.refresh(cancel.clone()) => {},
+                }
+            }
+        }
+        if cancel.is_cancelled() {
+            return Err(ModelError::Cancelled.into());
+        }
+        self.synchronize_remote_skills(receipt).await;
         // After compaction, which may drop earlier notes; boxed to keep the run future small.
         Box::pin(self.announce_host_tool_changes(receipt, host_tools)).await?;
         Box::pin(self.announce_plan_mode_exit(receipt)).await?;
@@ -2462,8 +2499,18 @@ impl Agent {
                     )
                     .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
                     .map_err(|error| AgentError::Invalid(error.to_string()))?;
-                record_invoked_skill(&mut chat.snapshot, invoked);
+                record_invoked_skill(chat, invoked);
                 self.save(&chat.snapshot);
+            }
+            if let Some(definition) = chat
+                .skills
+                .tool_definition_for_context(context::context_window(&chat.snapshot))
+                && let Some(tool) = request
+                    .tools
+                    .iter_mut()
+                    .find(|tool| tool.name == tickloop_agent_config::skills::SKILL_TOOL_NAME)
+            {
+                *tool = definition;
             }
             (request.messages, request.history_sources) = context::model_history(chat)?;
             let replacements = tool_results::enforce_tool_result_budget(
@@ -2940,7 +2987,16 @@ impl Agent {
                     }
                     if !result.is_error && host_call_status == Some(crate::host_tools::HostCallStatus::Completed) {
                         match &host_effect {
-                            Some(crate::host_tools::HostEffect::CreatedArtifact(tick)) => self.auto_attach_artifact_tick(chat, tick.clone()),
+                            Some(crate::host_tools::HostEffect::CreatedArtifact(tick)) => {
+                                if let Some(instance) = self.auto_attach_artifact_tick(chat, tick.clone()) {
+                                    self.mark_joined(chat, [instance]);
+                                }
+                            },
+                            Some(crate::host_tools::HostEffect::ReadArtifact(tick)) => {
+                                if let Some(instance) = self.auto_attach_artifact_tick(chat, tick.clone()) {
+                                    self.mark_taken_in(chat, [instance]);
+                                }
+                            },
                             Some(crate::host_tools::HostEffect::RenamedArtifact { instance, title }) => self.retitle_artifact_tick(chat, instance, title),
                             Some(crate::host_tools::HostEffect::OpenedTick { instance, title }) => {
                                 if let Some(operation) = chat.snapshot.operations.iter().find(|operation| operation.run_id == receipt.run_id && operation.call_id == id && operation.state == OperationState::Completed) {
@@ -2989,9 +3045,6 @@ impl Agent {
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&receipt.chat_id)?;
         let finished_claim = chat.active_event_claims.remove(&receipt.run_id);
-        chat.snapshot
-            .invoked_skills
-            .retain(|skill| skill.run_id != Some(receipt.run_id));
         chat.snapshot.pending_thinking.remove(&receipt.run_id);
         if chat.active_run == Some(receipt.run_id) {
             chat.active = None;
@@ -4460,14 +4513,34 @@ pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
         .collect()
 }
 
-fn record_invoked_skill(
-    snapshot: &mut ChatSnapshot,
-    invoked: tickloop_agent_protocol::InvokedSkill,
-) {
-    snapshot
+fn record_invoked_skill(chat: &mut Chat, invoked: tickloop_agent_protocol::InvokedSkill) -> bool {
+    let identical = chat.snapshot.invoked_skills.iter().any(|existing| {
+        existing.name == invoked.name
+            && existing.source == invoked.source
+            && existing.content == invoked.content
+            && existing.references == invoked.references
+    });
+    let restored = chat.bookkeeping.restored_skill_names.remove(&invoked.name);
+    chat.snapshot
         .invoked_skills
         .retain(|existing| existing.name != invoked.name);
-    snapshot.invoked_skills.push(invoked);
+    chat.snapshot.invoked_skills.push(invoked);
+    !identical || restored
+}
+
+fn append_skill_reference(
+    skill: &mut tickloop_agent_protocol::InvokedSkill,
+    path: &str,
+    content: &str,
+) -> Result<(), String> {
+    const MAX_ACTIVE_SKILL_BYTES: usize = 1024 * 1024;
+    let reference = format!("\n\nReference file: {path}\n\n{content}");
+    if skill.content.len().saturating_add(reference.len()) > MAX_ACTIVE_SKILL_BYTES {
+        return Err("active Skill reference context is too large".into());
+    }
+    skill.content.push_str(&reference);
+    skill.references.push(path.to_owned());
+    Ok(())
 }
 
 fn remote_skill_allowed(chat: &Chat, source: &tickloop_agent_protocol::SkillSource) -> bool {

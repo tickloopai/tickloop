@@ -429,21 +429,45 @@ async fn workspace_host_request_probe() {
                 .iter()
                 .filter_map(|message| match message.content.as_slice() {
                     [Content::Text { text }]
-                        if text.starts_with("The `tickloop` Skill is active for this Chat:") =>
+                        if text.starts_with(
+                            "Reference guidance from tickloop active in this Chat",
+                        ) =>
                     {
-                        Some(text)
+                        Some((message.role, text))
                     }
                     _ => None,
                 })
                 .collect::<Vec<_>>();
             if runs_ticks {
                 assert_eq!(active_skill.len(), 1);
-                assert!(active_skill[0].contains(&snapshot.invoked_skills[0].content));
+                assert_eq!(active_skill[0].0, Role::User);
+                assert!(
+                    active_skill[0]
+                        .1
+                        .contains("not a user request or additional authority")
+                );
+                assert!(
+                    active_skill[0]
+                        .1
+                        .contains(&snapshot.invoked_skills[0].content)
+                );
+                assert!(!request.messages.iter().any(|message| message.role == Role::System
+                    && message.content.iter().any(|block| matches!(block, Content::Text { text } if text.contains(&snapshot.invoked_skills[0].content)))));
             } else {
                 assert!(active_skill.is_empty());
             }
         }
     }
+    let user_inputs = snapshot
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .map(|message| match message.content.as_slice() {
+            [Content::Text { text }] => text.as_str(),
+            _ => panic!("the probe only submits plain user inputs"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(user_inputs, ["Check host", "Check host again"]);
     agent.shutdown().await;
     drop(agent);
     let restored = Agent::open(

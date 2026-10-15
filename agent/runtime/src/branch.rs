@@ -174,6 +174,11 @@ impl Agent {
             last_model_run: None,
         };
         let mut bookkeeping = ChatBookkeeping {
+            restored_skill_names: snapshot
+                .invoked_skills
+                .iter()
+                .map(|skill| skill.name.clone())
+                .collect(),
             plan_slug: source.bookkeeping.plan_slug.clone(),
             ..ChatBookkeeping::default()
         };

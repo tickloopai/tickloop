@@ -46,11 +46,16 @@ pub struct ServiceControl {
     pub reject_mcp: AtomicBool,
     pub directory_unavailable: AtomicBool,
     pub skills_enabled: AtomicBool,
+    pub skill_revision: AtomicUsize,
+    pub skill_reference_bytes: AtomicUsize,
     pub tamper_skill: AtomicBool,
     pub hold_skill_response: AtomicBool,
     pub skill_response_started: Notify,
     pub release_skill_response: Notify,
     pub session_unavailable: AtomicBool,
+    pub hold_status_response: AtomicBool,
+    pub status_response_started: Notify,
+    pub release_status_response: Notify,
     pub hold_session_response: AtomicBool,
     pub session_response_started: Notify,
     pub release_session_response: Notify,
@@ -59,6 +64,7 @@ pub struct ServiceControl {
     pub omit_comment_tool: AtomicBool,
     /// Answers a creation with the catalog's stored format names, as deployed services do.
     pub catalog_format_names: AtomicBool,
+    pub read_result: Mutex<Option<Value>>,
     pub drop_call_response: AtomicBool,
     pub fail_link: AtomicBool,
     /// Who the fixture artifact is published to, as its metadata reports it; unknown when unset.
@@ -135,6 +141,9 @@ fn call_tool(control: &ServiceControl, origin: &str, params: &Value) -> Value {
         arguments["action"].as_str().unwrap_or(""),
     ) {
         ("ArtifactRead", "read") => {
+            if let Some(result) = control.read_result.lock().unwrap().clone() {
+                return result;
+            }
             json!({"artifact_id":artifact_id,"title":"Fixture","format":"doc","url":artifact_url(origin, artifact_id),"access_role":"owner","revision":3,"blocks":[{"id":"b1","hash":"h1","text":"# Fixture body"}],"next_cursor":null})
         }
         ("ArtifactRead", "threads") => {
@@ -233,10 +242,10 @@ fn mcp(control: &ServiceControl, origin: &str, body: &Value) -> Value {
             json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":capabilities,"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":name,"version":"1"}}})
         }
         "skills/list" => {
-            json!({"resultType":"complete","skills":skill_entries(),"ttlMs":0,"cacheScope":"private"})
+            json!({"resultType":"complete","skills":skill_entries(control.skill_revision.load(Ordering::SeqCst), control.skill_reference_bytes.load(Ordering::SeqCst)),"ttlMs":0,"cacheScope":"private"})
         }
         "skills/get" => {
-            json!({"resultType":"complete","skill":skill_entries().into_iter().find(|entry| entry["uri"] == body["params"]["uri"]).unwrap(),"ttlMs":0,"cacheScope":"private"})
+            json!({"resultType":"complete","skill":skill_entries(control.skill_revision.load(Ordering::SeqCst), control.skill_reference_bytes.load(Ordering::SeqCst)).into_iter().find(|entry| entry["uri"] == body["params"]["uri"]).unwrap(),"ttlMs":0,"cacheScope":"private"})
         }
         "resources/read" => {
             let uri = body["params"]["uri"].as_str().unwrap();
@@ -244,9 +253,9 @@ fn mcp(control: &ServiceControl, origin: &str, body: &Value) -> Value {
             let text = if control.tamper_skill.load(Ordering::SeqCst) {
                 "tampered content".into()
             } else if uri.ends_with("SKILL.md") {
-                skill_body(name)
+                skill_body(name, control.skill_revision.load(Ordering::SeqCst))
             } else {
-                "Reference fixture: preserve data units".into()
+                skill_reference(control.skill_reference_bytes.load(Ordering::SeqCst))
             };
             json!({"resultType":"complete","contents":[{"uri":uri,"mimeType":"text/markdown","text":text}],"ttlMs":0,"cacheScope":"private"})
         }
@@ -260,16 +269,25 @@ fn mcp(control: &ServiceControl, origin: &str, body: &Value) -> Value {
     json!({"jsonrpc":"2.0","id":body["id"],"result":result})
 }
 
-fn skill_body(name: &str) -> String {
+fn skill_body(name: &str, revision: usize) -> String {
     format!(
-        "---\nname: {name}\ndescription: Fixture guidance for {name}\n---\nPage guidance fixture for {name}: verify the facts and preserve existing content.\n"
+        "---\nname: {name}\ndescription: Fixture guidance for {name}\n---\nPage guidance fixture for {name}: verify the facts and preserve existing content.\nManifest revision: {revision}\n"
     )
 }
 
-fn skill_entries() -> Vec<Value> {
+fn skill_reference(extra_bytes: usize) -> String {
+    let mut content = "Reference fixture: preserve data units".to_owned();
+    if extra_bytes > 0 {
+        content.push_str(&"x".repeat(extra_bytes));
+        content.push_str("REFERENCE_END");
+    }
+    content
+}
+
+fn skill_entries(revision: usize, reference_bytes: usize) -> Vec<Value> {
     ["artifact-design", "artifact-diagramming", "artifact-dataviz", "artifact-draft"].into_iter().map(|name| {
         let uri = format!("skill://tickloop-docs/{name}/SKILL.md");
-        let resources = [(uri.clone(), skill_body(name)), (format!("skill://tickloop-docs/{name}/references/runtime.md"), "Reference fixture: preserve data units".into())].into_iter().map(|(uri, text)| json!({"uri":uri,"size":text.len(),"digest":format!("sha256:{:x}", Sha256::digest(text.as_bytes()))})).collect::<Vec<_>>();
+        let resources = [(uri.clone(), skill_body(name, revision)), (format!("skill://tickloop-docs/{name}/references/runtime.md"), skill_reference(reference_bytes))].into_iter().map(|(uri, text)| json!({"uri":uri,"size":text.len(),"digest":format!("sha256:{:x}", Sha256::digest(text.as_bytes()))})).collect::<Vec<_>>();
         json!({"uri":uri,"frontmatter":{"name":name,"description":format!("Fixture guidance for {name}")},"resources":resources})
     }).collect()
 }
@@ -411,9 +429,18 @@ fn lifecycle(control: &ServiceControl, method: &str, target: &str, body: &Value)
         }
         ("GET", ["", "api", "v1", "artifacts", artifact_id]) => {
             let link = control.links.lock().unwrap().get(*artifact_id).cloned();
+            let canonical_id = control
+                .read_result
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|result| result["structuredContent"]["artifact_id"].as_str())
+                .filter(|id| tickloop_agent_artifacts::artifact_ids_match(artifact_id, id))
+                .unwrap_or(artifact_id)
+                .to_owned();
             (
                 200,
-                json!({"id":artifact_id,"title":"Fixture","format":"markdown","access_role":"owner","publication":control.publication.lock().unwrap().clone(),"agent_link":link.map(|link| json!({"binding_id":link.binding_id,"chat_id":link.chat_id,"loop_id":link.loop_id,"epoch":link.epoch}))}),
+                json!({"id":canonical_id,"title":"Fixture","format":"markdown","access_role":"owner","publication":control.publication.lock().unwrap().clone(),"agent_link":link.map(|link| json!({"binding_id":link.binding_id,"chat_id":link.chat_id,"loop_id":link.loop_id,"epoch":link.epoch}))}),
             )
         }
         _ => (
@@ -502,6 +529,10 @@ impl ArtifactService {
                             json!({"access_token":format!("test-service-token-{revision}"),"token_type":"Bearer","expires_in":600,"user":user}),
                         )
                     } else if target == "/api/v1/auth/session" {
+                        if control.hold_status_response.load(Ordering::SeqCst) {
+                            control.status_response_started.notify_one();
+                            control.release_status_response.notified().await;
+                        }
                         (
                             200,
                             json!({"user":user,"expires_at":"2099-01-01T00:00:00Z"}),

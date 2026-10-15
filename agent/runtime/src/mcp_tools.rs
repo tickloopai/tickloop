@@ -241,7 +241,7 @@ impl McpHostToolProvider {
         tokio::select! {
             () = cancel.cancelled() => Err("MCP call cancelled".into()),
             result = self.artifact.read_with_credential(id, credential) => match result {
-                Ok(metadata) if metadata.id != id => Err("Artifact metadata identity does not match the requested artifact".into()),
+                Ok(metadata) if !tickloop_agent_artifacts::artifact_ids_match(id, &metadata.id) => Err("Artifact metadata identity does not match the requested artifact".into()),
                 Ok(metadata) => Ok(metadata.access_role == "owner"),
                 Err(ArtifactError::Connection | ArtifactError::InvalidResponse
                     | ArtifactError::Service { status: 500..=599, .. }
@@ -614,8 +614,7 @@ impl McpHostToolProvider {
             return None;
         }
         let title = structured.get("title")?.as_str()?;
-        // The tool contract names types by intent and the catalog by its stored format names;
-        // a service may answer with either.
+        // Tool results use public format names; Monitor retains storage names.
         let format = match structured.get("format")?.as_str()? {
             "doc" => "markdown",
             "page" => "html",
@@ -650,9 +649,7 @@ impl McpHostToolProvider {
         let requested = artifact_update_id(ARTIFACT_EDIT_TOOL, &prepared.arguments)?;
         let saved = result.structured_content.as_ref()?;
         let artifact_id = bounded_identifier(saved.get("artifact_id"))?;
-        if tickloop_agent_artifacts::short_artifact_id(artifact_id)
-            != tickloop_agent_artifacts::short_artifact_id(requested)
-        {
+        if !tickloop_agent_artifacts::artifact_ids_match(requested, artifact_id) {
             return None;
         }
         let title = saved.get("title")?.as_str()?;
@@ -665,6 +662,60 @@ impl McpHostToolProvider {
             instance: tick_protocol::InstanceRef::artifact(origin, artifact_id).ok()?,
             title: title.to_owned(),
         })
+    }
+
+    fn read_effect(
+        result: &rmcp::model::CallToolResult,
+        prepared: &PreparedMcpCall,
+    ) -> Option<HostEffect> {
+        if result.is_error == Some(true) || !has_action(&prepared.arguments, "read") {
+            return None;
+        }
+        let requested = artifact_read_id(ARTIFACT_READ_TOOL, &prepared.arguments)?;
+        let read = result.structured_content.as_ref()?;
+        let artifact_id = bounded_identifier(read.get("artifact_id"))?;
+        if artifact_id.contains(['/', '?', '#'])
+            || !tickloop_agent_artifacts::artifact_ids_match(requested, artifact_id)
+        {
+            return None;
+        }
+        let title = read.get("title")?.as_str()?;
+        if title.trim().is_empty() || title.encode_utf16().count() > MAX_ARTIFACT_TITLE_UTF16_UNITS
+        {
+            return None;
+        }
+        read.get("revision")?.as_u64()?;
+        let format = match read.get("format")?.as_str()? {
+            "doc" if read.get("blocks")?.is_array() => "markdown",
+            "page" if read.get("source")?.is_string() => "html",
+            _ => return None,
+        };
+        let access_role = match read.get("access_role")?.as_str()? {
+            "owner" => "owner",
+            "edit" => "editor",
+            "view" => "viewer",
+            _ => return None,
+        };
+        let origin = prepared.credential.origin.trim_end_matches('/');
+        let url = read.get("url")?.as_str()?;
+        let expected = tickloop_agent_artifacts::artifact_url(origin, artifact_id);
+        if reqwest::Url::parse(url).ok()? != reqwest::Url::parse(&expected).ok()? {
+            return None;
+        }
+        Some(HostEffect::ReadArtifact(
+            tickloop_agent_protocol::ArtifactTick {
+                artifact_id: uuid::Uuid::parse_str(artifact_id)
+                    .ok()
+                    .filter(|_| artifact_id.len() == 36)
+                    .map_or_else(|| artifact_id.into(), |id| id.to_string()),
+                origin: origin.into(),
+                title: title.into(),
+                format: format.into(),
+                url: url.into(),
+                access_role: access_role.into(),
+                added_at_ms: tickloop_agent_base::private_fs::unix_time_milliseconds(),
+            },
+        ))
     }
 
     /// A confirmed `ArtifactComment` done for the request this run claimed.
@@ -1436,6 +1487,7 @@ impl HostToolProvider for McpHostToolProvider {
             }
         };
         let effect = match name.as_str() {
+            ARTIFACT_READ_TOOL => Self::read_effect(&result, &prepared),
             ARTIFACT_EDIT_TOOL => Self::creation_effect(&result, &prepared)
                 .map(HostEffect::CreatedArtifact)
                 .or_else(|| Self::rename_effect(&result, &prepared)),
