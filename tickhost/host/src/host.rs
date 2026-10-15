@@ -2297,7 +2297,6 @@ async fn instance_request(
                 Adapter::Terminal(program) => Ok(json!(tick.terminal_read(program))),
             }
         }
-        "snapshot" => Ok(json!(tick.screen.lock().unwrap().snapshot())),
         "resources" => {
             let Lifecycle::Live { business_pid, .. } = tick.lifecycle.borrow().clone() else {
                 return Err(HostError::before("TargetGone", "the Tick is not running"));

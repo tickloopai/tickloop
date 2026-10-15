@@ -3995,25 +3995,44 @@ for line in sys.stdin:
             .await
             .unwrap();
         let mut reader = fixture.reader(&opened).await;
-        let mut last = String::new();
-        for _ in 0..200 {
-            let snapshot = reader
-                .request("snapshot", json!({}), CONTROL_TIMEOUT)
-                .await
-                .unwrap();
-            last = snapshot["lines"]
-                .as_array()
-                .unwrap()
-                .last()
-                .and_then(|line| line.as_str())
-                .unwrap_or_default()
-                .to_owned();
-            if last == "line 1499" {
-                break;
+        // A view of the Tick's own size paints its hidden screen as it is.
+        let (rows, columns) = (tickhost::pty::DEFAULT_ROWS, tickhost::pty::DEFAULT_COLUMNS);
+        let mut view = fixture.reader(&opened).await;
+        let attached = view
+            .request(
+                "attach",
+                json!({"size":{"rows":rows,"columns":columns}}),
+                CONTROL_TIMEOUT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(attached["attached"], true);
+        let mut shown = vt100::Parser::new(rows, columns, 0);
+        let last_line = |shown: &vt100::Parser| {
+            shown
+                .screen()
+                .contents()
+                .lines()
+                .rfind(|line| !line.trim().is_empty())
+                .map(str::to_owned)
+        };
+        let painted = tokio::time::timeout(Duration::from_secs(10), async {
+            while last_line(&shown).as_deref() != Some("line 1499") {
+                let frame = view
+                    .next_event()
+                    .await
+                    .unwrap()
+                    .expect("the view stays attached");
+                assert_eq!(frame["event"], "frame", "{frame}");
+                shown.process(frame["data"].as_str().unwrap().as_bytes());
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        assert_eq!(last, "line 1499", "no tail line is lost");
+        })
+        .await;
+        assert!(
+            painted.is_ok(),
+            "no tail line is lost: {:?}",
+            last_line(&shown)
+        );
         let read = reader
             .request("read", json!({"activity":"explicit"}), CONTROL_TIMEOUT)
             .await

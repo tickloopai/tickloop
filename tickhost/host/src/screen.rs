@@ -12,13 +12,10 @@ pub struct Screen {
 }
 
 /// The latest visible text, newest lines kept when the limits cut it.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScreenSnapshot {
     pub lines: Vec<String>,
     pub truncated: bool,
-    pub rows: u16,
-    pub columns: u16,
-    pub alternate_screen: bool,
 }
 
 impl Screen {
@@ -61,9 +58,7 @@ impl Screen {
     }
 
     pub fn snapshot(&self) -> ScreenSnapshot {
-        let screen = self.parser.screen();
-        let (rows, columns) = screen.size();
-        let text = screen.contents();
+        let text = self.parser.screen().contents();
         let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
         while lines.last().is_some_and(|line| line.trim().is_empty()) {
             lines.pop();
@@ -78,13 +73,7 @@ impl Screen {
             bytes -= lines.remove(0).len() + 1;
             truncated = true;
         }
-        ScreenSnapshot {
-            lines,
-            truncated,
-            rows,
-            columns,
-            alternate_screen: screen.alternate_screen(),
-        }
+        ScreenSnapshot { lines, truncated }
     }
 
     #[cfg(test)]
@@ -119,14 +108,10 @@ mod tests {
     fn wide_characters_and_the_alternate_screen_are_modelled() {
         let mut screen = Screen::new(TerminalSize::default());
         screen.process("\x1b[?1049h行情 CJK".as_bytes());
-        let snapshot = screen.snapshot();
-        assert!(snapshot.alternate_screen);
-        assert_eq!(snapshot.lines[0], "行情 CJK");
+        assert!(screen.parser.screen().alternate_screen());
+        assert_eq!(screen.snapshot().lines[0], "行情 CJK");
         screen.resize(TerminalSize::validated(10, 40).unwrap());
-        assert_eq!(
-            (screen.snapshot().rows, screen.snapshot().columns),
-            (10, 40)
-        );
+        assert_eq!(screen.size(), TerminalSize::validated(10, 40).unwrap());
     }
 
     #[test]
