@@ -16,7 +16,7 @@ use tick_protocol::{InstanceRef, TickDescriptor};
 use tickhost::host::{Receipt, TerminalDescription, TerminalRead, TickAdapter, TickRow};
 use tickhost_connect::{
     herdr::Pane,
-    host_error::HostError,
+    host_error::{HostError, TOOL_FAILED},
     hosted::{CALL_RESPONSE_TIMEOUT, CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role},
     layout::{LayoutContext, Placement},
     page::{MAX_PAGE_SIZE, PageCursor},
@@ -45,6 +45,8 @@ use tickloop_agent_protocol::{
 
 /// How results name the Tickhost that runs a Tick.
 const HOSTED_HOST: &str = "tickhost";
+/// What a call the Tick ran and reported failed tells the model, unlike an unknown outcome.
+const TOOL_FAILED_DIAGNOSTIC: &str = "The Tick ran the call and reported this failure; its outcome is known. Correct the call before making it again.";
 
 #[derive(Clone)]
 struct DataBinding {
@@ -854,6 +856,13 @@ impl HostedTickTools {
                     Ok(result) => completed(
                         json!({"status":"completed","tick_instance_id":instance,"result":result}),
                     ),
+                    Err(error) if error.code == TOOL_FAILED => {
+                        HostCallResult::Completed(ToolResult {
+                            content: json!({"status":"failed","tick_instance_id":instance,"error":error.message,"diagnostic":TOOL_FAILED_DIAGNOSTIC}).to_string(),
+                            is_error: true,
+                            output_ref: None,
+                        })
+                    }
                     Err(error) if error.dispatched => {
                         HostCallResult::OutcomeUnknown(error.to_string())
                     }

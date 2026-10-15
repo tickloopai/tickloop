@@ -468,12 +468,14 @@ impl OutboundQueue {
     }
 }
 
+/// Writes the latest update before the responses queued with it: a read answered after that
+/// update was published reports its seq, and must not reach the host ahead of it.
 async fn drain_outbound<W: AsyncWrite + Unpin>(queue: Arc<OutboundQueue>, mut writer: W) {
     loop {
         let (frames, closed) = {
             let mut pending = queue.state();
-            let mut frames: Vec<Vec<u8>> = pending.responses.drain(..).collect();
-            frames.extend(pending.update.take());
+            let mut frames: Vec<Vec<u8>> = pending.update.take().into_iter().collect();
+            frames.extend(pending.responses.drain(..));
             (frames, pending.closed)
         };
         if frames.is_empty() {
