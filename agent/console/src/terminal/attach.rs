@@ -30,6 +30,16 @@ const ESCAPE: u8 = 0x1b;
 const ESCAPE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 /// Ctrl+B Esc sends Esc to the Tick and Ctrl+B Ctrl+B sends Ctrl+B.
 const SEND_KEY_PREFIX: u8 = 0x02;
+/// The byte after Esc that begins a control sequence, the form of arrow keys and of every key
+/// the kitty keyboard protocol reports.
+const CONTROL_SEQUENCE_START: u8 = b'[';
+/// A control sequence still unfinished at this length is no key's, so it reaches the Tick as it
+/// is.
+const LONGEST_KEY_SEQUENCE: usize = 32;
+/// Modifier bits of the kitty keyboard protocol: Ctrl, and the Caps Lock and Num Lock states a
+/// terminal may report with any key.
+const KITTY_CONTROL: u16 = 4;
+const KITTY_LOCKS: u16 = 64 | 128;
 
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
@@ -40,11 +50,14 @@ const FALLBACK_TERMINAL_SIZE: (u16, u16) = (80, 24);
 const QUEUED_KEY_READS: usize = 16;
 /// How often the key reader looks whether its view has ended.
 const KEY_POLL_MILLISECONDS: i32 = 100;
-/// The view draws on its own screen and leaves the user's scrollback untouched.
-const TAKE_SCREEN: &str = "\x1b[?1049h\x1b[H\x1b[2J";
+/// The view draws on its own screen and leaves the user's scrollback untouched. It pushes empty
+/// kitty keyboard flags on that screen, so it reads legacy keys, the ones the Tick's terminal
+/// takes, whatever flags an earlier program left there.
+const TAKE_SCREEN: &str = "\x1b[?1049h\x1b[>0u\x1b[H\x1b[2J";
 /// Undoes every mode the Tick's frames may have turned on: colours, a hidden cursor, mouse and
-/// paste reporting, application cursor and keypad keys, and the view's own screen.
-const RESTORE_TERMINAL: &str = "\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1l\x1b>\x1b[?1049l";
+/// paste reporting, application cursor and keypad keys; then pops the view's keyboard flags while
+/// its own screen, which it leaves last, is still shown.
+const RESTORE_TERMINAL: &str = "\x1b[0m\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1l\x1b>\x1b[<u\x1b[?1049l";
 /// Starts a redraw of a screen of another size: no cursor, default colours, nothing shown.
 const BEGIN_REDRAW: &[u8] = b"\x1b[?25l\x1b[m\x1b[H\x1b[J";
 const DEFAULT_COLOURS: &[u8] = b"\x1b[m";
@@ -145,17 +158,16 @@ impl AttachedView {
                             send(&mut requests, json!({"method":"detach"})).await?;
                             return Ok(AttachEnd::Detached);
                         };
-                        for request in input_requests(&filter.feed(&keys)) {
-                            send(&mut requests, request).await?;
+                        if deliver(&mut requests, filter.feed(&keys)).await? {
+                            return Ok(AttachEnd::Detached);
                         }
                         escape_deadline = filter
-                            .holds_escape()
+                            .holds_sequence()
                             .then(|| tokio::time::Instant::now() + ESCAPE_DELAY);
                     }
                     _ = tokio::time::sleep_until(escape_deadline.unwrap_or_else(tokio::time::Instant::now)), if escape_deadline.is_some() => {
                         escape_deadline = None;
-                        if filter.take_lone_escape() {
-                            send(&mut requests, json!({"method":"detach"})).await?;
+                        if deliver(&mut requests, filter.flush()).await? {
                             return Ok(AttachEnd::Detached);
                         }
                     }
@@ -183,8 +195,23 @@ async fn send(
     hosted::write_frame(requests, &request, ATTACH_REQUEST_FRAME_BYTES).await
 }
 
+/// Sends the Tick its share of the user's keys and, when they close the view, detaches it;
+/// returns whether they closed it.
+async fn deliver(
+    requests: &mut tokio::net::unix::OwnedWriteHalf,
+    keys: FilteredKeys,
+) -> Result<bool, HostError> {
+    for request in input_requests(&keys.forwarded) {
+        send(requests, request).await?;
+    }
+    if keys.closes {
+        send(requests, json!({"method":"detach"})).await?;
+    }
+    Ok(keys.closes)
+}
+
 /// The input requests that carry `forwarded` to the Tick, each within the host's input limit:
-/// a held prefix byte can make one read's keys one byte longer than a request may carry.
+/// a held prefix or escape sequence can make one read's keys longer than a request may carry.
 fn input_requests(forwarded: &[u8]) -> impl Iterator<Item = Value> + '_ {
     forwarded
         .chunks(ATTACH_INPUT_BYTES)
@@ -353,56 +380,123 @@ fn read_keys(stop: &AtomicBool, keys: &tokio::sync::mpsc::Sender<Vec<u8>>) {
 }
 
 /// Splits the user's keys into what reaches the Tick and the request to close the view. A lone
-/// Esc closes it once nothing follows within the escape delay, while escape sequences and
-/// Alt-keys reach the Tick. Ctrl+B Esc sends one Esc, Ctrl+B Ctrl+B sends one Ctrl+B and Ctrl+B
-/// followed by any other byte sends both in order; a prefix may span reads. Text inside a
-/// bracketed paste never closes the view or counts as a prefix.
+/// Esc closes it, while escape sequences and Alt-keys reach the Tick: a legacy Esc closes once
+/// nothing follows within the escape delay, and an Esc in the kitty keyboard protocol's encoding,
+/// which a terminal may still send when a program left the protocol on, closes at once. Ctrl+B
+/// Esc sends one Esc, Ctrl+B Ctrl+B sends one Ctrl+B, Ctrl+B followed by an escape sequence sends
+/// that sequence and Ctrl+B followed by any other byte sends both in order. Esc and Ctrl+B count
+/// in either encoding and reach the Tick as their legacy bytes; every other sequence reaches it
+/// as it came. A prefix or a sequence may span reads. Text inside a bracketed paste never closes
+/// the view or counts as a prefix.
 #[derive(Default)]
 struct KeyFilter {
     after_prefix: bool,
     in_paste: bool,
-    /// An Esc that ended a read: the start of a sequence if more keys follow, else a lone Esc.
-    held_escape: bool,
+    /// An escape sequence not ended yet: a lone Esc, or the start of a key's sequence, held until
+    /// the next keys or the escape delay show which.
+    sequence: Vec<u8>,
     /// The newest forwarded bytes, enough to recognise a paste marker split across reads.
     recent: Vec<u8>,
 }
 
+/// What a read of the user's keys does.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FilteredKeys {
+    /// The bytes the Tick receives.
+    forwarded: Vec<u8>,
+    /// Whether the keys close the view; keys read after the closing Esc go with it.
+    closes: bool,
+}
+
+/// How a byte read after the start of an escape sequence relates to it.
+enum SequenceStep {
+    Continues,
+    Ends,
+    /// The byte belongs to no sequence begun so far, which therefore ended before it.
+    Breaks,
+}
+
 impl KeyFilter {
-    /// The bytes of `input` the Tick receives.
-    fn feed(&mut self, input: &[u8]) -> Vec<u8> {
-        let mut forwarded = Vec::with_capacity(input.len() + 1);
-        if !input.is_empty() && std::mem::take(&mut self.held_escape) {
-            self.forward(&mut forwarded, ESCAPE);
-        }
-        for (index, &byte) in input.iter().enumerate() {
-            if self.after_prefix {
-                self.after_prefix = false;
-                match byte {
-                    SEND_KEY_PREFIX | ESCAPE => self.forward(&mut forwarded, byte),
-                    other => {
-                        self.forward(&mut forwarded, SEND_KEY_PREFIX);
-                        self.forward(&mut forwarded, other);
+    fn feed(&mut self, input: &[u8]) -> FilteredKeys {
+        let mut keys = FilteredKeys::default();
+        for &byte in input {
+            if !self.sequence.is_empty() {
+                match sequence_step(&self.sequence, byte) {
+                    SequenceStep::Continues => {
+                        self.sequence.push(byte);
+                        continue;
+                    }
+                    SequenceStep::Ends => {
+                        self.sequence.push(byte);
+                        let sequence = std::mem::take(&mut self.sequence);
+                        match kitty_key(&sequence) {
+                            Some(key) => self.key(key, &mut keys),
+                            None => self.forward_sequence(&sequence, &mut keys.forwarded),
+                        }
+                        if keys.closes {
+                            return keys;
+                        }
+                        continue;
+                    }
+                    SequenceStep::Breaks => {
+                        let sequence = std::mem::take(&mut self.sequence);
+                        self.forward_sequence(&sequence, &mut keys.forwarded);
                     }
                 }
-            } else if byte == SEND_KEY_PREFIX && !self.in_paste {
-                self.after_prefix = true;
-            } else if byte == ESCAPE && !self.in_paste && index + 1 == input.len() {
-                self.held_escape = true;
+            }
+            if byte == ESCAPE && !self.in_paste {
+                self.sequence.push(byte);
             } else {
-                self.forward(&mut forwarded, byte);
+                self.key(byte, &mut keys);
             }
         }
-        forwarded
+        keys
     }
 
-    /// Whether a read ended with an Esc that may still begin a sequence.
-    fn holds_escape(&self) -> bool {
-        self.held_escape
+    /// Whether the keys read so far end inside an escape sequence, perhaps a lone Esc.
+    fn holds_sequence(&self) -> bool {
+        !self.sequence.is_empty()
     }
 
-    /// Takes the held Esc once nothing followed it in time: it was pressed alone.
-    fn take_lone_escape(&mut self) -> bool {
-        std::mem::take(&mut self.held_escape)
+    /// Ends the held sequence once nothing followed it within the escape delay: a lone Esc was
+    /// pressed alone, and any other unfinished sequence reaches the Tick as it is.
+    fn flush(&mut self) -> FilteredKeys {
+        let mut keys = FilteredKeys::default();
+        let sequence = std::mem::take(&mut self.sequence);
+        match sequence.as_slice() {
+            [] => {}
+            [ESCAPE] => self.key(ESCAPE, &mut keys),
+            _ => self.forward_sequence(&sequence, &mut keys.forwarded),
+        }
+        keys
+    }
+
+    /// Acts on one key the view has a meaning for, or forwards it: a byte read as it is, or the
+    /// legacy byte of an Esc or Ctrl+B in the kitty keyboard protocol's encoding.
+    fn key(&mut self, byte: u8, keys: &mut FilteredKeys) {
+        if std::mem::take(&mut self.after_prefix) {
+            if !matches!(byte, SEND_KEY_PREFIX | ESCAPE) {
+                self.forward(&mut keys.forwarded, SEND_KEY_PREFIX);
+            }
+            self.forward(&mut keys.forwarded, byte);
+        } else if self.in_paste {
+            self.forward(&mut keys.forwarded, byte);
+        } else if byte == SEND_KEY_PREFIX {
+            self.after_prefix = true;
+        } else if byte == ESCAPE {
+            keys.closes = true;
+        } else {
+            self.forward(&mut keys.forwarded, byte);
+        }
+    }
+
+    /// Forwards an escape sequence that is no key of the view's as it came, in place of any
+    /// prefix before it.
+    fn forward_sequence(&mut self, sequence: &[u8], forwarded: &mut Vec<u8>) {
+        self.after_prefix = false;
+        for &byte in sequence {
+            self.forward(forwarded, byte);
+        }
     }
 
     fn forward(&mut self, forwarded: &mut Vec<u8>, byte: u8) {
@@ -416,6 +510,44 @@ impl KeyFilter {
         } else if self.recent.ends_with(PASTE_END) {
             self.in_paste = false;
         }
+    }
+}
+
+fn sequence_step(sequence: &[u8], byte: u8) -> SequenceStep {
+    if sequence.len() == 1 {
+        return if byte == CONTROL_SEQUENCE_START {
+            SequenceStep::Continues
+        } else {
+            SequenceStep::Breaks
+        };
+    }
+    match byte {
+        _ if sequence.len() >= LONGEST_KEY_SEQUENCE => SequenceStep::Breaks,
+        0x20..=0x3f => SequenceStep::Continues,
+        0x40..=0x7e => SequenceStep::Ends,
+        _ => SequenceStep::Breaks,
+    }
+}
+
+/// The legacy byte of Esc or Ctrl+B when `sequence` is how the kitty keyboard protocol reports
+/// that key pressed or repeated: `CSI 27 u` or `CSI 98;5 u`, perhaps with lock states, an event
+/// type or alternate keys.
+fn kitty_key(sequence: &[u8]) -> Option<u8> {
+    let parameters = sequence.strip_prefix(b"\x1b[")?.strip_suffix(b"u")?;
+    let mut fields = std::str::from_utf8(parameters).ok()?.split(';');
+    let code = fields.next()?.split(':').next()?;
+    let (modifiers, event) = match fields.next() {
+        Some(field) => field.split_once(':').unwrap_or((field, "1")),
+        None => ("1", "1"),
+    };
+    let modifiers = modifiers.parse::<u16>().ok()?.checked_sub(1)? & !KITTY_LOCKS;
+    if !matches!(event, "1" | "2") {
+        return None;
+    }
+    match (code, modifiers) {
+        ("27", 0) => Some(ESCAPE),
+        ("98", KITTY_CONTROL) => Some(SEND_KEY_PREFIX),
+        _ => None,
     }
 }
 
@@ -565,53 +697,120 @@ mod tests {
     }
 
     fn feed_all(filter: &mut KeyFilter, chunks: &[&[u8]]) -> Vec<u8> {
-        chunks.iter().flat_map(|chunk| filter.feed(chunk)).collect()
+        chunks
+            .iter()
+            .flat_map(|chunk| filter.feed(chunk).forwarded)
+            .collect()
     }
+
+    fn forwarded(bytes: &[u8]) -> FilteredKeys {
+        FilteredKeys {
+            forwarded: bytes.to_vec(),
+            closes: false,
+        }
+    }
+
+    const CLOSED: FilteredKeys = FilteredKeys {
+        forwarded: Vec::new(),
+        closes: true,
+    };
 
     #[test]
     fn escape_sequences_alt_keys_and_ordinary_keys_reach_the_tick_unchanged() {
         let mut filter = KeyFilter::default();
-        assert_eq!(
-            filter.feed(b"\x1bjk\x1b[A\xe8\x85\xbe"),
-            b"\x1bjk\x1b[A\xe8\x85\xbe".to_vec()
-        );
+        let typed = b"\x1bjk\x1b[A\x1bOB\x1b[<0;3;4M\xe8\x85\xbe";
+        assert_eq!(filter.feed(typed), forwarded(typed));
         assert_eq!(
             feed_all(&mut filter, &[b"\x1b", b"[B"]),
             b"\x1b[B".to_vec(),
             "a sequence split across reads"
         );
-        assert!(!filter.take_lone_escape());
+        assert!(!filter.holds_sequence());
+        let kitty = b"\x1b[27;1:3u\x1b[27;5u\x1b[13;5u\x1b[98;6u\x1b[97;3u";
+        assert_eq!(
+            filter.feed(kitty),
+            forwarded(kitty),
+            "an Esc release, Ctrl+Esc and other keys in the kitty encoding"
+        );
     }
 
     #[test]
     fn a_lone_escape_closes_the_view_once_nothing_follows_it() {
         let mut filter = KeyFilter::default();
-        assert_eq!(filter.feed(b"ab\x1b"), b"ab".to_vec());
-        assert!(filter.holds_escape());
-        assert!(filter.take_lone_escape(), "a lone Esc closes the view");
-        assert!(!filter.holds_escape());
+        assert_eq!(filter.feed(b"ab\x1b"), forwarded(b"ab"));
+        assert!(filter.holds_sequence());
+        assert_eq!(filter.flush(), CLOSED, "a lone Esc closes the view");
+        assert!(!filter.holds_sequence());
     }
 
     #[test]
-    fn the_prefix_sends_escape_or_itself_once_and_otherwise_both_bytes_even_across_reads() {
+    fn an_escape_in_the_kitty_encoding_closes_the_view_at_once_even_across_reads() {
+        for escape in [
+            b"\x1b[27u".as_slice(),
+            b"\x1b[27;1u",
+            b"\x1b[27;1:1u",
+            b"\x1b[27;1:2u",
+            b"\x1b[27;129u",
+        ] {
+            let mut filter = KeyFilter::default();
+            assert_eq!(
+                filter.feed(&[b"ab", escape, b"cd"].concat()),
+                FilteredKeys {
+                    forwarded: b"ab".to_vec(),
+                    closes: true,
+                },
+                "{escape:?}"
+            );
+        }
         let mut filter = KeyFilter::default();
-        assert_eq!(filter.feed(b"\x02\x1b"), vec![ESCAPE]);
-        assert!(!filter.take_lone_escape(), "Ctrl+B Esc never closes");
+        assert_eq!(filter.feed(b"\x1b[2"), forwarded(b""));
+        assert!(filter.holds_sequence());
+        assert_eq!(filter.feed(b"7u"), CLOSED);
+    }
+
+    #[test]
+    fn an_unfinished_sequence_reaches_the_tick_once_nothing_follows_it() {
+        let mut filter = KeyFilter::default();
+        assert_eq!(filter.feed(b"a\x1b["), forwarded(b"a"));
+        assert_eq!(filter.flush(), forwarded(b"\x1b["), "Alt+[");
+        let long = [b"\x1b[".as_slice(), &[b'1'; LONGEST_KEY_SEQUENCE]].concat();
+        assert_eq!(filter.feed(&long), forwarded(&long));
+        assert!(!filter.holds_sequence(), "no key's sequence is that long");
+    }
+
+    #[test]
+    fn the_prefix_sends_escape_or_itself_once_in_either_encoding_and_otherwise_both_bytes() {
+        for (prefix, escape) in [
+            (b"\x02".as_slice(), b"\x1b".as_slice()),
+            (b"\x1b[98;5u", b"\x1b[27u"),
+        ] {
+            let mut filter = KeyFilter::default();
+            let held = filter.feed(&[prefix, escape].concat());
+            let flushed = filter.flush();
+            assert!(!held.closes && !flushed.closes, "Ctrl+B Esc never closes");
+            assert_eq!([held.forwarded, flushed.forwarded].concat(), [ESCAPE]);
+            assert_eq!(
+                feed_all(&mut filter, &[prefix, prefix]),
+                vec![SEND_KEY_PREFIX]
+            );
+            assert_eq!(
+                feed_all(&mut filter, &[b"ab", prefix, b"qz"]),
+                b"ab\x02qz".to_vec()
+            );
+        }
+        let mut filter = KeyFilter::default();
         assert_eq!(
-            feed_all(&mut filter, &[b"\x02", b"\x02"]),
-            vec![SEND_KEY_PREFIX]
-        );
-        assert_eq!(
-            feed_all(&mut filter, &[b"ab\x02", b"qz"]),
-            b"ab\x02qz".to_vec()
+            filter.feed(b"\x02\x1b[A"),
+            forwarded(b"\x1b[A"),
+            "a sequence after the prefix is sent alone"
         );
     }
 
     #[test]
     fn a_held_prefix_and_a_full_read_go_out_as_requests_the_host_accepts() {
         let mut filter = KeyFilter::default();
-        assert!(filter.feed(&[SEND_KEY_PREFIX]).is_empty());
-        let forwarded = filter.feed(&[b'x'; ATTACH_INPUT_BYTES]);
+        assert!(filter.feed(&[SEND_KEY_PREFIX]).forwarded.is_empty());
+        let forwarded = filter.feed(&[b'x'; ATTACH_INPUT_BYTES]).forwarded;
         assert_eq!(forwarded.len(), ATTACH_INPUT_BYTES + 1);
         let requests: Vec<Value> = input_requests(&forwarded).collect();
         assert_eq!(requests.len(), 2);
@@ -630,14 +829,60 @@ mod tests {
     fn pasted_text_never_closes_the_view_even_when_its_markers_span_reads() {
         let mut filter = KeyFilter::default();
         assert_eq!(
-            feed_all(&mut filter, &[b"\x1b[20", b"0~a\x02\x1b", b"b\x1b[201~"]),
-            b"\x1b[200~a\x02\x1bb\x1b[201~".to_vec()
+            feed_all(
+                &mut filter,
+                &[b"\x1b[20", b"0~a\x02\x1b", b"b\x1b[27u\x1b[201~"]
+            ),
+            b"\x1b[200~a\x02\x1bb\x1b[27u\x1b[201~".to_vec()
         );
-        assert!(!filter.holds_escape(), "an Esc inside the paste is text");
-        assert!(filter.feed(b"\x1b").is_empty());
+        assert!(!filter.holds_sequence(), "an Esc inside the paste is text");
+        assert!(filter.feed(b"\x1b").forwarded.is_empty());
+        assert_eq!(filter.flush(), CLOSED, "Esc closes again after the paste");
+    }
+
+    /// A program that crashed on the alternate screen can leave keyboard flags pushed there; the
+    /// view still reads legacy keys and leaves them as they were. Closing it turns off the input
+    /// modes the Tick's frames turned on, as `python3 -q` does with bracketed paste and
+    /// application cursor and keypad keys, before the Console takes the terminal back.
+    #[test]
+    fn the_view_reads_legacy_keys_on_its_screen_and_turns_off_the_ticks_input_modes() {
+        use tickloop_agent_test_support::kitty_keyboard::{
+            DISAMBIGUATE_ESCAPE_CODES, KittyKeyboard,
+        };
+        let mut output = b"\x1b[?1049h\x1b[>1u\x1b[?1049l".to_vec();
+        output.extend(TAKE_SCREEN.as_bytes());
+        assert_eq!(KittyKeyboard::after(&output).flags(), 0, "legacy keys");
+
+        let mut host = HostScreen::new(24, 80);
+        let (tick, frame) = host.frame(b"\x1b[?2004h\x1b[?1h\x1b=\x1b[?1000h\x1b[?1006h>>> ");
+        output.extend(ViewScreen::new(size(24, 80)).frame(tick, &frame));
+        let mut terminal = vt100::Parser::default();
+        terminal.process(&output);
+        let shown = terminal.screen();
         assert!(
-            filter.take_lone_escape(),
-            "Esc closes again after the paste"
+            shown.bracketed_paste() && shown.application_cursor() && shown.application_keypad()
+        );
+
+        output.extend(RESTORE_TERMINAL.as_bytes());
+        let keyboard = KittyKeyboard::after(&output);
+        assert_eq!(keyboard.alternate(), [DISAMBIGUATE_ESCAPE_CODES]);
+        assert!(keyboard.main().is_empty(), "{keyboard:?}");
+        let mut terminal = vt100::Parser::default();
+        terminal.process(&output);
+        let restored = terminal.screen();
+        assert!(!restored.alternate_screen());
+        assert!(
+            !restored.bracketed_paste()
+                && !restored.application_cursor()
+                && !restored.application_keypad()
+        );
+        assert_eq!(
+            restored.mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        );
+        assert_eq!(
+            restored.mouse_protocol_encoding(),
+            vt100::MouseProtocolEncoding::Default
         );
     }
 }
