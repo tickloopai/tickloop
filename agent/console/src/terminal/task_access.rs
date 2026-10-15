@@ -276,6 +276,7 @@ mod timestamp_tests {
             tickloop_agent_test_support::config(),
             Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
         );
+        runtime.install_own_tickhost();
         let access = Arc::new(OlderTaskRecords(EmbeddedAgentAccess::new(runtime.clone())));
         let agent = ConsoleExecution::from_access_for_test(
             access.clone(),

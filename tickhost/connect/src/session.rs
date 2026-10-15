@@ -191,7 +191,7 @@ impl TickSession {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true);
-        let mut child = child.spawn()?;
+        let mut child = crate::hosted::spawn_child(|| child.spawn())?;
         let process_id = child.id();
         let stdin = child
             .stdin

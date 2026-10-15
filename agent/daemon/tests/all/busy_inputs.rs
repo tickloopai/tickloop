@@ -117,6 +117,7 @@ impl Busy {
             Some(archive) => Agent::open_embedded(archive.clone(), config(), gate.clone()).unwrap(),
             None => Agent::new_embedded(config(), gate.clone()),
         };
+        runtime.install_own_tickhost();
         let access = EmbeddedAgentAccess::new(runtime.clone());
         let mut launch = LaunchSpec::embedded(directory.to_path_buf());
         launch.config_root = archive;

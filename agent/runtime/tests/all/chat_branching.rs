@@ -586,6 +586,7 @@ async fn branch_materializes_summary_tool_and_user_shell_public_types() {
     ]));
     let agent =
         Agent::open_embedded(directory.path().join("state"), config(), model.clone()).unwrap();
+    agent.install_own_tickhost();
     let source_chat_id = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let first = agent
@@ -1045,6 +1046,7 @@ async fn background_user_shell_output_after_branch_stays_in_the_source_chat() {
         Arc::new(ScriptedModel::new(Vec::<Vec<Content>>::new())),
     )
     .unwrap();
+    agent.install_own_tickhost();
     let source_chat_id = agent.create_chat(directory.path().into()).await.unwrap();
     let shell = agent
         .submit_user_shell_for_goal(source_chat_id, None, gated_shell_command(&gate), true)
@@ -1108,6 +1110,7 @@ async fn background_user_shell_output_after_branch_stays_in_the_source_chat() {
         Arc::new(ScriptedModel::new(Vec::<Vec<Content>>::new())),
     )
     .unwrap();
+    reopened.install_own_tickhost();
     let reopened_source = reopened.resume_chat(source_chat_id).await.unwrap();
     assert!(has_task_notification(&reopened_source, shell.command_id));
     let reopened_child = reopened.resume_chat(outcome.child_chat_id).await.unwrap();
@@ -1161,6 +1164,7 @@ async fn background_agent_shell_output_after_branch_stays_in_the_source_chat() {
         text("The source background task is running."),
     ]));
     let agent = Agent::open_embedded(directory.path().join("state"), config(), model).unwrap();
+    agent.install_own_tickhost();
     let source_chat_id = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let source = agent

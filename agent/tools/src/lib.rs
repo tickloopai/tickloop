@@ -29,8 +29,8 @@ pub use search::{GLOB_TOOL_NAME, GREP_TOOL_NAME};
 mod shell;
 pub use shell::CANCELLED_COMMAND_REASON;
 pub use shell::{
-    BASH_TOOL_NAME, ShellExit, ShellHost, ShellLaunch, ShellProcess, TASK_STOP_TOOL_NAME,
-    UserCommandSnapshot,
+    BASH_TOOL_NAME, ShellExit, ShellHost, ShellLaunch, ShellProcess, ShellStartError,
+    TASK_STOP_TOOL_NAME, UserCommandSnapshot,
 };
 mod web;
 pub use web::SecondaryModel;

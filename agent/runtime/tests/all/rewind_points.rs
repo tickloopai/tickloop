@@ -289,6 +289,7 @@ async fn permission_allow_and_deny_comments_reach_history_without_becoming_promp
             text("The permission comment was received"),
         ]));
         let agent = Agent::new_embedded(config(), model.clone());
+        agent.install_own_tickhost();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let mut events = agent.subscribe();
         let receipt = agent
@@ -349,6 +350,7 @@ async fn compaction_commands_and_direct_shell_do_not_capture_points_but_later_pr
         text("Followup after host actions"),
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let first = agent

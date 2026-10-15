@@ -60,14 +60,36 @@ pub struct ShellIdentity {
     pub chat: Uuid,
 }
 
-/// What the Worker approved and checked last: the shell, the command line and the directory it
-/// named; the directory itself travels as a descriptor.
+/// What the Worker approved and checked last: the shell, the command line, the directory it named
+/// and the [`environment_digest`] of the environment it starts with. The directory itself travels
+/// as a descriptor, the environment with the request.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ShellApproval {
     pub shell: PathBuf,
     pub command: String,
     pub cwd: PathBuf,
+    pub environment: String,
+}
+
+/// How a spawn grant binds an environment: SHA-256 over its variables in sorted order, each name
+/// and value prefixed with its length, in hex.
+pub fn environment_digest(environment: &[(Vec<u8>, Vec<u8>)]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut variables = environment.iter().collect::<Vec<_>>();
+    variables.sort();
+    let mut digest = Sha256::new();
+    for (name, value) in variables {
+        for part in [name, value] {
+            digest.update((part.len() as u64).to_be_bytes());
+            digest.update(part);
+        }
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// What one spawn grant admits: one operation of one Worker and Chat, with what was approved.
@@ -383,7 +405,7 @@ impl ShellTask {
                 Ok(())
             });
         }
-        let child = command.spawn().map_err(launch_failed)?;
+        let child = hosted::spawn_child(|| command.spawn()).map_err(launch_failed)?;
         drop(directory);
         let pid = child.id().ok_or_else(|| {
             HostError::before("LaunchFailed", "the shell exited before it started")
@@ -626,8 +648,27 @@ mod tests {
                 shell: "/bin/sh".into(),
                 command: "true".into(),
                 cwd: "/".into(),
+                environment: environment_digest(&[]),
             },
         }
+    }
+
+    #[test]
+    fn an_environment_digest_ignores_the_order_of_variables_but_not_where_one_ends() {
+        let variable =
+            |name: &str, value: &str| (name.as_bytes().to_vec(), value.as_bytes().to_vec());
+        assert_eq!(
+            environment_digest(&[variable("A", "1"), variable("B", "2")]),
+            environment_digest(&[variable("B", "2"), variable("A", "1")])
+        );
+        assert_ne!(
+            environment_digest(&[variable("AB", "C")]),
+            environment_digest(&[variable("A", "BC")])
+        );
+        assert_ne!(
+            environment_digest(&[variable("A", "1")]),
+            environment_digest(&[variable("A", "1"), variable("B", "")])
+        );
     }
 
     #[test]

@@ -425,6 +425,19 @@ impl HostConnection {
     }
 }
 
+/// Outside Linux a received descriptor is close-on-exec only once marked after it arrived, so a
+/// child spawned in between would inherit it. Receiving holds this lock exclusively from arrival
+/// to marking; every spawn of the processes that receive descriptors shares it.
+static DESCRIPTOR_ARRIVAL: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Runs `spawn`, which starts a child process, while no passed descriptor is still arriving.
+pub fn spawn_child<T>(spawn: impl FnOnce() -> T) -> T {
+    let _arrivals = DESCRIPTOR_ARRIVAL
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    spawn()
+}
+
 /// Receives the descriptors a peer passed ahead of its next frame. Nothing may be buffered yet:
 /// the descriptors travel with the first byte after the hello reply.
 pub async fn receive_descriptors(
@@ -513,6 +526,9 @@ fn receive_with_descriptors(
     let flags = libc::MSG_CMSG_CLOEXEC;
     #[cfg(not(target_os = "linux"))]
     let flags = 0;
+    let _arriving = DESCRIPTOR_ARRIVAL
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let received = unsafe { libc::recvmsg(socket, &mut message, flags) };
     if received < 0 {
         return Err(std::io::Error::last_os_error());
@@ -643,6 +659,37 @@ mod tests {
         assert_eq!(
             read_frame(&mut reader, 64).await.unwrap(),
             Some(json!({"method":"spawn"}))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn passed_descriptors_arrive_only_while_no_child_is_being_spawned() {
+        let directory = tempfile::tempdir().unwrap();
+        let folder = std::fs::File::open(directory.path()).unwrap();
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (_, client_writer) = client.into_split();
+        let (server_reader, _) = server.into_split();
+        send_with_descriptors(client_writer.as_ref().as_raw_fd(), &[folder.as_raw_fd()]).unwrap();
+        let receiving = tokio::spawn(async move {
+            let reader = BufReader::new(server_reader);
+            receive_descriptors(&reader, 1).await
+        });
+        spawn_child(|| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(
+                !receiving.is_finished(),
+                "a descriptor arrived while a child was being spawned"
+            );
+        });
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), receiving)
+            .await
+            .expect("the descriptor arrives once the spawn is done")
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.len(), 1);
+        assert_ne!(
+            unsafe { libc::fcntl(received[0].as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
         );
     }
 

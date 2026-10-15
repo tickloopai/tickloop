@@ -1,7 +1,7 @@
 //! The Agent daemon's single controller of the Tickhost. The daemon starts the host on its first
 //! open or Shell spawn, keeps the controller key in its private runtime directory so a restarted
-//! daemon fences the previous one, and never replaces a host it cannot verify. An Agent that runs
-//! without a daemon controls a host of its own, served inside its process.
+//! daemon fences the previous one, and never replaces a host it cannot verify. An Agent without a
+//! daemon that is given a host of its own, as in tests, controls one served inside its process.
 
 use std::{
     io::Write,
@@ -159,7 +159,8 @@ impl HostController {
         )
     }
 
-    /// The controller of a host served inside this process, for an Agent without a daemon.
+    /// The controller of a host served inside this process, for an Agent without a daemon that is
+    /// given a host of its own.
     pub fn in_process(agent_runtime: &Path, paths: HostPaths, daemon_epoch: Uuid) -> Self {
         Self::with_program(
             agent_runtime,

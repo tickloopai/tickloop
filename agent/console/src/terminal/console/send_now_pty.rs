@@ -45,6 +45,7 @@ fn send_now_pty_fixture() {
                         model.clone(),
                         scripted.clone(),
                     );
+                    core.install_own_tickhost();
                     let agent = crate::terminal::execution::ConsoleExecution::from_embedded(
                         core.clone(),
                         model.clone(),

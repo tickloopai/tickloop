@@ -176,6 +176,7 @@ impl tickloop_agent_model::ModelClient for BurstAfterCommand {
 async fn two_slow_observers_recover_the_same_real_command_without_stalling_execution() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(config(), Arc::new(BurstAfterCommand));
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
         .set_execution_mode(chat, tickloop_agent_protocol::ExecutionMode::AcceptEdits)

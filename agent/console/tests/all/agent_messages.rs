@@ -2573,6 +2573,7 @@ async fn family_stop_cancels_owned_background_commands_and_keeps_other_families(
         }
     }));
     let core = Agent::new_embedded(tickloop_agent_test_support::config(), model);
+    core.install_own_tickhost();
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.set_execution_mode(root, tickloop_agent_protocol::ExecutionMode::FullAccess)
         .await
@@ -2646,6 +2647,7 @@ impl DirectedFixture {
             }
         }));
         let core = Agent::new_embedded(tickloop_agent_test_support::config(), model);
+        core.install_own_tickhost();
         let access = EmbeddedAgentAccess::new(core.clone());
         let CommandResult::Created {
             execution: root,
@@ -3382,6 +3384,7 @@ async fn a_background_completion_is_drained_at_the_busy_parents_next_tool_round(
         Some("while [ ! -f parent-release ]; do sleep 0.01; done".into()),
     ));
     let core = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
+    core.install_own_tickhost();
     let directory = tempfile::tempdir().unwrap();
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.set_execution_mode(root, tickloop_agent_protocol::ExecutionMode::FullAccess)
@@ -3662,6 +3665,7 @@ async fn background_completion_obeys_the_same_pending_inbox_limit() {
     });
     let model = Arc::new(timing);
     let core = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
+    core.install_own_tickhost();
     let directory = tempfile::tempdir().unwrap();
     let root = core.create_chat(directory.path().into()).await.unwrap();
     core.set_execution_mode(root, tickloop_agent_protocol::ExecutionMode::FullAccess)

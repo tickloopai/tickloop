@@ -176,6 +176,7 @@ async fn a_shell_subscription_reaches_the_loop_once_when_the_shell_exits() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![]));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let receipt = agent.submit_user_shell_for_goal(chat,None,"printf baseline; while [ ! -f release ]; do sleep 0.02; done; printf ' final-output'; exit 7".into(),true).await.unwrap();
     let center = ShellTaskCenter::new(agent.clone());

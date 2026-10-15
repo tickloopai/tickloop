@@ -228,6 +228,7 @@ async fn direct_user_shell_joins_the_conversation_without_agent_permissions_or_o
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(CapturingModel::default());
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut shell_events = agent.subscribe_user_shells();
 
@@ -319,6 +320,7 @@ async fn direct_user_shell_joins_the_conversation_without_agent_permissions_or_o
 async fn stale_background_update_cannot_replace_a_user_terminal_fact() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(config(), Arc::new(CapturingModel::default()));
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut shell_events = agent.subscribe_user_shells();
     let receipt = agent
@@ -394,6 +396,7 @@ async fn stale_background_update_cannot_replace_a_user_terminal_fact() {
 async fn a_user_shell_can_be_backgrounded_and_stopped_without_a_loop_identity() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(config(), Arc::new(CapturingModel::default()));
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut shell_events = agent.subscribe_user_shells();
     let receipt = agent
@@ -473,6 +476,7 @@ async fn a_user_shell_can_be_backgrounded_and_stopped_without_a_loop_identity() 
 async fn a_user_shell_moved_by_its_timeout_is_announced_as_running_in_the_background() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(config(), Arc::new(CapturingModel::default()));
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut shell_events = agent.subscribe_user_shells();
     let command = "while [ ! -e never ]; do sleep 0.05; done";
@@ -534,6 +538,7 @@ async fn a_background_notification_follows_messages_that_finished_before_it() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(CapturingModel::default());
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut shell_events = agent.subscribe_user_shells();
     agent
@@ -603,6 +608,7 @@ async fn shells_submitted_while_agent_is_busy_are_persisted_and_run_in_order() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(BlockingModel::default());
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut shell_events = agent.subscribe_user_shells();
 
@@ -660,6 +666,7 @@ async fn shell_and_model_inputs_keep_their_typed_submission_order() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(BlockingModel::default());
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
 
@@ -756,6 +763,7 @@ async fn restart_forgets_queued_shell_state_and_does_not_leave_chat_busy() {
     let store = tempfile::tempdir().unwrap();
     let model = Arc::new(BlockingModel::default());
     let source = Agent::open_embedded(store.path().into(), config(), model.clone()).unwrap();
+    source.install_own_tickhost();
     let chat = source.create_chat(directory.path().into()).await.unwrap();
     source
         .submit(chat, None, "hold the execution slot".into())
@@ -781,6 +789,7 @@ async fn restart_forgets_queued_shell_state_and_does_not_leave_chat_busy() {
         Arc::new(CapturingModel::default()),
     )
     .unwrap();
+    recovered.install_own_tickhost();
     let snapshot = recovered.resume_chat(chat).await.unwrap();
     assert!(snapshot.user_shells.is_empty());
     assert!(

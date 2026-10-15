@@ -77,6 +77,7 @@ async fn both_backends_review_authorization_only_after_a_potential_risk() {
                     text("done"),
                 ])),
             );
+            agent.install_own_tickhost();
             let llm = Arc::new(ScriptedModel::new(
                 blocks
                     .iter()
@@ -186,6 +187,7 @@ async fn twenty_screening_hits_cleared_by_authorization_never_trigger_denial_esc
             .collect::<Vec<_>>();
         replies.push(text("done"));
         let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(replies)));
+        agent.install_own_tickhost();
         let blocks = (0..20).flat_map(|_| [true, false]).collect::<Vec<_>>();
         if use_jev {
             agent
@@ -407,6 +409,7 @@ async fn malformed_risk_screen_can_recover_through_authorization_with_identical_
                     text("done"),
                 ])),
             );
+            agent.install_own_tickhost();
             let llm = Arc::new(ScriptedModel::new(vec![
                 text("invalid"),
                 text("invalid"),

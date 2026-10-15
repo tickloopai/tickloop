@@ -34,6 +34,7 @@ async fn builtin_selection_with_a_mock_transport_completes_tools_and_resumes_his
         Arc::new(HttpModelClient::new(config.clone()).unwrap()),
     )
     .unwrap();
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let first = agent
@@ -59,6 +60,7 @@ async fn builtin_selection_with_a_mock_transport_completes_tools_and_resumes_his
         Arc::new(HttpModelClient::new(config).unwrap()),
     )
     .unwrap();
+    reopened.install_own_tickhost();
     reopened.resume_chat(chat).await.unwrap();
     let mut events = reopened.subscribe();
     let second = reopened
@@ -391,6 +393,7 @@ async fn three_http_protocols_switch_only_after_the_running_shell_and_old_tool_r
             original.clone(),
             Arc::new(HttpModelClient::new(original.clone()).unwrap()),
         );
+        agent.install_own_tickhost();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         let initial_model = agent.snapshot(chat).await.unwrap().model;
         let mut events = agent.subscribe();

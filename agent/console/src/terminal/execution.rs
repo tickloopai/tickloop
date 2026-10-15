@@ -541,6 +541,7 @@ impl ConsoleExecution {
         client: Arc<dyn tickloop_agent_model::ModelClient>,
     ) -> Self {
         let core = tickloop_agent_runtime::Agent::new_embedded(model.clone(), client);
+        core.install_own_tickhost();
         Self::from_embedded(core, model)
     }
 
@@ -552,6 +553,7 @@ impl ConsoleExecution {
     ) -> Result<Self, AccessError> {
         let core =
             tickloop_agent_runtime::Agent::open_embedded(root.clone(), model.clone(), client)?;
+        core.install_own_tickhost();
         let mut execution = Self::from_embedded(core, model);
         Arc::get_mut(&mut execution.inner)
             .expect("new execution is unique")

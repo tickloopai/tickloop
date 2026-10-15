@@ -516,6 +516,7 @@ async fn minimax_preview_and_deepseek_recover_malformed_review_without_relaxing_
                 text("done"),
             ])),
         );
+        agent.install_own_tickhost();
         agent
             .set_auto_reviewer(Arc::new(HttpModelClient::new(reviewer_config).unwrap()))
             .await;

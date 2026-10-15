@@ -20,6 +20,7 @@ async fn command_output_is_readable_only_in_the_process_that_ran_it() {
         ])),
     )
     .unwrap();
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent
@@ -69,6 +70,7 @@ async fn command_output_is_readable_only_in_the_process_that_ran_it() {
     drop(agent);
     let model = Arc::new(ScriptedModel::new(Vec::new()));
     let restored = Agent::open_embedded(state, config(), model.clone()).unwrap();
+    restored.install_own_tickhost();
     restored.resume_chat(chat).await.unwrap();
     assert!(restored.commands(chat).await.unwrap().is_empty());
     assert!(restored.read_command(chat, operation, 6, 7).await.is_err());

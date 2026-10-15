@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use tickloop_agent_protocol::CommandState;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::ToolError;
@@ -20,6 +21,9 @@ pub struct ShellLaunch {
     pub cwd: PathBuf,
     pub directory: std::fs::File,
     pub output: std::fs::File,
+    /// Cancelled once the command is stopped or its operation cancelled. A host that sees it
+    /// before dispatching the start dispatches nothing.
+    pub cancel: CancellationToken,
 }
 
 /// How a command ended.
@@ -32,9 +36,20 @@ pub struct ShellExit {
     pub state: CommandState,
 }
 
+/// Why a command was not started as asked.
+#[derive(Debug)]
+pub enum ShellStartError {
+    /// Nothing was dispatched, so nothing runs; [`ToolError::Cancelled`] when the launch was
+    /// cancelled first.
+    NotStarted(ToolError),
+    /// The start was dispatched and its answer lost: the command may have run, and running it
+    /// again may repeat what it did.
+    OutcomeUnknown(String),
+}
+
 #[async_trait::async_trait]
 pub trait ShellHost: Send + Sync {
-    async fn start(&self, launch: ShellLaunch) -> Result<Box<dyn ShellProcess>, ToolError>;
+    async fn start(&self, launch: ShellLaunch) -> Result<Box<dyn ShellProcess>, ShellStartError>;
 }
 
 /// A started command. Dropping it stops the command if it still runs.
@@ -54,9 +69,9 @@ pub(super) struct NoShellHost;
 
 #[async_trait::async_trait]
 impl ShellHost for NoShellHost {
-    async fn start(&self, _: ShellLaunch) -> Result<Box<dyn ShellProcess>, ToolError> {
-        Err(ToolError::Rejected(
+    async fn start(&self, _: ShellLaunch) -> Result<Box<dyn ShellProcess>, ShellStartError> {
+        Err(ShellStartError::NotStarted(ToolError::Rejected(
             "shell commands run in the Tickhost, which this Agent does not have".into(),
-        ))
+        )))
     }
 }

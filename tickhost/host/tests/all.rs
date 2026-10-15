@@ -8,3 +8,5 @@ mod hosted_launch;
 mod protocol;
 #[path = "all/shell_tasks.rs"]
 mod shell_tasks;
+#[path = "all/spawn_paths.rs"]
+mod spawn_paths;

@@ -769,6 +769,7 @@ async fn codex_auto_review_allows_or_blocks_a_real_protected_operation() {
         let client = LoopbackCodexClient::new(config.clone(), &state_dir, endpoint.as_str());
         let client = client.into_fixture_client();
         let agent = Agent::new_embedded(config, client.clone());
+        agent.install_own_tickhost();
         agent.set_auto_reviewer(client).await;
         let chat = agent.create_chat(state_dir.clone()).await.unwrap();
         agent
@@ -887,6 +888,7 @@ async fn explicit_codex_reviewer_uses_its_own_model_and_usage_identity() {
         reviewer_endpoint.as_str(),
     );
     let agent = Agent::new_embedded(main_config.clone(), main_client.into_fixture_client());
+    agent.install_own_tickhost();
     agent
         .set_auto_reviewer(reviewer_client.into_fixture_client())
         .await;

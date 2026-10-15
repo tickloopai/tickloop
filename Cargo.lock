@@ -5015,6 +5015,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tickloop-tick-protocol",
  "tickloop-tickhost-connect",

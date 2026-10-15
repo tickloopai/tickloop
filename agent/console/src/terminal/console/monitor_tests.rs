@@ -370,6 +370,7 @@ async fn shell_detail_live_updates_its_tail_over_the_whole_screen() {
         tickloop_agent_test_support::config(),
         Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
     );
+    core.install_own_tickhost();
     let agent =
         ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -490,6 +491,7 @@ async fn shell_detail_recovers_from_an_output_error() {
         tickloop_agent_test_support::config(),
         Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
     );
+    core.install_own_tickhost();
     let agent =
         ConsoleExecution::from_embedded(core.clone(), tickloop_agent_test_support::config());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();

@@ -602,7 +602,7 @@ mod tests {
     }
 
     fn agent() -> Agent {
-        Agent::new_embedded(
+        let agent = Agent::new_embedded(
             ModelConfig {
                 provider: tickloop_agent_protocol::ModelProvider::Api,
                 auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
@@ -620,7 +620,9 @@ mod tests {
                 input_modalities: vec![InputModality::Text],
             },
             Arc::new(UnusedModel),
-        )
+        );
+        agent.install_own_tickhost();
+        agent
     }
 
     async fn create_chat(agent: &Agent, workdir: &Path) -> ChatId {

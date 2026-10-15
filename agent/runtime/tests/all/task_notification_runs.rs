@@ -113,6 +113,7 @@ async fn background_agent_command_completion_continues_its_goal() {
         text("the background command finished"),
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "start it".into()).await.unwrap();
@@ -183,6 +184,7 @@ async fn a_foreground_command_past_its_timeout_moves_to_the_background_and_notif
         text("the background command finished"),
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "run it".into()).await.unwrap();
@@ -239,6 +241,7 @@ async fn a_foreground_command_the_user_backgrounds_returns_at_once_and_notifies_
         text("the background command finished"),
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "run it".into()).await.unwrap();
@@ -319,6 +322,7 @@ async fn background_user_shell_completion_continues_the_goal_that_started_it() {
         text("the shell command finished"),
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent.submit(chat, None, "hello".into()).await.unwrap();
@@ -363,6 +367,7 @@ async fn background_completion_does_not_resume_an_interrupted_loop() {
         2,
     ));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "start it".into()).await.unwrap();
@@ -416,6 +421,7 @@ async fn background_completion_does_not_resume_a_failed_loop() {
         json!({ "command": gated_command(&gate), "run_in_background": true }),
     )]));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "start it".into()).await.unwrap();
@@ -454,6 +460,7 @@ async fn background_completion_without_a_goal_only_records_the_notification() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(Vec::new()));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
 
     agent
@@ -503,6 +510,7 @@ async fn background_completions_during_a_run_continue_the_goal_once() {
         3,
     ));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "start both".into()).await.unwrap();
@@ -583,6 +591,7 @@ async fn a_completion_inside_a_running_tool_loop_does_not_add_a_run() {
         2,
     ));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     agent.submit(chat, None, "start it".into()).await.unwrap();
@@ -649,6 +658,7 @@ async fn background_completion_does_not_continue_another_chat() {
         text("the shell command finished"),
     ]));
     let agent = Agent::new_embedded(config(), model.clone());
+    agent.install_own_tickhost();
     let first = agent.create_chat(directory.path().into()).await.unwrap();
     let second = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
