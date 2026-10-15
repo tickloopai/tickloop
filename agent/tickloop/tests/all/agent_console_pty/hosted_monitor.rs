@@ -211,19 +211,14 @@ fn selected_row_is_gone(frame: &str) -> bool {
         .any(|line| line.starts_with("enter reopen · x remove"))
 }
 
-/// Moves the Monitor selection to a row whose hosted Tick no longer runs.
-async fn select_gone_row(view: &mut PtyView) {
-    const SETTLE: Duration = Duration::from_millis(150);
-    for key in [b"j", b"k"] {
-        for _ in 0..4 {
-            if selected_row_is_gone(&view.frame()) {
-                return;
-            }
-            view.send(key);
-            tokio::time::sleep(SETTLE).await;
-        }
-    }
-    panic!("no gone row in Monitor: {}", view.frame());
+/// The screen lines of the hosted Tick rows in Monitor.
+fn hosted_rows(frame: &str) -> Vec<usize> {
+    frame
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| monitor_part(line).is_some_and(|part| part.contains('◉')))
+        .map(|(row, _)| row)
+        .collect()
 }
 
 /// The Tick Subscriptions of `execution`'s Chat.
@@ -262,11 +257,13 @@ async fn eventually<T, F: std::future::Future<Output = Option<T>>>(
     .unwrap_or_else(|_| panic!("{what} never happened"))
 }
 
-/// How long a gone row used to stay before it left Monitor by itself.
-const RETIRED_GONE_DISPLAY: Duration = Duration::from_secs(30);
+/// How often the Console probes its hosted Ticks. That an ended Tick's row stays however long
+/// ago it ended is `monitor_rows::builtin`'s `ended_ticks_stay_listed_until_the_user_removes_them`;
+/// here it outlasts the Console's next probe.
+const MEMBER_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A protocol Tick whose process ended by itself keeps its Monitor row, and its launch record,
-/// until its user removes it, well past the 30 seconds after which a gone row used to leave.
+/// until its user removes it, across the Console's later probes and refreshes.
 /// Enter reopens it in its row's place from that record once confirmed, restoring its
 /// subscription by default; `x` takes a gone row out with its record at once, and closes a
 /// reopened one, with the record it was reopened from and its subscription, once confirmed.
@@ -314,15 +311,22 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
         .await;
         view.wait_for("the selected row turns gone", selected_row_is_gone)
             .await;
-        tokio::time::sleep(RETIRED_GONE_DISPLAY + Duration::from_secs(2)).await;
+        tokio::time::sleep(MEMBER_PROBE_INTERVAL + Duration::from_secs(1)).await;
         let later = view.frame();
         assert!(
             later.contains("Monitor 2") && selected_row_is_gone(&later),
             "both gone rows stay: {later}"
         );
-        view.send(b"j");
-        view.wait_for("the other row is gone too", selected_row_is_gone)
-            .await;
+        let other = hosted_rows(&later)
+            .into_iter()
+            .find(|row| Some(*row) != selected_line(&later))
+            .expect("the other hosted row");
+        select_line(&mut view, other).await;
+        assert!(
+            selected_row_is_gone(&view.frame()),
+            "the other row is gone too: {}",
+            view.frame()
+        );
         assert_eq!(
             launch_record_count(&fixture),
             2,
@@ -365,7 +369,21 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
             "the reopened instance's record joins the one it came from and the other gone Tick's"
         );
 
-        select_gone_row(&mut view).await;
+        // The gone row that was not reopened never had a subscription. The reopened row may still
+        // show its ended instance until the Console has the reopen's answer, and would then turn
+        // into the running one under the selection.
+        let frame = view.frame();
+        let not_reopened = hosted_rows(&frame)
+            .into_iter()
+            .find(|row| {
+                frame
+                    .lines()
+                    .nth(*row)
+                    .is_some_and(|line| !line.contains('⟳'))
+            })
+            .expect("the gone row that was not reopened");
+        select_line(&mut view, not_reopened).await;
+        assert!(selected_row_is_gone(&view.frame()), "{}", view.frame());
         view.send(b"x");
         view.wait_for("the gone row leaves at once", |frame| {
             frame.contains("Monitor 1") && frame.contains("enter open · x close")
@@ -863,16 +881,6 @@ async fn view_with_local_ticks(
     view
 }
 
-/// The selected Monitor row's text.
-/// The selected Monitor row's text without the selection mark, its first column included.
-fn selected_text(frame: &str) -> Option<String> {
-    frame.lines().find_map(|line| {
-        let (before, after) = line.split_once(SELECTED_MARK)?;
-        let lead = before.rsplit_once("│ ").map_or(before, |(_, lead)| lead);
-        Some(format!("{lead}{after}"))
-    })
-}
-
 /// The input has the focus again: its prompt and the status bar show and no Monitor row offers
 /// its keys. Unlike the welcome header, none of these scroll away as the conversation grows.
 fn input_focused(frame: &str) -> bool {
@@ -889,20 +897,44 @@ fn monitor_hint(frame: &str) -> &str {
         .unwrap_or_default()
 }
 
+/// The part of a screen line in the Monitor pane, right of its border.
+fn monitor_part(line: &str) -> Option<&str> {
+    line.rsplit_once("│ ").map(|(_, part)| part)
+}
+
+/// The screen line of the selected Monitor row.
+fn selected_line(frame: &str) -> Option<usize> {
+    frame
+        .lines()
+        .position(|line| monitor_part(line).is_some_and(|part| part.contains(SELECTED_MARK)))
+}
+
+/// Moves the Monitor selection to the row on screen line `target` one key at a time, sending each
+/// only once the last one moved the selection, so no key is still on its way when it returns.
+async fn select_line(view: &mut PtyView, target: usize) {
+    loop {
+        let frame = view.frame();
+        let selected =
+            selected_line(&frame).unwrap_or_else(|| panic!("no Monitor row is selected: {frame}"));
+        if selected == target {
+            return;
+        }
+        view.send(if target > selected { b"j" } else { b"k" });
+        view.wait_for("the Monitor selection to move", |frame| {
+            selected_line(frame) != Some(selected)
+        })
+        .await;
+    }
+}
+
 /// Moves the Monitor selection to the row that names `needle`.
 async fn select_row(view: &mut PtyView, needle: &str) {
-    const STEPS: usize = 8;
-    const SETTLE: Duration = Duration::from_millis(150);
-    for key in [b"j", b"k"] {
-        for _ in 0..STEPS {
-            if selected_text(&view.frame()).is_some_and(|row| row.contains(needle)) {
-                return;
-            }
-            view.send(key);
-            tokio::time::sleep(SETTLE).await;
-        }
-    }
-    panic!("no Monitor row names {needle:?}: {}", view.frame());
+    let frame = view.frame();
+    let target = frame
+        .lines()
+        .position(|line| monitor_part(line).is_some_and(|part| part.contains(needle)))
+        .unwrap_or_else(|| panic!("no Monitor row names {needle:?}: {frame}"));
+    select_line(view, target).await;
 }
 
 /// Waits until a view took the terminal: the Console's frame is gone from the screen.

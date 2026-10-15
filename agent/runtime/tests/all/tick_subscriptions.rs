@@ -2029,6 +2029,13 @@ fn delivery_payload(text: &str) -> serde_json::Value {
     .unwrap()
 }
 
+/// The delivery the model received in its request `index`. The turn after a delivery may start
+/// as soon as the delivery's own turn ends, so a test that follows several turns reads each by
+/// its request, never as the newest one.
+fn delivery_in_request(model: &ScriptedModel, index: usize) -> serde_json::Value {
+    delivery_payload(&user_text(model, index))
+}
+
 /// The item of `payload` for `instance`.
 fn delivered_item<'a>(
     payload: &'a serde_json::Value,
@@ -2240,7 +2247,7 @@ async fn items_that_do_not_fit_one_delivery_arrive_in_the_next_turn() {
 
     tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
-    let first = delivery_payload(&last_user_text(&model));
+    let first = delivery_in_request(&model, 1);
     let first_items = first["items"].as_array().unwrap().len();
     assert!((1..5).contains(&first_items), "{first}");
     assert_eq!(first["more_next_turn"], 5 - first_items);
@@ -2252,7 +2259,7 @@ async fn items_that_do_not_fit_one_delivery_arrive_in_the_next_turn() {
         started.elapsed() < HIGH_PERIOD,
         "the rest arrives in the next turn, not a period later"
     );
-    let second = delivery_payload(&last_user_text(&model));
+    let second = delivery_in_request(&model, 2);
     assert!(second.get("more_next_turn").is_none(), "{second}");
     let mut delivered: Vec<_> = [&first, &second]
         .iter()
@@ -2365,8 +2372,7 @@ async fn an_item_that_waited_goes_before_newer_ones() {
     wait_for_completion(&mut events).await;
 
     let delivered = |index: usize| {
-        let payload = delivery_payload(&user_text(&model, index));
-        payload["items"]
+        delivery_in_request(&model, index)["items"]
             .as_array()
             .unwrap()
             .iter()
@@ -2464,12 +2470,12 @@ async fn a_deferred_item_holds_no_data_and_is_read_again_in_its_turn() {
 
     tokio::time::advance(HIGH_PERIOD).await;
     wait_for_completion(&mut events).await;
-    let first = delivery_payload(&last_user_text(&model));
+    let first = delivery_in_request(&model, 1);
     assert_eq!(first["items"].as_array().unwrap().len(), 3, "{first}");
     assert_eq!(first["more_next_turn"], 1);
 
     wait_for_completion(&mut events).await;
-    let second = delivery_payload(&last_user_text(&model));
+    let second = delivery_in_request(&model, 2);
     let item = delivered_item(&second, &instances[3]);
     assert_eq!(item["data"]["phase"], "read again", "{item}");
     assert_eq!(item["seq"], "1→2");
@@ -2597,7 +2603,7 @@ async fn many_subscribed_instances_are_delivered_over_turns_of_at_most_sixteen_k
     while delivered.len() < instances.len() {
         wait_for_completion(&mut events).await;
         turns += 1;
-        let text = last_user_text(&model);
+        let text = user_text(&model, turns);
         assert!(
             text.len() <= MAX_DELIVERY_PAYLOAD_BYTES + 500,
             "{} bytes",
