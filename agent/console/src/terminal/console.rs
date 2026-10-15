@@ -10362,6 +10362,11 @@ impl State {
                     super::tick_actions::TickDetailKey::Action(action) => {
                         Some(InputEvent::TickAction { chat, action })
                     }
+                    super::tick_actions::TickDetailKey::Finish(action) => {
+                        self.monitor.close_detail();
+                        self.rendered_region = None;
+                        Some(InputEvent::TickAction { chat, action })
+                    }
                 };
             }
             let mut types_into_input = false;

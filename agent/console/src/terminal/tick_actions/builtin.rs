@@ -132,7 +132,8 @@ async fn refresh_subscriptions(ctx: &TickActionContext<'_>) -> Result<(), String
     ctx.console.update_subscribed_ticks(ctx.chat, &rows)
 }
 /// Changes or cancels one subscription for the subscription detail `panel`, which reports a
-/// refusal; either way Monitor then shows the subscriptions as the Agent holds them.
+/// refusal, or the status line once the panel closed; either way Monitor then shows the
+/// subscriptions as the Agent holds them.
 pub(in crate::terminal) fn change_subscription(
     panel: Uuid,
     request: SubscriptionRequest,
@@ -151,13 +152,17 @@ impl TickActionBackend for ChangeSubscription {
             .update_tick_subscription(ctx.chat, self.request.subscription, self.request.change)
             .await
         {
-            ctx.update_detail(self.panel, |detail: &mut SubscriptionDetail| {
-                detail.report_error(format!(
-                    "Cannot update the Tick Subscription: {}",
-                    safe_text(&error.to_string())
-                ));
+            let message = format!(
+                "Cannot update the Tick Subscription: {}",
+                safe_text(&error.to_string())
+            );
+            let reported = ctx.update_detail(self.panel, |detail: &mut SubscriptionDetail| {
+                detail.report_error(message.clone());
                 Some(())
             })?;
+            if reported.is_none() {
+                ctx.notify(&message)?;
+            }
         }
         refresh_subscriptions(&ctx).await
     }

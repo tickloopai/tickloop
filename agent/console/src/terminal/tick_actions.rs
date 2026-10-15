@@ -26,6 +26,8 @@ pub enum TickDetailKey {
     None,
     Back,
     Action(PreparedTickAction),
+    /// Runs the action and closes the detail, which has nothing left to show.
+    Finish(PreparedTickAction),
 }
 pub struct TickConfirmationView {
     pub title: String,

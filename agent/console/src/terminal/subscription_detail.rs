@@ -45,6 +45,15 @@ pub(super) struct SubscriptionRequest {
     pub(super) change: TickSubscriptionChange,
 }
 
+/// Where a key leaves the detail.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DetailStep {
+    Stay,
+    Request(SubscriptionRequest),
+    /// Closes the detail, after asking for the change when there is one.
+    Leave(Option<SubscriptionRequest>),
+}
+
 pub(super) struct SubscriptionDetail {
     id: Uuid,
     chat: Uuid,
@@ -56,6 +65,9 @@ pub(super) struct SubscriptionDetail {
     focus: SubscriptionFocus,
     /// The periodic frequency the cursor is on while the user picks one.
     frequency_choice: TickSubscriptionFrequency,
+    /// The row's frequency key opened the detail straight into the picker, so leaving the picker
+    /// leaves the detail.
+    is_frequency_entry: bool,
     top: usize,
     error: Option<String>,
     display: DisplayProfile,
@@ -81,6 +93,7 @@ impl SubscriptionDetail {
             goals,
             focus: SubscriptionFocus::List,
             frequency_choice: TickSubscriptionFrequency::PERIODIC[0],
+            is_frequency_entry: false,
             top: 0,
             error: None,
             display,
@@ -88,7 +101,10 @@ impl SubscriptionDetail {
         if detail.rows.len() == 1 {
             match operation {
                 SubscriptionOperation::View => {}
-                SubscriptionOperation::EditFrequency => detail.edit_frequency(),
+                SubscriptionOperation::EditFrequency => {
+                    detail.edit_frequency();
+                    detail.is_frequency_entry = detail.focus == SubscriptionFocus::Frequency;
+                }
                 SubscriptionOperation::Cancel => {
                     detail.focus = SubscriptionFocus::CancelConfirmation
                 }
@@ -138,7 +154,7 @@ impl SubscriptionDetail {
         self.error = Some(message);
     }
 
-    fn apply_key(&mut self, key: KeyEvent) -> Result<Option<SubscriptionRequest>, bool> {
+    fn apply_key(&mut self, key: KeyEvent) -> DetailStep {
         self.error = None;
         match self.focus {
             SubscriptionFocus::List => match (key.code, key.modifiers) {
@@ -154,7 +170,7 @@ impl SubscriptionDetail {
                         self.focus = SubscriptionFocus::CancelConfirmation;
                     }
                 }
-                (KeyCode::Esc | KeyCode::Left, _) => return Err(true),
+                (KeyCode::Esc | KeyCode::Left, _) => return DetailStep::Leave(None),
                 _ => {}
             },
             SubscriptionFocus::Frequency => match (key.code, key.modifiers) {
@@ -162,17 +178,29 @@ impl SubscriptionDetail {
                 | (KeyCode::Char('p'), KeyModifiers::CONTROL) => self.choose_by(-1),
                 (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
                 | (KeyCode::Char('n'), KeyModifiers::CONTROL) => self.choose_by(1),
+                (KeyCode::Esc, _) if self.is_frequency_entry => return DetailStep::Leave(None),
                 (KeyCode::Esc, _) => self.leave_editing(),
-                (KeyCode::Enter, _) => return Ok(self.confirm_frequency()),
+                (KeyCode::Enter, _) => {
+                    let is_frequency_entry = self.is_frequency_entry;
+                    let request = self.chosen_frequency();
+                    if is_frequency_entry {
+                        return DetailStep::Leave(request);
+                    }
+                    if let Some(request) = request {
+                        return DetailStep::Request(request);
+                    }
+                }
                 _ => {}
             },
             SubscriptionFocus::CancelConfirmation => match (key.code, key.modifiers) {
                 (KeyCode::Enter, _) | (KeyCode::Char('y'), KeyModifiers::NONE) => {
                     self.focus = SubscriptionFocus::List;
-                    return Ok(self.selected.map(|subscription| SubscriptionRequest {
-                        subscription,
-                        change: TickSubscriptionChange::Cancel,
-                    }));
+                    if let Some(subscription) = self.selected {
+                        return DetailStep::Request(SubscriptionRequest {
+                            subscription,
+                            change: TickSubscriptionChange::Cancel,
+                        });
+                    }
                 }
                 (KeyCode::Esc, _) | (KeyCode::Char('n'), KeyModifiers::NONE) => {
                     self.focus = SubscriptionFocus::List;
@@ -180,7 +208,7 @@ impl SubscriptionDetail {
                 _ => {}
             },
         }
-        Ok(None)
+        DetailStep::Stay
     }
 
     /// Starts picking a frequency for the selected subscription; an immediate one has none to pick.
@@ -206,7 +234,7 @@ impl SubscriptionDetail {
     }
 
     /// Asks for the chosen frequency, or nothing when it is the one the subscription has.
-    fn confirm_frequency(&mut self) -> Option<SubscriptionRequest> {
+    fn chosen_frequency(&mut self) -> Option<SubscriptionRequest> {
         let current = self.selected_row().map(|row| (row.id, row.frequency));
         self.leave_editing();
         let (subscription, frequency) = current?;
@@ -218,6 +246,7 @@ impl SubscriptionDetail {
 
     fn leave_editing(&mut self) {
         self.focus = SubscriptionFocus::List;
+        self.is_frequency_entry = false;
     }
 
     fn move_by(&mut self, step: isize) {
@@ -400,17 +429,22 @@ impl TickDetailView for SubscriptionDetail {
     }
 
     fn key(&mut self, key: KeyEvent, _width: usize, _height: usize) -> TickDetailKey {
-        match self.apply_key(key) {
-            Err(_) => TickDetailKey::Back,
-            Ok(None) => TickDetailKey::None,
-            Ok(Some(request)) => TickDetailKey::Action(PreparedTickAction::new(
+        let step = self.apply_key(key);
+        let prepare = |request: SubscriptionRequest| {
+            PreparedTickAction::new(
                 self.instance.to_string(),
                 match request.change {
                     TickSubscriptionChange::Frequency(_) => FREQUENCY_KEY,
                     TickSubscriptionChange::Cancel => UNSUBSCRIBE_KEY,
                 },
                 super::tick_actions::builtin::change_subscription(self.id, request),
-            )),
+            )
+        };
+        match step {
+            DetailStep::Stay => TickDetailKey::None,
+            DetailStep::Request(request) => TickDetailKey::Action(prepare(request)),
+            DetailStep::Leave(None) => TickDetailKey::Back,
+            DetailStep::Leave(Some(request)) => TickDetailKey::Finish(prepare(request)),
         }
     }
 
@@ -560,10 +594,8 @@ mod tests {
 
     #[test]
     fn a_frequency_is_picked_among_the_three_periodic_ones_only() {
-        let mut detail = detail(
-            vec![row(3, TickSubscriptionFrequency::Medium)],
-            SubscriptionOperation::EditFrequency,
-        );
+        let mut detail = detail_from_list(TickSubscriptionFrequency::Medium);
+        press(&mut detail, KeyCode::Char('e'));
         assert_eq!(detail.focus(), SubscriptionFocus::Frequency);
         assert_eq!(detail.hint(), "j/k select · enter save · esc back");
         assert_eq!(
@@ -593,31 +625,66 @@ mod tests {
 
         assert_eq!(
             detail.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            Ok(Some(SubscriptionRequest {
+            DetailStep::Request(SubscriptionRequest {
                 subscription: Uuid::from_u128(3),
                 change: TickSubscriptionChange::Frequency(TickSubscriptionFrequency::High),
-            }))
+            })
         );
         assert_eq!(detail.focus(), SubscriptionFocus::List);
     }
 
     #[test]
-    fn keeping_the_current_frequency_or_escaping_changes_nothing() {
+    fn a_frequency_picked_straight_from_the_row_saves_on_enter_and_leaves_the_detail() {
         let mut detail = detail(
+            vec![row(3, TickSubscriptionFrequency::Medium)],
+            SubscriptionOperation::EditFrequency,
+        );
+        press(&mut detail, KeyCode::Char('j'));
+
+        match press(&mut detail, KeyCode::Enter) {
+            TickDetailKey::Finish(action) => assert_eq!(action.key, 'e'),
+            _ => panic!("Enter saves the frequency with no further step"),
+        }
+    }
+
+    #[test]
+    fn keeping_the_current_frequency_or_escaping_changes_nothing() {
+        let mut unchanged = detail(
             vec![row(3, TickSubscriptionFrequency::Low)],
             SubscriptionOperation::EditFrequency,
         );
-        assert_eq!(requested(press(&mut detail, KeyCode::Enter)), None);
-        assert_eq!(detail.focus(), SubscriptionFocus::List);
+        assert!(
+            matches!(press(&mut unchanged, KeyCode::Enter), TickDetailKey::Back),
+            "the picker opened from the row returns to the row unchanged"
+        );
 
-        press(&mut detail, KeyCode::Char('e'));
-        press(&mut detail, KeyCode::Char('k'));
+        let mut from_list = detail_from_list(TickSubscriptionFrequency::Low);
+        press(&mut from_list, KeyCode::Char('e'));
+        assert_eq!(requested(press(&mut from_list, KeyCode::Enter)), None);
+        assert_eq!(from_list.focus(), SubscriptionFocus::List);
+
+        press(&mut from_list, KeyCode::Char('e'));
+        press(&mut from_list, KeyCode::Char('k'));
         assert!(matches!(
-            press(&mut detail, KeyCode::Esc),
+            press(&mut from_list, KeyCode::Esc),
             TickDetailKey::None
         ));
-        assert_eq!(detail.focus(), SubscriptionFocus::List);
-        assert_eq!(text(&mut detail)[2], "› ⟳ low · every 30 min");
+        assert_eq!(from_list.focus(), SubscriptionFocus::List);
+        assert_eq!(text(&mut from_list)[2], "› ⟳ low · every 30 min");
+
+        let mut from_row = detail(
+            vec![row(3, TickSubscriptionFrequency::Low)],
+            SubscriptionOperation::EditFrequency,
+        );
+        press(&mut from_row, KeyCode::Char('k'));
+        assert!(matches!(
+            press(&mut from_row, KeyCode::Esc),
+            TickDetailKey::Back
+        ));
+    }
+
+    fn detail_from_list(frequency: TickSubscriptionFrequency) -> SubscriptionDetail {
+        detail(vec![row(3, frequency)], SubscriptionOperation::View)
     }
 
     #[test]
@@ -667,10 +734,10 @@ mod tests {
         press(&mut detail, KeyCode::Char('u'));
         assert_eq!(
             detail.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            Ok(Some(SubscriptionRequest {
+            DetailStep::Request(SubscriptionRequest {
                 subscription: Uuid::from_u128(4),
                 change: TickSubscriptionChange::Cancel,
-            }))
+            })
         );
     }
 

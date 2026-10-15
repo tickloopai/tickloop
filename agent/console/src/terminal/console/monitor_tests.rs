@@ -2103,6 +2103,29 @@ fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() 
 }
 
 #[test]
+fn the_row_frequency_key_saves_the_picked_frequency_on_enter_without_another_step() {
+    let mut state = subscribed_fixture(1);
+    assert_eq!(requested_key(press(&mut state, KeyCode::Char('e'))), 'e');
+    press(&mut state, KeyCode::Char('j'));
+
+    assert_eq!(requested_key(press(&mut state, KeyCode::Enter)), 'e');
+    assert!(
+        state.monitor.detail.is_none(),
+        "the change applies and Monitor returns to its rows: {}",
+        monitor_text(&mut state)
+    );
+    assert!(state.monitor.focused);
+    assert!(!state.input_dialog_visible());
+
+    press(&mut state, KeyCode::Char('e'));
+    assert!(press(&mut state, KeyCode::Esc).is_none());
+    assert!(
+        state.monitor.detail.is_none(),
+        "Esc returns without a change"
+    );
+}
+
+#[test]
 fn several_subscriptions_on_one_row_show_a_summary_and_open_as_a_list() {
     let mut state = subscribed_fixture(3);
     let text = monitor_text(&mut state);
