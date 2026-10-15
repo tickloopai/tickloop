@@ -1627,7 +1627,7 @@ fn row_details_end_at_the_monitor_edge_and_the_mark_leads_the_row_at_any_width()
         };
         let subscribed_row = monitor_rows("python3 -q").remove(0);
         assert!(
-            subscribed_row.starts_with("↻ ") && subscribed_row.matches('↻').count() == 1,
+            subscribed_row.starts_with("⟳ ") && subscribed_row.matches('⟳').count() == 1,
             "{width}: the mark leads the row, a blank column after it: {subscribed_row:?}"
         );
         let running_rows = monitor_rows("cargo nextest");
@@ -1826,10 +1826,10 @@ fn a_finished_background_shell_leaves_once_handled_unless_its_detail_is_open() {
             lines
                 .iter()
                 .flat_map(|line| &line.spans)
-                .any(|span| span.role == Some(Role::UpdateSquare))
+                .any(|span| span.role == Some(Role::UpdateMark))
                 && !text.contains('●')
                 && !text.contains("1s"),
-            "an unread end shows its square and no time: {text}"
+            "an unread end shows its glyph in the update colour and no time: {text}"
         );
         assert!(
             lines.iter().all(|line| line.band.is_none()),
@@ -2127,7 +2127,7 @@ fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() 
     let text = monitor_text(&mut state);
     let row = text.lines().find(|line| line.contains("calendar")).unwrap();
     assert!(
-        row.rsplit_once("│ ").unwrap().1.starts_with('↻')
+        row.rsplit_once("│ ").unwrap().1.starts_with('⟳')
             && !row.contains("high")
             && !text.contains("live"),
         "the mark leads the row: {text}"
@@ -2159,17 +2159,17 @@ fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() 
     assert_eq!(requested_key(press(&mut state, KeyCode::Char('w'))), 'w');
     let text = monitor_text(&mut state);
     assert!(text.contains("Tick Subscriptions 1"), "{text}");
-    assert!(text.contains("› ↻ high · every 1 min"), "{text}");
+    assert!(text.contains("› ⟳ high · every 1 min"), "{text}");
     assert!(!state.input_dialog_visible(), "the detail stays in Monitor");
 
     assert_eq!(requested_key(press(&mut state, KeyCode::Char('f'))), 'f');
     assert!(
-        monitor_text(&mut state).contains("› ↻ medium · every 10 min"),
+        monitor_text(&mut state).contains("› ⟳ medium · every 10 min"),
         "the detail shows the new frequency at once"
     );
     assert_eq!(requested_key(press(&mut state, KeyCode::Char('f'))), 'f');
     let text = monitor_text(&mut state);
-    assert!(text.contains("› ↻ low · every 30 min"), "{text}");
+    assert!(text.contains("› ⟳ low · every 30 min"), "{text}");
     assert!(
         press(&mut state, KeyCode::Char('e')).is_none() && state.monitor.detail.is_some(),
         "e no longer changes anything"
@@ -2240,7 +2240,7 @@ fn several_subscriptions_on_one_row_show_a_summary_and_open_as_a_list() {
     let text = monitor_text(&mut state);
     let row = text.lines().find(|line| line.contains("calendar")).unwrap();
     assert!(
-        row.rsplit_once("│ ").unwrap().1.starts_with('↻') && !row.contains('3'),
+        row.rsplit_once("│ ").unwrap().1.starts_with('⟳') && !row.contains('3'),
         "several subscriptions show one mark without a count: {text}"
     );
     assert!(
@@ -2258,6 +2258,88 @@ fn several_subscriptions_on_one_row_show_a_summary_and_open_as_a_list() {
     press(&mut state, KeyCode::Char('j'));
     press(&mut state, KeyCode::Char('u'));
     assert!(monitor_text(&mut state).contains("Cancel Tick Subscription"));
+}
+
+#[test]
+fn a_cancel_from_the_row_returns_to_the_list_on_that_row_once_it_goes_through() {
+    let mut state = subscribed_fixture(2);
+    let row = state.monitor.selected().unwrap().instance.clone();
+    assert_eq!(requested_key(press(&mut state, KeyCode::Char('u'))), 'u');
+    press(&mut state, KeyCode::Char('u'));
+    assert_eq!(requested_key(press(&mut state, KeyCode::Enter)), 'u');
+    state.monitor.rebuild();
+    assert!(
+        state.monitor.detail.is_some(),
+        "the detail waits for the cancel to go through"
+    );
+
+    state.monitor.subscriptions.remove(0);
+    state.monitor.rebuild();
+    let text = monitor_text(&mut state);
+    assert!(state.monitor.detail.is_none(), "{text}");
+    assert!(!text.contains("Tick Subscriptions"), "{text}");
+    assert!(state.monitor.focused);
+    assert_eq!(
+        state.monitor.selected().map(|entry| entry.instance.clone()),
+        Some(row),
+        "the row keeps the selection"
+    );
+
+    let mut single = subscribed_fixture(1);
+    assert_eq!(requested_key(press(&mut single, KeyCode::Char('u'))), 'u');
+    assert_eq!(requested_key(press(&mut single, KeyCode::Enter)), 'u');
+    single.monitor.subscriptions.clear();
+    single.monitor.rebuild();
+    assert!(single.monitor.detail.is_none());
+    assert!(
+        !monitor_text(&mut single).contains("Tick Subscriptions"),
+        "no empty detail is left behind"
+    );
+}
+
+#[test]
+fn a_refused_cancel_stays_on_the_detail_with_its_reason() {
+    let mut state = subscribed_fixture(1);
+    assert_eq!(requested_key(press(&mut state, KeyCode::Char('u'))), 'u');
+    assert_eq!(requested_key(press(&mut state, KeyCode::Enter)), 'u');
+    state
+        .monitor
+        .detail
+        .as_mut()
+        .and_then(|detail| {
+            detail
+                .as_any_mut()
+                .downcast_mut::<super::super::subscription_detail::SubscriptionDetail>()
+        })
+        .unwrap()
+        .report("Cannot update the Tick Subscription: refused".into());
+    state.monitor.rebuild();
+    assert!(state.monitor.detail.is_some());
+    let text = monitor_text(&mut state);
+    assert!(text.contains("Tick Subscriptions 1"), "{text}");
+    assert!(
+        text.contains("Cannot update the Tick Subscription: refused"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_subscription_detail_opened_to_view_closes_once_no_subscription_is_left() {
+    let mut state = subscribed_fixture(2);
+    assert_eq!(requested_key(press(&mut state, KeyCode::Char('w'))), 'w');
+    press(&mut state, KeyCode::Char('u'));
+    assert_eq!(requested_key(press(&mut state, KeyCode::Enter)), 'u');
+    state.monitor.subscriptions.remove(0);
+    state.monitor.rebuild();
+    assert!(
+        monitor_text(&mut state).contains("Tick Subscriptions 1"),
+        "it stays while one is left"
+    );
+
+    state.monitor.subscriptions.clear();
+    state.monitor.rebuild();
+    assert!(state.monitor.detail.is_none());
+    assert!(!monitor_text(&mut state).contains("Tick Subscriptions"));
 }
 
 #[tokio::test]
@@ -2728,7 +2810,7 @@ fn an_artifact_linked_here_shows_no_subscription_mark_and_x_unlinks_it() {
     let text = monitor_text(&mut state);
     let row = text.lines().find(|line| line.contains("Brief")).unwrap();
     assert!(
-        row.trim_end().ends_with("Brief") && !row.contains('●') && !row.contains('↻'),
+        row.trim_end().ends_with("Brief") && !row.contains('●') && !row.contains('⟳'),
         "an artifact never shows a Tick Subscription: {row}"
     );
     assert_eq!(
@@ -2752,7 +2834,7 @@ fn a_paused_association_stays_in_words() {
     let text = monitor_text(&mut state);
     let row = text.lines().find(|line| line.contains("Brief")).unwrap();
     assert!(
-        row.contains("feedback paused") && !row.contains('↻'),
+        row.contains("feedback paused") && !row.contains('⟳'),
         "{row}"
     );
     assert_eq!(action_labels(&state)[1], ('x', "unlink"));

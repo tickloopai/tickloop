@@ -201,33 +201,32 @@ pub(super) enum Role {
     AgentCyan,
     /// State marks: the glyph that leads a Monitor or Subagents row and carries its state in the
     /// accent, success, error or warning colour. A running row's mark blinks between
-    /// `RunningMark` and the dimmed `RunningMarkDim`, and a Monitor row's mark flashes them once
-    /// for each new update.
+    /// `RunningMark` and the dimmed `RunningMarkDim`.
     RunningMark,
     RunningMarkDim,
     SuccessMark,
     ErrorMark,
     WarningMark,
-    /// A Monitor row's update it has not handed over: a square painted in the accent colour in
-    /// the row's lead, kept on a selected row.
-    UpdateSquare,
+    /// A Monitor row's glyph while the row holds an update the Chat has not handled, over its
+    /// state colour: the accent's hue, clear on the row's every background, and its dimmed phase,
+    /// which each new update flashes once.
+    UpdateMark,
+    UpdateMarkDim,
     /// A one-off flash alternates these fills: strong, soft, strong. A Monitor row flashes them
     /// as an Agent turn takes its update in.
     FlashStrong,
     FlashSoft,
-    /// A Monitor row's `↻`, one hue from the brightest for the most frequent subscription to the
+    /// A Monitor row's `⟳`, one hue from the brightest for the most frequent subscription to the
     /// dimmest for the least. Marks, so a selected row keeps them.
     SubscriptionHigh,
     SubscriptionMedium,
     SubscriptionLow,
-    /// The bar that runs from a Monitor row's update square while a periodic subscription holds
-    /// the update, to the part of the period elapsed before its next check hands it to the
-    /// Agent: the square's hue, dimmed, on a selected row too. A flashing square dims to it.
+    /// The bar that runs from a Monitor row's first column while a periodic subscription holds
+    /// an update, to the part of the period elapsed before its next check hands it to the Agent:
+    /// the accent's hue, dimmed, on a selected row too.
     UpdateProgress,
-    /// The update square of a row with periodic subscriptions, which holds their `↻`, and its
-    /// dimmed flash phase: the square's backgrounds with a foreground that stays clear on each.
-    SubscriptionSquare,
-    SubscriptionSquareDim,
+    /// A Monitor row's `⟳` where the update bar covers it: one foreground clear on the bar.
+    SubscriptionOnProgress,
     /// A Markdown link label: the terminal's own blue, as Claude Code's `chalk.blue`.
     Link,
     /// Inline code inside strong text or a heading: the code colour, still bold.
@@ -313,15 +312,15 @@ impl Role {
         Self::SuccessMark,
         Self::ErrorMark,
         Self::WarningMark,
-        Self::UpdateSquare,
+        Self::UpdateMark,
+        Self::UpdateMarkDim,
         Self::FlashStrong,
         Self::FlashSoft,
         Self::SubscriptionHigh,
         Self::SubscriptionMedium,
         Self::SubscriptionLow,
         Self::UpdateProgress,
-        Self::SubscriptionSquare,
-        Self::SubscriptionSquareDim,
+        Self::SubscriptionOnProgress,
         Self::Link,
         Self::StrongCode,
         Self::MutedStrong,
@@ -341,8 +340,8 @@ impl Role {
         Self::CodeMeta,
     ];
 
-    /// Agent Colors and marks only paint marks, such as a member dot, a row's state glyph, its
-    /// `↻` or its update square, never the words of a row.
+    /// Agent Colors and marks only paint marks, such as a member dot, a row's glyph or its `⟳`,
+    /// never the words of a row.
     const fn is_mark(self) -> bool {
         matches!(
             self,
@@ -359,13 +358,13 @@ impl Role {
                 | Self::SuccessMark
                 | Self::ErrorMark
                 | Self::WarningMark
-                | Self::UpdateSquare
+                | Self::UpdateMark
+                | Self::UpdateMarkDim
                 | Self::UpdateProgress
                 | Self::SubscriptionHigh
                 | Self::SubscriptionMedium
                 | Self::SubscriptionLow
-                | Self::SubscriptionSquare
-                | Self::SubscriptionSquareDim
+                | Self::SubscriptionOnProgress
         )
     }
 
@@ -572,24 +571,27 @@ const DARK_PALETTE: [Style; ROLE_COUNT] = [
     fg(78, 186, 101), // SuccessMark     <- success
     fg(255, 107, 128), // ErrorMark       <- error
     fg(255, 193, 7),  // WarningMark     <- warning
-    bg(215, 119, 87), // UpdateSquare    <- claude, as a background
-    bg(95, 61, 50),   // FlashStrong     <- local: claude tinted into the dark background
-    bg(58, 43, 39),   // FlashSoft       <- local: claude tinted half as strong
+    // The accent itself falls under 3:1 on the selection and the update bar, so the update mark
+    // is a lighter tint of its hue.
+    fg(255, 160, 120), // UpdateMark      <- local: claude, lightened
+    Style {
+        dim: true,
+        ..fg(255, 160, 120)
+    }, // UpdateMarkDim
+    bg(95, 61, 50),    // FlashStrong     <- local: claude tinted into the dark background
+    bg(58, 43, 39),    // FlashSoft       <- local: claude tinted half as strong
     fg(175, 255, 255), // SubscriptionHigh <- local: one cyan hue, brightest
-    fg(95, 215, 215), // SubscriptionMedium
-    fg(0, 175, 175),  // SubscriptionLow
-    bg(110, 63, 48),  // UpdateProgress  <- local: claude dimmed, still clear on black terminals
-    // At 256 colours the square is the lighter 173, where no foreground also clears the dimmed
-    // phase, so the `↻` turns dark on the full square and white on the dimmed one.
-    on(fg(0, 0, 0), Rgb::new(215, 119, 87)), // SubscriptionSquare
-    on(fg(255, 255, 255), Rgb::new(110, 63, 48)), // SubscriptionSquareDim
-    ansi(AnsiColour::Blue),                  // Link            <- chalk.blue
-    strong(177, 185, 249),                   // StrongCode      <- permission + bold
-    strong(153, 153, 153),                   // MutedStrong     <- inactive + bold
-    bg(2, 40, 0),                            // DiffLineAdded   <- colour-diff addLine
-    bg(61, 1, 0),                            // DiffLineRemoved <- colour-diff deleteLine
-    bg(4, 71, 0),                            // DiffWordAdded   <- colour-diff addWord
-    bg(92, 2, 0),                            // DiffWordRemoved <- colour-diff deleteWord
+    fg(95, 215, 215),  // SubscriptionMedium
+    fg(0, 175, 175),   // SubscriptionLow
+    bg(110, 63, 48),   // UpdateProgress  <- local: claude dimmed, still clear on black terminals
+    fg(255, 255, 255), // SubscriptionOnProgress
+    ansi(AnsiColour::Blue), // Link            <- chalk.blue
+    strong(177, 185, 249), // StrongCode      <- permission + bold
+    strong(153, 153, 153), // MutedStrong     <- inactive + bold
+    bg(2, 40, 0),      // DiffLineAdded   <- colour-diff addLine
+    bg(61, 1, 0),      // DiffLineRemoved <- colour-diff deleteLine
+    bg(4, 71, 0),      // DiffWordAdded   <- colour-diff addWord
+    bg(92, 2, 0),      // DiffWordRemoved <- colour-diff deleteWord
     on(fg(80, 200, 80), Rgb::new(2, 40, 0)), // DiffMarkerAdded <- addDecoration on addLine
     on(fg(220, 90, 90), Rgb::new(61, 1, 0)), // DiffMarkerRemoved <- deleteDecoration on deleteLine
     CODE_COLOURS[0],
@@ -670,15 +672,20 @@ const LIGHT_PALETTE: [Style; ROLE_COUNT] = [
     fg(44, 122, 57),  // SuccessMark
     fg(171, 43, 63),  // ErrorMark
     fg(150, 108, 30), // WarningMark
-    bg(215, 119, 87), // UpdateSquare
+    // The accent itself falls under 3:1 on white at 256 colours, so the update mark is a darker
+    // shade of its hue.
+    fg(180, 80, 40), // UpdateMark
+    Style {
+        dim: true,
+        ..fg(180, 80, 40)
+    }, // UpdateMarkDim
     bg(243, 214, 205), // FlashStrong
     bg(250, 239, 235), // FlashSoft
-    fg(0, 95, 95),    // SubscriptionHigh: the strongest on a light background
-    fg(0, 135, 135),  // SubscriptionMedium
+    fg(0, 95, 95),   // SubscriptionHigh: the strongest on a light background
+    fg(0, 135, 135), // SubscriptionMedium
     fg(95, 135, 135), // SubscriptionLow
     bg(238, 223, 215), // UpdateProgress
-    on(fg(0, 0, 0), Rgb::new(215, 119, 87)), // SubscriptionSquare
-    on(fg(0, 0, 0), Rgb::new(238, 223, 215)), // SubscriptionSquareDim
+    fg(0, 0, 0),     // SubscriptionOnProgress
     ansi(AnsiColour::Blue), // Link
     strong(87, 105, 247), // StrongCode
     strong(102, 102, 102), // MutedStrong
@@ -1257,20 +1264,21 @@ pub(super) fn emitted_contrast(foreground: Colour, background: Colour, depth: Co
         }
     };
     let luminance = |colour: Rgb| {
-        let channel = |value: u8| {
-            let value = f64::from(value) / 255.0;
-            if value <= 0.04045 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * channel(colour.red)
-            + 0.7152 * channel(colour.green)
-            + 0.0722 * channel(colour.blue)
+        0.2126 * linear(colour.red) + 0.7152 * linear(colour.green) + 0.0722 * linear(colour.blue)
     };
     let (first, second) = (luminance(sent(foreground)), luminance(sent(background)));
     (first.max(second) + 0.05) / (first.min(second) + 0.05)
+}
+
+/// An sRGB channel as linear light.
+#[cfg(test)]
+fn linear(value: u8) -> f64 {
+    let value = f64::from(value) / 255.0;
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 /// The standard xterm value of an index the quantiser can emit.
@@ -1502,11 +1510,6 @@ mod tests {
             ] {
                 assert_eq!(theme.style(mark), theme.style(state), "{name:?} {mark:?}");
             }
-            assert_eq!(
-                theme.style(Role::UpdateSquare).background,
-                theme.style(Role::Accent).foreground,
-                "{name:?}: the update square is the accent colour"
-            );
         }
     }
 
@@ -1540,7 +1543,6 @@ mod tests {
                 let fills = [
                     Role::FlashStrong,
                     Role::FlashSoft,
-                    Role::UpdateSquare,
                     Role::UpdateProgress,
                     Role::Selection,
                 ];
@@ -1590,11 +1592,10 @@ mod tests {
     }
 
     #[test]
-    fn the_update_square_and_bar_show_on_every_terminal_and_keep_the_row_readable() {
+    fn the_update_bar_shows_on_every_terminal_and_keeps_the_row_readable() {
         for name in ThemeName::ALL {
             let theme = Theme::new(name);
             let progress = background(theme, Role::UpdateProgress);
-            let square = background(theme, Role::UpdateSquare);
             for depth in [ColourDepth::Indexed256, ColourDepth::TrueColour] {
                 for (terminal, minimum) in terminal_backgrounds(name) {
                     let ratio = emitted_contrast(progress, Colour::Rgb(terminal), depth);
@@ -1602,29 +1603,25 @@ mod tests {
                         ratio >= minimum,
                         "{name:?} {depth:?} bar on {terminal:?}: {ratio:.2}"
                     );
-                    let ratio = emitted_contrast(square, Colour::Rgb(terminal), depth);
-                    assert!(
-                        ratio >= 2.5,
-                        "{name:?} {depth:?} square on {terminal:?}: {ratio:.2}"
-                    );
                 }
-                let ratio = emitted_contrast(square, progress, depth);
-                assert!(
-                    ratio >= 2.0,
-                    "{name:?} {depth:?} the square stands out of its bar: {ratio:.2}"
-                );
-                for (role, minimum) in [
-                    (Role::Text, 4.5),
-                    (Role::MutedText, 3.0),
-                    (Role::SubscriptionHigh, 3.0),
-                    (Role::SubscriptionMedium, 3.0),
-                    (Role::SubscriptionLow, 3.0),
-                ] {
+                for (role, minimum) in [(Role::Text, 4.5), (Role::MutedText, 3.0)] {
                     let foreground = theme.style(role).foreground.unwrap();
                     let ratio = emitted_contrast(foreground, progress, depth);
                     assert!(
                         ratio >= minimum,
                         "{name:?} {depth:?} {role:?} on the bar: {ratio:.2}"
+                    );
+                }
+                // A row flash covers the bar, and the `⟳` with it.
+                let mark = theme
+                    .style(Role::SubscriptionOnProgress)
+                    .foreground
+                    .unwrap();
+                for fill in [Role::UpdateProgress, Role::FlashStrong, Role::FlashSoft] {
+                    let ratio = emitted_contrast(mark, background(theme, fill), depth);
+                    assert!(
+                        ratio >= 4.5,
+                        "{name:?} {depth:?} the `⟳` on {fill:?}: {ratio:.2}"
                     );
                 }
             }
@@ -1661,47 +1658,98 @@ mod tests {
                     strength[0] > strength[1] && strength[1] > strength[2],
                     "{name:?} {depth:?}: high stands out most, low least: {strength:?}"
                 );
-                // A selected row leaves its first column, where the mark is, off the selection.
-                for mark in MARKS {
-                    for (backdrop, colour) in [
-                        ("canvas", canvas(name)),
-                        ("update bar", background(theme, Role::UpdateProgress)),
-                    ] {
-                        let ratio =
-                            emitted_contrast(theme.style(mark).foreground.unwrap(), colour, depth);
-                        assert!(
-                            ratio >= 3.0,
-                            "{name:?} {depth:?} {mark:?} on the {backdrop}: {ratio:.2}"
-                        );
-                    }
+                // A selected row leaves its first column, where the mark is, off the selection,
+                // and on the update bar the mark takes `SubscriptionOnProgress`.
+                for (mark, strength) in MARKS.into_iter().zip(strength) {
+                    assert!(
+                        strength >= 3.0,
+                        "{name:?} {depth:?} {mark:?} on the canvas: {strength:.2}"
+                    );
                 }
             }
         }
     }
 
-    /// The `↻` on a waiting row's square stays clear on both phases of the square's flash, and
-    /// the square keeps the colours of a square without one.
+    /// CIE76 colour difference, the distance of two colours in CIELAB: about 2 is the least a
+    /// viewer notices, and past 10 two colours read as different ones.
+    fn colour_distance(left: Rgb, right: Rgb) -> f64 {
+        let lab = |colour: Rgb| {
+            let (red, green, blue) = (
+                linear(colour.red),
+                linear(colour.green),
+                linear(colour.blue),
+            );
+            let scale = |value: f64| {
+                if value > 0.008856 {
+                    value.cbrt()
+                } else {
+                    7.787 * value + 16.0 / 116.0
+                }
+            };
+            let x = scale((0.4124 * red + 0.3576 * green + 0.1805 * blue) / 0.95047);
+            let y = scale(0.2126 * red + 0.7152 * green + 0.0722 * blue);
+            let z = scale((0.0193 * red + 0.1192 * green + 0.9505 * blue) / 1.08883);
+            [116.0 * y - 16.0, 500.0 * (x - y), 200.0 * (y - z)]
+        };
+        lab(left)
+            .into_iter()
+            .zip(lab(right))
+            .map(|(left, right)| (left - right).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    /// A row's glyph in the update colour stays clear wherever the glyph sits: on the terminal,
+    /// the selection, the update bar and the flash of a row taken in; and it never reads as one
+    /// of the state colours it covers.
     #[test]
-    fn the_mark_on_an_update_square_stays_clear_through_its_flash() {
+    fn the_update_mark_stays_clear_on_every_row_background_and_apart_from_the_state_colours() {
         for name in ThemeName::ALL {
             let theme = Theme::new(name);
-            for (held, square) in [
-                (Role::SubscriptionSquare, Role::UpdateSquare),
-                (Role::SubscriptionSquareDim, Role::UpdateProgress),
-            ] {
-                let style = theme.style(held);
-                assert_eq!(
-                    style.background,
-                    Some(background(theme, square)),
-                    "{name:?} {held:?}"
-                );
-                for depth in [ColourDepth::Indexed256, ColourDepth::TrueColour] {
-                    let ratio = emitted_contrast(
-                        style.foreground.unwrap(),
-                        style.background.unwrap(),
-                        depth,
+            assert_eq!(
+                theme.style(Role::UpdateMarkDim),
+                Style {
+                    dim: true,
+                    ..theme.style(Role::UpdateMark)
+                },
+                "{name:?}: a flash dims the mark itself"
+            );
+            let mark = theme.style(Role::UpdateMark).foreground.unwrap();
+            let backdrops = terminal_backgrounds(name)
+                .into_iter()
+                .map(|(terminal, _)| Colour::Rgb(terminal))
+                .chain(
+                    [
+                        Role::Selection,
+                        Role::UpdateProgress,
+                        Role::FlashStrong,
+                        Role::FlashSoft,
+                    ]
+                    .map(|fill| background(theme, fill)),
+                )
+                .collect::<Vec<_>>();
+            for depth in [ColourDepth::Indexed256, ColourDepth::TrueColour] {
+                for backdrop in &backdrops {
+                    let ratio = emitted_contrast(mark, *backdrop, depth);
+                    assert!(
+                        ratio >= 3.0,
+                        "{name:?} {depth:?} on {backdrop:?}: {ratio:.2}"
                     );
-                    assert!(ratio >= 3.0, "{name:?} {depth:?} {held:?}: {ratio:.2}");
+                }
+                for state in [
+                    Role::SuccessMark,
+                    Role::ErrorMark,
+                    Role::WarningMark,
+                    Role::MutedText,
+                ] {
+                    let distance = colour_distance(
+                        sent_colour(theme, Role::UpdateMark, depth),
+                        sent_colour(theme, state, depth),
+                    );
+                    assert!(
+                        distance >= 15.0,
+                        "{name:?} {depth:?} apart from {state:?}: {distance:.1}"
+                    );
                 }
             }
         }
@@ -1738,22 +1786,19 @@ mod tests {
                     .collect::<Vec<_>>()
             };
             let progress = theme.style(Role::UpdateProgress).background;
-            let square = theme.style(Role::UpdateSquare).background;
-            let row = RoleLine::role(" ", Role::MutedText)
-                .with(" ", Role::UpdateSquare)
-                .with("◉ ", Role::MutedText)
-                .with("中文", Role::MutedText)
-                .with("↻", Role::SubscriptionLow);
+            let row = RoleLine::role("  ", Role::MutedText)
+                .with("◉", Role::UpdateMark)
+                .with(" 中文", Role::MutedText)
+                .with("⟳", Role::SubscriptionLow);
             let unselected = row
                 .clone()
                 .banded(1..5, Role::UpdateProgress)
                 .resolve(theme, 12);
-            assert_eq!(unselected.render(ColourDepth::None), "  ◉ 中文↻");
+            assert_eq!(unselected.render(ColourDepth::None), "  ◉ 中文⟳");
             assert_eq!(
                 backgrounds(&unselected),
-                [vec![None, square], vec![progress; 3], vec![None; 2]].concat(),
-                "{name:?}: the square sits on its bar, and the wide character that starts \
-                 inside the band stays in it"
+                [vec![None], vec![progress; 4], vec![None; 2]].concat(),
+                "{name:?}: the wide character that starts inside the band stays in it"
             );
             let short = RoleLine::role("ab", Role::Text)
                 .banded(1..6, Role::UpdateProgress)
@@ -1775,19 +1820,17 @@ mod tests {
                 .resolve(theme, 12);
             assert_eq!(
                 backgrounds(&selected),
-                [
-                    vec![selection, square],
-                    vec![progress; 3],
-                    vec![selection; 5]
-                ]
-                .concat(),
+                [vec![selection], vec![progress; 4], vec![selection; 5]].concat(),
                 "{name:?}: the bar keeps its colour, the rest is the selection"
             );
             for span in &selected.spans {
-                if span.text == "↻" {
+                if let Some(mark) = [("◉", Role::UpdateMark), ("⟳", Role::SubscriptionLow)]
+                    .into_iter()
+                    .find_map(|(text, mark)| (span.text == text).then_some(mark))
+                {
                     assert_eq!(
                         span.style.foreground,
-                        theme.style(Role::SubscriptionLow).foreground,
+                        theme.style(mark).foreground,
                         "a mark keeps its hue"
                     );
                 } else if !span.text.trim().is_empty() {

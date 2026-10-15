@@ -187,7 +187,7 @@ impl RowUpdate {
     }
 }
 
-/// How a row marks the periodic Tick Subscriptions on its instance: `↻` in the colour of the most
+/// How a row marks the periodic Tick Subscriptions on its instance: `⟳` in the colour of the most
 /// frequent, and whether updates, or a Terminal Tick's changed screen, wait on them for a check to
 /// hand them to the Agent. Immediate subscriptions, which Shells and artifacts have by default,
 /// are never marked.
