@@ -354,7 +354,7 @@ fn tick_descriptions_use_tick_terminology_and_minimum_panel_sizes() {
     let (code, stdout, stderr) = run(tick().env("LANG", "C").arg("describe"));
     assert_eq!(code, 0, "{stderr}");
     let ticks: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(ticks.as_array().unwrap().len(), 8);
+    assert_eq!(ticks.as_array().unwrap().len(), 9);
     let descriptor = |kind: &str| {
         ticks
             .as_array()
@@ -420,6 +420,22 @@ fn tick_descriptions_use_tick_terminology_and_minimum_panel_sizes() {
     assert_eq!(
         tools[0]["input_schema"]["properties"]["count"]["maximum"], 20,
         "the declared schema bounds the periods the Agent may ask for"
+    );
+    let community = descriptor("community");
+    assert_eq!(community["configuration"], "user_input");
+    assert_eq!(community["recover_with"], "posts");
+    let tools = community["tools"].as_array().unwrap();
+    assert_eq!(
+        (tools[0]["name"].clone(), tools[0]["mutates"].clone()),
+        (serde_json::json!("posts"), serde_json::json!(false))
+    );
+    assert_eq!(
+        (tools[1]["name"].clone(), tools[1]["mutates"].clone()),
+        (serde_json::json!("reply"), serde_json::json!(true))
+    );
+    assert_eq!(
+        tools[1]["input_schema"]["properties"]["topic_id"]["format"],
+        "int64"
     );
     assert!(
         ticks
