@@ -7,7 +7,8 @@ use tokio_util::sync::CancellationToken;
 
 use tickloop_agent_protocol::{
     ChatSnapshot, CommandState, Content, EventKind, InputModality, LoopSnapshot, LoopState,
-    ModelConfig, PendingInput, Protocol, Receipt, Trigger, TriggerSource, Usage, UserShellState,
+    ModelConfig, PendingInput, Protocol, Receipt, Trigger, TriggerPromptSource, TriggerSource,
+    Usage, UserShellState,
 };
 use tickloop_agent_tools::UserCommandSnapshot;
 
@@ -135,6 +136,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
     let trigger = Trigger {
         id: uuid::Uuid::new_v4(),
         prompt: "scheduled after restart".into(),
+        prompt_source: TriggerPromptSource::Explicit,
         interval_seconds: Some(1),
         expires_at_ms: None,
         accepts_events: false,

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use tickloop_agent_protocol::{
-    Decision, EventKind, LoopState, PermissionRule, QuestionAnswer, Trigger, TriggerSource,
+    Decision, EventKind, LoopState, PermissionRule, QuestionAnswer, Trigger, TriggerPromptSource,
+    TriggerSource,
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::*;
@@ -28,6 +29,7 @@ async fn a_continuous_goal_waits_for_explicit_events_and_stopped_goals_reject_wa
             Some(Trigger {
                 id: Uuid::new_v4(),
                 prompt: "Check the notes".into(),
+                prompt_source: TriggerPromptSource::Explicit,
                 interval_seconds: None,
                 expires_at_ms: None,
                 accepts_events: true,
@@ -152,6 +154,7 @@ async fn busy_triggers_coalesce_and_user_input_has_priority() {
             Some(Trigger {
                 id: Uuid::new_v4(),
                 prompt: "scheduled check".into(),
+                prompt_source: TriggerPromptSource::Explicit,
                 interval_seconds: None,
                 expires_at_ms: None,
                 accepts_events: true,
@@ -233,6 +236,7 @@ async fn an_interval_wakes_the_same_goal_and_shutdown_cancels_future_ticks() {
             Some(Trigger {
                 id: Uuid::new_v4(),
                 prompt: "timed check".into(),
+                prompt_source: TriggerPromptSource::Explicit,
                 interval_seconds: Some(10),
                 expires_at_ms: None,
                 accepts_events: false,
@@ -291,6 +295,7 @@ async fn an_event_only_goal_expires_without_waiting_for_another_event() {
             Some(Trigger {
                 id: Uuid::new_v4(),
                 prompt: "check".into(),
+                prompt_source: TriggerPromptSource::Explicit,
                 interval_seconds: None,
                 expires_at_ms: Some(now + 50),
                 accepts_events: true,
@@ -368,6 +373,7 @@ async fn manually_resuming_a_restored_goal_rearms_only_its_trigger() {
                 Some(Trigger {
                     id: Uuid::new_v4(),
                     prompt: "periodic check".into(),
+                    prompt_source: TriggerPromptSource::Explicit,
                     interval_seconds: Some(10),
                     expires_at_ms: None,
                     accepts_events: true,
@@ -515,6 +521,7 @@ async fn replacing_a_trigger_cancels_its_old_interval_and_deadline_even_with_the
             Some(Trigger {
                 id,
                 prompt: "old schedule".into(),
+                prompt_source: TriggerPromptSource::Explicit,
                 interval_seconds: Some(10),
                 expires_at_ms: Some(now + 20_000),
                 accepts_events: true,
@@ -531,6 +538,7 @@ async fn replacing_a_trigger_cancels_its_old_interval_and_deadline_even_with_the
             Some(Trigger {
                 id,
                 prompt: "new schedule".into(),
+                prompt_source: TriggerPromptSource::Explicit,
                 interval_seconds: Some(30),
                 expires_at_ms: None,
                 accepts_events: true,
@@ -634,6 +642,7 @@ async fn expiration_clears_the_selected_goals_waiters_and_preserves_other_queued
                 Some(Trigger {
                     id: Uuid::new_v4(),
                     prompt: "check".into(),
+                    prompt_source: TriggerPromptSource::Explicit,
                     interval_seconds: None,
                     expires_at_ms: Some(now + 1000),
                     accepts_events: true,

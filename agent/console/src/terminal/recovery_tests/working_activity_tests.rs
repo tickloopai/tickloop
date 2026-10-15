@@ -126,6 +126,7 @@ impl AgentAccess for ActivityAccess {
                     Some(Trigger {
                         id: Uuid::new_v4(),
                         prompt: "Check for updates".into(),
+                        prompt_source: TriggerPromptSource::Explicit,
                         interval_seconds: None,
                         expires_at_ms: None,
                         accepts_events: true,

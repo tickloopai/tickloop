@@ -1149,6 +1149,7 @@ async fn an_armed_waiting_goal_is_not_masked_by_a_later_completed_loop() {
             Some(tickloop_agent_protocol::Trigger {
                 id: Uuid::new_v4(),
                 prompt: "Check the notes".into(),
+                prompt_source: tickloop_agent_protocol::TriggerPromptSource::Explicit,
                 interval_seconds: None,
                 expires_at_ms: None,
                 accepts_events: true,

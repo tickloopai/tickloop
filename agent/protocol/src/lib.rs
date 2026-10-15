@@ -126,7 +126,7 @@ pub use local_messages::{
 };
 pub use loops::{
     EventSourceBinding, LoopSnapshot, LoopState, LoopTriggerNotice, LoopTriggerNoticeKind, Trigger,
-    TriggerSource,
+    TriggerPromptSource, TriggerSource,
 };
 pub use model::{
     ApiKeyStatus, Content, ImageSource, InputModality, Message, ModelAuthSource, ModelConfig,

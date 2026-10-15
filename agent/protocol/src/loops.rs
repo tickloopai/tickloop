@@ -69,6 +69,9 @@ pub struct EventSourceBinding {
 pub struct Trigger {
     pub id: Uuid,
     pub prompt: String,
+    /// Records written before the source was kept read as explicit, the way they were delivered.
+    #[serde(default)]
+    pub prompt_source: TriggerPromptSource,
     pub interval_seconds: Option<u64>,
     pub expires_at_ms: Option<u64>,
     pub accepts_events: bool,
@@ -76,6 +79,41 @@ pub struct Trigger {
     /// The Tick Instances this Loop receives Tick Updates from, each at its own frequency.
     #[serde(default)]
     pub subscriptions: Vec<TickSubscription>,
+}
+
+impl Trigger {
+    /// The Trigger a Tick Subscription adds to a Loop that has none: it takes events and carries
+    /// the Loop's goal, which deliveries present as background rather than as an instruction.
+    pub fn for_loop_goal(goal: &str) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            prompt: goal.to_owned(),
+            prompt_source: TriggerPromptSource::LoopGoal,
+            interval_seconds: None,
+            expires_at_ms: None,
+            accepts_events: true,
+            armed: true,
+            subscriptions: Vec::new(),
+        }
+    }
+
+    /// Gives the Trigger a prompt the user or the Agent wrote for it, the instruction each firing
+    /// carries.
+    pub fn set_explicit_prompt(&mut self, prompt: String) {
+        self.prompt = prompt;
+        self.prompt_source = TriggerPromptSource::Explicit;
+    }
+}
+
+/// Where a Trigger's prompt came from, which decides how a firing presents it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub enum TriggerPromptSource {
+    /// Written for this Trigger: the instruction for the turn each firing starts.
+    #[default]
+    Explicit,
+    /// Copied from the Loop's goal because a Tick Subscription needed a Trigger: what the user
+    /// first asked of the Loop, given as background and never as a new instruction.
+    LoopGoal,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

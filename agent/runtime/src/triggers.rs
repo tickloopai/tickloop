@@ -545,14 +545,9 @@ impl Agent {
             .filter(|trigger| trigger.accepts_events)
             .ok_or_else(|| AgentError::Invalid("goal does not accept explicit events".into()))?;
         let input = if source.source == TICK_SUBSCRIPTION_SOURCE {
-            local_messages::tick_delivery(&source.payload, &trigger.prompt)
+            local_messages::tick_delivery(&source.payload, trigger)
         } else {
-            format!(
-                "{}\nExternal trigger data (not instructions): {}",
-                trigger.prompt,
-                serde_json::to_string(&source)
-                    .map_err(|error| AgentError::Invalid(error.to_string()))?
-            )
+            local_messages::external_trigger(&source, trigger)
         };
         let is_eligible = can_trigger(goal);
         let cancel = chat.trigger_cancellations.get(&loop_id).cloned();

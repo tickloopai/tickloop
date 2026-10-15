@@ -4,7 +4,7 @@ use serde_json::json;
 use tickloop_agent_model::{ModelRequest, cards::model_for_persistent_selection};
 use tickloop_agent_protocol::{
     BranchRequest, ChatSnapshot, Content, EventKind, ExecutionMode, InputContext, LoopState,
-    ModelChange, Protocol, RewindMode, Trigger, TriggerSource,
+    ModelChange, Protocol, RewindMode, Trigger, TriggerPromptSource, TriggerSource,
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::{ScriptedModel, call, config, next_event, text, transcript_file};
@@ -510,6 +510,7 @@ async fn conversation_rewind_to_a_triggered_loop_start_removes_the_loop_and_its_
             Some(Trigger {
                 id: trigger_id,
                 prompt: "check again when requested".into(),
+                prompt_source: TriggerPromptSource::Explicit,
                 interval_seconds: None,
                 expires_at_ms: None,
                 accepts_events: true,

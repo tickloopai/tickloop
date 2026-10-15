@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tickloop_agent_model::ModelRequest;
 use tickloop_agent_protocol::{
     Content, EventKind, INTERRUPT_MESSAGE_FOR_TOOL_USE, LoopState, QuestionAnswer, Trigger,
-    TriggerSource,
+    TriggerPromptSource, TriggerSource,
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::*;
@@ -416,6 +416,7 @@ async fn triggers_cannot_bypass_clarification_and_cancelled_answers_cannot_resum
             Some(Trigger {
                 id: Uuid::new_v4(),
                 prompt: "Check the report.".into(),
+                prompt_source: TriggerPromptSource::Explicit,
                 interval_seconds: None,
                 expires_at_ms: None,
                 accepts_events: true,

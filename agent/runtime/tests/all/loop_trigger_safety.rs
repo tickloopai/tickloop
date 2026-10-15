@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
     ChatId, ChatSnapshot, Content, EventKind, LoopId, LoopState, LoopTriggerNoticeKind, Message,
-    ModelIdentity, Protocol, Receipt, RewindMode, Trigger, TriggerSource, Usage,
+    ModelIdentity, Protocol, Receipt, RewindMode, Trigger, TriggerPromptSource, TriggerSource,
+    Usage,
 };
 use tickloop_agent_runtime::{Agent, AgentError};
 use tickloop_agent_test_support::{config, next_event};
@@ -105,6 +106,7 @@ fn periodic(prompt: &str, interval_seconds: Option<u64>) -> Trigger {
     Trigger {
         id: Uuid::new_v4(),
         prompt: prompt.into(),
+        prompt_source: TriggerPromptSource::Explicit,
         interval_seconds,
         expires_at_ms: None,
         accepts_events: true,

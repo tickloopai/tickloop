@@ -11,7 +11,7 @@ use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, Mod
 use tickloop_agent_protocol::{
     AgentHostOptions, BranchRequest, ChatId, Content, Decision, EventKind, ExecutionMode, LoopId,
     LoopState, Message, ModelIdentity, PermissionRule, PromptPolicy, Protocol, Receipt, RewindMode,
-    Role, ToolResultBlock, ToolResultContent, Trigger, Usage,
+    Role, ToolResultBlock, ToolResultContent, Trigger, TriggerPromptSource, Usage,
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::{
@@ -545,6 +545,7 @@ async fn restored_loops_are_interrupted_and_triggers_disarmed() {
             Some(Trigger {
                 id: Uuid::new_v4(),
                 prompt: "periodic check".into(),
+                prompt_source: TriggerPromptSource::Explicit,
                 interval_seconds: Some(3_600),
                 expires_at_ms: None,
                 accepts_events: false,

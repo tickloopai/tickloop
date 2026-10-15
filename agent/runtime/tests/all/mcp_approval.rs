@@ -341,7 +341,9 @@ async fn artifact_preparation_distinguishes_private_shared_public_and_unknown_au
 
 #[tokio::test]
 async fn artifact_creation_from_an_automated_turn_does_not_inherit_the_human_fast_path() {
-    use tickloop_agent_protocol::{Content, ExecutionMode, Trigger, TriggerSource};
+    use tickloop_agent_protocol::{
+        Content, ExecutionMode, Trigger, TriggerPromptSource, TriggerSource,
+    };
     use tickloop_agent_test_support::{auto_classification, next_event};
     for mode in [
         ExecutionMode::Auto,
@@ -397,6 +399,7 @@ async fn artifact_creation_from_an_automated_turn_does_not_inherit_the_human_fas
                 Some(Trigger {
                     id: Uuid::new_v4(),
                     prompt: "Summarize the new event.".into(),
+                    prompt_source: TriggerPromptSource::Explicit,
                     interval_seconds: None,
                     expires_at_ms: None,
                     accepts_events: true,
