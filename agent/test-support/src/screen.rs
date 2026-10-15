@@ -138,8 +138,8 @@ pub const SELECTION_BACKGROUNDS: [&str; 4] =
 
 /// [`visible_screen`] with the selection fill made visible: in each row, the first cell painted
 /// with the selection background shows [`SELECTED_MARK`] when that cell is blank, as the indent
-/// of a list's selected row is. A Monitor row whose first column holds its update square or `↻`
-/// keeps that column off the selection, so its mark falls on the second column. Where something
+/// of a list's selected row is. A Monitor row whose first column holds its `⟳` keeps that column
+/// off the selection, so its mark falls on the second column. Where something
 /// else paints the middle of a selected row, such as a Monitor row's update bar, the selection
 /// that resumes after it shows no second mark.
 pub fn visible_screen_with_selection(output: &str, width: usize, height: usize) -> String {
@@ -277,17 +277,18 @@ fn the_selection_fill_shows_as_a_mark_where_its_run_begins_on_a_blank_cell() {
         "  plain\n  ◉ chosen\n❯ option\nleft   row",
         "the plain screen keeps the blank cells"
     );
-    let banded = "\x1b[?2026h\x1b[2J\x1b[1;1H\x1b[48;5;24m \x1b[48;5;173m \x1b[48;5;239m◉ a \x1b[48;5;24m b  \x1b[0m\x1b[?2026l";
+    let banded = "\x1b[?2026h\x1b[2J\x1b[1;1H\x1b[48;5;24m \x1b[48;5;239m ◉ a \x1b[48;5;24m b  \x1b[0m\x1b[?2026l";
     assert_eq!(
         visible_screen_with_selection(banded, 20, 1),
         "▌ ◉ a  b",
         "the selection resuming after a band shows no second mark"
     );
-    let led = "\x1b[?2026h\x1b[2J\x1b[1;1H\x1b[38;5;37m↻\x1b[48;5;24m ◉ quotes  \x1b[0m\x1b[2;1H\x1b[48;5;173m \x1b[48;5;24m ◉ news  \x1b[0m\x1b[?2026l";
+    let led = "\x1b[?2026h\x1b[2J\x1b[1;1H\x1b[38;5;37m⟳\x1b[48;5;24m ◉ quotes  \x1b[0m\x1b[2;1H\x1b[48;5;24m  \x1b[38;5;216m◉\x1b[38;5;255m news  \x1b[0m\x1b[?2026l";
     assert_eq!(
         visible_screen_with_selection(led, 20, 2),
-        "↻▌◉ quotes\n ▌◉ news",
-        "a Monitor row's first column stays off the selection"
+        "⟳▌◉ quotes\n▌ ◉ news",
+        "a Monitor row's `⟳` stays off the selection; a row without one, whatever its glyph's \
+         colour, is selected from its first column"
     );
 }
 

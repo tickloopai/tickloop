@@ -5,7 +5,8 @@
 //! the instance is live. Here `f` moves the selected periodic subscription on to the next
 //! frequency at once, and `u` cancels a subscription once confirmed; an immediate subscription
 //! keeps the frequency its Tick type decides. The Agent creates subscriptions, and the user
-//! creates one with `f` on the row itself.
+//! creates one with `f` on the row itself. Monitor returns to its list once no subscription is
+//! left, or once the cancel the row's `u` opened the detail for goes through.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -66,6 +67,10 @@ pub(super) struct SubscriptionDetail {
     top: usize,
     /// A refusal or explanation the hint shows until the next key.
     notice: Option<String>,
+    /// Whether the row's `u` opened the detail, so it closes once a cancel goes through.
+    opened_to_cancel: bool,
+    /// The subscription whose cancel the detail last asked for, until the Agent refuses it.
+    cancelling: Option<Uuid>,
     display: DisplayProfile,
 }
 
@@ -95,6 +100,8 @@ impl SubscriptionDetail {
             focus,
             top: 0,
             notice: None,
+            opened_to_cancel: operation == SubscriptionOperation::Cancel,
+            cancelling: None,
             display,
         }
     }
@@ -138,6 +145,17 @@ impl SubscriptionDetail {
 
     pub(super) fn report(&mut self, message: String) {
         self.notice = Some(message);
+        self.cancelling = None;
+    }
+
+    /// Whether the detail has nothing left to show: no subscription remains, or the cancel the
+    /// row's `u` opened it for went through.
+    pub(super) fn is_done(&self) -> bool {
+        self.rows.is_empty()
+            || (self.opened_to_cancel
+                && self
+                    .cancelling
+                    .is_some_and(|subscription| self.index_of(subscription).is_none()))
     }
 
     fn apply_key(&mut self, key: KeyEvent) -> DetailStep {
@@ -172,6 +190,7 @@ impl SubscriptionDetail {
                 (KeyCode::Enter, _) | (KeyCode::Char('y'), KeyModifiers::NONE) => {
                     self.focus = SubscriptionFocus::List;
                     if let Some(subscription) = self.selected {
+                        self.cancelling = Some(subscription);
                         return DetailStep::Cancel(subscription);
                     }
                 }
@@ -221,7 +240,7 @@ impl SubscriptionDetail {
             Role::MutedText
         };
         let mut frequency = format!(
-            "{}↻ {}",
+            "{}⟳ {}",
             if selected { "› " } else { "  " },
             frequency_label(row.frequency)
         );
@@ -257,10 +276,6 @@ impl SubscriptionDetail {
                 Role::MutedText,
             ),
         ];
-        if self.rows.is_empty() {
-            lines.push(RoleLine::role("No subscription left.", Role::MutedText));
-            return lines;
-        }
         let capacity = (height.saturating_sub(HEADER_ROWS) / SUBSCRIPTION_ROWS).max(1);
         let selected = self.selected_index().unwrap_or(0);
         self.top = self.top.min(self.rows.len().saturating_sub(capacity));
@@ -316,7 +331,6 @@ impl TickDetailView for SubscriptionDetail {
             return format!("{notice} · esc back");
         }
         match self.focus {
-            SubscriptionFocus::List if self.rows.is_empty() => "esc back".into(),
             SubscriptionFocus::List
                 if self
                     .selected_row()
@@ -493,10 +507,10 @@ mod tests {
 
         assert_eq!(lines[0], "Fixture run");
         assert_eq!(lines[1], "Tick Subscriptions 2");
-        assert_eq!(lines[2], "› ↻ high · every 1 min · 4 new");
+        assert_eq!(lines[2], "› ⟳ high · every 1 min · 4 new");
         assert_eq!(lines[3], "    ◉ Watch run 3");
         assert_eq!(lines[4], "    10:00:45 3 #12 · dropped 2 · live");
-        assert_eq!(lines[5], "  ↻ medium · every 10 min");
+        assert_eq!(lines[5], "  ⟳ medium · every 10 min");
         assert_eq!(lines[7], "    no delivery yet · live");
         assert_eq!(detail.hint(), "f frequency · u unsubscribe · esc back");
     }
@@ -541,7 +555,7 @@ mod tests {
             vec![row(3, TickSubscriptionFrequency::Immediate)],
             SubscriptionOperation::View,
         );
-        assert_eq!(text(&mut detail)[2], "› ↻ immediate");
+        assert_eq!(text(&mut detail)[2], "› ⟳ immediate");
         assert_eq!(detail.hint(), "u unsubscribe · esc back");
 
         assert!(matches!(
@@ -621,13 +635,53 @@ mod tests {
         );
 
         assert_eq!(detail.focus(), SubscriptionFocus::List);
-        assert_eq!(text(&mut detail)[2], "› ↻ high · every 1 min");
+        assert_eq!(text(&mut detail)[2], "› ⟳ high · every 1 min");
+        assert!(
+            !detail.is_done(),
+            "a detail opened to view stays while one is left"
+        );
         detail.update("Fixture run".into(), Vec::new(), HashMap::new());
-        assert_eq!(text(&mut detail)[2], "No subscription left.");
-        assert_eq!(detail.hint(), "esc back");
-        assert!(matches!(
-            press(&mut detail, KeyCode::Esc),
-            TickDetailKey::Back
-        ));
+        assert!(
+            detail.is_done(),
+            "with none left Monitor goes back to its list"
+        );
+    }
+
+    #[test]
+    fn a_detail_the_rows_u_opened_is_done_once_its_cancel_goes_through_but_not_when_refused() {
+        let mut detail = detail(
+            vec![
+                row(3, TickSubscriptionFrequency::High),
+                row(4, TickSubscriptionFrequency::Low),
+            ],
+            SubscriptionOperation::Cancel,
+        );
+        press(&mut detail, KeyCode::Char('u'));
+        assert_eq!(requested(press(&mut detail, KeyCode::Enter)), Some('u'));
+        assert!(!detail.is_done(), "the cancel has not gone through yet");
+
+        detail.report("Cannot update the Tick Subscription: refused".into());
+        detail.update(
+            "Fixture run".into(),
+            vec![
+                row(3, TickSubscriptionFrequency::High),
+                row(4, TickSubscriptionFrequency::Low),
+            ],
+            HashMap::new(),
+        );
+        assert!(!detail.is_done(), "a refused cancel stays on the detail");
+        assert_eq!(
+            detail.hint(),
+            "Cannot update the Tick Subscription: refused · esc back"
+        );
+
+        press(&mut detail, KeyCode::Char('u'));
+        press(&mut detail, KeyCode::Enter);
+        detail.update(
+            "Fixture run".into(),
+            vec![row(4, TickSubscriptionFrequency::Low)],
+            HashMap::new(),
+        );
+        assert!(detail.is_done(), "the cancelled subscription is gone");
     }
 }

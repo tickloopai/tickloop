@@ -2,9 +2,9 @@
 //! colour is the row's state, the name, and right-aligned muted details. A row whose whole name
 //! does not fit beside its details continues the name on a second line, under its first, and
 //! keeps the details at the right edge there, so details line up whatever a row's height. A
-//! Monitor row leads with its periodic subscriptions' `↻` and its update square in the first
-//! column, the `↻` on the square while the square shows; while a periodic subscription holds the
-//! update, a bar runs from the square across the row.
+//! Monitor row leads with its periodic subscriptions' `⟳` in the first column, and its glyph
+//! takes the update colour over its state colour while the row holds an unhandled update; while a
+//! periodic subscription holds the update, a bar runs from the first column across the row.
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -18,7 +18,7 @@ use tickloop_agent_protocol::TickSubscriptionFrequency;
 
 /// The columns before a list row's glyph. The selection fill alone marks the selected row.
 pub(super) const ROW_INDENT: &str = "  ";
-/// What follows a Monitor row's first column before its glyph: a blank column, so a `↻` some
+/// What follows a Monitor row's first column before its glyph: a blank column, so a `⟳` some
 /// fallback font draws wider than its column never meets the glyph.
 const LEAD_GAP: &str = " ";
 const STATUS_GAP_COLUMNS: usize = 2;
@@ -28,7 +28,8 @@ const MILLISECONDS_PER_SECOND: u64 = 1000;
 pub(super) struct ListRow<'a> {
     pub(super) selected: bool,
     pub(super) glyph: &'a str,
-    /// The glyph's colour, which is the row's state; see [`state_mark`].
+    /// The glyph's colour: the row's state, see [`state_mark`], or an update the Chat has not
+    /// handled, see [`update_mark`].
     pub(super) glyph_role: Role,
     pub(super) name: &'a str,
     /// A running row's elapsed time and the row's notes; see [`row_details`].
@@ -36,19 +37,12 @@ pub(super) struct ListRow<'a> {
     /// The row's flash fill while it flashes; see [`flash_fill`]. It covers the update bar, and
     /// the selection fill wins over it.
     pub(super) fill: Option<Role>,
-    /// The `↻` of the row's periodic subscriptions in its frequency's colour; see
-    /// [`subscription_mark`]. On the update square it takes the square's own colours.
+    /// The `⟳` of the row's periodic subscriptions in its frequency's colour; see
+    /// [`subscription_mark`]. On the update bar it takes a foreground clear on the bar.
     pub(super) subscription: Option<(&'a str, Role)>,
-    pub(super) update: Option<UpdateIndicator>,
-}
-
-/// How a Monitor row shows an update it has not handed over yet.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct UpdateIndicator {
-    /// The square's role; see [`update_square`].
-    pub(super) square: Role,
-    /// While a periodic subscription holds the update, how many columns from the row's left the
-    /// bar reaches: the part of the period elapsed before the check that hands it to the Agent.
+    /// While a periodic subscription holds an update, how many columns from the row's left the
+    /// update bar reaches: the part of the period elapsed before the check that hands it to the
+    /// Agent.
     pub(super) bar_columns: Option<usize>,
 }
 
@@ -61,21 +55,15 @@ impl ListRow<'_> {
         }
     }
 
-    /// Whether the first column holds the update square or `↻`, which keep their own colours on
-    /// a selected row, so the selection fill starts after them.
-    fn has_lead_mark(&self) -> bool {
-        self.update.is_some() || self.subscription.is_some()
-    }
-
     fn prefix(&self) -> RoleLine {
         let role = self.role();
-        let lead_role = self
-            .update
-            .map(|update| update.square)
-            .or(self.subscription.map(|(_, mark_role)| mark_role))
-            .unwrap_or(role);
-        let lead = self.subscription.map_or(" ", |(mark, _)| mark);
-        let mut line = RoleLine::role(lead, lead_role);
+        let mut line = match self.subscription {
+            Some((mark, _)) if self.bar_columns.is_some() => {
+                RoleLine::role(mark, Role::SubscriptionOnProgress)
+            }
+            Some((mark, mark_role)) => RoleLine::role(mark, mark_role),
+            None => RoleLine::role(" ", role),
+        };
         line.push(LEAD_GAP, Some(role));
         line.push(self.glyph, Some(self.glyph_role));
         line.push(" ", Some(role));
@@ -137,15 +125,14 @@ impl ListRow<'_> {
     }
 
     /// Fills the line: the selection with the update bar over it, else a flash over everything,
-    /// else the update bar alone. The bar starts at the square, which it never leaves behind.
+    /// else the update bar alone. The bar always covers the first column, so the `⟳` there keeps
+    /// one background while the bar shows. A `⟳` keeps its own colours on a selected row, so the
+    /// selection starts after it.
     fn finish(&self, mut line: RoleLine, width: usize) -> RoleLine {
         line.truncate(width);
-        let bar = self
-            .update
-            .and_then(|update| update.bar_columns)
-            .map(|columns| 0..columns.max(1));
+        let bar = self.bar_columns.map(|columns| 0..columns.max(1));
         if self.selected {
-            line = line.filled_from(Role::Selection, usize::from(self.has_lead_mark()));
+            line = line.filled_from(Role::Selection, usize::from(self.subscription.is_some()));
         } else if let Some(fill) = self.fill {
             return line.filled(fill);
         }
@@ -197,21 +184,15 @@ pub(super) fn running_mark(display: DisplayProfile, now_ms: u64) -> Role {
     }
 }
 
-/// A row's update square. A new update flashes it once since `flash_since`, full, dim, full,
-/// then it stays full; under Reduce motion it never flashes. A square that holds the `↻` of a
-/// periodic subscription draws it in a foreground clear on both phases.
-pub(super) fn update_square(
-    flash_since: Option<u64>,
-    holds_subscription: bool,
-    display: DisplayProfile,
-    now_ms: u64,
-) -> Role {
+/// The colour of a row's glyph while the row holds an update the Chat has not handled, over its
+/// state colour. A new update flashes it once since `flash_since`, bright, dim, bright, then it
+/// stays bright; under Reduce motion it never flashes.
+pub(super) fn update_mark(flash_since: Option<u64>, display: DisplayProfile, now_ms: u64) -> Role {
     let is_dim = flash_since.and_then(|since| display.flash_strong(since, now_ms)) == Some(false);
-    match (holds_subscription, is_dim) {
-        (false, false) => Role::UpdateSquare,
-        (false, true) => Role::UpdateProgress,
-        (true, false) => Role::SubscriptionSquare,
-        (true, true) => Role::SubscriptionSquareDim,
+    if is_dim {
+        Role::UpdateMarkDim
+    } else {
+        Role::UpdateMark
     }
 }
 
@@ -238,7 +219,7 @@ fn subscription_role(frequency: TickSubscriptionFrequency) -> Role {
     }
 }
 
-/// The `↻` that leads a row with periodic subscriptions, in its frequency's colour.
+/// The `⟳` that leads a row with periodic subscriptions, in its frequency's colour.
 pub(super) fn subscription_mark(
     subscription: Option<SubscriptionMark>,
     display: DisplayProfile,
@@ -306,7 +287,7 @@ mod tests {
             details: details.into(),
             fill: None,
             subscription: None,
-            update: None,
+            bar_columns: None,
         }
     }
 
@@ -427,7 +408,7 @@ mod tests {
             (TickSubscriptionFrequency::Low, Role::SubscriptionLow),
         ] {
             let mark = subscription_mark(periodic(frequency), DisplayProfile::default());
-            assert_eq!(mark, Some(("↻", role)), "{frequency:?}");
+            assert_eq!(mark, Some(("⟳", role)), "{frequency:?}");
             let line = ListRow {
                 subscription: mark,
                 ..row("Quotes", "exit 101")
@@ -437,7 +418,7 @@ mod tests {
             assert_eq!(
                 lead(&line, 3),
                 [
-                    ("↻".to_owned(), Some(role)),
+                    ("⟳".to_owned(), Some(role)),
                     (" ".to_owned(), Some(Role::MutedText)),
                     ("$".to_owned(), Some(Role::RunningMark))
                 ],
@@ -451,20 +432,11 @@ mod tests {
     }
 
     #[test]
-    fn the_name_starts_in_one_column_with_or_without_a_mark_or_square() {
+    fn the_name_starts_in_one_column_with_or_without_a_mark() {
         let names = [
             row("Quotes", "").lines(20)[0].clone(),
             ListRow {
-                subscription: Some(("↻", Role::SubscriptionLow)),
-                ..row("Quotes", "")
-            }
-            .lines(20)[0]
-                .clone(),
-            ListRow {
-                update: Some(UpdateIndicator {
-                    square: Role::UpdateSquare,
-                    bar_columns: None,
-                }),
+                subscription: Some(("⟳", Role::SubscriptionLow)),
                 ..row("Quotes", "")
             }
             .lines(20)[0]
@@ -473,52 +445,55 @@ mod tests {
         .map(|line| line.text().find("Quotes").unwrap());
         assert_eq!(
             names,
-            [4, 6, 4],
-            "byte offsets: `↻` takes three bytes in one column"
+            [4, 6],
+            "byte offsets: `⟳` takes three bytes in one column"
         );
         let narrow = ListRow {
-            subscription: Some(("↻", Role::SubscriptionLow)),
+            subscription: Some(("⟳", Role::SubscriptionLow)),
             ..row("python3 -q", "exit 101 · SIGTERM")
         };
         for width in [12, 20, 60] {
             let last = narrow.lines(width).last().unwrap().text();
             assert_eq!(last.width(), width, "{last:?}");
             assert!(
-                !last.ends_with('↻') && !last.ends_with(' '),
+                !last.ends_with('⟳') && !last.ends_with(' '),
                 "{width}: no mark or blank column at the right: {last:?}"
             );
         }
     }
 
     #[test]
-    fn a_square_takes_the_first_column_and_holds_the_mark_of_a_subscription() {
-        let updated = ListRow {
-            update: Some(UpdateIndicator {
-                square: Role::UpdateSquare,
-                bar_columns: None,
-            }),
+    fn an_unread_row_leaves_its_first_column_bare_and_the_bar_turns_the_mark_clear_on_it() {
+        let theme = super::super::style::Theme::new(super::super::style::ThemeName::ClaudeCodeDark);
+        let unread = ListRow {
+            glyph_role: Role::UpdateMark,
             ..row("Quotes", "")
         }
         .lines(20)[0]
             .clone();
-        assert_eq!(updated.text(), row("Quotes", "").lines(20)[0].text());
+        assert_eq!(unread.text(), row("Quotes", "").lines(20)[0].text());
         assert_eq!(
-            lead(&updated, 2),
+            lead(&unread, 3),
             [
-                (" ".to_owned(), Some(Role::UpdateSquare)),
-                (" ".to_owned(), Some(Role::MutedText))
-            ]
+                (" ".to_owned(), Some(Role::MutedText)),
+                (" ".to_owned(), Some(Role::MutedText)),
+                ("$".to_owned(), Some(Role::UpdateMark))
+            ],
+            "the glyph's colour alone tells the update"
         );
         assert_eq!(
-            updated.band, None,
-            "no bar without a subscription holding it"
+            unread.resolve(theme, 20).spans[0].style.background,
+            None,
+            "the first column has no background"
+        );
+        assert_eq!(
+            unread.band, None,
+            "no bar without a subscription holding the update"
         );
         let held = ListRow {
-            update: Some(UpdateIndicator {
-                square: Role::SubscriptionSquare,
-                bar_columns: Some(10),
-            }),
-            subscription: Some(("↻", Role::SubscriptionMedium)),
+            glyph_role: Role::UpdateMark,
+            bar_columns: Some(10),
+            subscription: Some(("⟳", Role::SubscriptionMedium)),
             ..row("Quotes", "")
         }
         .lines(20)[0]
@@ -526,15 +501,15 @@ mod tests {
         assert_eq!(
             lead(&held, 2),
             [
-                ("↻".to_owned(), Some(Role::SubscriptionSquare)),
+                ("⟳".to_owned(), Some(Role::SubscriptionOnProgress)),
                 (" ".to_owned(), Some(Role::MutedText))
             ],
-            "the `↻` sits on the square in the square's foreground"
+            "on the bar the `⟳` takes one foreground clear on it, whatever its frequency"
         );
         assert_eq!(
             held.band.map(|band| (band.columns, band.role)),
             Some((0..10, Role::UpdateProgress)),
-            "the bar runs from the square through the blank column"
+            "the bar runs from the first column through the blank one"
         );
     }
 
@@ -562,30 +537,44 @@ mod tests {
         assert_eq!(name.fill, Some(Role::Selection));
         assert_eq!(status.fill, Some(Role::Selection));
         assert!(!line.text().contains('›'));
-        for marked in [
-            ListRow {
-                subscription: Some(("↻", Role::SubscriptionHigh)),
-                ..selected_row()
-            },
-            ListRow {
-                update: Some(UpdateIndicator {
-                    square: Role::UpdateSquare,
-                    bar_columns: None,
-                }),
-                ..selected_row()
-            },
-        ] {
-            for line in marked.lines(30) {
-                assert_eq!(
-                    (line.fill, line.fill_start),
-                    (Some(Role::Selection), 1),
-                    "the first column keeps its own colours: {line:?}"
-                );
-            }
+        let marked = ListRow {
+            subscription: Some(("⟳", Role::SubscriptionHigh)),
+            ..selected_row()
+        };
+        for line in marked.lines(30) {
+            assert_eq!(
+                (line.fill, line.fill_start),
+                (Some(Role::Selection), 1),
+                "the first column keeps its own colours: {line:?}"
+            );
         }
         let theme = super::super::style::Theme::new(super::super::style::ThemeName::ClaudeCodeDark);
+        let unread = ListRow {
+            glyph_role: Role::UpdateMark,
+            ..selected_row()
+        }
+        .one_line(40);
+        assert_eq!(
+            (unread.fill, unread.fill_start),
+            (Some(Role::Selection), 0),
+            "an unread row without `⟳` fills from its first column"
+        );
+        let glyph = unread
+            .resolve(theme, 40)
+            .spans
+            .into_iter()
+            .find(|span| span.text == "$")
+            .unwrap();
+        assert_eq!(
+            (glyph.style.foreground, glyph.style.background),
+            (
+                theme.style(Role::UpdateMark).foreground,
+                theme.style(Role::Selection).background
+            ),
+            "the glyph keeps the update colour on the selection"
+        );
         let resolved = ListRow {
-            subscription: Some(("↻", Role::SubscriptionHigh)),
+            subscription: Some(("⟳", Role::SubscriptionHigh)),
             ..selected_row()
         }
         .one_line(40)
@@ -599,17 +588,14 @@ mod tests {
     }
 
     #[test]
-    fn a_bar_runs_from_the_square_on_every_line_and_a_flash_covers_it() {
+    fn a_bar_runs_from_the_first_column_on_every_line_and_a_flash_covers_it() {
         let check = NextCheck {
             at_ms: 160_000,
             period_ms: 60_000,
         };
         let waiting = ListRow {
-            update: Some(UpdateIndicator {
-                square: Role::SubscriptionSquare,
-                bar_columns: Some(check.elapsed_columns(30, 130_000)),
-            }),
-            subscription: Some(("↻", Role::SubscriptionHigh)),
+            bar_columns: Some(check.elapsed_columns(30, 130_000)),
+            subscription: Some(("⟳", Role::SubscriptionHigh)),
             ..row("Quote board for the whole watchlist", "")
         };
         let lines = waiting.lines(30);
@@ -619,14 +605,12 @@ mod tests {
             assert_eq!(
                 line.band.clone().map(|band| (band.columns, band.role)),
                 Some((0..15, Role::UpdateProgress)),
-                "half the period fills half the row, from the square on: {line:?}"
+                "half the period fills half the row, from the first column on: {line:?}"
             );
         }
         let just_started = ListRow {
-            update: Some(UpdateIndicator {
-                square: Role::UpdateSquare,
-                bar_columns: Some(0),
-            }),
+            bar_columns: Some(0),
+            subscription: Some(("⟳", Role::SubscriptionHigh)),
             ..row("Quotes", "")
         };
         assert_eq!(
@@ -635,7 +619,7 @@ mod tests {
                 .clone()
                 .map(|band| band.columns),
             Some(0..1),
-            "the bar never leaves its square behind"
+            "the bar always covers the `⟳`"
         );
         let flashing = ListRow {
             fill: Some(Role::FlashStrong),
@@ -660,38 +644,29 @@ mod tests {
     }
 
     #[test]
-    fn a_new_update_flashes_the_square_full_dim_full_and_it_then_stays_full() {
+    fn a_new_update_flashes_the_glyph_bright_dim_bright_and_it_then_stays_bright() {
         let animated = DisplayProfile::default();
         assert_eq!(
-            [5_000, 5_400, 5_800, 6_200].map(|now| update_square(
-                Some(5_000),
-                false,
-                animated,
-                now
-            )),
+            [5_000, 5_400, 5_800, 6_200].map(|now| update_mark(Some(5_000), animated, now)),
             [
-                Role::UpdateSquare,
-                Role::UpdateProgress,
-                Role::UpdateSquare,
-                Role::UpdateSquare
+                Role::UpdateMark,
+                Role::UpdateMarkDim,
+                Role::UpdateMark,
+                Role::UpdateMark
             ]
         );
         assert_eq!(
-            [5_000, 5_400, 6_200].map(|now| update_square(Some(5_000), true, animated, now)),
-            [
-                Role::SubscriptionSquare,
-                Role::SubscriptionSquareDim,
-                Role::SubscriptionSquare
-            ],
-            "a square holding a `↻` flashes the same backgrounds"
+            update_mark(None, animated, 5_400),
+            Role::UpdateMark,
+            "an update without a flash stays bright"
         );
         let still = DisplayProfile::new(DisplayPreferences {
             prefers_reduced_motion: true,
         });
         assert_eq!(
-            update_square(Some(5_000), false, still, 5_400),
-            Role::UpdateSquare,
-            "under Reduce motion the square does not flash"
+            update_mark(Some(5_000), still, 5_400),
+            Role::UpdateMark,
+            "under Reduce motion the glyph does not flash"
         );
     }
 

@@ -45,8 +45,8 @@ pub(super) fn dragged_columns(width: usize, column: usize) -> Option<usize> {
 
 pub(super) use crate::monitor_rows::TickGroup;
 use crate::monitor_rows::{
-    MonitorAction, MonitorContext, MonitorRowsRegistry, RowUpdate, StatusTone, SubscriptionMark,
-    TickDescriptor, TickGlyph, TickOwner, TickResources, page_of,
+    MonitorAction, MonitorContext, MonitorRowsRegistry, NextCheck, RowUpdate, StatusTone,
+    SubscriptionMark, TickDescriptor, TickGlyph, TickOwner, TickResources, page_of,
 };
 use tick_protocol::InstanceRef;
 use tickloop_agent_protocol::{
@@ -82,6 +82,25 @@ impl MonitorEntry {
             (true, _) => "—",
             (false, _) => &self.status,
         }
+    }
+
+    /// Whether the row holds an update the Chat has not handled: a row with periodic
+    /// subscriptions while they hold one for a check, any other row until the Chat handles its
+    /// latest update.
+    fn is_unread(&self) -> bool {
+        match self.subscription {
+            Some(mark) => mark.is_waiting,
+            None => self
+                .update
+                .as_ref()
+                .is_some_and(|update| update.unread.is_some()),
+        }
+    }
+
+    /// The check that hands over what the row's periodic subscriptions hold, once the Agent
+    /// reports it; the update bar counts toward it.
+    fn waiting_check(&self) -> Option<NextCheck> {
+        self.subscription.filter(|mark| mark.is_waiting)?.next_check
     }
 }
 
@@ -153,7 +172,7 @@ pub(super) struct Monitor {
     /// The latest update of each row as this View last listed it, `None` for a row without one.
     /// A row's first listing is its baseline, so only an update that comes after it is new.
     listed_updates: HashMap<InstanceRef, Option<u64>>,
-    /// Since when each row's update square flashes for the new update this View last listed.
+    /// Since when each row's glyph flashes for the new update this View last listed.
     update_flashes: HashMap<InstanceRef, u64>,
     /// The frequencies the user asked for that the Agent does not report yet, by subscription.
     /// Monitor shows them at once, and the next `f` cycles on from them rather than from a report
@@ -387,10 +406,13 @@ impl Monitor {
                 crate::monitor_rows::subscriptions_on(&shown_subscriptions, &instance),
                 goals,
             );
+            if detail.is_done() {
+                self.close_detail();
+            }
         }
         self.reconcile_selection();
     }
-    /// Notes what flashes: the update square of a row whose new update just came, and the whole row whose
+    /// Notes what flashes: the glyph of a row whose new update just came, and the whole row whose
     /// update an Agent turn has just taken in. A row the user opened does not flash, nor one taken
     /// in before this View showed the Chat, nor an update the row already showed handled that a
     /// turn takes in again.
@@ -454,8 +476,8 @@ impl Monitor {
             .min()
     }
     /// When time alone next changes the list drawn `width` columns wide without changing its
-    /// rows: a running row's glyph blinking or its elapsed time ticking, a row or its update
-    /// square flashing, or an update bar filling one more column. `None` while nothing runs,
+    /// rows: a running row's glyph blinking or its elapsed time ticking, a row or an unread row's
+    /// glyph flashing, or an update bar filling one more column. `None` while nothing runs,
     /// flashes or fills, or a detail covers the list.
     pub(super) fn next_frame_ms(
         &self,
@@ -477,7 +499,9 @@ impl Monitor {
             .flat_map(|entry| {
                 [
                     self.taken_in.get(&entry.instance),
-                    self.update_flashes.get(&entry.instance),
+                    self.update_flashes
+                        .get(&entry.instance)
+                        .filter(|_| entry.is_unread()),
                 ]
             })
             .flatten()
@@ -485,11 +509,7 @@ impl Monitor {
         let counting_down = self
             .entries
             .iter()
-            .filter(|entry| {
-                self.update_indicator(entry, width, display, now_ms)
-                    .is_some_and(|update| update.bar_columns.is_some())
-            })
-            .filter_map(|entry| entry.subscription?.next_check)
+            .filter_map(MonitorEntry::waiting_check)
             .filter_map(|check| check.next_column_at(width, now_ms));
         running
             .into_iter()
@@ -497,44 +517,15 @@ impl Monitor {
             .chain(counting_down)
             .min()
     }
-    /// How `entry` shows an update it has not handed over, drawn `width` columns wide. A row
-    /// with periodic subscriptions shows one while they hold updates for a check, and once its
-    /// square stops flashing, a bar to the part of the period elapsed before that check; any
-    /// other row shows one until the Chat handles its latest update.
-    fn update_indicator(
-        &self,
-        entry: &MonitorEntry,
-        width: usize,
-        display: DisplayProfile,
-        now_ms: u64,
-    ) -> Option<list_row::UpdateIndicator> {
-        let flash_since = self.update_flashes.get(&entry.instance).copied();
-        let is_flashing =
-            flash_since.is_some_and(|since| display.flash_strong(since, now_ms).is_some());
-        let bar_columns = match entry.subscription {
-            Some(mark) if !mark.is_waiting => return None,
-            Some(mark) => mark
-                .next_check
-                .filter(|_| !is_flashing)
-                .map(|check| check.elapsed_columns(width, now_ms)),
-            None if entry
-                .update
-                .as_ref()
-                .is_none_or(|update| update.unread.is_none()) =>
-            {
-                return None;
-            }
-            None => None,
-        };
-        Some(list_row::UpdateIndicator {
-            square: list_row::update_square(
-                flash_since,
-                entry.subscription.is_some(),
-                display,
-                now_ms,
-            ),
-            bar_columns,
-        })
+    /// The colour of `entry`'s glyph: the update colour, flashing for each new update, while the
+    /// row holds an update the Chat has not handled, and its state colour otherwise.
+    fn glyph_role(&self, entry: &MonitorEntry, display: DisplayProfile, now_ms: u64) -> Role {
+        if entry.is_unread() {
+            let flash_since = self.update_flashes.get(&entry.instance).copied();
+            list_row::update_mark(flash_since, display, now_ms)
+        } else {
+            list_row::state_mark(entry.tone, display, now_ms)
+        }
     }
     /// The row's title, or the instance itself when no row shows it.
     pub(super) fn title_of(&self, instance: &InstanceRef) -> String {
@@ -754,7 +745,7 @@ impl Monitor {
             .map(|(entry, title)| ListRow {
                 selected: self.focused && self.selected.as_ref() == Some(&entry.instance),
                 glyph: display.glyph(entry.glyph),
-                glyph_role: list_row::state_mark(entry.tone, display, now_ms),
+                glyph_role: self.glyph_role(entry, display, now_ms),
                 name: title,
                 details: list_row::row_details(entry.tone, &entry.notes, now_ms),
                 fill: list_row::flash_fill(
@@ -763,7 +754,9 @@ impl Monitor {
                     now_ms,
                 ),
                 subscription: list_row::subscription_mark(entry.subscription, display),
-                update: self.update_indicator(entry, width, display, now_ms),
+                bar_columns: entry
+                    .waiting_check()
+                    .map(|check| check.elapsed_columns(width, now_ms)),
             })
             .collect::<Vec<_>>();
         let groups = self
@@ -1073,7 +1066,7 @@ mod registered_rows_tests {
 #[cfg(test)]
 mod signal_tests {
     use super::*;
-    use crate::monitor_rows::{MonitorRows, NextCheck, RowUpdate};
+    use crate::monitor_rows::{MonitorRows, RowUpdate};
     use std::sync::{Arc, Mutex};
     use tickloop_agent_config::DisplayPreferences;
     use tickloop_agent_protocol::{
@@ -1177,23 +1170,11 @@ mod signal_tests {
             .and_then(|span| span.role)
     }
 
-    /// The role of the row's update square, `None` without one. The square takes the row's
-    /// first column.
-    fn square(monitor: &Monitor, display: DisplayProfile, now_ms: u64) -> Option<Role> {
-        row(monitor, display, now_ms)
-            .spans
-            .into_iter()
-            .next()
-            .and_then(|span| span.role)
-            .filter(|role| {
-                matches!(
-                    role,
-                    Role::UpdateSquare
-                        | Role::UpdateProgress
-                        | Role::SubscriptionSquare
-                        | Role::SubscriptionSquareDim
-                )
-            })
+    /// The text and role of the row's first column.
+    fn lead(monitor: &Monitor, display: DisplayProfile, now_ms: u64) -> (String, Option<Role>) {
+        let line = row(monitor, display, now_ms);
+        let first = &line.spans[0];
+        (first.text.chars().take(1).collect(), first.role)
     }
 
     fn reduced_motion() -> DisplayProfile {
@@ -1203,7 +1184,7 @@ mod signal_tests {
     }
 
     #[test]
-    fn an_unread_update_shows_a_still_square_without_a_fill_a_time_or_a_dot() {
+    fn an_unread_update_colours_the_glyph_without_a_fill_a_time_or_a_dot() {
         let (mut monitor, _) = updated_monitor(Some(chat()));
         monitor.rebuild_at(UPDATED_AT + 100);
         let animated = DisplayProfile::default();
@@ -1215,7 +1196,12 @@ mod signal_tests {
                 "no subscription holds the update, so no bar"
             );
             assert!(!line.text().contains('●'), "{line:?}");
-            assert_eq!(square(&monitor, animated, now), Some(Role::UpdateSquare));
+            assert_eq!(glyph(&monitor, animated, now), Some(Role::UpdateMark));
+            assert_eq!(
+                lead(&monitor, animated, now),
+                (" ".to_owned(), Some(Role::MutedText)),
+                "the first column stays bare"
+            );
         }
         assert_eq!(
             monitor.next_frame_ms(UPDATED_AT + 100, WIDTH, animated),
@@ -1225,7 +1211,7 @@ mod signal_tests {
     }
 
     #[test]
-    fn each_new_update_flashes_the_square_while_the_glyph_keeps_its_state() {
+    fn each_new_update_flashes_the_glyph_in_the_update_colour() {
         let (mut monitor, update) = updated_monitor(Some(chat()));
         monitor.rebuild_at(UPDATED_AT + 100);
         let animated = DisplayProfile::default();
@@ -1234,22 +1220,15 @@ mod signal_tests {
             let seen = next + 200;
             monitor.rebuild_at(seen);
             assert_eq!(
-                [0, 400, 800, 1_200].map(|elapsed| square(&monitor, animated, seen + elapsed)),
+                [0, 400, 800, 1_200].map(|elapsed| glyph(&monitor, animated, seen + elapsed)),
                 [
-                    Some(Role::UpdateSquare),
-                    Some(Role::UpdateProgress),
-                    Some(Role::UpdateSquare),
-                    Some(Role::UpdateSquare)
+                    Some(Role::UpdateMark),
+                    Some(Role::UpdateMarkDim),
+                    Some(Role::UpdateMark),
+                    Some(Role::UpdateMark)
                 ],
-                "the update at {next} flashes the square, which then stays"
+                "the update at {next} flashes the glyph, which then stays in the update colour"
             );
-            for elapsed in [0, 400, 800] {
-                assert_eq!(
-                    glyph(&monitor, animated, seen + elapsed),
-                    Some(Role::SuccessMark),
-                    "the glyph keeps its state colour"
-                );
-            }
             assert_eq!(
                 fill(&monitor, animated, seen),
                 None,
@@ -1273,9 +1252,9 @@ mod signal_tests {
         *update.lock().unwrap() = Some(UPDATED_AT + 2_000);
         still.rebuild_at(UPDATED_AT + 2_200);
         assert_eq!(
-            square(&still, reduced_motion(), UPDATED_AT + 2_200),
-            Some(Role::UpdateSquare),
-            "under Reduce motion the square never flashes"
+            glyph(&still, reduced_motion(), UPDATED_AT + 2_200),
+            Some(Role::UpdateMark),
+            "under Reduce motion the glyph never flashes"
         );
         assert_eq!(
             still.next_frame_ms(UPDATED_AT + 2_200, WIDTH, reduced_motion()),
@@ -1284,7 +1263,7 @@ mod signal_tests {
     }
 
     #[test]
-    fn a_turn_taking_the_update_in_flashes_the_row_and_removes_the_mark() {
+    fn a_turn_taking_the_update_in_flashes_the_row_and_restores_the_state_colour() {
         let monitor = handled_while_listed(MonitorMembership::mark_taken_in);
         let animated = DisplayProfile::default();
         let fills = [0, 399, 400, 799, 800, 1_199, 1_200, 5_000]
@@ -1302,7 +1281,10 @@ mod signal_tests {
                 None
             ]
         );
-        assert_eq!(square(&monitor, animated, HANDLED_AT + 50), None);
+        assert_eq!(
+            glyph(&monitor, animated, HANDLED_AT + 50),
+            Some(Role::SuccessMark)
+        );
         assert_eq!(
             monitor.next_frame_ms(HANDLED_AT + 50, WIDTH, animated),
             Some(HANDLED_AT + 400)
@@ -1320,10 +1302,13 @@ mod signal_tests {
     }
 
     #[test]
-    fn under_reduce_motion_a_taken_in_row_loses_its_mark_without_a_flash() {
+    fn under_reduce_motion_a_taken_in_row_restores_the_state_colour_without_a_flash() {
         let monitor = handled_while_listed(MonitorMembership::mark_taken_in);
         assert_eq!(fill(&monitor, reduced_motion(), HANDLED_AT + 50), None);
-        assert_eq!(square(&monitor, reduced_motion(), HANDLED_AT + 50), None);
+        assert_eq!(
+            glyph(&monitor, reduced_motion(), HANDLED_AT + 50),
+            Some(Role::SuccessMark)
+        );
         assert_eq!(
             monitor.next_frame_ms(HANDLED_AT + 50, WIDTH, reduced_motion()),
             None
@@ -1331,11 +1316,14 @@ mod signal_tests {
     }
 
     #[test]
-    fn the_user_opening_the_row_removes_the_mark_without_a_flash() {
+    fn the_user_opening_the_row_restores_the_state_colour_without_a_flash() {
         let monitor = handled_while_listed(MonitorMembership::mark_handled);
         let animated = DisplayProfile::default();
         assert_eq!(fill(&monitor, animated, HANDLED_AT + 50), None);
-        assert_eq!(square(&monitor, animated, HANDLED_AT + 50), None);
+        assert_eq!(
+            glyph(&monitor, animated, HANDLED_AT + 50),
+            Some(Role::SuccessMark)
+        );
         assert_eq!(
             monitor.next_frame_ms(HANDLED_AT + 50, WIDTH, animated),
             None
@@ -1379,14 +1367,14 @@ mod signal_tests {
         monitor.settle_flashes(UPDATED_AT + 3_000);
         monitor.rebuild_at(UPDATED_AT + 3_000);
         assert_eq!(
-            square(&monitor, animated, UPDATED_AT + 3_400),
-            Some(Role::UpdateSquare)
+            glyph(&monitor, animated, UPDATED_AT + 3_400),
+            Some(Role::UpdateMark)
         );
         *update.lock().unwrap() = Some(UPDATED_AT + 4_000);
         monitor.rebuild_at(UPDATED_AT + 4_100);
         assert_eq!(
-            square(&monitor, animated, UPDATED_AT + 4_500),
-            Some(Role::UpdateProgress),
+            glyph(&monitor, animated, UPDATED_AT + 4_500),
+            Some(Role::UpdateMarkDim),
             "an update after coming back flashes"
         );
     }
@@ -1421,20 +1409,20 @@ mod signal_tests {
     }
 
     #[test]
-    fn a_selected_unread_row_keeps_the_selection_and_its_update_square() {
+    fn a_selected_unread_row_fills_from_its_first_column_and_keeps_the_update_colour() {
         let (mut monitor, _) = updated_monitor(Some(chat()));
         monitor.rebuild_at(UPDATED_AT + 100);
         monitor.focus(false, None);
         let line = row(&monitor, DisplayProfile::default(), UPDATED_AT + 100);
         assert_eq!(
             (line.fill, line.fill_start),
-            (Some(Role::Selection), 1),
-            "the selection starts after the square"
+            (Some(Role::Selection), 0),
+            "nothing keeps the first column off the selection"
         );
         assert!(line.text().starts_with("  ◉ Quotes"), "{line:?}");
         assert_eq!(
-            square(&monitor, DisplayProfile::default(), UPDATED_AT + 100),
-            Some(Role::UpdateSquare)
+            glyph(&monitor, DisplayProfile::default(), UPDATED_AT + 100),
+            Some(Role::UpdateMark)
         );
     }
 
@@ -1519,18 +1507,20 @@ mod signal_tests {
     }
 
     #[test]
-    fn a_quiet_periodic_row_shows_no_square_and_no_bar() {
+    fn a_quiet_periodic_row_keeps_its_state_colour_and_shows_no_bar() {
         let monitor = subscribed(
             vec![subscription(TickSubscriptionFrequency::High, Some(100_000))],
             70_000,
         );
         assert_eq!(bar(&monitor, 70_000), None);
-        assert_eq!(square(&monitor, DisplayProfile::default(), 70_000), None);
-        let lead = row(&monitor, DisplayProfile::default(), 70_000).spans[0].clone();
         assert_eq!(
-            (lead.text.as_str(), lead.role),
-            ("↻", Some(Role::SubscriptionHigh)),
-            "the `↻` leads the row in its frequency's colour"
+            glyph(&monitor, DisplayProfile::default(), 70_000),
+            Some(Role::SuccessMark)
+        );
+        assert_eq!(
+            lead(&monitor, DisplayProfile::default(), 70_000),
+            ("⟳".to_owned(), Some(Role::SubscriptionHigh)),
+            "the `⟳` leads the row in its frequency's colour"
         );
         assert_eq!(
             monitor.next_frame_ms(70_000, WIDTH, DisplayProfile::default()),
@@ -1540,7 +1530,7 @@ mod signal_tests {
     }
 
     #[test]
-    fn a_waiting_update_fills_a_bar_from_its_square_until_the_check_hands_it_over() {
+    fn a_waiting_update_fills_a_bar_from_the_first_column_until_the_check_hands_it_over() {
         let period = 60_000;
         let first_check = 100_000;
         let mut monitor = subscribed(
@@ -1560,9 +1550,13 @@ mod signal_tests {
                 "at {now}"
             );
             assert_eq!(
-                square(&monitor, DisplayProfile::default(), now),
-                Some(Role::SubscriptionSquare),
-                "the square holds the `↻`"
+                glyph(&monitor, DisplayProfile::default(), now),
+                Some(Role::UpdateMark)
+            );
+            assert_eq!(
+                lead(&monitor, DisplayProfile::default(), now),
+                ("⟳".to_owned(), Some(Role::SubscriptionOnProgress)),
+                "the `⟳` turns clear on the bar"
             );
         }
         let text = monitor
@@ -1599,9 +1593,13 @@ mod signal_tests {
         monitor.rebuild_at(first_check + 100);
         assert_eq!(bar(&monitor, first_check + 100), None);
         assert_eq!(
-            square(&monitor, DisplayProfile::default(), first_check + 100),
-            None,
+            glyph(&monitor, DisplayProfile::default(), first_check + 100),
+            Some(Role::SuccessMark),
             "the check handed the update over, or found nothing to hand over"
+        );
+        assert_eq!(
+            lead(&monitor, DisplayProfile::default(), first_check + 100),
+            ("⟳".to_owned(), Some(Role::SubscriptionHigh))
         );
         assert_eq!(
             row(&monitor, DisplayProfile::default(), first_check + 100).fill,
@@ -1611,7 +1609,7 @@ mod signal_tests {
     }
 
     #[test]
-    fn a_new_waiting_update_flashes_the_square_before_its_bar_shows() {
+    fn a_new_waiting_update_flashes_the_glyph_while_its_bar_shows() {
         let animated = DisplayProfile::default();
         let mut monitor = subscribed(
             vec![waiting(TickSubscriptionFrequency::High, Some(100_000))],
@@ -1622,24 +1620,64 @@ mod signal_tests {
         updated.updated_at_ms = Some(50_000);
         monitor.subscriptions = vec![updated];
         monitor.rebuild_at(50_000);
+        assert_eq!(glyph(&monitor, animated, 50_400), Some(Role::UpdateMarkDim));
         assert_eq!(
-            square(&monitor, animated, 50_400),
-            Some(Role::SubscriptionSquareDim)
+            bar(&monitor, 50_400),
+            Some((0..6, Role::UpdateProgress)),
+            "the bar does not wait for the flash"
         );
-        assert_eq!(bar(&monitor, 50_400), None, "the bar waits for the flash");
         assert_eq!(monitor.next_frame_ms(50_900, WIDTH, animated), Some(51_200));
-        assert_eq!(
-            square(&monitor, animated, 51_200),
-            Some(Role::SubscriptionSquare)
-        );
+        assert_eq!(glyph(&monitor, animated, 51_200), Some(Role::UpdateMark));
         assert_eq!(bar(&monitor, 51_200), Some((0..7, Role::UpdateProgress)));
     }
 
-    /// A Terminal Tick's screen that changed since its subscription last got it shows the square
-    /// with its flash and then the bar to the check that reads it; a check that finds the screen
-    /// changed back clears both, and the row does not flash.
+    /// A Tick that updates every second, quicker than a flash lasts, keeps its bar on screen and
+    /// growing with the period while each update flashes its glyph anew.
     #[test]
-    fn a_changed_terminal_screen_shows_the_square_and_bar_until_its_check() {
+    fn an_update_every_second_keeps_its_bar_growing_while_the_glyph_flashes() {
+        let animated = DisplayProfile::default();
+        let (period, check) = (60_000, 100_000);
+        let mut monitor = subscribed(
+            vec![waiting(TickSubscriptionFrequency::High, Some(check))],
+            49_000,
+        );
+        monitor.chat_status = Some(Arc::new(chat()));
+        let mut reached = 0;
+        for second in (50_000..=58_000).step_by(1_000) {
+            let mut updated = waiting(TickSubscriptionFrequency::High, Some(check));
+            updated.updated_at_ms = Some(second);
+            monitor.subscriptions = vec![updated];
+            monitor.rebuild_at(second);
+            for (elapsed_in_second, phase) in [
+                (0, Role::UpdateMark),
+                (400, Role::UpdateMarkDim),
+                (800, Role::UpdateMark),
+            ] {
+                let now = second + elapsed_in_second;
+                let filled = (now - (check - period)) as usize * WIDTH / period as usize;
+                assert_eq!(
+                    bar(&monitor, now),
+                    Some((0..filled, Role::UpdateProgress)),
+                    "at {now} the bar shows the part of the period elapsed"
+                );
+                assert!(filled >= reached, "the bar never shrinks");
+                reached = filled;
+                assert_eq!(glyph(&monitor, animated, now), Some(phase), "at {now}");
+                assert_eq!(
+                    lead(&monitor, animated, now),
+                    ("⟳".to_owned(), Some(Role::SubscriptionOnProgress))
+                );
+            }
+        }
+        assert_eq!(reached, 12, "the bar grew with the seconds");
+    }
+
+    /// A Terminal Tick's screen that changed since its subscription last got it flashes the glyph
+    /// in the update colour and shows the bar to the check that reads it; a check that finds the
+    /// screen changed back restores the state colour and clears the bar, and the row does not
+    /// flash.
+    #[test]
+    fn a_changed_terminal_screen_shows_the_update_colour_and_bar_until_its_check() {
         let animated = DisplayProfile::default();
         let mut monitor = subscribed(
             vec![subscription(TickSubscriptionFrequency::High, Some(100_000))],
@@ -1652,15 +1690,12 @@ mod signal_tests {
         monitor.subscriptions = vec![changed];
         monitor.rebuild_at(50_000);
         assert_eq!(
-            square(&monitor, animated, 50_400),
-            Some(Role::SubscriptionSquareDim),
-            "the change flashes the square"
+            glyph(&monitor, animated, 50_400),
+            Some(Role::UpdateMarkDim),
+            "the change flashes the glyph"
         );
-        assert_eq!(bar(&monitor, 50_400), None);
-        assert_eq!(
-            square(&monitor, animated, 51_200),
-            Some(Role::SubscriptionSquare)
-        );
+        assert_eq!(bar(&monitor, 50_400), Some((0..6, Role::UpdateProgress)));
+        assert_eq!(glyph(&monitor, animated, 51_200), Some(Role::UpdateMark));
         assert_eq!(bar(&monitor, 51_200), Some((0..7, Role::UpdateProgress)));
 
         let mut settled = subscription(TickSubscriptionFrequency::High, Some(160_000));
@@ -1668,7 +1703,7 @@ mod signal_tests {
         monitor.subscriptions = vec![settled];
         monitor.rebuild_at(100_100);
         assert_eq!(bar(&monitor, 100_100), None);
-        assert_eq!(square(&monitor, animated, 100_100), None);
+        assert_eq!(glyph(&monitor, animated, 100_100), Some(Role::SuccessMark));
         assert_eq!(row(&monitor, animated, 100_100).fill, None);
     }
 
@@ -1699,15 +1734,15 @@ mod signal_tests {
         let line = &monitor
             .frame(WIDTH, 10, DisplayProfile::default(), now)
             .lines[2];
-        assert_eq!(line.text().matches('↻').count(), 1, "{line:?}");
+        assert_eq!(line.text().matches('⟳').count(), 1, "{line:?}");
         assert!(
             !line.text().contains(['2', '3']),
             "no count of subscriptions: {line:?}"
         );
         assert_eq!(
             (line.spans[0].text.as_str(), line.spans[0].role),
-            ("↻", Some(Role::SubscriptionSquare)),
-            "while a subscription waits, the `↻` is on the square"
+            ("⟳", Some(Role::SubscriptionOnProgress)),
+            "while a subscription waits, the `⟳` is on the bar"
         );
         assert_eq!(
             bar(&monitor, now),
@@ -1730,7 +1765,7 @@ mod signal_tests {
             .frame(WIDTH, 10, DisplayProfile::default(), 40_000)
             .lines[2];
         assert_eq!(line.band, None);
-        assert!(!line.text().contains(['↻', '↯']), "{line:?}");
+        assert!(!line.text().contains(['⟳', '↯']), "{line:?}");
         assert_eq!(
             monitor.next_frame_ms(40_000, WIDTH, DisplayProfile::default()),
             None

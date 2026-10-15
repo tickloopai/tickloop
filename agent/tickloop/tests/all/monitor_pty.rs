@@ -112,20 +112,18 @@ impl Session {
     fn wait(&self, needle: &str) {
         self.wait_until_shown(needle, true);
     }
-    /// Waits until the Console paints a Monitor row's update square, which has no text of its own:
-    /// the accent background at 256 colours or in true colour, in the Monitor's first column,
-    /// right after its divider.
-    fn wait_for_update_square(&self) {
-        const UPDATE_SQUARE_BACKGROUNDS: [&str; 2] =
-            ["│ \x1b[48;5;173m", "│ \x1b[48;2;215;119;87m"];
+    /// Waits until the Console paints a Shell row's `$` in the update colour, at 256 colours or
+    /// in true colour, which tells an update colour cannot show in the plain frame.
+    fn wait_for_unread_shell(&self) {
+        const UNREAD_SHELL_GLYPHS: [&str; 2] = ["\x1b[38;5;216m$", "\x1b[38;2;255;160;120m$"];
         let deadline = Instant::now() + TIMEOUT;
-        while !UPDATE_SQUARE_BACKGROUNDS
+        while !UNREAD_SHELL_GLYPHS
             .iter()
-            .any(|background| self.output.lock().unwrap().contains(background))
+            .any(|glyph| self.output.lock().unwrap().contains(glyph))
         {
             assert!(
                 Instant::now() < deadline,
-                "PTY never painted an update square: {}",
+                "PTY never painted the Shell's glyph in the update colour: {}",
                 self.frame()
             );
             thread::sleep(Duration::from_millis(20));
@@ -227,8 +225,8 @@ fn shell_tick_appears_can_be_focused_and_removed_in_an_isolated_pty() {
     session.send(b"\x02");
     session.wait("Shells (1)");
     std::fs::write(directory.path().join("finish"), "").unwrap();
-    // A clean exit adds no words or time to the row; its unread end is the accent square.
-    session.wait_for_update_square();
+    // A clean exit adds no words or time to the row; its unread end colours its glyph.
+    session.wait_for_unread_shell();
     assert!(!session.frame().contains("exit 0"), "{}", session.frame());
     session.send(b"\x1b[Cx");
     session.wait_without("Shells (1)");
