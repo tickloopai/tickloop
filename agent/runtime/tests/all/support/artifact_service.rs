@@ -223,7 +223,7 @@ fn mcp(control: &ServiceControl, origin: &str, body: &Value) -> Value {
         .unwrap()
         .clone()
         .unwrap_or_else(|| "tickloop-docs".into());
-    let result = match body["method"].as_str().unwrap_or("") {
+    let mut result = match body["method"].as_str().unwrap_or("") {
         "server/discover" => {
             let mut capabilities = json!({"tools":{"listChanged":true}});
             if control.skills_enabled.load(Ordering::SeqCst) {
@@ -254,6 +254,9 @@ fn mcp(control: &ServiceControl, origin: &str, body: &Value) -> Value {
         "tools/call" => call_tool(control, origin, &body["params"]),
         method => panic!("unexpected MCP method: {method}"),
     };
+    if matches!(body["method"].as_str(), Some("skills/list" | "skills/get")) {
+        result["_meta"] = json!({"io.modelcontextprotocol/serverInfo":{"name":name,"version":"1"}});
+    }
     json!({"jsonrpc":"2.0","id":body["id"],"result":result})
 }
 

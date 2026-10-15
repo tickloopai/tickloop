@@ -448,6 +448,15 @@ impl Scrollback {
         self.separate_block();
     }
 
+    /// Appends `text` as a block that leaves an open read or search group open, as Claude Code
+    /// lets a thinking block pass a collapsed group without ending it.
+    pub(super) fn append_aside(&mut self, text: &str, role: Option<Role>) {
+        let open_group = self.open_group;
+        self.separate_block();
+        self.append_as(text, role, None);
+        self.open_group = open_group;
+    }
+
     fn separate_block(&mut self) {
         if !self.lines.last().unwrap().is_empty() || self.last_line_is_markdown() {
             self.start_line();
@@ -2289,7 +2298,8 @@ mod tests {
         scrollback.append_tool_result("a", &result("file content"));
         scrollback.finish_tool_call(run, "a", false);
         scrollback.finish_tool_call(run, "b", false);
-        // Thinking leaves no row, so the group goes on; the same file read again counts once.
+        // A thinking label passes the group; the same file read again counts once.
+        scrollback.append_aside("∴ Thinking\n", None);
         scrollback.set_tool_call(run, "c", &read_spans, ToolCallState::Running, read("a.txt"));
         scrollback.set_tool_call(run, "d", &read_spans, ToolCallState::Running, read("b.txt"));
         scrollback.finish_tool_call(run, "c", false);
@@ -2307,6 +2317,8 @@ mod tests {
             [
                 "",
                 "  Searched for 1 pattern, read 2 files (ctrl+o to expand)",
+                "",
+                "∴ Thinking",
                 "",
                 "⏺ Text ends the group.",
                 "",

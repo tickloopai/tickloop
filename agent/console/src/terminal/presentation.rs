@@ -17,9 +17,8 @@ use super::{
     agent_messaging::{self, AgentColors, AgentInput, AgentMessage},
     console::Console,
     conversation::{
-        AssistantState, ConversationBlock, ConversationBlockId, ConversationBlockKind,
-        ConversationBlockMetadata, ConversationOutcome, ThinkingSource,
-        project as project_conversation,
+        AssistantState, ConversationBlockId, ConversationBlockKind, ConversationBlockMetadata,
+        ConversationOutcome, ThinkingSource, project as project_conversation,
     },
     display::{DisplayProfile, Glyph},
     hyperlink,
@@ -160,9 +159,9 @@ impl MessageGroups {
     }
 }
 
-/// The conversation as Claude Code's detailed transcript shows it: every block expanded, each
-/// tool result under its call, the time and model above each reply and only the latest thinking
-/// of the current turn.
+/// The conversation as the detailed transcript shows it: every block expanded, each tool result
+/// under its call, the time and model above each reply, and every thinking block in place, as
+/// Codex's transcript overlay keeps each reasoning block.
 pub(super) fn transcript_document(
     snapshot: &ChatSnapshot,
     display: DisplayProfile,
@@ -170,7 +169,6 @@ pub(super) fn transcript_document(
     colors: &AgentColors,
 ) -> TranscriptDocument {
     let blocks = project_conversation(snapshot).blocks;
-    let shown_thinking = current_turn_thinking(&blocks, snapshot);
     let results = blocks
         .iter()
         .filter_map(|block| match &block.kind {
@@ -184,7 +182,7 @@ pub(super) fn transcript_document(
     };
     let mut answered = HashSet::new();
     let mut waiting_notice_written = false;
-    for (index, block) in blocks.iter().enumerate() {
+    for block in &blocks {
         match &block.kind {
             ConversationBlockKind::User { text } => {
                 let is_agent_message = is_agent_message(&block.id, snapshot);
@@ -272,10 +270,7 @@ pub(super) fn transcript_document(
                 state: AssistantState::Complete,
             } => writer.reply(text, &block.metadata),
             ConversationBlockKind::Assistant { .. } => {}
-            ConversationBlockKind::Thinking { text, source } if shown_thinking == Some(index) => {
-                writer.thinking(text, *source)
-            }
-            ConversationBlockKind::Thinking { .. } => {}
+            ConversationBlockKind::Thinking { text, source } => writer.thinking(text, *source),
             ConversationBlockKind::ToolCall {
                 exchange,
                 name,
@@ -439,22 +434,6 @@ pub(super) fn transcript_document(
         }
     }
     writer.document
-}
-
-/// The thinking block the detailed transcript shows: the latest one after the last prompt.
-fn current_turn_thinking(blocks: &[ConversationBlock], snapshot: &ChatSnapshot) -> Option<usize> {
-    for (index, block) in blocks.iter().enumerate().rev() {
-        match &block.kind {
-            ConversationBlockKind::Thinking { .. } => return Some(index),
-            ConversationBlockKind::User { text }
-                if typed_local_message(text, is_agent_message(&block.id, snapshot)).is_none() =>
-            {
-                return None;
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 fn is_agent_message(id: &ConversationBlockId, snapshot: &ChatSnapshot) -> bool {
@@ -1941,6 +1920,14 @@ pub(super) fn running_shell_runs(output: &str, display: DisplayProfile) -> RoleR
     rows.runs
 }
 
+/// The label a finished thinking block leaves in the conversation; Ctrl+O shows the thinking.
+pub(super) fn thinking_label() -> super::console::ConversationPiece {
+    super::console::ConversationPiece::Aside(
+        "∴ Thinking (ctrl+o to expand)\n".into(),
+        Some(Role::ThinkingHeading),
+    )
+}
+
 pub(super) fn interrupted_notice(display: DisplayProfile) -> String {
     format!("  {}  {INTERRUPTED}", display.glyph(Glyph::ToolResult))
 }
@@ -2953,8 +2940,8 @@ mod tests {
         }
         assert_eq!(
             text.matches("∴ Thinking…").count(),
-            1,
-            "only the current turn's latest thinking is shown"
+            RETAINED_TOOL_EVENTS + 2,
+            "every saved thinking block is shown"
         );
         for hidden in [
             "system-only",

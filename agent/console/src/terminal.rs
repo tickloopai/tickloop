@@ -132,6 +132,8 @@ use tickloop_agent_protocol::{
 use workflows::Workflow;
 
 const SUBSCRIPTION_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// How often an open transcript view is rebuilt while the Chat it shows keeps changing.
+const TRANSCRIPT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 /// How often the host state of Monitor members without a subscription is sampled.
 const MEMBER_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -1648,6 +1650,10 @@ async fn interact(
     animation_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut elapsed_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
     elapsed_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut transcript_refresh = tokio::time::interval(TRANSCRIPT_REFRESH_INTERVAL);
+    transcript_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The selected Chat changed since an open transcript view was last rebuilt.
+    let mut transcript_refresh_due = false;
     let mut working_shimmer = RunningShimmer::default();
     let task_center = ShellTaskCenter::new(agent.clone());
     let mut prompt_watchdog_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -3862,6 +3868,7 @@ async fn interact(
                         EventKind::QuestionAsked { request } => menus.note_request(event.chat_id, request.id),
                         _ => {}
                     }
+                    transcript_refresh_due |= Some(event.chat_id) == selected_chat;
                 }
                 match event {
                 Ok(event) if !overview_active && (pending.contains_key(&event.run_id) || Some(event.chat_id)==selected_chat) => {
@@ -4000,6 +4007,9 @@ async fn interact(
                         && let Some(mut reply) = reply_lines.remove(&event.run_id) {
                             reply.finish();
                             write_pending_reply_lines(console, &mut reply)?;
+                    }
+                    if interactive && stopped_thinking {
+                        console.write_pieces(&[presentation::thinking_label()])?;
                     }
                     let interrupted_by_user = matches!(&event.kind,EventKind::Completed {..} | EventKind::Failed(_) | EventKind::Interrupted)
                         && user_interrupted_runs.remove(&event.run_id)
@@ -4494,6 +4504,15 @@ async fn interact(
             _ = animation_refresh.tick(), if interactive && !visual_pacing_pending && (thinking_frame_due || (!prefers_reduced_motion && (!pending.is_empty() || !directed_summaries.is_empty()))) => {
                 thinking_frame_due = false;
                 activity_dirty = true;
+            },
+            _ = transcript_refresh.tick(), if interactive && transcript_refresh_due => {
+                transcript_refresh_due = false;
+                if let Some(chat) = selected_chat
+                    && let Some(id) = console.open_transcript()?
+                    && let Ok(snapshot) = agent.snapshot(chat).await
+                {
+                    console.refresh_transcript(id, presentation::transcript_document(&snapshot, console.display_profile()?, &console.image_links()?, &console.agent_colors()?))?;
+                }
             },
             _ = elapsed_refresh.tick(), if interactive && !visual_pacing_pending && (todo_refresh_pending || prefers_reduced_motion && running_activity.as_ref().is_some_and(|activity| activity.started_at.is_some())) => {
                 activity_dirty = true;
@@ -5323,6 +5342,14 @@ fn render_restored_observation(
                         .contains(&id.replace(":assistant:", ":thinking:"))
                 });
             let console = &console.for_message(message_id.clone());
+            if matches!(event.kind, EventKind::Thinking(_)) {
+                thinking_runs.insert(event.run_id);
+            } else if ends_thinking(&event.kind)
+                && thinking_runs.remove(&event.run_id)
+                && console.is_interactive()
+            {
+                console.write_pieces(&[presentation::thinking_label()])?;
+            }
             let facts = tools.call_facts(event, &observation.snapshot);
             let interrupted_by_rejection = tools.ended_with_rejection(event.run_id);
             if tools.present_event(console, event, &facts)? {

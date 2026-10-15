@@ -2648,10 +2648,28 @@ impl Console {
         Ok(closed)
     }
 
-    pub fn update_transcript(
+    /// The transcript view open now, which `refresh_transcript` keeps current.
+    pub fn open_transcript(&self) -> Result<Option<Uuid>, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        Ok(state.transcript.as_ref().map(|(id, _)| *id))
+    }
+
+    /// Loads the conversation into the transcript view `id`, which then shows its end.
+    pub fn update_transcript(&self, id: Uuid, document: TranscriptDocument) -> Result<(), String> {
+        self.apply_transcript(id, document, Transcript::update)
+    }
+
+    /// Brings the open transcript view `id` up to date with the conversation, keeping where the
+    /// reader is unless the view was at its end.
+    pub fn refresh_transcript(&self, id: Uuid, document: TranscriptDocument) -> Result<(), String> {
+        self.apply_transcript(id, document, Transcript::refresh)
+    }
+
+    fn apply_transcript(
         &self,
         id: Uuid,
         mut document: TranscriptDocument,
+        apply: fn(&mut Transcript, TranscriptDocument),
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         if let Some(chat) = state.chat
@@ -2678,7 +2696,7 @@ impl Console {
         if let Some((current, transcript)) = &mut state.transcript
             && id == *current
         {
-            transcript.update(document);
+            apply(transcript, document);
             state
                 .draw(&mut io::stdout().lock())
                 .map_err(|error| error.to_string())?;
@@ -4703,6 +4721,8 @@ impl Drop for Lifetime {
 pub(super) enum ConversationPiece {
     /// Starts a block one blank row below the visible content above it.
     Block,
+    /// A block that leaves an open read or search group open, such as a thinking label.
+    Aside(String, Option<Role>),
     Styled(String, Option<Role>),
     /// `⎿` response rows at the end of the conversation, each wrapping under its content.
     Response(Vec<(String, Option<Role>)>),
@@ -4767,6 +4787,7 @@ impl ConversationPiece {
     fn append_to(&self, scrollback: &mut Scrollback, display: DisplayProfile) {
         match self {
             Self::Block => scrollback.start_block(),
+            Self::Aside(text, role) => scrollback.append_aside(text, *role),
             Self::ToolCall {
                 run_id,
                 call_key,
@@ -4809,6 +4830,7 @@ impl ConversationPiece {
     pub(super) fn text(&self) -> std::borrow::Cow<'_, str> {
         match self {
             Self::Block => "\n".into(),
+            Self::Aside(text, _) => format!("\n{text}").into(),
             Self::Styled(text, _)
             | Self::Input { text, .. }
             | Self::Markdown { text, .. }
