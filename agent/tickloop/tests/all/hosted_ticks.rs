@@ -3557,10 +3557,10 @@ for line in sys.stdin:
     }
 
     /// Reconciling keeps the record of a Tick nobody watches past the host's idle timeout, which
-    /// keeps running, and drops the record of one the same host no longer runs instead of keeping
-    /// it for recovery.
+    /// keeps running, still ends an orphan whose Chat owns no record, and drops the record of a
+    /// Tick the same host no longer runs instead of keeping it for recovery.
     #[tokio::test(flavor = "multi_thread")]
-    async fn reconcile_keeps_an_unwatched_tick_and_drops_the_record_of_a_closed_one() {
+    async fn reconcile_keeps_an_unwatched_tick_ends_orphans_and_drops_closed_records() {
         use tickloop_agent_runtime::hosted::registry::{LaunchRecord, LaunchState, Registry};
         let idle_timeout = Duration::from_secs(2);
         let fixture = Fixture::with_idle_timeout(idle_timeout);
@@ -3590,12 +3590,24 @@ for line in sys.stdin:
             ticks.push(opened);
         }
         let [closed, kept] = <[_; 2]>::try_from(ticks).unwrap();
+        let orphan_owner = TickOwner {
+            root: fixture.owner.root.clone(),
+            chat: Uuid::new_v4(),
+        };
+        let orphan = controller
+            .open(counter_request(orphan_owner, fixture.directory.path()))
+            .await
+            .unwrap();
 
         tokio::time::sleep(idle_timeout * 2 + Duration::from_millis(500)).await;
         root.reconcile_with_host(&controller, &fixture.owner.root)
             .await
             .unwrap();
         assert!(alive(closed.business_pid) && alive(kept.business_pid));
+        assert!(
+            gone(orphan.business_pid).await,
+            "a Tick whose Chat owns no record is still reaped as an orphan"
+        );
         assert_eq!(root.launches(fixture.owner.chat).await.unwrap().len(), 2);
 
         controller
