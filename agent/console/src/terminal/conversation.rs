@@ -506,6 +506,7 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
         | EventKind::ApprovalAssessed { .. }
         | EventKind::PermissionChecked { .. }
         | EventKind::ContextCompaction { .. }
+        | EventKind::TaskBoardChanged { .. }
         | EventKind::ProgressUpdated { .. } => return None,
     };
     Some(block)

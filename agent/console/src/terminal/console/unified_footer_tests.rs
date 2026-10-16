@@ -16,11 +16,43 @@ fn fixture() -> Console {
     tests::console_with_state(state)
 }
 
-fn todo(content: &str) -> TodoItem {
-    TodoItem {
-        content: content.into(),
-        status: tickloop_agent_protocol::TodoStatus::InProgress,
-        active_form: "Working".into(),
+fn task(content: &str) -> tickloop_agent_protocol::SharedTask {
+    crate::terminal::status_area::test_task_board(&[content])
+        .tasks
+        .remove(0)
+}
+
+fn shell_snapshot(revision: u64, tasks: Vec<(Uuid, &str, ShellTaskState)>) -> ShellTaskSnapshot {
+    ShellTaskSnapshot {
+        chat_id: CHAT,
+        live_revision: revision,
+        tasks: tasks
+            .into_iter()
+            .map(|(id, command, state)| ShellTask {
+                updated_at_ms: None,
+                ended_at_ms: None,
+                id,
+                chat_id: CHAT,
+                origin: ShellTaskOrigin::User,
+                owner: ShellTaskOwner::User { chat_id: CHAT },
+                call_id: None,
+                command: command.into(),
+                description: None,
+                cwd: PathBuf::from("/fixture"),
+                state,
+                was_background: true,
+                pid: None,
+                exit_code: None,
+                signal: None,
+                reason: None,
+                output_bytes: 0,
+                capabilities: ShellTaskCapabilities {
+                    can_background: false,
+                    can_stop: !state.is_terminal(),
+                    can_read_output: false,
+                },
+            })
+            .collect(),
     }
 }
 
@@ -38,15 +70,24 @@ fn key(console: &Console, code: KeyCode) -> Option<InputEvent> {
         .key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
-fn update(console: &Console, todos: Vec<TodoItem>) {
+fn update(console: &Console, todos: Vec<tickloop_agent_protocol::SharedTask>) {
     console
         .update_status_area(
             "Auto".into(),
             "fixture".into(),
             Some((42_000, 200_000)),
-            todos,
+            Some({
+                let mut board = crate::terminal::status_area::test_task_board(&[]);
+                board.tasks = todos;
+                board
+            }),
         )
         .unwrap();
+    let mut state = console.state.lock().unwrap();
+    state
+        .status_area
+        .task_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    state.status_area.release_task_focus();
 }
 
 fn agent(id: u128, parent: Option<Uuid>, title: &str) -> AgentRow {
@@ -65,6 +106,7 @@ fn agent(id: u128, parent: Option<Uuid>, title: &str) -> AgentRow {
         glyph: status_glyph(AttentionGroup::Working, false),
         preview: None,
         updated_at: None,
+        run_started_at: None,
         subagent: parent.map(|_| SubagentRegistration {
             child_chat_id: Uuid::from_u128(id),
             handle: if title.contains(' ') {
@@ -473,7 +515,7 @@ fn subagents_and_context_colors_resolve_from_theme_roles() {
             (None, "Context unknown", Role::MutedText),
         ] {
             console
-                .update_status_area("Auto".into(), "fixture".into(), context, vec![])
+                .update_status_area("Auto".into(), "fixture".into(), context, None)
                 .unwrap();
             let mut state = console.state.lock().unwrap();
             state.display.set_theme(theme_name);
@@ -522,7 +564,7 @@ fn subagents_and_context_colors_resolve_from_theme_roles() {
 #[test]
 fn family_updates_preserve_editor_focus_and_never_expose_todo_or_shell_categories() {
     let console = fixture();
-    update(&console, vec![todo("todo unique")]);
+    update(&console, vec![task("todo unique")]);
     console
         .set_agent_family(
             vec![
@@ -535,7 +577,7 @@ fn family_updates_preserve_editor_focus_and_never_expose_todo_or_shell_categorie
     for character in "jk".chars() {
         key(&console, KeyCode::Char(character));
     }
-    update(&console, vec![todo("new todo")]);
+    update(&console, vec![task("new todo")]);
     let rendered = frame(&console);
     assert!(rendered.iter().any(|row| row.contains("child unique")));
     assert!(
@@ -549,134 +591,6 @@ fn family_updates_preserve_editor_focus_and_never_expose_todo_or_shell_categorie
             .any(|row| row.contains("Todo ") || row.contains("Shell "))
     );
     assert!(console.state.lock().unwrap().footer.selected().is_none());
-}
-
-#[test]
-fn runtime_empty_progress_clears_completed_activity_details_while_working_and_idle() {
-    let console = fixture();
-    let mut done = todo("retired runtime task");
-    done.status = tickloop_agent_protocol::TodoStatus::Completed;
-    update(&console, vec![done]);
-    console
-        .set_activity(Some(&[(
-            "Working runtime update".into(),
-            Some(Role::MutedText),
-        )]))
-        .unwrap();
-    assert!(
-        frame(&console)
-            .iter()
-            .any(|row| row.contains("retired runtime task"))
-    );
-    update(&console, vec![]);
-    let working = frame(&console);
-    assert!(
-        working
-            .iter()
-            .any(|row| row.contains("Working runtime update"))
-    );
-    assert!(
-        !working
-            .iter()
-            .any(|row| row.contains("retired runtime task"))
-    );
-    console.set_activity(None).unwrap();
-    assert!(
-        !frame(&console)
-            .iter()
-            .any(|row| row.contains("retired runtime task"))
-    );
-}
-
-#[test]
-fn todos_follow_working_and_remain_when_idle_only_for_the_visible_agent() {
-    let console = fixture();
-    let mut pending = todo("pending unique");
-    pending.status = tickloop_agent_protocol::TodoStatus::Pending;
-    let active = todo("active unique");
-    let mut done = todo("completed unique");
-    done.status = tickloop_agent_protocol::TodoStatus::Completed;
-    update(&console, vec![pending, active, done]);
-    assert!(
-        frame(&console)
-            .iter()
-            .any(|row| row.contains("pending unique"))
-    );
-    console
-        .set_activity(Some(&[(
-            "Working (esc to interrupt)".into(),
-            Some(Role::MutedText),
-        )]))
-        .unwrap();
-    let working = frame(&console);
-    let activity = working
-        .iter()
-        .position(|row| row.contains("Working (esc"))
-        .unwrap();
-    assert!(
-        working[activity + 1].contains("pending unique"),
-        "{working:?}"
-    );
-    assert!(working[activity + 1].starts_with("  ⎿  ◻ "));
-    assert!(working[activity + 2].starts_with("     ◼ "));
-    assert!(working[activity + 3].starts_with("     ✔ "));
-    assert!(working[activity + 2].contains("active unique"));
-    assert!(working[activity + 3].contains("completed unique"));
-    assert!(!working.iter().any(|row| row.contains("Todo 3")));
-    console.activate_agent(Uuid::from_u128(99)).unwrap();
-    update(&console, vec![todo("child todo unique")]);
-    console
-        .set_activity(Some(&[("Working child".into(), Some(Role::MutedText))]))
-        .unwrap();
-    let child = frame(&console);
-    assert!(child.iter().any(|row| row.contains("child todo unique")));
-    assert!(!child.iter().any(|row| row.contains("pending unique")));
-    console.activate_agent(CHAT).unwrap();
-    assert!(
-        frame(&console)
-            .iter()
-            .any(|row| row.contains("pending unique"))
-    );
-    console.set_activity(None).unwrap();
-    assert!(
-        frame(&console)
-            .iter()
-            .any(|row| row.contains("pending unique"))
-    );
-}
-
-fn shell_snapshot(revision: u64, tasks: Vec<(Uuid, &str, ShellTaskState)>) -> ShellTaskSnapshot {
-    ShellTaskSnapshot {
-        chat_id: CHAT,
-        live_revision: revision,
-        tasks: tasks
-            .into_iter()
-            .map(|(id, command, state)| ShellTask {
-                updated_at_ms: None,
-                ended_at_ms: None,
-                id,
-                chat_id: CHAT,
-                origin: ShellTaskOrigin::User,
-                owner: ShellTaskOwner::User { chat_id: CHAT },
-                call_id: None,
-                command: command.into(),
-                description: None,
-                cwd: PathBuf::from("/fixture"),
-                state,
-                was_background: true,
-                pid: None,
-                exit_code: None,
-                signal: None,
-                reason: None,
-                output_bytes: 0,
-                capabilities: ShellTaskCapabilities {
-                    can_background: false,
-                    can_stop: !state.is_terminal(),
-                    can_read_output: false,
-                },
-            })
-            .collect(),
-    }
 }
 
 #[test]
@@ -824,7 +738,7 @@ fn core_status_is_always_right_aligned_with_styled_content_and_fallback() {
     for mode in ["Auto", "Plan", "Ask", "Full Access"] {
         let console = fixture();
         console
-            .update_status_area(mode.into(), "模型 fixture".into(), None, vec![])
+            .update_status_area(mode.into(), "模型 fixture".into(), None, None)
             .unwrap();
         let rendered = frame(&console);
         let editor = rendered
@@ -1060,39 +974,6 @@ fn modified_enter_never_opens_a_member_from_the_agents_list() {
 }
 
 #[test]
-fn todos_use_claude_status_marks_styles_and_width_ellipsis() {
-    let console = fixture();
-    let mut pending = todo("pending mark");
-    pending.status = tickloop_agent_protocol::TodoStatus::Pending;
-    let mut done = todo("completed mark");
-    done.status = tickloop_agent_protocol::TodoStatus::Completed;
-    update(
-        &console,
-        vec![pending, todo(&"active mark ".repeat(20)), done],
-    );
-    let rows = frame(&console);
-    assert!(
-        rows.iter().any(|row| row.contains("◻ pending mark")),
-        "{rows:?}"
-    );
-    assert!(
-        rows.iter()
-            .any(|row| row.contains("◼ active mark") && row.ends_with('…')),
-        "{rows:?}"
-    );
-    assert!(rows.iter().any(|row| row.contains("✔ completed mark")));
-    let mut bytes = Vec::new();
-    let mut state = console.state.lock().unwrap();
-    state.rendered_region = None;
-    state.draw(&mut bytes).unwrap();
-    let ansi = String::from_utf8(bytes).unwrap();
-    assert!(
-        ansi.contains("\x1b[9m"),
-        "completed text must keep its strike decoration: {ansi:?}"
-    );
-}
-
-#[test]
 fn question_mark_help_matches_agents_focus_layers_and_monitor_shells() {
     let mut state = State::new(true, 160, 40);
     state.prompt_enabled = true;
@@ -1119,4 +1000,129 @@ fn question_mark_help_matches_agents_focus_layers_and_monitor_shells() {
             .iter()
             .any(|row| row.starts_with('❯') && row.contains('j'))
     );
+}
+
+#[test]
+fn shared_task_focus_yields_to_requests_and_keeps_the_draft() {
+    let console = fixture();
+    update(&console, vec![task("check notes")]);
+    let mut state = console.state.lock().unwrap();
+    let before = state.editor.draft().to_owned();
+    state.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(state.editor.draft(), before);
+    state.yield_focus_to_request();
+    state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(state.editor.draft(), format!("{before}j"));
+}
+
+#[test]
+fn shared_task_focus_stays_released_after_scroll_and_repeated_updates() {
+    let console = fixture();
+    let board = crate::terminal::status_area::test_task_board(&["visible task"]);
+    console
+        .update_status_area("Auto".into(), "fixture".into(), None, Some(board.clone()))
+        .unwrap();
+    let mut state = console.state.lock().unwrap();
+    let toggle = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+    state.key(toggle);
+    state.key(toggle);
+    state
+        .status_area
+        .update("Auto".into(), "fixture".into(), None, Some(board));
+    assert_eq!(state.status_area.task_lines(80, 24, state.display).len(), 1);
+    state.key(toggle);
+    state.scroll_conversation(ScrollAction::First);
+    let before = state.editor.draft().to_owned();
+    state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(state.editor.draft(), format!("{before}j"));
+}
+
+#[test]
+fn hidden_task_rows_in_short_terminals_never_take_editor_keys() {
+    for height in [4, 5, 6] {
+        for initially_expanded in [false, true] {
+            let console = fixture();
+            console
+                .update_status_area(
+                    "Auto".into(),
+                    "fixture".into(),
+                    None,
+                    Some(crate::terminal::status_area::test_task_board(&[
+                        "inspect", "verify",
+                    ])),
+                )
+                .unwrap();
+            let mut state = console.state.lock().unwrap();
+            let toggle = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+            if initially_expanded {
+                state.key(toggle);
+            }
+            state.height = height;
+            state.draw(&mut io::sink()).unwrap();
+            assert!(!state.task_panel_can_own_focus(), "height {height}");
+            assert!(
+                state.status_area.task_lines(80, height, state.display)[0]
+                    .text()
+                    .contains("Resize to view")
+            );
+            state.key(toggle);
+            let before = state.editor.draft().to_owned();
+            state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+            assert_eq!(
+                state.editor.draft(),
+                format!("{before}j"),
+                "height {height}"
+            );
+            state.height = 24;
+            state.draw(&mut io::sink()).unwrap();
+            let hint = state.status_area.task_lines(80, 24, state.display)[0].text();
+            assert!(
+                hint.contains(if initially_expanded {
+                    "Ctrl+T focus"
+                } else {
+                    "Ctrl+T expand"
+                }),
+                "{hint}"
+            );
+            let before = state.editor.draft().to_owned();
+            state.key(toggle);
+            state.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+            assert_eq!(state.editor.draft(), before);
+        }
+    }
+}
+
+#[test]
+fn hiding_task_tools_releases_focus_and_preserves_draft_and_view_choice() {
+    let console = fixture();
+    let board = crate::terminal::status_area::test_task_board(&["inspect", "verify"]);
+    console
+        .update_status_area("Auto".into(), "fixture".into(), None, Some(board.clone()))
+        .unwrap();
+    let mut state = console.state.lock().unwrap();
+    let draft = state.editor.draft().to_owned();
+    state.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    let toggle = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+    state.key(toggle);
+    state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(state.editor.draft(), format!("{draft}x"));
+    state
+        .status_area
+        .update("Auto".into(), "fixture".into(), None, None);
+    assert!(
+        state
+            .status_area
+            .task_lines(80, 24, state.display)
+            .is_empty()
+    );
+    state.key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+    assert_eq!(state.editor.draft(), format!("{draft}xk"));
+    state
+        .status_area
+        .update("Auto".into(), "fixture".into(), None, Some(board));
+    let lines = state.status_area.task_lines(80, 24, state.display);
+    assert!(lines[0].text().contains("Ctrl+T focus"), "{lines:?}");
+    state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+    assert_eq!(state.editor.draft(), format!("{draft}xkj"));
 }

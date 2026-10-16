@@ -24,14 +24,9 @@ pub struct ChatSummary {
 impl Agent {
     /// What the Chat is doing now, without its history.
     pub async fn status(&self, chat: ChatId) -> Result<ChatStatus, AgentError> {
-        let mut status = self
-            .inner
-            .chats
-            .lock()
-            .await
-            .get(&chat)
-            .map(|chat| ChatStatus::of(&chat.snapshot))
-            .ok_or(AgentError::NotFound)?;
+        let chats = self.inner.chats.lock().await;
+        let mut status = ChatStatus::of(&chats.get(&chat).ok_or(AgentError::NotFound)?.snapshot);
+        status.task_board = shared_tasks::view(&chats, chat);
         status.provider_failures = self.inner.provider_failures.lock().unwrap().clone();
         Ok(status)
     }

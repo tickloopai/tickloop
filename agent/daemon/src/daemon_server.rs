@@ -295,12 +295,26 @@ impl DaemonServer {
             .lock()
             .await
             .insert(execution, worker.clone());
+        let restored_family = if snapshot.conversation.delegation.is_some() {
+            worker_directory(worker.as_ref()).await.ok()
+        } else {
+            None
+        };
+        if let Some(family) = &restored_family {
+            let mut routes = self.inner.routes.lock().await;
+            for member in family {
+                routes.insert(member.execution, worker.clone());
+            }
+        }
         let root = {
             let mut workers = self.inner.workers.lock().await;
             let known = workers
                 .iter_mut()
                 .find(|known| Arc::ptr_eq(&known.access, &worker));
             if let Some(known) = known {
+                if let Some(family) = restored_family {
+                    known.last_directory = family;
+                }
                 let record = known
                     .launch
                     .config_root
@@ -335,6 +349,7 @@ impl DaemonServer {
                     chat_id: snapshot.conversation.id,
                     workdir: snapshot.conversation.workdir.clone(),
                     run_id: super::summary::summary_run_id(&snapshot.conversation.loops, &state),
+                    run_started_at: super::summary::run_started_at(&snapshot.conversation.loops),
                     state,
                     preview: chat_preview(&snapshot.conversation, &title),
                     title,

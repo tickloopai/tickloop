@@ -310,3 +310,229 @@ async fn an_empty_failed_reply_does_not_persist_private_thinking() {
     );
     agent.shutdown().await;
 }
+
+#[tokio::test]
+async fn disabling_task_tools_returns_an_unavailable_result_for_a_stale_task_call() {
+    let directory = tempfile::tempdir().unwrap();
+    let ready = CancellationToken::new();
+    ready.cancel();
+    let model = Arc::new(StreamingModel {
+        requests: Mutex::new(Vec::new()),
+        replies: Mutex::new(VecDeque::from([
+            Reply {
+                deltas: Vec::new(),
+                finish: ready.clone(),
+                outcome: Ok(vec![Content::ToolUse {
+                    id: "create-before-disable".into(),
+                    name: "TaskCreate".into(),
+                    input: json!({"mutation_id":uuid::Uuid::new_v4(),"title":"Existing task","description":"Preserve this task"}),
+                }]),
+            },
+            Reply {
+                deltas: Vec::new(),
+                finish: ready.clone(),
+                outcome: Ok(vec![Content::Text {
+                    text: "Task recorded".into(),
+                }]),
+            },
+            Reply {
+                deltas: Vec::new(),
+                finish: ready.clone(),
+                outcome: Ok(["TaskList", "TaskGet", "TaskCreate", "TaskUpdate"]
+                    .into_iter()
+                    .map(|name| Content::ToolUse {
+                        id: format!("stale-{name}"),
+                        name: name.into(),
+                        input: json!({}),
+                    })
+                    .collect()),
+            },
+            Reply {
+                deltas: Vec::new(),
+                finish: ready,
+                outcome: Ok(vec![Content::Text {
+                    text: "Continuing without task tools".into(),
+                }]),
+            },
+        ])),
+    });
+    let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent.set_task_tools_enabled(chat, true).await.unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent
+        .submit(chat, None, "Record a task".into())
+        .await
+        .unwrap();
+    wait_for(&mut events, |kind| {
+        matches!(kind, EventKind::Completed { .. })
+    })
+    .await;
+    let before = agent.snapshot(chat).await.unwrap().task_boards;
+    agent.set_task_tools_enabled(chat, false).await.unwrap();
+    agent
+        .submit(chat, Some(receipt.loop_id), "Continue without tasks".into())
+        .await
+        .unwrap();
+    wait_for(&mut events, |kind| {
+        matches!(kind, EventKind::Completed { .. })
+    })
+    .await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert_eq!(snapshot.task_boards, before);
+    assert!(
+        !snapshot
+            .operations
+            .iter()
+            .any(|operation| operation.call_id.starts_with("stale-"))
+    );
+    for name in ["TaskList", "TaskGet", "TaskCreate", "TaskUpdate"] {
+        assert!(snapshot.messages.iter().flat_map(|message| &message.content).any(|content| matches!(
+            content,
+            Content::ToolResult { tool_use_id, content, is_error: true }
+                if *tool_use_id == format!("stale-{name}") && content.text().contains("Task tools are disabled")
+        )));
+    }
+    let requests = model.requests.lock().unwrap();
+    assert!(
+        !requests[2]
+            .tools
+            .iter()
+            .any(|tool| tool.name.starts_with("Task") && tool.name != "TaskStop")
+    );
+    assert_eq!(requests.len(), 4);
+    drop(requests);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn disabled_task_calls_still_reject_duplicate_ids_and_malformed_or_unknown_calls() {
+    let task_call = Content::ToolUse {
+        id: "stale-task".into(),
+        name: "TaskList".into(),
+        input: json!({}),
+    };
+    for content in [
+        vec![task_call.clone(), task_call.clone()],
+        vec![Content::ToolUse {
+            id: String::new(),
+            name: "TaskList".into(),
+            input: json!({}),
+        }],
+        vec![Content::ToolUse {
+            id: "malformed".into(),
+            name: "TaskList".into(),
+            input: json!([]),
+        }],
+        vec![Content::ToolUse {
+            id: "unknown".into(),
+            name: "TaskDeleteEverything".into(),
+            input: json!({}),
+        }],
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let finish = CancellationToken::new();
+        finish.cancel();
+        let model = Arc::new(StreamingModel {
+            requests: Mutex::new(Vec::new()),
+            replies: Mutex::new(VecDeque::from([Reply {
+                deltas: Vec::new(),
+                finish,
+                outcome: Ok(content),
+            }])),
+        });
+        let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model);
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let mut events = agent.subscribe();
+        agent
+            .submit(chat, None, "Continue without task tools".into())
+            .await
+            .unwrap();
+        wait_for(&mut events, |kind| matches!(kind, EventKind::Failed(error) if error.contains("invalid or repeated tool call"))).await;
+        let snapshot = agent.snapshot(chat).await.unwrap();
+        assert!(snapshot.operations.is_empty());
+        assert!(snapshot.task_boards.is_empty());
+        assert!(
+            snapshot
+                .messages
+                .iter()
+                .all(|message| message.role != Role::Assistant)
+        );
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn disabling_task_tools_during_a_model_request_does_not_execute_its_task_create() {
+    let directory = tempfile::tempdir().unwrap();
+    let in_flight = CancellationToken::new();
+    let done = CancellationToken::new();
+    done.cancel();
+    let model = Arc::new(StreamingModel {
+        requests: Mutex::new(Vec::new()),
+        replies: Mutex::new(VecDeque::from([
+            Reply {
+                deltas: vec![ModelDelta::Text("request-in-flight".into())],
+                finish: in_flight.clone(),
+                outcome: Ok(vec![Content::ToolUse {
+                    id: "create-after-disable".into(),
+                    name: "TaskCreate".into(),
+                    input: json!({"mutation_id":uuid::Uuid::new_v4(),"title":"Do not create","description":"Disabled before dispatch"}),
+                }]),
+            },
+            Reply {
+                deltas: Vec::new(),
+                finish: done,
+                outcome: Ok(vec![Content::Text {
+                    text: "Continuing without tasks".into(),
+                }]),
+            },
+        ])),
+    });
+    let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent.set_task_tools_enabled(chat, true).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Record a task".into())
+        .await
+        .unwrap();
+    wait_for(
+        &mut events,
+        |kind| matches!(kind, EventKind::Text(text) if text == "request-in-flight"),
+    )
+    .await;
+    agent.set_task_tools_enabled(chat, false).await.unwrap();
+    in_flight.cancel();
+    wait_for(&mut events, |kind| {
+        matches!(kind, EventKind::Completed { .. })
+    })
+    .await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(
+        snapshot
+            .task_boards
+            .values()
+            .all(|board| board.tasks.is_empty())
+    );
+    assert!(snapshot.messages.iter().flat_map(|message| &message.content).any(|content| matches!(
+        content,
+        Content::ToolResult { tool_use_id, content, is_error: true }
+            if tool_use_id == "create-after-disable" && content.text().contains("Task tools are disabled")
+    )));
+    let requests = model.requests.lock().unwrap();
+    assert!(
+        requests[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "TaskCreate")
+    );
+    assert!(
+        !requests[1]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "TaskCreate")
+    );
+    drop(requests);
+    agent.shutdown().await;
+}

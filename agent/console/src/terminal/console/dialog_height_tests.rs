@@ -195,7 +195,7 @@ fn merged_dialog_heights_hide_and_restore_the_family_panel_and_failure_status() 
         state.provider_failure = Some("Provider allowance warning".into());
         state
             .status_area
-            .update("Ask".into(), "Fixture model".into(), None, Vec::new());
+            .update("Ask".into(), "Fixture model".into(), None, None);
         let rows = [root, child]
             .into_iter()
             .map(|id| AgentRow {
@@ -212,6 +212,7 @@ fn merged_dialog_heights_hide_and_restore_the_family_panel_and_failure_status() 
                 glyph: status_glyph(AttentionGroup::Working, false),
                 preview: None,
                 updated_at: None,
+                run_started_at: None,
                 subagent: (id == child).then_some(SubagentRegistration {
                     child_chat_id: child,
                     handle: "scoped-child".into(),

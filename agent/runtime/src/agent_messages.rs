@@ -5,7 +5,7 @@ use tickloop_agent_protocol::local_messages;
 use tickloop_agent_protocol::{
     AgentMessageSource, ChatSnapshot, EventKind, FamilyCompletion, FamilyMessageRejection,
     FamilyMessageRejectionCode, LoopId, LoopState, MessageCause, PendingInput, Receipt,
-    SEND_AGENT_MESSAGE_TOOL_NAME, SubagentRegistration, ToolDefinition, ToolResult, UserShellState,
+    SEND_AGENT_MESSAGE_TOOL_NAME, SubagentRegistration, ToolDefinition, ToolResult,
     VerifiedUserRelay, chat_display_title,
 };
 
@@ -32,7 +32,7 @@ pub(super) struct PreparedFamilyMessage {
 pub(super) struct PreparedFamilyStop {
     policy_input: Value,
     target: ChatId,
-    generation: u64,
+    generations: Vec<(ChatId, u64)>,
 }
 
 pub(super) enum PreparedFamilyCall {
@@ -113,26 +113,24 @@ impl From<DispatchRefusal> for String {
     }
 }
 
-pub(super) fn definitions(is_child: bool) -> Vec<ToolDefinition> {
+pub(super) fn definitions() -> Vec<ToolDefinition> {
     let mut definitions = vec![
         ToolDefinition {
             name: LIST_SUBAGENTS_TOOL_NAME.into(),
-            description: "List the root and direct children in your own family, including retained idle/finished contexts. Returns stable identities, immutable handles, descriptions and actual availability/state/timestamps. Listing never runs a model, reopens history or grants authority. Messages and completion notifications arrive automatically; finish your turn when awaiting new input instead of repeatedly listing.".into(),
+            description: "List the root and all descendants in your own family, including retained idle/finished contexts. Returns stable identities, immutable handles, descriptions and actual availability/state/timestamps. Listing never runs a model, reopens history or grants authority. Messages and completion notifications arrive automatically; finish your turn when awaiting new input instead of repeatedly listing.".into(),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
         },
         ToolDefinition {
             name: SEND_AGENT_MESSAGE_TOOL_NAME.into(),
-            description: "Send task context or clarification to one member of your family, including siblings. Use to=parent for your parent, or a bare handle or complete child_chat_id returned by Subagent. Messages arrive automatically at the next tool round; an idle recipient starts a new turn. A finished child (completed, failed or stopped) resumes its existing context and frozen authorization; an ended root or expired task requires human continuation. Agent messages never grant user approval, alter permissions or expand inherited scope. Self, unrelated families, nested delegation and broadcast are unavailable.".into(),
+            description: "Send task context or clarification to one member of your family, including siblings. Use to=parent for your parent, or a bare handle or complete child_chat_id returned by Subagent. Messages arrive automatically at the next tool round; an idle recipient starts a new turn. A finished child (completed, failed or stopped) resumes its existing context and frozen authorization; an ended root or expired task requires human continuation. Agent messages never grant user approval, alter permissions or expand inherited scope. Self, unrelated families and broadcast are unavailable.".into(),
             input_schema: json!({"type":"object","properties":{"to":{"type":"string","minLength":1},"message":{"type":"string","minLength":1},"relay_user_message_id":{"type":"string","format":"uuid","description":"Optional reference to genuine human input in your own current chain. Relay stays Agent-origin, never user authorization."}},"required":["to","message"],"additionalProperties":false}),
         },
     ];
-    if !is_child {
-        definitions.push(ToolDefinition {
+    definitions.push(ToolDefinition {
             name: STOP_SUBAGENT_TOOL_NAME.into(),
-            description: "Stop one direct child under your normal admission policy. Cancels active/parked runs, queued work, requests, triggers and owned commands; preserves context, handles and Views. Repeated stop is idempotent. View close or panel hiding does not stop execution. Parent, siblings, other families and whole-family stop are unavailable.".into(),
+            description: "Stop one direct child and its descendants under your normal admission policy. The root may target any descendant. Cancels active/parked runs, queued work, requests, triggers and owned commands; preserves context, handles and Views. Repeated stop is idempotent. View close or panel hiding does not stop execution. Parent, siblings, other families and whole-family stop are unavailable.".into(),
             input_schema: json!({"type":"object","properties":{"to":{"type":"string","minLength":1}},"required":["to"],"additionalProperties":false}),
         });
-    }
     definitions
 }
 
@@ -154,17 +152,7 @@ fn result(value: Value) -> ToolResult {
 }
 
 fn family_root(chats: &HashMap<ChatId, Chat>, member: ChatId) -> Result<ChatId, String> {
-    let member = chats.get(&member).ok_or("family member is unavailable")?;
-    let Some(delegation) = &member.snapshot.delegation else {
-        return Ok(member.snapshot.id);
-    };
-    let root = chats
-        .get(&delegation.parent_chat_id)
-        .ok_or("family root is unavailable")?;
-    if root.snapshot.delegation.is_some() {
-        return Err("nested families are unsupported".into());
-    }
-    Ok(root.snapshot.id)
+    super::family_tree::root(chats, member)
 }
 
 fn peer_target(
@@ -188,8 +176,15 @@ fn peer_target(
         root
     } else {
         registry
-            .get(&root)
-            .and_then(|entries| entries.iter().find(|entry| entry.handle == target))
+            .values()
+            .flatten()
+            .find(|entry| {
+                entry.handle == target
+                    && chats
+                        .get(&entry.child_chat_id)
+                        .and_then(|chat| chat.snapshot.delegation.as_ref())
+                        .is_some_and(|delegation| delegation.root_chat_id() == root)
+            })
             .map(|entry| entry.child_chat_id)
             .or_else(|| Uuid::parse_str(target).ok())
             .ok_or("use a family handle or complete family Chat identity")?
@@ -198,7 +193,7 @@ fn peer_target(
         return Err("an Agent cannot send a message to itself".into());
     }
     if family_root(chats, target_id)? != root {
-        return Err("Agent messages are limited to one actual root and its direct children".into());
+        return Err("Agent messages are limited to one actual family".into());
     }
     let receiver = &chats[&target_id];
     if target_id == root {
@@ -207,7 +202,7 @@ fn peer_target(
             .delegation
             .as_ref()
             .ok_or("sender has no parent")?;
-        return Ok((target_id, delegation.parent_loop_id, "child"));
+        return Ok((target_id, delegation.root_loop_id(), "child"));
     }
     let loop_id = receiver
         .snapshot
@@ -218,8 +213,20 @@ fn peer_target(
     Ok((
         target_id,
         loop_id,
-        if sender.chat_id == root {
+        if receiver
+            .snapshot
+            .delegation
+            .as_ref()
+            .is_some_and(|delegation| delegation.parent_chat_id == sender.chat_id)
+        {
             "parent"
+        } else if source
+            .snapshot
+            .delegation
+            .as_ref()
+            .is_some_and(|delegation| delegation.parent_chat_id == target_id)
+        {
+            "child"
         } else {
             "sibling"
         },
@@ -295,13 +302,7 @@ impl Agent {
                     code: FamilyMessageRejectionCode::OriginInactive,
                     message: error.to_string(),
                 })?;
-        if snapshot.delegation.is_some() {
-            return Err(FamilyMessageRejection {
-                code: FamilyMessageRejectionCode::InvalidTarget,
-                message: "only the family root may stop its direct child".into(),
-            });
-        }
-        self.subagents(sender.chat_id)
+        self.family_registrations(sender.chat_id)
             .await
             .map_err(|error| FamilyMessageRejection {
                 code: FamilyMessageRejectionCode::InvalidTarget,
@@ -319,18 +320,31 @@ impl Agent {
             code: FamilyMessageRejectionCode::InvalidTarget,
             message,
         })?;
-        if relationship != "parent" {
+        if relationship != "parent" && snapshot.delegation.is_some() {
             return Err(FamilyMessageRejection {
                 code: FamilyMessageRejectionCode::InvalidTarget,
                 message: "StopSubagent targets only your direct child".into(),
             });
         }
+        let mut targets = super::family_tree::descendants(&chats, target).map_err(|message| {
+            FamilyMessageRejection {
+                code: FamilyMessageRejectionCode::InvalidTarget,
+                message,
+            }
+        })?;
+        targets.push(target);
+        targets.sort();
+        let generations = targets
+            .iter()
+            .map(|id| (*id, chats[id].family_generation))
+            .collect();
         let mut policy_input = input.clone();
         policy_input["to"] = target.to_string().into();
+        policy_input["affected_members"] = json!(targets);
         Ok(PreparedFamilyCall::Stop(PreparedFamilyStop {
             policy_input,
             target,
-            generation: chats[&target].family_generation,
+            generations,
         }))
     }
 
@@ -349,8 +363,8 @@ impl Agent {
         let root = snapshot
             .delegation
             .as_ref()
-            .map_or(sender.chat_id, |delegation| delegation.parent_chat_id);
-        self.subagents(root).await.map_err(|error| {
+            .map_or(sender.chat_id, |delegation| delegation.root_chat_id());
+        self.family_registrations(root).await.map_err(|error| {
             reject(FamilyMessageRejectionCode::InvalidTarget, error.to_string())
         })?;
         let chats = self.inner.chats.lock().await;
@@ -481,6 +495,11 @@ impl Agent {
         delivery: FamilyDelivery<'_>,
         cancel: &CancellationToken,
     ) -> Result<ToolResult, DispatchRefusal> {
+        if call_id.starts_with("task-assignment-") {
+            self.refresh_task_tools_setting()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         let is_handback = matches!(&delivery, FamilyDelivery::Handback { .. });
         let is_completion = matches!(&delivery, FamilyDelivery::Completion { .. });
         let (target, message, is_result, prepared) = match delivery {
@@ -523,6 +542,31 @@ impl Agent {
                 message: "prepared family target changed before dispatch".into(),
             }
             .result());
+        }
+        let task_message_id =
+            shared_tasks::assignment_message_id(&chats, sender, target_id, message, call_id);
+        if let Some(message_id) = task_message_id {
+            if !chats[&sender.chat_id].snapshot.task_tools_enabled {
+                return Err(
+                    "Task tools are disabled; assignment notification was not dispatched".into(),
+                );
+            }
+            let target = &chats[&target_id].snapshot;
+            if target
+                .agent_message_origins
+                .values()
+                .any(|source| source["message_id"] == message_id.to_string())
+                || target.pending_inputs.iter().any(|input| {
+                    input
+                        .agent_message
+                        .as_ref()
+                        .is_some_and(|source| source.message_id == message_id)
+                })
+            {
+                return Ok(result(
+                    json!({"status":"accepted","message_id":message_id,"delivery":"already_accepted"}),
+                ));
+            }
         }
         let key = (sender.run_id, call_id.to_owned());
         if let Some(existing) = mailbox.sent.get(&key) {
@@ -582,6 +626,9 @@ impl Agent {
         };
         cause.depth = cause.depth.saturating_add(1);
         let original = chats.get_mut(&target_id).unwrap();
+        if original.family_stopping {
+            return Err("Subagent subtree is stopping".into());
+        }
         let is_target_run_ending = original
             .active
             .as_ref()
@@ -653,7 +700,7 @@ impl Agent {
             message_id: if is_result {
                 sender.run_id
             } else {
-                Uuid::new_v4()
+                task_message_id.unwrap_or_else(Uuid::new_v4)
             },
             call_id: Some(call_id.into()),
             created_at: now,
@@ -812,107 +859,19 @@ impl Agent {
         prepared: &PreparedFamilyStop,
         cancel: &CancellationToken,
     ) -> Result<ToolResult, String> {
-        let (loops, commands, shells) = {
-            let mut chats = self.inner.chats.lock().await;
-            let root = chats.get(&sender.chat_id).ok_or("root is unavailable")?;
-            if root.snapshot.delegation.is_some()
-                || root.active_run != Some(sender.run_id)
-                || cancel.is_cancelled()
-            {
-                return Err("StopSubagent origin is no longer an active root".into());
-            }
-            let child = chats
-                .get_mut(&prepared.target)
-                .ok_or("child is unavailable")?;
-            if child.family_generation != prepared.generation
-                || child
-                    .snapshot
-                    .delegation
-                    .as_ref()
-                    .is_none_or(|delegation| delegation.parent_chat_id != sender.chat_id)
-            {
-                return Err("prepared child binding changed".into());
-            }
-            if !child
-                .snapshot
-                .loops
-                .iter()
-                .all(|goal| matches!(goal.state, LoopState::Stopped | LoopState::Expired))
-            {
-                child.family_generation = child.family_generation.saturating_add(1);
-            }
-            child.snapshot.pending_commands.clear();
-            child.snapshot.pending_inputs.clear();
-            child.ready_runs.clear();
-            for record in &mut child.snapshot.user_shells {
-                if record.state == UserShellState::Queued {
-                    record.armed = false;
-                }
-            }
-            let loops = child
-                .snapshot
-                .loops
-                .iter()
-                .map(|goal| goal.id)
-                .collect::<Vec<_>>();
-            let commands = child
-                .snapshot
-                .commands
-                .iter()
-                .filter(|command| {
-                    matches!(
-                        command.state,
-                        tickloop_agent_protocol::CommandState::Running
-                            | tickloop_agent_protocol::CommandState::Background
-                    )
-                })
-                .map(|command| command.operation_id)
-                .collect::<Vec<_>>();
-            let shells = child
-                .snapshot
-                .user_shells
-                .iter()
-                .filter(|record| {
-                    matches!(
-                        record.state,
-                        UserShellState::Running
-                            | UserShellState::Background
-                            | UserShellState::Queued
-                            | UserShellState::WaitingPermission
-                            | UserShellState::Cancelling
-                    )
-                })
-                .map(|record| record.id)
-                .collect::<Vec<_>>();
-            self.save(&child.snapshot);
-            (loops, commands, shells)
-        };
-        let mut unknown = Vec::new();
-        for loop_id in loops {
-            unknown.extend(
-                self.stop(prepared.target, loop_id)
-                    .await
-                    .map_err(|error| error.to_string())?,
-            );
-        }
-        for command in commands {
-            self.stop_command(prepared.target, command)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        for shell in shells {
-            self.stop_user_shell(prepared.target, shell)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        let mut stopped = json!({"status":"stopped","child_chat_id":prepared.target,"unresolved_operations":unknown});
-        let hook = self.inner.stopped_child_hook.read().unwrap().clone();
-        if let Some(hook) = hook
-            && let Err(error) = hook.child_stopped(sender.chat_id, prepared.target).await
-        {
-            stopped["hosted_ticks_error"] = json!(error);
-        }
-        Ok(result(stopped))
+        let stopped = self
+            .stop_subagent_tree(
+                prepared.target,
+                Some((&prepared.generations, sender, cancel)),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let failed = !stopped.failures.is_empty();
+        Ok(ToolResult {
+            content: json!({"status":if failed {"partial_failure"} else {"stopped"},"child_chat_id":prepared.target,
+                "unresolved_operations":stopped.operations,"failures":stopped.failures}).to_string(),
+            is_error: failed, output_ref: None,
+        })
     }
 
     /// Installs the hook StopSubagent calls once a child is stopped.

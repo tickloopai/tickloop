@@ -22,6 +22,12 @@ use crate::{
 /// computed where the history is.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChatStatus {
+    #[serde(default)]
+    pub task_tools_enabled: bool,
+    #[serde(default)]
+    pub task_board: Option<crate::TaskBoard>,
+    #[serde(default)]
+    pub task_boards: BTreeMap<crate::LoopId, crate::TaskBoard>,
     pub id: ChatId,
     pub workdir: PathBuf,
     pub additional_directories: Vec<PathBuf>,
@@ -146,6 +152,9 @@ impl ChatStatus {
             .filter_map(|(index, _)| conversation.message_runs.get(index).copied())
             .collect();
         Self {
+            task_tools_enabled: conversation.task_tools_enabled,
+            task_board: conversation.task_board.clone(),
+            task_boards: conversation.task_boards.clone(),
             id: conversation.id,
             workdir: conversation.workdir.clone(),
             additional_directories: process.additional_directories.to_vec(),

@@ -45,6 +45,7 @@ pub(crate) struct AgentRow {
     pub(crate) preview: Option<String>,
     /// Unix milliseconds of the latest reported state change; `None` when nobody recorded it.
     pub(crate) updated_at: Option<u64>,
+    pub(crate) run_started_at: Option<u64>,
     pub(crate) subagent: Option<SubagentRegistration>,
 }
 

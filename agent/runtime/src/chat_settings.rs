@@ -74,6 +74,14 @@ impl Agent {
         let mut saved = self.inner.settings.as_ref().map(UserSettings::load);
         let defaults = new_chat_settings(saved.as_mut(), &self.inner.host_options, &snapshot.model);
         snapshot.policy.mode = defaults.execution_mode;
+        snapshot.task_tools_enabled = saved.as_ref().map_or_else(
+            || {
+                self.inner
+                    .task_tools_enabled
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            },
+            |_| defaults.task_tools_enabled,
+        );
         let Some(mut saved) = saved else {
             return OutputStyle::default();
         };
@@ -173,6 +181,51 @@ impl Agent {
             chat.snapshot.thinking_enabled = true;
         }
         Ok(())
+    }
+
+    pub async fn set_task_tools_enabled(
+        &self,
+        chat_id: ChatId,
+        enabled: bool,
+    ) -> Result<(), AgentError> {
+        let _settings_gate = self.inner.settings_writes.lock().await;
+        if !self.inner.chats.lock().await.contains_key(&chat_id) {
+            return Err(AgentError::NotFound);
+        }
+        self.write_user_settings(move |settings| settings.save_task_tools_enabled(enabled))
+            .await?;
+        self.apply_task_tools_setting(enabled).await;
+        Ok(())
+    }
+
+    pub async fn task_tools_setting(&self, chat_id: ChatId) -> Result<bool, AgentError> {
+        if !self.inner.chats.lock().await.contains_key(&chat_id) {
+            return Err(AgentError::NotFound);
+        }
+        self.refresh_task_tools_setting().await?;
+        Ok(self
+            .inner
+            .task_tools_enabled
+            .load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    pub(super) async fn refresh_task_tools_setting(&self) -> Result<(), AgentError> {
+        let _settings_gate = self.inner.settings_writes.lock().await;
+        if let Some(mut settings) = self.load_user_settings().await? {
+            self.apply_task_tools_setting(settings.task_tools_enabled())
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn apply_task_tools_setting(&self, enabled: bool) {
+        self.inner
+            .task_tools_enabled
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+        let mut chats = self.inner.chats.lock().await;
+        for chat in chats.values_mut() {
+            chat.snapshot.task_tools_enabled = enabled;
+        }
     }
 
     pub async fn set_thinking_enabled(

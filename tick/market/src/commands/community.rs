@@ -201,7 +201,10 @@ impl CommunityView {
     fn show(&mut self, feed: Feed) {
         let previous_index = self.selected_index();
         self.feed = feed;
-        if !self.selected_topic.is_some_and(|topic| self.feed.lists(topic)) {
+        if !self
+            .selected_topic
+            .is_some_and(|topic| self.feed.lists(topic))
+        {
             let posts = &self.feed.posts;
             self.selected_topic = posts
                 .get(previous_index.min(posts.len().saturating_sub(1)))

@@ -48,6 +48,7 @@ pub(super) const OUTPUT_STYLE_SETTING_INDEX: usize = 10;
 pub(super) const PERMISSIONS_SETTING_INDEX: usize = 11;
 const ARTIFACT_SIGN_OUT_SETTING_INDEX: usize = 12;
 const PROMPT_SUGGESTION_SETTING_INDEX: usize = 13;
+const TASK_TOOLS_SETTING_INDEX: usize = 14;
 
 enum Selection {
     ArtifactSignOut {
@@ -1480,8 +1481,10 @@ impl Menus {
             .await
             .map_err(|error| error.to_string())?;
         let mut context = vec![
-            "Model, Thinking, effort, persistent rules, shift+tab modes, output style, reduced motion and prompt suggestions are saved in user settings; execution mode applies to this process.".into(),
-            "Auto-scroll and Theme apply to this terminal session.".into(),
+            "Preferences and persistent rules are saved in user settings.".into(),
+            "Execution mode applies to this process; Auto-scroll and Theme to this terminal."
+                .into(),
+            "Task tools apply to all agents; Off lets claimed tasks finish.".into(),
             safe_text(&format!(
                 "Current model: {}",
                 settings::model_label(&snapshot.model)
@@ -1584,6 +1587,14 @@ impl Menus {
                     format!(
                         "Prompt suggestions: {}",
                         if console.prompt_suggestion_enabled()? {
+                            "On"
+                        } else {
+                            "Off"
+                        }
+                    ),
+                    format!(
+                        "Task tools: {}",
+                        if snapshot.task_tools_enabled {
                             "On"
                         } else {
                             "Off"
@@ -2519,7 +2530,7 @@ impl Menus {
                 },
                 Selection::Workflow(workflow) => {
                     let permission = match &workflow { Workflow::Plan { request, .. } => *request, _ => None };
-                    let effect = workflow.choose_with_feedback(agent, console, index, comment).await?;
+                    let effect = Box::pin(workflow.choose_with_feedback(agent, console, index, comment)).await?;
                     if let Some(request) = permission { self.restored_plans.remove(&request); }
                     if let Some(next) = effect.next {
                         self.workflow(console, next)?;
@@ -2871,6 +2882,13 @@ impl Menus {
                     }
                 },
                 Selection::Settings { target } => match index {
+                    Some(TASK_TOOLS_SETTING_INDEX) => {
+                        let configuration = agent.configuration(target).await.map_err(|error| error.to_string())?;
+                        agent.change_configuration(target, ConfigurationChange::TaskToolsEnabled {
+                            enabled: !configuration.task_tools_enabled,
+                        }).await.map_err(|error| error.to_string())?;
+                        self.settings(agent, console, target).await?;
+                    }
                     Some(PROMPT_SUGGESTION_SETTING_INDEX) => {
                         let enabled = !console.prompt_suggestion_enabled()?;
                         self.user_settings.as_ref().ok_or("cannot save prompt suggestions because the user settings directory is unavailable")?

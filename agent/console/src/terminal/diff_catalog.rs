@@ -1186,6 +1186,7 @@ mod tests {
         file_change: PreparedFileChange,
     ) -> OperationRecord {
         OperationRecord {
+            task_binding: None,
             id: uuid::Uuid::new_v4(),
             loop_id: uuid::Uuid::new_v4(),
             run_id,

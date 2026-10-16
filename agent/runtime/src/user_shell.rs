@@ -22,7 +22,7 @@ struct UserShellAuthorization {
     owner: super::session_permissions::PermissionOwner,
     operation: super::session_permissions::SessionPermissionOperation,
     evaluation: super::session_permissions::SessionPermissionEvaluation,
-    parent_revision: Option<u64>,
+    ancestor_revisions: Vec<(ChatId, u64)>,
     policy_revision: u64,
 }
 
@@ -527,7 +527,7 @@ impl Agent {
                 owner,
                 operation,
                 evaluation,
-                parent_revision: authority.parent_revision,
+                ancestor_revisions: authority.ancestor_revisions,
                 policy_revision,
             });
             self.refresh_project_rules(chat_id).await?;
@@ -555,14 +555,14 @@ impl Agent {
                     None,
                 )
                 .ok_or(AgentError::NotFound)?;
-                if !current
-                    .still_admits(authorization.policy_revision, authorization.parent_revision)
-                    || !sessions.revalidate(
-                        &authorization.evaluation.token,
-                        authorization.owner,
-                        &authorization.operation,
-                    )
-                {
+                if !current.still_admits(
+                    authorization.policy_revision,
+                    &authorization.ancestor_revisions,
+                ) || !sessions.revalidate(
+                    &authorization.evaluation.token,
+                    authorization.owner,
+                    &authorization.operation,
+                ) {
                     return Err(AgentError::Invalid(
                         "Shell permission authority changed before dispatch".into(),
                     ));

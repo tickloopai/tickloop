@@ -7,6 +7,7 @@ use crate::LoadedSettings;
 /// only execution mode follows host options; other fields keep the empty Chat defaults.
 /// The New Agent draft uses the same rules to preview its first creation.
 pub struct NewChatSettings {
+    pub task_tools_enabled: bool,
     pub execution_mode: ExecutionMode,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub thinking_enabled: bool,
@@ -21,6 +22,7 @@ pub fn new_chat_settings(
     let host_mode = host_options.execution_mode_override;
     let Some(saved) = saved else {
         return NewChatSettings {
+            task_tools_enabled: false,
             execution_mode: host_mode.unwrap_or(ExecutionMode::Auto),
             reasoning_effort: None,
             thinking_enabled: true,
@@ -50,6 +52,7 @@ pub fn new_chat_settings(
         None => None,
     };
     NewChatSettings {
+        task_tools_enabled: saved.task_tools_enabled(),
         execution_mode,
         reasoning_effort,
         thinking_enabled: saved.thinking_enabled(),

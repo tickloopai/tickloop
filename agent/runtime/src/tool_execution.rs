@@ -30,6 +30,7 @@ enum ToolRoute {
     TickSubscription,
     Delegation,
     AgentMessage,
+    SharedTask,
     Handback,
     Host(Arc<dyn crate::host_tools::HostToolProvider>),
 }
@@ -79,6 +80,7 @@ impl ToolRegistry {
         host_provider: Option<Arc<dyn crate::host_tools::HostToolProvider>>,
         tick_stream_installed: bool,
         prompt_policy: PromptPolicy,
+        task_access: shared_tasks::TaskToolAccess,
     ) -> Self {
         let is_delegated = chat.snapshot.delegation.is_some();
         let mut tools = tickloop_agent_tools::Tools::definitions()
@@ -104,7 +106,9 @@ impl ToolRegistry {
                     route: ToolRoute::Interaction,
                 }),
         );
-        if !is_delegated {
+        if chat.snapshot.delegation.as_ref().is_none_or(|delegation| {
+            delegation.depth() < tickloop_agent_protocol::MAX_SUBAGENT_DEPTH
+        }) {
             tools.extend(
                 delegation::definitions()
                     .into_iter()
@@ -115,13 +119,23 @@ impl ToolRegistry {
             );
         }
         tools.extend(
-            agent_messages::definitions(is_delegated)
+            agent_messages::definitions()
                 .into_iter()
                 .map(|definition| RegisteredTool {
                     definition,
                     route: ToolRoute::AgentMessage,
                 }),
         );
+        if task_access != shared_tasks::TaskToolAccess::Disabled {
+            tools.extend(
+                shared_tasks::definitions(task_access)
+                    .into_iter()
+                    .map(|definition| RegisteredTool {
+                        definition,
+                        route: ToolRoute::SharedTask,
+                    }),
+            );
+        }
         if crate::handback::available(chat, prompt_policy) {
             tools.push(RegisteredTool {
                 definition: crate::handback::definition(),
@@ -442,6 +456,7 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
         match &registered.route {
+            ToolRoute::SharedTask => self.shared_task_tool(receipt, operation, &cancel).await,
             ToolRoute::AgentMessage => {
                 self.agent_message_tool(
                     receipt,
@@ -517,6 +532,27 @@ impl Agent {
         if cancel.is_cancelled() {
             return Err("run interrupted before tool preparation".into());
         }
+        if registration.is_none() && shared_tasks::is_task_tool(&name) {
+            return Ok(ToolCallOutcome::not_admitted(
+                "Task tools are disabled or limited for this request; this call was not executed. Continue with the available tools. Task tools can be enabled in Settings."
+                    .into(),
+            ));
+        }
+        self.refresh_task_binding_setting(receipt)
+            .await
+            .map_err(|error| ToolCallError::from(error.to_string()))?;
+        let task_binding = if matches!(
+            registration.as_ref().map(|tool| &tool.route),
+            Some(ToolRoute::SharedTask)
+        ) {
+            None
+        } else {
+            Some(
+                shared_tasks::binding_for_tool(&*self.inner.chats.lock().await, receipt, &name)
+                    .map_err(ToolCallError::from)?,
+            )
+        };
+
         if let Some(registered) = &registration
             && registered.is_host_or_local()
             && let Err(error) = match &registered.route {
@@ -721,6 +757,9 @@ impl Agent {
             .map(|call| call.permission())
             .or_else(|| {
                 let route = &registration.as_ref()?.route;
+                if matches!(route, ToolRoute::SharedTask) {
+                    return Some(crate::host_tools::HostToolPermission::ReadOnly);
+                }
                 (matches!(route, ToolRoute::Delegation)
                     || matches!(route, ToolRoute::AgentMessage)
                         && name == SEND_AGENT_MESSAGE_TOOL_NAME)
@@ -767,6 +806,7 @@ impl Agent {
             )
             .map_err(|error| error.to_string())?;
             let operation = OperationRecord {
+                task_binding: task_binding.flatten(),
                 id: Uuid::new_v4(),
                 loop_id: receipt.loop_id,
                 run_id: receipt.run_id,
@@ -781,6 +821,7 @@ impl Agent {
                 decision,
                 explicit_ask,
                 mut revision,
+                ancestor_revisions,
                 mut session_evaluation,
                 execution_mode,
                 policy,
@@ -792,33 +833,25 @@ impl Agent {
                 }
                 chat.snapshot.operations.push(operation.clone());
                 self.save(&chat.snapshot);
-                let session_evaluation = self
-                    .inner
-                    .session_permissions
-                    .lock()
-                    .await
-                    .evaluate(permission_owner, &session_operation);
-                let explicit_decision = chat.snapshot.policy.explicit_match_with_session(
-                    normalized_name,
+                let sessions = self.inner.session_permissions.lock().await;
+                let session_evaluation = sessions.evaluate(permission_owner, &session_operation);
+                let (authority, policy) = delegation::host_authority(
+                    &chats,
+                    &sessions,
+                    receipt,
+                    &operation,
                     permission_input,
-                    receipt.loop_id,
+                    host_permission,
                     session_evaluation.decision,
-                );
+                )?;
                 (
-                    host_tool_decision(
-                        explicit_decision.map(Decision::from),
-                        host_permission,
-                        chat.snapshot.policy.mode,
-                        host_permission
-                            == Some(crate::host_tools::HostToolPermission::PrivateArtifactWrite)
-                            && chat.has_human_input_for_run(receipt.run_id),
-                    ),
-                    explicit_decision
-                        == Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Ask),
-                    chat.snapshot.policy.revision,
+                    authority.decision,
+                    authority.explicit_ask,
+                    authority.policy_revision,
+                    authority.ancestor_revisions,
                     session_evaluation,
-                    chat.snapshot.policy.mode,
-                    chat.snapshot.policy.clone(),
+                    policy.mode,
+                    policy,
                 )
             };
             // The user confirms every request to enter Plan mode, whatever the execution mode;
@@ -1040,6 +1073,9 @@ impl Agent {
                         Err(error)
                     }
                     Ok(()) => {
+                        self.refresh_task_binding_setting(receipt)
+                            .await
+                            .map_err(|error| ToolCallError::from(error.to_string()))?;
                         if self.refresh_project_rules(receipt.chat_id).await.is_err() {
                             if cancel.is_cancelled() {
                                 return Err("run interrupted before host admission".into());
@@ -1065,8 +1101,11 @@ impl Agent {
                                 &operation,
                                 permission_input,
                                 HostAdmission {
+                                    tool_name: &name,
+                                    expected_task_binding: task_binding,
                                     session_evaluation: &session_evaluation,
                                     policy_revision: revision,
+                                    ancestor_revisions: &ancestor_revisions,
                                     host_permission,
                                     approval_path: if was_approved_by_human {
                                         ApprovalPath::Human
@@ -1198,6 +1237,7 @@ impl Agent {
                         SessionPermissionOperation::from_prepared(&prepared, &configured_workspace)
                             .map_err(|error| error.to_string())?;
                     let operation = OperationRecord {
+                        task_binding: task_binding.flatten(),
                         id: Uuid::new_v4(),
                         loop_id: receipt.loop_id,
                         run_id: receipt.run_id,
@@ -1247,7 +1287,7 @@ impl Agent {
                             authority.decision,
                             authority.explicit_ask,
                             authority.policy_revision,
-                            authority.parent_revision,
+                            authority.ancestor_revisions,
                             session_evaluation,
                             chat.snapshot.policy.mode,
                             chat.snapshot.policy.clone(),
@@ -1345,6 +1385,18 @@ impl Agent {
                                         let sessions = self.inner.session_permissions.lock().await;
                                         let current_session =
                                             sessions.evaluate(permission_owner, &session_operation);
+                                        if let Some(binding) = task_binding
+                                            && shared_tasks::binding_for_tool(
+                                                &chats, receipt, &name,
+                                            )
+                                            .map_err(ToolCallError::from)?
+                                                != binding
+                                        {
+                                            return Err(
+                                                "task execution binding changed before dispatch"
+                                                    .into(),
+                                            );
+                                        }
                                         let current = delegation::permission_authority(
                                             &chats,
                                             &sessions,
@@ -1359,7 +1411,7 @@ impl Agent {
                                     let current_decision = current.decision;
                                     policy = current_policy;
                                     policy_revision = current.policy_revision;
-                                    delegated_revision = current.parent_revision;
+                                    delegated_revision = current.ancestor_revisions;
                                     session_evaluation = current_session;
                                     if review_attempts < 2
                                         && current_decision == Decision::Check
@@ -1508,6 +1560,9 @@ impl Agent {
                                 return Err(ToolCallError::denied(reason, record));
                             }
                         }
+                        self.refresh_task_binding_setting(receipt)
+                            .await
+                            .map_err(|error| ToolCallError::from(error.to_string()))?;
                         if self.refresh_project_rules(receipt.chat_id).await.is_err() {
                             if cancel.is_cancelled() {
                                 return Err("run interrupted before tool admission".into());
@@ -1575,6 +1630,13 @@ impl Agent {
                             .finish(receipt.chat_id, &operation);
                             ToolCallError::denied(reason, record)
                         })?;
+                        if let Some(binding) = task_binding
+                            && shared_tasks::binding_for_tool(&chats, receipt, &name)
+                                .map_err(ToolCallError::from)?
+                                != binding
+                        {
+                            return Err("task execution binding changed before dispatch".into());
+                        }
                         let current = delegation::permission_authority(
                             &chats,
                             &session_context,
@@ -1588,7 +1650,7 @@ impl Agent {
                             &session_evaluation.token,
                             permission_owner,
                             &current_session_operation,
-                        ) || !current.still_admits(policy_revision, delegated_revision)
+                        ) || !current.still_admits(policy_revision, &delegated_revision)
                         {
                             let reason =
                                 "permission policy changed before admission; retry the operation"
@@ -1896,11 +1958,7 @@ mod tests {
             .chain([false, true].into_iter().flat_map(plan::definitions))
             .chain([false, true].into_iter().flat_map(interaction::definitions))
             .chain(delegation::definitions())
-            .chain(
-                [false, true]
-                    .into_iter()
-                    .flat_map(agent_messages::definitions),
-            )
+            .chain(agent_messages::definitions())
             .chain([crate::handback::definition()])
             .chain(tick_subscriptions::definitions())
             .chain(skills.tool_definition())

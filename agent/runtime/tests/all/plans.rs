@@ -3,12 +3,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tickloop_agent_protocol::{
-    BranchRequest, ChatId, ChatSnapshot, Content, Decision, EventKind, ExecutionMode, LoopId,
-    LoopState, PermissionRule, RewindMode, TodoItem, TodoStatus, ToolResult,
+    BranchRequest, ChatId, ChatSnapshot, Content, EventKind, ExecutionMode, LoopId, LoopState,
+    RewindMode, ToolResult,
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::*;
-use tickloop_agent_tools::{EXIT_PLAN_MODE_TOOL_NAME, TODO_WRITE_TOOL_NAME};
+use tickloop_agent_tools::EXIT_PLAN_MODE_TOOL_NAME;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -357,7 +357,7 @@ async fn approving_a_plan_returns_claude_codes_approval_and_the_plan_file_to_the
     assert_eq!(
         result.content,
         format!(
-            "User has approved your plan. You can now start coding. Start with updating your todo list if applicable\n\nYour plan has been saved to: {plan_file}\nYou can refer back to it if needed during implementation.\n\n## Approved Plan:\n{markdown}"
+            "User has approved your plan. You can now start coding. Proceed with the approved work\n\nYour plan has been saved to: {plan_file}\nYou can refer back to it if needed during implementation.\n\n## Approved Plan:\n{markdown}"
         )
     );
     agent.shutdown().await;
@@ -494,592 +494,6 @@ async fn a_plan_file_that_was_never_submitted_is_not_restored_as_a_plan() {
     restarted.shutdown().await;
 }
 
-#[tokio::test]
-async fn ordinary_progress_retires_completed_todos_and_restores_empty_state() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = directory.path().join("archive");
-    let model = Arc::new(ScriptedModel::new(vec![
-        todo_write(
-            "progress-start",
-            "Write the report",
-            "Writing the report",
-            "in_progress",
-        ),
-        call(
-            "write",
-            "Write",
-            json!({"file_path":"report.txt", "content":"ordinary progress result"}),
-        ),
-        todo_write(
-            "progress-finish",
-            "Write the report",
-            "Writing the report",
-            "completed",
-        ),
-        text("The report is ready."),
-    ]));
-    let agent = Agent::open_embedded(store.clone(), config(), model).unwrap();
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    agent
-        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
-        .await
-        .unwrap();
-    agent
-        .set_permission_rules(
-            chat,
-            vec![PermissionRule {
-                id: Uuid::new_v4(),
-                decision: Decision::Allow,
-                tool: "Write".into(),
-                specifier: None,
-                input: None,
-                loop_id: None,
-                persistent: false,
-            }],
-        )
-        .await
-        .unwrap();
-    let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(
-            chat,
-            None,
-            "Write the report and keep me informed of progress.".into(),
-        )
-        .await
-        .unwrap();
-    let mut observed = Vec::new();
-    let mut retired = false;
-    loop {
-        match next_event(&mut events).await.kind {
-            EventKind::ProgressUpdated { progress } => {
-                assert_eq!(progress.loop_id, receipt.loop_id);
-                if let Some(todo) = progress.todos.first() {
-                    observed.push(Some(todo.status.clone()));
-                } else {
-                    retired = true;
-                }
-                let snapshot = agent.snapshot(chat).await.unwrap();
-                assert_eq!(snapshot.policy.mode, ExecutionMode::AcceptEdits);
-                assert!(snapshot.plans.is_empty());
-            }
-            EventKind::PermissionRequested { .. } => {
-                panic!("ordinary progress must not introduce Plan approval")
-            }
-            EventKind::Failed(error) => panic!("{error}"),
-            EventKind::Completed { .. } => break,
-            _ => {}
-        }
-    }
-    assert_eq!(
-        observed,
-        [Some(TodoStatus::InProgress), Some(TodoStatus::Completed)]
-    );
-    if !retired {
-        tokio::time::pause();
-        tokio::time::advance(std::time::Duration::from_secs(31)).await;
-        loop {
-            if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind
-                && progress.loop_id == receipt.loop_id
-                && progress.todos.is_empty()
-            {
-                break;
-            }
-        }
-        tokio::time::resume();
-    }
-    assert_eq!(
-        std::fs::read_to_string(directory.path().join("report.txt")).unwrap(),
-        "ordinary progress result"
-    );
-    agent.shutdown().await;
-    drop(agent);
-    let restored =
-        Agent::open_embedded(store, config(), Arc::new(ScriptedModel::new(vec![]))).unwrap();
-    restored.resume_chat(chat).await.unwrap();
-    let snapshot = restored.snapshot(chat).await.unwrap();
-    assert!(snapshot.plans.is_empty());
-    assert_eq!(snapshot.progress.len(), 1);
-    assert_eq!(snapshot.progress[0].loop_id, receipt.loop_id);
-    assert!(snapshot.progress[0].todos.is_empty());
-    assert!(snapshot.messages.iter().any(|message| message.content.iter().any(|content| matches!(content,
-        Content::ToolUse { name, input, .. } if name == TODO_WRITE_TOOL_NAME && input["todos"][0]["status"] == "completed"
-    ))));
-    restored.shutdown().await;
-}
-
-async fn finish_progress_turn(
-    agent: &Agent,
-    chat: ChatId,
-    target: Option<LoopId>,
-) -> tickloop_agent_protocol::Receipt {
-    let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, target, "Update progress".into())
-        .await
-        .unwrap();
-    loop {
-        match next_event(&mut events).await.kind {
-            EventKind::Completed { .. } => return receipt,
-            EventKind::Failed(error) => panic!("{error}"),
-            _ => {}
-        }
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn all_done_rewrites_do_not_extend_the_completion_deadline() {
-    let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(ScriptedModel::new(vec![
-        todo_write("first", "Original done", "Finishing", "completed"),
-        text("done"),
-        todo_write("rewrite", "Rewritten done", "Rewriting", "completed"),
-        text("rewritten"),
-    ]));
-    let agent = Agent::new_embedded(config(), model);
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let first = finish_progress_turn(&agent, chat, None).await;
-    tokio::time::advance(std::time::Duration::from_secs(29)).await;
-    finish_progress_turn(&agent, chat, Some(first.loop_id)).await;
-    assert_eq!(
-        agent.snapshot(chat).await.unwrap().progress[0].todos[0].content,
-        "Rewritten done"
-    );
-    let mut events = agent.subscribe();
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    loop {
-        if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind
-            && progress.loop_id == first.loop_id
-            && progress.todos.is_empty()
-        {
-            break;
-        }
-    }
-    agent.shutdown().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn incomplete_replacements_cancel_grace_and_explicit_empty_clears_immediately() {
-    let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(ScriptedModel::new(vec![
-        todo_write("first", "Done task", "Finishing", "completed"),
-        text("done"),
-        todo_write("partial", "Pending replacement", "Working", "pending"),
-        text("pending"),
-        todo_write("again", "Done again", "Finishing", "completed"),
-        text("done again"),
-        call("empty", "TodoWrite", json!({"todos":[]})),
-        text("empty"),
-    ]));
-    let agent = Agent::new_embedded(config(), model);
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let first = finish_progress_turn(&agent, chat, None).await;
-    tokio::time::advance(std::time::Duration::from_secs(3)).await;
-    finish_progress_turn(&agent, chat, Some(first.loop_id)).await;
-    tokio::time::advance(std::time::Duration::from_secs(3)).await;
-    assert_eq!(
-        agent.snapshot(chat).await.unwrap().progress[0].todos[0].status,
-        TodoStatus::Pending
-    );
-    finish_progress_turn(&agent, chat, Some(first.loop_id)).await;
-    finish_progress_turn(&agent, chat, Some(first.loop_id)).await;
-    assert!(
-        agent.snapshot(chat).await.unwrap().progress[0]
-            .todos
-            .is_empty()
-    );
-    tokio::time::advance(std::time::Duration::from_secs(31)).await;
-    assert!(
-        agent.snapshot(chat).await.unwrap().progress[0]
-            .todos
-            .is_empty()
-    );
-    agent.shutdown().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn retirement_is_isolated_by_agent_and_loop_and_partial_lists_persist() {
-    let directory = tempfile::tempdir().unwrap();
-    let model = Arc::new(ScriptedModel::new(vec![
-        todo_write("done", "Completed first Loop", "Finishing", "completed"),
-        text("done"),
-        todo_write("same-agent", "Other Loop partial", "Working", "pending"),
-        text("partial"),
-        todo_write(
-            "other-agent",
-            "Other Agent partial",
-            "Working",
-            "in_progress",
-        ),
-        text("partial"),
-    ]));
-    let agent = Agent::new_embedded(config(), model);
-    let first_chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let second_chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let first = finish_progress_turn(&agent, first_chat, None).await;
-    let other_loop = finish_progress_turn(&agent, first_chat, None).await;
-    let other_agent = finish_progress_turn(&agent, second_chat, None).await;
-    let mut events = agent.subscribe();
-    tokio::time::advance(std::time::Duration::from_secs(31)).await;
-    loop {
-        if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind
-            && progress.loop_id == first.loop_id
-            && progress.todos.is_empty()
-        {
-            break;
-        }
-    }
-    let first_state = agent.snapshot(first_chat).await.unwrap();
-    assert!(
-        first_state
-            .progress
-            .iter()
-            .find(|p| p.loop_id == first.loop_id)
-            .unwrap()
-            .todos
-            .is_empty()
-    );
-    assert_eq!(
-        first_state
-            .progress
-            .iter()
-            .find(|p| p.loop_id == other_loop.loop_id)
-            .unwrap()
-            .todos[0]
-            .content,
-        "Other Loop partial"
-    );
-    assert_eq!(
-        agent
-            .snapshot(second_chat)
-            .await
-            .unwrap()
-            .progress
-            .iter()
-            .find(|p| p.loop_id == other_agent.loop_id)
-            .unwrap()
-            .todos[0]
-            .content,
-        "Other Agent partial"
-    );
-    agent.shutdown().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn restoring_unretired_completed_progress_starts_a_fresh_grace() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = directory.path().join("archive");
-    let agent = Agent::open_embedded(
-        store.clone(),
-        config(),
-        Arc::new(ScriptedModel::new(vec![
-            todo_write("done", "Restored completed task", "Finishing", "completed"),
-            text("done"),
-        ])),
-    )
-    .unwrap();
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let receipt = finish_progress_turn(&agent, chat, None).await;
-    tokio::time::advance(std::time::Duration::from_secs(29)).await;
-    agent.shutdown().await;
-    drop(agent);
-    let restored =
-        Agent::open_embedded(store, config(), Arc::new(ScriptedModel::new(vec![]))).unwrap();
-    assert_eq!(
-        restored.resume_chat(chat).await.unwrap().progress[0]
-            .todos
-            .len(),
-        1
-    );
-    tokio::time::advance(std::time::Duration::from_secs(29)).await;
-    assert_eq!(
-        restored.snapshot(chat).await.unwrap().progress[0]
-            .todos
-            .len(),
-        1
-    );
-    let mut events = restored.subscribe();
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    loop {
-        if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind
-            && progress.loop_id == receipt.loop_id
-            && progress.todos.is_empty()
-        {
-            break;
-        }
-    }
-    restored.shutdown().await;
-}
-
-#[tokio::test]
-async fn retirement_checkpoint_precedes_later_todo_results_in_the_same_assistant_batch() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = directory.path().join("archive");
-    let batch = vec![
-        Content::ToolUse {
-            id: "done".into(),
-            name: "TodoWrite".into(),
-            input: json!({"todos":[{"content":"First list done","activeForm":"Finishing","status":"completed"}]}),
-        },
-        Content::ToolUse {
-            id: "wait".into(),
-            name: "Bash".into(),
-            // Outlasts the 30-second completion grace, so the retirement lands mid-batch.
-            input: json!({"command":"sleep 31"}),
-        },
-        Content::ToolUse {
-            id: "pending".into(),
-            name: "TodoWrite".into(),
-            input: json!({"todos":[{"content":"Later pending list","activeForm":"Working","status":"pending"}]}),
-        },
-    ];
-    let agent = Agent::open_embedded(
-        store.clone(),
-        config(),
-        Arc::new(ScriptedModel::new(vec![batch, text("done")])),
-    )
-    .unwrap();
-    agent.install_own_tickhost();
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    agent
-        .set_execution_mode(chat, ExecutionMode::FullAccess)
-        .await
-        .unwrap();
-    let mut events = agent.subscribe();
-    let receipt = agent
-        .submit(chat, None, "Update progress".into())
-        .await
-        .unwrap();
-    loop {
-        match tickloop_agent_test_support::next_event_within(
-            &mut events,
-            std::time::Duration::from_secs(45),
-        )
-        .await
-        .kind
-        {
-            EventKind::Completed { .. } => break,
-            EventKind::Failed(error) => panic!("{error}"),
-            _ => {}
-        }
-    }
-    assert_eq!(
-        agent.snapshot(chat).await.unwrap().progress[0].todos[0].content,
-        "Later pending list"
-    );
-    agent.shutdown().await;
-    drop(agent);
-    let restored =
-        Agent::open_embedded(store, config(), Arc::new(ScriptedModel::new(vec![]))).unwrap();
-    restored.install_own_tickhost();
-    let snapshot = restored.resume_chat(chat).await.unwrap();
-    assert_eq!(
-        snapshot
-            .progress
-            .iter()
-            .find(|p| p.loop_id == receipt.loop_id)
-            .unwrap()
-            .todos[0]
-            .content,
-        "Later pending list"
-    );
-    restored.shutdown().await;
-}
-
-#[tokio::test(start_paused = true)]
-async fn completed_todos_keep_five_seconds_across_turns_then_restore_an_empty_checkpoint() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = directory.path().join("archive");
-    let model = Arc::new(ScriptedModel::new(vec![
-        todo_write(
-            "finished",
-            "Grace-period task",
-            "Finishing the task",
-            "completed",
-        ),
-        text("First turn finished"),
-        text("Next turn finished"),
-    ]));
-    let agent = Agent::open_embedded(store.clone(), config(), model).unwrap();
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let mut events = agent.subscribe();
-    let first = agent
-        .submit(chat, None, "Finish the task".into())
-        .await
-        .unwrap();
-    loop {
-        match next_event(&mut events).await.kind {
-            EventKind::Completed { .. } => break,
-            EventKind::Failed(error) => panic!("{error}"),
-            _ => {}
-        }
-    }
-    assert_eq!(
-        agent.snapshot(chat).await.unwrap().progress[0].todos[0].status,
-        TodoStatus::Completed
-    );
-    tokio::time::advance(std::time::Duration::from_secs(29)).await;
-    agent
-        .submit(chat, None, "A second real message".into())
-        .await
-        .unwrap();
-    loop {
-        match next_event(&mut events).await.kind {
-            EventKind::Completed { .. } => break,
-            EventKind::Failed(error) => panic!("{error}"),
-            _ => {}
-        }
-    }
-    assert_eq!(
-        agent.snapshot(chat).await.unwrap().progress[0].todos.len(),
-        1
-    );
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    loop {
-        if let EventKind::ProgressUpdated { progress } = next_event(&mut events).await.kind
-            && progress.loop_id == first.loop_id
-            && progress.todos.is_empty()
-        {
-            break;
-        }
-    }
-    assert!(
-        agent.snapshot(chat).await.unwrap().progress[0]
-            .todos
-            .is_empty()
-    );
-    agent.flush_transcripts().await;
-    agent.shutdown().await;
-    drop(agent);
-    let restored =
-        Agent::open_embedded(store, config(), Arc::new(ScriptedModel::new(vec![]))).unwrap();
-    let snapshot = restored.resume_chat(chat).await.unwrap();
-    assert!(
-        snapshot
-            .progress
-            .iter()
-            .find(|p| p.loop_id == first.loop_id)
-            .unwrap()
-            .todos
-            .is_empty()
-    );
-    restored.shutdown().await;
-}
-
-#[tokio::test]
-async fn todo_write_takes_claude_code_todos_and_rejects_incomplete_ones() {
-    let directory = tempfile::tempdir().unwrap();
-    let todo = |content: &str, status: &str, active_form: &str| json!({"content": content, "status": status, "activeForm": active_form});
-    let rejected_inputs = [
-        (
-            "old-steps",
-            json!({"steps":[{"description":"Read the notes","status":"pending"}]}),
-        ),
-        (
-            "missing-active-form",
-            json!({"todos":[{"content":"Read the notes","status":"pending"}]}),
-        ),
-        (
-            "empty-content",
-            json!({"todos":[todo("", "pending", "Reading the notes")]}),
-        ),
-        (
-            "blank-active-form",
-            json!({"todos":[todo("Read the notes", "pending", "  ")]}),
-        ),
-        (
-            "unknown-status",
-            json!({"todos":[todo("Read the notes", "done", "Reading the notes")]}),
-        ),
-        (
-            "extra-field",
-            json!({"todos":[todo("Read the notes", "pending", "Reading the notes")], "note": "x"}),
-        ),
-    ];
-    let mut steps = rejected_inputs
-        .iter()
-        .map(|(id, input)| call(id, TODO_WRITE_TOOL_NAME, input.clone()))
-        .collect::<Vec<_>>();
-    steps.extend([
-        call(
-            "accepted",
-            TODO_WRITE_TOOL_NAME,
-            json!({"todos":[
-                todo("Read the notes", "completed", "Reading the notes"),
-                todo("Draft the report", "in_progress", "Drafting the report"),
-                todo("Check the figures", "in_progress", "Checking the figures"),
-            ]}),
-        ),
-        text("Drafting."),
-    ]);
-    let model = Arc::new(ScriptedModel::new(steps));
-    let agent = Agent::new_embedded(config(), model.clone());
-    let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    let results = run_turn_results(&agent, chat, None, "Draft the report").await;
-
-    for (id, _) in &rejected_inputs {
-        let result = result_of(&results, id);
-        assert!(result.is_error, "{id}: {}", result.content);
-        assert!(
-            result.content.starts_with("invalid TodoWrite input"),
-            "{id}: {}",
-            result.content
-        );
-    }
-    let accepted = result_of(&results, "accepted");
-    assert!(!accepted.is_error, "{}", accepted.content);
-    assert_eq!(
-        accepted.content,
-        "Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable"
-    );
-    let snapshot = agent.snapshot(chat).await.unwrap();
-    assert_eq!(snapshot.progress.len(), 1);
-    assert_eq!(snapshot.progress[0].loop_id, snapshot.loops[0].id);
-    assert_eq!(
-        snapshot.progress[0].todos[1],
-        TodoItem {
-            content: "Draft the report".into(),
-            status: TodoStatus::InProgress,
-            active_form: "Drafting the report".into(),
-        }
-    );
-
-    let requests = model.requests.lock().unwrap().clone();
-    let tool_names = requests[0]
-        .tools
-        .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<Vec<_>>();
-    assert!(!tool_names.contains(&"update_progress"), "{tool_names:?}");
-    let todo_write = requests[0]
-        .tools
-        .iter()
-        .find(|tool| tool.name == TODO_WRITE_TOOL_NAME)
-        .expect("TodoWrite is offered");
-    assert!(
-        todo_write
-            .description
-            .starts_with("Use this tool to create and manage a structured task list"),
-        "{}",
-        todo_write.description
-    );
-    let item_schema = &todo_write.input_schema["properties"]["todos"]["items"];
-    assert_eq!(
-        item_schema["required"],
-        json!(["content", "status", "activeForm"])
-    );
-    assert_eq!(
-        item_schema["properties"]["status"]["enum"],
-        json!(["pending", "in_progress", "completed"])
-    );
-    assert_eq!(item_schema["properties"]["content"]["minLength"], 1);
-    assert_eq!(item_schema["properties"]["activeForm"]["minLength"], 1);
-    assert!(
-        system_prompt(requests.last().unwrap()).contains(r#""activeForm":"Drafting the report""#)
-    );
-    agent.shutdown().await;
-}
-
 async fn run_turn(
     agent: &Agent,
     chat: ChatId,
@@ -1183,18 +597,8 @@ fn read_plan(id: &str) -> Vec<Content> {
     call(id, "Read", json!({ "file_path": PLAN_FILE }))
 }
 
-fn todo_write(id: &str, content: &str, active_form: &str, status: &str) -> Vec<Content> {
-    call(
-        id,
-        TODO_WRITE_TOOL_NAME,
-        json!({"todos":[{"content": content, "status": status, "activeForm": active_form}]}),
-    )
-}
-
-/// Loop id、计划（版本与内容）与待办项。
 type LoopPlanState = (LoopId, Option<(u64, String)>, Vec<String>);
 
-/// 每个 Loop 的计划版本与内容、待办项（按 Loop id 排序），用于比较重启前后。
 fn plan_state(snapshot: &ChatSnapshot) -> Vec<LoopPlanState> {
     let mut state = snapshot
         .loops
@@ -1279,14 +683,11 @@ async fn two_loops_keep_separate_plans_and_progress_and_processed_versions_after
     let root = directory.path().join("root");
     let model = Arc::new(ScriptedModel::new(vec![
         submit_plan("a-plan-1", "Plan A, first draft."),
-        todo_write("a-progress-1", "Research A", "Researching A", "in_progress"),
         text("A is planned."),
         submit_plan("b-plan-1", "Plan B, first draft."),
         submit_plan("b-plan-2", "Plan B, second draft."),
-        todo_write("b-progress-1", "Research B", "Researching B", "completed"),
         text("B is planned."),
         submit_plan("a-plan-2", "Plan A, second draft."),
-        todo_write("a-progress-2", "Research A", "Researching A", "completed"),
         text("A is revised."),
     ]));
     let agent = Agent::open_embedded(root.clone(), config(), model).unwrap();
@@ -1375,23 +776,11 @@ async fn branched_and_forked_chats_revise_independent_plan_files() {
     let root = directory.path().join("root");
     let model = Arc::new(ScriptedModel::new(vec![
         submit_plan("plan-1", "Shared plan."),
-        todo_write(
-            "progress-1",
-            "Shared step",
-            "Taking the shared step",
-            "in_progress",
-        ),
         text("Planned."),
         text("Paused."),
         // The Branch has not read its copy of the plan file yet.
         read_plan("child-read"),
         submit_plan("child-plan", "Child plan."),
-        todo_write(
-            "child-progress",
-            "Child step",
-            "Taking the child step",
-            "completed",
-        ),
         text("Child revised."),
         submit_plan("source-plan", "Source plan."),
         text("Source revised."),
@@ -1418,10 +807,7 @@ async fn branched_and_forked_chats_revise_independent_plan_files() {
         .unwrap();
     let child = branch.child_chat_id;
     assert_eq!(plan_of(&branch.snapshot, goal), (1, "Shared plan.".into()));
-    assert_eq!(
-        plan_state(&branch.snapshot)[0].2,
-        ["Shared step:Taking the shared step:InProgress"]
-    );
+    assert!(plan_state(&branch.snapshot)[0].2.is_empty());
     enter_plan_mode(&agent, child).await;
     run_turn(&agent, child, Some(goal), "Revise in the Branch").await;
     enter_plan_mode(&agent, source).await;
@@ -1498,7 +884,6 @@ async fn rewinding_keeps_the_current_plan_version_and_restart_agrees() {
         submit_plan("plan-1", "First plan."),
         text("Planned."),
         submit_plan("plan-2", "Second plan."),
-        todo_write("progress", "Revise", "Revising", "in_progress"),
         text("Revised."),
         text("Continued after the rewind."),
     ]));

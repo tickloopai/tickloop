@@ -650,6 +650,7 @@ mod tests {
             "/bashes",
             "/subs",
             "/tasks",
+            "/todo",
             "/subscriptions",
             "/quit",
         ] {

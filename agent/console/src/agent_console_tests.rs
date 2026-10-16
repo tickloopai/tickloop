@@ -78,6 +78,7 @@ async fn an_explicitly_unknown_work_fact_stays_unknown() {
         title: "New Agent".into(),
         has_work,
         updated_at: None,
+        run_started_at: None,
         preview: None,
         waiting_permissions: 0,
         waiting_questions: 0,

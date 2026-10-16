@@ -2,10 +2,9 @@ use super::*;
 use tickloop_agent_protocol::{AgentAccess, ShellTask};
 use tickloop_agent_test_support::screen::SELECTED_MARK;
 
-const TODO_FIRST: &str = "Inspect the source-owned footer behavior";
-const TODO_SECOND: &str = "Explain the verified layout result";
-const TODO_REPLY: &str = "FOOTER-TODO-READY";
-const TODO_DRAFT: &str = "jk-FOOTER-EDITOR-DRAFT";
+const TASK_TITLE: &str = "Inspect the shared task panel";
+const TASK_REPLY: &str = "SHARED-TASK-READY";
+const TASK_DRAFT: &str = "literal-jk-shared-draft";
 const SHELL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Waits until the terminal no longer shows the Shell view headed by `command`.
@@ -25,245 +24,80 @@ async fn shell_view_shows(pty: &PtyView, command: &str, output: &str, status: &s
     view_shows(pty, &[&format!("$ {command}"), output, status]).await;
 }
 
-async fn run_working_todo_list(fixture: &PrivateFixture) {
-    let todos = json!({"todos":[
-        {"content":TODO_FIRST,"status":"in_progress","activeForm":"Inspecting the source-owned footer behavior"},
-        {"content":TODO_SECOND,"status":"pending","activeForm":"Explaining the verified layout result"}
-    ]});
-    let completed = json!({"todos":[
-        {"content":TODO_FIRST,"status":"completed","activeForm":"Inspecting the source-owned footer behavior"},
-        {"content":TODO_SECOND,"status":"completed","activeForm":"Explaining the verified layout result"}
-    ]});
-    let (base_url, mut requests, mut releases) =
-        model_http_support::serve_responses_with_gated_responses(
-            vec![
-                (
-                    200,
-                    chat_reply(Some(("TodoWrite", "active-todos", todos)), ""),
-                ),
-                (200, chat_reply(None, TODO_REPLY)),
-                (
-                    200,
-                    chat_reply(Some(("TodoWrite", "completed-todos", completed)), ""),
-                ),
-                (200, chat_reply(None, "TODO-ALL-DONE")),
-                (200, chat_reply(None, "TODO-THIRD-REPLY")),
-                (200, chat_reply(None, "OTHER-GRACE-AGENT-REPLY")),
-                (200, chat_reply(Some(("TodoWrite", "idle-done", json!({"todos":[{"content":"IDLE-GRACE-TASK","status":"completed","activeForm":"Finishing idle task"}]}))), "")),
-                (200, chat_reply(None, "TODO-IDLE-DONE")),
-                (200, chat_reply(Some(("TodoWrite", "invalid-todo", json!({"todos":"invalid"}))), "")),
-                (200, chat_reply(None, "TODO-ERROR-REPLY")),
-            ],
-            &[1, 4],
-        )
-        .await;
+async fn run_shared_task_list(fixture: &PrivateFixture) {
+    tickloop_agent_config::UserSettings::in_root(&fixture.path("config"))
+        .save_task_tools_enabled(true)
+        .unwrap();
+    let (base_url, mut requests, mut releases) = model_http_support::serve_responses_with_gated_responses(vec![
+        (200, chat_reply(Some(("Subagent", "helper", json!({"name":"helper","description":"Inspect notes","task":"Inspect the notes"}))), "")),
+        (200, chat_reply(None, "Helper finished")),
+        (200, chat_reply(Some(("TaskCreate", "create-task", json!({"mutation_id":uuid::Uuid::new_v4(),"title":TASK_TITLE,"description":"Verify the shared status and dependency details"}))), "")),
+        (200, chat_reply(None, TASK_REPLY)),
+    ], &[3]).await;
     fixture.set_chat_model(&base_url);
     let mut pty = PtyView::launch(fixture, &["--dangerously-skip-permissions"], &[], true);
-    pty.wait_for("new Todo View ready with known empty context", |frame| {
-        new_input_is_visible(frame) && frame.contains("Context 0% used")
-    })
-    .await;
-    pty.resize(80, 24).await;
+    pty.wait_for("new shared Task View", new_input_is_visible)
+        .await;
+    pty.resize(100, 30).await;
     let client = fixture.client().await;
-    pty.send(b"Todo grace probe.\r");
-    let execution = tokio::time::timeout(UI_TIMEOUT, async {
-        loop {
-            if let [row] = catalog(&client).await.as_slice() {
-                break row.execution;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let actual = wait_snapshot(
-        &client,
-        execution,
-        "TodoWrite updates own progress",
-        |current| {
-            current
-                .conversation
-                .progress
-                .first()
-                .is_some_and(|progress| progress.todos.len() == 2)
-        },
-    )
-    .await;
-    assert_eq!(actual.conversation.progress[0].todos[0].content, TODO_FIRST);
-    let working = pty
-        .wait_for(
-            "live Todos immediately follow the activity above input",
-            |frame| {
-                let rows = frame.lines().collect::<Vec<_>>();
-                rows.iter()
-                    .position(|line| {
-                        // The first frames may not show the elapsed time yet.
-                        line.contains("Working") && line.contains("s · esc to interrupt)")
-                    })
-                    .is_some_and(|activity| {
-                        rows.get(activity + 1)
-                            .is_some_and(|line| line.contains(TODO_FIRST))
-                            && rows
-                                .get(activity + 2)
-                                .is_some_and(|line| line.contains(TODO_SECOND))
-                    })
-            },
-        )
-        .await;
-    assert!(!working.contains("Todo 2"));
-    assert!(
-        !working.contains("TodoWrite")
-            && !working.contains("Todos have been modified successfully")
-    );
-    assert!(
-        working
-            .lines()
-            .any(|line| line.starts_with("  ⎿  ◼ ") && line.contains(TODO_FIRST))
-    );
-    assert!(
-        working
-            .lines()
-            .any(|line| line.starts_with("     ◻ ") && line.contains(TODO_SECOND))
-    );
-    assert!(
-        working
-            .lines()
-            .any(|line| { line.contains("Working") && line.contains("s · esc to interrupt)") }),
-        "{working}"
-    );
-    releases.remove(0).send(()).unwrap();
-    pty.wait_for("idle keeps the same owned Todo list", |frame| {
-        frame.contains(TODO_REPLY)
-            && frame.contains(TODO_FIRST)
-            && frame.contains(TODO_SECOND)
-            && frame.contains("2 tasks (0 done, 1 in progress, 1 open)")
+    pty.send(b"Inspect with a helper.\r");
+    pty.wait_for("shared Task summary appears", |frame| {
+        frame.contains("Tasks") && frame.contains("0/1 completed")
     })
     .await;
-    pty.wait_for_editor("idle input accepts the next turn", Some(""))
-        .await;
-    pty.send(b"Complete the checklist.\r");
-    let done = pty
-        .wait_for("all-done list remains during idle grace", |frame| {
-            frame.contains("TODO-ALL-DONE")
-                && frame
-                    .lines()
-                    .any(|row| row.contains("✔") && row.contains(TODO_FIRST))
-        })
-        .await;
-    assert!(!done.contains("TodoWrite") && !done.contains("Todos have been modified successfully"));
-    pty.send(b"A third real message while grace is active.\r");
-    pty.wait_for(
-        "next Working preserves completed rows until the same deadline",
-        |frame| {
-            frame.contains("Working")
-                && frame
-                    .lines()
-                    .any(|row| row.contains("✔") && row.contains(TODO_FIRST))
-        },
-    )
-    .await;
-    let main_title = catalog(&client)
+    let root = catalog(&client)
         .await
         .into_iter()
-        .find(|row| row.execution == execution)
+        .find(|row| row.parent.is_none())
         .unwrap()
-        .title;
-    let mut other = PtyView::start(fixture);
-    other
-        .wait_for("other grace Agent draft", new_input_is_visible)
-        .await;
-    other.send(b"Other grace Agent.\r");
-    other
-        .wait_for("other real Agent completes", |frame| {
-            frame.contains("OTHER-GRACE-AGENT-REPLY")
-        })
-        .await;
-    let other_title = catalog(&client)
-        .await
-        .into_iter()
-        .find(|row| row.execution != execution)
-        .unwrap()
-        .title;
-    pty.send(b"\x1b[D");
-    pty.wait_for("grace overview", |frame| frame.contains("Agents · local"))
-        .await;
-    select_overview_row(&mut pty, &other_title).await;
-    pty.send(b"\r");
-    pty.wait_for("other Agent does not inherit completed rows", |frame| {
-        frame.contains("OTHER-GRACE-AGENT-REPLY") && !frame.contains(TODO_FIRST)
-    })
-    .await;
-    pty.send(b"\x1b[D");
-    pty.wait_for("return overview", |frame| frame.contains("Agents · local"))
-        .await;
-    select_overview_row(&mut pty, &main_title).await;
-    pty.send(b"\r");
-    // The completion grace is 30 seconds.
-    pty.wait_for_within(
-        "grace expires while the third turn is still Working",
-        Duration::from_secs(40),
-        |frame| {
-            !frame.contains("Agents · local")
-                && frame.contains("Working")
-                && !frame.contains(TODO_FIRST)
-                && !frame.contains(TODO_SECOND)
-        },
-    )
-    .await;
-    let completed = wait_snapshot(&client, execution, "completed list retired", |current| {
+        .execution;
+    let actual = wait_snapshot(&client, root, "one persisted shared task", |current| {
         current
             .conversation
-            .progress
-            .iter()
-            .any(|progress| progress.todos.is_empty())
+            .task_board
+            .as_ref()
+            .is_some_and(|board| board.tasks.len() == 1)
     })
     .await;
-    assert!(completed.events.iter().any(|event| matches!(&event.kind, tickloop_agent_protocol::EventKind::ProgressUpdated { progress } if progress.todos.is_empty())));
-    releases.remove(0).send(()).unwrap();
-    pty.wait_for("idle retains the empty retired state", |frame| {
-        frame.contains("TODO-THIRD-REPLY") && !frame.contains(TODO_FIRST)
-    })
-    .await;
-    pty.send(b"\x0f");
-    let archive = pty
-        .wait_for("TodoWrite stays model-only in Transcript", |frame| {
-            frame.contains("Showing detailed transcript") && frame.contains("TODO-THIRD-REPLY")
-        })
-        .await;
-    assert!(
-        !archive.contains("TodoWrite")
-            && !archive.contains("Todos have been modified successfully")
+    assert_eq!(
+        actual.conversation.task_board.as_ref().unwrap().tasks[0].title,
+        TASK_TITLE
     );
-    pty.send(b"\x0f");
-    pty.wait_for_editor("completed checklist returns editor focus", Some(""))
-        .await;
-    pty.send(b"Finish a checklist and stay idle.\r");
-    pty.wait_for("idle completed rows retain their grace", |frame| {
-        frame.contains("TODO-IDLE-DONE") && frame.contains("IDLE-GRACE-TASK")
+    pty.send(b"\x14");
+    pty.wait_for("Task list expands with owner and state", |frame| {
+        frame.contains(TASK_TITLE)
+            && frame.contains("pending")
+            && !frame.contains("unassigned")
+            && frame.contains("Enter details")
     })
     .await;
-    pty.wait_for_within(
-        "idle completed rows expire without another message",
-        Duration::from_secs(40),
-        |frame| frame.contains("TODO-IDLE-DONE") && !frame.contains("IDLE-GRACE-TASK"),
-    )
+    pty.send(b"\r");
+    pty.wait_for("Task details show dependencies", |frame| {
+        frame.contains("Dependencies: none")
+    })
     .await;
-    pty.send(b"Show a validation failure.\r");
-    let failed = pty
-        .wait_for("failed TodoWrite remains visible", |frame| {
-            frame.contains("TODO-ERROR-REPLY")
-                && frame.contains("⏺ TodoWrite")
-                && frame.contains("⎿  Failed")
-        })
-        .await;
-    assert!(!failed.contains("Todos have been modified successfully"));
-    pty.send(TODO_DRAFT.as_bytes());
-    pty.wait_for("literal editor keys survive layout", |frame| {
-        frame.contains(TODO_DRAFT)
+    pty.send(b"\x1b");
+    pty.wait_for("Task details close first", |frame| {
+        !frame.contains("Dependencies: none") && frame.contains("Enter details")
+    })
+    .await;
+    pty.send(b"\x1b");
+    pty.wait_for("Task list returns focus to editing", |frame| {
+        frame.contains("Ctrl+T focus")
+    })
+    .await;
+    pty.send(TASK_DRAFT.as_bytes());
+    pty.wait_for("Task panel returns focus to ordinary editing", |frame| {
+        frame.contains(TASK_DRAFT)
+    })
+    .await;
+    releases.remove(0).send(()).unwrap();
+    pty.wait_for("shared Task persists while idle", |frame| {
+        frame.contains(TASK_REPLY) && frame.contains("0/1 completed") && frame.contains(TASK_DRAFT)
     })
     .await;
     let mut captured = Vec::new();
-    for _ in 0..10 {
+    for _ in 0..4 {
         captured.push(
             tokio::time::timeout(UI_TIMEOUT, requests.recv())
                 .await
@@ -272,14 +106,21 @@ async fn run_working_todo_list(fixture: &PrivateFixture) {
                 .1,
         );
     }
-    assert!(captured[4]["messages"].to_string().contains("TodoWrite"));
     assert!(
-        captured[4]["messages"]
-            .to_string()
-            .contains("Todos have been modified successfully")
+        captured[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "TaskCreate")
+    );
+    assert!(
+        captured[2]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "TaskCreate")
     );
     assert!(requests.try_recv().is_err());
-    other.close().await;
     pty.close().await;
     client
         .execute(CommandEnvelope {
@@ -290,19 +131,15 @@ async fn run_working_todo_list(fixture: &PrivateFixture) {
         .await
         .unwrap();
     fixture.shutdown().await;
-    let chat_id = completed.conversation.id.to_string();
+    let chat_id = actual.conversation.id.to_string();
     let mut resumed = PtyView::launch(fixture, &["--resume", &chat_id], &[], true);
-    let restored = resumed
+    resumed
         .wait_for(
-            "expired Todos do not return after daemon restart",
-            |frame| frame.contains("History opened.") && frame.contains("TODO-THIRD-REPLY"),
+            "shared Task survives history load without model execution",
+            |frame| frame.contains("History opened.") && frame.contains("0/1 completed"),
         )
         .await;
-    assert!(
-        !restored.contains(TODO_FIRST)
-            && !restored.contains("TodoWrite · Completed")
-            && !restored.contains("Todos have been modified successfully")
-    );
+    assert!(requests.try_recv().is_err());
     resumed.close().await;
 }
 
@@ -605,9 +442,9 @@ async fn actual_cli_shell_category_uses_its_exact_eligible_count_and_task() {
 }
 
 #[tokio::test]
-async fn actual_cli_completed_todos_keep_grace_then_retire_across_working_switch_and_restart() {
+async fn actual_cli_shared_tasks_expand_and_persist_without_personal_todos() {
     let fixture = PrivateFixture::new();
-    let result = AssertUnwindSafe(run_working_todo_list(&fixture))
+    let result = AssertUnwindSafe(run_shared_task_list(&fixture))
         .catch_unwind()
         .await;
     fixture.shutdown().await;

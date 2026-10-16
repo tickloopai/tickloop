@@ -117,6 +117,7 @@ impl Agent {
         };
         let client = source.client.clone();
         let mut snapshot = ChatSnapshot {
+            task_tools_enabled: false,
             subagent_reports: Default::default(),
             failure_events: Vec::new(),
             provider_failures: Default::default(),
@@ -129,6 +130,8 @@ impl Agent {
             branch_origin: Some(origin),
             delegation: None,
             family_completions: Vec::new(),
+            task_boards: BTreeMap::new(),
+            task_board: None,
             family_inputs: BTreeMap::new(),
             sent_agent_messages: BTreeMap::new(),
             generated_title: None,
@@ -244,9 +247,11 @@ impl Agent {
             child_chat_id,
             Chat {
                 family_generation: 0,
+                family_stopping: false,
+                task_checkpoint_pending: false,
+                family_finishing: HashSet::new(),
                 snapshot: snapshot.clone(),
                 bookkeeping,
-                todo_completion_graces: Default::default(),
                 start_new_tool_result_message: false,
                 needs_plan_mode_exit_notice: false,
                 // 备份在锁外复制完成之前占住子 Chat，不能开始 Run 或 rewind。
@@ -278,6 +283,7 @@ impl Agent {
         *permission_context = permission_candidate;
         drop(permission_context);
         drop(chats);
+        drop(_settings_gate);
         // 照 Claude Code `copyFileHistoryForResume` 把备份硬链接到子 Chat 的目录（失败时复制），
         // 复制可能涉及大文件，放在锁外；备份全部复制成功的快照以子 Chat 的 id 写入 Transcript。
         let copied_snapshots = tokio::task::spawn_blocking(move || {
@@ -305,7 +311,6 @@ impl Agent {
         if let Some(next) = next {
             self.inner.tasks.lock().await.push(self.run_task(next));
         }
-        self.start_restored_todo_graces(child_chat_id).await;
         self.flush_transcripts().await;
         Ok(BranchOutcome {
             source_chat_id: request.source_chat_id,
@@ -1063,6 +1068,7 @@ mod tests {
                     chat.snapshot
                         .operations
                         .push(tickloop_agent_protocol::OperationRecord {
+                            task_binding: None,
                             id: Uuid::new_v4(),
                             loop_id,
                             run_id,

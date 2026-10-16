@@ -2220,11 +2220,16 @@ fn run_merge_boundary_pty(route: &str) {
         fixture.wait_for("Agents · local");
         fixture.send(b"\x1b[27u");
         let restored = fixture.wait_for_phase(&phase_path, "restored");
-        let frame = fixture.repaint_after_recovery("Overview restore", |frame| {
-            !frame.contains("Agents · local")
-                && !frame.contains("Showing detailed transcript")
-                && frame.contains("busy charlie")
-        });
+        // The catalog title arrives independently of the restore and merge events.
+        let frame =
+            fixture.repaint_after_recovery("Overview restore with the current goal", |frame| {
+                !frame.contains("Agents · local")
+                    && !frame.contains("Showing detailed transcript")
+                    && frame.contains("busy charlie")
+                    && frame
+                        .lines()
+                        .any(|line| line.starts_with('─') && line.contains("start the busy work"))
+            });
         println!(
             "MERGE_RESTORE_PROOF {restored}\nMERGE_RESTORE_FRAME_BEGIN\n{frame}\nMERGE_RESTORE_FRAME_END"
         );

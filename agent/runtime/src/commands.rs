@@ -431,6 +431,7 @@ mod tests {
                 .snapshot
                 .operations
                 .push(OperationRecord {
+                    task_binding: None,
                     id: operation_id,
                     loop_id,
                     run_id: Uuid::new_v4(),

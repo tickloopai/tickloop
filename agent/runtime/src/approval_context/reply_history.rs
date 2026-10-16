@@ -83,10 +83,16 @@ pub(crate) fn capture(
                 history
                     .contexts
                     .extend(inherited.contexts.into_iter().filter(|context| {
-                        context.chat_id == delegation.parent_chat_id
+                        delegation
+                            .lineage()
+                            .iter()
+                            .any(|parent| context.chat_id == parent.chat_id)
                             && originals.iter().any(|input| {
                                 input.chat_id == context.chat_id
-                                    && input.loop_id == delegation.parent_loop_id
+                                    && delegation.lineage().iter().any(|parent| {
+                                        input.chat_id == parent.chat_id
+                                            && input.loop_id == parent.loop_id
+                                    })
                                     && input.message_id == context.user_message_id
                             })
                     }));

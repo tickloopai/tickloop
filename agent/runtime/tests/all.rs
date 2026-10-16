@@ -100,6 +100,8 @@ mod model_stream_replay;
 mod module_boundaries_live;
 #[path = "all/monitor_updates.rs"]
 mod monitor_updates;
+#[path = "all/nested_subagents.rs"]
+mod nested_subagents;
 #[path = "all/observers.rs"]
 mod observers;
 #[path = "all/output_limit_recovery.rs"]
@@ -176,3 +178,6 @@ mod waiting_runs;
 mod web_tools;
 #[path = "all/workspace_host_context.rs"]
 mod workspace_host_context;
+
+#[path = "all/shared_tasks.rs"]
+mod shared_tasks;

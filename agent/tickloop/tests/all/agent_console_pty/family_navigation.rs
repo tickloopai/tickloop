@@ -262,32 +262,11 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
         ),
         chat_reply(None, SECOND_CHILD_REPLY),
         chat_reply(None, MAIN_REPLY),
-        chat_reply(
-            Some((
-                "TodoWrite",
-                "main-todo",
-                json!({"todos":[{"content":"MAIN-OWN-TODO","status":"in_progress","activeForm":"Main own work"}]}),
-            )),
-            "",
-        ),
+        chat_reply(Some(("ListSubagents", "main-todo", json!({}))), ""),
         waiting_reply("main-context-wait", "Main remains busy"),
-        chat_reply(
-            Some((
-                "TodoWrite",
-                "first-todo",
-                json!({"todos":[{"content":"FIRST-OWN-TODO","status":"in_progress","activeForm":"First own work"}]}),
-            )),
-            "",
-        ),
+        chat_reply(Some(("ListSubagents", "first-todo", json!({}))), ""),
         waiting_reply("first-context-wait", "First child remains busy"),
-        chat_reply(
-            Some((
-                "TodoWrite",
-                "second-todo",
-                json!({"todos":[{"content":"SECOND-OWN-TODO","status":"in_progress","activeForm":"Second own work"}]}),
-            )),
-            "",
-        ),
+        chat_reply(Some(("ListSubagents", "second-todo", json!({}))), ""),
         waiting_reply("second-context-wait", "Second child remains busy"),
         waiting_reply(
             "second-follow-up-wait",
@@ -532,21 +511,6 @@ async fn run_family_navigation(fixture: &PrivateFixture) {
         (main_execution, MAIN_TASK, MAIN_REPLY, MAIN_DRAFT),
     ] {
         version = open_family_member(&mut pty, &client, target, title, reply, view, version).await;
-        let own_todo = if target == main_execution {
-            "MAIN-OWN-TODO"
-        } else if target == first_execution {
-            "FIRST-OWN-TODO"
-        } else {
-            "SECOND-OWN-TODO"
-        };
-        let working = pty
-            .wait_for("the visible Agent owns the live Todo list", |frame| {
-                frame.contains(own_todo)
-            })
-            .await;
-        for other in ["MAIN-OWN-TODO", "FIRST-OWN-TODO", "SECOND-OWN-TODO"] {
-            assert_eq!(working.contains(other), other == own_todo, "{working}");
-        }
         assert!(pty.frame().contains(draft));
         assert_eq!(catalog(&client).await.len(), 3);
     }

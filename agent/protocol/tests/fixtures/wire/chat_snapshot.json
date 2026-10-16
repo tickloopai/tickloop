@@ -1,4 +1,5 @@
 {
+  "task_tools_enabled": false,
   "failure_events": [],
   "provider_failures": {},
   "artifact_ticks": [

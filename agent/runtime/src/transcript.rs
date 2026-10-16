@@ -19,7 +19,7 @@ pub(crate) use entry::{
     FileHistorySnapshotEntry, ForkedFrom, LOOP_CREATED_SUBTYPE, LOOP_ENDED_SUBTYPE,
     LOOP_STATE_SUBTYPE, LOOP_TRIGGER_SUBTYPE, LastPromptEntry, Line, LoopRecord,
     MonitorMembersEntry, PartialCompactDirection, SentAgentMessagesEntry, SubagentsEntry,
-    SummarizeMetadata as SummarizeMetadataEntry,
+    SummarizeMetadata as SummarizeMetadataEntry, TaskBoardsEntry,
 };
 pub(crate) use listing::list_project;
 pub(crate) use path::{

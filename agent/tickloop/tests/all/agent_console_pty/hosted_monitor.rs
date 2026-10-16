@@ -221,6 +221,61 @@ fn hosted_rows(frame: &str) -> Vec<usize> {
         .collect()
 }
 
+/// The last fully committed Monitor screen, excluding an in-flight repaint.
+fn completed_monitor_frame(view: &PtyView) -> Option<String> {
+    let output = view.output.lock().unwrap();
+    let ansi = String::from_utf8_lossy(&output);
+    let end = ansi.rfind(COMPLETED_FRAME_END)? + COMPLETED_FRAME_END.len();
+    Some(screen::visible_screen_with_selection(
+        &ansi[..end],
+        view.width,
+        view.height,
+    ))
+}
+
+/// Selects a hosted row by subscription identity and confirms its action in the same frame.
+/// A reopen can replace and reorder rows after its process is already running.
+async fn select_committed_hosted_state(view: &mut PtyView, subscribed: bool, gone: bool) -> String {
+    let mut latest = String::new();
+    let mut pending_from = None;
+    tokio::time::timeout(UI_TIMEOUT, async {
+        loop {
+            if let Some(frame) = completed_monitor_frame(view) {
+                let is_gone = selected_row_is_gone(&frame);
+                let is_running = frame
+                    .lines()
+                    .any(|line| line.starts_with("enter open · x close"));
+                if is_gone || is_running {
+                    let target = hosted_rows(&frame).into_iter().find(|row| {
+                        frame
+                            .lines()
+                            .nth(*row)
+                            .is_some_and(|line| line.contains('↻') == subscribed)
+                    });
+                    if let (Some(selected), Some(target)) = (selected_line(&frame), target) {
+                        if selected == target && if gone { is_gone } else { is_running } {
+                            return frame;
+                        }
+                        if pending_from.is_some_and(|previous| previous != selected) {
+                            pending_from = None;
+                        }
+                        if selected != target && pending_from.is_none() {
+                            view.send(if target > selected { b"j" } else { b"k" });
+                            pending_from = Some(selected);
+                        }
+                    }
+                }
+                latest = frame;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("Monitor did not select subscribed={subscribed}, gone={gone}: {latest}")
+    })
+}
+
 /// The Tick Subscriptions of `execution`'s Chat.
 async fn tick_subscriptions(
     client: &LocalAgentClient,
@@ -369,21 +424,9 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
             "the reopened instance's record joins the one it came from and the other gone Tick's"
         );
 
-        // The gone row that was not reopened never had a subscription. The reopened row may still
-        // show its ended instance until the Console has the reopen's answer, and would then turn
-        // into the running one under the selection.
-        let frame = view.frame();
-        let not_reopened = hosted_rows(&frame)
-            .into_iter()
-            .find(|row| {
-                frame
-                    .lines()
-                    .nth(*row)
-                    .is_some_and(|line| !line.contains('↻'))
-            })
-            .expect("the gone row that was not reopened");
-        select_line(&mut view, not_reopened).await;
-        assert!(selected_row_is_gone(&view.frame()), "{}", view.frame());
+        select_committed_hosted_state(&mut view, true, false).await;
+        let selected_gone = select_committed_hosted_state(&mut view, false, true).await;
+        assert!(selected_row_is_gone(&selected_gone), "{selected_gone}");
         view.send(b"x");
         view.wait_for("the gone row leaves at once", |frame| {
             frame.contains("Monitor 1") && frame.contains("enter open · x close")

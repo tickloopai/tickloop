@@ -1183,6 +1183,14 @@ async fn legacy_or_unknown_delegated_human_authority_requires_manual_review_and_
         restored.install_host_tools(tick.clone()).unwrap();
         restored.set_auto_reviewer(reviewer.clone()).await;
         let loaded = restored.resume_chat(child.id).await.unwrap();
+        restored
+            .set_execution_mode(
+                loaded.delegation.as_ref().unwrap().root_chat_id(),
+                tickloop_agent_protocol::ExecutionMode::Auto,
+            )
+            .await
+            .unwrap();
+
         assert!(
             loaded.delegation.is_some(),
             "unknown authority must not erase delegation or elevate to an unrestricted root"
@@ -2105,10 +2113,17 @@ async fn each_child_completion_is_recorded_once_and_background_delivery_is_not_r
     completed(&mut events, &second).await;
     let completions = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            let value = serde_json::to_value(core.snapshot(root).await.unwrap()).unwrap();
-            if value["family_completions"]
-                .as_array()
-                .is_some_and(|items| items.len() == 2)
+            let snapshot = core.snapshot(root).await.unwrap();
+            let settled = snapshot.pending_inputs.is_empty()
+                && snapshot
+                    .loops
+                    .iter()
+                    .all(|goal| goal.state == tickloop_agent_protocol::LoopState::Completed);
+            let value = serde_json::to_value(snapshot).unwrap();
+            if settled
+                && value["family_completions"]
+                    .as_array()
+                    .is_some_and(|items| items.len() == 2 && items[1]["notification"] == "queued")
             {
                 break value["family_completions"].clone();
             }
@@ -2216,12 +2231,17 @@ async fn stop_subagent_tells_its_hook_which_direct_child_stopped_and_reports_a_f
         let child = core.subagents(root).await.unwrap()[0].child_chat_id;
         assert_eq!(*hook.stopped.lock().unwrap(), vec![(root, child)]);
         let stopped = tool_result(&core.snapshot(root).await.unwrap().messages, "stop").unwrap();
-        assert_eq!(stopped["status"], "stopped");
         assert_eq!(
-            stopped.get("hosted_ticks_error").and_then(Value::as_str),
-            answer.err().as_deref(),
-            "{stopped}"
+            stopped["status"],
+            if answer.is_err() {
+                "partial_failure"
+            } else {
+                "stopped"
+            }
         );
+        if let Err(error) = answer {
+            assert_eq!(stopped["failures"][0]["error"], error);
+        }
         core.shutdown().await;
     }
 }
@@ -3132,7 +3152,19 @@ async fn sender_rate_budget_survives_partial_family_restore(compact: bool) {
         .unwrap()
         .child_chat_id;
     if compact {
-        core.compact(root).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match core.compact(root).await {
+                    Ok(_) => break,
+                    Err(tickloop_agent_runtime::AgentError::Busy) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("compaction failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("background completion turns settle before compaction");
     }
     core.shutdown().await;
     let resumed = Agent::open_embedded(

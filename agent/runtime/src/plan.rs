@@ -237,19 +237,6 @@ pub(super) fn definitions(is_delegated: bool) -> Vec<ToolDefinition> {
             }}}),
         });
     }
-    definitions.push(ToolDefinition {
-        name: TODO_WRITE_TOOL_NAME.into(),
-        description: prompts::todo_write_description(),
-        input_schema: json!({"type":"object","properties":{"todos":{
-            "type":"array",
-            "description":"The updated todo list",
-            "items":{"type":"object","properties":{
-                "content":{"type":"string","minLength":1},
-                "status":{"type":"string","enum":["pending","in_progress","completed"]},
-                "activeForm":{"type":"string","minLength":1}
-            },"required":["content","status","activeForm"],"additionalProperties":false}
-        }},"required":["todos"],"additionalProperties":false}),
-    });
     definitions
 }
 
@@ -895,10 +882,7 @@ impl Agent {
     ) -> Option<Result<ToolResult, String>> {
         let name = operation.name.as_str();
         let input = &operation.input;
-        if !matches!(
-            name,
-            ENTER_PLAN_MODE_TOOL_NAME | EXIT_PLAN_MODE_TOOL_NAME | TODO_WRITE_TOOL_NAME
-        ) {
+        if !matches!(name, ENTER_PLAN_MODE_TOOL_NAME | EXIT_PLAN_MODE_TOOL_NAME) {
             return None;
         }
         let result = async {
@@ -946,21 +930,7 @@ impl Agent {
                     chat.bookkeeping = bookkeeping;
                     (Some(EventKind::PlanUpdated { plan }), None)
                 }
-                _ => {
-                    let progress = Progress {
-                        loop_id: receipt.loop_id,
-                        todos: TodoWriteInput::parse(input)?,
-                    };
-                    snapshot
-                        .progress
-                        .retain(|progress| progress.loop_id != receipt.loop_id);
-                    snapshot.progress.push(progress.clone());
-                    self.track_todo_progress(chat, &progress);
-                    (
-                        Some(EventKind::ProgressUpdated { progress }),
-                        Some(prompts::TODO_WRITE_RESULT.into()),
-                    )
-                }
+                _ => unreachable!("plan tools were checked above"),
             };
             self.save(&snapshot);
             chat.snapshot = snapshot;

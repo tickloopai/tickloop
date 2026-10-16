@@ -1,0 +1,311 @@
+use super::*;
+
+const TASK_TOOLS: [&str; 4] = ["TaskCreate", "TaskGet", "TaskList", "TaskUpdate"];
+const TASK_TOOLS_MENU_INDEX: usize = 14;
+
+fn assert_task_tools(request: &Value, enabled: bool) {
+    let names = request["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect::<Vec<_>>();
+    for name in TASK_TOOLS {
+        assert_eq!(names.contains(&name), enabled, "{name}: {names:?}");
+    }
+    assert!(!names.contains(&"TodoWrite"));
+}
+
+async fn toggle_task_tools(pty: &mut PtyView, enabled: bool) {
+    pty.send(b"/settings\r");
+    pty.wait_for("Settings opens", |frame| {
+        frame.contains("Settings") && frame.contains("enter change")
+    })
+    .await;
+    pty.send(&[b'j'; TASK_TOOLS_MENU_INDEX]);
+    let before = if enabled { "Off" } else { "On" };
+    pty.wait_for("Task tools setting is selected", |frame| {
+        frame.lines().any(|line| {
+            (line.contains(SELECTED_MARK) || line.trim_start().starts_with('❯'))
+                && line.contains(&format!("Task tools: {before}"))
+        })
+    })
+    .await;
+    pty.send(b"\r");
+    let after = if enabled { "On" } else { "Off" };
+    pty.wait_for("Task tools setting changes immediately", |frame| {
+        frame.lines().any(|line| {
+            (line.contains(SELECTED_MARK) || line.trim_start().starts_with('❯'))
+                && line.contains(&format!("Task tools: {after}"))
+        })
+    })
+    .await;
+    pty.send(b"\x1b");
+    pty.wait_for_editor("Settings returns to the editor", Some(""))
+        .await;
+}
+
+fn subagent_reply(name: &str) -> String {
+    chat_reply(
+        Some((
+            "Subagent",
+            name,
+            json!({"name":name,"description":name,"task":"Report your result"}),
+        )),
+        "",
+    )
+}
+
+async fn exercise_task_tools_setting(fixture: &PrivateFixture) {
+    let (base_url, mut requests) = model_http_support::serve_responses(vec![
+        (
+            200,
+            chat_reply(
+                Some((
+                    "TaskCreate",
+                    "create-shared-task",
+                    json!({
+                        "mutation_id":uuid::Uuid::new_v4(),
+                        "title":"TASK-SAVED-WHEN-HIDDEN",
+                        "description":"Check the authorized work"
+                    }),
+                )),
+                "",
+            ),
+        ),
+        (200, subagent_reply("enabled-member")),
+        (200, chat_reply(None, "ENABLED-MEMBER-DONE")),
+        (200, chat_reply(None, "ENABLED-ROOT-DONE")),
+        (200, subagent_reply("disabled-member")),
+        (200, chat_reply(None, "DISABLED-MEMBER-DONE")),
+        (200, chat_reply(None, "DISABLED-ROOT-DONE")),
+        (200, chat_reply(None, "REENABLED-ROOT-DONE")),
+        (200, chat_reply(None, "NEW-GOAL-ENABLED")),
+    ])
+    .await;
+    fixture.set_chat_model(&base_url);
+    let mut pty = PtyView::launch(fixture, &["--dangerously-skip-permissions"], &[], true);
+    pty.wait_for("task setting draft ready", new_input_is_visible)
+        .await;
+    pty.resize(100, 50).await;
+    let client = fixture.client().await;
+    assert!(catalog(&client).await.is_empty());
+    toggle_task_tools(&mut pty, true).await;
+    assert!(
+        catalog(&client).await.is_empty(),
+        "Settings must not create an Agent"
+    );
+    assert!(requests.try_recv().is_err());
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(fixture.path("config/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["taskToolsEnabled"], true);
+
+    pty.send(b"Create a task and delegate its review.\r");
+    pty.wait_for("shared task appears in the compact list", |frame| {
+        frame.contains("ENABLED-ROOT-DONE")
+            && frame.split_once("Tasks ·").is_some_and(|(_, tasks)| {
+                tasks.contains("TASK-SAVED-WHEN-HIDDEN") && tasks.contains("Ctrl+T expand")
+            })
+    })
+    .await;
+    for _ in 0..4 {
+        let request = tokio::time::timeout(UI_TIMEOUT, requests.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_task_tools(&request, true);
+    }
+    let root = catalog(&client)
+        .await
+        .into_iter()
+        .find(|row| row.parent.is_none())
+        .unwrap()
+        .execution;
+    let before = snapshot(&client, root).await;
+    let board = before.conversation.task_boards.values().next().unwrap();
+    assert_eq!(board.tasks.len(), 1);
+    let task_id = board.tasks[0].id;
+    pty.wait_for_editor("enabled work completed", Some(""))
+        .await;
+
+    let child_id = catalog(&client)
+        .await
+        .into_iter()
+        .find(|row| row.parent.is_some())
+        .unwrap()
+        .chat_id
+        .to_string();
+    let mut child_view = PtyView::launch(fixture, &["--resume", &child_id], &[], true);
+    child_view.resize(100, 50).await;
+    child_view
+        .wait_for("child View shares the task panel", |frame| {
+            frame.contains("TASK-SAVED-WHEN-HIDDEN") && frame.contains("Tasks ·")
+        })
+        .await;
+    toggle_task_tools(&mut pty, false).await;
+    assert!(requests.try_recv().is_err());
+    pty.wait_for(
+        "disabling tools immediately hides the task panel",
+        |frame| !frame.contains("Tasks ·"),
+    )
+    .await;
+    child_view
+        .wait_for(
+            "idle child View hides tasks after the setting changes",
+            |frame| !frame.contains("Tasks ·"),
+        )
+        .await;
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(fixture.path("config/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["taskToolsEnabled"], false);
+    for member in catalog(&client).await {
+        assert!(
+            !snapshot(&client, member.execution)
+                .await
+                .conversation
+                .task_tools_enabled
+        );
+    }
+    pty.send(b"Delegate again with task tools disabled.\r");
+    pty.wait_for("disabled work completed", |frame| {
+        frame.contains("DISABLED-ROOT-DONE")
+    })
+    .await;
+    for _ in 0..3 {
+        let request = tokio::time::timeout(UI_TIMEOUT, requests.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_task_tools(&request, false);
+    }
+    let after = snapshot(&client, root).await;
+    assert_eq!(
+        after
+            .conversation
+            .task_boards
+            .values()
+            .next()
+            .unwrap()
+            .tasks[0]
+            .id,
+        task_id
+    );
+    pty.wait_for_editor("disabled work leaves editor ready", Some(""))
+        .await;
+    toggle_task_tools(&mut pty, true).await;
+    assert!(requests.try_recv().is_err());
+    pty.wait_for("reenabling tools restores the same task panel", |frame| {
+        frame
+            .split_once("Tasks ·")
+            .is_some_and(|(_, tasks)| tasks.contains("TASK-SAVED-WHEN-HIDDEN"))
+    })
+    .await;
+    child_view
+        .wait_for("idle child View restores tasks after reenabling", |frame| {
+            frame.contains("Tasks ·") && frame.contains("TASK-SAVED-WHEN-HIDDEN")
+        })
+        .await;
+    child_view.close().await;
+    pty.send(b"Continue with task tools enabled.\r");
+    pty.wait_for("re-enabled work completed", |frame| {
+        frame.contains("REENABLED-ROOT-DONE")
+    })
+    .await;
+    let request = tokio::time::timeout(UI_TIMEOUT, requests.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_task_tools(&request, true);
+    pty.wait_for_editor("re-enabled work leaves editor ready", Some(""))
+        .await;
+    pty.send(b"/loops new\r");
+    pty.wait_for("new goal draft selected", |frame| {
+        frame.contains("The next input will start a new goal")
+    })
+    .await;
+    pty.wait_for_editor("new goal draft is editable", Some(""))
+        .await;
+    pty.send(b"Use the saved global Task tools setting.\r");
+    pty.wait_for("new goal retains the enabled global setting", |frame| {
+        frame.contains("NEW-GOAL-ENABLED")
+    })
+    .await;
+    let request = tokio::time::timeout(UI_TIMEOUT, requests.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .1;
+    assert_task_tools(&request, true);
+    assert_eq!(snapshot(&client, root).await.conversation.loops.len(), 2);
+    pty.close().await;
+}
+
+#[tokio::test]
+async fn actual_cli_settings_toggle_task_tools_for_main_and_subagents_without_model_calls() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(exercise_task_tools_setting(&fixture))
+        .catch_unwind()
+        .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn exercise_default_task_tools(fixture: &PrivateFixture) {
+    let (base_url, mut requests) = model_http_support::serve_responses(vec![
+        (200, subagent_reply("default-member")),
+        (200, chat_reply(None, "DEFAULT-MEMBER-DONE")),
+        (200, chat_reply(None, "DEFAULT-ROOT-DONE")),
+    ])
+    .await;
+    fixture.set_chat_model(&base_url);
+    let mut pty = PtyView::launch(fixture, &["--dangerously-skip-permissions"], &[], true);
+    pty.wait_for("default task setting draft ready", new_input_is_visible)
+        .await;
+    let client = fixture.client().await;
+    pty.send(b"Delegate one check using default settings.\r");
+    pty.wait_for("default main and child completed", |frame| {
+        frame.contains("DEFAULT-ROOT-DONE")
+    })
+    .await;
+    for _ in 0..3 {
+        let request = tokio::time::timeout(UI_TIMEOUT, requests.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_task_tools(&request, false);
+    }
+    let members = catalog(&client).await;
+    assert_eq!(members.len(), 2);
+    for member in members {
+        let current = snapshot(&client, member.execution).await;
+        assert!(!current.conversation.task_tools_enabled);
+        assert!(
+            current
+                .conversation
+                .task_boards
+                .values()
+                .all(|board| board.tasks.is_empty())
+        );
+    }
+    pty.close().await;
+}
+
+#[tokio::test]
+async fn actual_cli_default_subagent_creation_does_not_enable_task_tools() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(exercise_default_task_tools(&fixture))
+        .catch_unwind()
+        .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

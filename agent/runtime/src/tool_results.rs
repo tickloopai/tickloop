@@ -58,7 +58,7 @@ impl Agent {
         let family_id = snapshot
             .delegation
             .as_ref()
-            .map_or(chat_id, |delegation| delegation.parent_chat_id);
+            .map_or(chat_id, |delegation| delegation.root_chat_id());
         let family_temp = private_family_temp_directory(family_id);
         let persistent_project = self
             .inner

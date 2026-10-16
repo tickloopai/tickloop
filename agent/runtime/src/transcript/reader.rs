@@ -261,6 +261,10 @@ fn load_lines(
                 metadata.family_inputs = Some(entry.clone());
                 continue;
             }
+            Line::TaskBoards(entry) => {
+                metadata.task_boards = Some(entry.clone());
+                continue;
+            }
             Line::FamilyCompletions(entry) => {
                 metadata.family_completions = Some(entry.clone());
                 continue;
@@ -1023,6 +1027,14 @@ mod tests {
                     chat_id: Uuid::nil(),
                     inputs: [(message_id, record)].into(),
                 }),
+                Line::TaskBoards(crate::transcript::TaskBoardsEntry {
+                    chat_id: Uuid::nil(),
+                    boards: [(
+                        message_id,
+                        tickloop_agent_protocol::TaskBoard::new(Uuid::nil(), message_id),
+                    )]
+                    .into(),
+                }),
                 Line::User(entry(
                     prompt,
                     None,
@@ -1049,6 +1061,10 @@ mod tests {
         assert_eq!(
             records[&message_id].response.as_deref(),
             Some("Verified reply")
+        );
+        assert_eq!(
+            loaded.metadata.task_boards.unwrap().boards[&message_id].root_loop_id,
+            message_id
         );
         assert_eq!(loaded.chain.first().unwrap().uuid, compacted);
     }

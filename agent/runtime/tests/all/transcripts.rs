@@ -1479,11 +1479,6 @@ async fn transcripts_hold_only_specified_entries_and_restart_rebuilds_the_chat_f
     std::fs::write(other.join("notes.txt"), lines).unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
         submit_plan("plan", "Deliver the report."),
-        call(
-            "progress-1",
-            "TodoWrite",
-            json!({"todos":[{"content":"Write the report","status":"in_progress","activeForm":"Writing the report"}]}),
-        ),
         text("Planned."),
         text("Summary of the planning turn."),
         call(
@@ -1501,11 +1496,6 @@ async fn transcripts_hold_only_specified_entries_and_restart_rebuilds_the_chat_f
             "write-2",
             "Write",
             json!({"file_path":"report.txt","content":"second draft"}),
-        ),
-        call(
-            "progress-2",
-            "TodoWrite",
-            json!({"todos":[{"content":"Write the report","status":"completed","activeForm":"Writing the report"}]}),
         ),
         text("Second draft written."),
     ]));

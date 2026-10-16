@@ -295,7 +295,6 @@ impl Agent {
             .any(|(_, note)| *note == HostNote::PlanModeExit);
         chat.snapshot = candidate;
         chat.bookkeeping = candidate_bookkeeping;
-        self.reset_restored_todo_graces(chat);
         self.emit_conversation_rewound(chat, loop_id, point.message_id);
     }
 

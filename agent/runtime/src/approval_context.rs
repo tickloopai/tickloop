@@ -565,8 +565,9 @@ pub(super) fn capture(
         let mut inherited = frozen
             .iter()
             .filter(|input| {
-                input.chat_id == delegation.parent_chat_id
-                    && input.loop_id == delegation.parent_loop_id
+                delegation.lineage().iter().any(|parent| {
+                    input.chat_id == parent.chat_id && input.loop_id == parent.loop_id
+                })
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -726,6 +727,7 @@ mod tests {
             snapshot.message_runs.insert(index, run);
         }
         let operation = OperationRecord {
+            task_binding: None,
             id: Uuid::new_v4(),
             loop_id: Uuid::new_v4(),
             run_id: run,
