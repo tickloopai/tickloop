@@ -10,12 +10,11 @@ CARGO_PACKAGE := -p tickloop-agent
 PACKAGE_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
 TICK_PACKAGES := longbridge futu
-TICKS_CHECKOUT ?= $(HOME)/github/ticks
 
-.PHONY: dev build install package package-ticks install-ticks publish-ticks test check release-docs prototype-earnings-review
+.PHONY: dev build install package package-ticks dev-ticks release-ticks test check release-docs prototype-earnings-review
 
-## Install the Tick packages from this checkout, then start in the current directory with the global configuration; example: make dev ARGS="-c"
-dev: install-ticks
+## Start in the current directory with the global configuration; Tick packages are installed separately with make dev-ticks; example: make dev ARGS="-c"
+dev:
 	"$(DEV_LAUNCHER)" $(ARGS)
 
 build:
@@ -38,7 +37,7 @@ package-ticks:
 	scripts/package-ticks.sh $(TICK_PACKAGES)
 
 ## Package the Tick packages, then install each with the tickloop built from this checkout.
-install-ticks:
+dev-ticks:
 	@TICK_PACKAGE_QUIET=1 scripts/package-ticks.sh $(TICK_PACKAGES)
 	@echo "Building tickloop…"
 	@cargo build --locked --quiet -p tickloop-agent --bin tickloop
@@ -46,9 +45,9 @@ install-ticks:
 		cargo run --locked --quiet -p tickloop-agent --bin tickloop -- tick install --path "dist/ticks/$$package" || exit 1; \
 	done
 
-## Prepare the release of the Tick packages in the tickloopai/ticks checkout TICKS_CHECKOUT and print the commands that publish it; it publishes nothing.
-publish-ticks:
-	scripts/publish-ticks.sh "$(TICKS_CHECKOUT)" $(TICK_PACKAGES)
+## Release the Tick packages at the workspace version: push the tag ticks-v<version> on HEAD; GitHub Actions builds them on Apple Silicon, publishes them to tickloopai/ticks and verifies the downloads.
+release-ticks:
+	@scripts/release-ticks.sh tag
 
 test:
 	@cargo nextest --version >/dev/null 2>&1 || { echo 'make test requires cargo-nextest; install it with: cargo install --locked cargo-nextest' >&2; exit 1; }

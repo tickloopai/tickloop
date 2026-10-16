@@ -23,5 +23,8 @@ chmod 0500 "$bin_directory" "$run_directory"
 # Detached daemons and workers can still exec this bundle after the View exits.
 trap - 0 1 2 15
 cd "$launch_directory"
+if "$bin_directory/tickloop" tick list 2>/dev/null | grep -qx 'No Tick packages are installed.'; then
+    echo 'No Tick packages are installed: run make dev-ticks to open Longbridge and Futu Ticks.' >&2
+fi
 printf 'Development executable: %s\n' "$bin_directory/tickloop" >&2
 exec "$bin_directory/tickloop" "$@"

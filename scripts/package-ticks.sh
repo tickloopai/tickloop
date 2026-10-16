@@ -1,13 +1,18 @@
 #!/bin/sh
 # Builds each named Tick package under ticks/ for Apple Silicon, assembles its package directory
 # in dist/ticks/<package>/ and its release archive beside it, and prints the archive's SHA-256 and
-# the matching marketplace.json entry. It publishes nothing. With TICK_PACKAGE_QUIET set it only
-# names each program it builds, for make install-ticks.
+# the matching marketplace.json entry. Every package carries THIRD_PARTY_NOTICES.md with the
+# license copies it names, under the paths it names them by. It publishes nothing. With
+# TICK_PACKAGE_QUIET set it only names each program it builds, for make dev-ticks and the
+# release build (scripts/release-ticks.sh build).
 set -eu
 
 target=aarch64-apple-darwin
 release_downloads=https://github.com/tickloopai/ticks/releases/download
-repository_root=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
+# The third-party notices and the license copies they name, which every package carries.
+license_notices="THIRD_PARTY_NOTICES.md licenses vendor/longbridge-oauth/LICENSE-MIT
+vendor/longbridge-oauth/LICENSE-APACHE vendor/longbridge-oauth/README.md vendor/crossterm/LICENSE"
+repository_root=$(CDPATH='' cd "$(dirname "$0")/.." && pwd -P)
 target_directory=${CARGO_TARGET_DIR:-$repository_root/target}
 dist_directory=$repository_root/dist/ticks
 cd "$repository_root"
@@ -48,13 +53,18 @@ for package in "$@"; do
     cp "$manifest" "$package_directory/tick-package.json"
     cp "$target_directory/$target/release/$program" "$package_directory/$executable"
     cp -R "$source_directory/skills" "$package_directory/skills"
+    for notice in $license_notices; do
+        mkdir -p "$package_directory/$(dirname "$notice")"
+        cp -R "$notice" "$package_directory/$notice"
+    done
 
     archive_name=tick-$package-$version-$target.tar.gz
     archive=$dist_directory/$archive_name
     # No AppleDouble files, extended attributes or owner names from this machine.
     COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --no-acls \
         --uid 0 --gid 0 --numeric-owner \
-        -czf "$archive" -C "$package_directory" tick-package.json "${executable%%/*}" skills
+        -czf "$archive" -C "$package_directory" tick-package.json "${executable%%/*}" skills \
+        THIRD_PARTY_NOTICES.md licenses vendor
     if [ -n "${TICK_PACKAGE_QUIET:-}" ]; then
         continue
     fi

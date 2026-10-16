@@ -97,14 +97,16 @@ Agent 中的 `/ticks` 是同一套安装、更新、卸载与登录的管理界�
 开发者在本机从源码安装：
 
 ```sh
-make install-ticks                # make package-ticks，再对每个包 tickloop tick install --path dist/ticks/<包>
+make dev-ticks                # make package-ticks，再对每个包 tickloop tick install --path dist/ticks/<包>
 tickloop tick list
 tickloop tick uninstall longbridge
 ```
 
-`make package-ticks` 为每个包构建 `aarch64-apple-darwin` release，在 `dist/ticks/<包>/` 组装包目录，打出 `dist/ticks/tick-<包>-<版本>-aarch64-apple-darwin.tar.gz`（解开后就是包目录），并输出它的 sha256 与对应的 `marketplace.json` 条目；它不发布任何内容。`make install-ticks` 用这份源码构建的 `tickloop`（`cargo run`）安装，不使用 PATH 上的 `tickloop`。
+`make package-ticks` 为每个包构建 `aarch64-apple-darwin` release，在 `dist/ticks/<包>/` 组装包目录，打出 `dist/ticks/tick-<包>-<版本>-aarch64-apple-darwin.tar.gz`（解开后就是包目录），并输出它的 sha256 与对应的 `marketplace.json` 条目；它不发布任何内容。`make dev-ticks` 用这份源码构建的 `tickloop`（`cargo run`）安装，不使用 PATH 上的 `tickloop`。
 
-发布到 Tick 市场用 `make publish-ticks`（市场仓库的本地克隆由 `TICKS_CHECKOUT` 指定，默认 `~/github/ticks`）。它在同一次运行中执行 `package-ticks`，检查每个压缩包只含 `tick-package.json`、`bin/` 与 `skills/`、程序是带 ad-hoc 签名的 arm64 可执行文件且版本与清单一致、发布程序的普通依赖中没有 `tick/test-support`，并用本源码的 `tickloop` 从压缩包试装；再把压缩包复制到 `dist/release/`，更新克隆中 `marketplace.json` 的版本、说明、下载地址与 SHA-256 以及 README 的包列表，最后打印 `gh release create`、`git commit` 与 `git push` 命令。它不创建 Release，也不提交或推送：发布是对外操作，由用户自己执行或当次明确授权。市场中已列出的版本不会被覆盖，要重新发布须先升版本。
+发布到 Tick 市场与 Docs 的发布方式相同：在要发布的提交上运行 `make release-ticks`，发布在 GitHub Actions 中完成，命令不等待也不显示进度。版本就是工作区版本（各包清单重复它，测试会核对），要发布新版本先升工作区版本并提交。`make release-ticks` 只做检查并打标签：HEAD 是已提交的快照且含 `.github/workflows/release-ticks.yml`，工作区没有未提交的改动，`origin` 只有一个指向 `github.com/griffinqiu/tickloop` 的拉取与推送地址，标签 `ticks-v<版本>` 在本地与 `origin` 都不存在，公开市场的 `marketplace.json` 没有列出这个版本，`tickloopai/ticks` 也没有 `<包>-v<版本>` 标签；然后在 HEAD 上创建附注标签 `ticks-v<版本>`，只推送这个标签，打印标签与 Actions 页面地址后退出（`scripts/release-ticks.sh tag --check` 只检查，不改动 Git）。标签推送触发工作流 `Release Tick packages`，分三个作业，失败的作业可以单独重跑（“Re-run failed jobs”）：Build and verify 在 Apple Silicon 的 macOS 运行器上构建并检查每个压缩包（只含包目录与许可声明、程序是带 ad-hoc 签名且版本与清单一致的 arm64 可执行文件、普通依赖中没有 `tick/test-support`，并用同一提交的 `tickloop` 试装），作为工作流制品保存；Publish to the Tick marketplace 用 `TICKS_RELEASE_TOKEN` 在 `tickloopai/ticks` 为每个包创建 Release `<包>-v<版本>`（说明写明源仓库、提交与 SHA-256），再更新该仓库的 `marketplace.json` 与 README 包列表、提交 `feat: release …` 并推送，重跑时已有且附件相同的 Release 保留、已列出的版本不再提交；Verify downloads 不带凭据下载每个附件核对 SHA-256。结果写在运行的摘要中。Publish 或 Verify 在已有 Release 之后失败时，日志列出 `tickloopai/ticks` 中已有的 Release，以及重跑该作业（或在本机运行同一阶段）的命令和撤回用的 `gh release delete` 命令；工作流从不删除 Release。市场 README 中的登录说明随之改为在 `/ticks`（或终端的 `tickloop tick login <包>`）登录。每个包（压缩包与 `make dev-ticks` 安装的包目录）都带 `THIRD_PARTY_NOTICES.md` 及其引用的许可副本（`licenses/`、`vendor/longbridge-oauth/` 的 `LICENSE-MIT`／`LICENSE-APACHE` 与补丁说明、`vendor/crossterm/LICENSE`），路径与仓库中相同。本机可以用 `scripts/release-ticks.sh build` 跑同样的构建与检查（产物在 `dist/release/`），`make package-ticks` 只打包、便于查看。
+
+首次发布前的一次性设置：在 GitHub 为 `tickloopai` 组织创建细粒度个人访问令牌（Resource owner 选 `tickloopai`，Repository access 只选 `tickloopai/ticks`，Repository permissions 中 Contents 设为 Read and write；组织需允许细粒度令牌），把它存为 `griffinqiu/tickloop` 的 Actions 密钥 `TICKS_RELEASE_TOKEN`（Settings → Secrets and variables → Actions，或 `gh secret set TICKS_RELEASE_TOKEN --repo griffinqiu/tickloop`）。缺少这个密钥时 Publish 作业立即失败并说明。Publish 作业使用部署环境 `tick-marketplace`，首次运行时自动创建，可以在仓库设置中为它加审批人。令牌过期后更新这个密钥即可。
 
 `tickloop tick install --path` 接受包目录或上面的压缩包，并总是替换已装的同名包：本地构建不一定改版本号，所以版本相同时也重新安装并报告“Reinstalled”。清单缺字段或无效、可执行文件不存在或不可执行、路径或符号链接越出包目录时安装失败，原安装与登记保持不变。`uninstall` 删除包目录与登记；配置根 `credentials/<包>/` 中的登录保留，输出会说明位置。
 
@@ -116,7 +118,7 @@ tickloop tick uninstall longbridge
 
 Agent 从同一个配置根读取已安装的包，不需要改 PATH。每个新建的 Chat（以及换工作目录时）加载各包 `skills/` 中的 Skill，名字带包前缀，如 `longbridge:usage`，正文中的 `${TICK_PACKAGE_ROOT}` 换成包的安装目录；包 Skill 与用户 Skill 一样不带额外权限，带前缀的名字也不会与内置、用户或项目 Skill 重名，格式错误或重名的只产生 warning。
 
-打开 Tick 时，裸程序名依次在 Agent 旁的自带程序（`tick-reader`、`tickhost`）、已安装包的程序（`tick-<包>`）和 PATH 中查找；清单 `protocol` 为 true 的包程序不用传 `protocol: true` 就按协议 Tick 打开，审批摘要写明来自哪个包。包的程序（按名称或路径打开都算）启动时由 Agent 守护进程按当时保存的登录补上凭据，只给这个实例：`oauth2` 包得到 `TICKLOOP_OAUTH_TOKEN_FILE`（`oauth2.json` 的绝对路径，未登录时也设置，由程序报告未授权），`api_key` 包在清单声明的变量中得到密钥（未登录时不设置）；Worker 环境中继承来的这两个变量一律让位，凭据只来自 Tickloop。重开丢失的实例时同样按当时的登录补上，登记中从不保存凭据。密钥只进入程序的环境，不进入审批摘要、审批依据、工具结果、Transcript 或 Monitor。新装的包马上可以打开，它的 Skill 在之后新建的 Chat 中出现。打开没装的包的程序（如 `tick-longbridge`）时报告包未安装并给出 `tickloop tick install <包>`，Agent 只提示用户运行，不自己安装。`make dev` 会先执行 `make install-ticks`，把本源码构建的包装进配置根（替换已装的同名包），再启动开发版 Agent。
+打开 Tick 时，裸程序名依次在 Agent 旁的自带程序（`tick-reader`、`tickhost`）、已安装包的程序（`tick-<包>`）和 PATH 中查找；清单 `protocol` 为 true 的包程序不用传 `protocol: true` 就按协议 Tick 打开，审批摘要写明来自哪个包。包的程序（按名称或路径打开都算）启动时由 Agent 守护进程按当时保存的登录补上凭据，只给这个实例：`oauth2` 包得到 `TICKLOOP_OAUTH_TOKEN_FILE`（`oauth2.json` 的绝对路径，未登录时也设置，由程序报告未授权），`api_key` 包在清单声明的变量中得到密钥（未登录时不设置）；Worker 环境中继承来的这两个变量一律让位，凭据只来自 Tickloop。重开丢失的实例时同样按当时的登录补上，登记中从不保存凭据。密钥只进入程序的环境，不进入审批摘要、审批依据、工具结果、Transcript 或 Monitor。新装的包马上可以打开，它的 Skill 在之后新建的 Chat 中出现。打开没装的包的程序（如 `tick-longbridge`）时报告包未安装并给出 `tickloop tick install <包>`，Agent 只提示用户运行，不自己安装。`make dev` 不构建 Tick 包，使用配置根中已安装的包；包有改动时另行执行 `make dev-ticks`（把本源码构建的包装进配置根，替换已装的同名包）。
 
 ## 授权
 

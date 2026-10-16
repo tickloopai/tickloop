@@ -1046,7 +1046,12 @@ impl LiveView for EarningsView {
         let area = frame.area();
         if area.height >= 10 {
             let styles = settings.styles();
-            let observed = self.table.observed_at.as_deref().unwrap_or("unknown");
+            let observed = self
+                .table
+                .observed_at
+                .as_deref()
+                .map_or_else(|| "unknown".to_owned(), observed_label);
+            let observed = observed.as_str();
             let source = match self.table.source {
                 "longbridge" => "Longbridge",
                 other => other,
@@ -1115,6 +1120,16 @@ impl LiveView for EarningsView {
     }
 }
 
+/// When the data was read, as the info line shows it: to the minute in UTC, so the facts after it
+/// fit the narrowest panel; the Tick's state keeps the full time.
+fn observed_label(observed_at: &str) -> String {
+    let shown = time::macros::format_description!("[year]-[month]-[day] [hour]:[minute] UTC");
+    time::OffsetDateTime::parse(observed_at, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .and_then(|observed| observed.to_offset(time::UtcOffset::UTC).format(&shown).ok())
+        .unwrap_or_else(|| observed_at.to_owned())
+}
+
 /// Joins the facts, truncating them only when they alone overflow, then the key hints that
 /// still fit whole; the help overlay lists every key the line drops.
 fn info_line(
@@ -1163,8 +1178,33 @@ pub async fn run_live<
 
 #[cfg(test)]
 mod info_line_tests {
-    use super::info_line;
+    use super::{info_line, observed_label};
     use tickloop_ui::{format::Hint, settings::AmbiguousWidth};
+
+    /// The narrowest panel is 62 columns, 60 inside its padding.
+    const NARROWEST_CONTENT: usize = 60;
+
+    #[test]
+    fn a_detail_line_keeps_its_caveat_whole_at_the_narrowest_panel() {
+        // A live read is timed to the nanosecond, which the line shows to the minute.
+        let observed = observed_label("2026-10-16T03:30:12.123456789Z");
+        assert_eq!(observed, "2026-10-16 03:30 UTC");
+        let facts = [
+            "Longbridge".to_owned(),
+            observed,
+            "estimates not archived".to_owned(),
+        ];
+        let line = info_line(&facts, &[], NARROWEST_CONTENT, AmbiguousWidth::Narrow);
+        assert_eq!(
+            line,
+            "Longbridge · 2026-10-16 03:30 UTC · estimates not archived"
+        );
+        assert_eq!(
+            observed_label("2026-10-16T11:30:00+08:00"),
+            "2026-10-16 03:30 UTC"
+        );
+        assert_eq!(observed_label("not a time"), "not a time");
+    }
 
     #[test]
     fn key_hints_drop_whole_while_facts_truncate_only_when_they_alone_overflow() {
