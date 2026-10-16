@@ -179,6 +179,8 @@ pub enum HostEffect {
     /// A confirmed `ArtifactEdit` create; the new artifact joins Monitor and is linked to the
     /// calling Loop.
     CreatedArtifact(tickloop_agent_protocol::ArtifactTick),
+    /// A verified body read joins Monitor without linking the artifact to a Loop.
+    ReadArtifact(tickloop_agent_protocol::ArtifactTick),
     /// A confirmed `ArtifactEdit` rename; Monitor shows the artifact's new title without waiting
     /// for its metadata to be read again.
     RenamedArtifact {
@@ -339,6 +341,23 @@ pub trait HostToolProvider: Send + Sync {
 
     async fn refresh(&self, _cancel: CancellationToken) -> Result<(), String> {
         Ok(())
+    }
+
+    fn remote_skills(&self) -> Vec<tickloop_agent_protocol::RemoteSkillDefinition> {
+        Vec::new()
+    }
+
+    fn remote_skill_is_current(&self, _source: &tickloop_agent_protocol::SkillSource) -> bool {
+        false
+    }
+
+    async fn read_remote_skill(
+        &self,
+        _definition: &tickloop_agent_protocol::RemoteSkillDefinition,
+        _resource: Option<&str>,
+        _cancel: CancellationToken,
+    ) -> Result<String, String> {
+        Err("remote Skills are unavailable".into())
     }
 
     fn validate_input(&self, name: &str, schema: &Value, input: &Value) -> Result<(), String> {

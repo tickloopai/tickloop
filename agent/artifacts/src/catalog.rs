@@ -189,7 +189,7 @@ impl ArtifactClient {
                 credential,
             )
             .await?;
-        if metadata.id != id {
+        if !crate::artifact_ids_match(id, &metadata.id) {
             return Err(ArtifactError::InvalidResponse);
         }
         if metadata.url.is_empty() {

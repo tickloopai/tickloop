@@ -63,16 +63,7 @@ fn discovers_builtin_user_and_nearest_project_skills_in_stable_order() {
         .map(|skill| skill.name.as_str())
         .collect::<Vec<_>>();
 
-    assert_eq!(
-        names,
-        [
-            "artifact-draft",
-            "nearest",
-            "personal",
-            "root-skill",
-            "tickloop"
-        ]
-    );
+    assert_eq!(names, ["nearest", "personal", "root-skill", "tickloop"]);
     assert!(registry.warnings().is_empty());
     assert!(matches!(
         registry
@@ -182,7 +173,7 @@ fn expansion_applies_arguments_allowed_tools_and_invocation_gates() {
 }
 
 #[test]
-fn model_listing_stops_at_the_budget_without_cutting_an_entry() {
+fn model_listing_retains_complete_names_when_descriptions_exceed_the_budget() {
     let registry = SkillRegistry::discover_with_builtins(
         std::path::Path::new("."),
         None,
@@ -192,7 +183,9 @@ fn model_listing_stops_at_the_budget_without_cutting_an_entry() {
         ],
     );
 
-    assert_eq!(registry.model_listing_with_budget(13), "- first: One\n");
+    let listing = registry.model_listing_with_budget(13);
+    assert!(listing.lines().any(|line| line.starts_with("- first")));
+    assert!(listing.lines().any(|line| line.starts_with("- second")));
 }
 
 async fn wait_for_completion(agent: &Agent, chat: uuid::Uuid) {
@@ -251,6 +244,13 @@ async fn model_sees_metadata_then_receives_the_body_only_after_calling_skill() {
             "Use the installed host tools as the authority for targets and capabilities"
         ));
         assert!(second.contains("Launching skill: tickloop"));
+        let guidance = requests[1].messages.iter().find(|message| message.content.iter().any(|content| matches!(content, Content::Text { text } if text.contains("Use the installed host tools as the authority for targets and capabilities")))).unwrap();
+        assert_eq!(guidance.role, tickloop_agent_protocol::Role::User);
+        assert!(
+            serde_json::to_string(guidance)
+                .unwrap()
+                .contains("not a user request")
+        );
     }
 
     let snapshot = agent.snapshot(chat).await.unwrap();
@@ -259,7 +259,7 @@ async fn model_sees_metadata_then_receives_the_body_only_after_calling_skill() {
 }
 
 #[tokio::test]
-async fn model_passes_skill_arguments_as_args_like_claude_code() {
+async fn model_passes_skill_arguments_through_the_args_parameter() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join(".git")).unwrap();
     write_skill(
@@ -306,10 +306,13 @@ async fn model_passes_skill_arguments_as_args_like_claude_code() {
             .unwrap()
             .keys()
             .collect::<Vec<_>>(),
-        ["args", "skill"]
+        ["args", "resource", "skill"]
     );
     assert_eq!(skill_tool.input_schema["required"], json!(["skill"]));
-    assert!(skill_tool.description.contains("args: \""));
+    assert_eq!(
+        skill_tool.input_schema["properties"]["args"]["type"],
+        "string"
+    );
     let results = requests
         .last()
         .unwrap()
@@ -406,4 +409,118 @@ async fn invoked_skill_content_survives_compaction_and_transcript_restore() {
             .content
             .contains("Use the installed host tools as the authority for targets and capabilities")
     );
+}
+
+#[tokio::test]
+async fn local_skill_arguments_are_reexpanded_and_identical_repeats_are_elided() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join(".git")).unwrap();
+    write_skill(
+        &directory.path().join(".tickloop/skills"),
+        "analyze",
+        "name: analyze\ndescription: Analyze a target",
+        "Analyze $ARGUMENTS carefully.",
+    );
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "first",
+            "Skill",
+            json!({"skill":"analyze","args":"first.md"}),
+        ),
+        call(
+            "same",
+            "Skill",
+            json!({"skill":"analyze","args":"first.md"}),
+        ),
+        call(
+            "changed",
+            "Skill",
+            json!({"skill":"analyze","args":"second.md"}),
+        ),
+        text("ready"),
+    ]));
+    let agent = Agent::new(config(), model.clone());
+    agent
+        .trust_working_directory(directory.path().into())
+        .await
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .submit(chat, None, "Analyze these targets".into())
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    let requests = model.requests.lock().unwrap();
+    assert!(
+        serde_json::to_string(&requests[2].messages)
+            .unwrap()
+            .contains("Already loaded analyze")
+    );
+    let guidance = requests[3].messages.iter().find(|message| message.content.iter().any(|block| matches!(block, Content::Text { text } if text.contains("Analyze second.md carefully.")))).unwrap();
+    assert_eq!(guidance.role, tickloop_agent_protocol::Role::User);
+    assert!(
+        !serde_json::to_string(&snapshot.messages)
+            .unwrap()
+            .contains("Analyze second.md carefully.")
+    );
+}
+
+#[tokio::test]
+async fn compacted_skill_guidance_is_restored_with_per_skill_and_total_budgets() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join(".git")).unwrap();
+    for index in 0..6 {
+        let name = format!("guide-{index}");
+        write_skill(
+            &directory.path().join(".tickloop/skills"),
+            &name,
+            &format!("name: {name}\ndescription: Restore guide {index}"),
+            &format!("RESTORE_GUIDE_{index} {}", "x".repeat(24_000)),
+        );
+    }
+    let mut outputs = (0..7).map(|_| text("ready")).collect::<Vec<_>>();
+    outputs.extend([text("A compact summary"), text("continued")]);
+    let model = Arc::new(ScriptedModel::new(outputs));
+    let agent = Agent::new(config(), model.clone());
+    agent
+        .trust_working_directory(directory.path().into())
+        .await
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    for index in 0..6 {
+        agent
+            .invoke_skill(chat, None, &format!("guide-{index}"), "")
+            .await
+            .unwrap();
+        wait_for_completion(&agent, chat).await;
+    }
+    agent.invoke_skill(chat, None, "guide-0", "").await.unwrap();
+    wait_for_completion(&agent, chat).await;
+    agent.compact(chat).await.unwrap();
+    agent
+        .submit(chat, None, "Continue with these guides".into())
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    let requests = model.requests.lock().unwrap();
+    let restored = requests
+        .last()
+        .unwrap()
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            Content::Text { text } if text.contains("RESTORE_GUIDE_") => {
+                Some(text.split_once("\n\n").unwrap().1)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(restored.len(), 5);
+    assert!(restored.iter().any(|body| body.contains("RESTORE_GUIDE_0")));
+    assert!(!restored.iter().any(|body| body.contains("RESTORE_GUIDE_1")));
+    assert!(restored.iter().all(|body| body.len() <= 20_000));
+    assert!(restored.iter().map(|body| body.len()).sum::<usize>() <= 100_000);
+    assert!(restored.iter().any(|body| body.contains("truncated")));
 }

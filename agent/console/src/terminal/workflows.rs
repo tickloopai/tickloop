@@ -1049,8 +1049,11 @@ fn public_history_pieces(
                 source,
                 message,
                 contexts,
-                ..
+                has_thinking,
             } => {
+                if has_thinking {
+                    history.pieces.push(presentation::thinking_label());
+                }
                 if let Some(origin) = source
                     .message_id
                     .and_then(|id| chat.human_family_origins.get(&id))
@@ -2141,7 +2144,10 @@ mod tests {
         let history = public_history(&before, DisplayProfile::default());
         assert!(history.contains("public answer"));
         assert_eq!(history.matches("public answer").count(), 1);
-        assert!(!history.contains("Thinking"), "{history}");
+        assert!(
+            history.contains("\n∴ Thinking (ctrl+o to expand)\n"),
+            "{history}"
+        );
         assert!(!history.contains("private thought"));
         let mut summarized = before.clone();
         let summary = "Retained summary\nwith controls\u{1b}[31m";

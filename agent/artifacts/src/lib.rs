@@ -174,6 +174,11 @@ pub fn short_artifact_id(artifact_id: &str) -> String {
     String::from_utf8(digits.to_vec()).expect("base62 digits are ASCII")
 }
 
+/// A canonical UUID and its public short ID identify the same artifact.
+pub fn artifact_ids_match(expected: &str, actual: &str) -> bool {
+    short_artifact_id(expected) == short_artifact_id(actual)
+}
+
 /// The page address of one artifact on a service origin.
 pub fn artifact_url(origin: &str, artifact_id: &str) -> String {
     format!("{origin}{APP_BASE_PATH}/{}", short_artifact_id(artifact_id))
@@ -748,6 +753,36 @@ mod tests {
             .await
             .unwrap();
         (directory, client)
+    }
+
+    #[tokio::test]
+    async fn catalog_reads_accept_canonical_ids_for_short_ids_but_reject_other_artifacts() {
+        let (origin, _) = server(|_, _, _| {
+            (200, serde_json::json!({"id":"e1b85a39-a57b-4c28-a8a5-ae9233aead3e","title":"Fixture","format":"markdown","access_role":"owner"}).to_string())
+        }).await;
+        let (_directory, client) = catalog_client(&origin).await;
+        let metadata = client.read("6rvWPvOnhVABug7llbHb26").await.unwrap();
+        assert_eq!(metadata.id, "e1b85a39-a57b-4c28-a8a5-ae9233aead3e");
+        assert_eq!(
+            metadata.url,
+            format!("{origin}/artifact/6rvWPvOnhVABug7llbHb26")
+        );
+        assert!(matches!(
+            client.read("another-artifact").await,
+            Err(ArtifactError::InvalidResponse)
+        ));
+        assert!(matches!(
+            client.read("e1b85a39a57b4c28a8a5ae9233aead3e").await,
+            Err(ArtifactError::InvalidResponse)
+        ));
+        assert_eq!(
+            client
+                .read("E1B85A39-A57B-4C28-A8A5-AE9233AEAD3E")
+                .await
+                .unwrap()
+                .id,
+            metadata.id
+        );
     }
 
     #[tokio::test]

@@ -13,7 +13,10 @@ use futures_util::{StreamExt, stream::BoxStream};
 use http::{HeaderName, HeaderValue};
 use reqwest::{Client, Method, StatusCode, Url, header, redirect::Policy};
 use rmcp::{
-    model::{ClientJsonRpcMessage, ServerJsonRpcMessage},
+    model::{
+        ClientJsonRpcMessage, ClientRequest, CustomResult, JsonRpcResponse, ServerJsonRpcMessage,
+        ServerResult,
+    },
     transport::streamable_http_client::{
         SseError, StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse,
     },
@@ -180,6 +183,11 @@ impl StreamableHttpClient for McpHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        let preserve_custom_result = matches!(
+            &message,
+            ClientJsonRpcMessage::Request(request)
+                if matches!(&request.request, ClientRequest::CustomRequest(_))
+        );
         let mut request = self.request(Method::POST, &uri, auth_header, custom_headers)?;
         if let Some(session_id) = session_id {
             request = request.header("Mcp-Session-Id", session_id.as_ref());
@@ -216,7 +224,21 @@ impl StreamableHttpClient for McpHttpClient {
             return Err(unexpected("invalid MCP content type"));
         }
         let body = json_bytes(response).await?;
-        match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
+        // The SDK's untagged result decoder mistakes extension metadata for a tool result.
+        let decoded = if preserve_custom_result {
+            serde_json::from_slice::<JsonRpcResponse<serde_json::Value>>(&body)
+                .map(|response| {
+                    ServerJsonRpcMessage::Response(JsonRpcResponse {
+                        jsonrpc: response.jsonrpc,
+                        id: response.id,
+                        result: ServerResult::CustomResult(CustomResult::new(response.result)),
+                    })
+                })
+                .or_else(|_| serde_json::from_slice::<ServerJsonRpcMessage>(&body))
+        } else {
+            serde_json::from_slice::<ServerJsonRpcMessage>(&body)
+        };
+        match decoded {
             Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id)),
             Err(_) => Err(unexpected("invalid MCP JSON response")),
         }

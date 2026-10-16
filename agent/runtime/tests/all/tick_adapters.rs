@@ -23,10 +23,31 @@ async fn shell_subscription_preserves_its_policy_including_final_admission() {
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let task = agent
-        .submit_user_shell_for_goal(chat, None, "printf shell-body".into(), true)
+        .submit_user_shell_for_goal(chat, None, "sleep 0.1; printf shell-body".into(), true)
         .await
         .unwrap();
     let instance = InstanceRef::shell(task.command_id);
+    // A later Shell exit legitimately starts another model turn; admission needs a settled baseline.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if agent
+                .snapshot(chat)
+                .await
+                .unwrap()
+                .user_shells
+                .iter()
+                .any(|record| {
+                    record.id == task.command_id
+                        && record.state == tickloop_agent_protocol::UserShellState::Completed
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     agent
         .install_tick_stream(Arc::new(TickAdapters::builtin(agent.clone(), None)))
         .await;

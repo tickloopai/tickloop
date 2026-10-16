@@ -293,6 +293,8 @@ async fn followed_and_reopened_conversations_share_one_claude_code_layout() {
             "",
             "❯ Audit the build",
             "",
+            "∴ Thinking (ctrl+o to expand)",
+            "",
             "⏺ I checked the build setup.",
             "",
             "  - First item",

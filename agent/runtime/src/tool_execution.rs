@@ -140,7 +140,7 @@ impl ToolRegistry {
         }
         tools.extend(
             chat.skills
-                .tool_definition()
+                .tool_definition_for_context(context::context_window(&chat.snapshot))
                 .into_iter()
                 .map(|definition| RegisteredTool {
                     definition,
@@ -1866,6 +1866,52 @@ mod tests {
     use super::*;
 
     const SCHEMA_COMBINATORS: [&str; 3] = ["oneOf", "anyOf", "allOf"];
+
+    #[tokio::test]
+    async fn skill_catalog_tracks_the_active_model_context_and_learned_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let description = "Long workflow description "
+            .repeat(30)
+            .trim_end()
+            .to_owned();
+        let path = directory.path().join(".tickloop/skills/catalog-workflow");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("SKILL.md"),
+            format!("---\nname: catalog-workflow\ndescription: {description}\n---\nPrivate body"),
+        )
+        .unwrap();
+        let agent = Agent::new(
+            tickloop_agent_test_support::config_with_window(8_192),
+            Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![])),
+        );
+        agent
+            .trust_working_directory(directory.path().into())
+            .await
+            .unwrap();
+        let chat_id = agent.create_chat(directory.path().into()).await.unwrap();
+        let mut chats = agent.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).unwrap();
+        let catalog = |chat: &Chat| {
+            ToolRegistry::for_chat(chat, None, false, PromptPolicy::Interactive)
+                .resolve(tickloop_agent_config::skills::SKILL_TOOL_NAME)
+                .unwrap()
+                .definition
+                .description
+        };
+        let small = catalog(chat);
+        assert!(small.contains("catalog-workflow"));
+        assert!(!small.contains(&description));
+
+        chat.snapshot.model = tickloop_agent_test_support::config_with_window(1_000_000);
+        chat.snapshot.context_window_tokens = Some(8_192);
+        assert!(catalog(chat).contains(&description));
+
+        chat.snapshot.model = tickloop_agent_test_support::config();
+        assert!(!catalog(chat).contains(&description));
+        chat.snapshot.context_window_tokens = Some(1_000_000);
+        assert!(catalog(chat).contains(&description));
+    }
 
     fn combinators(schema: &Value) -> Vec<String> {
         match schema {

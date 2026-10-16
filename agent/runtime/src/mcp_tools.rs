@@ -2,7 +2,7 @@
 //! first-party built-ins, backed by service-scoped credentials.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
@@ -10,7 +10,9 @@ use std::{
 use async_trait::async_trait;
 use rmcp::{
     ClientLifecycleMode, ClientServiceExt, RoleClient,
-    model::{CallToolRequestParams, ClientConfig, ProtocolVersion, Tool},
+    model::{
+        CallToolRequestParams, ClientConfig, ClientRequest, CustomRequest, ProtocolVersion, Tool,
+    },
     service::RunningService,
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
@@ -31,7 +33,7 @@ use crate::{
 use tickloop_agent_artifacts::{ArtifactClient, ArtifactError, CredentialSnapshot, mcp_endpoint};
 use tickloop_agent_protocol::{
     ArtifactAudience, ArtifactPublication, ChatId, HostCallContext, HostEndpointIdentity,
-    HostToolAuthority, ToolDefinition, ToolResult,
+    HostToolAuthority, RemoteSkillDefinition, SkillSource, ToolDefinition, ToolResult,
 };
 
 pub const ARTIFACT_READ_TOOL: &str = "ArtifactRead";
@@ -58,7 +60,7 @@ const MAX_APPROVAL_COLLECTION_ITEMS: usize = 64;
 const MAX_APPROVAL_DEPTH: usize = 8;
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_ARTIFACT_TITLE_UTF16_UNITS: usize = 200;
-const ARTIFACT_LOGIN_DESCRIPTION: &str = "Tickloop Artifacts is not signed in. Call this when the user wants a doc or design; it starts sign-in and returns a link and code for the user. After the user approves, ArtifactRead, ArtifactEdit and ArtifactComment become available automatically.";
+const ARTIFACT_LOGIN_DESCRIPTION: &str = "Tickloop Artifacts is not signed in. Call this when the user wants a doc or page; it starts sign-in and returns a link and code for the user. After the user approves, ArtifactRead, ArtifactEdit and ArtifactComment become available automatically.";
 
 pub(crate) fn login_definition() -> ToolDefinition {
     ToolDefinition {
@@ -74,11 +76,20 @@ struct DiscoveredTool {
     permission: HostToolPermission,
 }
 
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct SkillFileKey {
+    credential_key: [u8; 32],
+    uri: String,
+    digest: String,
+}
+
 struct Directory {
     credential_key: [u8; 32],
     fingerprint: [u8; 32],
     protocol_version: ProtocolVersion,
     tools: Vec<DiscoveredTool>,
+    skills: Vec<RemoteSkillDefinition>,
+    skill_error: Option<String>,
 }
 
 struct PreparedArtifactLogin;
@@ -208,6 +219,7 @@ pub struct McpHostToolProvider {
     native: Option<Arc<dyn HostToolProvider>>,
     directory: RwLock<Option<Directory>>,
     service_status: RwLock<ArtifactServiceStatus>,
+    skill_files: RwLock<BTreeMap<SkillFileKey, String>>,
     publication_admissions: RwLock<HashSet<ArtifactPublicationAdmission>>,
     pending_login: Arc<Mutex<Option<PendingLogin>>>,
     next_login_id: std::sync::atomic::AtomicU64,
@@ -229,7 +241,7 @@ impl McpHostToolProvider {
         tokio::select! {
             () = cancel.cancelled() => Err("MCP call cancelled".into()),
             result = self.artifact.read_with_credential(id, credential) => match result {
-                Ok(metadata) if metadata.id != id => Err("Artifact metadata identity does not match the requested artifact".into()),
+                Ok(metadata) if !tickloop_agent_artifacts::artifact_ids_match(id, &metadata.id) => Err("Artifact metadata identity does not match the requested artifact".into()),
                 Ok(metadata) => Ok(metadata.access_role == "owner"),
                 Err(ArtifactError::Connection | ArtifactError::InvalidResponse
                     | ArtifactError::Service { status: 500..=599, .. }
@@ -252,7 +264,7 @@ impl McpHostToolProvider {
                 !title.trim().is_empty()
                     && title.encode_utf16().count() <= MAX_ARTIFACT_TITLE_UTF16_UNITS
             })
-            && matches!(input["format"].as_str(), Some("doc" | "design"))
+            && matches!(input["format"].as_str(), Some("doc" | "page"))
             && input["content"].is_string();
         if ordinary_creation {
             HostToolPermission::PrivateArtifactWrite
@@ -266,6 +278,7 @@ impl McpHostToolProvider {
             native,
             directory: RwLock::new(None),
             service_status: RwLock::new(ArtifactServiceStatus::default()),
+            skill_files: RwLock::new(BTreeMap::new()),
             publication_admissions: RwLock::new(HashSet::new()),
             pending_login: Arc::new(Mutex::new(None)),
             next_login_id: std::sync::atomic::AtomicU64::new(0),
@@ -368,6 +381,7 @@ impl McpHostToolProvider {
 
     fn clear_directory(&self) {
         *self.directory.write().unwrap() = None;
+        self.skill_files.write().unwrap().clear();
     }
 
     fn credential_key(snapshot: &CredentialSnapshot) -> [u8; 32] {
@@ -481,8 +495,46 @@ impl McpHostToolProvider {
                     ));
                 }
             };
-        self.validate_directory(tools, credential, protocol_version)
-            .map_err(DirectoryFailure::Rejected)
+        let supports_skills = protocol_version == ProtocolVersion::V_2026_07_28
+            && serde_json::to_value(&peer.capabilities)
+                .ok()
+                .is_some_and(|capabilities| {
+                    capabilities["extensions"]
+                        .get(crate::remote_skills::EXTENSION)
+                        .is_some()
+                        && capabilities.get("resources").is_some()
+                });
+        let mut directory = self
+            .validate_directory(tools, credential, protocol_version)
+            .map_err(DirectoryFailure::Rejected)?;
+        if supports_skills {
+            match Self::skill_request(&service, "skills/list", json!({}))
+                .await
+                .and_then(|value| crate::remote_skills::parse_directory(&value, credential))
+            {
+                Ok(catalog) => {
+                    directory.skills = catalog.definitions;
+                    if !catalog.errors.is_empty() {
+                        directory.skill_error = Some(catalog.errors.join("; "));
+                    }
+                }
+                Err(error) => directory.skill_error = Some(error),
+            }
+        }
+        Ok(directory)
+    }
+
+    async fn skill_request(
+        service: &RunningService<RoleClient, ClientConfig>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, String> {
+        let request = ClientRequest::CustomRequest(CustomRequest::new(method, Some(params)));
+        let result = tokio::time::timeout(DIRECTORY_TIMEOUT, service.peer().send_request(request))
+            .await
+            .map_err(|_| "Skill resource request timed out")?
+            .map_err(|_| "Skill resource request failed")?;
+        serde_json::to_value(result).map_err(|_| "invalid Skill response".into())
     }
 
     async fn invalidate(&self, token: &str) {
@@ -543,6 +595,8 @@ impl McpHostToolProvider {
             fingerprint: Sha256::digest(serialized).into(),
             protocol_version,
             tools: mapped,
+            skills: Vec::new(),
+            skill_error: None,
         })
     }
 
@@ -560,11 +614,10 @@ impl McpHostToolProvider {
             return None;
         }
         let title = structured.get("title")?.as_str()?;
-        // The tool contract names types by intent and the catalog by its stored format names;
-        // a service may answer with either.
+        // Tool results use public format names; Monitor retains storage names.
         let format = match structured.get("format")?.as_str()? {
-            "doc" | "markdown" => "markdown",
-            "design" | "html" => "html",
+            "doc" => "markdown",
+            "page" => "html",
             _ => return None,
         };
         let url = structured.get("url")?.as_str()?;
@@ -596,9 +649,7 @@ impl McpHostToolProvider {
         let requested = artifact_update_id(ARTIFACT_EDIT_TOOL, &prepared.arguments)?;
         let saved = result.structured_content.as_ref()?;
         let artifact_id = bounded_identifier(saved.get("artifact_id"))?;
-        if tickloop_agent_artifacts::short_artifact_id(artifact_id)
-            != tickloop_agent_artifacts::short_artifact_id(requested)
-        {
+        if !tickloop_agent_artifacts::artifact_ids_match(requested, artifact_id) {
             return None;
         }
         let title = saved.get("title")?.as_str()?;
@@ -611,6 +662,60 @@ impl McpHostToolProvider {
             instance: tick_protocol::InstanceRef::artifact(origin, artifact_id).ok()?,
             title: title.to_owned(),
         })
+    }
+
+    fn read_effect(
+        result: &rmcp::model::CallToolResult,
+        prepared: &PreparedMcpCall,
+    ) -> Option<HostEffect> {
+        if result.is_error == Some(true) || !has_action(&prepared.arguments, "read") {
+            return None;
+        }
+        let requested = artifact_read_id(ARTIFACT_READ_TOOL, &prepared.arguments)?;
+        let read = result.structured_content.as_ref()?;
+        let artifact_id = bounded_identifier(read.get("artifact_id"))?;
+        if artifact_id.contains(['/', '?', '#'])
+            || !tickloop_agent_artifacts::artifact_ids_match(requested, artifact_id)
+        {
+            return None;
+        }
+        let title = read.get("title")?.as_str()?;
+        if title.trim().is_empty() || title.encode_utf16().count() > MAX_ARTIFACT_TITLE_UTF16_UNITS
+        {
+            return None;
+        }
+        read.get("revision")?.as_u64()?;
+        let format = match read.get("format")?.as_str()? {
+            "doc" if read.get("blocks")?.is_array() => "markdown",
+            "page" if read.get("source")?.is_string() => "html",
+            _ => return None,
+        };
+        let access_role = match read.get("access_role")?.as_str()? {
+            "owner" => "owner",
+            "edit" => "editor",
+            "view" => "viewer",
+            _ => return None,
+        };
+        let origin = prepared.credential.origin.trim_end_matches('/');
+        let url = read.get("url")?.as_str()?;
+        let expected = tickloop_agent_artifacts::artifact_url(origin, artifact_id);
+        if reqwest::Url::parse(url).ok()? != reqwest::Url::parse(&expected).ok()? {
+            return None;
+        }
+        Some(HostEffect::ReadArtifact(
+            tickloop_agent_protocol::ArtifactTick {
+                artifact_id: uuid::Uuid::parse_str(artifact_id)
+                    .ok()
+                    .filter(|_| artifact_id.len() == 36)
+                    .map_or_else(|| artifact_id.into(), |id| id.to_string()),
+                origin: origin.into(),
+                title: title.into(),
+                format: format.into(),
+                url: url.into(),
+                access_role: access_role.into(),
+                added_at_ms: tickloop_agent_base::private_fs::unix_time_milliseconds(),
+            },
+        ))
     }
 
     /// A confirmed `ArtifactComment` done for the request this run claimed.
@@ -806,12 +911,33 @@ impl HostToolProvider for McpHostToolProvider {
             .artifact
             .credential_snapshot()
             .map(|credential| credential.as_ref().map(Self::credential_key));
-        connections["artifacts"] =
-            if generation.is_ok_and(|generation| generation == status.credential_generation) {
-                json!(*status)
-            } else {
-                json!(ArtifactServiceStatus::default())
-            };
+        connections["artifacts"] = if generation
+            .as_ref()
+            .is_ok_and(|generation| *generation == status.credential_generation)
+        {
+            json!(*status)
+        } else {
+            json!(ArtifactServiceStatus::default())
+        };
+        let directory = self.directory.read().unwrap();
+        connections["artifacts"]["skills"] = directory
+            .as_ref()
+            .filter(|directory| {
+                generation
+                    .as_ref()
+                    .is_ok_and(|key| *key == Some(directory.credential_key))
+            })
+            .map_or_else(
+                || json!({"state":"unavailable"}),
+                |directory| match &directory.skill_error {
+                    Some(error) if !directory.skills.is_empty() => {
+                        json!({"state":"partial","count":directory.skills.len(),"error":error})
+                    }
+                    Some(error) => json!({"state":"unavailable","error":error}),
+                    None if directory.skills.is_empty() => json!({"state":"not_supported"}),
+                    None => json!({"state":"available","count":directory.skills.len()}),
+                },
+            );
         connections
     }
 
@@ -830,6 +956,74 @@ impl HostToolProvider for McpHostToolProvider {
 
     fn artifact_client(&self) -> Option<Arc<ArtifactClient>> {
         Some(self.artifact.clone())
+    }
+
+    fn remote_skills(&self) -> Vec<RemoteSkillDefinition> {
+        let Ok(Some(credential)) = self.artifact.credential_snapshot() else {
+            return Vec::new();
+        };
+        self.directory
+            .read()
+            .unwrap()
+            .as_ref()
+            .filter(|directory| directory.credential_key == Self::credential_key(&credential))
+            .map(|directory| directory.skills.clone())
+            .unwrap_or_default()
+    }
+
+    fn remote_skill_is_current(&self, source: &SkillSource) -> bool {
+        self.remote_skills()
+            .iter()
+            .any(|definition| &definition.source == source)
+    }
+
+    async fn read_remote_skill(
+        &self,
+        definition: &RemoteSkillDefinition,
+        relative: Option<&str>,
+        cancel: CancellationToken,
+    ) -> Result<String, String> {
+        if !self.remote_skill_is_current(&definition.source) {
+            return Err("Skill source, account or manifest changed".into());
+        }
+        let credential = self
+            .artifact
+            .credential_snapshot()
+            .map_err(|_| "Skill credential unavailable")?
+            .ok_or("Artifact account signed out")?;
+        let resource = crate::remote_skills::resource_entry(definition, relative)?;
+        let key = SkillFileKey {
+            credential_key: Self::credential_key(&credential),
+            uri: resource.uri.clone(),
+            digest: resource.digest.clone(),
+        };
+        if let Some(text) = self.skill_files.read().unwrap().get(&key).cloned() {
+            return Ok(text);
+        }
+        let operation = async {
+            let (service, http) = self.open_session(&credential).await?;
+            let result =
+                Self::skill_request(&service, "resources/read", json!({"uri": resource.uri})).await;
+            if http.unauthorized() {
+                self.invalidate(&credential.access_token).await;
+            }
+            crate::remote_skills::verify_text(resource, &result?)
+        };
+        let text = tokio::select! {
+            () = cancel.cancelled() => return Err("Skill loading cancelled".into()),
+            result = operation => result?,
+        };
+        if !self.credential_is_current(&credential)
+            || !self.remote_skill_is_current(&definition.source)
+        {
+            return Err("Skill source changed during loading".into());
+        }
+        let mut cache = self.skill_files.write().unwrap();
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, text.clone());
+        Ok(text)
     }
 
     async fn refresh(&self, cancel: CancellationToken) -> Result<(), String> {
@@ -1293,6 +1487,7 @@ impl HostToolProvider for McpHostToolProvider {
             }
         };
         let effect = match name.as_str() {
+            ARTIFACT_READ_TOOL => Self::read_effect(&result, &prepared),
             ARTIFACT_EDIT_TOOL => Self::creation_effect(&result, &prepared)
                 .map(HostEffect::CreatedArtifact)
                 .or_else(|| Self::rename_effect(&result, &prepared)),

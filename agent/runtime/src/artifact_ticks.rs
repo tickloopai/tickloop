@@ -2,27 +2,29 @@ use super::{Agent, AgentError};
 use tickloop_agent_protocol::{ArtifactTick, ChatId};
 
 impl Agent {
-    pub(super) fn auto_attach_artifact_tick(&self, chat: &mut super::Chat, tick: ArtifactTick) {
-        let Ok(tick) = normalize_artifact_tick(tick) else {
-            return;
-        };
+    pub(super) fn auto_attach_artifact_tick(
+        &self,
+        chat: &mut super::Chat,
+        tick: ArtifactTick,
+    ) -> Option<tick_protocol::InstanceRef> {
+        let tick = normalize_artifact_tick(tick).ok()?;
         if chat
             .snapshot
             .removed_artifact_ticks
             .contains(&tick.instance_id())
         {
-            return;
+            return None;
         }
-        let instance = tick_protocol::InstanceRef::artifact(&tick.origin, &tick.artifact_id).ok();
+        let instance =
+            tick_protocol::InstanceRef::artifact(&tick.origin, &tick.artifact_id).ok()?;
         upsert_artifact_tick(chat, tick);
-        // What the artifact went through before it joined is no news for this Chat.
-        self.mark_joined(chat, instance);
         self.record_artifact_ticks(
             chat.snapshot.id,
             &chat.snapshot.workdir,
             chat.snapshot.artifact_ticks.clone(),
             chat.snapshot.removed_artifact_ticks.clone(),
         );
+        Some(instance)
     }
     /// A confirmed rename: the Chat's artifact row and every subscription on the artifact show
     /// the new title before its metadata is read again.

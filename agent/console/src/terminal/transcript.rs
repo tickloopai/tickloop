@@ -242,6 +242,26 @@ impl Transcript {
         self.clear_search();
     }
 
+    /// Replaces the content as the conversation goes on while the view is open: a view at the end
+    /// follows the new rows, one scrolled up keeps its rows, and a search keeps its query.
+    pub(super) fn refresh(&mut self, document: TranscriptDocument) {
+        if self.document == document {
+            return;
+        }
+        self.document = document;
+        self.layout();
+        if !self.query.is_empty() {
+            let selected_row = self.selected_match.map(|index| self.matches[index].row);
+            self.collect_matches();
+            self.selected_match = selected_row.and_then(|row| {
+                self.matches
+                    .iter()
+                    .position(|found| found.row >= row)
+                    .or_else(|| self.matches.len().checked_sub(1))
+            });
+        }
+    }
+
     pub(super) fn paste(&mut self, text: &str) {
         if self.search.is_none() {
             return;
@@ -519,8 +539,22 @@ impl Transcript {
     /// Finds the query in every row, case-insensitively, and selects the first match at or below
     /// `from`, or the last one above it.
     fn find_matches(&mut self, from: usize) {
-        self.matches.clear();
         self.selected_match = None;
+        self.collect_matches();
+        if self.matches.is_empty() {
+            return;
+        }
+        let index = self
+            .matches
+            .iter()
+            .position(|found| found.row >= from)
+            .unwrap_or(self.matches.len() - 1);
+        self.select_match(index);
+    }
+
+    /// Finds every case-insensitive occurrence of the query in the rows.
+    fn collect_matches(&mut self) {
+        self.matches.clear();
         let query = self.query.chars().map(lowercase).collect::<Vec<_>>();
         if query.is_empty() {
             return;
@@ -554,15 +588,6 @@ impl Transcript {
                 }
             }
         }
-        if self.matches.is_empty() {
-            return;
-        }
-        let index = self
-            .matches
-            .iter()
-            .position(|found| found.row >= from)
-            .unwrap_or(self.matches.len() - 1);
-        self.select_match(index);
     }
 
     fn next_match(&mut self, forward: bool) {
@@ -817,6 +842,48 @@ mod tests {
         assert_eq!(body(&mut transcript), "line 0");
         transcript.key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
         assert_eq!(body(&mut transcript), "line 90");
+    }
+
+    #[test]
+    fn a_refresh_follows_at_the_end_and_keeps_a_scrolled_view_and_its_search() {
+        let numbered_document = |count: usize| TranscriptDocument {
+            pieces: vec![TranscriptPiece::text(
+                (0..count)
+                    .map(|index| format!("line {index}\n"))
+                    .collect::<String>(),
+                None,
+            )],
+        };
+        let body = |transcript: &mut Transcript| texts(transcript, 40, 13)[0].clone();
+        let mut transcript = numbered(100);
+        assert_eq!(body(&mut transcript), "line 90");
+        transcript.refresh(numbered_document(110));
+        assert_eq!(
+            body(&mut transcript),
+            "line 100",
+            "the end follows new rows"
+        );
+
+        press(&mut transcript, KeyCode::Char('g'));
+        press(&mut transcript, KeyCode::Char('/'));
+        for character in "line 5".chars() {
+            press(&mut transcript, KeyCode::Char(character));
+        }
+        press(&mut transcript, KeyCode::Enter);
+        assert_eq!(transcript.matches.len(), 11);
+        transcript.refresh(numbered_document(501));
+        assert_eq!(
+            body(&mut transcript),
+            "line 0",
+            "a scrolled view keeps its rows"
+        );
+        assert_eq!(transcript.query, "line 5");
+        assert_eq!(
+            transcript.matches.len(),
+            12,
+            "the new rows are searched too"
+        );
+        assert_eq!(transcript.selected_match, Some(0));
     }
 
     #[test]

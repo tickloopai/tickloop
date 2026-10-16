@@ -2638,6 +2638,11 @@ impl Agent {
         );
         let mut snapshot = recovered.snapshot;
         let mut bookkeeping = recovered.bookkeeping;
+        bookkeeping.restored_skill_names = snapshot
+            .invoked_skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect();
         // 与设置写入互斥到 Chat 加入本进程为止，期间写入的持久规则改动不会漏掉这个 Chat。
         let _settings_gate = self.inner.settings_writes.lock().await;
         let (client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);

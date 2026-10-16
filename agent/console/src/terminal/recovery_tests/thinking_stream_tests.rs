@@ -495,16 +495,13 @@ fn run_thinking_restore(fixture: &mut RecoveryPty, directory: &std::path::Path) 
         "{frame}"
     );
     assert_eq!(frame.matches(STREAM_REPLY).count(), 1, "{frame}");
-    assert!(
-        !frame.contains("∴ Thinking"),
-        "as in Claude Code, thinking stays out of the conversation and only ctrl+o shows it: {frame}"
-    );
     let input = frame.find("Continue the same Thinking stream.").unwrap();
+    let thinking = frame.find("∴ Thinking (ctrl+o to expand)").unwrap();
     let tool = frame.find("Read").unwrap();
     let text = frame.find(STREAM_REPLY).unwrap();
     let done = crate::terminal::turn_summary_position(&frame).unwrap();
     assert!(
-        input < tool && tool < text && text < done,
+        input < thinking && thinking < tool && tool < text && text < done,
         "restored events changed order: {frame}"
     );
     fixture.send(b"\x0f");

@@ -2,18 +2,19 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use tickloop_agent_protocol::{InvokedSkill, SkillSource, ToolDefinition};
+use tickloop_agent_protocol::{InvokedSkill, RemoteSkillDefinition, SkillSource, ToolDefinition};
 
 pub const TICKLOOP_SKILL: &str = include_str!("../skills/tickloop/SKILL.md");
-pub const ARTIFACT_DRAFT_SKILL: &str = include_str!("../skills/artifact-draft/SKILL.md");
-pub const BUILTIN_SKILLS: [&str; 2] = [TICKLOOP_SKILL, ARTIFACT_DRAFT_SKILL];
+pub const BUILTIN_SKILLS: [&str; 1] = [TICKLOOP_SKILL];
 pub const SKILL_TOOL_NAME: &str = "Skill";
 
 const SKILL_FILE_NAME: &str = "SKILL.md";
 const PROJECT_SKILLS_DIRECTORY: &str = ".tickloop/skills";
 const MAX_NAME_BYTES: usize = 64;
-const MAX_DESCRIPTION_CHARS: usize = 250;
-const DEFAULT_LISTING_BYTES: usize = 8 * 1024;
+const MAX_DESCRIPTION_CHARS: usize = 1536;
+const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 200_000;
+const ESTIMATED_LISTING_BYTES_PER_TOKEN: usize = 4;
+const LISTING_CONTEXT_PERCENT: usize = 1;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SkillContext {
@@ -53,6 +54,8 @@ impl TryFrom<SkillExpansion> for InvokedSkill {
             name: expansion.name,
             content: expansion.content,
             source: expansion.source,
+            run_id: None,
+            references: Vec::new(),
         })
     }
 }
@@ -66,7 +69,17 @@ pub enum SkillCaller {
 #[derive(Clone, Debug, Default)]
 pub struct SkillRegistry {
     skills: BTreeMap<String, SkillDefinition>,
+    remote: BTreeMap<String, SkillDefinition>,
     warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillCatalog {
+    pub content: String,
+    pub budget_bytes: usize,
+    pub capped_descriptions: Vec<String>,
+    pub omitted_descriptions: Vec<String>,
+    pub over_budget: bool,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -119,7 +132,7 @@ impl SkillRegistry {
     }
 
     pub fn definitions(&self) -> impl Iterator<Item = &SkillDefinition> {
-        self.skills.values()
+        self.skills.values().chain(self.remote.values())
     }
 
     pub fn warnings(&self) -> &[String] {
@@ -132,58 +145,141 @@ impl SkillRegistry {
     }
 
     pub fn model_listing(&self) -> String {
-        self.model_listing_with_budget(DEFAULT_LISTING_BYTES)
+        self.model_catalog_for_context(None).content
     }
 
     pub fn model_listing_with_budget(&self, budget: usize) -> String {
-        let mut listing = String::new();
-        for skill in self
-            .skills
-            .values()
-            .filter(|skill| !skill.disable_model_invocation)
-        {
-            let description = skill
-                .description
-                .chars()
-                .take(MAX_DESCRIPTION_CHARS)
-                .collect::<String>();
-            let entry = format!("- {}: {}\n", skill.name, description);
-            if listing.len().saturating_add(entry.len()) > budget {
-                break;
-            }
-            listing.push_str(&entry);
-        }
-        listing
+        self.catalog_with_budget(budget).content
     }
 
-    /// Claude Code's `SkillTool` prompt and input schema. Claude Code lists the skills in
-    /// system reminders; here the listing follows the prompt, and a loaded skill stays active for
-    /// the Chat instead of arriving as a command message.
+    pub fn model_catalog_for_context(&self, context_window_tokens: Option<usize>) -> SkillCatalog {
+        let budget = context_window_tokens
+            .filter(|tokens| *tokens > 0)
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
+            .saturating_mul(ESTIMATED_LISTING_BYTES_PER_TOKEN)
+            .saturating_mul(LISTING_CONTEXT_PERCENT)
+            / 100;
+        self.catalog_with_budget(budget.max(1))
+    }
+
+    fn catalog_with_budget(&self, budget: usize) -> SkillCatalog {
+        let mut capped_descriptions = Vec::new();
+        let mut entries = self
+            .definitions()
+            .filter(|skill| !skill.disable_model_invocation)
+            .map(|skill| {
+                let mut description = skill
+                    .description
+                    .chars()
+                    .take(MAX_DESCRIPTION_CHARS)
+                    .collect::<String>();
+                if skill
+                    .description
+                    .chars()
+                    .nth(MAX_DESCRIPTION_CHARS)
+                    .is_some()
+                {
+                    description.pop();
+                    description.push('\u{2026}');
+                    capped_descriptions.push(skill.name.clone());
+                }
+                let name_only = format!("- {}\n", skill.name);
+                let full = format!("- {}: {description}\n", skill.name);
+                (skill, name_only, full)
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.name.cmp(&right.0.name));
+        // Names and built-in guidance remain discoverable even when they exceed the soft budget.
+        let mut used = entries
+            .iter()
+            .map(|(skill, name, full)| {
+                if skill.source == SkillSource::BuiltIn {
+                    full.len()
+                } else {
+                    name.len()
+                }
+            })
+            .sum::<usize>();
+        let mut content = String::new();
+        let mut omitted_descriptions = Vec::new();
+        for (skill, name, full) in entries {
+            if skill.source == SkillSource::BuiltIn {
+                content.push_str(&full);
+            } else if used.saturating_add(full.len() - name.len()) <= budget {
+                used += full.len() - name.len();
+                content.push_str(&full);
+            } else {
+                omitted_descriptions.push(skill.name.clone());
+                content.push_str(&name);
+            }
+        }
+        SkillCatalog {
+            over_budget: content.len() > budget,
+            content,
+            budget_bytes: budget,
+            capped_descriptions,
+            omitted_descriptions,
+        }
+    }
+
+    pub fn replace_remote(&mut self, definitions: Vec<RemoteSkillDefinition>) {
+        self.remote = definitions
+            .into_iter()
+            .map(|definition| {
+                (
+                    definition.name.clone(),
+                    SkillDefinition {
+                        name: definition.name,
+                        description: definition.description,
+                        source: definition.source,
+                        body: String::new(),
+                        allowed_tools: Vec::new(),
+                        user_invocable: false,
+                        disable_model_invocation: false,
+                        context: SkillContext::Inline,
+                    },
+                )
+            })
+            .collect();
+    }
+
+    /// Exposes discoverable guidance and on-demand reference loading for the current context.
     pub fn tool_definition(&self) -> Option<ToolDefinition> {
-        let listing = self.model_listing();
+        self.tool_definition_for_context(None)
+    }
+
+    pub fn tool_definition_for_context(
+        &self,
+        context_window_tokens: Option<usize>,
+    ) -> Option<ToolDefinition> {
+        let catalog = self.model_catalog_for_context(context_window_tokens);
+        let mut listing = catalog.content;
+        if !catalog.capped_descriptions.is_empty()
+            || !catalog.omitted_descriptions.is_empty()
+            || catalog.over_budget
+        {
+            listing.push_str(&format!(
+                "\nCatalog budget: {} estimated bytes; {} descriptions shortened, {} omitted. All eligible Skill names remain listed.{}\n",
+                catalog.budget_bytes,
+                catalog.capped_descriptions.len(),
+                catalog.omitted_descriptions.len(),
+                if catalog.over_budget { " Names and built-in guidance exceed that budget." } else { "" },
+            ));
+        }
         (!listing.is_empty()).then(|| ToolDefinition {
             name: SKILL_TOOL_NAME.into(),
             description: format!(
-                r#"Execute a skill within the main conversation
+                r#"Load specialized task guidance from the available catalog.
 
-When users ask you to perform tasks, check if any of the available skills match. Skills provide specialized capabilities and domain knowledge.
+When a listed Skill matches the user's task, invoke {SKILL_TOOL_NAME} before substantial task work. Selection follows the user's intent, regardless of the language used or whether the user names the Skill.
 
-When users reference a "slash command" or "/<something>" (e.g., "/tickloop"), they are referring to a skill. Use this tool to invoke it.
-
-How to invoke:
-- Use this tool with the skill name and optional arguments
-- Examples:
-  - `skill: "pdf"` - invoke the pdf skill
-  - `skill: "commit", args: "-m 'Fix bug'"` - invoke with arguments
-  - `skill: "review-pr", args: "123"` - invoke with arguments
-
-Important:
-- Available skills are listed below; only their metadata is listed, and the full instructions load after invocation
-- When a skill matches the user's request, this is a BLOCKING REQUIREMENT: invoke the relevant {SKILL_TOOL_NAME} tool BEFORE generating any other response about the task
-- NEVER mention a skill without actually calling this tool
-- Do not invoke a skill that is already running
-- Do not use this tool for built-in CLI commands (like /help, /clear, etc.)
-- If a system message says a skill is active for this Chat, the skill has ALREADY been loaded - follow the instructions directly instead of calling this tool again
+- Use the exact catalog name; the listing contains metadata, and invocation loads the full instructions.
+- Pass args only when the Skill needs task arguments.
+- For an already activated remote Skill, use resource to read a relative reference path in its manifest. Resource and args are mutually exclusive.
+- Reuse verified guidance that the host marks active in the current context. Historical loading records alone do not establish current activation.
+- Follow the current source, account and version checks for remote guidance. Report an unavailable or failed load accurately.
+- Skill instructions and references operate within existing user authorization and tool permissions.
+- Built-in commands such as /help and /clear are CLI actions, not Skill names.
 
 Available Skills:
 {listing}"#
@@ -193,11 +289,15 @@ Available Skills:
                 "properties": {
                     "skill": {
                         "type": "string",
-                        "description": "The skill name. E.g., \"commit\", \"review-pr\", or \"pdf\""
+                        "description": "The exact Skill name from the available catalog, including its source qualifier when present"
                     },
                     "args": {
                         "type": "string",
                         "description": "Optional arguments for the skill"
+                    },
+                    "resource": {
+                        "type": "string",
+                        "description": "Read a listed relative reference file from an already activated remote Skill; mutually exclusive with args"
                     }
                 },
                 "required": ["skill"],
@@ -317,6 +417,41 @@ Available Skills:
                 .push(format!("{} is ignored: {error}", display_source(path))),
         }
     }
+}
+
+pub fn expand_remote(
+    markdown: &str,
+    definition: &RemoteSkillDefinition,
+    arguments: &str,
+) -> Result<InvokedSkill, SkillError> {
+    let skill = parse_skill(markdown, definition.source.clone())?;
+    if format!("tickloop-docs:{}", skill.name) != definition.name
+        || skill.description != definition.description
+    {
+        return Err(SkillError::Invalid(
+            "remote frontmatter does not match its directory entry".into(),
+        ));
+    }
+    if skill.disable_model_invocation
+        || skill.context != SkillContext::Inline
+        || !skill.allowed_tools.is_empty()
+    {
+        return Err(SkillError::Invalid(
+            "unsupported remote invocation or execution metadata".into(),
+        ));
+    }
+    let content = if arguments.trim().is_empty() {
+        skill.body
+    } else {
+        format!("{}\n\nTask arguments:\n{}", skill.body, arguments.trim())
+    };
+    Ok(InvokedSkill {
+        name: definition.name.clone(),
+        content,
+        source: definition.source.clone(),
+        run_id: None,
+        references: Vec::new(),
+    })
 }
 
 #[derive(Clone, Copy)]

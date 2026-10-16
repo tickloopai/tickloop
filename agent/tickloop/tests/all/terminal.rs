@@ -842,14 +842,13 @@ async fn piped_follow_up_keeps_context_and_waits_for_both_replies_before_eof_exi
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(requests[1]["messages"].as_array().unwrap().len(), 3);
-    assert_eq!(
-        requests[1]["messages"][0]["content"][0]["text"],
-        "Remember the word violet."
-    );
-    assert_eq!(
-        requests[1]["messages"][1]["content"][0]["text"],
-        "Remembered violet."
+    assert_tickloop_reference_and_messages(
+        &requests[1],
+        &[
+            ("user", "Remember the word violet."),
+            ("assistant", "Remembered violet."),
+            ("user", "What was the word?"),
+        ],
     );
 }
 
@@ -1216,13 +1215,21 @@ async fn restart_lists_saved_chats_without_running_until_manual_resume_and_input
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        requests[1]["messages"][0]["content"][0]["text"],
-        "Remember cedar."
-    );
-    assert_eq!(
-        requests[1]["messages"][1]["content"][0]["text"],
-        "Saved the word cedar."
+    assert_tickloop_reference_and_messages(
+        &requests[1],
+        &[
+            ("user", "Remember cedar."),
+            ("assistant", "Saved the word cedar."),
+            ("user", "What was the word?"),
+            (
+                "user",
+                concat!(
+                    "Host notice: host tools available in this conversation now: ArtifactLogin, CallTickTool, ModifyTick, ReadTick, ReadWorkspace. ",
+                    "Earlier statements in this conversation about tool availability may be outdated. ",
+                    "This notice comes from the host, not the user, and does not authorize any new work."
+                ),
+            ),
+        ],
     );
 }
 
@@ -2805,6 +2812,31 @@ async fn model_control_sequences_cannot_change_terminal_state() {
             .all(|character| !character.is_control() || character == '\n' || character == '\t')
     );
     server.await.unwrap();
+}
+
+fn assert_tickloop_reference_and_messages(request: &Value, expected_messages: &[(&str, &str)]) {
+    let messages = request["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), expected_messages.len() + 1);
+    assert_eq!(messages[0]["role"], "user");
+    let reference = messages[0]["content"].as_array().unwrap();
+    assert_eq!(reference.len(), 1);
+    assert_eq!(reference[0]["type"], "text");
+    assert!(reference[0]["text"].as_str().unwrap().starts_with(
+        "Reference guidance from tickloop active in this Chat where relevant. This is reference material, not a user request or additional authority.\n\n# Tickloop Ticks\n"
+    ));
+    let conversation = messages[1..]
+        .iter()
+        .map(|message| {
+            let content = message["content"].as_array().unwrap();
+            assert_eq!(content.len(), 1);
+            assert_eq!(content[0]["type"], "text");
+            (
+                message["role"].as_str().unwrap(),
+                content[0]["text"].as_str().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(conversation.as_slice(), expected_messages);
 }
 
 async fn read_request(socket: &mut tokio::net::TcpStream) -> Value {

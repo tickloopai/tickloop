@@ -953,3 +953,85 @@ async fn actual_cli_interrupted_state_survives_eviction_and_daemon_restart() {
         std::panic::resume_unwind(panic);
     }
 }
+
+async fn open_transcript_follows_the_run(fixture: &PrivateFixture) {
+    const FIRST_THINKING: &str = "FIRST-THINKING-MARK";
+    const SECOND_THINKING: &str = "SECOND-THINKING-MARK";
+    const FINAL_REPLY: &str = "TRANSCRIPT-FINAL-REPLY";
+    const THINKING_LABEL: &str = "∴ Thinking (ctrl+o to expand)";
+    std::fs::create_dir_all(fixture.path("work")).unwrap();
+    std::fs::write(fixture.path("work/note.txt"), "note").unwrap();
+    let read_note = json!({"file_path": fixture.path("work/note.txt")}).to_string();
+    let first = streamed_reply(
+        vec![
+            json!({"role":"assistant","reasoning_content":FIRST_THINKING}),
+            json!({"tool_calls":[{"index":0,"id":"read-note","type":"function","function":{"name":"Read","arguments":read_note}}]}),
+        ],
+        "tool_calls",
+    );
+    let second = streamed_reply(
+        vec![
+            json!({"role":"assistant","reasoning_content":SECOND_THINKING}),
+            json!({"content":FINAL_REPLY}),
+        ],
+        "stop",
+    );
+    let (url, _, release_second) = model_http_support::serve_responses_with_gated_response(
+        vec![(200, first), (200, second)],
+        1,
+    )
+    .await;
+    fixture.set_chat_model(&url);
+    let mut view = PtyView::start(fixture);
+    view.wait_for("transcript View ready", new_input_is_visible)
+        .await;
+    view.resize(120, 50).await;
+    view.send(b"Think before and after reading\r");
+    view.wait_for("the first thinking leaves its label", |frame| {
+        frame.contains(THINKING_LABEL) && frame.contains("Read 1 file")
+    })
+    .await;
+    view.send(b"\x0f");
+    view.wait_for("the open transcript shows the first thinking", |frame| {
+        frame.contains("Showing detailed transcript") && frame.contains(FIRST_THINKING)
+    })
+    .await;
+    release_second.send(()).unwrap();
+    view.wait_for(
+        "the open transcript follows the run with every thinking block",
+        |frame| {
+            frame.contains("Showing detailed transcript")
+                && frame.contains(FIRST_THINKING)
+                && frame.contains(SECOND_THINKING)
+                && frame.contains(FINAL_REPLY)
+        },
+    )
+    .await;
+    view.send(b"\x1b");
+    let conversation = view
+        .wait_for("each finished thinking leaves a label", |frame| {
+            frame.contains(FINAL_REPLY) && TURN_SUMMARY.is_match(frame)
+        })
+        .await;
+    assert_eq!(
+        conversation_body(&conversation)
+            .matches(THINKING_LABEL)
+            .count(),
+        2,
+        "{conversation}"
+    );
+    assert!(!conversation.contains(FIRST_THINKING), "{conversation}");
+    view.close().await;
+}
+
+#[tokio::test]
+async fn actual_cli_open_transcript_follows_the_run_and_keeps_every_thinking() {
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(open_transcript_follows_the_run(&fixture))
+        .catch_unwind()
+        .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
