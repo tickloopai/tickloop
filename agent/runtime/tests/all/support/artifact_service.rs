@@ -1,5 +1,5 @@
-//! A controllable Tickloop Artifacts service: device login, the `tickloop-artifacts` MCP tools and the Agent
-//! request lifecycle under `/api/v1/agent/*`.
+//! A controllable Tickloop Artifacts service: device login, the `tickloop-artifacts` MCP tools, the Agent
+//! request lifecycle under `/api/v1/agent/*` and Artifact image uploads.
 
 use std::{
     collections::BTreeMap,
@@ -26,6 +26,16 @@ pub const CREATED_ARTIFACT: &str = "created-doc";
 const PROTOCOL_VERSION: &str = "2026-07-28";
 /// The service's `tools/list`, recorded from `artifact`.
 const RECORDED_TOOLS: &str = include_str!("../fixtures/artifact_service_tools.json");
+
+/// One image upload the service received, with the receipt it committed.
+#[derive(Clone)]
+pub struct Upload {
+    pub artifact_id: String,
+    pub operation_id: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+    pub receipt: Value,
+}
 
 #[derive(Clone)]
 pub struct Link {
@@ -69,6 +79,21 @@ pub struct ServiceControl {
     pub fail_link: AtomicBool,
     /// Who the fixture artifact is published to, as its metadata reports it; unknown when unset.
     pub publication: Mutex<Option<Value>>,
+    /// The stored format the fixture artifact's metadata reports; `markdown` when unset.
+    pub metadata_format: Mutex<Option<String>>,
+    pub uploads: Mutex<Vec<Upload>>,
+    /// Commits an upload but closes the connection before answering it.
+    pub drop_upload_response: AtomicBool,
+    /// Answers the operation receipt of a lost upload as if the upload never committed.
+    pub forget_upload_operations: AtomicBool,
+    /// Stores only an image's eight-byte signature, as if the rest were metadata it strips, so
+    /// the receipt describes a smaller file than the one sent.
+    pub strip_upload_metadata: AtomicBool,
+    /// Refuses every upload with this status, error code and message.
+    pub refuse_uploads: Mutex<Option<(u16, String, String)>>,
+    /// Commits an upload but never answers it, after signalling `upload_held`.
+    pub hold_upload_response: AtomicBool,
+    pub upload_held: Notify,
     pub links: Mutex<BTreeMap<String, Link>>,
     pub pending: Mutex<Vec<(String, String)>>,
     pub running: Mutex<BTreeMap<String, String>>,
@@ -160,7 +185,11 @@ fn call_tool(control: &ServiceControl, origin: &str, params: &Value) -> Value {
                 }
                 _ => arguments["format"].clone(),
             };
-            json!({"artifact_id":CREATED_ARTIFACT,"title":arguments["title"],"format":format,"url":artifact_url(origin, CREATED_ARTIFACT),"revision":0})
+            let mut created = json!({"artifact_id":CREATED_ARTIFACT,"title":arguments["title"],"format":format,"url":artifact_url(origin, CREATED_ARTIFACT),"revision":0});
+            if format == "slides" {
+                created["blocks"] = json!([{"id":"cover","hash":"c1"}]);
+            }
+            created
         }
         ("ArtifactEdit", "patch") => {
             json!({"artifact_id":artifact_id,"revision":4,"changed":[{"id":"b1","hash":"h2"}]})
@@ -285,11 +314,55 @@ fn skill_reference(extra_bytes: usize) -> String {
 }
 
 fn skill_entries(revision: usize, reference_bytes: usize) -> Vec<Value> {
-    ["artifact-design", "artifact-diagramming", "artifact-dataviz", "artifact-draft"].into_iter().map(|name| {
+    ["artifact-design", "artifact-diagramming", "artifact-dataviz", "artifact-draft", "artifact-slides"].into_iter().map(|name| {
         let uri = format!("skill://tickloop-artifacts/{name}/SKILL.md");
         let resources = [(uri.clone(), skill_body(name, revision)), (format!("skill://tickloop-artifacts/{name}/references/runtime.md"), skill_reference(reference_bytes))].into_iter().map(|(uri, text)| json!({"uri":uri,"size":text.len(),"digest":format!("sha256:{:x}", Sha256::digest(text.as_bytes()))})).collect::<Vec<_>>();
         json!({"uri":uri,"frontmatter":{"name":name,"description":format!("Fixture guidance for {name}")},"resources":resources})
     }).collect()
+}
+
+/// `POST /api/v1/artifacts/:id/assets?operation_id=…` with the image as the raw body; the same
+/// operation returns the receipt it committed.
+fn upload(control: &ServiceControl, target: &str, head: &str, body: &[u8]) -> (u16, Value) {
+    if let Some((status, code, message)) = control.refuse_uploads.lock().unwrap().clone() {
+        return (status, json!({"error":{"code":code,"message":message}}));
+    }
+    let artifact_id = target.split('/').nth(4).unwrap_or_default().to_owned();
+    let operation_id = query(target)
+        .get("operation_id")
+        .cloned()
+        .unwrap_or_default();
+    let content_type = head
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case("content-type")
+                .then(|| value.trim().to_owned())
+        })
+        .unwrap_or_default();
+    let mut uploads = control.uploads.lock().unwrap();
+    if let Some(existing) = uploads
+        .iter()
+        .find(|upload| upload.operation_id == operation_id)
+    {
+        return (201, existing.receipt.clone());
+    }
+    let asset_id = format!("asset-{}", uploads.len() + 1);
+    let stored = if control.strip_upload_metadata.load(Ordering::SeqCst) {
+        &body[..body.len().min(8)]
+    } else {
+        body
+    };
+    let receipt = json!({"asset_id":asset_id,"ref":format!("asset:{asset_id}"),"content_type":content_type,"bytes":stored.len(),"sha256":format!("{:x}", Sha256::digest(stored)),"width":640,"height":360});
+    uploads.push(Upload {
+        artifact_id,
+        operation_id,
+        content_type,
+        bytes: body.to_vec(),
+        receipt: receipt.clone(),
+    });
+    (201, receipt)
 }
 
 fn lifecycle(control: &ServiceControl, method: &str, target: &str, body: &Value) -> (u16, Value) {
@@ -440,8 +513,40 @@ fn lifecycle(control: &ServiceControl, method: &str, target: &str, body: &Value)
                 .to_owned();
             (
                 200,
-                json!({"id":canonical_id,"title":"Fixture","format":"markdown","access_role":"owner","publication":control.publication.lock().unwrap().clone(),"agent_link":link.map(|link| json!({"binding_id":link.binding_id,"chat_id":link.chat_id,"loop_id":link.loop_id,"epoch":link.epoch}))}),
+                json!({"id":canonical_id,"title":"Fixture","format":control.metadata_format.lock().unwrap().as_deref().unwrap_or("markdown"),"access_role":"owner","publication":control.publication.lock().unwrap().clone(),"agent_link":link.map(|link| json!({"binding_id":link.binding_id,"chat_id":link.chat_id,"loop_id":link.loop_id,"epoch":link.epoch}))}),
             )
+        }
+        (
+            "GET",
+            [
+                "",
+                "api",
+                "v1",
+                "artifacts",
+                artifact_id,
+                "operations",
+                operation_id,
+            ],
+        ) => {
+            let upload = control
+                .uploads
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|upload| {
+                    upload.artifact_id == *artifact_id && upload.operation_id == *operation_id
+                })
+                .cloned();
+            match upload {
+                Some(upload) if !control.forget_upload_operations.load(Ordering::SeqCst) => (
+                    200,
+                    json!({"operation_id":operation_id,"status":"committed","result":upload.receipt}),
+                ),
+                _ => (
+                    404,
+                    json!({"error":{"code":"not_found","message":"Operation not found"}}),
+                ),
+            }
         }
         _ => (
             404,
@@ -512,7 +617,25 @@ impl ArtifactService {
                             .await;
                         return;
                     }
-                    let (mut status, response) = if target == "/api/v1/auth/device" {
+                    let is_upload = method == "POST"
+                        && target.starts_with("/api/v1/artifacts/")
+                        && target
+                            .split('?')
+                            .next()
+                            .unwrap_or_default()
+                            .ends_with("/assets");
+                    let (mut status, response) = if is_upload {
+                        let (status, receipt) =
+                            upload(&control, &target, &head, &bytes[header_end + 4..]);
+                        if status == 201 && control.drop_upload_response.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        if status == 201 && control.hold_upload_response.load(Ordering::SeqCst) {
+                            control.upload_held.notify_one();
+                            std::future::pending::<()>().await;
+                        }
+                        (status, receipt)
+                    } else if target == "/api/v1/auth/device" {
                         (
                             200,
                             json!({"device_code":"test-device","user_code":"TEST","verification_uri":format!("{origin}/artifact/device?code=TEST"),"expires_in":30,"interval":1}),
@@ -650,6 +773,10 @@ impl ArtifactService {
 
     pub fn finished(&self) -> Vec<(String, String)> {
         self.control.finished.lock().unwrap().clone()
+    }
+
+    pub fn uploads(&self) -> Vec<Upload> {
+        self.control.uploads.lock().unwrap().clone()
     }
 
     pub fn requests(&self) -> Vec<Value> {

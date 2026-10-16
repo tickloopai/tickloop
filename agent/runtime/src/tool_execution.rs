@@ -15,6 +15,20 @@ use tickloop_agent_tools::{
     permissions::PermissionPolicyExt,
 };
 
+/// Admits the `Read` of each local file a host call would send, by the calling Chat's Read rules
+/// and delegated scope, before the file is opened.
+struct ChatLocalReads {
+    agent: Agent,
+    receipt: Receipt,
+}
+
+#[async_trait::async_trait]
+impl tickloop_agent_tools::LocalReadAdmission for ChatLocalReads {
+    async fn admit(&self, read: &tickloop_agent_tools::PreparedTool) -> Result<bool, String> {
+        self.agent.check_local_read(&self.receipt, read).await
+    }
+}
+
 struct AutoPermissionDecision {
     decision: Decision,
     approval_reason: Option<String>,
@@ -748,21 +762,28 @@ impl Agent {
                 return Ok(ToolCallOutcome::not_admitted(error));
             }
             let context = self.host_call_context(receipt, &workspace.workdir);
-            let prepared = if let Some(context) = context {
-                provider
-                    .prepare_call_in_context(
-                        receipt.chat_id,
-                        &context,
-                        &name,
-                        &input,
-                        cancel.clone(),
-                    )
-                    .await
-            } else {
-                provider
-                    .prepare_call(receipt.chat_id, &name, &input, cancel.clone())
-                    .await
+            let local_files = self
+                .inner
+                .chats
+                .lock()
+                .await
+                .get(&receipt.chat_id)
+                .ok_or("chat is unavailable")?
+                .tools
+                .local_file_reader(
+                    &workspace,
+                    Arc::new(ChatLocalReads {
+                        agent: self.clone(),
+                        receipt: receipt.clone(),
+                    }),
+                );
+            let scope = crate::host_tools::HostCallScope {
+                local_files: &local_files,
+                context: context.as_ref(),
             };
+            let prepared = provider
+                .prepare_call_in_scope(receipt.chat_id, &scope, &name, &input, cancel.clone())
+                .await;
             match prepared {
                 Ok(prepared) => {
                     if prepared.name() != name || prepared.source_input() != &input {
@@ -838,6 +859,9 @@ impl Agent {
         } else {
             None
         };
+        let local_read_asks = prepared_host_call
+            .as_ref()
+            .is_some_and(|call| call.local_read_asks());
         let prepared_local = if matches!(
             name.as_str(),
             SEND_AGENT_MESSAGE_TOOL_NAME | agent_messages::STOP_SUBAGENT_TOOL_NAME
@@ -966,8 +990,12 @@ impl Agent {
                     session_evaluation.decision,
                 )?;
                 (
-                    authority.decision,
-                    authority.explicit_ask,
+                    if local_read_asks {
+                        authority.decision.stricter(Decision::Ask)
+                    } else {
+                        authority.decision
+                    },
+                    authority.explicit_ask || local_read_asks,
                     authority.policy_revision,
                     authority.ancestor_revisions,
                     session_evaluation,
@@ -1128,7 +1156,7 @@ impl Agent {
                 let validation = if let (Some(provider), Some(prepared)) =
                     (host_tools.as_ref(), prepared_host_call.as_ref())
                 {
-                    match self
+                    let admitted = match self
                         .check_delegated_host_call(
                             receipt,
                             provider.as_ref(),
@@ -1137,6 +1165,21 @@ impl Agent {
                         )
                         .await
                     {
+                        Ok(()) => match prepared.local_read() {
+                            Some(read) => match self.check_local_read(receipt, read).await {
+                                Ok(true) if !local_read_asks => Err(format!(
+                                    "{} of {} now needs approval, so the file was not sent; call {name} again to ask",
+                                    read.name,
+                                    read.input["file_path"].as_str().unwrap_or("the file")
+                                )),
+                                Ok(_) => Ok(()),
+                                Err(error) => Err(error),
+                            },
+                            None => Ok(()),
+                        },
+                        Err(error) => Err(error),
+                    };
+                    match admitted {
                         Ok(()) => {
                             provider
                                 .revalidate_call(receipt.chat_id, prepared, cancel.clone())
@@ -2137,7 +2180,10 @@ mod tests {
                     .into_iter()
                     .flat_map(crate::tick_tools::definitions),
             )
-            .chain([crate::mcp_tools::login_definition()])
+            .chain([
+                crate::mcp_tools::login_definition(),
+                crate::mcp_tools::upload_definition(),
+            ])
             .collect()
     }
 
@@ -2154,6 +2200,7 @@ mod tests {
             "SubscribeTick",
             "ModifyTick",
             "ArtifactLogin",
+            "ArtifactUpload",
         ] {
             assert!(
                 definitions.iter().any(|definition| definition.name == name),
@@ -2215,7 +2262,10 @@ mod tests {
         assert!(named.is_superset(&HashSet::from([
             "ModifyTick",
             "SubscribeTick",
-            "ArtifactRead"
+            "ArtifactRead",
+            "ArtifactEdit",
+            "ArtifactLogin",
+            "ArtifactUpload",
         ])));
         for word in named {
             assert!(

@@ -95,7 +95,13 @@ fn package_skills_are_named_after_their_package_with_its_install_directory_in_th
             .definitions()
             .map(|skill| skill.name.as_str())
             .collect::<Vec<_>>(),
-        ["guide", "sample:guide", "sample:tickloop", "tickloop"]
+        [
+            "guide",
+            "sample:guide",
+            "sample:tickloop",
+            "slides",
+            "tickloop"
+        ]
     );
     assert!(
         registry

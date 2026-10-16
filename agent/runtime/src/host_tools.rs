@@ -24,6 +24,9 @@ pub enum HostToolPermission {
     PublicArtifactWrite,
     /// A subsequent write to an Artifact with the same admitted audience in this conversation.
     ArtifactContinuation,
+    /// An image upload to an Artifact of a file from outside the workspace, reviewed like a first
+    /// public write whatever the Artifact's audience.
+    ArtifactUploadFromOutside,
     /// A mutation governed by the Chat execution mode and ordinary approval policy.
     Reviewable,
     /// A host requirement for human confirmation, independent of execution mode.
@@ -47,6 +50,7 @@ pub struct PreparedHostCall {
     event_context: Option<EventToolContext>,
     policy_identity: Option<HostPolicyIdentity>,
     approval_facts: tickloop_agent_protocol::PreparedApprovalFacts,
+    local_read: Option<(tickloop_agent_tools::PreparedTool, bool)>,
 }
 
 impl std::fmt::Debug for PreparedHostCall {
@@ -82,6 +86,7 @@ impl PreparedHostCall {
             payload: None,
             event_context: None,
             policy_identity: None,
+            local_read: None,
         }
     }
 
@@ -100,6 +105,26 @@ impl PreparedHostCall {
 
     pub fn approval_facts(&self) -> &tickloop_agent_protocol::PreparedApprovalFacts {
         &self.approval_facts
+    }
+
+    /// The call sends a local file the Chat admitted a `Read` of; `read_asks` reports an explicit
+    /// Ask on that `Read`, which the call's one approval must satisfy. The runtime checks the
+    /// `Read` again before dispatch.
+    pub fn with_local_read(
+        mut self,
+        read: tickloop_agent_tools::PreparedTool,
+        read_asks: bool,
+    ) -> Self {
+        self.local_read = Some((read, read_asks));
+        self
+    }
+
+    pub fn local_read(&self) -> Option<&tickloop_agent_tools::PreparedTool> {
+        self.local_read.as_ref().map(|(read, _)| read)
+    }
+
+    pub fn local_read_asks(&self) -> bool {
+        self.local_read.as_ref().is_some_and(|(_, asks)| *asks)
     }
 
     pub(crate) fn with_event_context(mut self, context: EventToolContext) -> Self {
@@ -209,6 +234,13 @@ pub(crate) struct EventToolContext {
     pub request_id: String,
     pub claim_id: String,
     pub fencing_token: String,
+}
+
+/// What the calling Chat lends one host call: read-only access to its local files by the `Read`
+/// path rules in its workspace, and the host context of the View or Work Context it serves.
+pub struct HostCallScope<'a> {
+    pub local_files: &'a tickloop_agent_tools::LocalFileReader,
+    pub context: Option<&'a HostCallContext>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -475,10 +507,10 @@ pub trait HostToolProvider: Send + Sync {
         ))
     }
 
-    async fn prepare_call_in_context(
+    async fn prepare_call_in_scope(
         &self,
         chat_id: ChatId,
-        _context: &HostCallContext,
+        _scope: &HostCallScope<'_>,
         name: &str,
         input: &Value,
         cancel: CancellationToken,

@@ -1,5 +1,6 @@
 use std::{
     fs::File,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -68,6 +69,108 @@ impl Workspace {
             .filter_map(|directory| directory.canonicalize().ok())
             .any(|directory| path.starts_with(directory))
     }
+
+    /// `path` below the workspace directory that holds it, as written or in canonical form, or
+    /// the whole path when no directory does.
+    fn below_directory<'a>(&self, path: &'a Path) -> &'a Path {
+        std::iter::once(&self.workdir)
+            .chain(&self.additional_directories)
+            .flat_map(|directory| [Some(directory.clone()), directory.canonicalize().ok()])
+            .flatten()
+            .find_map(|directory| path.strip_prefix(directory).ok())
+            .unwrap_or(path)
+    }
+}
+
+/// A local file a host tool sends elsewhere, read whole by the `Read` path rules: it needs no
+/// approval in the workspace or this Chat's own directories and approval anywhere else. `read`
+/// is that `Read`, which the Chat admitted before the file was opened.
+#[derive(Clone, Debug)]
+pub struct LocalFile {
+    pub path: PathBuf,
+    pub read: PreparedTool,
+    /// An explicit Ask rule covers the `Read`, so the call's one approval must come from a person.
+    pub read_asks: bool,
+    pub bytes: Vec<u8>,
+}
+
+/// The Chat's decision on a `Read` of a local file a host tool would send elsewhere, made after the
+/// path is resolved and before the file is opened: `Ok(true)` admits it under an explicit Ask, and
+/// `Err` says why it is refused.
+#[async_trait::async_trait]
+pub trait LocalReadAdmission: Send + Sync {
+    async fn admit(&self, read: &PreparedTool) -> Result<bool, String>;
+}
+
+/// Read-only access to one Chat's local files, lent to a host tool that sends a file elsewhere: it
+/// reads whole files by that Chat's `Read` path rules in its workspace, only once the Chat admits
+/// each `Read`, and can neither write files nor run anything.
+#[derive(Clone)]
+pub struct LocalFileReader {
+    workspace: Workspace,
+    readable_directories: Vec<PathBuf>,
+    family_temp: PathBuf,
+    admission: std::sync::Arc<dyn LocalReadAdmission>,
+}
+
+impl LocalFileReader {
+    /// Resolves `file_path`, has the Chat admit its `Read`, and only then opens the file and reads
+    /// at most `max_bytes` of it. A path that looks like it holds credentials or secrets is
+    /// refused, whatever the approval.
+    pub async fn read(&self, file_path: &str, max_bytes: usize) -> Result<LocalFile, ToolError> {
+        let reader = self.clone();
+        let requested = file_path.to_owned();
+        let read = run_blocking(file_path, move || reader.resolve(&requested)).await?;
+        let read_asks = self
+            .admission
+            .admit(&read)
+            .await
+            .map_err(ToolError::Rejected)?;
+        let workspace = self.workspace.clone();
+        let (read, bytes) = run_blocking(file_path, move || {
+            if [&read.original_path, &read.resolved_path]
+                .into_iter()
+                .any(|path| is_sensitive_path(workspace.below_directory(path)))
+            {
+                return Err(ToolError::Rejected(format!(
+                    "{} looks like it holds credentials or secrets, so its contents are never sent",
+                    read.original_path.display()
+                )));
+            }
+            let bytes = read_whole_file(&read.resolved_path, max_bytes)?;
+            Ok((read, bytes))
+        })
+        .await?;
+        Ok(LocalFile {
+            path: read.resolved_path.clone(),
+            read,
+            read_asks,
+            bytes,
+        })
+    }
+
+    fn resolve(&self, file_path: &str) -> Result<PreparedTool, ToolError> {
+        prepare_with_readable_directories(
+            &self.workspace,
+            READ_TOOL_NAME,
+            &json!({"file_path": file_path}),
+            &self.readable_directories,
+            Some(&self.family_temp),
+            &FileReadState::default(),
+        )
+    }
+}
+
+async fn run_blocking<T: Send + 'static>(
+    file_path: &str,
+    work: impl FnOnce() -> Result<T, ToolError> + Send + 'static,
+) -> Result<T, ToolError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| ToolError::Io {
+            path: file_path.into(),
+            reason: format!("file read did not finish: {error}"),
+        })?
 }
 
 /// A write Claude Code never admits through a fast path, following its
@@ -474,6 +577,24 @@ impl Tools {
             search.config = Some(config);
         }
         Ok(prepared)
+    }
+
+    /// Read-only access to this Chat's local files in `workspace`, for a host tool that sends a
+    /// file elsewhere; `admission` decides each `Read` before the file is opened.
+    pub fn local_file_reader(
+        &self,
+        workspace: &Workspace,
+        admission: std::sync::Arc<dyn LocalReadAdmission>,
+    ) -> LocalFileReader {
+        LocalFileReader {
+            workspace: workspace.clone(),
+            readable_directories: vec![
+                self.output_dir.path().to_path_buf(),
+                self.family_temp.path().to_path_buf(),
+            ],
+            family_temp: self.family_temp.path().to_path_buf(),
+            admission,
+        }
     }
 
     pub async fn set_search(&self, config: Option<SearchConfig>) -> Result<(), ToolError> {
@@ -964,6 +1085,39 @@ pub(crate) fn open_existing(path: &Path, directory: bool) -> Result<File, ToolEr
         OpenTarget::Entry
     };
     open_without_following_links(path, target).map_err(|error| io_error(path, error))
+}
+
+fn read_whole_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, ToolError> {
+    let file = open_existing(path, false)?;
+    let metadata = file.metadata().map_err(|error| io_error(path, error))?;
+    if metadata.is_dir() {
+        return Err(ToolError::Rejected(format!(
+            "EISDIR: illegal operation on a directory, read '{}'",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(ToolError::UnsupportedType(path.into()));
+    }
+    let too_large = |size: usize| {
+        ToolError::Rejected(format!(
+            "File content ({}) exceeds maximum allowed size ({}).",
+            format_file_size(size),
+            format_file_size(max_bytes)
+        ))
+    };
+    let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    if size > max_bytes {
+        return Err(too_large(size));
+    }
+    let mut bytes = Vec::with_capacity(size);
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error(path, error))?;
+    if bytes.len() > max_bytes {
+        return Err(too_large(bytes.len()));
+    }
+    Ok(bytes)
 }
 
 /// Claude Code `formatFileSize`.

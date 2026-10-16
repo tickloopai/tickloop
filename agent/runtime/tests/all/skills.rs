@@ -70,7 +70,10 @@ fn discovers_builtin_user_and_nearest_project_skills_in_stable_order() {
         .map(|skill| skill.name.as_str())
         .collect::<Vec<_>>();
 
-    assert_eq!(names, ["nearest", "personal", "root-skill", "tickloop"]);
+    assert_eq!(
+        names,
+        ["nearest", "personal", "root-skill", "slides", "tickloop"]
+    );
     assert!(registry.warnings().is_empty());
     assert!(matches!(
         registry
@@ -942,4 +945,158 @@ async fn rediscovery_during_a_model_request_preserves_its_skill_body_snapshot() 
         assert!(!history.contains("Updated skill guidance."));
     }
     agent.shutdown().await;
+}
+
+const SLIDES_GUIDANCE: &str = "The user ran /slides to make a new Slides artifact.";
+
+fn carries_slides_guidance(request: &ModelRequest) -> bool {
+    serde_json::to_string(&request.messages)
+        .unwrap()
+        .contains(SLIDES_GUIDANCE)
+}
+
+#[tokio::test]
+async fn slides_guides_the_run_its_user_invocation_starts_through_its_questions_and_no_later_run() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "topic",
+            tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME,
+            json!({"questions":[{"question":"What should these Slides present?","header":"Topic","options":[
+                {"label":"Quarterly results","description":"Revenue and margins"},
+                {"label":"Product launch","description":"What ships and when"}
+            ]}]}),
+        ),
+        text("Writing the Slides about the Q3 review."),
+        call("load", "Skill", json!({"skill": "slides"})),
+        text("Done."),
+    ]));
+    let agent = Agent::new(config(), model.clone());
+    agent
+        .trust_working_directory(directory.path().into())
+        .await
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+
+    let invocation = agent.invoke_skill(chat, None, "slides", "").await.unwrap();
+    let question = loop {
+        if let EventKind::QuestionAsked { request } = next_event(&mut events).await.kind {
+            break request;
+        }
+    };
+    agent
+        .answer_question(
+            chat,
+            question.id,
+            vec![tickloop_agent_protocol::QuestionAnswer::other(
+                "The Q3 review",
+            )],
+        )
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    agent
+        .submit(chat, Some(invocation.loop_id), "Something unrelated".into())
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(carries_slides_guidance(&requests[0]));
+    assert!(
+        serde_json::to_string(&requests[0].messages)
+            .unwrap()
+            .contains("Topic: \\n")
+    );
+    assert!(
+        carries_slides_guidance(&requests[1])
+            && serde_json::to_string(&requests[1].messages)
+                .unwrap()
+                .contains("The Q3 review"),
+        "the answer returns within the run /slides guides"
+    );
+    assert!(
+        !carries_slides_guidance(&requests[2]) && !carries_slides_guidance(&requests[3]),
+        "a later run is not guided by /slides"
+    );
+    let skill_tool = requests[2]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "Skill")
+        .unwrap();
+    assert!(
+        !skill_tool
+            .description
+            .lines()
+            .any(|line| line.starts_with("- slides"))
+    );
+    assert!(
+        serde_json::to_string(&requests[3].messages)
+            .unwrap()
+            .contains("skill `slides` cannot be invoked by the model")
+    );
+}
+
+#[tokio::test]
+async fn slides_invoked_while_its_loop_works_guides_the_run_it_joins() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("slow", "Bash", json!({"command":"sleep 0.3"})),
+        text("Started the Slides."),
+        text("Next task done."),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    let active = agent
+        .submit(chat, None, "Check the workspace".into())
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            next_event(&mut events).await.kind,
+            EventKind::ToolStarted { .. }
+        ) {
+            break;
+        }
+    }
+    let joined = agent
+        .invoke_skill(chat, Some(active.loop_id), "slides", "the Q3 review")
+        .await
+        .unwrap();
+    let mut merged = false;
+    loop {
+        let event = next_event(&mut events).await;
+        match event.kind {
+            EventKind::InputMerged { into_run_id } if event.run_id == joined.run_id => {
+                assert_eq!(into_run_id, active.run_id);
+                merged = true;
+            }
+            EventKind::Completed { .. } if event.run_id == active.run_id => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert!(merged, "the invocation joined the working run");
+    agent
+        .submit(chat, Some(active.loop_id), "Next task".into())
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(!carries_slides_guidance(&requests[0]));
+    assert!(carries_slides_guidance(&requests[1]));
+    assert!(
+        serde_json::to_string(&requests[1].messages)
+            .unwrap()
+            .contains("Topic: the Q3 review")
+    );
+    assert!(!carries_slides_guidance(&requests[2]));
 }

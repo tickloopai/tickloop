@@ -33,8 +33,8 @@ use super::{
 };
 use crate::{
     host_tools::{
-        HostCallResult, HostEffect, HostToolPermission, HostToolProvider, PreparedHostCall,
-        WorkspaceHostContext,
+        HostCallResult, HostCallScope, HostEffect, HostToolPermission, HostToolProvider,
+        PreparedHostCall, WorkspaceHostContext,
     },
     tick_tools::{CALL_TICK_TOOL, HIDDEN_PLACEMENT, MODIFY_TICK, READ_TICK, READ_WORKSPACE},
 };
@@ -1591,10 +1591,10 @@ impl HostToolProvider for HostedTickTools {
         self.prepare(chat, name, input, None).await
     }
 
-    async fn prepare_call_in_context(
+    async fn prepare_call_in_scope(
         &self,
         chat: ChatId,
-        context: &HostCallContext,
+        scope: &HostCallScope<'_>,
         name: &str,
         input: &Value,
         cancel: CancellationToken,
@@ -1602,7 +1602,7 @@ impl HostToolProvider for HostedTickTools {
         if cancel.is_cancelled() {
             return Err("hosted Tick operation was cancelled before preparation".into());
         }
-        self.prepare(chat, name, input, Some(context)).await
+        self.prepare(chat, name, input, scope.context).await
     }
 
     async fn revalidate_call(

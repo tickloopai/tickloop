@@ -50,6 +50,7 @@ const OVERVIEW_COMMANDS: &[(&str, &str)] = &[
     ("/exit", "Leaves this View; Agents keep running."),
     ("/help", "Shows overview keys and commands."),
     ("/resume", "Opens saved Agent history."),
+    ("/slides", "Starts a new Agent that makes Slides."),
     ("/tickloop", "Starts a new Agent with the Tickloop Skill."),
 ];
 
@@ -138,6 +139,12 @@ const COMMANDS: &[CommandSpec] = &[
         command: "/tickloop",
         arguments: "[REQUEST]",
         description: "Loads the Tickloop Skill.",
+        menu_group: Some(CommandGroup::Skills),
+    },
+    CommandSpec {
+        command: "/slides",
+        arguments: "[TOPIC]",
+        description: "Makes new Slides in Tickloop Artifacts.",
         menu_group: Some(CommandGroup::Skills),
     },
     CommandSpec {
@@ -612,8 +619,8 @@ mod tests {
     fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-        assert_eq!(completion.candidates().len(), 23);
-        assert_eq!(builtin_commands().len(), 43);
+        assert_eq!(completion.candidates().len(), 24);
+        assert_eq!(builtin_commands().len(), 44);
         assert_eq!(
             builtin_commands()
                 .iter()
@@ -627,6 +634,7 @@ mod tests {
             "/cwd",
             "/details",
             "/tickloop",
+            "/slides",
             "/artifacts",
             "/ticks",
         ] {
@@ -682,7 +690,10 @@ mod tests {
     fn only_public_prefix_matches_are_returned() {
         let mut completion = Completion::default();
         completion.update("/s");
-        assert_eq!(command_names(&completion), vec!["/settings", "/stop"]);
+        assert_eq!(
+            command_names(&completion),
+            vec!["/settings", "/slides", "/stop"]
+        );
         completion.update("/operations");
         assert!(!completion.is_open());
     }

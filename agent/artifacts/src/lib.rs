@@ -24,10 +24,54 @@ use tickloop_agent_base::{
 
 mod agent_requests;
 mod catalog;
+mod images;
 pub use agent_requests::{
     AgentLink, AgentLinkRequest, ClaimedRequest, PendingRequest, PendingRequestPage, ReleaseOutcome,
 };
 pub use catalog::{AgentLinkMetadata, ArtifactMetadata, ArtifactOperation, ArtifactPage};
+pub use images::{
+    ArtifactImage, IMAGE_ARTIFACT_FORMAT, MAX_IMAGE_BYTES, MAX_SVG_BYTES, artifact_image_type,
+};
+
+/// One Artifact type: the format name catalogs and Artifact Ticks store, the name the MCP tools
+/// use, and the type name people see.
+pub struct ArtifactType {
+    pub stored_format: &'static str,
+    pub tool_format: &'static str,
+    pub name: &'static str,
+}
+
+pub static ARTIFACT_TYPES: [ArtifactType; 3] = [
+    ArtifactType {
+        stored_format: "markdown",
+        tool_format: "doc",
+        name: "Doc",
+    },
+    ArtifactType {
+        stored_format: "html",
+        tool_format: "page",
+        name: "Page",
+    },
+    ArtifactType {
+        stored_format: "slides",
+        tool_format: "slides",
+        name: "Slides",
+    },
+];
+
+/// The type of an Artifact whose catalog or Tick format is `stored_format`.
+pub fn artifact_type(stored_format: &str) -> Option<&'static ArtifactType> {
+    ARTIFACT_TYPES
+        .iter()
+        .find(|artifact_type| artifact_type.stored_format == stored_format)
+}
+
+/// The type an MCP tool result names by `tool_format`.
+pub fn artifact_type_for_tool(tool_format: &str) -> Option<&'static ArtifactType> {
+    ARTIFACT_TYPES
+        .iter()
+        .find(|artifact_type| artifact_type.tool_format == tool_format)
+}
 
 pub const DEFAULT_ORIGIN: &str = "https://tickloop.ai";
 /// Every page, API route and the MCP endpoint of Tickloop Artifacts live under this path of its origin.
@@ -70,8 +114,14 @@ pub enum ArtifactError {
     AccountChanged,
     #[error("Tickloop Artifacts credential storage is unavailable or unsafe")]
     Storage,
+    /// The service refused the request with an error envelope; `message` is its explanation,
+    /// empty when the envelope gives none.
     #[error("Tickloop Artifacts returned HTTP {status}: {code}")]
-    Service { status: u16, code: String },
+    Service {
+        status: u16,
+        code: String,
+        message: String,
+    },
     #[error("Tickloop Artifacts modification outcome unknown; operation {operation_id}: {outcome}")]
     OutcomeUnknown {
         operation_id: String,
@@ -654,6 +704,20 @@ fn path_segment(value: &str) -> Result<&str, ArtifactError> {
     Ok(value)
 }
 
+/// The code and message of a service error envelope `{"error":{"code","message"}}`.
+fn service_error(envelope: &serde_json::Value) -> (String, String) {
+    let field = |name: &str| {
+        envelope
+            .pointer(&format!("/error/{name}"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    (
+        field("code").unwrap_or_else(|| "invalid_response".into()),
+        field("message").unwrap_or_default(),
+    )
+}
+
 fn bearer(token: &str) -> Result<header::HeaderValue, ArtifactError> {
     let mut value = header::HeaderValue::from_str(&format!("Bearer {token}"))
         .map_err(|_| ArtifactError::Storage)?;
@@ -878,13 +942,218 @@ mod tests {
         assert!(client.credential_snapshot().unwrap().is_some());
     }
 
+    fn png_bytes() -> Vec<u8> {
+        [
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a][..],
+            b"pixels",
+        ]
+        .concat()
+    }
+
+    fn image_receipt(bytes: &[u8]) -> serde_json::Value {
+        serde_json::json!({"asset_id":"asset-1","ref":"asset:asset-1","content_type":"image/png","bytes":bytes.len(),"sha256":format!("{:x}", Sha256::digest(bytes)),"width":4,"height":null})
+    }
+
+    #[tokio::test]
+    async fn an_upload_sends_the_raw_image_under_its_operation_and_returns_its_reference() {
+        let bytes = png_bytes();
+        let receipt = image_receipt(&bytes);
+        let (origin, requests) = server(move |_, _, _| (201, receipt.to_string())).await;
+        let (_directory, client) = catalog_client(&origin).await;
+        let credential = client.credential_snapshot().unwrap().unwrap();
+        let operation_id = Uuid::new_v4();
+        let image = client
+            .upload_image(
+                "slides-1",
+                "image/png",
+                bytes.clone(),
+                operation_id,
+                &credential,
+            )
+            .await
+            .unwrap();
+        assert_eq!(image.reference, "asset:asset-1");
+        assert_eq!((image.width, image.height), (Some(4), None));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with(&format!(
+            "POST /artifact/api/v1/artifacts/slides-1/assets?operation_id={operation_id} "
+        )));
+        let headers = requests[0].to_ascii_lowercase();
+        assert!(headers.contains("content-type: image/png"));
+        assert!(headers.contains("authorization: bearer test-token"));
+        assert!(requests[0].ends_with(&*String::from_utf8_lossy(&bytes)));
+    }
+
+    #[tokio::test]
+    async fn a_lost_upload_response_asks_for_its_operation_once_without_sending_it_again() {
+        let bytes = png_bytes();
+        let receipt = image_receipt(&bytes);
+        let (origin, requests) = server(move |request, _, _| {
+            if request.starts_with("POST ") {
+                (503, r#"{"error":{"code":"storage_unavailable"}}"#.into())
+            } else {
+                let operation_id = request.split_whitespace().nth(1).unwrap().rsplit('/').next().unwrap();
+                (200, serde_json::json!({"operation_id":operation_id,"status":"committed","result":receipt}).to_string())
+            }
+        })
+        .await;
+        let (_directory, client) = catalog_client(&origin).await;
+        let credential = client.credential_snapshot().unwrap().unwrap();
+        let operation_id = Uuid::new_v4();
+        let image = client
+            .upload_image("slides-1", "image/png", bytes, operation_id, &credential)
+            .await
+            .unwrap();
+        assert_eq!(image.asset_id, "asset-1");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].starts_with(&format!(
+            "GET /artifact/api/v1/artifacts/slides-1/operations/{operation_id} "
+        )));
+    }
+
+    #[tokio::test]
+    async fn uploads_report_refusals_and_unconfirmed_or_mismatched_receipts_without_retrying() {
+        let bytes = png_bytes();
+        let (origin, requests) = server(|request, _, _| {
+            if request.contains("assets?operation_id=") && request.contains("refused") {
+                (413, r#"{"error":{"code":"asset_limit","message":"full"}}"#.into())
+            } else if request.starts_with("POST ") {
+                (201, serde_json::json!({"asset_id":"asset-1","ref":"asset:asset-1","content_type":"image/jpeg","bytes":1,"sha256":"0","width":null,"height":null}).to_string())
+            } else {
+                (200, r#"{"operation_id":"other","status":"committed"}"#.into())
+            }
+        })
+        .await;
+        let (_directory, client) = catalog_client(&origin).await;
+        let credential = client.credential_snapshot().unwrap().unwrap();
+        assert!(matches!(
+            client
+                .upload_image("refused", "image/png", bytes.clone(), Uuid::new_v4(), &credential)
+                .await,
+            Err(ArtifactError::Service { status: 413, code, message }) if code == "asset_limit" && message == "full"
+        ));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(matches!(
+            client
+                .upload_image("slides-1", "image/png", bytes, Uuid::new_v4(), &credential)
+                .await,
+            Err(ArtifactError::OutcomeUnknown { .. })
+        ));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].starts_with("GET /artifact/api/v1/artifacts/slides-1/operations/"));
+    }
+
+    #[tokio::test]
+    async fn a_receipt_for_the_stored_file_without_its_metadata_still_confirms_the_upload() {
+        let sent = [png_bytes(), b"tEXt camera serial".to_vec()].concat();
+        let stored = image_receipt(&png_bytes());
+        let receipt = stored.clone();
+        let (origin, requests) = server(move |request, _, _| {
+            if request.contains("slides-lost") && request.starts_with("POST ") {
+                (503, r#"{"error":{"code":"storage_unavailable"}}"#.into())
+            } else if request.starts_with("POST ") {
+                (201, receipt.to_string())
+            } else {
+                let operation_id = request.split_whitespace().nth(1).unwrap().rsplit('/').next().unwrap();
+                (200, serde_json::json!({"operation_id":operation_id,"status":"committed","result":receipt}).to_string())
+            }
+        })
+        .await;
+        let (_directory, client) = catalog_client(&origin).await;
+        let credential = client.credential_snapshot().unwrap().unwrap();
+        for artifact in ["slides-1", "slides-lost"] {
+            let image = client
+                .upload_image(
+                    artifact,
+                    "image/png",
+                    sent.clone(),
+                    Uuid::new_v4(),
+                    &credential,
+                )
+                .await
+                .unwrap();
+            assert_eq!(image.bytes, png_bytes().len() as u64, "{artifact}");
+            assert_eq!(image.sha256, stored["sha256"], "{artifact}");
+        }
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            3,
+            "one send each, and one receipt query for the lost response"
+        );
+        assert!(requests[2].starts_with("GET /artifact/api/v1/artifacts/slides-lost/operations/"));
+    }
+
+    #[tokio::test]
+    async fn a_busy_upload_is_refused_with_the_service_message_and_not_retried() {
+        let (origin, requests) = server(|_, _, _| {
+            (
+                429,
+                r#"{"error":{"code":"asset_busy","message":"These Slides already have 4 uploads in progress"}}"#.into(),
+            )
+        })
+        .await;
+        let (_directory, client) = catalog_client(&origin).await;
+        let credential = client.credential_snapshot().unwrap().unwrap();
+        assert!(matches!(
+            client
+                .upload_image("slides-1", "image/png", png_bytes(), Uuid::new_v4(), &credential)
+                .await,
+            Err(ArtifactError::Service { status: 429, code, message })
+                if code == "asset_busy" && message == "These Slides already have 4 uploads in progress"
+        ));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(client.credential_snapshot().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn an_unauthorized_upload_invalidates_the_credential_without_asking_for_its_receipt() {
+        let (origin, requests) =
+            server(|_, _, _| (401, r#"{"error":{"code":"unauthorized"}}"#.into())).await;
+        let (_directory, client) = catalog_client(&origin).await;
+        let credential = client.credential_snapshot().unwrap().unwrap();
+        assert!(matches!(
+            client
+                .upload_image(
+                    "slides-1",
+                    "image/png",
+                    png_bytes(),
+                    Uuid::new_v4(),
+                    &credential
+                )
+                .await,
+            Err(ArtifactError::AccessDenied)
+        ));
+        assert!(client.credential_snapshot().unwrap().is_none());
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("POST /artifact/api/v1/artifacts/slides-1/assets?"));
+    }
+
+    #[test]
+    fn artifact_types_map_stored_and_tool_formats_to_one_type_name() {
+        for (stored, tool, name) in [
+            ("markdown", "doc", "Doc"),
+            ("html", "page", "Page"),
+            ("slides", "slides", "Slides"),
+        ] {
+            assert_eq!(artifact_type(stored).unwrap().name, name);
+            assert_eq!(artifact_type_for_tool(tool).unwrap().stored_format, stored);
+        }
+        assert!(artifact_type("doc").is_none());
+        assert!(artifact_type_for_tool("markdown").is_none());
+    }
+
     #[tokio::test]
     async fn catalog_conflict_is_reported_without_query_or_mutation_retry() {
         let (origin, requests) =
             server(|_, _, _| (409, r#"{"error":{"code":"catalog_conflict"}}"#.into())).await;
         let (_directory, client) = catalog_client(&origin).await;
         assert!(
-            matches!(client.list("all", "", Some("old")).await, Err(ArtifactError::Service { status:409, code }) if code == "catalog_conflict")
+            matches!(client.list("all", "", Some("old")).await, Err(ArtifactError::Service { status:409, code, .. }) if code == "catalog_conflict")
         );
         assert_eq!(requests.lock().unwrap().len(), 1);
     }

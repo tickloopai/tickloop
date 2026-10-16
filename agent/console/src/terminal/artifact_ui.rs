@@ -1,6 +1,6 @@
 use super::{console::Console, execution::ConsoleExecution};
 use std::path::Path;
-use tickloop_agent_artifacts::{ArtifactClient, ArtifactError};
+use tickloop_agent_artifacts::{ArtifactClient, ArtifactError, artifact_type};
 use uuid::Uuid;
 
 pub(super) async fn refresh(
@@ -156,9 +156,11 @@ pub(super) async fn open(
             .await
             .map_err(|error| error.to_string())?;
         for artifact in page.artifacts.iter().take(20) {
+            let type_name = artifact_type(&artifact.format)
+                .map_or(artifact.format.as_str(), |artifact_type| artifact_type.name);
             console.write_line(&super::safe_text(&format!(
-                "{} · {} · {} · {}",
-                artifact.title, artifact.format, artifact.access_role, artifact.url
+                "{} · {type_name} · {} · {}",
+                artifact.title, artifact.access_role, artifact.url
             )))?;
         }
         return Ok(());

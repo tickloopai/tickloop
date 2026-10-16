@@ -3978,11 +3978,10 @@ mod tests {
     use serde_json::{Value, json};
     use std::os::unix::fs::MetadataExt;
     use tickloop_agent_daemon::serve_listener;
-    use tickloop_agent_protocol::HostCallContext;
     use tickloop_agent_protocol::ToolDefinition;
     use tickloop_agent_protocol::{DisplayReceipt, HostWorkContext, VIEW_LEASE_SECONDS};
     use tickloop_agent_runtime::host_tools::{
-        HostToolPermission, HostToolProvider, PreparedHostCall,
+        HostCallScope, HostToolPermission, HostToolProvider, PreparedHostCall,
     };
     use tickloop_agent_test_support::TRANSPORT_LIMITS;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -4119,14 +4118,17 @@ mod tests {
             HostToolPermission::ReadOnly
         }
 
-        async fn prepare_call_in_context(
+        async fn prepare_call_in_scope(
             &self,
-            _: Uuid,
-            context: &HostCallContext,
+            chat: Uuid,
+            scope: &HostCallScope<'_>,
             name: &str,
             input: &Value,
-            _: CancellationToken,
+            cancel: CancellationToken,
         ) -> Result<PreparedHostCall, String> {
+            let Some(context) = scope.context else {
+                return self.prepare_call(chat, name, input, cancel).await;
+            };
             Ok(PreparedHostCall::new(
                 name.into(),
                 input.clone(),

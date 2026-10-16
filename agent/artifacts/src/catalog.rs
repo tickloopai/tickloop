@@ -5,7 +5,9 @@ use uuid::Uuid;
 
 use tickloop_agent_protocol::ArtifactTick;
 
-use super::{ArtifactClient, ArtifactError, MAX_RESPONSE_BYTES, bearer, path_segment};
+use super::{
+    ArtifactClient, ArtifactError, MAX_RESPONSE_BYTES, bearer, path_segment, service_error,
+};
 const MAX_CATALOG_RESPONSE_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -121,12 +123,12 @@ impl ArtifactClient {
             let envelope: Value = self
                 .read_json_with_limit(response, MAX_RESPONSE_BYTES)
                 .await?;
-            let code = envelope
-                .pointer("/error/code")
-                .and_then(Value::as_str)
-                .unwrap_or("invalid_response")
-                .to_owned();
-            return Err(ArtifactError::Service { status, code });
+            let (code, message) = service_error(&envelope);
+            return Err(ArtifactError::Service {
+                status,
+                code,
+                message,
+            });
         }
         self.read_json_with_limit(response, limit).await
     }

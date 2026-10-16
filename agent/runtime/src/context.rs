@@ -87,6 +87,14 @@ pub(super) fn model_history(
         {
             continue;
         }
+        // A built-in Skill only the user invokes, such as /slides, is bound to the run its
+        // invocation started and guides no later run.
+        if invoked.source == tickloop_agent_protocol::SkillSource::BuiltIn
+            && invoked.run_id.is_some()
+            && invoked.run_id != chat.active_run
+        {
+            continue;
+        }
         let content = if chat
             .bookkeeping
             .restored_skill_names

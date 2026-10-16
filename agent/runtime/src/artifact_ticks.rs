@@ -133,7 +133,7 @@ fn normalize_artifact_tick(mut tick: ArtifactTick) -> Result<ArtifactTick, Agent
         .map_err(|_| AgentError::Invalid("invalid artifact origin".into()))?;
     let _url = reqwest::Url::parse(&tick.url)
         .map_err(|_| AgentError::Invalid("invalid artifact URL".into()))?;
-    if !["markdown", "html"].contains(&tick.format.as_str())
+    if tickloop_agent_artifacts::artifact_type(&tick.format).is_none()
         || !["owner", "editor", "viewer"].contains(&tick.access_role.as_str())
         || tick.artifact_id.is_empty()
         || tick.artifact_id.contains(['/', '?', '#'])

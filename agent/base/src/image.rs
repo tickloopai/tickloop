@@ -40,6 +40,11 @@ pub fn is_supported_image(bytes: &[u8]) -> bool {
     source_format(bytes).is_some()
 }
 
+/// The MIME type of the image format whose signature starts the bytes: PNG, JPEG, GIF or WebP.
+pub fn signature_media_type(bytes: &[u8]) -> Option<&'static str> {
+    source_format(bytes).map(SourceFormat::media_type)
+}
+
 /// Turns image file bytes into a model-ready image: longest side at most 2000px in the
 /// original format, GIF as PNG, and one JPEG re-encode when the base64 exceeds 5 MB.
 pub fn prepare(bytes: &[u8]) -> Result<Image, ImageError> {
@@ -101,6 +106,15 @@ impl SourceFormat {
             Self::Jpeg => ImageFormat::Jpeg,
             Self::Gif => ImageFormat::Gif,
             Self::Webp => ImageFormat::WebP,
+        }
+    }
+
+    fn media_type(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Gif => "image/gif",
+            Self::Webp => "image/webp",
         }
     }
 
@@ -253,5 +267,19 @@ mod tests {
             Err(ImageError::Undecodable(_))
         ));
         assert!(!is_supported_image(b"BM\x00\x00"));
+    }
+
+    #[test]
+    fn signatures_name_the_mime_type_of_the_original_format() {
+        for (format, media_type) in [
+            (ImageFormat::Png, "image/png"),
+            (ImageFormat::Jpeg, "image/jpeg"),
+            (ImageFormat::Gif, "image/gif"),
+            (ImageFormat::WebP, "image/webp"),
+        ] {
+            let bytes = encoded(&gradient(4, 4), format);
+            assert_eq!(signature_media_type(&bytes), Some(media_type), "{format:?}");
+        }
+        assert_eq!(signature_media_type(b"<svg></svg>"), None);
     }
 }

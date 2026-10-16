@@ -21,7 +21,7 @@ fn record_artifact_account(
     host_tools: &mut BTreeMap<String, BTreeSet<HostToolAuthority>>,
     provider: &dyn HostToolProvider,
 ) -> Result<bool, String> {
-    let names = crate::mcp_tools::ARTIFACT_TOOL_NAMES;
+    let names = crate::mcp_tools::ARTIFACT_ACCOUNT_TOOL_NAMES;
     if names.iter().any(|name| host_tools.contains_key(*name)) {
         return Ok(false);
     }
@@ -893,6 +893,49 @@ impl Agent {
             prepared,
             plan_file.as_deref(),
         )
+    }
+
+    /// A host call that sends a local file elsewhere answers to the rules of its `Read` of that
+    /// file: the delegated scope and every ancestor's denials refuse it, and so does an explicit
+    /// Deny the Chat is under. `Ok(true)` reports an explicit Ask, which the call's one approval
+    /// then has to satisfy.
+    pub(super) async fn check_local_read(
+        &self,
+        receipt: &Receipt,
+        read: &PreparedTool,
+    ) -> Result<bool, String> {
+        self.check_delegated_call(receipt, &read.name, &read.input, Some(read))
+            .await?;
+        let chats = self.inner.chats.lock().await;
+        let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
+        let owner = PermissionOwner::new(receipt.chat_id, receipt.loop_id)
+            .map_err(|error| error.to_string())?;
+        let operation =
+            SessionPermissionOperation::from_prepared(read, &configured_workspace_for_chat(chat))
+                .map_err(|error| error.to_string())?;
+        let session = self
+            .inner
+            .session_permissions
+            .lock()
+            .await
+            .evaluate(owner, &operation)
+            .decision;
+        match effective_policy(&chats, receipt)?.explicit_match_with_session(
+            &read.name,
+            &read.input,
+            receipt.loop_id,
+            session,
+        ) {
+            Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Deny) => {
+                Err(format!(
+                    "{} of {} is denied, so the file is not sent",
+                    read.name,
+                    read.input["file_path"].as_str().unwrap_or("this file")
+                ))
+            }
+            Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Ask) => Ok(true),
+            _ => Ok(false),
+        }
     }
 
     pub(super) fn subagent_tool<'a>(

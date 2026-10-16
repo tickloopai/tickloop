@@ -8,11 +8,12 @@ use tickloop_agent_protocol::{RemoteSkillDefinition, RemoteSkillResource, SkillS
 pub(crate) const EXTENSION: &str = "io.modelcontextprotocol/skills";
 pub(crate) const MAX_FILE_BYTES: usize = 256 * 1024;
 const MAX_RESOURCES: usize = 64;
-const PRODUCT_NAMES: [&str; 4] = [
+const PRODUCT_NAMES: [&str; 5] = [
     "artifact-design",
     "artifact-diagramming",
     "artifact-dataviz",
     "artifact-draft",
+    "artifact-slides",
 ];
 
 pub(crate) struct RemoteSkillCatalog {
@@ -35,7 +36,7 @@ pub(crate) fn parse_directory(
         .as_array()
         .ok_or("invalid Artifact Skill directory")?;
     if entries.len() != PRODUCT_NAMES.len() {
-        return Err("Artifact Skill directory must contain the four product Skills".into());
+        return Err("Artifact Skill directory must contain the five product Skills".into());
     }
     let mut found = HashSet::new();
     let mut definitions = Vec::new();

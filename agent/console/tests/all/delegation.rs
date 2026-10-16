@@ -773,13 +773,24 @@ async fn replacing_the_herdr_socket_blocks_a_prepared_workspace_read_before_disp
         .unwrap();
     let original = ScopedHostSocket::start(directory.path().join("host.sock"));
     let provider = original.tools();
-    let call = provider
-        .prepare_call_in_context(
-            uuid::Uuid::new_v4(),
-            &HostCallContext {
+    let local_files = tickloop_agent_tools::Tools::new(directory.path().join("chat"))
+        .local_file_reader(
+            &tickloop_agent_tools::Workspace {
                 workdir: directory.path().into(),
-                workspace_id: Some("W1".into()),
-                interaction: None,
+                additional_directories: Vec::new(),
+            },
+            Arc::new(NoLocalReads),
+        );
+    let call = provider
+        .prepare_call_in_scope(
+            uuid::Uuid::new_v4(),
+            &tickloop_agent_runtime::host_tools::HostCallScope {
+                local_files: &local_files,
+                context: Some(&HostCallContext {
+                    workdir: directory.path().into(),
+                    workspace_id: Some("W1".into()),
+                    interaction: None,
+                }),
             },
             "ReadWorkspace",
             &json!({}),
@@ -3137,4 +3148,14 @@ async fn a_child_preserves_the_parents_frozen_persistent_shell_allow_rule() {
     let result = result.unwrap();
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("5438"));
+}
+
+/// Refuses every local file read; the host calls these tests prepare send no file.
+struct NoLocalReads;
+
+#[async_trait::async_trait]
+impl tickloop_agent_tools::LocalReadAdmission for NoLocalReads {
+    async fn admit(&self, _: &tickloop_agent_tools::PreparedTool) -> Result<bool, String> {
+        Err("no local file is read here".into())
+    }
 }
