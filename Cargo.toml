@@ -12,7 +12,7 @@ resolver = "3"
 exclude = ["vendor/crossterm", "vendor/dotenv", "vendor/longbridge-oauth"]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 publish = false
 
