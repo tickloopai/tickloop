@@ -269,3 +269,116 @@ async fn a_finished_delegate_with_a_background_shell_blocks_task_release_until_s
     );
     core.shutdown().await;
 }
+
+#[tokio::test]
+async fn solo_background_tasks_finish_in_their_claiming_run_after_waiting() {
+    use tickloop_agent_protocol::{Content, SharedTaskStatus};
+    use tickloop_agent_test_support::routed::history_text;
+
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(RoutedModel::new(|request| {
+        if !has_tool_result(request, "create-first") {
+            let mut calls = call(
+                "create-first",
+                "TaskCreate",
+                json!({"mutation_id":Uuid::from_u128(700),"title":"First background task","description":"Wait for first output"}),
+            );
+            calls.extend(call("create-second", "TaskCreate", json!({"mutation_id":Uuid::from_u128(701),"title":"Second background task","description":"Wait for second output"})));
+            for name in ["first-shell", "second-shell"] {
+                calls.extend(call(name, "Bash", json!({"command":"while [ ! -f finish-background ]; do sleep 0.01; done; printf done","run_in_background":true})));
+            }
+            return calls;
+        }
+        let first = tool_result(&request.messages, "create-first").unwrap()["task"]["id"].clone();
+        let second = tool_result(&request.messages, "create-second").unwrap()["task"]["id"].clone();
+        if !has_tool_result(request, "claim-first") {
+            return call(
+                "claim-first",
+                "TaskUpdate",
+                json!({"mutation_id":Uuid::from_u128(702),"task_id":first,"expected_revision":1,"action":"claim"}),
+            );
+        }
+        let history = history_text(request);
+        let notified = |name: &str| history.contains(&format!("<tool-use-id>{name}</tool-use-id>"));
+        if !notified("first-shell") || !notified("second-shell") {
+            return text("Waiting for both background commands");
+        }
+        if !has_tool_result(request, "complete-first") {
+            let mut calls = call(
+                "complete-first",
+                "TaskUpdate",
+                json!({"mutation_id":Uuid::from_u128(703),"task_id":first,"expected_revision":2,"action":"complete","result":"First background command completed"}),
+            );
+            calls.extend(call("claim-second", "TaskUpdate", json!({"mutation_id":Uuid::from_u128(704),"task_id":second,"expected_revision":1,"action":"claim"})));
+            calls.extend(call("complete-second", "TaskUpdate", json!({"mutation_id":Uuid::from_u128(705),"task_id":second,"expected_revision":2,"action":"complete","result":"Second background command completed"})));
+            return calls;
+        }
+        text("All tracked work finished")
+    }));
+    let core = Agent::new_embedded(config(), model);
+    core.install_own_tickhost();
+    let chat = core.create_chat(directory.path().into()).await.unwrap();
+    core.set_task_tools_enabled(chat, true).await.unwrap();
+    core.set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let mut events = core.subscribe();
+    let receipt = core
+        .submit(chat, None, "Track two background commands".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(event.kind, EventKind::Text(ref text) if text == "Waiting for both background commands") {
+                break;
+            }
+            if let EventKind::Failed(error) = event.kind {
+                panic!("{error}");
+            }
+        }
+    }).await.unwrap();
+    // The old runtime ends this Run here; the fixed runtime waits without polling the model.
+    let _ = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.run_id == receipt.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+                break;
+            }
+        }
+    })
+    .await;
+    std::fs::write(directory.path().join("finish-background"), "go").unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut final_run = None;
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(event.kind, EventKind::Text(ref text) if text == "All tracked work finished") {
+                final_run = Some(event.run_id);
+            }
+            if Some(event.run_id) == final_run && matches!(event.kind, EventKind::Completed { .. }) {
+                break;
+            }
+            if let EventKind::Failed(error) = event.kind {
+                panic!("{error}");
+            }
+        }
+    }).await.unwrap();
+    let snapshot = core.snapshot(chat).await.unwrap();
+    core.shutdown().await;
+    assert!(snapshot.delegation.is_none());
+    let tasks = &snapshot.task_boards[&receipt.loop_id].tasks;
+    assert_eq!(tasks.len(), 2);
+    for task in tasks {
+        assert_eq!(task.status, SharedTaskStatus::Completed);
+        assert_eq!(task.claim.as_ref().unwrap().run_id, receipt.run_id);
+        assert_eq!(task.report.as_ref().unwrap().run_id, receipt.run_id);
+    }
+    assert!(
+        !snapshot
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .any(|content| matches!(content, Content::ToolResult { is_error: true, .. }))
+    );
+}

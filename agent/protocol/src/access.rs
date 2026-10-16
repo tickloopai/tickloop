@@ -357,6 +357,11 @@ pub enum AgentCommand {
         execution: ExecutionRef,
         action: TaskAction,
     },
+    ClearCompletedTasks {
+        execution: ExecutionRef,
+        root_loop_id: Uuid,
+        expected_revision: u64,
+    },
     EnqueueAfterTurn {
         execution: ExecutionRef,
         target_loop: Option<Uuid>,
@@ -397,7 +402,8 @@ impl AgentCommand {
             | Self::ReopenHostedTick { execution, .. }
             | Self::AttachHostedTick { execution, .. }
             | Self::EnqueueAfterTurn { execution, .. }
-            | Self::RefreshConfiguration { execution } => Some(*execution),
+            | Self::RefreshConfiguration { execution }
+            | Self::ClearCompletedTasks { execution, .. } => Some(*execution),
             Self::DecidePermission { request, .. }
             | Self::AnswerQuestion { request, .. }
             | Self::DeclineQuestion { request } => Some(request.execution),
@@ -1206,6 +1212,7 @@ pub enum AccessCapability {
     EditHistory,
     ManageLoop,
     ManageTask,
+    ClearCompletedTasks,
     EnqueueAfterTurn,
     RefreshConfiguration,
     TrustWorkingDirectory,

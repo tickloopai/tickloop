@@ -2980,6 +2980,28 @@ impl ConsoleExecution {
             .map(|_| ())
     }
 
+    pub(super) async fn clear_completed_tasks(
+        &self,
+        chat: Uuid,
+        cleanup: super::completed_tasks::CompletedTaskCleanup,
+    ) -> Result<(), AccessError> {
+        let execution = self.reference(chat).await?;
+        match self
+            .command(
+                AgentCommand::ClearCompletedTasks {
+                    execution,
+                    root_loop_id: cleanup.root_loop_id,
+                    expected_revision: cleanup.expected_revision,
+                },
+                None,
+            )
+            .await?
+        {
+            CommandResult::Done => Ok(()),
+            _ => Err(unexpected()),
+        }
+    }
+
     async fn loop_command(
         &self,
         chat: Uuid,

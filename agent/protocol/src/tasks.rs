@@ -50,6 +50,8 @@ pub struct TaskMutationReceipt {
     pub input: String,
     pub task_id: Uuid,
     #[serde(default)]
+    pub task_cleared: bool,
+    #[serde(default)]
     pub notification: Option<TaskAssignment>,
 }
 
@@ -60,6 +62,8 @@ pub struct TaskBoard {
     pub root_chat_id: ChatId,
     pub root_loop_id: LoopId,
     pub revision: u64,
+    #[serde(default)]
+    pub task_number_offset: u64,
     pub tasks: Vec<SharedTask>,
     #[serde(default)]
     pub mutations: BTreeMap<Uuid, TaskMutationReceipt>,
@@ -76,9 +80,17 @@ impl TaskBoard {
             root_chat_id,
             root_loop_id,
             revision: 0,
+            task_number_offset: 0,
             tasks: Vec::new(),
             mutations: BTreeMap::new(),
         }
+    }
+
+    pub fn task_number(&self, index: usize) -> Option<u64> {
+        self.tasks.get(index)?;
+        self.task_number_offset
+            .checked_add(u64::try_from(index).ok()?)?
+            .checked_add(1)
     }
 
     pub fn blocked_by(&self, task: &SharedTask) -> Vec<Uuid> {

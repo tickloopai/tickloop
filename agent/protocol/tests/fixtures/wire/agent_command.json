@@ -375,6 +375,16 @@
     "launch": null
   },
   {
+    "kind": "clear_completed_tasks",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "root_loop_id": "00000000-0000-0000-0000-000000000010",
+    "expected_revision": 7
+  },
+  {
     "kind": "flush_transcripts"
   },
   {

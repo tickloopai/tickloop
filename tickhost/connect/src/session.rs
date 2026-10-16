@@ -570,7 +570,10 @@ async fn log(core: &Core, line: &str) {
             tick_protocol::now_rfc3339(),
             core.instance
         );
-        let _ = file.write_all(entry.as_bytes()).await;
+        if file.write_all(entry.as_bytes()).await.is_ok() {
+            // Tokio buffers file writes; finish this append before reading the next frame.
+            let _ = file.flush().await;
+        }
     }
 }
 

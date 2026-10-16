@@ -21,6 +21,7 @@ mod auto_setup_surface;
 mod child_config_tests;
 mod clipboard;
 mod clipboard_hint;
+mod completed_tasks;
 mod completion;
 mod console;
 mod conversation;
@@ -1692,6 +1693,8 @@ async fn interact(
     let mut eof = false;
     let mut failed = false;
     let mut status_dirty = true;
+    let mut completed_task_retention = completed_tasks::CompletedTaskRetention::default();
+    let mut completed_task_cleanups = tokio::task::JoinSet::new();
     let mut activity_dirty = false;
     // Thinking text arrived since the activity row was last drawn; the next animation frame
     // shows it, so a fast stream redraws at the frame rate rather than once per delta.
@@ -1952,6 +1955,7 @@ async fn interact(
             cached_activity_status = None;
             console.set_activity_interruptible(false)?;
             if overview_active {
+                completed_task_retention.observe(None, std::time::Instant::now());
                 // The overview heading and dispatch line carry counts and directory; the status
                 // row keeps the latest action feedback until another action replaces it.
                 console.set_activity(None)?;
@@ -2036,17 +2040,30 @@ async fn interact(
                         .get(&status.model.provider_id)
                         .map(|failure| failure.summary()),
                 )?;
+                let visible_task_board = if !status.task_tools_enabled {
+                    None
+                } else if status.delegation.is_some() {
+                    status.task_board.clone()
+                } else {
+                    goal.and_then(|id| status.task_boards.get(&id).cloned())
+                };
+                if let Some(cleanup) = completed_task_retention.observe(
+                    if eof {
+                        None
+                    } else {
+                        visible_task_board.as_ref()
+                    },
+                    std::time::Instant::now(),
+                ) {
+                    let agent = agent.clone();
+                    completed_task_cleanups
+                        .spawn(async move { agent.clear_completed_tasks(chat, cleanup).await });
+                }
                 console.update_status_area(
                     status.policy.mode.to_string(),
                     safe_text(&status.model.model),
                     context_usage(&status),
-                    if !status.task_tools_enabled {
-                        None
-                    } else if status.delegation.is_some() {
-                        status.task_board.clone()
-                    } else {
-                        goal.and_then(|id| status.task_boards.get(&id).cloned())
-                    },
+                    visible_task_board,
                 )?;
                 let running_receipt = pending
                     .values()
@@ -2215,6 +2232,7 @@ async fn interact(
                     &safe_text(status.trim_start_matches(" · ")),
                 )?;
             } else {
+                completed_task_retention.observe(None, std::time::Instant::now());
                 let draft = agent.configuration(ConfigTarget::NewDraft).await;
                 let _frame_hold = console.hold_frames()?;
                 console.set_activity(None)?;
@@ -2331,6 +2349,19 @@ async fn interact(
         #[cfg(not(test))]
         let global_refresh_enabled = true;
         tokio::select! {
+            result = completed_task_cleanups.join_next(), if !completed_task_cleanups.is_empty() => {
+                match result {
+                    Some(Ok(Ok(()))) => {},
+                    Some(Ok(Err(error))) => {
+                        console.set_status(&format!("Completed task cleanup unavailable · {}", safe_line(&error.to_string())))?;
+                    },
+                    Some(Err(_)) => {
+                        console.set_status("Completed task cleanup result unavailable; task records will be refreshed")?;
+                    },
+                    None => {},
+                }
+                status_dirty = true;
+            },
             _ = artifact_refresh.tick(), if console.artifacts_picker_is_open()? => {},
             result = artifact_loads.join_next(), if !artifact_loads.is_empty() => {
                 if let Some(Ok((request, result))) = result { console.artifact_page_loaded(&request, result)?; }

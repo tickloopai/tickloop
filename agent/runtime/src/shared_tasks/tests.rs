@@ -441,3 +441,184 @@ async fn a_delegates_unrelated_later_run_does_not_own_the_old_task() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn task_command_wait_does_not_adopt_other_runs_or_unknown_results_and_honors_cancel() {
+    for case in [
+        "other-run",
+        "unknown",
+        "cancelled",
+        "parked-running",
+        "parked-notified",
+    ] {
+        let (core, receipts) = family(None).await;
+        let receipt = &receipts[0];
+        let task = create(&core, receipt, vec![]).await;
+        invoke(&core, receipt, "TaskUpdate", json!({"mutation_id":Uuid::new_v4(),"task_id":task.id,"expected_revision":1,"action":"claim"})).await.unwrap();
+        let mut op = operation(
+            receipt,
+            "Bash",
+            json!({"command":"wait","run_in_background":true}),
+        );
+        if case == "other-run" {
+            op.run_id = Uuid::new_v4();
+        }
+        let state = if case == "unknown" {
+            CommandState::Unknown
+        } else if case == "parked-notified" {
+            CommandState::Completed
+        } else {
+            CommandState::Background
+        };
+        let parked_cancellations = {
+            let mut chats = core.inner.chats.lock().await;
+            let chat = chats.get_mut(&receipt.chat_id).unwrap();
+            let cancellations = if case.starts_with("parked-") {
+                for parked in chat.parked.values_mut() {
+                    parked.receipt.run_id = Uuid::new_v4();
+                    parked.receipt.loop_id = Uuid::new_v4();
+                }
+                Vec::new()
+            } else {
+                let cancellations = chat
+                    .parked
+                    .values()
+                    .map(|parked| parked.cancel.clone())
+                    .collect::<Vec<_>>();
+                chat.parked.clear();
+                cancellations
+            };
+            if case == "parked-notified" {
+                chat.bookkeeping
+                    .deferred_notifications
+                    .push(tick_protocol::InstanceRef::shell(op.id));
+                chat.deferred_messages.push(Message {
+                    role: Role::User,
+                    content: vec![Content::Text {
+                        text: "Blocked completion notification".into(),
+                    }],
+                });
+            }
+            chat.snapshot
+                .commands
+                .push(tickloop_agent_protocol::CommandSnapshot {
+                    operation_id: op.id,
+                    loop_id: receipt.loop_id,
+                    command: "wait".into(),
+                    description: None,
+                    cwd: std::env::temp_dir(),
+                    pid: None,
+                    state,
+                    was_background: true,
+                    backgrounded_on_timeout: false,
+                    exit_code: None,
+                    signal: None,
+                    reason: None,
+                    output_ref: PathBuf::new(),
+                    output_bytes: 0,
+                    updated_at_ms: None,
+                });
+            chat.snapshot.operations.push(op);
+            cancellations
+        };
+        let cancel = CancellationToken::new();
+        if case == "cancelled" {
+            cancel.cancel();
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            core.wait_for_task_commands(receipt, &cancel),
+        )
+        .await
+        .unwrap();
+        if case == "cancelled" {
+            assert!(result.unwrap_err().contains("interrupted"));
+        } else {
+            assert!(!result.unwrap());
+        }
+        if case == "parked-notified" {
+            let chats = core.inner.chats.lock().await;
+            let chat = &chats[&receipt.chat_id];
+            assert_eq!(chat.bookkeeping.deferred_notifications.len(), 1);
+            assert_eq!(chat.deferred_messages.len(), 1);
+        }
+        core.settle_task_claims(receipt).await;
+        let snapshot = core.snapshot(receipt.chat_id).await.unwrap();
+        for cancel in parked_cancellations {
+            cancel.cancel();
+        }
+        core.shutdown().await;
+        assert_eq!(
+            snapshot.task_boards[&receipt.loop_id].tasks[0].status,
+            Status::NeedsAttention
+        );
+    }
+}
+
+#[tokio::test]
+async fn task_command_wait_consumes_an_already_queued_completion_once() {
+    let (core, receipts) = family(None).await;
+    let receipt = &receipts[0];
+    let task = create(&core, receipt, vec![]).await;
+    invoke(&core, receipt, "TaskUpdate", json!({"mutation_id":Uuid::new_v4(),"task_id":task.id,"expected_revision":1,"action":"claim"})).await.unwrap();
+    let mut op = operation(
+        receipt,
+        "Bash",
+        json!({"command":"done","run_in_background":true}),
+    );
+    op.state = OperationState::Completed;
+    let parked_cancellations = {
+        let mut chats = core.inner.chats.lock().await;
+        let chat = chats.get_mut(&receipt.chat_id).unwrap();
+        let cancellations = chat
+            .parked
+            .values()
+            .map(|parked| parked.cancel.clone())
+            .collect::<Vec<_>>();
+        chat.parked.clear();
+        chat.snapshot
+            .commands
+            .push(tickloop_agent_protocol::CommandSnapshot {
+                operation_id: op.id,
+                loop_id: receipt.loop_id,
+                command: "done".into(),
+                description: None,
+                cwd: std::env::temp_dir(),
+                pid: None,
+                state: CommandState::Completed,
+                was_background: true,
+                backgrounded_on_timeout: false,
+                exit_code: Some(0),
+                signal: None,
+                reason: None,
+                output_ref: PathBuf::new(),
+                output_bytes: 0,
+                updated_at_ms: None,
+            });
+        chat.bookkeeping
+            .deferred_notifications
+            .push(tick_protocol::InstanceRef::shell(op.id));
+        chat.deferred_messages.push(Message {
+            role: Role::User,
+            content: vec![Content::Text {
+                text: "Owned command completed".into(),
+            }],
+        });
+        chat.snapshot.operations.push(op);
+        cancellations
+    };
+    let cancel = CancellationToken::new();
+    assert!(core.wait_for_task_commands(receipt, &cancel).await.unwrap());
+    assert!(!core.wait_for_task_commands(receipt, &cancel).await.unwrap());
+    let snapshot = core.snapshot(receipt.chat_id).await.unwrap();
+    for cancel in parked_cancellations {
+        cancel.cancel();
+    }
+    core.shutdown().await;
+    assert_eq!(snapshot.messages.iter().flat_map(|message| &message.content).filter(|content| matches!(content, Content::Text { text } if text == "Owned command completed")).count(), 1);
+    assert_eq!(
+        snapshot.task_boards[&receipt.loop_id].tasks[0].status,
+        Status::InProgress
+    );
+    assert_eq!(snapshot.task_boards[&receipt.loop_id].tasks[0].revision, 2);
+}

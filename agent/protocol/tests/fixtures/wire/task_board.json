@@ -4,6 +4,7 @@
     "root_chat_id": "00000000-0000-0000-0000-0000000000c1",
     "root_loop_id": "00000000-0000-0000-0000-000000000010",
     "revision": 0,
+    "task_number_offset": 0,
     "tasks": [],
     "mutations": {}
   },
@@ -12,6 +13,7 @@
     "root_chat_id": "00000000-0000-0000-0000-0000000000c1",
     "root_loop_id": "00000000-0000-0000-0000-000000000010",
     "revision": 0,
+    "task_number_offset": 0,
     "tasks": [],
     "mutations": {}
   }

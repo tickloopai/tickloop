@@ -581,6 +581,11 @@ fn agent_commands_keep_their_recorded_wire() {
                 as_new: false,
                 launch: None,
             },
+            AgentCommand::ClearCompletedTasks {
+                execution: execution(),
+                root_loop_id: id(0x10),
+                expected_revision: 7,
+            },
             AgentCommand::FlushTranscripts,
             AgentCommand::ReplaceTickhost,
             AgentCommand::EditHistory {
@@ -1075,11 +1080,10 @@ fn task_board_mode_preserves_legacy_teams_and_new_solo_boards() {
     assert!(!board.is_team);
     let mut legacy = serde_json::to_value(&board).unwrap();
     legacy.as_object_mut().unwrap().remove("is_team");
-    assert!(
-        serde_json::from_value::<tickloop_agent_protocol::TaskBoard>(legacy)
-            .unwrap()
-            .is_team
-    );
+    legacy.as_object_mut().unwrap().remove("task_number_offset");
+    let restored = serde_json::from_value::<tickloop_agent_protocol::TaskBoard>(legacy).unwrap();
+    assert!(restored.is_team);
+    assert_eq!(restored.task_number_offset, 0);
     let solo = board.clone();
     board.is_team = true;
     assert_golden("task_board", &vec![solo, board]);

@@ -99,7 +99,7 @@ pub(super) fn definitions(access: TaskToolAccess) -> Vec<ToolDefinition> {
     let uuid = json!({"type":"string","format":"uuid"});
     let mut tools = vec![
         ToolDefinition { name: "TaskCreate".into(), description: "Create an optional task in the current Loop’s task board. Reuse mutation_id when retrying an uncertain response. Tasks do not extend user authorization. The root can assign work; any member may claim available work. No automatic pickup or polling is needed.".into(), input_schema: json!({"type":"object","properties":{"mutation_id":uuid,"title":{"type":"string","minLength":1},"description":{"type":"string","minLength":1},"dependencies":{"type":"array","items":uuid}},"required":["mutation_id","title","description"],"additionalProperties":false}) },
-        ToolDefinition { name: "TaskList".into(), description: "Read the current task board, including revisions, assignments and unresolved dependencies. Do not poll: assignment messages arrive automatically. A Run ending does not complete its Task. A member may have multiple Runs: compare claim.run_id and report.run_id; a hand-back from an earlier Run does not settle a later claim.".into(), input_schema: json!({"type":"object","properties":{},"additionalProperties":false}) },
+        ToolDefinition { name: "TaskList".into(), description: "Read the current task board, including revisions, assignments and unresolved dependencies. Display numbers are task_number_offset plus the task’s position in board.tasks plus one; TaskGet/TaskUpdate still require the task UUID, not its display number. Do not poll: assignment messages arrive automatically. A Run ending does not complete its Task. A member may have multiple Runs: compare claim.run_id and report.run_id; a hand-back from an earlier Run does not settle a later claim.".into(), input_schema: json!({"type":"object","properties":{},"additionalProperties":false}) },
         ToolDefinition { name: "TaskGet".into(), description: "Read one task with its current revision and dependencies.".into(), input_schema: json!({"type":"object","properties":{"task_id":uuid},"required":["task_id"],"additionalProperties":false}) },
         ToolDefinition { name: "TaskUpdate".into(), description: "Apply one typed action at expected_revision. claim atomically starts an unowned or self-assigned pending task; one active task per member. assign, edit and cancel are root-only. complete marks the task completed and requires its claiming Run. release relinquishes unfinished work back to pending, clearing owner and claim; it does not mark work completed. Only the claiming Run may release active work; main may release needs_attention after reconciling its effects. A hand-back from a different Run does not settle the current claim: compare claim.run_id and report.run_id. Completed and cancelled tasks must not be changed. Active work cannot be reassigned or cancelled: stop its execution first and reconcile its effects. A recovered/ended claim needs attention and never automatically reruns. On a revision conflict, use current_task to reconsider the action; do not blindly retry with a newer revision, and do not retry terminal tasks. Reuse mutation_id only with identical input. Completion stores a report reference; include the final report in the normal final response or Subagent report. Assignment notifies the target once; a delivery failure is reported without rolling back the assignment.".into(), input_schema: json!({"type":"object","properties":{"mutation_id":uuid,"task_id":uuid,"expected_revision":{"type":"integer","minimum":1},"action":{"type":"string","enum":["claim","assign","complete","release","cancel","edit"]},"owner":{"type":"string","minLength":1},"result":{"type":"string","minLength":1},"title":{"type":"string","minLength":1},"description":{"type":"string","minLength":1},"dependencies":{"type":"array","items":uuid}},"required":["mutation_id","task_id","expected_revision","action"],"additionalProperties":false}) },
     ];
@@ -167,6 +167,10 @@ pub(super) fn validate_restored_boards(snapshot: &ChatSnapshot) -> Result<(), St
             || board.root_loop_id != *loop_id
             || board.tasks.len() > MAX_TASKS
             || board.mutations.len() > MAX_TASK_MUTATIONS
+            || board
+                .task_number_offset
+                .checked_add(board.tasks.len() as u64)
+                .is_none()
         {
             return Err("persisted task board identity or limits are invalid".into());
         }
@@ -181,11 +185,13 @@ pub(super) fn validate_restored_boards(snapshot: &ChatSnapshot) -> Result<(), St
             text_valid(&task.description)?;
             validate_dependencies(board, task.id, &task.dependencies)?;
         }
-        if board
-            .mutations
-            .values()
-            .any(|mutation| !ids.contains(&mutation.task_id))
-        {
+        if board.mutations.values().any(|mutation| {
+            if mutation.task_cleared {
+                ids.contains(&mutation.task_id) || mutation.notification.is_some()
+            } else {
+                !ids.contains(&mutation.task_id)
+            }
+        }) {
             return Err("task mutation receipt references a missing task".into());
         }
     }
@@ -296,18 +302,22 @@ pub(super) fn assignment_message_id(
 ) -> Option<Uuid> {
     let id = Uuid::parse_str(call_id.strip_prefix("task-assignment-")?).ok()?;
     let (root, loop_id) = scope(chats, sender).ok()?;
-    let mutation = chats
-        .get(&root)?
-        .snapshot
-        .task_boards
-        .get(&loop_id)?
-        .mutations
-        .get(&id)?;
+    let board = chats.get(&root)?.snapshot.task_boards.get(&loop_id)?;
+    let mutation = board.mutations.get(&id)?;
     let notification = mutation.notification.as_ref()?;
+    let task = board
+        .tasks
+        .iter()
+        .find(|task| task.id == mutation.task_id)?;
     (mutation.actor == sender.chat_id
         && notification.target == target
-        && notification.message == body)
-        .then_some(id)
+        && notification.message == body
+        && task
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.chat_id == target)
+        && !matches!(task.status, Status::Completed | Status::Cancelled))
+    .then_some(id)
 }
 
 fn text_valid(text: &str) -> Result<(), String> {
@@ -629,6 +639,173 @@ fn ensure_execution_settled(
 }
 
 impl Agent {
+    pub async fn clear_completed_tasks(
+        &self,
+        chat_id: ChatId,
+        root_loop_id: LoopId,
+        expected_revision: u64,
+    ) -> Result<(), AgentError> {
+        self.refresh_task_tools_setting().await?;
+        let _settings_gate = self.inner.settings_writes.lock().await;
+        let mut chats = self.inner.chats.lock().await;
+        let source = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+        let root_id = if let Some(delegation) = &source.snapshot.delegation {
+            if delegation.root_loop_id() != root_loop_id {
+                return Err(AgentError::Invalid(
+                    "task board belongs to another root Loop".into(),
+                ));
+            }
+            let lineage = family_tree::lineage(&chats, chat_id).map_err(AgentError::Invalid)?;
+            lineage
+                .first()
+                .ok_or_else(|| AgentError::Invalid("task family is unavailable".into()))?
+                .chat_id
+        } else {
+            chat_id
+        };
+        let root = chats.get_mut(&root_id).ok_or(AgentError::NotFound)?;
+        if !root
+            .snapshot
+            .loops
+            .iter()
+            .any(|goal| goal.id == root_loop_id)
+        {
+            return Err(AgentError::Invalid(
+                "the task board's root Loop no longer exists".into(),
+            ));
+        }
+        if !root.snapshot.task_tools_enabled {
+            return Ok(());
+        }
+        if root.task_checkpoint_pending {
+            self.persist_task_boards(root)
+                .await
+                .map_err(AgentError::Invalid)?;
+        }
+        let Some(board) = root.snapshot.task_boards.get_mut(&root_loop_id) else {
+            return Ok(());
+        };
+        if board.revision != expected_revision
+            || board.tasks.is_empty()
+            || board
+                .tasks
+                .iter()
+                .any(|task| task.status != Status::Completed)
+        {
+            return Ok(());
+        }
+        let offset = board
+            .task_number_offset
+            .checked_add(board.tasks.len() as u64)
+            .ok_or_else(|| AgentError::Invalid("task numbering exhausted".into()))?;
+        let revision = board
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| AgentError::Invalid("task board revision exhausted".into()))?;
+        for mutation in board.mutations.values_mut() {
+            mutation.task_cleared = true;
+            mutation.notification = None;
+        }
+        board.tasks.clear();
+        board.task_number_offset = offset;
+        board.revision = revision;
+        self.persist_task_boards(root)
+            .await
+            .map_err(AgentError::Invalid)?;
+        self.publish_task_board(&mut chats, root_id, root_loop_id);
+        Ok(())
+    }
+
+    pub(super) async fn wait_for_task_commands(
+        &self,
+        receipt: &Receipt,
+        cancel: &CancellationToken,
+    ) -> Result<bool, String> {
+        let mut events = self.subscribe();
+        loop {
+            {
+                let mut chats = self.inner.chats.lock().await;
+                let (root_id, loop_id) = scope(&chats, receipt)?;
+                let chat = chats.get(&receipt.chat_id).ok_or("Agent is unavailable")?;
+                let has_claim = chats[&root_id]
+                    .snapshot
+                    .task_boards
+                    .get(&loop_id)
+                    .is_some_and(|board| {
+                        board.tasks.iter().any(|task| {
+                            task.status == Status::InProgress
+                                && task
+                                    .owner
+                                    .as_ref()
+                                    .is_some_and(|owner| owner.chat_id == receipt.chat_id)
+                                && task.claim.as_ref().is_some_and(|claim| {
+                                    claim.run_id == receipt.run_id
+                                        && claim.generation == chat.family_generation
+                                })
+                        })
+                    });
+                if !has_claim {
+                    return Ok(false);
+                }
+                if cancel.is_cancelled()
+                    || chat.family_stopping
+                    || chat.active_run != Some(receipt.run_id)
+                {
+                    return Err("waiting for task commands was interrupted".into());
+                }
+                if !chat.parked.is_empty() {
+                    return Ok(false);
+                }
+                let commands = chat
+                    .snapshot
+                    .commands
+                    .iter()
+                    .filter(|command| {
+                        command.was_background
+                            && chat.snapshot.operations.iter().any(|operation| {
+                                operation.id == command.operation_id
+                                    && operation.loop_id == receipt.loop_id
+                                    && operation.run_id == receipt.run_id
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                let notification = commands.iter().find_map(|command| {
+                    let instance = tick_protocol::InstanceRef::shell(command.operation_id);
+                    chat.bookkeeping
+                        .deferred_notifications
+                        .contains(&instance)
+                        .then_some(instance)
+                });
+                if let Some(notification) = notification {
+                    let chat = chats.get_mut(&receipt.chat_id).unwrap();
+                    self.flush_deferred_messages(chat, MessageBoundary::ToolResults)
+                        .map_err(|error| error.to_string())?;
+                    return Ok(!chat
+                        .bookkeeping
+                        .deferred_notifications
+                        .contains(&notification));
+                }
+                if !commands.iter().any(|command| {
+                    matches!(
+                        command.state,
+                        tickloop_agent_protocol::CommandState::Running
+                            | tickloop_agent_protocol::CommandState::Background
+                            | tickloop_agent_protocol::CommandState::Cancelling
+                    )
+                }) {
+                    return Ok(false);
+                }
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return Err("waiting for task commands was interrupted".into()),
+                event = events.recv() => match event {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                    Err(_) => return Err("task command event stream closed".into()),
+                }
+            }
+        }
+    }
+
     pub(super) async fn refresh_task_binding_setting(
         &self,
         receipt: &Receipt,
@@ -929,6 +1106,14 @@ impl Agent {
             if previous.actor != receipt.chat_id || previous.input != encoded {
                 return Err("mutation_id was already used for a different operation".into());
             }
+            if previous.task_cleared {
+                return Ok(ToolResult {
+                    content: json!({"status":"already_applied","task":null,"task_cleared":true})
+                        .to_string(),
+                    is_error: false,
+                    output_ref: None,
+                });
+            }
             let task = board
                 .tasks
                 .iter()
@@ -958,6 +1143,11 @@ impl Agent {
                 if candidate.tasks.len() >= MAX_TASKS {
                     return Err(format!("task board is limited to {MAX_TASKS} tasks"));
                 }
+                candidate
+                    .task_number_offset
+                    .checked_add(candidate.tasks.len() as u64)
+                    .and_then(|number| number.checked_add(1))
+                    .ok_or("task numbering exhausted")?;
                 text_valid(&create.title)?;
                 text_valid(&create.description)?;
                 let id = Uuid::new_v4();
@@ -1075,6 +1265,7 @@ impl Agent {
                 actor: receipt.chat_id,
                 input: encoded,
                 task_id,
+                task_cleared: false,
                 notification,
             },
         );
@@ -1195,17 +1386,16 @@ impl Agent {
                     return format!("notification outcome unknown: {error}");
                 }
                 let root = chats.get_mut(&root_id).unwrap();
-                root.snapshot
+                let Some(notification) = root
+                    .snapshot
                     .task_boards
                     .get_mut(&loop_id)
-                    .unwrap()
-                    .mutations
-                    .get_mut(&mutation_id)
-                    .unwrap()
-                    .notification
-                    .as_mut()
-                    .unwrap()
-                    .delivered = true;
+                    .and_then(|board| board.mutations.get_mut(&mutation_id))
+                    .and_then(|mutation| mutation.notification.as_mut())
+                else {
+                    return result;
+                };
+                notification.delivered = true;
                 if let Err(error) = self.persist_task_boards(root).await {
                     return error;
                 }
@@ -1298,3 +1488,6 @@ mod tests;
 
 #[cfg(test)]
 mod activation_tests;
+
+#[cfg(test)]
+mod cleanup_tests;

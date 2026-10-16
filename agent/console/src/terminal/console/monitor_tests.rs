@@ -629,7 +629,13 @@ fn passive_tasks_allow_monitor_focus_on_right_and_shift_arrows() {
             state
                 .rendered_screen
                 .iter()
-                .any(|row| row.contains("Tasks"))
+                .any(|row| row.contains("1 tasks ("))
+        );
+        assert!(
+            state
+                .rendered_screen
+                .iter()
+                .any(|row| row.contains("own passive task"))
         );
         state.key(key);
         assert!(state.monitor.focused);

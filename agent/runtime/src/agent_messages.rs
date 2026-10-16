@@ -545,6 +545,9 @@ impl Agent {
         }
         let task_message_id =
             shared_tasks::assignment_message_id(&chats, sender, target_id, message, call_id);
+        if call_id.starts_with("task-assignment-") && task_message_id.is_none() {
+            return Err("task assignment was cleared or superseded before dispatch".into());
+        }
         if let Some(message_id) = task_message_id {
             if !chats[&sender.chat_id].snapshot.task_tools_enabled {
                 return Err(

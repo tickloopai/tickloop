@@ -835,6 +835,18 @@ impl EmbeddedAgentAccess {
             AgentCommand::ManageTask { execution, action } => {
                 self.manage_task(execution, action).await
             }
+            AgentCommand::ClearCompletedTasks {
+                execution,
+                root_loop_id,
+                expected_revision,
+            } => {
+                let chat = self.chat(execution).await?;
+                self.inner
+                    .agent
+                    .clear_completed_tasks(chat, root_loop_id, expected_revision)
+                    .await?;
+                Ok(CommandResult::Done)
+            }
             AgentCommand::EnqueueAfterTurn {
                 execution,
                 target_loop,

@@ -2775,7 +2775,9 @@ impl Agent {
                     self.emit(chat, &receipt, EventKind::AssistantMessageCommitted { message_id: assistant_message_id, tool_calls: calls.clone() });
                 }
                 if calls.is_empty() {
-                    if self.wait_for_subagents(&receipt, &cancel).await? {
+                    if self.wait_for_subagents(&receipt, &cancel).await?
+                        || self.wait_for_task_commands(&receipt, &cancel).await?
+                    {
                         self.merge_queued_messages(&receipt).await.map_err(|error| error.to_string())?;
                         let chats = self.inner.chats.lock().await;
                         request = self.continuation_request(&chats[&receipt.chat_id])?;

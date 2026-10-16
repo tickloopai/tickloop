@@ -1126,3 +1126,40 @@ fn hiding_task_tools_releases_focus_and_preserves_draft_and_view_choice() {
     state.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
     assert_eq!(state.editor.draft(), format!("{draft}xkj"));
 }
+
+#[test]
+fn working_tasks_connect_once_and_become_an_independent_idle_list() {
+    let console = fixture();
+    update(&console, vec![task("Inspect"), task("Verify")]);
+    console
+        .state
+        .lock()
+        .unwrap()
+        .scrollback
+        .set_activity(Some(RoleLine::plain("✢ Working")));
+    let working = frame(&console);
+    let activity = working
+        .iter()
+        .position(|line| line.contains("✢ Working"))
+        .unwrap();
+    let header = working
+        .iter()
+        .position(|line| line.contains("2 tasks"))
+        .unwrap();
+    assert!(header > activity);
+    assert!(working[header].starts_with("  ⎿  2 tasks"));
+    assert_eq!(
+        working
+            .iter()
+            .map(|line| line.matches('⎿').count())
+            .sum::<usize>(),
+        1
+    );
+    console.state.lock().unwrap().scrollback.set_activity(None);
+    let idle = frame(&console);
+    assert!(idle.iter().any(|line| line.starts_with("  2 tasks")));
+    assert!(
+        idle.iter()
+            .all(|line| !line.contains('⎿') && !line.contains("✢ Working"))
+    );
+}

@@ -909,7 +909,7 @@ struct EscapeConfirmation {
 }
 
 struct SubmittedPrompt {
-    family_target: Option<super::file_mentions::FamilyMentionTarget>,
+    family_mentions: Vec<super::file_mentions::AcceptedFamilyMention>,
     draft: String,
     paste_blocks: PasteBlocks,
     mentions: Vec<AcceptedMention>,
@@ -928,7 +928,7 @@ struct ChatInput {
 }
 
 struct InputStash {
-    family_target: Option<super::file_mentions::FamilyMentionTarget>,
+    family_mentions: Vec<super::file_mentions::AcceptedFamilyMention>,
     paste_blocks: PasteBlocks,
     restored_contexts: Vec<InputContext>,
     accepted_mentions: Vec<AcceptedMention>,
@@ -6513,6 +6513,7 @@ impl State {
             self.height,
             viewport_rows,
             self.display,
+            self.scrollback.activity_line().is_some(),
         );
         self.scrollback.set_activity_details(task_lines);
         frame
@@ -8053,7 +8054,12 @@ impl State {
                             row.display_path.clone(),
                             match &row.target {
                                 MentionTarget::Agent(target) => {
-                                    format!("Agent · {}", target.description)
+                                    let kind = if self.file_mentions.completing_recipient() {
+                                        "Recipient"
+                                    } else {
+                                        "Reference"
+                                    };
+                                    format!("{kind} · {}", target.description)
                                 }
                                 MentionTarget::File { .. } => "File".into(),
                             },
@@ -8113,15 +8119,14 @@ impl State {
             return vec![(0..text.len(), Role::MutedText)];
         }
         let offset = usize::from(self.shell_input.kind() == InputKind::Shell);
-        let mut marks: Vec<_> = self
-            .paste_blocks
-            .projection(
-                self.editor.draft(),
-                self.editor.cursor(),
-                self.width.saturating_sub(2),
-            )
+        let projection = self.paste_blocks.projection(
+            self.editor.draft(),
+            self.editor.cursor(),
+            self.width.saturating_sub(2),
+        );
+        let mut marks: Vec<_> = projection
             .blocks
-            .into_iter()
+            .iter()
             .filter(|block| block.is_image)
             .map(|block| {
                 (
@@ -8130,9 +8135,24 @@ impl State {
                 )
             })
             .collect();
-        if let Some(target) = self.file_mentions.accepted_family() {
-            let start = self.editor.draft().len() - self.editor.draft().trim_start().len();
-            marks.push((start..start + target.handle.len() + 1, Role::Accent));
+        if self.shell_input.kind() != InputKind::Shell {
+            for mention in self.file_mentions.accepted_family_mentions() {
+                let range = &mention.replacement_range;
+                if projection.blocks.iter().any(|block| {
+                    range.start < block.raw_range.end && block.raw_range.start < range.end
+                }) {
+                    continue;
+                }
+                let start = projection
+                    .blocks
+                    .iter()
+                    .rev()
+                    .find(|block| block.raw_range.end <= range.start)
+                    .map_or(range.start, |block| {
+                        block.display_range.end + range.start - block.raw_range.end
+                    });
+                marks.push((start..start + range.len(), Role::Accent));
+            }
         }
         marks
     }
@@ -8297,7 +8317,7 @@ impl State {
         self.paste_blocks.restore(prompt.paste_blocks);
         self.file_mentions
             .restore_accepted(self.editor.draft(), prompt.mentions);
-        self.file_mentions.restore_family(prompt.family_target);
+        self.file_mentions.restore_family(prompt.family_mentions);
         self.file_mentions.dismiss();
         self.completion.dismiss();
         self.restore_saved_contexts(&contexts);
@@ -8567,7 +8587,7 @@ impl State {
         self.last_input_edit = Some(Instant::now());
         if !self.editor.draft().is_empty() {
             self.input_stash = Some(InputStash {
-                family_target: self.file_mentions.take_family(),
+                family_mentions: self.file_mentions.take_family(),
                 paste_blocks: self.paste_blocks.take(),
                 restored_contexts: std::mem::take(&mut self.restored_contexts),
                 accepted_mentions: self.file_mentions.take_accepted(),
@@ -8580,7 +8600,7 @@ impl State {
             self.restored_contexts = stash.restored_contexts;
             self.file_mentions
                 .restore_accepted(self.editor.draft(), stash.accepted_mentions);
-            self.file_mentions.restore_family(stash.family_target);
+            self.file_mentions.restore_family(stash.family_mentions);
             self.shell_input = stash.shell_input;
             self.refresh_completion();
         }
@@ -11374,7 +11394,7 @@ impl State {
                 self.submitted_pasted_texts = Some((line.clone(), pasted_texts));
                 self.submitted_retry_of = self.retry_of.take();
                 self.submitted_prompt = Some(SubmittedPrompt {
-                    family_target: self.file_mentions.take_family(),
+                    family_mentions: self.file_mentions.take_family(),
                     draft,
                     paste_blocks: self.paste_blocks.take(),
                     mentions: self.file_mentions.take_accepted(),
@@ -15808,6 +15828,105 @@ mod tests {
                 .unwrap()
                 .execution,
             target.execution
+        );
+    }
+
+    #[test]
+    fn multiple_agent_mentions_keep_colour_through_edits_stash_and_rejection() {
+        let mut state = State::new(true, 80, 24);
+        state.prompt_enabled = true;
+        let first = FamilyMentionTarget {
+            execution: ExecutionRef {
+                daemon_epoch: Uuid::new_v4(),
+                agent_id: Uuid::new_v4(),
+                generation: 1,
+            },
+            handle: "worker-a".into(),
+            description: "First worker".into(),
+            available: true,
+        };
+        let mut second = first.clone();
+        second.handle = "worker-b".into();
+        second.execution.agent_id = Uuid::new_v4();
+        state
+            .file_mentions
+            .set_family_targets(vec![first.clone(), second]);
+        state.insert("@worker-a");
+        state.key(key(KeyCode::Tab));
+        state.insert("@worker-b");
+        assert!(
+            state
+                .candidate_rows(6)
+                .iter()
+                .any(|line| line.text().contains("Reference"))
+        );
+        state.key(key(KeyCode::Tab));
+        assert_eq!(state.editor.draft(), "@worker-a @worker-b ");
+        assert_eq!(
+            state.input_image_marks(),
+            vec![(0..9, Role::Accent), (10..19, Role::Accent)]
+        );
+        state.insert("请协作");
+        assert!(matches!(
+            state.key(key(KeyCode::Enter)),
+            Some(InputEvent::Prompt { family_target: Some(target), text, .. })
+                if target == first.execution && text == "@worker-a @worker-b 请协作"
+        ));
+        assert!(state.restore_rejected_prompt(vec![]));
+        state.stash_input();
+        assert!(state.input_image_marks().is_empty());
+        state.stash_input();
+        assert_eq!(
+            state.input_image_marks(),
+            vec![(0..9, Role::Accent), (10..19, Role::Accent)]
+        );
+
+        let prefixed = format!("说明 {}", state.editor.draft());
+        state.replace_draft(prefixed.clone(), "说明 ".len());
+        assert_eq!(
+            state.input_image_marks(),
+            vec![(7..16, Role::Accent), (17..26, Role::Accent)]
+        );
+        assert!(
+            state
+                .file_mentions
+                .family_target_for_submission(&prefixed)
+                .unwrap()
+                .is_none()
+        );
+        state.replace_draft(prefixed.replace("@worker-b", "@worker-c"), 0);
+        assert_eq!(state.input_image_marks(), vec![(7..16, Role::Accent)]);
+        let remaining = state.editor.draft().replace("@worker-a ", "");
+        state.replace_draft(remaining, 0);
+        assert!(state.input_image_marks().is_empty());
+    }
+
+    #[test]
+    fn agent_mention_colours_follow_folded_paste_projection() {
+        let mut state = State::new(true, 80, 24);
+        state.prompt_enabled = true;
+        state
+            .file_mentions
+            .set_family_targets(vec![FamilyMentionTarget {
+                execution: ExecutionRef {
+                    daemon_epoch: Uuid::new_v4(),
+                    agent_id: Uuid::new_v4(),
+                    generation: 1,
+                },
+                handle: "worker".into(),
+                description: "Worker".into(),
+                available: true,
+            }]);
+        state.insert("检查 ");
+        state.paste("first\nsecond\nthird\nfourth");
+        state.insert(" @work");
+        state.key(key(KeyCode::Tab));
+        let (display, _) = state.input_display();
+        assert!(!display.contains("first"));
+        let start = display.find("@worker").unwrap();
+        assert_eq!(
+            state.input_image_marks(),
+            vec![(start..start + 7, Role::Accent)]
         );
     }
 

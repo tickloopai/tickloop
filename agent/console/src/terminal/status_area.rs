@@ -575,17 +575,42 @@ impl StatusArea {
         height: usize,
         viewport_rows: usize,
         display: DisplayProfile,
+        under_activity: bool,
     ) -> Vec<RoleLine> {
-        let (preview, selected_row) = self.task_frame(width, height, display, true);
-        let available = selected_row.is_some_and(|row| {
-            // The scrollback tail reserves a blank row below the task list.
-            viewport_rows > preview.len().saturating_sub(row)
-        });
+        let connector = under_activity.then(|| format!("  {}", display.glyph(Glyph::ToolResult)));
+        let connector_columns = connector.as_ref().map_or(0, |prefix| prefix.width());
+        let task_columns = width.saturating_sub(connector_columns);
+        let (preview, selected_row) = self.task_frame(task_columns, height, display, true);
+        let available = task_columns
+            > super::list_row::ROW_INDENT.width() + display.glyph(Glyph::TodoPending).width()
+            && selected_row.is_some_and(|row| {
+                // The scrollback tail reserves a blank row below the task list.
+                viewport_rows > preview.len().saturating_sub(row)
+            });
         self.task_focus_available = Some(available);
         if !available {
             self.release_task_focus();
         }
-        self.task_lines(width, height, display)
+        let mut lines = self.task_lines(task_columns, height, display);
+        if let Some(connector) = connector {
+            for (index, line) in lines.iter_mut().enumerate() {
+                let mut nested = RoleLine::role(
+                    if index == 0 {
+                        connector.clone()
+                    } else {
+                        " ".repeat(connector_columns)
+                    },
+                    Role::MutedText,
+                );
+                nested.spans.append(&mut line.spans);
+                line.spans = nested.spans;
+                if line.fill.is_some() {
+                    line.fill_start += connector_columns;
+                }
+                line.truncate(width);
+            }
+        }
+        lines
     }
 
     pub(super) fn task_lines(
@@ -657,7 +682,17 @@ impl StatusArea {
                         .tasks
                         .iter()
                         .position(|task| task.id == *id)
-                        .map_or_else(|| "unknown task".into(), |index| format!("#{}", index + 1))
+                        .map_or_else(
+                            || "unknown task".into(),
+                            |index| {
+                                format!(
+                                    "#{}",
+                                    board
+                                        .task_number(index)
+                                        .map_or_else(|| "?".into(), |number| number.to_string())
+                                )
+                            },
+                        )
                 })
                 .collect::<Vec<_>>();
             suffix.push(
@@ -758,7 +793,7 @@ impl StatusArea {
             0
         };
         let mut visible_tasks = board.tasks.iter().enumerate().collect::<Vec<_>>();
-        if !expanded && board.tasks.len() > capacity {
+        if !expanded {
             visible_tasks.sort_by_key(|(_, task)| match task.status {
                 SharedTaskStatus::NeedsAttention => 0,
                 SharedTaskStatus::InProgress => 1,
@@ -789,7 +824,9 @@ impl StatusArea {
                 for text in [
                     format!(
                         "Task #{} · {} · {}",
-                        index + 1,
+                        board
+                            .task_number(index)
+                            .map_or_else(|| "?".into(), |number| number.to_string()),
                         match task.status {
                             SharedTaskStatus::Pending => "pending",
                             SharedTaskStatus::InProgress => "in progress",
@@ -816,7 +853,14 @@ impl StatusArea {
                                         .map_or_else(
                                             || id.to_string(),
                                             |(index, dependency)| {
-                                                format!("#{} {}", index + 1, dependency.title)
+                                                format!(
+                                                    "#{} {}",
+                                                    board.task_number(index).map_or_else(
+                                                        || "?".into(),
+                                                        |number| number.to_string()
+                                                    ),
+                                                    dependency.title
+                                                )
                                             },
                                         )
                                 })
@@ -1540,6 +1584,50 @@ mod tests {
 mod shared_task_tests {
     use super::*;
     #[test]
+    fn working_task_block_has_one_connector_and_reserves_its_columns() {
+        let mut area = StatusArea::default();
+        area.update(
+            "Auto".into(),
+            "model".into(),
+            None,
+            Some(test_task_board(&["Inspect", "Verify"])),
+        );
+        let display = DisplayProfile::default();
+        let rows = area.task_lines_in_viewport(80, 24, 20, display, true);
+        assert!(rows[0].text().starts_with("  ⎿  2 tasks"));
+        assert_eq!(
+            rows.iter()
+                .map(|line| line.text().matches('⎿').count())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(rows[1].text(), "     ◼ Inspect");
+        assert_eq!(rows[2].text(), "     ◼ Verify");
+        assert!(area.task_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)));
+        let focused = area.task_lines_in_viewport(80, 24, 20, display, true);
+        let selected = focused
+            .iter()
+            .find(|line| line.fill == Some(Role::Selection))
+            .unwrap();
+        assert_eq!(selected.fill_start, 3);
+        for width in [0, 1, 3, 6, 8, 24] {
+            let rows = area.task_lines_in_viewport(width, 24, 20, display, true);
+            assert!(rows.iter().all(|row| row.text().width() <= width));
+            if width <= 6 {
+                assert!(!area.tasks_can_take_focus());
+            }
+        }
+        let idle = area.task_lines_in_viewport(80, 24, 20, display, false);
+        assert!(idle[0].text().starts_with("  2 tasks"));
+        assert!(idle.iter().all(|row| !row.text().contains('⎿')));
+        area.update("Auto".into(), "model".into(), None, None);
+        assert!(
+            area.task_lines_in_viewport(80, 24, 20, display, true)
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn task_list_uses_inline_owners_and_accurate_overflow_counts() {
         let mut area = StatusArea::default();
         let mut board = test_task_board(&[
@@ -1710,6 +1798,38 @@ mod shared_task_tests {
     }
 
     #[test]
+    fn task_numbers_continue_after_a_completed_list_is_cleared() {
+        let mut board = test_task_board(&["Prerequisite", "Dependent"]);
+        board.task_number_offset = 11;
+        for task in &mut board.tasks {
+            task.status = SharedTaskStatus::Pending;
+            task.owner = None;
+        }
+        board.tasks[1].dependencies = vec![board.tasks[0].id];
+        let mut area = StatusArea::default();
+        assert_eq!(
+            area.task_line(&board, 1, 100, DisplayProfile::default(), false)
+                .text(),
+            "  ◻ Dependent ▸ blocked by #12"
+        );
+        area.update("Auto".into(), "model".into(), None, Some(board));
+        area.task_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        area.task_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        area.task_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let lines = area.task_lines(160, 40, DisplayProfile::default());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text().contains("Task #13 · pending"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text().contains("Dependencies: #12 Prerequisite"))
+        );
+    }
+
+    #[test]
     fn task_list_omits_zero_running_count_and_keeps_a_long_title_on_one_line() {
         let mut area = StatusArea::default();
         let mut board =
@@ -1740,6 +1860,8 @@ mod shared_task_tests {
         area.update("Auto".into(), "model".into(), None, Some(board));
         let compact = area.task_lines(80, 24, DisplayProfile::default());
         assert_eq!(compact.len(), 3);
+        assert!(compact[1].text().contains("Verify"));
+        assert!(compact[2].text().contains("Inspect"));
         assert!(
             compact[0]
                 .text()
@@ -1927,13 +2049,13 @@ mod shared_task_tests {
             ])),
         );
         let toggle = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
-        area.task_lines_in_viewport(24, 24, 2, DisplayProfile::default());
+        area.task_lines_in_viewport(24, 24, 2, DisplayProfile::default(), false);
         assert!(!area.tasks_can_take_focus());
         assert!(!area.task_key(toggle));
-        area.task_lines_in_viewport(24, 24, 3, DisplayProfile::default());
+        area.task_lines_in_viewport(24, 24, 3, DisplayProfile::default(), false);
         assert!(area.tasks_can_take_focus());
         assert!(area.task_key(toggle));
-        area.task_lines_in_viewport(24, 24, 2, DisplayProfile::default());
+        area.task_lines_in_viewport(24, 24, 2, DisplayProfile::default(), false);
         assert!(!area.task_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)));
         assert!(area.task_view.presentation == TaskPresentation::Expanded);
     }

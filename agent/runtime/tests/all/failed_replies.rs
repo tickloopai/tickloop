@@ -393,15 +393,16 @@ async fn disabling_task_tools_returns_an_unavailable_result_for_a_stale_task_cal
                 if *tool_use_id == format!("stale-{name}") && content.text().contains("Task tools are disabled")
         )));
     }
-    let requests = model.requests.lock().unwrap();
-    assert!(
-        !requests[2]
-            .tools
-            .iter()
-            .any(|tool| tool.name.starts_with("Task") && tool.name != "TaskStop")
-    );
-    assert_eq!(requests.len(), 4);
-    drop(requests);
+    {
+        let requests = model.requests.lock().unwrap();
+        assert!(
+            !requests[2]
+                .tools
+                .iter()
+                .any(|tool| tool.name.starts_with("Task") && tool.name != "TaskStop")
+        );
+        assert_eq!(requests.len(), 4);
+    }
     agent.shutdown().await;
 }
 
@@ -520,19 +521,20 @@ async fn disabling_task_tools_during_a_model_request_does_not_execute_its_task_c
         Content::ToolResult { tool_use_id, content, is_error: true }
             if tool_use_id == "create-after-disable" && content.text().contains("Task tools are disabled")
     )));
-    let requests = model.requests.lock().unwrap();
-    assert!(
-        requests[0]
-            .tools
-            .iter()
-            .any(|tool| tool.name == "TaskCreate")
-    );
-    assert!(
-        !requests[1]
-            .tools
-            .iter()
-            .any(|tool| tool.name == "TaskCreate")
-    );
-    drop(requests);
+    {
+        let requests = model.requests.lock().unwrap();
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "TaskCreate")
+        );
+        assert!(
+            !requests[1]
+                .tools
+                .iter()
+                .any(|tool| tool.name == "TaskCreate")
+        );
+    }
     agent.shutdown().await;
 }
