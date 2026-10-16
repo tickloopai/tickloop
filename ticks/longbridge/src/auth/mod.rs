@@ -4,13 +4,15 @@
 
 pub mod device;
 mod oauth;
-mod server;
 
 pub use device::{DeviceLogin, LoginNotice};
 #[cfg(test)]
 pub(crate) use oauth::lapsing_oauth;
 pub use oauth::{Authorized, authorized_oauth, current_token};
 
+use std::time::Duration;
+
+use reqwest::redirect::Policy;
 use tick_packages::{LockedOAuth, OAuthToken, PackageCredentials, PackageError};
 use tick_provider::error::{Error, Result};
 
@@ -18,6 +20,7 @@ use crate::{PACKAGE, not_authorized};
 
 /// The SDK renews a token this close to its expiry before using it.
 const SDK_REFRESH_WINDOW_SECONDS: u64 = 300;
+const AUTHORIZATION_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Where this run finds the login: the token file Tickloop named when it started the program,
 /// else the package's own in the config root, so a program run on its own shares Tickloop's
@@ -64,13 +67,14 @@ async fn lock(credentials: &PackageCredentials) -> Result<LockedOAuth> {
     blocking(move || credentials.lock_oauth()).await
 }
 
-/// Runs `change` on the package's OAuth files under their lock.
-async fn locked<T: Send + 'static>(
-    credentials: &PackageCredentials,
-    change: impl FnOnce(&LockedOAuth) -> std::result::Result<T, PackageError> + Send + 'static,
-) -> Result<T> {
-    let files = lock(credentials).await?;
-    blocking(move || change(&files)).await
+/// The client the login and the renewals reach the authorization server with: no redirects,
+/// and a bound on each request.
+fn http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(AUTHORIZATION_REQUEST_TIMEOUT)
+        .redirect(Policy::none())
+        .build()
+        .map_err(|_| Error::network("cannot create HTTP client"))
 }
 
 /// Runs file work off the async threads.

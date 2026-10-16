@@ -3,7 +3,8 @@ members = [
     "agent/*",
     "tickhost/host", "tickhost/connect",
     "tick/protocol", "tick/sdk", "tick/provider",
-    "tick/market", "tick/command", "tick/reader", "tick/packages", "tick/test-support",
+    "tick/market", "tick/command", "tick/reader", "tick/packages", "tick/oauth",
+    "tick/test-support",
     "ticks/longbridge", "ticks/futu",
     "ui",
 ]

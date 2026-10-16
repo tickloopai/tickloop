@@ -88,9 +88,7 @@ mod against_a_stand_in {
 
     use serde_json::{Value, json};
     use tick_packages::OAuthToken;
-    use tickloop_agent_test_support::authorization_server::{
-        AuthorizationServer, TOKEN_PATH, TokenReply,
-    };
+    use tick_test_support::authorization_server::{AuthorizationServer, TOKEN_PATH, TokenReply};
 
     use super::{GLOBAL_ISSUER, home, hosted_longbridge};
     use crate::support::{

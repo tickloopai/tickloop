@@ -7,7 +7,7 @@ use tick_longbridge::{
     region::{GLOBAL_ISSUER, Issuers},
 };
 use tick_market::config::Settings;
-use tickloop_agent_test_support::authorization_server::{AuthorizationServer, TokenReply};
+use tick_test_support::authorization_server::{AuthorizationServer, TokenReply};
 
 use crate::support::login::{credentials, now, save, saved, token};
 

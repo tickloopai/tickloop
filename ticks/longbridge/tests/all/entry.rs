@@ -282,13 +282,45 @@ fn hidden_fundamentals_probe_is_noninteractive_and_exits_three_without_authoriza
 }
 
 #[test]
-fn auth_status_and_logout_work_without_a_login() {
-    let (code, stdout, stderr) = run(tick_longbridge().args(["auth", "status"]));
+fn auth_status_and_logout_work_without_a_login_and_create_nothing() {
+    let home = scratch_dir("logged-out-home");
+    let (code, stdout, stderr) = run(tick_longbridge()
+        .env("HOME", &home)
+        .args(["auth", "status"]));
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(stdout, format!("Not logged in; {AUTH_HINT}.\n"));
-    let (code, stdout, stderr) = run(tick_longbridge().args(["auth", "logout"]));
+    let (code, stdout, stderr) = run(tick_longbridge()
+        .env("HOME", &home)
+        .args(["auth", "logout"]));
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.contains("Logged out"), "{stdout}");
+    assert!(
+        !home.join(".tickloop").exists(),
+        "logging out without a login creates no directory or lock"
+    );
+}
+
+/// Logging out of a token file in a directory the user made, such as the home directory,
+/// deletes the token and leaves the directory's permissions as they were.
+#[test]
+fn logging_out_of_a_named_token_file_leaves_its_directory_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let shared = scratch_dir("logout-shared");
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+    let token_file = shared.join("oauth2.json");
+    fs::write(&token_file, token(4102444800, None)).unwrap();
+
+    let (code, stdout, stderr) = run(tick_longbridge()
+        .env("TICKLOOP_OAUTH_TOKEN_FILE", &token_file)
+        .args(["auth", "logout"]));
+
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("Logged out"), "{stdout}");
+    assert!(!token_file.exists());
+    assert_eq!(
+        fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
 }
 
 /// The status reads the saved login alone and renews nothing; a lapsed access token still

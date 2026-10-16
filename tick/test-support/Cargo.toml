@@ -1,6 +1,6 @@
 [package]
 name = "tickloop-tick-test-support"
-description = "Test-only mock quotes, account, news, options, community posts and earnings release, and the tick-mock executable that runs a Tick on them"
+description = "Test-only mock quotes, account, news, options, community posts and earnings release, the tick-mock executable that runs a Tick on them, and an OAuth authorization server for package logins"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -24,6 +24,7 @@ tickloop-tick-provider = { path = "../provider" }
 time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
 time-tz = "2"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+url = "2"
 
 [dev-dependencies]
 libc = "0.2"

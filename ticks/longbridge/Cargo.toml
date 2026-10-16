@@ -32,19 +32,18 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tickloop-tick-command = { path = "../../tick/command" }
 tickloop-tick-market = { path = "../../tick/market" }
+tickloop-tick-oauth = { path = "../../tick/oauth" }
 tickloop-tick-packages = { path = "../../tick/packages" }
 tickloop-tick-provider = { path = "../../tick/provider" }
 tickloop-ui = { path = "../../ui" }
-time ={ version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
+time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
 time-tz = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync"] }
-url = "2"
+tokio-util = "0.7"
 
 [dev-dependencies]
 tempfile = "3"
-tickloop-agent-packages = { path = "../../agent/packages" }
-tickloop-agent-test-support = { path = "../../agent/test-support" }
 tickloop-tick-sdk = { path = "../../tick/sdk" }
+tickloop-tick-test-support = { path = "../../tick/test-support" }
 tokio = { version = "1", features = ["test-util"] }
-tokio-util = "0.7"
 vt100 = "0.16.2"

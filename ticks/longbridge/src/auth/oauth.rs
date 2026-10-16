@@ -8,13 +8,11 @@ use longbridge::oauth::{
     OAuth, OAuthBuilder, OAuthError, OAuthResult, RefreshFuture, StoredToken, TokenRefresher,
     TokenStorage,
 };
+use tick_oauth::RefreshError;
 use tick_packages::{OAuthToken, PackageCredentials};
 use tick_provider::error::{Error, Result};
 
-use super::{
-    blocking, is_due, lock, saved_token,
-    server::{REFRESH_TOKEN_GRANT, Reply, Server},
-};
+use super::{blocking, http_client, is_due, lock, saved_token};
 use crate::{not_authorized, region::Region};
 
 /// The Longbridge login an SDK client uses, and the network it reaches the API through.
@@ -80,45 +78,20 @@ pub async fn current_token(credentials: &PackageCredentials) -> Result<OAuthToke
     Ok(renewed)
 }
 
-/// Asks `token`'s token endpoint for a new access token (RFC 6749 section 6). The refresh token
-/// and scope stay unless the server replaced them.
+/// Asks `token`'s token endpoint for a new access token with Tickloop's OAuth client. Only the
+/// server refusing the refresh token ends the login; any other failure may pass by the next
+/// renewal.
 async fn renew(token: &OAuthToken, refresh_token: &str) -> Result<OAuthToken> {
-    let server = Server::new(&token.issuer)?;
-    let endpoint = server.endpoint(&token.token_endpoint, "token_endpoint")?;
     // Longbridge routes a credential to its data center by this header.
     let data_center = longbridge::DcRegion::from_credential(refresh_token);
-    let request = server
-        .http()
-        .post(endpoint)
-        .header(longbridge::DC_REGION_HEADER, data_center.as_str())
-        .form(&[
-            ("grant_type", REFRESH_TOKEN_GRANT),
-            ("refresh_token", refresh_token),
-            ("client_id", &token.client_id),
-        ]);
-    match server.request_token(request).await {
-        Ok(Reply::Token(response)) => Ok(OAuthToken {
-            refresh_token: response
-                .refresh_token()
-                .or_else(|| token.refresh_token.clone()),
-            scope: response.scope.clone().or_else(|| token.scope.clone()),
-            expires_at: response.expires_at(),
-            access_token: response.access_token,
-            token_type: response.token_type,
-            ..token.clone()
-        }),
-        Ok(Reply::Refused(_)) => Err(not_authorized("authorization expired or revoked")),
-        Ok(Reply::Unexpected(status))
-            if status == reqwest::StatusCode::BAD_REQUEST
-                || status == reqwest::StatusCode::UNAUTHORIZED =>
-        {
-            Err(not_authorized("authorization expired or revoked"))
-        }
-        Ok(Reply::Unexpected(status)) => Err(Error::network(format!(
-            "token refresh failed: HTTP {status}"
-        ))),
-        Err(_) => Err(Error::network("token refresh request failed")),
-    }
+    tick_oauth::refresh(&http_client()?, token, refresh_token, |request| {
+        request.header(longbridge::DC_REGION_HEADER, data_center.as_str())
+    })
+    .await
+    .map_err(|error| match error {
+        RefreshError::Refused(_) => not_authorized("authorization expired or revoked"),
+        RefreshError::Failed(reason) => Error::network(format!("token refresh failed: {reason}")),
+    })
 }
 
 fn stored(token: &OAuthToken) -> StoredToken {

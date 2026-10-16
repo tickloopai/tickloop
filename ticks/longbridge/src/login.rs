@@ -75,10 +75,13 @@ pub fn inspect(
             }
         },
         AuthAction::Logout => {
-            credentials
-                .lock_oauth()
-                .and_then(|files| files.remove_token())
-                .map_err(|error| Error::usage(error.to_string()))?;
+            // Without a token there is nothing to lock, and nothing is created.
+            if credentials.oauth_token_path().exists() {
+                credentials
+                    .lock_oauth()
+                    .and_then(|files| files.remove_token())
+                    .map_err(|error| Error::usage(error.to_string()))?;
+            }
             writeln!(output, "Logged out")?;
         }
     }

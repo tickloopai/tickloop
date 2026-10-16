@@ -1,6 +1,9 @@
 //! Test-only mock data for the financial Ticks: simulated quotes, account, news, options,
-//! community posts and an earnings release, so tests run a Tick offline without an account. Only
-//! tests and the `tick-mock` executable depend on this crate; no shipped program links it.
+//! community posts and an earnings release, so tests run a Tick offline without an account, and
+//! an OAuth authorization server for Tick package logins. Only tests and the `tick-mock`
+//! executable depend on this crate; no shipped program links it.
+
+pub mod authorization_server;
 
 mod api;
 mod community;

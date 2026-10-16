@@ -4805,12 +4805,12 @@ name = "tickloop-agent-packages"
 version = "0.2.0"
 dependencies = [
  "reqwest 0.12.28",
- "serde",
  "serde_json",
  "tempfile",
  "tickloop-agent-base",
- "tickloop-agent-test-support",
+ "tickloop-tick-oauth",
  "tickloop-tick-packages",
+ "tickloop-tick-test-support",
  "tokio",
  "tokio-util",
 ]
@@ -4882,7 +4882,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "unicode-width",
- "url",
  "uuid",
 ]
 
@@ -4968,19 +4967,18 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "tickloop-agent-packages",
- "tickloop-agent-test-support",
  "tickloop-tick-command",
  "tickloop-tick-market",
+ "tickloop-tick-oauth",
  "tickloop-tick-packages",
  "tickloop-tick-provider",
  "tickloop-tick-sdk",
+ "tickloop-tick-test-support",
  "tickloop-ui",
  "time",
  "time-tz",
  "tokio",
  "tokio-util",
- "url",
  "vt100",
 ]
 
@@ -5012,6 +5010,21 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "toml",
+]
+
+[[package]]
+name = "tickloop-tick-oauth"
+version = "0.2.0"
+dependencies = [
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tickloop-tick-packages",
+ "tickloop-tick-test-support",
+ "tokio",
+ "tokio-util",
+ "url",
 ]
 
 [[package]]
@@ -5096,6 +5109,7 @@ dependencies = [
  "time",
  "time-tz",
  "tokio",
+ "url",
 ]
 
 [[package]]

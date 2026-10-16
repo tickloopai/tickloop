@@ -11,7 +11,7 @@ use tick_longbridge::{
 };
 use tick_packages::{LoginState, OAuthIssuer, PackageAuth};
 use tick_provider::exit_code;
-use tickloop_agent_test_support::authorization_server::{
+use tick_test_support::authorization_server::{
     AuthorizationServer, DEVICE_CODE_GRANT, REGISTRATION_PATH, TOKEN_PATH, TokenReply, USER_CODE,
 };
 use tokio::sync::mpsc;

@@ -13,7 +13,8 @@ use tick_packages::{
     Marketplace, MarketplacePackage, PackageError, PackageStore, Uninstalled,
 };
 
-pub use login::{LoggedOut, LoginError, OAuthLogin, log_out};
+pub use login::{LoggedOut, log_out, start_login};
+pub use tick_oauth::{DeviceLogin, LoginError};
 pub use marketplace::MarketplaceSource;
 
 /// Installs `package` as the marketplace at `source` offers it: an installed package of its

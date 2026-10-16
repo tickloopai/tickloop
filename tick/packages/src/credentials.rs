@@ -145,6 +145,10 @@ impl fmt::Debug for ApiKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageCredentials {
     directory: PathBuf,
+    /// Whether the directory is the one Tickloop picks under a config root, which it keeps
+    /// owner-only even when it was made before. A directory a program is pointed at is made
+    /// owner-only only when it is created here.
+    is_chosen_by_tickloop: bool,
 }
 
 impl PackageCredentials {
@@ -152,20 +156,14 @@ impl PackageCredentials {
         validate_package_name(name)?;
         Ok(Self {
             directory: config_root.join(CREDENTIALS_DIRECTORY).join(name),
+            is_chosen_by_tickloop: true,
         })
     }
 
-    /// The credentials a program of the `oauth2` package `name` uses: those around the token file
-    /// [`OAUTH_TOKEN_FILE_VARIABLE`] names when Tickloop started the program, else the package's
-    /// own in the [`default_config_root`], so a program run on its own shares Tickloop's login.
-    pub fn for_program(name: &str) -> Result<Self, PackageError> {
-        let Some(token_file) = std::env::var_os(OAUTH_TOKEN_FILE_VARIABLE) else {
-            let config_root = default_config_root().ok_or_else(|| {
-                PackageError::Invalid("cannot find the home directory".to_owned())
-            })?;
-            return Self::in_config_root(&config_root, name);
-        };
-        let token_file = PathBuf::from(token_file);
+    /// The credentials around the OAuth token file at `token_file`, an absolute path to a file
+    /// named [`OAUTH_TOKEN_FILE_NAME`], as a program is pointed at it: the lock and the other
+    /// files are beside it.
+    pub fn with_token_file(token_file: &Path) -> Result<Self, PackageError> {
         match token_file.parent() {
             Some(directory)
                 if token_file.is_absolute()
@@ -173,11 +171,27 @@ impl PackageCredentials {
             {
                 Ok(Self {
                     directory: directory.to_path_buf(),
+                    is_chosen_by_tickloop: false,
                 })
             }
             _ => Err(PackageError::Invalid(format!(
                 "{OAUTH_TOKEN_FILE_VARIABLE} must be the absolute path of an {OAUTH_TOKEN_FILE_NAME} file"
             ))),
+        }
+    }
+
+    /// The credentials a program of the `oauth2` package `name` uses: those around the token file
+    /// [`OAUTH_TOKEN_FILE_VARIABLE`] names when Tickloop started the program, else the package's
+    /// own in the [`default_config_root`], so a program run on its own shares Tickloop's login.
+    pub fn for_program(name: &str) -> Result<Self, PackageError> {
+        match std::env::var_os(OAUTH_TOKEN_FILE_VARIABLE) {
+            Some(token_file) => Self::with_token_file(Path::new(&token_file)),
+            None => {
+                let config_root = default_config_root().ok_or_else(|| {
+                    PackageError::Invalid("cannot find the home directory".to_owned())
+                })?;
+                Self::in_config_root(&config_root, name)
+            }
         }
     }
 
@@ -296,6 +310,10 @@ impl PackageCredentials {
 
     fn create_directory(&self) -> Result<(), PackageError> {
         let failed = || PackageError::io(format!("cannot create {}", self.directory.display()));
+        if !self.is_chosen_by_tickloop && self.directory.is_dir() {
+            // Someone else's directory, such as the home directory, keeps its permissions.
+            return Ok(());
+        }
         DirBuilder::new()
             .recursive(true)
             .mode(PRIVATE_DIRECTORY_MODE)
