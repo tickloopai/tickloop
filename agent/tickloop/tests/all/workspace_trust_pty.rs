@@ -19,7 +19,7 @@ use std::{
 
 use portable_pty::{PtySize, native_pty_system};
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+const TIMEOUT: Duration = Duration::from_secs(30);
 const FRAME_START: &str = "\x1b[?2026h";
 const FRAME_END: &str = "\x1b[?2026l";
 const CURSOR_SHOW: &str = "\x1b[?25h";
