@@ -1224,7 +1224,7 @@ async fn restart_lists_saved_chats_without_running_until_manual_resume_and_input
             (
                 "user",
                 concat!(
-                    "Host notice: host tools available in this conversation now: ArtifactLogin, CallTickTool, ModifyTick, ReadTick, ReadWorkspace. ",
+                    "Host notice: host tools available in this conversation now: ArtifactLogin, CallTickTool, ModifyTick, ReadTick. ",
                     "Earlier statements in this conversation about tool availability may be outdated. ",
                     "This notice comes from the host, not the user, and does not authorize any new work."
                 ),
@@ -2691,6 +2691,9 @@ async fn run_with_config(
     let runtime_directory = support::cli_runtime::command_directory(command.as_std());
     let mut child = command
         .env("TICKLOOP_CONFIG_DIR", directory.join("config-root"))
+        .env_remove("HERDR_ENV")
+        .env_remove("HERDR_PANE_ID")
+        .env_remove("HERDR_SOCKET_PATH")
         .arg("--transport-fixture")
         .arg(directory.join("model.json"))
         .arg("--cwd")

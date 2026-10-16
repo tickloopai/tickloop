@@ -174,20 +174,33 @@ async fn hosted_members(
     client: &LocalAgentClient,
     execution: ExecutionRef,
 ) -> Vec<tickloop_agent_protocol::HostedMember> {
-    let result = client
-        .execute(CommandEnvelope {
-            daemon_epoch: client.daemon_epoch(),
-            command_id: uuid::Uuid::new_v4(),
-            command: AgentCommand::ListHostedTicks { execution },
-        })
-        .await
-        .unwrap()
-        .into_result()
-        .unwrap();
-    let CommandResult::HostedTicks(members) = result else {
-        panic!("hosted Ticks expected: {result:?}");
-    };
-    members
+    let mut last_error = None;
+    tokio::time::timeout(UI_TIMEOUT, async {
+        loop {
+            let result = client
+                .execute(CommandEnvelope {
+                    daemon_epoch: client.daemon_epoch(),
+                    command_id: uuid::Uuid::new_v4(),
+                    command: AgentCommand::ListHostedTicks { execution },
+                })
+                .await
+                .unwrap()
+                .into_result();
+            match result {
+                Ok(CommandResult::HostedTicks(members)) => break members,
+                // The last Tick ending can close the host while a read-only listing is in flight.
+                Err(error)
+                    if error.code == tickloop_agent_protocol::AccessErrorCode::Unavailable =>
+                {
+                    last_error = Some(error);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                result => panic!("hosted Ticks expected: {result:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("hosted Ticks stayed unavailable: {last_error:?}"))
 }
 
 /// How many hosted Tick launch records the fixture's Chats keep.
@@ -322,11 +335,8 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
             .find(|row| Some(*row) != selected_line(&later))
             .expect("the other hosted row");
         select_line(&mut view, other).await;
-        assert!(
-            selected_row_is_gone(&view.frame()),
-            "the other row is gone too: {}",
-            view.frame()
-        );
+        view.wait_for("the other row is gone too", selected_row_is_gone)
+            .await;
         assert_eq!(
             launch_record_count(&fixture),
             2,
@@ -383,7 +393,16 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
             })
             .expect("the gone row that was not reopened");
         select_line(&mut view, not_reopened).await;
-        assert!(selected_row_is_gone(&view.frame()), "{}", view.frame());
+        view.wait_for("the selected unreopened Tick is gone", |frame| {
+            selected_row_is_gone(frame)
+                && selected_line(frame).is_some_and(|row| {
+                    frame
+                        .lines()
+                        .nth(row)
+                        .is_some_and(|line| !line.contains('↻'))
+                })
+        })
+        .await;
         view.send(b"x");
         view.wait_for("the gone row leaves at once", |frame| {
             frame.contains("Monitor 1") && frame.contains("enter open · x close")

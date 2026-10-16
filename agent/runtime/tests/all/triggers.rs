@@ -263,7 +263,7 @@ async fn an_interval_wakes_the_same_goal_and_shutdown_cancels_future_ticks() {
     assert_eq!(model.requests.lock().unwrap().len(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_event_only_goal_expires_without_waiting_for_another_event() {
     let directory = tempfile::tempdir().unwrap();
     let agent = Agent::new_embedded(
@@ -288,6 +288,7 @@ async fn an_event_only_goal_expires_without_waiting_for_another_event() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
+    let lifetime = std::time::Duration::from_secs(60);
     agent
         .configure_trigger(
             chat,
@@ -297,7 +298,7 @@ async fn an_event_only_goal_expires_without_waiting_for_another_event() {
                 prompt: "check".into(),
                 prompt_source: TriggerPromptSource::Explicit,
                 interval_seconds: None,
-                expires_at_ms: Some(now + 50),
+                expires_at_ms: Some(now + lifetime.as_millis() as u64),
                 accepts_events: true,
                 armed: true,
                 subscriptions: Vec::new(),
@@ -305,7 +306,19 @@ async fn an_event_only_goal_expires_without_waiting_for_another_event() {
         )
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(90)).await;
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().loops[0].state,
+        LoopState::WaitingTrigger
+    );
+    tokio::time::advance(lifetime).await;
+    loop {
+        let event = next_event(&mut events).await;
+        if let EventKind::GoalEnded { reason, .. } = event.kind {
+            assert_eq!(event.loop_id, receipt.loop_id);
+            assert_eq!(reason, "deadline reached");
+            break;
+        }
+    }
     assert_eq!(
         agent.snapshot(chat).await.unwrap().loops[0].state,
         LoopState::Expired

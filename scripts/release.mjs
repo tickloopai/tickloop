@@ -41,6 +41,7 @@ const channels = {
     tagPrefix: "site-v",
     workflow: ".github/workflows/site-deploy.yml",
     versionFromWorkspace: false,
+    pushBranch: true,
     checks: [
       { name: "dependency install", command: "npm", args: ["--prefix", "site", "ci"] },
       { name: "build", command: "npm", args: ["--prefix", "site", "run", "build"] },
@@ -74,6 +75,9 @@ function gitOutput(args, failureMessage) {
 
 function preflight(channel) {
   const commit = gitOutput(["rev-parse", "--verify", "HEAD^{commit}"], "HEAD must be a committed snapshot.");
+  const branch = channel.pushBranch
+    ? gitOutput(["symbolic-ref", "--quiet", "HEAD"], "Site release requires a branch; detached HEAD cannot be published with a branch.")
+    : undefined;
   const workflowType = gitOutput(["cat-file", "-t", `HEAD:${channel.workflow}`], `The committed snapshot must contain ${channel.workflow}.`);
   if (workflowType !== "blob") throw new Error(`The committed snapshot must contain ${channel.workflow} as a file.`);
 
@@ -83,7 +87,7 @@ function preflight(channel) {
       throw new Error(`origin must have exactly one fetch and one push URL for github.com/${expectedRepository}.`);
     }
   }
-  return commit;
+  return { commit, branch };
 }
 
 function nextVersion(channel) {
@@ -182,18 +186,19 @@ function main() {
     throw new Error("VERSION must be a release number such as 0.1.0 (three numeric parts, no leading zeroes).");
   }
 
-  const commit = preflight(channel);
+  const { commit, branch } = preflight(channel);
   const version = releaseVersion(channel, commit, requestedVersion);
   const tag = `${channel.tagPrefix}${version}`;
   const ref = assertUnusedTag(tag);
   if (mode) {
-    process.stdout.write(`Ready to release ${tag} from ${commit}. No Git changes were made.\n`);
+    process.stdout.write(`Ready to release ${tag} from ${commit}${branch ? ` and update origin/${branch.slice("refs/heads/".length)}` : ""}. No Git changes were made.\n`);
     return;
   }
 
   runChecks(channel, commit);
-  const checkedCommit = preflight(channel);
-  if (checkedCommit !== commit) throw new Error(`HEAD changed during ${channel.label} checks (${commit} to ${checkedCommit}); no release tag was created.`);
+  const checked = preflight(channel);
+  if (checked.commit !== commit) throw new Error(`HEAD changed during ${channel.label} checks (${commit} to ${checked.commit}); no release tag was created.`);
+  if (checked.branch !== branch) throw new Error(`Branch changed during ${channel.label} checks (${branch} to ${checked.branch}); no release tag was created.`);
   if (!channel.versionFromWorkspace && !requestedVersion && nextVersion(channel) !== version) {
     throw new Error(`${channel.label} release tags changed during checks; rerun the release to select the next version. No release tag was created.`);
   }
@@ -202,11 +207,15 @@ function main() {
   const created = git(["tag", "-a", tag, "-m", `${channel.label} release ${version}`, commit], { readOnly: false });
   if (created.status !== 0) throw new Error(`Could not create ${tag}: ${created.stderr.trim() || "git tag failed"}`);
 
-  const pushed = git(["push", "--porcelain", "origin", `${ref}:${ref}`], { readOnly: false });
+  const refspecs = branch ? [`${commit}:${branch}`, `${ref}:${ref}`] : [`${ref}:${ref}`];
+  const pushed = git(["push", "--porcelain", ...(branch ? ["--atomic"] : []), "origin", ...refspecs], { readOnly: false });
   if (pushed.status !== 0) {
-    throw new Error(`Push of ${tag} failed. The local tag remains at ${commit}. Check the remote tag with git ls-remote --tags origin ${ref}; if absent, push only ${ref} after resolving the error. Git reported: ${pushed.stderr.trim() || pushed.stdout.trim() || "git push failed"}`);
+    const recovery = branch
+      ? `Check both remote refs with git ls-remote origin ${branch} ${ref}; retry the same atomic branch-and-tag push after resolving the error.`
+      : `Check the remote tag with git ls-remote --tags origin ${ref}; if absent, push only ${ref} after resolving the error.`;
+    throw new Error(`Push of ${tag}${branch ? ` and ${branch}` : ""} failed. The local tag remains at ${commit}. ${recovery} Git reported: ${pushed.stderr.trim() || pushed.stdout.trim() || "git push failed"}`);
   }
-  process.stdout.write(`Published ${tag} from ${commit} to origin. ${channel.outcome}\n`);
+  process.stdout.write(`Published ${tag} from ${commit} to origin${branch ? ` with branch ${branch.slice("refs/heads/".length)}` : ""}. ${channel.outcome}\n`);
 }
 
 try {

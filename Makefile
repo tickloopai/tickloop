@@ -54,7 +54,7 @@ check:
 release:
 	@node scripts/release.mjs binary
 
-## 发布已提交的官网快照；默认递增 patch，可用 VERSION=0.1.0 指定版本
+## 将官网快照的当前分支与标签一起推送；默认递增 patch，可用 VERSION=0.1.0 指定版本
 release-site:
 	@node scripts/release.mjs site
 

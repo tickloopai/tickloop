@@ -87,6 +87,11 @@ fi
 if [ "$RELEASE_TEST_CHECK_DIRTY_WORKTREE" = 1 ]; then
   printf 'changed during build\\n' > "$RELEASE_TEST_REPO_PATH/snapshot.txt"
 fi
+if [ "$RELEASE_TEST_CHECK_SWITCH_BRANCH" = 1 ]; then
+  git -C "$RELEASE_TEST_REPO_PATH" show-ref --verify --quiet refs/heads/switched ||
+    git -C "$RELEASE_TEST_REPO_PATH" branch switched || exit 1
+  git -C "$RELEASE_TEST_REPO_PATH" checkout -q switched || exit 1
+fi
 if [ -n "$RELEASE_TEST_CHECK_ADD_TAG" ]; then
   git -C "$RELEASE_TEST_REPO_PATH" show-ref --verify --quiet "refs/tags/$RELEASE_TEST_CHECK_ADD_TAG" ||
     git -C "$RELEASE_TEST_REPO_PATH" tag "$RELEASE_TEST_CHECK_ADD_TAG" || exit 1
@@ -163,6 +168,9 @@ for (const channel of channels) {
     assert.equal(git(["rev-parse", `refs/tags/${channel.tag}^{}`], setup), commit);
     const localTag = git(["rev-parse", `refs/tags/${channel.tag}`], setup);
     assert.equal(git(["ls-remote", "--refs", "origin", `refs/tags/${channel.tag}`], setup).split("\t")[0], localTag);
+    const branch = git(["symbolic-ref", "HEAD"], setup);
+    const remoteBranch = git(["ls-remote", "--refs", "origin", branch], setup);
+    assert.equal(remoteBranch, channel.name === "site" ? `${commit}\t${branch}` : "");
   });
 
   test(`${channel.name}: reject existing local and remote tags without retrying`, t => {
@@ -205,6 +213,67 @@ for (const channel of channels) {
     git(["show-ref", "--verify", "--quiet", `refs/tags/${channel.tag}`], setup, 1);
   });
 }
+
+test("site: atomically publish the current branch and tag at the same checked commit", t => {
+  const setup = fixture(t);
+  git(["checkout", "-qb", "website/release"], setup);
+  const commit = git(["rev-parse", "HEAD"], setup);
+  const checked = release(setup, "site", ["--check"]);
+  assert.equal(checked.status, 0, checked.stderr);
+  assert.match(checked.stdout, /website\/release/);
+  assert.equal(git(["ls-remote", "--refs", "origin"], setup), "");
+  const result = release(setup, "site");
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(git(["ls-remote", "--refs", "origin", "refs/heads/website/release"], setup), `${commit}\trefs/heads/website/release`);
+  assert.equal(git(["ls-remote", "origin", "refs/tags/site-v0.1.0^{}"], setup), `${commit}\trefs/tags/site-v0.1.0^{}`);
+});
+
+test("site: reject a detached HEAD before checks or tag creation", t => {
+  const setup = fixture(t);
+  git(["checkout", "--detach", "-q"], setup);
+  const result = release(setup, "site");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Site release requires a branch/);
+  assert.deepEqual(ranChecks(setup), []);
+  assert.equal(git(["tag", "--list"], setup), "");
+});
+
+test("site: reject a branch switch during checks even when HEAD is unchanged", t => {
+  const setup = fixture(t);
+  const commit = git(["rev-parse", "HEAD"], setup);
+  const result = release(setup, "site", [], { ...setup.env, RELEASE_TEST_CHECK_SWITCH_BRANCH: "1" });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Branch changed during Site checks/);
+  assert.equal(git(["rev-parse", "HEAD"], setup), commit);
+  assert.equal(git(["tag", "--list"], setup), "");
+  assert.equal(git(["ls-remote", "--refs", "origin"], setup), "");
+});
+
+test("site: a rejected branch leaves neither remote branch nor release tag", t => {
+  const setup = fixture(t);
+  const hook = join(setup.remote, "hooks", "update");
+  writeFileSync(hook, '#!/bin/sh\ncase "$1" in refs/heads/*) exit 1 ;; esac\n');
+  chmodSync(hook, 0o700);
+  const result = release(setup, "site");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /atomic branch-and-tag push/);
+  assert.equal(git(["ls-remote", "--refs", "origin"], setup), "");
+  git(["show-ref", "--verify", "--quiet", "refs/tags/site-v0.1.0"], setup);
+});
+
+test("site: a remote branch ahead of HEAD is not overwritten or partially released", t => {
+  const setup = fixture(t);
+  const branch = git(["symbolic-ref", "HEAD"], setup);
+  git(["checkout", "-qb", "remote-work"], setup);
+  git(["commit", "--allow-empty", "-qm", "Remote work"], setup);
+  const remoteCommit = git(["rev-parse", "HEAD"], setup);
+  git(["push", "origin", `HEAD:${branch}`], setup);
+  git(["checkout", "-q", branch.slice("refs/heads/".length)], setup);
+  const result = release(setup, "site");
+  assert.equal(result.status, 1);
+  assert.equal(git(["ls-remote", "--refs", "origin", branch], setup), `${remoteCommit}\t${branch}`);
+  assert.equal(git(["ls-remote", "--refs", "origin", "refs/tags/site-v0.1.0"], setup), "");
+});
 
 test("start at 0.1.0 when VERSION is omitted or empty and no Docs tags exist", t => {
   const setup = fixture(t);
