@@ -1454,11 +1454,28 @@ async fn open_saved_chat(
     })
 }
 
-/// Startup banner following Claude Code's condensed logo: the mark, the product
-/// name in bold with its version dimmed, then model and working directory
-/// dimmed under the name. The service endpoint lives in Session status instead,
-/// and command tips belong to the footer, as neither appears in Claude Code's
-/// banner.
+/// The brand mark in block characters beside the startup banner: eight ticks round an empty
+/// centre, the 12 o'clock one in Tick Red. Nine columns by five rows is the smallest grid where
+/// the diagonal ticks still take two cells.
+const BANNER_MARK: [&[(&str, Role)]; 5] = [
+    &[
+        (" ▄  ", Role::Text),
+        ("█", Role::TickMark),
+        ("  ▄ ", Role::Text),
+    ],
+    &[("  ▀   ▀  ", Role::Text)],
+    &[("▀▀     ▀▀", Role::Text)],
+    &[(" ▄▀ ▄ ▀▄ ", Role::Text)],
+    &[("    ▀    ", Role::Text)],
+];
+/// The mark rows the banner's three lines of text sit beside, centring them on the mark.
+const BANNER_TEXT_FIRST_ROW: usize = 1;
+const BANNER_MARK_GAP: &str = "  ";
+
+/// Startup banner following Claude Code's condensed logo: the mark, then beside it the product
+/// name in bold with its version dimmed, the model and the working directory dimmed. The
+/// service endpoint lives in Session status instead, and command tips belong to the footer, as
+/// neither appears in Claude Code's banner.
 fn write_banner(
     console: &Console,
     config: &ModelConfig,
@@ -1493,29 +1510,33 @@ fn startup_banner_spans(
         }
         _ => directory,
     };
-    // The mark is the brand's 12 o'clock tick at rest; the lines under the name line up with it.
-    let mark = tickloop_ui::icons::TICK_SPINNER_FRAMES[0];
-    let indent = " ".repeat(unicode_width::UnicodeWidthStr::width(mark) + 1);
-    vec![
-        (mark.into(), Some(Role::TickMark)),
-        (" Tickloop".into(), Some(Role::Title)),
-        (
-            format!(" v{}\n", env!("CARGO_PKG_VERSION")),
-            Some(Role::MutedText),
-        ),
-        (
-            format!(
-                "{indent}{} · {:?}\n",
-                safe_text(&config.model),
-                config.protocol
-            ),
-            Some(Role::MutedText),
-        ),
-        (
-            format!("{indent}{}\n", safe_text(&directory)),
-            Some(Role::MutedText),
-        ),
-    ]
+    let text_lines: [Vec<(String, Role)>; 3] = [
+        vec![
+            ("Tickloop".into(), Role::Title),
+            (format!(" v{}", env!("CARGO_PKG_VERSION")), Role::MutedText),
+        ],
+        vec![(
+            format!("{} · {:?}", safe_text(&config.model), config.protocol),
+            Role::MutedText,
+        )],
+        vec![(safe_text(&directory), Role::MutedText)],
+    ];
+    let mut spans = Vec::new();
+    for (row, mark) in BANNER_MARK.iter().enumerate() {
+        spans.extend(
+            mark.iter()
+                .map(|(text, role)| ((*text).into(), Some(*role))),
+        );
+        if let Some(text) = row
+            .checked_sub(BANNER_TEXT_FIRST_ROW)
+            .and_then(|line| text_lines.get(line))
+        {
+            spans.push((BANNER_MARK_GAP.into(), None));
+            spans.extend(text.iter().cloned().map(|(text, role)| (text, Some(role))));
+        }
+        spans.push(("\n".into(), None));
+    }
+    spans
 }
 
 async fn open_current_plan(

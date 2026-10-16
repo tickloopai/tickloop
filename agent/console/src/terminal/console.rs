@@ -6114,7 +6114,13 @@ impl State {
     fn next_row_clock(&self, now_ms: u64) -> Option<u64> {
         let monitor = self
             .monitor_visible()
-            .then(|| self.monitor.next_frame_ms(now_ms, self.display))
+            .then(|| {
+                self.monitor.next_frame_ms(
+                    now_ms,
+                    self.monitor_columns().saturating_sub(2),
+                    self.display,
+                )
+            })
             .flatten();
         let panel = (!self.full_review && self.transcript.is_none())
             .then(|| self.status_area.next_frame_ms(now_ms))

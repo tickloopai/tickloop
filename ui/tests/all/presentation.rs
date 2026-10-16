@@ -53,8 +53,8 @@ fn wide_ambiguous_glyphs_reserve_their_second_buffer_cell() {
 }
 
 #[test]
-fn the_tick_ring_lights_its_eight_dots_one_at_a_time_and_its_progress_keeps_them_lit() {
-    use tickloop_ui::icons::{TICK_PROGRESS_FRAMES, TICK_SPINNER_FRAMES};
+fn the_tick_ring_steps_its_gap_round_all_eight_dots() {
+    use tickloop_ui::icons::TICK_SPINNER_FRAMES;
     let dots = |frame: &str| {
         let character = frame.chars().next().unwrap() as u32;
         assert!(
@@ -63,14 +63,14 @@ fn the_tick_ring_lights_its_eight_dots_one_at_a_time_and_its_progress_keeps_them
         );
         character - 0x2800
     };
-    let mut lit = 0;
-    for (spinner, progress) in TICK_SPINNER_FRAMES.iter().zip(TICK_PROGRESS_FRAMES) {
-        assert_eq!(dots(spinner).count_ones(), 1, "{spinner} lights one dot");
-        assert_eq!(lit & dots(spinner), 0, "{spinner} lights a new dot");
-        lit |= dots(spinner);
-        assert_eq!(dots(progress), lit, "{progress} keeps every dot lit so far");
+    let mut passed = 0;
+    for spinner in TICK_SPINNER_FRAMES {
+        let gap = !dots(spinner) & 0xff;
+        assert_eq!(gap.count_ones(), 1, "{spinner} leaves one dot dark");
+        assert_eq!(passed & gap, 0, "{spinner} moves its gap to a new dot");
+        passed |= gap;
     }
-    assert_eq!(lit, 0xff, "the ring covers all eight dots");
+    assert_eq!(passed, 0xff, "the gap goes round all eight dots");
 }
 
 #[test]
@@ -78,7 +78,7 @@ fn status_icons_are_single_column_unicode_symbols() {
     use tickloop_ui::icons::Icon;
     assert_eq!(Icon::Connection.glyph(), "●");
     assert_eq!(Icon::MarketOpen.glyph(), "▶");
-    assert_eq!(Icon::TickUpdate.glyph(), "⠁");
+    assert_eq!(Icon::TickUpdate.glyph(), "⣾");
     for icon in [
         Icon::Connection,
         Icon::TickUpdate,

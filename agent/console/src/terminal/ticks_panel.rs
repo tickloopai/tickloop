@@ -910,6 +910,7 @@ impl TicksPanel {
                 details,
                 fill: None,
                 subscription: None,
+                bar_columns: None,
             }
             .lines(width)
         };

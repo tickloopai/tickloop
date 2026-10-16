@@ -1247,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    fn a_countdown_fills_parts_as_its_period_passes_and_names_the_next_change() {
+    fn a_countdown_fills_columns_as_its_period_passes_and_names_the_next_change() {
         let check = NextCheck {
             at_ms: 160_000,
             period_ms: 60_000,
@@ -1261,14 +1261,18 @@ mod tests {
             (160_000, 40),
             (200_000, 40),
         ] {
-            assert_eq!(check.elapsed_parts(40, now), filled, "at {now}");
+            assert_eq!(check.elapsed_columns(40, now), filled, "at {now}");
         }
-        assert_eq!(check.next_part_at(40, 100_000), Some(101_500));
-        assert_eq!(check.next_part_at(40, 101_500), Some(103_000));
-        assert_eq!(check.next_part_at(40, 158_499), Some(158_500));
-        assert_eq!(check.next_part_at(40, 158_500), Some(160_000));
-        assert_eq!(check.next_part_at(40, 160_000), None, "a due check is full");
-        assert_eq!(check.next_part_at(0, 100_000), None);
+        assert_eq!(check.next_column_at(40, 100_000), Some(101_500));
+        assert_eq!(check.next_column_at(40, 101_500), Some(103_000));
+        assert_eq!(check.next_column_at(40, 158_499), Some(158_500));
+        assert_eq!(check.next_column_at(40, 158_500), Some(160_000));
+        assert_eq!(
+            check.next_column_at(40, 160_000),
+            None,
+            "a due check is full"
+        );
+        assert_eq!(check.next_column_at(0, 100_000), None);
     }
 
     #[test]

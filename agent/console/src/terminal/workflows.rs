@@ -1776,7 +1776,7 @@ mod tests {
         let history = public_history(&tick_delivery_history("quiet"), DisplayProfile::default());
 
         assert!(
-            history.contains("⢀ calendar:fixture-run-3 #8→12 · 5 updates\n"),
+            history.contains("⡿ calendar:fixture-run-3 #8→12 · 5 updates\n"),
             "{history}"
         );
         assert!(!history.contains("last_done"), "{history}");
@@ -1805,11 +1805,11 @@ mod tests {
         );
 
         assert!(
-            history.contains("⠁ calendar:fixture-run-3 #941→1000 · 60 updates · trimmed"),
+            history.contains("⣾ calendar:fixture-run-3 #941→1000 · 60 updates · trimmed"),
             "{history}"
         );
         assert!(
-            history.contains("⠂ calendar:fixture-run-4 #7\n"),
+            history.contains("⣽ calendar:fixture-run-4 #7\n"),
             "{history}"
         );
     }
@@ -1827,7 +1827,7 @@ mod tests {
             DisplayProfile::default(),
         );
 
-        assert!(history.contains("⠁ calendar:fixture-run-3\n"), "{history}");
+        assert!(history.contains("⣾ calendar:fixture-run-3\n"), "{history}");
     }
 
     #[test]
