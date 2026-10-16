@@ -42,7 +42,7 @@
       {
         "type": "tool_use",
         "id": "call-1",
-        "name": "ReadTick",
+        "name": "TickRead",
         "input": {
           "instance": "hosted:00000000-0000-0000-0000-000000000041"
         }

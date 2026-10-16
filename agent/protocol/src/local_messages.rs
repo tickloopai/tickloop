@@ -150,6 +150,12 @@ pub enum LocalMessage {
     TickDelivery {
         items: Vec<TickDeliveryLine>,
     },
+    ArtifactRequest {
+        artifact_id: String,
+        request_id: String,
+        title: Option<String>,
+        body: String,
+    },
 }
 
 /// A child's report as its caller receives it in an Agent message: the safety reviewer's note
@@ -197,6 +203,8 @@ impl SubagentReportMessage {
 /// whether its data was trimmed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TickDeliveryLine {
+    pub title: Option<String>,
+    pub kind: Option<crate::ObservationKind>,
     pub instance: tick_protocol::InstanceRef,
     pub seq: Option<String>,
     pub updates: u64,
@@ -244,6 +252,21 @@ impl LocalMessage {
                 command: command.to_owned(),
             });
         }
+        if let Some(rest) = text.strip_prefix("@tickloop request ")
+            && let Some((request_id, rest)) = rest.split_once(" on artifact ")
+            && let Some((artifact_id, _)) = rest.split_once(". Request input JSON:\n")
+            && !request_id.is_empty()
+            && !artifact_id.is_empty()
+            && !request_id.chars().any(char::is_whitespace)
+            && !artifact_id.chars().any(char::is_whitespace)
+        {
+            return Some(Self::ArtifactRequest {
+                artifact_id: artifact_id.into(),
+                request_id: request_id.into(),
+                title: None,
+                body: text.into(),
+            });
+        }
         if text.starts_with(&format!("<{TICK_DELIVERY_TAG}>")) {
             let payload = serde_json::from_str::<serde_json::Value>(&unescape_xml(
                 extract_tag(text, TICK_DELIVERY_TAG).unwrap_or_default(),
@@ -271,6 +294,8 @@ impl LocalMessage {
 
 fn tick_delivery_line(item: &serde_json::Value) -> Option<TickDeliveryLine> {
     Some(TickDeliveryLine {
+        title: item["title"].as_str().map(str::to_owned),
+        kind: serde_json::from_value(item["kind"].clone()).ok(),
         instance: serde_json::from_value(item["instance"].clone()).ok()?,
         seq: item["seq"].as_str().map(str::to_owned),
         updates: item["updates"].as_u64().unwrap_or_default(),

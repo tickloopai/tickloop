@@ -32,7 +32,7 @@ use super::{
     TickObservation, TickStreamHandle, TickStreamPort, WatchAdmission, WatchId, connection_state,
     current_observation, follow_instances, observe_protocol,
 };
-use crate::{host_tools::HostToolProvider, hosted::tools::HostedTickTools, tick_tools::READ_TICK};
+use crate::{host_tools::HostToolProvider, hosted::tools::HostedTickTools, tick_tools::TICK_READ};
 use tickloop_agent_protocol::{HostToolAuthority, ObservationKind};
 
 type Screens = Arc<Mutex<TerminalScreens>>;
@@ -883,7 +883,7 @@ impl TickStreamPort for HostedTickStream {
             .tools
             .prepare_call(
                 chat,
-                READ_TICK,
+                TICK_READ,
                 &json!({"tick_instance_id":instance}),
                 cancel,
             )

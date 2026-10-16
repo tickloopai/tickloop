@@ -87,25 +87,25 @@ impl TickActionUi<'_> {
             self.state.display,
         ))
     }
-    /// The subscription on `instance` whose frequency the row's `f` cycles: the one of the
-    /// Chat's most recent Loop that subscribes to it with a periodic frequency.
-    pub(super) fn frequency_target(&self, instance: &tick_protocol::InstanceRef) -> Option<Uuid> {
-        self.state.monitor.frequency_target(instance)
+    /// The fastest periodic subscription on `instance`, matching the row's displayed frequency.
+    pub(super) fn subscription_target(
+        &self,
+        instance: &tick_protocol::InstanceRef,
+    ) -> Option<Uuid> {
+        self.state.monitor.subscription_target(instance)
     }
     /// Moves `subscription` on to its next periodic frequency in Monitor at once, so the next
     /// press cycles on from it before the Agent reports the change, and says which it is now.
-    pub(super) fn cycle_frequency(
+    pub(super) fn cycle_subscription(
         &mut self,
         subscription: Uuid,
-    ) -> Option<tickloop_agent_protocol::TickSubscriptionFrequency> {
-        let frequency = self.state.monitor.request_next_frequency(subscription)?;
-        self.state.rendered_region = None;
-        self.notify(&format!(
-            "Subscription frequency: {}",
-            super::subscription_detail::frequency_label(frequency)
-        ));
-        Some(frequency)
+        all_on_instance: bool,
+    ) -> Option<tickloop_agent_protocol::TickSubscriptionChange> {
+        self.state
+            .monitor
+            .request_next_subscription(subscription, all_on_instance)
     }
+
     pub(super) fn monitor_entry(
         &self,
         instance: &tick_protocol::InstanceRef,

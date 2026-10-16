@@ -6,7 +6,7 @@ use tickloop_agent_protocol::{
 /// Stops a running Shell from its Monitor row after confirmation.
 pub(crate) const SHELL_STOP_KEY: char = 's';
 /// Subscribes the Chat to an extension or terminal Tick from its Monitor row.
-pub(crate) const SUBSCRIBE_KEY: char = 'f';
+pub(crate) const SUBSCRIBE_KEY: char = 's';
 /// The one key that takes a row out, doing what its state calls for.
 pub(crate) const REMOVE_KEY: char = 'x';
 
@@ -28,19 +28,35 @@ impl MonitorRows for HostedRows {
                 });
                 let run = if row.link == TickLinkState::InstanceGone {
                     HostedRun::Ended
+                } else if row.program_exit.is_some() {
+                    HostedRun::Exited
                 } else {
                     HostedRun::Running
                 };
+                let mut descriptor = super::subscription_descriptor(row);
+                if context.chat.as_ref().is_some_and(|chat| {
+                    chat.monitor
+                        .members
+                        .iter()
+                        .any(|member| member.instance == row.instance && member.is_terminal)
+                }) {
+                    descriptor.glyph = TickGlyph::Terminal;
+                    descriptor.kind = "Terminal".into();
+                }
                 TickDescriptor {
                     instance: row.instance.clone(),
                     group: TickGroup::Ticks,
-                    glyph: TickGlyph::Protocol,
+                    glyph: descriptor.glyph,
                     title: row
                         .title
                         .clone()
                         .unwrap_or_else(|| row.instance.to_string()),
-                    kind: "Tick".into(),
-                    status: link_status(row.link).into(),
+                    kind: descriptor.kind,
+                    status: row
+                        .program_exit
+                        .filter(|_| run == HostedRun::Exited)
+                        .map(terminal_exit_status)
+                        .unwrap_or_else(|| link_status(row.link).into()),
                     notes: Vec::new(),
                     subscription: None,
                     owner: if is_opened_here {
@@ -48,10 +64,14 @@ impl MonitorRows for HostedRows {
                     } else {
                         TickOwner::Unknown
                     },
-                    tone: link_tone(row.link),
+                    tone: if run == HostedRun::Exited {
+                        StatusTone::Neutral
+                    } else {
+                        link_tone(row.link)
+                    },
                     updated_at_ms: row.updated_at_ms,
                     update: subscription_update(row),
-                    running: row.link == TickLinkState::Live,
+                    running: run == HostedRun::Running && row.link == TickLinkState::Live,
                     resources: None,
                     actions: hosted_actions(&row.instance, is_opened_here, run),
                 }
@@ -61,6 +81,10 @@ impl MonitorRows for HostedRows {
     /// A hosted member reports its host's latest listing and process sample.
     fn member(&self, member: &MonitorMember, context: &MonitorContext) -> TickDescriptor {
         let mut row = super::member_descriptor(member);
+        if context.terminal_members.contains(&member.instance) {
+            row.glyph = TickGlyph::Terminal;
+            row.kind = "Terminal".into();
+        }
         row.resources = context.member_resources.get(&member.instance).cloned();
         add_probed_update(&mut row, context);
         let run = match context.member_states.get(&member.instance) {
@@ -990,6 +1014,8 @@ mod tests {
                 frequency: TickSubscriptionFrequency::High,
                 accumulated: 0,
                 has_pending_change: false,
+                pending_since_ms: None,
+                program_exit: None,
                 last_delivery_ms: None,
                 last_delivery: None,
                 kind: Some(ObservationKind::Protocol),
@@ -1035,6 +1061,8 @@ mod tests {
             frequency: TickSubscriptionFrequency::High,
             accumulated,
             has_pending_change: false,
+            pending_since_ms: None,
+            program_exit: None,
             last_delivery_ms: None,
             last_delivery: None,
             kind: Some(ObservationKind::Protocol),
@@ -1166,7 +1194,7 @@ mod tests {
                 is_waiting: true,
                 next_check: Some(NextCheck {
                     at_ms: 65_000,
-                    period_ms: 1_800_000,
+                    wait_ms: 1_800_000,
                 }),
             }),
             "the most frequent colours the mark and the nearest check hands the updates over"
@@ -1200,6 +1228,8 @@ mod tests {
             mark(vec![TickSubscriptionStatus {
                 accumulated: 0,
                 has_pending_change: true,
+                pending_since_ms: None,
+                program_exit: None,
                 ..checked(TickSubscriptionFrequency::High, 60_000)
             }]),
             Some(SubscriptionMark {
@@ -1207,7 +1237,7 @@ mod tests {
                 is_waiting: true,
                 next_check: Some(NextCheck {
                     at_ms: 60_000,
-                    period_ms: 60_000,
+                    wait_ms: 60_000,
                 }),
             }),
             "a Terminal Tick's changed screen waits for the check that reads it"
@@ -1250,7 +1280,7 @@ mod tests {
     fn a_countdown_fills_columns_as_its_period_passes_and_names_the_next_change() {
         let check = NextCheck {
             at_ms: 160_000,
-            period_ms: 60_000,
+            wait_ms: 60_000,
         };
         for (now, filled) in [
             (90_000, 0),

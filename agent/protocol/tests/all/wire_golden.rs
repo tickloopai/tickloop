@@ -225,7 +225,7 @@ fn messages() -> Vec<Message> {
                 },
                 Content::ToolUse {
                     id: "call-1".into(),
-                    name: "ReadTick".into(),
+                    name: "TickRead".into(),
                     input: json!({"instance": "hosted:00000000-0000-0000-0000-000000000041"}),
                 },
                 Content::ProtocolData {
@@ -312,10 +312,10 @@ fn chat_snapshot() -> ChatSnapshot {
                     "ReadWorkspace": [
                         {"kind": "native", "endpoint": {"kind": "herdr_socket", "path": "/run/herdr.sock", "owner": 501, "device": 16_777_220, "inode": 42}},
                     ],
-                    "ReadTick": [
+                    "TickRead": [
                         {"kind": "native", "endpoint": {"kind": "tickhost", "endpoint": "/run/tickhost.sock", "uid": 501}},
                     ],
-                    "CallTickTool": [{"kind": "mcp", "server_id": "calendar", "account_id": "me"}],
+                    "TickCall": [{"kind": "mcp", "server_id": "calendar", "account_id": "me"}],
                 },
                 "tick_instances": [terminal_instance(), hosted_instance()],
             },
@@ -361,11 +361,13 @@ fn chat_snapshot() -> ChatSnapshot {
     .unwrap();
     snapshot.monitor = MonitorMembership {
         members: vec![MonitorMember {
+            is_terminal: false,
             instance: terminal_instance(),
             title: Some("Counter".into()),
         }],
         removed: [hosted_instance()].into(),
         handled: [(terminal_instance(), 7_500)].into(),
+        observed: [(terminal_instance(), 7_900)].into(),
         taken_in: [(terminal_instance(), 7_500)].into(),
         used: [(terminal_instance(), 7_800)].into(),
     };
@@ -419,6 +421,7 @@ fn access_error() -> AccessError {
 fn hosted_members() -> Vec<HostedMember> {
     vec![
         HostedMember {
+            is_terminal: false,
             instance: hosted_instance(),
             title: Some("Quotes".into()),
             state: HostedMemberState::Running,
@@ -432,6 +435,7 @@ fn hosted_members() -> Vec<HostedMember> {
             exit: None,
         },
         HostedMember {
+            is_terminal: true,
             instance: InstanceRef::hosted(id(0x42)),
             title: Some("cat".into()),
             state: HostedMemberState::Exited,
@@ -443,6 +447,7 @@ fn hosted_members() -> Vec<HostedMember> {
             }),
         },
         HostedMember {
+            is_terminal: false,
             instance: InstanceRef::hosted(id(0x41)),
             title: None,
             state: HostedMemberState::Lost,
@@ -456,11 +461,13 @@ fn hosted_members() -> Vec<HostedMember> {
 fn monitor_membership() -> MonitorMembership {
     MonitorMembership {
         members: vec![MonitorMember {
+            is_terminal: false,
             instance: hosted_instance(),
             title: Some("Quotes".into()),
         }],
         removed: [terminal_instance()].into(),
         handled: [(hosted_instance(), 8_500)].into(),
+        observed: [(hosted_instance(), 8_900)].into(),
         taken_in: [(hosted_instance(), 8_500)].into(),
         used: [(hosted_instance(), 8_800)].into(),
     }
@@ -554,7 +561,11 @@ fn agent_commands_keep_their_recorded_wire() {
             },
             AgentCommand::ManageLoop {
                 execution: execution(),
-                action: LoopAction::SubscribeTick {
+                action: LoopAction::TickUpdate { instance: hosted_instance() },
+            },
+            AgentCommand::ManageLoop {
+                execution: execution(),
+                action: LoopAction::TickManage {
                     instance: hosted_instance(),
                 },
             },
@@ -732,6 +743,8 @@ fn observation_values_keep_their_recorded_wire() {
                 frequency: TickSubscriptionFrequency::High,
                 accumulated: 2,
                 has_pending_change: false,
+                pending_since_ms: None,
+                program_exit: None,
                 last_delivery_ms: Some(6_000),
                 last_delivery: Some("hosted:00000000-0000-0000-0000-000000000040 #4".into()),
                 kind: Some(ObservationKind::Protocol),
@@ -808,7 +821,7 @@ fn observation_changes_keep_their_recorded_wire() {
                     "chat_id": id(0xc1),
                     "loop_id": id(0x10),
                     "run_id": id(0x20),
-                    "kind": {"ToolStarted": {"call_id": "call-1", "name": "ReadTick", "input": {"instance": "hosted:00000000-0000-0000-0000-000000000041"}}},
+                    "kind": {"ToolStarted": {"call_id": "call-1", "name": "TickRead", "input": {"instance": "hosted:00000000-0000-0000-0000-000000000041"}}},
                 }))
                 .unwrap(),
             ),

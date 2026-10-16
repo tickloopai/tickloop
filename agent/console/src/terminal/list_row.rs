@@ -21,6 +21,11 @@ pub(super) const ROW_INDENT: &str = "  ";
 /// What follows a Monitor row's first column before its glyph: a blank column, so a `↻` some
 /// fallback font draws wider than its column never meets the glyph.
 const LEAD_GAP: &str = " ";
+const NAME_GAP: &str = " ";
+
+pub(super) fn name_column(glyph: &str) -> usize {
+    ROW_INDENT.width() + glyph.width() + NAME_GAP.width()
+}
 const STATUS_GAP_COLUMNS: usize = 2;
 const SEGMENT_SEPARATOR: &str = " · ";
 const MILLISECONDS_PER_SECOND: u64 = 1000;
@@ -63,7 +68,7 @@ impl ListRow<'_> {
         };
         line.push(LEAD_GAP, Some(role));
         line.push(self.glyph, Some(self.glyph_role));
-        line.push(" ", Some(role));
+        line.push(NAME_GAP, Some(role));
         line
     }
 
@@ -121,18 +126,20 @@ impl ListRow<'_> {
         line.push(details, Some(Role::MutedText));
     }
 
-    /// Fills the line: the selection with the update bar over it, else a flash over everything
-    /// else, else the update bar alone. The bar starts at the first column, where the `↻` keeps
-    /// its frequency's colour; a selection or a flash starts after a `↻`, which keeps its own
-    /// colours under both.
+    /// Selection takes priority over a flash, with the progress bar over the selection.
+    /// Progress and flashes start at the name; the subscription mark keeps its own background.
     fn finish(&self, mut line: RoleLine, width: usize) -> RoleLine {
         line.truncate(width);
-        let bar = self.bar_columns.map(|columns| 0..columns.max(1));
+        let name_start = name_column(self.glyph).min(width);
+        let bar = self
+            .bar_columns
+            .filter(|_| name_start < width)
+            .map(|columns| name_start..(name_start + columns.max(1)).min(width));
         let after_mark = usize::from(self.subscription.is_some());
         if self.selected {
             line = line.filled_from(Role::Selection, after_mark);
         } else if let Some(fill) = self.fill {
-            return line.filled_from(fill, after_mark);
+            return line.filled_from(fill, name_start);
         }
         match bar {
             Some(columns) => line.banded(columns, Role::UpdateProgress),
@@ -521,8 +528,8 @@ mod tests {
         );
         assert_eq!(
             held.band.map(|band| (band.columns, band.role)),
-            Some((0..10, Role::UpdateProgress)),
-            "the bar runs from the first column through the blank one"
+            Some((4..14, Role::UpdateProgress)),
+            "the bar starts after the icons"
         );
     }
 
@@ -601,13 +608,13 @@ mod tests {
     }
 
     #[test]
-    fn a_bar_runs_from_the_first_column_on_every_line_and_a_flash_covers_it() {
+    fn a_bar_and_flash_start_at_the_name_on_every_line() {
         let check = NextCheck {
             at_ms: 160_000,
-            period_ms: 60_000,
+            wait_ms: 60_000,
         };
         let waiting = ListRow {
-            bar_columns: Some(check.elapsed_columns(30, 130_000)),
+            bar_columns: Some(check.elapsed_columns(26, 130_000)),
             subscription: Some(("↻", Role::SubscriptionHigh)),
             ..row("Quote board for the whole watchlist", "")
         };
@@ -617,8 +624,8 @@ mod tests {
             assert_eq!(line.fill, None);
             assert_eq!(
                 line.band.clone().map(|band| (band.columns, band.role)),
-                Some((0..15, Role::UpdateProgress)),
-                "half the period fills half the row, from the first column on: {line:?}"
+                Some((4..17, Role::UpdateProgress)),
+                "half the wait fills half the name area: {line:?}"
             );
         }
         let just_started = ListRow {
@@ -631,8 +638,8 @@ mod tests {
                 .band
                 .clone()
                 .map(|band| band.columns),
-            Some(0..1),
-            "the bar always covers the `↻`"
+            Some(4..5),
+            "the bar starts with one name cell and excludes the icons"
         );
         let flashing = ListRow {
             fill: Some(Role::UseFlashStrong),
@@ -641,8 +648,8 @@ mod tests {
         for line in flashing.lines(30) {
             assert_eq!(
                 (line.fill, line.fill_start),
-                (Some(Role::UseFlashStrong), 1),
-                "the flash starts after the `↻`"
+                (Some(Role::UseFlashStrong), 4),
+                "the flash starts at the name"
             );
             assert_eq!(line.band, None, "the flash covers the bar");
         }
@@ -654,7 +661,7 @@ mod tests {
             assert_eq!(line.fill, Some(Role::Selection), "the selection wins");
             assert_eq!(
                 line.band.map(|band| (band.columns, band.role)),
-                Some((0..15, Role::UpdateProgress)),
+                Some((4..17, Role::UpdateProgress)),
                 "a selected row's bar keeps its colour over the selection"
             );
         }

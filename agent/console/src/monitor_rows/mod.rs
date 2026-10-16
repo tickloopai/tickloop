@@ -80,6 +80,7 @@ pub enum TickIntent {
     /// Subscribes the Chat to an extension or terminal Tick at the default frequency, or, once one
     /// of its Loops subscribes to it, cycles that subscription through high, medium and low.
     Subscribe(InstanceRef),
+    SendUpdate(InstanceRef),
     /// Stops a running Shell; the Console asks for confirmation first.
     StopShell {
         task: Uuid,
@@ -219,30 +220,33 @@ impl SubscriptionMark {
     }
 }
 
-/// When a periodic subscription next checks its instance, and its period.
+/// The next periodic check and the wait from its first pending change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NextCheck {
     pub at_ms: u64,
-    pub period_ms: u64,
+    pub wait_ms: u64,
 }
 
 impl NextCheck {
     fn of(row: &TickSubscriptionStatus) -> Option<Self> {
         let (at_ms, period_ms) = row.next_check_at_ms.zip(row.period_ms)?;
-        (period_ms > 0).then_some(Self { at_ms, period_ms })
+        let wait_ms = row
+            .pending_since_ms
+            .map_or(period_ms, |since| at_ms.saturating_sub(since).max(1));
+        (wait_ms > 0).then_some(Self { at_ms, wait_ms })
     }
 
-    fn period_started_at(self) -> u64 {
-        self.at_ms.saturating_sub(self.period_ms)
+    fn wait_started_at(self) -> u64 {
+        self.at_ms.saturating_sub(self.wait_ms)
     }
 
-    /// How many of `columns` the part of the period elapsed at `now_ms` fills; all of them once
+    /// How many of `columns` the wait since the first pending change fills; all of them once
     /// the check is due.
     pub fn elapsed_columns(self, columns: usize, now_ms: u64) -> usize {
         let elapsed = now_ms
-            .saturating_sub(self.period_started_at())
-            .min(self.period_ms);
-        (u128::from(elapsed) * columns as u128 / u128::from(self.period_ms)) as usize
+            .saturating_sub(self.wait_started_at())
+            .min(self.wait_ms);
+        (u128::from(elapsed) * columns as u128 / u128::from(self.wait_ms)) as usize
     }
 
     /// When the elapsed part next fills one more of `columns`; `None` once it fills them all.
@@ -250,8 +254,8 @@ impl NextCheck {
         let filled = self.elapsed_columns(columns, now_ms);
         (filled < columns).then(|| {
             let elapsed =
-                (u128::from(self.period_ms) * (filled as u128 + 1)).div_ceil(columns as u128);
-            self.period_started_at() + elapsed as u64
+                (u128::from(self.wait_ms) * (filled as u128 + 1)).div_ceil(columns as u128);
+            self.wait_started_at() + elapsed as u64
         })
     }
 }
@@ -285,6 +289,7 @@ pub struct TickDescriptor {
 }
 #[derive(Default)]
 pub struct MonitorContext {
+    pub terminal_members: std::collections::HashSet<InstanceRef>,
     /// Shared with the View that read it; listing rows never copies the conversation.
     pub chat: Option<Arc<ChatStatus>>,
     pub shells: Option<ShellTaskSnapshot>,
@@ -301,6 +306,14 @@ pub struct MonitorContext {
     /// The row whose detail is open; it stays listed while the detail is open.
     pub retained: Option<InstanceRef>,
     pub now_ms: u64,
+}
+
+pub(crate) fn terminal_exit_status(exit: tickloop_agent_protocol::HostedProgramExit) -> String {
+    match (exit.code, exit.signal) {
+        (Some(code), _) => format!("exited {code}"),
+        (_, Some(signal)) => format!("exited by signal {signal}"),
+        _ => "exited".into(),
+    }
 }
 
 /// A host probe's finding for one member. Probing reads host state only: it never reads Tick
@@ -321,10 +334,10 @@ pub enum MemberState {
 /// The row action Enter and a click run.
 pub const MONITOR_ENTER_KEY: char = 'o';
 pub const MONITOR_REFRESH_KEY: char = 'r';
-/// Cancels a subscribed row's subscription after confirmation.
+/// Cancels the selected subscription directly in its detail.
 pub const UNSUBSCRIBE_KEY: char = 'u';
 /// What the subscribe key does on a row with a periodic subscription.
-const FREQUENCY_LABEL: &str = "frequency";
+const SUBSCRIPTION_ACTION_LABEL: &str = "subscriptions";
 /// Shows a subscribed row's Tick Subscriptions; Enter stays with opening the Tick.
 pub const SUBSCRIPTIONS_KEY: char = 'w';
 /// Keys the Monitor list itself owns. Row actions never use them, so the list's hints always
@@ -425,10 +438,6 @@ fn subscription_descriptor(row: &TickSubscriptionStatus) -> TickDescriptor {
 fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus]) {
     entry.subscription = SubscriptionMark::of(rows);
     let instance = entry.instance.clone();
-    let manage = |operation| TickIntent::ManageSubscriptions {
-        instance: instance.clone(),
-        operation,
-    };
     if !entry
         .actions
         .iter()
@@ -453,33 +462,13 @@ fn mark_subscribed(entry: &mut TickDescriptor, rows: &[&TickSubscriptionStatus])
             .iter_mut()
             .find(|action| matches!(action.intent, TickIntent::Subscribe(_)))
         {
-            Some(subscribe) => subscribe.label = FREQUENCY_LABEL,
+            Some(subscribe) => subscribe.label = SUBSCRIPTION_ACTION_LABEL,
             None if is_key_free => entry.actions.push(MonitorAction {
                 key: SUBSCRIBE_KEY,
-                label: FREQUENCY_LABEL,
+                label: SUBSCRIPTION_ACTION_LABEL,
                 intent: TickIntent::Subscribe(instance.clone()),
             }),
             None => {}
-        }
-    }
-    for (key, label, operation) in [
-        (
-            SUBSCRIPTIONS_KEY,
-            "subscriptions",
-            SubscriptionOperation::View,
-        ),
-        (
-            UNSUBSCRIBE_KEY,
-            "unsubscribe",
-            SubscriptionOperation::Cancel,
-        ),
-    ] {
-        if !entry.actions.iter().any(|action| action.key == key) {
-            entry.actions.push(MonitorAction {
-                key,
-                label,
-                intent: manage(operation),
-            });
         }
     }
 }
@@ -498,7 +487,7 @@ fn offer_subscribing(entry: &mut TickDescriptor) {
     {
         entry.actions.push(MonitorAction {
             key: SUBSCRIBE_KEY,
-            label: "subscribe",
+            label: "subscriptions",
             intent: TickIntent::Subscribe(entry.instance.clone()),
         });
     }
@@ -512,6 +501,13 @@ fn resolve_unread(
     membership: Option<&MonitorMembership>,
     accumulated: u64,
 ) {
+    if let Some(observed) =
+        membership.and_then(|membership| membership.observed_at(&entry.instance))
+        && entry.updated_at_ms.is_none_or(|updated| updated < observed)
+    {
+        entry.updated_at_ms = Some(observed);
+        entry.update = Some(RowUpdate::new(observed));
+    }
     let handled_at = membership.and_then(|membership| membership.handled_at(&entry.instance));
     let taken_in_at = membership.and_then(|membership| membership.taken_in_at(&entry.instance));
     let Some(update) = &mut entry.update else {
@@ -536,8 +532,17 @@ pub fn member_descriptor(member: &MonitorMember) -> TickDescriptor {
             .unwrap_or_else(|| member.instance.to_string()),
         instance: member.instance.clone(),
         group: TickGroup::Ticks,
-        glyph: TickGlyph::Protocol,
-        kind: "Tick".into(),
+        glyph: if member.is_terminal {
+            TickGlyph::Terminal
+        } else {
+            TickGlyph::Protocol
+        },
+        kind: if member.is_terminal {
+            "Terminal"
+        } else {
+            "Tick"
+        }
+        .into(),
         status: String::new(),
         notes: Vec::new(),
         subscription: None,
@@ -659,6 +664,17 @@ impl MonitorRowsRegistry {
                 .map_or(&[][..], Vec::as_slice);
             if !rows.is_empty() {
                 mark_subscribed(entry, rows);
+            }
+            if rows.is_empty()
+                && entry.instance.access() == "hosted"
+                && entry.running
+                && entry.owner == TickOwner::ThisChat
+            {
+                entry.actions.push(MonitorAction {
+                    key: 'u',
+                    label: "send update",
+                    intent: TickIntent::SendUpdate(entry.instance.clone()),
+                });
             }
             let accumulated = subscribed
                 .get(&entry.instance)

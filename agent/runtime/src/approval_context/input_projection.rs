@@ -122,9 +122,9 @@ fn has_dedicated_projection(tool: &str) -> bool {
             | "Skill"
             | "TodoWrite"
             | "ReadWorkspace"
-            | "ReadTick"
-            | "CallTickTool"
-            | "ModifyTick"
+            | "TickRead"
+            | "TickCall"
+            | "TickManage"
             | "StartGoal"
             | "ListSubagents"
             | "Subagent"
@@ -358,21 +358,21 @@ mod tests {
     fn tickloop_tools_keep_targets_execution_and_delegation_content() {
         let cases = [
             ("ReadWorkspace", json!({"workspace_id":"w"})),
-            ("ReadTick", json!({"tick_instance_id":"hosted:1"})),
+            ("TickRead", json!({"tick_instance_id":"hosted:1"})),
             (
-                "CallTickTool",
+                "TickCall",
                 json!({"tick_instance_id":"hosted:1","tool":"trade","args":{"size":100}}),
             ),
             (
-                "ModifyTick",
+                "TickManage",
                 json!({"action":"open","command":["python","a.py"],"cwd":"/project"}),
             ),
             (
-                "ModifyTick",
+                "TickManage",
                 json!({"action":"close","tick_instance_id":"hosted:1"}),
             ),
             (
-                "ModifyTick",
+                "TickManage",
                 json!({"action":"send_input","tick_instance_id":"herdr:1","text":"all code","keys":["Enter"]}),
             ),
             ("StartGoal", json!({"goal":"keep watching"})),

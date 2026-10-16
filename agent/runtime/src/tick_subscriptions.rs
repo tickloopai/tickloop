@@ -37,11 +37,10 @@ use tickloop_agent_protocol::{
 
 const SUBSCRIPTION_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const ALREADY_SUBSCRIBED: &str =
-    "a Loop of this Chat already subscribes to this Tick; f cycles its frequency";
+    "a Loop of this Chat already subscribes to this Tick; s cycles its subscription";
 const NO_SUBSCRIBING_LOOP: &str = "no Loop of this Chat can take its Tick Updates";
 
-const SUBSCRIBE_TICK_TOOL: &str = "SubscribeTick";
-const UNSUBSCRIBE_TICK_TOOL: &str = "UnsubscribeTick";
+use crate::tick_tools::TICK_MANAGE;
 const DEFAULT_FREQUENCY: TickSubscriptionFrequency = TickSubscriptionFrequency::High;
 /// How soon a delivery its Loop could not take is looked at again, whatever the frequency of the
 /// subscriptions it carries.
@@ -56,10 +55,25 @@ const ITEM_FIT_ATTEMPTS: usize = 4;
 /// The longest text a Tick reports for an item's header fields, its observation times and
 /// recovery guidance, that a delivery carries; a longer one is replaced by its size.
 const MAX_HEADER_TEXT_BYTES: usize = 128;
-const TRIMMED_HINT: &str = "Where an item lists `trimmed`, whole segments of its data were left out in place, each cut saying how many elements or lines it replaced; for the full content use that instance's `recover_with` (an extension Tick's query tool through CallTickTool, a Shell's output file through Read) or ReadTick.";
-const TRIMMED_SCREEN_HINT: &str = "A Terminal Tick's trimmed screen text keeps its first and last lines; ReadTick returns its current screen, and output that scrolled past between periods cannot be recovered.";
+const TRIMMED_HINT: &str = "Where an item lists `trimmed`, whole segments of its data were left out in place, each cut saying how many elements or lines it replaced; for the full content use that instance's `recover_with` (an extension Tick's query tool through TickCall, a Shell's output file through Read) or TickRead.";
+const TRIMMED_SCREEN_HINT: &str = "A Terminal Tick's trimmed screen text keeps its first and last lines; TickRead returns its current screen, and output that scrolled past between periods cannot be recovered.";
 const UNREADABLE_HINT: &str = "Where `data` or a Terminal Tick's `text` is null, the update could not be read again; read that instance with the native tools for its type.";
 const ARTIFACT_SUBSCRIPTION_REFUSAL: &str = "an artifact takes no Tick Subscription: its association with a goal is its subscription and brings each @tickloop feedback request to that goal. An artifact a goal creates is associated with it; the user associates others by selecting them in /artifacts or with f on their Monitor row.";
+
+pub(super) fn can_take_manual_update(goal: &LoopSnapshot) -> bool {
+    !matches!(
+        goal.state,
+        LoopState::Stopped
+            | LoopState::Expired
+            | LoopState::Failed
+            | LoopState::Interrupted
+            | LoopState::WaitingPlan
+    ) && goal
+        .trigger
+        .as_ref()
+        .and_then(|trigger| trigger.expires_at_ms)
+        .is_none_or(|deadline| deadline > crate::monitor_members::now_ms())
+}
 
 pub(super) fn validate(trigger: &Trigger) -> Result<(), String> {
     if trigger.subscriptions.is_empty() {
@@ -130,38 +144,40 @@ pub(super) fn definitions() -> Vec<ToolDefinition> {
         .collect::<Vec<_>>()
         .join(", ");
     let frequencies = TickSubscriptionFrequency::PERIODIC.map(TickSubscriptionFrequency::name);
-    vec![
-        ToolDefinition {
-            name: SUBSCRIBE_TICK_TOOL.into(),
-            description: format!(
-                "Subscribe the current goal to a Tick Instance. An extension or terminal Tick wakes the goal with that instance's latest Tick Update, how many updates it merges and their seq and time span, at the chosen frequency: {periods}; `{}` is the default, and a period without updates wakes nothing. A terminal Tick's program exit is delivered as soon as it happens, with its last screen. A Shell Tick takes no frequency: it updates once, when it exits, and that update is delivered as soon as it arrives; read its output_file for progress before then. An artifact takes no Tick Subscription: its @tickloop requests reach the goal it is associated with. Intermediate updates are not kept, so read older data with the Tick's own query tools.",
-                DEFAULT_FREQUENCY.name()
-            ),
-            input_schema: json!({"type":"object","properties":{"tick_instance_id":{"type":"string","minLength":3},"frequency":{"type":"string","enum":frequencies}},"required":["tick_instance_id"],"additionalProperties":false}),
-        },
-        ToolDefinition {
-            name: UNSUBSCRIBE_TICK_TOOL.into(),
-            description: "Cancel a Tick Subscription of the current goal by its subscription id."
-                .into(),
-            input_schema: json!({"type":"object","properties":{"subscription":{"type":"string","format":"uuid"}},"required":["subscription"],"additionalProperties":false}),
-        },
-    ]
+    vec![ToolDefinition {
+        name: TICK_MANAGE.into(),
+        description: format!(
+            "Manage Tick subscriptions of the current Loop. action=subscribe requires tick_instance_id and optionally frequency ({periods}; default {}). A Shell Tick is immediate and takes no frequency. An artifact uses its association rather than a subscription. action=unsubscribe requires subscription, the subscription id. A quiet period delivers nothing; state updates merge to the latest value. Opening or reading a Tick never subscribes automatically.",
+            DEFAULT_FREQUENCY.name()
+        ),
+        input_schema: json!({"type":"object","properties":{
+            "action":{"type":"string","enum":["subscribe","unsubscribe"]},
+            "tick_instance_id":{"type":"string","minLength":3,"description":"Required for subscribe."},
+            "frequency":{"type":"string","enum":frequencies,"description":"Optional for subscribe; not accepted for unsubscribe."},
+            "subscription":{"type":"string","format":"uuid","description":"Required for unsubscribe."}
+        },"required":["action"],"additionalProperties":false}),
+    }]
 }
 
 #[derive(Deserialize)]
-struct SubscribeTickInput {
+#[serde(deny_unknown_fields)]
+struct TickSubscribeInput {
+    action: String,
     tick_instance_id: InstanceRef,
     frequency: Option<TickSubscriptionFrequency>,
 }
 
-/// The Tick Instance a `SubscribeTick` call names and the frequency it gets: a Shell Tick is
+/// The Tick Instance a `TickManage` call names and the frequency it gets: a Shell Tick is
 /// always immediate and takes no frequency, an artifact takes no subscription, any other type
 /// gets the chosen periodic one or the default.
 pub(super) fn subscription_request(
     input: &Value,
 ) -> Result<(InstanceRef, TickSubscriptionFrequency), String> {
-    let input: SubscribeTickInput = serde_json::from_value(input.clone())
-        .map_err(|error| format!("invalid {SUBSCRIBE_TICK_TOOL} input: {error}"))?;
+    let input: TickSubscribeInput = serde_json::from_value(input.clone())
+        .map_err(|error| format!("invalid {TICK_MANAGE} input: {error}"))?;
+    if input.action != "subscribe" {
+        return Err("TickManage requires action=subscribe here".into());
+    }
     let frequency = match (fixed_frequency(&input.tick_instance_id)?, input.frequency) {
         (Some(_), Some(_)) => {
             return Err(
@@ -177,7 +193,9 @@ pub(super) fn subscription_request(
 }
 
 #[derive(Deserialize)]
-struct UnsubscribeTickInput {
+#[serde(deny_unknown_fields)]
+struct TickUnsubscribeInput {
+    action: String,
     subscription: Uuid,
 }
 
@@ -186,6 +204,7 @@ pub(super) struct TickDeliveries {
     pub(super) port: Option<Arc<dyn TickStreamPort>>,
     desired: Option<tokio::sync::watch::Sender<BTreeMap<WatchId, InstanceRef>>>,
     subscriptions: BTreeMap<Uuid, SubscriptionRuntime>,
+    monitor_watches: BTreeMap<(ChatId, InstanceRef), MonitorWatch>,
     /// The newest update data of every subscription, within the Agent's content budget.
     content: TickContentCache,
     pending: HashMap<(ChatId, LoopId), PendingDelivery>,
@@ -196,6 +215,14 @@ struct WatchBinding {
     watch: WatchId,
     instance: InstanceRef,
     authority: Option<HostToolAuthority>,
+}
+
+struct MonitorWatch {
+    watch: WatchId,
+    authority: Option<HostToolAuthority>,
+    ready: bool,
+    series: Vec<StateSeries>,
+    last_sequence: Option<u64>,
 }
 
 struct SubscriptionRuntime {
@@ -226,6 +253,8 @@ struct SubscriptionRuntime {
     /// A Terminal Tick's screen changed since this subscription last got it; its next sample
     /// settles it.
     has_pending_change: bool,
+    pending_since: Option<Instant>,
+    program_exit: Option<tickloop_agent_protocol::HostedProgramExit>,
     gap: bool,
     last_delivery_ms: Option<u64>,
     last_delivery: Option<String>,
@@ -237,6 +266,7 @@ struct SubscriptionRuntime {
 }
 
 struct FirstUpdate {
+    received_at: Instant,
     sequence: u64,
     observed_at: String,
 }
@@ -264,6 +294,7 @@ struct PendingDelivery {
 
 #[derive(Clone)]
 struct DeliveryItem {
+    title: Option<String>,
     subscription: Uuid,
     watch: WatchId,
     instance: InstanceRef,
@@ -314,6 +345,9 @@ impl DeliveryItem {
             "kind": self.kind,
             "data": Value::Null,
         });
+        if let Some(title) = &self.title {
+            header["title"] = json!(bounded_text(title));
+        }
         if let Some(recover_with) = &self.recover_with {
             header["recover_with"] = json!(bounded_text(recover_with));
         }
@@ -324,27 +358,36 @@ impl DeliveryItem {
     /// item takes at most `allowance` encoded bytes, with what was shortened. Data that does not
     /// fit beside what its trimming reports gives way whole.
     fn delivered(&self, header: &Value, allowance: usize) -> (Value, Vec<Trimmed>) {
-        let mut data_allowance = allowance.saturating_sub(encoded_len(header));
-        for _ in 0..ITEM_FIT_ATTEMPTS {
-            let mut item = header.clone();
-            let mut data = self.data.clone();
-            let trimmed = trim(&mut data, data_allowance, &self.series);
-            if !trimmed.is_empty() {
-                item["trimmed"] = json!(trimmed);
-            }
-            item["data"] = data;
-            let size = encoded_len(&item);
-            if size <= allowance {
-                return (item, trimmed);
-            }
-            data_allowance = data_allowance.saturating_sub(size - allowance);
-        }
-        let (marker, record) = Trimmed::whole_omission(encoded_len(&self.data));
-        let mut item = header.clone();
-        item["data"] = marker;
-        item["trimmed"] = json!([&record]);
-        (item, vec![record])
+        fit_tick_item(header, &self.data, &self.series, allowance)
     }
+}
+
+fn fit_tick_item(
+    header: &Value,
+    data: &Value,
+    series: &[StateSeries],
+    allowance: usize,
+) -> (Value, Vec<Trimmed>) {
+    let mut data_allowance = allowance.saturating_sub(encoded_len(header));
+    for _ in 0..ITEM_FIT_ATTEMPTS {
+        let mut item = header.clone();
+        let mut data = data.clone();
+        let trimmed = trim(&mut data, data_allowance, series);
+        if !trimmed.is_empty() {
+            item["trimmed"] = json!(trimmed);
+        }
+        item["data"] = data;
+        let size = encoded_len(&item);
+        if size <= allowance {
+            return (item, trimmed);
+        }
+        data_allowance = data_allowance.saturating_sub(size - allowance);
+    }
+    let (marker, record) = Trimmed::whole_omission(encoded_len(data));
+    let mut item = header.clone();
+    item["data"] = marker;
+    item["trimmed"] = json!([&record]);
+    (item, vec![record])
 }
 
 /// `text` as a delivery's header carries it: as it is, or replaced by its size when longer than
@@ -383,6 +426,11 @@ impl TickDeliveries {
                 audience,
                 metadata,
             } => {
+                for ((_, target), watch) in &mut self.monitor_watches {
+                    if *target == instance && audience.contains(&watch.watch) {
+                        watch.series = metadata.series.clone();
+                    }
+                }
                 for subscription in self.subscriptions.values_mut().filter(|subscription| {
                     audience.contains(&subscription.watch) && subscription.instance == instance
                 }) {
@@ -394,6 +442,13 @@ impl TickDeliveries {
                 }
             }
             TickStreamEvent::Ready { watch } => {
+                for monitor in self
+                    .monitor_watches
+                    .values_mut()
+                    .filter(|monitor| monitor.watch == watch)
+                {
+                    monitor.ready = true;
+                }
                 if let Some(subscription) = self
                     .subscriptions
                     .values_mut()
@@ -438,6 +493,7 @@ impl TickDeliveries {
                         subscription.blocked = Some(link);
                         subscription.latest = None;
                         subscription.has_pending_change = false;
+                        subscription.pending_since = None;
                         self.content.remove(*id);
                     }
                 }
@@ -542,6 +598,12 @@ impl TickDeliveries {
                             .clone()
                             .map(|authority| (subscription.watch, authority))
                     })
+                    .chain(self.monitor_watches.values().filter_map(|watch| {
+                        watch
+                            .authority
+                            .clone()
+                            .map(|authority| (watch.watch, authority))
+                    }))
                     .collect(),
             );
             port.set_watch_chats(
@@ -549,6 +611,11 @@ impl TickDeliveries {
                     .values()
                     .filter(|subscription| subscription.blocked.is_none())
                     .map(|subscription| (subscription.watch, subscription.chat_id))
+                    .chain(
+                        self.monitor_watches
+                            .iter()
+                            .map(|((chat, _), watch)| (watch.watch, *chat)),
+                    )
                     .collect(),
             );
         }
@@ -557,6 +624,11 @@ impl TickDeliveries {
             .values()
             .filter(|subscription| subscription.blocked.is_none())
             .map(|subscription| (subscription.watch, subscription.instance.clone()))
+            .chain(
+                self.monitor_watches
+                    .iter()
+                    .map(|((_, instance), watch)| (watch.watch, instance.clone())),
+            )
             .collect();
         if let Some(sender) = &self.desired {
             sender.send_if_modified(|current| {
@@ -577,6 +649,10 @@ impl TickDeliveries {
                 && subscription.instance == observation.instance
         }) {
             subscription.kind = Some(observation.kind.clone());
+            if matches!(observation.kind, ObservationKind::Terminal { .. }) {
+                subscription.program_exit =
+                    serde_json::from_value(observation.data["exit"].clone()).ok();
+            }
             // A reconnect that repeats a delivered update delivers nothing again. After a gap
             // the source numbers its updates afresh, so the old watermark no longer applies.
             if observation.gap {
@@ -603,6 +679,7 @@ impl TickDeliveries {
                     observation.dropped
                 };
                 subscription.first = Some(FirstUpdate {
+                    received_at: Instant::now(),
                     sequence: observation.sequence.saturating_sub(merged),
                     observed_at: observation.observed_at.clone(),
                 });
@@ -619,6 +696,7 @@ impl TickDeliveries {
                 .superseded
                 .saturating_add(observation.dropped)
                 .saturating_add(replaced);
+            subscription.pending_since.get_or_insert_with(Instant::now);
             subscription.accumulated = subscription
                 .accumulated
                 .saturating_add(1 + observation.dropped);
@@ -669,6 +747,11 @@ impl TickDeliveries {
                 ));
             }
             subscription.has_pending_change = is_pending;
+            if is_pending {
+                subscription.pending_since.get_or_insert_with(Instant::now);
+            } else if subscription.accumulated == 0 {
+                subscription.pending_since = None;
+            }
         }
     }
 
@@ -718,10 +801,12 @@ impl TickDeliveries {
             let item = subscription.latest.take().map(|update| {
                 let data = self.content.take(*id);
                 let first = subscription.first.take().unwrap_or(FirstUpdate {
+                    received_at: now,
                     sequence: update.sequence,
                     observed_at: update.observed_at.clone(),
                 });
                 DeliveryItem {
+                    title: subscription.title.clone(),
                     subscription: *id,
                     watch: subscription.watch,
                     instance: subscription.instance.clone(),
@@ -820,8 +905,7 @@ impl TickDeliveries {
 }
 
 impl Agent {
-    /// Installs the Tick observation stream. `SubscribeTick` and `UnsubscribeTick` reach
-    /// the model only after a port is installed.
+    /// Installs the Tick observation stream and enables the subscription actions of `TickManage`.
     pub async fn install_tick_stream(&self, port: Arc<dyn TickStreamPort>) {
         let handle = port.open();
         {
@@ -887,6 +971,14 @@ impl Agent {
                     frequency: subscription.frequency,
                     accumulated: runtime.map_or(0, |runtime| runtime.accumulated),
                     has_pending_change: runtime.is_some_and(|runtime| runtime.has_pending_change),
+                    pending_since_ms: runtime.and_then(|runtime| runtime.pending_since).map(
+                        |since| {
+                            now_ms.saturating_sub(
+                                now.saturating_duration_since(since).as_millis() as u64
+                            )
+                        },
+                    ),
+                    program_exit: runtime.and_then(|runtime| runtime.program_exit),
                     last_delivery_ms: runtime.and_then(|runtime| runtime.last_delivery_ms),
                     last_delivery: runtime.and_then(|runtime| runtime.last_delivery.clone()),
                     kind: runtime.and_then(|runtime| runtime.kind.clone()),
@@ -945,7 +1037,7 @@ impl Agent {
     /// the instance's Monitor row. The Chat's newest Loop that has not ended receives it; an
     /// instance one of its Loops already subscribes to, or a Chat without such a Loop, is refused
     /// with what to do instead.
-    pub async fn subscribe_tick_for_user(
+    pub async fn tick_subscribe_for_user(
         &self,
         chat_id: ChatId,
         instance: InstanceRef,
@@ -1025,8 +1117,271 @@ impl Agent {
         )))
     }
 
+    async fn admit_manual_tick(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        instance: &InstanceRef,
+    ) -> Result<Option<HostToolAuthority>, AgentError> {
+        if instance.access() != "hosted" {
+            return Err(AgentError::Invalid(
+                "Send Update requires an extension or Terminal Tick".into(),
+            ));
+        }
+        let port = self
+            .tick_deliveries()
+            .port
+            .clone()
+            .ok_or_else(|| AgentError::Invalid("Tick stream is unavailable".into()))?;
+        let input = json!({"tick_instance_id": instance});
+        let watch = port
+            .prepare_watch(chat_id, instance, &input, self.inner.shutdown.child_token())
+            .await
+            .map_err(AgentError::Invalid)?;
+        let authority = watch
+            .as_ref()
+            .map(|watch| watch.host_authority())
+            .transpose()
+            .map_err(AgentError::Invalid)?
+            .flatten()
+            .and_then(|binding| binding.authority);
+        let admission = watch.map(|watch| watch.into_admission(input.clone()));
+        let (policy_name, permission_input) = admission
+            .as_ref()
+            .map_or((crate::tick_tools::TICK_READ, &input), |call| {
+                (call.policy_name(), call.permission_input())
+            });
+        self.refresh_project_rules(chat_id).await?;
+        {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+            if chat.snapshot.monitor.is_removed(instance)
+                || !chat
+                    .snapshot
+                    .monitor
+                    .members
+                    .iter()
+                    .any(|member| member.instance == *instance)
+            {
+                return Err(AgentError::Invalid(
+                    "Send Update requires a Tick owned by this Chat".into(),
+                ));
+            }
+            let goal = chat
+                .snapshot
+                .loops
+                .iter()
+                .find(|goal| goal.id == loop_id)
+                .ok_or(AgentError::NotFound)?;
+            if !can_take_manual_update(goal) {
+                return Err(AgentError::Invalid(NO_SUBSCRIBING_LOOP.into()));
+            }
+            let operation = SessionPermissionOperation::from_normalized(
+                policy_name.to_owned(),
+                permission_input.clone(),
+                super::session_permissions::capture_workspace_scope(
+                    &configured_workspace_for_chat(chat),
+                )
+                .map_err(|error| AgentError::Invalid(error.to_string()))?,
+            )
+            .map_err(|error| AgentError::Invalid(error.to_string()))?;
+            let session = self.inner.session_permissions.lock().await.evaluate(
+                PermissionOwner::new(chat_id, loop_id)
+                    .map_err(|error| AgentError::Invalid(error.to_string()))?,
+                &operation,
+            );
+            if chat.snapshot.policy.explicit_match_with_session(
+                policy_name,
+                permission_input,
+                loop_id,
+                session.decision,
+            ) == Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Deny)
+            {
+                return Err(AgentError::Invalid(format!(
+                    "a Deny rule for {policy_name} refuses sending {instance}"
+                )));
+            }
+        }
+        if let Some(admission) = &admission {
+            crate::tick_stream::PreparedTickWatch::revalidate(
+                chat_id,
+                admission,
+                self.inner.shutdown.child_token(),
+            )
+            .await
+            .map_err(AgentError::Invalid)?;
+        }
+        port.revalidate_watch(chat_id, instance, authority.as_ref())
+            .await
+            .map_err(AgentError::Invalid)?;
+        Ok(authority)
+    }
+
+    pub async fn tick_send_update_for_user(
+        &self,
+        chat_id: ChatId,
+        instance: InstanceRef,
+    ) -> Result<Receipt, AgentError> {
+        let (loop_id, goal, title) = {
+            let chats = self.inner.chats.lock().await;
+            let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+            if chat
+                .snapshot
+                .loops
+                .iter()
+                .flat_map(|goal| {
+                    goal.trigger
+                        .iter()
+                        .flat_map(|trigger| &trigger.subscriptions)
+                })
+                .any(|subscription| subscription.instance == instance)
+            {
+                return Err(AgentError::Invalid(
+                    "Send Update is available for unsubscribed Ticks".into(),
+                ));
+            }
+            let goal = chat
+                .snapshot
+                .loops
+                .iter()
+                .rev()
+                .find(|goal| can_take_manual_update(goal))
+                .ok_or_else(|| AgentError::Invalid(NO_SUBSCRIBING_LOOP.into()))?;
+            let title = chat
+                .snapshot
+                .monitor
+                .members
+                .iter()
+                .find(|member| member.instance == instance)
+                .and_then(|member| member.title.clone());
+            (goal.id, goal.goal.clone(), title)
+        };
+        let authority = self.admit_manual_tick(chat_id, loop_id, &instance).await?;
+        let port = self
+            .tick_deliveries()
+            .port
+            .clone()
+            .ok_or_else(|| AgentError::Invalid("Tick stream is unavailable".into()))?;
+        {
+            let mut deliveries = self.tick_deliveries();
+            let key = (chat_id, instance.clone());
+            if deliveries
+                .monitor_watches
+                .get(&key)
+                .is_none_or(|watch| watch.authority != authority)
+            {
+                deliveries.monitor_watches.insert(
+                    key,
+                    MonitorWatch {
+                        watch: Uuid::new_v4(),
+                        authority: authority.clone(),
+                        ready: false,
+                        series: Vec::new(),
+                        last_sequence: None,
+                    },
+                );
+            }
+            deliveries.publish_desired();
+        }
+        let series = tokio::time::timeout(SUBSCRIPTION_READY_TIMEOUT, async {
+            loop {
+                let notify = self.tick_deliveries().ready_changed.clone();
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if let Some(series) = self
+                    .tick_deliveries()
+                    .monitor_watches
+                    .get(&(chat_id, instance.clone()))
+                    .filter(|watch| watch.ready)
+                    .map(|watch| watch.series.clone())
+                {
+                    break series;
+                }
+                tokio::select! {
+                    _ = notified => {},
+                    _ = self.inner.shutdown.cancelled() => return Vec::new(),
+                }
+            }
+        })
+        .await
+        .map_err(|_| AgentError::Invalid("The Tick did not become ready for Send Update".into()))?;
+        let through_ms = crate::monitor_members::now_ms();
+        let observation =
+            tokio::time::timeout(SAMPLE_TIMEOUT, port.read_current(chat_id, &instance))
+                .await
+                .map_err(|_| AgentError::Invalid("Reading the Tick timed out".into()))?
+                .map_err(AgentError::Invalid)?
+                .ok_or_else(|| AgentError::Invalid("The Tick has no readable content".into()))?;
+        if observation.instance != instance
+            || (matches!(observation.kind, ObservationKind::Terminal { .. })
+                && !observation.data["exit"].is_null())
+        {
+            return Err(AgentError::Invalid(
+                "The Tick has ended or changed identity".into(),
+            ));
+        }
+        let current_authority = self.admit_manual_tick(chat_id, loop_id, &instance).await?;
+        if current_authority != authority {
+            return Err(AgentError::Invalid(
+                "Tick authority changed while reading".into(),
+            ));
+        }
+        let mut header = json!({"instance":instance,"seq":observation.sequence.to_string(),"kind":observation.kind,"updates":1,"through_ms":through_ms});
+        if let Some(title) = title {
+            header["title"] = json!(bounded_text(&title));
+        }
+        let (item, trimmed) =
+            fit_tick_item(&header, &observation.data, &series, MAX_DELIVERY_ITEM_BYTES);
+        let payload = delivery_payload(
+            vec![item],
+            &DeliveryNotes {
+                is_trimmed: !trimmed.is_empty(),
+                ..Default::default()
+            },
+        );
+        let input = tickloop_agent_protocol::local_messages::tick_delivery(
+            &payload,
+            &Trigger::for_loop_goal(&goal),
+        );
+        let source = TriggerSource {
+            source: TICK_MANUAL_SOURCE.into(),
+            payload: json!({"items":payload["items"],"authority":authority}),
+        };
+        self.submit_internal(
+            chat_id,
+            Some(loop_id),
+            input,
+            SubmissionOptions {
+                trigger_source: Some(source),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    pub(super) async fn revalidate_manual_tick_source(
+        &self,
+        chat: ChatId,
+        loop_id: LoopId,
+        payload: &Value,
+    ) -> Result<(), AgentError> {
+        let instance: InstanceRef = serde_json::from_value(payload["items"][0]["instance"].clone())
+            .map_err(|error| AgentError::Invalid(error.to_string()))?;
+        let expected: Option<HostToolAuthority> =
+            serde_json::from_value(payload["authority"].clone())
+                .map_err(|error| AgentError::Invalid(error.to_string()))?;
+        let authority = self.admit_manual_tick(chat, loop_id, &instance).await?;
+        if authority != expected {
+            return Err(AgentError::Invalid(
+                "Tick authority changed before delivery".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Subscribes `loop_id` to `instance` at `frequency` on its user's word, as an approved
-    /// SubscribeTick would without asking: the watch is admitted under the Chat's current
+    /// TickManage would without asking: the watch is admitted under the Chat's current
     /// authority, and a Deny rule for it still refuses it.
     async fn subscribe_loop_for_user(
         &self,
@@ -1041,7 +1396,8 @@ impl Agent {
             .port
             .clone()
             .ok_or_else(|| AgentError::Invalid("Tick Subscriptions are unavailable".into()))?;
-        let input = json!({"tick_instance_id": instance, "frequency": frequency});
+        let input =
+            json!({"action":"subscribe","tick_instance_id": instance, "frequency": frequency});
         let watch = port
             .prepare_watch(chat_id, &instance, &input, CancellationToken::new())
             .await
@@ -1058,7 +1414,7 @@ impl Agent {
         };
         let (policy_name, permission_input) = admission
             .as_ref()
-            .map_or((SUBSCRIBE_TICK_TOOL, &input), |admission| {
+            .map_or((TICK_MANAGE, &input), |admission| {
                 (admission.policy_name(), admission.permission_input())
             });
         self.refresh_project_rules(chat_id).await?;
@@ -1127,10 +1483,12 @@ impl Agent {
         input: &Value,
         authority: Option<HostToolAuthority>,
     ) -> Result<ToolResult, String> {
-        let outcome = match name {
-            SUBSCRIBE_TICK_TOOL => self.subscribe_tick(receipt, input, authority).await,
-            UNSUBSCRIBE_TICK_TOOL => self.unsubscribe_tick(receipt, input).await,
-            _ => Err("unknown Tick Subscription tool".into()),
+        let outcome = match (name, input["action"].as_str()) {
+            (TICK_MANAGE, Some("subscribe")) => {
+                self.tick_subscribe(receipt, input, authority).await
+            }
+            (TICK_MANAGE, Some("unsubscribe")) => self.tick_unsubscribe(receipt, input).await,
+            _ => Err("unknown TickManage subscription action".into()),
         };
         Ok(match outcome {
             Ok(content) => ToolResult {
@@ -1146,7 +1504,7 @@ impl Agent {
         })
     }
 
-    async fn subscribe_tick(
+    async fn tick_subscribe(
         &self,
         receipt: &Receipt,
         input: &Value,
@@ -1178,7 +1536,7 @@ impl Agent {
             .find(|subscription| subscription.instance == instance)
         {
             return Err(format!(
-                "this goal already subscribes to Tick Instance {} as {}; cancel it with {UNSUBSCRIBE_TICK_TOOL} before subscribing at another frequency",
+                "this goal already subscribes to Tick Instance {} as {}; cancel it with {TICK_MANAGE} before subscribing at another frequency",
                 existing.instance, existing.id
             ));
         }
@@ -1258,9 +1616,12 @@ impl Agent {
         }
     }
 
-    async fn unsubscribe_tick(&self, receipt: &Receipt, input: &Value) -> Result<String, String> {
-        let input: UnsubscribeTickInput = serde_json::from_value(input.clone())
-            .map_err(|error| format!("invalid {UNSUBSCRIBE_TICK_TOOL} input: {error}"))?;
+    async fn tick_unsubscribe(&self, receipt: &Receipt, input: &Value) -> Result<String, String> {
+        let input: TickUnsubscribeInput = serde_json::from_value(input.clone())
+            .map_err(|error| format!("invalid {TICK_MANAGE} input: {error}"))?;
+        if input.action != "unsubscribe" {
+            return Err("TickManage requires action=unsubscribe here".into());
+        }
         self.update_tick_subscription(
             receipt.chat_id,
             input.subscription,
@@ -1281,7 +1642,7 @@ impl Agent {
             return;
         }
         let saves_chats = self.inner.recorder.is_some();
-        let (configured, existing) = {
+        let (configured, existing, members) = {
             let chats = self.inner.chats.lock().await;
             let configured: Vec<_> = chats
                 .iter()
@@ -1320,10 +1681,22 @@ impl Agent {
                 .flat_map(|trigger| &trigger.subscriptions)
                 .map(|subscription| subscription.id)
                 .collect();
-            (configured, existing)
+            let members: BTreeSet<_> = chats
+                .iter()
+                .flat_map(|(chat_id, chat)| {
+                    chat.snapshot
+                        .monitor
+                        .members
+                        .iter()
+                        .filter(|member| !chat.snapshot.monitor.is_removed(&member.instance))
+                        .map(|member| (*chat_id, member.instance.clone()))
+                })
+                .collect();
+            (configured, existing, members)
         };
         // Watermark files are read and removed outside the delivery lock.
         let mut cancelled = Vec::new();
+        let mut monitor_samples = Vec::new();
         let mut restored = Vec::new();
         {
             let mut deliveries = self.tick_deliveries();
@@ -1350,7 +1723,34 @@ impl Agent {
                 .map(|(id, runtime)| (*id, runtime.watermarks.clone()))
                 .collect();
             for (id, watermarks) in removed {
-                deliveries.subscriptions.remove(&id);
+                if let Some(runtime) = deliveries.subscriptions.remove(&id)
+                    && members.contains(&(runtime.chat_id, runtime.instance.clone()))
+                    && runtime.instance.access() == "hosted"
+                    && runtime.blocked.is_none()
+                {
+                    let key = (runtime.chat_id, runtime.instance.clone());
+                    if deliveries
+                        .monitor_watches
+                        .get(&key)
+                        .is_none_or(|watch| watch.authority != runtime.authority)
+                    {
+                        monitor_samples.push((runtime.watch, runtime.instance));
+                        deliveries.monitor_watches.insert(
+                            key,
+                            MonitorWatch {
+                                watch: runtime.watch,
+                                authority: runtime.authority,
+                                ready: runtime.ready,
+                                series: runtime.series,
+                                last_sequence: runtime
+                                    .latest
+                                    .as_ref()
+                                    .map(|latest| latest.sequence)
+                                    .max(runtime.delivered.map(|delivered| delivered.sequence)),
+                            },
+                        );
+                    }
+                }
                 deliveries.content.remove(id);
                 if !existing.contains(&id)
                     && let Some(directory) = watermarks
@@ -1404,6 +1804,8 @@ impl Agent {
                                 superseded: 0,
                                 accumulated: 0,
                                 has_pending_change: false,
+                                pending_since: None,
+                                program_exit: None,
                                 gap: false,
                                 last_delivery_ms: None,
                                 last_delivery: None,
@@ -1416,8 +1818,23 @@ impl Agent {
                     }
                 }
             }
+            deliveries
+                .monitor_watches
+                .retain(|member, _| members.contains(member));
             deliveries.publish_desired();
             deliveries.ready_changed.notify_waiters();
+        }
+        if let Some(port) = self.tick_deliveries().port.clone() {
+            for (watch, instance) in monitor_samples {
+                let port = port.clone();
+                let shutdown = self.inner.shutdown.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => {},
+                        _ = tokio::time::timeout(SAMPLE_TIMEOUT, port.sample(watch, &instance)) => {},
+                    }
+                });
+            }
         }
         if !cancelled.is_empty() || !restored.is_empty() {
             // A watermark that cannot be read is treated as none: a corrupt record must not
@@ -1579,6 +1996,23 @@ impl Agent {
         if items.is_empty() {
             return;
         }
+        {
+            let chats = self.inner.chats.lock().await;
+            if let Some(chat) = chats.get(&chat_id) {
+                for item in &mut items {
+                    if let Some(title) = chat
+                        .snapshot
+                        .monitor
+                        .members
+                        .iter()
+                        .find(|member| member.instance == item.instance)
+                        .and_then(|member| member.title.clone())
+                    {
+                        item.title = Some(title);
+                    }
+                }
+            }
+        }
         let FittedDelivery {
             payload,
             delivered: items,
@@ -1650,7 +2084,12 @@ impl Agent {
                 let delivered_at = tickloop_agent_base::private_fs::unix_time_milliseconds();
                 for item in &items {
                     if let Some(runtime) = deliveries.subscriptions.get_mut(&item.subscription) {
-                        runtime.accumulated = 0;
+                        runtime.accumulated = runtime.accumulated.saturating_sub(item.updates);
+                        if let Some(first) = &runtime.first {
+                            runtime.pending_since = Some(first.received_at);
+                        } else if runtime.accumulated == 0 && !runtime.has_pending_change {
+                            runtime.pending_since = None;
+                        }
                         runtime.last_delivery_ms = Some(delivered_at);
                         runtime.last_delivery = Some(summary.clone());
                     }
@@ -1883,6 +2322,107 @@ impl Agent {
     }
 
     async fn apply_stream_event(&self, event: TickStreamEvent) {
+        let changed = match &event {
+            TickStreamEvent::Observation { audience, value } => Some((&value.instance, audience)),
+            TickStreamEvent::ScreenChange {
+                instance,
+                audience,
+                is_pending: true,
+            }
+            | TickStreamEvent::ProgramExited { instance, audience } => Some((instance, audience)),
+            _ => None,
+        };
+        let is_new_sequence = |previous: Option<u64>| match &event {
+            TickStreamEvent::Observation { value, .. } => {
+                value.gap || previous.is_none_or(|previous| value.sequence > previous)
+            }
+            _ => true,
+        };
+        if let Some((instance, audience)) = changed {
+            let (owners, passive, port) = {
+                let mut deliveries = self.tick_deliveries();
+                let owners: BTreeSet<_> = deliveries
+                    .subscriptions
+                    .values()
+                    .filter(|runtime| {
+                        runtime.instance == *instance
+                            && runtime.ready
+                            && runtime.blocked.is_none()
+                            && audience.contains(&runtime.watch)
+                            && is_new_sequence(
+                                runtime
+                                    .latest
+                                    .as_ref()
+                                    .map(|latest| latest.sequence)
+                                    .max(runtime.delivered.map(|delivered| delivered.sequence)),
+                            )
+                    })
+                    .map(|runtime| runtime.chat_id)
+                    .chain(
+                        deliveries
+                            .monitor_watches
+                            .iter()
+                            .filter(|((_, target), watch)| {
+                                target == instance
+                                    && watch.ready
+                                    && audience.contains(&watch.watch)
+                                    && is_new_sequence(watch.last_sequence)
+                            })
+                            .map(|((chat, _), _)| *chat),
+                    )
+                    .collect();
+                let passive: Vec<_> = deliveries
+                    .monitor_watches
+                    .iter()
+                    .filter(|((_, target), watch)| {
+                        target == instance && audience.contains(&watch.watch)
+                    })
+                    .map(|(_, watch)| watch.watch)
+                    .collect();
+                if let TickStreamEvent::Observation { value, .. } = &event {
+                    for ((_, target), watch) in &mut deliveries.monitor_watches {
+                        if target == instance
+                            && audience.contains(&watch.watch)
+                            && is_new_sequence(watch.last_sequence)
+                        {
+                            watch.last_sequence = Some(value.sequence);
+                        }
+                    }
+                }
+                (owners, passive, deliveries.port.clone())
+            };
+            let mut chats = self.inner.chats.lock().await;
+            for owner in owners {
+                if let Some(chat) = chats.get_mut(&owner) {
+                    chat.snapshot
+                        .monitor
+                        .mark_observed(instance.clone(), crate::monitor_members::now_ms());
+                    self.record_monitor_membership(
+                        owner,
+                        &chat.snapshot.workdir,
+                        chat.snapshot.monitor.clone(),
+                    );
+                }
+            }
+            drop(chats);
+            if matches!(
+                event,
+                TickStreamEvent::ScreenChange { .. } | TickStreamEvent::ProgramExited { .. }
+            ) && let Some(port) = port
+            {
+                for watch in passive {
+                    let instance = instance.clone();
+                    let port = port.clone();
+                    let shutdown = self.inner.shutdown.clone();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => {},
+                            _ = tokio::time::timeout(SAMPLE_TIMEOUT, port.sample(watch, &instance)) => {},
+                        }
+                    });
+                }
+            }
+        }
         if let TickStreamEvent::ProgramExited { instance, audience } = &event {
             let exited = self.tick_deliveries().samplable_watches(instance, audience);
             self.sample_screens(exited);
@@ -2036,5 +2576,38 @@ fn left_out(kind: &ObservationKind, data: &Value) -> Value {
             json!({"text": null, "exit": data["exit"]})
         }
         _ => Value::Null,
+    }
+}
+
+#[cfg(test)]
+mod manual_admission_tests {
+    use super::*;
+
+    #[test]
+    fn manual_updates_respect_plan_approval_and_expiry_before_the_timer_changes_state() {
+        let mut goal: LoopSnapshot = serde_json::from_value(json!({
+            "id": Uuid::new_v4(), "goal": "observe", "state": "Completed",
+            "run_id": null, "run_started_at": null,
+        }))
+        .unwrap();
+        assert!(can_take_manual_update(&goal));
+        goal.state = LoopState::WaitingPermission;
+        assert!(
+            can_take_manual_update(&goal),
+            "permission waits may queue data"
+        );
+        goal.state = LoopState::WaitingPlan;
+        assert!(
+            !can_take_manual_update(&goal),
+            "data must not approve a plan"
+        );
+        goal.state = LoopState::WaitingTrigger;
+        let mut trigger = Trigger::for_loop_goal(&goal.goal);
+        trigger.expires_at_ms = Some(0);
+        goal.trigger = Some(trigger);
+        assert!(
+            !can_take_manual_update(&goal),
+            "the wall-clock deadline holds even before expiry dispatch"
+        );
     }
 }

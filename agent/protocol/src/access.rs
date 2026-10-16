@@ -42,9 +42,15 @@ use crate::{
 /// Terminal Tick's screen changed since a Tick Subscription last got it, so Monitor shows that
 /// change waiting for the next check. 20.6 records when the Chat's Agent last read or operated
 /// each Monitor instance with a tool, so Monitor flashes the row it uses. 21.0 adds source-bound
-/// remote Skill manifests and their Run and reference activation records. Older business majors
+/// remote Skill manifests and their Run and reference activation records. 21.1 adds the first
+/// pending change time, terminal program exit, and terminal Tick identity in Monitor membership
+/// and listings.
+/// 22.0 uses TickDescribe, TickRead, TickCall and one TickManage with per-action admission;
+/// TickRead returns state without repeating the capability catalog.
+/// 23.0 adds manual TickUpdate delivery and subscription-independent Monitor observations.
+/// Older business majors
 /// are refused before dispatch; the frozen daemon management protocol remains independent.
-pub const PROTOCOL_MAJOR: u16 = 21;
+pub const PROTOCOL_MAJOR: u16 = 23;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
@@ -523,9 +529,13 @@ pub enum LoopAction {
         subscription_id: Uuid,
         change: TickSubscriptionChange,
     },
+    /// Sends one snapshot of an unsubscribed Tick to an eligible Loop without subscribing.
+    TickUpdate {
+        instance: tick_protocol::InstanceRef,
+    },
     /// Subscribes the Chat's newest Loop that has not ended to `instance` at the default
     /// frequency, at the user's request from Monitor.
-    SubscribeTick {
+    TickManage {
         instance: InstanceRef,
     },
     RetryDeniedOperation {

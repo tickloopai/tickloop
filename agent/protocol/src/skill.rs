@@ -34,6 +34,18 @@ pub enum SkillSource {
     },
 }
 
+impl SkillSource {
+    pub fn display_label(&self) -> String {
+        match self {
+            Self::BuiltIn => "Built-in".into(),
+            Self::User { .. } => "User".into(),
+            Self::Project { .. } => "Project".into(),
+            Self::TickPackage { package, .. } => format!("Tick package · {package}"),
+            Self::Remote { .. } => "Remote".into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct RemoteSkillDefinition {
     pub name: String,

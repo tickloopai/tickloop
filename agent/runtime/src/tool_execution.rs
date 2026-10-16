@@ -29,6 +29,7 @@ enum ToolRoute {
     /// The Skills whose listing the request sent, which its Skill calls expand against.
     Skill(Arc<tickloop_agent_config::skills::SkillRegistry>),
     TickSubscription,
+    TickManage(Option<Arc<dyn crate::host_tools::HostToolProvider>>),
     Delegation,
     AgentMessage,
     SharedTask,
@@ -69,6 +70,53 @@ impl RegisteredTool {
     fn is_host_or_local(&self) -> bool {
         !matches!(self.route, ToolRoute::BuiltIn)
     }
+}
+
+fn merge_tick_management(mut tools: Vec<RegisteredTool>) -> Vec<RegisteredTool> {
+    let variants = tools
+        .iter()
+        .filter(|tool| tool.definition.name == crate::tick_tools::TICK_MANAGE)
+        .cloned()
+        .collect::<Vec<_>>();
+    if variants.len() < 2 {
+        return tools;
+    }
+    let mut definition = variants[0].definition.clone();
+    let mut provider = None;
+    let mut actions = Vec::new();
+    let mut properties = serde_json::Map::new();
+    let mut descriptions = Vec::new();
+    for variant in variants {
+        if let ToolRoute::Host(host) = variant.route {
+            provider = Some(host);
+        }
+        descriptions.push(variant.definition.description);
+        if let Some(fields) = variant.definition.input_schema["properties"].as_object() {
+            for (key, value) in fields {
+                if key == "action" {
+                    for action in value["enum"].as_array().into_iter().flatten() {
+                        if !actions.contains(action) {
+                            actions.push(action.clone());
+                        }
+                    }
+                } else {
+                    properties.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+    properties.insert(
+        "action".into(),
+        serde_json::json!({"type":"string","enum":actions}),
+    );
+    definition.input_schema = serde_json::json!({"type":"object","properties":properties,"required":["action"],"additionalProperties":false});
+    definition.description = descriptions.join(" ");
+    tools.retain(|tool| tool.definition.name != crate::tick_tools::TICK_MANAGE);
+    tools.push(RegisteredTool {
+        definition,
+        route: ToolRoute::TickManage(provider),
+    });
+    tools
 }
 
 pub(super) struct ToolRegistry {
@@ -178,7 +226,9 @@ impl ToolRegistry {
                     }),
             );
         }
-        Self { tools }
+        Self {
+            tools: merge_tick_management(tools),
+        }
     }
 
     pub(super) fn definitions(&self) -> Vec<ToolDefinition> {
@@ -205,7 +255,12 @@ impl ToolRegistry {
     pub(super) fn host_tool_names(&self) -> std::collections::BTreeSet<String> {
         self.tools
             .iter()
-            .filter(|tool| matches!(tool.route, ToolRoute::Host(_)))
+            .filter(|tool| {
+                matches!(
+                    tool.route,
+                    ToolRoute::Host(_) | ToolRoute::TickManage(Some(_))
+                )
+            })
             .map(|tool| tool.definition.name.clone())
             .collect()
     }
@@ -501,6 +556,7 @@ impl Agent {
                     .await
             }
             ToolRoute::Skill(skills) => self.skill_tool(receipt, skills, &operation.input).await,
+            ToolRoute::TickManage(_) => Err("TickManage route was not prepared".into()),
             ToolRoute::TickSubscription => {
                 self.tick_subscription_tool(receipt, &operation.name, &operation.input, authority)
                     .await
@@ -650,6 +706,21 @@ impl Agent {
             input,
             registration,
         } = invocation;
+        let registration = registration.map(|mut registered| {
+            if let ToolRoute::TickManage(provider) = &registered.route {
+                registered.route =
+                    if matches!(input["action"].as_str(), Some("subscribe" | "unsubscribe")) {
+                        ToolRoute::TickSubscription
+                    } else {
+                        provider
+                            .as_ref()
+                            .map_or(ToolRoute::TickSubscription, |provider| {
+                                ToolRoute::Host(provider.clone())
+                            })
+                    };
+            }
+            registered
+        });
         if cancel.is_cancelled() {
             return Err("run interrupted before tool preparation".into());
         }
@@ -804,7 +875,8 @@ impl Agent {
         } else if matches!(
             registration.as_ref().map(|registered| &registered.route),
             Some(ToolRoute::TickSubscription)
-        ) && name == "SubscribeTick"
+        ) && name == "TickManage"
+            && input["action"] == "subscribe"
         {
             let instance = match tick_subscriptions::subscription_request(&input) {
                 Ok((instance, _)) => instance,
@@ -2151,8 +2223,10 @@ mod tests {
             "Read",
             "Skill",
             "Subagent",
-            "SubscribeTick",
-            "ModifyTick",
+            "TickDescribe",
+            "TickRead",
+            "TickCall",
+            "TickManage",
             "ArtifactLogin",
         ] {
             assert!(
@@ -2178,14 +2252,14 @@ mod tests {
     }
 
     /// The built-in Skills and those of the Tick packages in this repository name a tool by its
-    /// compound name, such as `ModifyTick`; each such name must be a tool the model can be given.
+    /// compound name, such as `TickManage`; each such name must be a tool the model can be given.
     #[test]
     fn shipped_skills_name_only_tools_the_agent_offers() {
         const PACKAGE_SKILLS: [&str; 2] = [
             include_str!("../../../ticks/longbridge/skills/usage/SKILL.md"),
             include_str!("../../../ticks/futu/skills/usage/SKILL.md"),
         ];
-        const NOT_TOOLS: [&str; 1] = ["OutcomeUnknown"];
+        const NOT_TOOLS: [&str; 2] = ["OutcomeUnknown", "TickUpdate"];
         let tools = built_in_definitions()
             .into_iter()
             .map(|definition| definition.name)
@@ -2212,11 +2286,7 @@ mod tests {
             .flat_map(|skill| skill.split(|character: char| !character.is_ascii_alphanumeric()))
             .filter(is_compound_name)
             .collect::<HashSet<_>>();
-        assert!(named.is_superset(&HashSet::from([
-            "ModifyTick",
-            "SubscribeTick",
-            "ArtifactRead"
-        ])));
+        assert!(named.is_superset(&HashSet::from(["TickManage", "TickRead", "ArtifactRead"])));
         for word in named {
             assert!(
                 tools.contains(word) || NOT_TOOLS.contains(&word),

@@ -1177,6 +1177,8 @@ impl RoleLine {
         let band = self.band.as_ref().map_or(0..0, |band| {
             band.columns.start.min(width)..band.columns.end.min(width)
         });
+        let fill_start = self.fill.map_or(0, |_| self.fill_start.min(width));
+        let boundaries = [band.start, band.end, fill_start];
         let mut line = StyledLine {
             link: self.link.clone(),
             ..Default::default()
@@ -1185,9 +1187,10 @@ impl RoleLine {
         for span in &self.spans {
             let mut rest = span.text.as_str();
             while !rest.is_empty() {
-                let boundary = [band.start, band.end]
+                let boundary = boundaries
                     .into_iter()
-                    .find(|boundary| *boundary > column);
+                    .filter(|boundary| *boundary > column)
+                    .min();
                 let (piece, after) = match boundary {
                     Some(boundary) => split_at_column(rest, boundary - column),
                     None => (rest, ""),
@@ -1203,25 +1206,19 @@ impl RoleLine {
                 rest = after;
             }
         }
-        if column < band.end {
-            if column < band.start {
-                line.push(Span::styled(
-                    " ".repeat(band.start - column),
-                    self.style_at(theme, column, None),
-                ));
-                column = band.start;
-            }
+        let padded_width = if self.fill.is_some() { width } else { band.end };
+        while column < padded_width {
+            let end = boundaries
+                .into_iter()
+                .filter(|boundary| *boundary > column)
+                .min()
+                .unwrap_or(padded_width)
+                .min(padded_width);
             line.push(Span::styled(
-                " ".repeat(band.end - column),
+                " ".repeat(end - column),
                 self.style_at(theme, column, None),
             ));
-            column = band.end;
-        }
-        if self.fill.is_some() && column < width {
-            line.push(Span::styled(
-                " ".repeat(width - column),
-                self.style_at(theme, column, None),
-            ));
+            column = end;
         }
         line
     }
@@ -1460,6 +1457,42 @@ mod tests {
                 .all(|span| span.style.background == background)
         );
         assert_eq!(line.render(ColourDepth::None), "❯ 中    ");
+    }
+
+    #[test]
+    fn partial_flash_colours_name_text_and_padding_without_colouring_icons() {
+        for name in ThemeName::ALL {
+            let theme = Theme::new(name);
+            for flash in [
+                Role::UseFlashStrong,
+                Role::UseFlashSoft,
+                Role::TakeInFlashStrong,
+                Role::TakeInFlashSoft,
+            ] {
+                for text in ["", "↻ > ", "↻ > python3"] {
+                    let line = RoleLine::role(text, Role::MutedText)
+                        .filled_from(flash, 4)
+                        .resolve(theme, 16);
+                    let backgrounds = line
+                        .spans
+                        .iter()
+                        .flat_map(|span| span.text.chars().map(move |_| span.style.background))
+                        .collect::<Vec<_>>();
+                    assert_eq!(backgrounds.len(), 16);
+                    for (column, background) in backgrounds.into_iter().enumerate() {
+                        assert_eq!(
+                            background,
+                            if column < 4 {
+                                None
+                            } else {
+                                theme.style(flash).background
+                            },
+                            "{name:?} {flash:?} {text:?} column {column}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -85,6 +85,7 @@ mod subscription_detail;
 mod task_access;
 mod thinking_preview;
 pub mod tick_actions;
+mod tick_labels;
 mod ticks_panel;
 mod ticks_work;
 mod transcript;
@@ -4643,10 +4644,7 @@ async fn interact(
             },
             notification = task_notifications.recv() => match notification {
                 Ok(notification) if !overview_active && Some(notification.chat_id)==selected_chat => {
-                    console.write_roles(&task_notification_line(
-                        &notification,
-                        console.display_profile()?,
-                    ))?;
+                    console.write_shell_notification(&notification)?;
                     status_dirty=true;
                 },
                 Ok(notification) => {
@@ -6607,6 +6605,34 @@ fn consume_input_echo_from_snapshot(
     snapshot: &ChatSnapshot,
     input: uuid::Uuid,
 ) -> Result<Option<InputEcho>, String> {
+    let deliveries = snapshot
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(index, message)| {
+            snapshot.message_runs.get(index) == Some(&input)
+                && message.role == tickloop_agent_protocol::Role::User
+                && !snapshot.host_notes.contains_key(index)
+        })
+        .flat_map(|(_, message)| &message.content)
+        .filter_map(|content| match content {
+            tickloop_agent_protocol::Content::Text { text } => {
+                presentation::typed_local_message(text, false)
+            }
+            _ => None,
+        })
+        .filter(|message| {
+            matches!(
+                message,
+                tickloop_agent_protocol::LocalMessage::ArtifactRequest { .. }
+                    | tickloop_agent_protocol::LocalMessage::TickDelivery { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    if !deliveries.is_empty() {
+        console.record_local_deliveries(snapshot, input, &deliveries)?;
+        return Ok(None);
+    }
     match consumed_input_text(snapshot, input) {
         Some(text) => {
             // The input leaves the queue in the frame that shows it sent.
@@ -8350,6 +8376,182 @@ mod tests {
                 "report first: {report_first}"
             );
         }
+    }
+
+    #[test]
+    fn a_tick_delivery_is_visible_once_when_its_live_run_starts() {
+        use super::{ChatSnapshot, consume_input_echo_from_snapshot};
+        let chat = uuid::Uuid::new_v4();
+        let run = uuid::Uuid::new_v4();
+        let instance = "hosted:7247ea8b-fced-497c-8e04-2885648826e";
+        let payload = serde_json::json!({"items":[{"instance":instance,"title":"Stock watcher","seq":"7","updates":1,"data":{"text":"second check"}}]});
+        let text = tickloop_agent_protocol::local_messages::tick_delivery(
+            &payload,
+            &tickloop_agent_protocol::Trigger::for_loop_goal("watch"),
+        );
+        let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
+            "id":chat,"workdir":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"loops":[]
+        })).unwrap();
+        snapshot.message_ids.insert(0, uuid::Uuid::new_v4());
+        snapshot.message_runs.insert(0, run);
+        let history = super::workflows::public_history(&snapshot, super::DisplayProfile::default());
+        assert!(
+            history.contains("TickUpdate: Stock watcher"),
+            "history: {history:?}"
+        );
+        let console = Console::test_interactive_for_chat(chat);
+        console.defer_input_echo(chat, run).unwrap();
+        consume_input_echo_from_snapshot(&console, &snapshot, run).unwrap();
+        let live = console.test_conversation_text();
+        assert!(
+            live.contains("TickUpdate: Stock watcher"),
+            "live Tick Update source line is missing"
+        );
+        consume_input_echo_from_snapshot(&console, &snapshot, run).unwrap();
+        assert_eq!(
+            console.test_conversation_text(),
+            live,
+            "a repeated snapshot does not repeat the delivery"
+        );
+        let replay = Console::test_interactive_for_chat(chat);
+        super::workflows::write_public_history(&replay, &snapshot).unwrap();
+        let replayed = replay.test_conversation_text();
+        consume_input_echo_from_snapshot(&replay, &snapshot, run).unwrap();
+        assert_eq!(
+            replay.test_conversation_text(),
+            replayed,
+            "history already rendered this source"
+        );
+
+        let cached = Console::test_interactive_for_chat(chat);
+        cached.select_chat(Some(uuid::Uuid::new_v4())).unwrap();
+        consume_input_echo_from_snapshot(&cached, &snapshot, run).unwrap();
+        assert!(
+            !cached
+                .test_conversation_text()
+                .contains("TickUpdate: Stock watcher"),
+            "another Chat must not receive the label"
+        );
+        cached.select_chat(Some(chat)).unwrap();
+        assert!(
+            cached
+                .test_conversation_text()
+                .contains("TickUpdate: Stock watcher")
+        );
+        consume_input_echo_from_snapshot(&cached, &snapshot, run).unwrap();
+        assert_eq!(
+            cached
+                .test_conversation_text()
+                .matches("TickUpdate: Stock watcher")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn mixed_native_deliveries_keep_both_labels_once() {
+        use super::{ChatSnapshot, consume_input_echo_from_snapshot};
+        let chat = uuid::Uuid::new_v4();
+        let run = uuid::Uuid::new_v4();
+        let tick = tickloop_agent_protocol::local_messages::tick_delivery(
+            &serde_json::json!({"items":[{"instance":"hosted:feed","title":"Feed","seq":"1","updates":1,"data":{}}]}),
+            &tickloop_agent_protocol::Trigger::for_loop_goal("watch"),
+        );
+        let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({"id":chat,"workdir":"/work","messages":[{"role":"user","content":[{"type":"text","text":"@tickloop request req on artifact doc. Request input JSON:\n{}"},{"type":"text","text":tick}]}],"loops":[]})).unwrap();
+        snapshot.message_runs.insert(0, run);
+        let console = Console::test_interactive_for_chat(chat);
+        for _ in 0..2 {
+            consume_input_echo_from_snapshot(&console, &snapshot, run).unwrap();
+        }
+        let shown = console.test_conversation_text();
+        assert_eq!(
+            shown.matches("@tickloop request: doc").count(),
+            1,
+            "{shown}"
+        );
+        assert_eq!(shown.matches("TickUpdate: Feed").count(), 1, "{shown}");
+    }
+
+    #[test]
+    fn an_artifact_request_is_visible_once_when_its_live_run_starts() {
+        use super::{ChatSnapshot, consume_input_echo_from_snapshot};
+        let chat = uuid::Uuid::new_v4();
+        let run = uuid::Uuid::new_v4();
+        let text = "@tickloop request req-1 on artifact doc. Request input JSON:\n{\"message\":\"please update\"}";
+        let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
+            "id":chat,"workdir":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"loops":[]
+        })).unwrap();
+        snapshot.artifact_ticks.push(serde_json::from_value(serde_json::json!({"artifact_id":"doc","origin":"https://docs.example","title":"doc","format":"html","url":"https://docs.example/artifact/doc","access_role":"owner","added_at_ms":1})).unwrap());
+        snapshot.monitor.mark_taken_in(
+            tick_protocol::InstanceRef::artifact("https://docs.example", "doc").unwrap(),
+            tickloop_agent_base::private_fs::unix_time_milliseconds(),
+        );
+        snapshot.message_ids.insert(0, uuid::Uuid::new_v4());
+        snapshot.message_runs.insert(0, run);
+        let history = super::workflows::public_history(&snapshot, super::DisplayProfile::default());
+        assert!(
+            history.contains("@tickloop request: doc"),
+            "history: {history:?}"
+        );
+        let console = Console::test_interactive_for_chat(chat);
+        console.defer_input_echo(chat, run).unwrap();
+        consume_input_echo_from_snapshot(&console, &snapshot, run).unwrap();
+        let flash = console
+            .test_conversation_rows()
+            .into_iter()
+            .find(|line| line.text().contains("@tickloop request: doc"))
+            .unwrap()
+            .band
+            .unwrap();
+        assert_eq!(flash.columns.start, 2);
+        assert!(matches!(
+            flash.role,
+            super::style::Role::TakeInFlashStrong | super::style::Role::TakeInFlashSoft
+        ));
+        let live = console.test_conversation_text();
+        assert!(
+            live.contains("@tickloop request: doc"),
+            "live Artifact request label is missing"
+        );
+        consume_input_echo_from_snapshot(&console, &snapshot, run).unwrap();
+        assert_eq!(
+            console.test_conversation_text(),
+            live,
+            "a repeated snapshot does not repeat the delivery"
+        );
+        let replay = Console::test_interactive_for_chat(chat);
+        super::workflows::write_public_history(&replay, &snapshot).unwrap();
+        let replayed = replay.test_conversation_text();
+        consume_input_echo_from_snapshot(&replay, &snapshot, run).unwrap();
+        assert_eq!(
+            replay.test_conversation_text(),
+            replayed,
+            "history already rendered this source"
+        );
+
+        let cached = Console::test_interactive_for_chat(chat);
+        cached.select_chat(Some(uuid::Uuid::new_v4())).unwrap();
+        consume_input_echo_from_snapshot(&cached, &snapshot, run).unwrap();
+        assert!(
+            !cached
+                .test_conversation_text()
+                .contains("@tickloop request: doc"),
+            "another Chat must not receive the label"
+        );
+        cached.select_chat(Some(chat)).unwrap();
+        assert!(
+            cached
+                .test_conversation_text()
+                .contains("@tickloop request: doc")
+        );
+        consume_input_echo_from_snapshot(&cached, &snapshot, run).unwrap();
+        assert_eq!(
+            cached
+                .test_conversation_text()
+                .matches("@tickloop request: doc")
+                .count(),
+            1
+        );
     }
 
     #[test]

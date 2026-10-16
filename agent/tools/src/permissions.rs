@@ -445,6 +445,22 @@ pub fn bypasses_auto_classifier(rule: &PermissionRule) -> bool {
         })
 }
 
+// Persisted permission rules keep their original authority across the Tick API rename. These
+// names are policy projections only; model calls never dispatch through the old tool names.
+fn previous_tick_tool_name(name: &str, input: &Value) -> Option<&'static str> {
+    match name {
+        "TickDescribe" | "TickRead" => Some("ReadTick"),
+        "TickCall" => Some("CallTickTool"),
+        "TickManage" => match input["action"].as_str() {
+            Some("subscribe") => Some("SubscribeTick"),
+            Some("unsubscribe") => Some("UnsubscribeTick"),
+            Some("open" | "close" | "reopen" | "move" | "send_input") => Some("ModifyTick"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn rule_matches_any(
     rule: &PermissionRule,
     decision: Decision,
@@ -452,6 +468,22 @@ fn rule_matches_any(
     input: &Value,
     loop_id: Uuid,
 ) -> bool {
+    if let Some(previous) = previous_tick_tool_name(name, input)
+        && (rule.tool == previous
+            || (rule.tool == "*"
+                && rule
+                    .input
+                    .as_ref()
+                    .is_some_and(|expected| expected.get("action").is_none())))
+    {
+        let mut previous_input = input.clone();
+        if matches!(previous, "SubscribeTick" | "UnsubscribeTick")
+            && let Some(fields) = previous_input.as_object_mut()
+        {
+            fields.remove("action");
+        }
+        return rule_matches_any(rule, decision, previous, &previous_input, loop_id);
+    }
     rule.decision == decision
         && rule_applies_to_tool_and_goal(rule, name, loop_id)
         && match &rule.specifier {
@@ -477,11 +509,15 @@ fn allow_rules_cover_call(
         .iter()
         .copied()
         .filter(|rule| {
-            rule.decision == Decision::Allow && rule_applies_to_tool_and_goal(rule, name, loop_id)
+            rule.decision == Decision::Allow
+                && (rule_applies_to_tool_and_goal(rule, name, loop_id)
+                    || previous_tick_tool_name(name, input).is_some_and(|previous| {
+                        rule_applies_to_tool_and_goal(rule, previous, loop_id)
+                    }))
         })
         .collect::<Vec<_>>();
     if allow_rules.iter().any(|rule| {
-        rule.specifier.is_none() && rule.input.as_ref().is_none_or(|expected| expected == input)
+        rule.specifier.is_none() && rule_matches_any(rule, Decision::Allow, name, input, loop_id)
     }) {
         return true;
     }
@@ -1419,5 +1455,97 @@ mod tests {
             policy.decide_with_session(&operation, &workspace, Uuid::nil(), None),
             policy.decide(&operation, &workspace, Uuid::nil())
         );
+    }
+}
+
+#[cfg(test)]
+mod tick_policy_rename_tests {
+    use super::*;
+
+    #[test]
+    fn saved_exact_subscription_rules_match_through_the_policy_decision() {
+        let loop_id = Uuid::new_v4();
+        for (tool, action, input) in [
+            (
+                "SubscribeTick",
+                "subscribe",
+                serde_json::json!({"tick_instance_id":"shell:one"}),
+            ),
+            (
+                "UnsubscribeTick",
+                "unsubscribe",
+                serde_json::json!({"subscription":Uuid::new_v4()}),
+            ),
+        ] {
+            for decision in [Decision::Allow, Decision::Deny, Decision::Ask] {
+                let policy = PermissionPolicy {
+                    rules: vec![PermissionRule {
+                        id: Uuid::new_v4(),
+                        decision,
+                        tool: tool.into(),
+                        specifier: None,
+                        input: Some(input.clone()),
+                        loop_id: Some(loop_id),
+                        persistent: true,
+                    }],
+                    ..PermissionPolicy::default()
+                };
+                let mut current = input.clone();
+                current["action"] = action.into();
+                assert_eq!(
+                    policy.explicit_decision_with_session("TickManage", &current, loop_id, None),
+                    Some(decision)
+                );
+                current["action"] = "close".into();
+                assert_eq!(
+                    policy.explicit_decision_with_session("TickManage", &current, loop_id, None),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saved_tick_permissions_keep_their_action_boundaries() {
+        let loop_id = Uuid::new_v4();
+        for decision in [Decision::Allow, Decision::Deny, Decision::Ask] {
+            let rule = PermissionRule {
+                id: Uuid::new_v4(),
+                decision,
+                tool: "SubscribeTick".into(),
+                specifier: None,
+                input: None,
+                loop_id: None,
+                persistent: true,
+            };
+            assert!(rule_matches_call(
+                &rule,
+                "TickManage",
+                &serde_json::json!({"action":"subscribe","tick_instance_id":"hosted:one"}),
+                loop_id
+            ));
+            assert!(!rule_matches_call(
+                &rule,
+                "TickManage",
+                &serde_json::json!({"action":"close","tick_instance_id":"hosted:one"}),
+                loop_id
+            ));
+            let rule = PermissionRule {
+                tool: "ModifyTick".into(),
+                ..rule
+            };
+            assert!(!rule_matches_call(
+                &rule,
+                "TickManage",
+                &serde_json::json!({"action":"subscribe","tick_instance_id":"hosted:one"}),
+                loop_id
+            ));
+            assert!(rule_matches_call(
+                &rule,
+                "TickManage",
+                &serde_json::json!({"action":"close","tick_instance_id":"hosted:one"}),
+                loop_id
+            ));
+        }
     }
 }

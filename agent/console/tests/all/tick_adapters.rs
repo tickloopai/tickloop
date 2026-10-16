@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use tick_protocol::InstanceRef;
 use tickloop_agent_console::monitor_rows::{
     MonitorAction, MonitorContext, MonitorRows, MonitorRowsRegistry, NextCheck, SubscriptionMark,
-    SubscriptionOperation, TickDescriptor, TickGlyph, TickGroup, TickIntent,
+    TickDescriptor, TickGlyph, TickGroup, TickIntent,
 };
 use tickloop_agent_protocol::{
     EventKind, ObservationKind, TickSubscriptionChange, TickSubscriptionFrequency,
@@ -92,8 +92,8 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
     let model = Arc::new(ScriptedModel::new(vec![
         call(
             "s1",
-            "SubscribeTick",
-            json!({"tick_instance_id":calendar()}),
+            "TickManage",
+            json!({"action":"subscribe","tick_instance_id":calendar()}),
         ),
         text("watching"),
         text("calendar changed"),
@@ -112,12 +112,14 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
         let subscribe = requests[0]
             .tools
             .iter()
-            .find(|tool| tool.name == "SubscribeTick")
+            .find(|tool| tool.name == "TickManage")
             .unwrap();
         assert!(
             jsonschema::validator_for(&subscribe.input_schema)
                 .unwrap()
-                .is_valid(&json!({"tick_instance_id":"cal:a","frequency":"medium"})),
+                .is_valid(
+                    &json!({"action":"subscribe","tick_instance_id":"cal:a","frequency":"medium"})
+                ),
             "the model API must accept a short registered identity"
         );
     }
@@ -174,7 +176,7 @@ async fn a_registered_type_lists_subscribes_and_triggers_without_type_branches()
                 frequency: TickSubscriptionFrequency::High,
                 is_waiting: true,
                 next_check: Some(NextCheck {
-                    period_ms: 60_000,
+                    wait_ms: 60_000,
                     ..
                 }),
             })
@@ -232,8 +234,8 @@ async fn a_shell_subscription_reaches_the_loop_once_when_the_shell_exits() {
     agent.install_tick_stream(adapters).await;
     model.enqueue(call(
         "s1",
-        "SubscribeTick",
-        json!({"tick_instance_id":InstanceRef::shell(receipt.command_id)}),
+        "TickManage",
+        json!({"action":"subscribe","tick_instance_id":InstanceRef::shell(receipt.command_id)}),
     ));
     model.enqueue(text("watching"));
     model.enqueue(text("shell completed"));
@@ -430,22 +432,6 @@ fn built_in_rows_describe_their_actions_as_intents() {
             .clone()
     };
     let action = |key, label, intent| MonitorAction { key, label, intent };
-    let manage = |instance: &InstanceRef| {
-        [
-            ('w', "subscriptions", SubscriptionOperation::View),
-            ('u', "unsubscribe", SubscriptionOperation::Cancel),
-        ]
-        .map(|(key, label, operation)| {
-            action(
-                key,
-                label,
-                TickIntent::ManageSubscriptions {
-                    instance: instance.clone(),
-                    operation,
-                },
-            )
-        })
-    };
     let running_instance = InstanceRef::shell(running.id);
     assert_eq!(
         actions(&running_instance),
@@ -488,7 +474,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
             ),
         ]
     );
-    let mut pane_actions = vec![
+    let pane_actions = vec![
         action('o', "open", TickIntent::ShowDetails(pane.instance.clone())),
         action(
             'x',
@@ -496,12 +482,11 @@ fn built_in_rows_describe_their_actions_as_intents() {
             TickIntent::RemoveFromMonitor(pane.instance.clone()),
         ),
         action(
-            'f',
-            "frequency",
+            's',
+            "subscriptions",
             TickIntent::Subscribe(pane.instance.clone()),
         ),
     ];
-    pane_actions.extend(manage(&pane.instance));
     assert_eq!(actions(&pane.instance), pane_actions);
     let artifact_actions = [
         ('o', "open"),
@@ -527,6 +512,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
     );
     let member = InstanceRef::new("cal", "member").unwrap();
     let member_row = tickloop_agent_console::monitor_rows::member_descriptor(&MonitorMember {
+        is_terminal: false,
         instance: member.clone(),
         title: None,
     });
@@ -629,8 +615,8 @@ async fn shell_subscription_refuses_foreign_chat_before_baseline_and_restoration
     agent.install_tick_stream(adapters).await;
     model.enqueue(call(
         "foreign-watch",
-        "SubscribeTick",
-        json!({"tick_instance_id":instance}),
+        "TickManage",
+        json!({"action":"subscribe","tick_instance_id":instance}),
     ));
     model.enqueue(text("watch refused"));
     let mut events = agent.subscribe();

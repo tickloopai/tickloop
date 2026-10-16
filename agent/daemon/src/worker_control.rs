@@ -46,7 +46,7 @@ use tickloop_agent_runtime::{
             WorkerControlGrant, WorkerEnvelope, WorkerRequest, root_identity,
         },
     },
-    tick_tools::MODIFY_TICK,
+    tick_tools::TICK_MANAGE,
 };
 
 /// A worker request is small: an open carries argv, cwd and the launch environment.
@@ -508,6 +508,8 @@ impl WorkerControl {
                         .into_iter()
                         .filter_map(|record| match record.state {
                             LaunchState::Lost { instance, .. } => Some(LostTick {
+                                is_terminal: record.adapter
+                                    == tickhost::host::TickAdapter::Terminal,
                                 instance,
                                 title: record.title,
                             }),
@@ -741,7 +743,7 @@ impl WorkerControl {
                 uid: tickhost::paths::current_uid(),
             },
         };
-        if admission.tool != MODIFY_TICK || admission.authority != expected {
+        if admission.tool != TICK_MANAGE || admission.authority != expected {
             return Err(HostError::before(
                 "Forbidden",
                 "the request was not prepared for this daemon's Tickhost",

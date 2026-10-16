@@ -1,4 +1,4 @@
-<!-- source-sha256: 2b59c24aa11505c2368daa9063387a0858e6d0c7a85e66e751719a5245cc7358 -->
+<!-- source-sha256: 0eed43408210a7d6473e527f2790edb37e6a43b6d359f75aef606d0ed11baa7e -->
 
 # Tick Protocol Specification
 
@@ -8,6 +8,10 @@
 | Status | Draft; describes the Tickloop 0.2 implementation in this repository |
 | Date | 2026-10-14 |
 | Reference implementation | Host types and validation in `tick/protocol`; Tick-side SDK in `tick/sdk`; example in `tick/examples/counter.py` |
+
+## Agent tools and package guidance
+
+The protocol has three request methods (`tick/describe`, `tick/read`, `tick/call`) and one notification (`tick/update`). Tickloop exposes them through TickDescribe (capabilities), TickRead (current state), TickCall (declared operations) and TickUpdate (delivery event). TickRead does not repeat the descriptor or tool catalog. TickManage handles lifecycle, views, terminal input and Loop subscriptions in the Agent/host; it is not an additional Tick program RPC. Package Skills document launch commands and login prerequisites. A running instance's descriptor is the authoritative capability catalog.
 
 ## 1. Overview
 

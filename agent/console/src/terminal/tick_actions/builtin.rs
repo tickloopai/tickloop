@@ -32,6 +32,7 @@ pub(in crate::terminal) fn executor(intent: &TickIntent) -> Option<Arc<dyn TickA
             confirmed: None,
         }),
         TickIntent::Subscribe(instance) => Arc::new(Subscribe { instance }),
+        TickIntent::SendUpdate(instance) => Arc::new(SendUpdate { instance }),
         TickIntent::StopShell { task } => Arc::new(StopShell {
             task,
             is_confirmed: false,
@@ -126,6 +127,12 @@ async fn refresh_subscriptions(ctx: &TickActionContext<'_>) -> Result<(), String
         .tick_subscriptions(ctx.chat)
         .await
         .map_err(|error| format!("Cannot read Tick Subscriptions: {error}"))?;
+    ctx.console.update_monitor_chat(
+        ctx.agent
+            .current_status(ctx.chat)
+            .await
+            .map_err(|error| error.to_string())?,
+    )?;
     ctx.console.update_subscribed_ticks(ctx.chat, &rows)
 }
 /// Changes or cancels one subscription. A refusal shows in the subscription detail `panel` while
@@ -144,13 +151,39 @@ struct ChangeSubscription {
 #[async_trait]
 impl TickActionBackend for ChangeSubscription {
     async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
-        if let Err(error) = ctx
+        let rows = ctx
             .agent
-            .update_tick_subscription(ctx.chat, self.request.subscription, self.request.change)
+            .tick_subscriptions(ctx.chat)
             .await
-        {
-            ctx.console
-                .forget_requested_frequency(ctx.chat, self.request.subscription)?;
+            .map_err(|error| error.to_string())?;
+        let targets = rows
+            .iter()
+            .find(|row| row.id == self.request.subscription)
+            .filter(|_| self.panel.is_none())
+            .map(|selected| {
+                rows.iter()
+                    .filter(|row| {
+                        row.instance == selected.instance && row.frequency.period().is_some()
+                    })
+                    .map(|row| row.id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![self.request.subscription]);
+        let mut failure = None;
+        for id in &targets {
+            if let Err(error) = ctx
+                .agent
+                .update_tick_subscription(ctx.chat, *id, self.request.change)
+                .await
+            {
+                failure = Some(error);
+                break;
+            }
+        }
+        if let Some(error) = failure {
+            for id in targets {
+                ctx.console.forget_requested_subscription(ctx.chat, id)?;
+            }
             let message = format!(
                 "Cannot update the Tick Subscription: {}",
                 safe_text(&error.to_string())
@@ -169,18 +202,18 @@ impl TickActionBackend for ChangeSubscription {
         refresh_subscriptions(&ctx).await
     }
 }
-/// Moves one periodic subscription on to its next frequency, high after low, at once: Monitor
+/// Moves one periodic subscription on to its next frequency, off after low, at once: Monitor
 /// shows the new frequency before the Agent confirms it, without asking. A refusal shows in the
 /// subscription detail `panel` while it is open.
-pub(in crate::terminal) struct CycleFrequency {
+pub(in crate::terminal) struct CycleSubscription {
     pub(in crate::terminal) instance: tick_protocol::InstanceRef,
     pub(in crate::terminal) subscription: Uuid,
     pub(in crate::terminal) panel: Option<Uuid>,
 }
-impl TickActionExecutor for CycleFrequency {
+impl TickActionExecutor for CycleSubscription {
     fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
-        let frequency = ui
-            .cycle_frequency(self.subscription)
+        let change = ui
+            .cycle_subscription(self.subscription, self.panel.is_none())
             .ok_or("This Tick Subscription has no frequency to change")?;
         Ok(PreparedTickAction::new(
             self.instance.to_string(),
@@ -189,7 +222,7 @@ impl TickActionExecutor for CycleFrequency {
                 self.panel,
                 SubscriptionRequest {
                     subscription: self.subscription,
-                    change: tickloop_agent_protocol::TickSubscriptionChange::Frequency(frequency),
+                    change,
                 },
             ),
         ))
@@ -240,19 +273,12 @@ impl TickActionBackend for OpenView {
             Ok(None) => return open_full_screen(&ctx, &self.instance).await,
             Ok(Some(popup)) => match popup.check(&ctx).await {
                 Ok(()) => popup.float(&ctx, &self.instance).await,
-                Err(reason)
-                    if reason.offers_registration()
-                        && ctx.console.take_popup_registration_offer()? =>
-                {
-                    ctx.console.confirm_tick_action(
-                        ctx.chat,
-                        self.instance.to_string(),
-                        Arc::new(RegisterPopup {
-                            instance: self.instance.clone(),
-                        }),
-                        reason.registration_prompt(),
-                    )?;
-                    return Ok(());
+                Err(reason) if reason.needs_registration() => {
+                    return RegisterPopup {
+                        instance: self.instance.clone(),
+                    }
+                    .execute(ctx)
+                    .await;
                 }
                 Err(reason) => Err(reason),
             },
@@ -262,11 +288,6 @@ impl TickActionBackend for OpenView {
     }
 }
 
-const REGISTER_POPUP_PROMPT: &str =
-    "Register Tickloop's Herdr popup plugin? No other plugin is touched.";
-const TURN_ON_POPUP_PROMPT: &str = "Turn Tickloop's Herdr popup on? No other plugin is touched.";
-const REGISTER_THIS_TICKLOOP_PROMPT: &str =
-    "Tickloop's Herdr popup runs another tickloop. Register this one instead?";
 const HERDR_BUSY: &str = "Herdr is showing another view; close it and press enter again";
 
 /// Why a local Tick did not float in the Herdr popup.
@@ -278,7 +299,7 @@ enum NotFloated {
     Outdated,
     /// The popup cannot show it here, such as when another plugin holds our id; nothing opened.
     Unavailable,
-    /// The user confirmed registering our plugin, but it could not be registered.
+    /// Opening the Tick needed our plugin, but registration failed.
     RegistrationFailed(String),
     /// Herdr is showing something other than its workspace view, such as another popup.
     Busy,
@@ -298,16 +319,8 @@ impl From<crate::terminal::popup::FloatError> for NotFloated {
 }
 
 impl NotFloated {
-    fn offers_registration(&self) -> bool {
-        matches!(self, Self::NotRegistered | Self::TurnedOff | Self::Outdated)
-    }
-
-    fn registration_prompt(&self) -> &'static str {
-        match self {
-            Self::TurnedOff => TURN_ON_POPUP_PROMPT,
-            Self::Outdated => REGISTER_THIS_TICKLOOP_PROMPT,
-            _ => REGISTER_POPUP_PROMPT,
-        }
+    fn needs_registration(&self) -> bool {
+        matches!(self, Self::NotRegistered | Self::Outdated)
     }
 }
 
@@ -342,6 +355,15 @@ impl HerdrPopup {
     /// Whether our plugin is registered and turned on in this session.
     async fn check(&self, ctx: &TickActionContext<'_>) -> Result<(), NotFloated> {
         use crate::terminal::popup::PopupReadiness;
+        if ctx
+            .console
+            .monitor_popup()
+            .map_err(|_| NotFloated::Unavailable)?
+            == tickloop_agent_config::MonitorPopup::Disabled
+        {
+            return Err(NotFloated::TurnedOff);
+        }
+
         match self
             .herdr
             .readiness(&self.plugin)
@@ -354,18 +376,10 @@ impl HerdrPopup {
             PopupReadiness::Outdated => return Err(NotFloated::Outdated),
             PopupReadiness::Foreign { .. } => return Err(NotFloated::Unavailable),
         }
-        if ctx
-            .console
-            .monitor_popup()
-            .map_err(|_| NotFloated::Unavailable)?
-            == tickloop_agent_config::MonitorPopup::Disabled
-        {
-            return Err(NotFloated::TurnedOff);
-        }
         Ok(())
     }
 
-    /// Links our plugin enabled and turns `monitorPopup` on; the user has just confirmed.
+    /// Links our own popup plugin and enables the popup requested by opening the Tick.
     async fn register(&self, ctx: &TickActionContext<'_>) -> Result<(), NotFloated> {
         self.herdr
             .install(&self.plugin, &self.settings)
@@ -391,21 +405,9 @@ impl HerdrPopup {
     }
 }
 
-/// Registers, or turns on, Tickloop's popup plugin in this View's Herdr session once the user
-/// confirmed, then floats the Tick.
+/// Registers, or turns on, Tickloop's popup plugin in this View's Herdr session when the user opens a Tick, then floats it.
 struct RegisterPopup {
     instance: tick_protocol::InstanceRef,
-}
-impl TickActionExecutor for RegisterPopup {
-    fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
-        Ok(PreparedTickAction::new(
-            self.instance.to_string(),
-            crate::monitor_rows::MONITOR_ENTER_KEY,
-            Arc::new(RegisterPopup {
-                instance: self.instance.clone(),
-            }),
-        ))
-    }
 }
 #[async_trait]
 impl TickActionBackend for RegisterPopup {
@@ -556,7 +558,6 @@ fn tick_subscriptions(count: usize) -> String {
 }
 const STOP_SHELL_PROMPT: &str = "Stop this Shell? enter confirm · esc cancel";
 const REOPEN_HOSTED_PROMPT: &str = "Open a new instance of this Tick with its command? It takes this row's place. enter confirm · esc cancel";
-const ALREADY_SUBSCRIBED_NOTICE: &str = "Already subscribed · f cycles the frequency, u cancels it";
 
 /// What closing a hosted Tick asks before it runs.
 fn close_hosted_prompt(subscriptions: usize) -> String {
@@ -724,7 +725,32 @@ impl TickActionBackend for ReopenHosted {
     }
 }
 
-/// The row's `f` on an extension or terminal Tick: subscribes the Chat at the default frequency
+struct SendUpdate {
+    instance: tick_protocol::InstanceRef,
+}
+impl TickActionExecutor for SendUpdate {
+    fn prepare(&self, _ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
+        Ok(PreparedTickAction::new(
+            self.instance.to_string(),
+            'u',
+            Arc::new(Self {
+                instance: self.instance.clone(),
+            }),
+        ))
+    }
+}
+#[async_trait]
+impl TickActionBackend for SendUpdate {
+    async fn execute(&self, ctx: TickActionContext<'_>) -> Result<(), String> {
+        ctx.agent
+            .tick_send_update(ctx.chat, self.instance.clone())
+            .await
+            .map_err(|error| format!("Cannot send update: {}", safe_text(&error.to_string())))?;
+        refresh_subscriptions(&ctx).await
+    }
+}
+
+/// The row's `s` on an extension or terminal Tick: subscribes the Chat at the default frequency
 /// on its user's word, or, once a Loop of the Chat subscribes to it, cycles that subscription's
 /// frequency.
 struct Subscribe {
@@ -732,14 +758,11 @@ struct Subscribe {
 }
 impl TickActionExecutor for Subscribe {
     fn prepare(&self, ui: &mut TickActionUi<'_>) -> Result<PreparedTickAction, String> {
-        if let Some(subscription) = ui.frequency_target(&self.instance) {
-            return CycleFrequency {
-                instance: self.instance.clone(),
-                subscription,
-                panel: None,
-            }
-            .prepare(ui);
+        if let Some(subscription) = ui.subscription_target(&self.instance) {
+            ui.cycle_subscription(subscription, true);
         }
+        // Keep queued row presses relative, including those prepared before the first subscribe
+        // completes. Mixing these with absolute frequency requests would lose a rapid press.
         Ok(PreparedTickAction::new(
             self.instance.to_string(),
             SUBSCRIBE_KEY,
@@ -757,15 +780,35 @@ impl TickActionBackend for Subscribe {
             .tick_subscriptions(ctx.chat)
             .await
             .map_err(|error| format!("Cannot read Tick Subscriptions: {error}"))?;
-        if !crate::monitor_rows::subscriptions_on(&subscriptions, &self.instance).is_empty() {
-            return ctx.notify(ALREADY_SUBSCRIBED_NOTICE);
+        if let Some(row) = crate::monitor_rows::subscriptions_on(&subscriptions, &self.instance)
+            .into_iter()
+            .filter(|row| row.frequency.period().is_some())
+            .min_by_key(|row| row.frequency.period())
+        {
+            let change = match row.frequency {
+                tickloop_agent_protocol::TickSubscriptionFrequency::Low => {
+                    tickloop_agent_protocol::TickSubscriptionChange::Cancel
+                }
+                frequency => tickloop_agent_protocol::TickSubscriptionChange::Frequency(
+                    frequency.next_periodic().expect("periodic subscription"),
+                ),
+            };
+            return ChangeSubscription {
+                panel: None,
+                request: SubscriptionRequest {
+                    subscription: row.id,
+                    change,
+                },
+            }
+            .execute(ctx)
+            .await;
         }
         ctx.agent
-            .subscribe_tick(ctx.chat, self.instance.clone())
+            .tick_subscribe(ctx.chat, self.instance.clone())
             .await
             .map_err(|error| format!("Cannot subscribe: {}", safe_text(&error.to_string())))?;
         refresh_subscriptions(&ctx).await?;
-        ctx.notify("Subscribed at high · f cycles the frequency")
+        Ok(())
     }
 }
 /// Stops a running Shell from its Monitor row once confirmed, under the Shell's own controls:

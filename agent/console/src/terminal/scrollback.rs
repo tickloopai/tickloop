@@ -74,6 +74,8 @@ struct LineStyle {
     markdown: Option<Box<MarkdownBlock>>,
     /// Lines that produce no rows, such as a superseded completion notice.
     hidden: bool,
+    flash: Option<(super::list_row::RowFlash, u64)>,
+    pending_take_in: Option<tick_protocol::InstanceRef>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -198,6 +200,7 @@ pub(super) struct Scrollback {
     id: u64,
     lines: Vec<String>,
     line_styles: Vec<LineStyle>,
+    pending_take_in_lines: Vec<usize>,
     block: Option<Block>,
     rows: Vec<Row>,
     /// Rows of the conversation itself, without the blank rows that end it; kept with `rows`.
@@ -228,6 +231,7 @@ pub(super) struct Scrollback {
     /// Logical lines of each input echo, oldest first.
     inputs: Vec<(u64, Range<usize>)>,
     next_input: u64,
+    flashes_since_ms: u64,
     groups: Vec<CollapsedGroup>,
     /// The collapsed group that ends the conversation, which the next read or search joins.
     open_group: Option<usize>,
@@ -239,6 +243,7 @@ impl Default for Scrollback {
             id: NEXT_SCROLLBACK.fetch_add(1, Ordering::Relaxed),
             lines: vec![String::new()],
             line_styles: vec![LineStyle::default()],
+            pending_take_in_lines: Vec::new(),
             block: None,
             rows: Vec::new(),
             conversation_rows: 0,
@@ -261,6 +266,7 @@ impl Default for Scrollback {
             completion_notice: None,
             inputs: Vec::new(),
             next_input: 0,
+            flashes_since_ms: 0,
             groups: Vec::new(),
             open_group: None,
         }
@@ -658,6 +664,76 @@ impl Scrollback {
         );
     }
 
+    pub(super) fn append_flashing_label(
+        &mut self,
+        runs: &[(String, Option<Role>)],
+        flash: Option<(super::list_row::RowFlash, u64)>,
+        pending_take_in: Option<tick_protocol::InstanceRef>,
+    ) {
+        self.start_block();
+        let start = self.lines.len() - 1;
+        for (text, role) in runs {
+            self.append_as(text.trim_start_matches('\n'), *role, None);
+        }
+        for index in start..self.lines.len() {
+            if !self.lines[index].is_empty() {
+                self.line_styles[index].flash = flash;
+                self.line_styles[index].pending_take_in = pending_take_in.clone();
+                if pending_take_in.is_some() {
+                    self.pending_take_in_lines.push(index);
+                }
+            }
+        }
+    }
+
+    pub(super) fn sync_native_take_in(
+        &mut self,
+        membership: &tickloop_agent_protocol::MonitorMembership,
+    ) {
+        self.pending_take_in_lines.retain(|index| {
+            let Some(style) = self.line_styles.get_mut(*index) else {
+                return false;
+            };
+            let Some(instance) = &style.pending_take_in else {
+                return false;
+            };
+            let Some(since) = membership.taken_in_at(instance) else {
+                return true;
+            };
+            if since >= self.flashes_since_ms {
+                style.flash = Some((super::list_row::RowFlash::TakeIn, since));
+            }
+            style.pending_take_in = None;
+            false
+        });
+    }
+
+    pub(super) fn flash_tool_call(&mut self, key: &str, since_ms: u64) {
+        if let Some(header) = self.tool_call_headers.get(key) {
+            self.line_styles[header.line].flash = Some((super::list_row::RowFlash::Use, since_ms));
+        }
+    }
+
+    pub(super) fn settle_flashes(&mut self, now_ms: u64) {
+        self.flashes_since_ms = now_ms;
+    }
+
+    pub(super) fn next_flash_frame_ms(
+        &self,
+        now_ms: u64,
+        display: super::display::DisplayProfile,
+    ) -> Option<u64> {
+        let top = self.top_row();
+        self.rows
+            .iter()
+            .skip(top)
+            .take(self.height)
+            .filter_map(|row| self.line_styles[row.start.line].flash)
+            .filter(|(_, since)| *since >= self.flashes_since_ms)
+            .filter_map(|(_, since)| display.next_flash_change_ms(since, now_ms))
+            .min()
+    }
+
     /// Shows a call's row in `state`, adding it as a block when the call is new. A read or
     /// search (`collapse`) joins the collapsed group that ends the conversation, or starts one.
     pub(super) fn set_tool_call(
@@ -999,6 +1075,21 @@ impl Scrollback {
         height: usize,
         prefers_reduced_motion: bool,
     ) -> ScrollFrame {
+        self.frame_at(
+            width,
+            height,
+            prefers_reduced_motion,
+            tickloop_agent_base::private_fs::unix_time_milliseconds(),
+        )
+    }
+
+    pub(super) fn frame_at(
+        &mut self,
+        width: usize,
+        height: usize,
+        prefers_reduced_motion: bool,
+        now_ms: u64,
+    ) -> ScrollFrame {
         if width == 0 || height == 0 {
             return ScrollFrame {
                 top: 0,
@@ -1020,6 +1111,29 @@ impl Scrollback {
         let styled: Vec<RoleLine> = (top.min(conversation_end)..conversation_end)
             .map(|index| {
                 let mut styled = self.rows[index].styled.clone();
+                if !prefers_reduced_motion
+                    && let Some(flash) = self.line_styles[self.rows[index].start.line]
+                        .flash
+                        .filter(|(_, since)| *since >= self.flashes_since_ms)
+                    && let Some(fill) = super::list_row::flash_fill(
+                        Some(flash),
+                        super::display::DisplayProfile::default(),
+                        now_ms,
+                    )
+                {
+                    let columns = unicode_width::UnicodeWidthStr::width(styled.text().as_str());
+                    let first_line = &self.lines[self.rows[index].start.line];
+                    let start = first_line
+                        .find(' ')
+                        .map(|byte| unicode_width::UnicodeWidthStr::width(&first_line[..byte + 1]))
+                        .unwrap_or(0);
+                    let start = if self.rows[index].start.byte == 0 {
+                        start
+                    } else {
+                        0
+                    };
+                    styled = styled.banded(start.min(columns)..columns, fill);
+                }
                 if running_tool_rows.contains(&index) {
                     let spans = std::mem::take(&mut styled.spans);
                     for span in spans {
@@ -1649,6 +1763,105 @@ mod tests {
             .iter()
             .map(|span| (span.text.clone(), span.role))
             .collect()
+    }
+
+    #[test]
+    fn native_completion_waits_for_take_in_and_never_replays_after_a_view_switch() {
+        let instance = tick_protocol::InstanceRef::shell(Uuid::new_v4());
+        let mut scroll = Scrollback::new();
+        scroll.append_flashing_label(
+            &[("⏺ Background command completed\n".into(), None)],
+            None,
+            Some(instance.clone()),
+        );
+        let mut membership = tickloop_agent_protocol::MonitorMembership::default();
+        scroll.sync_native_take_in(&membership);
+        assert!(scroll.line_styles.iter().all(|style| style.flash.is_none()));
+        membership.mark_taken_in(instance.clone(), 1_000);
+        scroll.sync_native_take_in(&membership);
+        let frame = scroll.frame_at(40, 10, false, 1_100);
+        let row = frame
+            .styled
+            .iter()
+            .find(|row| row.text().contains("Background"))
+            .unwrap();
+        assert_eq!(row.band.as_ref().unwrap().columns.start, 2);
+        assert_eq!(row.band.as_ref().unwrap().role, Role::TakeInFlashStrong);
+        membership.mark_taken_in(instance, 2_000);
+        scroll.sync_native_take_in(&membership);
+        assert!(
+            scroll
+                .line_styles
+                .iter()
+                .filter_map(|style| style.flash)
+                .all(|(_, since)| since == 1_000)
+        );
+        scroll.settle_flashes(2_000);
+        assert!(
+            scroll
+                .frame_at(40, 10, false, 2_000)
+                .styled
+                .iter()
+                .all(|line| line.band.is_none())
+        );
+    }
+
+    #[test]
+    fn tick_labels_share_the_monitor_flash_phases_and_reduce_motion() {
+        use super::super::{
+            display::DisplayProfile,
+            list_row::{RowFlash, flash_fill},
+        };
+        let mut scroll = Scrollback::new();
+        scroll.append_flashing_label(
+            &[("Tick update\n".into(), Some(Role::MutedText))],
+            Some((RowFlash::TakeIn, 1_000)),
+            None,
+        );
+        scroll.set_tool_call(
+            Uuid::from_u128(1),
+            "read",
+            &[("TickRead".into(), Some(Role::ToolName))],
+            ToolCallState::Finished,
+            None,
+        );
+        scroll.flash_tool_call("read", 1_000);
+        for now in [1_000, 1_400, 1_800, 2_200] {
+            let frame = scroll.frame_at(40, 10, false, now);
+            for (text, kind) in [
+                ("Tick update", RowFlash::TakeIn),
+                ("TickRead", RowFlash::Use),
+            ] {
+                let row = frame
+                    .styled
+                    .iter()
+                    .find(|row| row.text().contains(text))
+                    .unwrap();
+                assert_eq!(
+                    row.band.as_ref().map(|band| band.role),
+                    flash_fill(Some((kind, 1_000)), DisplayProfile::default(), now)
+                );
+            }
+        }
+        assert!(
+            scroll
+                .frame_at(40, 10, true, 1_000)
+                .styled
+                .iter()
+                .all(|line| line.band.is_none())
+        );
+        scroll.settle_flashes(1_001);
+        assert!(
+            scroll
+                .frame_at(40, 10, false, 1_100)
+                .styled
+                .iter()
+                .all(|line| line.band.is_none())
+        );
+        assert_eq!(
+            scroll.next_flash_frame_ms(1_100, DisplayProfile::default()),
+            None
+        );
     }
 
     #[test]

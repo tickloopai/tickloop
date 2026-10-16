@@ -88,13 +88,11 @@ impl MonitorEntry {
     /// subscriptions while they hold one for a check, any other row until the Chat handles its
     /// latest update.
     fn is_unread(&self) -> bool {
-        match self.subscription {
-            Some(mark) => mark.is_waiting,
-            None => self
+        self.subscription.is_some_and(|mark| mark.is_waiting)
+            || self
                 .update
                 .as_ref()
-                .is_some_and(|update| update.unread.is_some()),
-        }
+                .is_some_and(|update| update.unread.is_some())
     }
 
     /// The check that hands over what the row's periodic subscriptions hold, once the Agent
@@ -163,9 +161,8 @@ pub(super) struct Monitor {
     /// Since when this View has shown this Chat's Monitor; an Agent turn taking an update in or
     /// using an instance earlier never flashes its row.
     flashes_since: Option<u64>,
-    /// The update each row last listed as handled; taking the same update in again, such as the
-    /// completion notification of a Shell end the Agent already read, does not flash the row.
-    handled_updates: HashMap<InstanceRef, u64>,
+    /// Delivery timestamps already seen, retained when active flashes are settled.
+    seen_take_ins: HashMap<InstanceRef, u64>,
     /// When an Agent turn took in each row's update while this View showed the Chat; the row
     /// flashes warm from then on.
     taken_in: HashMap<InstanceRef, u64>,
@@ -180,7 +177,7 @@ pub(super) struct Monitor {
     /// The frequencies the user asked for that the Agent does not report yet, by subscription.
     /// Monitor shows them at once, and the next `f` cycles on from them rather than from a report
     /// that predates the request.
-    requested_frequencies: HashMap<uuid::Uuid, TickSubscriptionFrequency>,
+    requested_subscriptions: HashMap<uuid::Uuid, Option<TickSubscriptionFrequency>>,
 }
 
 /// What one status refresh reads for Monitor.
@@ -299,54 +296,74 @@ impl Monitor {
         self.subscriptions
             .iter()
             .cloned()
-            .map(|mut row| {
-                if let Some(frequency) = self.requested_frequencies.get(&row.id) {
-                    row.frequency = *frequency;
+            .filter_map(|mut row| {
+                if let Some(frequency) = self.requested_subscriptions.get(&row.id) {
+                    row.frequency = (*frequency)?;
                 }
-                row
+                Some(row)
             })
             .collect()
     }
     /// The subscription on `instance` whose frequency the row's `f` cycles: the last periodic
     /// one, since the Agent lists subscriptions in the order their Loops began.
-    pub(super) fn frequency_target(&self, instance: &InstanceRef) -> Option<uuid::Uuid> {
+    pub(super) fn subscription_target(&self, instance: &InstanceRef) -> Option<uuid::Uuid> {
         crate::monitor_rows::subscriptions_on(&self.shown_subscriptions(), instance)
             .iter()
-            .rev()
-            .find(|row| row.frequency.period().is_some())
+            .filter(|row| row.frequency.period().is_some())
+            .min_by_key(|row| row.frequency.period())
             .map(|row| row.id)
     }
-    /// Asks for the periodic frequency after the one `subscription` shows and shows it at once;
-    /// `None` for a subscription that is gone or immediate.
-    pub(super) fn request_next_frequency(
+    pub(super) fn request_next_subscription(
         &mut self,
         subscription: uuid::Uuid,
-    ) -> Option<TickSubscriptionFrequency> {
-        let next = self
-            .shown_subscriptions()
-            .iter()
-            .find(|row| row.id == subscription)?
-            .frequency
-            .next_periodic()?;
-        self.requested_frequencies.insert(subscription, next);
+        all_on_instance: bool,
+    ) -> Option<tickloop_agent_protocol::TickSubscriptionChange> {
+        let rows = self.shown_subscriptions();
+        let row = rows.iter().find(|row| row.id == subscription)?;
+        let next = match row.frequency {
+            TickSubscriptionFrequency::Low => None,
+            frequency => Some(frequency.next_periodic()?),
+        };
+        for target in rows.iter().filter(|target| {
+            target.id == subscription
+                || (all_on_instance
+                    && target.instance == row.instance
+                    && target.frequency.period().is_some())
+        }) {
+            self.requested_subscriptions.insert(target.id, next);
+        }
         self.rebuild();
-        Some(next)
+        Some(next.map_or(
+            tickloop_agent_protocol::TickSubscriptionChange::Cancel,
+            tickloop_agent_protocol::TickSubscriptionChange::Frequency,
+        ))
     }
+
     /// Shows what the Agent reports for `subscription` again, after it refused the change.
-    pub(super) fn forget_requested_frequency(&mut self, subscription: uuid::Uuid) {
-        if self.requested_frequencies.remove(&subscription).is_some() {
+    pub(super) fn forget_requested_subscription(&mut self, subscription: uuid::Uuid) {
+        if self.requested_subscriptions.remove(&subscription).is_some() {
             self.rebuild();
         }
     }
     fn rebuild_at(&mut self, now_ms: u64) {
         let subscriptions = &self.subscriptions;
-        self.requested_frequencies.retain(|id, requested| {
-            subscriptions
-                .iter()
-                .any(|row| row.id == *id && row.frequency != *requested)
+        self.requested_subscriptions.retain(|id, requested| {
+            subscriptions.iter().any(|row| {
+                row.id == *id && requested.is_none_or(|frequency| row.frequency != frequency)
+            })
         });
         let shown_subscriptions = self.shown_subscriptions();
+        let mut member_updates = self.member_findings.updates.clone();
+        for row in &self.subscriptions {
+            if (row.has_pending_change || row.accumulated > 0)
+                && let Some(updated) = row.updated_at_ms
+            {
+                let mark = member_updates.entry(row.instance.clone()).or_default();
+                *mark = (*mark).max(updated);
+            }
+        }
         let context = MonitorContext {
+            terminal_members: self.member_findings.terminals.clone(),
             chat: self.chat_status.clone(),
             shells: self.shell_snapshot.clone(),
             subscriptions: shown_subscriptions.clone(),
@@ -354,7 +371,7 @@ impl Monitor {
             metadata_failures: self.metadata_failures.clone(),
             member_states: self.member_findings.states.clone(),
             member_resources: self.member_findings.resources.clone(),
-            member_updates: self.member_findings.updates.clone(),
+            member_updates,
             shell_starts: self.shell_starts.clone(),
             retained: self.detail.as_ref().and_then(|detail| detail.instance()),
             now_ms,
@@ -418,18 +435,34 @@ impl Monitor {
     /// Notes what flashes: the glyph of a row whose new update just came, the whole row whose
     /// update an Agent turn has just taken in, and the whole row whose instance the Agent has just
     /// used. A row the user opened does not flash, nor one taken in or used before this View
-    /// showed the Chat, nor an update the row already showed handled that a turn takes in again.
+    /// showed the Chat, nor the same recorded delivery listed again. Each new delivery can flash even when a read already handled its content.
     fn note_flashes(&mut self, listed: &[TickDescriptor], now_ms: u64) {
         let flashes_since = *self.flashes_since.get_or_insert(now_ms);
         let membership = self.chat_status.as_deref().map(|chat| &chat.monitor);
-        let mut handled_updates = HashMap::new();
         let mut listed_updates = HashMap::new();
         for entry in listed {
             if let Some(used) = membership
                 .and_then(|membership| membership.used_at(&entry.instance))
                 .filter(|used| *used >= flashes_since)
             {
-                self.used.insert(entry.instance.clone(), used);
+                self.used
+                    .entry(entry.instance.clone())
+                    .and_modify(|since| *since = (*since).max(used))
+                    .or_insert(used);
+            }
+            if let Some(taken_in) = membership
+                .and_then(|membership| membership.taken_in_at(&entry.instance))
+                .or_else(|| {
+                    entry
+                        .update
+                        .as_ref()
+                        .and_then(|update| update.taken_in_at_ms)
+                })
+            {
+                let previous = self.seen_take_ins.insert(entry.instance.clone(), taken_in);
+                if previous != Some(taken_in) && taken_in >= flashes_since {
+                    self.taken_in.insert(entry.instance.clone(), taken_in);
+                }
             }
             let at_ms = entry.update.as_ref().map(|update| update.at_ms);
             if self
@@ -440,28 +473,15 @@ impl Monitor {
                 self.update_flashes.insert(entry.instance.clone(), now_ms);
             }
             listed_updates.insert(entry.instance.clone(), at_ms);
-            let Some(update) = entry
-                .update
-                .as_ref()
-                .filter(|update| update.unread.is_none())
-            else {
-                continue;
-            };
-            if let Some(taken_in) = update.taken_in_at_ms
-                && taken_in >= flashes_since
-                && self.handled_updates.get(&entry.instance) != Some(&update.at_ms)
-            {
-                self.taken_in.insert(entry.instance.clone(), taken_in);
-            }
-            handled_updates.insert(entry.instance.clone(), update.at_ms);
         }
         self.taken_in
-            .retain(|instance, _| handled_updates.contains_key(instance));
+            .retain(|instance, _| listed_updates.contains_key(instance));
         self.used
             .retain(|instance, _| listed_updates.contains_key(instance));
         self.update_flashes
             .retain(|instance, _| listed_updates.contains_key(instance));
-        self.handled_updates = handled_updates;
+        self.seen_take_ins
+            .retain(|instance, _| listed_updates.contains_key(instance));
         self.listed_updates = listed_updates;
     }
     /// Ends the flashes under way and lets only later updates, take-ins and uses flash, as when
@@ -520,11 +540,12 @@ impl Monitor {
             })
             .flatten()
             .filter_map(|since| display.next_flash_change_ms(*since, now_ms));
-        let counting_down = self
-            .entries
-            .iter()
-            .filter_map(MonitorEntry::waiting_check)
-            .filter_map(|check| check.next_column_at(width, now_ms));
+        let counting_down = self.entries.iter().filter_map(|entry| {
+            entry.waiting_check()?.next_column_at(
+                width.saturating_sub(list_row::name_column(display.glyph(entry.glyph))),
+                now_ms,
+            )
+        });
         running
             .into_iter()
             .chain(flashing)
@@ -533,6 +554,10 @@ impl Monitor {
     }
     /// What `entry`'s whole row flashes for, and since when: the later of an Agent turn taking its
     /// update in and the Agent using its instance, so a flash that starts covers one under way.
+    pub(super) fn flash_use(&mut self, instance: InstanceRef, since_ms: u64) {
+        self.used.insert(instance, since_ms);
+    }
+
     fn row_flash(&self, entry: &MonitorEntry) -> Option<(RowFlash, u64)> {
         let taken_in = self
             .taken_in
@@ -707,6 +732,36 @@ impl Monitor {
         self.frame(width, height, display, now_ms).lines
     }
 
+    fn selected_status(&self) -> String {
+        let Some(entry) = self.selected() else {
+            return String::new();
+        };
+        let mut parts = vec![match entry.tone {
+            StatusTone::Running { .. } => "Running".to_owned(),
+            StatusTone::Live => "Live".to_owned(),
+            StatusTone::Degraded => "Degraded".to_owned(),
+            StatusTone::Gone => "Gone".to_owned(),
+            StatusTone::Succeeded => "Completed".to_owned(),
+            StatusTone::Failed => "Failed".to_owned(),
+            StatusTone::Stopped => "Stopped".to_owned(),
+            StatusTone::Neutral => entry.status.clone(),
+        }];
+        if let Some(mark) = entry.subscription {
+            let frequency = match mark.frequency {
+                TickSubscriptionFrequency::High => "Every 1 min",
+                TickSubscriptionFrequency::Medium => "Every 10 min",
+                TickSubscriptionFrequency::Low => "Every 30 min",
+                TickSubscriptionFrequency::Immediate => "Immediate",
+            };
+            parts.push(frequency.to_owned());
+        }
+        if entry.is_unread() {
+            parts.push("Unread".to_owned());
+        }
+        parts.retain(|part| !part.is_empty());
+        parts.join(" · ")
+    }
+
     /// The keys of the focused list: the selected row's actions and Esc.
     pub(super) fn hint(&self) -> String {
         let mut hints = self
@@ -780,9 +835,12 @@ impl Monitor {
                 details: list_row::row_details(entry.tone, &entry.notes, now_ms),
                 fill: list_row::flash_fill(self.row_flash(entry), display, now_ms),
                 subscription: list_row::subscription_mark(entry.subscription, display),
-                bar_columns: entry
-                    .waiting_check()
-                    .map(|check| check.elapsed_columns(width, now_ms)),
+                bar_columns: entry.waiting_check().map(|check| {
+                    check.elapsed_columns(
+                        width.saturating_sub(list_row::name_column(display.glyph(entry.glyph))),
+                        now_ms,
+                    )
+                }),
             })
             .collect::<Vec<_>>();
         let groups = self
@@ -823,7 +881,7 @@ impl Monitor {
             rows.push(RoleLine::role(EMPTY_MONITOR_TEXT, Role::MutedText));
             row_ids.push(None);
         }
-        let capacity = height.saturating_sub(1);
+        let capacity = height.saturating_sub(2);
         let offset = selected_row.saturating_sub(capacity.saturating_sub(2));
         let targets = row_ids
             .into_iter()
@@ -833,6 +891,10 @@ impl Monitor {
             .filter_map(|(row, id)| id.map(|id| (row + 1, id)))
             .collect();
         lines.extend(rows.into_iter().skip(offset).take(capacity));
+        if height > 1 {
+            lines.resize(height - 1, RoleLine::default());
+            lines.push(RoleLine::role(self.selected_status(), Role::MutedText));
+        }
         lines.truncate(height);
         for line in &mut lines {
             line.truncate(width);
@@ -1080,8 +1142,8 @@ mod registered_rows_tests {
             assert!(text.contains(expected), "{text}");
         }
         assert!(
-            !text.contains("waiting"),
-            "the state is the glyph's colour: {text}"
+            text.lines().last() == Some("waiting"),
+            "selected state belongs in the footer: {text}"
         );
         assert!(!text.contains("Subscribed"));
         assert!(!text.contains("enter"), "keys are on the hint row: {text}");
@@ -1406,7 +1468,7 @@ mod signal_tests {
     }
 
     #[test]
-    fn a_take_in_flashes_even_before_the_view_listed_the_update_unread_but_not_twice() {
+    fn distinct_take_ins_flash_even_when_the_update_was_already_handled() {
         let animated = DisplayProfile::default();
         let (mut monitor, _) = updated_monitor(Some(chat()));
         let listed = monitor.rows.take();
@@ -1429,8 +1491,8 @@ mod signal_tests {
         monitor.rebuild_at(HANDLED_AT + 5_050);
         assert_eq!(
             fill(&monitor, animated, HANDLED_AT + 5_050),
-            None,
-            "taking in an update the row already showed handled is no new hand-over"
+            Some(Role::TakeInFlashStrong),
+            "an explicitly delivered snapshot flashes even if its content was already handled"
         );
     }
 
@@ -1582,7 +1644,7 @@ mod signal_tests {
         let line = row(&monitor, animated, HANDLED_AT + 50);
         assert_eq!(
             (line.fill, line.fill_start),
-            (Some(Role::UseFlashStrong), 0),
+            (Some(Role::UseFlashStrong), 4),
             "a row without `↻` flashes from its first column"
         );
 
@@ -1595,7 +1657,7 @@ mod signal_tests {
         let line = row(&subscribed, animated, HANDLED_AT + 50);
         assert_eq!(
             (line.fill, line.fill_start, line.band),
-            (Some(Role::UseFlashStrong), 1, None),
+            (Some(Role::UseFlashStrong), 4, None),
             "the flash starts after the `↻` and covers the bar"
         );
 
@@ -1665,6 +1727,8 @@ mod signal_tests {
             frequency,
             accumulated: 0,
             has_pending_change: false,
+            pending_since_ms: None,
+            program_exit: None,
             last_delivery_ms: None,
             last_delivery: None,
             kind: None,
@@ -1707,6 +1771,121 @@ mod signal_tests {
     }
 
     #[test]
+    fn a_late_first_change_starts_its_bar_at_the_arrival_and_fills_until_delivery() {
+        let mut monitor = subscribed(
+            vec![subscription(TickSubscriptionFrequency::High, Some(60_000))],
+            0,
+        );
+        assert_eq!(bar(&monitor, 48_000), None);
+        let mut status = serde_json::to_value(&monitor.subscriptions[0]).unwrap();
+        status["has_pending_change"] = true.into();
+        status["pending_since_ms"] = 49_000.into();
+        monitor.subscriptions[0] = serde_json::from_value(status).unwrap();
+        monitor.rebuild_at(49_000);
+        let actual = bar(&monitor, 49_000);
+        assert_eq!(actual, Some((4..5, Role::UpdateProgress)));
+
+        assert_eq!(bar(&monitor, 54_500), Some((4..22, Role::UpdateProgress)));
+        assert_eq!(bar(&monitor, 60_000), Some((4..40, Role::UpdateProgress)));
+
+        let mut early = subscribed(
+            vec![subscription(TickSubscriptionFrequency::High, Some(60_000))],
+            0,
+        );
+        early.subscriptions[0].has_pending_change = true;
+        early.rebuild_at(1_000);
+        assert_eq!(bar(&early, 1_000), Some((4..5, Role::UpdateProgress)));
+    }
+
+    #[test]
+    fn changing_a_periodic_frequency_keeps_the_unread_mark_and_bar() {
+        let mut status = waiting(TickSubscriptionFrequency::High, Some(60_000));
+        status.has_pending_change = true;
+        status.updated_at_ms = Some(49_000);
+        status.pending_since_ms = Some(49_000);
+        let id = status.id;
+        let mut monitor = subscribed(vec![status], 49_000);
+        assert!(monitor.entries[0].is_unread());
+        for (frequency, deadline) in [
+            (TickSubscriptionFrequency::Medium, 650_000),
+            (TickSubscriptionFrequency::Low, 1_850_000),
+        ] {
+            monitor.request_next_subscription(id, true).unwrap();
+            assert!(
+                monitor.entries[0].is_unread(),
+                "optimistic {frequency:?} cleared unread"
+            );
+            assert!(bar(&monitor, 50_000).is_some());
+            monitor.subscriptions[0].frequency = frequency;
+            monitor.subscriptions[0].next_check_at_ms = Some(deadline);
+            monitor.subscriptions[0].period_ms =
+                Some(frequency.period().unwrap().as_millis() as u64);
+            monitor.rebuild_at(50_000);
+            assert!(
+                monitor.entries[0].is_unread(),
+                "confirmed {frequency:?} cleared unread"
+            );
+            assert!(bar(&monitor, 50_000).is_some());
+        }
+    }
+
+    #[test]
+    fn hosted_subscriptions_keep_their_terminal_or_protocol_type() {
+        for (kind, glyph) in [
+            (
+                tickloop_agent_protocol::ObservationKind::Terminal { truncated: false },
+                Glyph::TerminalTick,
+            ),
+            (
+                tickloop_agent_protocol::ObservationKind::Protocol,
+                Glyph::ProtocolTick,
+            ),
+        ] {
+            let mut status = subscription(TickSubscriptionFrequency::High, Some(60_000));
+            status.instance = InstanceRef::new("hosted", "typed-instance").unwrap();
+            status.kind = Some(kind);
+            let monitor = subscribed(vec![status], 0);
+            assert_eq!(monitor.entries[0].glyph, glyph);
+        }
+    }
+
+    #[test]
+    fn a_subscribed_exited_terminal_keeps_its_type_and_stops_showing_running() {
+        let mut status = subscription(TickSubscriptionFrequency::High, Some(60_000));
+        status.instance = InstanceRef::new("hosted", "exited-terminal").unwrap();
+        status.kind = Some(tickloop_agent_protocol::ObservationKind::Terminal { truncated: false });
+        status.program_exit = Some(tickloop_agent_protocol::HostedProgramExit {
+            code: Some(3),
+            signal: None,
+        });
+        let monitor = subscribed(vec![status], 0);
+        assert_eq!(monitor.entries[0].glyph, Glyph::TerminalTick);
+        assert_eq!(monitor.entries[0].status, "exited 3");
+        assert_eq!(monitor.entries[0].tone, StatusTone::Neutral);
+    }
+
+    #[test]
+    fn an_unsubscribed_terminal_keeps_its_type_without_a_live_probe() {
+        let instance = InstanceRef::new("hosted", "terminal-instance").unwrap();
+        let mut chat = chat();
+        chat.monitor
+            .record_opened(instance.clone(), Some("sh watcher.sh".into()))
+            .is_terminal = true;
+        let mut monitor = Monitor {
+            chat_status: Some(Arc::new(chat)),
+            ..Default::default()
+        };
+        monitor.rebuild_at(0);
+        let entry = monitor
+            .entries
+            .iter()
+            .find(|entry| entry.instance == instance)
+            .unwrap();
+        assert_eq!(entry.glyph, Glyph::TerminalTick);
+        assert_eq!(entry.kind, "Terminal");
+    }
+
+    #[test]
     fn a_quiet_periodic_row_keeps_its_state_colour_and_shows_no_bar() {
         let monitor = subscribed(
             vec![subscription(TickSubscriptionFrequency::High, Some(100_000))],
@@ -1738,15 +1917,15 @@ mod signal_tests {
             first_check - period,
         );
         for (now, end) in [
-            (first_check - period, 1),
-            (first_check - 45_000, 10),
-            (first_check - 30_000, 20),
+            (first_check - period, 5),
+            (first_check - 45_000, 13),
+            (first_check - 30_000, 22),
             (first_check, 40),
             (first_check + 5_000, 40),
         ] {
             assert_eq!(
                 bar(&monitor, now),
-                Some((0..end, Role::UpdateProgress)),
+                Some((4..end, Role::UpdateProgress)),
                 "at {now}"
             );
             assert_eq!(
@@ -1769,7 +1948,7 @@ mod signal_tests {
         );
         assert_eq!(
             monitor.next_frame_ms(first_check - 30_000, WIDTH, DisplayProfile::default()),
-            Some(first_check - 30_000 + 1_500),
+            Some(first_check - 30_000 + 1_667),
             "the next frame is when one more column fills"
         );
         assert_eq!(
@@ -1781,7 +1960,7 @@ mod signal_tests {
         monitor.focus(false, None);
         assert_eq!(
             bar(&monitor, first_check - 30_000),
-            Some((0..20, Role::UpdateProgress)),
+            Some((4..22, Role::UpdateProgress)),
             "a selected row keeps the bar's colour over the selection"
         );
 
@@ -1823,12 +2002,12 @@ mod signal_tests {
         assert_eq!(glyph(&monitor, animated, 50_400), Some(Role::UpdateMarkDim));
         assert_eq!(
             bar(&monitor, 50_400),
-            Some((0..6, Role::UpdateProgress)),
+            Some((4..10, Role::UpdateProgress)),
             "the bar does not wait for the flash"
         );
         assert_eq!(monitor.next_frame_ms(50_900, WIDTH, animated), Some(51_200));
         assert_eq!(glyph(&monitor, animated, 51_200), Some(Role::UpdateMark));
-        assert_eq!(bar(&monitor, 51_200), Some((0..7, Role::UpdateProgress)));
+        assert_eq!(bar(&monitor, 51_200), Some((4..10, Role::UpdateProgress)));
     }
 
     /// A Tick that updates every second, quicker than a flash lasts, keeps its bar on screen and
@@ -1854,10 +2033,10 @@ mod signal_tests {
                 (800, Role::UpdateMark),
             ] {
                 let now = second + elapsed_in_second;
-                let filled = (now - (check - period)) as usize * WIDTH / period as usize;
+                let filled = (now - (check - period)) as usize * (WIDTH - 4) / period as usize;
                 assert_eq!(
                     bar(&monitor, now),
-                    Some((0..filled, Role::UpdateProgress)),
+                    Some((4..4 + filled.max(1), Role::UpdateProgress)),
                     "at {now} the bar shows the part of the period elapsed"
                 );
                 assert!(filled >= reached, "the bar never shrinks");
@@ -1869,13 +2048,12 @@ mod signal_tests {
                 );
             }
         }
-        assert_eq!(reached, 12, "the bar grew with the seconds");
+        assert_eq!(reached, 11, "the bar grew with the seconds");
     }
 
     /// A Terminal Tick's screen that changed since its subscription last got it flashes the glyph
-    /// in the update colour and shows the bar to the check that reads it; a check that finds the
-    /// screen changed back restores the state colour and clears the bar, and the row does not
-    /// flash.
+    /// in the update colour and shows the bar to the check that reads it. Clearing the pending
+    /// subscription sample clears the bar, but only handling content clears the known unread mark.
     #[test]
     fn a_changed_terminal_screen_shows_the_update_colour_and_bar_until_its_check() {
         let animated = DisplayProfile::default();
@@ -1894,17 +2072,22 @@ mod signal_tests {
             Some(Role::UpdateMarkDim),
             "the change flashes the glyph"
         );
-        assert_eq!(bar(&monitor, 50_400), Some((0..6, Role::UpdateProgress)));
+        assert_eq!(bar(&monitor, 50_400), Some((4..10, Role::UpdateProgress)));
         assert_eq!(glyph(&monitor, animated, 51_200), Some(Role::UpdateMark));
-        assert_eq!(bar(&monitor, 51_200), Some((0..7, Role::UpdateProgress)));
+        assert_eq!(bar(&monitor, 51_200), Some((4..10, Role::UpdateProgress)));
 
         let mut settled = subscription(TickSubscriptionFrequency::High, Some(160_000));
         settled.updated_at_ms = Some(50_000);
         monitor.subscriptions = vec![settled];
         monitor.rebuild_at(100_100);
         assert_eq!(bar(&monitor, 100_100), None);
-        assert_eq!(glyph(&monitor, animated, 100_100), Some(Role::SuccessMark));
+        assert_eq!(glyph(&monitor, animated, 100_100), Some(Role::UpdateMark));
         assert_eq!(row(&monitor, animated, 100_100).fill, None);
+        let mut handled = chat();
+        handled.monitor.mark_handled(quotes(), 100_100);
+        monitor.chat_status = Some(Arc::new(handled));
+        monitor.rebuild_at(100_200);
+        assert_eq!(glyph(&monitor, animated, 100_200), Some(Role::SuccessMark));
     }
 
     #[test]
@@ -1926,7 +2109,7 @@ mod signal_tests {
                 is_waiting: true,
                 next_check: Some(NextCheck {
                     at_ms: now + 30_000,
-                    period_ms: 1_800_000,
+                    wait_ms: 1_800_000,
                 }),
             }),
             "the quiet high subscription's sooner check hands nothing over"
@@ -1946,7 +2129,7 @@ mod signal_tests {
         );
         assert_eq!(
             bar(&monitor, now),
-            Some((0..39, Role::UpdateProgress)),
+            Some((4..39, Role::UpdateProgress)),
             "the low subscription checks first, with 30 s of its 30 min left"
         );
     }

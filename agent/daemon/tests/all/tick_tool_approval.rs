@@ -1,5 +1,5 @@
 //! How ordinary Tick modifications go through approval in each execution mode. A controlled
-//! Tick tool provider stands in for the Tickhost: it declares ModifyTick as the hosted tools do,
+//! Tick tool provider stands in for the Tickhost: it declares TickManage as the hosted tools do,
 //! with the same reviewable permission and approval facts, and counts what reaches it.
 
 use std::collections::BTreeMap;
@@ -23,7 +23,7 @@ use tickloop_agent_protocol::{
 };
 use tickloop_agent_test_support::{ScriptedModel, call, config, text};
 
-/// ModifyTick as a Tick tool provider declares it, recording each call that was dispatched.
+/// TickManage as a Tick tool provider declares it, recording each call that was dispatched.
 #[derive(Default)]
 struct ControlledTicks {
     sent: Mutex<Vec<Value>>,
@@ -33,7 +33,7 @@ struct ControlledTicks {
 impl HostToolProvider for ControlledTicks {
     fn definitions(&self) -> Vec<ToolDefinition> {
         vec![ToolDefinition {
-            name: "ModifyTick".into(),
+            name: "TickManage".into(),
             description: "Modify a Tick this Chat opened.".into(),
             input_schema: json!({"type":"object","properties":{"action":{"type":"string","enum":["send_input","close"]},"tick_instance_id":{"type":"string"},"text":{"type":"string"}},"required":["action","tick_instance_id"],"additionalProperties":false}),
         }]
@@ -148,7 +148,7 @@ async fn tick_modification_mode_rules_and_human_recovery_apply_to_new_messages_f
         let host = Arc::new(ControlledTicks::default());
         let mut outputs = Vec::new();
         for step in 0..12 {
-            outputs.push(call(&format!("input-{step}"), "ModifyTick", json!({"action":"send_input","tick_instance_id":target_instance(),"text":format!("input-{step}")})));
+            outputs.push(call(&format!("input-{step}"), "TickManage", json!({"action":"send_input","tick_instance_id":target_instance(),"text":format!("input-{step}")})));
             outputs.push(text("Step completed."));
         }
         let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(outputs)));
@@ -206,7 +206,7 @@ async fn tick_modification_mode_rules_and_human_recovery_apply_to_new_messages_f
                         .map(|decision| PermissionRule {
                             id: uuid::Uuid::new_v4(),
                             decision: *decision,
-                            tool: "ModifyTick".into(),
+                            tool: "TickManage".into(),
                             specifier: None,
                             input: None,
                             loop_id: None,
@@ -275,7 +275,7 @@ async fn assert_mode_admits_tick_modification_without_human(mode: ExecutionMode,
     let model = Arc::new(ScriptedModel::new(vec![
         call(
             "close",
-            "ModifyTick",
+            "TickManage",
             json!({"action":"close","tick_instance_id":target_instance()}),
         ),
         text("Closed."),

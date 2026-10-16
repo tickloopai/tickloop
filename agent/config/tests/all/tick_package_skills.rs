@@ -100,7 +100,7 @@ fn package_skills_are_named_after_their_package_with_its_install_directory_in_th
     assert!(
         registry
             .model_listing()
-            .contains("- sample:guide: Open sample Ticks\n")
+            .contains("- sample:guide [Tick package · sample]: Open sample Ticks\n")
     );
     let expansion = registry
         .expand("sample:guide", "", SkillCaller::Model)
@@ -257,7 +257,7 @@ fn the_shipped_package_skills_load_from_an_installed_package() {
         assert!(
             registry
                 .model_listing()
-                .contains(&format!("- {name}:usage: ")),
+                .contains(&format!("- {name}:usage [Tick package · {name}]: ")),
             "{name}"
         );
         let content = registry

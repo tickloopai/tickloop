@@ -6,6 +6,8 @@ use tick_protocol::InstanceRef;
 /// An instance this Chat opened; the Chat owns its lifecycle.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MonitorMember {
+    #[serde(default)]
+    pub is_terminal: bool,
     pub instance: InstanceRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -27,6 +29,9 @@ pub struct MonitorMembership {
     /// instance joined Monitor. A later update is unread.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub handled: BTreeMap<InstanceRef, u64>,
+    /// Latest content change known to this Chat, independent of automatic delivery.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub observed: BTreeMap<InstanceRef, u64>,
     /// When an Agent turn of this Chat last took in each instance's updates, in Unix
     /// milliseconds: a subscription delivery, a completion notification or a claimed feedback
     /// request; its instances are among those `handled` marks.
@@ -39,10 +44,45 @@ pub struct MonitorMembership {
 }
 
 impl MonitorMembership {
+    pub fn observed_at(&self, instance: &InstanceRef) -> Option<u64> {
+        self.observed.get(instance).copied()
+    }
+
+    pub fn mark_observed(&mut self, instance: InstanceRef, at_ms: u64) -> bool {
+        let mark = self.observed.entry(instance).or_default();
+        if *mark >= at_ms {
+            return false;
+        }
+        *mark = at_ms;
+        while self.observed.len() > MAX_MARKS {
+            if let Some(oldest) = oldest_mark(&self.observed) {
+                self.observed.remove(&oldest);
+            }
+        }
+        true
+    }
+
+    pub fn mark_taken_in_through(
+        &mut self,
+        instance: InstanceRef,
+        through_ms: u64,
+        taken_in_ms: u64,
+    ) -> bool {
+        let changed = self.mark_handled(instance.clone(), through_ms);
+        if !self.handled.contains_key(&instance) {
+            return changed;
+        }
+        let mark = self.taken_in.entry(instance).or_default();
+        let advanced = *mark < taken_in_ms;
+        *mark = (*mark).max(taken_in_ms);
+        changed || advanced
+    }
+
     pub fn is_empty(&self) -> bool {
         self.members.is_empty()
             && self.removed.is_empty()
             && self.handled.is_empty()
+            && self.observed.is_empty()
             && self.taken_in.is_empty()
             && self.used.is_empty()
     }
@@ -59,6 +99,7 @@ impl MonitorMembership {
             members: Vec::new(),
             removed: self.removed.clone(),
             handled: self.handled.clone(),
+            observed: BTreeMap::new(),
             taken_in: self.taken_in.clone(),
             used: BTreeMap::new(),
         }
@@ -125,19 +166,32 @@ impl MonitorMembership {
     }
 
     /// Records a verified open. A removal mark stays: a removed row stays hidden.
-    pub fn record_opened(&mut self, instance: InstanceRef, title: Option<String>) {
-        match self
+    pub fn record_opened(
+        &mut self,
+        instance: InstanceRef,
+        title: Option<String>,
+    ) -> &mut MonitorMember {
+        let index = match self
             .members
-            .iter_mut()
-            .find(|member| member.instance == instance)
+            .iter()
+            .position(|member| member.instance == instance)
         {
-            Some(member) => {
+            Some(index) => {
                 if title.is_some() {
-                    member.title = title;
+                    self.members[index].title = title;
                 }
+                index
             }
-            None => self.members.push(MonitorMember { instance, title }),
-        }
+            None => {
+                self.members.push(MonitorMember {
+                    instance,
+                    title,
+                    is_terminal: false,
+                });
+                self.members.len() - 1
+            }
+        };
+        &mut self.members[index]
     }
 
     pub fn remove(&mut self, instance: InstanceRef) {

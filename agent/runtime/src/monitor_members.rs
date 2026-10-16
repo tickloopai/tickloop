@@ -17,7 +17,8 @@ use tick_protocol::InstanceRef;
 
 use super::{Agent, AgentError, Chat};
 use tickloop_agent_protocol::{
-    ChatId, LoopState, MonitorMembership, PendingInput, TICK_SUBSCRIPTION_SOURCE,
+    ChatId, LoopState, MonitorMembership, PendingInput, TICK_MANUAL_SOURCE,
+    TICK_SUBSCRIPTION_SOURCE,
 };
 use uuid::Uuid;
 
@@ -50,9 +51,10 @@ impl ToolUse {
                 .map(|id| UseTarget::Artifact(id.into()))
         };
         let (target, reads) = match name {
-            crate::tick_tools::READ_TICK => (tick()?, true),
-            crate::tick_tools::CALL_TICK_TOOL => (tick()?, false),
-            crate::tick_tools::MODIFY_TICK if input["action"].as_str() == Some("send_input") => {
+            crate::tick_tools::TICK_DESCRIBE => (tick()?, false),
+            crate::tick_tools::TICK_READ => (tick()?, true),
+            crate::tick_tools::TICK_CALL => (tick()?, false),
+            crate::tick_tools::TICK_MANAGE if input["action"].as_str() == Some("send_input") => {
                 (tick()?, false)
             }
             tickloop_agent_tools::READ_TOOL_NAME => {
@@ -110,8 +112,12 @@ impl Agent {
         chat: &mut Chat,
         instance: InstanceRef,
         title: Option<String>,
+        is_terminal: bool,
     ) {
-        chat.snapshot.monitor.record_opened(instance.clone(), title);
+        chat.snapshot
+            .monitor
+            .record_opened(instance.clone(), title)
+            .is_terminal = is_terminal;
         // What the instance did before it joined is no news for this Chat.
         chat.snapshot.monitor.mark_handled(instance, now_ms());
         self.record_monitor_membership(
@@ -129,17 +135,26 @@ impl Agent {
         lost: &InstanceRef,
         reopened: InstanceRef,
     ) -> Result<MonitorMembership, AgentError> {
-        self.update_monitor(chat_id, |membership| {
-            let title = membership
-                .members
-                .iter()
-                .find(|member| &member.instance == lost)
-                .and_then(|member| member.title.clone());
-            membership.record_opened(reopened.clone(), title);
-            membership.mark_handled(reopened, now_ms());
-            membership.remove(lost.clone());
-        })
-        .await
+        let membership = self
+            .update_monitor(chat_id, |membership| {
+                let title = membership
+                    .members
+                    .iter()
+                    .find(|member| &member.instance == lost)
+                    .and_then(|member| member.title.clone());
+                let is_terminal = membership
+                    .members
+                    .iter()
+                    .any(|member| &member.instance == lost && member.is_terminal);
+                membership
+                    .record_opened(reopened.clone(), title)
+                    .is_terminal = is_terminal;
+                membership.mark_handled(reopened, now_ms());
+                membership.remove(lost.clone());
+            })
+            .await?;
+        self.sync_tick_subscriptions().await;
+        Ok(membership)
     }
 
     /// Removes an instance from the Chat's Monitor view only.
@@ -148,8 +163,11 @@ impl Agent {
         chat_id: ChatId,
         instance: InstanceRef,
     ) -> Result<MonitorMembership, AgentError> {
-        self.update_monitor(chat_id, |membership| membership.remove(instance))
-            .await
+        let membership = self
+            .update_monitor(chat_id, |membership| membership.remove(instance))
+            .await?;
+        self.sync_tick_subscriptions().await;
+        Ok(membership)
     }
 
     /// The user opened the instance's Monitor row: its updates so far count as handled.
@@ -243,6 +261,27 @@ impl Agent {
         if let Some(claim) = chat.active_event_claims.get(&pending.receipt.run_id) {
             instances.extend(
                 InstanceRef::artifact(&claim.source.origin, &claim.source.artifact_id).ok(),
+            );
+        }
+        if let Some(source) = pending
+            .trigger_source
+            .as_ref()
+            .filter(|source| source.source == TICK_MANUAL_SOURCE)
+        {
+            for item in source.payload["items"].as_array().into_iter().flatten() {
+                if let (Ok(instance), Some(through_ms)) = (
+                    serde_json::from_value(item["instance"].clone()),
+                    item["through_ms"].as_u64(),
+                ) {
+                    chat.snapshot
+                        .monitor
+                        .mark_taken_in_through(instance, through_ms, now_ms());
+                }
+            }
+            self.record_monitor_membership(
+                chat.snapshot.id,
+                &chat.snapshot.workdir,
+                chat.snapshot.monitor.clone(),
             );
         }
         self.mark_taken_in(chat, instances);

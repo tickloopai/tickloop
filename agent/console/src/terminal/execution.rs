@@ -3147,12 +3147,21 @@ impl ConsoleExecution {
         .await
         .map(|_| ())
     }
-    pub(super) async fn subscribe_tick(
+    pub(super) async fn tick_send_update(
         &self,
         chat: Uuid,
         instance: tick_protocol::InstanceRef,
     ) -> Result<(), AccessError> {
-        self.loop_command(chat, LoopAction::SubscribeTick { instance })
+        self.loop_command(chat, LoopAction::TickUpdate { instance })
+            .await
+            .map(|_| ())
+    }
+    pub(super) async fn tick_subscribe(
+        &self,
+        chat: Uuid,
+        instance: tick_protocol::InstanceRef,
+    ) -> Result<(), AccessError> {
+        self.loop_command(chat, LoopAction::TickManage { instance })
             .await
             .map(|_| ())
     }

@@ -1,4 +1,4 @@
-//! A ModifyTick open of an installed Tick package's program, prepared as an Agent's call is; the
+//! A TickManage open of an installed Tick package's program, prepared as an Agent's call is; the
 //! running Tick is covered by `agent/tickloop`'s hosted tests.
 
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
@@ -76,7 +76,7 @@ async fn prepare_open(
     tools
         .prepare_call(
             uuid::Uuid::new_v4(),
-            "ModifyTick",
+            "TickManage",
             &json!({"action":"open","command":command,"cwd":cwd}),
             CancellationToken::new(),
         )

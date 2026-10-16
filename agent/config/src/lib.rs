@@ -203,8 +203,8 @@ pub enum MonitorPreference {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MonitorPopup {
-    #[default]
     Disabled,
+    #[default]
     Enabled,
 }
 

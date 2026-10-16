@@ -634,7 +634,7 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
             .host_tools,
     )
     .unwrap();
-    for tool in ["ReadTick", "CallTickTool", "ModifyTick"] {
+    for tool in ["TickRead", "TickCall", "TickManage"] {
         assert_eq!(
             frozen[tool].as_array().map(Vec::len),
             Some(1),
@@ -647,7 +647,7 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
     let model = Arc::new(ScriptedModel::new(vec![
         call(
             "child-hosted",
-            "ReadTick",
+            "TickRead",
             json!({"tick_instance_id":tick_protocol::InstanceRef::hosted(uuid::Uuid::new_v4())}),
         ),
         text("Checked."),
@@ -717,7 +717,7 @@ async fn a_child_never_gains_herdr_views_added_after_its_delegation() {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>();
-        assert!(offered.contains(&"ReadTick"), "{offered:?}");
+        assert!(offered.contains(&"TickRead"), "{offered:?}");
         assert!(!offered.contains(&"ReadWorkspace"), "{offered:?}");
     }
     let hosted = &results["child-hosted"];
@@ -2109,8 +2109,8 @@ async fn a_full_access_child_can_run_an_interpreter_under_its_frozen_authority()
         .delegation
         .unwrap()
         .ceiling;
-    assert_eq!(ceiling.host_tools["ReadTick"].len(), 1);
-    assert_eq!(ceiling.host_tools["ModifyTick"].len(), 2);
+    assert_eq!(ceiling.host_tools["TickRead"].len(), 1);
+    assert_eq!(ceiling.host_tools["TickManage"].len(), 2);
     assert!(!ceiling.host_tools.contains_key("Bash"));
     core.shutdown().await;
     routed.stop().await;

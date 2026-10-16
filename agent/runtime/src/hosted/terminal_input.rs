@@ -1,4 +1,4 @@
-//! The bytes ModifyTick `send_input` writes to a hosted terminal Tick: its text as it is, then its
+//! The bytes TickManage `send_input` writes to a hosted terminal Tick: its text as it is, then its
 //! logical keys as a terminal sends them.
 
 use tickhost_connect::hosted::ATTACH_INPUT_BYTES;

@@ -342,7 +342,7 @@ async fn model_passes_skill_arguments_through_the_args_parameter() {
     assert!(old_arguments.contains("arguments"), "{old_arguments}");
     assert_eq!(
         results["with-args"],
-        ("Launching skill: analyze".into(), false)
+        ("Launching skill: analyze [Project]".into(), false)
     );
     let last = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
     assert!(last.contains("Analyze report.md carefully."));
@@ -628,7 +628,7 @@ async fn a_package_installed_mid_chat_reaches_its_next_request_and_leaves_with_i
         .unwrap();
     finish(&mut events, &receipt).await;
     assert!(
-        skill_listing(&model, 1).contains("- quotes:usage: Read quotes"),
+        skill_listing(&model, 1).contains("- quotes:usage [Tick package · quotes]: Read quotes"),
         "{}",
         skill_listing(&model, 1)
     );
@@ -733,7 +733,7 @@ async fn an_edited_user_skill_description_shows_at_the_next_request() {
 
     let receipt = agent.submit(chat, None, "One".into()).await.unwrap();
     finish(&mut events, &receipt).await;
-    assert!(skill_listing(&model, 0).contains("- notes: Take notes\n"));
+    assert!(skill_listing(&model, 0).contains("- notes [User]: Take notes\n"));
 
     write_skill(
         &user_skills,
@@ -744,7 +744,7 @@ async fn an_edited_user_skill_description_shows_at_the_next_request() {
     let receipt = agent.submit(chat, None, "Two".into()).await.unwrap();
     finish(&mut events, &receipt).await;
     assert!(
-        skill_listing(&model, 1).contains("- notes: Take dated notes\n"),
+        skill_listing(&model, 1).contains("- notes [User]: Take dated notes\n"),
         "{}",
         skill_listing(&model, 1)
     );
@@ -756,7 +756,7 @@ fn lists_skill(request: &ModelRequest, name: &str) -> bool {
     request
         .tools
         .iter()
-        .any(|tool| tool.name == "Skill" && tool.description.contains(&format!("- {name}:")))
+        .any(|tool| tool.name == "Skill" && tool.description.contains(&format!("- {name} [")))
 }
 
 #[tokio::test]

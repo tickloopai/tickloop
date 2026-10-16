@@ -68,31 +68,83 @@ pub fn response_line(line: &str) -> &str {
     line.trim().trim_start_matches('⎿').trim_start()
 }
 
-/// The queued inputs a frame lists above the input box, as Claude Code shows them: `  ❯ text`,
-/// or `  ! command` for a queued command.
+/// The queued inputs immediately above the input box, aligned with its prompt.
 #[allow(dead_code)]
 pub fn queued_inputs(frame: &str) -> Vec<&str> {
-    frame.lines().filter(|line| is_queued_input(line)).collect()
+    split_at_queue(frame)
+        .map(|(_, queue)| {
+            queue
+                .lines()
+                .take_while(|line| !line.starts_with('─'))
+                .filter(|line| is_input_preview(line))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `frame` split before its first queued input: the conversation, then the queue and the rows
 /// below it.
 #[allow(dead_code)]
 pub fn split_at_queue(frame: &str) -> Option<(&str, &str)> {
-    let mut offset = 0;
-    for line in frame.split_inclusive('\n') {
-        if is_queued_input(line) {
-            return Some(frame.split_at(offset));
-        }
-        offset += line.len();
+    let lines = frame.split_inclusive('\n').collect::<Vec<_>>();
+    let composer = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, line)| line.starts_with('─'))
+        .nth(1)?
+        .0;
+    if let Some(activity) = lines[..composer]
+        .iter()
+        .rposition(|line| line.contains("Working (") || line.contains("Thinking ("))
+        && let Some(entry) = lines[activity + 1..composer]
+            .iter()
+            .position(|line| is_input_preview(line))
+    {
+        let start = activity + 1 + entry;
+        return Some(frame.split_at(lines[..start].iter().map(|line| line.len()).sum()));
     }
-    None
+    if !frame.contains("Press up to edit queued messages")
+        && !frame.contains("ctrl+enter to send now")
+    {
+        return None;
+    }
+    let mut start = composer;
+    while start > 0
+        && (lines[start - 1].trim().is_empty()
+            || lines[start - 1].trim() == "ctrl+enter to send now")
+    {
+        start -= 1;
+    }
+    let end = start;
+    while start > 0 && (is_input_preview(lines[start - 1]) || lines[start - 1].starts_with("… "))
+    {
+        start -= 1;
+    }
+    (start < end).then(|| frame.split_at(lines[..start].iter().map(|line| line.len()).sum()))
 }
 
-/// Whether `line` lists a queued input rather than echoing a sent one.
-#[allow(dead_code)]
-pub fn is_queued_input(line: &str) -> bool {
-    line.starts_with("  ❯ ") || line.starts_with("  ! ")
+fn is_input_preview(line: &str) -> bool {
+    line.starts_with("❯ ") || line.starts_with("! ")
+}
+
+#[test]
+fn aligned_queue_is_separate_from_identical_sent_text() {
+    let frame = "❯ same message\n\nWorking (1s)\n\n❯ same message\n! echo later\n  ctrl+enter to send now\n\n────\n❯\u{a0}Press up to edit queued messages\n────\nhelp";
+    assert_eq!(queued_inputs(frame), ["❯ same message", "! echo later"]);
+    let (body, _) = split_at_queue(frame).unwrap();
+    assert_eq!(body.matches("same message").count(), 1);
+    assert!(body.contains("Working (1s)"));
+    let idle = "❯ same message\n\n────\n❯\u{a0}\n────\nhelp";
+    assert!(queued_inputs(idle).is_empty());
+}
+
+#[test]
+fn aligned_queue_without_send_now_hint_still_uses_the_composer_boundary() {
+    let frame = "❯ sent\n\nWorking (1s)\n\n❯ first\n❯ second\n❯ third\n\n────\n❯\u{a0}Press up to edit queued messages\n────\nhelp";
+    assert_eq!(queued_inputs(frame), ["❯ first", "❯ second", "❯ third"]);
+    let completing = "❯ sent\n\nWorking (1s)\n\n❯ queued\n\n  /artifacts  Choose artifacts\n  /branch  Branch this conversation\n────\n❯\u{a0}/\n────\nhelp";
+    assert_eq!(queued_inputs(completing), ["❯ queued"]);
 }
 
 #[allow(dead_code)]

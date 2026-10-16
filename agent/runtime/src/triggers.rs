@@ -214,7 +214,9 @@ impl Agent {
                 || pending.trigger_source.as_ref().is_none_or(|source| {
                     matches!(
                         source.source.as_str(),
-                        super::event_sources::ARTIFACT_REQUEST_SOURCE | TICK_SUBSCRIPTION_SOURCE
+                        super::event_sources::ARTIFACT_REQUEST_SOURCE
+                            | TICK_SUBSCRIPTION_SOURCE
+                            | TICK_MANUAL_SOURCE
                     )
                 });
             if !keep {

@@ -1304,9 +1304,9 @@ async fn model_tool_inventory_keeps_artifact_shell_and_tick_names() {
         "Bash",
         "Read",
         "TaskStop",
-        "CallTickTool",
-        "ReadTick",
-        "ModifyTick",
+        "TickCall",
+        "TickRead",
+        "TickManage",
     ] {
         assert!(tool_names(&requests[0]).contains(&name), "{name}");
     }
@@ -1323,7 +1323,7 @@ async fn model_tool_inventory_keeps_artifact_shell_and_tick_names() {
             && prompt.contains("Honor an explicit local-file or chat-only destination")
     );
     assert!(!tool_names(&requests[0]).contains(&"ArtifactLogin"));
-    for name in ["CallTickTool", "ReadTick"] {
+    for name in ["TickCall", "TickRead"] {
         let definition = requests[0]
             .tools
             .iter()

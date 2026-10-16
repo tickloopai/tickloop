@@ -28,7 +28,7 @@ impl Launch {
             .ok_or_else(|| {
                 HostError::before(
                     "NotLaunched",
-                    "only the Tickhost starts a launcher; an Agent opens a protocol program with ModifyTick and protocol: true",
+                    "only the Tickhost starts a launcher; an Agent opens a protocol program with TickManage and protocol: true",
                 )
             })?;
         let terminal = std::io::stderr();

@@ -7,6 +7,10 @@
 | 日期 | 2026-10-14 |
 | 参考实现 | 宿主侧类型与校验 `tick/protocol`，Tick 侧 `tick/sdk`，示例 `tick/examples/counter.py` |
 
+## 与 Agent 工具和包 Skill 的分工
+
+协议保留三个请求方法 `tick/describe`、`tick/read`、`tick/call` 和一个通知 `tick/update`。Tickloop 分别通过 TickDescribe 查询能力、TickRead 读取当前状态、TickCall 调用声明的业务工具，TickUpdate 表示更新交付事件。TickRead 不重复返回 descriptor 或工具目录。TickManage 在 Agent／宿主侧管理生命周期、视图、终端输入和 Loop 的订阅关系，不新增 Tick 程序 RPC。包 Skill 只负责启动命令、参数和登录前提，运行实例的 descriptor 是当前能力目录的权威来源。
+
 ## 1. 概述
 
 ### 1.1 目的

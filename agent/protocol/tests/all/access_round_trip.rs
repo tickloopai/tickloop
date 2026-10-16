@@ -30,6 +30,7 @@ fn monitor_members_and_required_push_completion_fields_share_one_snapshot_wire()
         }))
         .unwrap();
         snapshot.monitor.members.push(MonitorMember {
+            is_terminal: false,
             instance: instance.clone(),
             title: Some("Counter".into()),
         });
@@ -252,10 +253,12 @@ fn a_membership_saved_with_member_sources_loads_every_member_as_opened() {
         saved.members,
         [
             MonitorMember {
+                is_terminal: false,
                 instance: "hosted:opened".parse().unwrap(),
                 title: Some("Quotes".into()),
             },
             MonitorMember {
+                is_terminal: false,
                 instance: "hosted:added".parse().unwrap(),
                 title: None,
             },

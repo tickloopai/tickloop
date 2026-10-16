@@ -1180,8 +1180,11 @@ impl EmbeddedAgentAccess {
                     .await?;
                 Ok(CommandResult::Done)
             }
-            LoopAction::SubscribeTick { instance } => {
-                agent.subscribe_tick_for_user(chat, instance).await?;
+            LoopAction::TickUpdate { instance } => Ok(CommandResult::Submitted(
+                agent.tick_send_update_for_user(chat, instance).await?,
+            )),
+            LoopAction::TickManage { instance } => {
+                agent.tick_subscribe_for_user(chat, instance).await?;
                 Ok(CommandResult::Done)
             }
             LoopAction::RetryDeniedOperation { record_id } => Ok(CommandResult::Submitted(

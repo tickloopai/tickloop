@@ -449,14 +449,14 @@ fn composer_row(frame: &str) -> &str {
 
 /// Body rows that echo `input` as a submitted line.
 fn echoed(frame: &str, input: &str) -> usize {
-    body_above_rules(frame)
+    let total = body_above_rules(frame)
         .iter()
         .filter(|line| {
-            let is_echo = !screen::is_queued_input(line);
             let line = line.trim_start();
-            is_echo && (line.starts_with('❯') || line.starts_with("! ")) && line.contains(input)
+            (line.starts_with('❯') || line.starts_with("! ")) && line.contains(input)
         })
-        .count()
+        .count();
+    total.saturating_sub(queued(frame, input))
 }
 
 /// Queue rows that list `input`.

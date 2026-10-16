@@ -431,7 +431,7 @@ impl TickStreamPort for ShellTickStream {
         validator.revalidate(chat, cancel).await?;
         let task = task_of(instance).ok_or("Shell watch requires a Shell task")?;
         let admission = crate::host_tools::PreparedHostCall::new(
-            "SubscribeTick".into(),
+            "TickManage".into(),
             input.clone(),
             input.clone(),
             crate::host_tools::HostToolPermission::ReadOnly,

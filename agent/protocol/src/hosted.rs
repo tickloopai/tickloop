@@ -8,6 +8,8 @@ use crate::HostedResources;
 /// One hosted Tick as its Chat's Monitor shows it.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq)]
 pub struct HostedMember {
+    #[serde(default)]
+    pub is_terminal: bool,
     pub instance: InstanceRef,
     pub title: Option<String>,
     pub state: HostedMemberState,

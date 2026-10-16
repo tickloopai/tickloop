@@ -2,7 +2,7 @@
   {
     "Hello": {
       "process_id": 4242,
-      "major": 21,
+      "major": 23,
       "minor": 0,
       "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
       "session_id": "00000000-0000-0000-0000-000000000051",
@@ -117,7 +117,7 @@
             "kind": {
               "ToolStarted": {
                 "call_id": "call-1",
-                "name": "ReadTick",
+                "name": "TickRead",
                 "input": {
                   "instance": "hosted:00000000-0000-0000-0000-000000000041"
                 }
@@ -143,6 +143,7 @@
         "result": {
           "HostedTicks": [
             {
+              "is_terminal": false,
               "instance": "hosted:00000000-0000-0000-0000-000000000040",
               "title": "Quotes",
               "state": "running",
@@ -155,6 +156,7 @@
               "updated_at_ms": 8000
             },
             {
+              "is_terminal": true,
               "instance": "hosted:00000000-0000-0000-0000-000000000042",
               "title": "cat",
               "state": "exited",
@@ -165,6 +167,7 @@
               }
             },
             {
+              "is_terminal": false,
               "instance": "hosted:00000000-0000-0000-0000-000000000041",
               "title": null,
               "state": "lost",

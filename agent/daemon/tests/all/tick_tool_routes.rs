@@ -118,57 +118,57 @@ async fn ticks_run_under_the_tickhost_and_their_herdr_panes_under_herdr() {
     for (name, input, expected) in [
         ("ReadWorkspace", json!({}), &herdr_authority),
         (
-            "ReadTick",
+            "TickRead",
             json!({"tick_instance_id":hosted}),
             &host_authority,
         ),
         (
-            "CallTickTool",
+            "TickCall",
             json!({"tick_instance_id":hosted,"tool":"increment","args":{}}),
             &host_authority,
         ),
         (
-            "ModifyTick",
+            "TickManage",
             json!({"action":"open","command":["tick"]}),
             &host_authority,
         ),
         (
-            "ModifyTick",
+            "TickManage",
             json!({"action":"open","command":["tick"],"placement":{"type":"hidden"}}),
             &host_authority,
         ),
         (
-            "ModifyTick",
+            "TickManage",
             json!({"action":"open","command":["tick"],"placement":{"type":"new_tab"}}),
             &herdr_authority,
         ),
         (
-            "ModifyTick",
+            "TickManage",
             json!({"action":"open","command":["tick"],"placement":{"type":"current_tab"}}),
             &herdr_authority,
         ),
         (
-            "ModifyTick",
+            "TickManage",
             json!({"action":"open","command":["python3","counter.py"],"protocol":true,"placement":{"type":"pane","pane_id":"p"}}),
             &herdr_authority,
         ),
         (
-            "ModifyTick",
+            "TickManage",
             json!({"action":"move","tick_instance_id":hosted}),
             &herdr_authority,
         ),
         (
-            "ModifyTick",
+            "TickManage",
             json!({"action":"send_input","tick_instance_id":hosted,"text":"q"}),
             &host_authority,
         ),
         (
-            "ModifyTick",
+            "TickManage",
             json!({"action":"close","tick_instance_id":hosted}),
             &host_authority,
         ),
         (
-            "ModifyTick",
+            "TickManage",
             json!({"action":"reopen","tick_instance_id":hosted}),
             &host_authority,
         ),
@@ -179,7 +179,7 @@ async fn ticks_run_under_the_tickhost_and_their_herdr_panes_under_herdr() {
             "{name} {input}"
         );
     }
-    for name in ["ReadTick", "CallTickTool"] {
+    for name in ["TickRead", "TickCall"] {
         assert_eq!(
             tools.in_herdr.tool_authorities(name),
             Ok(BTreeSet::from([tools.host_authority.clone()])),
@@ -187,7 +187,7 @@ async fn ticks_run_under_the_tickhost_and_their_herdr_panes_under_herdr() {
         );
     }
     assert_eq!(
-        tools.in_herdr.tool_authorities("ModifyTick"),
+        tools.in_herdr.tool_authorities("TickManage"),
         Ok(BTreeSet::from([
             tools.herdr_authority.clone(),
             tools.host_authority.clone()
@@ -204,7 +204,7 @@ async fn ticks_run_under_the_tickhost_and_their_herdr_panes_under_herdr() {
     ] {
         let refused = tools
             .hosted
-            .call_authority("ModifyTick", &input)
+            .call_authority("TickManage", &input)
             .unwrap_err();
         assert!(refused.contains("Herdr"), "{input}: {refused}");
     }
@@ -216,7 +216,7 @@ async fn ticks_run_under_the_tickhost_and_their_herdr_panes_under_herdr() {
             .contains("Herdr")
     );
     assert_eq!(
-        tools.hosted.tool_authorities("ModifyTick"),
+        tools.hosted.tool_authorities("TickManage"),
         Ok(BTreeSet::from([tools.host_authority.clone()]))
     );
     assert_eq!(
@@ -237,13 +237,13 @@ async fn artifact_shell_herdr_and_untyped_targets_never_reach_a_host() {
             ("shell:task", "TaskStop"),
         ] {
             for (name, input) in [
-                ("ReadTick", json!({"tick_instance_id":target})),
+                ("TickRead", json!({"tick_instance_id":target})),
                 (
-                    "CallTickTool",
+                    "TickCall",
                     json!({"tick_instance_id":target,"tool":"read","args":{}}),
                 ),
                 (
-                    "ModifyTick",
+                    "TickManage",
                     json!({"action":"close","tick_instance_id":target}),
                 ),
             ] {
@@ -263,7 +263,7 @@ async fn artifact_shell_herdr_and_untyped_targets_never_reach_a_host() {
             let error = tools
                 .prepare_call(
                     chat,
-                    "ReadTick",
+                    "TickRead",
                     &json!({"tick_instance_id":target}),
                     CancellationToken::new(),
                 )
@@ -304,11 +304,17 @@ fn tick_tool_schemas_open_in_the_tickhost_and_place_views_only_in_herdr() {
             .iter()
             .map(|tool| tool.name.clone())
             .collect::<BTreeSet<_>>(),
-        strings(&["CallTickTool", "ModifyTick", "ReadTick", "ReadWorkspace"])
+        strings(&[
+            "TickCall",
+            "TickDescribe",
+            "TickManage",
+            "TickRead",
+            "ReadWorkspace"
+        ])
     );
     let modify = in_herdr
         .iter()
-        .find(|tool| tool.name == "ModifyTick")
+        .find(|tool| tool.name == "TickManage")
         .unwrap();
     for fact in ["Tickhost", "Monitor", "view", "closes only that view"] {
         assert!(
@@ -317,7 +323,7 @@ fn tick_tool_schemas_open_in_the_tickhost_and_place_views_only_in_herdr() {
             modify.description
         );
     }
-    let schema = tool(&in_herdr, "ModifyTick");
+    let schema = tool(&in_herdr, "TickManage");
     assert_eq!(schema["required"], json!(["action"]));
     assert_eq!(
         choices(&schema["properties"]["action"]),
@@ -331,15 +337,15 @@ fn tick_tool_schemas_open_in_the_tickhost_and_place_views_only_in_herdr() {
     let refusal = |input: Value| {
         tools
             .in_herdr
-            .validate_input("ModifyTick", schema, &input)
+            .validate_input("TickManage", schema, &input)
             .unwrap_err()
     };
-    assert!(refusal(json!({})).starts_with("invalid ModifyTick input: action is required: one of open (requires command), move (requires tick_instance_id)"));
+    assert!(refusal(json!({})).starts_with("invalid TickManage input: action is required: one of open (requires command), move (requires tick_instance_id)"));
     assert_eq!(
         refusal(
             json!({"action":"move","tick_instance_id":"hosted:1","placement":{"type":"new_tab"}})
         ),
-        "invalid ModifyTick input: placement.type for move must be one of current_tab, pane"
+        "invalid TickManage input: placement.type for move must be one of current_tab, pane"
     );
 
     let hosted = tools.hosted.definitions();
@@ -348,9 +354,9 @@ fn tick_tool_schemas_open_in_the_tickhost_and_place_views_only_in_herdr() {
             .iter()
             .map(|tool| tool.name.clone())
             .collect::<BTreeSet<_>>(),
-        strings(&["CallTickTool", "ModifyTick", "ReadTick"])
+        strings(&["TickCall", "TickDescribe", "TickManage", "TickRead"])
     );
-    let schema = tool(&hosted, "ModifyTick");
+    let schema = tool(&hosted, "TickManage");
     assert_eq!(
         choices(&schema["properties"]["action"]),
         strings(&["open", "send_input", "close", "reopen"])
@@ -363,14 +369,14 @@ fn tick_tool_schemas_open_in_the_tickhost_and_place_views_only_in_herdr() {
     assert_eq!(
         tools
             .hosted
-            .validate_input("ModifyTick", schema, &json!({"action":"close"}))
+            .validate_input("TickManage", schema, &json!({"action":"close"}))
             .unwrap_err(),
-        "invalid ModifyTick input: close requires tick_instance_id"
+        "invalid TickManage input: close requires tick_instance_id"
     );
     for definitions in [&in_herdr, &hosted] {
         let read = definitions
             .iter()
-            .find(|tool| tool.name == "ReadTick")
+            .find(|tool| tool.name == "TickRead")
             .unwrap();
         assert!(read.description.contains("hosted:"), "{}", read.description);
         assert!(!read.description.contains("herdr:"), "{}", read.description);
@@ -433,7 +439,7 @@ async fn a_native_tool_redirect_precedes_an_invalid_herdr_endpoint() {
     let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
         tickloop_agent_test_support::call(
             "redirect",
-            "CallTickTool",
+            "TickCall",
             json!({"tick_instance_id":"artifact:doc","tool":"read","args":{}}),
         ),
         tickloop_agent_test_support::text("Done."),

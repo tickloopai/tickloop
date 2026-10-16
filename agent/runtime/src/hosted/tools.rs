@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tick_packages::PackageStore;
 use tick_protocol::{InstanceRef, TickDescriptor};
-use tickhost::host::{Receipt, TerminalDescription, TerminalRead, TickAdapter, TickRow};
+use tickhost::host::{Receipt, TerminalRead, TickAdapter, TickRow};
 use tickhost_connect::{
     herdr::Pane,
     host_error::{HostError, TOOL_FAILED},
@@ -36,7 +36,9 @@ use crate::{
         HostCallResult, HostEffect, HostToolPermission, HostToolProvider, PreparedHostCall,
         WorkspaceHostContext,
     },
-    tick_tools::{CALL_TICK_TOOL, HIDDEN_PLACEMENT, MODIFY_TICK, READ_TICK, READ_WORKSPACE},
+    tick_tools::{
+        HIDDEN_PLACEMENT, READ_WORKSPACE, TICK_CALL, TICK_DESCRIBE, TICK_MANAGE, TICK_READ,
+    },
 };
 use tickloop_agent_protocol::{
     ChatId, HostCallContext, HostEndpointIdentity, HostToolAuthority, HostedMember,
@@ -109,6 +111,9 @@ enum Operation {
         operation: Uuid,
         lost: InstanceRef,
         title: Option<String>,
+    },
+    Describe {
+        instance: InstanceRef,
     },
     Read {
         instance: InstanceRef,
@@ -291,7 +296,7 @@ impl HostedTickTools {
                     summary,
                 )
             }
-            (MODIFY_TICK, Some("open")) => {
+            (TICK_MANAGE, Some("open")) => {
                 let words = input["command"]
                     .as_array()
                     .and_then(|words| {
@@ -398,7 +403,7 @@ impl HostedTickTools {
                     ),
                 )
             }
-            (MODIFY_TICK, Some("move")) => {
+            (TICK_MANAGE, Some("move")) => {
                 let instance = hosted_target(input)?;
                 // Only a running Tick of this Chat has views to move or show.
                 self.adapter(chat, &instance)
@@ -445,7 +450,7 @@ impl HostedTickTools {
                     summary,
                 )
             }
-            (MODIFY_TICK, Some("close")) => {
+            (TICK_MANAGE, Some("close")) => {
                 let instance = hosted_target(input)?;
                 (
                     Operation::Close {
@@ -456,7 +461,7 @@ impl HostedTickTools {
                     format!("Close hosted Tick {instance}"),
                 )
             }
-            (MODIFY_TICK, Some("reopen")) => {
+            (TICK_MANAGE, Some("reopen")) => {
                 let lost = hosted_target(input)?;
                 // The daemon alone judges whether the instance can be reopened; the listing only
                 // names it for the approval.
@@ -482,7 +487,7 @@ impl HostedTickTools {
                     summary,
                 )
             }
-            (MODIFY_TICK, Some("send_input")) => {
+            (TICK_MANAGE, Some("send_input")) => {
                 let instance = hosted_target(input)?;
                 if self
                     .adapter(chat, &instance)
@@ -491,7 +496,7 @@ impl HostedTickTools {
                     == TickAdapter::Protocol
                 {
                     return Err(format!(
-                        "UnsupportedCapability: {instance} is an extension Tick; operate it with CallTickTool and the tools it declares"
+                        "UnsupportedCapability: {instance} is an extension Tick; operate it with TickCall and the tools it declares"
                     ));
                 }
                 let text = match input.get("text") {
@@ -523,12 +528,22 @@ impl HostedTickTools {
                     ),
                 )
             }
-            (MODIFY_TICK, _) => {
+            (TICK_MANAGE, _) => {
                 return Err(
-                    "ModifyTick action must be open, move, send_input, close or reopen".into(),
+                    "TickManage action must be open, move, send_input, close or reopen".into(),
                 );
             }
-            (READ_TICK, _) => {
+            (TICK_DESCRIBE, _) => {
+                let instance = hosted_target(input)?;
+                (
+                    Operation::Describe {
+                        instance: instance.clone(),
+                    },
+                    HostToolPermission::ReadOnly,
+                    format!("Describe hosted Tick {instance}"),
+                )
+            }
+            (TICK_READ, _) => {
                 let instance = hosted_target(input)?;
                 (
                     Operation::Read {
@@ -538,7 +553,7 @@ impl HostedTickTools {
                     format!("Read hosted Tick {instance}"),
                 )
             }
-            (CALL_TICK_TOOL, _) => {
+            (TICK_CALL, _) => {
                 let instance = hosted_target(input)?;
                 if self
                     .adapter(chat, &instance)
@@ -547,7 +562,7 @@ impl HostedTickTools {
                     == TickAdapter::Terminal
                 {
                     return Err(format!(
-                        "UnsupportedCapability: {instance} is a terminal Tick and declares no tools; read it with ReadTick and type into it with ModifyTick send_input"
+                        "UnsupportedCapability: {instance} is a terminal Tick and declares no tools; read it with TickRead and type into it with TickManage send_input"
                     ));
                 }
                 let tool = input["tool"].as_str().ok_or("tool is required")?.to_owned();
@@ -671,6 +686,7 @@ impl HostedTickTools {
             Operation::Close { .. }
             | Operation::Reopen { .. }
             | Operation::Read { .. }
+            | Operation::Describe { .. }
             | Operation::Input { .. }
             | Operation::Call { .. } => Ok(()),
         }
@@ -840,6 +856,11 @@ impl HostedTickTools {
                     Err(unresolved) => unresolved,
                 }
             }
+            Operation::Describe { instance } => match self.describe_instance(chat, &instance).await
+            {
+                Ok(descriptor) => completed(descriptor),
+                Err(error) => HostCallResult::NotDispatched(error),
+            },
             Operation::Read { instance } => match self.read(chat, &instance).await {
                 Ok(read) => completed(read),
                 Err(error) => HostCallResult::NotDispatched(error),
@@ -908,7 +929,7 @@ impl HostedTickTools {
 
     fn admission(&self) -> HostedAdmission {
         HostedAdmission {
-            tool: MODIFY_TICK.into(),
+            tool: TICK_MANAGE.into(),
             authority: self.authority(),
         }
     }
@@ -970,12 +991,13 @@ impl HostedTickTools {
                 )));
             }
         };
+        let adapter = serde_json::from_value::<TickAdapter>(opened["adapter"].clone()).ok();
         let binding = match (
             opened["terminal"]["endpoint"].as_str(),
             opened["data_token"].as_str(),
-            serde_json::from_value::<TickAdapter>(opened["adapter"].clone()),
+            adapter,
         ) {
-            (Some(endpoint), Some(token), Ok(adapter)) => Some(DataBinding {
+            (Some(endpoint), Some(token), Some(adapter)) => Some(DataBinding {
                 endpoint: endpoint.into(),
                 data_token: token.into(),
                 adapter,
@@ -1010,6 +1032,7 @@ impl HostedTickTools {
             result["replaces"] = json!(lost);
         }
         Ok(OpenedTick {
+            is_terminal: adapter == Some(TickAdapter::Terminal),
             instance,
             title,
             result,
@@ -1057,6 +1080,28 @@ impl HostedTickTools {
         serde_json::from_value(value).map_err(|error| error.to_string())
     }
 
+    async fn describe_instance(
+        &self,
+        chat: ChatId,
+        instance: &InstanceRef,
+    ) -> Result<Value, String> {
+        let adapter = self
+            .adapter(chat, instance)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut connection = self
+            .data(chat, instance)
+            .await
+            .map_err(|error| error.to_string())?;
+        let descriptor = connection
+            .request("describe", json!({}), CONTROL_TIMEOUT)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(
+            json!({"tick_instance_id":instance,"source":if adapter == TickAdapter::Terminal {"terminal"} else {"protocol"},"descriptor":descriptor}),
+        )
+    }
+
     async fn read(&self, chat: ChatId, instance: &InstanceRef) -> Result<Value, String> {
         let adapter = self
             .adapter(chat, instance)
@@ -1070,10 +1115,6 @@ impl HostedTickTools {
             .request("read", json!({}), CONTROL_TIMEOUT)
             .await
             .map_err(|error| error.to_string())?;
-        let descriptor = connection
-            .request("describe", json!({}), CONTROL_TIMEOUT)
-            .await
-            .map_err(|error| error.to_string())?;
         match adapter {
             TickAdapter::Protocol => Ok(json!({
                 "tick_instance_id": instance,
@@ -1081,14 +1122,10 @@ impl HostedTickTools {
                 "seq": read["seq"],
                 "at": read["at"],
                 "data": read["data"],
-                "descriptor": descriptor,
-                "tools": descriptor["tools"],
             })),
             TickAdapter::Terminal => {
                 let read: TerminalRead =
                     serde_json::from_value(read).map_err(|error| error.to_string())?;
-                let description: TerminalDescription =
-                    serde_json::from_value(descriptor).map_err(|error| error.to_string())?;
                 Ok(json!({
                     "tick_instance_id": instance,
                     "source": "terminal",
@@ -1096,8 +1133,6 @@ impl HostedTickTools {
                     "at": read.at,
                     "data": read.data(),
                     "truncated": read.truncated,
-                    "command": description.command,
-                    "cwd": description.cwd,
                 }))
             }
         }
@@ -1189,6 +1224,7 @@ impl HostedTickTools {
                     }
                     Err(_) => (None, None),
                 };
+                let is_terminal = binding.adapter == TickAdapter::Terminal;
                 self.bindings
                     .lock()
                     .await
@@ -1198,6 +1234,7 @@ impl HostedTickTools {
                     signal: exit.signal,
                 });
                 members.push(HostedMember {
+                    is_terminal,
                     instance,
                     title: row.title,
                     state: if exit.is_some() {
@@ -1211,6 +1248,7 @@ impl HostedTickTools {
                 });
             }
             members.extend(page.lost.into_iter().map(|lost| HostedMember {
+                is_terminal: lost.is_terminal,
                 instance: lost.instance,
                 title: lost.title,
                 state: HostedMemberState::Lost,
@@ -1269,7 +1307,7 @@ impl HostedTickTools {
     }
 
     /// Starts a new instance in place of a lost one because its user asked to, through the same
-    /// prepared reopen a model's approved ModifyTick runs. The daemon checks the recorded launch
+    /// prepared reopen a model's approved TickManage runs. The daemon checks the recorded launch
     /// again under the Chat's current authority; the lost instance and its Watches stay gone, and
     /// nothing reopens on its own. Returns the new instance.
     pub async fn reopen_for_user(
@@ -1281,7 +1319,7 @@ impl HostedTickTools {
         let prepared = self
             .prepare_call(
                 chat,
-                MODIFY_TICK,
+                TICK_MANAGE,
                 &json!({"action":"reopen","tick_instance_id":lost}),
                 cancel.clone(),
             )
@@ -1306,7 +1344,7 @@ impl HostedTickTools {
     }
 
     /// Closes one of the Chat's hosted Ticks because its user asked to, through the same
-    /// prepared close a model's approved ModifyTick runs.
+    /// prepared close a model's approved TickManage runs.
     pub async fn close_for_user(
         &self,
         chat: ChatId,
@@ -1316,7 +1354,7 @@ impl HostedTickTools {
         let prepared = self
             .prepare_call(
                 chat,
-                MODIFY_TICK,
+                TICK_MANAGE,
                 &json!({"action":"close","tick_instance_id":instance}),
                 cancel.clone(),
             )
@@ -1434,6 +1472,7 @@ async fn described_title(
 
 /// A just opened Tick: its instance, the name it joins the Monitor under and what the call reports.
 struct OpenedTick {
+    is_terminal: bool,
     instance: InstanceRef,
     title: Option<String>,
     result: Value,
@@ -1448,6 +1487,7 @@ impl OpenedTick {
                 output_ref: None,
             },
             Box::new(HostEffect::OpenedTick {
+                is_terminal: self.is_terminal,
                 instance: self.instance,
                 title: self.title,
             }),
@@ -1526,7 +1566,7 @@ impl HostToolProvider for HostedTickTools {
         Ok(Some(self.endpoint.clone()))
     }
 
-    /// Ticks run under this worker's Tickhost; ReadWorkspace, and the views ModifyTick places or
+    /// Ticks run under this worker's Tickhost; ReadWorkspace, and the views TickManage places or
     /// moves, under its Herdr.
     fn tool_authorities(&self, name: &str) -> Result<BTreeSet<HostToolAuthority>, String> {
         let mut authorities = BTreeSet::new();
@@ -1534,7 +1574,7 @@ impl HostToolProvider for HostedTickTools {
             authorities.insert(self.authority());
         }
         if let Some(views) = &self.views
-            && matches!(name, READ_WORKSPACE | MODIFY_TICK)
+            && matches!(name, READ_WORKSPACE | TICK_MANAGE)
             && let Some(endpoint) = views.endpoint()?
         {
             authorities.insert(HostToolAuthority::Native { endpoint });
@@ -1571,7 +1611,7 @@ impl HostToolProvider for HostedTickTools {
     }
 
     fn permission(&self, _: ChatId, name: &str, _: &Value) -> HostToolPermission {
-        if matches!(name, READ_TICK | READ_WORKSPACE) {
+        if matches!(name, TICK_DESCRIBE | TICK_READ | READ_WORKSPACE) {
             HostToolPermission::ReadOnly
         } else {
             HostToolPermission::Reviewable
@@ -1822,7 +1862,7 @@ mod tests {
         for (name, input) in [
             (READ_WORKSPACE, json!({"workspace_id":"W1"})),
             (
-                MODIFY_TICK,
+                TICK_MANAGE,
                 json!({"action":"open","command":["/bin/cat"],"cwd":directory.path(),"workspace_id":"W1","placement":{"type":"new_tab"}}),
             ),
         ] {
@@ -1866,7 +1906,7 @@ mod tests {
         let prepared = tools
             .prepare(
                 chat,
-                MODIFY_TICK,
+                TICK_MANAGE,
                 &json!({"action":"open","command":["/bin/echo", argument],"cwd":directory.path()}),
                 None,
             )

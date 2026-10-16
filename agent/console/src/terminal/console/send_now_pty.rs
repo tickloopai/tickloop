@@ -33,13 +33,12 @@ fn placements(frame: &str, text: &str) -> (usize, usize) {
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let above = &rows[..rules[rules.len() - 2]];
-    let shows = |sent: bool| {
-        above
-            .iter()
-            .filter(|row| row.contains(text) && screen::is_queued_input(row) != sent)
-            .count()
-    };
-    (shows(true), shows(false))
+    let total = above.iter().filter(|row| row.contains(text)).count();
+    let queued = screen::queued_inputs(frame)
+        .iter()
+        .filter(|row| row.contains(text))
+        .count();
+    (total.saturating_sub(queued), queued)
 }
 
 /// Follows `text` through the frames drawn after `offset`: it shows at most once, queued or

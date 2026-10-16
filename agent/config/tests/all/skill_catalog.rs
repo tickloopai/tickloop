@@ -44,7 +44,7 @@ fn skill_catalog_preserves_names_when_even_the_minimum_exceeds_budget() {
         assert!(
             listing
                 .lines()
-                .any(|line| line == format!("- {}", skill.name))
+                .any(|line| line == format!("- {} [{}]", skill.name, skill.source.display_label()))
         );
     }
     assert!(!listing.contains("Private body"));

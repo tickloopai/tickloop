@@ -124,10 +124,10 @@ async fn actual_cli_after_restarting_a_tickhost_of_another_build_opens_and_reads
     let (base_url, mut requests) = model_http_support::serve_router(move |request| {
         let results = tool_results(request);
         match results.as_slice() {
-            [] => chat_reply(Some(("ModifyTick", "open-counter", open.clone())), ""),
+            [] => chat_reply(Some(("TickManage", "open-counter", open.clone())), ""),
             [opened] => chat_reply(
                 Some((
-                    "ReadTick",
+                    "TickRead",
                     "read-counter",
                     json!({"tick_instance_id": opened["tick_instance_id"]}),
                 )),
@@ -182,7 +182,7 @@ async fn actual_cli_keeping_a_tickhost_of_another_build_refuses_ticks_and_shells
             200,
             chat_reply(
                 Some((
-                    "ModifyTick",
+                    "TickManage",
                     "open-quotes",
                     json!({"action":"open","command":["/bin/sleep","30"]}),
                 )),

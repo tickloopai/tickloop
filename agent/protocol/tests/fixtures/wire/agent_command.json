@@ -321,7 +321,19 @@
       "generation": 3
     },
     "action": {
-      "kind": "subscribe_tick",
+      "kind": "tick_update",
+      "instance": "hosted:00000000-0000-0000-0000-000000000040"
+    }
+  },
+  {
+    "kind": "manage_loop",
+    "execution": {
+      "daemon_epoch": "00000000-0000-0000-0000-0000000000e0",
+      "agent_id": "00000000-0000-0000-0000-0000000000a1",
+      "generation": 3
+    },
+    "action": {
+      "kind": "tick_manage",
       "instance": "hosted:00000000-0000-0000-0000-000000000040"
     }
   },

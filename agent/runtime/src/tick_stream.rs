@@ -189,7 +189,7 @@ impl PreparedTickWatch {
         input: serde_json::Value,
     ) -> crate::host_tools::PreparedHostCall {
         crate::host_tools::PreparedHostCall::new(
-            "SubscribeTick".into(),
+            "TickManage".into(),
             input.clone(),
             input,
             self.admission.permission(),
@@ -260,7 +260,7 @@ pub trait TickStreamPort: Send + Sync + 'static {
 
 /// What an extension Tick that declares no recovery query tells the Agent instead.
 const NO_RECOVERY: &str =
-    "none: dropped Tick Updates cannot be recovered; ReadTick returns only the current state";
+    "none: dropped Tick Updates cannot be recovered; TickRead returns only the current state";
 
 /// An extension Tick's current content as an observation, for a delivery read again.
 fn current_observation(instance: &InstanceRef, read: tick_protocol::TickState) -> TickObservation {

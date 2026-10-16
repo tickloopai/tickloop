@@ -25,6 +25,7 @@ pub trait TickProbe: Send + Sync {
 /// What a host probe found for members no subscription reports on.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MemberFindings {
+    pub terminals: std::collections::HashSet<InstanceRef>,
     pub states: HashMap<InstanceRef, MemberState>,
     /// Process samples of the members whose host takes them.
     pub resources: HashMap<InstanceRef, TickResources>,

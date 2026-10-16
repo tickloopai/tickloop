@@ -5,7 +5,7 @@ description: Open Longbridge Ticks with real quotes, K-line charts, the watchlis
 
 # Longbridge Ticks
 
-`tick-longbridge` serves Longbridge data as protocol Ticks. Open it through the `tickloop` Skill's flow: `ModifyTick` with `action: "open"` and `command` from the table below. It opens as a protocol Tick by itself, so leave out `protocol`.
+`tick-longbridge` serves Longbridge data as protocol Ticks. Open it through the `tickloop` Skill's flow: `TickManage` with `action: "open"` and `command` from the table below. It opens as a protocol Tick by itself, so leave out `protocol`.
 
 | Requested view | `command` |
 | --- | --- |
@@ -31,3 +31,5 @@ Use the broker symbol format: Tesla / 特斯拉 is `TSLA.US`, Apple / 苹果 is 
 `MEMBER_ID` is the number in the member's profile link, such as 91 in `https://longbridge.com/zh-CN/profiles/91`; there is no nickname search, so ask for the link when the user names someone only by nickname. The community Tick's `reply` tool posts a public reply as the logged-in Longbridge user: call it only for a reply the user asked for, with the text they want posted.
 
 Quotes need the logged-in account's quote permissions for the market; the watchlist and positions read that account. A Tick that Longbridge turned down because the account lacks a quote permission needs no new login: report the reason it shows, since logging in again does not add the permission. Every view needs a Longbridge login, which `longbridge`'s `login` in `workspace_host.tick_packages` reports. When it is not `logged_in`, or a Tick ends with an authorization diagnostic, report that and ask the user to log in to `longbridge` from `/ticks` in this Agent, where they choose China mainland or Global and confirm a code on their own device. Open the Tick again once they say they have logged in; no Agent restart is needed. Logging in is the user's step: never suggest `!` for it or a terminal command instead, never run the login yourself, and never read its credential files.
+
+After opening an instance, use `TickDescribe` for its current tool catalog and revision, `TickRead` for its state, and `TickCall` for a declared operation. This Skill describes launch commands and prerequisites, not a second runtime capability catalog.

@@ -57,6 +57,7 @@ impl HostToolProvider for OpeningHost {
                 output_ref: None,
             },
             Box::new(HostEffect::OpenedTick {
+                is_terminal: false,
                 instance: calendar("opened"),
                 title: Some("Earnings calendar".into()),
             }),
@@ -219,8 +220,8 @@ async fn removal_outlives_restart_but_never_hides_a_subscription() {
     let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
         tickloop_agent_test_support::call(
             "subscribe",
-            "SubscribeTick",
-            json!({"tick_instance_id":"cal:watched","frequency":"low"}),
+            "TickManage",
+            json!({"action":"subscribe","tick_instance_id":"cal:watched","frequency":"low"}),
         ),
         tickloop_agent_test_support::text("watching"),
     ]));
@@ -315,8 +316,8 @@ async fn one_row_merges_every_source_and_frequency_and_pages_cover_the_full_set(
                 vec![
                     tickloop_agent_test_support::call(
                         &format!("s-{frequency}"),
-                        "SubscribeTick",
-                        json!({"tick_instance_id":"cal:shared","frequency":frequency}),
+                        "TickManage",
+                        json!({"action":"subscribe","tick_instance_id":"cal:shared","frequency":frequency}),
                     ),
                     tickloop_agent_test_support::text("watching"),
                 ]
@@ -522,8 +523,13 @@ async fn hosted_rows_offer_one_x_and_enter_by_what_still_runs_and_who_opened_it(
             .clone()
     };
     let action = |key, label, intent| MonitorAction { key, label, intent };
-    let subscribe =
-        |instance: &InstanceRef| action('f', "subscribe", TickIntent::Subscribe(instance.clone()));
+    let subscribe = |instance: &InstanceRef| {
+        action(
+            's',
+            "subscriptions",
+            TickIntent::Subscribe(instance.clone()),
+        )
+    };
 
     let live = row(&running);
     assert!(live.running);
@@ -542,6 +548,7 @@ async fn hosted_rows_offer_one_x_and_enter_by_what_still_runs_and_who_opened_it(
                 },
             ),
             subscribe(&running),
+            action('u', "send update", TickIntent::SendUpdate(running.clone())),
         ],
         "a running Tick this Chat opened closes with x"
     );
@@ -593,10 +600,10 @@ async fn hosted_rows_offer_one_x_and_enter_by_what_still_runs_and_who_opened_it(
                 "remove",
                 TickIntent::RemoveFromMonitor(foreign.clone())
             ),
-            action('f', "frequency", TickIntent::Subscribe(foreign.clone())),
+            action('s', "subscriptions", TickIntent::Subscribe(foreign.clone())),
         ],
         "a Tick only this Chat's subscriptions show leaves with them and is never closed; \
-         its f cycles their frequency"
+         its s cycles their subscriptions"
     );
     assert!(
         rows.iter()

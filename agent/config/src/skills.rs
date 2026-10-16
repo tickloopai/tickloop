@@ -207,8 +207,12 @@ impl SkillRegistry {
                     description.push('\u{2026}');
                     capped_descriptions.push(skill.name.clone());
                 }
-                let name_only = format!("- {}\n", skill.name);
-                let full = format!("- {}: {description}\n", skill.name);
+                let name_only = format!("- {} [{}]\n", skill.name, skill.source.display_label());
+                let full = format!(
+                    "- {} [{}]: {description}\n",
+                    skill.name,
+                    skill.source.display_label()
+                );
                 (skill, name_only, full)
             })
             .collect::<Vec<_>>();

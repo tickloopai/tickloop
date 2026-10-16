@@ -1,12 +1,8 @@
 //! The Tick Subscriptions on one Monitor row, shown inside the Monitor column.
 //!
-//! Each Loop that subscribes to the row's Tick Instance appears with its frequency, how many Tick
-//! Updates accumulated since the last delivery, what that delivery was, and whether the link to
-//! the instance is live. Here `f` moves the selected periodic subscription on to the next
-//! frequency at once, and `u` cancels a subscription once confirmed; an immediate subscription
-//! keeps the frequency its Tick type decides. The Agent creates subscriptions, and the user
-//! creates one with `f` on the row itself. Monitor returns to its list once no subscription is
-//! left, or once the cancel the row's `u` opened the detail for goes through.
+//! Each Loop's subscription shows its frequency, pending updates, last delivery and link state.
+//! `s` cycles a periodic subscription through its frequencies and off; `u` cancels immediately.
+//! Immediate subscriptions keep the frequency their Tick type decides.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -18,8 +14,8 @@ use super::{
     display::{DisplayProfile, Glyph},
     style::{Role, RoleLine},
     tick_actions::{
-        PreparedTickAction, TickConfirmationView, TickDetailKey, TickDetailLine, TickDetailView,
-        builtin::{CycleFrequency, change_subscription},
+        PreparedTickAction, TickDetailKey, TickDetailLine, TickDetailView,
+        builtin::{CycleSubscription, change_subscription},
     },
 };
 use crate::monitor_rows::{SUBSCRIBE_KEY, SubscriptionOperation, UNSUBSCRIBE_KEY};
@@ -33,12 +29,6 @@ const HEADER_ROWS: usize = 2;
 const DETAIL_INDENT: &str = "    ";
 const IMMEDIATE_FREQUENCY_NOTICE: &str = "Its Tick type decides an immediate frequency";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum SubscriptionFocus {
-    List,
-    CancelConfirmation,
-}
-
 /// A requested change the detail hands to the Agent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SubscriptionRequest {
@@ -51,7 +41,7 @@ pub(super) struct SubscriptionRequest {
 enum DetailStep {
     Stay,
     Leave,
-    CycleFrequency(Uuid),
+    CycleSubscription(Uuid),
     Cancel(Uuid),
 }
 
@@ -63,7 +53,6 @@ pub(super) struct SubscriptionDetail {
     rows: Vec<TickSubscriptionStatus>,
     goals: HashMap<LoopId, String>,
     selected: Option<Uuid>,
-    focus: SubscriptionFocus,
     top: usize,
     /// A refusal or explanation the hint shows until the next key.
     notice: Option<String>,
@@ -84,11 +73,6 @@ impl SubscriptionDetail {
         operation: SubscriptionOperation,
         display: DisplayProfile,
     ) -> Self {
-        let focus = if rows.len() == 1 && operation == SubscriptionOperation::Cancel {
-            SubscriptionFocus::CancelConfirmation
-        } else {
-            SubscriptionFocus::List
-        };
         Self {
             id: Uuid::new_v4(),
             chat,
@@ -97,7 +81,6 @@ impl SubscriptionDetail {
             selected: rows.first().map(|row| row.id),
             rows,
             goals,
-            focus,
             top: 0,
             notice: None,
             opened_to_cancel: operation == SubscriptionOperation::Cancel,
@@ -110,13 +93,8 @@ impl SubscriptionDetail {
         &self.instance
     }
 
-    #[cfg(test)]
-    pub(super) fn focus(&self) -> SubscriptionFocus {
-        self.focus
-    }
-
     /// Takes the row's current subscriptions without disturbing the cursor. A subscription that
-    /// disappeared hands the cursor to its neighbour and ends any confirmation about it.
+    /// disappeared hands the cursor to its neighbour.
     pub(super) fn update(
         &mut self,
         title: String,
@@ -136,7 +114,6 @@ impl SubscriptionDetail {
         {
             return;
         }
-        self.focus = SubscriptionFocus::List;
         self.selected = previous_index
             .and_then(|index| self.rows.get(index.min(self.rows.len().saturating_sub(1))))
             .or_else(|| self.rows.first())
@@ -160,45 +137,31 @@ impl SubscriptionDetail {
 
     fn apply_key(&mut self, key: KeyEvent) -> DetailStep {
         self.notice = None;
-        match self.focus {
-            SubscriptionFocus::List => match (key.code, key.modifiers) {
-                (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
-                | (KeyCode::Char('p'), KeyModifiers::CONTROL) => self.move_by(-1),
-                (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
-                | (KeyCode::Char('n'), KeyModifiers::CONTROL) => self.move_by(1),
-                (KeyCode::Char(SUBSCRIBE_KEY), KeyModifiers::NONE) => {
-                    match self
-                        .selected_row()
-                        .map(|row| (row.id, row.frequency.period()))
-                    {
-                        Some((subscription, Some(_))) => {
-                            return DetailStep::CycleFrequency(subscription);
-                        }
-                        Some((_, None)) => self.notice = Some(IMMEDIATE_FREQUENCY_NOTICE.into()),
-                        None => {}
+        match (key.code, key.modifiers) {
+            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+            | (KeyCode::Char('p'), KeyModifiers::CONTROL) => self.move_by(-1),
+            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+            | (KeyCode::Char('n'), KeyModifiers::CONTROL) => self.move_by(1),
+            (KeyCode::Char(SUBSCRIBE_KEY), KeyModifiers::NONE) => {
+                match self
+                    .selected_row()
+                    .map(|row| (row.id, row.frequency.period()))
+                {
+                    Some((subscription, Some(_))) => {
+                        return DetailStep::CycleSubscription(subscription);
                     }
+                    Some((_, None)) => self.notice = Some(IMMEDIATE_FREQUENCY_NOTICE.into()),
+                    None => {}
                 }
-                (KeyCode::Char(UNSUBSCRIBE_KEY), KeyModifiers::NONE) => {
-                    if self.selected_row().is_some() {
-                        self.focus = SubscriptionFocus::CancelConfirmation;
-                    }
+            }
+            (KeyCode::Char(UNSUBSCRIBE_KEY), KeyModifiers::NONE) => {
+                if let Some(subscription) = self.selected {
+                    self.cancelling = Some(subscription);
+                    return DetailStep::Cancel(subscription);
                 }
-                (KeyCode::Esc | KeyCode::Left, _) => return DetailStep::Leave,
-                _ => {}
-            },
-            SubscriptionFocus::CancelConfirmation => match (key.code, key.modifiers) {
-                (KeyCode::Enter, _) | (KeyCode::Char('y'), KeyModifiers::NONE) => {
-                    self.focus = SubscriptionFocus::List;
-                    if let Some(subscription) = self.selected {
-                        self.cancelling = Some(subscription);
-                        return DetailStep::Cancel(subscription);
-                    }
-                }
-                (KeyCode::Esc, _) | (KeyCode::Char('n'), KeyModifiers::NONE) => {
-                    self.focus = SubscriptionFocus::List;
-                }
-                _ => {}
-            },
+            }
+            (KeyCode::Esc | KeyCode::Left, _) => return DetailStep::Leave,
+            _ => {}
         }
         DetailStep::Stay
     }
@@ -292,21 +255,6 @@ impl SubscriptionDetail {
 }
 
 impl TickDetailView for SubscriptionDetail {
-    fn confirmation(&self) -> Option<TickConfirmationView> {
-        let row = self
-            .selected_row()
-            .filter(|_| self.focus == SubscriptionFocus::CancelConfirmation)?;
-        Some(TickConfirmationView {
-            title: "Cancel Tick Subscription".into(),
-            message: format!(
-                "Stop delivering {} to {}?",
-                super::safe_line(&self.title),
-                self.goal(row)
-            ),
-            label: "Cancel subscription".into(),
-        })
-    }
-
     fn id(&self) -> Uuid {
         self.id
     }
@@ -330,18 +278,13 @@ impl TickDetailView for SubscriptionDetail {
         if let Some(notice) = &self.notice {
             return format!("{notice} · esc back");
         }
-        match self.focus {
-            SubscriptionFocus::List
-                if self
-                    .selected_row()
-                    .is_some_and(|row| row.frequency.period().is_none()) =>
-            {
-                format!("{UNSUBSCRIBE_KEY} unsubscribe · esc back")
-            }
-            SubscriptionFocus::List => {
-                format!("{SUBSCRIBE_KEY} frequency · {UNSUBSCRIBE_KEY} unsubscribe · esc back")
-            }
-            SubscriptionFocus::CancelConfirmation => "enter confirm · esc back".into(),
+        if self
+            .selected_row()
+            .is_some_and(|row| row.frequency.period().is_none())
+        {
+            format!("{UNSUBSCRIBE_KEY} unsubscribe · esc back")
+        } else {
+            format!("{SUBSCRIBE_KEY} subscriptions · {UNSUBSCRIBE_KEY} unsubscribe · esc back")
         }
     }
 
@@ -349,8 +292,8 @@ impl TickDetailView for SubscriptionDetail {
         match self.apply_key(key) {
             DetailStep::Stay => TickDetailKey::None,
             DetailStep::Leave => TickDetailKey::Back,
-            DetailStep::CycleFrequency(subscription) => {
-                TickDetailKey::Prepare(Arc::new(CycleFrequency {
+            DetailStep::CycleSubscription(subscription) => {
+                TickDetailKey::Prepare(Arc::new(CycleSubscription {
                     instance: self.instance.clone(),
                     subscription,
                     panel: Some(self.id),
@@ -446,6 +389,8 @@ mod tests {
             frequency,
             accumulated: 0,
             has_pending_change: false,
+            pending_since_ms: None,
+            program_exit: None,
             last_delivery_ms: None,
             last_delivery: None,
             link: TickLinkState::Live,
@@ -512,7 +457,7 @@ mod tests {
         assert_eq!(lines[4], "    10:00:45 3 #12 · dropped 2 · live");
         assert_eq!(lines[5], "  ↻ medium · every 10 min");
         assert_eq!(lines[7], "    no delivery yet · live");
-        assert_eq!(detail.hint(), "f frequency · u unsubscribe · esc back");
+        assert_eq!(detail.hint(), "s subscriptions · u unsubscribe · esc back");
     }
 
     fn step(detail: &mut SubscriptionDetail, code: KeyCode) -> DetailStep {
@@ -520,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn f_moves_the_selected_periodic_subscription_on_at_once_without_a_picker() {
+    fn s_moves_the_selected_periodic_subscription_on_at_once_without_a_picker() {
         let mut detail = detail(
             vec![
                 row(3, TickSubscriptionFrequency::High),
@@ -528,21 +473,21 @@ mod tests {
             ],
             SubscriptionOperation::View,
         );
-        assert_eq!(detail.hint(), "f frequency · u unsubscribe · esc back");
+        assert_eq!(detail.hint(), "s subscriptions · u unsubscribe · esc back");
         assert_eq!(
-            step(&mut detail, KeyCode::Char('f')),
-            DetailStep::CycleFrequency(Uuid::from_u128(3))
+            step(&mut detail, KeyCode::Char('s')),
+            DetailStep::CycleSubscription(Uuid::from_u128(3))
         );
         assert!(matches!(
-            press(&mut detail, KeyCode::Char('f')),
+            press(&mut detail, KeyCode::Char('s')),
             TickDetailKey::Prepare(_)
         ));
         press(&mut detail, KeyCode::Char('j'));
         assert_eq!(
-            step(&mut detail, KeyCode::Char('f')),
-            DetailStep::CycleFrequency(Uuid::from_u128(4))
+            step(&mut detail, KeyCode::Char('s')),
+            DetailStep::CycleSubscription(Uuid::from_u128(4))
         );
-        assert_eq!(detail.focus(), SubscriptionFocus::List, "no step follows");
+        assert!(detail.confirmation().is_none(), "no confirmation follows");
 
         for code in [KeyCode::Char('e'), KeyCode::Enter] {
             assert_eq!(step(&mut detail, code), DetailStep::Stay, "{code:?}");
@@ -550,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn an_immediate_subscription_shows_immediate_and_f_only_explains_its_frequency() {
+    fn an_immediate_subscription_shows_immediate_and_s_only_explains_its_frequency() {
         let mut detail = detail(
             vec![row(3, TickSubscriptionFrequency::Immediate)],
             SubscriptionOperation::View,
@@ -559,7 +504,7 @@ mod tests {
         assert_eq!(detail.hint(), "u unsubscribe · esc back");
 
         assert!(matches!(
-            press(&mut detail, KeyCode::Char('f')),
+            press(&mut detail, KeyCode::Char('s')),
             TickDetailKey::None
         ));
         assert_eq!(
@@ -571,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn unsubscribing_asks_first_and_escape_keeps_the_subscription() {
+    fn unsubscribing_is_immediate_and_escape_leaves_the_detail() {
         let mut detail = detail(
             vec![
                 row(3, TickSubscriptionFrequency::High),
@@ -579,40 +524,26 @@ mod tests {
             ],
             SubscriptionOperation::Cancel,
         );
-        assert_eq!(
-            detail.focus(),
-            SubscriptionFocus::List,
-            "several subscriptions let the user choose first"
-        );
         press(&mut detail, KeyCode::Char('j'));
-        press(&mut detail, KeyCode::Char('u'));
-        let confirmation = detail.confirmation().unwrap();
         assert_eq!(
-            confirmation.message,
-            "Stop delivering Fixture run to Watch run 4?"
-        );
-
-        assert!(matches!(
-            press(&mut detail, KeyCode::Esc),
-            TickDetailKey::None
-        ));
-        assert!(detail.confirmation().is_none());
-
-        press(&mut detail, KeyCode::Char('u'));
-        assert_eq!(
-            detail.apply_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            detail.apply_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
             DetailStep::Cancel(Uuid::from_u128(4))
         );
+        assert!(detail.confirmation().is_none());
+        assert!(matches!(
+            press(&mut detail, KeyCode::Esc),
+            TickDetailKey::Back
+        ));
     }
 
     #[test]
-    fn a_single_subscription_opens_straight_into_the_cancel_confirmation() {
+    fn a_single_subscription_cancels_without_confirmation() {
         let mut detail = detail(
             vec![row(3, TickSubscriptionFrequency::Immediate)],
             SubscriptionOperation::Cancel,
         );
-        assert!(detail.confirmation().is_some());
-        assert_eq!(requested(press(&mut detail, KeyCode::Enter)), Some('u'));
+        assert!(detail.confirmation().is_none());
+        assert_eq!(requested(press(&mut detail, KeyCode::Char('u'))), Some('u'));
     }
 
     #[test]
@@ -626,7 +557,7 @@ mod tests {
         );
         press(&mut detail, KeyCode::Down);
         press(&mut detail, KeyCode::Char('u'));
-        assert_eq!(detail.focus(), SubscriptionFocus::CancelConfirmation);
+        assert!(detail.confirmation().is_none());
 
         detail.update(
             "Fixture run".into(),
@@ -634,7 +565,6 @@ mod tests {
             HashMap::new(),
         );
 
-        assert_eq!(detail.focus(), SubscriptionFocus::List);
         assert_eq!(text(&mut detail)[2], "› ↻ high · every 1 min");
         assert!(
             !detail.is_done(),
@@ -656,8 +586,7 @@ mod tests {
             ],
             SubscriptionOperation::Cancel,
         );
-        press(&mut detail, KeyCode::Char('u'));
-        assert_eq!(requested(press(&mut detail, KeyCode::Enter)), Some('u'));
+        assert_eq!(requested(press(&mut detail, KeyCode::Char('u'))), Some('u'));
         assert!(!detail.is_done(), "the cancel has not gone through yet");
 
         detail.report("Cannot update the Tick Subscription: refused".into());
@@ -676,7 +605,6 @@ mod tests {
         );
 
         press(&mut detail, KeyCode::Char('u'));
-        press(&mut detail, KeyCode::Enter);
         detail.update(
             "Fixture run".into(),
             vec![row(4, TickSubscriptionFrequency::Low)],

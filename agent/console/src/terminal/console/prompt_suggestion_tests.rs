@@ -44,7 +44,7 @@ fn prompt_suggestion_is_ghost_text_until_tab_accepts_and_enter_submits() {
 }
 
 #[test]
-fn prompt_suggestion_right_accepts_before_the_monitor_and_empty_enter_submits_once() {
+fn prompt_suggestion_does_not_take_right_or_empty_enter() {
     for code in [KeyCode::Right, KeyCode::Enter] {
         let console = console();
         console
@@ -56,18 +56,9 @@ fn prompt_suggestion_right_accepts_before_the_monitor_and_empty_enter_submits_on
         show(&console, "run the tests");
         let mut state = console.state.lock().unwrap();
         let event = state.key(KeyEvent::new(code, KeyModifiers::NONE));
-        assert!(!state.monitor.focused);
-        if code == KeyCode::Right {
-            assert!(event.is_none());
-            assert_eq!(state.editor.draft(), "run the tests");
-        } else {
-            assert!(
-                matches!(event, Some(InputEvent::Prompt { text, .. }) if text == "run the tests")
-            );
-            assert!(
-                !matches!(state.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some(InputEvent::Prompt { text, .. }) if text == "run the tests")
-            );
-        }
+        assert!(state.editor.draft().is_empty());
+        assert!(!matches!(event, Some(InputEvent::Prompt { text, .. }) if !text.is_empty()));
+        assert_eq!(state.monitor.focused, code == KeyCode::Right);
     }
 }
 
@@ -97,8 +88,8 @@ fn the_footer_hint_names_what_right_does_while_a_suggestion_is_visible() {
     assert!(hint(&console).contains("→ Monitor"));
     show(&console, "run the tests");
     let shown = hint(&console);
-    assert!(shown.contains("tab/→ accept"), "{shown}");
-    assert!(!shown.contains("→ Monitor"), "{shown}");
+    assert!(shown.contains("tab accept"), "{shown}");
+    assert!(shown.contains("→ Monitor"), "{shown}");
 }
 
 #[test]

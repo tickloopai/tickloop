@@ -130,12 +130,6 @@ impl DisplayProfile {
         TICK_SPINNER_FRAMES[frame as usize]
     }
 
-    /// The mark of a delivered Tick Update: each seq moves the ring's gap one dot on, so
-    /// consecutive updates step around the ring.
-    pub(super) fn tick_update_glyph(self, seq: u64) -> &'static str {
-        TICK_SPINNER_FRAMES[(seq % TICK_SPINNER_FRAMES.len() as u64) as usize]
-    }
-
     /// Whether a blinking glyph is in its dimmed phase at `now_ms`; under Reduce motion it never
     /// dims.
     pub(super) fn blink_dimmed(self, now_ms: u64) -> bool {
@@ -208,15 +202,6 @@ mod tests {
             prefers_reduced_motion: true,
         });
         assert_eq!(still.spinner_at(770), "⣾", "the still running glyph");
-    }
-
-    #[test]
-    fn tick_updates_step_the_ring() {
-        let display = DisplayProfile::default();
-        let steps = (41..=49)
-            .map(|seq| display.tick_update_glyph(seq))
-            .collect::<String>();
-        assert_eq!(steps, "⣷⣯⣟⡿⢿⣻⣽⣾⣷");
     }
 
     #[test]

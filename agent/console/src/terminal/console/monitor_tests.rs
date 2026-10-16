@@ -1286,6 +1286,7 @@ impl crate::monitor_rows::TickProbe for FixtureHostedProbe {
             return Err(crate::monitor_rows::ProbeError("host unreachable".into()));
         }
         Ok(crate::monitor_rows::MemberFindings {
+            terminals: Default::default(),
             updates: Default::default(),
             states: instances
                 .iter()
@@ -1345,6 +1346,7 @@ fn each_access_probes_its_own_members_beside_the_others() {
         (hosted.clone(), "hidden"),
     ] {
         snapshot.monitor.members.push(MonitorMember {
+            is_terminal: false,
             instance,
             title: Some(title.into()),
         });
@@ -1399,6 +1401,7 @@ fn monitor_pages_hold_at_most_128_rows_while_n_counts_the_full_set() {
     let mut snapshot = chat_status(chat);
     for index in 0..130 {
         snapshot.monitor.members.push(MonitorMember {
+            is_terminal: false,
             instance: format!("calendar:member-{index:03}").parse().unwrap(),
             title: None,
         });
@@ -1435,6 +1438,7 @@ fn probed_members_report_their_host_state_and_owner() {
     let mut snapshot = chat_status(chat);
     for id in ["quotes", "news"] {
         snapshot.monitor.members.push(MonitorMember {
+            is_terminal: false,
             instance: format!("hosted:{id}").parse().unwrap(),
             title: Some(id.into()),
         });
@@ -1490,6 +1494,7 @@ fn member_details_show_the_recorded_owner_and_no_invented_resources() {
     state.prompt_enabled = true;
     let mut snapshot = chat_status(chat);
     snapshot.monitor.members.push(MonitorMember {
+        is_terminal: false,
         instance: tick_protocol::InstanceRef::new("calendar", "opened").unwrap(),
         title: Some("Opened counter".into()),
     });
@@ -2127,7 +2132,7 @@ fn a_subscribed_shell_row_is_marked_immediate_and_offers_no_frequency() {
         .map(|action| action.key)
         .collect::<Vec<_>>();
     assert!(
-        keys.contains(&'w') && keys.contains(&'u') && !keys.contains(&'e'),
+        !keys.contains(&'w') && !keys.contains(&'u') && !keys.contains(&'f'),
         "an immediate subscription has no frequency to change: {keys:?}"
     );
 }
@@ -2145,6 +2150,17 @@ fn subscribed_fixture(subscriptions: usize) -> State {
             row
         })
         .collect();
+    let mut snapshot: tickloop_agent_protocol::ChatSnapshot = serde_json::from_value(
+        serde_json::json!({"id":Uuid::from_u128(77),"workdir":"/fixture","messages":[],"loops":[]}),
+    )
+    .unwrap();
+    snapshot.monitor.record_opened(
+        tick_protocol::InstanceRef::new("calendar", "fixture-run").unwrap(),
+        Some("calendar".into()),
+    );
+    state.monitor.chat_status = Some(std::sync::Arc::new(
+        tickloop_agent_protocol::ChatStatus::of(&snapshot),
+    ));
     state.monitor.rebuild();
     state.monitor.focus(false, None);
     state
@@ -2167,224 +2183,111 @@ fn requested_key(event: Option<InputEvent>) -> char {
 }
 
 #[test]
-fn a_subscribed_row_shows_its_marker_and_manages_subscriptions_inside_monitor() {
+fn subscriptions_have_one_key_and_a_fixed_monitor_footer() {
     let mut state = subscribed_fixture(1);
     let text = monitor_text(&mut state);
-    let row = text.lines().find(|line| line.contains("calendar")).unwrap();
-    assert!(
-        row.rsplit_once("│ ").unwrap().1.starts_with('↻')
-            && !row.contains("high")
-            && !text.contains("live"),
-        "the mark leads the row: {text}"
-    );
-    assert!(
-        text.contains("enter open")
-            && text.contains("f frequency")
-            && text.contains("w subscriptions"),
-        "{text}"
-    );
-    assert_eq!(
-        state
-            .monitor
-            .selected()
-            .unwrap()
-            .actions
-            .iter()
-            .map(|action| (action.key, action.label))
-            .collect::<Vec<_>>(),
-        [
-            ('o', "open"),
-            ('x', "remove"),
-            ('f', "frequency"),
-            ('w', "subscriptions"),
-            ('u', "unsubscribe")
-        ]
-    );
-
-    assert_eq!(requested_key(press(&mut state, KeyCode::Char('w'))), 'w');
-    let text = monitor_text(&mut state);
-    assert!(text.contains("Tick Subscriptions 1"), "{text}");
-    assert!(text.contains("› ↻ high · every 1 min"), "{text}");
-    assert!(!state.input_dialog_visible(), "the detail stays in Monitor");
-
-    assert_eq!(requested_key(press(&mut state, KeyCode::Char('f'))), 'f');
-    assert!(
-        monitor_text(&mut state).contains("› ↻ medium · every 10 min"),
-        "the detail shows the new frequency at once"
-    );
-    assert_eq!(requested_key(press(&mut state, KeyCode::Char('f'))), 'f');
-    let text = monitor_text(&mut state);
-    assert!(text.contains("› ↻ low · every 30 min"), "{text}");
-    assert!(
-        press(&mut state, KeyCode::Char('e')).is_none() && state.monitor.detail.is_some(),
-        "e no longer changes anything"
-    );
-
-    press(&mut state, KeyCode::Char('u'));
-    let text = monitor_text(&mut state);
-    assert!(text.contains("Cancel Tick Subscription"), "{text}");
-    assert!(press(&mut state, KeyCode::Esc).is_none());
-    assert!(!monitor_text(&mut state).contains("Cancel Tick Subscription"));
-    press(&mut state, KeyCode::Char('u'));
-    assert_eq!(requested_key(press(&mut state, KeyCode::Enter)), 'u');
-
-    press(&mut state, KeyCode::Esc);
-    assert!(state.monitor.detail.is_none());
-    assert!(state.monitor.focused, "Esc only closes the detail");
-}
-
-#[test]
-fn the_row_f_cycles_high_medium_low_at_once_however_fast_it_is_pressed() {
-    use tickloop_agent_protocol::TickSubscriptionFrequency::{High, Low, Medium};
-    let mut state = subscribed_fixture(1);
-    let shown = |state: &State| {
-        state
-            .monitor
-            .selected()
-            .unwrap()
-            .subscription
-            .unwrap()
-            .frequency
-    };
-    for (expected, label) in [
-        (Medium, "medium · every 10 min"),
-        (Low, "low · every 30 min"),
-        (High, "high · every 1 min"),
-    ] {
-        assert_eq!(requested_key(press(&mut state, KeyCode::Char('f'))), 'f');
-        assert_eq!(
-            shown(&state),
-            expected,
-            "no reply from the Agent in between"
-        );
-        assert_eq!(state.status, format!("Subscription frequency: {label}"));
-        assert!(state.monitor.detail.is_none(), "no picker or confirmation");
-    }
-
-    press(&mut state, KeyCode::Char('f'));
-    state.monitor.subscriptions[0].frequency = Medium;
-    state.monitor.rebuild();
-    assert_eq!(
-        shown(&state),
-        Medium,
-        "the Agent reporting the last request lets Monitor show its report again"
-    );
-    press(&mut state, KeyCode::Char('f'));
-    press(&mut state, KeyCode::Char('f'));
-    state.monitor.rebuild();
-    assert_eq!(
-        shown(&state),
-        High,
-        "a report that predates the latest request does not undo it"
-    );
-}
-
-#[test]
-fn several_subscriptions_on_one_row_show_a_summary_and_open_as_a_list() {
-    let mut state = subscribed_fixture(3);
-    let text = monitor_text(&mut state);
-    let row = text.lines().find(|line| line.contains("calendar")).unwrap();
-    assert!(
-        row.rsplit_once("│ ").unwrap().1.starts_with('↻') && !row.contains('3'),
-        "several subscriptions show one mark without a count: {text}"
-    );
-    assert!(
-        !text.contains('●'),
-        "a row with no update time shows no unread mark: {text}"
-    );
-
-    assert_eq!(requested_key(press(&mut state, KeyCode::Char('u'))), 'u');
-    let text = monitor_text(&mut state);
-    assert!(text.contains("Tick Subscriptions 3"), "{text}");
-    assert!(
-        !text.contains("Cancel Tick Subscription"),
-        "with several subscriptions the user picks one first: {text}"
-    );
-    press(&mut state, KeyCode::Char('j'));
-    press(&mut state, KeyCode::Char('u'));
-    assert!(monitor_text(&mut state).contains("Cancel Tick Subscription"));
-}
-
-#[test]
-fn a_cancel_from_the_row_returns_to_the_list_on_that_row_once_it_goes_through() {
-    let mut state = subscribed_fixture(2);
-    let row = state.monitor.selected().unwrap().instance.clone();
-    assert_eq!(requested_key(press(&mut state, KeyCode::Char('u'))), 'u');
-    press(&mut state, KeyCode::Char('u'));
-    assert_eq!(requested_key(press(&mut state, KeyCode::Enter)), 'u');
-    state.monitor.rebuild();
-    assert!(
-        state.monitor.detail.is_some(),
-        "the detail waits for the cancel to go through"
-    );
-
-    state.monitor.subscriptions.remove(0);
-    state.monitor.rebuild();
-    let text = monitor_text(&mut state);
-    assert!(state.monitor.detail.is_none(), "{text}");
-    assert!(!text.contains("Tick Subscriptions"), "{text}");
-    assert!(state.monitor.focused);
-    assert_eq!(
-        state.monitor.selected().map(|entry| entry.instance.clone()),
-        Some(row),
-        "the row keeps the selection"
-    );
-
-    let mut single = subscribed_fixture(1);
-    assert_eq!(requested_key(press(&mut single, KeyCode::Char('u'))), 'u');
-    assert_eq!(requested_key(press(&mut single, KeyCode::Enter)), 'u');
-    single.monitor.subscriptions.clear();
-    single.monitor.rebuild();
-    assert!(single.monitor.detail.is_none());
-    assert!(
-        !monitor_text(&mut single).contains("Tick Subscriptions"),
-        "no empty detail is left behind"
-    );
-}
-
-#[test]
-fn a_refused_cancel_stays_on_the_detail_with_its_reason() {
-    let mut state = subscribed_fixture(1);
-    assert_eq!(requested_key(press(&mut state, KeyCode::Char('u'))), 'u');
-    assert_eq!(requested_key(press(&mut state, KeyCode::Enter)), 'u');
-    state
+    assert!(text.contains("Live · Every 1 min"), "{text}");
+    let keys = state
         .monitor
-        .detail
-        .as_mut()
-        .and_then(|detail| {
-            detail
-                .as_any_mut()
-                .downcast_mut::<super::super::subscription_detail::SubscriptionDetail>()
-        })
+        .selected()
         .unwrap()
-        .report("Cannot update the Tick Subscription: refused".into());
-    state.monitor.rebuild();
-    assert!(state.monitor.detail.is_some());
-    let text = monitor_text(&mut state);
-    assert!(text.contains("Tick Subscriptions 1"), "{text}");
+        .actions
+        .iter()
+        .map(|action| action.key)
+        .collect::<Vec<_>>();
+    assert!(keys.contains(&'s'));
+    for old in ['f', 'w', 'u'] {
+        assert!(!keys.contains(&old));
+        assert!(press(&mut state, KeyCode::Char(old)).is_none());
+        state.monitor.focus(false, None);
+    }
     assert!(
-        text.contains("Cannot update the Tick Subscription: refused"),
-        "{text}"
+        state.monitor.hint().contains("s subscriptions"),
+        "shortcuts belong in the global hint row"
     );
+    for frequency in [Some("10 min"), Some("30 min"), None] {
+        assert_eq!(requested_key(press(&mut state, KeyCode::Char('s'))), 's');
+        let text = monitor_text(&mut state);
+        if let Some(frequency) = frequency {
+            assert!(text.contains(&format!("Every {frequency}")));
+        } else {
+            assert!(
+                !state
+                    .monitor
+                    .frame(60, 10, state.display, 0)
+                    .lines
+                    .last()
+                    .unwrap()
+                    .text()
+                    .contains("Every")
+            );
+        }
+        assert!(
+            !state
+                .monitor
+                .frame(60, 10, state.display, 0)
+                .lines
+                .last()
+                .unwrap()
+                .text()
+                .contains("Not subscribed")
+        );
+        assert!(
+            !state
+                .monitor
+                .frame(60, 10, state.display, 0)
+                .lines
+                .last()
+                .unwrap()
+                .text()
+                .contains("off")
+        );
+        assert!(
+            state.monitor.detail.is_none(),
+            "switching never opens a confirmation or picker"
+        );
+    }
+    assert_eq!(requested_key(press(&mut state, KeyCode::Char('s'))), 's');
 }
 
 #[test]
-fn a_subscription_detail_opened_to_view_closes_once_no_subscription_is_left() {
-    let mut state = subscribed_fixture(2);
-    assert_eq!(requested_key(press(&mut state, KeyCode::Char('w'))), 'w');
-    press(&mut state, KeyCode::Char('u'));
-    assert_eq!(requested_key(press(&mut state, KeyCode::Enter)), 'u');
-    state.monitor.subscriptions.remove(0);
-    state.monitor.rebuild();
-    assert!(
-        monitor_text(&mut state).contains("Tick Subscriptions 1"),
-        "it stays while one is left"
-    );
+fn the_row_switch_updates_all_periodic_subscriptions_of_the_instance() {
+    let mut state = subscribed_fixture(3);
+    for frequency in [
+        Some(tickloop_agent_protocol::TickSubscriptionFrequency::Medium),
+        Some(tickloop_agent_protocol::TickSubscriptionFrequency::Low),
+        None,
+    ] {
+        assert_eq!(requested_key(press(&mut state, KeyCode::Char('s'))), 's');
+        let shown = state.monitor.shown_subscriptions();
+        match frequency {
+            Some(frequency) => assert!(shown.iter().all(|row| row.frequency == frequency)),
+            None => assert!(shown.is_empty()),
+        }
+        assert!(state.monitor.detail.is_none());
+    }
+}
 
-    state.monitor.subscriptions.clear();
-    state.monitor.rebuild();
+#[test]
+fn a_refused_subscription_switch_restores_the_reported_frequency() {
+    let mut state = subscribed_fixture(1);
+    let id = state.monitor.subscriptions[0].id;
+    press(&mut state, KeyCode::Char('s'));
+    assert!(monitor_text(&mut state).contains("Every 10 min"));
+    state.monitor.forget_requested_subscription(id);
+    assert!(monitor_text(&mut state).contains("Every 1 min"));
     assert!(state.monitor.detail.is_none());
-    assert!(!monitor_text(&mut state).contains("Tick Subscriptions"));
+}
+
+#[test]
+fn the_subscription_footer_stays_at_the_panel_bottom() {
+    let state = subscribed_fixture(1);
+    for height in [4, 10, 20] {
+        let frame = state.monitor.frame(42, height, state.display, 0);
+        assert_eq!(frame.lines.len(), height);
+        assert_eq!(frame.lines.last().unwrap().text(), "Live · Every 1 min");
+        assert!(frame.targets.iter().all(|(row, _)| *row < height - 1));
+    }
 }
 
 #[tokio::test]
@@ -2412,8 +2315,8 @@ async fn removing_a_subscribed_row_confirms_then_cancels_its_subscriptions() {
         Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
             tickloop_agent_test_support::call(
                 "subscribe",
-                "SubscribeTick",
-                serde_json::json!({"tick_instance_id":"cal:watched"}),
+                "TickManage",
+                serde_json::json!({"action":"subscribe","tick_instance_id":"cal:watched"}),
             ),
             tickloop_agent_test_support::text("watching"),
         ])),
@@ -3089,8 +2992,8 @@ async fn subscribed_calendar_chat(
         Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
             tickloop_agent_test_support::call(
                 "subscribe",
-                "SubscribeTick",
-                serde_json::json!({"tick_instance_id":"cal:watched"}),
+                "TickManage",
+                serde_json::json!({"action":"subscribe","tick_instance_id":"cal:watched"}),
             ),
             tickloop_agent_test_support::text("watching"),
         ])),
@@ -3145,7 +3048,55 @@ async fn run_intent(
 }
 
 #[tokio::test]
-async fn f_subscribes_a_tick_on_the_newest_loop_then_cycles_its_frequency() {
+async fn rapid_subscription_presses_across_the_first_reply_each_advance_one_step() {
+    use crate::monitor_rows::TickIntent;
+    use crate::terminal::tick_actions::{TickActionUi, builtin, execute};
+    use tickloop_agent_protocol::TickSubscriptionFrequency::Low;
+    let directory = tempfile::tempdir().unwrap();
+    let (core, agent, console, chat) = subscribed_calendar_chat(directory.path()).await;
+    let context = crate::terminal::tick_actions::TickActionContext {
+        agent: &agent,
+        console: &console,
+        root: Some(directory.path()),
+        chat,
+    };
+    let instance = tick_protocol::InstanceRef::new("cal", "other").unwrap();
+    let press = || {
+        let mut state = console.state.lock().unwrap();
+        builtin::executor(&TickIntent::Subscribe(instance.clone()))
+            .unwrap()
+            .prepare(&mut TickActionUi { state: &mut state })
+            .unwrap()
+    };
+    let first = press();
+    let second = press();
+    execute(first, context).await.unwrap();
+    let third = press();
+    execute(second, context).await.unwrap();
+    execute(third, context).await.unwrap();
+    let subscriptions = agent.tick_subscriptions(chat).await.unwrap();
+    assert_eq!(
+        subscriptions
+            .iter()
+            .find(|row| row.instance == instance)
+            .unwrap()
+            .frequency,
+        Low
+    );
+    execute(press(), context).await.unwrap();
+    assert!(
+        !agent
+            .tick_subscriptions(chat)
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.instance == instance)
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn s_subscribes_a_tick_then_cycles_through_frequencies_and_off_without_a_notice() {
     use crate::monitor_rows::TickIntent;
     use tickloop_agent_protocol::TickSubscriptionFrequency::{High, Medium};
     let directory = tempfile::tempdir().unwrap();
@@ -3173,13 +3124,17 @@ async fn f_subscribes_a_tick_on_the_newest_loop_then_cycles_its_frequency() {
         .await
         .unwrap();
     assert_eq!(frequency_of_other().await, Some((loop_id, High)));
-    assert!(status().contains("Subscribed at high"), "{}", status());
+    assert!(
+        status().is_empty(),
+        "frequency stays in the Monitor footer: {}",
+        status()
+    );
 
     run_intent(context, TickIntent::Subscribe(other.clone()))
         .await
         .unwrap();
     assert_eq!(frequency_of_other().await, Some((loop_id, Medium)));
-    assert_eq!(status(), "Subscription frequency: medium · every 10 min");
+    assert!(status().is_empty());
 
     let (first, second) = {
         let mut state = console.state.lock().unwrap();
@@ -3199,10 +3154,10 @@ async fn f_subscribes_a_tick_on_the_newest_loop_then_cycles_its_frequency() {
         .unwrap();
     assert_eq!(
         frequency_of_other().await,
-        Some((loop_id, High)),
-        "two presses before the Agent replies go on to low, then high again"
+        None,
+        "two presses before the Agent replies go on to low, then off"
     );
-    assert_eq!(agent.tick_subscriptions(chat).await.unwrap().len(), 2);
+    assert_eq!(agent.tick_subscriptions(chat).await.unwrap().len(), 1);
 
     console.update_subscribed_ticks(chat, &[]).unwrap();
     run_intent(context, TickIntent::Subscribe(other.clone()))
@@ -3213,7 +3168,7 @@ async fn f_subscribes_a_tick_on_the_newest_loop_then_cycles_its_frequency() {
         2,
         "a View that has not heard of the subscription yet subscribes nothing twice"
     );
-    assert!(status().starts_with("Already subscribed"), "{}", status());
+    assert!(status().is_empty());
 
     let without_loop = agent.create_chat(directory.path().into()).await.unwrap();
     let refused = run_intent(
@@ -3221,7 +3176,7 @@ async fn f_subscribes_a_tick_on_the_newest_loop_then_cycles_its_frequency() {
             chat: without_loop,
             ..context
         },
-        TickIntent::Subscribe(other),
+        TickIntent::Subscribe(tick_protocol::InstanceRef::new("cal", "unsubscribed").unwrap()),
     )
     .await
     .unwrap_err();

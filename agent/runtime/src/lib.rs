@@ -112,9 +112,9 @@ use tickloop_agent_protocol::{
     PendingInput, PermissionApprovalSource, PermissionExecution, PermissionPolicy,
     PermissionRequest, PermissionRule, PermissionScope, PromptPolicy, ProposedToolCall,
     QueuedInput, QueuedInputKind, ReasoningEffort, Receipt, RequestOutcome, RequestUsageLedger,
-    ResponseRejection, Role, RunId, SubagentRegistration, TICK_SUBSCRIPTION_SOURCE,
-    TaskNotification, ToolResultBlock, ToolResultContent, TriggerSource, Usage, UserShellRecord,
-    UserShellState, VerdictEvidence, projection,
+    ResponseRejection, Role, RunId, SubagentRegistration, TICK_MANUAL_SOURCE,
+    TICK_SUBSCRIPTION_SOURCE, TaskNotification, ToolResultBlock, ToolResultContent, TriggerSource,
+    Usage, UserShellRecord, UserShellState, VerdictEvidence, projection,
 };
 use tickloop_agent_tools::permissions::SessionPermissionDecision;
 use tickloop_agent_tools::{
@@ -892,7 +892,9 @@ impl Agent {
             let is_artifact_tool =
                 crate::mcp_tools::ARTIFACT_TOOL_NAMES.contains(&definition.name.as_str());
             if definition.name.trim().is_empty()
-                || (reserved.contains(&definition.name) && !(serves_artifacts && is_artifact_tool))
+                || (reserved.contains(&definition.name)
+                    && definition.name != crate::tick_tools::TICK_MANAGE
+                    && !(serves_artifacts && is_artifact_tool))
                 || !names.insert(definition.name.clone())
             {
                 return Err(AgentError::Invalid(format!(
@@ -954,13 +956,14 @@ impl Agent {
             .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
             .map_err(|error| error.to_string())?;
         let name = invoked.name.clone();
+        let origin = invoked.source.display_label();
         let changed = record_invoked_skill(chat, invoked);
         self.save(&chat.snapshot);
         Ok(tickloop_agent_protocol::ToolResult {
             content: if changed {
-                format!("Launching skill: {name}")
+                format!("Launching skill: {name} [{origin}]")
             } else {
-                format!("Already loaded {name}")
+                format!("Already loaded {name} [{origin}]")
             },
             is_error: false,
             output_ref: None,
@@ -2362,7 +2365,15 @@ impl Agent {
             } else {
                 None
             };
-        if trigger_source.is_some() {
+        let is_manual_tick = trigger_source
+            .as_ref()
+            .is_some_and(|source| source.source == TICK_MANUAL_SOURCE);
+        if is_manual_tick && !tick_subscriptions::can_take_manual_update(goal) {
+            return Err(AgentError::Invalid(
+                "this Loop cannot take a manual update".into(),
+            ));
+        }
+        if trigger_source.is_some() && !is_manual_tick {
             if trigger_cancel
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
@@ -2381,7 +2392,11 @@ impl Agent {
                 .pending_inputs
                 .iter()
                 .find(|pending| {
-                    pending.receipt.loop_id == loop_id && pending.trigger_source.is_some()
+                    pending.receipt.loop_id == loop_id
+                        && pending
+                            .trigger_source
+                            .as_ref()
+                            .is_some_and(|source| source.source != TICK_MANUAL_SOURCE)
                 })
                 .map(|pending| pending.receipt.clone());
             if let Some(pending_receipt) = pending_receipt {
@@ -3094,11 +3109,11 @@ impl Agent {
                                 }
                             },
                             Some(crate::host_tools::HostEffect::RenamedArtifact { instance, title }) => self.retitle_artifact_tick(chat, instance, title),
-                            Some(crate::host_tools::HostEffect::OpenedTick { instance, title }) => {
+                            Some(crate::host_tools::HostEffect::OpenedTick { instance, title, is_terminal }) => {
                                 if let Some(operation) = chat.snapshot.operations.iter().find(|operation| operation.run_id == receipt.run_id && operation.call_id == id && operation.state == OperationState::Completed) {
                                     chat.bookkeeping.tick_creation_receipts.push(approval_context::TickCreationReceipt { loop_id: receipt.loop_id, operation_id: operation.id, instance: instance.clone() });
                                 }
-                                self.record_opened_tick(chat, instance.clone(), title.clone());
+                                self.record_opened_tick(chat, instance.clone(), title.clone(), *is_terminal);
                             },
                             Some(crate::host_tools::HostEffect::FinishedFeedbackRequest { request_id }) => {
                                 if let Some(active) = chat.active_event_claims.get_mut(&receipt.run_id)
@@ -3468,11 +3483,23 @@ impl Agent {
                 }
                 RunAdmission::ValidateTick(pending) => {
                     let source = pending.trigger_source.as_ref().unwrap();
-                    if self
-                        .revalidate_tick_source(chat_id, pending.receipt.loop_id, &source.payload)
+                    let validation = if source.source == TICK_MANUAL_SOURCE {
+                        // Read admission must not enlarge every run's shared async stack.
+                        Box::pin(self.revalidate_manual_tick_source(
+                            chat_id,
+                            pending.receipt.loop_id,
+                            &source.payload,
+                        ))
                         .await
-                        .is_ok()
-                    {
+                    } else {
+                        self.revalidate_tick_source(
+                            chat_id,
+                            pending.receipt.loop_id,
+                            &source.payload,
+                        )
+                        .await
+                    };
+                    if validation.is_ok() {
                         if let Ok(mut chats) = self.inner.chats.try_lock() {
                             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
                             match self.select_next_run(chat, Some(&pending))? {
@@ -3578,13 +3605,25 @@ impl Agent {
                 .find(|goal| goal.id == pending.receipt.loop_id)
                 .ok_or(AgentError::NotFound)?;
             if matches!(goal.state, LoopState::Stopped | LoopState::Expired)
-                || (pending.trigger_source.is_some() && !triggers::can_trigger(goal))
+                || (pending
+                    .trigger_source
+                    .as_ref()
+                    .is_some_and(|source| source.source == TICK_MANUAL_SOURCE)
+                    && !tick_subscriptions::can_take_manual_update(goal))
+                || (pending
+                    .trigger_source
+                    .as_ref()
+                    .is_some_and(|source| source.source != TICK_MANUAL_SOURCE)
+                    && !triggers::can_trigger(goal))
             {
                 candidate.snapshot.pending_inputs.remove(index);
                 continue;
             }
             if let Some(source) = &pending.trigger_source
-                && source.source == TICK_SUBSCRIPTION_SOURCE
+                && matches!(
+                    source.source.as_str(),
+                    TICK_SUBSCRIPTION_SOURCE | TICK_MANUAL_SOURCE
+                )
             {
                 let validated = validated_tick.is_some_and(|validated| {
                     validated.receipt.run_id == pending.receipt.run_id
@@ -3598,14 +3637,15 @@ impl Agent {
                     *chat = candidate;
                     return Ok(RunAdmission::ValidateTick(Box::new(pending)));
                 }
-                if self
-                    .validate_tick_source_bindings(
-                        pending.receipt.chat_id,
-                        pending.receipt.loop_id,
-                        &source.payload,
-                        &candidate.snapshot.loops,
-                    )
-                    .is_err()
+                if source.source == TICK_SUBSCRIPTION_SOURCE
+                    && self
+                        .validate_tick_source_bindings(
+                            pending.receipt.chat_id,
+                            pending.receipt.loop_id,
+                            &source.payload,
+                            &candidate.snapshot.loops,
+                        )
+                        .is_err()
                 {
                     candidate.snapshot.pending_inputs.remove(index);
                     self.finish_discarded_trigger_input(&mut candidate, &pending.receipt);

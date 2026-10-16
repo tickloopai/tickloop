@@ -1223,7 +1223,7 @@ async fn restart_lists_saved_chats_without_running_until_manual_resume_and_input
             (
                 "user",
                 concat!(
-                    "Host notice: host tools available in this conversation now: ArtifactLogin, CallTickTool, ModifyTick, ReadTick. ",
+                    "Host notice: host tools available in this conversation now: ArtifactLogin, TickCall, TickDescribe, TickManage, TickRead. ",
                     "Earlier statements in this conversation about tool availability may be outdated. ",
                     "This notice comes from the host, not the user, and does not authorize any new work."
                 ),

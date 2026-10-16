@@ -917,6 +917,7 @@ pub(super) fn pending_reply(snapshot: &ChatSnapshot) -> String {
 }
 
 struct PublicHistoryBuilder<'a> {
+    tick_labels: super::tick_labels::TickLabels,
     chat: &'a ChatSnapshot,
     pieces: Vec<ConversationPiece>,
     image_links: ImageLinks,
@@ -1028,6 +1029,7 @@ fn public_history_pieces(
         )];
     };
     let mut history = PublicHistoryBuilder {
+        tick_labels: super::tick_labels::TickLabels::from_snapshot(chat),
         chat,
         pieces: Vec::new(),
         image_links,
@@ -1181,6 +1183,13 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
             .values()
             .copied()
             .filter(|input| super::consumed_input_text(chat, *input).is_some())
+            .chain(
+                chat.messages
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, message)| is_tick_delivery(message) || (message.role == Role::User && message.content.iter().any(|content| matches!(content, Content::Text { text } if matches!(LocalMessage::parse(text), Some(LocalMessage::ArtifactRequest { .. }))))))
+                    .filter_map(|(index, _)| chat.message_runs.get(&index).copied()),
+            )
             .chain(agent_messaging::shown_agent_inputs(chat)),
     )?;
     if console.is_interactive()
@@ -1280,6 +1289,8 @@ fn append_public_message(
                     && let Some(local_message) =
                         presentation::typed_local_message(text, source.is_agent_message) =>
             {
+                let local_message =
+                    presentation::name_local_ticks(local_message, &history.tick_labels);
                 if let LocalMessage::BashInput { command } = &local_message {
                     history.push_prompt(
                         source_chat_id,
@@ -1346,7 +1357,13 @@ fn append_public_message(
                             display,
                         )
                     } else {
-                        presentation::tool_call_roles(name, input, &history.chat.workdir, display)
+                        presentation::tool_call_roles(
+                            name,
+                            input,
+                            &history.chat.workdir,
+                            display,
+                            &history.tick_labels,
+                        )
                     };
                     let mut text = spans
                         .iter()
@@ -1361,7 +1378,12 @@ fn append_public_message(
                         call_key: presentation::tool_call_key(run, id),
                         spans,
                         state,
-                        collapse: presentation::collapsed_call(name, input),
+                        collapse: history
+                            .tick_labels
+                            .native_tool_instance(name, input)
+                            .is_none()
+                            .then(|| presentation::collapsed_call(name, input))
+                            .flatten(),
                     });
                 } else {
                     history.push_role(
@@ -1370,6 +1392,7 @@ fn append_public_message(
                             input,
                             &history.chat.workdir,
                             display,
+                            &history.tick_labels,
                         ),
                         super::style::Role::MutedText,
                     );
@@ -1413,6 +1436,7 @@ fn append_public_message(
                             input,
                             &history.chat.workdir,
                             display,
+                            &history.tick_labels,
                         );
                         history.pieces.push(ConversationPiece::ToolCall {
                             run_id: run,
@@ -1745,6 +1769,7 @@ mod tests {
                 "items": [{
                     "subscription": Uuid::from_u128(700),
                     "instance": "calendar:fixture-run-3",
+                    "title": "Quote board",
                     "updates": 5,
                     "seq": "8→12",
                     "between": "2026-09-21T03:11:00Z→2026-09-21T03:15:00Z",
@@ -1776,7 +1801,7 @@ mod tests {
         let history = public_history(&tick_delivery_history("quiet"), DisplayProfile::default());
 
         assert!(
-            history.contains("⡿ calendar:fixture-run-3 #8→12 · 5 updates\n"),
+            history.contains("◉ TickUpdate: Quote board  #8→12 · 5 merged\n"),
             "{history}"
         );
         assert!(!history.contains("last_done"), "{history}");
@@ -1805,11 +1830,11 @@ mod tests {
         );
 
         assert!(
-            history.contains("⣾ calendar:fixture-run-3 #941→1000 · 60 updates · trimmed"),
+            history.contains("◉ TickUpdate: Tick fixture-  #941→1000 · 60 merged · trimmed"),
             "{history}"
         );
         assert!(
-            history.contains("⣽ calendar:fixture-run-4 #7\n"),
+            history.contains("◉ TickUpdate: Tick fixture-  #7\n"),
             "{history}"
         );
     }
@@ -1827,7 +1852,10 @@ mod tests {
             DisplayProfile::default(),
         );
 
-        assert!(history.contains("⣾ calendar:fixture-run-3\n"), "{history}");
+        assert!(
+            history.contains("◉ TickUpdate: Tick fixture-\n"),
+            "{history}"
+        );
     }
 
     #[test]

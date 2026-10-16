@@ -13,7 +13,7 @@ use tickloop_agent_protocol::{
 use tickloop_agent_runtime::{
     Agent,
     host_tools::{HostToolPermission, HostToolProvider},
-    tick_tools::{CALL_TICK_TOOL, MODIFY_TICK, READ_TICK},
+    tick_tools::{TICK_CALL, TICK_MANAGE, TICK_READ},
 };
 use tickloop_agent_test_support::{ScriptedModel, call, config, next_event, text};
 use tokio::sync::broadcast;
@@ -189,7 +189,7 @@ struct TickTools {
 #[async_trait]
 impl HostToolProvider for TickTools {
     fn definitions(&self) -> Vec<ToolDefinition> {
-        [READ_TICK, CALL_TICK_TOOL, MODIFY_TICK]
+        [TICK_READ, TICK_CALL, TICK_MANAGE]
             .map(|name| ToolDefinition {
                 name: name.into(),
                 description: format!("{name} on a fixture Tick."),
@@ -222,25 +222,25 @@ async fn every_successful_tick_tool_use_marks_the_instance_used_and_only_a_read_
     let [read, called, typed, failing, closed] = ["read", "called", "typed", "failing", "closed"]
         .map(|id| InstanceRef::new("hosted", id).unwrap());
     let model = Arc::new(ScriptedModel::new(vec![
-        call("read", READ_TICK, json!({"tick_instance_id": read})),
+        call("read", TICK_READ, json!({"tick_instance_id": read})),
         call(
             "call",
-            CALL_TICK_TOOL,
+            TICK_CALL,
             json!({"tick_instance_id": called, "tool": "refresh", "args": {}}),
         ),
         call(
             "type",
-            MODIFY_TICK,
+            TICK_MANAGE,
             json!({"action": "send_input", "tick_instance_id": typed, "text": "q"}),
         ),
         call(
             "fail",
-            CALL_TICK_TOOL,
+            TICK_CALL,
             json!({"tick_instance_id": failing, "tool": "refresh", "args": {}}),
         ),
         call(
             "close",
-            MODIFY_TICK,
+            TICK_MANAGE,
             json!({"action": "close", "tick_instance_id": closed}),
         ),
         text("done"),
@@ -261,7 +261,7 @@ async fn every_successful_tick_tool_use_marks_the_instance_used_and_only_a_read_
     finish_run(&agent, chat, &mut events).await;
 
     let monitor = agent.snapshot(chat).await.unwrap().monitor;
-    let read_at = monitor.used_at(&read).expect("ReadTick used its instance");
+    let read_at = monitor.used_at(&read).expect("TickRead used its instance");
     assert!(read_at >= before);
     assert_eq!(
         monitor.handled_at(&read),

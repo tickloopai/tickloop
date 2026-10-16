@@ -4,7 +4,7 @@ use tick_provider::error::{Error, Result};
 use tick_sdk::stream::Describe;
 
 /// Ticks whose content comes from services the shared runtime does not hand to query tools, so
-/// they declare no recovery tool. The Agent re-reads their Panel content with `ReadTick`.
+/// they declare no recovery tool. The Agent re-reads their Panel content with `TickRead`.
 const EXEMPT_FROM_RECOVERY: [TickKind; 2] = [TickKind::Positions, TickKind::News];
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Serialize, PartialEq, Eq)]

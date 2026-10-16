@@ -108,10 +108,10 @@ struct Observed {
     calls: AtomicUsize,
     host_before_open: std::sync::atomic::AtomicBool,
     results: Mutex<Vec<String>>,
-    modify_schema: Mutex<Value>,
+    tick_manage_schema: Mutex<Value>,
 }
 
-/// The model first sends ModifyTick with no arguments, as GLM did for a schema whose root was
+/// The model first sends TickManage with no arguments, as GLM did for a schema whose root was
 /// only a `oneOf`, and is told which fields to fill. It then opens the Tick package program
 /// `tick-counter` by name and without `protocol`: the worker finds the package installed in its
 /// View's config root, and the program runs as the protocol Tick its manifest declares.
@@ -141,30 +141,30 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
                 *observed.results.lock().unwrap() = results.clone();
                 if let Some(modify) = request["tools"]
                     .as_array()
-                    .and_then(|tools| tools.iter().find(|tool| tool["name"] == "ModifyTick"))
+                    .and_then(|tools| tools.iter().find(|tool| tool["name"] == "TickManage"))
                 {
-                    *observed.modify_schema.lock().unwrap() = modify["input_schema"].clone();
+                    *observed.tick_manage_schema.lock().unwrap() = modify["input_schema"].clone();
                 }
                 observed.calls.fetch_add(1, Ordering::SeqCst);
                 let instance = hosted_instance(&results);
                 let block = match (results.len(), instance) {
                     (0, _) => {
-                        json!({"type":"tool_use","id":"empty","name":"ModifyTick","input":{}})
+                        json!({"type":"tool_use","id":"empty","name":"TickManage","input":{}})
                     }
                     (1, _) => {
                         observed
                             .host_before_open
                             .store(host_socket.exists(), Ordering::SeqCst);
-                        json!({"type":"tool_use","id":"open","name":"ModifyTick","input":{"action":"open","command":["tick-counter"],"placement":{"type":"hidden"}}})
+                        json!({"type":"tool_use","id":"open","name":"TickManage","input":{"action":"open","command":["tick-counter"],"placement":{"type":"hidden"}}})
                     }
                     (2, Some(instance)) => {
-                        json!({"type":"tool_use","id":"read","name":"ReadTick","input":{"tick_instance_id":instance}})
+                        json!({"type":"tool_use","id":"read","name":"TickRead","input":{"tick_instance_id":instance}})
                     }
                     (3, Some(instance)) => {
-                        json!({"type":"tool_use","id":"call","name":"CallTickTool","input":{"tick_instance_id":instance,"tool":"increment","args":{"amount":2}}})
+                        json!({"type":"tool_use","id":"call","name":"TickCall","input":{"tick_instance_id":instance,"tool":"increment","args":{"amount":2}}})
                     }
                     (4, Some(instance)) => {
-                        json!({"type":"tool_use","id":"close","name":"ModifyTick","input":{"action":"close","tick_instance_id":instance}})
+                        json!({"type":"tool_use","id":"close","name":"TickManage","input":{"action":"close","tick_instance_id":instance}})
                     }
                     _ => json!({"type":"text","text":"Hosted counter finished."}),
                 };
@@ -237,13 +237,16 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(results.len(), 5, "{results:#?}");
-    let modify_schema = observed.modify_schema.lock().unwrap().clone();
-    assert_eq!(modify_schema["type"], "object", "{modify_schema}");
-    assert_eq!(modify_schema["required"], json!(["action"]));
-    assert!(modify_schema.get("oneOf").is_none(), "{modify_schema}");
+    let tick_manage_schema = observed.tick_manage_schema.lock().unwrap().clone();
+    assert_eq!(tick_manage_schema["type"], "object", "{tick_manage_schema}");
+    assert_eq!(tick_manage_schema["required"], json!(["action"]));
+    assert!(
+        tick_manage_schema.get("oneOf").is_none(),
+        "{tick_manage_schema}"
+    );
     assert_eq!(
         results[0],
-        "invalid ModifyTick input: action is required: one of open (requires command), send_input (requires tick_instance_id), close (requires tick_instance_id), reopen (requires tick_instance_id)"
+        "invalid TickManage input: action is required: one of open (requires command), send_input (requires tick_instance_id), close (requires tick_instance_id), reopen (requires tick_instance_id)"
     );
     assert!(
         !observed.host_before_open.load(Ordering::SeqCst),
@@ -255,7 +258,7 @@ async fn a_worker_opens_reads_calls_and_closes_a_hidden_tick_through_its_daemon(
     assert!(opened["business_pid"].as_u64().is_some());
     let read: Value = serde_json::from_str(&results[2]).unwrap();
     assert_eq!(read["data"]["value"], 0, "{results:#?}");
-    assert!(read["tools"].to_string().contains("increment"));
+    assert!(read.get("descriptor").is_none() && read.get("tools").is_none());
     let called: Value = serde_json::from_str(&results[3]).unwrap();
     assert_eq!(called["result"]["value"], 2, "{results:#?}");
     let closed: Value = serde_json::from_str(&results[4]).unwrap();
@@ -310,7 +313,7 @@ mod channel {
 
     /// The Herdr Workspace a Herdr worker's Chats work in.
     const HERDR_WORKSPACE: &str = "workspace-a";
-    /// How long a hosted test waits for its next event. It outlasts SubscribeTick's 10-second
+    /// How long a hosted test waits for its next event. It outlasts TickManage's 10-second
     /// wait for a Watch to become ready, during which a run emits nothing.
     const HOSTED_EVENT_WAIT: Duration = Duration::from_secs(30);
 
@@ -653,7 +656,7 @@ mod channel {
         }
     }
 
-    /// The ModifyTick input that opens the protocol `program` hidden in the daemon's Tickhost.
+    /// The TickManage input that opens the protocol `program` hidden in the daemon's Tickhost.
     fn open_command(daemon: &Daemon, program: Vec<String>) -> Value {
         json!({"action":"open","command":program,"protocol":true,"cwd":daemon.root,"placement":{"type":"hidden"}})
     }
@@ -748,7 +751,7 @@ mod channel {
                 environment: Vec::new(),
                 title: None,
                 admission: HostedAdmission {
-                    tool: "ModifyTick".into(),
+                    tool: "TickManage".into(),
                     authority: HostToolAuthority::Native {
                         endpoint: HostEndpointIdentity::Tickhost {
                             endpoint: "/elsewhere/host.sock".into(),
@@ -812,7 +815,7 @@ mod channel {
         let approved = tools
             .prepare_call(
                 chat,
-                "ModifyTick",
+                "TickManage",
                 &json!({"action":"open","command":["/bin/sh"],"cwd":work,"placement":{"type":"hidden"}}),
                 CancellationToken::new(),
             )
@@ -908,7 +911,7 @@ mod channel {
         let settled = call_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"open","command":["/bin/sh"],"cwd":"/private/tmp","placement":{"type":"hidden"}}),
         )
         .await;
@@ -923,7 +926,7 @@ mod channel {
         let unknown = call_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"close","tick_instance_id":instance}),
         )
         .await;
@@ -949,7 +952,7 @@ mod channel {
         assert_eq!(requests[0]["operation"], requests[1]["operation"]);
         assert_eq!(requests[2]["operation"], requests[3]["operation"]);
         assert_eq!(
-            requests[0]["admission"]["tool"], "ModifyTick",
+            requests[0]["admission"]["tool"], "TickManage",
             "lifecycle requests carry their admission facts"
         );
     }
@@ -990,7 +993,7 @@ for line in sys.stdin:
         let opened = run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             open_command(&daemon, python_program(&script, &[])),
         )
         .await;
@@ -1002,7 +1005,7 @@ for line in sys.stdin:
         let approved = tools
             .prepare_call(
                 chat,
-                "CallTickTool",
+                "TickCall",
                 &json!({"tick_instance_id":instance,"tool":"increment","args":{}}),
                 CancellationToken::new(),
             )
@@ -1020,7 +1023,7 @@ for line in sys.stdin:
         run_tool(
             &tools,
             chat,
-            "CallTickTool",
+            "TickCall",
             json!({"tick_instance_id":instance,"tool":"evolve","args":{}}),
         )
         .await;
@@ -1034,7 +1037,7 @@ for line in sys.stdin:
         let read = run_tool(
             &tools,
             chat,
-            "ReadTick",
+            "TickRead",
             json!({"tick_instance_id":instance}),
         )
         .await;
@@ -1043,7 +1046,7 @@ for line in sys.stdin:
         let HostCallResult::NotDispatched(refused) = call_tool(
             &tools,
             other_chat,
-            "ReadTick",
+            "TickRead",
             json!({"tick_instance_id":instance}),
         )
         .await
@@ -1051,11 +1054,23 @@ for line in sys.stdin:
             panic!("another Chat of this worker never reuses the daemon's binding");
         };
         assert!(refused.contains("Forbidden"), "{refused}");
-        assert!(read["tools"].to_string().contains("decrement"));
+        let described = run_tool(
+            &tools,
+            chat,
+            "TickDescribe",
+            json!({"tick_instance_id":instance}),
+        )
+        .await;
+        assert!(
+            described["descriptor"]["tools"]
+                .to_string()
+                .contains("decrement")
+        );
+        assert!(read.get("descriptor").is_none() && read.get("tools").is_none());
         let closed = run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"close","tick_instance_id":instance}),
         )
         .await;
@@ -1095,20 +1110,20 @@ for line in sys.stdin:
         let opened = run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             open_command(&daemon, python_program(&script, &[])),
         )
         .await;
         let instance = opened["tick_instance_id"].clone();
         let call = |tool: &str| json!({"tick_instance_id":instance,"tool":tool,"args":{}});
         let HostCallResult::NotDispatched(refused) =
-            call_tool(&tools, chat, "CallTickTool", call("strict")).await
+            call_tool(&tools, chat, "TickCall", call("strict")).await
         else {
             panic!("arguments the Tick refuses leave the call unrun");
         };
         assert!(refused.contains("amount is required"), "{refused}");
         let HostCallResult::Completed(failed) =
-            call_tool(&tools, chat, "CallTickTool", call("jam")).await
+            call_tool(&tools, chat, "TickCall", call("jam")).await
         else {
             panic!("a tool that ran and failed has a known outcome");
         };
@@ -1120,7 +1135,7 @@ for line in sys.stdin:
         run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"close","tick_instance_id":instance}),
         )
         .await;
@@ -1138,21 +1153,34 @@ for line in sys.stdin:
         let tools = daemon.tools().with_tick_packages(packages.clone());
         let open = json!({"action":"open","command":["tick-counter"],"cwd":daemon.root});
 
-        let opened = run_tool(&tools, chat, "ModifyTick", open.clone()).await;
+        let opened = run_tool(&tools, chat, "TickManage", open.clone()).await;
         let instance = opened["tick_instance_id"].clone();
         let read = run_tool(
             &tools,
             chat,
-            "ReadTick",
+            "TickRead",
             json!({"tick_instance_id":instance}),
         )
         .await;
         assert_eq!(read["data"]["value"], 0, "{read}");
-        assert!(read["tools"].to_string().contains("increment"), "{read}");
+        let described = run_tool(
+            &tools,
+            chat,
+            "TickDescribe",
+            json!({"tick_instance_id":instance}),
+        )
+        .await;
+        assert!(
+            described["descriptor"]["tools"]
+                .to_string()
+                .contains("increment"),
+            "{described}"
+        );
+        assert!(read.get("tools").is_none());
         let called = run_tool(
             &tools,
             chat,
-            "CallTickTool",
+            "TickCall",
             json!({"tick_instance_id":instance,"tool":"increment","args":{"amount":2}}),
         )
         .await;
@@ -1160,14 +1188,14 @@ for line in sys.stdin:
         run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"close","tick_instance_id":instance}),
         )
         .await;
 
         packages.uninstall("counter").unwrap();
         let refused = tools
-            .prepare_call(chat, "ModifyTick", &open, CancellationToken::new())
+            .prepare_call(chat, "TickManage", &open, CancellationToken::new())
             .await
             .unwrap_err();
         assert!(
@@ -1188,7 +1216,7 @@ for line in sys.stdin:
         let opened = run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"open","command":["tick-counter"],"cwd":daemon.root}),
         )
         .await;
@@ -1201,7 +1229,7 @@ for line in sys.stdin:
         let reopen = json!({"action":"reopen","tick_instance_id":opened["tick_instance_id"]});
 
         let HostCallResult::NotDispatched(uninstalled) =
-            call_tool(&tools, chat, "ModifyTick", reopen.clone()).await
+            call_tool(&tools, chat, "TickManage", reopen.clone()).await
         else {
             panic!("a reopen of an uninstalled package's program runs nothing");
         };
@@ -1213,7 +1241,7 @@ for line in sys.stdin:
         );
         super::support::hosted::install_counter_package(&daemon.config_root, &daemon.root);
         let HostCallResult::NotDispatched(changed) =
-            call_tool(&tools, chat, "ModifyTick", reopen).await
+            call_tool(&tools, chat, "TickManage", reopen).await
         else {
             panic!("a reinstalled program is another program");
         };
@@ -1262,8 +1290,8 @@ for line in sys.stdin:
         ]));
         runtime.set_auto_reviewer(reviewer.clone()).await;
         let open = |program: &str| json!({"action":"open","command":[program],"cwd":daemon.root});
-        model.enqueue(call("keyed", "ModifyTick", open("tick-keyed")));
-        model.enqueue(call("signed", "ModifyTick", open("tick-signed")));
+        model.enqueue(call("keyed", "TickManage", open("tick-keyed")));
+        model.enqueue(call("signed", "TickManage", open("tick-signed")));
         model.enqueue(text("opened"));
 
         let results = run_turn(&runtime, chat, "Open the keyed and the signed counters").await;
@@ -1310,7 +1338,7 @@ for line in sys.stdin:
         inherited.push(("SAMPLE_API_KEY".into(), "inherited".into()));
         let tools = HostedTickTools::new(DaemonControl::new(daemon.grants[0].clone()), inherited)
             .with_tick_packages(packages);
-        let opened = run_tool(&tools, chat, "ModifyTick", open("tick-keyed")).await;
+        let opened = run_tool(&tools, chat, "TickManage", open("tick-keyed")).await;
         assert_eq!(opened["status"], "opened", "{opened}");
         let keyed_environment = super::support::hosted::recorded_environment(&sources, "keyed");
         assert!(!keyed_environment.contains_key("SAMPLE_API_KEY"));
@@ -1343,7 +1371,7 @@ for line in sys.stdin:
                 text(&cleanup.to_string()),
             ]));
             runtime.set_auto_reviewer(reviewer.clone()).await;
-            model.enqueue(call("open", "ModifyTick", counter_command(&daemon)));
+            model.enqueue(call("open", "TickManage", counter_command(&daemon)));
             model.enqueue(text("opened"));
             let results = run_turn(
                 &runtime,
@@ -1364,7 +1392,7 @@ for line in sys.stdin:
                 .id;
             model.enqueue(call(
                 "close",
-                "ModifyTick",
+                "TickManage",
                 json!({"action":"close","tick_instance_id":instance}),
             ));
             model.enqueue(text("closed"));
@@ -1423,7 +1451,7 @@ for line in sys.stdin:
                     run_tool(
                         &daemon.tools(),
                         chat,
-                        "ReadTick",
+                        "TickRead",
                         json!({"tick_instance_id":instance})
                     )
                     .await["data"]["value"],
@@ -1531,7 +1559,7 @@ for line in sys.stdin:
         assert_eq!(daemon.owner_state(root), None);
         let tools = daemon.tools();
         let HostCallResult::NotDispatched(refused) =
-            call_tool(&tools, child, "ModifyTick", counter_command(&daemon)).await
+            call_tool(&tools, child, "TickManage", counter_command(&daemon)).await
         else {
             panic!("a stopped child opens nothing before it continues");
         };
@@ -1548,7 +1576,7 @@ for line in sys.stdin:
         let daemon = Daemon::start_with(model, super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         let tools = daemon.tools();
-        let earlier = run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
+        let earlier = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
         let earlier_pid = earlier["business_pid"].as_u64().unwrap() as u32;
         std::fs::write(
             daemon
@@ -1560,7 +1588,7 @@ for line in sys.stdin:
         )
         .unwrap();
         let HostCallResult::NotDispatched(refused) =
-            call_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await
+            call_tool(&tools, chat, "TickManage", counter_command(&daemon)).await
         else {
             panic!("a stopped Chat opens nothing before it continues");
         };
@@ -1579,7 +1607,7 @@ for line in sys.stdin:
                 _ => {}
             }
         }
-        let reopened = run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
+        let reopened = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
         assert!(
             super::gone(earlier_pid).await,
             "the Tick of the stopped Chat ends"
@@ -1607,12 +1635,12 @@ for line in sys.stdin:
         .await;
         let chat = daemon.chats[0];
         let tools = daemon.tools();
-        let counter = run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
+        let counter = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
         let business_pid = counter["business_pid"].as_u64().unwrap() as u32;
         let exited = run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"open","command":["/bin/sh","-c","printf finished"],"cwd":daemon.root}),
         )
         .await;
@@ -1625,7 +1653,7 @@ for line in sys.stdin:
         let read = run_tool(
             &tools,
             chat,
-            "ReadTick",
+            "TickRead",
             json!({"tick_instance_id":exited["tick_instance_id"]}),
         )
         .await;
@@ -1641,7 +1669,7 @@ for line in sys.stdin:
             run_tool(
                 &tools,
                 chat,
-                "ModifyTick",
+                "TickManage",
                 json!({"action":"close","tick_instance_id":opened["tick_instance_id"]}),
             )
             .await;
@@ -1658,13 +1686,13 @@ for line in sys.stdin:
         let daemon = Daemon::start_with(model.clone(), Duration::from_secs(2), 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         let tools = daemon.tools();
-        let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
+        let opened = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
         let instance = opened["tick_instance_id"].clone();
         let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
         model.enqueue(tickloop_agent_test_support::call(
             "subscribe",
-            "SubscribeTick",
-            json!({"tick_instance_id":instance}),
+            "TickManage",
+            json!({"action":"subscribe","tick_instance_id":instance}),
         ));
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
@@ -1696,7 +1724,7 @@ for line in sys.stdin:
         run_tool(
             &tools,
             chat,
-            "CallTickTool",
+            "TickCall",
             json!({"tick_instance_id":instance,"tool":"increment","args":{"amount":7}}),
         )
         .await;
@@ -1797,15 +1825,15 @@ for line in sys.stdin:
         let opened = run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             open_command(&daemon, python_program(&script, &[])),
         )
         .await;
         let instance = opened["tick_instance_id"].clone();
         model.enqueue(tickloop_agent_test_support::call(
             "subscribe",
-            "SubscribeTick",
-            json!({"tick_instance_id":instance}),
+            "TickManage",
+            json!({"action":"subscribe","tick_instance_id":instance}),
         ));
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
@@ -1829,7 +1857,7 @@ for line in sys.stdin:
             run_tool(
                 &tools,
                 chat,
-                "CallTickTool",
+                "TickCall",
                 json!({"tick_instance_id":instance,"tool":"advance","args":{}}),
             )
             .await;
@@ -1874,7 +1902,7 @@ for line in sys.stdin:
         assert_eq!(item["recover_with"], "history");
     }
 
-    /// The ModifyTick input that opens `/bin/cat` as a terminal Tick in the daemon's Tickhost.
+    /// The TickManage input that opens `/bin/cat` as a terminal Tick in the daemon's Tickhost.
     fn cat_command(daemon: &Daemon) -> Value {
         json!({"action":"open","command":["/bin/cat"],"cwd":daemon.root})
     }
@@ -1897,7 +1925,7 @@ for line in sys.stdin:
         panic!("no sample of {watch} showed what was expected");
     }
 
-    /// A program opened without `protocol` runs as a terminal Tick: ReadTick returns its screen
+    /// A program opened without `protocol` runs as a terminal Tick: TickRead returns its screen
     /// text, send_input types into it, and it declares no tools. Its Watches get no screen
     /// pushed: each starts from the screen as it is when it joins, is told once that the screen
     /// changed since it last got it, and a sample reports the screen only when its text, or
@@ -1908,7 +1936,7 @@ for line in sys.stdin:
         let daemon = Daemon::start(1).await;
         let chat = daemon.chats[0];
         let tools = Arc::new(daemon.tools());
-        let opened = run_tool(&tools, chat, "ModifyTick", cat_command(&daemon)).await;
+        let opened = run_tool(&tools, chat, "TickManage", cat_command(&daemon)).await;
         let instance = opened["tick_instance_id"].clone();
         assert!(
             instance.as_str().unwrap().starts_with("hosted:"),
@@ -1917,17 +1945,25 @@ for line in sys.stdin:
         let read = run_tool(
             &tools,
             chat,
-            "ReadTick",
+            "TickRead",
             json!({"tick_instance_id":instance}),
         )
         .await;
         assert_eq!(read["source"], "terminal", "{read}");
-        assert_eq!(read["command"], json!(["/bin/cat"]));
+        let described = run_tool(
+            &tools,
+            chat,
+            "TickDescribe",
+            json!({"tick_instance_id":instance}),
+        )
+        .await;
+        assert_eq!(described["descriptor"]["command"], json!(["/bin/cat"]));
+        assert!(read.get("command").is_none());
         assert_eq!(read["data"]["exit"], Value::Null);
         let refused = tools
             .prepare_call(
                 chat,
-                "CallTickTool",
+                "TickCall",
                 &json!({"tick_instance_id":instance,"tool":"increment","args":{}}),
                 CancellationToken::new(),
             )
@@ -1939,7 +1975,7 @@ for line in sys.stdin:
         let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
         let stream = HostedTickStream::new(tools.clone());
         let authority = tools
-            .tool_authorities("ReadTick")
+            .tool_authorities("TickRead")
             .unwrap()
             .pop_first()
             .unwrap();
@@ -1970,7 +2006,7 @@ for line in sys.stdin:
         let typed = run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"send_input","tick_instance_id":instance,"text":"hello terminal","keys":["Enter"]}),
         )
         .await;
@@ -2042,7 +2078,7 @@ for line in sys.stdin:
         run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"send_input","tick_instance_id":instance,"keys":["Ctrl-D"]}),
         )
         .await;
@@ -2089,7 +2125,7 @@ for line in sys.stdin:
         let late = call_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"send_input","tick_instance_id":instance,"text":"late"}),
         )
         .await;
@@ -2102,7 +2138,7 @@ for line in sys.stdin:
         run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"close","tick_instance_id":instance}),
         )
         .await;
@@ -2119,6 +2155,75 @@ for line in sys.stdin:
         assert!(stream.sample(first, &target).await.is_none());
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn changing_a_hosted_terminal_frequency_keeps_its_pending_screen() {
+        let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new()));
+        let daemon =
+            Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
+        let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
+        let tools = daemon.tools();
+        let opened = run_tool(&tools, chat, "TickManage", cat_command(&daemon)).await;
+        let instance = opened["tick_instance_id"].clone();
+        model.enqueue(tickloop_agent_test_support::call(
+            "subscribe",
+            "TickManage",
+            json!({"action":"subscribe","tick_instance_id":instance}),
+        ));
+        model.enqueue(tickloop_agent_test_support::text("watching"));
+        let mut events = runtime.subscribe();
+        runtime
+            .submit(chat, None, "Watch this terminal".into())
+            .await
+            .unwrap();
+        loop {
+            match tickloop_agent_test_support::next_event(&mut events)
+                .await
+                .kind
+            {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        run_tool(&tools, chat, "TickManage", json!({"action":"send_input","tick_instance_id":instance,"text":"pending update","keys":["Enter"]})).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let before = loop {
+            let status = runtime.tick_subscriptions(chat).await.unwrap().remove(0);
+            if status.has_pending_change {
+                break status;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "pending screen never arrived: {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        for frequency in [
+            tickloop_agent_protocol::TickSubscriptionFrequency::Medium,
+            tickloop_agent_protocol::TickSubscriptionFrequency::Low,
+            tickloop_agent_protocol::TickSubscriptionFrequency::High,
+        ] {
+            runtime
+                .update_tick_subscription(
+                    chat,
+                    before.id,
+                    TickSubscriptionChange::Frequency(frequency),
+                )
+                .await
+                .unwrap();
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                let status = runtime.tick_subscriptions(chat).await.unwrap().remove(0);
+                assert!(
+                    status.has_pending_change,
+                    "changing to {frequency:?} cleared the unread screen: {status:?}"
+                );
+                assert!(status.pending_since_ms.is_some());
+                assert_eq!(status.last_delivery_ms, before.last_delivery_ms);
+            }
+        }
+    }
+
     /// A Loop subscribed to a terminal Tick at the default high frequency: the screen is read
     /// once its period elapsed, and the input and exit that changed it wake the Loop once with
     /// the new text and the exit code.
@@ -2129,12 +2234,12 @@ for line in sys.stdin:
             Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         let tools = daemon.tools();
-        let opened = run_tool(&tools, chat, "ModifyTick", cat_command(&daemon)).await;
+        let opened = run_tool(&tools, chat, "TickManage", cat_command(&daemon)).await;
         let instance = opened["tick_instance_id"].clone();
         model.enqueue(tickloop_agent_test_support::call(
             "subscribe",
-            "SubscribeTick",
-            json!({"tick_instance_id":instance}),
+            "TickManage",
+            json!({"action":"subscribe","tick_instance_id":instance}),
         ));
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
@@ -2166,7 +2271,7 @@ for line in sys.stdin:
         run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"send_input","tick_instance_id":instance,"text":"quote ready","keys":["Enter","Ctrl-D"]}),
         )
         .await;
@@ -2203,15 +2308,15 @@ for line in sys.stdin:
         let opened = run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"open","command":["/bin/sh","-c","read symbol; echo \"no quote for $symbol\"; exit 3"],"cwd":daemon.root}),
         )
         .await;
         let instance = opened["tick_instance_id"].clone();
         model.enqueue(tickloop_agent_test_support::call(
             "subscribe",
-            "SubscribeTick",
-            json!({"tick_instance_id":instance}),
+            "TickManage",
+            json!({"action":"subscribe","tick_instance_id":instance}),
         ));
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
@@ -2234,7 +2339,7 @@ for line in sys.stdin:
         run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"send_input","tick_instance_id":instance,"text":"700.HK","keys":["Enter"]}),
         )
         .await;
@@ -2349,7 +2454,7 @@ for line in sys.stdin:
         open.as_object_mut().unwrap().remove("placement");
         model.enqueue(tickloop_agent_test_support::call(
             "open",
-            "ModifyTick",
+            "TickManage",
             open,
         ));
         model.enqueue(tickloop_agent_test_support::text("opened"));
@@ -2382,8 +2487,8 @@ for line in sys.stdin:
 
         model.enqueue(tickloop_agent_test_support::call(
             "subscribe",
-            "SubscribeTick",
-            json!({"tick_instance_id":instance}),
+            "TickManage",
+            json!({"action":"subscribe","tick_instance_id":instance}),
         ));
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let results = run_turn(&runtime, chat, "Watch the counter").await;
@@ -2398,7 +2503,7 @@ for line in sys.stdin:
         run_tool(
             &daemon.tools(),
             chat,
-            "CallTickTool",
+            "TickCall",
             json!({"tick_instance_id":instance,"tool":"increment","args":{"amount":7}}),
         )
         .await;
@@ -2421,12 +2526,12 @@ for line in sys.stdin:
 
         model.enqueue(tickloop_agent_test_support::call(
             "visible",
-            "ModifyTick",
+            "TickManage",
             json!({"action":"open","command":["/bin/cat"],"cwd":daemon.root,"workspace_id":HERDR_WORKSPACE,"placement":{"type":"new_tab"}}),
         ));
         model.enqueue(tickloop_agent_test_support::call(
             "close",
-            "ModifyTick",
+            "TickManage",
             json!({"action":"close","tick_instance_id":instance}),
         ));
         model.enqueue(tickloop_agent_test_support::text("done"));
@@ -2484,7 +2589,7 @@ for line in sys.stdin:
             })
             .await;
         let parents = daemon.tools();
-        let opened = run_tool(&parents, chat, "ModifyTick", counter_command(&daemon)).await;
+        let opened = run_tool(&parents, chat, "TickManage", counter_command(&daemon)).await;
         let instance = opened["tick_instance_id"].clone();
         let mut child_open = counter_command(&daemon);
         child_open.as_object_mut().unwrap().remove("placement");
@@ -2496,10 +2601,10 @@ for line in sys.stdin:
             ),
             tickloop_agent_test_support::call(
                 "child-read",
-                "ReadTick",
+                "TickRead",
                 json!({"tick_instance_id":instance}),
             ),
-            tickloop_agent_test_support::call("child-open", "ModifyTick", child_open),
+            tickloop_agent_test_support::call("child-open", "TickManage", child_open),
             tickloop_agent_test_support::text("The child is done."),
             tickloop_agent_test_support::text("Delegated."),
         ] {
@@ -2545,9 +2650,9 @@ for line in sys.stdin:
         )
         .unwrap();
         for (tool, hosts) in [
-            ("ReadTick", 1),
-            ("CallTickTool", 1),
-            ("ModifyTick", 2),
+            ("TickRead", 1),
+            ("TickCall", 1),
+            ("TickManage", 2),
             ("ReadWorkspace", 1),
         ] {
             assert_eq!(
@@ -2559,7 +2664,7 @@ for line in sys.stdin:
         let read = run_tool(
             &parents,
             chat,
-            "ReadTick",
+            "TickRead",
             json!({"tick_instance_id":instance}),
         )
         .await;
@@ -2655,7 +2760,7 @@ for line in sys.stdin:
         let opened = run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"open","command":["/bin/cat"],"cwd":daemon.root,"workspace_id":workspace,"placement":beside("right")}),
         )
         .await;
@@ -2692,7 +2797,7 @@ for line in sys.stdin:
         run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"send_input","tick_instance_id":instance,"text":"seen in herdr","keys":["Enter"]}),
         )
         .await;
@@ -2714,7 +2819,7 @@ for line in sys.stdin:
         let moved = run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"move","tick_instance_id":instance,"workspace_id":workspace,"placement":beside("left")}),
         )
         .await;
@@ -2751,7 +2856,7 @@ for line in sys.stdin:
         let read = run_tool(
             &tools,
             chat,
-            "ReadTick",
+            "TickRead",
             json!({"tick_instance_id":instance}),
         )
         .await;
@@ -2767,7 +2872,7 @@ for line in sys.stdin:
         let shown = run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"move","tick_instance_id":instance,"workspace_id":workspace,"placement":beside("down")}),
         )
         .await;
@@ -2850,7 +2955,7 @@ for line in sys.stdin:
         let closed = run_tool(
             &restarted,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"close","tick_instance_id":instance}),
         )
         .await;
@@ -2865,7 +2970,7 @@ for line in sys.stdin:
             call_tool(
                 &tools,
                 chat,
-                "ReadTick",
+                "TickRead",
                 json!({"tick_instance_id":instance}),
             )
             .await,
@@ -2873,7 +2978,7 @@ for line in sys.stdin:
         ));
     }
 
-    /// A model reopens a Tick lost with its host through ModifyTick: the reopen waits for
+    /// A model reopens a Tick lost with its host through TickManage: the reopen waits for
     /// approval like any change, starts a new hidden instance in place of the lost one, and joins
     /// the Chat's Monitor under the lost Tick's title without any subscription.
     #[tokio::test(flavor = "multi_thread")]
@@ -2883,7 +2988,7 @@ for line in sys.stdin:
             Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         let tools = daemon.tools();
-        let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
+        let opened = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
         let lost = opened["tick_instance_id"].as_str().unwrap().to_owned();
         let lost_title = launch_records(&daemon.root, chat)[0]["title"].clone();
         let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
@@ -2897,7 +3002,7 @@ for line in sys.stdin:
 
         model.enqueue(tickloop_agent_test_support::call(
             "reopen",
-            "ModifyTick",
+            "TickManage",
             json!({"action":"reopen","tick_instance_id":lost}),
         ));
         model.enqueue(tickloop_agent_test_support::text("reopened"));
@@ -2960,7 +3065,7 @@ for line in sys.stdin:
         run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             json!({"action":"close","tick_instance_id":instance}),
         )
         .await;
@@ -2976,14 +3081,14 @@ for line in sys.stdin:
             Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         let tools = daemon.tools();
-        let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
+        let opened = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
         let instance = opened["tick_instance_id"].clone();
         let mut events = runtime.subscribe();
         let run = |name: &'static str| {
             model.enqueue(tickloop_agent_test_support::call(
                 name,
-                "SubscribeTick",
-                json!({"tick_instance_id":instance}),
+                "TickManage",
+                json!({"action":"subscribe","tick_instance_id":instance}),
             ));
             model.enqueue(tickloop_agent_test_support::text("watching"));
         };
@@ -3022,7 +3127,7 @@ for line in sys.stdin:
         run_tool(
             &tools,
             chat,
-            "CallTickTool",
+            "TickCall",
             json!({"tick_instance_id":instance,"tool":"increment","args":{"amount":1}}),
         )
         .await;
@@ -3059,7 +3164,7 @@ for line in sys.stdin:
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         assert!(is_gone, "the Watch of a Tick whose host died fails closed");
-        run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
+        run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
         tokio::time::sleep(Duration::from_secs(6)).await;
         assert_eq!(
             model.requests.lock().unwrap().len(),
@@ -3117,7 +3222,7 @@ for line in sys.stdin:
         let opened = run_tool(
             &daemon.tools(),
             chat,
-            "ModifyTick",
+            "TickManage",
             open_command(&daemon, python_program(&script, &[])),
         )
         .await;
@@ -3129,8 +3234,8 @@ for line in sys.stdin:
 
         model.enqueue(tickloop_agent_test_support::call(
             "subscribe",
-            "SubscribeTick",
-            json!({"tick_instance_id":instance}),
+            "TickManage",
+            json!({"action":"subscribe","tick_instance_id":instance}),
         ));
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let results = run_turn(&runtime, chat, "Watch it").await;
@@ -3167,8 +3272,8 @@ for line in sys.stdin:
             .unwrap();
         model.enqueue(tickloop_agent_test_support::call(
             "again",
-            "SubscribeTick",
-            json!({"tick_instance_id":instance}),
+            "TickManage",
+            json!({"action":"subscribe","tick_instance_id":instance}),
         ));
         model.enqueue(tickloop_agent_test_support::text("watching again"));
         let results = run_turn(&runtime, chat, "Watch it again").await;
@@ -3257,18 +3362,18 @@ for line in sys.stdin:
         let growing = run_tool(
             &tools,
             chat,
-            "ModifyTick",
+            "TickManage",
             open_command(
                 &daemon,
                 python_program(&script, &[GROWN_VALUES.to_string()]),
             ),
         )
         .await;
-        let counter = run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
+        let counter = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
         let (large, small) = (Uuid::new_v4(), Uuid::new_v4());
         let stream = HostedTickStream::new(tools.clone());
         let authority = tools
-            .tool_authorities("ReadTick")
+            .tool_authorities("TickRead")
             .unwrap()
             .pop_first()
             .unwrap();
@@ -3308,7 +3413,7 @@ for line in sys.stdin:
         let settled = match call_tool(
             &tools,
             chat,
-            "CallTickTool",
+            "TickCall",
             json!({"tick_instance_id":growing["tick_instance_id"],"tool":"grow","args":{}}),
         )
         .await
@@ -3352,7 +3457,7 @@ for line in sys.stdin:
         run_tool(
             &tools,
             chat,
-            "CallTickTool",
+            "TickCall",
             json!({"tick_instance_id":counter["tick_instance_id"],"tool":"increment","args":{"amount":1}}),
         )
         .await;
@@ -3383,8 +3488,8 @@ for line in sys.stdin:
         let daemon = Daemon::start(1).await;
         let (chat, execution) = (daemon.chats[0], daemon.executions[0]);
         let tools = daemon.tools();
-        let closed = run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
-        let kept = run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
+        let closed = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
+        let kept = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
         let CommandResult::HostedTicks(members) = daemon
             .command(AgentCommand::ListHostedTicks { execution })
             .await
@@ -3405,7 +3510,7 @@ for line in sys.stdin:
         run_tool(
             &tools,
             chat,
-            "CallTickTool",
+            "TickCall",
             json!({"tick_instance_id":kept["tick_instance_id"],"tool":"increment","args":{"amount":1}}),
         )
         .await;
@@ -3550,7 +3655,7 @@ for line in sys.stdin:
         let (chat, execution, other) =
             (daemon.chats[0], daemon.executions[0], daemon.executions[1]);
         let tools = daemon.tools();
-        let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
+        let opened = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
         let instance: tick_protocol::InstanceRef =
             serde_json::from_value(opened["tick_instance_id"].clone()).unwrap();
         assert!(
@@ -3614,13 +3719,13 @@ for line in sys.stdin:
             daemon.executions[0],
         );
         let tools = daemon.tools();
-        let opened = run_tool(&tools, chat, "ModifyTick", counter_command(&daemon)).await;
+        let opened = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
         let lost: tick_protocol::InstanceRef =
             serde_json::from_value(opened["tick_instance_id"].clone()).unwrap();
         model.enqueue(tickloop_agent_test_support::call(
             "subscribe",
-            "SubscribeTick",
-            json!({"tick_instance_id":lost}),
+            "TickManage",
+            json!({"action":"subscribe","tick_instance_id":lost}),
         ));
         model.enqueue(tickloop_agent_test_support::text("watching"));
         let mut events = runtime.subscribe();
@@ -3767,7 +3872,7 @@ for line in sys.stdin:
         std::fs::create_dir(&work).unwrap();
         let mut command = counter_command(&daemon);
         command["cwd"] = json!(work);
-        let opened = run_tool(&tools, chat, "ModifyTick", command).await;
+        let opened = run_tool(&tools, chat, "TickManage", command).await;
         let business_pid = opened["business_pid"].as_u64().unwrap() as u32;
         let launcher = tickhost::process::sample(business_pid).unwrap().parent;
         let host = tickhost::process::sample(launcher).unwrap().parent;

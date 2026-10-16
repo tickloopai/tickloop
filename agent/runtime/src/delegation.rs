@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use super::*;
 use crate::{
     host_tools::HostToolProvider,
-    tick_tools::{CALL_TICK_TOOL, MODIFY_TICK, READ_TICK, READ_WORKSPACE, uses_herdr_layout},
+    tick_tools::{READ_WORKSPACE, TICK_CALL, TICK_MANAGE, TICK_READ, uses_herdr_layout},
 };
 use tickloop_agent_protocol::local_messages;
 use tickloop_agent_protocol::{
@@ -356,11 +356,8 @@ fn check_direct_call(
             return Err("delegated authorization ceiling denies this operation".into());
         }
     }
-    if matches!(
-        name,
-        READ_WORKSPACE | READ_TICK | CALL_TICK_TOOL | MODIFY_TICK
-    ) {
-        if name == MODIFY_TICK
+    if matches!(name, READ_WORKSPACE | TICK_READ | TICK_CALL | TICK_MANAGE) {
+        if name == TICK_MANAGE
             && matches!(
                 input["action"].as_str(),
                 Some("open" | "reopen" | "send_input")
@@ -385,9 +382,7 @@ fn check_direct_call(
                 );
             }
         }
-        if ceiling.policy.mode == ExecutionMode::Plan
-            && matches!(name, CALL_TICK_TOOL | MODIFY_TICK)
-        {
+        if ceiling.policy.mode == ExecutionMode::Plan && matches!(name, TICK_CALL | TICK_MANAGE) {
             return Err("delegated Plan authorization does not admit host mutations".into());
         }
     }

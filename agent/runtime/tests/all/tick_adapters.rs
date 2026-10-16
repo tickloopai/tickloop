@@ -57,10 +57,10 @@ async fn shell_subscription_preserves_its_policy_including_final_admission() {
         chat,
         &[AdmissionCase {
             plan_denied: false,
-            name: "SubscribeTick",
-            input: json!({"tick_instance_id":instance}),
-            policy_name: "SubscribeTick",
-            policy_input: json!({"tick_instance_id":instance}),
+            name: "TickManage",
+            input: json!({"action":"subscribe","tick_instance_id":instance}),
+            policy_name: "TickManage",
+            policy_input: json!({"action":"subscribe","tick_instance_id":instance}),
         }],
     )
     .await;

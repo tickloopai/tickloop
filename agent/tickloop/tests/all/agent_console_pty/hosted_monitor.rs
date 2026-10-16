@@ -18,7 +18,7 @@ async fn view_with_keys_ticks(
                 200,
                 chat_reply(
                     Some((
-                        "ModifyTick",
+                        "TickManage",
                         &format!("open-keys-{index}"),
                         json!({"action":"open","command":["/usr/bin/python3", "-u", script],"protocol":true}),
                     )),
@@ -350,7 +350,7 @@ async fn actual_cli_an_ended_protocol_tick_stays_until_removed_and_enter_reopens
         view.send(b"\x1b[C");
         view.wait_for("Monitor focused", |frame| frame.contains("enter open"))
             .await;
-        view.send(b"f");
+        view.send(b"s");
         let subscribed = eventually("the subscription", || async {
             tick_subscriptions(&client, execution).await.pop()
         })
@@ -577,7 +577,7 @@ async fn actual_cli_keeps_a_long_reply_streaming_while_a_hosted_tick_owns_the_te
 /// closes it while the Tick keeps running. A click on the row is Enter, and while Herdr already
 /// shows a popup the View only says so instead of opening the Tick a second time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn actual_cli_enter_opens_a_hosted_tick_in_a_herdr_popup_after_a_one_key_registration() {
+async fn actual_cli_enter_opens_a_hosted_tick_in_a_herdr_popup_with_automatic_registration() {
     use support::herdr::{HerdrClient, PrivateHerdr, wait_until};
     let herdr = PrivateHerdr::start();
     let pane = herdr.create_workspace();
@@ -600,16 +600,6 @@ async fn actual_cli_enter_opens_a_hosted_tick_in_a_herdr_popup_after_a_one_key_r
         view.send(b"\x1b[C");
         view.wait_for("Monitor focused", |frame| frame.contains("enter open"))
             .await;
-        view.send(b"\r");
-        view.wait_for("the one-key registration offer", |frame| {
-            frame.contains("Register Tickloop") && frame.contains("enter confirm")
-        })
-        .await;
-        assert!(
-            herdr.plugins().is_empty(),
-            "nothing is registered before Enter"
-        );
-
         view.send(b"\r");
         wait_until("the popup shows the Tick", || {
             Some(client.screen())
@@ -752,17 +742,6 @@ async fn actual_cli_enter_re_registers_a_popup_plugin_another_tickloop_linked() 
         view.wait_for("Monitor focused", |frame| frame.contains("enter open"))
             .await;
         view.send(b"\r");
-        view.wait_for("the offer to register this tickloop", |frame| {
-            frame.contains("runs another tickloop") && frame.contains("enter confirm")
-        })
-        .await;
-        assert_eq!(
-            herdr.plugins()[0]["panes"][0]["command"][0],
-            json!(other_tickloop),
-            "nothing is re-registered before Enter"
-        );
-
-        view.send(b"\r");
         wait_until("the popup shows the Tick", || {
             Some(client.screen())
                 .filter(|screen| screen.contains("┌Tickloop") && screen.contains("keys"))
@@ -794,8 +773,7 @@ async fn actual_cli_enter_re_registers_a_popup_plugin_another_tickloop_linked() 
     }
 }
 
-/// Declining the one-time registration offer with Esc links nothing and is not asked again: the
-/// next Enter opens the Tick full screen and returns quietly. With another plugin holding Tick
+/// A disabled popup opens the Tick full screen without asking. With another plugin holding Tick
 /// Loop's popup id, Enter opens full screen too and leaves that plugin linked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_cli_enter_without_a_usable_popup_opens_full_screen() {
@@ -805,6 +783,9 @@ async fn actual_cli_enter_without_a_usable_popup_opens_full_screen() {
     let fixture = PrivateFixture::new();
     let socket = herdr.socket();
     let result = AssertUnwindSafe(async {
+        tickloop_agent_config::UserSettings::in_root(&fixture.path("config"))
+            .save_monitor_popup(tickloop_agent_config::MonitorPopup::Disabled)
+            .unwrap();
         let mut view = view_with_keys_ticks(
             &fixture,
             &[
@@ -820,28 +801,16 @@ async fn actual_cli_enter_without_a_usable_popup_opens_full_screen() {
         view.wait_for("Monitor focused", |frame| frame.contains("enter open"))
             .await;
         view.send(b"\r");
-        view.wait_for("the one-key registration offer", |frame| {
-            frame.contains("Register Tickloop")
-        })
-        .await;
-        view.send(b"\x1b");
-        view.wait_for("the offer declined", |frame| {
-            !frame.contains("Register Tickloop") && frame.contains("enter open")
-        })
-        .await;
-        assert!(herdr.plugins().is_empty(), "declining links nothing");
-
-        view.send(b"\r");
         terminal_shows(&view, "size 100x32").await;
         view.send(CLOSE);
         let back = back_in_monitor_quietly(&view).await;
         assert!(
             !back.contains("Register Tickloop"),
-            "the offer is made once: {back}"
+            "opening never asks for confirmation: {back}"
         );
         assert!(
             herdr.plugins().is_empty(),
-            "nothing is linked without consent"
+            "an explicitly disabled popup is not enabled"
         );
 
         let foreign = herdr.link_foreign_plugin();
@@ -890,12 +859,12 @@ async fn view_with_local_ticks(
     std::fs::write(fixture.path("work/sleeper.sh"), "sleep 600\n").unwrap();
     let mut calls = vec![
         (
-            "ModifyTick",
+            "TickManage",
             "open-keys",
             json!({"action":"open","command":["/usr/bin/python3", "-u", keys],"protocol":true}),
         ),
         (
-            "ModifyTick",
+            "TickManage",
             "open-cat",
             json!({"action":"open","command":["/bin/cat"]}),
         ),
@@ -1205,11 +1174,6 @@ async fn actual_cli_enter_floats_every_local_tick_in_the_herdr_popup() {
 
         select_row(&mut view, "Keys").await;
         view.send(b"\r");
-        view.wait_for("the one-key registration offer", |frame| {
-            frame.contains("Register Tickloop") && frame.contains("enter confirm")
-        })
-        .await;
-        view.send(b"\r");
         client.shows("size ");
         client.send(CLOSE);
         popup_closes(&client);
@@ -1250,6 +1214,103 @@ async fn actual_cli_enter_floats_every_local_tick_in_the_herdr_popup() {
     fixture.shutdown().await;
     drop(client);
     drop(herdr);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_cli_s_keeps_a_terminal_update_pending_while_changing_frequency() {
+    use tickloop_agent_protocol::TickSubscriptionFrequency;
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(async {
+        let script = fixture.path("work/frequency.py");
+        let gate = fixture.path("work/frequency-change");
+        std::fs::write(&script, format!("import pathlib,time\nprint('baseline',flush=True)\nwhile not pathlib.Path({:?}).exists(): time.sleep(.02)\nprint('pending content',flush=True)\ntime.sleep(600)\n", gate.to_string_lossy())).unwrap();
+        let (base_url, mut requests) = model_http_support::serve_responses(vec![
+            (200, chat_reply(Some(("TickManage", "open", json!({"action":"open","command":["/usr/bin/python3","-u",script]}))), "")),
+            (200, chat_reply(None, "Frequency fixture ready.")),
+            (200, chat_reply(None, "Manual update received.")),
+        ]).await;
+        fixture.set_chat_model(&base_url);
+        let mut view = PtyView::start_with_environment(&fixture, &["--dangerously-skip-permissions"], &[("COLORTERM", std::path::Path::new("truecolor"))]);
+        view.wait_for("input ready", new_input_is_visible).await;
+        view.send(b"Open the test terminal.\r");
+        view.wait_for("terminal opened", |frame| frame.contains("Monitor 1") && frame.contains("Frequency fixture ready.")).await;
+        let client = fixture.client().await;
+        let execution = catalog(&client).await[0].execution;
+        view.send(b"\x1b[C");
+        view.wait_for("Monitor focused", |frame| frame.contains("enter open")).await;
+        view.send(b"s");
+        let original = eventually("high subscription", || async {
+            tick_subscriptions(&client, execution).await.into_iter().find(|row| row.frequency == TickSubscriptionFrequency::High)
+        }).await;
+        std::fs::write(&gate, "change").unwrap();
+        eventually("pending screen", || async {
+            tick_subscriptions(&client, execution).await.into_iter().find(|row| row.has_pending_change)
+        }).await;
+        let signals = |view: &PtyView| {
+            let mut parser = vt100::Parser::new(view.height as u16, view.width as u16, 0);
+            parser.process(&view.output.lock().unwrap());
+            let (mut unread, mut progress) = (false, false);
+            for row in 0..view.height as u16 {
+                let mut in_monitor = false;
+                for col in 0..view.width as u16 {
+                    if let Some(cell) = parser.screen().cell(row, col) {
+                        if cell.contents() == "│" { in_monitor = true; }
+                        if !in_monitor { continue; }
+                        unread |= cell.contents() == ">" && cell.fgcolor() == vt100::Color::Rgb(255, 160, 120);
+                        progress |= cell.bgcolor() == vt100::Color::Rgb(110, 63, 48);
+                    }
+                }
+            }
+            (unread, progress)
+        };
+        eventually("visible unread and progress", || async { (signals(&view) == (true, true)).then_some(()) }).await;
+        for (frequency, label) in [(TickSubscriptionFrequency::Medium, "10 min"), (TickSubscriptionFrequency::Low, "30 min")] {
+            view.send(b"s");
+            view.wait_for("new frequency footer", |frame| frame.contains(label)).await;
+            eventually("frequency applied by the worker", || async {
+                tick_subscriptions(&client, execution).await.into_iter().find(|row| row.frequency == frequency)
+            }).await;
+            for _ in 0..10 {
+                let rows = tick_subscriptions(&client, execution).await;
+                let row = rows.iter().find(|row| row.id == original.id).expect("frequency does not replace the subscription");
+                assert_eq!(row.frequency, frequency);
+                assert!(row.has_pending_change, "s cleared pending at {frequency:?}: {row:?}\n{}", view.frame());
+                assert!(row.pending_since_ms.is_some());
+                assert_eq!(signals(&view), (true, true), "s cleared the visible update signals at {frequency:?}: {}", view.frame());
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        }
+        view.send(b"s");
+        eventually("subscription cancelled", || async {
+            tick_subscriptions(&client, execution).await.is_empty().then_some(())
+        }).await;
+        eventually("cancellation keeps unread but removes periodic progress", || async {
+            (signals(&view) == (true, false)).then_some(())
+        }).await;
+        view.send(b"s");
+        eventually("resubscribed at high", || async {
+            tick_subscriptions(&client, execution).await.into_iter().find(|row| row.frequency == TickSubscriptionFrequency::High)
+        }).await;
+        eventually("resubscribing preserves known unread", || async { (signals(&view).0).then_some(()) }).await;
+        view.send(b"sss");
+        eventually("rapid cycle cancels again", || async { tick_subscriptions(&client, execution).await.is_empty().then_some(()) }).await;
+        view.wait_for("manual send available globally", |frame| frame.contains("u send update") && frame.contains("s subscriptions")).await;
+        assert!(!view.frame().contains("Not subscribed"));
+        view.send(b"u");
+        view.wait_for("manual update delivered", |frame| frame.contains("Manual update received.") && frame.contains("TickUpdate:")).await;
+        eventually("manual consumption clears unread", || async { (!signals(&view).0).then_some(()) }).await;
+        assert!(tick_subscriptions(&client, execution).await.is_empty());
+        let mut captured = Vec::new();
+        while let Ok(request) = requests.try_recv() { captured.push(request); }
+        assert!(captured.iter().any(|(_, body)| body.to_string().contains("pending content")), "manual update carries the current terminal text");
+        view.send(CLOSE);
+        view.wait_for("input focused after frequency test", input_focused).await;
+        view.close().await;
+    }).catch_unwind().await;
+    fixture.shutdown().await;
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }

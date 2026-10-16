@@ -190,6 +190,7 @@ pub enum HostEffect {
     /// A verified open created this Tick Instance for the calling Chat. It joins that Chat's
     /// Monitor without subscribing; a failed or unknown open never produces this effect.
     OpenedTick {
+        is_terminal: bool,
         instance: tick_protocol::InstanceRef,
         title: Option<String>,
     },

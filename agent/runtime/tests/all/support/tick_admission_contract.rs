@@ -116,7 +116,12 @@ pub async fn verify_admission_policy(
                 let after = agent.tick_subscriptions(chat).await.unwrap().len();
                 assert_eq!(
                     after,
-                    before + usize::from(case.name == "SubscribeTick" && !denied),
+                    before
+                        + usize::from(
+                            case.name == "TickManage"
+                                && case.input["action"] == "subscribe"
+                                && !denied
+                        ),
                     "{} {mode:?}",
                     case.name
                 );

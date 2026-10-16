@@ -6,6 +6,8 @@ use uuid::Uuid;
 
 use crate::{HostToolAuthority, LoopId, LoopState};
 
+pub const TICK_MANUAL_SOURCE: &str = "manual_tick_update";
+
 pub const TICK_SUBSCRIPTION_SOURCE: &str = "tick_subscription";
 /// The most one delivery may add to the model's context; an item it carries alone may take all of
 /// it. Tick Update data over its item's share is trimmed by whole segments, and items that no
@@ -100,6 +102,13 @@ pub struct TickSubscriptionStatus {
     /// reads it, and delivers it unless the text changed back by then.
     #[serde(default)]
     pub has_pending_change: bool,
+    /// When the first still-pending change arrived, in Unix milliseconds. Later updates do not
+    /// restart its progress toward the next check.
+    #[serde(default)]
+    pub pending_since_ms: Option<u64>,
+    /// A terminal program can exit while its Tick and last screen remain available.
+    #[serde(default)]
+    pub program_exit: Option<crate::HostedProgramExit>,
     pub last_delivery_ms: Option<u64>,
     pub last_delivery: Option<String>,
     #[serde(default)]
@@ -122,7 +131,7 @@ pub struct TickSubscriptionStatus {
     pub period_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ObservationKind {
     Protocol,
     Terminal { truncated: bool },

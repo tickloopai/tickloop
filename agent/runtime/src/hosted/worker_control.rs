@@ -133,6 +133,8 @@ pub struct HostedTickPage {
 /// An instance lost with its host, which its user can reopen as a new one.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LostTick {
+    #[serde(default)]
+    pub is_terminal: bool,
     pub instance: InstanceRef,
     pub title: Option<String>,
 }

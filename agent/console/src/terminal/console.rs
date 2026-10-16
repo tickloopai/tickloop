@@ -824,7 +824,6 @@ pub(super) struct State {
     monitor_popup: tickloop_agent_config::MonitorPopup,
     /// The socket of the Herdr session this View runs inside, where Enter floats hosted Ticks.
     herdr_socket: Option<PathBuf>,
-    popup_registration_offered: bool,
     /// A hosted Tick waiting to take this terminal; the input thread attaches it between keys.
     full_screen_attach: Option<FullScreenAttach>,
     /// An attached view owns the terminal; nothing is drawn until it is taken back.
@@ -1577,6 +1576,10 @@ impl Console {
             findings
                 .updates
                 .retain(|instance, _| instance.access() != access);
+            findings
+                .terminals
+                .retain(|instance| instance.access() != access);
+            findings.terminals.extend(probed.terminals);
             findings.states.extend(probed.states);
             findings.resources.extend(probed.resources);
             findings.updates.extend(probed.updates);
@@ -1617,7 +1620,7 @@ impl Console {
         monitor.rebuild();
         Ok(())
     }
-    pub(super) fn forget_requested_frequency(
+    pub(super) fn forget_requested_subscription(
         &self,
         chat: Uuid,
         subscription: Uuid,
@@ -1625,7 +1628,7 @@ impl Console {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state
             .monitor_for_chat_mut(chat)
-            .forget_requested_frequency(subscription);
+            .forget_requested_subscription(subscription);
         Ok(())
     }
     pub(super) fn monitor_has_entries(&self) -> Result<bool, String> {
@@ -1725,16 +1728,6 @@ impl Console {
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())?;
         Ok(applied)
-    }
-
-    /// Whether the one-time offer to register the Herdr popup plugin is still to be made in
-    /// this View; asking takes it.
-    pub(super) fn take_popup_registration_offer(&self) -> Result<bool, String> {
-        let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        Ok(!std::mem::replace(
-            &mut state.popup_registration_offered,
-            true,
-        ))
     }
 
     pub(super) fn set_monitor_preference(
@@ -3538,6 +3531,140 @@ impl Console {
         Ok(())
     }
 
+    pub(super) fn tick_labels(&self) -> Result<super::tick_labels::TickLabels, String> {
+        let state = self.state.lock().map_err(|error| error.to_string())?;
+        let mut labels = state
+            .monitor
+            .chat_status
+            .as_ref()
+            .map(|chat| super::tick_labels::TickLabels::from_membership(&chat.monitor))
+            .unwrap_or_default();
+        if let Some(chat) = &state.monitor.chat_status {
+            labels.include_native(
+                &chat.commands,
+                &chat.user_shells,
+                &chat.artifact_ticks,
+                &chat.workdir,
+            );
+        }
+        for row in &state.monitor.subscriptions {
+            labels.include_subscription(row);
+        }
+        Ok(labels)
+    }
+
+    pub(super) fn record_local_deliveries(
+        &self,
+        snapshot: &tickloop_agent_protocol::ChatSnapshot,
+        input: Uuid,
+        messages: &[tickloop_agent_protocol::LocalMessage],
+    ) -> Result<(), String> {
+        let display = self.display_profile()?;
+        let names = super::tick_labels::TickLabels::from_snapshot(snapshot);
+        let mut labels = Vec::new();
+        for message in messages.iter().cloned() {
+            let message = super::presentation::name_local_ticks(message, &names);
+            match &message {
+                tickloop_agent_protocol::LocalMessage::TickDelivery { items } => {
+                    for item in items {
+                        let flash = snapshot
+                            .monitor
+                            .taken_in_at(&item.instance)
+                            .map(|since| (super::list_row::RowFlash::TakeIn, since));
+                        labels.push((
+                            super::presentation::tick_delivery_runs(
+                                std::slice::from_ref(item),
+                                super::presentation::OutputDetail::Preview,
+                                display,
+                            ),
+                            flash,
+                        ));
+                    }
+                }
+                tickloop_agent_protocol::LocalMessage::ArtifactRequest { artifact_id, .. } => {
+                    let flash = names
+                        .artifact_instance(artifact_id)
+                        .and_then(|instance| snapshot.monitor.taken_in_at(&instance))
+                        .map(|since| (super::list_row::RowFlash::TakeIn, since));
+                    labels.push((
+                        super::presentation::local_message_runs(
+                            &message,
+                            super::presentation::OutputDetail::Preview,
+                            display,
+                        )
+                        .0,
+                        flash,
+                    ));
+                }
+                _ => {}
+            }
+        }
+        self.record_delivery_labels(snapshot.id, input, labels)
+    }
+
+    fn record_delivery_labels(
+        &self,
+        chat: Uuid,
+        input: Uuid,
+        labels: Vec<(
+            super::presentation::RoleRuns,
+            Option<(super::list_row::RowFlash, u64)>,
+        )>,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let visible = state.chat == Some(chat);
+        let append = |scrollback: &mut Scrollback| {
+            for (runs, flash) in &labels {
+                scrollback.append_flashing_label(runs, if visible { *flash } else { None }, None);
+            }
+        };
+        if visible {
+            state.awaiting_input_echoes.remove(&input);
+            if state.echoed_inputs.insert(input) {
+                append(&mut state.scrollback);
+                state
+                    .draw(&mut io::stdout().lock())
+                    .map_err(|error| error.to_string())?;
+            }
+        } else if let Some(cached) = state.view_cache.get_mut(&Some(chat)) {
+            cached.awaiting_input_echoes.remove(&input);
+            if cached.echoed_inputs.insert(input) {
+                append(&mut cached.scrollback);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn write_shell_notification(
+        &self,
+        notification: &tickloop_agent_protocol::TaskNotification,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let runs = super::task_notification_line(notification, state.display);
+        state.scrollback.append_flashing_label(
+            &runs,
+            None,
+            Some(tick_protocol::InstanceRef::shell(notification.task_id)),
+        );
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn flash_tick_use(
+        &self,
+        call_key: &str,
+        instance: tick_protocol::InstanceRef,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let now_ms = tickloop_agent_base::private_fs::unix_time_milliseconds();
+        state.scrollback.flash_tool_call(call_key, now_ms);
+        state.monitor.flash_use(instance, now_ms);
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+
     pub(super) fn record_consumed_input(
         &self,
         chat: Uuid,
@@ -4960,7 +5087,7 @@ fn append_input_echo(
     Some(echo)
 }
 
-/// Queued inputs as Claude Code shows them above the input: each behind a subtle `❯`, or `!` for
+/// Queued inputs align with the input prompt: each behind a subtle `❯`, or `!` for
 /// a command, then a blank row that keeps them clear of the input. When `rows` cannot hold them
 /// all, the last row counts the rest.
 fn pending_input_lines(
@@ -4986,9 +5113,9 @@ fn pending_input_lines(
     let mut lines = Vec::with_capacity(rows);
     for (index, entry) in entries.iter().take(shown).enumerate() {
         let lead = match entry.kind {
-            QueuedInputKind::Shell => "  ! ".to_owned(),
+            QueuedInputKind::Shell => "! ".to_owned(),
             QueuedInputKind::Message | QueuedInputKind::Command => {
-                format!("  {} ", display.glyph(Glyph::Prompt))
+                format!("{} ", display.glyph(Glyph::Prompt))
             }
         };
         let more = if omitted > 0 && entry_rows == 1 && index == 0 {
@@ -5007,12 +5134,12 @@ fn pending_input_lines(
         lines.push(line);
     }
     if send_now {
-        let mut hint = RoleLine::role(format!("    {QUEUED_SEND_NOW_HINT}"), Role::MutedText);
+        let mut hint = RoleLine::role(format!("  {QUEUED_SEND_NOW_HINT}"), Role::MutedText);
         hint.truncate(width);
         lines.push(hint);
     }
     if omitted > 0 && entry_rows > 1 {
-        lines.push(RoleLine::role(format!("  … {omitted} more"), Role::Subtle));
+        lines.push(RoleLine::role(format!("… {omitted} more"), Role::Subtle));
     }
     if rows > 1 {
         lines.push(RoleLine::default());
@@ -5210,8 +5337,9 @@ impl State {
         self.switch_editor_chat(chat);
         let previous = self.replace_view(next);
         self.view_cache.insert(previous_chat, previous);
-        self.monitor
-            .settle_flashes(tickloop_agent_base::private_fs::unix_time_milliseconds());
+        let now_ms = tickloop_agent_base::private_fs::unix_time_milliseconds();
+        self.monitor.settle_flashes(now_ms);
+        self.scrollback.settle_flashes(now_ms);
         self.hide_diff_screen();
         if let Some((dialog, suspended)) = self.dialog_cache.remove(&chat) {
             self.replace_dialog(dialog);
@@ -5462,7 +5590,6 @@ impl State {
             monitor_separator: None,
             monitor_popup: tickloop_agent_config::MonitorPopup::default(),
             herdr_socket: None,
-            popup_registration_offered: false,
             full_screen_attach: None,
             terminal_lent: false,
             member_probes: Vec::new(),
@@ -6125,7 +6252,11 @@ impl State {
         let panel = (!self.full_review && self.transcript.is_none())
             .then(|| self.status_area.next_frame_ms(now_ms))
             .flatten();
-        monitor.into_iter().chain(panel).min()
+        let conversation =
+            (self.overview.projection.is_none() && !self.full_review && self.transcript.is_none())
+                .then(|| self.scrollback.next_flash_frame_ms(now_ms, self.display))
+                .flatten();
+        monitor.into_iter().chain(panel).chain(conversation).min()
     }
 
     fn draw_frame(&mut self, output: &mut impl Write) -> io::Result<()> {
@@ -6250,6 +6381,8 @@ impl State {
             body_height,
             self.display.preferences().prefers_reduced_motion,
         );
+        self.row_clock_at =
+            self.next_row_clock(tickloop_agent_base::private_fs::unix_time_milliseconds());
         self.initialize_screen(output)?;
         write!(output, "{RESET_SCROLL_REGION}")?;
         let padding = body_height.saturating_sub(body.lines.len());
@@ -7280,6 +7413,9 @@ impl State {
     }
 
     fn normal_styled_frame(&mut self) -> (Vec<RoleLine>, usize, usize) {
+        if let Some(chat) = &self.monitor.chat_status {
+            self.scrollback.sync_native_take_in(&chat.monitor);
+        }
         let panels = self.status_area.available_panels().collect::<Vec<_>>();
         if self.status_area.is_configured() || !panels.is_empty() {
             self.footer.update(panels);
@@ -7930,9 +8066,12 @@ impl State {
                     return_hint = self.back_to_bottom_label().unwrap_or_default();
                     return_hint.as_str()
                 } else if self.editor.draft().is_empty() {
-                    // A visible suggestion takes Tab and →, so → no longer opens Monitor.
-                    let navigation_hint = if self.visible_prompt_suggestion().is_some() {
-                        "← Agents · tab/→ accept · ? help · ctrl+o details · ctrl+g editor"
+                    let navigation_hint = if self.visible_prompt_suggestion().is_some()
+                        && self.monitor.total() > 0
+                    {
+                        "← Agents · → Monitor · tab accept · ? help · ctrl+o details · ctrl+g editor"
+                    } else if self.visible_prompt_suggestion().is_some() {
+                        "← Agents · tab accept · ? help · ctrl+o details · ctrl+g editor"
                     } else if self.monitor.total() == 0 {
                         "← Agents · ? help · ctrl+o details · ctrl+g editor"
                     } else {
@@ -10664,7 +10803,7 @@ impl State {
         }
         if self.visible_prompt_suggestion().is_some()
             && key.modifiers == KeyModifiers::NONE
-            && matches!(key.code, KeyCode::Tab | KeyCode::Right | KeyCode::Enter)
+            && key.code == KeyCode::Tab
         {
             let text = self
                 .prompt_suggestion
@@ -10672,9 +10811,7 @@ impl State {
                 .expect("visible suggestion exists");
             self.clear_prompt_suggestion();
             self.insert(&text);
-            if key.code != KeyCode::Enter {
-                return None;
-            }
+            return None;
         }
         if self.chat.is_some()
             && self.monitor.total() > 0
@@ -12582,6 +12719,8 @@ mod tests {
             frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
             accumulated: 0,
             has_pending_change: false,
+            pending_since_ms: None,
+            program_exit: None,
             last_delivery_ms: None,
             last_delivery: None,
             link: tickloop_agent_protocol::TickLinkState::Live,
@@ -19597,7 +19736,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_inputs_show_like_claude_code_above_the_input_without_owner_hashes() {
+    fn queued_inputs_align_with_the_input_without_owner_hashes() {
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
         let message = queued_input(QueuedInputKind::Message, "check deadbeef exactly", 1);
@@ -19611,9 +19750,9 @@ mod tests {
         let divider = lines.iter().position(|line| line.starts_with('─')).unwrap();
         let message_row = lines
             .iter()
-            .position(|line| line == "  ❯ check deadbeef exactly")
+            .position(|line| line == "❯ check deadbeef exactly")
             .unwrap();
-        assert_eq!(lines[message_row + 1], "  ! printf exact-shell");
+        assert_eq!(lines[message_row + 1], "! printf exact-shell");
         assert_eq!(
             divider,
             message_row + 3,
@@ -19656,7 +19795,8 @@ mod tests {
                 .frame()
                 .0
                 .into_iter()
-                .filter(|line| line.starts_with("  ❯ ") || line.starts_with("  ! "))
+                .take_while(|line| !line.starts_with('─'))
+                .filter(|line| line.starts_with("❯ ") || line.starts_with("! "))
                 .collect::<Vec<_>>()
         };
         let earlier = queued_input(QueuedInputKind::Message, "earlier message", 1);
@@ -19668,7 +19808,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             listed(),
-            ["  ❯ earlier message"],
+            ["❯ earlier message"],
             "another Chat's queue leaves the shown one as it is"
         );
 
@@ -19682,9 +19822,9 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(listed(), ["  ❯ earlier message", "  ! printf later"]);
+        assert_eq!(listed(), ["❯ earlier message", "! printf later"]);
         console.withdraw_queued_input(shell).unwrap();
-        assert_eq!(listed(), ["  ❯ earlier message"]);
+        assert_eq!(listed(), ["❯ earlier message"]);
 
         console
             .queue_submitted_input(QueuedInputKind::Message, "later message")
@@ -19696,7 +19836,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             listed(),
-            ["  ❯ earlier message", "  ❯ later message"],
+            ["❯ earlier message", "❯ later message"],
             "the Agent's entry takes the place of the provisional one"
         );
     }
@@ -19794,7 +19934,7 @@ mod tests {
             state.rendered_screen.join("\n")
         };
         assert!(
-            screen.contains("    ctrl+enter to send now")
+            screen.contains("  ctrl+enter to send now")
                 && !hint_row(&mut state).contains(SEND_NOW_HINT),
             "the hint sits under the queued message, not in the hint row: {screen}"
         );
@@ -19868,7 +20008,7 @@ mod tests {
                     } else {
                         &lines[..]
                     };
-                    assert!(entry_rows[0].text().starts_with("  ❯ "), "{lines:?}");
+                    assert!(entry_rows[0].text().starts_with("❯ "), "{lines:?}");
                     if count > entry_rows.len() {
                         assert!(
                             entry_rows.iter().any(|line| line.text().contains("more")),

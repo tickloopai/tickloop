@@ -24,6 +24,7 @@
         "monitor": {
           "members": [
             {
+              "is_terminal": false,
               "instance": "hosted:00000000-0000-0000-0000-000000000041",
               "title": "Counter"
             }
@@ -33,6 +34,9 @@
           ],
           "handled": {
             "hosted:00000000-0000-0000-0000-000000000041": 7500
+          },
+          "observed": {
+            "hosted:00000000-0000-0000-0000-000000000041": 7900
           },
           "taken_in": {
             "hosted:00000000-0000-0000-0000-000000000041": 7500
@@ -124,23 +128,6 @@
               }
             },
             "host_tools": {
-              "CallTickTool": [
-                {
-                  "kind": "mcp",
-                  "server_id": "calendar",
-                  "account_id": "me"
-                }
-              ],
-              "ReadTick": [
-                {
-                  "kind": "native",
-                  "endpoint": {
-                    "kind": "tickhost",
-                    "endpoint": "/run/tickhost.sock",
-                    "uid": 501
-                  }
-                }
-              ],
               "ReadWorkspace": [
                 {
                   "kind": "native",
@@ -150,6 +137,23 @@
                     "owner": 501,
                     "device": 16777220,
                     "inode": 42
+                  }
+                }
+              ],
+              "TickCall": [
+                {
+                  "kind": "mcp",
+                  "server_id": "calendar",
+                  "account_id": "me"
+                }
+              ],
+              "TickRead": [
+                {
+                  "kind": "native",
+                  "endpoint": {
+                    "kind": "tickhost",
+                    "endpoint": "/run/tickhost.sock",
+                    "uid": 501
                   }
                 }
               ]
@@ -235,7 +239,7 @@
               {
                 "type": "tool_use",
                 "id": "call-1",
-                "name": "ReadTick",
+                "name": "TickRead",
                 "input": {
                   "instance": "hosted:00000000-0000-0000-0000-000000000041"
                 }
@@ -606,6 +610,8 @@
         "frequency": "high",
         "accumulated": 2,
         "has_pending_change": false,
+        "pending_since_ms": null,
+        "program_exit": null,
         "last_delivery_ms": 6000,
         "last_delivery": "hosted:00000000-0000-0000-0000-000000000040 #4",
         "kind": "Protocol",
@@ -738,23 +744,6 @@
               }
             },
             "host_tools": {
-              "CallTickTool": [
-                {
-                  "kind": "mcp",
-                  "server_id": "calendar",
-                  "account_id": "me"
-                }
-              ],
-              "ReadTick": [
-                {
-                  "kind": "native",
-                  "endpoint": {
-                    "kind": "tickhost",
-                    "endpoint": "/run/tickhost.sock",
-                    "uid": 501
-                  }
-                }
-              ],
               "ReadWorkspace": [
                 {
                   "kind": "native",
@@ -764,6 +753,23 @@
                     "owner": 501,
                     "device": 16777220,
                     "inode": 42
+                  }
+                }
+              ],
+              "TickCall": [
+                {
+                  "kind": "mcp",
+                  "server_id": "calendar",
+                  "account_id": "me"
+                }
+              ],
+              "TickRead": [
+                {
+                  "kind": "native",
+                  "endpoint": {
+                    "kind": "tickhost",
+                    "endpoint": "/run/tickhost.sock",
+                    "uid": 501
                   }
                 }
               ]
@@ -953,6 +959,7 @@
         "monitor": {
           "members": [
             {
+              "is_terminal": false,
               "instance": "hosted:00000000-0000-0000-0000-000000000041",
               "title": "Counter"
             }
@@ -962,6 +969,9 @@
           ],
           "handled": {
             "hosted:00000000-0000-0000-0000-000000000041": 7500
+          },
+          "observed": {
+            "hosted:00000000-0000-0000-0000-000000000041": 7900
           },
           "taken_in": {
             "hosted:00000000-0000-0000-0000-000000000041": 7500

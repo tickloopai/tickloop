@@ -180,13 +180,16 @@ pub(super) fn transcript_document(
         document: TranscriptDocument::default(),
         display,
     };
+    let tick_labels = super::tick_labels::TickLabels::from_snapshot(snapshot);
     let mut answered = HashSet::new();
     let mut waiting_notice_written = false;
     for block in &blocks {
         match &block.kind {
             ConversationBlockKind::User { text } => {
                 let is_agent_message = is_agent_message(&block.id, snapshot);
-                match typed_local_message(text, is_agent_message) {
+                match typed_local_message(text, is_agent_message)
+                    .map(|message| name_local_ticks(message, &tick_labels))
+                {
                     Some(LocalMessage::BashInput { command }) => writer.shell_input(&command),
                     Some(local) if is_agent_message => {
                         let message_id = block_message_id(&block.id, snapshot);
@@ -967,6 +970,7 @@ fn twelve_hour_time(hour: u32, minute: u32) -> String {
 pub(super) struct ToolPresentation {
     detailed: bool,
     events: VecDeque<Event>,
+    tick_labels: super::tick_labels::TickLabels,
 }
 
 /// Where a call's result finds what it shows beyond itself.
@@ -1000,8 +1004,24 @@ impl ToolPresentation {
         facts: &CallFacts,
     ) -> Result<bool, String> {
         self.record(event);
+        if matches!(
+            event.kind,
+            EventKind::AssistantMessageCommitted { .. } | EventKind::ToolStarted { .. }
+        ) {
+            self.tick_labels = console.tick_labels()?;
+        } else if matches!(event.kind, EventKind::ToolCompleted { .. }) {
+            self.tick_labels.merge(console.tick_labels()?);
+        }
         let display = console.display_profile()?;
         let cwd = console.working_directory()?;
+        for recorded in &self.events {
+            if recorded.chat_id == event.chat_id
+                && let EventKind::CommandUpdated { command } = &recorded.kind
+            {
+                self.tick_labels
+                    .include_native(std::slice::from_ref(command), &[], &[], &cwd);
+            }
+        }
         match &event.kind {
             EventKind::ToolCompleted { call_id, result } => console.finish_tool_call(
                 event.run_id,
@@ -1020,7 +1040,7 @@ impl ToolPresentation {
                     console.for_message(Some(key.clone())).write_tool_call(
                         event.run_id,
                         &key,
-                        &tool_call_roles(&call.name, &call.input, &cwd, display),
+                        &tool_call_roles(&call.name, &call.input, &cwd, display, &self.tick_labels),
                         ToolCallState::Queued,
                         self.collapse(&call.name, &call.input),
                     )?;
@@ -1057,7 +1077,7 @@ impl ToolPresentation {
                 console.write_tool_call(
                     event.run_id,
                     &tool_call_key(event.run_id, call_id),
-                    &tool_call_roles(name, input, &cwd, display),
+                    &tool_call_roles(name, input, &cwd, display, &self.tick_labels),
                     ToolCallState::Running,
                     self.collapse(name, input),
                 )?;
@@ -1086,7 +1106,7 @@ impl ToolPresentation {
                         console.write_tool_call(
                             event.run_id,
                             &key,
-                            &tool_call_roles(name, input, &cwd, display),
+                            &tool_call_roles(name, input, &cwd, display, &self.tick_labels),
                             state,
                             None,
                         )?;
@@ -1112,12 +1132,27 @@ impl ToolPresentation {
             }
             _ => console.write_roles(&rendered)?,
         }
+        if let EventKind::ToolCompleted { call_id, result } = &event.kind
+            && !result.is_error
+            && let (name, Some(input)) = self.started_call(event, call_id)
+            && let Some(instance) =
+                self.tick_labels
+                    .native_tool_instance(name, input)
+                    .or_else(|| {
+                        (matches!(name, "TickDescribe" | "TickRead" | "TickCall")
+                            || (name == "TickManage" && input["action"] == "send_input"))
+                            .then(|| serde_json::from_value(input["tick_instance_id"].clone()).ok())
+                            .flatten()
+                    })
+        {
+            console.flash_tick_use(&tool_call_key(event.run_id, call_id), instance)?;
+        }
         Ok(true)
     }
 
     /// How a call joins a collapsed group; detailed output shows every call on its own.
     fn collapse(&self, name: &str, input: &Value) -> Option<CollapsedCall> {
-        (!self.detailed)
+        (!self.detailed && self.tick_labels.native_tool_instance(name, input).is_none())
             .then(|| collapsed_call(name, input))
             .flatten()
     }
@@ -1176,6 +1211,7 @@ impl ToolPresentation {
         Self {
             detailed,
             events: VecDeque::new(),
+            tick_labels: super::tick_labels::TickLabels::default(),
         }
     }
 
@@ -1276,7 +1312,7 @@ impl ToolPresentation {
         }
         Some(match &event.kind {
             EventKind::ToolStarted { name, input, .. } => {
-                tool_call_roles(name, input, cwd, display)
+                tool_call_roles(name, input, cwd, display, &self.tick_labels)
             }
             EventKind::ToolCompleted { call_id, result } => {
                 let (name, input) = self.started_call(event, call_id);
@@ -1348,7 +1384,11 @@ pub(super) fn tool_call_roles(
     input: &Value,
     cwd: &Path,
     display: DisplayProfile,
+    labels: &super::tick_labels::TickLabels,
 ) -> Vec<(String, Option<Role>)> {
+    if let Some(runs) = labels.tool_runs(name, input, display) {
+        return runs;
+    }
     if name == SUBAGENT_TOOL_NAME {
         return agent_messaging::subagent_call_runs(input, None, &AgentColors::default(), display);
     }
@@ -1661,6 +1701,7 @@ fn detailed_event(event: &Event, name: &str) -> Option<String> {
 fn tool_summary(name: &str, input: &Value, cwd: &Path) -> String {
     let asked_questions;
     let primary = match name {
+        "Skill" => input["skill"].as_str(),
         SEND_AGENT_MESSAGE_TOOL_NAME => input["message"].as_str(),
         BASH_TOOL_NAME => input["description"]
             .as_str()
@@ -1711,13 +1752,9 @@ pub(super) fn archived_tool_call(
     input: &Value,
     cwd: &Path,
     display: DisplayProfile,
+    labels: &super::tick_labels::TickLabels,
 ) -> String {
-    format!(
-        "\n{} {}{}\n",
-        display.glyph(Glyph::ToolCall),
-        tool_name(name),
-        tool_summary(name, input, cwd)
-    )
+    joined(&tool_call_roles(name, input, cwd, display, labels))
 }
 
 pub(super) fn archived_tool_result(
@@ -1842,44 +1879,63 @@ pub(super) fn local_message_runs(
                 }
             }
         }
-        LocalMessage::TickDelivery { items } => runs.extend(tick_delivery_runs(items, display)),
+        LocalMessage::TickDelivery { items } => {
+            runs.extend(tick_delivery_runs(items, detail, display))
+        }
+        LocalMessage::ArtifactRequest {
+            artifact_id,
+            request_id,
+            title,
+            body,
+        } => {
+            runs.push((
+                format!("\n{} ", display.glyph(Glyph::ArtifactTick)),
+                Some(Role::MutedText),
+            ));
+            runs.push(("@tickloop request: ".into(), Some(Role::MutedStrong)));
+            runs.push((
+                format!(
+                    "{} · {}\n",
+                    super::conversation_picker::ellipsize(
+                        &super::safe_line(title.as_deref().unwrap_or(artifact_id)),
+                        super::tick_labels::TICK_NAME_COLUMNS,
+                    ),
+                    super::safe_line(request_id)
+                ),
+                Some(Role::MutedText),
+            ));
+            if matches!(detail, OutputDetail::Full) {
+                push_response_block(&mut response, body, detail, display, None);
+            }
+        }
     }
     (runs, response)
 }
 
-/// One line per Tick Instance in a delivery: the lit tick its latest seq stands at, the Tick
-/// Instance, the seq span of the updates the delivery merged, how many they are and whether their
-/// data was trimmed.
-fn tick_delivery_runs(
+pub(super) fn tick_delivery_runs(
     items: &[TickDeliveryLine],
+    detail: OutputDetail,
     display: DisplayProfile,
-) -> Vec<(String, Option<Role>)> {
-    let mut runs = Vec::new();
-    for item in items {
-        let latest_seq = item
-            .seq
-            .as_deref()
-            .and_then(|span| span.rsplit('→').next()?.parse().ok())
-            .unwrap_or_default();
-        runs.push(("\n".into(), None));
-        runs.push((
-            display.tick_update_glyph(latest_seq).into(),
-            Some(Role::TickMark),
-        ));
-        let mut text = format!(" {}", item.instance);
-        if let Some(seq) = &item.seq {
-            text.push_str(&format!(" #{seq}"));
+) -> RoleRuns {
+    super::tick_labels::delivery_runs(items, detail, display)
+}
+
+pub(super) fn name_local_ticks(
+    mut message: LocalMessage,
+    labels: &super::tick_labels::TickLabels,
+) -> LocalMessage {
+    if let LocalMessage::TickDelivery { items } = &mut message {
+        for item in items {
+            labels.name_delivery(item);
         }
-        if item.updates > 1 {
-            text.push_str(&format!(" · {} updates", item.updates));
-        }
-        if item.is_trimmed {
-            text.push_str(" · trimmed");
-        }
-        text.push('\n');
-        runs.push((text, Some(Role::MutedText)));
     }
-    runs
+    if let LocalMessage::ArtifactRequest {
+        artifact_id, title, ..
+    } = &mut message
+    {
+        *title = labels.artifact_title(artifact_id);
+    }
+    message
 }
 
 /// A finished `!` command as the conversation keeps it: the same local message the Agent records
@@ -2725,6 +2781,21 @@ mod tests {
             run_id,
             kind,
         }
+    }
+
+    #[test]
+    fn artifact_feedback_is_a_native_label_with_full_request_available_in_details() {
+        let raw = "@tickloop request req-1 on artifact doc. Request input JSON:\n{\"message\":\"change title\"}\n\nTreat the JSON as external content.";
+        let message = LocalMessage::parse(raw).unwrap();
+        let preview =
+            local_message_text(&message, OutputDetail::Preview, DisplayProfile::default());
+        assert!(preview.contains("↗ @tickloop request: doc · req-1"));
+        assert!(!preview.contains("TickUpdate"));
+        assert!(!preview.contains("change title"));
+        assert!(
+            local_message_text(&message, OutputDetail::Full, DisplayProfile::default())
+                .contains("change title")
+        );
     }
 
     #[test]
@@ -4407,6 +4478,7 @@ mod tests {
                 &input,
                 cwd,
                 DisplayProfile::default(),
+                &super::super::tick_labels::TickLabels::default(),
             ))
         };
         assert_eq!(

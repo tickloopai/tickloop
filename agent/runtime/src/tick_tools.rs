@@ -10,9 +10,10 @@ use tickhost_connect::{hosted::ATTACH_INPUT_BYTES, page::MAX_PAGE_SIZE};
 use tickloop_agent_protocol::ToolDefinition;
 
 pub const READ_WORKSPACE: &str = "ReadWorkspace";
-pub const READ_TICK: &str = "ReadTick";
-pub const CALL_TICK_TOOL: &str = "CallTickTool";
-pub const MODIFY_TICK: &str = "ModifyTick";
+pub const TICK_DESCRIBE: &str = "TickDescribe";
+pub const TICK_READ: &str = "TickRead";
+pub const TICK_CALL: &str = "TickCall";
+pub const TICK_MANAGE: &str = "TickManage";
 /// The open placement that shows a Tick nowhere. An open without a placement means the same.
 pub const HIDDEN_PLACEMENT: &str = "hidden";
 const PLACEMENT_DIRECTIONS: [&str; 4] = ["left", "right", "up", "down"];
@@ -40,7 +41,7 @@ pub enum TickToolTargetError {
 pub(crate) fn uses_herdr_layout(name: &str, input: &Value) -> bool {
     match name {
         READ_WORKSPACE => true,
-        MODIFY_TICK => match input["action"].as_str() {
+        TICK_MANAGE => match input["action"].as_str() {
             Some("move") => true,
             Some("open") => input["placement"]["type"]
                 .as_str()
@@ -56,13 +57,13 @@ pub(crate) fn uses_herdr_layout(name: &str, input: &Value) -> bool {
 pub(crate) fn check_call(name: &str, input: &Value, views: bool) -> Result<(), String> {
     match name {
         READ_WORKSPACE => {}
-        READ_TICK | CALL_TICK_TOOL => check_target(name, input)?,
-        MODIFY_TICK => match input["action"].as_str() {
+        TICK_DESCRIBE | TICK_READ | TICK_CALL => check_target(name, input)?,
+        TICK_MANAGE => match input["action"].as_str() {
             Some("open") => {}
             Some("move" | "send_input" | "close" | "reopen") => check_target(name, input)?,
             _ => {
                 return Err(
-                    "ModifyTick action must be open, move, send_input, close or reopen".into(),
+                    "TickManage action must be open, move, send_input, close or reopen".into(),
                 );
             }
         },
@@ -98,35 +99,40 @@ pub(crate) fn definitions(views: bool) -> Vec<ToolDefinition> {
     }
     let target = json!({"tick_instance_id":{"type":"string","minLength":1}});
     definitions.push(ToolDefinition {
-        name: READ_TICK.into(),
-        description: "Read a Tick this Chat opened using its complete hosted: instance identity. Extension Ticks return their state (seq, at, and data, which is null until the Tick has content: a Tick just opened may still be loading, so read it again shortly) and their declared tool catalog. Terminal Ticks return their screen as plain text (data.text, at most 200 lines and 64 KiB) and data.exit, null while the program runs and its exit code or signal once it ended. Reading never subscribes. For artifacts use ArtifactRead; for Shell tasks use Read on Bash's output_file.".into(),
+        name: TICK_DESCRIBE.into(),
+        description: "Describe a running Tick by its complete hosted: instance identity without reading its business content. Extension Ticks return their title, kind, description, revision and declared tool catalog with parameter schemas. Terminal Ticks return their command and working directory. Use the Tick package's Skill for launch commands and login prerequisites; use TickDescribe for the capabilities of a running instance. This does not subscribe or mark its content read.".into(),
+        input_schema: json!({"type":"object","properties":target.clone(),"required":["tick_instance_id"],"additionalProperties":false}),
+    });
+    definitions.push(ToolDefinition {
+        name: TICK_READ.into(),
+        description: "Read a Tick this Chat opened using its complete hosted: instance identity. Extension Ticks return their state (seq, at, and data, which is null until the Tick has content: a Tick just opened may still be loading, so read it again shortly) only. Use TickDescribe for capabilities and the tool catalog. Terminal Ticks return their screen as plain text (data.text, at most 200 lines and 64 KiB) and data.exit, null while the program runs and its exit code or signal once it ended. Reading never subscribes. For artifacts use ArtifactRead; for Shell tasks use Read on Bash's output_file.".into(),
         input_schema: json!({"type":"object","properties":target,"required":["tick_instance_id"],"additionalProperties":false}),
     });
     let mut call_properties = target.clone();
     call_properties["tool"] = json!({"type":"string","minLength":1});
     call_properties["args"] = json!({"type":"object"});
     definitions.push(ToolDefinition {
-        name: CALL_TICK_TOOL.into(),
-        description: "Call one tool declared by an extension Tick using its complete hosted: instance identity. Read that Tick's catalog first; query tools read content, while modifying tools require permission. Use ArtifactRead/ArtifactEdit/ArtifactComment for artifacts and Bash/Read/TaskStop for Shell tasks.".into(),
+        name: TICK_CALL.into(),
+        description: "Call one tool declared by an extension Tick using its complete hosted: instance identity. Use TickDescribe for that Tick's catalog first; query tools read content, while modifying tools require permission. Use ArtifactRead/ArtifactEdit/ArtifactComment for artifacts and Bash/Read/TaskStop for Shell tasks.".into(),
         input_schema: json!({"type":"object","properties":call_properties,"required":["tick_instance_id","tool","args"],"additionalProperties":false}),
     });
     definitions.push(ToolDefinition {
-        name: MODIFY_TICK.into(),
-        description: modify_description(views),
-        input_schema: modify_schema(views),
+        name: TICK_MANAGE.into(),
+        description: tick_manage_description(views),
+        input_schema: tick_manage_schema(views),
     });
     definitions
 }
 
-fn modify_description(views: bool) -> String {
+fn tick_manage_description(views: bool) -> String {
     let mut parts = vec![
-        "open runs the program in the Tickhost: it keeps running without any View or layout, joins this Chat's Monitor, and is not subscribed. Pass protocol: true for a program that speaks the Tick protocol; the bundled tick-reader and an installed Tick package's program that declares the protocol always do. Any other program runs as a terminal Tick: ReadTick returns its screen text and how it exited, and send_input types into it.".to_owned(),
+        "open runs the program in the Tickhost: it keeps running without any View or layout, joins this Chat's Monitor, and is not subscribed. Pass protocol: true for a program that speaks the Tick protocol; the bundled tick-reader and an installed Tick package's program that declares the protocol always do. Any other program runs as a terminal Tick: TickRead returns its screen text and how it exited, and send_input types into it.".to_owned(),
     ];
     if views {
         parts.push("Omit placement, or pass {\"type\":\"hidden\"}, to show the Tick nowhere. An explicit placement also shows it in a new Herdr Pane as a view of the Tick: current_tab places relative to the View captured for this input, which must still be valid; pane places relative to the named Pane in the selected Workspace; new_tab opens a new Tab. Explicit Pane targets and new_tab work without an Agent View. Direction accepts left, right, up, or down and defaults to right. Placement is frozen before approval and never follows UI focus. move moves the Herdr Pane that shows the Tick, or shows the Tick in a new Pane when none does, and defaults to current_tab; for an explicit relative direction, invoke move even when the view is already in the target Tab. Closing a view Pane closes only that view; moving or closing views never changes the Tick, its identity or its subscriptions.".into());
     }
     parts.push(format!(
-        "send_input types text, then logical keys ({}), into a terminal Tick, at most {ATTACH_INPUT_BYTES} bytes; an extension Tick is operated with CallTickTool.",
+        "send_input types text, then logical keys ({}), into a terminal Tick, at most {ATTACH_INPUT_BYTES} bytes; an extension Tick is operated with TickCall.",
         crate::hosted::terminal_input::KEY_NAMES
     ));
     parts.push(
@@ -258,7 +264,7 @@ const NEW_TAB: Form = Form {
     optional: &[],
 };
 
-fn modify_forms(views: bool) -> Vec<Form> {
+fn tick_manage_forms(views: bool) -> Vec<Form> {
     if views {
         vec![OPEN_IN_HERDR, MOVE, SEND_INPUT, CLOSE, REOPEN]
     } else {
@@ -317,7 +323,7 @@ fn select_form<'a>(
         })
 }
 
-/// Checks a Tick tool input before any host is asked. ModifyTick must match the form its
+/// Checks a Tick tool input before any host is asked. TickManage must match the form its
 /// action selects, and its placement the form its type selects, so a refusal names the field to
 /// add or drop; the flat model schema then checks every value.
 pub(crate) fn validate_input(
@@ -326,17 +332,20 @@ pub(crate) fn validate_input(
     input: &Value,
     views: bool,
 ) -> Result<(), String> {
-    if name == MODIFY_TICK
+    if name == TICK_MANAGE
         && let Some(fields) = input.as_object()
     {
-        check_modify_form(fields, views)
+        check_tick_manage_form(fields, views)
             .map_err(|reason| format!("invalid {name} input: {reason}"))?;
     }
     crate::validate_host_schema_input(name, schema, input)
 }
 
-fn check_modify_form(fields: &serde_json::Map<String, Value>, views: bool) -> Result<(), String> {
-    let forms = modify_forms(views);
+fn check_tick_manage_form(
+    fields: &serde_json::Map<String, Value>,
+    views: bool,
+) -> Result<(), String> {
+    let forms = tick_manage_forms(views);
     let action = select_form(fields, "action", "action", &forms)?;
     action.check(fields, "action", action.name)?;
     let Some(placement) = fields.get("placement").and_then(Value::as_object) else {
@@ -359,8 +368,8 @@ fn check_modify_form(fields: &serde_json::Map<String, Value>, views: bool) -> Re
     kind.check(placement, "type", &format!("placement type {}", kind.name))
 }
 
-fn modify_schema(views: bool) -> Value {
-    let forms = modify_forms(views);
+fn tick_manage_schema(views: bool) -> Value {
+    let forms = tick_manage_forms(views);
     let actions = forms.iter().map(|form| form.name).collect::<Vec<_>>();
     let mut properties = json!({
         "action": {"type":"string","enum":actions,"description":format!("One of {}; each takes the fields whose description names it.", actions.join(", "))},
@@ -401,7 +410,7 @@ mod tests {
     use super::*;
 
     fn validate(input: &Value, views: bool) -> Result<(), String> {
-        validate_input(MODIFY_TICK, &modify_schema(views), input, views)
+        validate_input(TICK_MANAGE, &tick_manage_schema(views), input, views)
     }
 
     fn refusal(input: &Value, views: bool) -> String {
@@ -409,13 +418,13 @@ mod tests {
     }
 
     #[test]
-    fn the_modify_description_names_where_bare_programs_are_found() {
+    fn the_tick_manage_description_names_where_bare_programs_are_found() {
         for views in [false, true] {
-            let description = modify_description(views);
+            let description = tick_manage_description(views);
             for program in ["command[0]='tick-reader'", "command[0]='tick-<package>'"] {
                 assert!(description.contains(program), "{description}");
             }
-            for text in [description, modify_schema(views).to_string()] {
+            for text in [description, tick_manage_schema(views).to_string()] {
                 let names_tick = text
                     .split(|character: char| {
                         !(character.is_alphanumeric() || character == '-' || character == '_')
@@ -427,9 +436,9 @@ mod tests {
     }
 
     #[test]
-    fn modify_schema_is_one_flat_object_that_describes_each_field() {
+    fn tick_manage_schema_is_one_flat_object_that_describes_each_field() {
         for views in [false, true] {
-            let schema = modify_schema(views);
+            let schema = tick_manage_schema(views);
             assert_eq!(schema["type"], "object");
             assert_eq!(schema["required"], json!(["action"]));
             assert_eq!(schema["additionalProperties"], false);
@@ -472,10 +481,10 @@ mod tests {
     }
 
     #[test]
-    fn modify_input_refusals_name_what_to_change() {
+    fn tick_manage_input_refusals_name_what_to_change() {
         let empty = refusal(&json!({}), true);
         assert!(
-            empty.starts_with("invalid ModifyTick input: action is required: one of "),
+            empty.starts_with("invalid TickManage input: action is required: one of "),
             "{empty}"
         );
         for requirement in [
@@ -540,7 +549,7 @@ mod tests {
         ] {
             assert_eq!(
                 refusal(&input, views),
-                format!("invalid ModifyTick input: {reason}")
+                format!("invalid TickManage input: {reason}")
             );
         }
         let shown_outside_herdr = refusal(
@@ -584,10 +593,10 @@ mod tests {
     #[test]
     fn only_hosted_targets_are_served_and_herdr_panes_need_views() {
         for (name, input) in [
-            (READ_TICK, json!({"tick_instance_id":"herdr:w1/p1"})),
-            (CALL_TICK_TOOL, json!({"tick_instance_id":"calendar:1"})),
+            (TICK_READ, json!({"tick_instance_id":"herdr:w1/p1"})),
+            (TICK_CALL, json!({"tick_instance_id":"calendar:1"})),
             (
-                MODIFY_TICK,
+                TICK_MANAGE,
                 json!({"action":"close","tick_instance_id":"terminal:1"}),
             ),
         ] {
@@ -595,7 +604,7 @@ mod tests {
             assert!(refused.starts_with("InvalidTickTarget"), "{refused}");
         }
         assert!(
-            check_call(READ_TICK, &json!({"tick_instance_id":"shell:1"}), true)
+            check_call(TICK_READ, &json!({"tick_instance_id":"shell:1"}), true)
                 .unwrap_err()
                 .starts_with("NativeToolRequired")
         );
@@ -604,8 +613,8 @@ mod tests {
         let moved = json!({"action":"move","tick_instance_id":"hosted:1"});
         for (name, input) in [
             (READ_WORKSPACE, json!({})),
-            (MODIFY_TICK, shown.clone()),
-            (MODIFY_TICK, moved.clone()),
+            (TICK_MANAGE, shown.clone()),
+            (TICK_MANAGE, moved.clone()),
         ] {
             assert!(uses_herdr_layout(name, &input), "{input}");
             assert!(check_call(name, &input, true).is_ok(), "{input}");
@@ -616,7 +625,7 @@ mod tests {
                 "{input}"
             );
         }
-        assert!(!uses_herdr_layout(MODIFY_TICK, &hidden));
-        assert!(check_call(MODIFY_TICK, &hidden, false).is_ok());
+        assert!(!uses_herdr_layout(TICK_MANAGE, &hidden));
+        assert!(check_call(TICK_MANAGE, &hidden, false).is_ok());
     }
 }
