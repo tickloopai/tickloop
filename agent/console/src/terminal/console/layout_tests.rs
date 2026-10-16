@@ -4364,7 +4364,14 @@ fn agent_layout_a_vanished_counter_selects_the_last_row_of_its_group() {
 
 #[test]
 fn agent_layout_overview_redraws_only_the_rows_that_changed() {
-    let mut state = State::new(true, 80, 24);
+    let mut state = State::new_with_display(
+        true,
+        80,
+        24,
+        DisplayPreferences {
+            prefers_reduced_motion: true,
+        },
+    );
     state.prompt_enabled = true;
     let console = super::tests::console_with_state(state);
     let overview = |worker_title: &str| AgentOverview {
