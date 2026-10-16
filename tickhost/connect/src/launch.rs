@@ -119,6 +119,15 @@ pub async fn run(
     }
 }
 
+/// What the launcher writes to put its terminal back the way the business Tick may have left it:
+/// mouse, paste and alternate screen modes off, cursor shown, attributes reset. The leading DECSC
+/// saves the cursor of the screen in use, so leaving an alternate screen the Tick never entered
+/// keeps the cursor below its output instead of moving it to the top left, where the launcher's
+/// own failure would overwrite the Tick's last words. A Tick stopped inside the alternate screen
+/// still returns to where it entered it: that screen keeps its own saved cursor.
+const TERMINAL_RESTORE: &[u8] =
+    b"\x1b7\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[0m";
+
 struct TerminalRestore(Option<libc::termios>);
 
 impl TerminalRestore {
@@ -143,9 +152,51 @@ impl Drop for TerminalRestore {
             unsafe {
                 libc::tcsetattr(libc::STDERR_FILENO, libc::TCSANOW, modes);
             }
-            let _ = std::io::stderr().write_all(
-                b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[0m",
-            );
+            let _ = std::io::stderr().write_all(TERMINAL_RESTORE);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TERMINAL_RESTORE;
+
+    const LAUNCHER_FAILURE: &str = "tickhost: LaunchFailed: Tick session is gone\r\n";
+
+    fn rows(output: &[&[u8]]) -> Vec<String> {
+        let mut terminal = vt100::Parser::new(24, 80, 0);
+        for bytes in output {
+            terminal.process(bytes);
+        }
+        terminal
+            .screen()
+            .rows(0, 80)
+            .take_while(|row| !row.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn the_launchers_failure_follows_the_words_of_a_tick_that_never_took_the_alternate_screen() {
+        let reason = "tick-sample: not authorized; run `tick-sample auth`";
+        assert_eq!(
+            rows(&[
+                format!("{reason}\r\n").as_bytes(),
+                TERMINAL_RESTORE,
+                LAUNCHER_FAILURE.as_bytes(),
+            ]),
+            [reason, LAUNCHER_FAILURE.trim_end()]
+        );
+    }
+
+    #[test]
+    fn a_tick_stopped_inside_the_alternate_screen_returns_to_where_it_entered_it() {
+        assert_eq!(
+            rows(&[
+                b"before\r\n\x1b[?1049h\x1b[5;10Hfull screen view",
+                TERMINAL_RESTORE,
+                LAUNCHER_FAILURE.as_bytes(),
+            ]),
+            ["before", LAUNCHER_FAILURE.trim_end()]
+        );
     }
 }

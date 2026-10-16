@@ -2,6 +2,8 @@
 
 #[path = "all/charts.rs"]
 mod charts;
+#[path = "all/hyperlink.rs"]
+mod hyperlink;
 #[path = "all/markdown.rs"]
 mod markdown;
 #[path = "all/presentation.rs"]

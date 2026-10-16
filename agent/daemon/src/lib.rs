@@ -545,6 +545,13 @@ pub async fn build_runtime_with_client(
                 })
                 .collect(),
         );
+        // Opens find the Tick packages `tickloop tick install` placed in this View's config root.
+        let tools = match &launch.config_root {
+            Some(root) => {
+                tools.with_tick_packages(tick_packages::PackageStore::in_config_root(root))
+            }
+            None => tools,
+        };
         Arc::new(match views {
             Some(views) => tools.with_herdr_views(views),
             None => tools,

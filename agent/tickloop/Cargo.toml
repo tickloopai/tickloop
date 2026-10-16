@@ -1,6 +1,6 @@
 [package]
 name = "tickloop-agent"
-description = "The tickloop executable: the Console, the daemon and worker entries, and their end-to-end tests"
+description = "The tickloop executable: the Console, the daemon and worker entries, the Tick package commands, and their end-to-end tests"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -27,14 +27,19 @@ harness = false
 [dependencies]
 crossterm = "0.29"
 tickloop-agent-client = { path = "../client" }
+tickloop-agent-config = { path = "../config" }
 tickloop-agent-console = { path = "../console" }
 tickloop-agent-daemon = { path = "../daemon" }
+tickloop-agent-packages = { path = "../packages" }
 tickloop-agent-protocol = { path = "../protocol" }
+tickloop-tick-packages = { path = "../../tick/packages" }
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 
 [dev-dependencies]
 async-trait = "0.1"
 base64 = "0.22"
+flate2 = "1"
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 libc = "0.2"
@@ -45,14 +50,16 @@ rmcp = { version = "3.5.0", default-features = false, features = ["client", "tra
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
+sha2 = "0.10"
 shell-words = "1"
+tar = { version = "0.4", default-features = false }
 tempfile = "3"
 tickloop-agent-artifacts = { path = "../artifacts" }
-tickloop-agent-config = { path = "../config" }
 tickloop-agent-model = { path = "../model" }
 tickloop-agent-runtime = { path = "../runtime" }
 tickloop-agent-test-support = { path = "../test-support" }
 tickloop-tick-protocol = { path = "../../tick/protocol" }
+tickloop-tick-test-support = { path = "../../tick/test-support" }
 tickloop-tickhost = { path = "../../tickhost/host" }
 tickloop-tickhost-connect = { path = "../../tickhost/connect" }
 time = { version = "0.3", features = ["formatting", "parsing"] }

@@ -449,3 +449,162 @@ async fn recovered_snapshot_updates_the_last_trade_without_waiting_for_another_p
         .collect();
     assert!(screen.contains("130.00"), "{screen}");
 }
+
+/// Its host waits only briefly for a launched Tick to answer, while the first quotes may take
+/// longer: a quote Tick still waiting on them is already described and reads as no data yet.
+#[tokio::test]
+async fn a_quote_tick_waiting_on_its_first_quotes_already_answers_describe_and_read() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let (mut host_requests, tick_requests) = tokio::io::duplex(8 * 1024);
+    let (tick_responses, host_responses) = tokio::io::duplex(64 * 1024);
+    let mut session = TickStream::duplex(TickKind::Quote, tick_requests, tick_responses);
+    let tick = tokio::spawn(async move {
+        let args = QuoteArgs {
+            symbols: vec!["TSLA.US".into()],
+            output: OnceArgs::default(),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        tick_market::commands::quote::run_live(
+            &args,
+            &HangingQuotes,
+            &Settings::default(),
+            &mut terminal,
+            futures_util::stream::pending(),
+            &mut session,
+        )
+        .await
+    });
+    let mut answers = tokio::io::BufReader::new(host_responses).lines();
+    for request in [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tick/describe"}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tick/read"}),
+    ] {
+        host_requests
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    let mut answer = async || {
+        let line = tokio::time::timeout(std::time::Duration::from_secs(1), answers.next_line())
+            .await
+            .expect("answered while the first quotes are pending")
+            .unwrap()
+            .unwrap();
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()
+    };
+    let described = answer().await;
+    assert_eq!(described["id"], 1);
+    assert_eq!(described["result"]["kind"], "quote");
+    let read = answer().await;
+    assert_eq!(read["id"], 2);
+    assert_eq!(read["result"], serde_json::json!({"seq": 0, "data": null}));
+    tick.abort();
+}
+
+/// Quotes that answer the first request and leave every later one running, with a market feed
+/// the test drives.
+struct LaterQuotesRunning {
+    requests: std::sync::atomic::AtomicUsize,
+    later_request: tokio::sync::Notify,
+    events: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<MarketEvent>>>,
+}
+
+#[async_trait]
+impl QuoteApi for LaterQuotesRunning {
+    async fn quotes(&self, _: &[String]) -> Result<Vec<Quote>> {
+        if self
+            .requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.later_request.notify_one();
+            return std::future::pending().await;
+        }
+        Ok(serde_json::from_str(
+            r#"[{"symbol":"TSLA.US","name":"Tesla","latest_price":"100","previous_close":"90"}]"#,
+        )
+        .unwrap())
+    }
+    async fn subscribe_quotes(&self, _: &[String]) -> Result<()> {
+        Ok(())
+    }
+    async fn take_events(&self) -> Result<tokio::sync::mpsc::UnboundedReceiver<MarketEvent>> {
+        Ok(self.events.lock().unwrap().take().unwrap())
+    }
+}
+
+/// A view that fails, here because the login was refused, still answers the Tick Tool calls it
+/// was running instead of leaving its host to wait them out.
+#[tokio::test]
+async fn a_failing_view_answers_the_tick_tool_calls_it_was_running() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let (pushes, events) = tokio::sync::mpsc::unbounded_channel();
+    let api = LaterQuotesRunning {
+        requests: Default::default(),
+        later_request: Default::default(),
+        events: Mutex::new(Some(events)),
+    };
+    let (mut host_requests, tick_requests) = tokio::io::duplex(8 * 1024);
+    let (tick_responses, host_responses) = tokio::io::duplex(64 * 1024);
+    let mut session = TickStream::duplex(TickKind::Quote, tick_requests, tick_responses);
+    let args = QuoteArgs {
+        symbols: vec!["TSLA.US".into()],
+        output: OnceArgs::default(),
+    };
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+    let settings = Settings::default();
+    let tick = tick_market::commands::quote::run_live(
+        &args,
+        &api,
+        &settings,
+        &mut terminal,
+        futures_util::stream::pending(),
+        &mut session,
+    );
+    let host = async {
+        let mut frames = tokio::io::BufReader::new(host_responses).lines();
+        let mut next = async || {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(1), frames.next_line())
+                .await
+                .expect("a frame within a second")
+                .unwrap()
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()
+        };
+        let content = next().await;
+        assert_eq!(content["method"], "tick/update", "{content}");
+        let describe = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tick/describe"});
+        host_requests
+            .write_all(format!("{describe}\n").as_bytes())
+            .await
+            .unwrap();
+        let revision = next().await["result"]["revision"].clone();
+        let call = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tick/call","params":{"tool":"quotes","args":{"symbols":["TSLA.US"]},"revision":revision}});
+        host_requests
+            .write_all(format!("{call}\n").as_bytes())
+            .await
+            .unwrap();
+        api.later_request.notified().await;
+        pushes
+            .send(MarketEvent::Failure {
+                code: tick_provider::exit_code::NOT_AUTHORIZED,
+                message: "authorization expired or revoked".into(),
+            })
+            .unwrap();
+        next().await
+    };
+    let (result, answered) = tokio::join!(tick, host);
+    assert_eq!(
+        result.unwrap_err().code,
+        tick_provider::exit_code::NOT_AUTHORIZED
+    );
+    assert_eq!(answered["id"], 2, "{answered}");
+    assert_eq!(
+        answered["error"]["message"],
+        "authorization expired or revoked"
+    );
+    assert_eq!(
+        answered["error"]["data"]["code"],
+        tick_provider::exit_code::NOT_AUTHORIZED
+    );
+}

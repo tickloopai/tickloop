@@ -1047,10 +1047,9 @@ impl LiveView for EarningsView {
         if area.height >= 10 {
             let styles = settings.styles();
             let observed = self.table.observed_at.as_deref().unwrap_or("unknown");
-            let source = if self.table.source == "demo" {
-                "Demo"
-            } else {
-                "Longbridge"
+            let source = match self.table.source {
+                "longbridge" => "Longbridge",
+                other => other,
             };
             let (facts, hints): (Vec<String>, &[Hint]) = match self.mode {
                 EarningsMode::Detail => {

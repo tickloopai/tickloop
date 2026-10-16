@@ -1,9 +1,6 @@
 use serde::Serialize;
 use tick_protocol::{StateDeclaration, StateSeries, TickTool};
-use tick_provider::{
-    Interface,
-    error::{Error, Result},
-};
+use tick_provider::error::{Error, Result};
 use tick_sdk::stream::Describe;
 
 /// Ticks whose content comes from services the shared runtime does not hand to query tools, so
@@ -148,18 +145,6 @@ impl TickKind {
             Self::Community => (40, 10),
         };
         MinimumPanelSize { columns, rows }
-    }
-
-    /// The provider interfaces this Tick reads its data through.
-    pub fn interfaces(self) -> &'static [Interface] {
-        match self {
-            Self::Quote | Self::Watchlist | Self::Kline | Self::Earnings => &[Interface::Quote],
-            Self::Positions => &[Interface::Quote, Interface::Trade],
-            Self::News => &[Interface::Quote, Interface::News],
-            Self::Options => &[Interface::Options],
-            Self::Reader => &[],
-            Self::Community => &[Interface::Community],
-        }
     }
 
     pub fn descriptor(self) -> TickDescriptor {

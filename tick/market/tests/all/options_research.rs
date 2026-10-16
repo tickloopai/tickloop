@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use crossterm::event::KeyCode;
 use serde_json::json;
-use tick_builtin::DemoOptions;
 use tick_market::{
     commands::options::OptionsView,
     config::Settings,
@@ -12,6 +11,7 @@ use tick_market::{
 };
 use tick_provider::options::{Contract, MarketQuote, OptionSide, OptionsApi};
 use tick_sdk::tools::{ToolCall, ToolDispatch};
+use tick_test_support::MockOptions;
 
 fn research(period: &str, date: &str) -> ResearchContext {
     ResearchContext {
@@ -51,7 +51,7 @@ fn event_snapshot(
 
 #[tokio::test]
 async fn event_history_filters_two_periods_by_original_quote_times_not_save_order() {
-    let api = Arc::new(DemoOptions);
+    let api = Arc::new(MockOptions);
     let template = options::load(
         api.as_ref(),
         &OptionsRequest::new("DEMO.US", None, 21).unwrap(),
@@ -90,7 +90,7 @@ async fn event_history_filters_two_periods_by_original_quote_times_not_save_orde
 
 #[tokio::test]
 async fn switching_historical_context_never_shows_current_chain_as_before_event() {
-    let api = Arc::new(DemoOptions);
+    let api = Arc::new(MockOptions);
     let request = OptionsRequest::new("DEMO.US", None, 21).unwrap();
     let snapshot = options::load(api.as_ref(), &request).await.unwrap();
     let temporary = tempfile::tempdir().unwrap();
@@ -162,7 +162,7 @@ async fn switching_historical_context_never_shows_current_chain_as_before_event(
 
 #[tokio::test]
 async fn unknown_release_time_does_not_guess_same_day_before_or_after() {
-    let api = Arc::new(DemoOptions);
+    let api = Arc::new(MockOptions);
     let template = options::load(
         api.as_ref(),
         &OptionsRequest::new("DEMO.US", None, 21).unwrap(),
@@ -225,7 +225,7 @@ async fn historical_options_start_and_remain_readable_without_opend() {
             unreachable!()
         }
     }
-    let api = Arc::new(DemoOptions);
+    let api = Arc::new(MockOptions);
     let template = options::load(
         api.as_ref(),
         &OptionsRequest::new("DEMO.US", None, 21).unwrap(),
@@ -366,11 +366,11 @@ fn option_requests_normalize_broker_notation_and_reject_invalid_dates_or_paths()
 }
 
 #[tokio::test]
-async fn demo_uses_real_assembly_and_history_requires_an_explicit_saved_snapshot() {
-    let api = Arc::new(DemoOptions);
+async fn mock_options_use_real_assembly_and_history_requires_an_explicit_saved_snapshot() {
+    let api = Arc::new(MockOptions);
     let request = OptionsRequest::new("DEMO.US", None, 21).unwrap();
     let snapshot = options::load(api.as_ref(), &request).await.unwrap();
-    assert_eq!(snapshot.source, "demo");
+    assert_eq!(snapshot.source, "mock");
     assert!((snapshot.atm.as_ref().unwrap().move_percent - 6.0).abs() < 1e-9);
     let temporary = tempfile::tempdir().unwrap();
     let store = SnapshotStore::new(Some(temporary.path().join("history"))).unwrap();
@@ -396,7 +396,7 @@ async fn demo_uses_real_assembly_and_history_requires_an_explicit_saved_snapshot
 
 #[tokio::test]
 async fn options_tick_changes_expiry_and_exposes_live_tools_without_a_longbridge_service() {
-    let api = Arc::new(DemoOptions);
+    let api = Arc::new(MockOptions);
     let request = OptionsRequest::new("DEMO.US", None, 21).unwrap();
     let snapshot = options::load(api.as_ref(), &request).await.unwrap();
     let first_expiry = snapshot.expiry.clone();

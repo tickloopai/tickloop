@@ -17,6 +17,7 @@ tickloop-agent-base = { path = "../base" }
 tickloop-agent-model = { path = "../model" }
 tickloop-agent-protocol = { path = "../protocol" }
 tickloop-agent-tools = { path = "../tools" }
+tickloop-tick-packages = { path = "../../tick/packages" }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]

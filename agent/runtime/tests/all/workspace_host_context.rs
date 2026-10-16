@@ -14,6 +14,7 @@ use tickhost_connect::{
     host_error::HostError,
     layout::HerdrLayout,
 };
+use tickloop_agent_config::skills::TICKLOOP_SKILL;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
     Content, EventKind, HerdrInteraction, HerdrPane, HostCallContext, ModelIdentity, Role,
@@ -334,13 +335,33 @@ fn first_model_request_identifies_host_without_advertising_missing_integrations(
         );
         let runs_ticks = matches!(case, "herdr" | "tickhost");
         assert!(
-            runs_ticks || state["workspace_host"]["tick_executable"].is_null(),
-            "{case}: only an Agent that can run Ticks names its tick_executable"
+            runs_ticks || state["workspace_host"]["reader_executable"].is_null(),
+            "{case}: only an Agent that can run Ticks names its reader_executable"
         );
         assert!(
             state["workspace_host"].get("tickhost_executable").is_none(),
             "{case}: the bundled tickhost is no program to open"
         );
+        assert_eq!(
+            state["workspace_host"]["tick_packages"],
+            json!([]),
+            "{case}: no Tick package is installed"
+        );
+        for field in TICKLOOP_SKILL
+            .split("workspace_host.")
+            .skip(1)
+            .filter_map(|rest| {
+                rest.split(|character: char| {
+                    !(character.is_ascii_alphanumeric() || character == '_')
+                })
+                .next()
+            })
+        {
+            assert!(
+                state["workspace_host"].get(field).is_some(),
+                "{case}: the tickloop Skill names workspace_host.{field}"
+            );
+        }
         assert_eq!(
             state["workspace_host"]["tickhost"],
             if runs_ticks {

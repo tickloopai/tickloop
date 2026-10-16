@@ -1,7 +1,7 @@
-// Modified by Tick Loop to route automatic refresh by credential; see ../README.md.
+// Modified by Tick Loop to renew tokens through a token refresher when one is set; see ../README.md.
 use std::{fmt, sync::Arc};
 
-use longbridge_geo::{DC_REGION_HEADER, DcRegion, is_cn};
+use longbridge_geo::is_cn;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, CsrfToken, RedirectUrl, RefreshToken, RevocationUrl,
     Scope, TokenUrl, basic::BasicClient, reqwest::async_http_client,
@@ -11,6 +11,7 @@ use poem::listener::{Acceptor, Listener, TcpListener};
 use crate::{
     callback::wait_for_callback,
     error::{OAuthError, OAuthResult},
+    refresher::TokenRefresher,
     storage::TokenStorage,
     token::OAuthToken,
 };
@@ -40,7 +41,7 @@ pub(crate) struct OAuthInner {
     pub(crate) client_id: String,
     pub(crate) callback_port: u16,
     pub(crate) storage: Arc<dyn TokenStorage>,
-    pub(crate) refresh_token_urls: Option<(TokenUrl, TokenUrl)>,
+    pub(crate) refresher: Option<Arc<dyn TokenRefresher>>,
     pub(crate) token: tokio::sync::Mutex<Option<OAuthToken>>,
 }
 
@@ -73,7 +74,7 @@ impl OAuth {
             client_id: String::new(),
             callback_port: DEFAULT_CALLBACK_PORT,
             storage: crate::storage::default_storage(),
-            refresh_token_urls: None,
+            refresher: None,
             token: tokio::sync::Mutex::new(Some(OAuthToken {
                 client_id: String::new(),
                 access_token,
@@ -182,6 +183,11 @@ impl OAuth {
 
     /// Refresh the access token using the stored refresh token.
     pub(crate) async fn refresh_token(&self, token: &OAuthToken) -> OAuthResult<OAuthToken> {
+        if let Some(refresher) = &self.0.refresher {
+            let current = token.clone().into();
+            return refresher.refresh(&current).await.map(Into::into);
+        }
+
         let refresh_token_str = token.refresh_token.as_deref().ok_or_else(|| {
             tracing::warn!(client_id = %self.0.client_id, "no refresh token available");
             OAuthError::NoRefreshToken
@@ -189,34 +195,14 @@ impl OAuth {
 
         tracing::debug!(client_id = %self.0.client_id, "refreshing OAuth token");
 
-        let region = DcRegion::from_credential(refresh_token_str);
-        let token_url = if let Some((ap_url, us_url)) = &self.0.refresh_token_urls {
-            match region {
-                DcRegion::Ap => ap_url.clone(),
-                DcRegion::Us => us_url.clone(),
-            }
-        } else {
-            let base = match region {
-                DcRegion::Ap => oauth_base_url().await,
-                DcRegion::Us => OAUTH_BASE_URL,
-            };
-            TokenUrl::new(format!("{base}/token")).unwrap()
-        };
-        let client = BasicClient::new(
-            ClientId::new(self.0.client_id.clone()),
-            None,
-            AuthUrl::new(format!("{OAUTH_BASE_URL}/authorize")).unwrap(),
-            Some(token_url),
-        );
+        let client = create_oauth_client(
+            &self.0.client_id,
+            &format!("http://localhost:{}/callback", self.0.callback_port),
+        )
+        .await;
         let token_response = client
             .exchange_refresh_token(&RefreshToken::new(refresh_token_str.to_string()))
-            .request_async(|mut request| {
-                request.headers.insert(
-                    DC_REGION_HEADER,
-                    oauth2::http::HeaderValue::from_static(region.as_str()),
-                );
-                async_http_client(request)
-            })
+            .request_async(async_http_client)
             .await
             .map_err(|e| {
                 tracing::error!(client_id = %self.0.client_id, error = %e, "failed to refresh token");

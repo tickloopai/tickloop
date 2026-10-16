@@ -107,10 +107,6 @@ impl ViewState {
             self.connection = ConnectionState::Disconnected;
             self.last_error = Some(error.message);
             Ok(())
-        } else if error.code == tick_provider::exit_code::NOT_AUTHORIZED
-            && !error.message.contains(tick_provider::error::AUTH_HINT)
-        {
-            Err(Error::auth(error.message))
         } else {
             Err(error)
         }
@@ -204,8 +200,26 @@ pub trait LiveView: Send {
     }
 }
 
-type RunningToolCall<'a> =
-    futures_util::future::BoxFuture<'a, (Value, std::result::Result<Value, RpcError>)>;
+/// A query Tick Tool call running beside the view. Its id stays readable, so a run that fails
+/// still answers it.
+struct RunningToolCall<'a> {
+    id: Value,
+    result: futures_util::future::BoxFuture<'a, std::result::Result<Value, RpcError>>,
+}
+
+impl std::future::Future for RunningToolCall<'_> {
+    type Output = (Value, std::result::Result<Value, RpcError>);
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.result
+            .as_mut()
+            .poll(context)
+            .map(|result| (self.id.clone(), result))
+    }
+}
 
 /// An accepted `tick/call`: a query already running beside the view, or an
 /// action the loop still has to apply on the UI path.
@@ -214,8 +228,8 @@ enum AcceptedToolCall<'a> {
     Action { id: Value, call: ToolCall },
 }
 
-fn tool_failure(error: Error) -> RpcError {
-    RpcError::new(TOOL_FAILED, error.message).with_data(json!({"code": error.code}))
+fn tool_failure(error: &Error) -> RpcError {
+    RpcError::new(TOOL_FAILED, error.message.clone()).with_data(json!({"code": error.code}))
 }
 
 /// Checks one `tick/call` against the declared catalog and either starts it
@@ -252,12 +266,15 @@ fn accept_tool_call<'a>(
     let id = call.id;
     Ok(match dispatch {
         ToolDispatch::Action(call) => AcceptedToolCall::Action { id, call },
-        ToolDispatch::Query(running) => AcceptedToolCall::Query(Box::pin(async move {
-            let result = tokio::time::timeout(TOOL_CALL_TIMEOUT, running)
-                .await
-                .unwrap_or_else(|_| Err(Error::network("Tick Tool call timed out")));
-            (id, result.map_err(tool_failure))
-        })),
+        ToolDispatch::Query(running) => AcceptedToolCall::Query(RunningToolCall {
+            id,
+            result: Box::pin(async move {
+                tokio::time::timeout(TOOL_CALL_TIMEOUT, running)
+                    .await
+                    .unwrap_or_else(|_| Err(Error::network("Tick Tool call timed out")))
+                    .map_err(|error| tool_failure(&error))
+            }),
+        }),
     })
 }
 
@@ -306,164 +323,174 @@ pub async fn run<V: LiveView, B: Backend, S: Stream<Item = std::io::Result<Event
     );
     refreshes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     updates.publish(view.content())?;
-    loop {
-        if view.take_navigation().is_some() {
-            state.last_error = Some("Cross-Tick navigation is unavailable in this host.".into());
-            dirty = true;
-        }
-        let next_refresh = view.refresh_interval();
-        if next_refresh != configured_refresh {
-            configured_refresh = next_refresh;
-            if let Some(interval) = configured_refresh {
-                refreshes =
-                    tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
-                refreshes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let outcome: Result<()> = async {
+        loop {
+            if view.take_navigation().is_some() {
+                state.last_error = Some("Cross-Tick navigation is unavailable in this host.".into());
+                dirty = true;
             }
-        }
-        tokio::select! {
-            line = requests.next(), if !requests_closed => match line {
-                None => {
-                    requests_closed = true;
-                    if running_calls.is_empty() { break; }
+            let next_refresh = view.refresh_interval();
+            if next_refresh != configured_refresh {
+                configured_refresh = next_refresh;
+                if let Some(interval) = configured_refresh {
+                    refreshes =
+                        tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+                    refreshes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 }
-                Some(line) => {
-                    if let Some(call) = updates.dispatch(line) {
-                        match accept_tool_call(&tools, api, call, running_calls.len()) {
-                            Ok(AcceptedToolCall::Query(running)) => running_calls.push(running),
-                            Ok(AcceptedToolCall::Action { id, call }) => {
-                                let previous_content = view.content();
-                                let applied = view.act(call).await;
-                                if applied.is_ok() {
-                                    let content = view.content();
-                                    if content != previous_content {
-                                        updates.publish(content)?;
+            }
+            tokio::select! {
+                line = requests.next(), if !requests_closed => match line {
+                    None => {
+                        requests_closed = true;
+                        if running_calls.is_empty() { break; }
+                    }
+                    Some(line) => {
+                        if let Some(call) = updates.dispatch(line) {
+                            match accept_tool_call(&tools, api, call, running_calls.len()) {
+                                Ok(AcceptedToolCall::Query(running)) => running_calls.push(running),
+                                Ok(AcceptedToolCall::Action { id, call }) => {
+                                    let previous_content = view.content();
+                                    let applied = view.act(call).await;
+                                    if applied.is_ok() {
+                                        let content = view.content();
+                                        if content != previous_content {
+                                            updates.publish(content)?;
+                                        }
+                                        dirty = true;
                                     }
-                                    dirty = true;
+                                    updates.answer(id, applied.map_err(|error| tool_failure(&error)));
                                 }
-                                updates.answer(id, applied.map_err(tool_failure));
+                                Err((id, error)) => updates.answer(id, Err(error)),
                             }
-                            Err((id, error)) => updates.answer(id, Err(error)),
                         }
                     }
+                },
+                finished = running_calls.next(), if !running_calls.is_empty() => {
+                    if let Some((id, result)) = finished {
+                        updates.answer(id, result);
+                    }
+                    if requests_closed && running_calls.is_empty() { break; }
                 }
-            },
-            finished = running_calls.next(), if !running_calls.is_empty() => {
-                if let Some((id, result)) = finished {
-                    updates.answer(id, result);
+                _ = refreshes.tick(), if configured_refresh.is_some() => {
+                    if state.connection != ConnectionState::Connected {
+                        state.connection = ConnectionState::Reconnecting;
+                        render(view, terminal, &mut state, &mut viewport, settings)?;
+                    }
+                    match refresh_cancellable(view, api, &mut input).await {
+                        Ok(None) => break,
+                        Ok(Some(())) => { state.received_data(); updates.publish(view.content())?; }
+                        Err(error) => state.failed(error)?,
+                    }
+                    dirty = true;
                 }
-                if requests_closed && running_calls.is_empty() { break; }
-            }
-            _ = refreshes.tick(), if configured_refresh.is_some() => {
-                if state.connection != ConnectionState::Connected {
-                    state.connection = ConnectionState::Reconnecting;
-                    render(view, terminal, &mut state, &mut viewport, settings)?;
+                _ = frames.tick() => {
+                    if dirty { render(view, terminal, &mut state, &mut viewport, settings)?; dirty = false; }
                 }
-                match refresh_cancellable(view, api, &mut input).await {
-                    Ok(None) => break,
-                    Ok(Some(())) => { state.received_data(); updates.publish(view.content())?; }
-                    Err(error) => state.failed(error)?,
-                }
-                dirty = true;
-            }
-            _ = frames.tick() => {
-                if dirty { render(view, terminal, &mut state, &mut viewport, settings)?; dirty = false; }
-            }
-            event = market.recv(), if market_open => {
-                dirty = true;
-                match event {
-                    Some(event) => {
-                        match event {
-                            MarketEvent::Failure { code, message } => state.failed(Error { code, message })?,
-                            MarketEvent::Connection(connection) => {
-                                let recovered = connection == ConnectionState::Connected && state.connection != ConnectionState::Connected;
-                                if recovered && view.refresh_on_recovery() {
-                                    state.connection = ConnectionState::Reconnecting;
-                                    render(view, terminal, &mut state, &mut viewport, settings)?;
-                                    match refresh_cancellable(view, api, &mut input).await {
-                                        Ok(None) => break,
-                                        Ok(Some(())) => { state.received_data(); updates.publish(view.content())?; }
-                                        Err(error) => state.failed(error)?,
+                event = market.recv(), if market_open => {
+                    dirty = true;
+                    match event {
+                        Some(event) => {
+                            match event {
+                                MarketEvent::Failure { code, message } => state.failed(Error::new(code, message))?,
+                                MarketEvent::Connection(connection) => {
+                                    let recovered = connection == ConnectionState::Connected && state.connection != ConnectionState::Connected;
+                                    if recovered && view.refresh_on_recovery() {
+                                        state.connection = ConnectionState::Reconnecting;
+                                        render(view, terminal, &mut state, &mut viewport, settings)?;
+                                        match refresh_cancellable(view, api, &mut input).await {
+                                            Ok(None) => break,
+                                            Ok(Some(())) => { state.received_data(); updates.publish(view.content())?; }
+                                            Err(error) => state.failed(error)?,
+                                        }
+                                    } else {
+                                        state.connection = connection;
+                                        if connection == ConnectionState::Connected { state.received_data(); }
                                     }
-                                } else {
-                                    state.connection = connection;
-                                    if connection == ConnectionState::Connected { state.received_data(); }
+                                }
+                                event => {
+                                    let previous_content = view.content();
+                                    view.on_market(&event);
+                                    let content = view.content();
+                                    if content != previous_content {
+                                        state.received_data();
+                                        updates.publish(content)?;
+                                    }
                                 }
                             }
-                            event => {
-                                let previous_content = view.content();
-                                view.on_market(&event);
+                        }
+                        None => { market_open = false; state.connection = ConnectionState::Disconnected; }
+                    }
+                }
+                event = input.next() => {
+                    dirty = true;
+                    match event {
+                        None => break,
+                        Some(Err(error)) => return Err(error.into()),
+                        Some(Ok(Event::Resize(_, _))) => { terminal.clear().map_err(|error| Error::usage(error.to_string()))?; }
+                        Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
+                            let capturing = view.captures_text();
+                            let interrupted = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+                            if interrupted && capturing { view.cancel_text(); continue; }
+                            if interrupted { break; }
+                            if !capturing && key.code == KeyCode::Char('q') { break; }
+                            if !capturing && key.code == KeyCode::Char('?') { state.help = !state.help; continue; }
+                            if state.help { if key.code == KeyCode::Backspace { state.help = false; } continue; }
+                            if !capturing && let KeyCode::Char(character) = key.code && viewport.handle_key(character) { continue; }
+                            let code = if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                match key.code {
+                                    KeyCode::Char('n') => KeyCode::Down,
+                                    KeyCode::Char('p') => KeyCode::Up,
+                                    _ => continue,
+                                }
+                            } else if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER) {
+                                continue;
+                            } else { key.code };
+                            let previous_content = view.content();
+                            // Enter submits the edit, so what it waits for is no longer editing and q / Ctrl+C quit again.
+                            let editing = capturing && code != KeyCode::Enter;
+                            let handled = match cancellable_unless_editing(view.on_key(code, api, &mut state), &mut input, editing).await {
+                                Ok(Some(handled)) => handled,
+                                Ok(None) => break,
+                                Err(error) => { state.failed(error)?; continue; }
+                            };
+                            if handled {
                                 let content = view.content();
                                 if content != previous_content {
                                     state.received_data();
                                     updates.publish(content)?;
                                 }
+                                continue;
+                            }
+                            let length = view.table().rows.len();
+                            let page = terminal.size().map_err(|error| Error::usage(error.to_string()))?.height.saturating_sub(4).max(1) as usize;
+                            match code {
+                                KeyCode::Char('j') | KeyCode::Down => state.selected = (state.selected + 1).min(length.saturating_sub(1)),
+                                KeyCode::Char('k') | KeyCode::Up => state.selected = state.selected.saturating_sub(1),
+                                KeyCode::PageDown => state.selected = (state.selected + page).min(length.saturating_sub(1)),
+                                KeyCode::PageUp => state.selected = state.selected.saturating_sub(page),
+                                KeyCode::Char('g') | KeyCode::Home => state.selected = 0,
+                                KeyCode::Char('G') | KeyCode::End => state.selected = length.saturating_sub(1),
+                                _ => (),
                             }
                         }
+                        _ => (),
                     }
-                    None => { market_open = false; state.connection = ConnectionState::Disconnected; }
-                }
-            }
-            event = input.next() => {
-                dirty = true;
-                match event {
-                    None => break,
-                    Some(Err(error)) => return Err(error.into()),
-                    Some(Ok(Event::Resize(_, _))) => { terminal.clear().map_err(|error| Error::usage(error.to_string()))?; }
-                    Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
-                        let capturing = view.captures_text();
-                        let interrupted = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-                        if interrupted && capturing { view.cancel_text(); continue; }
-                        if interrupted { break; }
-                        if !capturing && key.code == KeyCode::Char('q') { break; }
-                        if !capturing && key.code == KeyCode::Char('?') { state.help = !state.help; continue; }
-                        if state.help { if key.code == KeyCode::Backspace { state.help = false; } continue; }
-                        if !capturing && let KeyCode::Char(character) = key.code && viewport.handle_key(character) { continue; }
-                        let code = if key.modifiers.contains(KeyModifiers::CONTROL) {
-                            match key.code {
-                                KeyCode::Char('n') => KeyCode::Down,
-                                KeyCode::Char('p') => KeyCode::Up,
-                                _ => continue,
-                            }
-                        } else if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER) {
-                            continue;
-                        } else { key.code };
-                        let previous_content = view.content();
-                        // Enter submits the edit, so what it waits for is no longer editing and q / Ctrl+C quit again.
-                        let editing = capturing && code != KeyCode::Enter;
-                        let handled = match cancellable_unless_editing(view.on_key(code, api, &mut state), &mut input, editing).await {
-                            Ok(Some(handled)) => handled,
-                            Ok(None) => break,
-                            Err(error) => { state.failed(error)?; continue; }
-                        };
-                        if handled {
-                            let content = view.content();
-                            if content != previous_content {
-                                state.received_data();
-                                updates.publish(content)?;
-                            }
-                            continue;
-                        }
-                        let length = view.table().rows.len();
-                        let page = terminal.size().map_err(|error| Error::usage(error.to_string()))?.height.saturating_sub(4).max(1) as usize;
-                        match code {
-                            KeyCode::Char('j') | KeyCode::Down => state.selected = (state.selected + 1).min(length.saturating_sub(1)),
-                            KeyCode::Char('k') | KeyCode::Up => state.selected = state.selected.saturating_sub(1),
-                            KeyCode::PageDown => state.selected = (state.selected + page).min(length.saturating_sub(1)),
-                            KeyCode::PageUp => state.selected = state.selected.saturating_sub(page),
-                            KeyCode::Char('g') | KeyCode::Home => state.selected = 0,
-                            KeyCode::Char('G') | KeyCode::End => state.selected = length.saturating_sub(1),
-                            _ => (),
-                        }
-                    }
-                    _ => (),
                 }
             }
         }
+        if dirty {
+            render(view, terminal, &mut state, &mut viewport, settings)?;
+        }
+        Ok(())
     }
-    if dirty {
-        render(view, terminal, &mut state, &mut viewport, settings)?;
+    .await;
+    if let Err(error) = &outcome {
+        // The host would otherwise wait out its own timeout for the queries still running.
+        for call in running_calls.iter() {
+            updates.answer(call.id.clone(), Err(tool_failure(error)));
+        }
     }
-    Ok(())
+    outcome
 }
 
 fn render<V: LiveView, B: Backend>(
@@ -550,8 +577,8 @@ fn render<V: LiveView, B: Backend>(
     Ok(())
 }
 
-/// Draws the view with the demo heading and the status row into the frame, which is the Panel
-/// itself or, for a Panel smaller than the Tick's minimum, the canvas it scrolls over.
+/// Draws the view and the status row into the frame, which is the Panel itself or, for a Panel
+/// smaller than the Tick's minimum, the canvas it scrolls over.
 fn draw_canvas<V: LiveView>(
     view: &V,
     frame: &mut Frame<'_>,
@@ -569,48 +596,6 @@ fn draw_canvas<V: LiveView>(
     } else {
         1
     };
-    if settings.is_demo {
-        let heading_area = Rect::new(area.x, area.y, area.width, 1);
-        frame
-            .buffer_mut()
-            .set_style(heading_area, styles.panel_base());
-        write_text(
-            frame.buffer_mut(),
-            area.x,
-            area.y,
-            &" ".repeat(area.width as usize),
-            area.width as usize,
-            settings.ambiguous_width,
-            styles.panel_base(),
-        );
-        let title_width = area
-            .width
-            .saturating_sub(horizontal_padding * 2)
-            .saturating_sub(7);
-        write_text(
-            frame.buffer_mut(),
-            area.x + horizontal_padding,
-            area.y,
-            &pad(
-                &view.title(),
-                title_width as usize,
-                settings.ambiguous_width,
-                false,
-            ),
-            title_width as usize,
-            settings.ambiguous_width,
-            styles.panel_base().patch(styles.title),
-        );
-        write_text(
-            frame.buffer_mut(),
-            area.right() - horizontal_padding - 4,
-            area.y,
-            "DEMO",
-            4,
-            settings.ambiguous_width,
-            styles.panel_base().patch(styles.muted_text),
-        );
-    }
     let status_area = Rect::new(area.x, area.bottom() - 1, area.width, 1);
     let mut status_style = styles.status_base().patch(styles.muted_text);
     if state.last_error.is_some() {
@@ -626,8 +611,6 @@ fn draw_canvas<V: LiveView>(
         } else {
             format!("{icon} {} · {error}", state.availability())
         }
-    } else if settings.is_demo {
-        "Simulated data".to_owned()
     } else {
         format!("{icon} {}", state.availability())
     };
@@ -669,6 +652,99 @@ fn draw_canvas<V: LiveView>(
         settings.ambiguous_width,
         styles.status_base().patch(styles.muted_text),
     );
+}
+
+/// Why a Tick has no content from its data source yet.
+pub enum Connecting<'a> {
+    /// Attempt `attempt` is under way or next; `last_error` is why the one before failed.
+    Retrying {
+        attempt: usize,
+        last_error: Option<&'a str>,
+    },
+    /// The source refused the login; `hint` says how to log in again.
+    NotAuthorized { hint: &'a str },
+    /// The source turned the Tick's request down with `error`, such as an unknown symbol.
+    Rejected { error: &'a str },
+}
+
+/// Draws what a Tick shows before its first content while it reaches its data source `source`.
+pub fn draw_connecting<B: Backend>(
+    terminal: &mut Terminal<B>,
+    settings: &Settings,
+    source: &str,
+    connecting: &Connecting<'_>,
+) -> Result<()> {
+    use tick_provider::preferences::Language;
+    let styles = settings.styles();
+    let (status, detail, detail_style) = match (connecting, settings.language) {
+        (
+            Connecting::Retrying {
+                attempt,
+                last_error,
+            },
+            Language::ZhCn,
+        ) => (
+            format!("正在连接{source}（第 {attempt} 次）"),
+            last_error.map(|error| format!("上次错误：{error}")),
+            styles.error,
+        ),
+        (
+            Connecting::Retrying {
+                attempt,
+                last_error,
+            },
+            Language::En,
+        ) => (
+            format!("Connecting to {source} (attempt {attempt})"),
+            last_error.map(|error| format!("Last error: {error}")),
+            styles.error,
+        ),
+        (Connecting::NotAuthorized { hint }, Language::ZhCn) => (
+            format!("{source}需要重新登录"),
+            Some((*hint).to_owned()),
+            styles.muted_text,
+        ),
+        (Connecting::NotAuthorized { hint }, Language::En) => (
+            format!("Log in to {source} again"),
+            Some((*hint).to_owned()),
+            styles.muted_text,
+        ),
+        (Connecting::Rejected { error }, Language::ZhCn) => (
+            format!("{source}拒绝了这个 Tick 的请求"),
+            Some((*error).to_owned()),
+            styles.error,
+        ),
+        (Connecting::Rejected { error }, Language::En) => (
+            format!("{source} turned this Tick's request down"),
+            Some((*error).to_owned()),
+            styles.error,
+        ),
+    };
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            frame.buffer_mut().set_style(area, styles.panel_base());
+            let inner = table_content_area(area);
+            write_text(
+                frame.buffer_mut(),
+                inner.x,
+                area.y,
+                &status,
+                inner.width as usize,
+                settings.ambiguous_width,
+                styles.panel_base().patch(styles.title),
+            );
+            if let Some(detail) = detail {
+                frame.render_widget(
+                    Paragraph::new(detail)
+                        .wrap(Wrap { trim: false })
+                        .style(styles.panel_base().patch(detail_style)),
+                    inner,
+                );
+            }
+        })
+        .map_err(|error| Error::usage(error.to_string()))?;
+    Ok(())
 }
 
 pub fn table_content_area(area: Rect) -> Rect {

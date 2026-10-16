@@ -19,18 +19,18 @@ Current Tickloop connects to an independently running Herdr through its API; it 
 - Upstream: [Longbridge Terminal](https://github.com/longbridge/longbridge-terminal).
 - Reference revision: `b834538` (2026-09-07).
 - Upstream sources: `src/utils/text.rs`, `src/utils/number.rs`, `src/openapi/rate_limiter.rs`, `src/tui/nav.rs`, `src/cli/output.rs`.
-- Adapted source: `ui/src/format.rs` (width, padding, truncation, number abbreviation), `tick/providers/longbridge/src/rate_limit.rs`, `tick/provider/src/api.rs` (symbol normalization), and `tick/market/src/output.rs` (header keys).
+- Adapted source: `ui/src/format.rs` (width, padding, truncation, number abbreviation), `ticks/longbridge/src/rate_limit.rs`, `tick/provider/src/api.rs` (symbol normalization), and `tick/market/src/output.rs` (header keys).
 - Applicable license: Apache License, Version 2.0. An unmodified copy is included in [licenses/Longbridge-Terminal-Apache-2.0.txt](./licenses/Longbridge-Terminal-Apache-2.0.txt).
 
 The adaptation adds configurable ambiguous width, grapheme-aware truncation, and Chinese units, and removes global state from the limiter. Longbridge Terminal is a source reference, not a build dependency. Other dependencies retain their own licenses.
 
-## Longbridge OpenAPI OAuth runtime refresh patch
+## Longbridge OpenAPI OAuth token refresher patch
 
 - Upstream: [Longbridge OpenAPI](https://github.com/longbridge/openapi).
 - Reference revision: `59294104c48a3812049158ee52124f32e5046008` (`5929410`).
 - Upstream source: `rust/crates/oauth`.
 - Vendored source: `vendor/longbridge-oauth`, patched through the root Cargo manifest.
-- Changes: explicit AP/US refresh endpoints, credential-derived refresh routing, and the `x-dc-region` header; standalone Cargo dependency declarations and unit-test constructor updates. Details are in [the patch README](./vendor/longbridge-oauth/README.md).
+- Changes: a `TokenRefresher` hook through which the application renews tokens in place of the client's own refresh; standalone Cargo dependency declarations and unit-test constructor updates. Details are in [the patch README](./vendor/longbridge-oauth/README.md).
 - Applicable licenses: MIT OR Apache License, Version 2.0. Unmodified copies are included in [LICENSE-MIT](./vendor/longbridge-oauth/LICENSE-MIT) and [LICENSE-APACHE](./vendor/longbridge-oauth/LICENSE-APACHE).
 
 ## CLI Candlestick Chart glyph rules

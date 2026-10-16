@@ -21,6 +21,10 @@ use tickloop_agent_test_support::{ScriptedModel, call, config, next_event, text,
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+/// A run of a hundred denied calls takes about two seconds alone and much longer on a busy machine.
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
+const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 struct HeldReviewerModel {
     scripted: ScriptedModel,
     requests: AtomicUsize,
@@ -114,7 +118,7 @@ impl HostToolProvider for PanelHost {
 }
 
 async fn wait_for_completion(agent: &Agent, chat: Uuid) {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(COMPLETION_TIMEOUT, async {
         loop {
             if agent
                 .snapshot(chat)
@@ -126,7 +130,8 @@ async fn wait_for_completion(agent: &Agent, chat: Uuid) {
             {
                 return;
             }
-            tokio::task::yield_now().await;
+            // Snapshots clone the whole Chat, so polling without a pause starves the run under load.
+            tokio::time::sleep(COMPLETION_POLL_INTERVAL).await;
         }
     })
     .await

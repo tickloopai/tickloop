@@ -311,6 +311,9 @@ struct ProtocolLaunch {
     launch_token: String,
     /// Set by the first launcher connection: the launch token works once.
     launcher_claimed: AtomicBool,
+    /// Set once that launcher proved it is the foreground of the Tick's terminal; it then runs
+    /// the Tick and registers it after the Tick answered `tick/describe` and `tick/read`.
+    launcher_verified: AtomicBool,
     /// Where its launcher binds the Tick Session socket.
     session_directory: PathBuf,
     session: Mutex<Option<SessionClient>>,
@@ -340,6 +343,21 @@ impl Adapter {
 }
 
 impl HostedTick {
+    /// Where an extension Tick that is not ready yet stands: the host sees its launcher connect
+    /// and prove its terminal, but not which of `tick/describe` and `tick/read` it waits for.
+    fn startup_stage(&self) -> &'static str {
+        match &self.adapter {
+            Adapter::Protocol(launch) if !launch.launcher_claimed.load(Ordering::SeqCst) => {
+                "its launcher never connected to the Tickhost"
+            }
+            Adapter::Protocol(launch) if !launch.launcher_verified.load(Ordering::SeqCst) => {
+                "its launcher did not prove it runs on the Tick's terminal"
+            }
+            Adapter::Protocol(_) => "it did not answer tick/describe and tick/read",
+            Adapter::Terminal(_) => "its program did not start",
+        }
+    }
+
     /// Removes an extension Tick's session directory once the launcher is gone, with any socket it
     /// could not remove itself.
     fn remove_session_directory(&self) {
@@ -742,6 +760,7 @@ impl Host {
                 Adapter::Protocol(ProtocolLaunch {
                     launch_token,
                     launcher_claimed: AtomicBool::new(false),
+                    launcher_verified: AtomicBool::new(false),
                     session_directory,
                     session: Mutex::new(None),
                 })
@@ -847,16 +866,22 @@ impl Host {
                     .chars()
                     .take(DIAGNOSTIC_CHARACTERS)
                     .collect::<String>();
+                let failure = if outcome.is_err() {
+                    format!(
+                        "the Tick did not become ready within {CONTROL_TIMEOUT:?}: {}",
+                        tick.startup_stage()
+                    )
+                } else {
+                    "the Tick exited during startup".to_owned()
+                };
                 self.terminate(&tick).await;
                 self.reap(terminal, ReapReason::LaunchFailed).await;
                 Err(HostError::before(
                     "LaunchFailed",
-                    if outcome.is_err() {
-                        format!(
-                            "the Tick did not become ready within {CONTROL_TIMEOUT:?}: {screen}"
-                        )
+                    if screen.trim().is_empty() {
+                        format!("{failure}; it printed nothing")
                     } else {
-                        format!("the Tick exited during startup: {screen}")
+                        format!("{failure}: {screen}")
                     },
                 ))
             }
@@ -1273,7 +1298,8 @@ impl Host {
     }
 
     /// What stopping this host would end: its Ticks by title, its Shell tasks, the opens and
-    /// spawns under way that keep it from idling, and its business connections.
+    /// spawns under way that keep it from idling, its business connections and the views among
+    /// them.
     async fn occupancy(&self) -> HostOccupancy {
         let mut state = self.state.lock().await;
         let pending = state.pending_opens + state.spawn_grants.pending(Instant::now());
@@ -1293,6 +1319,14 @@ impl Host {
             shells: state.shells.len(),
             pending: Some(pending),
             connections: self.connections.load(Ordering::SeqCst),
+            views: Some(
+                state
+                    .ticks
+                    .values()
+                    .map(|tick| tick.views.lock().unwrap().len())
+                    .chain(state.shells.values().map(|task| task.view_count()))
+                    .sum(),
+            ),
         }
     }
 
@@ -2398,6 +2432,9 @@ async fn launcher_request(
                 ));
             }
             *verified = true;
+            if let Adapter::Protocol(launch) = &tick.adapter {
+                launch.launcher_verified.store(true, Ordering::SeqCst);
+            }
             Ok(json!({"verified":true}))
         }
         "register" => {

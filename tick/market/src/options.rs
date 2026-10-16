@@ -267,9 +267,7 @@ pub async fn load(api: &dyn OptionsApi, request: &OptionsRequest) -> Result<Opti
         expiry,
         expirations,
         observed_at: now_string(),
-        quote_time_zone: if api.source() == "demo" {
-            "UTC"
-        } else if request.symbol.ends_with(".US") {
+        quote_time_zone: if request.symbol.ends_with(".US") {
             "America/New_York"
         } else {
             "Asia/Hong_Kong"

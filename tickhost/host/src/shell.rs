@@ -575,6 +575,10 @@ impl ShellTask {
         self.view.lock().unwrap().screen.screen().frame_since(shown)
     }
 
+    pub(crate) fn view_count(&self) -> usize {
+        self.views.lock().unwrap().len()
+    }
+
     /// Applies `change` to the attached views and draws the screen at the size they now lead
     /// with.
     pub(crate) fn change_views<T>(&self, change: impl FnOnce(&mut Views) -> T) -> T {

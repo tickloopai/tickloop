@@ -3,12 +3,13 @@ members = [
     "agent/*",
     "tickhost/host", "tickhost/connect",
     "tick/protocol", "tick/sdk", "tick/provider",
-    "tick/providers/builtin", "tick/providers/longbridge", "tick/providers/futu",
-    "tick/market", "tick/cli",
+    "tick/market", "tick/command", "tick/reader", "tick/packages", "tick/oauth",
+    "tick/test-support",
+    "ticks/longbridge", "ticks/futu",
     "ui",
 ]
 resolver = "3"
-exclude = ["vendor/crossterm", "vendor/longbridge-oauth"]
+exclude = ["vendor/crossterm", "vendor/dotenv", "vendor/longbridge-oauth"]
 
 [workspace.package]
 version = "0.2.0"
@@ -20,6 +21,7 @@ debug = "line-tables-only"
 
 [patch.crates-io]
 crossterm = { path = "vendor/crossterm" }
+dotenv = { path = "vendor/dotenv" }
 
 [patch."https://github.com/longbridge/openapi"]
 longbridge-oauth = { path = "vendor/longbridge-oauth" }

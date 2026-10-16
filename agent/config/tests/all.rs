@@ -10,3 +10,5 @@ mod model_configuration;
 mod monitor_settings;
 #[path = "all/skill_catalog.rs"]
 mod skill_catalog;
+#[path = "all/tick_package_skills.rs"]
+mod tick_package_skills;

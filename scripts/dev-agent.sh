@@ -11,12 +11,13 @@ bin_directory="$run_directory/bin"
 trap 'rm -rf "$run_directory"' 0
 trap 'exit 1' 1 2 15
 
-cargo build --locked -p tickloop-agent --bin tickloop -p tickloop-tickhost --bin tickhost -p tickloop-tick --bin tick
+cargo build --locked -p tickloop-agent --bin tickloop -p tickloop-tickhost --bin tickhost \
+    -p tickloop-tick-reader --bin tick-reader
 mkdir "$bin_directory"
-cp "$target_directory/debug/tickloop" "$bin_directory/tickloop"
-cp "$target_directory/debug/tickhost" "$bin_directory/tickhost"
-cp "$target_directory/debug/tick" "$bin_directory/tick"
-chmod 0500 "$bin_directory/tickloop" "$bin_directory/tickhost" "$bin_directory/tick"
+for program in tickloop tickhost tick-reader; do
+    cp "$target_directory/debug/$program" "$bin_directory/$program"
+    chmod 0500 "$bin_directory/$program"
+done
 chmod 0500 "$bin_directory" "$run_directory"
 
 # Detached daemons and workers can still exec this bundle after the View exits.

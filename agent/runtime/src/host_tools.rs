@@ -241,7 +241,20 @@ pub struct WorkspaceHostContext {
     pub integration: WorkspaceIntegration,
     /// Whether this Agent can run Ticks in the Tickhost, in any container.
     pub tickhost: WorkspaceIntegration,
-    pub tick_executable: Option<PathBuf>,
+    pub reader_executable: Option<PathBuf>,
+    /// The installed Tick packages whose programs this Agent can open.
+    pub tick_packages: Vec<WorkspaceTickPackage>,
+}
+
+/// An installed Tick package, as the Agent sees it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct WorkspaceTickPackage {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub executable: PathBuf,
+    /// Its login state, from the credentials Tickloop saved for it.
+    pub login: tick_packages::LoginState,
 }
 
 impl WorkspaceHostContext {
@@ -255,12 +268,34 @@ impl WorkspaceHostContext {
     }
 
     /// The same container, where this Agent can also run Ticks in the Tickhost, among them the
-    /// bundled `tick`.
+    /// bundled `tick-reader`.
     pub fn with_tickhost(mut self) -> Self {
         self.tickhost = WorkspaceIntegration::Available;
-        self.tick_executable = self
-            .tick_executable
-            .or_else(tickhost_connect::program::bundled_tick_executable);
+        self.reader_executable = self
+            .reader_executable
+            .or_else(tickhost_connect::program::bundled_reader_executable);
+        self
+    }
+
+    /// The same container, listing the usable Tick packages installed in `packages` with their
+    /// login states, which reading the saved credentials gives at once.
+    pub fn with_tick_packages(mut self, packages: &tick_packages::PackageStore) -> Self {
+        self.tick_packages = packages
+            .installed()
+            .map(|installed| {
+                installed
+                    .packages
+                    .into_iter()
+                    .map(|package| WorkspaceTickPackage {
+                        login: packages.login_state(&package),
+                        executable: package.executable(),
+                        name: package.manifest.name,
+                        version: package.manifest.version,
+                        description: package.manifest.description,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         self
     }
 
@@ -285,7 +320,8 @@ impl WorkspaceHostContext {
             name,
             integration: WorkspaceIntegration::Unavailable,
             tickhost: WorkspaceIntegration::Unavailable,
-            tick_executable: None,
+            reader_executable: None,
+            tick_packages: Vec::new(),
         }
     }
 

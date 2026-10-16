@@ -21,6 +21,11 @@ pub enum SkillSource {
     Project {
         path: PathBuf,
     },
+    /// A Skill an installed Tick package brings, named `<package>:<skill>`.
+    TickPackage {
+        package: String,
+        path: PathBuf,
+    },
     Remote {
         server_id: String,
         account_id: String,

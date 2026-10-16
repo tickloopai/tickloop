@@ -1,0 +1,24 @@
+[package]
+name = "tickloop-tick-packages"
+description = "Tick packages: the tick-package.json manifest, the Tick marketplace's marketplace.json, and installing, listing and removing packages under a Tickloop config root"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "tick_packages"
+doctest = false
+
+[dependencies]
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tar = { version = "0.4", default-features = false }
+tempfile = "3"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting"] }
+url = "2"
+
+[dev-dependencies]
+time = { version = "0.3", features = ["parsing"] }

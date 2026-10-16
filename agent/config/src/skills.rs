@@ -2,13 +2,18 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use tick_packages::{InstalledPackage, PackageStore};
 use tickloop_agent_protocol::{InvokedSkill, RemoteSkillDefinition, SkillSource, ToolDefinition};
 
 pub const TICKLOOP_SKILL: &str = include_str!("../skills/tickloop/SKILL.md");
 pub const BUILTIN_SKILLS: [&str; 1] = [TICKLOOP_SKILL];
 pub const SKILL_TOOL_NAME: &str = "Skill";
+/// In the body of a Tick package's Skill, the directory the package is installed in.
+pub const PACKAGE_ROOT_VARIABLE: &str = "${TICK_PACKAGE_ROOT}";
 
 const SKILL_FILE_NAME: &str = "SKILL.md";
+/// The user's Skills in the config root, and a Tick package's in its install directory.
+const SKILLS_DIRECTORY: &str = "skills";
 const PROJECT_SKILLS_DIRECTORY: &str = ".tickloop/skills";
 const MAX_NAME_BYTES: usize = 64;
 const MAX_DESCRIPTION_CHARS: usize = 1536;
@@ -41,6 +46,18 @@ pub struct SkillExpansion {
     pub content: String,
     pub source: SkillSource,
     pub allowed_tools: Vec<String>,
+}
+
+impl SkillDefinition {
+    /// The Skill as its Tick package brings it: named `<package>:<skill>`, which no other Skill
+    /// can be named, with the package's install directory in place of `${TICK_PACKAGE_ROOT}`.
+    fn in_package(mut self, package: &InstalledPackage) -> Self {
+        self.name = format!("{}:{}", package.manifest.name, self.name);
+        self.body = self
+            .body
+            .replace(PACKAGE_ROOT_VARIABLE, &package.root.to_string_lossy());
+        self
+    }
 }
 
 impl TryFrom<SkillExpansion> for InvokedSkill {
@@ -108,13 +125,15 @@ struct Frontmatter {
 }
 
 impl SkillRegistry {
-    pub fn discover(workdir: &Path, user_skills_directory: Option<&Path>) -> Self {
-        Self::discover_with_builtins(workdir, user_skills_directory, BUILTIN_SKILLS)
+    /// The Skills a Chat working in `workdir` finds: the built-in ones, the user's and those of
+    /// the installed Tick packages in `config_root`, and the project's.
+    pub fn discover(workdir: &Path, config_root: Option<&Path>) -> Self {
+        Self::discover_with_builtins(workdir, config_root, BUILTIN_SKILLS)
     }
 
     pub fn discover_with_builtins<'a>(
         workdir: &Path,
-        user_skills_directory: Option<&Path>,
+        config_root: Option<&Path>,
         builtins: impl IntoIterator<Item = &'a str>,
     ) -> Self {
         let mut registry = Self::default();
@@ -122,8 +141,13 @@ impl SkillRegistry {
             registry.load_markdown(markdown, SkillSource::BuiltIn, None);
         }
         let mut seen_files = HashSet::new();
-        if let Some(directory) = user_skills_directory {
-            registry.load_directory(directory, SkillOrigin::User, &mut seen_files);
+        if let Some(root) = config_root {
+            registry.load_directory(
+                &root.join(SKILLS_DIRECTORY),
+                SkillOrigin::User,
+                &mut seen_files,
+            );
+            registry.load_tick_packages(root, &mut seen_files);
         }
         for directory in project_skill_directories(workdir) {
             registry.load_directory(&directory, SkillOrigin::Project, &mut seen_files);
@@ -345,10 +369,35 @@ Available Skills:
         })
     }
 
+    fn load_tick_packages(&mut self, config_root: &Path, seen_files: &mut HashSet<PathBuf>) {
+        let installed = match PackageStore::in_config_root(config_root).installed() {
+            Ok(installed) => installed,
+            Err(error) => {
+                self.warnings.push(format!(
+                    "the Skills of installed Tick packages are not loaded: {error}"
+                ));
+                return;
+            }
+        };
+        for broken in installed.broken {
+            self.warnings.push(format!(
+                "the Skills of Tick package {} are not loaded: it cannot be used ({}); install it again",
+                broken.name, broken.reason
+            ));
+        }
+        for package in &installed.packages {
+            self.load_directory(
+                &package.root.join(SKILLS_DIRECTORY),
+                SkillOrigin::TickPackage(package),
+                seen_files,
+            );
+        }
+    }
+
     fn load_directory(
         &mut self,
         directory: &Path,
-        origin: SkillOrigin,
+        origin: SkillOrigin<'_>,
         seen_files: &mut HashSet<PathBuf>,
     ) {
         let entries = match fs::read_dir(directory) {
@@ -390,20 +439,29 @@ Available Skills:
                     continue;
                 }
             };
-            let source = match origin {
-                SkillOrigin::User => SkillSource::User {
-                    path: canonical.clone(),
-                },
-                SkillOrigin::Project => SkillSource::Project {
-                    path: canonical.clone(),
-                },
+            let path = canonical.clone();
+            let parsed = match origin {
+                SkillOrigin::User => parse_skill(&markdown, SkillSource::User { path }),
+                SkillOrigin::Project => parse_skill(&markdown, SkillSource::Project { path }),
+                SkillOrigin::TickPackage(package) => parse_skill(
+                    &markdown,
+                    SkillSource::TickPackage {
+                        package: package.manifest.name.clone(),
+                        path,
+                    },
+                )
+                .map(|skill| skill.in_package(package)),
             };
-            self.load_markdown(&markdown, source, Some(&canonical));
+            self.register(parsed, Some(&canonical));
         }
     }
 
     fn load_markdown(&mut self, markdown: &str, source: SkillSource, path: Option<&Path>) {
-        match parse_skill(markdown, source) {
+        self.register(parse_skill(markdown, source), path);
+    }
+
+    fn register(&mut self, parsed: Result<SkillDefinition, SkillError>, path: Option<&Path>) {
+        match parsed {
             Ok(skill) if self.skills.contains_key(&skill.name) => self.warnings.push(format!(
                 "Skill `{}` from {} is ignored because that name is already registered",
                 skill.name,
@@ -455,9 +513,10 @@ pub fn expand_remote(
 }
 
 #[derive(Clone, Copy)]
-enum SkillOrigin {
+enum SkillOrigin<'a> {
     User,
     Project,
+    TickPackage(&'a InstalledPackage),
 }
 
 fn display_source(path: Option<&Path>) -> String {

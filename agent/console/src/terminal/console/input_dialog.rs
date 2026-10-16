@@ -34,6 +34,7 @@ pub(super) struct DialogState {
     picker_presentation: PickerPresentation,
     picker_search: Option<PickerSearch>,
     artifacts_picker: Option<super::super::artifacts_picker::ArtifactsPicker>,
+    ticks_panel: Option<super::super::ticks_panel::TicksPanel>,
     conversation_picker: Option<ConversationPicker>,
     menu_link: Option<(Uuid, String)>,
     menu_review: Option<MenuReviewState>,
@@ -217,6 +218,7 @@ impl State {
             ),
             picker_search: std::mem::replace(&mut self.picker_search, next.picker_search),
             artifacts_picker: std::mem::replace(&mut self.artifacts_picker, next.artifacts_picker),
+            ticks_panel: std::mem::replace(&mut self.ticks_panel, next.ticks_panel),
             conversation_picker: std::mem::replace(
                 &mut self.conversation_picker,
                 next.conversation_picker,
@@ -257,6 +259,15 @@ impl State {
         let chat = picker.chat;
         let next = DialogState {
             artifacts_picker: Some(picker),
+            ..DialogState::default()
+        };
+        self.install_user_dialog(chat, next);
+    }
+
+    pub(super) fn install_ticks_panel(&mut self, panel: super::super::ticks_panel::TicksPanel) {
+        let chat = panel.chat;
+        let next = DialogState {
+            ticks_panel: Some(panel),
             ..DialogState::default()
         };
         self.install_user_dialog(chat, next);
@@ -334,6 +345,36 @@ impl State {
             }
         }
         None
+    }
+
+    /// The `/ticks` panel `id`, shown, suspended behind an Agent request, or kept with another
+    /// Chat's dialog.
+    pub(super) fn ticks_panel_mut(
+        &mut self,
+        id: Uuid,
+    ) -> Option<&mut super::super::ticks_panel::TicksPanel> {
+        let is_it = |panel: &&mut super::super::ticks_panel::TicksPanel| panel.id() == id;
+        self.ticks_panel
+            .as_mut()
+            .filter(is_it)
+            .or_else(|| {
+                self.suspended_dialog
+                    .as_mut()
+                    .and_then(|dialog| dialog.ticks_panel.as_mut())
+                    .filter(is_it)
+            })
+            .or_else(|| {
+                self.dialog_cache
+                    .values_mut()
+                    .flat_map(|(active, suspended)| {
+                        active.ticks_panel.as_mut().into_iter().chain(
+                            suspended
+                                .as_mut()
+                                .and_then(|dialog| dialog.ticks_panel.as_mut()),
+                        )
+                    })
+                    .find(|panel| panel.id() == id)
+            })
     }
 
     pub(super) fn update_login(&mut self, menu: &Menu, address: &str, callback: bool) -> bool {
@@ -602,6 +643,8 @@ impl State {
             }
         } else if let Some(picker) = &self.artifacts_picker {
             picker.minimum_frame_rows()
+        } else if let Some(panel) = &self.ticks_panel {
+            panel.minimum_frame_rows()
         } else if self.conversation_picker.is_some() {
             4
         } else if let Some(surface) = &self.permissions_surface {
@@ -626,6 +669,8 @@ impl State {
             || {
                 if self.artifacts_picker.is_some() {
                     "Artifacts"
+                } else if self.ticks_panel.is_some() {
+                    "Tick packages"
                 } else if let Some(picker) = &self.conversation_picker {
                     picker.title()
                 } else if self.permissions_surface.is_some() {
@@ -674,6 +719,8 @@ impl State {
             self.menu_content_rows(menu, maximum)
         } else if let Some(picker) = &self.artifacts_picker {
             picker.content_rows()
+        } else if let Some(panel) = &self.ticks_panel {
+            panel.content_rows(self.width)
         } else if let Some(picker) = &self.conversation_picker {
             picker.content_rows()
         } else if let Some(surface) = &self.permissions_surface {
@@ -699,6 +746,7 @@ impl State {
             || self.workspace_trust.is_some()
             || self.permissions_surface.is_some()
             || self.artifacts_picker.is_some()
+            || self.ticks_panel.is_some()
             || self.conversation_picker.is_some()
             || self.help_open && self.overview.projection.is_none()
             || self.monitor.confirmation.is_some()
@@ -755,6 +803,8 @@ impl State {
         }
         let frame = if let Some(picker) = &mut self.artifacts_picker {
             Some(picker.frame(self.width, capacity, self.display))
+        } else if let Some(panel) = &mut self.ticks_panel {
+            Some(panel.frame(self.width, capacity, self.display))
         } else {
             self.conversation_picker
                 .as_mut()

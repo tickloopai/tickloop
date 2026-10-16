@@ -789,7 +789,7 @@ fn observation_values_keep_their_recorded_wire() {
                     ticks: vec!["Quote · AAPL.US".into()],
                     shells: 1,
                     pending: 1,
-                    connections: 0,
+                    views: Some(2),
                 }),
             })),
             ObservationValue::OtherTickhost(None),

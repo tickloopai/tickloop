@@ -1,9 +1,10 @@
-// Modified by Tick Loop to configure AP/US automatic-refresh endpoints; see ../README.md.
+// Modified by Tick Loop to take a token refresher; see ../README.md.
 use std::sync::Arc;
 
 use crate::{
     client::{DEFAULT_CALLBACK_PORT, OAuth, OAuthInner},
     error::OAuthResult,
+    refresher::TokenRefresher,
     storage::{TokenStorage, default_storage},
 };
 
@@ -20,7 +21,8 @@ pub struct OAuthBuilder {
     pub(crate) callback_port: u16,
     /// Token persistence backend
     pub(crate) storage: Arc<dyn TokenStorage>,
-    pub(crate) refresh_token_urls: Option<(oauth2::TokenUrl, oauth2::TokenUrl)>,
+    /// Renews tokens in place of the client's own refresh
+    pub(crate) refresher: Option<Arc<dyn TokenRefresher>>,
 }
 
 impl OAuthBuilder {
@@ -30,7 +32,7 @@ impl OAuthBuilder {
             client_id: client_id.into(),
             callback_port: DEFAULT_CALLBACK_PORT,
             storage: default_storage(),
-            refresh_token_urls: None,
+            refresher: None,
         }
     }
 
@@ -66,17 +68,11 @@ impl OAuthBuilder {
         self
     }
 
-    /// Set the AP and US token endpoints used for automatic refresh.
-    pub fn refresh_token_urls(
-        mut self,
-        ap_url: impl Into<String>,
-        us_url: impl Into<String>,
-    ) -> OAuthResult<Self> {
-        let parse = |url| oauth2::TokenUrl::new(url).map_err(|_| {
-            crate::error::OAuthError::Other("invalid refresh token URL".into())
-        });
-        self.refresh_token_urls = Some((parse(ap_url.into())?, parse(us_url.into())?));
-        Ok(self)
+    /// Renew tokens with `refresher` instead of the client's own refresh.
+    #[must_use]
+    pub fn token_refresher(mut self, refresher: impl TokenRefresher) -> Self {
+        self.refresher = Some(Arc::new(refresher));
+        self
     }
 
     /// Synchronously build the [`OAuth`] client.
@@ -125,7 +121,7 @@ impl OAuthBuilder {
             client_id: self.client_id.clone(),
             callback_port: self.callback_port,
             storage: Arc::clone(&storage),
-            refresh_token_urls: self.refresh_token_urls,
+            refresher: self.refresher,
             token: tokio::sync::Mutex::new(None),
         });
         let oauth = OAuth(inner);

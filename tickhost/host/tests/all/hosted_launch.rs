@@ -874,13 +874,14 @@ async fn the_management_hello_names_the_build_and_what_stopping_the_host_ends() 
         empty.occupancy,
         HostOccupancy {
             pending: Some(0),
+            views: Some(0),
             ..HostOccupancy::default()
         }
     );
 
     let mut controller = fixture.controller().await;
     let sleep = which("sleep");
-    fixture
+    let opened = fixture
         .open_terminal(&mut controller, &[&sleep, "30"])
         .await;
     let occupied = describe().await.occupancy;
@@ -888,6 +889,28 @@ async fn the_management_hello_names_the_build_and_what_stopping_the_host_ends() 
     assert_eq!(occupied.shells, 0);
     assert_eq!(occupied.pending, Some(0), "the open was answered");
     assert_eq!(occupied.connections, 1, "the controller's connection");
+    assert_eq!(occupied.views, Some(0), "a connection is not a view");
+
+    let _view = attach(&fixture, &opened, initial_size()).await;
+    let viewed = describe().await.occupancy;
+    assert_eq!(viewed.connections, 2);
+    assert_eq!(
+        viewed.views,
+        Some(1),
+        "only the attached view counts as one"
+    );
+    let (counter, work) = fixture.counter();
+    fixture.open(&mut controller, counter, &work).await.unwrap();
+    let protocol = describe().await.occupancy;
+    assert_eq!(
+        protocol.connections, 3,
+        "the counter's launcher connects too"
+    );
+    assert_eq!(
+        protocol.views,
+        Some(1),
+        "a protocol Tick's launcher is no view"
+    );
 
     ManagementConnection::connect(&fixture.paths.socket(), &fixture.key)
         .await
@@ -1788,6 +1811,77 @@ async fn launch_failures_are_reported_before_dispatch_and_the_host_continues() {
     );
     let opened = fixture.open(&mut controller, command, &work).await.unwrap();
     assert!(alive(opened["business_pid"].as_u64().unwrap() as u32));
+    shutdown(&fixture).await;
+}
+
+/// A program that explains on the terminal why it cannot start keeps its whole explanation in
+/// the launch failure. The launcher's own failure, written after it, is checked in
+/// `tickhost_connect::launch`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_program_that_exits_during_startup_keeps_its_whole_reason_in_the_failure() {
+    let fixture = Fixture::start().await;
+    let mut controller = fixture.controller().await;
+    let reason = "tick-sample: not authorized; run `tick-sample auth`";
+    let failed = fixture
+        .open(
+            &mut controller,
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("printf '%s\\n' '{reason}' >&2; exit 3"),
+            ],
+            fixture.directory.path(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(failed.code, "LaunchFailed", "{failed:?}");
+    assert!(failed.message.contains(reason), "{failed:?}");
+    shutdown(&fixture).await;
+}
+
+/// A launch failure says where a silent Tick stood instead of ending on an empty screen: one
+/// that exited printing nothing, and one whose launcher ran it but that never answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_tick_that_fails_to_start_says_where_it_stood() {
+    let fixture = Fixture::start().await;
+    let mut controller = fixture.controller().await;
+    let exited = fixture
+        .open(
+            &mut controller,
+            vec!["/usr/bin/false".into()],
+            fixture.directory.path(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (exited.code.as_str(), exited.message.as_str()),
+        (
+            "LaunchFailed",
+            "the Tick exited during startup; it printed nothing"
+        )
+    );
+
+    let silent = fixture
+        .open(
+            &mut controller,
+            vec![
+                env!("CARGO_BIN_EXE_tickhost").into(),
+                tickhost::cli::LAUNCH_COMMAND.into(),
+                "--".into(),
+                "/bin/sleep".into(),
+                "30".into(),
+            ],
+            fixture.directory.path(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (silent.code.as_str(), silent.message.as_str()),
+        (
+            "LaunchFailed",
+            "the Tick did not become ready within 10s: it did not answer tick/describe and tick/read; it printed nothing"
+        )
+    );
     shutdown(&fixture).await;
 }
 

@@ -267,6 +267,8 @@ async fn a_tickhost_of_another_build_that_runs_something_stays_until_the_user_re
     let occupancy = HostOccupancy {
         ticks: vec!["Quote board".into()],
         shells: 1,
+        connections: 3,
+        views: Some(1),
         ..nothing()
     };
     let fixture = Fixture::with_other_build(Business::Refused, other_build(occupancy.clone()));
@@ -294,7 +296,7 @@ async fn a_tickhost_of_another_build_that_runs_something_stays_until_the_user_re
                 ticks: occupancy.ticks,
                 shells: occupancy.shells,
                 pending: 0,
-                connections: occupancy.connections,
+                views: Some(1),
             }),
         })
     );

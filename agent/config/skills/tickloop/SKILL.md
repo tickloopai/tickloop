@@ -1,6 +1,6 @@
 ---
 name: tickloop
-description: Open, read or operate Ticks for stock quotes, candlestick charts and other live views, or subscribe a Loop to their updates. Use for price/chart requests without requiring the word Tick, and for Shell or Artifact update workflows.
+description: Show stock prices, quotes or K-line charts in Ticks, open or operate a Tick, or subscribe a Loop to Tick updates. Use it for requests such as seeing Tesla's stock price or opening a K-line chart, even without the word Tick, and for Shell or Artifact updates. Ticks run in the Tickhost and appear in this Chat's Monitor; a Herdr Pane shows one only when the user asks for a place.
 ---
 
 # Tickloop Ticks
@@ -18,7 +18,7 @@ Keep the complete `<type>:<id>` reference. Extension Ticks connect programs thro
 
 TaskStop stops only the current Loop's Agent command and retains its Ask/Deny and Plan behavior; user Shells and other Loops use explicit user UI stops. A program the user starts in a Herdr Pane or another terminal is not a Tick: to read or operate a program, open it as a Tick (section 2).
 
-Use the installed host tools as the authority for targets and capabilities. Start with `workspace_host` in Current host state; an installed multiplexer command or a repository name is not proof of the current environment. `tickhost` says whether this Agent can open Ticks, `name` and `integration` say whether a Herdr Pane can show them, and `tick_executable` is the bundled `tick` to launch.
+Use the installed host tools as the authority for targets and capabilities. Start with `workspace_host` in Current host state; an installed multiplexer command or a repository name is not proof of the current environment. `tickhost` says whether this Agent can open Ticks, `name` and `integration` say whether a Herdr Pane can show them, `reader_executable` is the bundled `tick-reader` to launch, and `tick_packages` lists the installed Tick packages with their login states.
 
 | Current host state | Action |
 | --- | --- |
@@ -33,7 +33,7 @@ For an unavailable branch, briefly name what is missing in ordinary language, wi
 
 ## 2. Open and operate Ticks
 
-"Show Tesla stock prices" requests a quote Tick even though the user did not say Tick. Prefer an existing matching instance in this Chat when the user asks to see information; open one if none exists. An explicit request to open a new Tick creates a new instance. A request to see a price uses Quote; a request for candlesticks or a chart uses Kline. A request explicitly asking for text only can use an ordinary data lookup instead. Opening, reading or listing a Tick never subscribes; use section 4 only for continued observation.
+“看看特斯拉股价” requests a Tick that shows the price even though the user did not say Tick. Prefer an existing matching instance in this Chat when the user asks to see information; open one if none exists. An explicit request to open a new Tick creates a new instance. A request explicitly asking for text only can use an ordinary data lookup instead. Opening, reading or listing a Tick never subscribes; use section 4 only for continued observation.
 
 ### Open a Tick
 
@@ -41,22 +41,17 @@ For an unavailable branch, briefly name what is missing in ordinary language, wi
 
 Call `ModifyTick` with `action: "open"`, a `command` argv array and optional `cwd`. The Tickhost runs the program: it needs no View or layout, takes no focus, joins this Chat's Monitor and is not subscribed. Omitted `cwd` uses the Agent's file work directory. Add a `placement` only when the user asks for a place (section 3).
 
-For a bundled Tick, use `workspace_host.tick_executable` as the executable; if it is null, explain that the companion `tick` is missing and needs to be built or installed (`make build` and `make install` include it) instead of searching project source for a launcher. The bundled `tick` always opens as an extension Tick. Build the argv from the requested view:
+Market data and other data sources come from the Tick packages the user installed. `workspace_host.tick_packages` lists each one's `name`, `version`, `description`, `executable` and `login`. Each package brings a Skill named `<package>:usage` that teaches its commands, arguments and login: load it with the Skill tool before opening that package's Ticks, and build `command` as it says. Any other Skill a package brings is also named `<package>:<skill>`. Open a package's program by its bare name `tick-<package>`; a program whose package declares the Tick protocol opens as an extension Tick without `protocol: true`. A package installed after this Chat began is listed and opens at once, but its Skill arrives only in a new Chat; until then run its `executable` with `--help` to learn its commands.
 
-| Requested view | Arguments after the executable |
-| --- | --- |
-| Stock price / market quote | `longbridge quote SYMBOL` |
-| K-line / candlestick chart | `longbridge kline SYMBOL` |
-| A Longbridge community member's posts | `longbridge community MEMBER_ID` |
-| Explicit offline chart demonstration | `builtin kline 700.HK` |
+When the data the user wants needs a package that `workspace_host.tick_packages` does not list, or the host reports that a Tick package is not installed, ask the user to install it from the marketplace page of `/ticks` in this Agent. The Tick marketplace offers packages such as `longbridge` for Longbridge quotes, K-lines and community posts and `futu` for Futu OpenD option pricing. Never install, update or uninstall a package yourself, and never search project source for a launcher or build one.
 
-`MEMBER_ID` is the number in the member's profile link, such as 91 in `https://longbridge.com/zh-CN/profiles/91`; there is no nickname search, so ask for the link when the user names someone only by nickname. The community Tick's `reply` tool posts publicly as the logged-in Longbridge user.
+A package's `login` says whether its data source is logged in: `logged_in`, `logged_out`, `expired`, `not_required` (the package needs no login) or `unknown` (its saved login could not be read). Before opening a package's Tick, check it: open at once when it is `logged_in` or `not_required`; otherwise ask the user to log in to that package from `/ticks` in this Agent, and open the Tick once they say they have. No Agent restart is needed: the state comes from the login Tickloop saved and is read again for every request.
 
-Use the broker symbol format: Tesla is `TSLA.US`, Apple is `AAPL.US`, and Tencent is `700.HK`. Clarify an ambiguous company or market before launching. For example, "Open a Tesla candlestick chart" means `command: [TICK_EXECUTABLE, "longbridge", "kline", "TSLA.US"]`. Omitted chart period uses the command's default; specify `--period` when the user asks for a period. The argv is always `PROVIDER TICK ...`: `longbridge` serves real quotes, account, news and community posts, `futu` serves option pricing from Futu OpenD, and `builtin` serves simulated data for every Tick; a provider that lacks the data a Tick needs refuses it and names the providers that have it. Use the executable's `--help`, `longbridge --help` or `longbridge kline --help` for other options and Tick types. A real stock request uses real data; the builtin demo is a separate, explicitly requested workflow.
+To read original documents, open the bundled Reader with `workspace_host.reader_executable` as the executable, followed by URLs or local files; if it is null, explain that the companion `tick-reader` is missing and needs to be built or installed (`make build` and `make install` include it). The bundled `tick-reader` always opens as an extension Tick.
 
 Any other program opens with the program itself first in `command`. Pass `protocol: true` for a program that speaks the Tick protocol, such as `["python3", "tick/examples/counter.py"]`; omit `protocol` for an ordinary interactive program (a REPL, `htop`, a log viewer), which opens as a terminal Tick. The host refuses the bundled `tickhost` as a command.
 
-The host checks local prerequisites before launching a bundled Tick. If authorization is missing, report the diagnostic and the authorization command (`TICK_EXECUTABLE longbridge auth`); an authorization failure is not a successful launch. Do not read credential files. After launch, read the returned `tick_instance_id` to confirm that the requested program and view are actually running, and report success only after that check. An `OutcomeUnknown` open may already have started a Tick: inspect what this Chat runs instead of opening another.
+A Tick whose data source refuses its login ends with an authorization diagnostic, even when `login` said `logged_in`: report it and ask the user to log in to that package again from `/ticks`, then open the Tick once they have; an authorization failure is not a successful launch. Logging in is the user's step in `/ticks`: never suggest `!` for a login or a terminal command instead, and never log in, log out, install, update or uninstall a package yourself. Do not read credential files. After launch, read the returned `tick_instance_id` to confirm that the requested program and view are actually running, and report success only after that check. An `OutcomeUnknown` open may already have started a Tick: inspect what this Chat runs instead of opening another.
 
 ### Show it to the user
 
@@ -64,7 +59,7 @@ The user opens a Tick from its Monitor row: Enter or a click shows a view of the
 
 ### Read, operate, close or reopen
 
-`ReadTick` returns an extension Tick's state (`seq`, `at`, and `data`, null until it has content) with its tool catalog, or a terminal Tick's screen text (at most 200 lines / 64 KiB) and its `exit`, null while the program runs. For an extension Tick, call `CallTickTool` with a declared `tool` and `args` matching its `input_schema`; query tools have `mutates: false` and actions have `mutates: true`. For a terminal Tick, call `ModifyTick` with `action: "send_input"`, the instance, and `text` and/or logical `keys` such as `Enter`, `Up` or `Ctrl-C`. Existing execution modes and permission rules govern each action. Verify changes by reading the same instance again. An extension Tick whose catalog changed after approval does not run the old call: read it again and prepare a fresh call.
+`ReadTick` returns an extension Tick's state (`seq`, `at`, and `data`, null until it has content) with its tool catalog, or a terminal Tick's screen text (at most 200 lines / 64 KiB) and its `exit`, null while the program runs. Null `data` means no content yet, not empty content: a Tick just opened may still be loading, so read it again shortly. A Tick that connects to its data source after opening reports `data.connection` until its content arrives: `state` `retrying` with the `error` it keeps retrying after, `not_authorized` with a `hint` (ask the user to log in to that package, as above), or `failed` with the `error` the source gave, which reopening with the same arguments does not fix; its tools fail with the same reason meanwhile. For an extension Tick, call `CallTickTool` with a declared `tool` and `args` matching its `input_schema`; query tools have `mutates: false` and actions have `mutates: true`. For a terminal Tick, call `ModifyTick` with `action: "send_input"`, the instance, and `text` and/or logical `keys` such as `Enter`, `Up` or `Ctrl-C`. Existing execution modes and permission rules govern each action. Verify changes by reading the same instance again. An extension Tick whose catalog changed after approval does not run the old call: read it again and prepare a fresh call.
 
 `ModifyTick` `close` ends the Tick and closes every view of it; so does the user's `x` on the Monitor row of a Tick this Chat opened. Hiding its view (Esc) or closing a Pane that shows it leaves it running. A Tick never ends for idling: it runs until it is closed, its Agent is stopped or the Tickhost is lost, and a terminal Tick whose program exited keeps its last screen readable until it is closed. When the Tickhost was lost, its Ticks are lost too; nothing restarts them on its own. `ModifyTick` `reopen` with the lost `tick_instance_id` starts a new instance from the recorded program after approval: it has a new identity and fresh state, and no subscription follows it, so subscribe again only if the user still wants updates. Reopen only when asked; the user can also reopen it from its Monitor row, keeping its subscriptions.
 

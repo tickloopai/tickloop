@@ -20,12 +20,12 @@ class Tickloop < Formula
   end
 
   def install
-    bin.install "tickloop", "tickhost", "tick"
+    bin.install "tickloop", "tickhost", "tick-reader"
   end
 
   test do
     assert_match(/^Usage: tickloop /, shell_output("#{bin}/tickloop --help"))
     assert_match(/^Usage: tickhost /, shell_output("#{bin}/tickhost --help"))
-    assert_match(/^Usage: tick /, shell_output("#{bin}/tick --help"))
+    assert_match(/^Usage: tick-reader /, shell_output("#{bin}/tick-reader --help"))
   end
 end

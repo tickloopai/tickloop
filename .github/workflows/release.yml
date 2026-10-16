@@ -106,7 +106,7 @@ jobs:
           fi
           unpacked=$(mktemp -d)
           tar -xzf "dist/tickloop-$PACKAGE_TARGET.tar.gz" -C "$unpacked"
-          for executable in tickloop tickhost tick; do
+          for executable in tickloop tickhost tick-reader; do
             arch "-$architecture" "$unpacked/$executable" --help > /dev/null
           done
 

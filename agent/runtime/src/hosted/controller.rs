@@ -769,7 +769,7 @@ impl HostController {
                     pending: host.occupancy.pending?,
                     ticks: host.occupancy.ticks,
                     shells: host.occupancy.shells,
-                    connections: host.occupancy.connections,
+                    views: host.occupancy.views,
                 })
             }),
         }))

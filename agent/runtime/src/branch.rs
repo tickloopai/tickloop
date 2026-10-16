@@ -230,7 +230,7 @@ impl Agent {
         let tools = self.create_chat_tools(&snapshot);
         let skills = tickloop_agent_config::skills::SkillRegistry::discover(
             &snapshot.workdir,
-            self.inner.user_skills_directory.as_deref(),
+            self.inner.config_root.as_deref(),
         );
         // 照 Claude Code `/branch`：以子 Chat 的 id 重新记录来源中仍在复制对话里的替换决定。
         let source_replacements = chats

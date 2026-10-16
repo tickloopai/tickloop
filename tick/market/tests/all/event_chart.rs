@@ -451,9 +451,9 @@ fn hk_closing_auction_publication_is_not_assumed_to_be_after_close() {
 }
 
 #[tokio::test]
-async fn demo_event_history_has_real_session_boundaries_and_explicit_demo_source() {
+async fn mock_event_history_has_real_session_boundaries_and_explicit_mock_source() {
     use time_tz::OffsetDateTimeExt;
-    let api = tick_builtin::DemoApi::new().unwrap();
+    let api = tick_test_support::MockApi::new().unwrap();
     let config = event(
         "2026-08-07",
         EventSession::AfterHours,
@@ -462,7 +462,7 @@ async fn demo_event_history_has_real_session_boundaries_and_explicit_demo_source
     let data = load_history(&api, "DEMO.US", CandleAdjust::None, &config)
         .await
         .unwrap();
-    assert_eq!(data.source, "demo");
+    assert_eq!(data.source, "mock");
     assert_eq!(
         data.window.first_regular_session.as_deref(),
         Some("2026-08-10")
@@ -496,7 +496,7 @@ async fn demo_event_history_has_real_session_boundaries_and_explicit_demo_source
 
 #[tokio::test]
 async fn large_event_windows_publish_bounded_pages_and_expose_the_next_offset() {
-    let api = tick_builtin::DemoApi::new().unwrap();
+    let api = tick_test_support::MockApi::new().unwrap();
     let mut config = config();
     config.range = EventRange::FiveSessions;
     let data = load_history(&api, "DEMO.US", CandleAdjust::None, &config)
@@ -527,7 +527,7 @@ async fn large_event_windows_publish_bounded_pages_and_expose_the_next_offset() 
 
 #[tokio::test]
 async fn an_event_window_publishes_a_summary_and_leaves_its_candles_to_event_history() {
-    let api = tick_builtin::DemoApi::new().unwrap();
+    let api = tick_test_support::MockApi::new().unwrap();
     let mut config = config();
     config.range = EventRange::FiveSessions;
     let data = load_history(&api, "DEMO.US", CandleAdjust::None, &config)
@@ -557,7 +557,7 @@ async fn an_event_window_publishes_a_summary_and_leaves_its_candles_to_event_his
 }
 
 struct CappedHistory {
-    demo: tick_builtin::DemoApi,
+    mock: tick_test_support::MockApi,
     offsets: Mutex<Vec<time::PrimitiveDateTime>>,
     repeats_page: bool,
 }
@@ -568,10 +568,10 @@ impl QuoteApi for CappedHistory {
         unreachable!()
     }
     async fn trading_days(&self, market: &str, range: DateRange) -> Result<Vec<time::Date>> {
-        self.demo.trading_days(market, range).await
+        self.mock.trading_days(market, range).await
     }
     async fn candles_by_date(&self, request: &CandleHistoryRequest) -> Result<Vec<Candle>> {
-        self.demo.candles_by_date(request).await
+        self.mock.candles_by_date(request).await
     }
     async fn candles_by_date_with_sessions(
         &self,
@@ -579,7 +579,7 @@ impl QuoteApi for CappedHistory {
         sessions: CandleSessions,
     ) -> Result<Vec<Candle>> {
         let mut candles = self
-            .demo
+            .mock
             .candles_by_date_with_sessions(request, sessions)
             .await?;
         candles.drain(..candles.len().saturating_sub(1_000));
@@ -595,7 +595,7 @@ impl QuoteApi for CappedHistory {
         assert_eq!(sessions, CandleSessions::All);
         self.offsets.lock().unwrap().push(before);
         let mut candles = self
-            .demo
+            .mock
             .candles_by_date_with_sessions(request, sessions)
             .await?;
         if !self.repeats_page {
@@ -614,14 +614,14 @@ impl QuoteApi for CappedHistory {
 #[tokio::test]
 async fn capped_history_pages_back_in_exchange_time_without_losing_pre_event_bars() {
     let api = CappedHistory {
-        demo: tick_builtin::DemoApi::new().unwrap(),
+        mock: tick_test_support::MockApi::new().unwrap(),
         offsets: Mutex::default(),
         repeats_page: false,
     };
     for range in [EventRange::Auto, EventRange::FiveSessions] {
         let mut config = config();
         config.range = range;
-        let expected = load_history(&api.demo, "DEMO.US", CandleAdjust::None, &config)
+        let expected = load_history(&api.mock, "DEMO.US", CandleAdjust::None, &config)
             .await
             .unwrap();
         let actual = load_history(&api, "DEMO.US", CandleAdjust::None, &config)
@@ -645,7 +645,7 @@ async fn capped_history_pages_back_in_exchange_time_without_losing_pre_event_bar
 #[tokio::test]
 async fn repeated_provider_page_is_an_error_instead_of_a_partial_success() {
     let api = CappedHistory {
-        demo: tick_builtin::DemoApi::new().unwrap(),
+        mock: tick_test_support::MockApi::new().unwrap(),
         offsets: Mutex::default(),
         repeats_page: true,
     };
@@ -657,7 +657,7 @@ async fn repeated_provider_page_is_an_error_instead_of_a_partial_success() {
 
 #[tokio::test]
 async fn compressed_event_plot_identifies_volume_sums_and_mixed_sessions() {
-    let api = tick_builtin::DemoApi::new().unwrap();
+    let api = tick_test_support::MockApi::new().unwrap();
     let mut config = config();
     config.range = EventRange::FiveSessions;
     let mut view = KlineView::with_event(request(), config).unwrap();
@@ -695,7 +695,7 @@ async fn compressed_event_plot_identifies_volume_sums_and_mixed_sessions() {
 
 #[tokio::test]
 async fn daily_event_marker_uses_known_date_without_inventing_publication_time() {
-    let api = tick_builtin::DemoApi::new().unwrap();
+    let api = tick_test_support::MockApi::new().unwrap();
     let mut config = config();
     config.published_at = None;
     config.view = tick_market::event_chart::EventChartMode::Daily;

@@ -9,32 +9,51 @@ ARGS ?=
 CARGO_PACKAGE := -p tickloop-agent
 PACKAGE_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
+TICK_PACKAGES := longbridge futu
+TICKS_CHECKOUT ?= $(HOME)/github/ticks
 
-.PHONY: dev build install package site test check release release-site release-docs prototype-earnings-review
+.PHONY: dev build install package site test check release release-site release-docs prototype-earnings-review package-ticks install-ticks publish-ticks
 
-## Start in the current directory with the global configuration; example: make dev ARGS="-c"
-dev:
+## Install the Tick packages from this checkout, then start in the current directory with the global configuration; example: make dev ARGS="-c"
+dev: install-ticks
 	"$(DEV_LAUNCHER)" $(ARGS)
 
 build:
-	cargo build --locked $(CARGO_PACKAGE) -p tickloop-tickhost -p tickloop-tick --bins
+	cargo build --locked $(CARGO_PACKAGE) -p tickloop-tickhost -p tickloop-tick-reader --bins
 
 install:
 	cargo install --locked --path agent/tickloop --bins
 	cargo install --locked --path tickhost/host --bin tickhost
-	cargo install --locked --path tick/cli --bin tick
+	cargo install --locked --path tick/reader --bin tick-reader
 
-## Package the Agent, the Tickhost and example Ticks.
+## Package the Agent, the Tickhost and the Reader.
 package:
-	cargo build --locked --release $(CARGO_PACKAGE) -p tickloop-tickhost -p tickloop-tick --bins --target "$(PACKAGE_TARGET)" --target-dir target
+	cargo build --locked --release $(CARGO_PACKAGE) -p tickloop-tickhost -p tickloop-tick-reader --bins --target "$(PACKAGE_TARGET)" --target-dir target
 	@mkdir -p dist
-	tar -czf "$(PACKAGE_ARCHIVE)" -C "target/$(PACKAGE_TARGET)/release" tickloop tickhost tick
+	tar -czf "$(PACKAGE_ARCHIVE)" -C "target/$(PACKAGE_TARGET)/release" tickloop tickhost tick-reader
 	@printf 'Package: %s\n' "$(PACKAGE_ARCHIVE)"
 
 ## 在本地构建官网，输出到 site/dist
 site:
 	npm --prefix site ci
 	npm --prefix site run build
+
+## Build the Tick packages for Apple Silicon into dist/ticks and print their marketplace.json entries.
+package-ticks:
+	scripts/package-ticks.sh $(TICK_PACKAGES)
+
+## Package the Tick packages, then install each with the tickloop built from this checkout.
+install-ticks:
+	@TICK_PACKAGE_QUIET=1 scripts/package-ticks.sh $(TICK_PACKAGES)
+	@echo "Building tickloop…"
+	@cargo build --locked --quiet -p tickloop-agent --bin tickloop
+	@for package in $(TICK_PACKAGES); do \
+		cargo run --locked --quiet -p tickloop-agent --bin tickloop -- tick install --path "dist/ticks/$$package" || exit 1; \
+	done
+
+## Prepare the release of the Tick packages in the tickloopai/ticks checkout TICKS_CHECKOUT and print the commands that publish it; it publishes nothing.
+publish-ticks:
+	scripts/publish-ticks.sh "$(TICKS_CHECKOUT)" $(TICK_PACKAGES)
 
 test:
 	@cargo nextest --version >/dev/null 2>&1 || { echo 'make test requires cargo-nextest; install it with: cargo install --locked cargo-nextest' >&2; exit 1; }
