@@ -13,6 +13,7 @@ mod auto_settings;
 mod auto_setup;
 mod branch;
 mod family;
+mod family_tree;
 pub mod file_history;
 mod handback;
 mod host_context;
@@ -67,10 +68,10 @@ use tool_execution::{ToolCallOutcome, ToolInvocation, ToolRegistry};
 mod commands;
 mod permission_management;
 mod plan;
+mod shared_tasks;
 mod tick_content;
 mod tick_subscriptions;
 mod tick_trim;
-mod todo_lifecycle;
 mod triggers;
 mod user_shell;
 #[cfg(test)]
@@ -282,6 +283,7 @@ struct Inner {
     /// 本进程内设置读写的次序：写入设置并同步已加载的 Chat、以及读取设置并加入新 Chat 都在
     /// 持有它时完成，保证已加载的 Chat 与设置文件一致。总在 `chats` 锁之前获取。
     settings_writes: Mutex<()>,
+    task_tools_enabled: AtomicBool,
     /// 最近一次为各 Chat 读取用户设置时发现的问题。
     settings_warnings: std::sync::Mutex<HashMap<ChatId, Vec<String>>>,
     provider_failures:
@@ -369,9 +371,11 @@ impl ChatBookkeeping {
 #[derive(Clone)]
 struct Chat {
     family_generation: u64,
+    family_stopping: bool,
+    task_checkpoint_pending: bool,
+    family_finishing: HashSet<RunId>,
     snapshot: ChatSnapshot,
     bookkeeping: ChatBookkeeping,
-    todo_completion_graces: HashMap<LoopId, todo_lifecycle::CompletionGrace>,
     start_new_tool_result_message: bool,
     /// Claude Code's `needsPlanModeExitAttachment`: the user left Plan mode without approving a
     /// plan, so the next request owes the model the exited-plan-mode notice.
@@ -438,6 +442,7 @@ struct ActiveEventClaim {
 
 #[derive(Default)]
 struct SubmissionOptions {
+    task_delegation: Option<Receipt>,
     attachment_admission: Option<family::AttachmentAdmission>,
     family_generation: Option<u64>,
     contexts: Vec<InputContext>,
@@ -468,8 +473,11 @@ struct PermissionAnswer {
 }
 
 struct HostAdmission<'a> {
+    tool_name: &'a str,
+    expected_task_binding: Option<Option<tickloop_agent_protocol::TaskExecutionBinding>>,
     session_evaluation: &'a session_permissions::SessionPermissionEvaluation,
     policy_revision: u64,
+    ancestor_revisions: &'a [(ChatId, u64)],
     host_permission: Option<crate::host_tools::HostToolPermission>,
     approval_path: ApprovalPath,
     direct_basis: denials::DirectApprovalBasis,
@@ -728,6 +736,7 @@ fn answerable_permission_request(
 
 fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnapshot {
     ChatSnapshot {
+        task_tools_enabled: false,
         subagent_reports: BTreeMap::new(),
         failure_events: Vec::new(),
         provider_failures: HashMap::new(),
@@ -740,6 +749,8 @@ fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnaps
         branch_origin: None,
         delegation: None,
         family_completions: Vec::new(),
+        task_boards: BTreeMap::new(),
+        task_board: None,
         family_inputs: BTreeMap::new(),
         sent_agent_messages: BTreeMap::new(),
         generated_title: None,
@@ -803,6 +814,11 @@ impl Agent {
             self.inner.host_tools.read().unwrap().clone(),
             self.inner.tick_stream_installed.load(Ordering::SeqCst),
             self.inner.host_options.prompt_policy,
+            if chat.snapshot.task_tools_enabled {
+                shared_tasks::TaskToolAccess::Enabled
+            } else {
+                shared_tasks::TaskToolAccess::Disabled
+            },
         )
         .definitions()
     }
@@ -1151,8 +1167,11 @@ impl Agent {
                     });
             let legacy_path = boundary_id
                 .and_then(|_| self.inner.recorder.as_ref()?.path_for_chat(receipt.chat_id));
+            let mut snapshot = chat.snapshot.clone();
+            snapshot.policy =
+                delegation::effective_policy(&chats, receipt).map_err(AgentError::Invalid)?;
             (
-                chat.snapshot.clone(),
+                snapshot,
                 chat.bookkeeping.clone(),
                 chat.client.clone(),
                 boundary_id,
@@ -1442,8 +1461,38 @@ impl Agent {
         chat_id: ChatId,
         loop_id: LoopId,
     ) -> Result<Vec<OperationRecord>, AgentError> {
-        self.end_goal(chat_id, loop_id, LoopState::Stopped, None)
+        let is_child = self
+            .inner
+            .chats
+            .lock()
             .await
+            .get(&chat_id)
+            .ok_or(AgentError::NotFound)?
+            .snapshot
+            .delegation
+            .is_some();
+        if is_child {
+            if !self
+                .snapshot(chat_id)
+                .await?
+                .loops
+                .iter()
+                .any(|goal| goal.id == loop_id)
+            {
+                return Err(AgentError::NotFound);
+            }
+            let stopped = self.stop_subagent_tree(chat_id, None).await?;
+            if !stopped.failures.is_empty() {
+                return Err(AgentError::Invalid(format!(
+                    "Subagent subtree stop was incomplete: {}",
+                    serde_json::json!({"failures":stopped.failures,"unresolved_operations":stopped.operations})
+                )));
+            }
+            Ok(stopped.operations)
+        } else {
+            self.end_goal(chat_id, loop_id, LoopState::Stopped, None)
+                .await
+        }
     }
 
     pub async fn interrupt(&self, chat_id: ChatId) -> Result<Vec<OperationRecord>, AgentError> {
@@ -1632,6 +1681,9 @@ impl Agent {
             .as_ref()
             .and_then(tickloop_agent_config::UserSettings::root)
             .map(|root| root.join("skills"));
+        let task_tools_enabled = settings
+            .as_ref()
+            .is_some_and(|settings| settings.load().task_tools_enabled());
         let agent = Self {
             inner: Arc::new(Inner {
                 selected_model: std::sync::Mutex::new(chat_settings::SelectedModel {
@@ -1642,6 +1694,7 @@ impl Agent {
                 host_options,
                 user_skills_directory,
                 settings_writes: Mutex::new(()),
+                task_tools_enabled: AtomicBool::new(task_tools_enabled),
                 settings_warnings: std::sync::Mutex::new(HashMap::new()),
                 provider_failures: std::sync::Mutex::new(HashMap::new()),
                 trusted_working_directories: std::sync::Mutex::new(HashSet::new()),
@@ -1811,6 +1864,7 @@ impl Agent {
                 snapshot.model = parent.model;
                 snapshot.reasoning_effort = parent.reasoning_effort;
                 snapshot.thinking_enabled = parent.thinking_enabled;
+                snapshot.task_tools_enabled = parent.task_tools_enabled;
                 snapshot.additional_directories = metadata.ceiling.additional_directories.clone();
                 snapshot.policy = metadata.ceiling.policy.clone();
                 snapshot.delegation = Some(metadata);
@@ -1849,9 +1903,11 @@ impl Agent {
             id,
             Chat {
                 family_generation: 0,
+                family_stopping: false,
+                task_checkpoint_pending: false,
+                family_finishing: HashSet::new(),
                 snapshot,
                 bookkeeping,
-                todo_completion_graces: HashMap::new(),
                 start_new_tool_result_message: false,
                 needs_plan_mode_exit_notice: false,
                 active: None,
@@ -2132,6 +2188,7 @@ impl Agent {
         options: SubmissionOptions,
     ) -> Result<Receipt, AgentError> {
         let SubmissionOptions {
+            task_delegation,
             attachment_admission,
             family_generation,
             contexts,
@@ -2161,6 +2218,9 @@ impl Agent {
             Self::validate_attachment_admission(&chats, &sessions, chat_id, goal, admission)?;
         }
         let original = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        if original.family_stopping {
+            return Err(AgentError::Invalid("Subagent subtree is stopping".into()));
+        }
         if family_generation.is_some_and(|expected| {
             expected != original.family_generation
                 || original
@@ -2375,6 +2435,11 @@ impl Agent {
             *context = candidate;
         }
         drop(chats);
+        if let Some(parent) = task_delegation {
+            self.bind_task_delegate(&parent, &receipt)
+                .await
+                .map_err(AgentError::Storage)?;
+        }
         let next = match self.next_run(chat_id).await {
             Ok(next) => next,
             Err(error) => {
@@ -2460,6 +2525,9 @@ impl Agent {
                 return Err(tickloop_agent_model::ModelError::Cancelled.into());
             }
         }
+        self.acknowledge_task_assignments(receipt)
+            .await
+            .map_err(AgentError::Invalid)?;
         if self.maybe_compact(receipt, cancel.clone()).await? {
             let provider = self.inner.host_tools.read().unwrap().clone();
             if let Some(provider) = provider {
@@ -2480,6 +2548,7 @@ impl Agent {
         let workspace_host = crate::host_tools::current_workspace_host(
             self.inner.host_tools.read().unwrap().as_deref(),
         );
+        let family_roster = self.family_agents(receipt.chat_id).await?;
         {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&receipt.chat_id).unwrap();
@@ -2526,6 +2595,10 @@ impl Agent {
                 "family_temp_directory": chat.tools.family_temp_directory(),
                 "scratchpad": chat.tools.family_temp_directory().join(tickloop_agent_tools::SCRATCHPAD_SUBDIRECTORY),
                 "delegation": chat.snapshot.delegation,
+                "family_members": family_roster.iter().map(|member| serde_json::json!({
+                    "chat_id": member.chat_id, "parent_chat_id": member.parent_chat_id,
+                    "name": member.handle, "depth": member.depth, "state": member.availability,
+                })).collect::<Vec<_>>(),
                 "workspace_host": workspace_host,
                 "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
                 "artifact_ticks": chat.snapshot.artifact_ticks,
@@ -2533,7 +2606,6 @@ impl Agent {
                 "chat_goals": chat.snapshot.loops,
                 "execution_mode": chat.snapshot.policy.mode,
                 "plan": chat.snapshot.plans.iter().find(|plan| plan.loop_id == receipt.loop_id),
-                "progress": chat.snapshot.progress.iter().find(|progress| progress.loop_id == receipt.loop_id),
                 "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
             });
             let plan_mode = self.plan_mode_section(chat, receipt.loop_id);
@@ -2650,7 +2722,7 @@ impl Agent {
         let invalid_call = response.output.content.iter().any(|content| {
             if let Content::ToolUse { id, name, input } = content {
                 id.is_empty()
-                    || !available_tools.contains(name)
+                    || (!available_tools.contains(name) && !shared_tasks::is_task_tool(name))
                     || !input.is_object()
                     || !used_calls.insert(id.clone())
             } else {
@@ -2782,6 +2854,11 @@ impl Agent {
             }
         }
         let mut chats = self.inner.chats.lock().await;
+        if let Some(expected) = admission.expected_task_binding
+            && shared_tasks::binding_for_tool(&chats, receipt, admission.tool_name)? != expected
+        {
+            return Err("task execution binding changed before host admission".into());
+        }
         let session_context = self.inner.session_permissions.lock().await;
         delegation::check_call(
             &chats,
@@ -2792,27 +2869,25 @@ impl Agent {
             None,
             None,
         )?;
-        let chat = chats.get_mut(&receipt.chat_id).unwrap();
         let current_session_operation = SessionPermissionOperation::from_normalized(
             operation.name.clone(),
             permission_input.clone(),
-            session_permissions::capture_workspace_scope(&configured_workspace_for_chat(chat))
-                .map_err(|error| error.to_string())?,
+            session_permissions::capture_workspace_scope(&configured_workspace_for_chat(
+                &chats[&receipt.chat_id],
+            ))
+            .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
-        let current_decision = host_tool_decision(
-            chat.snapshot.policy.explicit_decision_with_session(
-                &operation.name,
-                permission_input,
-                receipt.loop_id,
-                admission.session_evaluation.decision,
-            ),
+        let (authority, _) = delegation::host_authority(
+            &chats,
+            &session_context,
+            receipt,
+            operation,
+            permission_input,
             admission.host_permission,
-            chat.snapshot.policy.mode,
-            admission.host_permission
-                == Some(crate::host_tools::HostToolPermission::PrivateArtifactWrite)
-                && chat.has_human_input_for_run(receipt.run_id),
-        );
+            admission.session_evaluation.decision,
+        )?;
+        let chat = chats.get_mut(&receipt.chat_id).unwrap();
         let permission_is_current = session_context.revalidate(
             &admission.session_evaluation.token,
             PermissionOwner::new(receipt.chat_id, receipt.loop_id)
@@ -2822,9 +2897,7 @@ impl Agent {
         if cancel.is_cancelled()
             || chat.active_run != Some(receipt.run_id)
             || !permission_is_current
-            || current_decision == Decision::Deny
-            || (chat.snapshot.policy.revision != admission.policy_revision
-                && current_decision != Decision::Allow)
+            || !authority.still_admits(admission.policy_revision, admission.ancestor_revisions)
         {
             return Err("host operation permission changed before admission".into());
         }
@@ -2877,6 +2950,7 @@ impl Agent {
                 if let Some(provider) = host_provider {
                     let _ = provider.refresh(cancel.clone()).await;
                 }
+                self.refresh_task_tools_setting().await.map_err(|error| error.to_string())?;
                 self.ensure_handback_requirement(&receipt).await?;
                 self.pin_delegated_artifact_account(receipt.chat_id).await?;
                 self.synchronize_remote_skills(&receipt).await;
@@ -2888,6 +2962,7 @@ impl Agent {
                         self.inner.host_tools.read().unwrap().clone(),
                         self.inner.tick_stream_installed.load(Ordering::SeqCst),
                         self.inner.host_options.prompt_policy,
+                        shared_tasks::tool_access(&chats, &receipt),
                     )
                 };
                 request.tools = registry.definitions();
@@ -2915,6 +2990,14 @@ impl Agent {
                     self.emit(chat, &receipt, EventKind::AssistantMessageCommitted { message_id: assistant_message_id, tool_calls: calls.clone() });
                 }
                 if calls.is_empty() {
+                    if self.wait_for_subagents(&receipt, &cancel).await?
+                        || self.wait_for_task_commands(&receipt, &cancel).await?
+                    {
+                        self.merge_queued_messages(&receipt).await.map_err(|error| error.to_string())?;
+                        let chats = self.inner.chats.lock().await;
+                        request = self.continuation_request(&chats[&receipt.chat_id])?;
+                        continue;
+                    }
                     let mut chats = self.inner.chats.lock().await;
                     let chat = chats.get_mut(&receipt.chat_id).unwrap();
                     if handback::remind(chat, &receipt) {
@@ -3044,6 +3127,7 @@ impl Agent {
         }.await;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&receipt.chat_id)?;
+        chat.family_finishing.insert(receipt.run_id);
         let finished_claim = chat.active_event_claims.remove(&receipt.run_id);
         chat.snapshot.pending_thinking.remove(&receipt.run_id);
         if chat.active_run == Some(receipt.run_id) {
@@ -3161,6 +3245,7 @@ impl Agent {
             self.disarm_feedback_lease(receipt.chat_id, receipt.loop_id)
                 .await;
         }
+        self.settle_task_claims(&receipt).await;
         let next = match self.next_run(receipt.chat_id).await {
             Ok(next) => next,
             Err(error) => {
@@ -3177,6 +3262,9 @@ impl Agent {
         if finished_snapshot.delegation.is_some() {
             self.record_family_completion(&receipt, &finished_snapshot)
                 .await;
+        }
+        if let Some(chat) = self.inner.chats.lock().await.get_mut(&receipt.chat_id) {
+            chat.family_finishing.remove(&receipt.run_id);
         }
         next
     }
@@ -3355,6 +3443,9 @@ impl Agent {
             let admission = {
                 let mut chats = self.inner.chats.lock().await;
                 let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+                if chat.family_stopping {
+                    return Ok(None);
+                }
                 self.select_next_run(chat, None)?
             };
             match admission {
@@ -4113,18 +4204,16 @@ impl Agent {
             .ok_or(AgentError::NotFound)
     }
 
-    pub async fn snapshot(&self, chat: ChatId) -> Result<ChatSnapshot, AgentError> {
-        self.inner
-            .chats
-            .lock()
-            .await
-            .get(&chat)
-            .map(|chat| {
-                let mut snapshot = chat.snapshot.clone();
-                snapshot.provider_failures = self.inner.provider_failures.lock().unwrap().clone();
-                snapshot
-            })
-            .ok_or(AgentError::NotFound)
+    pub async fn snapshot(&self, chat_id: ChatId) -> Result<ChatSnapshot, AgentError> {
+        let chats = self.inner.chats.lock().await;
+        let mut snapshot = chats
+            .get(&chat_id)
+            .ok_or(AgentError::NotFound)?
+            .snapshot
+            .clone();
+        snapshot.task_board = shared_tasks::view(&chats, chat_id);
+        snapshot.provider_failures = self.inner.provider_failures.lock().unwrap().clone();
+        Ok(snapshot)
     }
 
     pub async fn take_queued_inputs(
@@ -4504,7 +4593,7 @@ pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
         .chain(interaction::definitions(false))
         .chain(tick_subscriptions::definitions())
         .chain(delegation::definitions())
-        .chain(agent_messages::definitions(false))
+        .chain(agent_messages::definitions())
         .map(|definition| definition.name)
         .chain(std::iter::once(
             tickloop_agent_config::skills::SKILL_TOOL_NAME.into(),

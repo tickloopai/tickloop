@@ -502,16 +502,6 @@ impl FamilyScript {
                     "SubagentHandback",
                     serde_json::json!({ "message": BACKGROUND_REPORT }),
                 )
-            } else if !has_tool_result(request, "todos") {
-                call(
-                    "todos",
-                    "TodoWrite",
-                    serde_json::json!({"todos": [{
-                        "content": "Check the config",
-                        "status": "in_progress",
-                        "activeForm": "Checking the config"
-                    }]}),
-                )
             } else if !has_tool_result(request, "config") {
                 call(
                     "config",
@@ -675,13 +665,6 @@ async fn followed_and_reopened_family_conversations_show_agent_communication_ali
         says(snapshot, "The scan is done.") && snapshot.family_completions.len() == 2
     })
     .await;
-    assert!(
-        snapshot
-            .events
-            .iter()
-            .any(|event| matches!(event.kind, EventKind::ProgressUpdated { .. })),
-        "the run updated its Todo progress"
-    );
     let colors = agent_messaging::catalog_colors(&agent.catalog().await.unwrap());
 
     let followed = followed_view(chat, &workdir, &snapshot, colors.clone());

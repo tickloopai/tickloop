@@ -48,6 +48,7 @@ pub(super) struct AgentConfiguration {
     pub(super) pending_model: Option<ModelConfig>,
     pub(super) reasoning_effort: Option<ReasoningEffort>,
     pub(super) thinking_enabled: bool,
+    pub(super) task_tools_enabled: bool,
     pub(super) execution_mode: ExecutionMode,
     pub(super) additional_directories: Vec<PathBuf>,
     /// The daemon's delegation fact for this Agent, never inferred from the visible tree.
@@ -61,6 +62,7 @@ impl AgentConfiguration {
             pending_model: status.pending_model.clone(),
             reasoning_effort: status.reasoning_effort,
             thinking_enabled: status.thinking_enabled,
+            task_tools_enabled: status.task_tools_enabled,
             execution_mode: status.policy.mode,
             additional_directories: status.additional_directories.clone(),
             delegated: status.delegation.is_some(),
@@ -334,6 +336,7 @@ mod tests {
             pending_model: None,
             reasoning_effort: None,
             thinking_enabled: true,
+            task_tools_enabled: false,
             execution_mode: ExecutionMode::Auto,
             additional_directories: Vec::new(),
             delegated: false,

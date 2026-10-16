@@ -44,6 +44,7 @@
             "workdir": "/work/project",
             "state": "Running",
             "run_id": "00000000-0000-0000-0000-000000000020",
+            "run_started_at": 1000,
             "title": "Counter check",
             "has_work": true,
             "updated_at": 2000,

@@ -24,6 +24,12 @@ pub type RunId = Uuid;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChatSnapshot {
+    #[serde(default)]
+    pub task_tools_enabled: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub task_boards: BTreeMap<LoopId, crate::TaskBoard>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_board: Option<crate::TaskBoard>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub subagent_reports: BTreeMap<RunId, crate::SubagentReport>,
     #[serde(default)]
@@ -316,6 +322,11 @@ pub enum EventKind {
     PlanUpdated {
         plan: Plan,
     },
+    TaskBoardChanged {
+        root_chat_id: ChatId,
+        root_loop_id: LoopId,
+        revision: u64,
+    },
     ProgressUpdated {
         progress: Progress,
     },
@@ -408,6 +419,8 @@ pub enum OperationState {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OperationRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_binding: Option<crate::TaskExecutionBinding>,
     pub id: Uuid,
     pub loop_id: LoopId,
     pub run_id: RunId,

@@ -21,6 +21,7 @@ mod auto_setup_surface;
 mod child_config_tests;
 mod clipboard;
 mod clipboard_hint;
+mod completed_tasks;
 mod completion;
 mod console;
 mod conversation;
@@ -126,8 +127,8 @@ use tickloop_agent_protocol::{
     PermissionChange, PermissionRule, PermissionScope, PromptPolicy, QuestionRequest,
     QueuedInputKind, ReasoningEffort, Receipt, ShellTaskNotice, ShellTaskOrigin,
     ShellTaskPromptWatchdog, ShellTaskState, TakenBackPrompt, TaskNotification,
-    TaskNotificationStatus, TodoItem, Trigger, TriggerPromptSource, TriggerSource, Usage,
-    UserInput, UserShellRecord, UserShellState, ViewRef,
+    TaskNotificationStatus, Trigger, TriggerPromptSource, TriggerSource, Usage, UserInput,
+    UserShellRecord, UserShellState, ViewRef,
 };
 use workflows::Workflow;
 
@@ -953,7 +954,7 @@ Subagents wear the colour they were given at creation; the input takes the colou
 The key hints always end the screen; notices share that row.
 shift+up/down focuses Monitor's Shells group; enter opens the selected Shell.
 enter or a click on a hosted Tick or a Shell in Monitor opens its view: in a Herdr popup inside Herdr (the popup plugin is offered once for registration), otherwise full screen here; a lone esc closes it and the Tick keeps running, ctrl+b esc sends esc and ctrl+b ctrl+b sends ctrl+b to the Tick; a Shell's view only shows it. s stops a running Shell after confirmation; x does what its hint says: it closes a running Tick this Chat opened, cancels the subscriptions of one only they show, or removes a finished row. enter on a Tick that no longer runs reopens it in place, keeping its subscriptions unless unchecked; f subscribes a Tick at high.
-Each Agent's own Todos stay below Working, including while idle, with a 30-second grace after all items complete; rewrites do not extend it.
+The shared tasks summary appears only when tasks exist. Ctrl+T expands or focuses it; j/k and ctrl+n/p select, Enter shows details, Esc returns to the editor.
 Mode and model stay right-aligned on the lower divider; Context appears only with confirmed nonzero rounded usage.
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
 /loops opens Loop management; /loops new starts another goal in this Chat; /loops UUID selects one.
@@ -1422,7 +1423,7 @@ fn initialize_startup_console(
         execution_mode.to_string(),
         safe_text(&config.model),
         initial_context_usage(config),
-        Vec::new(),
+        None,
     )?;
     write_banner(console, config, workdir)?;
     show_settings_warnings(console, warnings)?;
@@ -1698,6 +1699,8 @@ async fn interact(
     let mut eof = false;
     let mut failed = false;
     let mut status_dirty = true;
+    let mut completed_task_retention = completed_tasks::CompletedTaskRetention::default();
+    let mut completed_task_cleanups = tokio::task::JoinSet::new();
     let mut activity_dirty = false;
     // Thinking text arrived since the activity row was last drawn; the next animation frame
     // shows it, so a fast stream redraws at the frame rate rather than once per delta.
@@ -1958,6 +1961,7 @@ async fn interact(
             cached_activity_status = None;
             console.set_activity_interruptible(false)?;
             if overview_active {
+                completed_task_retention.observe(None, std::time::Instant::now());
                 // The overview heading and dispatch line carry counts and directory; the status
                 // row keeps the latest action feedback until another action replaces it.
                 console.set_activity(None)?;
@@ -2042,11 +2046,30 @@ async fn interact(
                         .get(&status.model.provider_id)
                         .map(|failure| failure.summary()),
                 )?;
+                let visible_task_board = if !status.task_tools_enabled {
+                    None
+                } else if status.delegation.is_some() {
+                    status.task_board.clone()
+                } else {
+                    goal.and_then(|id| status.task_boards.get(&id).cloned())
+                };
+                if let Some(cleanup) = completed_task_retention.observe(
+                    if eof {
+                        None
+                    } else {
+                        visible_task_board.as_ref()
+                    },
+                    std::time::Instant::now(),
+                ) {
+                    let agent = agent.clone();
+                    completed_task_cleanups
+                        .spawn(async move { agent.clear_completed_tasks(chat, cleanup).await });
+                }
                 console.update_status_area(
                     status.policy.mode.to_string(),
                     safe_text(&status.model.model),
                     context_usage(&status),
-                    current_loop_todos(&status, goal),
+                    visible_task_board,
                 )?;
                 let running_receipt = pending
                     .values()
@@ -2215,6 +2238,7 @@ async fn interact(
                     &safe_text(status.trim_start_matches(" · ")),
                 )?;
             } else {
+                completed_task_retention.observe(None, std::time::Instant::now());
                 let draft = agent.configuration(ConfigTarget::NewDraft).await;
                 let _frame_hold = console.hold_frames()?;
                 console.set_activity(None)?;
@@ -2226,7 +2250,7 @@ async fn interact(
                         draft.execution_mode.to_string(),
                         safe_text(&draft.model.model),
                         initial_context_usage(&draft.model),
-                        Vec::new(),
+                        None,
                     )?;
                 }
             }
@@ -2308,7 +2332,6 @@ async fn interact(
             && reply_lines
                 .values()
                 .any(|reply| Some(reply.chat_id) == selected_chat && reply.has_complete_line());
-        let todo_refresh_pending = interactive && console.todo_refresh_pending()?;
         let prefers_reduced_motion =
             interactive && console.display_preferences()?.prefers_reduced_motion;
         if interactive
@@ -2332,6 +2355,19 @@ async fn interact(
         #[cfg(not(test))]
         let global_refresh_enabled = true;
         tokio::select! {
+            result = completed_task_cleanups.join_next(), if !completed_task_cleanups.is_empty() => {
+                match result {
+                    Some(Ok(Ok(()))) => {},
+                    Some(Ok(Err(error))) => {
+                        console.set_status(&format!("Completed task cleanup unavailable · {}", safe_line(&error.to_string())))?;
+                    },
+                    Some(Err(_)) => {
+                        console.set_status("Completed task cleanup result unavailable; task records will be refreshed")?;
+                    },
+                    None => {},
+                }
+                status_dirty = true;
+            },
             _ = artifact_refresh.tick(), if console.artifacts_picker_is_open()? => {},
             result = artifact_loads.join_next(), if !artifact_loads.is_empty() => {
                 if let Some(Ok((request, result))) = result { console.artifact_page_loaded(&request, result)?; }
@@ -4200,7 +4236,7 @@ async fn interact(
                                 for todo in progress.todos {outln!(console, "  {:?}: {}",todo.status,safe_text(&todo.content));}
                             }
                         },
-                        EventKind::CommandUpdated {..} => {},
+                        EventKind::CommandUpdated {..} | EventKind::TaskBoardChanged {..} => {},
                         EventKind::ContextCompaction {status,error} => {
                             outln!(console, "\nContext compaction: {status:?}");
                             if let Some(error)=error {outln!(console, "{}",safe_text(&error));}
@@ -4514,7 +4550,7 @@ async fn interact(
                     console.refresh_transcript(id, presentation::transcript_document(&snapshot, console.display_profile()?, &console.image_links()?, &console.agent_colors()?))?;
                 }
             },
-            _ = elapsed_refresh.tick(), if interactive && !visual_pacing_pending && (todo_refresh_pending || prefers_reduced_motion && running_activity.as_ref().is_some_and(|activity| activity.started_at.is_some())) => {
+            _ = elapsed_refresh.tick(), if interactive && !visual_pacing_pending && (prefers_reduced_motion && running_activity.as_ref().is_some_and(|activity| activity.started_at.is_some())) => {
                 activity_dirty = true;
             },
             _ = tokio::task::yield_now(), if visual_pacing_pending => {
@@ -7263,15 +7299,6 @@ fn recover_background_chat(
     recovery
 }
 
-fn current_loop_todos(status: &ChatStatus, current_loop: Option<uuid::Uuid>) -> Vec<TodoItem> {
-    status
-        .progress
-        .iter()
-        .find(|progress| Some(progress.loop_id) == current_loop)
-        .map(|progress| progress.todos.clone())
-        .unwrap_or_default()
-}
-
 fn initial_context_usage(model: &ModelConfig) -> Option<(u64, usize)> {
     model
         .maximum_context_window_tokens()
@@ -7514,6 +7541,7 @@ fn agent_rows(rows: &[AgentSummary], aggregate: bool) -> Vec<console::AgentRow> 
                 ),
                 preview: row.preview.as_deref().map(safe_line),
                 updated_at: row.updated_at,
+                run_started_at: row.run_started_at,
                 subagent: row.subagent.clone(),
             }
         })
@@ -8323,9 +8351,9 @@ mod tests {
     };
     use super::{
         BackgroundRecovery, BackgroundRunNotice, BackgroundWaitKind, Receipt,
-        UNLABELED_BACKGROUND_AGENT, WORKING_ACTIVITY, background_wait, context_usage,
-        current_loop_todos, input_closed_while_waiting, observe_user_shell_record,
-        readable_background_label, recover_background_chat, track_run_requests,
+        UNLABELED_BACKGROUND_AGENT, background_wait, context_usage, input_closed_while_waiting,
+        observe_user_shell_record, readable_background_label, recover_background_chat,
+        track_run_requests,
     };
     use std::{
         collections::{HashMap, HashSet},
@@ -8334,204 +8362,6 @@ mod tests {
     use tickloop_agent_protocol::{Decision, PermissionRule};
     use tickloop_agent_protocol::{ModelRequestKind, RequestOutcome, RequestOwner};
     use uuid::Uuid;
-
-    #[tokio::test]
-    async fn todos_show_their_content_while_the_working_line_says_working() {
-        use super::{RunningShimmer, style};
-
-        let directory = tempfile::tempdir().unwrap();
-        let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
-            tickloop_agent_test_support::call(
-                "todos",
-                tickloop_agent_tools::TODO_WRITE_TOOL_NAME,
-                serde_json::json!({"todos": [
-                    {"content": "Read the notes", "status": "completed", "activeForm": "Reading the notes"},
-                    {"content": "Draft the\nreport", "status": "in_progress", "activeForm": "Drafting\tthe\nreport"},
-                    {"content": "Check the figures", "status": "pending", "activeForm": "Checking the figures"},
-                ]}),
-            ),
-            tickloop_agent_test_support::text("Drafting."),
-        ]));
-        let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model);
-        let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        let mut events = agent.subscribe();
-        let receipt = agent
-            .submit(chat, None, "Draft the report".into())
-            .await
-            .unwrap();
-        loop {
-            match tickloop_agent_test_support::next_event(&mut events)
-                .await
-                .kind
-            {
-                EventKind::Completed { .. } => break,
-                EventKind::Failed(error) => panic!("todo fixture failed: {error}"),
-                _ => {}
-            }
-        }
-        let snapshot = agent.snapshot(chat).await.unwrap();
-
-        let todos = current_loop_todos(
-            &tickloop_agent_protocol::ChatStatus::of(&snapshot),
-            Some(receipt.loop_id),
-        );
-        assert_eq!(todos[1].active_form, "Drafting\tthe\nreport");
-        assert_eq!(
-            todos
-                .iter()
-                .map(|todo| (todo.content.as_str(), todo.status.clone()))
-                .collect::<Vec<_>>(),
-            [
-                (
-                    "Read the notes",
-                    tickloop_agent_protocol::TodoStatus::Completed
-                ),
-                (
-                    "Draft the\nreport",
-                    tickloop_agent_protocol::TodoStatus::InProgress
-                ),
-                (
-                    "Check the figures",
-                    tickloop_agent_protocol::TodoStatus::Pending
-                ),
-            ]
-        );
-        let (console, _) = Console::start_with_display(
-            false,
-            tickloop_agent_config::DisplayPreferences {
-                prefers_reduced_motion: true,
-            },
-        )
-        .unwrap();
-        let activity = super::RunningActivity {
-            chat_id: chat,
-            label: WORKING_ACTIVITY.to_owned(),
-            started_at: Some(std::time::Instant::now()),
-            interruptible: true,
-        };
-        let spans = activity
-            .spans(&console, None, &RunningShimmer::default())
-            .unwrap();
-        let mut row = style::RoleLine::default();
-        for (text, role) in spans {
-            row.push(text, role);
-        }
-        assert!(row.text().ends_with("s · esc to interrupt)"));
-        assert!(row.text().starts_with("• Working ("), "{row:?}");
-        assert_eq!(row.spans[0].role, Some(style::Role::MutedText));
-        assert_eq!(row.spans[1].role, Some(style::Role::RunningShade0));
-        let themed = style::ThemeName::ALL.map(|name| {
-            row.resolve(style::Theme::new(name), 80)
-                .render(style::ColourDepth::TrueColour)
-        });
-        assert_ne!(themed[0], themed[1]);
-        for width in [0, 1, 12, 40, 80] {
-            let mut narrow = row.clone();
-            narrow.truncate(width);
-            assert!(unicode_width::UnicodeWidthStr::width(narrow.text().as_str()) <= width);
-        }
-    }
-
-    #[tokio::test]
-    async fn selected_loop_todos_follow_that_loop_when_another_goal_is_newer() {
-        let directory = tempfile::tempdir().unwrap();
-        let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
-            tickloop_agent_test_support::call(
-                "first-todos",
-                tickloop_agent_tools::TODO_WRITE_TOOL_NAME,
-                serde_json::json!({"todos":[
-                    {"content":"Draft the first report","status":"in_progress","activeForm":"Drafting the first report"},
-                    {"content":"Review the first report","status":"pending","activeForm":"Reviewing the first report"},
-                ]}),
-            ),
-            tickloop_agent_test_support::text("First goal recorded."),
-            tickloop_agent_test_support::call(
-                "second-todos",
-                tickloop_agent_tools::TODO_WRITE_TOOL_NAME,
-                serde_json::json!({"todos":[
-                    {"content":"Check the second dataset","status":"completed","activeForm":"Checking the second dataset"},
-                    {"content":"Summarize the second dataset","status":"in_progress","activeForm":"Summarizing the second dataset"},
-                ]}),
-            ),
-            tickloop_agent_test_support::text("Second goal recorded."),
-        ]));
-        let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model);
-        let chat = agent.create_chat(directory.path().into()).await.unwrap();
-        let mut events = agent.subscribe();
-        let mut goals = Vec::new();
-        for input in ["Draft the first report", "Summarize the second dataset"] {
-            let receipt = agent.submit(chat, None, input.into()).await.unwrap();
-            loop {
-                let event = tickloop_agent_test_support::next_event(&mut events).await;
-                if event.run_id != receipt.run_id {
-                    continue;
-                }
-                match event.kind {
-                    EventKind::Completed { .. } => break,
-                    EventKind::Failed(error) => panic!("todo fixture failed: {error}"),
-                    _ => {}
-                }
-            }
-            goals.push(receipt.loop_id);
-        }
-        assert_ne!(goals[0], goals[1]);
-        let snapshot = agent.snapshot(chat).await.unwrap();
-        assert_eq!(snapshot.progress.len(), 2);
-        assert_eq!(snapshot.progress.last().unwrap().loop_id, goals[1]);
-        for (goal, expected) in [
-            (
-                goals[0],
-                vec![
-                    (
-                        "Draft the first report",
-                        tickloop_agent_protocol::TodoStatus::InProgress,
-                    ),
-                    (
-                        "Review the first report",
-                        tickloop_agent_protocol::TodoStatus::Pending,
-                    ),
-                ],
-            ),
-            (
-                goals[1],
-                vec![
-                    (
-                        "Check the second dataset",
-                        tickloop_agent_protocol::TodoStatus::Completed,
-                    ),
-                    (
-                        "Summarize the second dataset",
-                        tickloop_agent_protocol::TodoStatus::InProgress,
-                    ),
-                ],
-            ),
-        ] {
-            let todos = current_loop_todos(
-                &tickloop_agent_protocol::ChatStatus::of(&snapshot),
-                Some(goal),
-            );
-            assert_eq!(
-                todos
-                    .iter()
-                    .map(|todo| (todo.content.as_str(), todo.status.clone()))
-                    .collect::<Vec<_>>(),
-                expected
-            );
-        }
-        assert!(
-            current_loop_todos(&tickloop_agent_protocol::ChatStatus::of(&snapshot), None)
-                .is_empty()
-        );
-        assert!(
-            current_loop_todos(
-                &tickloop_agent_protocol::ChatStatus::of(&snapshot),
-                Some(Uuid::new_v4())
-            )
-            .is_empty(),
-            "a Todo-free selected Loop must not borrow another Loop's list"
-        );
-        agent.shutdown().await;
-    }
 
     #[tokio::test]
     async fn context_starts_at_zero_and_uses_the_effective_model_window() {
@@ -9540,6 +9370,7 @@ mod tests {
             subagent: None,
             has_work: Some(true),
             updated_at: None,
+            run_started_at: None,
             preview: None,
             waiting_permissions: 1,
             waiting_questions: 0,
@@ -9611,14 +9442,14 @@ mod tests {
 #[cfg(test)]
 mod status_agents_help_tests {
     #[test]
-    fn help_describes_agents_only_footer_and_persistent_own_todos() {
+    fn help_describes_subagents_and_shared_tasks() {
         let help = super::help_text();
         assert!(help.contains("Subagents N") && help.contains("expanded by default"));
         assert!(help.contains("Click Subagents N") && help.contains("returns to the editor"));
         assert!(help.contains("x dismisses a finished subagent"));
         assert!(!help.contains("esc returns to the entry"));
         assert!(help.contains("Monitor's Shells group"));
-        assert!(help.contains("including while idle") && help.contains("30-second grace"));
+        assert!(help.contains("Ctrl+T") && help.contains("shared tasks"));
         assert!(!help.contains("Footer Tasks/Todo") && !help.contains("starts folded"));
     }
 

@@ -7,6 +7,7 @@
         "generation": 3
       },
       "conversation": {
+        "task_tools_enabled": false,
         "failure_events": [],
         "provider_failures": {},
         "artifact_ticks": [
@@ -528,6 +529,7 @@
         "workdir": "/work/project",
         "state": "Running",
         "run_id": "00000000-0000-0000-0000-000000000020",
+        "run_started_at": 1000,
         "title": "Counter check",
         "has_work": true,
         "updated_at": 2000,
@@ -645,6 +647,9 @@
         "generation": 3
       },
       "chat": {
+        "task_tools_enabled": false,
+        "task_board": null,
+        "task_boards": {},
         "id": "00000000-0000-0000-0000-0000000000c1",
         "workdir": "/work/project",
         "additional_directories": [
@@ -992,6 +997,12 @@
       "transcript_write_error": "disk full",
       "loop_trigger_notices": []
     }
+  },
+  {
+    "TaskToolsSetting": true
+  },
+  {
+    "TaskToolsSetting": false
   },
   {
     "Operation": {

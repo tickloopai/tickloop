@@ -516,6 +516,7 @@ mod tests {
             },
         ];
         let operation = tickloop_agent_protocol::OperationRecord {
+            task_binding: None,
             id: uuid::Uuid::new_v4(),
             loop_id,
             run_id,

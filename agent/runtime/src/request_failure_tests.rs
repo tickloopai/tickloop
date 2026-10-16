@@ -179,6 +179,7 @@ async fn fixture(checker: Arc<Checker>) -> (tempfile::TempDir, Agent, Receipt, C
 
 fn operation(receipt: &Receipt) -> OperationRecord {
     OperationRecord {
+        task_binding: None,
         id: Uuid::new_v4(),
         loop_id: receipt.loop_id,
         run_id: receipt.run_id,

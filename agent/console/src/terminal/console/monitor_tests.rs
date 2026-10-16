@@ -601,7 +601,7 @@ fn history_search_keeps_focus_on_right_and_shift_arrows() {
 }
 
 #[test]
-fn passive_todos_allow_monitor_focus_on_right_and_shift_arrows() {
+fn passive_tasks_allow_monitor_focus_on_right_and_shift_arrows() {
     for key in [
         KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
         KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
@@ -618,11 +618,9 @@ fn passive_todos_allow_monitor_focus_on_right_and_shift_arrows() {
                 "Auto".into(),
                 "fixture".into(),
                 None,
-                vec![TodoItem {
-                    content: "own passive todo".into(),
-                    status: tickloop_agent_protocol::TodoStatus::Pending,
-                    active_form: "Working".into(),
-                }],
+                Some(crate::terminal::status_area::test_task_board(&[
+                    "own passive task",
+                ])),
             )
             .unwrap();
         let mut state = console.state.lock().unwrap();
@@ -631,7 +629,13 @@ fn passive_todos_allow_monitor_focus_on_right_and_shift_arrows() {
             state
                 .rendered_screen
                 .iter()
-                .any(|row| row.contains("own passive todo"))
+                .any(|row| row.contains("1 tasks ("))
+        );
+        assert!(
+            state
+                .rendered_screen
+                .iter()
+                .any(|row| row.contains("own passive task"))
         );
         state.key(key);
         assert!(state.monitor.focused);
@@ -898,7 +902,7 @@ fn monitor_columns_preserve_full_width_input_dividers_cursor_and_mouse_geometry(
             .replace_draft("unchanged input across list toggle".into(), 20);
         state
             .status_area
-            .update("Auto".into(), "model".into(), Some((10, 100)), Vec::new());
+            .update("Auto".into(), "model".into(), Some((10, 100)), None);
         state
             .monitor
             .replace(TickGroup::Shells, vec![shell(Uuid::new_v4(), "echo A")]);
@@ -2947,7 +2951,7 @@ fn refresh_status(
             if changed { "plan" } else { "default" }.into(),
             "model".into(),
             None,
-            Vec::new(),
+            None,
         )
         .unwrap();
     console

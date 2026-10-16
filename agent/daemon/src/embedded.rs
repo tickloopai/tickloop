@@ -656,6 +656,11 @@ impl EmbeddedAgentAccess {
                         )
                         .await?;
                 }
+                if let Some(delegation) = &snapshot.delegation {
+                    for ancestor in delegation.lineage() {
+                        self.register(ancestor.chat_id, launch.clone()).await;
+                    }
+                }
                 let execution = self.register(snapshot.id, launch).await;
                 Ok(CommandResult::Loaded {
                     execution,
@@ -739,13 +744,13 @@ impl EmbeddedAgentAccess {
                 target_loop,
                 input,
                 origin,
-            } => self.submit(execution, target_loop, input, origin).await,
+            } => Box::pin(self.submit(execution, target_loop, input, origin)).await,
             AgentCommand::ContinueLoop {
                 execution,
                 loop_id,
                 input,
                 origin,
-            } => self.submit(execution, Some(loop_id), input, origin).await,
+            } => Box::pin(self.submit(execution, Some(loop_id), input, origin)).await,
             AgentCommand::DecidePermission {
                 request,
                 allow,
@@ -819,7 +824,7 @@ impl EmbeddedAgentAccess {
                         "External Provider definitions are not supported; choose a built-in model",
                     ));
                 }
-                self.configure(execution, change).await
+                Box::pin(self.configure(execution, change)).await
             }
             AgentCommand::EditHistory { execution, action } => {
                 self.history(execution, action, envelope.command_id).await
@@ -829,6 +834,18 @@ impl EmbeddedAgentAccess {
             }
             AgentCommand::ManageTask { execution, action } => {
                 self.manage_task(execution, action).await
+            }
+            AgentCommand::ClearCompletedTasks {
+                execution,
+                root_loop_id,
+                expected_revision,
+            } => {
+                let chat = self.chat(execution).await?;
+                self.inner
+                    .agent
+                    .clear_completed_tasks(chat, root_loop_id, expected_revision)
+                    .await?;
+                Ok(CommandResult::Done)
             }
             AgentCommand::EnqueueAfterTurn {
                 execution,
@@ -952,6 +969,9 @@ impl EmbeddedAgentAccess {
         let chat = self.chat(execution).await?;
         let agent = &self.inner.agent;
         match change {
+            ConfigurationChange::TaskToolsEnabled { enabled } => {
+                agent.set_task_tools_enabled(chat, enabled).await?
+            }
             ConfigurationChange::Model { config, thinking } => {
                 let config = self.builtin_config(config)?;
                 let root = self
@@ -1349,6 +1369,9 @@ impl EmbeddedAgentAccess {
             AgentDetailQuery::Snapshot | AgentDetailQuery::Status => {
                 unreachable!("Chat answers are read with their feed watermark")
             }
+            AgentDetailQuery::TaskToolsSetting => {
+                ObservationValue::TaskToolsSetting(self.inner.agent.task_tools_setting(chat).await?)
+            }
             AgentDetailQuery::Operation { run_id, call_id } => ObservationValue::Operation(
                 self.inner
                     .agent
@@ -1590,6 +1613,7 @@ impl AgentAccess for EmbeddedAgentAccess {
                         ),
                         workdir: summary.workdir,
                         run_id: super::summary::summary_run_id(&summary.loops, &state),
+                        run_started_at: super::summary::run_started_at(&summary.loops, &state),
                         state,
                         title: summary.title,
                         subagent: registration,
@@ -1751,7 +1775,7 @@ impl AgentAccess for EmbeddedAgentAccess {
         if let Some(receipt) = self.inner.receipts.begin(&envelope).await? {
             return Ok(receipt);
         }
-        let result = self.dispatch(&envelope).await;
+        let result = Box::pin(self.dispatch(&envelope)).await;
         let persistence = if let Some(error) = self.inner.agent.transcript_write_error() {
             PersistenceState::WriteFailed(error)
         } else if matches!(envelope.command, AgentCommand::FlushTranscripts) {
@@ -1816,11 +1840,14 @@ async fn watch_runtime(
                 .references
                 .lock()
                 .await
-                .get(&delegation.parent_chat_id)
+                .get(&delegation.root_chat_id())
                 .copied();
             if let Some(parent) = parent {
                 let launch = access.inner.launches.lock().await.get(&parent).cloned();
                 if let Some(launch) = launch {
+                    for ancestor in delegation.lineage() {
+                        access.register(ancestor.chat_id, launch.clone()).await;
+                    }
                     execution = Some(access.register(chat, launch).await);
                 }
             }

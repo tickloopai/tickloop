@@ -20,6 +20,12 @@ pub(super) struct FamilyMentionTarget {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AcceptedFamilyMention {
+    pub target: FamilyMentionTarget,
+    pub replacement_range: Range<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct MentionCandidate {
     pub display_path: String,
     pub replacement: String,
@@ -96,7 +102,7 @@ pub(super) enum FileMentionAction {
 pub(super) struct FileMentionState {
     index: Option<FileMentionIndex>,
     family_targets: Vec<FamilyMentionTarget>,
-    accepted_family: Option<FamilyMentionTarget>,
+    accepted_family: Vec<AcceptedFamilyMention>,
     next_generation: u64,
     requested_generation: Option<IndexGeneration>,
     completion: Option<FileMentionCompletion>,
@@ -180,11 +186,6 @@ impl FileMentionState {
             self.query_canceled = false;
         }
         self.sync_accepted_mentions(draft);
-        if self.accepted_family.as_ref().is_some_and(|target| {
-            draft.split_whitespace().next() != Some(format!("@{}", target.handle).as_str())
-        }) {
-            self.accepted_family = None;
-        }
         self.draft.clear();
         self.draft.push_str(draft);
         self.cursor = cursor;
@@ -209,6 +210,14 @@ impl FileMentionState {
             .map_or(&[], |completion| completion.candidates.as_slice())
     }
 
+    pub(super) fn completing_recipient(&self) -> bool {
+        self.completion.as_ref().is_some_and(|completion| {
+            self.draft[..completion.replacement_range.start]
+                .trim()
+                .is_empty()
+        })
+    }
+
     pub(super) fn selected_index(&self) -> Option<usize> {
         self.selected
     }
@@ -219,15 +228,23 @@ impl FileMentionState {
     }
 
     pub(super) fn accepted_family(&self) -> Option<&FamilyMentionTarget> {
-        self.accepted_family.as_ref()
+        let start = self.draft.len() - self.draft.trim_start().len();
+        self.accepted_family
+            .iter()
+            .find(|mention| mention.replacement_range.start == start)
+            .map(|mention| &mention.target)
     }
 
-    pub(super) fn take_family(&mut self) -> Option<FamilyMentionTarget> {
-        self.accepted_family.take()
+    pub(super) fn accepted_family_mentions(&self) -> &[AcceptedFamilyMention] {
+        &self.accepted_family
     }
 
-    pub(super) fn restore_family(&mut self, target: Option<FamilyMentionTarget>) {
-        self.accepted_family = target;
+    pub(super) fn take_family(&mut self) -> Vec<AcceptedFamilyMention> {
+        std::mem::take(&mut self.accepted_family)
+    }
+
+    pub(super) fn restore_family(&mut self, mentions: Vec<AcceptedFamilyMention>) {
+        self.accepted_family = mentions;
     }
 
     pub(super) fn take_accepted(&mut self) -> Vec<AcceptedMention> {
@@ -392,8 +409,7 @@ impl FileMentionState {
             return Ok(None);
         }
         let selected = self
-            .accepted_family
-            .as_ref()
+            .accepted_family()
             .filter(|target| target.handle == token);
         let current = self
             .family_targets
@@ -426,11 +442,6 @@ impl FileMentionState {
         }) = self.candidates().get(candidate_index)
         {
             let target = target.clone();
-            let leading = self.completion.as_ref().is_some_and(|completion| {
-                self.draft[..completion.replacement_range.start]
-                    .trim()
-                    .is_empty()
-            });
             let Some((mut draft, mut cursor)) = self
                 .completion
                 .as_ref()
@@ -438,15 +449,22 @@ impl FileMentionState {
             else {
                 return FileMentionAction::Ignored;
             };
+            let range = cursor - target.handle.len() - 1..cursor;
             if draft[cursor..].starts_with(char::is_whitespace) {
                 cursor += draft[cursor..].chars().next().unwrap().len_utf8();
             } else {
                 draft.insert(cursor, ' ');
                 cursor += 1;
             }
-            if leading {
-                self.accepted_family = Some(target);
-            }
+            self.sync_accepted_mentions(&draft);
+            self.accepted
+                .retain(|mention| mention.replacement_range != range);
+            self.accepted_family
+                .retain(|mention| mention.replacement_range != range);
+            self.accepted_family.push(AcceptedFamilyMention {
+                target,
+                replacement_range: range,
+            });
             self.draft.clone_from(&draft);
             self.cursor = cursor;
             self.dismiss();
@@ -463,6 +481,8 @@ impl FileMentionState {
         let token_start = applied.cursor - applied.token.len();
 
         self.sync_accepted_mentions(&applied.draft);
+        self.accepted_family
+            .retain(|mention| mention.replacement_range != (token_start..applied.cursor));
         self.accepted.push(AcceptedMention {
             token: applied.token.clone(),
             canonical_path: applied.path,
@@ -480,28 +500,17 @@ impl FileMentionState {
     }
 
     fn sync_accepted_mentions(&mut self, draft: &str) {
-        if self.draft == draft {
-            self.accepted
-                .retain(|mention| accepted_token_matches(draft, mention));
-            return;
-        }
-
         let edit = changed_range(&self.draft, draft);
         self.accepted.retain_mut(|mention| {
-            if mention.replacement_range.end <= edit.old_start {
-                return accepted_token_matches(draft, mention);
-            }
-            if mention.replacement_range.start >= edit.old_end {
-                let Some(start) = shift_index(mention.replacement_range.start, edit.delta) else {
-                    return false;
-                };
-                let Some(end) = shift_index(mention.replacement_range.end, edit.delta) else {
-                    return false;
-                };
-                mention.replacement_range = start..end;
-                return accepted_token_matches(draft, mention);
-            }
-            false
+            sync_accepted_range(draft, &mention.token, &mut mention.replacement_range, &edit)
+        });
+        self.accepted_family.retain_mut(|mention| {
+            sync_accepted_range(
+                draft,
+                &format!("@{}", mention.target.handle),
+                &mut mention.replacement_range,
+                &edit,
+            )
         });
         self.draft.clear();
         self.draft.push_str(draft);
@@ -547,13 +556,27 @@ fn shift_index(index: usize, delta: isize) -> Option<usize> {
     }
 }
 
-fn accepted_token_matches(draft: &str, mention: &AcceptedMention) -> bool {
-    if draft.get(mention.replacement_range.clone()) != Some(mention.token.as_str()) {
-        return false;
+fn sync_accepted_range(
+    draft: &str,
+    text: &str,
+    range: &mut Range<usize>,
+    edit: &ChangedRange,
+) -> bool {
+    if range.end > edit.old_start {
+        if range.start < edit.old_end {
+            return false;
+        }
+        let Some(start) = shift_index(range.start, edit.delta) else {
+            return false;
+        };
+        let Some(end) = shift_index(range.end, edit.delta) else {
+            return false;
+        };
+        *range = start..end;
     }
-    mention_token(draft, mention.replacement_range.end).is_some_and(|token| {
-        token.start == mention.replacement_range.start && token.end == mention.replacement_range.end
-    })
+    draft.get(range.clone()) == Some(text)
+        && mention_token(draft, range.end)
+            .is_some_and(|token| token.start == range.start && token.end == range.end)
 }
 
 impl FileMentionIndex {
@@ -1324,7 +1347,7 @@ mod tests {
         stale.execution.generation += 1;
         state.set_family_targets(vec![stale]);
         assert!(state.family_target_for_submission("@audit hello").is_err());
-        state.restore_family(None);
+        state.restore_family(Vec::new());
         let mut unavailable = target.clone();
         unavailable.available = false;
         state.set_family_targets(vec![unavailable]);
@@ -1341,6 +1364,57 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "accepted file metadata beats a bare Agent handle collision"
+        );
+    }
+
+    #[test]
+    fn agent_completion_moves_file_ranges_and_file_selection_replaces_agent_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("audit"), "evidence").unwrap();
+        let mut state =
+            FileMentionState::with_index(FileMentionIndex::build(directory.path(), &[]).unwrap());
+        let target = FamilyMentionTarget {
+            execution: ExecutionRef {
+                daemon_epoch: uuid::Uuid::new_v4(),
+                agent_id: uuid::Uuid::new_v4(),
+                generation: 1,
+            },
+            handle: "audit".into(),
+            description: "Review".into(),
+            available: true,
+        };
+        state.set_family_targets(vec![target.clone()]);
+        state.update_at("@a @audit", 9, 15);
+        assert!(matches!(
+            state.accept_candidate(1),
+            FileMentionAction::ReplaceDraft { .. }
+        ));
+        state.update_at("@a @audit", 2, 15);
+        let FileMentionAction::ReplaceDraft { draft, cursor } = state.accept_candidate(0) else {
+            panic!("Agent completion should apply");
+        };
+        assert_eq!(draft, "@audit @audit");
+        assert_eq!(state.accepted[0].replacement_range, 7..13);
+        assert_eq!(
+            state.revalidate_all_for_submission(&draft).unwrap().len(),
+            1
+        );
+        assert_eq!(state.accepted_family_mentions().len(), 1);
+        let mut replacement = target;
+        replacement.execution.generation += 1;
+        state.set_family_targets(vec![replacement]);
+        assert!(state.family_target_for_submission(&draft).is_err());
+        state.update_at(&draft, cursor - 1, 15);
+        assert!(matches!(
+            state.accept_candidate(1),
+            FileMentionAction::ReplaceDraft { .. }
+        ));
+        assert!(state.accepted_family_mentions().is_empty());
+        assert!(
+            state
+                .family_target_for_submission(&draft)
+                .unwrap()
+                .is_none()
         );
     }
 

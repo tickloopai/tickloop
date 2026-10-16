@@ -19,6 +19,7 @@ pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// 同类元数据的最后一条；退出时重新追加到文件末尾，让列表只读尾部就能取到。
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CachedMetadata {
+    pub task_boards: Option<super::entry::TaskBoardsEntry>,
     pub artifact_ticks: Option<super::entry::ArtifactTicksEntry>,
     pub monitor_members: Option<super::entry::MonitorMembersEntry>,
     pub custom_title: Option<CustomTitleEntry>,
@@ -40,6 +41,7 @@ impl CachedMetadata {
             Line::CustomTitle(entry) => self.custom_title = Some(entry.clone()),
             Line::AiTitle(entry) => self.ai_title = Some(entry.clone()),
             Line::Subagents(entry) => self.subagents = Some(entry.clone()),
+            Line::TaskBoards(entry) => self.task_boards = Some(entry.clone()),
             Line::FamilyCompletions(entry) => self.family_completions = Some(entry.clone()),
             Line::FamilyInputs(entry) => self.family_inputs = Some(entry.clone()),
             Line::SentAgentMessages(entry) => self.sent_agent_messages = Some(entry.clone()),
@@ -57,6 +59,7 @@ impl CachedMetadata {
             .into_iter()
             .chain(self.ai_title.clone().map(Line::AiTitle))
             .chain(self.subagents.clone().map(Line::Subagents))
+            .chain(self.task_boards.clone().map(Line::TaskBoards))
             .chain(self.family_completions.clone().map(Line::FamilyCompletions))
             .chain(self.family_inputs.clone().map(Line::FamilyInputs))
             .chain(

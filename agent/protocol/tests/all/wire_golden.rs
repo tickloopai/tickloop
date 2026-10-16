@@ -490,6 +490,7 @@ fn agent_commands_keep_their_recorded_wire() {
                 }),
                 origin: Some(interaction_source()),
             },
+            AgentCommand::Configure { execution: execution(), change: ConfigurationChange::TaskToolsEnabled { enabled: true }, provider: None },
             AgentCommand::Submit {
                 execution: execution(),
                 target_loop: Some(id(0x10)),
@@ -582,6 +583,11 @@ fn agent_commands_keep_their_recorded_wire() {
                 as_new: false,
                 launch: None,
             },
+            AgentCommand::ClearCompletedTasks {
+                execution: execution(),
+                root_loop_id: id(0x10),
+                expected_revision: 7,
+            },
             AgentCommand::FlushTranscripts,
             AgentCommand::ReplaceTickhost,
             AgentCommand::EditHistory {
@@ -651,6 +657,11 @@ fn observation_requests_keep_their_recorded_wire() {
             },
             ObservationRequest::Agent {
                 execution: execution(),
+                detail: AgentDetailQuery::TaskToolsSetting,
+                after: None,
+            },
+            ObservationRequest::Agent {
+                execution: execution(),
                 detail: AgentDetailQuery::Operation {
                     run_id: id(0x20),
                     call_id: "call-edit".into(),
@@ -680,6 +691,7 @@ fn observation_values_keep_their_recorded_wire() {
         subagent: None,
         has_work: Some(true),
         updated_at: Some(2_000),
+        run_started_at: Some(1_000),
         preview: None,
         waiting_permissions: 1,
         waiting_questions: 0,
@@ -739,7 +751,10 @@ fn observation_values_keep_their_recorded_wire() {
                 persistence: PersistenceState::WriteFailed("disk full".into()),
             }))),
             ObservationValue::Status(Box::new(live_chat_snapshot().status())),
+            ObservationValue::TaskToolsSetting(true),
+            ObservationValue::TaskToolsSetting(false),
             ObservationValue::Operation(Some(Box::new(OperationRecord {
+                task_binding: None,
                 id: id(0x50),
                 loop_id: id(0x10),
                 run_id: id(0x20),
@@ -1059,4 +1074,19 @@ fn server_messages_keep_their_recorded_wire() {
             },
         ],
     );
+}
+
+#[test]
+fn task_board_mode_preserves_legacy_teams_and_new_solo_boards() {
+    let mut board = tickloop_agent_protocol::TaskBoard::new(id(0xc1), id(0x10));
+    assert!(!board.is_team);
+    let mut legacy = serde_json::to_value(&board).unwrap();
+    legacy.as_object_mut().unwrap().remove("is_team");
+    legacy.as_object_mut().unwrap().remove("task_number_offset");
+    let restored = serde_json::from_value::<tickloop_agent_protocol::TaskBoard>(legacy).unwrap();
+    assert!(restored.is_team);
+    assert_eq!(restored.task_number_offset, 0);
+    let solo = board.clone();
+    board.is_team = true;
+    assert_golden("task_board", &vec![solo, board]);
 }

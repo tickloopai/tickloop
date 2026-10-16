@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    time::{Duration, Instant},
-};
+use std::collections::{HashMap, HashSet};
 
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
@@ -12,21 +9,15 @@ use super::{
     footer::{FooterFrame, FooterItemId},
     style::{Role, RoleLine},
 };
-use tickloop_agent_protocol::{LoopState, TodoItem, TodoStatus};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use tickloop_agent_protocol::{LoopState, SharedTask, SharedTaskStatus, TaskBoard};
 
 const MAX_PANEL_ITEMS: usize = 8;
-const TODO_CONTINUATION_INDENT: &str = "     ";
-/// A list shown on its own sits under its header, two columns in, as Claude Code's standalone
-/// `TaskListV2`.
-const TODO_STANDALONE_INDENT: &str = "  ";
-const TODO_ROW_PREFIX_COLUMNS: usize = 7;
-const TODO_STATUS_MARK_COLUMNS: usize = 2;
-const TODO_SUBJECT_MARGIN_COLUMNS: usize = 15;
-const TODO_LAYOUT_RESERVED_ROWS: usize = 14;
-const TODO_COMPACT_TERMINAL_ROWS: usize = 10;
-const MIN_TODO_DISPLAY_ITEMS: usize = 3;
-const MAX_TODO_DISPLAY_ITEMS: usize = 10;
-const RECENT_TODO_COMPLETION_TTL: Duration = Duration::from_secs(30);
+const MIN_COMPACT_TASK_ROWS: usize = 3;
+const MAX_COMPACT_TASK_ROWS: usize = 5;
+const TASK_COMPACT_HEIGHT_OFFSET: usize = 14;
+const TASK_COMPACT_RESERVED_ROWS: usize = 12;
+const MIN_TASK_TITLE_COLUMNS: usize = 8;
 const MAX_BACKGROUND_TITLE_COLUMNS: usize = 24;
 const BACKGROUND_AGENT_NAME_PREFIX: &str = "Agent ";
 const STATUS_SEGMENT_SEPARATOR: &str = " · ";
@@ -98,12 +89,55 @@ impl BackgroundStatusNotice {
 }
 
 #[derive(Default)]
+struct TaskCounts {
+    pending: usize,
+    in_progress: usize,
+    completed: usize,
+    needs_attention: usize,
+    cancelled: usize,
+}
+
+impl TaskCounts {
+    fn of<'a>(tasks: impl Iterator<Item = &'a SharedTask>) -> Self {
+        let mut counts = Self::default();
+        for task in tasks {
+            match task.status {
+                SharedTaskStatus::Pending => counts.pending += 1,
+                SharedTaskStatus::InProgress => counts.in_progress += 1,
+                SharedTaskStatus::Completed => counts.completed += 1,
+                SharedTaskStatus::NeedsAttention => counts.needs_attention += 1,
+                SharedTaskStatus::Cancelled => counts.cancelled += 1,
+            }
+        }
+        counts
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum TaskPresentation {
+    #[default]
+    Compact,
+    Expanded,
+    Collapsed,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TaskViewState {
+    presentation: TaskPresentation,
+    selected: usize,
+}
+
+#[derive(Default)]
 pub(super) struct StatusArea {
     mode: String,
     model: String,
     context: Option<(u64, usize)>,
-    todos: Vec<TodoItem>,
-    todo_completed_at: HashMap<(usize, String), Instant>,
+    tasks: Option<TaskBoard>,
+    task_view: TaskViewState,
+    task_views: HashMap<(Uuid, Uuid), TaskViewState>,
+    tasks_focused: bool,
+    task_focus_available: Option<bool>,
+    task_details: bool,
     agents: Vec<AgentRow>,
     /// The family member this View shows.
     visible_agent: Option<Uuid>,
@@ -126,48 +160,45 @@ impl StatusArea {
         !self.mode.is_empty()
     }
 
-    pub(super) fn todo_refresh_pending(&self) -> bool {
-        !self.todo_completed_at.is_empty()
-    }
-
     /// Returns whether anything the status area shows changed.
     pub(super) fn update(
         &mut self,
         mode: String,
         model: String,
         context: Option<(u64, usize)>,
-        todos: Vec<TodoItem>,
+        tasks: Option<TaskBoard>,
     ) -> bool {
         let context = context.filter(|(_, limit)| *limit > 0);
         let changed = self.mode != mode
             || self.model != model
             || self.context != context
-            || self.todos != todos;
+            || self.tasks != tasks;
         self.mode = mode;
         self.model = model;
         self.context = context;
-        let now = Instant::now();
-        if !self.todos.is_empty() {
-            for (index, todo) in todos
-                .iter()
-                .enumerate()
-                .filter(|(_, todo)| todo.status == TodoStatus::Completed)
-            {
-                let was_completed = self.todos.get(index).is_some_and(|previous| {
-                    previous.content == todo.content && previous.status == TodoStatus::Completed
-                });
-                if !was_completed {
-                    self.todo_completed_at
-                        .insert((index, todo.content.clone()), now);
-                }
+        let previous_scope = self
+            .tasks
+            .as_ref()
+            .map(|board| (board.root_chat_id, board.root_loop_id));
+        let next_scope = tasks
+            .as_ref()
+            .map(|board| (board.root_chat_id, board.root_loop_id));
+        if previous_scope != next_scope {
+            if let Some(scope) = previous_scope {
+                self.task_views.insert(scope, self.task_view);
             }
+            self.task_view = next_scope
+                .and_then(|scope| self.task_views.get(&scope).copied())
+                .unwrap_or_default();
+            self.tasks_focused = false;
+            self.task_details = false;
         }
-        self.todo_completed_at.retain(|(index, content), _| {
-            todos.get(*index).is_some_and(|todo| {
-                &todo.content == content && todo.status == TodoStatus::Completed
-            })
-        });
-        self.todos = todos;
+        self.tasks = tasks;
+        let count = self.tasks.as_ref().map_or(0, |board| board.tasks.len());
+        self.task_view.selected = self.task_view.selected.min(count.saturating_sub(1));
+        if count == 0 {
+            self.release_task_focus();
+        }
 
         self.reconcile_panel();
         self.clamp_offset();
@@ -233,6 +264,26 @@ impl StatusArea {
         }
     }
 
+    pub(super) fn adopt_task_views(&mut self, other: &Self) {
+        self.task_views.extend(other.task_views.clone());
+        if let Some(board) = &other.tasks {
+            self.task_views
+                .insert((board.root_chat_id, board.root_loop_id), other.task_view);
+        }
+        if let Some(board) = &self.tasks
+            && let Some(view) = self
+                .task_views
+                .get(&(board.root_chat_id, board.root_loop_id))
+        {
+            self.task_view = *view;
+            self.task_view.selected = self
+                .task_view
+                .selected
+                .min(board.tasks.len().saturating_sub(1));
+        }
+        self.release_task_focus();
+    }
+
     /// The selected member when it is a finished subagent the panel may drop now.
     pub(super) fn selected_dismissible(&self) -> Option<Uuid> {
         self.selected_agent()
@@ -263,7 +314,11 @@ impl StatusArea {
             .iter()
             .filter(|row| {
                 let mut parent = row.parent_id;
+                let mut visited = std::collections::HashSet::new();
                 while let Some(id) = parent {
+                    if !visited.insert(id) {
+                        return false;
+                    }
                     if self.collapsed_agents.contains(&id) {
                         return false;
                     }
@@ -350,7 +405,12 @@ impl StatusArea {
     }
 
     pub(super) fn row_count(&self, height: usize) -> usize {
-        if self.todos.is_empty() && self.agents.is_empty() {
+        if self
+            .tasks
+            .as_ref()
+            .is_none_or(|board| board.tasks.is_empty())
+            && self.agents.is_empty()
+        {
             return 0;
         }
         if height < 4 {
@@ -455,155 +515,402 @@ impl StatusArea {
         line.filled(Role::StatusBar)
     }
 
-    pub(super) fn todo_lines(
+    pub(super) fn release_task_focus(&mut self) {
+        self.tasks_focused = false;
+        self.task_details = false;
+    }
+
+    pub(super) fn task_key(&mut self, key: KeyEvent) -> bool {
+        let count = self.tasks.as_ref().map_or(0, |board| board.tasks.len());
+        if count == 0 || self.task_focus_available == Some(false) {
+            return false;
+        }
+        if key.code == KeyCode::Char('t') && key.modifiers == KeyModifiers::CONTROL {
+            self.task_view.presentation = if self.tasks_focused {
+                TaskPresentation::Collapsed
+            } else {
+                TaskPresentation::Expanded
+            };
+            self.tasks_focused = self.task_view.presentation == TaskPresentation::Expanded;
+            self.task_details = false;
+            return true;
+        }
+        if !self.tasks_focused {
+            return false;
+        }
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => {
+                if self.task_details {
+                    self.task_details = false;
+                } else {
+                    self.release_task_focus();
+                }
+            }
+            (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+            | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                self.task_view.selected = (self.task_view.selected + 1).min(count - 1);
+                self.task_details = false;
+            }
+            (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+            | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                self.task_view.selected = self.task_view.selected.saturating_sub(1);
+                self.task_details = false;
+            }
+            (KeyCode::Enter, KeyModifiers::NONE) => self.task_details = !self.task_details,
+            _ => {
+                self.release_task_focus();
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(super) fn tasks_can_take_focus(&self) -> bool {
+        self.task_focus_available == Some(true)
+    }
+
+    pub(super) fn task_lines_in_viewport(
         &mut self,
         width: usize,
         height: usize,
+        viewport_rows: usize,
         display: DisplayProfile,
-        has_activity: bool,
-        now: Instant,
+        under_activity: bool,
     ) -> Vec<RoleLine> {
-        self.todo_completed_at.retain(|_, completed| {
-            now.saturating_duration_since(*completed) < RECENT_TODO_COMPLETION_TTL
-        });
-        if self.todos.is_empty() {
-            return Vec::new();
-        }
-        let capacity = if height <= TODO_COMPACT_TERMINAL_ROWS {
-            1
-        } else {
-            height
-                .saturating_sub(TODO_LAYOUT_RESERVED_ROWS)
-                .clamp(MIN_TODO_DISPLAY_ITEMS, MAX_TODO_DISPLAY_ITEMS)
-        };
-        let mut todos = self.todos.iter().enumerate().collect::<Vec<_>>();
-        if todos.len() > capacity {
-            todos.sort_by_key(|(index, todo)| {
-                let rank = if self
-                    .todo_completed_at
-                    .contains_key(&(*index, todo.content.clone()))
-                {
-                    0
-                } else {
-                    match todo.status {
-                        TodoStatus::InProgress => 1,
-                        TodoStatus::Pending => 2,
-                        TodoStatus::Completed => 3,
-                    }
-                };
-                (rank, *index)
+        let connector = under_activity.then(|| format!("  {}", display.glyph(Glyph::ToolResult)));
+        let connector_columns = connector.as_ref().map_or(0, |prefix| prefix.width());
+        let task_columns = width.saturating_sub(connector_columns);
+        let (preview, selected_row) = self.task_frame(task_columns, height, display, true);
+        let available = task_columns
+            > super::list_row::ROW_INDENT.width() + display.glyph(Glyph::TodoPending).width()
+            && selected_row.is_some_and(|row| {
+                // The scrollback tail reserves a blank row below the task list.
+                viewport_rows > preview.len().saturating_sub(row)
             });
+        self.task_focus_available = Some(available);
+        if !available {
+            self.release_task_focus();
         }
-        let completed = self
-            .todos
-            .iter()
-            .filter(|todo| todo.status == TodoStatus::Completed)
-            .count();
-        let pending = self
-            .todos
-            .iter()
-            .filter(|todo| todo.status == TodoStatus::Pending)
-            .count();
-        let in_progress = self.todos.len() - completed - pending;
-        let mut lines = Vec::new();
-        if !has_activity {
-            let mut header = RoleLine::role("  ", Role::MutedText);
-            header.push(self.todos.len().to_string(), Some(Role::MutedStrong));
-            header.push(" tasks (", Some(Role::MutedText));
-            header.push(completed.to_string(), Some(Role::MutedStrong));
-            header.push(" done, ", Some(Role::MutedText));
-            if in_progress > 0 {
-                header.push(in_progress.to_string(), Some(Role::MutedStrong));
-                header.push(" in progress, ", Some(Role::MutedText));
-            }
-            header.push(pending.to_string(), Some(Role::MutedStrong));
-            header.push(" open)", Some(Role::MutedText));
-            header.truncate(width);
-            lines.push(header);
-        }
-        // Under the Working line the list hangs from `⎿`; on its own it has no connector.
-        let has_tree_indent = has_activity && width > TODO_ROW_PREFIX_COLUMNS;
-        let standalone_indent = if has_activity || width <= TODO_ROW_PREFIX_COLUMNS {
-            ""
-        } else {
-            TODO_STANDALONE_INDENT
-        };
-        let prefix_columns = if has_tree_indent {
-            TODO_ROW_PREFIX_COLUMNS
-        } else {
-            standalone_indent.len() + TODO_STATUS_MARK_COLUMNS
-        };
-        let subject_columns = width
-            .saturating_sub(TODO_SUBJECT_MARGIN_COLUMNS)
-            .max(TODO_SUBJECT_MARGIN_COLUMNS)
-            .min(width.saturating_sub(prefix_columns));
-        for (index, (_, todo)) in todos.iter().take(capacity).enumerate() {
-            // Claude Code's `TaskListV2`: a green tick and dim struck-through text when done, an
-            // orange square and bold text in progress, plain text still open.
-            let (glyph, icon_role, text_role) = match todo.status {
-                TodoStatus::Completed => (
-                    Glyph::TodoCompleted,
-                    Some(Role::Success),
-                    Some(Role::CompletedTodo),
-                ),
-                TodoStatus::InProgress => (
-                    Glyph::TodoInProgress,
-                    Some(Role::InProgressTodo),
-                    Some(Role::Strong),
-                ),
-                TodoStatus::Pending => (Glyph::TodoPending, None, None),
-            };
-            let mut title = super::safe_text(&todo.content).replace(['\n', '\t'], " ");
-            if UnicodeWidthStr::width(title.as_str()) > subject_columns {
-                title = format!(
-                    "{}…",
-                    truncate_width(&title, subject_columns.saturating_sub(1))
+        let mut lines = self.task_lines(task_columns, height, display);
+        if let Some(connector) = connector {
+            for (index, line) in lines.iter_mut().enumerate() {
+                let mut nested = RoleLine::role(
+                    if index == 0 {
+                        connector.clone()
+                    } else {
+                        " ".repeat(connector_columns)
+                    },
+                    Role::MutedText,
                 );
+                nested.spans.append(&mut line.spans);
+                line.spans = nested.spans;
+                if line.fill.is_some() {
+                    line.fill_start += connector_columns;
+                }
+                line.truncate(width);
             }
-            let prefix = if !has_tree_indent {
-                standalone_indent.to_owned()
-            } else if index == 0 {
-                format!("  {}  ", display.glyph(Glyph::TodoBranch))
-            } else {
-                TODO_CONTINUATION_INDENT.to_owned()
-            };
-            let mut line = RoleLine::role(prefix, Role::MutedText);
-            line.push(format!("{} ", display.glyph(glyph)), icon_role);
-            line.push(title, text_role);
-            line.truncate(width);
-            lines.push(line);
-        }
-        let hidden = &todos[capacity.min(todos.len())..];
-        if !hidden.is_empty() {
-            let parts = [
-                (TodoStatus::InProgress, "in progress"),
-                (TodoStatus::Pending, "pending"),
-                (TodoStatus::Completed, "completed"),
-            ]
-            .into_iter()
-            .filter_map(|(status, label)| {
-                let count = hidden
-                    .iter()
-                    .filter(|(_, todo)| todo.status == status)
-                    .count();
-                (count > 0).then(|| format!("{count} {label}"))
-            })
-            .collect::<Vec<_>>();
-            let indent = if has_tree_indent {
-                TODO_CONTINUATION_INDENT
-            } else {
-                standalone_indent
-            };
-            let mut summary =
-                RoleLine::role(format!("{indent}… +{}", parts.join(", ")), Role::MutedText);
-            summary.truncate(width);
-            lines.push(summary);
         }
         lines
     }
 
-    /// When time alone next changes the open Subagents list: a working member's run time ticking,
-    /// or another member's age. `None` while the list is closed.
+    pub(super) fn task_lines(
+        &self,
+        width: usize,
+        height: usize,
+        display: DisplayProfile,
+    ) -> Vec<RoleLine> {
+        self.task_frame(width, height, display, false).0
+    }
+
+    fn task_line(
+        &self,
+        board: &TaskBoard,
+        index: usize,
+        width: usize,
+        display: DisplayProfile,
+        selected: bool,
+    ) -> RoleLine {
+        let task = &board.tasks[index];
+        let blocked = board.blocked_by(task);
+        let (glyph, glyph_role, title_role) = match task.status {
+            SharedTaskStatus::Pending => (
+                Glyph::TodoPending,
+                Role::Text,
+                if blocked.is_empty() {
+                    Role::Text
+                } else {
+                    Role::MutedText
+                },
+            ),
+            SharedTaskStatus::InProgress => (
+                Glyph::TodoInProgress,
+                Role::InProgressTodo,
+                if blocked.is_empty() {
+                    Role::Strong
+                } else {
+                    Role::MutedStrong
+                },
+            ),
+            SharedTaskStatus::Completed => {
+                (Glyph::TodoCompleted, Role::Success, Role::CompletedTodo)
+            }
+            SharedTaskStatus::Cancelled => (Glyph::AgentStopped, Role::Warning, Role::MutedText),
+            SharedTaskStatus::NeedsAttention => (Glyph::Warning, Role::Error, Role::Error),
+        };
+        let mut suffix = RoleLine::default();
+        if board.is_team
+            && let Some(owner) = &task.owner
+        {
+            let color = self.agents.iter().find_map(|row| {
+                row.subagent
+                    .as_ref()
+                    .filter(|registration| registration.child_chat_id == owner.chat_id)
+                    .and_then(|registration| registration.color)
+            });
+            suffix.push(" (", Some(Role::MutedText));
+            suffix.push(
+                format!("@{}", super::safe_line(&owner.name)),
+                Some(color.map_or(Role::MutedText, Role::agent)),
+            );
+            suffix.push(")", Some(Role::MutedText));
+        }
+        if !blocked.is_empty() {
+            let blockers = blocked
+                .iter()
+                .map(|id| {
+                    board
+                        .tasks
+                        .iter()
+                        .position(|task| task.id == *id)
+                        .map_or_else(
+                            || "unknown task".into(),
+                            |index| {
+                                format!(
+                                    "#{}",
+                                    board
+                                        .task_number(index)
+                                        .map_or_else(|| "?".into(), |number| number.to_string())
+                                )
+                            },
+                        )
+                })
+                .collect::<Vec<_>>();
+            suffix.push(
+                format!(" ▸ blocked by {}", blockers.join(", ")),
+                Some(Role::MutedText),
+            );
+        }
+        let mut line = RoleLine::role(super::list_row::ROW_INDENT, Role::Text);
+        line.push(display.glyph(glyph), Some(glyph_role));
+        line.push(" ", Some(Role::Text));
+        let available = width.saturating_sub(line.text().width());
+        let title_columns = available
+            .saturating_sub(suffix.text().width())
+            .max(MIN_TASK_TITLE_COLUMNS.min(available));
+        line.push(
+            super::conversation_picker::ellipsize(&super::safe_line(&task.title), title_columns),
+            Some(title_role),
+        );
+        line.spans.extend(suffix.spans);
+        line.truncate(width);
+        if selected {
+            line = line.filled(Role::Selection);
+        }
+        line
+    }
+
+    fn task_frame(
+        &self,
+        width: usize,
+        height: usize,
+        display: DisplayProfile,
+        focus_preview: bool,
+    ) -> (Vec<RoleLine>, Option<usize>) {
+        let Some(board) = self.tasks.as_ref().filter(|board| !board.tasks.is_empty()) else {
+            return (Vec::new(), None);
+        };
+        let expanded = focus_preview || self.task_view.presentation == TaskPresentation::Expanded;
+        let focused = focus_preview || self.tasks_focused;
+        let counts = TaskCounts::of(board.tasks.iter());
+        let mut header = RoleLine::role("  ", Role::MutedText);
+        header.push(board.tasks.len().to_string(), Some(Role::MutedStrong));
+        header.push(" tasks (", Some(Role::MutedText));
+        let mut first = true;
+        for (count, label, show_zero) in [
+            (counts.completed, "done", true),
+            (counts.in_progress, "in progress", false),
+            (counts.pending, "open", true),
+            (counts.needs_attention, "needs attention", false),
+            (counts.cancelled, "cancelled", false),
+        ] {
+            if count == 0 && !show_zero {
+                continue;
+            }
+            if !first {
+                header.push(", ", Some(Role::MutedText));
+            }
+            first = false;
+            header.push(count.to_string(), Some(Role::MutedStrong));
+            header.push(format!(" {label}"), Some(Role::MutedText));
+        }
+        let hint = if self.task_focus_available == Some(false) {
+            "Resize to view"
+        } else if focused {
+            "Ctrl+T collapse"
+        } else if expanded {
+            "Ctrl+T focus"
+        } else {
+            "Ctrl+T expand"
+        };
+        header.push(format!(") · {hint}"), Some(Role::MutedText));
+        header.truncate(width);
+        let mut lines = vec![header];
+        if !focus_preview && self.task_view.presentation == TaskPresentation::Collapsed {
+            return (lines, None);
+        }
+        let capacity = if expanded {
+            let reserved = if self.task_details {
+                20
+            } else {
+                TASK_COMPACT_HEIGHT_OFFSET
+            };
+            height
+                .saturating_sub(reserved)
+                .clamp(1, MAX_COMPACT_TASK_ROWS)
+        } else {
+            height.saturating_sub(TASK_COMPACT_RESERVED_ROWS).min(
+                height
+                    .saturating_sub(TASK_COMPACT_HEIGHT_OFFSET)
+                    .clamp(MIN_COMPACT_TASK_ROWS, MAX_COMPACT_TASK_ROWS),
+            )
+        };
+        if capacity == 0 {
+            return (lines, None);
+        }
+        let start = if expanded {
+            self.task_view.selected.saturating_sub(capacity - 1)
+        } else {
+            0
+        };
+        let mut visible_tasks = board.tasks.iter().enumerate().collect::<Vec<_>>();
+        if !expanded {
+            visible_tasks.sort_by_key(|(_, task)| match task.status {
+                SharedTaskStatus::NeedsAttention => 0,
+                SharedTaskStatus::InProgress => 1,
+                SharedTaskStatus::Pending => 2,
+                SharedTaskStatus::Completed | SharedTaskStatus::Cancelled => 3,
+            });
+        }
+        let hidden = TaskCounts::of(
+            visible_tasks
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| *position < start || *position >= start + capacity)
+                .map(|(_, (_, task))| *task),
+        );
+        let mut selected_row = None;
+        for (index, task) in visible_tasks.into_iter().skip(start).take(capacity) {
+            if index == self.task_view.selected {
+                selected_row = Some(lines.len());
+            }
+            lines.push(self.task_line(
+                board,
+                index,
+                width,
+                display,
+                focused && index == self.task_view.selected,
+            ));
+            if index == self.task_view.selected && self.task_details {
+                for text in [
+                    format!(
+                        "Task #{} · {} · {}",
+                        board
+                            .task_number(index)
+                            .map_or_else(|| "?".into(), |number| number.to_string()),
+                        match task.status {
+                            SharedTaskStatus::Pending => "pending",
+                            SharedTaskStatus::InProgress => "in progress",
+                            SharedTaskStatus::Completed => "completed",
+                            SharedTaskStatus::NeedsAttention => "needs attention",
+                            SharedTaskStatus::Cancelled => "cancelled",
+                        },
+                        task.id
+                    ),
+                    task.description.clone(),
+                    format!(
+                        "Dependencies: {}",
+                        if task.dependencies.is_empty() {
+                            "none".into()
+                        } else {
+                            task.dependencies
+                                .iter()
+                                .map(|id| {
+                                    board
+                                        .tasks
+                                        .iter()
+                                        .enumerate()
+                                        .find(|(_, dependency)| dependency.id == *id)
+                                        .map_or_else(
+                                            || id.to_string(),
+                                            |(index, dependency)| {
+                                                format!(
+                                                    "#{} {}",
+                                                    board.task_number(index).map_or_else(
+                                                        || "?".into(),
+                                                        |number| number.to_string()
+                                                    ),
+                                                    dependency.title
+                                                )
+                                            },
+                                        )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    ),
+                    task.result.clone().unwrap_or_default(),
+                ] {
+                    if !text.is_empty() {
+                        let mut line = RoleLine::role(
+                            format!("    {}", super::safe_line(&text)),
+                            Role::MutedText,
+                        );
+                        line.truncate(width);
+                        lines.push(line);
+                    }
+                }
+            }
+        }
+        if board.tasks.len() > capacity {
+            let summary = [
+                (hidden.in_progress, "in progress"),
+                (hidden.pending, "pending"),
+                (hidden.completed, "completed"),
+                (hidden.needs_attention, "needs attention"),
+                (hidden.cancelled, "cancelled"),
+            ]
+            .into_iter()
+            .filter(|(count, _)| *count > 0)
+            .map(|(count, label)| format!("{count} {label}"))
+            .collect::<Vec<_>>();
+            lines.push(RoleLine::role(
+                format!("  … +{}", summary.join(", ")),
+                Role::MutedText,
+            ));
+        }
+        if focused {
+            lines.push(RoleLine::role(
+                "  j/k move · Enter details · Esc back",
+                Role::MutedText,
+            ));
+        }
+        for line in &mut lines {
+            line.truncate(width);
+        }
+        (lines, selected_row)
+    }
+
+    /// When a working member's run time next changes the open Subagents list.
     pub(super) fn next_frame_ms(&self, now: u64) -> Option<u64> {
         if !self.is_open() {
             return None;
@@ -756,6 +1063,32 @@ impl StatusArea {
 }
 
 #[cfg(test)]
+pub(super) fn test_task_board(titles: &[&str]) -> TaskBoard {
+    let mut board = TaskBoard::new(Uuid::from_u128(1010), Uuid::from_u128(1012));
+    board.tasks = titles
+        .iter()
+        .enumerate()
+        .map(|(index, title)| tickloop_agent_protocol::SharedTask {
+            id: Uuid::from_u128(2000 + index as u128),
+            title: (*title).into(),
+            description: "Verify the task".into(),
+            dependencies: vec![],
+            status: SharedTaskStatus::InProgress,
+            owner: Some(tickloop_agent_protocol::TaskOwner {
+                chat_id: Uuid::from_u128(1010),
+                name: "main".into(),
+            }),
+            claim: None,
+            delegated_runs: Vec::new(),
+            revision: 1,
+            result: None,
+            report: None,
+        })
+        .collect();
+    board
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -776,6 +1109,7 @@ mod tests {
             glyph: Glyph::AgentRunning,
             preview: None,
             updated_at: None,
+            run_started_at: None,
             subagent: parent.map(|_| tickloop_agent_protocol::SubagentRegistration {
                 child_chat_id: Uuid::from_u128(id),
                 handle: title.into(),
@@ -807,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_panel_elapsed_idle_and_backgrounds_follow_the_view_clock() {
+    fn subagent_panel_shows_run_elapsed_and_explicit_idle_state() {
         use crate::{agent_console::AttentionGroup, terminal::style::ThemeName};
         let root = Uuid::from_u128(1);
         let child = Uuid::from_u128(2);
@@ -825,11 +1159,12 @@ mod tests {
             glyph: Glyph::AgentRunning,
             preview: Some("Run sleep 30".into()),
             updated_at: Some(100_000),
+            run_started_at: Some(100_000),
             subagent: parent.map(|_| tickloop_agent_protocol::SubagentRegistration {
                 child_chat_id: id,
                 handle: title.into(),
                 description: "Run sleep 30".into(),
-                created_at: 100_000,
+                created_at: 10_000,
                 color: Some(tickloop_agent_protocol::AgentColor::Cyan),
             }),
         };
@@ -887,6 +1222,19 @@ mod tests {
                     .all(|line| line.fill.is_none() || line.fill == Some(Role::Selection))
             );
         }
+        rows[1].run_started_at = None;
+        area.update_agents(rows.clone(), Some(child));
+        let footer = FooterFrame {
+            items: Vec::new(),
+            selected: None,
+        };
+        let line = &area.panel_lines_at(&footer, 80, 3, DisplayProfile::default(), 161_000)[1];
+        assert!(
+            line.text().ends_with("Running"),
+            "missing Run timestamps cannot use the member creation time: {line:?}"
+        );
+        assert_eq!(area.next_frame_ms(161_000), None);
+        rows[1].run_started_at = Some(100_000);
         rows[1].status = "En cours".into();
         area.update_agents(rows.clone(), Some(child));
         let unfocused = FooterFrame {
@@ -926,8 +1274,8 @@ mod tests {
         );
         let waiting = &area.panel_lines_at(&unfocused, 80, 3, display, 181_000)[1];
         assert!(
-            waiting.text().ends_with(" 1m") && !waiting.text().contains("waiting"),
-            "a waiting member shows how long ago it changed: {waiting:?}"
+            waiting.text().ends_with("Waiting · trigger"),
+            "a waiting member shows its state: {waiting:?}"
         );
         assert_eq!(waiting.spans[1].role, Some(Role::AgentCyan));
         rows[1].group = AttentionGroup::Idle;
@@ -940,10 +1288,8 @@ mod tests {
             selected: None,
         };
         let idle = &area.panel_lines_at(&footer, 80, 3, DisplayProfile::default(), 181_000)[1];
-        assert!(
-            idle.text().ends_with(" 1m") && !idle.text().contains("idle"),
-            "{idle:?}"
-        );
+        assert!(idle.text().ends_with("idle"), "{idle:?}");
+        assert_eq!(area.next_frame_ms(181_000), None);
         rows[1].group = AttentionGroup::Working;
         rows[1].state = tickloop_agent_protocol::LoopState::Running;
         rows[1].status = "Running".into();
@@ -971,324 +1317,10 @@ mod tests {
         );
     }
 
-    fn todo(content: &str) -> TodoItem {
-        TodoItem {
-            content: content.into(),
-            status: TodoStatus::InProgress,
-            active_form: "Working".into(),
-        }
-    }
-
-    #[test]
-    fn todo_rows_lead_with_a_first_row_branch_and_aligned_continuations() {
-        let mut area = StatusArea::default();
-        let mut todos = vec![todo("pending"), todo("active"), todo("done")];
-        for (todo, status) in todos.iter_mut().zip([
-            TodoStatus::Pending,
-            TodoStatus::InProgress,
-            TodoStatus::Completed,
-        ]) {
-            todo.status = status;
-        }
-        area.update("Auto".into(), "fixture".into(), None, todos);
-        let rows = area.todo_lines(80, 24, DisplayProfile::default(), true, Instant::now());
-        assert_eq!(
-            rows.iter().map(RoleLine::text).collect::<Vec<_>>(),
-            ["  ⎿  ◻ pending", "     ◼ active", "     ✔ done"]
-        );
-        for row in &rows {
-            assert_eq!(
-                UnicodeWidthStr::width(row.text().as_str()),
-                7 + row.text().chars().skip(7).count()
-            );
-        }
-    }
-
-    #[test]
-    fn todo_status_colours_and_decorations_follow_the_active_theme() {
-        use super::super::style::{ColourDepth, ThemeName};
-
-        let mut area = StatusArea::default();
-        let mut todos = vec![todo("pending"), todo("active"), todo("done")];
-        for (todo, status) in todos.iter_mut().zip([
-            TodoStatus::Pending,
-            TodoStatus::InProgress,
-            TodoStatus::Completed,
-        ]) {
-            todo.status = status;
-        }
-        area.update("Auto".into(), "fixture".into(), None, todos);
-        let mut display = DisplayProfile::default();
-        let mut themed_rows = Vec::new();
-        for name in ThemeName::ALL {
-            display.set_theme(name);
-            let theme = display.theme();
-            let rows = area.todo_lines(80, 24, display, true, Instant::now());
-            let mut rendered_rows = Vec::new();
-            // Claude Code's task list: plain while open, an orange square and bold text in
-            // progress, a green tick and muted struck-through text when done.
-            for (row, (title, glyph, icon_colour, text_colour, bold, crossed_out)) in
-                rows.iter().zip([
-                    ("pending", Glyph::TodoPending, None, None, false, false),
-                    (
-                        "active",
-                        Glyph::TodoInProgress,
-                        Some(Role::Accent),
-                        None,
-                        true,
-                        false,
-                    ),
-                    (
-                        "done",
-                        Glyph::TodoCompleted,
-                        Some(Role::Success),
-                        Some(Role::MutedText),
-                        false,
-                        true,
-                    ),
-                ])
-            {
-                let resolved = row.resolve(theme, 80);
-                let icon = resolved
-                    .spans
-                    .iter()
-                    .find(|span| span.text.contains(display.glyph(glyph)))
-                    .unwrap();
-                let text = resolved
-                    .spans
-                    .iter()
-                    .find(|span| span.text.contains(title))
-                    .unwrap();
-                assert_eq!(
-                    icon.style.foreground,
-                    icon_colour.and_then(|role| theme.style(role).foreground),
-                    "{name:?} {title} icon"
-                );
-                assert_eq!(
-                    text.style.foreground,
-                    text_colour.and_then(|role| theme.style(role).foreground),
-                    "{name:?} {title} text"
-                );
-                assert!(!icon.style.bold);
-                assert!(!icon.style.crossed_out);
-                assert_eq!(text.style.bold, bold);
-                assert_eq!(text.style.crossed_out, crossed_out);
-                assert!(!icon.style.dim && !text.style.dim);
-                rendered_rows.push(resolved.render(ColourDepth::TrueColour));
-            }
-            let branch = rows[0].resolve(theme, 80);
-            assert_eq!(
-                branch.spans[0].style.foreground,
-                theme.style(Role::MutedText).foreground
-            );
-            themed_rows.push(rendered_rows);
-        }
-        for rows in &themed_rows {
-            assert!(
-                rows[0].ends_with(&format!(
-                    "\x1b[0m{} pending",
-                    display.glyph(Glyph::TodoPending)
-                )),
-                "an open task keeps the terminal's own colours: {:?}",
-                rows[0]
-            );
-        }
-        assert_ne!(
-            themed_rows[0][2], themed_rows[1][2],
-            "completed row must recolour when switching themes"
-        );
-    }
-
-    #[test]
-    fn narrow_todo_rows_keep_status_marks_and_truncate_subjects_by_display_columns() {
-        let mut area = StatusArea::default();
-        let mut todos = vec![
-            todo("中文ab中ab"),
-            todo("e\u{301}中ab"),
-            todo("done\nne\txt\r\u{1b}"),
-        ];
-        for (todo, status) in todos.iter_mut().zip([
-            TodoStatus::Pending,
-            TodoStatus::InProgress,
-            TodoStatus::Completed,
-        ]) {
-            todo.status = status;
-        }
-        area.update("Auto".into(), "fixture".into(), None, todos);
-        let display = DisplayProfile::default();
-        for width in 0..=40 {
-            let rows = area.todo_lines(width, 24, display, true, Instant::now());
-            assert_eq!(rows.len(), 3);
-            for row in &rows {
-                assert!(
-                    UnicodeWidthStr::width(row.text().as_str()) <= width,
-                    "width={width}: {row:?}"
-                );
-                assert!(!row.text().contains(['\n', '\t', '\r', '\u{1b}']));
-            }
-            if width > 0 {
-                for (row, glyph) in rows.iter().zip([
-                    Glyph::TodoPending,
-                    Glyph::TodoInProgress,
-                    Glyph::TodoCompleted,
-                ]) {
-                    assert!(
-                        row.text().contains(display.glyph(glyph)),
-                        "width={width}: status mark must survive"
-                    );
-                }
-            }
-        }
-        let rows = area.todo_lines(12, 24, display, true, Instant::now());
-        assert_eq!(
-            rows[0].text(),
-            format!(
-                "  {}  {} 中文…",
-                display.glyph(Glyph::TodoBranch),
-                display.glyph(Glyph::TodoPending)
-            )
-        );
-        assert_eq!(
-            rows[1].text(),
-            format!("     {} e\u{301}中ab", display.glyph(Glyph::TodoInProgress))
-        );
-        assert_eq!(
-            rows[2].text(),
-            format!("     {} done…", display.glyph(Glyph::TodoCompleted))
-        );
-        let short = area.todo_lines(40, 10, display, true, Instant::now());
-        assert!(
-            short[0]
-                .text()
-                .contains(display.glyph(Glyph::TodoInProgress))
-        );
-        assert_eq!(short[1].text(), "     … +1 pending, 1 completed");
-    }
-
-    #[test]
-    fn todo_truncation_prioritizes_live_work_and_accounts_for_hidden_statuses() {
-        let mut area = StatusArea::default();
-        let todos = (1..=13)
-            .map(|index| {
-                let mut todo = todo(&format!("todo {index}"));
-                todo.status = if index == 1 {
-                    TodoStatus::Completed
-                } else if index == 13 {
-                    TodoStatus::InProgress
-                } else {
-                    TodoStatus::Pending
-                };
-                todo
-            })
-            .collect();
-        area.update("Auto".into(), "fixture".into(), None, todos);
-        let rows = area.todo_lines(80, 24, DisplayProfile::default(), true, Instant::now());
-        assert!(
-            rows.iter().any(|row| row.text().contains("todo 13")),
-            "{rows:?}"
-        );
-        assert!(
-            !rows.iter().any(|row| row.text().ends_with("todo 1")),
-            "{rows:?}"
-        );
-        assert_eq!(
-            rows.last().unwrap().text().trim(),
-            "… +2 pending, 1 completed"
-        );
-    }
-
-    #[test]
-    fn todo_order_and_recent_completion_expiry_match_the_reference() {
-        let mut area = StatusArea::default();
-        let initial = (1..=13)
-            .map(|index| {
-                let mut todo = todo(&format!("todo {index}"));
-                todo.status = if index == 13 {
-                    TodoStatus::InProgress
-                } else {
-                    TodoStatus::Pending
-                };
-                todo
-            })
-            .collect::<Vec<_>>();
-        area.update("Auto".into(), "fixture".into(), None, initial.clone());
-        let mut completed = initial;
-        completed[0].status = TodoStatus::Completed;
-        area.update("Auto".into(), "fixture".into(), None, completed);
-        let now = Instant::now();
-        assert!(area.todo_refresh_pending());
-        let recent = area.todo_lines(80, 24, DisplayProfile::default(), true, now);
-        assert_eq!(recent[0].text(), "  ⎿  ✔ todo 1");
-        assert_eq!(recent[1].text(), "     ◼ todo 13");
-        assert_eq!(recent.last().unwrap().text().trim(), "… +3 pending");
-        let expired = area.todo_lines(
-            80,
-            24,
-            DisplayProfile::default(),
-            true,
-            now + Duration::from_secs(31),
-        );
-        assert_eq!(expired[0].text(), "  ⎿  ◼ todo 13");
-        assert_eq!(
-            expired.last().unwrap().text().trim(),
-            "… +2 pending, 1 completed"
-        );
-        assert!(!area.todo_refresh_pending());
-        let idle = area.todo_lines(
-            32,
-            24,
-            DisplayProfile::default(),
-            false,
-            now + Duration::from_secs(31),
-        );
-        assert!(
-            idle.iter()
-                .all(|row| UnicodeWidthStr::width(row.text().as_str()) <= 32)
-        );
-        area.update(
-            "Auto".into(),
-            "fixture".into(),
-            None,
-            vec![todo("third"), todo("first"), todo("second")],
-        );
-        let ordered = area.todo_lines(80, 24, DisplayProfile::default(), true, now);
-        assert!(ordered[0].text().ends_with("third"));
-        assert!(ordered[1].text().ends_with("first"));
-        assert!(ordered[2].text().ends_with("second"));
-        area.update("Auto".into(), "fixture".into(), None, vec![]);
-        assert!(
-            area.todo_lines(80, 24, DisplayProfile::default(), false, now)
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn an_idle_todo_list_sits_under_its_header_without_a_connector() {
-        let mut area = StatusArea::default();
-        let mut todos = vec![todo("Back up"), todo("Migrate"), todo("Verify")];
-        todos[0].status = TodoStatus::Completed;
-        todos[1].status = TodoStatus::InProgress;
-        todos[2].status = TodoStatus::Pending;
-        area.update("Auto".into(), "fixture".into(), None, todos);
-        let idle = area.todo_lines(80, 24, DisplayProfile::default(), false, Instant::now());
-        assert_eq!(
-            idle.iter().map(RoleLine::text).collect::<Vec<_>>(),
-            [
-                "  3 tasks (1 done, 1 in progress, 1 open)",
-                "  ✔ Back up",
-                "  ◼ Migrate",
-                "  ◻ Verify",
-            ]
-        );
-        let working = area.todo_lines(80, 24, DisplayProfile::default(), true, Instant::now());
-        assert_eq!(working[0].text(), "  ⎿  ✔ Back up");
-        assert_eq!(working[1].text(), "     ◼ Migrate");
-    }
-
     #[test]
     fn context_segment_shows_zero_before_usage_with_a_known_window() {
         let mut area = StatusArea::default();
-        area.update("Auto".into(), "model".into(), Some((0, 200_000)), vec![]);
+        area.update("Auto".into(), "model".into(), Some((0, 200_000)), None);
         assert_eq!(
             area.status_line(80, "").text(),
             "⏵⏵ Auto · model · Context 0% used"
@@ -1298,7 +1330,7 @@ mod tests {
     #[test]
     fn context_segment_shows_rounded_zero_usage() {
         let mut area = StatusArea::default();
-        area.update("Auto".into(), "model".into(), Some((999, 200_000)), vec![]);
+        area.update("Auto".into(), "model".into(), Some((999, 200_000)), None);
         assert_eq!(
             area.status_line(80, "").text(),
             "⏵⏵ Auto · model · Context 0% used"
@@ -1309,7 +1341,7 @@ mod tests {
     fn context_segment_shows_unknown_when_usage_or_window_is_unavailable() {
         let mut area = StatusArea::default();
         for context in [None, Some((42, 0))] {
-            area.update("Auto".into(), "model".into(), context, vec![]);
+            area.update("Auto".into(), "model".into(), context, None);
             assert_eq!(
                 area.status_line(80, "").text(),
                 "⏵⏵ Auto · model · Context unknown"
@@ -1320,13 +1352,13 @@ mod tests {
     #[test]
     fn context_segment_shows_rounded_usage_and_keeps_the_existing_fit_priority() {
         let mut area = StatusArea::default();
-        area.update("Auto".into(), "model".into(), Some((1000, 200_000)), vec![]);
+        area.update("Auto".into(), "model".into(), Some((1000, 200_000)), None);
         assert_eq!(
             area.status_line(80, "").text(),
             "⏵⏵ Auto · model · Context 1% used"
         );
         assert_eq!(area.status_line(16, "").text(), "⏵⏵ Auto · model");
-        area.update("Auto".into(), "model".into(), None, vec![]);
+        area.update("Auto".into(), "model".into(), None, None);
         assert_eq!(
             area.status_line(80, "Not saved").text(),
             "⏵⏵ Auto · model · Context unknown · Not saved"
@@ -1336,7 +1368,7 @@ mod tests {
     #[test]
     fn status_keeps_mode_and_notice_when_narrow_and_never_invents_usage() {
         let mut area = StatusArea::default();
-        area.update("Auto".into(), "gpt-5.6".into(), None, vec![]);
+        area.update("Auto".into(), "gpt-5.6".into(), None, None);
         assert_eq!(
             area.status_line(80, "").text(),
             "⏵⏵ Auto · gpt-5.6 · Context unknown"
@@ -1344,7 +1376,7 @@ mod tests {
         let narrow = area.status_line(24, "Not saved").text();
         assert!(narrow.starts_with("⏵⏵ Auto · Not saved"));
         assert!(!narrow.contains("gpt-5.6"));
-        area.update("Auto".into(), "gpt-5.6".into(), Some((0, 200_000)), vec![]);
+        area.update("Auto".into(), "gpt-5.6".into(), Some((0, 200_000)), None);
         assert_eq!(
             area.status_line(80, "").text(),
             "⏵⏵ Auto · gpt-5.6 · Context 0% used"
@@ -1353,7 +1385,7 @@ mod tests {
             "Auto".into(),
             "gpt-5.6".into(),
             Some((42_000, 200_000)),
-            vec![],
+            None,
         );
         assert_eq!(
             area.status_line(80, "").text(),
@@ -1371,15 +1403,10 @@ mod tests {
                 .and_then(|span| span.role)
         };
         let mut area = StatusArea::default();
-        area.update("Auto".into(), "model".into(), None, vec![]);
+        area.update("Auto".into(), "model".into(), None, None);
         assert_eq!(context_role(&area), Some(Role::MutedText));
         assert_eq!(area.status_line(80, "").spans[0].role, Some(Role::Warning));
-        area.update(
-            "Auto".into(),
-            "model".into(),
-            Some((42_000, 200_000)),
-            vec![],
-        );
+        area.update("Auto".into(), "model".into(), Some((42_000, 200_000)), None);
         assert_eq!(context_role(&area), Some(Role::Success));
         assert!(
             area.status_line(80, "")
@@ -1387,14 +1414,14 @@ mod tests {
                 .iter()
                 .all(|span| span.role != Some(Role::Error))
         );
-        area.update("Plan".into(), "model".into(), None, vec![]);
+        area.update("Plan".into(), "model".into(), None, None);
         assert_eq!(area.status_line(80, "").spans[0].role, Some(Role::PlanMode));
     }
 
     #[test]
     fn background_waiting_facts_and_agent_labels_use_separate_semantic_roles() {
         let mut area = StatusArea::default();
-        area.update("Auto".into(), "model".into(), None, vec![]);
+        area.update("Auto".into(), "model".into(), None, None);
         for message in ["waiting for approval", "waiting for your answer"] {
             let notice = BackgroundStatusNotice {
                 title: Some("Review the implementation".into()),
@@ -1430,13 +1457,13 @@ mod tests {
     #[test]
     fn permission_mode_status_uses_distinct_roles_for_ask_and_full_access() {
         let mut area = StatusArea::default();
-        area.update("Ask".into(), "model".into(), None, vec![]);
+        area.update("Ask".into(), "model".into(), None, None);
         assert_eq!(
             area.status_line(80, "").spans[0].role,
             Some(Role::AutoAccept)
         );
 
-        area.update("Full Access".into(), "model".into(), None, vec![]);
+        area.update("Full Access".into(), "model".into(), None, None);
         assert_eq!(area.status_line(80, "").spans[0].role, Some(Role::Error));
     }
 
@@ -1459,6 +1486,7 @@ mod tests {
             glyph: super::super::console::status_glyph(group, completed),
             preview: None,
             updated_at: Some(64_000),
+            run_started_at: None,
             subagent: (id != 1).then(|| SubagentRegistration {
                 child_chat_id: Uuid::from_u128(id),
                 handle: format!("member-{id}"),
@@ -1468,7 +1496,7 @@ mod tests {
             }),
         };
         let mut area = StatusArea::default();
-        area.update("Auto".into(), "model".into(), None, Vec::new());
+        area.update("Auto".into(), "model".into(), None, None);
         area.update_agents(
             vec![
                 row(1, LoopState::Idle, AttentionGroup::Idle, false),
@@ -1506,16 +1534,19 @@ mod tests {
                     .all(|span| span.role == Some(Role::MutedText)),
                 "{line:?}"
             );
-            assert!(line.text().ends_with(" 6s"), "only the age: {line:?}");
-            assert_eq!(line.spans.last().unwrap().role, Some(Role::MutedText));
+            let expected = ["idle", "Failed", "Stopped", "Interrupted"][index - 1];
+            assert!(line.text().ends_with(expected), "{line:?}");
+            let expected_role =
+                [Role::MutedText, Role::Error, Role::Warning, Role::Warning][index - 1];
+            assert_eq!(line.spans.last().unwrap().role, Some(expected_role));
             for word in ["done", "failed", "stopped", "✔", "✖"] {
                 assert!(!line.text().contains(word), "{line:?}");
             }
         }
         assert_eq!(
             area.next_frame_ms(70_000),
-            Some(71_000),
-            "the ages tick each second"
+            None,
+            "finished members do not keep a running timer"
         );
 
         area.select(FooterItemId::Agents);
@@ -1546,5 +1577,486 @@ mod tests {
             "a departed row falls back to the viewed member"
         );
         assert_eq!(next.selected_dismissible(), None, "the viewed member stays");
+    }
+}
+
+#[cfg(test)]
+mod shared_task_tests {
+    use super::*;
+    #[test]
+    fn working_task_block_has_one_connector_and_reserves_its_columns() {
+        let mut area = StatusArea::default();
+        area.update(
+            "Auto".into(),
+            "model".into(),
+            None,
+            Some(test_task_board(&["Inspect", "Verify"])),
+        );
+        let display = DisplayProfile::default();
+        let rows = area.task_lines_in_viewport(80, 24, 20, display, true);
+        assert!(rows[0].text().starts_with("  ⎿  2 tasks"));
+        assert_eq!(
+            rows.iter()
+                .map(|line| line.text().matches('⎿').count())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(rows[1].text(), "     ◼ Inspect");
+        assert_eq!(rows[2].text(), "     ◼ Verify");
+        assert!(area.task_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)));
+        let focused = area.task_lines_in_viewport(80, 24, 20, display, true);
+        let selected = focused
+            .iter()
+            .find(|line| line.fill == Some(Role::Selection))
+            .unwrap();
+        assert_eq!(selected.fill_start, 3);
+        for width in [0, 1, 3, 6, 8, 24] {
+            let rows = area.task_lines_in_viewport(width, 24, 20, display, true);
+            assert!(rows.iter().all(|row| row.text().width() <= width));
+            if width <= 6 {
+                assert!(!area.tasks_can_take_focus());
+            }
+        }
+        let idle = area.task_lines_in_viewport(80, 24, 20, display, false);
+        assert!(idle[0].text().starts_with("  2 tasks"));
+        assert!(idle.iter().all(|row| !row.text().contains('⎿')));
+        area.update("Auto".into(), "model".into(), None, None);
+        assert!(
+            area.task_lines_in_viewport(80, 24, 20, display, true)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn task_list_uses_inline_owners_and_accurate_overflow_counts() {
+        let mut area = StatusArea::default();
+        let mut board = test_task_board(&[
+            "Finished",
+            "Active",
+            "Ready",
+            "Blocked",
+            "Later",
+            "Needs check",
+            "Cancelled",
+            "More",
+        ]);
+        board.is_team = true;
+        for task in &mut board.tasks {
+            task.owner = None;
+            task.status = SharedTaskStatus::Pending;
+        }
+        board.tasks[0].status = SharedTaskStatus::Completed;
+        board.tasks[1].status = SharedTaskStatus::InProgress;
+        board.tasks[5].status = SharedTaskStatus::NeedsAttention;
+        board.tasks[6].status = SharedTaskStatus::Cancelled;
+        board.tasks[3].dependencies = vec![board.tasks[2].id];
+        let owner_chat = Uuid::from_u128(9000);
+        for index in [0, 1] {
+            board.tasks[index].owner = Some(tickloop_agent_protocol::TaskOwner {
+                chat_id: owner_chat,
+                name: "reader".into(),
+            });
+        }
+        area.update_agents(
+            vec![AgentRow {
+                agent_id: Uuid::from_u128(9001),
+                parent_id: Some(Uuid::from_u128(9002)),
+                title: "Read notes".into(),
+                status: "Completed".into(),
+                state: LoopState::Completed,
+                project: String::new(),
+                workspace: None,
+                approvals: 0,
+                questions: 0,
+                group: crate::agent_console::AttentionGroup::Done,
+                glyph: Glyph::AgentCompleted,
+                preview: None,
+                updated_at: None,
+                run_started_at: None,
+                subagent: Some(tickloop_agent_protocol::SubagentRegistration {
+                    child_chat_id: owner_chat,
+                    handle: "reader".into(),
+                    description: "Read notes".into(),
+                    created_at: 0,
+                    color: Some(tickloop_agent_protocol::AgentColor::Blue),
+                }),
+            }],
+            None,
+        );
+        area.update("Auto".into(), "model".into(), None, Some(board));
+        let lines = area.task_lines(180, 24, DisplayProfile::default());
+        assert!(
+            lines[0].text().starts_with(
+                "  8 tasks (1 done, 1 in progress, 4 open, 1 needs attention, 1 cancelled)"
+            ),
+            "{lines:?}"
+        );
+        assert_eq!(lines.len(), 7);
+        assert_eq!(
+            lines.last().unwrap().text(),
+            "  … +1 pending, 1 completed, 1 cancelled"
+        );
+        let active = lines
+            .iter()
+            .find(|line| line.text().contains("Active"))
+            .unwrap();
+        assert_eq!(active.text(), "  ◼ Active (@reader)");
+        assert!(
+            active
+                .spans
+                .iter()
+                .any(|span| span.text == "@reader" && span.role == Some(Role::AgentBlue))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text() == "  ◻ Blocked ▸ blocked by #3")
+        );
+        assert!(lines.iter().any(|line| line.text() == "  ! Needs check"));
+        area.task_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        let expanded = area.task_lines(180, 24, DisplayProfile::default());
+        assert_eq!(expanded[1].text(), "  ✔ Finished (@reader)");
+        assert!(
+            expanded[1]
+                .spans
+                .iter()
+                .any(|span| span.text == "Finished" && span.role == Some(Role::CompletedTodo))
+        );
+        for _ in 0..6 {
+            area.task_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        let cancelled = area.task_lines(180, 24, DisplayProfile::default());
+        assert!(cancelled.iter().any(|line| line.text() == "  ✖ Cancelled"));
+        area.task_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let details = area.task_lines(180, 40, DisplayProfile::default());
+        assert!(
+            details
+                .iter()
+                .any(|line| line.text().contains("Task #7 · cancelled"))
+        );
+        for width in [1, 8, 20, 60] {
+            let rows = area.task_lines(width, 24, DisplayProfile::default());
+            assert!(rows.iter().all(|row| row.text().width() <= width));
+        }
+    }
+
+    #[test]
+    fn task_dependencies_use_stable_display_numbers_and_clear_when_completed() {
+        let mut board = test_task_board(&["First", "Second", "Third", "Dependent"]);
+        for task in &mut board.tasks {
+            task.status = SharedTaskStatus::Pending;
+            task.owner = None;
+        }
+        board.tasks[1].status = SharedTaskStatus::Completed;
+        board.tasks[3].dependencies = vec![board.tasks[0].id, board.tasks[1].id, board.tasks[2].id];
+        let dependent_id = board.tasks[3].id;
+        let mut area = StatusArea::default();
+        assert_eq!(
+            area.task_line(&board, 3, 100, DisplayProfile::default(), false)
+                .text(),
+            "  ◻ Dependent ▸ blocked by #1, #3"
+        );
+        let mut added = board.tasks[0].clone();
+        added.id = Uuid::new_v4();
+        added.title = "Added later".into();
+        board.tasks.push(added);
+        board.tasks[0].status = SharedTaskStatus::Completed;
+        assert_eq!(
+            area.task_line(&board, 3, 100, DisplayProfile::default(), false)
+                .text(),
+            "  ◻ Dependent ▸ blocked by #3"
+        );
+        for width in [1, 8, 20, 30] {
+            assert!(
+                area.task_line(&board, 3, width, DisplayProfile::default(), false)
+                    .text()
+                    .width()
+                    <= width
+            );
+        }
+        board.tasks[2].status = SharedTaskStatus::Completed;
+        assert_eq!(
+            area.task_line(&board, 3, 100, DisplayProfile::default(), false)
+                .text(),
+            "  ◻ Dependent"
+        );
+        area.update("Auto".into(), "model".into(), None, Some(board));
+        area.task_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        for _ in 0..3 {
+            area.task_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        area.task_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let lines = area.task_lines(160, 40, DisplayProfile::default());
+        assert!(lines.iter().any(|line| {
+            line.text()
+                .contains(&format!("Task #4 · pending · {dependent_id}"))
+        }));
+        assert!(lines.iter().any(|line| {
+            line.text()
+                .contains("Dependencies: #1 First, #2 Second, #3 Third")
+        }));
+    }
+
+    #[test]
+    fn task_numbers_continue_after_a_completed_list_is_cleared() {
+        let mut board = test_task_board(&["Prerequisite", "Dependent"]);
+        board.task_number_offset = 11;
+        for task in &mut board.tasks {
+            task.status = SharedTaskStatus::Pending;
+            task.owner = None;
+        }
+        board.tasks[1].dependencies = vec![board.tasks[0].id];
+        let mut area = StatusArea::default();
+        assert_eq!(
+            area.task_line(&board, 1, 100, DisplayProfile::default(), false)
+                .text(),
+            "  ◻ Dependent ▸ blocked by #12"
+        );
+        area.update("Auto".into(), "model".into(), None, Some(board));
+        area.task_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        area.task_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        area.task_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let lines = area.task_lines(160, 40, DisplayProfile::default());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text().contains("Task #13 · pending"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text().contains("Dependencies: #12 Prerequisite"))
+        );
+    }
+
+    #[test]
+    fn task_list_omits_zero_running_count_and_keeps_a_long_title_on_one_line() {
+        let mut area = StatusArea::default();
+        let mut board =
+            test_task_board(&["A long task title that cannot fit on a narrow terminal"]);
+        board.tasks[0].status = SharedTaskStatus::Pending;
+        board.tasks[0].owner = None;
+        area.update("Auto".into(), "model".into(), None, Some(board));
+        let lines = area.task_lines(24, 24, DisplayProfile::default());
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].text().ends_with('…'));
+        assert!(!lines[1].text().contains("pending"));
+        let wide = area.task_lines(100, 24, DisplayProfile::default());
+        assert!(wide[0].text().starts_with("  1 tasks (0 done, 1 open)"));
+        assert!(!wide[0].text().contains("in progress"));
+    }
+
+    #[test]
+    fn tasks_are_hidden_when_empty_and_expand_with_owner_state_and_dependencies() {
+        let mut area = StatusArea::default();
+        assert!(
+            area.task_lines(80, 24, DisplayProfile::default())
+                .is_empty()
+        );
+        let mut board = test_task_board(&["Inspect", "Verify"]);
+        board.is_team = true;
+        board.tasks[0].status = SharedTaskStatus::Completed;
+        board.tasks[1].dependencies = vec![board.tasks[0].id];
+        area.update("Auto".into(), "model".into(), None, Some(board));
+        let compact = area.task_lines(80, 24, DisplayProfile::default());
+        assert_eq!(compact.len(), 3);
+        assert!(compact[1].text().contains("Verify"));
+        assert!(compact[2].text().contains("Inspect"));
+        assert!(
+            compact[0]
+                .text()
+                .contains("2 tasks (1 done, 1 in progress, 0 open)")
+        );
+        assert!(area.task_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)));
+        let expanded = area.task_lines(80, 24, DisplayProfile::default());
+        assert!(
+            expanded
+                .iter()
+                .any(|line| line.text().contains("Inspect") && line.text().contains("main"))
+        );
+        area.task_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        area.task_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            area.task_lines(80, 24, DisplayProfile::default())
+                .iter()
+                .any(|line| line.text().contains("Dependencies: #1 Inspect"))
+        );
+        area.release_task_focus();
+        assert!(!area.task_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)));
+        for width in [1, 8, 20, 80] {
+            for line in area.task_lines(width, 10, DisplayProfile::default()) {
+                assert!(UnicodeWidthStr::width(line.text().as_str()) <= width);
+            }
+        }
+        area.update("Auto".into(), "model".into(), None, None);
+        assert!(
+            area.task_lines(80, 24, DisplayProfile::default())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn compact_tasks_adapt_to_height_and_solo_team_ownership() {
+        let mut area = StatusArea::default();
+        let mut board = test_task_board(&["Inspect", "Verify", "Publish", "Later"]);
+        board.tasks[1].dependencies = vec![board.tasks[0].id];
+        area.update("Auto".into(), "model".into(), None, Some(board.clone()));
+        let compact = area.task_lines(80, 24, DisplayProfile::default());
+        assert_eq!(compact.len(), 5);
+        assert!(compact[1].text().contains("Inspect"));
+        assert!(compact[1].text().contains("◼"));
+        assert!(!compact[1].text().contains("in progress"));
+        assert!(compact[2].text().contains("blocked by #1"));
+        assert!(compact.iter().all(|line| !line.text().contains("main")));
+        assert!(compact.iter().any(|line| line.text().contains("Later")));
+        assert_eq!(area.task_lines(80, 13, DisplayProfile::default()).len(), 3);
+        assert_eq!(area.task_lines(80, 10, DisplayProfile::default()).len(), 1);
+        area.task_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        area.task_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        area.task_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            area.task_lines(80, 24, DisplayProfile::default())
+                .iter()
+                .any(|line| line.text().contains("Dependencies: #1 Inspect"))
+        );
+        area.release_task_focus();
+        board.is_team = true;
+        area.update("Auto".into(), "model".into(), None, Some(board));
+        assert!(
+            area.task_lines(80, 24, DisplayProfile::default())
+                .iter()
+                .any(|line| line.text().contains("Inspect") && line.text().contains("main"))
+        );
+    }
+
+    #[test]
+    fn unassigned_team_tasks_show_no_owner_or_repeated_status() {
+        let mut area = StatusArea::default();
+        let mut board = test_task_board(&["Inspect", "Verify"]);
+        board.is_team = true;
+        board.tasks[0].owner = None;
+        board.tasks[0].status = SharedTaskStatus::Pending;
+        board.tasks[1].status = SharedTaskStatus::Pending;
+        area.update("Auto".into(), "model".into(), None, Some(board));
+        let lines = area.task_lines(80, 24, DisplayProfile::default());
+        let unassigned = lines
+            .iter()
+            .find(|line| line.text().contains("Inspect"))
+            .unwrap()
+            .text();
+        assert_eq!(unassigned, "  ◻ Inspect");
+        assert!(
+            !unassigned.contains("unassigned") && !unassigned.contains('·'),
+            "{unassigned}"
+        );
+        let assigned = lines
+            .iter()
+            .find(|line| line.text().contains("Verify"))
+            .unwrap()
+            .text();
+        assert_eq!(assigned, "  ◻ Verify (@main)");
+    }
+
+    #[test]
+    fn manual_collapse_survives_updates_empty_data_and_scope_switching() {
+        let mut area = StatusArea::default();
+        let mut board = test_task_board(&["Inspect", "Verify"]);
+        area.update("Auto".into(), "model".into(), None, Some(board.clone()));
+        let toggle = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        area.task_key(toggle);
+        area.task_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        area.task_key(toggle);
+        assert!(!area.task_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)));
+        board.tasks[0].status = SharedTaskStatus::Completed;
+        board.is_team = true;
+        board.revision += 1;
+        area.update("Auto".into(), "model".into(), None, Some(board.clone()));
+        assert_eq!(area.task_lines(80, 24, DisplayProfile::default()).len(), 1);
+        area.update("Auto".into(), "model".into(), None, None);
+        let mut other = board.clone();
+        other.root_loop_id = Uuid::from_u128(9999);
+        area.update("Auto".into(), "model".into(), None, Some(other));
+        assert_eq!(area.task_lines(80, 24, DisplayProfile::default()).len(), 3);
+        area.update("Auto".into(), "model".into(), None, Some(board.clone()));
+        assert_eq!(area.task_lines(80, 24, DisplayProfile::default()).len(), 1);
+        assert_eq!(area.task_view.selected, 1);
+        let mut member = StatusArea::default();
+        member.update("Auto".into(), "model".into(), None, Some(board));
+        member.adopt_task_views(&area);
+        assert_eq!(
+            member.task_lines(80, 24, DisplayProfile::default()).len(),
+            1
+        );
+        assert_eq!(member.task_view.selected, 1);
+        assert!(!member.tasks_focused);
+    }
+
+    #[test]
+    fn escape_releases_details_then_focus_without_collapsing() {
+        let mut area = StatusArea::default();
+        area.update(
+            "Auto".into(),
+            "model".into(),
+            None,
+            Some(test_task_board(&["Inspect"])),
+        );
+        area.task_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        area.task_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(area.task_key(escape));
+        assert!(area.tasks_focused);
+        assert!(!area.task_details);
+        assert!(area.task_key(escape));
+        assert!(!area.tasks_focused);
+        assert!(area.task_view.presentation == TaskPresentation::Expanded);
+        assert!(
+            area.task_lines(80, 24, DisplayProfile::default())
+                .iter()
+                .any(|line| line.text().contains("Inspect"))
+        );
+        assert!(!area.task_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn compact_tasks_prioritize_unfinished_work_without_reordering_full_list() {
+        let mut area = StatusArea::default();
+        let mut board =
+            test_task_board(&["Finished", "Cancelled", "Pending", "Running", "Attention"]);
+        board.tasks[0].status = SharedTaskStatus::Completed;
+        board.tasks[1].status = SharedTaskStatus::Cancelled;
+        board.tasks[2].status = SharedTaskStatus::Pending;
+        board.tasks[4].status = SharedTaskStatus::NeedsAttention;
+        area.update("Auto".into(), "model".into(), None, Some(board));
+        let compact = area.task_lines(100, 17, DisplayProfile::default());
+        assert!(compact[1].text().contains("Attention"));
+        assert!(compact[2].text().contains("Running"));
+        assert!(compact[3].text().contains("Pending"));
+        area.task_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        let expanded = area.task_lines(80, 40, DisplayProfile::default());
+        assert!(expanded[1].text().contains("Finished"));
+        assert!(expanded[2].text().contains("Cancelled"));
+    }
+
+    #[test]
+    fn task_focus_requires_room_for_the_selected_single_row_and_hints() {
+        let mut area = StatusArea::default();
+        area.update(
+            "Auto".into(),
+            "model".into(),
+            None,
+            Some(test_task_board(&[
+                "A long task title that wraps across the list row",
+            ])),
+        );
+        let toggle = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        area.task_lines_in_viewport(24, 24, 2, DisplayProfile::default(), false);
+        assert!(!area.tasks_can_take_focus());
+        assert!(!area.task_key(toggle));
+        area.task_lines_in_viewport(24, 24, 3, DisplayProfile::default(), false);
+        assert!(area.tasks_can_take_focus());
+        assert!(area.task_key(toggle));
+        area.task_lines_in_viewport(24, 24, 2, DisplayProfile::default(), false);
+        assert!(!area.task_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)));
+        assert!(area.task_view.presentation == TaskPresentation::Expanded);
     }
 }

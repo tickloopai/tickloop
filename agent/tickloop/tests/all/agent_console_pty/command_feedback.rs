@@ -264,21 +264,37 @@ async fn run_background_event_reset(fixture: &PrivateFixture) {
     )
     .await;
     release.send(()).unwrap();
-    let completed = wait_snapshot(
-        &client,
-        first,
-        "background event range advances",
-        |snapshot| {
-            snapshot.conversation.messages.iter().any(|message| {
-                message.content.iter().any(|content| {
-                    matches!(content,
-                tickloop_agent_protocol::Content::Text { text } if text == SECOND_REPLY)
+    tokio::time::timeout(UI_TIMEOUT, async {
+        loop {
+            let observed = client
+                .observe(ObservationRequest::Agent {
+                    execution: first,
+                    detail: AgentDetailQuery::Status,
+                    after: None,
                 })
-            }) && snapshot.conversation.loops[0].state
-                == tickloop_agent_protocol::LoopState::Completed
-        },
-    )
-    .await;
+                .await
+                .unwrap();
+            let ObservationValue::Status(status) = observed.initial else {
+                panic!("expected background Agent status");
+            };
+            if status.chat.loops.iter().any(|goal| {
+                goal.id == before.conversation.loops[0].id
+                    && goal.state == tickloop_agent_protocol::LoopState::Completed
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the background model run completes");
+    let completed = snapshot(&client, first).await;
+    assert!(completed.conversation.messages.iter().any(|message| {
+        message.content.iter().any(|content| {
+            matches!(content,
+                tickloop_agent_protocol::Content::Text { text } if text == SECOND_REPLY)
+        })
+    }));
     assert!(
         completed.events[0].sequence > before.last_sequence + 1,
         "the actual worker evicts the earlier event range, requiring history recovery"

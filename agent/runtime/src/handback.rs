@@ -68,6 +68,22 @@ pub(super) fn completion_text(snapshot: &ChatSnapshot, run: Uuid) -> String {
     }
 }
 
+pub(super) fn reviewed_report(
+    message: &str,
+    assessment: &tickloop_agent_protocol::ApprovalAssessmentDetails,
+) -> String {
+    let note = match assessment.outcome {
+        ApprovalOutcome::Allow => None,
+        ApprovalOutcome::Block => Some(format!("SECURITY WARNING: auto review flagged this subagent's report. Reason: {}", assessment.reason.as_deref().unwrap_or("Policy risk detected"))),
+        _ => Some("Note: the safety reviewer was unavailable for this report. Carefully verify the subagent's actions and output before acting on it.".into()),
+    };
+    SubagentReportMessage {
+        note,
+        report: message.into(),
+    }
+    .text()
+}
+
 impl Agent {
     pub(super) async fn ensure_handback_requirement(
         &self,
@@ -97,6 +113,12 @@ impl Agent {
         receipt: &Receipt,
         input: &Value,
     ) -> Result<PreparedHandback, String> {
+        if self
+            .wait_for_subagents(receipt, &self.inner.shutdown)
+            .await?
+        {
+            return Err("Your delegated children have finished. Read their reports before preparing your final report.".into());
+        }
         let parsed: HandbackInput =
             serde_json::from_value(input.clone()).map_err(|error| error.to_string())?;
         let snapshot = self
@@ -162,16 +184,7 @@ impl Agent {
         if cancel.is_cancelled() || current.policy.revision != snapshot.policy.revision {
             return Err("SubagentHandback canceled or permissions changed before delivery".into());
         }
-        let note = match assessment.details.outcome {
-            ApprovalOutcome::Allow => None,
-            ApprovalOutcome::Block => Some(format!("SECURITY WARNING: auto review flagged this subagent's report. Reason: {}", assessment.details.reason.as_deref().unwrap_or("Policy risk detected"))),
-            _ => Some("Note: the safety reviewer was unavailable for this report. Carefully verify the subagent's actions and output before acting on it.".into()),
-        };
-        let report = SubagentReportMessage {
-            note,
-            report: prepared.message.clone(),
-        }
-        .text();
+        let report = reviewed_report(&prepared.message, &assessment.details);
         let result = self
             .deliver_handback_message(
                 receipt,

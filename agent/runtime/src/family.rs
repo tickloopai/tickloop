@@ -80,6 +80,8 @@ pub enum FamilyAvailability {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FamilyAgent {
     pub chat_id: ChatId,
+    pub parent_chat_id: Option<ChatId>,
+    pub depth: usize,
     pub role: FamilyRole,
     pub handle: String,
     pub display_name: String,
@@ -97,17 +99,10 @@ impl Agent {
         let root = snapshot
             .delegation
             .as_ref()
-            .map_or(member, |delegation| delegation.parent_chat_id);
-        let registrations = self.subagents(root).await?;
+            .map_or(member, |delegation| delegation.root_chat_id());
+        let registrations = self.family_registrations(root).await?;
         let chats = self.inner.chats.lock().await;
-        if chats
-            .get(&root)
-            .is_some_and(|chat| chat.snapshot.delegation.is_some())
-        {
-            return Err(AgentError::Invalid(
-                "nested families are unsupported".into(),
-            ));
-        }
+        super::family_tree::root(&chats, member).map_err(AgentError::Invalid)?;
         let mut members = vec![(root, None)];
         members.extend(
             registrations
@@ -166,6 +161,15 @@ impl Agent {
                     });
                 FamilyAgent {
                     chat_id: id,
+                    parent_chat_id: chat.and_then(|chat| {
+                        chat.snapshot
+                            .delegation
+                            .as_ref()
+                            .map(|delegation| delegation.parent_chat_id)
+                    }),
+                    depth: chat
+                        .and_then(|chat| chat.snapshot.delegation.as_ref())
+                        .map_or(0, |delegation| delegation.depth()),
                     role: if registration.is_some() {
                         FamilyRole::Child
                     } else {
@@ -274,19 +278,14 @@ impl Agent {
                     .find(|record| record.child_run_id == completion.child_run_id)
                 {
                     record.notification = delivery;
-                    if matches!(
-                        record.notification,
-                        SubagentNotificationDelivery::Rejected(_)
-                    ) {
-                        let updated = record.clone();
-                        self.emit(
-                            chat,
-                            &target,
-                            EventKind::FamilyRunCompleted {
-                                completion: updated,
-                            },
-                        );
-                    }
+                    let updated = record.clone();
+                    self.emit(
+                        chat,
+                        &target,
+                        EventKind::FamilyRunCompleted {
+                            completion: updated,
+                        },
+                    );
                 }
                 if let Some(recorder) = &self.inner.recorder {
                     recorder.record_family_completions(
@@ -490,11 +489,11 @@ impl Agent {
         let sender_root = sender_snapshot
             .delegation
             .as_ref()
-            .map_or(sender_snapshot.id, |delegation| delegation.parent_chat_id);
+            .map_or(sender_snapshot.id, |delegation| delegation.root_chat_id());
         let target_root = target_snapshot
             .delegation
             .as_ref()
-            .map_or(target_snapshot.id, |delegation| delegation.parent_chat_id);
+            .map_or(target_snapshot.id, |delegation| delegation.root_chat_id());
         if sender_root != target_root || source.source_chat_id == target {
             return Err(AgentError::Invalid(
                 "directed input targets another member of the same family".into(),

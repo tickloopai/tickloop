@@ -812,40 +812,6 @@ impl ChatRecorder {
         }
     }
 
-    pub(super) fn record_todo_retirement(
-        &self,
-        snapshot: &ChatSnapshot,
-        bookkeeping: &ChatBookkeeping,
-        loop_id: LoopId,
-    ) {
-        let Some((path, mut lines)) = self.sync_chat(snapshot, bookkeeping) else {
-            return;
-        };
-        let Some(goal) = snapshot.loops.iter().find(|goal| goal.id == loop_id) else {
-            return;
-        };
-        let Some(content) = plan_entry_content(snapshot, bookkeeping, goal) else {
-            return;
-        };
-        let mut logs = self.logs.lock().unwrap();
-        let Some(log) = logs.get_mut(&snapshot.id) else {
-            return;
-        };
-        let milliseconds = unix_time_milliseconds().max(log.last_entry_milliseconds + 1);
-        let mut parent = log.parent_cursor;
-        lines.push(record_loop(
-            log,
-            snapshot,
-            bookkeeping,
-            content,
-            &mut parent,
-            &format_timestamp(milliseconds),
-        ));
-        log.parent_cursor = parent;
-        log.last_entry_milliseconds = milliseconds;
-        self.writer.enqueue(&path, lines);
-    }
-
     /// 差分依据：运行时对消息只有三种修改：追加新消息；向最后一条消息追加内容块（并行工具
     /// 结果），写成标记接续该消息的新条目；rewind 截断对话，由 `truncate` 事先同步到已写出的条目。
     fn sync_chat(
@@ -1861,6 +1827,28 @@ fn recover_transcript(
         .filter(|entry| entry.chat_id == source_chat_id)
         .map(|entry| entry.completions.clone())
         .unwrap_or_default();
+    if chat_id == source_chat_id {
+        snapshot.task_boards = loaded
+            .metadata
+            .task_boards
+            .as_ref()
+            .filter(|entry| entry.chat_id == chat_id)
+            .map(|entry| entry.boards.clone())
+            .unwrap_or_default();
+        for board in snapshot.task_boards.values_mut() {
+            for task in &mut board.tasks {
+                if task.status == tickloop_agent_protocol::SharedTaskStatus::InProgress {
+                    task.status = tickloop_agent_protocol::SharedTaskStatus::NeedsAttention;
+                    task.result = Some(
+                        "Worker restored; reconcile the prior execution before explicit release."
+                            .into(),
+                    );
+                    task.revision += 1;
+                    board.revision += 1;
+                }
+            }
+        }
+    }
     snapshot.branch_origin = restored_branch_origin(loaded, source_chat_id);
     snapshot.delegation = loaded
         .metadata
@@ -2058,6 +2046,7 @@ fn recover_snapshot_for_resume(
     super::recovery::close_dangling_tool_calls(&mut snapshot, None)?;
     append_interruption_messages(&mut snapshot, &mut meta_messages);
     super::branch::validate_snapshot(&snapshot)?;
+    super::shared_tasks::validate_restored_boards(&snapshot).map_err(AgentError::Invalid)?;
     projection::projected_messages(&snapshot, &bookkeeping.denial_references)?;
     Ok(RecoveredSnapshot {
         snapshot,
@@ -2228,7 +2217,7 @@ impl Agent {
 
     /// Queues one Chat-level metadata line and wakes the background flush, so the change reaches
     /// disk while a long-lived service keeps the Chat open.
-    fn record_chat_metadata(&self, chat_id: ChatId, line: Line) {
+    pub(super) fn record_chat_metadata(&self, chat_id: ChatId, line: Line) {
         let Some(recorder) = &self.inner.recorder else {
             return;
         };
@@ -2507,46 +2496,92 @@ impl Agent {
     /// 按 id 恢复 Chat。已在本进程内存中时直接返回该实例；否则从 Transcript 加载，
     /// 执行恢复后处理，但不自动继续任何工作。
     pub async fn resume_chat(&self, chat_id: ChatId) -> Result<ChatSnapshot, AgentError> {
-        if let Some(chat) = self.inner.chats.lock().await.get(&chat_id) {
-            return Ok(chat.snapshot.clone());
+        {
+            let chats = self.inner.chats.lock().await;
+            if let Some(chat) = chats.get(&chat_id) {
+                super::family_tree::lineage(&chats, chat_id).map_err(AgentError::Invalid)?;
+                return Ok(chat.snapshot.clone());
+            }
         }
         let Some(recorder) = &self.inner.recorder else {
             return Err(AgentError::NotFound);
         };
         let _resume = recorder.resume_lock.lock().await;
-        if let Some(chat) = self.inner.chats.lock().await.get(&chat_id) {
-            return Ok(chat.snapshot.clone());
-        }
-        let (path, loaded) = self.load_saved_transcript(chat_id).await?;
-        if let Some(delegation) = loaded
-            .metadata
-            .delegation
-            .as_ref()
-            .map(|entry| &entry.delegation)
         {
-            let parent_id = delegation.parent_chat_id;
-            if parent_id == chat_id {
+            let chats = self.inner.chats.lock().await;
+            if let Some(chat) = chats.get(&chat_id) {
+                super::family_tree::lineage(&chats, chat_id).map_err(AgentError::Invalid)?;
+                return Ok(chat.snapshot.clone());
+            }
+        }
+        let mut pending = Vec::new();
+        let mut visited = HashSet::new();
+        let mut current = chat_id;
+        loop {
+            if !visited.insert(current)
+                || visited.len() > tickloop_agent_protocol::MAX_SUBAGENT_DEPTH + 1
+            {
                 return Err(AgentError::Invalid(
-                    "delegated parent identity is invalid".into(),
+                    "invalid or excessive delegation ancestry".into(),
                 ));
             }
-            if !self.inner.chats.lock().await.contains_key(&parent_id) {
-                let (parent_path, parent_loaded) = self.load_saved_transcript(parent_id).await?;
-                if parent_loaded.metadata.delegation.is_some() {
-                    return Err(AgentError::Invalid(
-                        "current parent permission authority is unavailable".into(),
-                    ));
-                }
-                self.insert_restored_chat(
-                    parent_id,
-                    parent_loaded,
-                    RestoreTarget::Resume(parent_path),
-                )
-                .await?;
+            if self.inner.chats.lock().await.contains_key(&current) {
+                break;
+            }
+            let (path, loaded) = self.load_saved_transcript(current).await?;
+            let parent = loaded
+                .metadata
+                .delegation
+                .as_ref()
+                .map(|entry| entry.delegation.parent_chat_id);
+            pending.push((current, path, loaded));
+            let Some(parent) = parent else { break };
+            current = parent;
+        }
+        let mut lineages = HashMap::new();
+        {
+            let chats = self.inner.chats.lock().await;
+            if chats.contains_key(&current) {
+                lineages.insert(
+                    current,
+                    super::family_tree::lineage(&chats, current).map_err(AgentError::Invalid)?,
+                );
             }
         }
-        self.insert_restored_chat(chat_id, loaded, RestoreTarget::Resume(path))
-            .await
+        for (id, _, loaded) in pending.iter().rev() {
+            let lineage = match &loaded.metadata.delegation {
+                Some(entry) => {
+                    let delegation = &entry.delegation;
+                    let mut lineage = lineages
+                        .get(&delegation.parent_chat_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            AgentError::Invalid("delegated parent is unavailable".into())
+                        })?;
+                    lineage.push(tickloop_agent_protocol::DelegationParent {
+                        chat_id: delegation.parent_chat_id,
+                        loop_id: delegation.parent_loop_id,
+                    });
+                    if lineage.len() > tickloop_agent_protocol::MAX_SUBAGENT_DEPTH
+                        || lineage != delegation.lineage()
+                    {
+                        return Err(AgentError::Invalid(
+                            "persisted delegation ancestry is inconsistent".into(),
+                        ));
+                    }
+                    lineage
+                }
+                None => Vec::new(),
+            };
+            lineages.insert(*id, lineage);
+        }
+        for (id, path, loaded) in pending.into_iter().rev() {
+            self.insert_restored_chat(id, loaded, RestoreTarget::Resume(path))
+                .await?;
+        }
+        super::family_tree::lineage(&*self.inner.chats.lock().await, chat_id)
+            .map_err(AgentError::Invalid)?;
+        self.snapshot(chat_id).await
     }
 
     /// 照 Claude Code `--fork-session`：从 Transcript 加载对话，换上新的 chatId，
@@ -2611,6 +2646,18 @@ impl Agent {
             RestoreTarget::NewChat { source } => *source,
         };
         let mut loaded = loaded;
+        let registrations = if chat_id == source_chat_id {
+            loaded
+                .metadata
+                .subagents
+                .as_ref()
+                .filter(|entry| entry.chat_id == chat_id)
+                .map(|entry| entry.subagents.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         let (restored, execution_mode_warnings) = restore_chain(&loaded.chain);
         loaded.warnings.extend(execution_mode_warnings);
         let removed = unrecoverable_assistant_messages(&restored.messages);
@@ -2728,13 +2775,20 @@ impl Agent {
             &snapshot.workdir,
             self.inner.user_skills_directory.as_deref(),
         );
+        self.inner
+            .subagent_registry
+            .lock()
+            .await
+            .insert(chat_id, registrations);
         self.inner.chats.lock().await.insert(
             chat_id,
             Chat {
                 family_generation: 0,
+                family_stopping: false,
+                task_checkpoint_pending: false,
+                family_finishing: HashSet::new(),
                 snapshot: snapshot.clone(),
                 bookkeeping,
-                todo_completion_graces: HashMap::new(),
                 start_new_tool_result_message: false,
                 needs_plan_mode_exit_notice: false,
                 active: None,
@@ -2769,7 +2823,7 @@ impl Agent {
             self.set_host_work_context(chat_id, context).await?;
         }
         self.save(&snapshot);
-        self.start_restored_todo_graces(chat_id).await;
+
         Ok(snapshot)
     }
 }

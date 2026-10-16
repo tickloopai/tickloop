@@ -220,10 +220,49 @@ pub struct DelegationMetadata {
     pub parent_loop_id: LoopId,
     pub parent_run_id: RunId,
     pub parent_call_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ancestors: Vec<DelegationParent>,
     pub task: String,
     pub ceiling: DelegationCeiling,
     #[serde(default)]
     pub trusted_user_inputs: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_reply_history: Option<Value>,
+}
+
+pub const MAX_SUBAGENT_DEPTH: usize = 3;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DelegationParent {
+    pub chat_id: ChatId,
+    pub loop_id: LoopId,
+}
+
+impl DelegationMetadata {
+    pub fn lineage(&self) -> Vec<DelegationParent> {
+        if self.ancestors.is_empty() {
+            vec![DelegationParent {
+                chat_id: self.parent_chat_id,
+                loop_id: self.parent_loop_id,
+            }]
+        } else {
+            self.ancestors.clone()
+        }
+    }
+
+    pub fn root_chat_id(&self) -> ChatId {
+        self.ancestors
+            .first()
+            .map_or(self.parent_chat_id, |parent| parent.chat_id)
+    }
+
+    pub fn root_loop_id(&self) -> LoopId {
+        self.ancestors
+            .first()
+            .map_or(self.parent_loop_id, |parent| parent.loop_id)
+    }
+
+    pub fn depth(&self) -> usize {
+        self.ancestors.len().max(1)
+    }
 }

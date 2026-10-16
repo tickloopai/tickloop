@@ -2,7 +2,6 @@ use super::{
     console::{AgentRow, MIN_REQUEST_AGENT_TITLE_COLUMNS, WIDE_TERMINAL_COLUMNS, truncate_width},
     display::{DisplayProfile, Glyph},
     list_row,
-    monitor::relative_time,
     style::{Role, RoleLine},
 };
 use crate::agent_console::AttentionGroup;
@@ -17,9 +16,8 @@ fn display_width(text: &str) -> usize {
 
 /// One member of the Subagents panel. The dot is filled for the member this View shows and
 /// hollow for the others, and only it carries the member's Agent Color; `main` has none, so its
-/// dot keeps the row's colour, as does every name. The right side keeps only details: how long a
-/// working member has run, how long ago any other member last changed state, or its waiting
-/// requests.
+/// dot keeps the row's colour, as does every name. The right side reports availability, the
+/// current running turn's duration, or waiting requests.
 pub(super) fn family_line(
     row: &AgentRow,
     selected: bool,
@@ -65,7 +63,16 @@ pub(super) fn family_line(
         .join(" ");
         (requests, row.status_role())
     } else {
-        (time_detail(row, now), Role::MutedText)
+        (
+            state_detail(row, now),
+            if row.group == AttentionGroup::Done
+                && row.state == tickloop_agent_protocol::LoopState::Completed
+            {
+                Role::MutedText
+            } else {
+                row.status_role()
+            },
+        )
     };
     let prefix_columns = display_width(&line.text());
     let details = truncate_width(
@@ -110,52 +117,32 @@ pub(super) fn family_line(
     line
 }
 
-/// How long a working member has run, or how long ago another member last changed state.
-fn time_detail(row: &AgentRow, now: u64) -> String {
-    match row.group {
-        AttentionGroup::Working => row
-            .subagent
-            .as_ref()
-            .map(|registration| {
-                list_row::format_elapsed(now.saturating_sub(registration.created_at))
-            })
-            .unwrap_or_default(),
-        _ => row
-            .updated_at
-            .map(|updated_at| relative_time(Some(updated_at), now))
-            .unwrap_or_default(),
-    }
-}
-
-/// When time alone next changes `row`'s line: the next second of its run while it works,
-/// otherwise the next change of its age.
-pub(super) fn next_change_ms(row: &AgentRow, now: u64) -> Option<u64> {
+fn state_detail(row: &AgentRow, now: u64) -> String {
     if row.group == AttentionGroup::Working {
-        const SECOND: u64 = 1000;
-        return row.subagent.as_ref().map(|registration| {
-            let since = registration.created_at;
-            since + (now.saturating_sub(since) / SECOND + 1) * SECOND
-        });
+        return row.run_started_at.map_or_else(
+            || row.status.clone(),
+            |started_at| list_row::format_elapsed(now.saturating_sub(started_at)),
+        );
     }
-    let is_family_member = row.parent_id.is_some() || row.subagent.is_some();
-    let shows_age = is_family_member && row.approvals + row.questions == 0;
-    row.updated_at
-        .filter(|_| shows_age)
-        .map(|updated_at| next_age_change_ms(updated_at, now))
+    if row.group == AttentionGroup::Idle
+        || (row.group == AttentionGroup::Done
+            && row.state == tickloop_agent_protocol::LoopState::Completed)
+    {
+        return "idle".into();
+    }
+    row.status.clone()
 }
 
-/// When the age [`relative_time`] shows for `since` next changes: each second under a minute,
-/// each minute under an hour, then each hour and each day.
-fn next_age_change_ms(since: u64, now: u64) -> u64 {
+pub(super) fn next_change_ms(row: &AgentRow, now: u64) -> Option<u64> {
+    if row.group != AttentionGroup::Working
+        || row.approvals + row.questions > 0
+        || (row.parent_id.is_none() && row.subagent.is_none())
+    {
+        return None;
+    }
     const SECOND: u64 = 1000;
-    let age = now.saturating_sub(since);
-    let unit = match age / SECOND {
-        0..60 => SECOND,
-        60..3600 => 60 * SECOND,
-        3600..86400 => 3600 * SECOND,
-        _ => 86400 * SECOND,
-    };
-    since + (age / unit + 1) * unit
+    row.run_started_at
+        .map(|since| since + (now.saturating_sub(since) / SECOND + 1) * SECOND)
 }
 
 /// The member's Agent Color, when the runtime assigned one.
@@ -173,25 +160,5 @@ fn ellipsize(text: &str, width: usize) -> String {
         String::new()
     } else {
         format!("{}…", truncate_width(text, width - 1))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_age_changes_each_second_then_each_minute_hour_and_day() {
-        for (age, next) in [
-            (0, 1_000),
-            (1_500, 2_000),
-            (59_999, 60_000),
-            (60_000, 120_000),
-            (3_599_000, 3_600_000),
-            (3_600_000, 7_200_000),
-            (90_000_000, 172_800_000),
-        ] {
-            assert_eq!(next_age_change_ms(10_000, 10_000 + age), 10_000 + next);
-        }
     }
 }

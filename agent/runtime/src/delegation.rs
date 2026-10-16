@@ -35,6 +35,79 @@ fn record_artifact_account(
     Ok(true)
 }
 
+#[cfg(test)]
+mod ancestry_authority_tests {
+    use super::*;
+    use tickloop_agent_test_support::{ScriptedModel, call, config, text};
+
+    #[tokio::test]
+    async fn parent_auto_review_is_not_bypassed_by_a_frozen_accept_edits_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let model = Arc::new(ScriptedModel::new(vec![
+            call("a", "Subagent", json!({"task":"report", "name":"a"})),
+            text("child done"),
+            text("root done"),
+        ]));
+        let core = Agent::new_embedded(config(), model);
+        let root = core.create_chat(directory.path().into()).await.unwrap();
+        core.set_execution_mode(root, ExecutionMode::AcceptEdits)
+            .await
+            .unwrap();
+        let mut events = core.subscribe();
+        let run = core.submit(root, None, "delegate".into()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.run_id == run.run_id && matches!(event.kind, EventKind::Completed { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let child = core.subagents(root).await.unwrap()[0].child_chat_id;
+        core.set_execution_mode(root, ExecutionMode::Auto)
+            .await
+            .unwrap();
+        {
+            let chats = core.inner.chats.lock().await;
+            let sessions = core.inner.session_permissions.lock().await;
+            let receipt = Receipt {
+                chat_id: child,
+                loop_id: chats[&child].snapshot.loops[0].id,
+                run_id: Uuid::new_v4(),
+            };
+            let input = json!({"task":"delegate again"});
+            let operation = OperationRecord {
+                task_binding: None,
+                id: Uuid::new_v4(),
+                loop_id: receipt.loop_id,
+                run_id: receipt.run_id,
+                call_id: "nested".into(),
+                name: SUBAGENT_TOOL_NAME.into(),
+                input: input.clone(),
+                file_change: None,
+                state: OperationState::Proposed,
+                result: None,
+            };
+            let (authority, _) = host_authority(
+                &chats,
+                &sessions,
+                &receipt,
+                &operation,
+                &input,
+                Some(crate::host_tools::HostToolPermission::Classified {
+                    allow_rule_bypasses_review: false,
+                }),
+                None,
+            )
+            .unwrap();
+            assert_eq!(authority.decision, Decision::Check);
+        }
+        core.shutdown().await;
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct SubagentInvocation {
     pub receipt: Receipt,
@@ -42,6 +115,7 @@ pub(super) struct SubagentInvocation {
 }
 
 pub const MAX_SUBAGENT_HANDLE_CHARACTERS: usize = 32;
+const MAX_ACTIVE_SUBAGENTS: usize = 256;
 const MAX_LABEL_INPUT_CHARACTERS: usize = 160;
 
 pub(super) struct PreparedDelegation {
@@ -88,7 +162,7 @@ impl PreparedDelegation {
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
         name: SUBAGENT_TOOL_NAME.into(),
-        description: "Create one bounded independent child under your frozen resource and permission ceiling. Foreground waits for its final report. Set run_in_background=true to return immediately; completion arrives automatically as a task notification. Messages arrive automatically, so finish a turn after asking for clarification. Name and description identify the child separately from its task. The child has its own identity, Loop and approval/question requests. Interrupting foreground observation does not stop the child; that run's completion then arrives as a task notification, as does every later run of the child (a user follow-up or your SendMessage). Bash follows the parent's frozen permission authority and normal approval checks; the working directory is not an OS sandbox. Nested delegation and history rewrites are unavailable.".into(),
+        description: "Create one bounded independent child under your frozen resource and permission ceiling. Foreground waits for its final report. Set run_in_background=true to return immediately; completion arrives automatically as a task notification. Messages arrive automatically, so finish a turn after asking for clarification. Name and description identify the child separately from its task. The child has its own identity, Loop and approval/question requests. Interrupting foreground observation does not stop the child; that run's completion then arrives as a task notification, as does every later run of the child (a user follow-up or your SendMessage). Bash follows the parent's frozen permission authority and normal approval checks; the working directory is not an OS sandbox. Delegation is limited to three levels below main; history rewrites are unavailable.".into(),
         input_schema: json!({"type":"object","properties":{
             "task":{"type":"string","minLength":1},
             "run_in_background":{"type":"boolean","default":false,"description":"Return immediately and receive the final report as an automatic task notification."},
@@ -178,6 +252,44 @@ pub(super) fn check_call(
     prepared: Option<&PreparedTool>,
     plan_file: Option<&std::path::Path>,
 ) -> Result<(), String> {
+    let parents = super::family_tree::lineage(chats, receipt.chat_id)?;
+    if std::iter::once(receipt.chat_id)
+        .chain(parents.iter().map(|parent| parent.chat_id))
+        .any(|id| chats[&id].family_stopping)
+    {
+        return Err("Subagent subtree is stopping".into());
+    }
+    if name == SUBAGENT_TOOL_NAME && parents.len() >= tickloop_agent_protocol::MAX_SUBAGENT_DEPTH {
+        return Err("Subagent nesting limit reached (maximum depth 3)".into());
+    }
+    check_direct_call(chats, sessions, receipt, name, input, prepared, plan_file)?;
+    for parent in parents.iter().rev() {
+        check_direct_call(
+            chats,
+            sessions,
+            &Receipt {
+                chat_id: parent.chat_id,
+                loop_id: parent.loop_id,
+                run_id: receipt.run_id,
+            },
+            name,
+            input,
+            prepared,
+            plan_file,
+        )?;
+    }
+    Ok(())
+}
+
+fn check_direct_call(
+    chats: &HashMap<ChatId, Chat>,
+    sessions: &session_permissions::SessionPermissionContext,
+    receipt: &Receipt,
+    name: &str,
+    input: &Value,
+    prepared: Option<&PreparedTool>,
+    plan_file: Option<&std::path::Path>,
+) -> Result<(), String> {
     let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
     let Some(delegation) = &chat.snapshot.delegation else {
         return Ok(());
@@ -215,20 +327,6 @@ pub(super) fn check_call(
                 "the parent's current denial still applies to this delegated operation".into(),
             );
         }
-        if name != tickloop_agent_tools::BASH_TOOL_NAME
-            && current_parent_decision == Some(Decision::Ask)
-            && chat.snapshot.policy.explicit_decision_with_session(
-                name,
-                input,
-                receipt.loop_id,
-                None,
-            ) != Some(Decision::Ask)
-        {
-            return Err("Unsupported: the parent's current approval restriction is not represented in this child's frozen authorization; this operation cannot proceed".into());
-        }
-    }
-    if name == SUBAGENT_TOOL_NAME {
-        return Err("Unsupported: nested delegation is unavailable for this child".into());
     }
     if ceiling
         .policy
@@ -302,9 +400,143 @@ pub(super) struct PermissionAuthority {
     pub explicit_ask: bool,
     /// The Chat's own policy revision.
     pub policy_revision: u64,
-    /// The parent policy revision a delegated child's Bash was decided under; `None` for other
-    /// calls, and when the parent is gone, which decides Deny.
-    pub parent_revision: Option<u64>,
+    /// Identity-bound policy revisions for every ancestor checked at admission.
+    pub ancestor_revisions: Vec<(ChatId, u64)>,
+}
+
+pub(super) fn ancestor_revisions(
+    chats: &HashMap<ChatId, Chat>,
+    chat_id: ChatId,
+) -> Result<Vec<(ChatId, u64)>, String> {
+    Ok(super::family_tree::lineage(chats, chat_id)?
+        .iter()
+        .map(|parent| {
+            (
+                parent.chat_id,
+                chats[&parent.chat_id].snapshot.policy.revision,
+            )
+        })
+        .collect())
+}
+
+pub(super) fn effective_policy(
+    chats: &HashMap<ChatId, Chat>,
+    receipt: &Receipt,
+) -> Result<tickloop_agent_protocol::PermissionPolicy, String> {
+    let parents = super::family_tree::lineage(chats, receipt.chat_id)?;
+    let mut policy = chats[&receipt.chat_id].snapshot.policy.clone();
+    for id in std::iter::once(receipt.chat_id).chain(parents.iter().map(|parent| parent.chat_id)) {
+        let Some(delegation) = &chats[&id].snapshot.delegation else {
+            continue;
+        };
+        for ancestor_policy in [
+            &delegation.ceiling.policy,
+            &chats[&delegation.parent_chat_id].snapshot.policy,
+        ] {
+            policy.mode = match (policy.mode, ancestor_policy.mode) {
+                (ExecutionMode::Plan, _) | (_, ExecutionMode::Plan) => ExecutionMode::Plan,
+                (ExecutionMode::AcceptEdits, _) | (_, ExecutionMode::AcceptEdits) => {
+                    ExecutionMode::AcceptEdits
+                }
+                (ExecutionMode::Auto, _) | (_, ExecutionMode::Auto) => ExecutionMode::Auto,
+                _ => ExecutionMode::FullAccess,
+            };
+            for rules in [
+                &ancestor_policy.rules,
+                &ancestor_policy.project_constraints,
+                &ancestor_policy.managed_constraints,
+            ] {
+                policy.managed_constraints.extend(
+                    rules
+                        .iter()
+                        .filter(|rule| {
+                            matches!(rule.decision, Decision::Deny | Decision::Ask)
+                                && rule
+                                    .loop_id
+                                    .is_none_or(|loop_id| loop_id == delegation.parent_loop_id)
+                        })
+                        .cloned()
+                        .map(|mut rule| {
+                            rule.loop_id = Some(receipt.loop_id);
+                            rule
+                        }),
+                );
+            }
+        }
+    }
+    Ok(policy)
+}
+
+pub(super) fn host_authority(
+    chats: &HashMap<ChatId, Chat>,
+    sessions: &session_permissions::SessionPermissionContext,
+    receipt: &Receipt,
+    operation: &OperationRecord,
+    permission_input: &Value,
+    permission: Option<crate::host_tools::HostToolPermission>,
+    session: Option<tickloop_agent_tools::permissions::SessionPermissionDecision>,
+) -> Result<
+    (
+        PermissionAuthority,
+        tickloop_agent_protocol::PermissionPolicy,
+    ),
+    String,
+> {
+    let policy = effective_policy(chats, receipt)?;
+    let decide = |policy: &tickloop_agent_protocol::PermissionPolicy, loop_id, session, human| {
+        let explicit =
+            policy.explicit_match_with_session(&operation.name, permission_input, loop_id, session);
+        (
+            host_tool_decision(explicit.map(Decision::from), permission, policy.mode, human),
+            explicit == Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Ask),
+        )
+    };
+    let own = &chats[&receipt.chat_id];
+    let (mut decision, mut explicit_ask) = decide(
+        &own.snapshot.policy,
+        receipt.loop_id,
+        session,
+        permission == Some(crate::host_tools::HostToolPermission::PrivateArtifactWrite)
+            && own.has_human_input_for_run(receipt.run_id),
+    );
+    let parents = super::family_tree::lineage(chats, receipt.chat_id)?;
+    for id in std::iter::once(receipt.chat_id).chain(parents.iter().map(|parent| parent.chat_id)) {
+        let Some(delegation) = &chats[&id].snapshot.delegation else {
+            continue;
+        };
+        let parent = &chats[&delegation.parent_chat_id];
+        let session_operation = SessionPermissionOperation::from_normalized(
+            operation.name.clone(),
+            permission_input.clone(),
+            super::session_permissions::capture_workspace_scope(&configured_workspace_for_chat(
+                parent,
+            ))
+            .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let owner = PermissionOwner::new(delegation.parent_chat_id, delegation.parent_loop_id)
+            .map_err(|error| error.to_string())?;
+        let inherited_session = sessions.evaluate(owner, &session_operation).decision;
+        for (ancestor_policy, session) in [
+            (&delegation.ceiling.policy, None),
+            (&parent.snapshot.policy, inherited_session),
+        ] {
+            let (ancestor_decision, ancestor_ask) =
+                decide(ancestor_policy, delegation.parent_loop_id, session, false);
+            decision = decision.stricter(ancestor_decision);
+            explicit_ask |= ancestor_ask;
+        }
+    }
+
+    Ok((
+        PermissionAuthority {
+            decision,
+            explicit_ask,
+            policy_revision: chats[&receipt.chat_id].snapshot.policy.revision,
+            ancestor_revisions: ancestor_revisions(chats, receipt.chat_id)?,
+        },
+        policy,
+    ))
 }
 
 impl PermissionAuthority {
@@ -313,19 +545,59 @@ impl PermissionAuthority {
     pub(super) fn still_admits(
         &self,
         approved_policy_revision: u64,
-        approved_parent_revision: Option<u64>,
+        approved_ancestor_revisions: &[(ChatId, u64)],
     ) -> bool {
         self.decision != Decision::Deny
             && (self.decision == Decision::Allow
                 || self.policy_revision == approved_policy_revision
-                    && self.parent_revision == approved_parent_revision)
+                    && self.ancestor_revisions == approved_ancestor_revisions)
     }
 }
 
 /// The permission decision for `prepared` in the receipt's Chat and Loop, or `None` when the
 /// Chat is gone. A delegated child's Bash is further narrowed by its frozen ceiling and by its
-/// parent's current policy.
+/// ancestors' current policies.
 pub(super) fn permission_authority(
+    chats: &HashMap<ChatId, Chat>,
+    sessions: &session_permissions::SessionPermissionContext,
+    receipt: &Receipt,
+    prepared: &PreparedTool,
+    session: Option<tickloop_agent_tools::permissions::SessionPermissionDecision>,
+    plan_file: Option<&std::path::Path>,
+) -> Option<PermissionAuthority> {
+    let parents = super::family_tree::lineage(chats, receipt.chat_id).ok()?;
+    let mut authority =
+        direct_permission_authority(chats, sessions, receipt, prepared, session, plan_file)?;
+    authority.ancestor_revisions = parents
+        .iter()
+        .map(|parent| {
+            (
+                parent.chat_id,
+                chats[&parent.chat_id].snapshot.policy.revision,
+            )
+        })
+        .collect();
+    for parent in parents.iter().rev() {
+        let parent_receipt = Receipt {
+            chat_id: parent.chat_id,
+            loop_id: parent.loop_id,
+            run_id: receipt.run_id,
+        };
+        let ancestor = direct_permission_authority(
+            chats,
+            sessions,
+            &parent_receipt,
+            prepared,
+            session,
+            plan_file,
+        )?;
+        authority.decision = authority.decision.stricter(ancestor.decision);
+        authority.explicit_ask |= ancestor.explicit_ask;
+    }
+    Some(authority)
+}
+
+fn direct_permission_authority(
     chats: &HashMap<ChatId, Chat>,
     sessions: &session_permissions::SessionPermissionContext,
     receipt: &Receipt,
@@ -350,7 +622,7 @@ pub(super) fn permission_authority(
             session,
         ) == Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Ask),
         policy_revision: policy.revision,
-        parent_revision: None,
+        ancestor_revisions: Vec::new(),
     };
     let Some(delegation) = chat
         .snapshot
@@ -416,12 +688,34 @@ pub(super) fn permission_authority(
     Some(PermissionAuthority {
         decision: own.decision.stricter(frozen).stricter(current),
         explicit_ask: own.explicit_ask || frozen_ask || parent_ask,
-        parent_revision: revision,
+        ancestor_revisions: revision
+            .map(|revision| vec![(delegation.parent_chat_id, revision)])
+            .unwrap_or_default(),
         ..own
     })
 }
 
 impl Agent {
+    pub async fn family_registrations(
+        &self,
+        member: ChatId,
+    ) -> Result<Vec<SubagentRegistration>, AgentError> {
+        let root = super::family_tree::root(&*self.inner.chats.lock().await, member)
+            .map_err(AgentError::Invalid)?;
+        let mut pending = vec![root];
+        let mut visited = HashSet::new();
+        let mut entries = Vec::new();
+        while let Some(parent) = pending.pop() {
+            if !visited.insert(parent) {
+                return Err(AgentError::Invalid("cyclic family registry".into()));
+            }
+            let children = self.subagents(parent).await?;
+            pending.extend(children.iter().map(|child| child.child_chat_id));
+            entries.extend(children);
+        }
+        Ok(entries)
+    }
+
     pub async fn subagents(&self, parent: ChatId) -> Result<Vec<SubagentRegistration>, AgentError> {
         let mut registry = self.inner.subagent_registry.lock().await;
         if let Some(entries) = registry.get(&parent) {
@@ -498,20 +792,32 @@ impl Agent {
         let Some(provider) = self.inner.host_tools.read().unwrap().clone() else {
             return Ok(());
         };
-        let delegation = {
+        let changed = {
             let mut chats = self.inner.chats.lock().await;
-            let Some(delegation) = chats
-                .get_mut(&chat_id)
-                .and_then(|chat| chat.snapshot.delegation.as_mut())
-            else {
-                return Ok(());
-            };
-            if !record_artifact_account(&mut delegation.ceiling.host_tools, provider.as_ref())? {
-                return Ok(());
+            let mut members = super::family_tree::lineage(&chats, chat_id)?
+                .into_iter()
+                .map(|parent| parent.chat_id)
+                .collect::<Vec<_>>();
+            members.push(chat_id);
+            let mut changed = Vec::new();
+            for member in members {
+                if let Some(delegation) = chats
+                    .get_mut(&member)
+                    .and_then(|chat| chat.snapshot.delegation.as_mut())
+                    && record_artifact_account(
+                        &mut delegation.ceiling.host_tools,
+                        provider.as_ref(),
+                    )?
+                {
+                    changed.push((member, delegation.clone()));
+                }
             }
-            delegation.clone()
+            changed
         };
-        self.record_delegation(chat_id, delegation);
+        for (member, delegation) in changed {
+            self.record_delegation(member, delegation);
+        }
+
         Ok(())
     }
 
@@ -522,17 +828,27 @@ impl Agent {
         authority: Option<HostToolAuthority>,
     ) -> Result<(), String> {
         let chats = self.inner.chats.lock().await;
-        let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
-        let Some(delegation) = &chat.snapshot.delegation else {
-            return Ok(());
-        };
-        let allowed = delegation
-            .ceiling
-            .host_tools
-            .get(name)
-            .ok_or("Unsupported: this tool is outside the child's inherited authorization")?;
-        if !authority.is_some_and(|authority| allowed.contains(&authority)) {
-            return Err("Unsupported: this tool endpoint or account is outside the child's inherited authorization".into());
+        let parents = super::family_tree::lineage(&chats, receipt.chat_id)?;
+        for id in std::iter::once(receipt.chat_id)
+            .chain(parents.iter().rev().map(|parent| parent.chat_id))
+        {
+            let chat = chats
+                .get(&id)
+                .ok_or("ancestor authorization is unavailable")?;
+            let Some(delegation) = &chat.snapshot.delegation else {
+                continue;
+            };
+            let allowed = delegation
+                .ceiling
+                .host_tools
+                .get(name)
+                .ok_or("Unsupported: this tool is outside the inherited authorization")?;
+            if !authority
+                .as_ref()
+                .is_some_and(|authority| allowed.contains(authority))
+            {
+                return Err("Unsupported: this tool endpoint or account is outside an ancestor's inherited authorization".into());
+            }
         }
         Ok(())
     }
@@ -607,15 +923,50 @@ impl Agent {
                         return Err("delegation interrupted before child creation".into());
                     }
                     let registrations = self
-                        .subagents(parent.chat_id)
+                        .family_registrations(parent.chat_id)
                         .await
                         .map_err(|error| error.to_string())?;
-                    let (snapshot, bookkeeping, client, output_style, session_denials, name) = {
+                    let (
+                        snapshot,
+                        bookkeeping,
+                        client,
+                        output_style,
+                        session_denials,
+                        name,
+                        ancestors,
+                    ) = {
                         let chats = self.inner.chats.lock().await;
                         let chat = chats.get(&parent.chat_id).ok_or("parent is unavailable")?;
-                        if chat.snapshot.delegation.is_some() {
-                            return Err("Unsupported: nested delegation is unavailable".into());
+                        if registrations
+                            .iter()
+                            .filter(|member| {
+                                chats.get(&member.child_chat_id).is_some_and(|chat| {
+                                    chat.active_run.is_some() || !chat.parked.is_empty()
+                                })
+                            })
+                            .count()
+                            >= MAX_ACTIVE_SUBAGENTS
+                        {
+                            return Err("Concurrent Subagent limit reached (20 active family members); wait for a completion instead of retrying".into());
                         }
+                        let mut ancestors = super::family_tree::lineage(&chats, parent.chat_id)?;
+                        if chat.family_stopping
+                            || ancestors
+                                .iter()
+                                .any(|ancestor| chats[&ancestor.chat_id].family_stopping)
+                        {
+                            return Err("Subagent subtree is stopping".into());
+                        }
+                        if ancestors.len() >= tickloop_agent_protocol::MAX_SUBAGENT_DEPTH {
+                            return Err("Subagent nesting limit reached (maximum depth 3)".into());
+                        }
+                        if chat.active_run != Some(parent.run_id) {
+                            return Err("delegating run is no longer active".into());
+                        }
+                        ancestors.push(tickloop_agent_protocol::DelegationParent {
+                            chat_id: parent.chat_id,
+                            loop_id: parent.loop_id,
+                        });
                         let parent_owner = PermissionOwner::new(parent.chat_id, parent.loop_id)
                             .map_err(|error| error.to_string())?;
                         let sessions = self.inner.session_permissions.lock().await;
@@ -632,6 +983,7 @@ impl Agent {
                                     .map(|registration| registration.handle.clone())
                                     .collect::<Vec<_>>(),
                             ),
+                            ancestors,
                         )
                     };
                     let mut cause = family_mailbox::current_cause(&snapshot, &bookkeeping, parent)
@@ -695,7 +1047,7 @@ impl Agent {
                         created_at: tickloop_agent_base::private_fs::unix_time_milliseconds(),
                         color: None,
                     };
-                    let trusted_user_inputs =
+                    let mut trusted_user_inputs =
                         approval_context::originals_for_active_chain(&snapshot, &bookkeeping)
                             .ok()
                             .map(|inputs| {
@@ -707,14 +1059,29 @@ impl Agent {
                                     })
                                     .collect::<Vec<_>>()
                             });
-                    let ancestors = self.approval_history_ancestors(&snapshot).await;
+                    if let Some(inherited) = snapshot
+                        .delegation
+                        .as_ref()
+                        .and_then(|delegation| delegation.trusted_user_inputs.as_ref())
+                        .and_then(|value| {
+                            serde_json::from_value::<
+                                    Vec<tickloop_agent_protocol::OriginalUserInput>,
+                                >(value.clone())
+                                .ok()
+                        })
+                    {
+                        trusted_user_inputs
+                            .get_or_insert_with(Vec::new)
+                            .extend(inherited);
+                    }
+                    let history_ancestors = self.approval_history_ancestors(&snapshot).await;
                     let trusted_reply_history = trusted_user_inputs.as_ref().and_then(|inputs| {
                         serde_json::to_value(approval_context::capture_reply_history(
                             &snapshot,
                             &bookkeeping,
                             Some((parent.run_id, call_id)),
                             inputs,
-                            ancestors.as_deref(),
+                            history_ancestors.as_deref(),
                         ))
                         .ok()
                     });
@@ -724,6 +1091,7 @@ impl Agent {
                         parent_loop_id: parent.loop_id,
                         parent_run_id: parent.run_id,
                         parent_call_id: call_id.to_owned(),
+                        ancestors,
                         task: task.clone(),
                         trusted_user_inputs: trusted_user_inputs
                             .and_then(|inputs| serde_json::to_value(inputs).ok()),
@@ -748,7 +1116,12 @@ impl Agent {
                                 .collect(),
                         },
                     };
-                    let sender_label = agent_messages::family_label(&snapshot, None);
+                    let parent_registration = self
+                        .subagent_registration(parent.chat_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let sender_label =
+                        agent_messages::family_label(&snapshot, parent_registration.as_ref());
                     let child_id = self
                         .create_chat_with_delegation(
                             registration.child_chat_id,
@@ -758,15 +1131,22 @@ impl Agent {
                         .await
                         .map_err(|error| error.to_string())?;
                     {
+                        let used = self
+                            .family_registrations(parent.chat_id)
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .iter()
+                            .map(|entry| entry.color)
+                            .collect::<Vec<_>>();
                         let mut registry = self.inner.subagent_registry.lock().await;
                         let entries = registry.entry(parent.chat_id).or_default();
-                        let used = entries.iter().map(|entry| entry.color).collect::<Vec<_>>();
                         registration.color = Some(AgentColor::next_for(&used));
                         entries.push(registration);
                         if let Some(recorder) = &self.inner.recorder {
                             recorder.record_subagents(parent.chat_id, entries.clone());
                         }
                     }
+                    self.ensure_team_task_board(parent).await?;
                     if let Some(context) = host_context {
                         self.set_host_work_context(child_id, context)
                             .await
@@ -784,7 +1164,10 @@ impl Agent {
                         sender_relationship: "parent".into(),
                         is_result: false,
                         sender_label,
-                        sender_handle: "main".into(),
+                        sender_handle: parent_registration
+                            .as_ref()
+                            .map_or("main", |registration| registration.handle.as_str())
+                            .into(),
                         relay: None,
                     };
                     let receipt = self
@@ -793,6 +1176,7 @@ impl Agent {
                             None,
                             local_messages::agent_message(&source, &task),
                             SubmissionOptions {
+                                task_delegation: Some(parent.clone()),
                                 agent_message: Some(source),
                                 goal_title: Some(task),
                                 ..Default::default()

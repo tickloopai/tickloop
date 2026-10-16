@@ -59,6 +59,7 @@ const SHIFT_TAB_MODES_KEY: &str = "shiftTabModes";
 pub const DEFAULT_SHIFT_TAB_MODES: [ExecutionMode; 2] = [ExecutionMode::Auto, ExecutionMode::Plan];
 /// Claude Code's `outputStyle` setting.
 const OUTPUT_STYLE_KEY: &str = "outputStyle";
+const TASK_TOOLS_ENABLED_KEY: &str = "taskToolsEnabled";
 /// 照 Claude Code `cleanupPeriodDays` 的名称与取值，但只有 0 有含义：不写 Transcript。Tickloop 不按
 /// 天数自动删除任何文件，正数与未设置一样保存 Chat。
 const CLEANUP_PERIOD_DAYS_KEY: &str = "cleanupPeriodDays";
@@ -299,6 +300,19 @@ impl LoadedSettings {
                 ))
             })
             .ok()
+    }
+
+    pub fn task_tools_enabled(&mut self) -> bool {
+        match self.settings.get(TASK_TOOLS_ENABLED_KEY) {
+            Some(Value::Bool(enabled)) => *enabled,
+            None => false,
+            Some(_) => {
+                self.warn(format!(
+                    "`{TASK_TOOLS_ENABLED_KEY}` must be a boolean and is ignored"
+                ));
+                false
+            }
+        }
     }
 
     pub fn thinking_enabled(&mut self) -> bool {
@@ -897,6 +911,13 @@ impl UserSettings {
         })
     }
 
+    pub fn save_task_tools_enabled(&self, enabled: bool) -> Result<(), SettingsError> {
+        self.update(|settings| {
+            settings.insert(TASK_TOOLS_ENABLED_KEY.into(), enabled.into());
+            Ok(())
+        })
+    }
+
     pub fn save_prompt_suggestion_enabled(&self, enabled: bool) -> Result<(), SettingsError> {
         self.update(|settings| {
             settings.insert(PROMPT_SUGGESTION_ENABLED_KEY.into(), enabled.into());
@@ -1356,6 +1377,23 @@ mod tests {
                 .unwrap();
         assert!(saved.get(MODEL_KEY).is_none());
         assert_eq!(saved[DEFAULT_MODEL_KEY]["provider"], "deepseek-api");
+    }
+
+    #[test]
+    fn task_tools_default_off_and_persist_only_the_boolean_preference() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = UserSettings::in_root(directory.path());
+        assert!(!settings.load().task_tools_enabled());
+        std::fs::write(&settings.path, r#"{"taskToolsEnabled":"yes","other":42}"#).unwrap();
+        let mut loaded = settings.load();
+        assert!(!loaded.task_tools_enabled());
+        assert!(!loaded.into_warnings().is_empty());
+        settings.save_task_tools_enabled(true).unwrap();
+        assert!(settings.load().task_tools_enabled());
+        let saved: Value = serde_json::from_slice(&std::fs::read(&settings.path).unwrap()).unwrap();
+        assert_eq!(saved["other"], 42);
+        settings.save_task_tools_enabled(false).unwrap();
+        assert!(!settings.load().task_tools_enabled());
     }
 
     #[test]

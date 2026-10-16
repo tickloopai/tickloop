@@ -1955,7 +1955,16 @@ impl ConsoleExecution {
         target: ConfigTarget,
     ) -> Result<AgentConfiguration, AccessError> {
         match target {
-            ConfigTarget::Agent(chat) => Ok(AgentConfiguration::of(&self.status(chat).await?)),
+            ConfigTarget::Agent(chat) => {
+                let mut configuration = AgentConfiguration::of(&self.status(chat).await?);
+                let ObservationValue::TaskToolsSetting(enabled) =
+                    self.value(chat, AgentDetailQuery::TaskToolsSetting).await?
+                else {
+                    return Err(unexpected());
+                };
+                configuration.task_tools_enabled = enabled;
+                Ok(configuration)
+            }
             ConfigTarget::NewDraft => {
                 let base = self.new_agent_defaults();
                 Ok(self.inner.draft.lock().unwrap().configuration(base))
@@ -2030,9 +2039,8 @@ impl ConsoleExecution {
         }
     }
 
-    /// Applies `change` to the visible Agent. For the New Agent, model, effort and Thinking are user
-    /// defaults saved at once, exactly as choosing them on an Agent saves them; process-local
-    /// choices wait for the first input.
+    /// Applies `change` to the visible Agent. For the New Agent, model, effort, Thinking and Task
+    /// tools are user defaults saved at once; process-local choices wait for the first input.
     pub(super) async fn change_configuration(
         &self,
         target: ConfigTarget,
@@ -2057,9 +2065,9 @@ impl ConsoleExecution {
         }
         Ok(outcome)
     }
-    /// Saves a New Agent model, effort or Thinking choice as the user default through the shared
-    /// settings, with the runtime's validation and context-window rule. Returns false for choices
-    /// that are not user defaults, or when this View has no settings to save into.
+    /// Saves a New Agent choice through the shared user settings, with the runtime's validation
+    /// and context-window rule. Task tools require durable settings; other choices may be staged
+    /// when this View has no settings to save into.
     fn save_new_agent_default(
         &self,
         current: &AgentConfiguration,
@@ -2069,6 +2077,11 @@ impl ConsoleExecution {
         // Without settings nothing is saved; the choices then wait for the first input like the
         // process-local ones.
         let Some(settings) = self.user_settings() else {
+            if matches!(change, ConfigurationChange::TaskToolsEnabled { .. }) {
+                return Err(AccessError::invalid(
+                    "cannot save Task tools because the user settings directory is unavailable",
+                ));
+            }
             return Ok(false);
         };
         let save = |write: &dyn Fn(
@@ -2095,6 +2108,9 @@ impl ConsoleExecution {
                     None => settings.save_model(&config, clear_context_window),
                 })?;
                 self.select_default_model(config);
+            }
+            ConfigurationChange::TaskToolsEnabled { enabled } => {
+                save(&|settings| settings.save_task_tools_enabled(*enabled))?;
             }
             ConfigurationChange::ReasoningEffort { effort } => {
                 tickloop_agent_model::validate_reasoning_effort(&current.model, *effort)
@@ -2504,6 +2520,7 @@ impl ConsoleExecution {
             pending_model: None,
             reasoning_effort: defaults.reasoning_effort,
             thinking_enabled: defaults.thinking_enabled,
+            task_tools_enabled: defaults.task_tools_enabled,
             execution_mode: defaults.execution_mode,
             additional_directories: Vec::new(),
             delegated: false,
@@ -2961,6 +2978,28 @@ impl ConsoleExecution {
         self.command(AgentCommand::DeclineQuestion { request }, None)
             .await
             .map(|_| ())
+    }
+
+    pub(super) async fn clear_completed_tasks(
+        &self,
+        chat: Uuid,
+        cleanup: super::completed_tasks::CompletedTaskCleanup,
+    ) -> Result<(), AccessError> {
+        let execution = self.reference(chat).await?;
+        match self
+            .command(
+                AgentCommand::ClearCompletedTasks {
+                    execution,
+                    root_loop_id: cleanup.root_loop_id,
+                    expected_revision: cleanup.expected_revision,
+                },
+                None,
+            )
+            .await?
+        {
+            CommandResult::Done => Ok(()),
+            _ => Err(unexpected()),
+        }
     }
 
     async fn loop_command(
@@ -5412,6 +5451,115 @@ mod tests {
                 .any(|view| view.rule.id == session.id),
             "the kept session rule is replayed on the created Agent"
         );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn task_tools_settings_reads_the_target_store_without_reconfiguring_the_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().canonicalize().unwrap();
+        let agent_root = project.join("agent-settings");
+        let view_root = project.join("view-settings");
+        let agent_settings = tickloop_agent_config::UserSettings::in_root(&agent_root);
+        let view_settings = tickloop_agent_config::UserSettings::in_root(&view_root);
+        agent_settings.save_task_tools_enabled(false).unwrap();
+        view_settings.save_task_tools_enabled(true).unwrap();
+        let model = tickloop_agent_test_support::config();
+        let client = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![]));
+        let runtime = tickloop_agent_runtime::Agent::new_with_user_settings_embedded(
+            model.clone(),
+            client.clone(),
+            agent_settings.clone(),
+        );
+        let access = Arc::new(EmbeddedAgentAccess::new(runtime.clone()));
+        let mut launch = LaunchSpec::embedded(project);
+        launch.model = Some(model.clone());
+        launch.config_root = Some(agent_root);
+        let created = access
+            .execute(CommandEnvelope {
+                daemon_epoch: access.daemon_epoch(),
+                command_id: Uuid::new_v4(),
+                command: AgentCommand::Create {
+                    launch: launch.clone(),
+                    initial: None,
+                    origin: None,
+                },
+            })
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+        let CommandResult::Created { snapshot, .. } = created else {
+            panic!("Agent was not created");
+        };
+        let chat = snapshot.conversation.id;
+        let before = runtime.snapshot(chat).await.unwrap();
+        launch.config_root = Some(view_root);
+        let terminal = ConsoleExecution::from_access_for_test(
+            access.clone(),
+            access.daemon_epoch(),
+            ViewRef {
+                session_id: Uuid::new_v4(),
+                view_id: Uuid::new_v4(),
+            },
+            launch,
+            None,
+        );
+        terminal.use_user_settings(Some(view_settings.clone()));
+        let target = ConfigTarget::Agent(chat);
+        assert!(
+            !terminal
+                .configuration(target)
+                .await
+                .unwrap()
+                .task_tools_enabled
+        );
+        assert!(
+            terminal
+                .configuration(ConfigTarget::NewDraft)
+                .await
+                .unwrap()
+                .task_tools_enabled
+        );
+
+        agent_settings.save_task_tools_enabled(true).unwrap();
+        view_settings.save_task_tools_enabled(false).unwrap();
+        assert!(
+            !terminal.status(chat).await.unwrap().task_tools_enabled,
+            "ordinary status does not read the settings store"
+        );
+        assert!(
+            terminal
+                .configuration(target)
+                .await
+                .unwrap()
+                .task_tools_enabled,
+            "explicit Settings reads a changed target store even while the Agent is idle"
+        );
+        assert!(
+            !terminal
+                .configuration(ConfigTarget::NewDraft)
+                .await
+                .unwrap()
+                .task_tools_enabled
+        );
+
+        view_settings.save_task_tools_enabled(true).unwrap();
+        terminal
+            .change_configuration(
+                target,
+                ConfigurationChange::TaskToolsEnabled { enabled: false },
+            )
+            .await
+            .unwrap();
+        assert!(!agent_settings.load().task_tools_enabled());
+        assert!(view_settings.load().task_tools_enabled());
+        let after = runtime.snapshot(chat).await.unwrap();
+        assert_eq!(after.model, before.model);
+        assert_eq!(after.pending_model, before.pending_model);
+        assert!(after.loops.is_empty());
+        assert_eq!(runtime.list_chats().await.len(), 1);
+        assert!(client.requests.lock().unwrap().is_empty());
         runtime.shutdown().await;
     }
 

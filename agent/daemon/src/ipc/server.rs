@@ -255,6 +255,7 @@ pub(super) async fn serve_connection_mode(
         AccessCapability::EditHistory,
         AccessCapability::ManageLoop,
         AccessCapability::ManageTask,
+        AccessCapability::ClearCompletedTasks,
         AccessCapability::EnqueueAfterTurn,
         AccessCapability::RefreshConfiguration,
         AccessCapability::FlushTranscripts,

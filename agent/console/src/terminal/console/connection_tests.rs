@@ -29,7 +29,7 @@ fn execution_connection_facts_fit_custom_status_help_and_short_screens() {
                         state.help_open = help_open;
                         state
                             .status_area
-                            .update("Auto".into(), "loss-model".into(), None, vec![]);
+                            .update("Auto".into(), "loss-model".into(), None, None);
                         state.execution_connection_notice = Some(connection);
                         let (lines, _, _) = state.normal_styled_frame();
                         let text = lines
@@ -99,7 +99,7 @@ fn connection_recovery_removes_the_short_notice_and_restores_core() {
     state.prompt_enabled = true;
     state
         .status_area
-        .update("Auto".into(), "loss-model".into(), None, vec![]);
+        .update("Auto".into(), "loss-model".into(), None, None);
     let console = super::tests::console_with_state(state);
     console
         .set_execution_connection_notice(

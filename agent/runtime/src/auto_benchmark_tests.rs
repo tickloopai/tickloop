@@ -302,6 +302,7 @@ async fn review_case(
     }
     let receipt = receipt.unwrap();
     let operation = OperationRecord {
+        task_binding: None,
         id: Uuid::new_v4(),
         loop_id: receipt.loop_id,
         run_id: receipt.run_id,

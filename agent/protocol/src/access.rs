@@ -359,6 +359,11 @@ pub enum AgentCommand {
         execution: ExecutionRef,
         action: TaskAction,
     },
+    ClearCompletedTasks {
+        execution: ExecutionRef,
+        root_loop_id: Uuid,
+        expected_revision: u64,
+    },
     EnqueueAfterTurn {
         execution: ExecutionRef,
         target_loop: Option<Uuid>,
@@ -399,7 +404,8 @@ impl AgentCommand {
             | Self::ReopenHostedTick { execution, .. }
             | Self::AttachHostedTick { execution, .. }
             | Self::EnqueueAfterTurn { execution, .. }
-            | Self::RefreshConfiguration { execution } => Some(*execution),
+            | Self::RefreshConfiguration { execution }
+            | Self::ClearCompletedTasks { execution, .. } => Some(*execution),
             Self::DecidePermission { request, .. }
             | Self::AnswerQuestion { request, .. }
             | Self::DeclineQuestion { request } => Some(request.execution),
@@ -412,6 +418,9 @@ impl AgentCommand {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 pub enum ConfigurationChange {
+    TaskToolsEnabled {
+        enabled: bool,
+    },
     GenerateAutoEnvironment {
         options: crate::AutoSetupOptions,
     },
@@ -590,6 +599,8 @@ pub enum AgentDetailQuery {
     Snapshot,
     /// What the Chat is doing now, without its history.
     Status,
+    /// Refreshes the Task tools preference from this Agent's configuration scope.
+    TaskToolsSetting,
     /// The tool operation a run recorded for one call.
     Operation {
         run_id: Uuid,
@@ -708,6 +719,9 @@ pub struct AgentSummary {
     pub workdir: PathBuf,
     pub state: LoopState,
     pub run_id: Option<RunId>,
+    /// Unix milliseconds when the current summarized run began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_started_at: Option<u64>,
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent: Option<SubagentRegistration>,
@@ -929,6 +943,7 @@ pub enum ObservationValue {
     Overview(Vec<AgentSummary>),
     Agent(Box<LiveChatSnapshot>),
     Status(Box<LiveChatStatus>),
+    TaskToolsSetting(bool),
     Operation(Option<Box<OperationRecord>>),
     Events(Vec<Event>),
     Permissions(Box<PermissionsView>),
@@ -1199,6 +1214,7 @@ pub enum AccessCapability {
     EditHistory,
     ManageLoop,
     ManageTask,
+    ClearCompletedTasks,
     EnqueueAfterTurn,
     RefreshConfiguration,
     TrustWorkingDirectory,

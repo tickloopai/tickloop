@@ -93,13 +93,12 @@ pub const DECLINED_QUESTIONS_RESULT: &str = "The user doesn't want to proceed wi
 
 /// Tools Auto admits without the classifier, mapped from Claude Code's
 /// `SAFE_YOLO_ALLOWLISTED_TOOLS`.
-pub const AUTO_ALLOWLISTED_TOOLS: [&str; 9] = [
+pub const AUTO_ALLOWLISTED_TOOLS: [&str; 8] = [
     READ_TOOL_NAME,
     GLOB_TOOL_NAME,
     GREP_TOOL_NAME,
     ENTER_PLAN_MODE_TOOL_NAME,
     EXIT_PLAN_MODE_TOOL_NAME,
-    TODO_WRITE_TOOL_NAME,
     START_GOAL_TOOL_NAME,
     TASK_STOP_TOOL_NAME,
     ASK_USER_QUESTION_TOOL_NAME,

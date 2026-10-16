@@ -21,6 +21,7 @@ pub(crate) enum Line {
     CustomTitle(CustomTitleEntry),
     AiTitle(AiTitleEntry),
     Subagents(SubagentsEntry),
+    TaskBoards(TaskBoardsEntry),
     FamilyCompletions(FamilyCompletionsEntry),
     FamilyInputs(FamilyInputsEntry),
     SentAgentMessages(SentAgentMessagesEntry),
@@ -51,6 +52,7 @@ pub(crate) enum MetadataKind {
     Subagents,
     FamilyInputs,
     SentAgentMessages,
+    TaskBoards,
     FamilyCompletions,
     FileHistorySnapshot,
     ContentReplacement,
@@ -466,4 +468,11 @@ mod record_type_tests {
 pub(crate) struct SentAgentMessagesEntry {
     pub chat_id: Uuid,
     pub messages: std::collections::BTreeMap<Uuid, AgentMessageSource>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TaskBoardsEntry {
+    pub chat_id: Uuid,
+    pub boards: std::collections::BTreeMap<Uuid, tickloop_agent_protocol::TaskBoard>,
 }

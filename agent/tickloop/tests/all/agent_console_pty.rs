@@ -15,11 +15,13 @@ mod family_navigation;
 mod hosted_monitor;
 mod interrupted_prompt;
 mod monitor_width;
+mod nested_family;
 mod other_tickhost;
 mod provider_errors;
 mod question_decline;
 mod reply_visibility;
 mod resume_picker;
+mod task_tools_setting;
 mod unified_footer;
 
 use std::{
@@ -1884,7 +1886,7 @@ async fn run_child_views(fixture: &PrivateFixture) {
             .any(|tool| tool["function"]["name"] == "Subagent")
     );
     assert!(
-        !seen[2].1["tools"]
+        seen[2].1["tools"]
             .as_array()
             .unwrap()
             .iter()

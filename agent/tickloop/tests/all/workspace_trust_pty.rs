@@ -20,6 +20,10 @@ use std::{
 use portable_pty::{PtySize, native_pty_system};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+const FRAME_START: &str = "\x1b[?2026h";
+const FRAME_END: &str = "\x1b[?2026l";
+const CURSOR_SHOW: &str = "\x1b[?25h";
+const CURSOR_HIDE: &str = "\x1b[?25l";
 
 struct Fixture {
     root: tempfile::TempDir,
@@ -155,6 +159,43 @@ impl Terminal {
         }
     }
 
+    fn wait_for_input(&self) {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let output = self.output.lock().unwrap().clone();
+            let ready = output.rfind(FRAME_END).is_some_and(|end| {
+                let Some(start) = output[..end].rfind(FRAME_START) else {
+                    return false;
+                };
+                let update = &output[start..end];
+                let cursor_visible = update.rfind(CURSOR_SHOW).is_some_and(|shown| {
+                    update
+                        .rfind(CURSOR_HIDE)
+                        .is_none_or(|hidden| shown > hidden)
+                });
+                let frame = screen::visible_screen(
+                    &output[..end + FRAME_END.len()],
+                    self.size.cols as usize,
+                    self.size.rows as usize,
+                );
+                cursor_visible
+                    && frame.contains("Tickloop v")
+                    && frame.contains("⏵⏵ ")
+                    && frame.lines().any(|line| line.trim() == "❯")
+                    && !frame.contains("Accessing workspace:")
+            });
+            if ready {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "input is not ready: {}",
+                self.frame()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn send(&mut self, bytes: &[u8]) {
         self.writer.write_all(bytes).unwrap();
         self.writer.flush().unwrap();
@@ -271,7 +312,7 @@ fn startup_trust_requires_the_complete_directory_before_confirmation_after_resiz
         terminal.wait(fixture.path("work").to_str().unwrap());
         terminal.wait("enter confirm");
         terminal.send(b"\r");
-        terminal.wait("⏵⏵ ");
+        terminal.wait_for_input();
         assert!(
             UserSettings::in_root(&fixture.path("config"))
                 .is_working_directory_trusted(&fixture.path("work"))
@@ -410,8 +451,7 @@ fn startup_trust_accepts_explicit_navigation_and_preserves_exact_scope_on_restar
         assert!(!fixture.path("config/settings.json").exists());
         terminal.send(navigation);
         terminal.send(b"\r\r");
-        terminal.wait("⏵⏵ ");
-        thread::sleep(Duration::from_millis(80));
+        terminal.wait_for_input();
         assert!(!fixture.path("config/projects").exists());
         let settings = UserSettings::in_root(&fixture.path("config"));
         assert!(settings.is_working_directory_trusted(&fixture.path("work")));
@@ -424,7 +464,7 @@ fn startup_trust_accepts_explicit_navigation_and_preserves_exact_scope_on_restar
         assert_eq!(terminal.exit_code(), 0);
         drop(terminal);
         let mut restarted = Terminal::start(&fixture, "fullscreen", &[]);
-        restarted.wait("⏵⏵ ");
+        restarted.wait_for_input();
         assert!(
             !restarted
                 .output
@@ -471,7 +511,7 @@ fn startup_trust_short_write_failure_shows_the_error_and_requires_resize_before_
         terminal.wait("Cannot save directory trust:");
         terminal.wait("Yes, I trust this folder");
         terminal.send(b"\x0e\r");
-        terminal.wait("⏵⏵ ");
+        terminal.wait_for_input();
         terminal.send(b"/exit\r");
         assert_eq!(terminal.exit_code(), 0);
         drop(terminal);
@@ -500,7 +540,7 @@ fn startup_trust_write_failure_stays_gated_and_requires_explicit_retry() {
             .is_working_directory_trusted(&fixture.path("work"))
     );
     terminal.send(b"\x0e\r");
-    terminal.wait("⏵⏵ ");
+    terminal.wait_for_input();
     assert!(
         UserSettings::in_root(&fixture.path("config"))
             .is_working_directory_trusted(&fixture.path("work"))
@@ -536,7 +576,7 @@ fn startup_trust_navigation_and_repeated_enter_never_submit_a_model_request() {
     terminal.wait("Accessing workspace:");
     assert_eq!(probe.requests.load(Ordering::SeqCst), 0);
     terminal.send(b"j\r\r");
-    terminal.wait("⏵⏵ ");
+    terminal.wait_for_input();
     thread::sleep(Duration::from_millis(100));
     assert_eq!(probe.requests.load(Ordering::SeqCst), 0);
     assert!(!fixture.path("config/projects").exists());
@@ -599,7 +639,7 @@ fn startup_trust_persists_the_exact_home_directory() {
     let mut terminal = Terminal::start(&fixture, "inline", &["--cwd", home.to_str().unwrap()]);
     terminal.wait("Accessing workspace:");
     terminal.send(b"j\r");
-    terminal.wait("⏵⏵ ");
+    terminal.wait_for_input();
     let settings = UserSettings::in_root(&fixture.path("config"));
     assert!(settings.is_working_directory_trusted(&home));
     assert!(!settings.is_working_directory_trusted(&fixture.path("work")));

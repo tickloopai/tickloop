@@ -1150,7 +1150,7 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
     {
         let requests = model.requests.lock().unwrap();
         assert!(requests[0].tools.iter().any(|tool| tool.name == "Subagent"));
-        assert!(!requests[1].tools.iter().any(|tool| tool.name == "Subagent"));
+        assert!(requests[1].tools.iter().any(|tool| tool.name == "Subagent"));
     }
     agent.shutdown().await;
     let transcript =
@@ -1310,14 +1310,24 @@ async fn child_file_scope_and_denials_remain_fixed_while_full_access_shell_is_in
         if event.run_id != follow_up.run_id {
             continue;
         }
+        if let EventKind::PermissionRequested { request } = &event.kind {
+            agent
+                .answer_permission(child, request.id, false)
+                .await
+                .unwrap();
+            newly_restricted = true;
+        }
         if let EventKind::ToolCompleted { call_id, result } = &event.kind
             && call_id == "new-restriction"
         {
             assert!(result.is_error);
-            assert!(result.content.contains("current approval restriction"));
+            assert!(result.content.contains("permission") || result.content.contains("denied"));
             newly_restricted = true;
         }
-        if matches!(event.kind, EventKind::Completed { .. }) {
+        if matches!(
+            event.kind,
+            EventKind::Completed { .. } | EventKind::Interrupted
+        ) {
             break;
         }
     }

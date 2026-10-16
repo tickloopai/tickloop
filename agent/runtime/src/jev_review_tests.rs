@@ -30,6 +30,7 @@ fn scenario(prompt: &str, command: &str) -> (ChatSnapshot, ChatBookkeeping, Oper
         }],
     });
     let operation = OperationRecord {
+        task_binding: None,
         id: Uuid::new_v4(),
         loop_id,
         run_id,

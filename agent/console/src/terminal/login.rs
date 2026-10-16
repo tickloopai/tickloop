@@ -1314,7 +1314,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
         };
-        wait("Ask");
+        wait_for_input_after(0);
         writer.write_all(b"/provider\r").unwrap();
         writer.flush().unwrap();
         wait("Choose Provider");

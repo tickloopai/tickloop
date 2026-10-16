@@ -92,6 +92,7 @@
           "generation": 3
         },
         "conversation": {
+          "task_tools_enabled": false,
           "failure_events": [],
           "provider_failures": {},
           "artifact_ticks": [
@@ -625,6 +626,7 @@
           "generation": 3
         },
         "conversation": {
+          "task_tools_enabled": false,
           "failure_events": [],
           "provider_failures": {},
           "artifact_ticks": [

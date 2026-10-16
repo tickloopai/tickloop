@@ -85,6 +85,7 @@ impl Session {
             run,
         );
         let operation = OperationRecord {
+            task_binding: None,
             id: Uuid::new_v4(),
             loop_id: self.loop_id,
             run_id: run,

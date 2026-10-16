@@ -221,7 +221,7 @@ impl TerminalSurface {
 use super::monitor::MonitorEntry;
 use tickloop_agent_protocol::{
     ExecutionRef, Image, ImageContext, ImageOrigin, InputContext, QueuedInput, QueuedInputKind,
-    TickSubscriptionStatus, TodoItem,
+    TaskBoard, TickSubscriptionStatus,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -909,7 +909,7 @@ struct EscapeConfirmation {
 }
 
 struct SubmittedPrompt {
-    family_target: Option<super::file_mentions::FamilyMentionTarget>,
+    family_mentions: Vec<super::file_mentions::AcceptedFamilyMention>,
     draft: String,
     paste_blocks: PasteBlocks,
     mentions: Vec<AcceptedMention>,
@@ -928,7 +928,7 @@ struct ChatInput {
 }
 
 struct InputStash {
-    family_target: Option<super::file_mentions::FamilyMentionTarget>,
+    family_mentions: Vec<super::file_mentions::AcceptedFamilyMention>,
     paste_blocks: PasteBlocks,
     restored_contexts: Vec<InputContext>,
     accepted_mentions: Vec<AcceptedMention>,
@@ -2231,15 +2231,6 @@ impl Console {
         Ok(self.state.lock().map_err(|error| error.to_string())?.width)
     }
 
-    pub(super) fn todo_refresh_pending(&self) -> Result<bool, String> {
-        Ok(self
-            .state
-            .lock()
-            .map_err(|error| error.to_string())?
-            .status_area
-            .todo_refresh_pending())
-    }
-
     pub(super) fn set_display_preferences(
         &self,
         preferences: DisplayPreferences,
@@ -2306,10 +2297,10 @@ impl Console {
         mode: String,
         model: String,
         context: Option<(u64, usize)>,
-        todos: Vec<TodoItem>,
+        tasks: Option<TaskBoard>,
     ) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        let changed = state.status_area.update(mode, model, context, todos);
+        let changed = state.status_area.update(mode, model, context, tasks);
         let panels = state.status_area.available_panels().collect::<Vec<_>>();
         state.footer.update(panels);
         state.clear_footer_selection_if_hidden();
@@ -5209,6 +5200,7 @@ impl State {
     fn replace_view(&mut self, mut next: ViewPresentation) -> ViewPresentation {
         next.status_area.agents_collapsed = self.status_area.agents_collapsed;
         next.status_area.adopt_agent_selection(&self.status_area);
+        next.status_area.adopt_task_views(&self.status_area);
         ViewPresentation {
             monitor: std::mem::replace(&mut self.monitor, next.monitor),
             scrollback: std::mem::replace(&mut self.scrollback, next.scrollback),
@@ -5917,6 +5909,7 @@ impl State {
         }
         self.clear_selection();
         self.scrollback.scroll(action);
+        self.status_area.release_task_focus();
         if action == ScrollAction::Last {
             self.conversation_focused = false;
         }
@@ -6527,23 +6520,25 @@ impl State {
     /// Builds the fixed rows below the conversation, each row carrying the
     /// roles its parts play so the writer can apply the active theme.
     fn styled_frame(&mut self) -> (Vec<RoleLine>, usize, usize) {
-        let todo_columns = self.content_columns();
-        let todo_lines = self.status_area.todo_lines(
-            todo_columns,
+        self.clear_footer_selection_if_hidden();
+        let frame = if self.input_dialog_visible() {
+            self.input_dialog_frame()
+        } else if self.history_search.is_some() {
+            self.history_search_frame()
+        } else {
+            self.normal_styled_frame()
+        };
+        // A sticky conversation prompt may occupy the first row above the input frame.
+        let viewport_rows = self.height.saturating_sub(frame.0.len()).saturating_sub(1);
+        let task_lines = self.status_area.task_lines_in_viewport(
+            self.content_columns(),
             self.height,
+            viewport_rows,
             self.display,
             self.scrollback.activity_line().is_some(),
-            Instant::now(),
         );
-        self.scrollback.set_activity_details(todo_lines);
-        self.clear_footer_selection_if_hidden();
-        if self.input_dialog_visible() {
-            return self.input_dialog_frame();
-        }
-        if self.history_search.is_some() {
-            return self.history_search_frame();
-        }
-        self.normal_styled_frame()
+        self.scrollback.set_activity_details(task_lines);
+        frame
     }
 
     fn menu_group_header(&self, index: usize, window_start: usize) -> Option<&str> {
@@ -8081,7 +8076,12 @@ impl State {
                             row.display_path.clone(),
                             match &row.target {
                                 MentionTarget::Agent(target) => {
-                                    format!("Agent · {}", target.description)
+                                    let kind = if self.file_mentions.completing_recipient() {
+                                        "Recipient"
+                                    } else {
+                                        "Reference"
+                                    };
+                                    format!("{kind} · {}", target.description)
                                 }
                                 MentionTarget::File { .. } => "File".into(),
                             },
@@ -8141,15 +8141,14 @@ impl State {
             return vec![(0..text.len(), Role::MutedText)];
         }
         let offset = usize::from(self.shell_input.kind() == InputKind::Shell);
-        let mut marks: Vec<_> = self
-            .paste_blocks
-            .projection(
-                self.editor.draft(),
-                self.editor.cursor(),
-                self.width.saturating_sub(2),
-            )
+        let projection = self.paste_blocks.projection(
+            self.editor.draft(),
+            self.editor.cursor(),
+            self.width.saturating_sub(2),
+        );
+        let mut marks: Vec<_> = projection
             .blocks
-            .into_iter()
+            .iter()
             .filter(|block| block.is_image)
             .map(|block| {
                 (
@@ -8158,9 +8157,24 @@ impl State {
                 )
             })
             .collect();
-        if let Some(target) = self.file_mentions.accepted_family() {
-            let start = self.editor.draft().len() - self.editor.draft().trim_start().len();
-            marks.push((start..start + target.handle.len() + 1, Role::Accent));
+        if self.shell_input.kind() != InputKind::Shell {
+            for mention in self.file_mentions.accepted_family_mentions() {
+                let range = &mention.replacement_range;
+                if projection.blocks.iter().any(|block| {
+                    range.start < block.raw_range.end && block.raw_range.start < range.end
+                }) {
+                    continue;
+                }
+                let start = projection
+                    .blocks
+                    .iter()
+                    .rev()
+                    .find(|block| block.raw_range.end <= range.start)
+                    .map_or(range.start, |block| {
+                        block.display_range.end + range.start - block.raw_range.end
+                    });
+                marks.push((start..start + range.len(), Role::Accent));
+            }
         }
         marks
     }
@@ -8325,7 +8339,7 @@ impl State {
         self.paste_blocks.restore(prompt.paste_blocks);
         self.file_mentions
             .restore_accepted(self.editor.draft(), prompt.mentions);
-        self.file_mentions.restore_family(prompt.family_target);
+        self.file_mentions.restore_family(prompt.family_mentions);
         self.file_mentions.dismiss();
         self.completion.dismiss();
         self.restore_saved_contexts(&contexts);
@@ -8595,7 +8609,7 @@ impl State {
         self.last_input_edit = Some(Instant::now());
         if !self.editor.draft().is_empty() {
             self.input_stash = Some(InputStash {
-                family_target: self.file_mentions.take_family(),
+                family_mentions: self.file_mentions.take_family(),
                 paste_blocks: self.paste_blocks.take(),
                 restored_contexts: std::mem::take(&mut self.restored_contexts),
                 accepted_mentions: self.file_mentions.take_accepted(),
@@ -8608,7 +8622,7 @@ impl State {
             self.restored_contexts = stash.restored_contexts;
             self.file_mentions
                 .restore_accepted(self.editor.draft(), stash.accepted_mentions);
-            self.file_mentions.restore_family(stash.family_target);
+            self.file_mentions.restore_family(stash.family_mentions);
             self.shell_input = stash.shell_input;
             self.refresh_completion();
         }
@@ -8837,6 +8851,15 @@ impl State {
         input.first_visual_row + input.cursor_row + 1 == input.total_visual_rows
     }
 
+    fn task_panel_can_own_focus(&self) -> bool {
+        self.ordinary_input_is_visible()
+            && self.scrollback.is_at_bottom()
+            && !self.monitor.focused
+            && !self.conversation_focused
+            && !self.terminal_lent
+            && self.status_area.tasks_can_take_focus()
+    }
+
     fn footer_can_own_focus(&self) -> bool {
         self.footer_items_are_visible()
             && self.shell_input.active_completion().is_none()
@@ -8852,6 +8875,7 @@ impl State {
     /// so its dialog closes back to the input, as Claude Code's prompt takes the keys back after a
     /// permission, question or plan dialog.
     fn yield_focus_to_request(&mut self) {
+        self.status_area.release_task_focus();
         if self.monitor.focused || self.monitor.overlay {
             self.monitor.focused = false;
             self.monitor.overlay = false;
@@ -8862,6 +8886,9 @@ impl State {
     }
 
     fn clear_footer_selection_if_hidden(&mut self) {
+        if !self.task_panel_can_own_focus() {
+            self.status_area.release_task_focus();
+        }
         if !self.help_open && !self.footer_can_own_focus() {
             self.clear_footer_selection();
         }
@@ -10817,6 +10844,9 @@ impl State {
                 _ => {}
             }
         }
+        if self.task_panel_can_own_focus() && self.status_area.task_key(key) {
+            return None;
+        }
         if self.footer.selected().is_some()
             && let Some(event) = self.footer_key(key)
         {
@@ -11386,7 +11416,7 @@ impl State {
                 self.submitted_pasted_texts = Some((line.clone(), pasted_texts));
                 self.submitted_retry_of = self.retry_of.take();
                 self.submitted_prompt = Some(SubmittedPrompt {
-                    family_target: self.file_mentions.take_family(),
+                    family_mentions: self.file_mentions.take_family(),
                     draft,
                     paste_blocks: self.paste_blocks.take(),
                     mentions: self.file_mentions.take_accepted(),
@@ -14712,6 +14742,7 @@ mod tests {
             glyph: status_glyph(AttentionGroup::Working, false),
             preview: None,
             updated_at: None,
+            run_started_at: None,
             subagent: None,
         };
         let requester = agent.reference(chat).await.unwrap().agent_id;
@@ -15823,6 +15854,105 @@ mod tests {
     }
 
     #[test]
+    fn multiple_agent_mentions_keep_colour_through_edits_stash_and_rejection() {
+        let mut state = State::new(true, 80, 24);
+        state.prompt_enabled = true;
+        let first = FamilyMentionTarget {
+            execution: ExecutionRef {
+                daemon_epoch: Uuid::new_v4(),
+                agent_id: Uuid::new_v4(),
+                generation: 1,
+            },
+            handle: "worker-a".into(),
+            description: "First worker".into(),
+            available: true,
+        };
+        let mut second = first.clone();
+        second.handle = "worker-b".into();
+        second.execution.agent_id = Uuid::new_v4();
+        state
+            .file_mentions
+            .set_family_targets(vec![first.clone(), second]);
+        state.insert("@worker-a");
+        state.key(key(KeyCode::Tab));
+        state.insert("@worker-b");
+        assert!(
+            state
+                .candidate_rows(6)
+                .iter()
+                .any(|line| line.text().contains("Reference"))
+        );
+        state.key(key(KeyCode::Tab));
+        assert_eq!(state.editor.draft(), "@worker-a @worker-b ");
+        assert_eq!(
+            state.input_image_marks(),
+            vec![(0..9, Role::Accent), (10..19, Role::Accent)]
+        );
+        state.insert("请协作");
+        assert!(matches!(
+            state.key(key(KeyCode::Enter)),
+            Some(InputEvent::Prompt { family_target: Some(target), text, .. })
+                if target == first.execution && text == "@worker-a @worker-b 请协作"
+        ));
+        assert!(state.restore_rejected_prompt(vec![]));
+        state.stash_input();
+        assert!(state.input_image_marks().is_empty());
+        state.stash_input();
+        assert_eq!(
+            state.input_image_marks(),
+            vec![(0..9, Role::Accent), (10..19, Role::Accent)]
+        );
+
+        let prefixed = format!("说明 {}", state.editor.draft());
+        state.replace_draft(prefixed.clone(), "说明 ".len());
+        assert_eq!(
+            state.input_image_marks(),
+            vec![(7..16, Role::Accent), (17..26, Role::Accent)]
+        );
+        assert!(
+            state
+                .file_mentions
+                .family_target_for_submission(&prefixed)
+                .unwrap()
+                .is_none()
+        );
+        state.replace_draft(prefixed.replace("@worker-b", "@worker-c"), 0);
+        assert_eq!(state.input_image_marks(), vec![(7..16, Role::Accent)]);
+        let remaining = state.editor.draft().replace("@worker-a ", "");
+        state.replace_draft(remaining, 0);
+        assert!(state.input_image_marks().is_empty());
+    }
+
+    #[test]
+    fn agent_mention_colours_follow_folded_paste_projection() {
+        let mut state = State::new(true, 80, 24);
+        state.prompt_enabled = true;
+        state
+            .file_mentions
+            .set_family_targets(vec![FamilyMentionTarget {
+                execution: ExecutionRef {
+                    daemon_epoch: Uuid::new_v4(),
+                    agent_id: Uuid::new_v4(),
+                    generation: 1,
+                },
+                handle: "worker".into(),
+                description: "Worker".into(),
+                available: true,
+            }]);
+        state.insert("检查 ");
+        state.paste("first\nsecond\nthird\nfourth");
+        state.insert(" @work");
+        state.key(key(KeyCode::Tab));
+        let (display, _) = state.input_display();
+        assert!(!display.contains("first"));
+        let start = display.find("@worker").unwrap();
+        assert_eq!(
+            state.input_image_marks(),
+            vec![(start..start + 7, Role::Accent)]
+        );
+    }
+
+    #[test]
     fn accepted_file_candidates_submit_structured_references_but_plain_mentions_do_not() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("notes.md");
@@ -16845,7 +16975,7 @@ mod tests {
         state.prompt_enabled = true;
         state
             .status_area
-            .update("Auto".into(), "claude-fable-5-1".into(), None, Vec::new());
+            .update("Auto".into(), "claude-fable-5-1".into(), None, None);
         assert!(!state.request_escape(EscapeAction::OpenRewind));
         let (lines, input_row, _) = state.frame();
         let line = lines.last().unwrap();
@@ -17202,16 +17332,9 @@ mod tests {
                 let mut state = State::new(true, 180, 24);
                 state.prompt_enabled = true;
                 state.execution_connection_notice = Some(notice);
-                state.status_area.update(
-                    "Auto".into(),
-                    "loss-model".into(),
-                    None,
-                    vec![TodoItem {
-                        content: "review".into(),
-                        status: tickloop_agent_protocol::TodoStatus::Pending,
-                        active_form: "Working".into(),
-                    }],
-                );
+                state
+                    .status_area
+                    .update("Auto".into(), "loss-model".into(), None, None);
                 super::layout_tests::set_status_family(&mut state.status_area);
                 state.insert("preserved draft");
                 let cursor = state.editor.cursor();
@@ -17523,7 +17646,7 @@ mod tests {
                 .any(|line| line.contains(status))
         };
         console
-            .update_status_area("Auto".into(), "fixture".into(), None, Vec::new())
+            .update_status_area("Auto".into(), "fixture".into(), None, None)
             .unwrap();
         assert!(painted("⏵⏵ Auto · fixture"));
         console.show_execution_mode(ExecutionMode::Plan).unwrap();
@@ -18537,7 +18660,7 @@ mod tests {
         state.prompt_enabled = true;
         state
             .status_area
-            .update("Auto".into(), "fixture".into(), None, vec![]);
+            .update("Auto".into(), "fixture".into(), None, None);
         super::layout_tests::set_status_family(&mut state.status_area);
         state.footer.update(state.status_area.available_panels());
         let (lines, input_row, _) = state.frame();
@@ -18615,16 +18738,9 @@ mod tests {
         state.prompt_enabled = true;
         state.insert("inspect current work");
         let draft = state.editor.draft().to_owned();
-        state.status_area.update(
-            "Auto".into(),
-            "model".into(),
-            Some((42000, 200000)),
-            vec![TodoItem {
-                content: "review results".into(),
-                status: tickloop_agent_protocol::TodoStatus::Pending,
-                active_form: "Reviewing results".into(),
-            }],
-        );
+        state
+            .status_area
+            .update("Auto".into(), "model".into(), Some((42000, 200000)), None);
         super::layout_tests::set_status_family(&mut state.status_area);
         state.footer.update(state.status_area.available_panels());
         state.key(key(KeyCode::Down));
@@ -18667,7 +18783,7 @@ mod tests {
         let cursor = state.editor.cursor();
         state
             .status_area
-            .update("Auto".into(), "model".into(), None, vec![]);
+            .update("Auto".into(), "model".into(), None, None);
         super::layout_tests::set_status_family(&mut state.status_area);
         state.footer.update(state.status_area.available_panels());
         state.key(key(KeyCode::Down));
@@ -18736,7 +18852,7 @@ mod tests {
         state.menu_focused = true;
         state
             .status_area
-            .update("Auto".into(), "model".into(), None, vec![]);
+            .update("Auto".into(), "model".into(), None, None);
         state.footer.update([FooterItemId::Agents]);
 
         assert!(!matches!(
@@ -18901,7 +19017,7 @@ mod tests {
             "Auto".into(),
             "deepseek-flash".into(),
             Some((12_500, 1_000_000)),
-            vec![],
+            None,
         );
         state.scrollback.append(
             &(0..100)
@@ -19697,7 +19813,7 @@ mod tests {
                     state.prompt_enabled = true;
                     state
                         .status_area
-                        .update("Ask".into(), "fixture".into(), None, Vec::new());
+                        .update("Ask".into(), "fixture".into(), None, None);
                     state.configured_status_lines = configured.clone();
                     state.help_open = help_open;
                     state.queued_inputs = vec![
@@ -20035,6 +20151,7 @@ mod tests {
                         "Permissions",
                         "Artifacts",
                         "Prompt suggestions",
+                        "Task tools",
                     ]
                 );
                 settings.id
