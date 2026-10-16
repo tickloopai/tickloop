@@ -220,10 +220,7 @@ impl Agent {
             recorder.register_branch(&source.snapshot, &source.bookkeeping, child_chat_id, &name);
         }
         let tools = self.create_chat_tools(&snapshot);
-        let skills = tickloop_agent_config::skills::SkillRegistry::discover(
-            &snapshot.workdir,
-            self.inner.config_root.as_deref(),
-        );
+        let skills = self.discover_skills(&snapshot.workdir);
         // 照 Claude Code `/branch`：以子 Chat 的 id 重新记录来源中仍在复制对话里的替换决定。
         let source_replacements = chats
             .get(&request.source_chat_id)

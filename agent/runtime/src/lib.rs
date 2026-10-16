@@ -385,7 +385,9 @@ struct Chat {
     /// Chat 的工具；其 Chat 目录持久化时为 Transcript 同级的 `<chatId>/`，不持久化时位于
     /// 系统临时目录的项目目录下，外存的工具结果与文件改动 review 写在这里。
     tools: Arc<tickloop_agent_tools::Tools>,
-    skills: tickloop_agent_config::skills::SkillRegistry,
+    /// Shared with the tool registry of each model request, whose Skill calls expand against the
+    /// listing that request sent even when the Chat's Skills are read again meanwhile.
+    skills: Arc<tickloop_agent_config::skills::SkillRegistry>,
     /// 照 Claude Code，替换决定只在运行期保存，恢复时由 Transcript 中的内容替换条目重建。
     content_replacements: tool_results::ContentReplacementState,
     file_history: FileHistory,
@@ -796,6 +798,37 @@ impl Drop for Inner {
 }
 
 impl Agent {
+    fn discover_skills(&self, workdir: &Path) -> Arc<tickloop_agent_config::skills::SkillRegistry> {
+        Arc::new(tickloop_agent_config::skills::SkillRegistry::discover(
+            workdir,
+            self.inner.config_root.as_deref(),
+        ))
+    }
+
+    /// Reads a Chat's Skills again, so a Tick package installed, updated or uninstalled by
+    /// `/ticks` or `tickloop tick` in another process, or an edited user or project Skill, reaches
+    /// the Chat at its next request or Skill invocation. Unchanged Skills give a byte-identical
+    /// listing, so the model's prompt cache still holds.
+    async fn rediscover_skills(&self, chat_id: ChatId) {
+        let Some(workdir) = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&chat_id)
+            .map(|chat| chat.snapshot.workdir.clone())
+        else {
+            return;
+        };
+        let skills = self.discover_skills(&workdir);
+        let mut chats = self.inner.chats.lock().await;
+        if let Some(chat) = chats.get_mut(&chat_id)
+            && chat.snapshot.workdir == workdir
+        {
+            chat.skills = skills;
+        }
+    }
+
     fn tool_definitions(&self, chat: &Chat) -> Vec<tickloop_agent_protocol::ToolDefinition> {
         ToolRegistry::for_chat(
             chat,
@@ -857,6 +890,7 @@ impl Agent {
     async fn skill_tool(
         &self,
         receipt: &Receipt,
+        skills: &tickloop_agent_config::skills::SkillRegistry,
         input: &serde_json::Value,
     ) -> Result<tickloop_agent_protocol::ToolResult, String> {
         #[derive(Deserialize)]
@@ -877,8 +911,7 @@ impl Agent {
         let chat = chats
             .get_mut(&receipt.chat_id)
             .ok_or_else(|| "chat is unavailable".to_string())?;
-        let invoked = chat
-            .skills
+        let invoked = skills
             .expand(
                 &input.skill,
                 &input.args,
@@ -1635,10 +1668,7 @@ impl Agent {
             .entry(id)
             .or_default();
         let tools = self.create_chat_tools(&snapshot);
-        let skills = tickloop_agent_config::skills::SkillRegistry::discover(
-            &snapshot.workdir,
-            self.inner.config_root.as_deref(),
-        );
+        let skills = self.discover_skills(&snapshot.workdir);
         let file_history = FileHistory::new(self.file_history_directory(id, &snapshot.workdir));
         let mut chats = self.inner.chats.lock().await;
         if let Some(metadata) = &mut snapshot.delegation {
@@ -1720,6 +1750,7 @@ impl Agent {
         arguments: &str,
         host_context: Option<HostCallContext>,
     ) -> Result<Receipt, AgentError> {
+        self.rediscover_skills(chat_id).await;
         let invoked = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
@@ -1751,6 +1782,7 @@ impl Agent {
     }
 
     pub async fn skill_warnings(&self, chat_id: ChatId) -> Result<Vec<String>, AgentError> {
+        self.rediscover_skills(chat_id).await;
         Ok(self
             .inner
             .chats
@@ -1770,21 +1802,19 @@ impl Agent {
         name: &str,
         arguments: &str,
     ) -> Result<(), AgentError> {
-        tickloop_agent_config::skills::SkillRegistry::discover(
-            workdir,
-            self.inner.config_root.as_deref(),
-        )
-        .expand(
-            name,
-            arguments,
-            tickloop_agent_config::skills::SkillCaller::User,
-        )
-        .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
-        .map(|_| ())
-        .map_err(|error| AgentError::Invalid(error.to_string()))
+        self.discover_skills(workdir)
+            .expand(
+                name,
+                arguments,
+                tickloop_agent_config::skills::SkillCaller::User,
+            )
+            .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
+            .map(|_| ())
+            .map_err(|error| AgentError::Invalid(error.to_string()))
     }
 
     pub async fn has_skill(&self, chat_id: ChatId, name: &str) -> Result<bool, AgentError> {
+        self.rediscover_skills(chat_id).await;
         Ok(self
             .inner
             .chats
@@ -2666,6 +2696,7 @@ impl Agent {
                 }
                 self.ensure_handback_requirement(&receipt).await?;
                 self.pin_delegated_artifact_account(receipt.chat_id).await?;
+                self.rediscover_skills(receipt.chat_id).await;
                 let registry = {
                     let chats = self.inner.chats.lock().await;
                     let chat = chats.get(&receipt.chat_id).unwrap();
@@ -3680,11 +3711,8 @@ impl Agent {
             chat.snapshot.workdir != workdir || chat.snapshot.additional_directories != additional;
         if chat.snapshot.workdir != workdir {
             // 持久规则属于工作目录的分区：换目录时换成新目录的持久规则，会话规则保留。
+            chat.skills = self.discover_skills(&workdir);
             chat.snapshot.workdir = workdir;
-            chat.skills = tickloop_agent_config::skills::SkillRegistry::discover(
-                &chat.snapshot.workdir,
-                self.inner.config_root.as_deref(),
-            );
             if let Some(saved) = saved {
                 self.replace_persistent_rules(&mut chat.snapshot, &mut chat.bookkeeping, saved);
             }

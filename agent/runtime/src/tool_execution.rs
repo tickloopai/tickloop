@@ -26,7 +26,8 @@ enum ToolRoute {
     BuiltIn,
     Plan,
     Interaction,
-    Skill,
+    /// The Skills whose listing the request sent, which its Skill calls expand against.
+    Skill(Arc<tickloop_agent_config::skills::SkillRegistry>),
     TickSubscription,
     Delegation,
     AgentMessage,
@@ -144,7 +145,7 @@ impl ToolRegistry {
                 .into_iter()
                 .map(|definition| RegisteredTool {
                     definition,
-                    route: ToolRoute::Skill,
+                    route: ToolRoute::Skill(chat.skills.clone()),
                 }),
         );
         if let Some(provider) = host_provider {
@@ -470,7 +471,7 @@ impl Agent {
                 self.subagent_tool(receipt, &operation.call_id, prepared, cancel)
                     .await
             }
-            ToolRoute::Skill => self.skill_tool(receipt, &operation.input).await,
+            ToolRoute::Skill(skills) => self.skill_tool(receipt, skills, &operation.input).await,
             ToolRoute::TickSubscription => {
                 self.tick_subscription_tool(receipt, &operation.name, &operation.input, authority)
                     .await

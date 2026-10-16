@@ -33,7 +33,6 @@ const INSTALLED_PAGE: usize = 0;
 const MARKETPLACE_PAGE: usize = 1;
 /// The header and the key hints.
 const CHROME_ROWS: usize = 2;
-const SKILL_LOADS_IN_A_NEW_CHAT: &str = "its Skill loads in a new Chat (/clear)";
 const EMPTY_INDENT: &str = "  ";
 const CONTEXT_INDENT: &str = "  ";
 
@@ -196,22 +195,16 @@ impl TickPackageResult {
                 let manifest = &installation.package.manifest;
                 let (name, version) = (&manifest.name, &manifest.version);
                 Notice::success(match &installation.outcome {
-                    InstallOutcome::Installed => {
-                        format!("Installed {name} {version}; {SKILL_LOADS_IN_A_NEW_CHAT}")
-                    }
+                    InstallOutcome::Installed => format!("Installed {name} {version}"),
                     InstallOutcome::Replaced { previous_version }
                         if is_later(version, previous_version) =>
                     {
-                        format!(
-                            "Updated {name} {previous_version} to {version}; {SKILL_LOADS_IN_A_NEW_CHAT}"
-                        )
+                        format!("Updated {name} {previous_version} to {version}")
                     }
-                    InstallOutcome::Replaced { previous_version } => format!(
-                        "Replaced {name} {previous_version} with {version}; {SKILL_LOADS_IN_A_NEW_CHAT}"
-                    ),
-                    InstallOutcome::Reinstalled => {
-                        format!("Reinstalled {name} {version}; {SKILL_LOADS_IN_A_NEW_CHAT}")
+                    InstallOutcome::Replaced { previous_version } => {
+                        format!("Replaced {name} {previous_version} with {version}")
                     }
+                    InstallOutcome::Reinstalled => format!("Reinstalled {name} {version}"),
                     InstallOutcome::AlreadyInstalled => {
                         format!("{name} {version} is already installed")
                     }
@@ -2072,9 +2065,11 @@ mod tests {
                 },
             })),
         });
+        let shown = text(&mut panel);
+        assert!(shown.contains("Updated alpha 1.0.0 to 2.0.0"), "{shown}");
         assert!(
-            text(&mut panel)
-                .contains("Updated alpha 1.0.0 to 2.0.0; its Skill loads in a new Chat (/clear)")
+            !shown.contains("new Chat"),
+            "the Skill reaches this Chat at once: {shown}"
         );
         press(&mut panel, KeyCode::Char('j'));
         let TickPackageRequest::Install(new) = work(press(&mut panel, KeyCode::Enter)) else {
