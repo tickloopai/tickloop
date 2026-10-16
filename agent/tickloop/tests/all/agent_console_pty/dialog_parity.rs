@@ -92,7 +92,7 @@ async fn answered_and_declined_questions(fixture: &PrivateFixture) {
     let live = view
         .wait_for("Ctrl+C declines the question and ends the run", |frame| {
             conversation_body(frame).contains(DECLINED)
-                && !frame.contains("• Working")
+                && !frame.contains("Working (")
                 && new_input_is_visible(frame)
         })
         .await;

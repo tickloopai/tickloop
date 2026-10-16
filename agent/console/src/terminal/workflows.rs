@@ -1196,7 +1196,7 @@ pub(super) fn write_public_history(console: &Console, chat: &ChatSnapshot) -> Re
     Ok(())
 }
 
-/// A Tick Update delivery: the Chat shows its `◉` lines, never the payload the model reads.
+/// A Tick Update delivery: the Chat shows its lit-tick lines, never the payload the model reads.
 fn is_tick_delivery(message: &tickloop_agent_protocol::Message) -> bool {
     message.role == Role::User
         && message.content.iter().any(|content| match content {
@@ -1776,7 +1776,7 @@ mod tests {
         let history = public_history(&tick_delivery_history("quiet"), DisplayProfile::default());
 
         assert!(
-            history.contains("◉ calendar:fixture-run-3 #8→12 · 5 updates\n"),
+            history.contains("⢀ calendar:fixture-run-3 #8→12 · 5 updates\n"),
             "{history}"
         );
         assert!(!history.contains("last_done"), "{history}");
@@ -1805,11 +1805,11 @@ mod tests {
         );
 
         assert!(
-            history.contains("◉ calendar:fixture-run-3 #941→1000 · 60 updates · trimmed"),
+            history.contains("⠁ calendar:fixture-run-3 #941→1000 · 60 updates · trimmed"),
             "{history}"
         );
         assert!(
-            history.contains("◉ calendar:fixture-run-4 #7\n"),
+            history.contains("⠂ calendar:fixture-run-4 #7\n"),
             "{history}"
         );
     }
@@ -1827,7 +1827,7 @@ mod tests {
             DisplayProfile::default(),
         );
 
-        assert!(history.contains("◉ calendar:fixture-run-3\n"), "{history}");
+        assert!(history.contains("⠁ calendar:fixture-run-3\n"), "{history}");
     }
 
     #[test]

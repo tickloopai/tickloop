@@ -16,7 +16,6 @@ pub(super) const NORMAL_LAYOUT_MIN_ROWS: usize = 16;
 pub(super) const TALL_LAYOUT_MIN_ROWS: usize = 24;
 pub(super) const MAX_CANDIDATE_ROWS: usize = 6;
 pub(in crate::terminal) const WIDE_TERMINAL_COLUMNS: usize = 80;
-const AGENT_SPINNER_FRAME_INTERVAL_MS: u64 = 100;
 const MIN_AGENT_TITLE_COLUMNS: usize = 8;
 /// The family panel's title floor before its request labels shrink further.
 pub(in crate::terminal) const MIN_REQUEST_AGENT_TITLE_COLUMNS: usize = 4;
@@ -75,7 +74,8 @@ struct RowFrame {
 impl AgentRow {
     pub(in crate::terminal) fn glyph_role(&self) -> Role {
         match self.group {
-            AttentionGroup::NeedsInput | AttentionGroup::Working => group_role(self.group),
+            AttentionGroup::NeedsInput => group_role(self.group),
+            AttentionGroup::Working => Role::TickMark,
             _ => self.status_role(),
         }
     }
@@ -96,7 +96,7 @@ impl AgentRow {
         now: u64,
     ) -> &'static str {
         if self.group == AttentionGroup::Working {
-            display.spinner_frame((now / AGENT_SPINNER_FRAME_INTERVAL_MS) as usize)
+            display.spinner_at(now)
         } else {
             display.glyph(self.glyph)
         }

@@ -1842,23 +1842,31 @@ pub(super) fn local_message_runs(
                 }
             }
         }
-        LocalMessage::TickDelivery { items } => {
-            runs.push((tick_delivery_text(items, display), Some(Role::MutedText)))
-        }
+        LocalMessage::TickDelivery { items } => runs.extend(tick_delivery_runs(items, display)),
     }
     (runs, response)
 }
 
-/// One line per Tick Instance in a delivery: the Tick Instance, the seq span of the updates the
-/// delivery merged, how many they are and whether their data was trimmed.
-pub(super) fn tick_delivery_text(items: &[TickDeliveryLine], display: DisplayProfile) -> String {
-    let mut text = String::new();
+/// One line per Tick Instance in a delivery: the lit tick its latest seq stands at, the Tick
+/// Instance, the seq span of the updates the delivery merged, how many they are and whether their
+/// data was trimmed.
+fn tick_delivery_runs(
+    items: &[TickDeliveryLine],
+    display: DisplayProfile,
+) -> Vec<(String, Option<Role>)> {
+    let mut runs = Vec::new();
     for item in items {
-        text.push_str(&format!(
-            "\n{} {}",
-            display.glyph(Glyph::TickDelivery),
-            item.instance
+        let latest_seq = item
+            .seq
+            .as_deref()
+            .and_then(|span| span.rsplit('→').next()?.parse().ok())
+            .unwrap_or_default();
+        runs.push(("\n".into(), None));
+        runs.push((
+            display.tick_update_glyph(latest_seq).into(),
+            Some(Role::TickMark),
         ));
+        let mut text = format!(" {}", item.instance);
         if let Some(seq) = &item.seq {
             text.push_str(&format!(" #{seq}"));
         }
@@ -1869,8 +1877,9 @@ pub(super) fn tick_delivery_text(items: &[TickDeliveryLine], display: DisplayPro
             text.push_str(" · trimmed");
         }
         text.push('\n');
+        runs.push((text, Some(Role::MutedText)));
     }
-    text
+    runs
 }
 
 /// A finished `!` command as the conversation keeps it: the same local message the Agent records

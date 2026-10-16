@@ -1,8 +1,7 @@
 use tickloop_agent_config::DisplayPreferences;
+use tickloop_ui::icons::{TICK_PROGRESS_FRAMES, TICK_SPINNER_FRAMES, TICK_SPINNER_INTERVAL_MS};
 
 use super::style::{Theme, ThemeName};
-
-const SPINNER: [&str; 12] = ["·", "✢", "✳", "✶", "✻", "✽", "✽", "✻", "✶", "✳", "✢", "·"];
 
 /// How long a blinking glyph stays in each phase. Every blinking glyph takes its phase from the
 /// same clock, so they blink together.
@@ -109,7 +108,7 @@ impl DisplayProfile {
             Glyph::ScrollUp => "↑",
             Glyph::ScrollDown => "↓",
             Glyph::AgentNeedsInput => "◆",
-            Glyph::AgentRunning => SPINNER[0],
+            Glyph::AgentRunning => TICK_SPINNER_FRAMES[0],
             Glyph::AgentWaiting => "◷",
             Glyph::AgentIdle | Glyph::AgentUnviewed => "○",
             Glyph::AgentFailed | Glyph::AgentStopped => "✖",
@@ -121,12 +120,26 @@ impl DisplayProfile {
         }
     }
 
-    /// Under Reduce motion every frame is the still running glyph.
-    pub(super) fn spinner_frame(self, frame: usize) -> &'static str {
+    /// The working spinner `elapsed_ms` into its run: the lit tick steps clockwise every
+    /// [`TICK_SPINNER_INTERVAL_MS`]. Under Reduce motion it rests at 12 o'clock.
+    pub(super) fn spinner_at(self, elapsed_ms: u64) -> &'static str {
         if self.preferences.prefers_reduced_motion {
             return self.glyph(Glyph::AgentRunning);
         }
-        SPINNER[frame % SPINNER.len()]
+        let frame = elapsed_ms / TICK_SPINNER_INTERVAL_MS % TICK_SPINNER_FRAMES.len() as u64;
+        TICK_SPINNER_FRAMES[frame as usize]
+    }
+
+    /// The mark of a delivered Tick Update: each seq lights the next tick, so consecutive
+    /// updates step around the ring.
+    pub(super) fn tick_update_glyph(self, seq: u64) -> &'static str {
+        TICK_SPINNER_FRAMES[(seq % TICK_SPINNER_FRAMES.len() as u64) as usize]
+    }
+
+    /// A periodic subscription's progress toward its next check: one lit tick per eighth of the
+    /// period elapsed, and the first from the start so the ring never goes blank.
+    pub(super) fn subscription_progress(self, elapsed_eighths: usize) -> &'static str {
+        TICK_PROGRESS_FRAMES[elapsed_eighths.clamp(1, TICK_PROGRESS_FRAMES.len()) - 1]
     }
 
     /// Whether a blinking glyph is in its dimmed phase at `now_ms`; under Reduce motion it never
@@ -191,14 +204,29 @@ mod tests {
         assert_eq!(animated.glyph(Glyph::ToolResult), "⎿");
         assert_eq!(animated.glyph(Glyph::AgentNeedsInput), "◆");
         assert_eq!(animated.glyph(Glyph::AgentWaiting), "◷");
-        assert_eq!(animated.spinner_frame(0), "·");
-        assert_eq!(animated.spinner_frame(1), "✢");
-        assert_eq!(animated.spinner_frame(SPINNER.len()), "·", "it loops");
+        assert_eq!(animated.spinner_at(0), "⠁");
+        assert_eq!(animated.spinner_at(109), "⠁");
+        assert_eq!(animated.spinner_at(110), "⠈");
+        assert_eq!(animated.spinner_at(7 * 110), "⠂");
+        assert_eq!(animated.spinner_at(8 * 110), "⠁", "it loops");
 
         let still = DisplayProfile::new(DisplayPreferences {
             prefers_reduced_motion: true,
         });
-        assert_eq!(still.spinner_frame(7), "·", "the still running glyph");
+        assert_eq!(still.spinner_at(770), "⠁", "the still running glyph");
+    }
+
+    #[test]
+    fn tick_updates_step_the_ring_and_progress_fills_it() {
+        let display = DisplayProfile::default();
+        let steps = (41..=49)
+            .map(|seq| display.tick_update_glyph(seq))
+            .collect::<String>();
+        assert_eq!(steps, "⠈⠐⠠⢀⡀⠄⠂⠁⠈");
+        let progress = (0..=9)
+            .map(|eighths| display.subscription_progress(eighths))
+            .collect::<String>();
+        assert_eq!(progress, "⠁⠁⠉⠙⠹⢹⣹⣽⣿⣿");
     }
 
     #[test]

@@ -236,21 +236,21 @@ impl NextCheck {
         self.at_ms.saturating_sub(self.period_ms)
     }
 
-    /// How many of `columns` the part of the period elapsed at `now_ms` fills; all of them once
-    /// the check is due.
-    pub fn elapsed_columns(self, columns: usize, now_ms: u64) -> usize {
+    /// How many of `parts` the part of the period elapsed at `now_ms` fills; all of them once the
+    /// check is due.
+    pub fn elapsed_parts(self, parts: usize, now_ms: u64) -> usize {
         let elapsed = now_ms
             .saturating_sub(self.period_started_at())
             .min(self.period_ms);
-        (u128::from(elapsed) * columns as u128 / u128::from(self.period_ms)) as usize
+        (u128::from(elapsed) * parts as u128 / u128::from(self.period_ms)) as usize
     }
 
-    /// When the elapsed part next fills one more of `columns`; `None` once it fills them all.
-    pub fn next_column_at(self, columns: usize, now_ms: u64) -> Option<u64> {
-        let filled = self.elapsed_columns(columns, now_ms);
-        (filled < columns).then(|| {
+    /// When the elapsed part next fills one more of `parts`; `None` once it fills them all.
+    pub fn next_part_at(self, parts: usize, now_ms: u64) -> Option<u64> {
+        let filled = self.elapsed_parts(parts, now_ms);
+        (filled < parts).then(|| {
             let elapsed =
-                (u128::from(self.period_ms) * (filled as u128 + 1)).div_ceil(columns as u128);
+                (u128::from(self.period_ms) * (filled as u128 + 1)).div_ceil(parts as u128);
             self.period_started_at() + elapsed as u64
         })
     }

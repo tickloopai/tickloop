@@ -1,4 +1,9 @@
-# Tickloop
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="site/src/site/brand/lockup-on-dark.svg">
+    <img src="site/src/site/brand/lockup.svg" alt="Tickloop" width="265" height="50">
+  </picture>
+</h1>
 
 Tickloop 提供完整的终端 Agent 和 example Tick。Tick 由 Tickhost 运行，可以在 Monitor 中或原生 Herdr 的 Pane 里查看；Agent 可以读取 Tick、调用它的工具，并通过明确订阅让内容变化推动 Loop 继续执行。
 

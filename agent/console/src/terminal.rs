@@ -172,12 +172,14 @@ impl RunningActivity {
         preview: Option<&ThinkingPreview>,
         shimmer: &RunningShimmer,
     ) -> Result<Vec<(String, Option<Role>)>, String> {
-        let preferences = console.display_preferences()?;
-        let reduced_motion = preferences.prefers_reduced_motion;
+        let display = console.display_profile()?;
+        let reduced_motion = display.preferences().prefers_reduced_motion;
+        let spinner = display.spinner_at(shimmer.elapsed_ms());
         if let Some(preview) = preview {
-            return Ok(preview.spans(console.conversation_width()?, reduced_motion));
+            return Ok(preview.spans(console.conversation_width()?, spinner, reduced_motion));
         }
-        let mut row = style::RoleLine::role("• ", Role::MutedText);
+        let mut row = style::RoleLine::role(spinner, Role::TickMark);
+        row.push(" ", Some(Role::MutedText));
         shimmer.append(&mut row, &self.label, reduced_motion);
         let mut details = self
             .started_at
@@ -1452,10 +1454,11 @@ async fn open_saved_chat(
     })
 }
 
-/// Startup banner following Claude Code's condensed logo: the product name in
-/// bold with its version dimmed, then model and working directory dimmed. The
-/// service endpoint lives in Session status instead, and command tips belong
-/// to the footer, as neither appears in Claude Code's banner.
+/// Startup banner following Claude Code's condensed logo: the mark, the product
+/// name in bold with its version dimmed, then model and working directory
+/// dimmed under the name. The service endpoint lives in Session status instead,
+/// and command tips belong to the footer, as neither appears in Claude Code's
+/// banner.
 fn write_banner(
     console: &Console,
     config: &ModelConfig,
@@ -1490,18 +1493,26 @@ fn startup_banner_spans(
         }
         _ => directory,
     };
+    // The mark is the brand's 12 o'clock tick at rest; the lines under the name line up with it.
+    let mark = tickloop_ui::icons::TICK_SPINNER_FRAMES[0];
+    let indent = " ".repeat(unicode_width::UnicodeWidthStr::width(mark) + 1);
     vec![
-        ("Tickloop".into(), Some(Role::Title)),
+        (mark.into(), Some(Role::TickMark)),
+        (" Tickloop".into(), Some(Role::Title)),
         (
             format!(" v{}\n", env!("CARGO_PKG_VERSION")),
             Some(Role::MutedText),
         ),
         (
-            format!("{} · {:?}\n", safe_text(&config.model), config.protocol),
+            format!(
+                "{indent}{} · {:?}\n",
+                safe_text(&config.model),
+                config.protocol
+            ),
             Some(Role::MutedText),
         ),
         (
-            format!("{}\n", safe_text(&directory)),
+            format!("{indent}{}\n", safe_text(&directory)),
             Some(Role::MutedText),
         ),
     ]

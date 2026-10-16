@@ -1694,7 +1694,7 @@ fn a_monitor_row_glyph_carries_its_state_and_blinks_while_it_runs() {
         glyph_role(2_500, display),
         [(true, Role::RunningMarkDim), (false, Role::ErrorMark)]
     );
-    assert_eq!(monitor.next_frame_ms(2_100, 40, display), Some(2_500));
+    assert_eq!(monitor.next_frame_ms(2_100, display), Some(2_500));
     let still = DisplayProfile::new(tickloop_agent_config::DisplayPreferences {
         prefers_reduced_motion: true,
     });
@@ -1703,7 +1703,7 @@ fn a_monitor_row_glyph_carries_its_state_and_blinks_while_it_runs() {
         [(true, Role::RunningMark), (false, Role::ErrorMark)]
     );
     assert_eq!(
-        monitor.next_frame_ms(2_100, 40, still),
+        monitor.next_frame_ms(2_100, still),
         Some(3_000),
         "a steady glyph still ticks its elapsed time"
     );
@@ -1836,8 +1836,10 @@ fn a_finished_background_shell_leaves_once_handled_unless_its_detail_is_open() {
             "an unread end shows its glyph in the update colour and no time: {text}"
         );
         assert!(
-            lines.iter().all(|line| line.band.is_none()),
-            "a Shell's end comes at once, so no bar counts toward it"
+            !tickloop_ui::icons::TICK_PROGRESS_FRAMES
+                .iter()
+                .any(|ring| text.contains(ring)),
+            "a Shell's end comes at once, so no ring counts toward it: {text}"
         );
         assert!(
             !text.contains("ended") && !text.contains("exit"),
@@ -1903,7 +1905,7 @@ fn a_shell_end_flashes_as_a_turn_takes_it_in_and_a_chat_switch_does_not_replay_i
             None,
             "an unread row has no fill"
         );
-        assert_eq!(state.monitor.next_frame_ms(ended + 500, 40, display), None);
+        assert_eq!(state.monitor.next_frame_ms(ended + 500, display), None);
     }
 
     let taken_in = ended + 1_000;
@@ -1915,7 +1917,7 @@ fn a_shell_end_flashes_as_a_turn_takes_it_in_and_a_chat_switch_does_not_replay_i
         Some(Role::TakeInFlashStrong)
     );
     assert_eq!(
-        state.monitor.next_frame_ms(taken_in + 100, 40, display),
+        state.monitor.next_frame_ms(taken_in + 100, display),
         Some(taken_in + 400)
     );
     state.switch_view_chat(Some(Uuid::new_v4()));
@@ -1924,10 +1926,7 @@ fn a_shell_end_flashes_as_a_turn_takes_it_in_and_a_chat_switch_does_not_replay_i
     console.update_monitor_chat(chat_snapshot.clone()).unwrap();
     let state = console.state.lock().unwrap();
     assert_eq!(row_fill(&state, taken_in + 100), None);
-    assert_eq!(
-        state.monitor.next_frame_ms(taken_in + 100, 40, display),
-        None
-    );
+    assert_eq!(state.monitor.next_frame_ms(taken_in + 100, display), None);
 }
 
 #[test]
