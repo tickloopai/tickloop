@@ -24,12 +24,12 @@ fn registry_with_project_skills(
 
 fn remote(name: &str, description: &str) -> RemoteSkillDefinition {
     RemoteSkillDefinition {
-        name: format!("tickloop-docs:{name}"),
+        name: format!("tickloop-artifacts:{name}"),
         description: description.into(),
         source: SkillSource::Remote {
             server_id: "https://artifacts.example.test".into(),
             account_id: "test-account".into(),
-            uri: format!("skill://tickloop-docs/{name}/SKILL.md"),
+            uri: format!("skill://tickloop-artifacts/{name}/SKILL.md"),
             resources: Vec::new(),
         },
     }

@@ -1,4 +1,4 @@
-//! End-to-end check of the host's Tickloop Artifacts integration against a real `tickloop-docs`
+//! End-to-end check of the host's Tickloop Artifacts integration against a real `tickloop-artifacts`
 //! deployment (the local realapp harness). Ignored by default; run with
 //!
 //! ```sh

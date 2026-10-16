@@ -12,7 +12,7 @@ PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
 TICK_PACKAGES := longbridge futu
 TICKS_CHECKOUT ?= $(HOME)/github/ticks
 
-.PHONY: dev build install package site test check release release-site release-docs prototype-earnings-review package-ticks install-ticks publish-ticks
+.PHONY: dev build install package site test check release release-site release-artifacts prototype-earnings-review package-ticks install-ticks publish-ticks
 
 ## Install the Tick packages from this checkout, then start in the current directory with the global configuration; example: make dev ARGS="-c"
 dev: install-ticks
@@ -77,9 +77,9 @@ release:
 release-site:
 	@node scripts/release.mjs site
 
-## 发布已提交的 Docs 快照；默认递增 patch，可用 VERSION=0.1.0 指定版本
-release-docs:
-	@node scripts/release.mjs docs
+## 发布已提交的 Artifacts 快照；默认递增 patch，可用 VERSION=0.1.0 指定版本
+release-artifacts:
+	@node scripts/release.mjs artifacts
 
 ## 启动财报复盘原型；访问 http://127.0.0.1:8766/earnings-review.html?variant=A
 prototype-earnings-review:

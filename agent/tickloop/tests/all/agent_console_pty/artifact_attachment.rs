@@ -59,7 +59,7 @@ async fn artifact_service() -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::Joi
                 } else if path.starts_with("POST /artifact/mcp ") {
                     let result = match body["method"].as_str().unwrap() {
                         "server/discover" => {
-                            json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"tickloop-docs","version":"1"}}})
+                            json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"tickloop-artifacts","version":"1"}}})
                         }
                         "tools/list" => json!({"tools":[
                             {"name":"ArtifactRead","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}},

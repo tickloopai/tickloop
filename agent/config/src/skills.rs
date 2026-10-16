@@ -483,7 +483,7 @@ pub fn expand_remote(
     arguments: &str,
 ) -> Result<InvokedSkill, SkillError> {
     let skill = parse_skill(markdown, definition.source.clone())?;
-    if format!("tickloop-docs:{}", skill.name) != definition.name
+    if format!("tickloop-artifacts:{}", skill.name) != definition.name
         || skill.description != definition.description
     {
         return Err(SkillError::Invalid(

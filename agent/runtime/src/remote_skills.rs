@@ -77,7 +77,7 @@ fn parse_definition(
     {
         return Err("unsupported remote Skill frontmatter".into());
     }
-    let uri = format!("skill://tickloop-docs/{name}/SKILL.md");
+    let uri = format!("skill://tickloop-artifacts/{name}/SKILL.md");
     if entry["uri"] != uri {
         return Err("invalid Artifact Skill URI".into());
     }
@@ -90,7 +90,7 @@ fn parse_definition(
     {
         return Err("incomplete Skill manifest".into());
     }
-    let prefix = format!("skill://tickloop-docs/{name}/");
+    let prefix = format!("skill://tickloop-artifacts/{name}/");
     let mut seen = HashSet::new();
     for resource in &resources {
         let path = resource
@@ -107,7 +107,7 @@ fn parse_definition(
     }
     resources.sort_by(|left, right| left.uri.cmp(&right.uri));
     Ok(RemoteSkillDefinition {
-        name: format!("tickloop-docs:{name}"),
+        name: format!("tickloop-artifacts:{name}"),
         description: description.to_owned(),
         source: SkillSource::Remote {
             server_id: credential.origin.clone(),

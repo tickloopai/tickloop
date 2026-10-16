@@ -894,7 +894,7 @@ impl Agent {
         if input.resource.is_some() && input.args.is_some() {
             return Err("Skill resource and args are mutually exclusive".into());
         }
-        if input.skill.starts_with("tickloop-docs:") {
+        if input.skill.starts_with("tickloop-artifacts:") {
             return self
                 .remote_skill_tool(
                     receipt,

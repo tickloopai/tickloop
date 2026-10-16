@@ -40,17 +40,17 @@ async fn remote_skills_are_lazy_reference_context_and_persist_across_turns() {
         call(
             "load",
             "Skill",
-            json!({"skill":"tickloop-docs:artifact-design"}),
+            json!({"skill":"tickloop-artifacts:artifact-design"}),
         ),
         call(
             "reference",
             "Skill",
-            json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"}),
+            json!({"skill":"tickloop-artifacts:artifact-design","resource":"references/runtime.md"}),
         ),
         call(
             "reuse",
             "Skill",
-            json!({"skill":"tickloop-docs:artifact-design"}),
+            json!({"skill":"tickloop-artifacts:artifact-design"}),
         ),
         text("done"),
         text("next task"),
@@ -65,7 +65,7 @@ async fn remote_skills_are_lazy_reference_context_and_persist_across_turns() {
             .unwrap()
             .invoked_skills
             .iter()
-            .any(|skill| skill.name == "tickloop-docs:artifact-design")
+            .any(|skill| skill.name == "tickloop-artifacts:artifact-design")
     );
     submit_and_wait(&agent, chat, "Read something unrelated").await;
     {
@@ -81,7 +81,11 @@ async fn remote_skills_are_lazy_reference_context_and_persist_across_turns() {
             "artifact-dataviz",
             "artifact-draft",
         ] {
-            assert!(first.description.contains(&format!("tickloop-docs:{name}")));
+            assert!(
+                first
+                    .description
+                    .contains(&format!("tickloop-artifacts:{name}"))
+            );
         }
         let body = "Page guidance fixture for artifact-design";
         let serialized = |index: usize| serde_json::to_string(&requests[index].messages).unwrap();
@@ -121,22 +125,22 @@ async fn remote_skill_changed_arguments_preserve_loaded_references_and_identical
         call(
             "load",
             "Skill",
-            json!({"skill":"tickloop-docs:artifact-design","args":"first target"}),
+            json!({"skill":"tickloop-artifacts:artifact-design","args":"first target"}),
         ),
         call(
             "reference",
             "Skill",
-            json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"}),
+            json!({"skill":"tickloop-artifacts:artifact-design","resource":"references/runtime.md"}),
         ),
         call(
             "changed",
             "Skill",
-            json!({"skill":"tickloop-docs:artifact-design","args":"second target"}),
+            json!({"skill":"tickloop-artifacts:artifact-design","args":"second target"}),
         ),
         call(
             "same",
             "Skill",
-            json!({"skill":"tickloop-docs:artifact-design","args":"second target"}),
+            json!({"skill":"tickloop-artifacts:artifact-design","args":"second target"}),
         ),
         text("done"),
     ]));
@@ -151,8 +155,9 @@ async fn remote_skill_changed_arguments_preserve_loaded_references_and_identical
             .flat_map(|message| &message.content)
             .find_map(|block| match block {
                 Content::Text { text }
-                    if text
-                        .starts_with("Reference guidance from tickloop-docs:artifact-design") =>
+                    if text.starts_with(
+                        "Reference guidance from tickloop-artifacts:artifact-design",
+                    ) =>
                 {
                     Some(text)
                 }
@@ -163,7 +168,7 @@ async fn remote_skill_changed_arguments_preserve_loaded_references_and_identical
         assert!(!changed.contains("first target"));
         assert!(changed.contains("Reference fixture: preserve data units"));
         let last = serde_json::to_string(&requests[4].messages).unwrap();
-        assert!(last.contains("Already loaded tickloop-docs:artifact-design"));
+        assert!(last.contains("Already loaded tickloop-artifacts:artifact-design"));
     }
     assert_eq!(
         service
@@ -196,12 +201,12 @@ async fn remote_skill_session_activation_is_invalidated_before_the_next_model_re
             call(
                 "load",
                 "Skill",
-                json!({"skill":"tickloop-docs:artifact-design"}),
+                json!({"skill":"tickloop-artifacts:artifact-design"}),
             ),
             call(
                 "reference",
                 "Skill",
-                json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"}),
+                json!({"skill":"tickloop-artifacts:artifact-design","resource":"references/runtime.md"}),
             ),
             text("done"),
             text("next"),
@@ -216,7 +221,7 @@ async fn remote_skill_session_activation_is_invalidated_before_the_next_model_re
                 .unwrap()
                 .invoked_skills
                 .iter()
-                .any(|skill| skill.name == "tickloop-docs:artifact-design")
+                .any(|skill| skill.name == "tickloop-artifacts:artifact-design")
         );
         match change {
             "account" => {
@@ -227,7 +232,7 @@ async fn remote_skill_session_activation_is_invalidated_before_the_next_model_re
                 service.control.skill_revision.store(1, Ordering::SeqCst);
             }
             "policy" | "reference_policy" => {
-                agent.set_permission_rules(chat, vec![tickloop_agent_protocol::PermissionRule { id:uuid::Uuid::new_v4(), decision:tickloop_agent_protocol::Decision::Deny, tool:"Skill".into(), specifier:None, input:(change == "reference_policy").then(|| json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"})), loop_id:None, persistent:false }]).await.unwrap();
+                agent.set_permission_rules(chat, vec![tickloop_agent_protocol::PermissionRule { id:uuid::Uuid::new_v4(), decision:tickloop_agent_protocol::Decision::Deny, tool:"Skill".into(), specifier:None, input:(change == "reference_policy").then(|| json!({"skill":"tickloop-artifacts:artifact-design","resource":"references/runtime.md"})), loop_id:None, persistent:false }]).await.unwrap();
             }
             "revoked" => {
                 service
@@ -269,7 +274,7 @@ async fn resumed_remote_skills_are_revalidated_before_the_first_model_request() 
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let account = service.login(directory.path()).await;
-        let agent = Agent::open_embedded(root.clone(), config(), Arc::new(ScriptedModel::new(vec![call("load", "Skill", json!({"skill":"tickloop-docs:artifact-design"})), call("reference", "Skill", json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"})), text("done")]))).unwrap();
+        let agent = Agent::open_embedded(root.clone(), config(), Arc::new(ScriptedModel::new(vec![call("load", "Skill", json!({"skill":"tickloop-artifacts:artifact-design"})), call("reference", "Skill", json!({"skill":"tickloop-artifacts:artifact-design","resource":"references/runtime.md"})), text("done")]))).unwrap();
         agent
             .install_host_tools(Arc::new(McpHostToolProvider::new(account, None)))
             .unwrap();
@@ -303,7 +308,7 @@ async fn resumed_remote_skills_are_revalidated_before_the_first_model_request() 
             .unwrap();
         let snapshot = restored.resume_chat(chat).await.unwrap();
         if change == "policy" || change == "reference_policy" {
-            restored.set_permission_rules(chat, vec![tickloop_agent_protocol::PermissionRule { id:uuid::Uuid::new_v4(), decision:tickloop_agent_protocol::Decision::Deny, tool:"Skill".into(), specifier:None, input:(change == "reference_policy").then(|| json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"})), loop_id:None, persistent:false }]).await.unwrap();
+            restored.set_permission_rules(chat, vec![tickloop_agent_protocol::PermissionRule { id:uuid::Uuid::new_v4(), decision:tickloop_agent_protocol::Decision::Deny, tool:"Skill".into(), specifier:None, input:(change == "reference_policy").then(|| json!({"skill":"tickloop-artifacts:artifact-design","resource":"references/runtime.md"})), loop_id:None, persistent:false }]).await.unwrap();
         }
 
         restored
@@ -346,7 +351,7 @@ async fn remote_skill_loading_drops_the_old_account_response() {
         call(
             "load",
             "Skill",
-            json!({"skill":"tickloop-docs:artifact-design"}),
+            json!({"skill":"tickloop-artifacts:artifact-design"}),
         ),
         text("done"),
     ]));
@@ -385,7 +390,7 @@ async fn remote_skill_policy_revocation_during_loading_prevents_activation() {
         call(
             "load",
             "Skill",
-            json!({"skill":"tickloop-docs:artifact-design"}),
+            json!({"skill":"tickloop-artifacts:artifact-design"}),
         ),
         text("done"),
     ]));
@@ -429,7 +434,7 @@ async fn remote_skill_policy_revocation_during_loading_prevents_activation() {
                 .find(|tool| tool.name == "Skill")
                 .unwrap()
                 .description
-                .contains("tickloop-docs:artifact-design")
+                .contains("tickloop-artifacts:artifact-design")
         );
     }
     agent.shutdown().await;
@@ -445,12 +450,12 @@ async fn remote_skill_digest_mismatch_and_unactivated_reference_never_enter_cont
         call(
             "reference-first",
             "Skill",
-            json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"}),
+            json!({"skill":"tickloop-artifacts:artifact-design","resource":"references/runtime.md"}),
         ),
         call(
             "load-tampered",
             "Skill",
-            json!({"skill":"tickloop-docs:artifact-design"}),
+            json!({"skill":"tickloop-artifacts:artifact-design"}),
         ),
         text("done"),
     ]));
@@ -647,9 +652,9 @@ async fn directory_presents_exactly_the_three_artifact_tools_as_built_ins() {
 }
 
 #[tokio::test]
-async fn a_server_other_than_tickloop_docs_provides_no_tools() {
+async fn a_server_other_than_tickloop_artifacts_provides_no_tools() {
     let service = ArtifactService::start().await;
-    *service.control.server_name.lock().unwrap() = Some("tickloop-artifacts".into());
+    *service.control.server_name.lock().unwrap() = Some("untrusted-artifacts".into());
     let directory = tempfile::tempdir().unwrap();
     let account = service.login(directory.path()).await;
     let provider = McpHostToolProvider::new(account, None);
@@ -3180,12 +3185,12 @@ async fn remote_skills_survive_compaction_but_changed_manifests_do_not() {
             call(
                 "load",
                 "Skill",
-                json!({"skill":"tickloop-docs:artifact-design","args":"keep these arguments"}),
+                json!({"skill":"tickloop-artifacts:artifact-design","args":"keep these arguments"}),
             ),
             call(
                 "reference",
                 "Skill",
-                json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"}),
+                json!({"skill":"tickloop-artifacts:artifact-design","resource":"references/runtime.md"}),
             ),
             text("done"),
             text("A compact summary"),
@@ -3208,7 +3213,7 @@ async fn remote_skills_survive_compaction_but_changed_manifests_do_not() {
                 .find_map(|block| match block {
                     Content::Text { text }
                         if text.starts_with(
-                            "Reference guidance from tickloop-docs:artifact-design",
+                            "Reference guidance from tickloop-artifacts:artifact-design",
                         ) =>
                     {
                         Some(text)
@@ -3238,19 +3243,19 @@ async fn remote_skill_reference_requested_after_compaction_reloads_truncated_gui
         call(
             "load",
             "Skill",
-            json!({"skill":"tickloop-docs:artifact-design","args":"preserve these arguments"}),
+            json!({"skill":"tickloop-artifacts:artifact-design","args":"preserve these arguments"}),
         ),
         call(
             "reference",
             "Skill",
-            json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"}),
+            json!({"skill":"tickloop-artifacts:artifact-design","resource":"references/runtime.md"}),
         ),
         text("done"),
         text("A compact summary"),
         call(
             "reload",
             "Skill",
-            json!({"skill":"tickloop-docs:artifact-design","resource":"references/runtime.md"}),
+            json!({"skill":"tickloop-artifacts:artifact-design","resource":"references/runtime.md"}),
         ),
         text("continued"),
     ]));
@@ -3269,7 +3274,7 @@ async fn remote_skill_reference_requested_after_compaction_reloads_truncated_gui
                 .find_map(|block| match block {
                     Content::Text { text }
                         if text.starts_with(
-                            "Reference guidance from tickloop-docs:artifact-design",
+                            "Reference guidance from tickloop-artifacts:artifact-design",
                         ) =>
                     {
                         Some(text)
@@ -3350,7 +3355,7 @@ async fn remote_skill_source_or_policy_change_during_compaction_refreshes_the_ef
                 call(
                     "load",
                     "Skill",
-                    json!({"skill":"tickloop-docs:artifact-design"}),
+                    json!({"skill":"tickloop-artifacts:artifact-design"}),
                 ),
                 text(&"older material ".repeat(2000)),
                 text("A compact summary"),
@@ -3415,7 +3420,7 @@ async fn remote_skill_source_or_policy_change_during_compaction_refreshes_the_ef
                     .find(|tool| tool.name == "Skill")
                     .unwrap()
                     .description
-                    .contains("tickloop-docs:artifact-design"),
+                    .contains("tickloop-artifacts:artifact-design"),
                 matches!(change, "manifest" | "account"),
                 "{change}"
             );
@@ -3440,7 +3445,7 @@ async fn remote_skill_post_compaction_refresh_can_be_cancelled_while_the_server_
             call(
                 "load",
                 "Skill",
-                json!({"skill":"tickloop-docs:artifact-design"}),
+                json!({"skill":"tickloop-artifacts:artifact-design"}),
             ),
             text(&"older material ".repeat(2000)),
             text("A compact summary"),

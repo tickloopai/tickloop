@@ -17,11 +17,11 @@ edition = "2024"
 `;
 const channels = [
   {
-    name: "docs",
-    tag: "docs-v0.1.0",
-    workflow: ".github/workflows/docs-deploy.yml",
+    name: "artifacts",
+    tag: "artifacts-v0.1.0",
+    workflow: ".github/workflows/artifacts-deploy.yml",
     checks: ["npm --prefix artifact ci", "npm --prefix artifact run typecheck", "npm --prefix artifact run build"],
-    failedCheck: /Docs dependency install failed; no release tag was created/,
+    failedCheck: /Artifacts dependency install failed; no release tag was created/,
   },
   {
     name: "site",
@@ -275,39 +275,39 @@ test("site: a remote branch ahead of HEAD is not overwritten or partially releas
   assert.equal(git(["ls-remote", "--refs", "origin", "refs/tags/site-v0.1.0"], setup), "");
 });
 
-test("start at 0.1.0 when VERSION is omitted or empty and no Docs tags exist", t => {
+test("start at 0.1.0 when VERSION is omitted or empty and no Artifacts tags exist", t => {
   const setup = fixture(t);
   delete setup.env.VERSION;
   for (const env of [setup.env, { ...setup.env, VERSION: "" }]) {
-    const result = release(setup, "docs", ["--check"], { ...env, RELEASE_TEST_CHECK_FAIL: "1" });
+    const result = release(setup, "artifacts", ["--check"], { ...env, RELEASE_TEST_CHECK_FAIL: "1" });
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /Ready to release docs-v0\.1\.0/);
+    assert.match(result.stdout, /Ready to release artifacts-v0\.1\.0/);
     assert.equal(git(["tag", "--list"], setup), "");
     assert.equal(git(["ls-remote", "--refs", "origin"], setup), "");
   }
-  assert.equal(release(setup, "docs").status, 0);
-  assert.equal(git(["cat-file", "-t", "refs/tags/docs-v0.1.0"], setup), "tag");
+  assert.equal(release(setup, "artifacts").status, 0);
+  assert.equal(git(["cat-file", "-t", "refs/tags/artifacts-v0.1.0"], setup), "tag");
 });
 
-test("increment the numerically highest stable Docs tag from origin even without a local copy", t => {
+test("increment the numerically highest stable Artifacts tag from origin even without a local copy", t => {
   const setup = fixture(t);
   delete setup.env.VERSION;
-  git(["tag", "-a", "docs-v1.10.9", "-m", "Prior release"], setup);
-  git(["push", "origin", "refs/tags/docs-v1.10.9"], setup);
-  git(["tag", "-d", "docs-v1.10.9"], setup);
-  for (const tag of ["docs-v1.9.99", "docs-v0.99.99", "docs-v1.10.8", "docs-v9.0.0-rc.1", "docs-v01.0.0", "v99.0.0", "site-v99.0.0"]) {
+  git(["tag", "-a", "artifacts-v1.10.9", "-m", "Prior release"], setup);
+  git(["push", "origin", "refs/tags/artifacts-v1.10.9"], setup);
+  git(["tag", "-d", "artifacts-v1.10.9"], setup);
+  for (const tag of ["artifacts-v1.9.99", "artifacts-v0.99.99", "artifacts-v1.10.8", "artifacts-v9.0.0-rc.1", "artifacts-v01.0.0", "v99.0.0", "site-v99.0.0"]) {
     git(["tag", tag], setup);
   }
-  const result = release(setup, "docs");
+  const result = release(setup, "artifacts");
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Published docs-v1\.10\.10/);
-  assert.notEqual(git(["ls-remote", "--refs", "origin", "refs/tags/docs-v1.10.10"], setup), "");
+  assert.match(result.stdout, /Published artifacts-v1\.10\.10/);
+  assert.notEqual(git(["ls-remote", "--refs", "origin", "refs/tags/artifacts-v1.10.10"], setup), "");
 });
 
 test("select the next site version from site tags only", t => {
   const setup = fixture(t);
   delete setup.env.VERSION;
-  for (const tag of ["docs-v3.0.0", "v9.0.0", "site-v0.4.1-rc.1"]) git(["tag", tag], setup);
+  for (const tag of ["artifacts-v3.0.0", "v9.0.0", "site-v0.4.1-rc.1"]) git(["tag", tag], setup);
   assert.match(release(setup, "site", ["--check"]).stdout, /Ready to release site-v0\.1\.0/);
   git(["tag", "site-v0.4.1"], setup);
   git(["push", "origin", "refs/tags/site-v0.4.1"], setup);
@@ -320,42 +320,42 @@ test("select the next site version from site tags only", t => {
 test("include local tags when selecting the next version", t => {
   const setup = fixture(t);
   delete setup.env.VERSION;
-  git(["tag", "docs-v1.99.99"], setup);
-  git(["push", "origin", "refs/tags/docs-v1.99.99"], setup);
-  git(["tag", "docs-v2.0.0"], setup);
-  const result = release(setup, "docs", ["--dry-run"]);
+  git(["tag", "artifacts-v1.99.99"], setup);
+  git(["push", "origin", "refs/tags/artifacts-v1.99.99"], setup);
+  git(["tag", "artifacts-v2.0.0"], setup);
+  const result = release(setup, "artifacts", ["--dry-run"]);
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Ready to release docs-v2\.0\.1/);
-  git(["show-ref", "--verify", "--quiet", "refs/tags/docs-v2.0.1"], setup, 1);
+  assert.match(result.stdout, /Ready to release artifacts-v2\.0\.1/);
+  git(["show-ref", "--verify", "--quiet", "refs/tags/artifacts-v2.0.1"], setup, 1);
 });
 
 test("honor an explicit version instead of incrementing existing tags", t => {
   const setup = fixture(t);
-  git(["tag", "docs-v1.0.9"], setup);
-  const result = release(setup, "docs", [], { ...setup.env, VERSION: "2.0.0" });
+  git(["tag", "artifacts-v1.0.9"], setup);
+  const result = release(setup, "artifacts", [], { ...setup.env, VERSION: "2.0.0" });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Published docs-v2\.0\.0/);
-  git(["show-ref", "--verify", "--quiet", "refs/tags/docs-v1.0.10"], setup, 1);
+  assert.match(result.stdout, /Published artifacts-v2\.0\.0/);
+  git(["show-ref", "--verify", "--quiet", "refs/tags/artifacts-v1.0.10"], setup, 1);
 });
 
 test("increment large patch numbers exactly and reject a version that grows beyond the supported length", t => {
   const setup = fixture(t);
   delete setup.env.VERSION;
-  git(["tag", "docs-v0.1.9007199254740993"], setup);
-  const result = release(setup, "docs", ["--check"]);
+  git(["tag", "artifacts-v0.1.9007199254740993"], setup);
+  const result = release(setup, "artifacts", ["--check"]);
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Ready to release docs-v0\.1\.9007199254740994/);
-  git(["tag", `docs-v1.0.${"9".repeat(22)}`], setup);
-  const overflow = release(setup, "docs");
+  assert.match(result.stdout, /Ready to release artifacts-v0\.1\.9007199254740994/);
+  git(["tag", `artifacts-v1.0.${"9".repeat(17)}`], setup);
+  const overflow = release(setup, "artifacts");
   assert.equal(overflow.status, 1);
-  assert.match(overflow.stderr, /next Docs version exceeds the supported length/);
+  assert.match(overflow.stderr, /next Artifacts version exceeds the supported length/);
   assert.equal(git(["ls-remote", "--refs", "origin"], setup), "");
 });
 
 test("do not guess an automatic version when origin cannot be read", t => {
   const setup = fixture(t);
   delete setup.env.VERSION;
-  for (const [channel, label] of [["docs", "Docs"], ["site", "Site"]]) {
+  for (const [channel, label] of [["artifacts", "Artifacts"], ["site", "Site"]]) {
     const result = release(setup, channel, [], { ...setup.env, RELEASE_TEST_REJECT_READ: "1" });
     assert.equal(result.status, 1);
     assert.match(result.stderr, new RegExp(`Could not check ${label} tags on origin`));
@@ -369,10 +369,10 @@ test("do not guess an automatic version when origin cannot be read", t => {
 test("stop if a newer tag appears during automatic release checks", t => {
   const setup = fixture(t);
   delete setup.env.VERSION;
-  const result = release(setup, "docs", [], { ...setup.env, RELEASE_TEST_CHECK_ADD_TAG: "docs-v1.0.0" });
+  const result = release(setup, "artifacts", [], { ...setup.env, RELEASE_TEST_CHECK_ADD_TAG: "artifacts-v1.0.0" });
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /Docs release tags changed during checks/);
-  git(["show-ref", "--verify", "--quiet", "refs/tags/docs-v0.1.0"], setup, 1);
+  assert.match(result.stderr, /Artifacts release tags changed during checks/);
+  git(["show-ref", "--verify", "--quiet", "refs/tags/artifacts-v0.1.0"], setup, 1);
   assert.equal(git(["ls-remote", "--refs", "origin"], setup), "");
 });
 
@@ -437,10 +437,10 @@ test("check and publish the captured HEAD, not staged, unstaged or untracked cha
       writeFileSync(join(setup.repo, "snapshot.txt"), "changed\n");
       if (change === "staged") git(["add", "snapshot.txt"], setup);
     }
-    const checked = release(setup, "docs", ["--check"]);
+    const checked = release(setup, "artifacts", ["--check"]);
     assert.equal(checked.status, 0, `${change}: ${checked.stderr}`);
-    git(["show-ref", "--verify", "--quiet", "refs/tags/docs-v0.1.0"], setup, 1);
-    const published = release(setup, "docs");
+    git(["show-ref", "--verify", "--quiet", "refs/tags/artifacts-v0.1.0"], setup, 1);
+    const published = release(setup, "artifacts");
     assert.equal(published.status, 0, `${change}: ${published.stderr}`);
     const contexts = checkContexts(setup);
     assert.equal(contexts.length, 3, change);
@@ -451,8 +451,8 @@ test("check and publish the captured HEAD, not staged, unstaged or untracked cha
       assert.equal(existsSync(context.directory), false, change);
     }
     assert.equal(worktreeCount(setup), 1, change);
-    assert.equal(git(["rev-parse", "refs/tags/docs-v0.1.0^{}"], setup), commit);
-    assert.notEqual(git(["ls-remote", "--refs", "origin", "refs/tags/docs-v0.1.0"], setup), "");
+    assert.equal(git(["rev-parse", "refs/tags/artifacts-v0.1.0^{}"], setup), commit);
+    assert.notEqual(git(["ls-remote", "--refs", "origin", "refs/tags/artifacts-v0.1.0"], setup), "");
   }
 });
 
@@ -472,54 +472,54 @@ test("reject multiple push destinations even when the first is correct", t => {
   const setup = fixture(t);
   git(["remote", "set-url", "--add", "--push", "origin", `git@github.com:${expectedRepository}.git`], setup);
   git(["remote", "set-url", "--add", "--push", "origin", "git@github.com:someone/other.git"], setup);
-  const result = release(setup, "docs", ["--check"]);
+  const result = release(setup, "artifacts", ["--check"]);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /exactly one fetch and one push URL/);
-  git(["show-ref", "--verify", "--quiet", "refs/tags/docs-v0.1.0"], setup, 1);
+  git(["show-ref", "--verify", "--quiet", "refs/tags/artifacts-v0.1.0"], setup, 1);
 });
 
 test("a HEAD change during local checks creates no tag", t => {
   const setup = fixture(t);
   const initialCommit = git(["rev-parse", "HEAD"], setup);
-  const result = release(setup, "docs", [], { ...setup.env, RELEASE_TEST_CHECK_MOVE_HEAD: "1" });
+  const result = release(setup, "artifacts", [], { ...setup.env, RELEASE_TEST_CHECK_MOVE_HEAD: "1" });
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /HEAD changed during Docs checks/);
+  assert.match(result.stderr, /HEAD changed during Artifacts checks/);
   assert.notEqual(git(["rev-parse", "HEAD"], setup), initialCommit);
-  git(["show-ref", "--verify", "--quiet", "refs/tags/docs-v0.1.0"], setup, 1);
+  git(["show-ref", "--verify", "--quiet", "refs/tags/artifacts-v0.1.0"], setup, 1);
 });
 
 test("worktree changes during local checks still publish the captured HEAD", t => {
   const setup = fixture(t);
   const commit = git(["rev-parse", "HEAD"], setup);
-  const result = release(setup, "docs", [], { ...setup.env, RELEASE_TEST_CHECK_DIRTY_WORKTREE: "1" });
+  const result = release(setup, "artifacts", [], { ...setup.env, RELEASE_TEST_CHECK_DIRTY_WORKTREE: "1" });
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(git(["rev-parse", "refs/tags/docs-v0.1.0^{}"], setup), commit);
-  assert.notEqual(git(["ls-remote", "--refs", "origin", "refs/tags/docs-v0.1.0"], setup), "");
+  assert.equal(git(["rev-parse", "refs/tags/artifacts-v0.1.0^{}"], setup), commit);
+  assert.notEqual(git(["ls-remote", "--refs", "origin", "refs/tags/artifacts-v0.1.0"], setup), "");
 });
 
 test("preserve the local tag and report recovery after a failed push", t => {
   const setup = fixture(t);
-  const result = release(setup, "docs", [], { ...setup.env, RELEASE_TEST_REJECT_PUSH: "1" });
+  const result = release(setup, "artifacts", [], { ...setup.env, RELEASE_TEST_REJECT_PUSH: "1" });
   assert.equal(result.status, 1);
   assert.match(result.stderr, /local tag remains/);
   assert.match(result.stderr, /git ls-remote --tags origin/);
-  git(["show-ref", "--verify", "--quiet", "refs/tags/docs-v0.1.0"], setup);
-  assert.equal(git(["ls-remote", "--refs", "origin", "refs/tags/docs-v0.1.0"], setup), "");
+  git(["show-ref", "--verify", "--quiet", "refs/tags/artifacts-v0.1.0"], setup);
+  assert.equal(git(["ls-remote", "--refs", "origin", "refs/tags/artifacts-v0.1.0"], setup), "");
 });
 
 test("reject unsafe versions, unknown channels and unsupported arguments before Git writes", t => {
   const setup = fixture(t);
-  for (const channel of ["docs", "binary"]) {
+  for (const channel of ["artifacts", "binary"]) {
     for (const version of [" ", "01.2.3", "1.2", "1.2.3;touch injected", "../1.2.3", "1.2.3-rc.1", "12345678901234567890123.2.3"]) {
       const result = release(setup, channel, [], { ...setup.env, VERSION: version });
       assert.equal(result.status, 1, `${channel} ${version}`);
       assert.match(result.stderr, /VERSION must be a release number/);
     }
   }
-  for (const args of [["docs", "--unknown"], ["docs", "--check", "extra"], ["artifact"], ["constructor"], []]) {
+  for (const args of [["artifacts", "--unknown"], ["artifacts", "--check", "extra"], ["artifact"], ["docs"], ["constructor"], []]) {
     const result = command(process.execPath, [releaseScript, ...args], { cwd: setup.repo, env: setup.env });
     assert.equal(result.status, 1, args.join(" "));
-    assert.match(result.stderr, /Usage: .*docs\|site\|binary/);
+    assert.match(result.stderr, /Usage: .*artifacts\|site\|binary/);
   }
   assert.deepEqual(ranChecks(setup), []);
   assert.equal(git(["tag", "--list"], setup), "");

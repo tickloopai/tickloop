@@ -1,4 +1,4 @@
-//! The Tickloop Artifacts MCP connection `tickloop-docs`, whose three tools the host presents as
+//! The Tickloop Artifacts MCP connection `tickloop-artifacts`, whose three tools the host presents as
 //! first-party built-ins, backed by service-scoped credentials.
 
 use std::{
@@ -48,7 +48,7 @@ pub const ARTIFACT_TOOL_NAMES: [&str; 3] = [
     ARTIFACT_COMMENT_TOOL,
 ];
 
-const SERVER_NAME: &str = "tickloop-docs";
+const SERVER_NAME: &str = "tickloop-artifacts";
 const EVENT_CONTEXT_META: &str = "tickloop.ai/event-bridge";
 const PUBLICATION_META: &str = "tickloop.ai/publication";
 const MAX_TOOLS: usize = 128;

@@ -15,26 +15,27 @@ const allowedRemoteUrls = new Set([
 ]);
 const versionPattern = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const maximumVersionLength = 26;
+const maximumReleaseTagLength = 32;
 const firstVersion = "0.1.0";
 const workspaceManifest = "Cargo.toml";
 const workspacePackageSection = "[workspace.package]";
 const workspaceVersionLine = /^version\s*=\s*"([^"]*)"\s*(#.*)?$/;
 
-// Docs and the site take the next patch after their highest tag; binaries carry the Cargo
+// Artifacts and the site take the next patch after their highest tag; binaries carry the Cargo
 // workspace version, so their tag follows the committed Cargo.toml. Checks run in a fresh checkout
 // of the tagged commit, so each channel installs its own dependencies there.
 const channels = {
-  docs: {
-    label: "Docs",
-    tagPrefix: "docs-v",
-    workflow: ".github/workflows/docs-deploy.yml",
+  artifacts: {
+    label: "Artifacts",
+    tagPrefix: "artifacts-v",
+    workflow: ".github/workflows/artifacts-deploy.yml",
     versionFromWorkspace: false,
     checks: [
       { name: "dependency install", command: "npm", args: ["--prefix", "artifact", "ci"] },
       { name: "typecheck", command: "npm", args: ["--prefix", "artifact", "run", "typecheck"] },
       { name: "build", command: "npm", args: ["--prefix", "artifact", "run", "build"] },
     ],
-    outcome: "GitHub Actions will deploy Docs.",
+    outcome: "GitHub Actions will deploy Artifacts.",
   },
   site: {
     label: "Site",
@@ -105,7 +106,7 @@ function nextVersion(channel) {
     if (!latest || difference !== -1 && parts[difference] > latest[difference]) latest = parts;
   }
   const version = latest ? `${latest[0]}.${latest[1]}.${latest[2] + 1n}` : firstVersion;
-  if (version.length > maximumVersionLength) throw new Error(`The next ${label} version exceeds the supported length; specify VERSION explicitly.`);
+  if (version.length > maximumVersionLength || version.length + tagPrefix.length > maximumReleaseTagLength) throw new Error(`The next ${label} version exceeds the supported length; specify VERSION explicitly.`);
   return version;
 }
 
@@ -182,7 +183,7 @@ function main() {
   }
 
   const requestedVersion = process.env.VERSION ?? "";
-  if (requestedVersion && (!versionPattern.test(requestedVersion) || requestedVersion.length > maximumVersionLength)) {
+  if (requestedVersion && (!versionPattern.test(requestedVersion) || requestedVersion.length > maximumVersionLength || requestedVersion.length + channel.tagPrefix.length > maximumReleaseTagLength)) {
     throw new Error("VERSION must be a release number such as 0.1.0 (three numeric parts, no leading zeroes).");
   }
 

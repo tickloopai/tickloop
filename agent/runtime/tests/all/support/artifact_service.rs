@@ -1,4 +1,4 @@
-//! A controllable Tickloop Artifacts service: device login, the `tickloop-docs` MCP tools and the Agent
+//! A controllable Tickloop Artifacts service: device login, the `tickloop-artifacts` MCP tools and the Agent
 //! request lifecycle under `/api/v1/agent/*`.
 
 use std::{
@@ -231,7 +231,7 @@ fn mcp(control: &ServiceControl, origin: &str, body: &Value) -> Value {
         .lock()
         .unwrap()
         .clone()
-        .unwrap_or_else(|| "tickloop-docs".into());
+        .unwrap_or_else(|| "tickloop-artifacts".into());
     let mut result = match body["method"].as_str().unwrap_or("") {
         "server/discover" => {
             let mut capabilities = json!({"tools":{"listChanged":true}});
@@ -286,8 +286,8 @@ fn skill_reference(extra_bytes: usize) -> String {
 
 fn skill_entries(revision: usize, reference_bytes: usize) -> Vec<Value> {
     ["artifact-design", "artifact-diagramming", "artifact-dataviz", "artifact-draft"].into_iter().map(|name| {
-        let uri = format!("skill://tickloop-docs/{name}/SKILL.md");
-        let resources = [(uri.clone(), skill_body(name, revision)), (format!("skill://tickloop-docs/{name}/references/runtime.md"), skill_reference(reference_bytes))].into_iter().map(|(uri, text)| json!({"uri":uri,"size":text.len(),"digest":format!("sha256:{:x}", Sha256::digest(text.as_bytes()))})).collect::<Vec<_>>();
+        let uri = format!("skill://tickloop-artifacts/{name}/SKILL.md");
+        let resources = [(uri.clone(), skill_body(name, revision)), (format!("skill://tickloop-artifacts/{name}/references/runtime.md"), skill_reference(reference_bytes))].into_iter().map(|(uri, text)| json!({"uri":uri,"size":text.len(),"digest":format!("sha256:{:x}", Sha256::digest(text.as_bytes()))})).collect::<Vec<_>>();
         json!({"uri":uri,"frontmatter":{"name":name,"description":format!("Fixture guidance for {name}")},"resources":resources})
     }).collect()
 }
