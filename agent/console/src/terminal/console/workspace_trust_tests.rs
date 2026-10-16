@@ -218,3 +218,63 @@ fn workspace_trust_acceptance_uses_navigation_and_retains_semantic_path_styles()
         ));
     }
 }
+
+#[test]
+fn workspace_trust_retry_becomes_ready_only_after_queued_keys_are_drained() {
+    let mut state = State::new(true, 120, 30);
+    state.workspace_trust = Some(WorkspaceTrust::new(PathBuf::from("/workspace/project")));
+    let console = tests::console_with_state(state);
+    console
+        .workspace_trust_failed("The displayed directory changed".into())
+        .unwrap();
+    let mut state = console.state.lock().unwrap();
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(
+        !state.shows_cursor(),
+        "queued input is still being discarded"
+    );
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(
+        state.release_finished_submissions(),
+        "readiness needs a new frame"
+    );
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.shows_cursor());
+    assert!(matches!(
+        state.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        Some(InputEvent::Cancel { .. })
+    ));
+}
+
+#[test]
+fn workspace_trust_completion_publishes_input_readiness_after_queued_keys_are_drained() {
+    let mut state = State::new(true, 120, 30);
+    state.prompt_enabled = true;
+    state.workspace_trust = Some(WorkspaceTrust::new(PathBuf::from("/workspace/project")));
+    let console = tests::console_with_state(state);
+    console.finish_workspace_trust().unwrap();
+    let mut state = console.state.lock().unwrap();
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(
+        !state.shows_cursor(),
+        "the composer cannot accept input yet"
+    );
+    assert!(
+        state
+            .key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .is_none()
+    );
+    assert!(state.editor.draft().is_empty());
+    assert!(
+        state.release_finished_submissions(),
+        "readiness needs a new frame"
+    );
+    state.draw(&mut Vec::new()).unwrap();
+    assert!(state.shows_cursor());
+    state.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+    assert_eq!(state.editor.draft(), "x");
+}

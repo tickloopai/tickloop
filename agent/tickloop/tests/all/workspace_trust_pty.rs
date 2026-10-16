@@ -160,6 +160,15 @@ impl Terminal {
     }
 
     fn wait_for_input(&self) {
+        self.wait_for_ready_frame("input", |frame| {
+            frame.contains("Tickloop v")
+                && frame.contains("⏵⏵ ")
+                && frame.lines().any(|line| line.trim() == "❯")
+                && !frame.contains("Accessing workspace:")
+        });
+    }
+
+    fn wait_for_ready_frame(&self, description: &str, matches: impl Fn(&str) -> bool) {
         let deadline = Instant::now() + TIMEOUT;
         loop {
             let output = self.output.lock().unwrap().clone();
@@ -178,18 +187,14 @@ impl Terminal {
                     self.size.cols as usize,
                     self.size.rows as usize,
                 );
-                cursor_visible
-                    && frame.contains("Tickloop v")
-                    && frame.contains("⏵⏵ ")
-                    && frame.lines().any(|line| line.trim() == "❯")
-                    && !frame.contains("Accessing workspace:")
+                cursor_visible && matches(&frame)
             });
             if ready {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "input is not ready: {}",
+                "{description} is not ready: {}",
                 self.frame()
             );
             thread::sleep(Duration::from_millis(10));
@@ -509,7 +514,10 @@ fn startup_trust_short_write_failure_shows_the_error_and_requires_resize_before_
         assert_eq!(fs::read_dir(fixture.path("runtime")).unwrap().count(), 0);
         terminal.resize(120, 30);
         terminal.wait("Cannot save directory trust:");
-        terminal.wait("Yes, I trust this folder");
+        terminal.wait_for_ready_frame("directory trust retry after resize", |frame| {
+            frame.contains("Cannot save directory trust:")
+                && frame.contains("Yes, I trust this folder")
+        });
         terminal.send(b"\x0e\r");
         terminal.wait_for_input();
         terminal.send(b"/exit\r");
@@ -527,7 +535,9 @@ fn startup_trust_write_failure_stays_gated_and_requires_explicit_retry() {
     let mut terminal = Terminal::start(&fixture, "fullscreen", &[]);
     terminal.wait("Accessing workspace:");
     terminal.send(b"j\r");
-    terminal.wait("Cannot save directory trust:");
+    terminal.wait_for_ready_frame("directory trust retry", |frame| {
+        frame.contains("Cannot save directory trust:")
+    });
     assert_eq!(
         fs::read_to_string(fixture.path("config/settings.json")).unwrap(),
         "invalid JSON"
@@ -557,7 +567,9 @@ fn startup_trust_rejects_a_directory_replaced_after_the_question() {
     fs::rename(fixture.path("work"), fixture.path("previous-work")).unwrap();
     fs::create_dir(fixture.path("work")).unwrap();
     terminal.send(b"j\r");
-    terminal.wait("The displayed directory changed");
+    terminal.wait_for_ready_frame("directory replacement rejection", |frame| {
+        frame.contains("The displayed directory changed")
+    });
     assert!(!fixture.path("config/settings.json").exists());
     assert_eq!(fs::read_dir(fixture.path("runtime")).unwrap().count(), 0);
     terminal.send(b"\x1b");

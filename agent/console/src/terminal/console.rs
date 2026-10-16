@@ -6413,6 +6413,9 @@ impl State {
 
     /// Whether the frame shows the terminal cursor at the input's or the input dialog's cursor.
     fn shows_cursor(&self) -> bool {
+        if self.menu_submission_is_pending() {
+            return false;
+        }
         if self.workspace_trust.is_some() {
             return self.dialog_cursor_visible;
         }
@@ -8879,6 +8882,7 @@ impl State {
         let Some(id) = self.menu_submission_finished else {
             return false;
         };
+        let cursor_was_visible = self.shows_cursor();
         self.menu_submission_pending = None;
         self.menu_submission_finished = None;
         self.menu_submission_navigation = false;
@@ -8889,7 +8893,7 @@ impl State {
             return true;
         }
         if self.menu.as_ref().is_none_or(|menu| menu.id != id) {
-            return false;
+            return self.shows_cursor() != cursor_was_visible;
         }
         self.reset_active_menu();
         self.resume_dialog();
