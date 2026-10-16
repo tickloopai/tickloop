@@ -251,7 +251,7 @@ US 账户目前读取 US 资产持仓接口；该响应不能确认可用数量�
 
 扩展 Tick 使用真实 stdin/stdout 上按行 JSON-RPC 2.0 的 Tick 协议 3：`tick/describe` 返回 `kind`、`revision` 与工具目录，`tick/read` 返回当前状态 `{seq, data, at?}`，`tick/call` 带审批时的 `revision` 操作同一实例，`tick/update` 推送业务变化。可见示例在同一业务进程的控制终端上绘制，stdout 专用于协议。
 
-Agent 通过一个 `TickCall` 调用声明的能力。`TickManage` 属于当前 Loop：扩展 Tick 与 Terminal Tick 选高频（每分钟，默认）、中频（每 10 分钟）或低频（每 30 分钟），到期投递最新内容；Shell 固定及时，只在退出时投递；Artifact 不接受订阅，经 Artifact 关联逐条交付 @tickloop 请求。打开、读取和发现不会自动订阅。Terminal Tick 到期读一次屏幕并与上次送出的文字比较，不保证完整输出或即时响应。
+Agent 通过一个 `TickCall` 调用声明的能力。`TickSubscription` 属于当前 Loop，由 `TickManage` 的 `subscribe`／`unsubscribe` 动作管理：扩展 Tick 与 Terminal Tick 选高频（每分钟，默认）、中频（每 10 分钟）或低频（每 30 分钟），到期投递最新内容；Shell 固定及时，只在退出时投递；Artifact 不接受订阅，经 Artifact 关联逐条交付 @tickloop 请求。打开、读取和发现不会自动订阅。Terminal Tick 到期读一次屏幕并与上次送出的文字比较，不保证完整输出或即时响应。
 
 外部接入示例见 [Counter](tick/examples/counter.py)，协议约束见 [Tickhost 与 Herdr 视图](docs/design/native-herdr.md#tick-协议-3)。
 
