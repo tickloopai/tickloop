@@ -351,6 +351,35 @@ async fn a_refused_renewal_asks_to_log_in_again() {
     );
 }
 
+/// A renewal the server cannot answer, even with an OAuth error in a 5xx body, is a network
+/// failure that leaves the login in place, and the next renewal passes.
+#[tokio::test]
+async fn a_renewal_the_server_cannot_answer_is_retried_later() {
+    let root = tempfile::tempdir().unwrap();
+    let server = AuthorizationServer::start();
+    let lapsed = token(server.issuer(), "ap_lapsed", Some("ap_refresh"), 1);
+    save(root.path(), &lapsed);
+    server.answer_polls([
+        TokenReply::Error(503, "temporarily_unavailable".into()),
+        TokenReply::Error(502, "invalid_grant".into()),
+        TokenReply::Approve,
+    ]);
+
+    for _ in 0..2 {
+        let error = auth::current_token(&credentials(root.path()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, exit_code::NETWORK, "{error}");
+        assert!(!error.message.contains("ap_refresh"), "{error}");
+        assert_eq!(saved(root.path()).unwrap(), lapsed);
+    }
+    let renewed = auth::current_token(&credentials(root.path()))
+        .await
+        .unwrap();
+    assert_eq!(renewed.access_token, "access-1");
+    assert_eq!(server.requests_to(TOKEN_PATH).len(), 3);
+}
+
 /// A process waiting on the lock while another renews the token takes the renewed token
 /// instead of asking again, which a rotating server would refuse.
 #[tokio::test]
@@ -443,11 +472,16 @@ async fn a_token_tickloop_saved_is_used() {
         label: "Local".into(),
         issuer: server.issuer().into(),
     };
-    let login = tickloop_agent_packages::OAuthLogin::start(&credentials(root.path()), &issuer, &[])
-        .await
-        .unwrap();
+    let login = tick_oauth::DeviceLogin::start(
+        reqwest::Client::new(),
+        &credentials(root.path()),
+        &issuer.issuer,
+        &[],
+    )
+    .await
+    .unwrap();
     login
-        .finish(&tokio_util::sync::CancellationToken::new())
+        .finish(&tokio_util::sync::CancellationToken::new(), |_| {})
         .await
         .unwrap();
 

@@ -19,17 +19,17 @@ use crate::{
 };
 
 /// The directory under the config root that holds every package's credentials.
-pub const CREDENTIALS_DIRECTORY: &str = "credentials";
+const CREDENTIALS_DIRECTORY: &str = "credentials";
 /// The token of an `oauth2` package.
-pub const OAUTH_TOKEN_FILE_NAME: &str = "oauth2.json";
+const OAUTH_TOKEN_FILE_NAME: &str = "oauth2.json";
 /// Held exclusively by whoever changes the token, Tickloop or a program refreshing it.
-pub const OAUTH_LOCK_FILE_NAME: &str = "oauth2.lock";
+const OAUTH_LOCK_FILE_NAME: &str = "oauth2.lock";
 /// The key of an `api_key` package.
-pub const API_KEY_FILE_NAME: &str = "api_key";
+const API_KEY_FILE_NAME: &str = "api_key";
 /// Names the token file of an `oauth2` package to a program Tickloop starts.
 pub const OAUTH_TOKEN_FILE_VARIABLE: &str = "TICKLOOP_OAUTH_TOKEN_FILE";
 /// Moves the config root away from `~/.tickloop` when set and not empty.
-pub const CONFIG_ROOT_VARIABLE: &str = "TICKLOOP_CONFIG_DIR";
+const CONFIG_ROOT_VARIABLE: &str = "TICKLOOP_CONFIG_DIR";
 const DEFAULT_CONFIG_ROOT: &str = ".tickloop";
 /// The `client_id` registered with each issuer, reused by the next login.
 const OAUTH_CLIENTS_FILE_NAME: &str = "oauth2-clients.json";

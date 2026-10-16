@@ -122,6 +122,16 @@ pub(super) enum TickPackageResult {
     },
 }
 
+/// What became of a result handed to a panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Applied {
+    Taken,
+    /// It belonged to a login that is no longer shown.
+    Ignored,
+    /// The panel is closed.
+    NoPanel,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Notice {
     pub(super) text: String,
@@ -375,8 +385,9 @@ impl TicksPanel {
         self.id
     }
 
-    pub(super) fn apply(&mut self, result: TickPackageResult) {
-        // The end of a login the user cancelled was told when it was cancelled.
+    /// Takes `result`, unless it belongs to a login that is no longer shown: the end of a login
+    /// the user cancelled was told when it was cancelled.
+    pub(super) fn apply(&mut self, result: TickPackageResult) -> Applied {
         let is_current = match &result {
             TickPackageResult::LoginWaiting { attempt, .. }
             | TickPackageResult::LoginEnded { attempt, .. } => self
@@ -386,7 +397,7 @@ impl TicksPanel {
             _ => true,
         };
         if !is_current {
-            return;
+            return Applied::Ignored;
         }
         if let Some(notice) = result.notice() {
             self.notice = Some(notice);
@@ -433,6 +444,7 @@ impl TicksPanel {
             let count = self.entry_count(page);
             self.selected[page] = self.selected[page].min(count.saturating_sub(1));
         }
+        Applied::Taken
     }
 
     /// Takes pasted text into the key being entered; elsewhere the panel takes no text.
@@ -1173,7 +1185,7 @@ struct LoginLines {
     focus: usize,
     /// Whether the focused row is the option that cancels the login.
     has_option: bool,
-    /// The column after the masked key, for the text cursor.
+    /// The column after the masked key on the focused row, for the text cursor.
     cursor: Option<usize>,
 }
 
@@ -1227,15 +1239,20 @@ fn login_lines(login: &LoginView, width: usize, display: DisplayProfile) -> Logi
                 &mut lines,
                 &format!("Enter the {label}. Only {name}'s programs get it; it is never shown."),
             );
-            let field = format!("{CONTEXT_INDENT}{}: ", safe_line(label));
-            let masked = "*".repeat(entered.chars().count());
-            let cursor = field.width() + masked.len();
-            lines.push(RoleLine::role(format!("{field}{masked}"), Role::Text));
+            // Wrapped like the Console's other secret fields, with the cursor after the last `*`.
+            let field = format!(
+                "{CONTEXT_INDENT}{}: {}",
+                safe_line(label),
+                "*".repeat(entered.chars().count())
+            );
+            let rows = wrap_text(&field, width.max(1));
+            let column = rows.last().map_or(0, |row| row.width());
+            lines.extend(rows.into_iter().map(|row| RoleLine::role(row, Role::Text)));
             return LoginLines {
                 focus: lines.len() - 1,
                 lines,
                 has_option: false,
-                cursor: Some(cursor),
+                cursor: Some(column.min(width.saturating_sub(1))),
             };
         }
     }
@@ -1817,6 +1834,69 @@ mod tests {
             }
         );
         assert!(text(&mut panel).contains("Log in to longbridge · Global"));
+    }
+
+    #[test]
+    fn a_login_result_the_panel_no_longer_shows_is_reported_ignored() {
+        let mut panel = loaded_panel();
+        press(&mut panel, KeyCode::Enter);
+        work(press(&mut panel, KeyCode::Enter));
+        let waiting = |attempt| TickPackageResult::LoginWaiting {
+            attempt,
+            link: LINK.into(),
+            code: "CODE".into(),
+            opened: true,
+        };
+        assert_eq!(panel.apply(waiting(1)), Applied::Taken);
+        work(press(&mut panel, KeyCode::Esc));
+        // Cancelled before its device code arrived: the Console then ends it without opening
+        // the browser or polling.
+        assert_eq!(panel.apply(waiting(1)), Applied::Ignored);
+        press(&mut panel, KeyCode::Enter);
+        work(press(&mut panel, KeyCode::Enter));
+        assert_eq!(panel.apply(waiting(1)), Applied::Ignored);
+        assert_eq!(panel.apply(waiting(2)), Applied::Taken);
+    }
+
+    #[test]
+    fn a_long_key_wraps_with_the_cursor_after_its_last_star() {
+        let mut panel = TicksPanel::new(None);
+        panel.apply(installed_list(
+            1,
+            vec![(
+                with_auth(
+                    installed("keyed", "1.0.0", false),
+                    PackageAuth::ApiKey {
+                        env: "KEYED_KEY".into(),
+                        label: "Keyed API key".into(),
+                    },
+                ),
+                LoginState::LoggedOut,
+            )],
+        ));
+        press(&mut panel, KeyCode::Enter);
+        press(&mut panel, KeyCode::Enter);
+        panel.paste(&"k".repeat(70));
+        let width = 40;
+        let rendered = panel.frame(width, 20, DisplayProfile::default());
+        let rows = rendered
+            .lines
+            .iter()
+            .map(RoleLine::text)
+            .filter(|row| row.contains('*'))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.concat().matches('*').count(),
+            70,
+            "every character shows: {rows:?}"
+        );
+        assert!(
+            rows.len() > 1 && rows.iter().all(|row| row.width() <= width),
+            "{rows:?}"
+        );
+        let (row, column) = rendered.cursor.unwrap();
+        assert_eq!(rendered.lines[row].text(), *rows.last().unwrap());
+        assert_eq!(column, rows.last().unwrap().width().min(width - 1));
     }
 
     #[test]

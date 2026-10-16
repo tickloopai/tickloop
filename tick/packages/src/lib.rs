@@ -23,9 +23,8 @@ use std::{
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub use credentials::{
-    API_KEY_FILE_NAME, ApiKey, CONFIG_ROOT_VARIABLE, CREDENTIALS_DIRECTORY, LockedOAuth,
-    LoginState, OAUTH_LOCK_FILE_NAME, OAUTH_TOKEN_FILE_NAME, OAUTH_TOKEN_FILE_VARIABLE, OAuthToken,
-    PackageCredentials, default_config_root,
+    ApiKey, LockedOAuth, LoginState, OAUTH_TOKEN_FILE_VARIABLE, OAuthToken, PackageCredentials,
+    default_config_root,
 };
 pub use manifest::{
     MANIFEST_FILE_NAME, OAuthIssuer, PackageAuth, PackageManifest, validate_package_name,

@@ -342,8 +342,8 @@ fn auth_status_reads_the_saved_login_alone() {
         (
             "auth-text-expired",
             token(1, None),
-            "Authorization expired; log in with `tickloop tick login longbridge`, or with /ticks in \
-             the Agent.\nExpires: 1970-01-01T00:00:01Z\nRegion: global\n",
+            "Authorization expired; log in with /ticks in the Agent, or `tickloop tick login \
+             longbridge` in a terminal.\nExpires: 1970-01-01T00:00:01Z\nRegion: global\n",
         ),
     ];
     for (name, saved, expected) in cases {

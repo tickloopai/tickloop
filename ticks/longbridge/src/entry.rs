@@ -320,18 +320,18 @@ mod tests {
     }
 
     /// A token endpoint of a stand-in for Longbridge that refuses every login it is asked to
-    /// renew.
+    /// renew, with the OAuth error response of RFC 6749 section 5.2.
     async fn refusing_login_renewals() -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const REFUSAL: &[u8] = b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
+            content-length: 25\r\nconnection: close\r\n\r\n{\"error\":\"invalid_grant\"}";
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((mut connection, _)) = listener.accept().await {
                 let mut request = [0; 4096];
                 let _ = connection.read(&mut request).await;
-                let _ = connection
-                    .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                    .await;
+                let _ = connection.write_all(REFUSAL).await;
             }
         });
         format!("http://{address}")

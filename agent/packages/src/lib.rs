@@ -14,8 +14,8 @@ use tick_packages::{
 };
 
 pub use login::{LoggedOut, log_out, start_login};
-pub use tick_oauth::{DeviceLogin, LoginError};
 pub use marketplace::MarketplaceSource;
+pub use tick_oauth::{DeviceLogin, LoginError};
 
 /// Installs `package` as the marketplace at `source` offers it: an installed package of its
 /// version stays as it is and is not downloaded again; any other version is replaced.

@@ -13,10 +13,8 @@ use std::{
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::json;
 use tick_packages::{CURRENT_TARGET, OAuthToken, PackageCredentials};
-use tickloop_agent_test_support::{
-    authorization_server::{AuthorizationServer, TokenReply, USER_CODE},
-    input_dialog, screen,
-};
+use tick_test_support::authorization_server::{AuthorizationServer, TokenReply, USER_CODE};
+use tickloop_agent_test_support::{input_dialog, screen};
 
 use crate::tick_package_commands::{
     Fixture, Reply, Server, archive_of, marketplace_json, oauth2, offered, path_text, succeeded,

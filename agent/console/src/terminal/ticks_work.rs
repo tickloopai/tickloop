@@ -6,7 +6,7 @@ use std::{collections::HashMap, future::Future, path::Path};
 
 use tick_packages::PackageStore;
 use tickloop_agent_packages::{
-    LoggedOut, LoginError, MarketplaceSource, OAuthLogin, needs_no_login,
+    DeviceLogin, LoggedOut, LoginError, MarketplaceSource, needs_no_login, start_login,
 };
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -16,7 +16,7 @@ use super::{
     console::Console,
     safe_line,
     ticks_panel::{
-        InstalledList, TickPackageRequest, TickPackageResult, TickPackageWork, TicksPanel,
+        Applied, InstalledList, TickPackageRequest, TickPackageResult, TickPackageWork, TicksPanel,
     },
 };
 
@@ -27,7 +27,7 @@ pub(super) enum Done {
     LoginStarted {
         attempt: u64,
         name: String,
-        login: Box<OAuthLogin>,
+        login: Box<DeviceLogin>,
         cancel: CancellationToken,
     },
 }
@@ -151,7 +151,7 @@ pub(super) fn start(root: &Path, work: TickPackageWork, tasks: &mut TickPackageT
             tasks.running.spawn(async move {
                 let started = async {
                     let credentials = store.credentials(&name).map_err(LoginError::from)?;
-                    OAuthLogin::start(&credentials, &issuer, &scopes).await
+                    start_login(&credentials, &issuer, &scopes).await
                 };
                 let started = tokio::select! {
                     () = cancel.cancelled() => Err(LoginError::Cancelled),
@@ -260,11 +260,15 @@ pub(super) fn finish(
         _ => None,
     };
     let notice = result.notice();
-    if !console.apply_tick_package_result(panel, result)? {
-        if let Some(notice) = notice {
-            console.write_line(&format!("/ticks: {}", safe_line(&notice.text)))?;
+    match console.apply_tick_package_result(panel, result)? {
+        Applied::Taken => {}
+        Applied::Ignored => return Ok(()),
+        Applied::NoPanel => {
+            if let Some(notice) = notice {
+                console.write_line(&format!("/ticks: {}", safe_line(&notice.text)))?;
+            }
+            return Ok(());
         }
-        return Ok(());
     }
     if changed_packages {
         tasks.read_installed(PackageStore::in_config_root(root), panel);
@@ -283,19 +287,16 @@ pub(super) fn finish(
 }
 
 /// Shows the panel the link and code of `login`, opens an https link in the browser as the
-/// Console's other device logins do, and waits for the user's approval. A login cancelled
-/// meanwhile, or whose panel is gone, goes no further.
+/// Console's other device logins do, and waits for the user's approval. A login the panel no
+/// longer shows, cancelled meanwhile or with its panel gone, ends here: no browser, no polling.
 fn wait_for_approval(
     console: &Console,
     panel: Uuid,
     (attempt, name): (u64, String),
-    login: OAuthLogin,
+    login: DeviceLogin,
     cancel: CancellationToken,
     tasks: &mut TickPackageTasks,
 ) -> Result<(), String> {
-    if cancel.is_cancelled() {
-        return Ok(());
-    }
     let link = login.link().to_owned();
     let opened = reqwest::Url::parse(&link).is_ok_and(|url| url.scheme() == "https");
     let waiting = TickPackageResult::LoginWaiting {
@@ -304,7 +305,8 @@ fn wait_for_approval(
         code: login.user_code().to_owned(),
         opened,
     };
-    if !console.apply_tick_package_result(panel, waiting)? {
+    if cancel.is_cancelled() || console.apply_tick_package_result(panel, waiting)? != Applied::Taken
+    {
         cancel.cancel();
         tasks.end_login(panel, attempt);
         return Ok(());
@@ -313,7 +315,7 @@ fn wait_for_approval(
         tokio::spawn(async move { super::login::launch_browser(&link).await });
     }
     tasks.spawn(async move {
-        let result = login.finish(&cancel).await;
+        let result = login.finish(&cancel, |_| {}).await;
         (
             panel,
             TickPackageResult::LoginEnded {

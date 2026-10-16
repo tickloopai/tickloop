@@ -12,7 +12,8 @@ Tickloop 提供完整的终端 Agent 和 example Tick。Tick 由 Tickhost 运行
 | `ticks/longbridge` | `tick-longbridge` | Tick 包 `longbridge`：Longbridge 接入，以及报价、自选、K 线、持仓、资讯、财报、社区动态与 `auth` |
 | `ticks/futu` | `tick-futu` | Tick 包 `futu`：Futu OpenD 接入与期权 |
 | `tick/packages` | — | Tick 包的清单 `tick-package.json`、Tick 市场的 `marketplace.json`，以及配置根中的安装、卸载、列出与登录状态 |
-| `agent/packages` | — | Tick 市场的读取与下载，以及 `/ticks` 与 `tickloop tick` 共用的安装、更新与卸载 |
+| `agent/packages` | — | Tick 市场的读取与下载，以及 `/ticks` 与 `tickloop tick` 共用的安装、更新、卸载、登录与退出登录（OAuth 经 `tick/oauth`，按 Agent 的 HTTP 策略） |
+| `tick/oauth` | — | Tick 包登录的标准 OAuth 2.0 客户端（RFC 8414 发现、7591 注册、8628 设备码、6749 刷新、7009 撤销），Tickloop 与包的程序共用，HTTP 客户端由调用方提供 |
 | `tick/command` | — | Tick Command 的共享入口：全局参数、配置、locale 检查、`describe` 与运行 Tick |
 | `tick/market` | — | 金融 Tick 本体，只经 provider 接口读取数据 |
 | `tick/provider` | — | provider 接口，由 `ticks/` 下的包与测试 mock 实现 |

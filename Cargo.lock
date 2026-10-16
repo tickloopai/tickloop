@@ -4602,6 +4602,7 @@ dependencies = [
  "tickloop-agent-test-support",
  "tickloop-tick-packages",
  "tickloop-tick-protocol",
+ "tickloop-tick-test-support",
  "tickloop-tickhost",
  "tickloop-tickhost-connect",
  "time",

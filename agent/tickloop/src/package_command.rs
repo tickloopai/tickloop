@@ -18,7 +18,7 @@ use tick_packages::{
 };
 use tickloop_agent_console::terminal::safe_line;
 use tickloop_agent_packages::{
-    InstalledVersion, MarketplaceSource, OAuthLogin, log_out, login_label, needs_no_login,
+    InstalledVersion, MarketplaceSource, log_out, login_label, needs_no_login, start_login,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -251,7 +251,7 @@ async fn log_in_with(
     let failed = |error: tickloop_agent_packages::LoginError| {
         format!("cannot log in to {name} ({}): {error}", issuer.label)
     };
-    let login = OAuthLogin::start(credentials, issuer, scopes)
+    let login = start_login(credentials, issuer, scopes)
         .await
         .map_err(failed)?;
     println!(
@@ -263,7 +263,7 @@ async fn log_in_with(
         login.expires_in().as_secs().div_ceil(60)
     );
     let cancellation = CancellationToken::new();
-    let finished = login.finish(&cancellation);
+    let finished = login.finish(&cancellation, |_| {});
     tokio::pin!(finished);
     let result = tokio::select! {
         result = &mut finished => result,

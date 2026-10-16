@@ -153,7 +153,7 @@ async fn opening_the_program_of_a_package_that_is_not_installed_names_the_instal
         .unwrap_err();
     assert_eq!(
         error,
-        "InvalidArguments: executable not found: tick-counter-sample comes from Tick package counter-sample, which is not installed; the user installs it with `tickloop tick install counter-sample`"
+        "InvalidArguments: executable not found: tick-counter-sample comes from Tick package counter-sample, which is not installed; the user installs it from /ticks in the Agent (or `tickloop tick install counter-sample` in a terminal)"
     );
     assert!(
         tools

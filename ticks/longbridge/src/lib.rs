@@ -22,7 +22,7 @@ pub const PACKAGE: &str = "longbridge";
 /// What an authorization failure asks the user to do: log in through Tickloop, which keeps the
 /// package's login.
 pub const AUTH_HINT: &str =
-    "log in with `tickloop tick login longbridge`, or with /ticks in the Agent";
+    "log in with /ticks in the Agent, or `tickloop tick login longbridge` in a terminal";
 
 /// An authorization failure that tells the user how to log in again.
 pub fn not_authorized(message: impl std::fmt::Display) -> Error {

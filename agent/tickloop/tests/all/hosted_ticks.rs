@@ -1207,7 +1207,7 @@ for line in sys.stdin:
         };
         assert!(
             uninstalled.contains(
-                "executable not found: tick-counter comes from Tick package counter, which is not installed; the user installs it with `tickloop tick install counter`"
+                "executable not found: tick-counter comes from Tick package counter, which is not installed; the user installs it from /ticks in the Agent (or `tickloop tick install counter` in a terminal)"
             ),
             "{uninstalled}"
         );

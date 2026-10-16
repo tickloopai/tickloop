@@ -25,7 +25,7 @@ const EXAMPLES: &str = "Examples:
 const EXIT_CODES: &str = "Exit codes:
   0  success
   2  usage or configuration error
-  3  not authorized; log in with `tickloop tick login longbridge`, or with /ticks in the Agent
+  3  not authorized; log in with /ticks in the Agent, or `tickloop tick login longbridge` in a terminal
   4  network or API error";
 
 /// The Ticks `tick-longbridge` runs, in the order `describe` lists them.

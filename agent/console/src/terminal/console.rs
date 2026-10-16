@@ -1706,21 +1706,21 @@ impl Console {
             .map_err(|error| error.to_string())
     }
 
-    /// Hands `result` to the `/ticks` panel `panel`, shown or waiting; false once it is closed.
+    /// Hands `result` to the `/ticks` panel `panel`, shown or waiting, and says what became of it.
     pub(super) fn apply_tick_package_result(
         &self,
         panel: Uuid,
         result: super::ticks_panel::TickPackageResult,
-    ) -> Result<bool, String> {
+    ) -> Result<super::ticks_panel::Applied, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         let Some(open) = state.ticks_panel_mut(panel) else {
-            return Ok(false);
+            return Ok(super::ticks_panel::Applied::NoPanel);
         };
-        open.apply(result);
+        let applied = open.apply(result);
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())?;
-        Ok(true)
+        Ok(applied)
     }
 
     /// Whether the one-time offer to register the Herdr popup plugin is still to be made in

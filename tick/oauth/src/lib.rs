@@ -25,7 +25,10 @@ pub enum LoginError {
     /// The device code expired before the user approved it.
     Expired,
     /// The server refused a request with the OAuth error `code` (RFC 6749 section 5.2).
-    Refused { code: String, message: String },
+    Refused {
+        code: String,
+        message: String,
+    },
     /// The server could not be reached, or answered something else.
     Failed(String),
 }

@@ -138,8 +138,7 @@ impl DeviceLogin {
             .filter(|uri| !uri.is_empty())
             .map(|uri| shown_url(uri, "verification_uri_complete"))
             .transpose()?;
-        if device.device_code.is_empty() || !is_shown(&device.user_code) || device.expires_in == 0
-        {
+        if device.device_code.is_empty() || !is_shown(&device.user_code) || device.expires_in == 0 {
             return Err(server.invalid("device authorization"));
         }
         let expires_in = Duration::from_secs(device.expires_in).min(MAX_DEVICE_CODE_LIFETIME);
@@ -152,11 +151,9 @@ impl DeviceLogin {
             user_code: device.user_code,
             verification_uri,
             verification_uri_complete,
-            interval: device
-                .interval
-                .map_or(DEFAULT_POLL_INTERVAL, |seconds| {
-                    Duration::from_secs(seconds.max(1))
-                }),
+            interval: device.interval.map_or(DEFAULT_POLL_INTERVAL, |seconds| {
+                Duration::from_secs(seconds.max(1))
+            }),
             expires_in,
             deadline: Instant::now() + expires_in,
         })
@@ -286,11 +283,7 @@ impl DeviceLogin {
             issuer: self.server.issuer.clone(),
             client_id: self.client_id.clone(),
             token_endpoint: self.endpoints.token.to_string(),
-            revocation_endpoint: self
-                .endpoints
-                .revocation
-                .as_ref()
-                .map(ToString::to_string),
+            revocation_endpoint: self.endpoints.revocation.as_ref().map(ToString::to_string),
         })
     }
 }

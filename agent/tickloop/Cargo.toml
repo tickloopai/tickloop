@@ -59,6 +59,7 @@ tickloop-agent-model = { path = "../model" }
 tickloop-agent-runtime = { path = "../runtime" }
 tickloop-agent-test-support = { path = "../test-support" }
 tickloop-tick-protocol = { path = "../../tick/protocol" }
+tickloop-tick-test-support = { path = "../../tick/test-support" }
 tickloop-tickhost = { path = "../../tickhost/host" }
 tickloop-tickhost-connect = { path = "../../tickhost/connect" }
 time = { version = "0.3", features = ["formatting", "parsing"] }

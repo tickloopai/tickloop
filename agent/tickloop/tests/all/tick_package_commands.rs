@@ -19,7 +19,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tick_packages::CURRENT_TARGET;
-use tickloop_agent_test_support::authorization_server::{
+use tick_test_support::authorization_server::{
     AuthorizationServer, REVOCATION_PATH, TokenReply, USER_CODE,
 };
 

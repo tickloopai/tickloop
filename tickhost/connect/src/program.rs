@@ -116,7 +116,7 @@ pub fn package_not_installed(program: &str, name: &str) -> HostError {
     HostError::before(
         INVALID_ARGUMENTS,
         format!(
-            "executable not found: {program} comes from Tick package {name}, which is not installed; the user installs it with `tickloop tick install {name}`"
+            "executable not found: {program} comes from Tick package {name}, which is not installed; the user installs it from /ticks in the Agent (or `tickloop tick install {name}` in a terminal)"
         ),
     )
 }
@@ -314,7 +314,7 @@ mod tests {
         let error = resolve("tick-sample").unwrap_err();
         assert_eq!(
             error.to_string(),
-            "InvalidArguments: executable not found: tick-sample comes from Tick package sample, which is not installed; the user installs it with `tickloop tick install sample`"
+            "InvalidArguments: executable not found: tick-sample comes from Tick package sample, which is not installed; the user installs it from /ticks in the Agent (or `tickloop tick install sample` in a terminal)"
         );
         assert!(!error.dispatched);
         assert_eq!(
