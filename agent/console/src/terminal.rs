@@ -3516,15 +3516,15 @@ async fn interact(
                                 };
                                 if let Some(effort) = effort {
                                     match agent.change_configuration(target, ConfigurationChange::ReasoningEffort {effort}).await {
-                                        Ok(change) => outln!(console, "Thinking: {}{}", effort.map_or("auto", ReasoningEffort::label), change.staged_note()),
-                                        Err(error) => outln!(console, "Cannot set Thinking: {}", safe_text(&error.to_string())),
+                                        Ok(change) => outln!(console, "Effort: {}{}", effort.map_or("auto", ReasoningEffort::label), change.staged_note()),
+                                        Err(error) => outln!(console, "Cannot set Effort: {}", safe_text(&error.to_string())),
                                     }
                                 } else {
                                     let levels = supported.iter().map(|effort| effort.label()).collect::<Vec<_>>().join(", ");
                                     if levels.is_empty() {
-                                        outln!(console, "{} does not support configurable Thinking.", safe_text(&configuration.model.model));
+                                        outln!(console, "{} does not support a configurable effort level.", safe_text(&configuration.model.model));
                                     } else {
-                                        outln!(console, "Thinking levels for {}: {}. Use auto for the model default; use /settings to toggle Thinking.", safe_text(&configuration.model.model), levels);
+                                        outln!(console, "Effort levels for {}: {}. Use auto for the model default; use /settings to toggle Thinking.", safe_text(&configuration.model.model), levels);
                                     }
                                 }
                             } else {

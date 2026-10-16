@@ -484,8 +484,7 @@ async fn piped_provider_model_and_settings_menus_apply_numbered_choices() {
     assert!(
         transcript.contains("Choose Provider · All")
             && transcript.contains("Choose model · Signed-in Providers")
-            && transcript
-                .contains("Model selection: Applied · DeepSeek-V4.1-Flash · Thinking auto"),
+            && transcript.contains("Model selection: Applied · DeepSeek-V4.1-Flash · Effort auto"),
         "{transcript}"
     );
     assert!(!transcript.contains("Accepted: Goal"), "{transcript}");
@@ -530,7 +529,7 @@ async fn effort_picker_saves_a_supported_level_without_model_credentials() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        transcript.contains("Thinking levels for deepseek-"),
+        transcript.contains("Effort levels for deepseek-"),
         "{transcript}"
     );
     assert!(transcript.contains("low, high, max"), "{transcript}");
@@ -539,7 +538,7 @@ async fn effort_picker_saves_a_supported_level_without_model_credentials() {
         "{transcript}"
     );
     assert!(!transcript.contains("medium · current"), "{transcript}");
-    assert!(transcript.contains("Thinking: max"), "{transcript}");
+    assert!(transcript.contains("Effort: max"), "{transcript}");
     assert!(transcript.contains("max · current"), "{transcript}");
     let saved: Value =
         serde_json::from_slice(&std::fs::read(config_root.join("settings.json")).unwrap()).unwrap();

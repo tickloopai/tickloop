@@ -197,7 +197,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         command: "/thinking",
         arguments: "[LEVEL]",
-        description: "Choose a Thinking level supported by the current model; no argument opens the picker.",
+        description: "Choose an effort level supported by the current model; no argument opens the picker.",
         menu_group: Some(CommandGroup::ModelAndSettings),
     },
     CommandSpec {

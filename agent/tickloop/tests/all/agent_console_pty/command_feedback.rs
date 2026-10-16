@@ -1,6 +1,6 @@
 use super::*;
 
-const MODEL_FEEDBACK: &str = "Model selection: Applied · DeepSeek-V4.1-Flash · Thinking auto";
+const MODEL_FEEDBACK: &str = "Model selection: Applied · DeepSeek-V4.1-Flash · Effort auto";
 const FIRST_PROMPT: &str = "Keep the prior model selection visible";
 const FIRST_REPLY: &str = "First message completed";
 

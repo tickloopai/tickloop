@@ -938,8 +938,8 @@ fn a_child_opened_in_place_refuses_root_only_changes_before_sending_and_keeps_it
     });
 
     view.send(b"\x15/thinking auto\r");
-    view.wait_for("the supported Thinking change", |frame| {
-        frame.contains("Thinking: auto")
+    view.wait_for("the supported effort change", |frame| {
+        frame.contains("Effort: auto")
     });
     view.send(b"\x15follow up\r");
     view.wait_for("the supported follow-up", |frame| {

@@ -366,10 +366,11 @@ fn settings_ux_pty_selections_close_and_toggles_stay_open() {
     fixture.send(b"/settings\r");
     fixture.wait(|frame| frame.contains("Settings"));
     fixture.send(b"jj\r");
-    fixture.wait(|frame| frame.contains("Thinking level"));
+    fixture.wait(|frame| frame.lines().any(|line| line.trim() == "Effort"));
     fixture.send(b"j\r");
     fixture.wait(|frame| {
-        !frame.lines().any(|line| line == "Settings") && !frame.contains("Thinking level")
+        !frame.lines().any(|line| line == "Settings")
+            && !frame.lines().any(|line| line.trim() == "Effort")
     });
     fixture.send(b"/settings\r");
     fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));
@@ -442,7 +443,7 @@ fn settings_ux_pty_model_groups_signed_in_providers_and_switches_atomically() {
 fn settings_ux_pty_settings_escape_returns_one_page_and_omits_numbers() {
     let mut fixture = Fixture::start();
     for (label, title) in [
-        ("Thinking: auto", "Thinking level"),
+        ("Effort: auto", "Effort levels depend"),
         ("Execution mode", "Choose execution mode"),
         ("Session status", "Session status"),
         ("Usage", "Usage"),

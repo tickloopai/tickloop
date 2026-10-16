@@ -1449,9 +1449,9 @@ impl Menus {
             console,
             Menu {
                 id: Uuid::new_v4(),
-                title: "Thinking level".into(),
+                title: "Effort".into(),
                 context: vec![
-                    "Levels depend on the current model; auto uses its default. Use Settings to turn Thinking on or off. The choice is saved in user settings.".into(),
+                    "Effort levels depend on the current model; auto uses its default. Use Settings to turn Thinking on or off. The choice is saved in user settings.".into(),
                     "Thinking is collapsed in conversation; ctrl+o opens the detailed transcript.".into(),
                 ],
                 options,
@@ -1544,7 +1544,7 @@ impl Menus {
                         }
                     ),
                     format!(
-                        "Thinking: {}",
+                        "Effort: {}",
                         snapshot
                             .reasoning_effort
                             .map_or("auto", ReasoningEffort::label)
@@ -2826,7 +2826,7 @@ impl Menus {
                         .await
                         .map_err(|error| error.to_string());
                     match result {
-                        Ok(change) => console.write(&safe_text(&format!("Model selection: {change} · {} · Thinking {}\n", choice.config.name, choice.thinking.map_or("auto", ReasoningEffort::label))))?,
+                        Ok(change) => console.write(&safe_text(&format!("Model selection: {change} · {} · Effort {}\n", choice.config.name, choice.thinking.map_or("auto", ReasoningEffort::label))))?,
                         Err(error) => {
                             self.show_model_choices(console, target, choices, index, Uuid::new_v4())?;
                             return Err(error);
@@ -2865,7 +2865,7 @@ impl Menus {
                         .await
                         .map_err(|error| error.to_string())?;
                     console.write(&format!(
-                        "Thinking: {}{}\n",
+                        "Effort: {}{}\n",
                         effort.map_or("auto", ReasoningEffort::label),
                         change.staged_note()
                     ))?;
