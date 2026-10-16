@@ -1,6 +1,6 @@
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
-use tickloop_agent_protocol::{Decision, EventKind, ExecutionMode, PermissionRule};
+use tickloop_agent_protocol::{Decision, EventKind, ExecutionMode, OperationState, PermissionRule};
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_test_support::{
     call, config,
@@ -13,6 +13,9 @@ async fn run_assignment(deny_messages: bool) {
     let directory = tempfile::tempdir().unwrap();
     let create_id = Uuid::new_v4();
     let assign_id = Uuid::new_v4();
+    let own_create_id = Uuid::new_v4();
+    let claim_id = Uuid::new_v4();
+    let complete_id = Uuid::new_v4();
     let model = Arc::new(RoutedModel::new(move |request| {
         let host = state(request);
         let tools = request
@@ -47,12 +50,34 @@ async fn run_assignment(deny_messages: bool) {
             );
         }
         let task = tool_result(&request.messages, "create").unwrap()["task"].clone();
+        if !has_tool_result(request, "create-own") {
+            return call(
+                "create-own",
+                "TaskCreate",
+                json!({"mutation_id":own_create_id,"title":"Summarize","description":"Summarize the authorized checks"}),
+            );
+        }
+        let own_task = tool_result(&request.messages, "create-own").unwrap()["task"].clone();
+        if !has_tool_result(request, "claim-own") {
+            return call(
+                "claim-own",
+                "TaskUpdate",
+                json!({"mutation_id":claim_id,"task_id":own_task["id"],"expected_revision":1,"action":"claim"}),
+            );
+        }
         let assignment = json!({"mutation_id":assign_id,"task_id":task["id"],"expected_revision":1,"action":"assign","owner":"helper"});
         if !has_tool_result(request, "assign") {
             return call("assign", "TaskUpdate", assignment);
         }
         if !has_tool_result(request, "retry") {
             return call("retry", "TaskUpdate", assignment);
+        }
+        if !has_tool_result(request, "complete-own") {
+            return call(
+                "complete-own",
+                "TaskUpdate",
+                json!({"mutation_id":complete_id,"task_id":own_task["id"],"expected_revision":2,"action":"complete","result":"Checks summarized"}),
+            );
         }
         text("root done")
     }));
@@ -125,7 +150,36 @@ async fn run_assignment(deny_messages: bool) {
                 .contains("pending")
         );
     }
-    assert_eq!(snapshot.task_board.unwrap().tasks.len(), 1);
+    let completed = core
+        .operation(root, receipt.run_id, "complete-own")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        completed.state,
+        OperationState::Completed,
+        "assigning another task must not block the assigner's completion: {:?}",
+        completed.result
+    );
+    let notification_call_id = format!("task-assignment-{assign_id}");
+    let notifications = snapshot
+        .operations
+        .iter()
+        .filter(|operation| operation.call_id == notification_call_id)
+        .collect::<Vec<_>>();
+    assert!(!notifications.is_empty());
+    for operation in notifications {
+        assert_eq!(
+            operation.state,
+            if deny_messages {
+                OperationState::Failed
+            } else {
+                OperationState::Completed
+            }
+        );
+        assert_eq!(operation.result.as_ref().unwrap().is_error, deny_messages);
+    }
+    assert_eq!(snapshot.task_board.unwrap().tasks.len(), 2);
     core.set_task_tools_enabled(root, false).await.unwrap();
     let solo = core.submit(root, None, "new solo".into()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {

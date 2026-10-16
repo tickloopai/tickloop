@@ -523,6 +523,95 @@ impl Agent {
         invocation: ToolInvocation,
         cancel: CancellationToken,
     ) -> Result<ToolCallOutcome, ToolCallError> {
+        let call_id = invocation.id.clone();
+        let is_shell = invocation.name == tickloop_agent_tools::BASH_TOOL_NAME;
+        // Retries reuse call IDs; settle only the operation created by this invocation.
+        let operation_start = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&receipt.chat_id)
+            .ok_or_else(|| ToolCallError::from("chat is unavailable"))?
+            .snapshot
+            .operations
+            .len();
+        let outcome = self
+            .execute_registered_call_inner(receipt, assistant_message_id, invocation, cancel)
+            .await;
+        let command_state = if is_shell {
+            self.command_state_for_call(receipt, &call_id).await
+        } else {
+            None
+        };
+        let mut chats = self.inner.chats.lock().await;
+        if let Some(chat) = chats.get_mut(&receipt.chat_id)
+            && let Some(operation) = chat
+                .snapshot
+                .operations
+                .iter_mut()
+                .skip(operation_start)
+                .rev()
+                .find(|operation| {
+                    operation.run_id == receipt.run_id && operation.call_id == call_id
+                })
+        {
+            use crate::host_tools::HostCallStatus;
+            use tickloop_agent_protocol::CommandState;
+
+            let (result, state) = match &outcome {
+                Ok(outcome) => {
+                    let state = match (outcome.host_call_status, command_state) {
+                        (Some(HostCallStatus::OutcomeUnknown), _) => OperationState::Unknown,
+                        (Some(HostCallStatus::NotDispatched), _) => OperationState::Failed,
+                        (
+                            _,
+                            Some(
+                                CommandState::Running
+                                | CommandState::Background
+                                | CommandState::Cancelling,
+                            ),
+                        ) => OperationState::Admitted,
+                        (_, Some(CommandState::Unknown)) => OperationState::Unknown,
+                        (_, Some(CommandState::Completed)) => OperationState::Completed,
+                        (_, Some(CommandState::Failed)) => OperationState::Failed,
+                        _ if outcome.result.is_error => OperationState::Failed,
+                        _ => OperationState::Completed,
+                    };
+                    (outcome.result.clone(), state)
+                }
+                Err(error) => (
+                    ToolResult {
+                        content: error.message.clone(),
+                        is_error: true,
+                        output_ref: None,
+                    },
+                    if operation.state == OperationState::Proposed {
+                        OperationState::Failed
+                    } else {
+                        OperationState::Unknown
+                    },
+                ),
+            };
+            if !matches!(
+                operation.state,
+                OperationState::Completed | OperationState::Failed
+            ) {
+                operation.state = state;
+            }
+            operation.result = Some(result);
+            self.save(&chat.snapshot);
+        }
+        outcome
+    }
+
+    async fn execute_registered_call_inner(
+        &self,
+        receipt: &Receipt,
+        assistant_message_id: Uuid,
+        invocation: ToolInvocation,
+        cancel: CancellationToken,
+    ) -> Result<ToolCallOutcome, ToolCallError> {
         let ToolInvocation {
             id,
             name,

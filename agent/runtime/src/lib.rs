@@ -3028,7 +3028,6 @@ impl Agent {
                     if let Some(record) = denial {
                         self.record_final_denial(record).await;
                     }
-                    let command_state=if name==tickloop_agent_tools::BASH_TOOL_NAME {self.command_state_for_call(&receipt,&id).await} else {None};
                     let mut result = result;
                     if let Some(crate::host_tools::HostEffect::CreatedArtifact(tick)) = &host_effect
                         && !result.is_error
@@ -3052,17 +3051,6 @@ impl Agent {
                     if let Some(message)=chat.snapshot.messages.last_mut().filter(|message|same_run && message.role==Role::User && message.content.iter().all(|content|matches!(content,Content::ToolResult{..}))) {message.content.push(block);} else {chat.snapshot.message_runs.insert(chat.snapshot.messages.len(),receipt.run_id);chat.snapshot.messages.push(Message {role:Role::User,content:vec![block]});}
                     chat.start_new_tool_result_message = false;
                     if let Some(operation) = chat.snapshot.operations.iter_mut().find(|operation|operation.run_id==receipt.run_id && operation.call_id==id) {
-                        let state=match (host_call_status, command_state) {
-                            (Some(crate::host_tools::HostCallStatus::OutcomeUnknown), _)=>OperationState::Unknown,
-                            (Some(crate::host_tools::HostCallStatus::NotDispatched), _)=>OperationState::Failed,
-                            (_, Some(tickloop_agent_protocol::CommandState::Running|tickloop_agent_protocol::CommandState::Background|tickloop_agent_protocol::CommandState::Cancelling))=>OperationState::Admitted,
-                            (_, Some(tickloop_agent_protocol::CommandState::Unknown))=>OperationState::Unknown,
-                            (_, Some(tickloop_agent_protocol::CommandState::Completed))=>OperationState::Completed,
-                            (_, Some(tickloop_agent_protocol::CommandState::Failed))=>OperationState::Failed,
-                            _ if result.is_error=>OperationState::Failed,
-                            _=>OperationState::Completed,
-                        };
-                        if !matches!(operation.state,OperationState::Completed|OperationState::Failed) {operation.state=state;}
                         operation.result=Some(result.clone());
                     }
                     if !result.is_error && let Some(tool_use) = tool_use {

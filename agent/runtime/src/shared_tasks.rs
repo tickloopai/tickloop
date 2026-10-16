@@ -1360,12 +1360,18 @@ impl Agent {
         {
             Ok(outcome) if !outcome.result.is_error => outcome.result.content,
             Ok(outcome) => {
+                if let Some(record) = outcome.denial {
+                    self.record_final_denial(record).await;
+                }
                 return format!(
                     "assignment saved; notification pending: {}",
                     outcome.result.content
                 );
             }
             Err(error) => {
+                if let Some(record) = error.denial {
+                    self.record_final_denial(record).await;
+                }
                 return format!("assignment saved; notification pending: {}", error.message);
             }
         };
