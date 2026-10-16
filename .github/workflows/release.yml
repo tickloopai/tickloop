@@ -39,7 +39,7 @@ jobs:
           node-version: '22'
 
       - name: Test the release script
-        run: node --test scripts/release.test.mjs
+        run: node --test scripts/release.test.mjs scripts/release-ticks.test.mjs
 
       - name: Validate release tag against the workspace version
         run: |

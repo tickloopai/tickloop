@@ -9,7 +9,7 @@ ARGS ?=
 CARGO_PACKAGE := -p tickloop-agent
 PACKAGE_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
-TICK_PACKAGES := longbridge futu
+TICK_PACKAGES ?= $(notdir $(patsubst %/tick-package.json,%,$(wildcard ticks/*/tick-package.json)))
 
 .PHONY: dev build install package site test check release release-site release-artifacts prototype-earnings-review package-ticks dev-ticks release-ticks
 
@@ -50,9 +50,9 @@ dev-ticks:
 		cargo run --locked --quiet -p tickloop-agent --bin tickloop -- tick install --path "dist/ticks/$$package" || exit 1; \
 	done
 
-## Release the Tick packages at the workspace version: push the tag ticks-v<version> on HEAD; GitHub Actions builds them on Apple Silicon, publishes them to tickloopai/ticks and verifies the downloads.
+## Bump each selected Tick package, commit their versions together and push individual tags; select with TICK_PACKAGES="longbridge futu".
 release-ticks:
-	@scripts/release-ticks.sh tag
+	@node scripts/release.mjs ticks
 
 test:
 	@cargo nextest --version >/dev/null 2>&1 || { echo 'make test requires cargo-nextest; install it with: cargo install --locked cargo-nextest' >&2; exit 1; }
@@ -68,15 +68,15 @@ check:
 	cargo clippy --locked --workspace --all-targets -- -D warnings
 	$(MAKE) test
 
-## 发布已提交的二进制快照：标签取 Cargo.toml 的 workspace 版本，VERSION 只能与它相同
+## Tickloop 版本 patch +1，检查后提交版本文件并推送分支与标签；VERSION 可指定更高版本
 release:
 	@node scripts/release.mjs binary
 
-## 将官网快照的当前分支与标签一起推送；默认递增 patch，可用 VERSION=0.1.0 指定版本
+## 官网版本 patch +1，检查后提交版本文件并推送分支与标签；VERSION 可指定更高版本
 release-site:
 	@node scripts/release.mjs site
 
-## 发布已提交的 Artifacts 快照；默认递增 patch，可用 VERSION=0.1.0 指定版本
+## Artifacts 版本 patch +1，检查后提交版本文件并推送分支与标签；VERSION 可指定更高版本
 release-artifacts:
 	@node scripts/release.mjs artifacts
 

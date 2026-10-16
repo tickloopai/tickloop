@@ -3,7 +3,7 @@ use std::path::Path;
 use tick_packages::{PackageAuth, PackageManifest};
 
 #[test]
-fn the_package_manifest_runs_this_program_at_the_workspace_version() {
+fn the_package_manifest_runs_this_program_at_its_package_version() {
     let package = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest =
         PackageManifest::parse(&std::fs::read(package.join("tick-package.json")).unwrap()).unwrap();

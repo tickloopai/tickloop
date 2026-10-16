@@ -1,22 +1,6 @@
 #!/bin/sh
-# Releases the Tick packages under ticks/ at the workspace version, in the stages the workflow
-# .github/workflows/release-ticks.yml runs, each of which also runs here:
-#
-#   tag [--check]                       make release-ticks: checks that the release can start and
-#                                       pushes the tag ticks-v<version> on HEAD, which starts the
-#                                       workflow; --check only checks.
-#   build                               builds and checks every package archive on Apple Silicon,
-#                                       as tickloop installs it, into dist/release/.
-#   publish MARKETPLACE_CHECKOUT DIR    creates the release <package>-v<version> in
-#                                       tickloopai/ticks for each archive in DIR, then commits and
-#                                       pushes marketplace.json and README.md in the checkout.
-#   verify DIR                          downloads every release asset anonymously and compares it
-#                                       with its archive in DIR.
-#
-# publish and verify can run again after a failure: a release that already carries the same
-# archive is kept, and a marketplace that already lists it is left as it is. A failure after a
-# release exists says what exists and the exact commands that finish or withdraw the release; no
-# release is ever deleted.
+# Builds, publishes and verifies the one Tick package selected by RELEASE_TAG=tick-<package>-vX.Y.Z.
+# Version commits and source tags are created by scripts/release.mjs ticks.
 set -eu
 
 target=aarch64-apple-darwin
@@ -24,8 +8,6 @@ source_repository=griffinqiu/tickloop
 marketplace_repository=tickloopai/ticks
 release_downloads=https://github.com/$marketplace_repository/releases/download
 marketplace_url=https://raw.githubusercontent.com/$marketplace_repository/HEAD/marketplace.json
-release_workflow=.github/workflows/release-ticks.yml
-release_tag_prefix=ticks-v
 test_support_crate=tickloop-tick-test-support
 download_attempts=6
 download_retry_seconds=5
@@ -40,7 +22,7 @@ fail() {
 }
 
 usage() {
-    echo "usage: $0 tag [--check] | build | publish MARKETPLACE_CHECKOUT ARCHIVE_DIRECTORY | verify ARCHIVE_DIRECTORY" >&2
+    echo "usage: RELEASE_TAG=tick-<package>-vX.Y.Z $0 build | publish MARKETPLACE_CHECKOUT ARCHIVE_DIRECTORY | verify ARCHIVE_DIRECTORY" >&2
     exit 2
 }
 
@@ -48,23 +30,31 @@ manifest_field() {
     python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$1" "$2"
 }
 
-# The packages under ticks/, by name.
-packages() {
-    for manifest in ticks/*/tick-package.json; do
-        basename "$(dirname "$manifest")"
-    done
+release_package() {
+    python3 -I - "${RELEASE_TAG:-}" <<'PYTAG'
+import json, re, sys
+from pathlib import Path
+match = re.fullmatch(r"tick-([a-z][a-z0-9-]*)-v((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))", sys.argv[1])
+if not match:
+    sys.exit("RELEASE_TAG must be tick-<package>-vX.Y.Z")
+name, version = match.groups()
+path = Path("ticks") / name / "tick-package.json"
+if not path.is_file():
+    sys.exit(f"Unknown Tick package {name}")
+manifest = json.loads(path.read_text())
+if manifest["name"] != name or manifest["version"] != version:
+    sys.exit(f"{path} does not match release tag {sys.argv[1]}")
+print(name)
+PYTAG
 }
 
-# The workspace version, which every package manifest must repeat.
+packages() {
+    release_package
+}
+
 release_version() {
-    version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)
-    [ -n "$version" ] || fail "Cargo.toml names no workspace version"
-    for package in $(packages); do
-        listed=$(manifest_field "ticks/$package/tick-package.json" version)
-        [ "$listed" = "$version" ] ||
-            fail "ticks/$package/tick-package.json names version $listed, not the workspace version $version"
-    done
-    echo "$version"
+    package=$(release_package)
+    manifest_field "ticks/$package/tick-package.json" version
 }
 
 archive_name() {
@@ -81,100 +71,8 @@ summarize() {
     fi
 }
 
-# Whether the marketplace file `$1` lists any package at version `$2`.
-lists_version() {
-    python3 -I -c '
-import json, sys
-marketplace_path, version = sys.argv[1:]
-with open(marketplace_path) as marketplace_file:
-    marketplace = json.load(marketplace_file)
-sys.exit(0 if any(package["version"] == version for package in marketplace["packages"]) else 1)
-' "$1" "$2"
-}
-
-# The remote tag `$2` of the repository `$1`: 0 when it exists, 2 when it does not.
-remote_tag_status() {
-    status=0
-    GIT_OPTIONAL_LOCKS=0 git ls-remote --exit-code --refs "$1" "refs/tags/$2" >/dev/null 2>&1 ||
-        status=$?
-    return "$status"
-}
-
-tag_release() {
-    is_check=false
-    case ${1:-} in
-    --check) is_check=true ;;
-    "") ;;
-    *) usage ;;
-    esac
-    export GIT_OPTIONAL_LOCKS=0
-    commit=$(git rev-parse --verify --quiet 'HEAD^{commit}') || fail "HEAD must be a committed snapshot."
-    [ "$(git cat-file -t "HEAD:$release_workflow" 2>/dev/null)" = blob ] ||
-        fail "The committed snapshot must contain $release_workflow."
-    for direction in fetch push; do
-        if [ "$direction" = push ]; then
-            urls=$(git remote get-url --push --all origin 2>/dev/null) || urls=""
-        else
-            urls=$(git remote get-url --all origin 2>/dev/null) || urls=""
-        fi
-        case $urls in
-        "git@github.com:$source_repository" | "git@github.com:$source_repository.git" | \
-            "ssh://git@github.com/$source_repository" | "ssh://git@github.com/$source_repository.git" | \
-            "https://github.com/$source_repository" | "https://github.com/$source_repository.git") ;;
-        *) fail "origin must have exactly one fetch and one push URL for github.com/$source_repository." ;;
-        esac
-    done
-    [ -z "$(git status --porcelain)" ] ||
-        fail "The working tree has uncommitted changes; commit them, so the release is built from HEAD."
-
-    version=$(release_version)
-    tag=$release_tag_prefix$version
-    ref=refs/tags/$tag
-    if git show-ref --verify --quiet "$ref"; then
-        fail "$tag already exists locally; inspect it before trying another release."
-    fi
-    status=0
-    remote_tag_status origin "$tag" || status=$?
-    case $status in
-    0) fail "$tag already exists on origin; inspect it before trying another release." ;;
-    2) ;;
-    *) fail "Could not check tags on origin. Check remote access before releasing." ;;
-    esac
-    marketplace=$(mktemp "${TMPDIR:-/tmp}/release-ticks-marketplace.XXXXXX")
-    trap 'rm -f "$marketplace"' EXIT
-    curl -fsSL -o "$marketplace" "$marketplace_url" ||
-        fail "Could not read the marketplace at $marketplace_url."
-    if lists_version "$marketplace" "$version"; then
-        fail "The marketplace already lists version $version; raise the workspace version to release again."
-    fi
-    for package in $(packages); do
-        status=0
-        remote_tag_status "https://github.com/$marketplace_repository" "$package-v$version" ||
-            status=$?
-        case $status in
-        0) fail "$marketplace_repository already has the release $package-v$version; raise the workspace version to release again." ;;
-        2) ;;
-        *) fail "Could not check the tags of $marketplace_repository. Check network access before releasing." ;;
-        esac
-    done
-    if $is_check; then
-        echo "Ready to release $tag from $commit. No Git changes were made."
-        return
-    fi
-
-    unset GIT_OPTIONAL_LOCKS
-    git tag -a "$tag" -m "Tick packages $version" "$commit" || fail "Could not create $tag."
-    git push --porcelain origin "$ref:$ref" >/dev/null ||
-        fail "Push of $tag failed. The local tag remains at $commit. Check the remote tag with git ls-remote --tags origin $ref; if absent, push only $ref after resolving the error."
-    echo "Published $tag from $commit to origin. GitHub Actions releases the Tick packages:"
-    echo "https://github.com/$source_repository/actions/workflows/$(basename "$release_workflow")"
-}
-
 build_release() {
     version=$(release_version)
-    if [ -n "${RELEASE_TAG:-}" ] && [ "$RELEASE_TAG" != "$release_tag_prefix$version" ]; then
-        fail "The release tag $RELEASE_TAG does not name the workspace version $version."
-    fi
     names=$(packages)
     for package in $names; do
         dependencies=$(cargo tree --locked --manifest-path "ticks/$package/Cargo.toml" \
@@ -253,9 +151,7 @@ publish_release() {
     [ -f "$marketplace" ] && [ -f "$readme" ] ||
         fail "$checkout is not a checkout of $marketplace_repository: it has no marketplace.json or README.md"
     version=$(release_version)
-    tag=${RELEASE_TAG:-$release_tag_prefix$version}
-    [ "$tag" = "$release_tag_prefix$version" ] ||
-        fail "The release tag $tag does not name the workspace version $version."
+    tag=$RELEASE_TAG
     commit=${RELEASE_COMMIT:-$(git rev-parse HEAD)}
     source=${GITHUB_REPOSITORY:-$source_repository}
     names=$(packages)
@@ -277,7 +173,7 @@ publish_release() {
                 --dir "$scratch/$release" ||
                 fail "Could not download $name from the existing release $release."
             [ "$(sha256_of "$scratch/$release/$name")" = "$sha256" ] ||
-                fail "The release $release already exists with another $name; raise the workspace version to release again."
+                fail "The release $release already exists with another $name; raise this package version to release again."
             published="$published $release"
             echo "The release $release already carries this archive."
         elif printf '%s\n' "$view" | grep -qi 'not found'; then
@@ -313,6 +209,8 @@ for name in names:
     with open(f"{archives}/{archive_name}", "rb") as archive_file:
         sha256 = hashlib.sha256(archive_file.read()).hexdigest()
     listed = packages.get(name)
+    if listed and tuple(map(int, listed["version"].split("."))) > tuple(map(int, version.split("."))):
+        sys.exit(f"marketplace.json already lists newer {name} {listed['version']}; refusing to downgrade to {version}")
     if listed and listed["version"] == version:
         listed_sha256 = listed["downloads"].get(target, {}).get("sha256")
         if listed_sha256 != sha256:
@@ -386,7 +284,7 @@ verify_release() {
     [ "$#" -eq 1 ] || usage
     archives=$(CDPATH='' cd "$1" && pwd -P)
     version=$(release_version)
-    tag=${RELEASE_TAG:-$release_tag_prefix$version}
+    tag=$RELEASE_TAG
     commit=${RELEASE_COMMIT:-$(git rev-parse HEAD)}
     published=$(for package in $(packages); do printf ' %s' "$package-v$version"; done)
     scratch=$(mktemp -d "${TMPDIR:-/tmp}/release-ticks.XXXXXX")
@@ -413,7 +311,6 @@ verify_release() {
 command=$1
 shift
 case $command in
-tag) tag_release "$@" ;;
 build)
     [ "$#" -eq 0 ] || usage
     build_release
