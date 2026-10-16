@@ -2771,10 +2771,7 @@ impl Agent {
             .await
             .map_err(AgentError::Storage)?;
         let tools = self.create_chat_tools(&snapshot);
-        let skills = tickloop_agent_config::skills::SkillRegistry::discover(
-            &snapshot.workdir,
-            self.inner.config_root.as_deref(),
-        );
+        let skills = self.discover_skills(&snapshot.workdir);
         self.inner
             .subagent_registry
             .lock()

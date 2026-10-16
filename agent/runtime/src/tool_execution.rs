@@ -26,7 +26,8 @@ enum ToolRoute {
     BuiltIn,
     Plan,
     Interaction,
-    Skill,
+    /// The Skills whose listing the request sent, which its Skill calls expand against.
+    Skill(Arc<tickloop_agent_config::skills::SkillRegistry>),
     TickSubscription,
     Delegation,
     AgentMessage,
@@ -158,7 +159,7 @@ impl ToolRegistry {
                 .into_iter()
                 .map(|definition| RegisteredTool {
                     definition,
-                    route: ToolRoute::Skill,
+                    route: ToolRoute::Skill(chat.skills.clone()),
                 }),
         );
         if let Some(provider) = host_provider {
@@ -185,6 +186,20 @@ impl ToolRegistry {
             .iter()
             .map(|tool| tool.definition.clone())
             .collect()
+    }
+
+    pub(super) fn refresh_skills(&mut self, chat: &Chat) {
+        if let Some(tool) = self
+            .tools
+            .iter_mut()
+            .find(|tool| matches!(tool.route, ToolRoute::Skill(_)))
+            && let Some(definition) = chat
+                .skills
+                .tool_definition_for_context(context::context_window(&chat.snapshot))
+        {
+            tool.definition = definition;
+            tool.route = ToolRoute::Skill(chat.skills.clone());
+        }
     }
 
     pub(super) fn host_tool_names(&self) -> std::collections::BTreeSet<String> {
@@ -485,7 +500,7 @@ impl Agent {
                 self.subagent_tool(receipt, &operation.call_id, prepared, cancel)
                     .await
             }
-            ToolRoute::Skill => self.skill_tool(receipt, &operation.input).await,
+            ToolRoute::Skill(skills) => self.skill_tool(receipt, skills, &operation.input).await,
             ToolRoute::TickSubscription => {
                 self.tick_subscription_tool(receipt, &operation.name, &operation.input, authority)
                     .await

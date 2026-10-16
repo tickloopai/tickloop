@@ -175,17 +175,23 @@ pub fn sdk_error(error: longbridge::Error) -> Error {
     }
 }
 
-/// An entitlement gap is not a network failure: the fundamentals endpoints refuse a credential
-/// whose data center or quote permissions do not cover them, and that exits as not authorized.
+/// An entitlement gap is not a network failure. A credential from another data center than the
+/// fundamentals endpoints need is fixed by logging in with the other server, so it exits as not
+/// authorized; an account without the quote permission they need stays without it after a new
+/// login, so that is a request Longbridge turned down, with its reason.
 pub fn fundamentals_error(error: longbridge::Error) -> Error {
-    let restricted = matches!(
+    let is_other_data_center = matches!(
         &error,
         longbridge::Error::HttpClient(
             longbridge::httpclient::HttpClientError::DcRegionRestricted { .. }
         )
-    ) || error.openapi_error_code() == Some(NO_QUOTE_PERMISSION);
-    if restricted {
+    );
+    if is_other_data_center {
         not_authorized(format!("Longbridge entitlement does not cover {error}"))
+    } else if error.openapi_error_code() == Some(NO_QUOTE_PERMISSION) {
+        Error::rejected(format!(
+            "the Longbridge account has no quote permission for this: {error}"
+        ))
     } else {
         sdk_error(error)
     }
@@ -1069,7 +1075,6 @@ mod tests {
         for error in [
             sdk_error(longbridge::Error::OAuth("refresh failed".into())),
             sdk_error(open_api(TOKEN_EXPIRED)),
-            fundamentals_error(open_api(NO_QUOTE_PERMISSION)),
             fundamentals_error(longbridge::Error::HttpClient(
                 HttpClientError::DcRegionRestricted {
                     path: "/v1/quote/financial-consensus".into(),
@@ -1084,5 +1089,22 @@ mod tests {
         let rejected = sdk_error(open_api(INVALID_REQUEST));
         assert_eq!(rejected.code, tick_provider::exit_code::NETWORK);
         assert!(!rejected.message.contains(crate::AUTH_HINT), "{rejected}");
+    }
+
+    /// Logging in again does not give an account a quote permission it lacks, so a missing one
+    /// is a request turned down with its reason, not a request to log in.
+    #[test]
+    fn a_missing_quote_permission_is_turned_down_without_asking_to_log_in() {
+        let error = fundamentals_error(open_api(NO_QUOTE_PERMISSION));
+        assert!(!asks_to_log_in(&error), "{error}");
+        assert!(error.rejected, "{error}");
+        assert_eq!(error.code, tick_provider::exit_code::NETWORK);
+        assert!(
+            error
+                .message
+                .starts_with("the Longbridge account has no quote permission for this: "),
+            "{error}"
+        );
+        assert!(!error.message.contains(crate::AUTH_HINT), "{error}");
     }
 }

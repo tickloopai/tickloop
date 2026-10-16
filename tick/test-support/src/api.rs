@@ -27,10 +27,17 @@ pub struct MockApi {
     state: Arc<Mutex<MockState>>,
     events: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<MarketEvent>>>,
     producer: tokio::task::JoinHandle<()>,
+    source: &'static str,
 }
 
 impl MockApi {
     pub fn new() -> Result<Self> {
+        Self::named(crate::SOURCE)
+    }
+
+    /// The same mock data under another source's name, such as `longbridge`, for layouts that
+    /// show the source.
+    pub fn named(source: &'static str) -> Result<Self> {
         let quotes = serde_json::from_str(r#"[
             {"symbol":"TSLA.US","name":"Demo · Tesla","latest_price":"248.5","previous_close":"240","open":"241.2","high":"250.6","low":"239.8","volume":72350000},
             {"symbol":"700.HK","name":"Demo · 腾讯控股","latest_price":"480.2","previous_close":"492","open":"490","high":"493.8","low":"478.6","volume":15840000},
@@ -103,6 +110,7 @@ impl MockApi {
             state,
             events: Mutex::new(Some(events)),
             producer,
+            source,
         })
     }
 }
@@ -116,7 +124,7 @@ impl Drop for MockApi {
 #[async_trait]
 impl QuoteApi for MockApi {
     fn source_name(&self) -> &'static str {
-        crate::SOURCE
+        self.source
     }
     async fn quotes(&self, symbols: &[String]) -> Result<Vec<Quote>> {
         let state = self.state.lock().unwrap();

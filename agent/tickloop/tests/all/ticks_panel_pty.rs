@@ -303,15 +303,15 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
     );
     assert!(frame.contains("◉ sample · The sample package"), "{frame}");
     terminal.press(b"\r", "the update", |frame| {
-        frame.contains("Updated alpha 1.0.0 to 2.0.0; its Skill loads in a new Chat (/clear)")
+        frame.contains("Updated alpha 1.0.0 to 2.0.0")
+            && !frame.contains("new Chat")
             && row_shows(frame, "alpha", "2.0.0 · installed")
     });
     terminal.press(b"j", "sample selected", |frame| {
         is_selected(frame, "sample")
     });
     terminal.press(b"\r", "the install", |frame| {
-        frame.contains("Installed sample 1.0.0; its Skill loads in a new Chat (/clear)")
-            && row_shows(frame, "sample", "1.0.0 · installed")
+        frame.contains("Installed sample 1.0.0") && row_shows(frame, "sample", "1.0.0 · installed")
     });
     assert!(
         fixture

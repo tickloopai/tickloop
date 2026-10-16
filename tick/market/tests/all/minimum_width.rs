@@ -25,6 +25,8 @@ const SCROLL_HINT: &str = "scroll";
 struct Scenario {
     kind: TickKind,
     event_chart: bool,
+    /// The source the mock data is named after; the mock's own name when `None`.
+    source: Option<&'static str>,
     keys: Vec<KeyCode>,
     shows: &'static [&'static str],
 }
@@ -33,6 +35,7 @@ fn scenario(kind: TickKind, keys: &[KeyCode], shows: &'static [&'static str]) ->
     Scenario {
         kind,
         event_chart: false,
+        source: None,
         keys: keys.to_vec(),
         shows,
     }
@@ -205,6 +208,20 @@ fn every_tick() -> Vec<Scenario> {
                 "· estimates not archived",
             ],
         ),
+        // The longest source a live read names, with its time read to the nanosecond: the
+        // short mock name once hid that the caveat overflowed the minimum width.
+        Scenario {
+            source: Some("longbridge"),
+            ..scenario(
+                TickKind::Earnings,
+                &[KeyCode::Enter],
+                &[
+                    "TSLA.US · Earnings · FY2026-Q2",
+                    "Longbridge · ",
+                    " UTC · estimates not archived",
+                ],
+            )
+        },
         scenario(
             TickKind::Earnings,
             &[KeyCode::Char('r')],
@@ -345,7 +362,11 @@ async fn render_keys(
     rows: u16,
     codes: Vec<KeyCode>,
 ) -> Vec<Vec<String>> {
-    let api = MockApi::new().unwrap();
+    let api = match scenario.source {
+        Some(source) => MockApi::named(source),
+        None => MockApi::new(),
+    }
+    .unwrap();
     let settings = Settings::default();
     let mut terminal = Terminal::new(TestBackend::new(columns, rows)).unwrap();
     let mut updates = TickStream::in_memory(scenario.kind);

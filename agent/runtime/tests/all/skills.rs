@@ -1,12 +1,19 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::json;
+use tick_packages::{MANIFEST_FILE_NAME, PackageStore};
 use tickloop_agent_config::skills::{SkillCaller, SkillError, SkillRegistry};
-use tickloop_agent_protocol::{Content, LoopState, SkillSource};
+use tickloop_agent_model::ModelRequest;
+use tickloop_agent_protocol::{Content, EventKind, ExecutionMode, LoopState, Receipt, SkillSource};
 use tickloop_agent_runtime::Agent;
 
-use tickloop_agent_test_support::{ScriptedModel, call, config, text};
+use tickloop_agent_test_support::routed::{RoutedModel, has_tool_result, state};
+use tickloop_agent_test_support::{
+    ScriptedModel, auto_classification, call, config, next_event, text,
+};
 
 fn write_skill(directory: &std::path::Path, name: &str, frontmatter: &str, body: &str) {
     let skill_directory = directory.join(name);
@@ -525,4 +532,414 @@ async fn compacted_skill_guidance_is_restored_with_per_skill_and_total_budgets()
     assert!(restored.iter().all(|body| body.len() <= 20_000));
     assert!(restored.iter().map(|body| body.len()).sum::<usize>() <= 100_000);
     assert!(restored.iter().any(|body| body.contains("truncated")));
+}
+
+/// Installs version `version` of the Tick package `name` into `packages`, as `/ticks` or
+/// `tickloop tick` would from another process, with a `usage` Skill described as `description`.
+fn install_package(
+    directory: &Path,
+    packages: &PackageStore,
+    name: &str,
+    version: &str,
+    description: &str,
+) {
+    let source = directory.join("sources").join(name).join(version);
+    fs::create_dir_all(source.join("bin")).unwrap();
+    fs::write(
+        source.join(MANIFEST_FILE_NAME),
+        json!({
+            "name": name,
+            "version": version,
+            "description": format!("The {name} package"),
+            "executable": format!("bin/tick-{name}"),
+            "protocol": true,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let program = source.join("bin").join(format!("tick-{name}"));
+    fs::write(&program, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    write_skill(
+        &source.join("skills"),
+        "usage",
+        &format!("name: usage\ndescription: {description}"),
+        &format!("Run tick-{name} {version}."),
+    );
+    packages.install_path(&source).unwrap();
+}
+
+/// Waits for the run `receipt` started to end.
+async fn finish(
+    events: &mut tokio::sync::broadcast::Receiver<tickloop_agent_protocol::Event>,
+    receipt: &Receipt,
+) {
+    loop {
+        let event = next_event(events).await;
+        match event.kind {
+            EventKind::Completed { .. } if event.run_id == receipt.run_id => return,
+            EventKind::Failed(error) if event.run_id == receipt.run_id => panic!("{error}"),
+            _ => {}
+        }
+    }
+}
+
+/// The Skill tool's description the model saw in request `index`.
+fn skill_listing(model: &ScriptedModel, index: usize) -> String {
+    model.requests.lock().unwrap()[index]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "Skill")
+        .map(|tool| tool.description.clone())
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_package_installed_mid_chat_reaches_its_next_request_and_leaves_with_its_uninstall() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let config_root = root.join("config");
+    let packages = PackageStore::in_config_root(&config_root);
+    let workdir = root.join("work");
+    fs::create_dir(&workdir).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        text("No package yet."),
+        call("usage", "Skill", json!({"skill": "quotes:usage"})),
+        text("Loaded."),
+        text("Read it."),
+        text("Gone."),
+    ]));
+    let agent = Agent::open(config_root.clone(), config(), model.clone()).unwrap();
+    agent
+        .trust_working_directory(workdir.clone())
+        .await
+        .unwrap();
+    let chat = agent.create_chat(workdir.clone()).await.unwrap();
+    let mut events = agent.subscribe();
+
+    let receipt = agent.submit(chat, None, "Quotes?".into()).await.unwrap();
+    finish(&mut events, &receipt).await;
+    assert!(!skill_listing(&model, 0).contains("quotes:usage"));
+
+    install_package(&root, &packages, "quotes", "1.0.0", "Read quotes");
+    let receipt = agent
+        .submit(chat, None, "Quotes now?".into())
+        .await
+        .unwrap();
+    finish(&mut events, &receipt).await;
+    assert!(
+        skill_listing(&model, 1).contains("- quotes:usage: Read quotes"),
+        "{}",
+        skill_listing(&model, 1)
+    );
+    let loaded = serde_json::to_string(&model.requests.lock().unwrap()[2].messages).unwrap();
+    assert!(loaded.contains("Launching skill: quotes:usage"), "{loaded}");
+    assert!(loaded.contains("Run tick-quotes 1.0.0."), "{loaded}");
+
+    let receipt = agent
+        .invoke_skill(chat, None, "/quotes:usage", "")
+        .await
+        .unwrap();
+    finish(&mut events, &receipt).await;
+    let invoked = serde_json::to_string(&model.requests.lock().unwrap()[3].messages).unwrap();
+    assert!(invoked.contains("/quotes:usage"), "{invoked}");
+
+    packages.uninstall("quotes").unwrap();
+    assert!(!agent.has_skill(chat, "quotes:usage").await.unwrap());
+    assert!(
+        agent
+            .invoke_skill(chat, None, "/quotes:usage", "")
+            .await
+            .is_err()
+    );
+    let receipt = agent.submit(chat, None, "And now?".into()).await.unwrap();
+    finish(&mut events, &receipt).await;
+    assert!(!skill_listing(&model, 4).contains("quotes:usage"));
+    agent.shutdown().await;
+}
+
+/// An Agent whose config root is `config_root`, with a Chat in `workdir` and the replies it gives,
+/// one per request.
+async fn agent_in(
+    config_root: &Path,
+    workdir: &Path,
+    replies: usize,
+) -> (Agent, uuid::Uuid, Arc<ScriptedModel>) {
+    let model = Arc::new(ScriptedModel::new(
+        (0..replies)
+            .map(|reply| text(&format!("Reply {reply}.")))
+            .collect(),
+    ));
+    let agent = Agent::open(config_root.to_path_buf(), config(), model.clone()).unwrap();
+    agent
+        .trust_working_directory(workdir.to_path_buf())
+        .await
+        .unwrap();
+    let chat = agent.create_chat(workdir.to_path_buf()).await.unwrap();
+    (agent, chat, model)
+}
+
+#[tokio::test]
+async fn unchanged_skills_send_the_same_skill_tool_definition_so_the_prompt_cache_holds() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let config_root = root.join("config");
+    let workdir = root.join("work");
+    fs::create_dir(&workdir).unwrap();
+    install_package(
+        &root,
+        &PackageStore::in_config_root(&config_root),
+        "quotes",
+        "1.0.0",
+        "Read quotes",
+    );
+    let (agent, chat, model) = agent_in(&config_root, &workdir, 2).await;
+    let mut events = agent.subscribe();
+
+    for prompt in ["One", "Two"] {
+        let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+        finish(&mut events, &receipt).await;
+    }
+
+    let skill_tool = |index: usize| {
+        model.requests.lock().unwrap()[index]
+            .tools
+            .iter()
+            .find(|tool| tool.name == "Skill")
+            .map(|tool| serde_json::to_string(tool).unwrap())
+            .unwrap()
+    };
+    assert!(skill_tool(0).contains("quotes:usage"));
+    assert_eq!(skill_tool(0), skill_tool(1));
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_edited_user_skill_description_shows_at_the_next_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let config_root = root.join("config");
+    let workdir = root.join("work");
+    fs::create_dir(&workdir).unwrap();
+    let user_skills = config_root.join("skills");
+    write_skill(
+        &user_skills,
+        "notes",
+        "name: notes\ndescription: Take notes",
+        "Write notes.",
+    );
+    let (agent, chat, model) = agent_in(&config_root, &workdir, 2).await;
+    let mut events = agent.subscribe();
+
+    let receipt = agent.submit(chat, None, "One".into()).await.unwrap();
+    finish(&mut events, &receipt).await;
+    assert!(skill_listing(&model, 0).contains("- notes: Take notes\n"));
+
+    write_skill(
+        &user_skills,
+        "notes",
+        "name: notes\ndescription: Take dated notes",
+        "Write dated notes.",
+    );
+    let receipt = agent.submit(chat, None, "Two".into()).await.unwrap();
+    finish(&mut events, &receipt).await;
+    assert!(
+        skill_listing(&model, 1).contains("- notes: Take dated notes\n"),
+        "{}",
+        skill_listing(&model, 1)
+    );
+    agent.shutdown().await;
+}
+
+/// Whether `request` offers the Skill `name`.
+fn lists_skill(request: &ModelRequest, name: &str) -> bool {
+    request
+        .tools
+        .iter()
+        .any(|tool| tool.name == "Skill" && tool.description.contains(&format!("- {name}:")))
+}
+
+#[tokio::test]
+async fn a_subagent_sees_a_package_installed_or_uninstalled_at_its_next_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let config_root = root.join("config");
+    let packages = PackageStore::in_config_root(&config_root);
+    let workdir = root.join("work");
+    fs::create_dir(&workdir).unwrap();
+    let model = Arc::new(RoutedModel::new(|request| {
+        if state(request)["delegation"].is_null() {
+            return if has_tool_result(request, "delegate") {
+                text("parent done")
+            } else {
+                call(
+                    "delegate",
+                    "Subagent",
+                    json!({"task": "Wait for quotes", "name": "quoter", "run_in_background": true}),
+                )
+            };
+        }
+        if lists_skill(request, "quotes:usage") && !has_tool_result(request, "child-usage") {
+            return call("child-usage", "Skill", json!({"skill": "quotes:usage"}));
+        }
+        text("child idle")
+    }));
+    let agent = Agent::open(config_root.clone(), config(), model.clone()).unwrap();
+    agent
+        .set_auto_reviewer(Arc::new(ScriptedModel::new(
+            (0..8)
+                .map(|_| text(&auto_classification(false).to_string()))
+                .collect(),
+        )))
+        .await;
+    agent
+        .trust_working_directory(workdir.clone())
+        .await
+        .unwrap();
+    let chat = agent.create_chat(workdir.clone()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(chat, None, "Delegate".into()).await.unwrap();
+    finish(&mut events, &receipt).await;
+    let child = agent.subagents(chat).await.unwrap()[0].child_chat_id;
+    let child_requests = || {
+        model
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| !state(request)["delegation"].is_null())
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    install_package(&root, &packages, "quotes", "1.0.0", "Read quotes");
+    let receipt = agent.submit(child, None, "Quotes".into()).await.unwrap();
+    finish(&mut events, &receipt).await;
+    let requests = child_requests();
+    let installed = requests
+        .iter()
+        .position(|request| lists_skill(request, "quotes:usage"))
+        .expect("the subagent's next request lists the installed package's Skill");
+    assert!(
+        requests[..installed]
+            .iter()
+            .all(|request| !lists_skill(request, "quotes:usage"))
+    );
+    let loaded = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+    assert!(loaded.contains("Launching skill: quotes:usage"), "{loaded}");
+    assert!(loaded.contains("Run tick-quotes 1.0.0."), "{loaded}");
+
+    packages.uninstall("quotes").unwrap();
+    let receipt = agent.submit(child, None, "Again".into()).await.unwrap();
+    finish(&mut events, &receipt).await;
+    assert!(!lists_skill(
+        child_requests().last().unwrap(),
+        "quotes:usage"
+    ));
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn rediscovery_during_a_model_request_preserves_its_skill_body_snapshot() {
+    struct PausedModel {
+        scripted: ScriptedModel,
+        entered: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+        pause_next: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl tickloop_agent_model::ModelClient for PausedModel {
+        fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
+            self.scripted.identity()
+        }
+
+        async fn generate_title(
+            &self,
+            request: ModelRequest,
+            events: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+            self.scripted.generate_title(request, events, cancel).await
+        }
+
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            events: tokio::sync::mpsc::UnboundedSender<tickloop_agent_model::ModelDelta>,
+            cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<tickloop_agent_model::ModelOutput, tickloop_agent_model::ModelError> {
+            if self
+                .pause_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.entered.notify_one();
+                tokio::select! {
+                    () = cancel.cancelled() => return Err(tickloop_agent_model::ModelError::Cancelled),
+                    () = self.resume.notified() => {},
+                }
+            }
+            self.scripted.complete(request, events, cancel).await
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join(".git")).unwrap();
+    let skill_root = directory.path().join(".tickloop/skills");
+    write_skill(
+        &skill_root,
+        "notes",
+        "name: notes\ndescription: Original notes",
+        "Original skill guidance.",
+    );
+    let model = Arc::new(PausedModel {
+        scripted: ScriptedModel::new(vec![
+            call("load", "Skill", json!({"skill":"notes"})),
+            text("done"),
+        ]),
+        entered: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+        pause_next: std::sync::atomic::AtomicBool::new(true),
+    });
+    let agent = Agent::new(config(), model.clone());
+    agent
+        .trust_working_directory(directory.path().into())
+        .await
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(chat, None, "Use notes".into()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), model.entered.notified())
+        .await
+        .unwrap();
+    write_skill(
+        &skill_root,
+        "notes",
+        "name: notes\ndescription: Updated notes",
+        "Updated skill guidance.",
+    );
+    assert!(agent.has_skill(chat, "notes").await.unwrap());
+    model.resume.notify_one();
+    finish(&mut events, &receipt).await;
+    {
+        let requests = model.scripted.requests.lock().unwrap();
+        let listing = |index: usize| {
+            &requests[index]
+                .tools
+                .iter()
+                .find(|tool| tool.name == "Skill")
+                .unwrap()
+                .description
+        };
+        assert!(listing(0).contains("Original notes"));
+        assert!(listing(1).contains("Updated notes"));
+        let history = serde_json::to_string(&requests[1].messages).unwrap();
+        assert!(history.contains("Original skill guidance."));
+        assert!(!history.contains("Updated skill guidance."));
+    }
+    agent.shutdown().await;
 }

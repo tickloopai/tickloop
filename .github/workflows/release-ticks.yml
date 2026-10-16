@@ -1,0 +1,130 @@
+name: Release Tick packages
+run-name: Release Tick packages ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - 'ticks-v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ticks-release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  RELEASE_TAG: ${{ github.ref_name }}
+  RELEASE_COMMIT: ${{ github.sha }}
+
+# Each stage is its own job so a failed stage can be re-run alone ("Re-run failed jobs")
+# without repeating the stages that already passed. A repeated publish keeps the releases an
+# earlier attempt created, as long as they carry the same archives.
+jobs:
+  build:
+    name: Build and verify
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Validate release tag
+        run: |
+          if ! printf '%s\n' "$RELEASE_TAG" | grep -Eqx 'ticks-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'; then
+            echo "::error::Expected a ticks-vX.Y.Z release tag, not $RELEASE_TAG"
+            exit 1
+          fi
+
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-apple-darwin
+          rustup default stable
+
+      - name: Restore the Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ticks-release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ticks-release-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build and check the packages
+        run: scripts/release-ticks.sh build
+
+      - name: Keep the archives for publishing and verification
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tick-packages-${{ github.sha }}
+          path: dist/release
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish to the Tick marketplace
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: tick-marketplace
+      url: https://github.com/tickloopai/ticks
+    steps:
+      - name: Check the marketplace token
+        env:
+          TICKS_RELEASE_TOKEN: ${{ secrets.TICKS_RELEASE_TOKEN }}
+        run: |
+          if [ -z "$TICKS_RELEASE_TOKEN" ]; then
+            echo '::error::Configure the TICKS_RELEASE_TOKEN Actions secret (a fine-grained token with Contents read and write on tickloopai/ticks) before releasing Tick packages.'
+            exit 1
+          fi
+
+      - name: Check out the tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Check out the marketplace
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: tickloopai/ticks
+          token: ${{ secrets.TICKS_RELEASE_TOKEN }}
+          path: marketplace
+
+      - name: Restore the archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tick-packages-${{ github.sha }}
+          path: dist/release
+
+      - name: Create the releases and update the marketplace
+        env:
+          GH_TOKEN: ${{ secrets.TICKS_RELEASE_TOKEN }}
+        run: |
+          printf '### Tick packages %s\n\nCommit: %s\n\n' "$RELEASE_TAG" "$RELEASE_COMMIT" >> "$GITHUB_STEP_SUMMARY"
+          scripts/release-ticks.sh publish marketplace dist/release
+
+  verify:
+    name: Verify downloads
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Restore the archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tick-packages-${{ github.sha }}
+          path: dist/release
+
+      - name: Download every release asset anonymously
+        run: scripts/release-ticks.sh verify dist/release
