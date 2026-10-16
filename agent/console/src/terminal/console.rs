@@ -20247,7 +20247,7 @@ mod tests {
                     [
                         "Model",
                         "Thinking",
-                        "Thinking",
+                        "Effort",
                         "Execution mode",
                         "shift+tab modes",
                         "Session status",
