@@ -24,7 +24,8 @@ pub enum LoginError {
     Denied,
     /// The device code expired before the user approved it.
     Expired,
-    /// The server refused a request with the OAuth error `code` (RFC 6749 section 5.2).
+    /// The server refused a request (RFC 6749 section 5.2): a 400 with the OAuth error `code`, or
+    /// a 401, whose `code` is `HTTP 401 Unauthorized` when it names none.
     Refused {
         code: String,
         message: String,

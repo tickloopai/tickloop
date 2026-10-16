@@ -73,7 +73,8 @@ impl TokenResponse {
 /// What an endpoint answered.
 pub(crate) enum Answer {
     Success(Vec<u8>),
-    /// An OAuth error response: 400 or 401 with a valid `error` code (RFC 6749 section 5.2).
+    /// An OAuth error response (RFC 6749 section 5.2): a 400 with a valid `error` code, or any
+    /// 401; its code, or `HTTP 401 Unauthorized` for a bare 401.
     Refused(String),
     /// Any other status, which may well pass, such as a 503 while the server restarts.
     Unexpected(StatusCode),
@@ -211,19 +212,24 @@ pub(crate) fn parse<T: DeserializeOwned>(body: &[u8]) -> Option<T> {
     serde_json::from_slice(body).ok()
 }
 
-/// The `error` of an OAuth error response (RFC 6749 section 5.2): only a 400 or 401 whose body
-/// names a valid error code, printable ASCII but '"' and '\'.
+/// What refuses a request (RFC 6749 section 5.2): a 400 whose body names a valid error code,
+/// printable ASCII but '"' and '\', or any 401, which a server may send bare for a client or
+/// token it no longer accepts; a bare 401 is named by its status.
 fn oauth_error(status: StatusCode, body: &[u8]) -> Option<String> {
-    if status != StatusCode::BAD_REQUEST && status != StatusCode::UNAUTHORIZED {
-        return None;
+    let code = parse::<ErrorResponse>(body)
+        .map(|response| response.error)
+        .filter(|error| {
+            !error.is_empty()
+                && error.len() <= MAX_ERROR_CODE_LENGTH
+                && error
+                    .bytes()
+                    .all(|byte| (0x20..=0x7e).contains(&byte) && byte != b'"' && byte != b'\\')
+        });
+    match status {
+        StatusCode::UNAUTHORIZED => Some(code.unwrap_or_else(|| format!("HTTP {status}"))),
+        StatusCode::BAD_REQUEST => code,
+        _ => None,
     }
-    let ErrorResponse { error } = parse(body)?;
-    let is_code = !error.is_empty()
-        && error.len() <= MAX_ERROR_CODE_LENGTH
-        && error
-            .bytes()
-            .all(|byte| (0x20..=0x7e).contains(&byte) && byte != b'"' && byte != b'\\');
-    is_code.then_some(error)
 }
 
 fn is_on_this_machine(url: &Url) -> bool {

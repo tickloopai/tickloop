@@ -12,7 +12,8 @@ use crate::{
 /// Why a token was not renewed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RefreshError {
-    /// The server refused the refresh token with this OAuth error code: the login is over.
+    /// The server refused the refresh token, with a 400 and this OAuth error code or with a 401
+    /// (`HTTP 401 Unauthorized` when bare): the login is over.
     Refused(String),
     /// The server could not be reached or answered something else; a later renewal may pass.
     Failed(String),

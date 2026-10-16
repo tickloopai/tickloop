@@ -59,15 +59,16 @@ async fn a_renewal_keeps_what_the_server_does_not_replace() {
     assert!(renewed.expires_at <= now() + 60);
 }
 
-/// Only a 400 or 401 with an OAuth error refuses the refresh token; a server that fails, even
-/// with an OAuth error in its body, leaves the login for a later renewal.
+/// A 400 with an OAuth error, or any 401, even bare, refuses the refresh token; a server that
+/// fails, even with an OAuth error in its body, leaves the login for a later renewal.
 #[tokio::test]
-async fn only_an_oauth_error_response_refuses_a_renewal() {
+async fn only_an_oauth_error_response_or_a_401_refuses_a_renewal() {
     let server = AuthorizationServer::start();
     let saved = token(&server, Some("refresh-old"));
     server.answer_polls([
         TokenReply::Error(400, "invalid_grant".into()),
         TokenReply::Error(401, "invalid_client".into()),
+        TokenReply::Status(401),
         TokenReply::Error(503, "temporarily_unavailable".into()),
         TokenReply::Error(500, "invalid_grant".into()),
         TokenReply::Status(400),
@@ -77,6 +78,7 @@ async fn only_an_oauth_error_response_refuses_a_renewal() {
     let expected = [
         RefreshError::Refused("invalid_grant".into()),
         RefreshError::Refused("invalid_client".into()),
+        RefreshError::Refused("HTTP 401 Unauthorized".into()),
         RefreshError::Failed(format!(
             "{issuer}{TOKEN_PATH} answered HTTP 503 Service Unavailable"
         )),

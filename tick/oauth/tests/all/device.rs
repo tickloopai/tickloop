@@ -213,6 +213,17 @@ async fn a_refused_expired_or_cancelled_login_saves_nothing() {
     );
     assert!(!error.to_string().contains("device-secret"), "{error}");
 
+    // A bare 401 refuses too: the server no longer accepts what the poll sent.
+    let login = Login::new();
+    login.server.answer_polls([TokenReply::Status(401)]);
+    assert!(
+        matches!(
+            login.run().await.unwrap_err(),
+            LoginError::Refused { code, .. } if code == "HTTP 401 Unauthorized"
+        ),
+        "a bare 401 is a refusal"
+    );
+
     // A code that expires before the next poll ends the login without waiting for the server.
     let login = Login::new();
     login
