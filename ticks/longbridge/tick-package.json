@@ -1,14 +1,20 @@
 {
   "name": "longbridge",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Longbridge quotes, watchlist, kline, positions, news, earnings and community posts",
   "executable": "bin/tick-longbridge",
   "protocol": true,
   "auth": {
     "type": "oauth2",
     "issuers": [
-      { "label": "China mainland", "issuer": "https://openapi.longbridge.cn" },
-      { "label": "Global", "issuer": "https://openapi.longbridge.com" }
+      {
+        "label": "China mainland",
+        "issuer": "https://openapi.longbridge.cn"
+      },
+      {
+        "label": "Global",
+        "issuer": "https://openapi.longbridge.com"
+      }
     ]
   }
 }

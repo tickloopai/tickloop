@@ -1,7 +1,7 @@
 [package]
 name = "tickloop-tick-longbridge"
 description = "Longbridge quotes, trading account, news and community posts, with the package's OAuth login and rate limits, and tick-longbridge, which runs the Ticks that read them and can log in on its own"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 publish.workspace = true
 
