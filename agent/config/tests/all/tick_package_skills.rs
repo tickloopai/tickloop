@@ -242,7 +242,7 @@ fn an_unusable_package_or_registry_only_warns() {
 }
 
 /// The `usage` Skills the `longbridge` and `futu` packages ship load as `<package>:usage`, open the
-/// installed program and leave logging in to the user, through `/ticks` or `tickloop tick login`.
+/// installed program and leave logging in to the user, through `/ticks` in the Agent.
 #[test]
 fn the_shipped_package_skills_load_from_an_installed_package() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -276,6 +276,8 @@ fn the_shipped_package_skills_load_from_an_installed_package() {
             format!("bin/{program} auth"),
             "auth status".into(),
             "`! ".into(),
+            "tickloop tick".into(),
+            "--region".into(),
         ] {
             assert!(!content.contains(&retired), "{name}: {retired}");
         }
@@ -284,7 +286,7 @@ fn the_shipped_package_skills_load_from_an_installed_package() {
                 "`login` in `workspace_host.tick_packages`",
                 "`logged_in`",
                 "from `/ticks` in this Agent",
-                "`tickloop tick login longbridge`",
+                "no Agent restart is needed",
                 "never suggest `!` for it",
             ] {
                 assert!(content.contains(login), "{login}");

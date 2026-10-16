@@ -13,10 +13,13 @@ use std::{
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde_json::json;
 use tick_packages::{CURRENT_TARGET, OAuthToken, PackageCredentials};
-use tickloop_agent_test_support::{input_dialog, screen};
+use tickloop_agent_test_support::{
+    authorization_server::{AuthorizationServer, TokenReply, USER_CODE},
+    input_dialog, screen,
+};
 
 use crate::tick_package_commands::{
-    Fixture, Reply, Server, archive_of, marketplace_json, offered, path_text, succeeded,
+    Fixture, Reply, Server, archive_of, marketplace_json, oauth2, offered, path_text, succeeded,
 };
 
 const COLUMNS: u16 = 110;
@@ -335,14 +338,10 @@ fn the_ticks_panel_installs_updates_logs_out_and_uninstalls() {
     assert!(frame.contains("enter confirm · esc back"), "{frame}");
     input_dialog::assert_frame(&frame, usize::from(ROWS), "Tick packages");
 
-    // Until /ticks logs in itself, Log in names the terminal command.
-    let frame = terminal.press(b"\r", "how to log in", |frame| {
-        dialog_text(frame).contains("Log in to alpha with tickloop tick login alpha in a terminal")
+    // A login saved elsewhere shows once the list is read again; logging out deletes it.
+    terminal.press(ESCAPE, "the list again", |frame| {
+        !frame.contains("❯ Log in")
     });
-    assert!(
-        panel_is_open(&frame) && !frame.contains("❯ Log in"),
-        "{frame}"
-    );
     save_login(&fixture, "alpha");
     terminal.press(b"r", "the login read again", |frame| {
         row_shows(frame, "alpha", "2.0.0 · logged in")
@@ -428,6 +427,127 @@ fn the_installed_page_works_while_the_marketplace_cannot_be_read() {
     );
     terminal.press(TAB, "the Installed page again", |frame| {
         frame.contains("[Installed]") && row_shows(frame, "alpha", "1.0.0 · needs login")
+    });
+    terminal.press(ESCAPE, "the closed panel", |frame| !panel_is_open(frame));
+    terminal.exit();
+}
+
+#[test]
+fn the_ticks_panel_logs_in_with_a_device_code_or_a_key() {
+    let fixture = Fixture::new();
+    let (server, other) = (AuthorizationServer::start(), AuthorizationServer::start());
+    for package in [
+        fixture.package_with_auth("alpha", "1.0.0", oauth2(&[("Local", server.issuer())])),
+        fixture.package_with_auth(
+            "multi",
+            "1.0.0",
+            oauth2(&[
+                ("China mainland", server.issuer()),
+                ("Global", other.issuer()),
+            ]),
+        ),
+        fixture.package_with_auth(
+            "keyed",
+            "1.0.0",
+            json!({"type": "api_key", "env": "KEYED_API_KEY", "label": "Keyed API key"}),
+        ),
+    ] {
+        install_path(&fixture, &package);
+    }
+    let token_path = fixture.root.join("config/credentials/alpha/oauth2.json");
+    let missing = path_text(&fixture.root.join("missing.json"));
+    let mut terminal = Terminal::start(&fixture, &missing);
+    terminal.wait_for_frame(0, "the prompt", |frame| frame.contains("❯"));
+    terminal.press(b"/ticks\r", "the Installed page", |frame| {
+        ["alpha", "keyed", "multi"]
+            .iter()
+            .all(|name| row_shows(frame, name, "1.0.0 · needs login"))
+    });
+
+    // The panel shows the link and code, and reports what the server answers.
+    server.answer_polls([TokenReply::Denied]);
+    terminal.press(b"\r", "alpha's actions", |frame| frame.contains("❯ Log in"));
+    let frame = terminal.press(b"\r", "the link and code", |frame| {
+        frame.contains(&format!("Enter code: {USER_CODE}"))
+    });
+    let shown = dialog_text(&frame);
+    assert!(
+        shown.contains("Log in to alpha · Local")
+            && shown.contains("Open this link on your own device:")
+            && shown.contains(&format!("{}/verify?user_code={USER_CODE}", server.issuer()))
+            && shown.contains("Waiting for the authorization of alpha. esc cancels.")
+            && shown.contains("❯ Cancel login"),
+        "{frame}"
+    );
+    input_dialog::assert_frame(&frame, usize::from(ROWS), "Tick packages");
+    terminal.wait_for_frame(terminal.mark(), "the refusal", |frame| {
+        dialog_text(frame).contains("Cannot log in to alpha: the authorization was denied")
+            && row_shows(frame, "alpha", "1.0.0 · needs login")
+    });
+
+    server.edit_device_authorization(|device| device["expires_in"] = json!(2));
+    terminal.press(b"\r", "alpha's actions", |frame| frame.contains("❯ Log in"));
+    terminal.press(b"\r", "the expiry", |frame| {
+        dialog_text(frame).contains(
+            "Cannot log in to alpha: the code expired before the authorization was approved",
+        )
+    });
+    server.edit_device_authorization(|device| device["expires_in"] = json!(600));
+
+    // esc cancels a login; a login under way leaves nothing behind.
+    terminal.press(b"\r", "alpha's actions", |frame| frame.contains("❯ Log in"));
+    terminal.press(b"\r", "the code", |frame| {
+        frame.contains(&format!("Enter code: {USER_CODE}"))
+    });
+    terminal.press(ESCAPE, "the cancelled login", |frame| {
+        frame.contains("Cancelled the login to alpha")
+            && row_shows(frame, "alpha", "1.0.0 · needs login")
+    });
+    assert!(!token_path.exists());
+
+    server.answer_polls([TokenReply::Pending, TokenReply::Approve]);
+    terminal.press(b"\r", "alpha's actions", |frame| frame.contains("❯ Log in"));
+    terminal.press(b"\r", "the login", |frame| {
+        frame.contains("Logged in to alpha") && row_shows(frame, "alpha", "1.0.0 · logged in")
+    });
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(&token_path).unwrap()).unwrap();
+    assert_eq!(saved["issuer"], server.issuer());
+    terminal.assert_alive();
+
+    // A package with several issuers offers a login at each.
+    terminal.press(b"jj", "multi selected", |frame| is_selected(frame, "multi"));
+    let frame = terminal.press(b"\r", "multi's actions", |frame| {
+        frame.contains("❯ Log in · China mainland")
+    });
+    assert!(frame.contains("  Log in · Global"), "{frame}");
+    terminal.press(ESCAPE, "the list again", |frame| {
+        !frame.contains("Log in · Global")
+    });
+
+    // A key is typed masked; j and k are text there.
+    terminal.press(b"k", "keyed selected", |frame| is_selected(frame, "keyed"));
+    terminal.press(b"\r", "keyed's actions", |frame| frame.contains("❯ Log in"));
+    let frame = terminal.press(b"\r", "the key entry", |frame| {
+        dialog_text(frame).contains("Enter the Keyed API key.")
+    });
+    assert!(frame.contains("enter save · esc cancel"), "{frame}");
+    let frame = terminal.press(b"jk-secret", "the masked key", |frame| {
+        frame.contains("Keyed API key: *********")
+    });
+    assert!(!frame.contains("jk-secret"), "{frame}");
+    terminal.press(b"\r", "the saved key", |frame| {
+        frame.contains("Saved the key for keyed") && row_shows(frame, "keyed", "1.0.0 · logged in")
+    });
+    assert_eq!(
+        fs::read(fixture.root.join("config/credentials/keyed/api_key")).unwrap(),
+        b"jk-secret"
+    );
+    terminal.press(b"\r", "keyed's actions", |frame| frame.contains("❯ Log in"));
+    terminal.press(CONTROL_N, "log out selected", |frame| {
+        frame.contains("❯ Log out")
+    });
+    terminal.press(b"\r", "the logout", |frame| {
+        frame.contains("Logged out of keyed") && row_shows(frame, "keyed", "1.0.0 · needs login")
     });
     terminal.press(ESCAPE, "the closed panel", |frame| !panel_is_open(frame));
     terminal.exit();

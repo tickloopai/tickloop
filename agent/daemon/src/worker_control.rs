@@ -279,6 +279,8 @@ impl WorkerControl {
                 )
                 .await?;
                 let record = LaunchRecord::opening(operation, chat, adapter, command, cwd, title)?;
+                let environment =
+                    with_package_credentials(environment, &record.command, &config_root);
                 self.launch(&registry, tick_owner, owner_revision, record, environment)
                     .await
                     .map(|opened| json!(opened))
@@ -435,6 +437,8 @@ impl WorkerControl {
                     lost.cwd.clone(),
                     lost.title.clone(),
                 )?;
+                let environment =
+                    with_package_credentials(environment, &record.command, &config_root);
                 match self
                     .launch(&registry, tick_owner, owner_revision, record, environment)
                     .await
@@ -594,6 +598,37 @@ async fn opening_revision(
             "this Chat was stopped and owns no hosted Ticks until it continues",
         )),
     }
+}
+
+/// The worker's launch `environment` with the credentials of the Tick package whose program
+/// `command` runs, read from `config_root` now: a reopen gets the current login, and no record
+/// ever holds a secret. Credentials come from Tickloop alone, so the inherited token file
+/// variable, and the variable a package names for its key, give way to them.
+fn with_package_credentials(
+    mut environment: Vec<(String, String)>,
+    command: &[String],
+    config_root: &Path,
+) -> Vec<(String, String)> {
+    let packages = tick_packages::PackageStore::in_config_root(config_root);
+    // Only the exact canonical path of an installed package's program gets its credentials.
+    let package = command
+        .first()
+        .and_then(|program| program::installed_package_of(Path::new(program), &packages));
+    let key_variable = package
+        .as_ref()
+        .and_then(|package| match &package.manifest.auth {
+            tick_packages::PackageAuth::ApiKey { env, .. } => Some(env.as_str()),
+            _ => None,
+        });
+    environment.retain(|(name, _)| {
+        name != tick_packages::OAUTH_TOKEN_FILE_VARIABLE && Some(name.as_str()) != key_variable
+    });
+    if let Some(package) = &package
+        && let Ok(credentials) = packages.credentials(&package.manifest.name)
+    {
+        environment.extend(credentials.launch_environment(&package.manifest.auth));
+    }
+    environment
 }
 
 /// A stopped Chat has continued once one of its Loops is live again: StopSubagent leaves every
@@ -775,5 +810,148 @@ async fn chat_snapshot(
             "Forbidden",
             "the Chat's state could not be read",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use tick_packages::{ApiKey, OAUTH_TOKEN_FILE_VARIABLE, PackageStore};
+
+    use super::*;
+
+    const KEY: &str = "sample-key-41c7";
+
+    /// Installs the package `name` that logs in as `auth` declares into `config_root`, from
+    /// sources in `directory`, and returns the canonical path of its program.
+    fn install(directory: &Path, config_root: &Path, name: &str, auth: Value) -> PathBuf {
+        let source = directory.join("sources").join(name);
+        std::fs::create_dir_all(source.join("bin")).unwrap();
+        std::fs::write(
+            source.join(tick_packages::MANIFEST_FILE_NAME),
+            json!({
+                "name": name,
+                "version": "1.0.0",
+                "description": "A test package",
+                "executable": format!("bin/tick-{name}"),
+                "protocol": true,
+                "auth": auth,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let program = source.join("bin").join(format!("tick-{name}"));
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let installed = PackageStore::in_config_root(config_root)
+            .install_path(&source)
+            .unwrap()
+            .package
+            .executable();
+        installed.canonicalize().unwrap()
+    }
+
+    fn launched(program: &Path, config_root: &Path) -> Vec<(String, String)> {
+        let inherited = vec![
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            (
+                OAUTH_TOKEN_FILE_VARIABLE.to_owned(),
+                "/elsewhere/oauth2.json".to_owned(),
+            ),
+        ];
+        let command = vec![program.to_string_lossy().into_owned(), "quote".to_owned()];
+        with_package_credentials(inherited, &command, config_root)
+    }
+
+    fn names(environment: &[(String, String)]) -> Vec<&str> {
+        environment.iter().map(|(name, _)| name.as_str()).collect()
+    }
+
+    /// Credentials go to the exact canonical path of an installed package's program only: a
+    /// program of the same name elsewhere, a symlink to the installed one, and a relative or
+    /// non-canonical path to it get none, and the inherited token file variable goes either way.
+    #[test]
+    fn only_the_canonical_installed_program_gets_its_packages_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_root = directory.path().join("config");
+        let keyed = install(
+            directory.path(),
+            &config_root,
+            "keyed",
+            json!({"type":"api_key","env":"SAMPLE_API_KEY","label":"Sample key"}),
+        );
+        let signed = install(
+            directory.path(),
+            &config_root,
+            "signed",
+            json!({"type":"oauth2","issuers":[{"label":"Sample","issuer":"https://auth.example.com"}]}),
+        );
+        let packages = PackageStore::in_config_root(&config_root);
+        packages
+            .credentials("keyed")
+            .unwrap()
+            .save_api_key(&ApiKey::new(KEY).unwrap())
+            .unwrap();
+        let token_file = packages
+            .credentials("signed")
+            .unwrap()
+            .oauth_token_path()
+            .to_string_lossy()
+            .into_owned();
+
+        assert_eq!(
+            launched(&keyed, &config_root),
+            [
+                ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+                ("SAMPLE_API_KEY".to_owned(), KEY.to_owned()),
+            ]
+        );
+        assert_eq!(
+            launched(&signed, &config_root),
+            [
+                ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+                (OAUTH_TOKEN_FILE_VARIABLE.to_owned(), token_file),
+            ]
+        );
+
+        let elsewhere = directory.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        for installed in [&keyed, &signed] {
+            let name = installed.file_name().unwrap();
+            let copy = elsewhere.join(name);
+            std::fs::copy(installed, &copy).unwrap();
+            let link = elsewhere.join("links").join(name);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            symlink(installed, &link).unwrap();
+            let relative = installed
+                .strip_prefix(directory.path().canonicalize().unwrap())
+                .unwrap()
+                .to_path_buf();
+            let roundabout = installed
+                .parent()
+                .unwrap()
+                .join("..")
+                .join("bin")
+                .join(name);
+            // On macOS the temporary directory is reached through a symlink, so this path names
+            // the installed program without being its canonical path.
+            let uncanonical = directory.path().join(
+                installed
+                    .strip_prefix(directory.path().canonicalize().unwrap())
+                    .unwrap(),
+            );
+            for program in [copy, link, relative, roundabout, uncanonical] {
+                if program == *installed {
+                    continue;
+                }
+                assert_eq!(
+                    names(&launched(&program, &config_root)),
+                    ["PATH"],
+                    "{}",
+                    program.display()
+                );
+            }
+        }
     }
 }

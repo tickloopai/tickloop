@@ -627,7 +627,7 @@ impl Drop for LogoutFlow {
     }
 }
 
-async fn launch_browser(address: &str) {
+pub(super) async fn launch_browser(address: &str) {
     #[cfg(not(test))]
     {
         let _ = launch_browser_result(address).await;

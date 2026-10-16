@@ -12,5 +12,7 @@ mod install;
 mod manifest;
 #[path = "all/marketplace.rs"]
 mod marketplace;
+#[path = "all/program_credentials.rs"]
+mod program_credentials;
 #[path = "all/support.rs"]
 mod support;

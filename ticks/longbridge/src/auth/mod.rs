@@ -1,47 +1,91 @@
+//! The Longbridge login: the standard token file Tickloop keeps for the package, which every
+//! `tick-longbridge` process reads and renews under its lock, and the device login of
+//! `tick-longbridge auth`, which saves to the same file.
+
 pub mod device;
 mod oauth;
-pub mod storage;
-pub use device::{AuthEndpoints, prepare_region, run_login};
-pub use oauth::authorized_oauth;
+mod server;
+
+pub use device::{DeviceLogin, LoginNotice};
 #[cfg(test)]
 pub(crate) use oauth::lapsing_oauth;
+pub use oauth::{Authorized, authorized_oauth, current_token};
 
-use crate::not_authorized;
-use storage::{AuthStorage, now_seconds};
+use tick_packages::{LockedOAuth, OAuthToken, PackageCredentials, PackageError};
 use tick_provider::error::{Error, Result};
 
-pub const NONINTERACTIVE_AUTH_ENV: &str = "TICKLOOP_NONINTERACTIVE_AUTH";
+use crate::{PACKAGE, not_authorized};
 
-pub fn check_noninteractive(storage: &AuthStorage) -> Result<()> {
-    let token = storage
-        .token()?
-        .ok_or_else(|| not_authorized("not authorized"))?;
-    if token.expires_at <= now_seconds().saturating_add(oauth::SDK_REFRESH_WINDOW_SECONDS + 1) {
-        return Err(not_authorized("authorization expired"));
-    }
-    Ok(())
+/// The SDK renews a token this close to its expiry before using it.
+const SDK_REFRESH_WINDOW_SECONDS: u64 = 300;
+
+/// Where this run finds the login: the token file Tickloop named when it started the program,
+/// else the package's own in the config root, so a program run on its own shares Tickloop's
+/// login.
+pub fn credentials() -> Result<PackageCredentials> {
+    PackageCredentials::for_program(PACKAGE).map_err(|error| Error::usage(error.to_string()))
 }
 
-/// Checks the stored login without the network: a token the SDK can use as it is, or one its
+/// The saved token; refused as not authorized when there is none or it cannot be read.
+pub fn saved_token(credentials: &PackageCredentials) -> Result<OAuthToken> {
+    credentials
+        .oauth_token()
+        .map_err(credentials_error)?
+        .ok_or_else(|| not_authorized("not authorized"))
+}
+
+/// Checks the saved login without the network: a token the SDK can use as it is, or one its
 /// refresh token can renew.
-pub fn check_stored(storage: &AuthStorage) -> Result<()> {
-    let token = storage
-        .token()?
-        .ok_or_else(|| not_authorized("not authorized"))?;
-    let renewable = token
-        .refresh_token
-        .as_deref()
-        .is_some_and(|refresh| !refresh.is_empty());
-    if !renewable
-        && token.expires_at <= now_seconds().saturating_add(oauth::SDK_REFRESH_WINDOW_SECONDS + 1)
-    {
+pub fn check_saved(credentials: &PackageCredentials) -> Result<()> {
+    let token = saved_token(credentials)?;
+    if is_due(&token) && token.refresh_token().is_none() {
         return Err(not_authorized("authorization expired"));
     }
     Ok(())
 }
 
-pub fn default_storage() -> Result<AuthStorage> {
-    let home =
-        std::env::home_dir().ok_or_else(|| Error::usage("cannot determine home directory"))?;
-    Ok(AuthStorage::in_home(&home))
+/// Whether the SDK would renew `token` before using it.
+fn is_due(token: &OAuthToken) -> bool {
+    token.expires_at <= now_seconds().saturating_add(SDK_REFRESH_WINDOW_SECONDS + 1)
+}
+
+/// A saved login that cannot be read is no login; a file system failure is reported as it is.
+fn credentials_error(error: PackageError) -> Error {
+    match error {
+        PackageError::Invalid(_) => not_authorized("the saved login cannot be read"),
+        error => Error::usage(error.to_string()),
+    }
+}
+
+/// Takes the lock of the package's OAuth files off the async threads, since it waits while
+/// another process changes the token.
+async fn lock(credentials: &PackageCredentials) -> Result<LockedOAuth> {
+    let credentials = credentials.clone();
+    blocking(move || credentials.lock_oauth()).await
+}
+
+/// Runs `change` on the package's OAuth files under their lock.
+async fn locked<T: Send + 'static>(
+    credentials: &PackageCredentials,
+    change: impl FnOnce(&LockedOAuth) -> std::result::Result<T, PackageError> + Send + 'static,
+) -> Result<T> {
+    let files = lock(credentials).await?;
+    blocking(move || change(&files)).await
+}
+
+/// Runs file work off the async threads.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> std::result::Result<T, PackageError> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| Error::usage(error.to_string()))?
+        .map_err(credentials_error)
+}
+
+pub fn now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }

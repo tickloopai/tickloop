@@ -6,7 +6,7 @@ use std::{
 };
 
 use serde::Deserialize;
-use tick_provider::preferences::{Language, Region};
+use tick_provider::preferences::Language;
 use tickloop_ui::settings::{AmbiguousWidth, ColorMode};
 
 pub const DEFAULT_RELATIVE_PATH: &str = ".tickloop/config.toml";
@@ -18,7 +18,6 @@ pub struct Settings {
     pub color_mode: ColorMode,
     pub language: Language,
     pub ambiguous_width: AmbiguousWidth,
-    pub region: Option<Region>,
 }
 
 /// Values given on the command line; `None` keeps the file or default value.
@@ -27,7 +26,6 @@ pub struct Overrides {
     pub color_mode: Option<ColorMode>,
     pub language: Option<Language>,
     pub ambiguous_width: Option<AmbiguousWidth>,
-    pub region: Option<Region>,
 }
 
 #[derive(Deserialize, Default)]
@@ -40,7 +38,10 @@ struct ConfigFile {
     _icon_theme: Option<serde::de::IgnoredAny>,
     language: Option<String>,
     ambiguous_width: Option<String>,
-    region: Option<String>,
+    /// The Longbridge network earlier versions chose here; a login now chooses it, so a file
+    /// that still names one loads and the value is not read.
+    #[serde(rename = "region")]
+    _region: Option<serde::de::IgnoredAny>,
 }
 
 impl Settings {
@@ -52,7 +53,6 @@ impl Settings {
             language: parse_field("language", file.language)?.unwrap_or_default(),
             ambiguous_width: parse_field("ambiguous_width", file.ambiguous_width)?
                 .unwrap_or_default(),
-            region: parse_field("region", file.region)?,
         })
     }
 
@@ -74,7 +74,6 @@ impl Settings {
             color_mode: overrides.color_mode.unwrap_or(self.color_mode),
             language: overrides.language.unwrap_or(self.language),
             ambiguous_width: overrides.ambiguous_width.unwrap_or(self.ambiguous_width),
-            region: overrides.region.or(self.region),
         }
     }
 

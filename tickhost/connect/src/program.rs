@@ -66,7 +66,7 @@ fn resolve_executable_from(
 ) -> Result<ResolvedExecutable, HostError> {
     if program.contains('/') {
         let path = executable_file(&cwd.join(program)).ok_or_else(|| not_found(program))?;
-        let package = packages.and_then(|packages| package_of(&path, packages));
+        let package = packages.and_then(|packages| installed_package_of(&path, packages));
         return Ok(ResolvedExecutable { path, package });
     }
     let is_bundled = BUNDLED_EXECUTABLES.contains(&program);
@@ -137,7 +137,7 @@ pub fn uninstalled_package_of(path: &Path, packages: &PackageStore) -> Option<St
 }
 
 /// The installed package whose program `path` is.
-fn package_of(path: &Path, packages: &PackageStore) -> Option<InstalledPackage> {
+pub fn installed_package_of(path: &Path, packages: &PackageStore) -> Option<InstalledPackage> {
     let name = path
         .file_name()?
         .to_str()?

@@ -918,7 +918,7 @@ Usage: tickloop [--cwd DIRECTORY]
        tickloop daemon stop
        tickloop monitor popup install|remove --herdr-socket SOCKET
        tickloop monitor attach
-       tickloop tick install PACKAGE | install --path PATH | uninstall PACKAGE | login PACKAGE | logout PACKAGE | list [--available]
+       tickloop tick install PACKAGE | install --path PATH | uninstall PACKAGE | login PACKAGE [--issuer LABEL] | logout PACKAGE | list [--available]
 
 daemon stop ends the local Agent daemon and all of its workers, which is every running Agent; saved history is kept and Ticks in the Tickhost keep running.
 Run tickloop again to start this build. TICKLOOP_DAEMON_RUNTIME_DIR selects the daemon.

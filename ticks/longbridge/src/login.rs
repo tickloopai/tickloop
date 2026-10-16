@@ -2,7 +2,6 @@
 
 use std::{
     io::Write,
-    path::Path,
     process::{Command, Stdio},
     thread,
 };
@@ -18,23 +17,19 @@ use ratatui::{
 };
 
 use tick_market::{config::Settings, runtime::is_exit};
+use tick_packages::{OAuthToken, PackageCredentials};
 use tick_provider::{
     error::{Error, Result},
     exit_code,
-    preferences::{Language, Region},
+    preferences::Language,
 };
 use tickloop_ui::hyperlink;
 
 use crate::{
     AUTH_HINT,
-    auth::{
-        check_noninteractive,
-        device::{
-            AuthEndpoints, DeviceLogin, LoginNotice, begin_login, complete_login, save_region,
-        },
-        storage::{AuthStorage, now_seconds},
-    },
+    auth::{self, DeviceLogin, LoginNotice, now_seconds},
     cli::AuthAction,
+    region::{Issuers, Region},
 };
 
 const MINIMUM_COLUMNS: u16 = 36;
@@ -46,114 +41,85 @@ const CARD_BORDER_COLUMNS: u16 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoginOutcome {
-    Authorized(Region),
+    Authorized,
     Cancelled,
 }
 
 pub fn inspect(
     action: AuthAction,
-    storage: &AuthStorage,
-    region: Option<Region>,
+    credentials: &PackageCredentials,
     output: &mut impl Write,
 ) -> Result<()> {
     match action {
-        AuthAction::Status { .. } => {
-            match stored_login(storage)? {
-                StoredLogin::None => writeln!(output, "Not logged in; {AUTH_HINT}.")?,
-                StoredLogin::Unreadable(error) => return Err(error),
-                StoredLogin::Current { expires_at } => {
-                    writeln!(output, "Logged in")?;
-                    writeln!(output, "Expires: {}", expiry_text(expires_at))?;
-                }
-                StoredLogin::Renewable { expires_at } => {
-                    writeln!(output, "Logged in; {ACCESS_TOKEN_RENEWS}")?;
-                    writeln!(output, "Access token expired: {}", expiry_text(expires_at))?;
-                }
-                StoredLogin::Expired { expires_at } => {
-                    writeln!(output, "Authorization expired; {AUTH_HINT}.")?;
-                    writeln!(output, "Expires: {}", expiry_text(expires_at))?;
-                }
+        AuthAction::Status => match saved_login(credentials)? {
+            SavedLogin::None => writeln!(output, "Not logged in; {AUTH_HINT}.")?,
+            SavedLogin::Unreadable(error) => return Err(error),
+            SavedLogin::Current(token) => {
+                writeln!(output, "Logged in")?;
+                writeln!(output, "Expires: {}", expiry_text(token.expires_at))?;
+                write_region(output, &token)?;
             }
-            writeln!(
-                output,
-                "Region: {}",
-                region.map_or("not configured", Region::as_str)
-            )?;
-        }
-        AuthAction::Check => check_noninteractive(storage)?,
+            SavedLogin::Renewable(token) => {
+                writeln!(output, "Logged in; {ACCESS_TOKEN_RENEWS}")?;
+                writeln!(
+                    output,
+                    "Access token expired: {}",
+                    expiry_text(token.expires_at)
+                )?;
+                write_region(output, &token)?;
+            }
+            SavedLogin::Expired(token) => {
+                writeln!(output, "Authorization expired; {AUTH_HINT}.")?;
+                writeln!(output, "Expires: {}", expiry_text(token.expires_at))?;
+                write_region(output, &token)?;
+            }
+        },
         AuthAction::Logout => {
-            storage.logout()?;
+            credentials
+                .lock_oauth()
+                .and_then(|files| files.remove_token())
+                .map_err(|error| Error::usage(error.to_string()))?;
             writeln!(output, "Logged out")?;
         }
     }
     Ok(())
 }
 
-/// What the token stored on this computer says about the login, read without refreshing it.
-enum StoredLogin {
+fn write_region(output: &mut impl Write, token: &OAuthToken) -> Result<()> {
+    writeln!(
+        output,
+        "Region: {}",
+        Region::of_issuer(&token.issuer).as_str()
+    )?;
+    Ok(())
+}
+
+/// What the saved token says about the login, read without renewing it.
+enum SavedLogin {
     None,
     Unreadable(Error),
-    Current {
-        expires_at: u64,
-    },
+    Current(OAuthToken),
     /// The access token lapsed, and its refresh token renews it when a Tick opens.
-    Renewable {
-        expires_at: u64,
-    },
-    Expired {
-        expires_at: u64,
-    },
+    Renewable(OAuthToken),
+    Expired(OAuthToken),
 }
 
 const ACCESS_TOKEN_RENEWS: &str = "the access token is renewed when a Tick opens";
 
-fn stored_login(storage: &AuthStorage) -> Result<StoredLogin> {
-    Ok(match storage.token() {
-        Ok(None) => StoredLogin::None,
-        Err(error) if error.code == exit_code::NOT_AUTHORIZED => StoredLogin::Unreadable(error),
-        Err(error) => return Err(error),
-        Ok(Some(token)) if token.expires_at > now_seconds() => StoredLogin::Current {
-            expires_at: token.expires_at,
-        },
-        Ok(Some(token))
-            if token
-                .refresh_token
-                .as_deref()
-                .is_some_and(|refresh| !refresh.is_empty()) =>
-        {
-            StoredLogin::Renewable {
-                expires_at: token.expires_at,
+fn saved_login(credentials: &PackageCredentials) -> Result<SavedLogin> {
+    Ok(match auth::saved_token(credentials) {
+        Err(error) if error.code == exit_code::NOT_AUTHORIZED => {
+            if credentials.oauth_token_path().exists() {
+                SavedLogin::Unreadable(error)
+            } else {
+                SavedLogin::None
             }
         }
-        Ok(Some(token)) => StoredLogin::Expired {
-            expires_at: token.expires_at,
-        },
+        Err(error) => return Err(error),
+        Ok(token) if token.expires_at > now_seconds() => SavedLogin::Current(token),
+        Ok(token) if token.refresh_token().is_some() => SavedLogin::Renewable(token),
+        Ok(token) => SavedLogin::Expired(token),
     })
-}
-
-/// Prints the login state as one JSON object, `{"state": …, "detail"?: …}`, from the token stored
-/// on this computer alone: nothing is refreshed and nothing goes over the network. A lapsed access
-/// token still counts as logged in while a refresh token can renew it when a Tick opens.
-pub fn print_status_json(storage: &AuthStorage, output: &mut impl Write) -> Result<()> {
-    let (state, detail) = match stored_login(storage)? {
-        StoredLogin::None => ("logged_out", None),
-        StoredLogin::Unreadable(_) => (
-            "logged_out",
-            Some("the saved login cannot be read; log in again".to_owned()),
-        ),
-        StoredLogin::Current { .. } => ("logged_in", None),
-        StoredLogin::Renewable { .. } => ("logged_in", Some(ACCESS_TOKEN_RENEWS.to_owned())),
-        StoredLogin::Expired { expires_at } => (
-            "expired",
-            Some(format!("expired at {}", expiry_text(expires_at))),
-        ),
-    };
-    let mut report = serde_json::json!({ "state": state });
-    if let Some(detail) = detail {
-        report["detail"] = detail.into();
-    }
-    writeln!(output, "{report}")?;
-    Ok(())
 }
 
 fn expiry_text(expires_at: u64) -> String {
@@ -221,12 +187,12 @@ pub fn open_in_browser(page: &str) -> bool {
     true
 }
 
-/// The login screens, opening the verification page in the system's browser.
+/// The login screens, logging in with `issuers` and opening the verification page in the
+/// system's browser.
 pub async fn run<B, S>(
     settings: &Settings,
-    config_path: &Path,
-    storage: &AuthStorage,
-    endpoints: Option<AuthEndpoints>,
+    credentials: &PackageCredentials,
+    issuers: &Issuers,
     terminal: &mut Terminal<B>,
     input: S,
 ) -> Result<LoginOutcome>
@@ -236,9 +202,8 @@ where
 {
     run_with_page_access(
         settings,
-        config_path,
-        storage,
-        endpoints,
+        credentials,
+        issuers,
         terminal,
         input,
         PageAccess::of_this_terminal(),
@@ -246,12 +211,12 @@ where
     .await
 }
 
-/// The login screens, handing over the verification page through `page_access`.
+/// The login screens, logging in with `issuers` and handing over the verification page through
+/// `page_access`. The login is saved in `credentials`, where Tickloop keeps it too.
 pub async fn run_with_page_access<B, S, O>(
     settings: &Settings,
-    config_path: &Path,
-    storage: &AuthStorage,
-    endpoints: Option<AuthEndpoints>,
+    credentials: &PackageCredentials,
+    issuers: &Issuers,
     terminal: &mut Terminal<B>,
     mut input: S,
     page_access: PageAccess<O>,
@@ -261,11 +226,15 @@ where
     S: Stream<Item = std::io::Result<Event>> + Unpin,
     O: FnOnce(&str) -> bool,
 {
-    let mut region = settings.region.unwrap_or(Region::Cn);
-    if let Some(token) = storage
-        .token()?
-        .filter(|token| token.expires_at > now_seconds())
-    {
+    let saved = match auth::saved_token(credentials) {
+        Ok(token) => Some(token),
+        Err(error) if error.code == exit_code::NOT_AUTHORIZED => None,
+        Err(error) => return Err(error),
+    };
+    let mut region = saved
+        .as_ref()
+        .map_or(Region::Cn, |token| Region::of_issuer(&token.issuer));
+    if let Some(token) = saved.filter(|token| token.expires_at > now_seconds()) {
         loop {
             draw(
                 terminal,
@@ -279,7 +248,7 @@ where
                 None => return Ok(LoginOutcome::Cancelled),
                 Some(event) if is_exit(&event) => return Ok(LoginOutcome::Cancelled),
                 Some(Event::Key(key)) if key.kind != KeyEventKind::Release => match key.code {
-                    KeyCode::Enter => return Ok(LoginOutcome::Authorized(region)),
+                    KeyCode::Enter => return Ok(LoginOutcome::Authorized),
                     KeyCode::Char('r') => break,
                     _ => {}
                 },
@@ -312,11 +281,13 @@ where
         }
     }
 
-    save_region(config_path, region)?;
     clear(terminal)?;
     draw(terminal, settings, Screen::Starting(region))?;
-    let login =
-        begin_or_cancel(begin_login(region, storage, endpoints.clone()), &mut input).await?;
+    let login = begin_or_cancel(
+        DeviceLogin::start(credentials, issuers.of(region)),
+        &mut input,
+    )
+    .await?;
     let Some(login) = login else {
         return Ok(LoginOutcome::Cancelled);
     };
@@ -325,7 +296,7 @@ where
 
     clear(terminal)?;
     let (notices, mut updates) = tokio::sync::mpsc::unbounded_channel();
-    let completion = complete_login(region, storage, endpoints, &login, &notices);
+    let completion = login.finish(&notices);
     tokio::pin!(completion);
     let mut status = waiting_text(settings.language).to_owned();
     let mut refresh = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -345,7 +316,7 @@ where
                 result?;
                 clear(terminal)?;
                 draw(terminal, settings, Screen::Authorized)?;
-                return Ok(LoginOutcome::Authorized(region));
+                return Ok(LoginOutcome::Authorized);
             }
             notice = updates.recv() => {
                 if let Some(notice) = notice {
@@ -741,7 +712,6 @@ fn waiting_text(language: Language) -> &'static str {
 fn notice_text(language: Language, notice: LoginNotice) -> &'static str {
     match (language, notice) {
         (Language::ZhCn, LoginNotice::TemporaryFailureRetry) => "授权服务暂时不可用，正在自动重试",
-        (Language::ZhCn, LoginNotice::EndpointUnavailable) => "正在改用另一个授权端点",
         (Language::ZhCn, LoginNotice::SlowerPolling) => "Longbridge 要求降低检查频率",
         (Language::En, notice) => notice.message(),
     }

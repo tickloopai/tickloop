@@ -1,4 +1,4 @@
-// Modified by Tick Loop: test constructors include refresh endpoint configuration; see ../README.md.
+// Modified by Tick Loop to export the token refresher hook; see ../README.md.
 //! OAuth 2.0 authentication support for Longbridge OpenAPI
 //!
 //! This crate provides utilities for performing OAuth 2.0 authorization code
@@ -33,12 +33,14 @@ mod builder;
 mod callback;
 mod client;
 mod error;
+mod refresher;
 mod storage;
 mod token;
 
 pub use builder::OAuthBuilder;
 pub use client::OAuth;
 pub use error::{OAuthError, OAuthResult};
+pub use refresher::{RefreshFuture, TokenRefresher};
 pub use storage::{FileTokenStorage, StoredToken, TokenStorage};
 
 #[cfg(test)]
@@ -178,7 +180,7 @@ mod tests {
             client_id: "test-client".to_string(),
             callback_port: DEFAULT_CALLBACK_PORT,
             storage: default_storage(),
-            refresh_token_urls: None,
+            refresher: None,
             token: tokio::sync::Mutex::new(Some(make_token(now_secs() + 7200))),
         });
         let oauth = OAuth(inner);
@@ -192,7 +194,7 @@ mod tests {
             client_id: "my-client".to_string(),
             callback_port: DEFAULT_CALLBACK_PORT,
             storage: default_storage(),
-            refresh_token_urls: None,
+            refresher: None,
             token: tokio::sync::Mutex::new(None),
         });
         let oauth = OAuth(inner);
@@ -205,7 +207,7 @@ mod tests {
             client_id: "shared-client".to_string(),
             callback_port: DEFAULT_CALLBACK_PORT,
             storage: default_storage(),
-            refresh_token_urls: None,
+            refresher: None,
             token: tokio::sync::Mutex::new(None),
         });
         let oauth1 = OAuth(inner);

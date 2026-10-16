@@ -34,6 +34,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "system-proxy"] }
+tempfile = "3"
 tickloop-agent-base = { path = "../base" }
 tickloop-agent-test-support = { path = "../test-support" }
 tickloop-agent-tools = { path = "../tools" }

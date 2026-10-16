@@ -12,11 +12,11 @@ use time::{
     format_description::well_known::{Rfc2822, Rfc3339},
 };
 
-use crate::{not_authorized, rate_limit::RateLimiter, sdk::endpoints};
+use crate::{rate_limit::RateLimiter, region::Region, sdk::endpoints};
 use tick_provider::{
     error::{Error, Result},
     news::{NewsApi, NewsArticle, NewsItem},
-    preferences::{Language, Region},
+    preferences::Language,
 };
 
 const RSS_BASE_URL: &str = "https://longbridge.com";
@@ -32,22 +32,13 @@ pub struct SdkNewsApi {
 }
 
 impl SdkNewsApi {
-    pub async fn new(
+    pub fn new(
         config: Arc<Config>,
         oauth: OAuth,
         language: Language,
-        region: Option<Region>,
+        region: Region,
         limiter: Arc<RateLimiter>,
     ) -> Result<Self> {
-        let token = oauth
-            .access_token()
-            .await
-            .map_err(|_| not_authorized("authorization expired"))?;
-        let region = if longbridge::DcRegion::from_credential(&token) == longbridge::DcRegion::Us {
-            Region::Global
-        } else {
-            region.unwrap_or(Region::Global)
-        };
         let signed_http =
             HttpClient::new(HttpClientConfig::from_oauth(oauth).http_url(endpoints(region).http))
                 .header("accept-language", language.as_str());
@@ -282,27 +273,4 @@ struct ArticlePayload {
 struct ArticleAuthor {
     #[serde(default)]
     name: String,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::asks_to_log_in;
-
-    #[tokio::test]
-    async fn a_lapsed_login_opens_no_news_api_and_asks_the_user_to_log_in_again() {
-        let oauth = crate::auth::lapsing_oauth().await;
-        let Err(error) = SdkNewsApi::new(
-            Arc::new(Config::from_oauth(oauth.clone())),
-            oauth,
-            Language::default(),
-            None,
-            Arc::new(RateLimiter::default()),
-        )
-        .await
-        else {
-            panic!("a lapsed login opens no news API");
-        };
-        assert!(asks_to_log_in(&error), "{error}");
-    }
 }

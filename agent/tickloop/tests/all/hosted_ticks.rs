@@ -370,10 +370,16 @@ mod channel {
                     );
                     runtime
                         .install_stopped_child_hook(Arc::new(DaemonLifecycle::new(grant.clone())));
-                    let tools = Arc::new(HostedTickTools::new(
-                        DaemonControl::new(grant.clone()),
-                        tick_environment(),
-                    ));
+                    let mut tools =
+                        HostedTickTools::new(DaemonControl::new(grant.clone()), tick_environment());
+                    // As the production worker does, an open finds the programs of the Tick
+                    // packages installed in the config root.
+                    if let Some(config_root) = &launch.config_root {
+                        tools = tools.with_tick_packages(
+                            tick_packages::PackageStore::in_config_root(config_root),
+                        );
+                    }
+                    let tools = Arc::new(tools);
                     runtime.install_host_tools(tools.clone()).unwrap();
                     runtime.install_hosted_ticks(tools.clone());
                     runtime
@@ -1212,6 +1218,103 @@ for line in sys.stdin:
             panic!("a reinstalled program is another program");
         };
         assert!(changed.contains("LaunchChanged"), "{changed}");
+    }
+
+    /// A package's program starts with its credentials in the environment: the token file of an
+    /// `oauth2` package and the key of an `api_key` one. The key reaches the program alone: no
+    /// approval evidence, tool result, model request, Chat record or Monitor row holds it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_package_program_starts_with_its_credentials_which_nothing_else_shows() {
+        use tick_packages::{ApiKey, OAUTH_TOKEN_FILE_VARIABLE, PackageCredentials};
+        use tickloop_agent_protocol::ExecutionMode;
+        use tickloop_agent_test_support::{ScriptedModel, auto_classification, call, text};
+        const KEY: &str = "sample-key-7f3a9c";
+        let model = Arc::new(ScriptedModel::new(Vec::new()));
+        let daemon =
+            Daemon::start_with(model.clone(), super::support::hosted::IDLE_TIMEOUT, 1).await;
+        let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
+        let sources = daemon.root.join("sources");
+        let install = |name, auth| {
+            super::support::hosted::install_environment_recording_package(
+                &daemon.config_root,
+                &sources,
+                name,
+                auth,
+            )
+        };
+        install(
+            "keyed",
+            json!({"type":"api_key","env":"SAMPLE_API_KEY","label":"Sample key"}),
+        );
+        let packages = install(
+            "signed",
+            json!({"type":"oauth2","issuers":[{"label":"Sample","issuer":"https://auth.example.com"}]}),
+        );
+        let keyed = packages.credentials("keyed").unwrap();
+        keyed.save_api_key(&ApiKey::new(KEY).unwrap()).unwrap();
+        runtime
+            .set_execution_mode(chat, ExecutionMode::Auto)
+            .await
+            .unwrap();
+        let reviewer = Arc::new(ScriptedModel::new(vec![
+            text(&auto_classification(false).to_string()),
+            text(&auto_classification(false).to_string()),
+        ]));
+        runtime.set_auto_reviewer(reviewer.clone()).await;
+        let open = |program: &str| json!({"action":"open","command":[program],"cwd":daemon.root});
+        model.enqueue(call("keyed", "ModifyTick", open("tick-keyed")));
+        model.enqueue(call("signed", "ModifyTick", open("tick-signed")));
+        model.enqueue(text("opened"));
+
+        let results = run_turn(&runtime, chat, "Open the keyed and the signed counters").await;
+
+        for name in ["keyed", "signed"] {
+            assert!(!results[name].is_error, "{}", results[name].content);
+        }
+        let keyed_environment = super::support::hosted::recorded_environment(&sources, "keyed");
+        assert_eq!(keyed_environment["SAMPLE_API_KEY"], KEY);
+        assert!(!keyed_environment.contains_key(OAUTH_TOKEN_FILE_VARIABLE));
+        let signed_environment = super::support::hosted::recorded_environment(&sources, "signed");
+        assert_eq!(
+            signed_environment[OAUTH_TOKEN_FILE_VARIABLE],
+            PackageCredentials::in_config_root(&daemon.config_root, "signed")
+                .unwrap()
+                .oauth_token_path()
+                .to_str()
+                .unwrap()
+        );
+        assert!(!signed_environment.contains_key("SAMPLE_API_KEY"));
+        let shown = [
+            serde_json::to_string(&results).unwrap(),
+            format!("{:?}", reviewer.requests.lock().unwrap()),
+            format!("{:?}", model.requests.lock().unwrap()),
+            serde_json::to_string(&runtime.snapshot(chat).await.unwrap()).unwrap(),
+            serde_json::to_string(&daemon.tools().members(chat).await.unwrap()).unwrap(),
+        ];
+        assert!(
+            reviewer.requests.lock().unwrap().len() == 2,
+            "both opens were reviewed"
+        );
+        for shown in shown {
+            assert!(!shown.contains(KEY), "{shown}");
+        }
+
+        // Credentials come from Tickloop alone: what the worker inherited gives way, and a
+        // package whose user never entered a key starts without one.
+        keyed.remove_api_key().unwrap();
+        let mut inherited = tick_environment();
+        inherited.push((
+            OAUTH_TOKEN_FILE_VARIABLE.into(),
+            "/elsewhere/oauth2.json".into(),
+        ));
+        inherited.push(("SAMPLE_API_KEY".into(), "inherited".into()));
+        let tools = HostedTickTools::new(DaemonControl::new(daemon.grants[0].clone()), inherited)
+            .with_tick_packages(packages);
+        let opened = run_tool(&tools, chat, "ModifyTick", open("tick-keyed")).await;
+        assert_eq!(opened["status"], "opened", "{opened}");
+        let keyed_environment = super::support::hosted::recorded_environment(&sources, "keyed");
+        assert!(!keyed_environment.contains_key("SAMPLE_API_KEY"));
+        assert!(!keyed_environment.contains_key(OAUTH_TOKEN_FILE_VARIABLE));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use tick_longbridge::region::{CHINA_MAINLAND_ISSUER, GLOBAL_ISSUER};
 use tick_packages::{OAuthIssuer, PackageAuth, PackageManifest};
 
 #[test]
@@ -7,7 +8,7 @@ fn the_package_manifest_runs_this_program_at_the_workspace_version_and_logs_in_w
     let package = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest =
         PackageManifest::parse(&std::fs::read(package.join("tick-package.json")).unwrap()).unwrap();
-    assert_eq!(manifest.name, "longbridge");
+    assert_eq!(manifest.name, tick_longbridge::PACKAGE);
     assert_eq!(manifest.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(manifest.executable, Path::new("bin/tick-longbridge"));
     assert_eq!(
@@ -21,11 +22,11 @@ fn the_package_manifest_runs_this_program_at_the_workspace_version_and_logs_in_w
             issuers: vec![
                 OAuthIssuer {
                     label: "China mainland".into(),
-                    issuer: "https://openapi.longbridge.cn".into(),
+                    issuer: CHINA_MAINLAND_ISSUER.into(),
                 },
                 OAuthIssuer {
                     label: "Global".into(),
-                    issuer: "https://openapi.longbridge.com".into(),
+                    issuer: GLOBAL_ISSUER.into(),
                 },
             ],
             scopes: Vec::new(),

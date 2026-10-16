@@ -72,6 +72,61 @@ pub fn install_counter_package(config_root: &Path, sources: &Path) -> tick_packa
     packages
 }
 
+/// Installs the Tick package `name` that logs in as `auth` declares under `config_root`, from a
+/// package directory it writes in `sources`: its program `tick-<name>` writes the environment it
+/// started with to `<sources>/<name>.env`, then runs the example counter Tick.
+pub fn install_environment_recording_package(
+    config_root: &Path,
+    sources: &Path,
+    name: &str,
+    auth: serde_json::Value,
+) -> tick_packages::PackageStore {
+    use std::os::unix::fs::PermissionsExt;
+    let source = sources.join(format!("{name}-package"));
+    std::fs::create_dir_all(source.join("bin")).unwrap();
+    std::fs::write(
+        source.join(tick_packages::MANIFEST_FILE_NAME),
+        serde_json::json!({
+            "name": name,
+            "version": "1.0.0",
+            "description": "The example counter, recording its environment",
+            "executable": format!("bin/tick-{name}"),
+            "protocol": true,
+            "auth": auth,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let program = source.join(format!("bin/tick-{name}"));
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\n/usr/bin/env > '{}'\nexec '{}' \"$@\"\n",
+            sources.join(format!("{name}.env")).display(),
+            counter_program().join("' '")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let packages = tick_packages::PackageStore::in_config_root(config_root);
+    packages.install_path(&source).unwrap();
+    packages
+}
+
+/// The environment the program of a package [`install_environment_recording_package`] installed
+/// last started with, by name.
+pub fn recorded_environment(
+    sources: &Path,
+    name: &str,
+) -> std::collections::BTreeMap<String, String> {
+    std::fs::read_to_string(sources.join(format!("{name}.env")))
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect()
+}
+
 /// An open of the protocol `program` for `owner`.
 pub fn tick_request(owner: TickOwner, cwd: &Path, program: Vec<String>) -> OpenRequest {
     OpenRequest {

@@ -164,16 +164,9 @@ pub const PASTE_FILE_EXTENSION: &str = ".txt";
 
 /// Tickloop 状态根目录：`TICKLOOP_CONFIG_DIR` 非空时使用它，否则为用户主目录下的 `.tickloop`。
 /// 主目录取自 `std::env::home_dir()`：`$HOME` 缺失或为空时回退到账户数据库。
-/// 两者都不可用时返回 `None`，调用方不写盘。
+/// 两者都不可用时返回 `None`，调用方不写盘。Tick 包的程序独立运行时用同一规则找到凭据。
 pub fn config_root_directory() -> Option<PathBuf> {
-    std::env::var_os("TICKLOOP_CONFIG_DIR")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::home_dir()
-                .filter(|home| !home.as_os_str().is_empty())
-                .map(|home| home.join(".tickloop"))
-        })
+    tick_packages::default_config_root()
 }
 
 #[derive(Clone, Debug)]

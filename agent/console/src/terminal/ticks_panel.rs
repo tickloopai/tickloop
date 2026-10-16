@@ -1,15 +1,20 @@
 //! `/ticks`: the Tick packages panel of the input dialog. The Installed page lists the installed
 //! packages with their versions and login states, and enter opens a package's actions there; the
-//! Marketplace page lists what the Tick marketplace offers, and enter installs or updates it. The
-//! panel keeps what it shows and what the user chose; the Console runs the work and hands each
-//! result back through [`TicksPanel::apply`].
+//! Marketplace page lists what the Tick marketplace offers, and enter installs or updates it.
+//! Logging in happens in the panel: the link and code of an OAuth device authorization, or a
+//! masked entry of a key. The panel keeps what it shows and what the user chose; the Console runs
+//! the work and hands each result back through [`TicksPanel::apply`].
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tick_packages::{
-    BrokenPackage, CURRENT_TARGET, InstallOutcome, Installation, InstalledPackage,
-    InstalledPackages, LoginState, Marketplace, MarketplacePackage, PackageAuth, Uninstalled,
+    ApiKey, BrokenPackage, CURRENT_TARGET, InstallOutcome, Installation, InstalledPackage,
+    InstalledPackages, LoginState, Marketplace, MarketplacePackage, OAuthIssuer, PackageAuth,
+    Uninstalled,
 };
-use tickloop_agent_packages::{InstalledVersion, LoggedOut, Offer, login_label, offers};
+use tickloop_agent_packages::{
+    InstalledVersion, LoggedOut, LoginError, Offer, login_label, offers,
+};
+use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 use super::{
@@ -40,6 +45,21 @@ pub(super) enum TickPackageRequest {
     /// Installs or updates to the version the marketplace offers.
     Install(MarketplacePackage),
     Uninstall(String),
+    /// Logs the package in at `issuer` with an OAuth device authorization the user approves;
+    /// the panel numbers each `attempt` as it starts, and its results carry the number.
+    LogIn {
+        name: String,
+        issuer: OAuthIssuer,
+        scopes: Vec<String>,
+        attempt: u64,
+    },
+    /// Stops the login `attempt`.
+    CancelLogIn(u64),
+    /// Saves the key the user entered for the package.
+    SaveKey {
+        name: String,
+        key: ApiKey,
+    },
     LogOut(String),
     /// Reads the package's login state again.
     RefreshLogin(String),
@@ -83,6 +103,23 @@ pub(super) enum TickPackageResult {
         name: String,
         result: Result<LoggedOut, String>,
     },
+    /// The package's login waits for the user to open `link` and confirm `code`; `opened` says
+    /// whether the browser was asked to open it.
+    LoginWaiting {
+        attempt: u64,
+        link: String,
+        code: String,
+        opened: bool,
+    },
+    LoginEnded {
+        attempt: u64,
+        name: String,
+        result: Result<(), LoginError>,
+    },
+    KeySaved {
+        name: String,
+        result: Result<(), String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,7 +148,33 @@ impl TickPackageResult {
     /// What an operation's result tells the user; `None` for a result that only refreshes a list.
     pub(super) fn notice(&self) -> Option<Notice> {
         Some(match self {
-            Self::Installed { .. } | Self::Marketplace(_) | Self::Login { .. } => return None,
+            Self::Installed { .. }
+            | Self::Marketplace(_)
+            | Self::Login { .. }
+            | Self::LoginWaiting { .. } => return None,
+            Self::LoginEnded {
+                name,
+                result: Ok(()),
+                ..
+            } => Notice::success(format!("Logged in to {name}")),
+            Self::LoginEnded {
+                name,
+                result: Err(LoginError::Cancelled),
+                ..
+            } => Notice::success(format!("Cancelled the login to {name}")),
+            Self::LoginEnded {
+                name,
+                result: Err(error),
+                ..
+            } => Notice::failure(format!("Cannot log in to {name}: {error}")),
+            Self::KeySaved {
+                name,
+                result: Ok(()),
+            } => Notice::success(format!("Saved the key for {name}")),
+            Self::KeySaved {
+                name,
+                result: Err(error),
+            } => Notice::failure(format!("Cannot save the key for {name}: {error}")),
             Self::Installation {
                 name,
                 result: Err(error),
@@ -198,8 +261,11 @@ enum Listing<T> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Choice {
     Run(TickPackageRequest),
-    /// Closes the menus and tells the user how to log the package in.
-    ExplainLogin(String),
+    /// Opens the masked entry of the key `label` names for the package.
+    EnterKey {
+        name: String,
+        label: String,
+    },
     /// Opens the confirmation of uninstalling the package.
     ConfirmUninstall {
         name: String,
@@ -214,6 +280,36 @@ struct PanelMenu {
     context: Vec<String>,
     options: Vec<(String, Choice)>,
     selected: usize,
+}
+
+/// A package's login under way in the panel, in place of its list and menus; `attempt` is the
+/// number of an OAuth login, 0 for a key entry.
+struct LoginView {
+    attempt: u64,
+    name: String,
+    /// The issuer's or the key's label.
+    label: String,
+    stage: LoginStage,
+}
+
+enum LoginStage {
+    /// Reading the server's metadata, registering and asking for a device code.
+    Starting,
+    Waiting {
+        link: String,
+        code: String,
+        opened: bool,
+    },
+    /// The key as typed so far, which only its length shows.
+    Key { entered: String },
+}
+
+/// What a key does to the login view.
+enum LoginAction {
+    Cancel,
+    Save,
+    Edit,
+    Ignore,
 }
 
 /// A row of the Installed page.
@@ -245,6 +341,9 @@ pub(super) struct TicksPanel {
     selected: [usize; 2],
     top: [usize; 2],
     menus: Vec<PanelMenu>,
+    login: Option<LoginView>,
+    /// The number of the last OAuth login started.
+    login_attempts: u64,
     /// The operation under way, as the panel shows it.
     busy: Option<String>,
     notice: Option<Notice>,
@@ -264,6 +363,8 @@ impl TicksPanel {
             selected: [0; 2],
             top: [0; 2],
             menus: Vec::new(),
+            login: None,
+            login_attempts: 0,
             busy: None,
             notice: None,
             row_targets: Vec::new(),
@@ -275,6 +376,18 @@ impl TicksPanel {
     }
 
     pub(super) fn apply(&mut self, result: TickPackageResult) {
+        // The end of a login the user cancelled was told when it was cancelled.
+        let is_current = match &result {
+            TickPackageResult::LoginWaiting { attempt, .. }
+            | TickPackageResult::LoginEnded { attempt, .. } => self
+                .login
+                .as_ref()
+                .is_some_and(|login| login.attempt == *attempt),
+            _ => true,
+        };
+        if !is_current {
+            return;
+        }
         if let Some(notice) = result.notice() {
             self.notice = Some(notice);
         }
@@ -300,9 +413,21 @@ impl TicksPanel {
                     *login = state;
                 }
             }
+            TickPackageResult::LoginWaiting {
+                link, code, opened, ..
+            } => {
+                if let Some(login) = &mut self.login {
+                    login.stage = LoginStage::Waiting { link, code, opened };
+                }
+            }
+            TickPackageResult::LoginEnded { .. } => {
+                self.login = None;
+                self.busy = None;
+            }
             TickPackageResult::Installation { .. }
             | TickPackageResult::Uninstallation { .. }
-            | TickPackageResult::Logout { .. } => self.busy = None,
+            | TickPackageResult::Logout { .. }
+            | TickPackageResult::KeySaved { .. } => self.busy = None,
         }
         for page in [INSTALLED_PAGE, MARKETPLACE_PAGE] {
             let count = self.entry_count(page);
@@ -310,7 +435,21 @@ impl TicksPanel {
         }
     }
 
+    /// Takes pasted text into the key being entered; elsewhere the panel takes no text.
+    pub(super) fn paste(&mut self, text: &str) {
+        if let Some(LoginView {
+            stage: LoginStage::Key { entered },
+            ..
+        }) = &mut self.login
+        {
+            entered.extend(text.chars().filter(|character| !character.is_control()));
+        }
+    }
+
     pub(super) fn key(&mut self, key: KeyEvent) -> TicksPanelEffect {
+        if self.login.is_some() {
+            return self.login_key(key);
+        }
         let movement = match (key.code, key.modifiers) {
             (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
             | (KeyCode::Char('p'), KeyModifiers::CONTROL) => Some(false),
@@ -352,7 +491,99 @@ impl TicksPanel {
         }
     }
 
+    /// A key while a login is shown: the key entry takes text, enter saves it and esc cancels;
+    /// an OAuth login only cancels, with esc or with enter on its one option.
+    fn login_key(&mut self, key: KeyEvent) -> TicksPanelEffect {
+        let Some(login) = &mut self.login else {
+            return TicksPanelEffect::None;
+        };
+        let action = match (&mut login.stage, key.code) {
+            (_, KeyCode::Esc) => LoginAction::Cancel,
+            (LoginStage::Key { .. }, KeyCode::Enter) => LoginAction::Save,
+            (LoginStage::Key { entered }, code) => {
+                match (code, key.modifiers) {
+                    (KeyCode::Backspace, _) => {
+                        entered.pop();
+                    }
+                    (KeyCode::Char('u'), KeyModifiers::CONTROL) => entered.clear(),
+                    (KeyCode::Char(character), modifiers)
+                        if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        entered.push(character);
+                    }
+                    _ => {}
+                }
+                LoginAction::Edit
+            }
+            (_, KeyCode::Enter) => LoginAction::Cancel,
+            _ => LoginAction::Ignore,
+        };
+        match action {
+            LoginAction::Edit | LoginAction::Ignore => TicksPanelEffect::None,
+            LoginAction::Save => {
+                let Some(LoginView {
+                    name,
+                    stage: LoginStage::Key { entered },
+                    ..
+                }) = self.login.take()
+                else {
+                    return TicksPanelEffect::None;
+                };
+                match ApiKey::new(&entered) {
+                    Ok(key) => self.start(TickPackageRequest::SaveKey { name, key }),
+                    Err(error) => {
+                        self.notice = Some(Notice::failure(error.to_string()));
+                        self.login = Some(LoginView {
+                            attempt: 0,
+                            label: self.key_label(&name),
+                            name,
+                            stage: LoginStage::Key { entered },
+                        });
+                        TicksPanelEffect::None
+                    }
+                }
+            }
+            LoginAction::Cancel => {
+                let Some(LoginView {
+                    attempt,
+                    name,
+                    stage,
+                    ..
+                }) = self.login.take()
+                else {
+                    return TicksPanelEffect::None;
+                };
+                if matches!(stage, LoginStage::Key { .. }) {
+                    return TicksPanelEffect::None;
+                }
+                self.busy = None;
+                self.notice = Some(Notice::success(format!("Cancelled the login to {name}")));
+                TicksPanelEffect::Work(TickPackageRequest::CancelLogIn(attempt))
+            }
+        }
+    }
+
+    /// The label of the key the package `name` logs in with.
+    fn key_label(&self, name: &str) -> String {
+        self.installed_entries()
+            .into_iter()
+            .find_map(|entry| match entry {
+                InstalledEntry::Usable { package, .. } if package.manifest.name == name => {
+                    match &package.manifest.auth {
+                        PackageAuth::ApiKey { label, .. } => Some(label.clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| "key".to_owned())
+    }
+
     pub(super) fn select_at_row(&mut self, row: usize) -> bool {
+        if self.login.is_some() {
+            // The login's one option is the only target.
+            return self.row_targets.iter().any(|(rows, _)| rows.contains(&row));
+        }
         let Some(index) = self
             .row_targets
             .iter()
@@ -374,11 +605,23 @@ impl TicksPanel {
                 self.menus.pop();
                 TicksPanelEffect::None
             }
-            Choice::ExplainLogin(name) => {
+            Choice::EnterKey { name, label } => {
+                if self.busy.is_some() {
+                    self.notice = Some(Notice::failure(
+                        "Wait for it to finish before starting another".to_owned(),
+                    ));
+                    return TicksPanelEffect::None;
+                }
                 self.menus.clear();
-                self.notice = Some(Notice::success(format!(
-                    "Log in to {name} with tickloop tick login {name} in a terminal"
-                )));
+                self.notice = None;
+                self.login = Some(LoginView {
+                    attempt: 0,
+                    name,
+                    label,
+                    stage: LoginStage::Key {
+                        entered: String::new(),
+                    },
+                });
                 TicksPanelEffect::None
             }
             Choice::ConfirmUninstall { name, version } => {
@@ -412,14 +655,16 @@ impl TicksPanel {
     }
 
     /// Starts `request` unless an operation is under way; reading lists never waits.
-    fn start(&mut self, request: TickPackageRequest) -> TicksPanelEffect {
+    fn start(&mut self, mut request: TickPackageRequest) -> TicksPanelEffect {
         let busy = match &request {
             TickPackageRequest::Load => {
                 self.installed = Listing::Loading;
                 self.marketplace = Listing::Loading;
                 return TicksPanelEffect::Work(request);
             }
-            TickPackageRequest::RefreshLogin(_) => return TicksPanelEffect::Work(request),
+            TickPackageRequest::RefreshLogin(_) | TickPackageRequest::CancelLogIn(_) => {
+                return TicksPanelEffect::Work(request);
+            }
             TickPackageRequest::Install(package) => match self.installed_version(&package.name) {
                 Some(installed) if is_later(&package.version, installed) => {
                     format!("Updating {} to {}…", package.name, package.version)
@@ -428,6 +673,8 @@ impl TicksPanel {
                 None => format!("Installing {} {}…", package.name, package.version),
             },
             TickPackageRequest::Uninstall(name) => format!("Uninstalling {name}…"),
+            TickPackageRequest::LogIn { name, .. } => format!("Logging in to {name}…"),
+            TickPackageRequest::SaveKey { name, .. } => format!("Saving the key for {name}…"),
             TickPackageRequest::LogOut(name) => format!("Logging out of {name}…"),
         };
         if self.busy.is_some() {
@@ -438,6 +685,22 @@ impl TicksPanel {
         }
         self.busy = Some(busy);
         self.notice = None;
+        if let TickPackageRequest::LogIn {
+            name,
+            issuer,
+            attempt,
+            ..
+        } = &mut request
+        {
+            self.login_attempts += 1;
+            *attempt = self.login_attempts;
+            self.login = Some(LoginView {
+                attempt: *attempt,
+                name: name.clone(),
+                label: issuer.label.clone(),
+                stage: LoginStage::Starting,
+            });
+        }
         TicksPanelEffect::Work(request)
     }
 
@@ -484,8 +747,35 @@ impl TicksPanel {
         let (title, context) = match entry {
             InstalledEntry::Usable { package, login } => {
                 let manifest = &package.manifest;
+                match &manifest.auth {
+                    PackageAuth::None => {}
+                    PackageAuth::ApiKey { label, .. } => options.push((
+                        "Log in".to_owned(),
+                        Choice::EnterKey {
+                            name: name.clone(),
+                            label: label.clone(),
+                        },
+                    )),
+                    PackageAuth::OAuth2 { issuers, scopes } => {
+                        for issuer in issuers {
+                            let text = if issuers.len() == 1 {
+                                "Log in".to_owned()
+                            } else {
+                                format!("Log in · {}", issuer.label)
+                            };
+                            options.push((
+                                text,
+                                Choice::Run(TickPackageRequest::LogIn {
+                                    name: name.clone(),
+                                    issuer: issuer.clone(),
+                                    scopes: scopes.clone(),
+                                    attempt: 0,
+                                }),
+                            ));
+                        }
+                    }
+                }
                 if manifest.auth != PackageAuth::None {
-                    options.push(("Log in".to_owned(), Choice::ExplainLogin(name.clone())));
                     options.push((
                         "Log out".to_owned(),
                         Choice::Run(TickPackageRequest::LogOut(name.clone())),
@@ -685,7 +975,8 @@ impl TicksPanel {
                     .map(|line| RoleLine::role(line, role)),
             );
         };
-        if let Some(busy) = &self.busy {
+        // A login under way shows itself in place of the list.
+        if let Some(busy) = self.busy.as_ref().filter(|_| self.login.is_none()) {
             add(busy, Role::Accent);
         }
         if let Some(notice) = &self.notice {
@@ -705,9 +996,12 @@ impl TicksPanel {
     }
 
     pub(super) fn content_rows(&self, width: usize) -> usize {
-        let body = match self.menus.last() {
-            Some(menu) => 1 + context_lines(menu, width).len() + menu.options.len(),
-            None => match self
+        let body = match (&self.login, self.menus.last()) {
+            (Some(login), _) => login_lines(login, width, DisplayProfile::default())
+                .lines
+                .len(),
+            (None, Some(menu)) => 1 + context_lines(menu, width).len() + menu.options.len(),
+            (None, None) => match self
                 .list_rows(width, DisplayProfile::default())
                 .iter()
                 .map(|(_, lines)| lines.len())
@@ -731,7 +1025,21 @@ impl TicksPanel {
         let capacity = height.saturating_sub(CHROME_ROWS + status.len());
         let mut body = Vec::new();
         let mut targets = Vec::new();
-        let (hint, selected_rows) = if let Some(menu) = self.menus.last() {
+        let mut cursor = None;
+        let (hint, selected_rows) = if let Some(login) = &self.login {
+            let shown = login_lines(login, width, display);
+            body = shown.lines;
+            if shown.has_option {
+                targets.push((shown.focus..shown.focus + 1, 0));
+            }
+            cursor = shown.cursor.map(|column| (shown.focus, column));
+            let hint = if shown.has_option {
+                "enter cancel login · esc cancel"
+            } else {
+                "enter save · esc cancel"
+            };
+            (hint.to_owned(), shown.focus..shown.focus + 1)
+        } else if let Some(menu) = self.menus.last() {
             body.push(RoleLine::role(safe_line(&menu.title), Role::Text));
             body.extend(context_lines(menu, width));
             for (index, (label, _)) in menu.options.iter().enumerate() {
@@ -782,7 +1090,8 @@ impl TicksPanel {
             (hint, selected_rows)
         };
         let top = &mut self.top[self.page];
-        if self.menus.is_empty() {
+        let shows_list = self.menus.is_empty() && self.login.is_none();
+        if shows_list {
             if selected_rows.start < *top {
                 *top = selected_rows.start;
             }
@@ -791,7 +1100,7 @@ impl TicksPanel {
             }
             *top = (*top).min(body.len().saturating_sub(capacity));
         }
-        let skip = if self.menus.is_empty() {
+        let skip = if shows_list {
             *top
         } else {
             selected_rows.end.saturating_sub(capacity)
@@ -814,7 +1123,10 @@ impl TicksPanel {
         }
         ConversationPickerFrame {
             lines,
-            cursor: None,
+            // Below the header, while the field is in view.
+            cursor: cursor
+                .filter(|(row, _)| (skip..skip + capacity).contains(row))
+                .map(|(row, column)| (row - skip + 1, column)),
         }
     }
 
@@ -855,6 +1167,93 @@ fn is_later(offered: &str, installed: &str) -> bool {
     matches!((numbers(offered), numbers(installed)), (Some(offered), Some(installed)) if offered > installed)
 }
 
+/// A login view's rows, with the row of its option or field.
+struct LoginLines {
+    lines: Vec<RoleLine>,
+    focus: usize,
+    /// Whether the focused row is the option that cancels the login.
+    has_option: bool,
+    /// The column after the masked key, for the text cursor.
+    cursor: Option<usize>,
+}
+
+/// The rows of `login` at `width`, worded as the Console's other device logins.
+fn login_lines(login: &LoginView, width: usize, display: DisplayProfile) -> LoginLines {
+    let LoginView {
+        name, label, stage, ..
+    } = login;
+    let title = match stage {
+        LoginStage::Key { .. } => format!("Log in to {name}"),
+        _ => format!("Log in to {name} · {label}"),
+    };
+    let mut lines = vec![RoleLine::role(safe_line(&title), Role::Text)];
+    let context_width = width.saturating_sub(CONTEXT_INDENT.len()).max(1);
+    let context = |lines: &mut Vec<RoleLine>, text: &str| {
+        lines.extend(
+            wrap_text(&safe_line(text), context_width)
+                .into_iter()
+                .map(|line| RoleLine::role(format!("{CONTEXT_INDENT}{line}"), Role::MutedText)),
+        );
+    };
+    match stage {
+        LoginStage::Starting => {
+            context(&mut lines, &format!("Starting the {label} authorization…"));
+        }
+        LoginStage::Waiting { link, code, opened } => {
+            context(
+                &mut lines,
+                if *opened {
+                    "Opening your browser. If no page appears, open this link on your own device:"
+                } else {
+                    "Open this link on your own device:"
+                },
+            );
+            // Every row of a wrapped link opens the whole link.
+            lines.extend(wrap_text(link, context_width).into_iter().map(|piece| {
+                RoleLine::linked(format!("{CONTEXT_INDENT}{piece}"), Role::Accent, link)
+            }));
+            context(
+                &mut lines,
+                "Use your terminal's link shortcut (often ctrl/cmd+click), or copy the URL.",
+            );
+            context(&mut lines, &format!("Enter code: {code}"));
+            context(
+                &mut lines,
+                &format!("Waiting for the authorization of {name}. esc cancels."),
+            );
+        }
+        LoginStage::Key { entered } => {
+            context(
+                &mut lines,
+                &format!("Enter the {label}. Only {name}'s programs get it; it is never shown."),
+            );
+            let field = format!("{CONTEXT_INDENT}{}: ", safe_line(label));
+            let masked = "*".repeat(entered.chars().count());
+            let cursor = field.width() + masked.len();
+            lines.push(RoleLine::role(format!("{field}{masked}"), Role::Text));
+            return LoginLines {
+                focus: lines.len() - 1,
+                lines,
+                has_option: false,
+                cursor: Some(cursor),
+            };
+        }
+    }
+    lines.push(
+        RoleLine::role(
+            format!("{} Cancel login", display.glyph(Glyph::Prompt)),
+            Role::Text,
+        )
+        .filled(Role::Selection),
+    );
+    LoginLines {
+        focus: lines.len() - 1,
+        lines,
+        has_option: true,
+        cursor: None,
+    }
+}
+
 /// The menu's context, indented and wrapped at `width`.
 fn context_lines(menu: &PanelMenu, width: usize) -> Vec<RoleLine> {
     menu.context
@@ -876,7 +1275,7 @@ fn step(selected: usize, count: usize, down: bool) -> usize {
 mod tests {
     use std::path::PathBuf;
 
-    use tick_packages::{OAuthIssuer, PackageManifest};
+    use tick_packages::PackageManifest;
 
     use super::*;
 
@@ -886,10 +1285,7 @@ mod tests {
     fn installed(name: &str, version: &str, declares_login: bool) -> InstalledPackage {
         let auth = if declares_login {
             PackageAuth::OAuth2 {
-                issuers: vec![OAuthIssuer {
-                    label: "Server".into(),
-                    issuer: "https://auth.example.com".into(),
-                }],
+                issuers: vec![server("Server")],
                 scopes: Vec::new(),
             }
         } else {
@@ -1203,20 +1599,307 @@ mod tests {
         );
     }
 
+    fn server(label: &str) -> OAuthIssuer {
+        OAuthIssuer {
+            label: label.into(),
+            issuer: format!(
+                "https://{}.example.com",
+                label.to_lowercase().replace(' ', "-")
+            ),
+        }
+    }
+
+    fn with_auth(mut package: InstalledPackage, auth: PackageAuth) -> InstalledPackage {
+        package.manifest.auth = auth;
+        package
+    }
+
+    const LINK: &str = "https://auth.example.com/oauth2/device/verify?user_code=WDJB-MJHT&client_name=a-rather-long-client-name";
+
     #[test]
-    fn logging_in_points_to_the_terminal_command_until_the_panel_logs_in_itself() {
+    fn an_oauth_login_shows_its_link_and_code_in_the_panel_until_it_ends() {
         let mut panel = loaded_panel();
         press(&mut panel, KeyCode::Enter);
+        assert_eq!(
+            work(press(&mut panel, KeyCode::Enter)),
+            TickPackageRequest::LogIn {
+                name: "alpha".into(),
+                issuer: server("Server"),
+                scopes: Vec::new(),
+                attempt: 1,
+            }
+        );
+        let shown = text(&mut panel);
+        assert!(
+            shown.contains("Log in to alpha · Server")
+                && shown.contains("Starting the Server authorization…")
+                && shown.contains("❯ Cancel login")
+                && shown.contains("enter cancel login · esc cancel"),
+            "{shown}"
+        );
+        assert!(!shown.contains("Logging in to alpha…"), "{shown}");
+
+        panel.apply(TickPackageResult::LoginWaiting {
+            attempt: 1,
+            link: LINK.into(),
+            code: "WDJB-MJHT".into(),
+            opened: true,
+        });
+        let lines = frame(&mut panel);
+        let shown = lines
+            .iter()
+            .map(RoleLine::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            shown.contains(
+                "Opening your browser. If no page appears, open this link on your own device:"
+            ) && shown.contains("Enter code: WDJB-MJHT")
+                && shown.contains("Waiting for the authorization of alpha. esc cancels."),
+            "{shown}"
+        );
+        let linked = lines
+            .iter()
+            .filter(|line| line.link.as_deref() == Some(LINK))
+            .map(|line| line.text().trim().to_owned())
+            .collect::<Vec<_>>();
+        assert!(linked.len() > 1, "the long link wraps:\n{shown}");
+        assert_eq!(
+            linked.concat(),
+            LINK,
+            "every row of the link opens all of it"
+        );
+
+        // Another operation waits for the login.
+        press(&mut panel, KeyCode::Tab);
+        assert!(matches!(
+            press(&mut panel, KeyCode::Tab),
+            TicksPanelEffect::None
+        ));
+        assert!(text(&mut panel).contains("Log in to alpha · Server"));
+
+        panel.apply(TickPackageResult::LoginEnded {
+            attempt: 1,
+            name: "alpha".into(),
+            result: Ok(()),
+        });
+        let shown = text(&mut panel);
+        assert!(
+            shown.contains("Logged in to alpha") && shown.contains("◉ alpha"),
+            "{shown}"
+        );
+        assert!(!shown.contains("Cancel login"), "{shown}");
+
+        press(&mut panel, KeyCode::Enter);
+        work(press(&mut panel, KeyCode::Enter));
+        panel.apply(TickPackageResult::LoginEnded {
+            attempt: 2,
+            name: "alpha".into(),
+            result: Err(LoginError::Denied),
+        });
+        assert!(text(&mut panel).contains("Cannot log in to alpha: the authorization was denied"));
+        press(&mut panel, KeyCode::Enter);
+        work(press(&mut panel, KeyCode::Enter));
+        panel.apply(TickPackageResult::LoginEnded {
+            attempt: 3,
+            name: "alpha".into(),
+            result: Err(LoginError::Expired),
+        });
+        assert!(text(&mut panel).contains(
+            "Cannot log in to alpha: the code expired before the authorization was approved"
+        ));
+    }
+
+    #[test]
+    fn esc_cancels_a_login_and_what_it_still_reports_is_ignored() {
+        let mut panel = loaded_panel();
+        press(&mut panel, KeyCode::Enter);
+        work(press(&mut panel, KeyCode::Enter));
+        panel.apply(TickPackageResult::LoginWaiting {
+            attempt: 1,
+            link: "http://127.0.0.1:9/verify".into(),
+            code: "CODE".into(),
+            opened: false,
+        });
+        let shown = text(&mut panel);
+        assert!(
+            shown.contains("Open this link on your own device:") && !shown.contains("Opening"),
+            "{shown}"
+        );
+        for key in ['j', 'k'] {
+            press(&mut panel, KeyCode::Char(key));
+        }
+        assert!(text(&mut panel).contains("Enter code: CODE"));
+        assert_eq!(
+            work(press(&mut panel, KeyCode::Esc)),
+            TickPackageRequest::CancelLogIn(1)
+        );
+        let shown = text(&mut panel);
+        assert!(
+            shown.contains("Cancelled the login to alpha") && shown.contains("◉ alpha"),
+            "{shown}"
+        );
+        panel.apply(TickPackageResult::LoginEnded {
+            attempt: 1,
+            name: "alpha".into(),
+            result: Err(LoginError::Cancelled),
+        });
+        panel.apply(TickPackageResult::LoginWaiting {
+            attempt: 1,
+            link: "http://127.0.0.1:9/verify".into(),
+            code: "LATE".into(),
+            opened: false,
+        });
+        let shown = text(&mut panel);
+        assert!(
+            shown.contains("Cancelled the login to alpha") && !shown.contains("LATE"),
+            "{shown}"
+        );
+        // A later login ignores what the cancelled one still reports; enter on Cancel login
+        // cancels too, and a new operation may start at once.
+        press(&mut panel, KeyCode::Enter);
+        work(press(&mut panel, KeyCode::Enter));
+        panel.apply(TickPackageResult::LoginEnded {
+            attempt: 1,
+            name: "alpha".into(),
+            result: Ok(()),
+        });
+        let shown = text(&mut panel);
+        assert!(
+            shown.contains("Starting the Server authorization…") && !shown.contains("Logged in"),
+            "{shown}"
+        );
+        assert_eq!(
+            work(press(&mut panel, KeyCode::Enter)),
+            TickPackageRequest::CancelLogIn(2)
+        );
+        press(&mut panel, KeyCode::Enter);
+        control(&mut panel, 'n');
+        assert_eq!(
+            work(press(&mut panel, KeyCode::Enter)),
+            TickPackageRequest::LogOut("alpha".into())
+        );
+    }
+
+    #[test]
+    fn a_package_with_several_issuers_offers_a_login_at_each() {
+        let mut panel = TicksPanel::new(None);
+        let issuers = vec![server("China mainland"), server("Global")];
+        panel.apply(installed_list(
+            1,
+            vec![(
+                with_auth(
+                    installed("longbridge", "0.2.0", true),
+                    PackageAuth::OAuth2 {
+                        issuers: issuers.clone(),
+                        scopes: vec!["4".into()],
+                    },
+                ),
+                LoginState::LoggedOut,
+            )],
+        ));
+        press(&mut panel, KeyCode::Enter);
+        let shown = text(&mut panel);
+        assert!(
+            shown.contains("❯ Log in · China mainland")
+                && shown.contains("  Log in · Global")
+                && shown.contains("  Log out"),
+            "{shown}"
+        );
+        control(&mut panel, 'n');
+        assert_eq!(
+            work(press(&mut panel, KeyCode::Enter)),
+            TickPackageRequest::LogIn {
+                name: "longbridge".into(),
+                issuer: issuers[1].clone(),
+                scopes: vec!["4".into()],
+                attempt: 1,
+            }
+        );
+        assert!(text(&mut panel).contains("Log in to longbridge · Global"));
+    }
+
+    #[test]
+    fn a_key_is_entered_masked_and_saved() {
+        let mut panel = TicksPanel::new(None);
+        panel.apply(installed_list(
+            1,
+            vec![(
+                with_auth(
+                    installed("keyed", "1.0.0", false),
+                    PackageAuth::ApiKey {
+                        env: "KEYED_KEY".into(),
+                        label: "Keyed API key".into(),
+                    },
+                ),
+                LoginState::LoggedOut,
+            )],
+        ));
+        press(&mut panel, KeyCode::Enter);
+        assert!(text(&mut panel).contains("❯ Log in"));
         assert!(matches!(
             press(&mut panel, KeyCode::Enter),
             TicksPanelEffect::None
         ));
         let shown = text(&mut panel);
         assert!(
-            shown.contains("Log in to alpha with tickloop tick login alpha in a terminal"),
+            shown.contains("Log in to keyed")
+                && shown.contains("Enter the Keyed API key.")
+                && shown.contains("enter save · esc cancel"),
             "{shown}"
         );
-        assert!(!shown.contains('❯'), "the menus close:\n{shown}");
+        assert!(matches!(
+            press(&mut panel, KeyCode::Enter),
+            TicksPanelEffect::None
+        ));
+        assert!(text(&mut panel).contains("a key holds 1 to 4096 bytes"));
+        for key in "jk-old".chars() {
+            press(&mut panel, KeyCode::Char(key));
+        }
+        control(&mut panel, 'u');
+        for key in "jk-secrets".chars() {
+            press(&mut panel, KeyCode::Char(key));
+        }
+        press(&mut panel, KeyCode::Backspace);
+        panel.paste("-2\n");
+        let rendered = panel.frame(WIDTH, HEIGHT, DisplayProfile::default());
+        let shown = rendered
+            .lines
+            .iter()
+            .map(RoleLine::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            shown.contains("Keyed API key: ***********") && !shown.contains("secret"),
+            "{shown}"
+        );
+        let (row, column) = rendered.cursor.unwrap();
+        assert!(rendered.lines[row].text().contains("Keyed API key: "));
+        assert_eq!(column, "  Keyed API key: ".len() + 11);
+        let TickPackageRequest::SaveKey { name, key } = work(press(&mut panel, KeyCode::Enter))
+        else {
+            panic!("enter does not save the key");
+        };
+        assert_eq!((name.as_str(), key.expose()), ("keyed", "jk-secret-2"));
+        assert!(text(&mut panel).contains("Saving the key for keyed…"));
+        panel.apply(TickPackageResult::KeySaved {
+            name: "keyed".into(),
+            result: Ok(()),
+        });
+        assert!(text(&mut panel).contains("Saved the key for keyed"));
+
+        press(&mut panel, KeyCode::Enter);
+        press(&mut panel, KeyCode::Enter);
+        press(&mut panel, KeyCode::Char('x'));
+        assert!(matches!(
+            press(&mut panel, KeyCode::Esc),
+            TicksPanelEffect::None
+        ));
+        let shown = text(&mut panel);
+        assert!(
+            shown.contains("◉ keyed") && !shown.contains("Enter the Keyed API key."),
+            "esc leaves the key entry without saving:\n{shown}"
+        );
     }
 
     #[test]
@@ -1269,10 +1952,13 @@ mod tests {
                 ),
             }),
         });
-        assert!(text(&mut panel).contains(
-            "Logged out of alpha; the authorization server did not revoke the token \
-             (https://auth.example.com/revoke answered HTTP 503)"
-        ));
+        let shown = text(&mut panel);
+        assert!(
+            shown
+                .contains("Logged out of alpha; the authorization server did not revoke the token")
+                && shown.contains("answered HTTP 503"),
+            "{shown}"
+        );
         panel.apply(TickPackageResult::Logout {
             name: "alpha".into(),
             result: Ok(LoggedOut {

@@ -1,830 +1,460 @@
-use crate::support::http;
+//! The Longbridge login against a local authorization server: the device login of
+//! `tick-longbridge auth` and the renewal every `tick-longbridge` makes of the saved token.
+
+use std::{os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
 use serde_json::json;
-use std::io::Cursor;
-use tick_longbridge::auth::{AuthEndpoints, run_login, storage::AuthStorage};
-use tick_market::config::Settings;
+use tick_longbridge::{
+    AUTH_HINT,
+    auth::{self, DeviceLogin, LoginNotice},
+    region::Region,
+};
+use tick_packages::{LoginState, OAuthIssuer, PackageAuth};
+use tick_provider::exit_code;
+use tickloop_agent_test_support::authorization_server::{
+    AuthorizationServer, DEVICE_CODE_GRANT, REGISTRATION_PATH, TOKEN_PATH, TokenReply, USER_CODE,
+};
+use tokio::sync::mpsc;
 
-const SDK_REFRESH_WINDOW_SECONDS: u64 = 300;
-const ACTIVE_TOKEN_LIFETIME_SECONDS: u64 = SDK_REFRESH_WINDOW_SECONDS + 3;
-/// Bounds a flow whose failure would wait for device-code expiry or a browser callback. Building
-/// an HTTP client reads the macOS system proxy settings, which scans the test executable's
-/// directory; in a large target with tests running in parallel that alone takes seconds.
-const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
+use crate::support::login::{credentials, now, save, saved, token};
 
-#[tokio::test]
-async fn approval_is_received_after_a_dropped_connection_without_progress_flooding() {
-    use std::{
-        collections::HashMap,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
-        time::{Duration, Instant},
-    };
-    const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
-    const RETRY_TIMEOUT: Duration = Duration::from_secs(5);
-    let (dropped_sender, mut dropped_receiver) = tokio::sync::oneshot::channel::<Instant>();
-    let dropped_sender = Mutex::new(Some(dropped_sender));
-    let ap_polls = AtomicUsize::new(0);
-    let observations = Arc::new(Mutex::new(Vec::new()));
-    let observed = observations.clone();
-    let stub = http::Stub::start_with_observer(move |request| {
-        if request.contains("/register ") {
-            Some((201, json!({"client_id":"client"})))
-        } else if request.contains("/device/authorize ") {
-            Some((200, json!({"device_code":"secret","user_code":"CODE","verification_uri":"https://example.com","expires_in":120,"interval":1})))
-        } else if request.contains("x-dc-region: ap") {
-            if ap_polls.fetch_add(1, Ordering::SeqCst) == 0 {
-                None
-            } else {
-                Some((200, json!({"access_token":"ap_authorized","expires_in":3600})))
-            }
-        } else {
-            Some((400, json!({"error":"authorization_pending"})))
-        }
-    }, move |event| {
-        if event.phase == "connection-dropped" && event.endpoint == "token" && event.center == "ap"
-            && let Some(sender) = dropped_sender.lock().unwrap().take()
-        {
-            let _ = sender.send(event.at);
-        }
-        observed.lock().unwrap().push(event);
-    }).await;
-    let home = tempfile::tempdir().unwrap();
-    let storage = AuthStorage::in_home(home.path());
-    let endpoints = AuthEndpoints {
-        ap: format!("{}/oauth2", stub.url),
-        us: format!("{}/oauth2", stub.url),
-    };
-    let mut output = Vec::new();
-    let started = Instant::now();
-    let mut first_dropped_at = None;
-    let mut completed_during_setup = false;
-    let result = {
-        let settings = Settings::default();
-        let config_path = home.path().join("config.toml");
-        let mut input = Cursor::new("cn\n");
-        let login = run_login(
-            settings.region,
-            &config_path,
-            &storage,
-            Some(endpoints),
-            &mut input,
-            &mut output,
-        );
-        tokio::pin!(login);
-        let setup_deadline = started + SETUP_TIMEOUT;
-        let setup = tokio::select! {
-            biased;
-            dropped = &mut dropped_receiver => {
-                dropped.map(|at| (at, None)).map_err(|_| "missing-disconnect")
-            }
-            completed = &mut login => {
-                match dropped_receiver.try_recv() {
-                    Ok(at) => {
-                        completed_during_setup = true;
-                        Ok((at, Some(completed)))
-                    }
-                    Err(_) => Err(if completed.is_ok() {
-                        "login-finished-before-disconnect"
-                    } else {
-                        "login-error-before-disconnect"
-                    }),
-                }
-            }
-            _ = tokio::time::sleep_until(setup_deadline.into()) => Err("setup-timeout"),
-        };
-        match setup {
-            Err(failure) => Err(failure),
-            Ok((dropped_at, completed)) => {
-                first_dropped_at = Some(dropped_at);
-                let received_at = Instant::now();
-                let retry_deadline = dropped_at + RETRY_TIMEOUT;
-                if dropped_at < started || dropped_at > setup_deadline {
-                    Err("disconnect-outside-setup-deadline")
-                } else if received_at > setup_deadline {
-                    Err("setup-deadline-exceeded")
-                } else if received_at > retry_deadline {
-                    Err("retry-deadline-already-elapsed")
-                } else {
-                    let completed = if let Some(completed) = completed {
-                        Ok(completed)
-                    } else {
-                        tokio::time::timeout_at(retry_deadline.into(), &mut login)
-                            .await
-                            .map_err(|_| "retry-timeout")
-                    };
-                    if Instant::now() > retry_deadline {
-                        Err("retry-deadline-exceeded")
-                    } else {
-                        completed
-                    }
-                }
-            }
-        }
-    };
-    let finished = Instant::now();
-    let observations = observations.lock().unwrap();
-    let mut ordinals = HashMap::new();
-    let mut connections = HashMap::new();
-    for event in observations
-        .iter()
-        .filter(|event| event.phase == "request-accepted")
-    {
-        let ordinal = ordinals.entry((event.endpoint, event.center)).or_insert(0);
-        *ordinal += 1;
-        connections.insert(event.connection, (event.endpoint, event.center, *ordinal));
-    }
-    let events: Vec<_> = observations.iter().map(|event| {
-        let (endpoint, center, ordinal) = connections.get(&event.connection).copied().unwrap_or(("unknown", "unknown", 0));
-        json!({"elapsed_us":event.at.saturating_duration_since(started).as_micros(), "connection":event.connection,
-            "phase":event.phase, "endpoint":endpoint, "center":center, "ordinal":ordinal,
-            "status":event.status, "write_ok":event.write_ok})
-    }).collect();
-    let notices = String::from_utf8_lossy(&output);
-    let outcome = match &result {
-        Err(failure) => *failure,
-        Ok(Err(_)) => "login-error",
-        Ok(Ok(())) => "success",
-    };
-    if !matches!(&result, Ok(Ok(()))) {
-        eprintln!(
-            "auth reconnect timing: {}",
-            json!({"setup_deadline_ms":SETUP_TIMEOUT.as_millis(), "retry_deadline_ms":RETRY_TIMEOUT.as_millis(),
-        "elapsed_us":finished.duration_since(started).as_micros(),
-        "first_drop_us":first_dropped_at.map(|at| at.saturating_duration_since(started).as_micros()),
-        "retry_elapsed_us":first_dropped_at.map(|at| finished.saturating_duration_since(at).as_micros()),
-        "completed_during_setup":completed_during_setup,
-        "outcome":outcome,
-        "notices":{"waiting":notices.matches("Waiting for Longbridge").count(), "retry":notices.matches("retrying automatically").count(),
-            "remaining":notices.matches("remaining").count(), "logged_in":notices.matches("Logged in").count()}, "events":events})
-        );
-    }
-    result
-        .expect("a brief connection failure must not abandon the approved center")
-        .unwrap();
-    assert_eq!(
-        storage.token().unwrap().unwrap().access_token,
-        "ap_authorized"
-    );
-    let output = String::from_utf8(output).unwrap();
-    assert_eq!(output.matches("Waiting for Longbridge").count(), 1);
-    assert_eq!(output.matches("retrying automatically").count(), 1);
-    assert!(!output.contains("remaining"));
-    assert!(output.contains("Logged in"));
-}
+/// Bounds a login whose failure would otherwise wait for its device code to expire.
+const HANG_GUARD: Duration = Duration::from_secs(30);
+/// Just outside the SDK's five-minute refresh window.
+const ACTIVE_FOR: u64 = 300 + 3;
 
-#[tokio::test]
-async fn approval_survives_transient_http_errors_without_abandoning_its_center() {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-
-    for status in [500, 502, 503, 504, 599] {
-        let ap_polls = Arc::new(AtomicUsize::new(0));
-        let observed = ap_polls.clone();
-        let stub = http::Stub::start(move |request| {
-            if request.contains("/register ") {
-                (201, json!({"client_id":"client"}))
-            } else if request.contains("/device/authorize ") {
-                (200, json!({"device_code":"secret","user_code":"CODE","verification_uri":"https://example.com","expires_in":120,"interval":1}))
-            } else if request.contains("x-dc-region: ap") {
-                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
-                    (status, json!({"error":"gateway_unavailable"}))
-                } else {
-                    (200, json!({"access_token":"ap_authorized","expires_in":3600}))
-                }
-            } else {
-                (400, json!({"error":"authorization_pending"}))
-            }
-        }).await;
-        let home = tempfile::tempdir().unwrap();
-        let storage = AuthStorage::in_home(home.path());
-        let endpoints = AuthEndpoints {
-            ap: format!("{}/oauth2", stub.url),
-            us: format!("{}/oauth2", stub.url),
-        };
-        let mut output = Vec::new();
-        tokio::time::timeout(
-            HANG_GUARD,
-            run_login(
-                None,
-                &home.path().join("config.toml"),
-                &storage,
-                Some(endpoints),
-                &mut Cursor::new("cn\n"),
-                &mut output,
-            ),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("HTTP {status} must not abandon the approved AP center"))
-        .unwrap();
-        assert_eq!(ap_polls.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            storage.token().unwrap().unwrap().access_token,
-            "ap_authorized"
-        );
-        let output = String::from_utf8(output).unwrap();
-        assert_eq!(output.matches("Waiting for Longbridge").count(), 1);
-        assert_eq!(output.matches("retrying automatically").count(), 1);
-        assert!(!output.contains("remaining"));
-        assert!(output.contains("Logged in"));
-    }
-}
-
-#[tokio::test]
-async fn simultaneous_endpoint_failures_share_one_continuous_outage_notice() {
-    assert_outage_notices(vec![503, 200], true, 1).await;
-}
-
-#[tokio::test]
-async fn a_new_outage_after_recovery_has_its_own_retry_notice() {
-    assert_outage_notices(vec![503, 400, 503, 200], false, 2).await;
-}
-
-async fn assert_outage_notices(ap_statuses: Vec<u16>, fail_us_once: bool, expected_notices: usize) {
-    use std::{
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
-        time::{Duration, Instant},
-    };
-    const OUTAGE_RETRY_BUDGET: Duration = Duration::from_secs(5);
-    let statuses = Arc::new(ap_statuses);
-    let responses = statuses.clone();
-    let ap_polls = Arc::new(AtomicUsize::new(0));
-    let observed_polls = ap_polls.clone();
-    let us_polls = AtomicUsize::new(0);
-    let timeline = Arc::new(Mutex::new(Vec::new()));
-    let observed_timeline = timeline.clone();
-    let stub = http::Stub::start(move |request| {
-        if request.contains("/register ") {
-            (201, json!({"client_id":"client"}))
-        } else if request.contains("/device/authorize ") {
-            (200, json!({"device_code":"secret","user_code":"CODE","verification_uri":"https://example.com","expires_in":120,"interval":1}))
-        } else if request.contains("x-dc-region: ap") {
-            let poll = observed_polls.fetch_add(1, Ordering::SeqCst);
-            let status = responses[poll];
-            observed_timeline.lock().unwrap().push((status, Instant::now()));
-            (status, match status {
-                200 => json!({"access_token":"ap_authorized","expires_in":3600}),
-                400 => json!({"error":"authorization_pending"}),
-                _ => json!({"error":"gateway_unavailable"}),
-            })
-        } else if fail_us_once && us_polls.fetch_add(1, Ordering::SeqCst) == 0 {
-            (502, json!({"error":"gateway_unavailable"}))
-        } else {
-            (400, json!({"error":"authorization_pending"}))
-        }
-    }).await;
-    let home = tempfile::tempdir().unwrap();
-    let storage = AuthStorage::in_home(home.path());
-    let mut output = Vec::new();
-    tokio::time::timeout(
-        HANG_GUARD,
-        run_login(
-            None,
-            &home.path().join("config.toml"),
-            &storage,
-            Some(AuthEndpoints {
-                ap: format!("{}/oauth2", stub.url),
-                us: format!("{}/oauth2", stub.url),
-            }),
-            &mut Cursor::new("cn\n"),
-            &mut output,
-        ),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(ap_polls.load(Ordering::SeqCst), statuses.len());
-    for pair in timeline.lock().unwrap().windows(2) {
-        if pair[0].0 >= 500 {
-            assert!(pair[1].1.duration_since(pair[0].1) < OUTAGE_RETRY_BUDGET);
-        }
-    }
-    assert_eq!(
-        storage.token().unwrap().unwrap().access_token,
-        "ap_authorized"
-    );
-    let output = String::from_utf8(output).unwrap();
-    assert_eq!(
-        output.matches("retrying automatically").count(),
-        expected_notices
-    );
-    assert_eq!(output.matches("Waiting for Longbridge").count(), 1);
-    assert!(!output.contains("remaining"));
-}
-
-#[tokio::test]
-async fn successful_device_authorization_without_expiry_does_not_keep_waiting() {
-    let stub = http::Stub::start(|request| {
-        if request.contains("/register ") {
-            (201, json!({"client_id":"client"}))
-        } else if request.contains("/device/authorize ") {
-            (200, json!({"device_code":"secret","user_code":"CODE","verification_uri":"https://example.com","expires_in":120,"interval":1}))
-        } else if request.contains("x-dc-region: ap") {
-            (200, json!({"access_token":"ap_authorized","refresh_token":"ap_refresh","expires_in":null}))
-        } else {
-            (400, json!({"error":"authorization_pending"}))
-        }
-    }).await;
-    let home = tempfile::tempdir().unwrap();
-    let storage = AuthStorage::in_home(home.path());
-    let endpoints = AuthEndpoints {
-        ap: format!("{}/oauth2", stub.url),
-        us: format!("{}/oauth2", stub.url),
-    };
-    let mut output = Vec::new();
-    tokio::time::timeout(
-        HANG_GUARD,
-        run_login(
-            None,
-            &home.path().join("config.toml"),
-            &storage,
-            Some(endpoints),
-            &mut Cursor::new("cn\n"),
-            &mut output,
-        ),
-    )
-    .await
-    .expect("successful authorization must end the wait even without expires_in")
-    .unwrap();
-    let token = storage.token().unwrap().expect("save the approved token");
-    assert_eq!(token.access_token, "ap_authorized");
-    let lifetime = token
-        .expires_at
-        .saturating_sub(tick_longbridge::auth::storage::now_seconds());
-    assert!((3595..=3600).contains(&lifetime));
-    let output = String::from_utf8(output).unwrap();
-    assert!(output.contains("Logged in"));
-    assert!(!output.contains("ap_authorized"));
-}
-
-#[tokio::test]
-async fn prepared_region_allows_device_login_without_reading_stdin() {
-    struct NoInput;
-    impl std::io::Read for NoInput {
-        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-            panic!("asynchronous login must not read stdin")
-        }
-    }
-    impl std::io::BufRead for NoInput {
-        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-            panic!("asynchronous login must not read stdin")
-        }
-        fn consume(&mut self, _: usize) {
-            panic!("asynchronous login must not read stdin")
-        }
-    }
-    let stub = http::Stub::start(|request| {
-        if request.contains("/register ") { (201, json!({"client_id":"client"})) }
-        else if request.contains("/device/authorize ") { (200, json!({"device_code":"secret","user_code":"CODE","verification_uri":"https://example.com","expires_in":30,"interval":1})) }
-        else { (200, json!({"access_token":"ap_token","expires_in":3600})) }
-    }).await;
-    let home = tempfile::tempdir().unwrap();
-    let storage = AuthStorage::in_home(home.path());
-    let config_path = home.path().join("config.toml");
-    std::fs::write(&config_path, "# Keep personal settings\nlanguage = 'en'\n").unwrap();
-    let mut settings = Settings::load(&config_path, true).unwrap();
-    let mut output = Vec::new();
-    settings.region = Some(
-        tick_longbridge::auth::prepare_region(
-            settings.region,
-            &config_path,
-            &mut Cursor::new("cn\n"),
-            &mut output,
-        )
-        .unwrap(),
-    );
-    assert!(
-        String::from_utf8(output.clone())
-            .unwrap()
-            .contains("Select region")
-    );
-    assert!(storage.token().unwrap().is_none());
-    assert!(stub.requests.lock().unwrap().is_empty());
-    assert!(
-        std::fs::read_to_string(&config_path)
-            .unwrap()
-            .contains("# Keep personal settings")
-    );
-    assert_eq!(
-        Settings::load(&config_path, true).unwrap().language,
-        tick_provider::preferences::Language::En
-    );
-    output.clear();
-    let endpoints = AuthEndpoints {
-        ap: format!("{}/oauth2", stub.url),
-        us: format!("{}/oauth2", stub.url),
-    };
-    run_login(
-        settings.region,
-        &config_path,
-        &storage,
-        Some(endpoints),
-        &mut NoInput,
-        &mut output,
-    )
-    .await
-    .unwrap();
-    let output = String::from_utf8(output).unwrap();
-    assert!(!output.contains("Select region"));
-    assert!(output.contains("Logged in"));
-}
-
-#[tokio::test]
-async fn device_login_registers_once_polls_both_centers_and_saves_private_token() {
-    let stub = http::Stub::start(|request| {
-        if request.starts_with("POST /oauth2/register ") {
-            assert!(request.contains("Tickloop"));
-            (201, json!({"client_id":"test-client"}))
-        } else if request.starts_with("POST /oauth2/device/authorize ") {
-            assert!(request.contains("client_id=test-client"));
-            (200, json!({"device_code":"device-secret","user_code":"ABCD-EFGH","verification_uri":"https://example.com/verify","expires_in":30,"interval":1}))
-        } else if request.contains("x-dc-region: us") {
-            assert!(request.contains("device_code=device-secret"));
-            (200, json!({"access_token":"us_test-access","refresh_token":"us_test-refresh","expires_in":3600}))
-        } else {
-            (400, json!({"error":"authorization_pending"}))
-        }
-    }).await;
-    let home = tempfile::tempdir().unwrap();
-    let storage = AuthStorage::in_home(home.path());
-    let config_path = home.path().join(".tickloop/config.toml");
-    let endpoints = AuthEndpoints {
-        ap: format!("{}/oauth2", stub.url),
-        us: format!("{}/oauth2", stub.url),
-    };
-    for _ in 0..2 {
-        let mut output = Vec::new();
-        run_login(
-            Settings::load(&config_path, false).unwrap().region,
-            &config_path,
-            &storage,
-            Some(endpoints.clone()),
-            &mut Cursor::new("global\n"),
-            &mut output,
-        )
-        .await
-        .unwrap();
-        let output = String::from_utf8(output).unwrap();
-        assert!(output.contains("ABCD-EFGH"), "{output}");
-        assert!(output.contains("https://example.com/verify"), "{output}");
-        assert!(output.contains("30s"), "{output}");
-        assert!(output.contains("Logged in"), "{output}");
-        assert!(!output.contains("device-secret"));
-        assert!(!output.contains("us_test-access"));
-    }
-    assert_eq!(
-        storage.token().unwrap().unwrap().access_token,
-        "us_test-access"
-    );
-    assert_eq!(
-        Settings::load(&config_path, true).unwrap().region,
-        Some(tick_provider::preferences::Region::Global)
-    );
-    let requests = stub.requests.lock().unwrap();
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.starts_with("POST /oauth2/register "))
-            .count(),
-        1
-    );
-    assert!(
-        requests
-            .iter()
-            .any(|request| request.contains("x-dc-region: ap"))
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            std::fs::metadata(storage.directory.join("auth.json"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-    }
-}
-
-#[tokio::test]
-async fn polling_reports_denial_and_expiry_without_saving_a_token() {
-    for (oauth_error, message) in [
-        ("access_denied", "denied"),
-        ("expired_token", "expired"),
-        ("invalid_client", "invalid_client"),
-        ("invalid_grant", "invalid_grant"),
-    ] {
-        let stub = http::Stub::start(move |request| {
-            if request.contains("/register ") { (201, json!({"client_id":"client"})) }
-            else if request.contains("/device/authorize ") { (200, json!({"device_code":"secret","user_code":"CODE","verification_uri":"https://example.com","expires_in":30,"interval":1})) }
-            else if request.contains("x-dc-region: ap") { (400, json!({"error":oauth_error})) }
-            else { (400, json!({"error":"authorization_pending"})) }
-        }).await;
-        let home = tempfile::tempdir().unwrap();
-        let storage = AuthStorage::in_home(home.path());
-        let endpoints = AuthEndpoints {
-            ap: format!("{}/oauth2", stub.url),
-            us: format!("{}/oauth2", stub.url),
-        };
-        let result = tokio::time::timeout(
-            HANG_GUARD,
-            run_login(
-                None,
-                &home.path().join("config.toml"),
-                &storage,
-                Some(endpoints),
-                &mut Cursor::new("cn\n"),
-                &mut Vec::new(),
-            ),
-        )
-        .await
-        .expect("a terminal rejection must cancel the other poller");
-        let error = result.unwrap_err();
-        assert_eq!(error.code, 3);
-        assert!(error.message.contains(message), "{error}");
-        assert!(storage.token().unwrap().is_none());
-    }
-}
-
-#[tokio::test]
-async fn malformed_approved_token_is_reported_instead_of_hidden_by_pending_center() {
-    let stub = http::Stub::start(|request| {
-        if request.contains("/register ") {
-            (201, json!({"client_id":"client"}))
-        } else if request.contains("/device/authorize ") {
-            (200, json!({"device_code":"secret","user_code":"CODE","verification_uri":"https://example.com","expires_in":120,"interval":1}))
-        } else if request.contains("x-dc-region: ap") {
-            (200, json!({"access_token":"ap_private","expires_in":0,"other":"private-response"}))
-        } else {
-            (400, json!({"error":"authorization_pending"}))
-        }
-    }).await;
-    let home = tempfile::tempdir().unwrap();
-    let storage = AuthStorage::in_home(home.path());
-    let endpoints = AuthEndpoints {
-        ap: format!("{}/oauth2", stub.url),
-        us: format!("{}/oauth2", stub.url),
-    };
-    let mut output = Vec::new();
-    let error = tokio::time::timeout(
-        HANG_GUARD,
-        run_login(
-            None,
-            &home.path().join("config.toml"),
-            &storage,
-            Some(endpoints),
-            &mut Cursor::new("cn\n"),
-            &mut output,
-        ),
-    )
-    .await
-    .expect("a rejected successful response must not silently wait for the other center")
-    .unwrap_err();
-    assert_eq!(error.code, 4);
-    assert!(error.message.contains("invalid token response"));
-    assert!(storage.token().unwrap().is_none());
-    for private in ["ap_private", "private-response", "secret"] {
-        assert!(!error.message.contains(private));
-        assert!(!String::from_utf8_lossy(&output).contains(private));
-    }
-}
-
-#[tokio::test]
-async fn slow_down_increases_both_poll_intervals_by_five_seconds() {
-    use std::{
-        sync::{Arc, Mutex},
-        time::Instant,
-    };
-    let slow_at = Arc::new(Mutex::new(None));
-    let observed = slow_at.clone();
-    let stub = http::Stub::start(move |request| {
-        if request.contains("/register ") { (201, json!({"client_id":"client"})) }
-        else if request.contains("/device/authorize ") { (200, json!({"device_code":"secret","user_code":"CODE","verification_uri":"https://example.com","expires_in":20,"interval":1})) }
-        else if request.contains("x-dc-region: ap") {
-            let mut at = observed.lock().unwrap();
-            if at.is_none() { *at = Some(Instant::now()); }
-            (400, json!({"error":"slow_down"}))
-        } else if observed.lock().unwrap().is_some_and(|at| at.elapsed().as_secs() >= 5) {
-            (200, json!({"access_token":"us_token","expires_in":3600}))
-        } else { (400, json!({"error":"authorization_pending"})) }
-    }).await;
-    let home = tempfile::tempdir().unwrap();
-    let endpoints = AuthEndpoints {
-        ap: format!("{}/oauth2", stub.url),
-        us: format!("{}/oauth2", stub.url),
-    };
-    let started = Instant::now();
-    run_login(
-        None,
-        &home.path().join("config.toml"),
-        &AuthStorage::in_home(home.path()),
-        Some(endpoints),
-        &mut Cursor::new("global\n"),
-        &mut Vec::new(),
-    )
-    .await
-    .unwrap();
-    assert!(started.elapsed().as_secs() >= 7);
-    let requests = stub.requests.lock().unwrap();
-    assert!(
-        requests
-            .iter()
-            .filter(|request| request.contains("/token ") && request.contains("x-dc-region: us"))
-            .count()
-            <= 2,
-        "slow_down must slow the sibling poller too"
-    );
-}
-
-#[tokio::test]
-async fn sdk_loads_device_token_without_browser_and_refresh_preserves_login_time() {
-    use longbridge::oauth::{StoredToken, TokenStorage};
-    let home = tempfile::tempdir().unwrap();
-    let storage = AuthStorage::in_home(home.path());
-    std::fs::create_dir_all(&storage.directory).unwrap();
-    std::fs::write(storage.directory.join("auth.json"), json!({"client_id":"client","access_token":"ap_token","refresh_token":"ap_refresh","expires_at":4102444800_u64,"logged_in_at":100}).to_string()).unwrap();
-    let oauth = tick_longbridge::auth::authorized_oauth(
-        &storage,
-        tick_provider::preferences::Region::Global,
-        None,
-    )
-    .await
-    .unwrap();
-    assert_eq!(oauth.access_token().await.unwrap(), "ap_token");
-    storage
-        .save(&StoredToken {
-            client_id: "client".into(),
-            access_token: "ap_refreshed".into(),
-            refresh_token: Some("ap_next-refresh".into()),
-            expires_at: 4102445800,
-        })
-        .unwrap();
-    assert_eq!(storage.token().unwrap().unwrap().logged_in_at, 100);
-    assert_eq!(storage.load("client").unwrap().access_token, "ap_refreshed");
-}
-
-#[tokio::test]
-async fn expired_us_token_refreshes_at_us_gateway_with_dc_header() {
-    let stub = http::Stub::start(|request| {
-        assert!(request.starts_with("POST /oauth2/token "));
-        if request.contains("x-dc-region: us") && request.contains("grant_type=refresh_token") {
-            (200, json!({"access_token":"us_fresh","expires_in":3600}))
-        } else {
-            (400, json!({"error":"invalid_grant"}))
-        }
+/// Logs in with `server` until the login ends, and returns what it ended with and the notices
+/// the waiting screen would have shown.
+async fn log_in(
+    config_root: &Path,
+    server: &AuthorizationServer,
+) -> (tick_provider::error::Result<()>, Vec<&'static str>) {
+    let (notices, mut shown) = mpsc::unbounded_channel();
+    let result = tokio::time::timeout(HANG_GUARD, async {
+        let login = DeviceLogin::start(&credentials(config_root), server.issuer()).await?;
+        assert_eq!(login.user_code(), USER_CODE);
+        login.finish(&notices).await
     })
-    .await;
-    let home = tempfile::tempdir().unwrap();
-    let storage = AuthStorage::in_home(home.path());
-    std::fs::create_dir_all(&storage.directory).unwrap();
-    std::fs::write(storage.directory.join("auth.json"), json!({"client_id":"client","access_token":"us_old","refresh_token":"us_refresh","expires_at":1,"logged_in_at":100}).to_string()).unwrap();
-    let endpoints = AuthEndpoints {
-        ap: "http://127.0.0.1:1/unreachable".into(),
-        us: format!("{}/oauth2", stub.url),
-    };
-    let oauth = tick_longbridge::auth::authorized_oauth(
-        &storage,
-        tick_provider::preferences::Region::Cn,
-        Some(endpoints),
-    )
     .await
-    .unwrap();
-    assert_eq!(oauth.access_token().await.unwrap(), "us_fresh");
-    let token = storage.token().unwrap().unwrap();
-    assert_eq!(token.logged_in_at, 100);
-    assert_eq!(token.refresh_token.as_deref(), Some("us_refresh"));
+    .expect("the login ends");
+    drop(notices);
+    let mut messages = Vec::new();
+    while let Some(notice) = shown.recv().await {
+        messages.push(notice.message());
+    }
+    (result, messages)
 }
 
-#[tokio::test]
-async fn running_us_oauth_refreshes_at_us_gateway_and_persists_the_new_token() {
-    use longbridge::oauth::{StoredToken, TokenStorage};
-    use tick_longbridge::auth::{authorized_oauth, storage::now_seconds};
-    use tick_provider::preferences::Region;
+fn mode(path: &Path) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
 
-    let ap = http::Stub::start(|_| (400, json!({"error":"invalid_grant"}))).await;
-    let us = http::Stub::start(|request| {
-        if request.starts_with("POST /oauth2/token ")
-            && request.contains("x-dc-region: us")
-            && request.contains("grant_type=refresh_token")
-            && request.contains("refresh_token=us_refresh")
-        {
-            (200, json!({"access_token":"us_renewed","refresh_token":"us_rotated","token_type":"Bearer","expires_in":3600}))
-        } else {
-            (400, json!({"error":"invalid_grant"}))
-        }
-    }).await;
-    let home = tempfile::tempdir().unwrap();
-    let storage = AuthStorage::in_home(home.path());
-    let expires_at = now_seconds() + ACTIVE_TOKEN_LIFETIME_SECONDS;
-    storage
-        .save(&StoredToken {
-            client_id: "client".into(),
-            access_token: "us_initial".into(),
-            refresh_token: Some("us_refresh".into()),
-            expires_at,
-        })
-        .unwrap();
-    let logged_in_at = storage.token().unwrap().unwrap().logged_in_at;
-    let endpoints = AuthEndpoints {
-        ap: format!("{}/oauth2", ap.url),
-        us: format!("{}/oauth2", us.url),
-    };
-    let oauth = authorized_oauth(&storage, Region::Cn, Some(endpoints))
-        .await
-        .unwrap();
-    assert_eq!(oauth.access_token().await.unwrap(), "us_initial");
-
-    while now_seconds() <= expires_at - SDK_REFRESH_WINDOW_SECONDS {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+/// The login Tickloop's manifest declares for the package, with `server` as its one issuer.
+fn package_auth(server: &AuthorizationServer) -> PackageAuth {
+    PackageAuth::OAuth2 {
+        issuers: vec![OAuthIssuer {
+            label: "Local".into(),
+            issuer: server.issuer().into(),
+        }],
+        scopes: Vec::new(),
     }
-    let token = tokio::time::timeout(HANG_GUARD, oauth.access_token())
-        .await
-        .expect("running refresh must finish without a browser callback")
-        .unwrap();
-    assert_eq!(token, "us_renewed");
-    assert!(
-        ap.requests.lock().unwrap().is_empty(),
-        "US credentials must not reach AP"
+}
+
+/// A device login registers as a public device client once, polls as RFC 8628 says and saves
+/// the token in the standard file Tickloop keeps, which Tickloop then reads as logged in. The
+/// next login reuses the client, also one Tickloop registered.
+#[tokio::test]
+async fn a_device_login_registers_once_and_saves_the_token_tickloop_reads() {
+    let root = tempfile::tempdir().unwrap();
+    let server = AuthorizationServer::start();
+    server.answer_polls([TokenReply::Pending, TokenReply::Approve]);
+
+    let (result, notices) = log_in(root.path(), &server).await;
+
+    result.unwrap();
+    assert!(notices.is_empty(), "{notices:?}");
+    let registrations = server.requests_to(REGISTRATION_PATH);
+    assert_eq!(registrations.len(), 1);
+    assert_eq!(
+        registrations[0].json,
+        Some(json!({
+            "client_name": "Tickloop",
+            "grant_types": [DEVICE_CODE_GRANT, "refresh_token"],
+            "token_endpoint_auth_method": "none",
+            "redirect_uris": ["http://localhost:60355/callback"],
+        }))
     );
-    assert_eq!(us.requests.lock().unwrap().len(), 1);
-    let saved = storage.token().unwrap().unwrap();
-    assert_eq!(saved.access_token, "us_renewed");
-    assert_eq!(saved.refresh_token.as_deref(), Some("us_rotated"));
-    assert_eq!(saved.logged_in_at, logged_in_at);
+    let polls = server.requests_to(TOKEN_PATH);
+    assert_eq!(polls.len(), 2);
+    assert_eq!(polls[0].form["grant_type"], DEVICE_CODE_GRANT);
+    assert_eq!(polls[0].form["device_code"], "device-secret-client-1");
+    assert_eq!(polls[0].form["client_id"], "client-1");
+    let login = saved(root.path()).unwrap();
+    assert_eq!(login.access_token, "access-1");
+    assert_eq!(login.refresh_token.as_deref(), Some("refresh-1"));
+    assert_eq!(login.token_type, "Bearer");
+    assert_eq!(login.issuer, server.issuer());
+    assert_eq!(login.client_id, "client-1");
+    assert_eq!(login.token_endpoint, format!("{}/token", server.issuer()));
+    assert_eq!(
+        login.revocation_endpoint,
+        Some(format!("{}/revoke", server.issuer()))
+    );
+    assert!((now() + 3590..=now() + 3600).contains(&login.expires_at));
+    let files = credentials(root.path());
+    assert_eq!(mode(files.directory()), 0o700);
+    assert_eq!(mode(&files.oauth_token_path()), 0o600);
+    assert_eq!(
+        files.login_state(&package_auth(&server)),
+        LoginState::LoggedIn
+    );
+
+    server.answer_polls([TokenReply::Approve]);
+    log_in(root.path(), &server).await.0.unwrap();
+    assert_eq!(server.requests_to(REGISTRATION_PATH).len(), 1);
+    assert_eq!(saved(root.path()).unwrap().access_token, "access-2");
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    credentials(elsewhere.path())
+        .lock_oauth()
+        .unwrap()
+        .set_client_id(server.issuer(), Some("tickloop-client"))
+        .unwrap();
+    server.answer_polls([TokenReply::Approve]);
+    log_in(elsewhere.path(), &server).await.0.unwrap();
+    assert_eq!(server.requests_to(REGISTRATION_PATH).len(), 1);
+    assert_eq!(
+        saved(elsewhere.path()).unwrap().client_id,
+        "tickloop-client"
+    );
 }
 
+/// A server that forgot the registered client gets a new registration, once.
 #[tokio::test]
-async fn running_ap_oauth_preserves_refresh_token_and_reports_revocation_without_browser_fallback()
-{
-    use longbridge::oauth::{StoredToken, TokenStorage};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-    use tick_longbridge::auth::{authorized_oauth, storage::now_seconds};
-    use tick_provider::preferences::Region;
+async fn a_forgotten_client_is_registered_again() {
+    let root = tempfile::tempdir().unwrap();
+    let server = AuthorizationServer::start();
+    server.answer_polls([TokenReply::Approve]);
+    log_in(root.path(), &server).await.0.unwrap();
+    server.forget_clients();
+    server.answer_polls([TokenReply::Approve]);
 
-    let refreshes = Arc::new(AtomicUsize::new(0));
-    let observed = refreshes.clone();
-    let ap = http::Stub::start(move |request| {
-        assert!(request.starts_with("POST /oauth2/token "));
-        assert!(request.contains("x-dc-region: ap"));
-        assert!(request.contains("refresh_token=ap_refresh"));
-        if observed.fetch_add(1, Ordering::SeqCst) == 0 {
-            (200, json!({"access_token":"ap_renewed","token_type":"Bearer","expires_in":1}))
-        } else {
-            (400, json!({"error":"invalid_grant","error_description":"revoked ap_refresh ap_renewed"}))
-        }
-    }).await;
-    let us = http::Stub::start(|_| (400, json!({"error":"invalid_grant"}))).await;
-    let home = tempfile::tempdir().unwrap();
-    let storage = AuthStorage::in_home(home.path());
-    let expires_at = now_seconds() + ACTIVE_TOKEN_LIFETIME_SECONDS;
-    storage
-        .save(&StoredToken {
-            client_id: "client".into(),
-            access_token: "ap_initial".into(),
-            refresh_token: Some("ap_refresh".into()),
-            expires_at,
-        })
-        .unwrap();
-    let endpoints = AuthEndpoints {
-        ap: format!("{}/oauth2", ap.url),
-        us: format!("{}/oauth2", us.url),
-    };
-    let oauth = authorized_oauth(&storage, Region::Global, Some(endpoints))
-        .await
-        .unwrap();
-    assert_eq!(oauth.access_token().await.unwrap(), "ap_initial");
+    log_in(root.path(), &server).await.0.unwrap();
 
-    while now_seconds() <= expires_at - SDK_REFRESH_WINDOW_SECONDS {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(server.requests_to(REGISTRATION_PATH).len(), 2);
+    assert_eq!(saved(root.path()).unwrap().client_id, "client-2");
+}
+
+/// A refused or expired authorization saves nothing and asks the user to log in again.
+#[tokio::test]
+async fn a_refused_or_expired_authorization_saves_nothing() {
+    for (reply, reason) in [
+        (TokenReply::Denied, "authorization denied"),
+        (TokenReply::Expired, "device code expired"),
+        (
+            TokenReply::Error(400, "invalid_grant".into()),
+            "Longbridge refused the device authorization (invalid_grant)",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let server = AuthorizationServer::start();
+        server.answer_polls([TokenReply::Pending, reply]);
+
+        let error = log_in(root.path(), &server).await.0.unwrap_err();
+
+        assert_eq!(error.code, exit_code::NOT_AUTHORIZED, "{error}");
+        assert!(error.message.starts_with(reason), "{error}");
+        assert!(error.message.ends_with(AUTH_HINT), "{error}");
+        assert_eq!(saved(root.path()), None);
     }
-    assert_eq!(oauth.access_token().await.unwrap(), "ap_renewed");
-    let error = tokio::time::timeout(HANG_GUARD, oauth.access_token())
+}
+
+/// A device code that runs out while the user has not approved it ends the login.
+#[tokio::test]
+async fn a_device_code_that_runs_out_ends_the_login() {
+    let root = tempfile::tempdir().unwrap();
+    let server = AuthorizationServer::start();
+    server.edit_device_authorization(|device| device["expires_in"] = json!(2));
+
+    let error = log_in(root.path(), &server).await.0.unwrap_err();
+
+    assert_eq!(error.code, exit_code::NOT_AUTHORIZED, "{error}");
+    assert!(error.message.starts_with("device code expired"), "{error}");
+}
+
+/// An answer that is no token is reported, and nothing is saved.
+#[tokio::test]
+async fn an_approval_without_a_token_is_reported() {
+    let root = tempfile::tempdir().unwrap();
+    let server = AuthorizationServer::start();
+    server.answer_polls([TokenReply::Token(json!({"token_type": "Bearer"}))]);
+
+    let error = log_in(root.path(), &server).await.0.unwrap_err();
+
+    assert_eq!(error.code, exit_code::NETWORK, "{error}");
+    assert_eq!(saved(root.path()), None);
+}
+
+/// While the server cannot answer, the login keeps polling, backing off, and says so once.
+#[tokio::test]
+async fn polling_rides_out_server_failures_and_says_so_once() {
+    let root = tempfile::tempdir().unwrap();
+    let server = AuthorizationServer::start();
+    server.answer_polls([
+        TokenReply::Status(503),
+        TokenReply::Status(500),
+        TokenReply::Approve,
+    ]);
+
+    let (result, notices) = log_in(root.path(), &server).await;
+
+    result.unwrap();
+    assert_eq!(notices, [LoginNotice::TemporaryFailureRetry.message()]);
+    let polls = server.requests_to(TOKEN_PATH);
+    assert_eq!(polls.len(), 3);
+    assert!(polls[2].at - polls[1].at > polls[1].at - polls[0].at);
+    assert_eq!(saved(root.path()).unwrap().access_token, "access-1");
+}
+
+/// A server asking for slower polling gets it, five seconds slower, and the user is told.
+#[tokio::test]
+async fn polling_slows_down_when_asked() {
+    let root = tempfile::tempdir().unwrap();
+    let server = AuthorizationServer::start();
+    server.answer_polls([TokenReply::SlowDown, TokenReply::Approve]);
+
+    let (result, notices) = log_in(root.path(), &server).await;
+
+    result.unwrap();
+    assert_eq!(notices, [LoginNotice::SlowerPolling.message()]);
+    let polls = server.requests_to(TOKEN_PATH);
+    assert_eq!(polls.len(), 2);
+    let slowed = polls[1].at - polls[0].at;
+    assert!(slowed >= Duration::from_secs(6), "{slowed:?}");
+}
+
+/// Only an https server is logged in with, or one on this machine.
+#[tokio::test]
+async fn a_server_without_https_or_device_authorization_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let credentials = credentials(root.path());
+    let error = DeviceLogin::start(&credentials, "http://example.com")
         .await
-        .expect("revoked authorization must fail without a browser callback")
+        .err()
+        .unwrap();
+    assert!(error.message.contains("only https"), "{error}");
+
+    let server = AuthorizationServer::start();
+    server.edit_metadata(|metadata| {
+        metadata["grant_types_supported"] = json!(["refresh_token"]);
+    });
+    let error = DeviceLogin::start(&credentials, server.issuer())
+        .await
+        .err()
+        .unwrap();
+    assert!(error.message.contains("no device authorization"), "{error}");
+    assert!(server.requests_to(REGISTRATION_PATH).is_empty());
+}
+
+/// A due token is renewed at its token endpoint and written back with the refresh token the
+/// server rotated it to.
+#[tokio::test]
+async fn a_due_token_is_renewed_and_its_rotated_refresh_token_saved() {
+    let root = tempfile::tempdir().unwrap();
+    let server = AuthorizationServer::start();
+    save(
+        root.path(),
+        &token(server.issuer(), "ap_lapsed", Some("us_refresh"), 1),
+    );
+    server.answer_polls([TokenReply::Approve]);
+
+    let renewed = auth::current_token(&credentials(root.path()))
+        .await
+        .unwrap();
+
+    assert_eq!(renewed.access_token, "access-1");
+    assert_eq!(saved(root.path()).unwrap(), renewed);
+    assert_eq!(renewed.refresh_token.as_deref(), Some("refresh-1"));
+    assert_eq!(renewed.client_id, "client-1");
+    assert!(renewed.expires_at > now() + 3000);
+    let refreshes = server.requests_to(TOKEN_PATH);
+    assert_eq!(refreshes.len(), 1);
+    assert_eq!(refreshes[0].form["grant_type"], "refresh_token");
+    assert_eq!(refreshes[0].form["refresh_token"], "us_refresh");
+    assert_eq!(refreshes[0].form["client_id"], "client-1");
+
+    // A server that does not rotate the refresh token keeps the one there was.
+    save(
+        root.path(),
+        &token(server.issuer(), "ap_lapsed", Some("ap_refresh"), 1),
+    );
+    server.answer_polls([TokenReply::Token(
+        json!({"access_token": "ap_renewed", "token_type": "Bearer", "expires_in": 7200}),
+    )]);
+    let renewed = auth::current_token(&credentials(root.path()))
+        .await
+        .unwrap();
+    assert_eq!(renewed.access_token, "ap_renewed");
+    assert_eq!(renewed.refresh_token.as_deref(), Some("ap_refresh"));
+}
+
+/// A token that is not due is used as it is, without the network.
+#[tokio::test]
+async fn a_token_that_is_not_due_is_not_renewed() {
+    let root = tempfile::tempdir().unwrap();
+    let server = AuthorizationServer::start();
+    let current = token(
+        server.issuer(),
+        "ap_current",
+        Some("ap_refresh"),
+        now() + 3600,
+    );
+    save(root.path(), &current);
+
+    assert_eq!(
+        auth::current_token(&credentials(root.path()))
+            .await
+            .unwrap(),
+        current
+    );
+    assert!(server.requests_to(TOKEN_PATH).is_empty());
+}
+
+/// A renewal Longbridge refuses asks the user to log in again and leaves the saved token.
+#[tokio::test]
+async fn a_refused_renewal_asks_to_log_in_again() {
+    let root = tempfile::tempdir().unwrap();
+    let server = AuthorizationServer::start();
+    let lapsed = token(server.issuer(), "ap_lapsed", Some("ap_refresh"), 1);
+    save(root.path(), &lapsed);
+    server.answer_polls([TokenReply::Error(400, "invalid_grant".into())]);
+
+    let error = auth::current_token(&credentials(root.path()))
+        .await
         .unwrap_err();
-    assert!(matches!(
-        error,
-        longbridge::oauth::OAuthError::RefreshTokenFailed { .. }
-    ));
-    assert!(!error.to_string().contains("ap_refresh"));
-    assert!(!error.to_string().contains("ap_renewed"));
-    let saved = storage.token().unwrap().unwrap();
-    assert_eq!(saved.access_token, "ap_renewed");
-    assert_eq!(saved.refresh_token.as_deref(), Some("ap_refresh"));
-    assert!(
-        us.requests.lock().unwrap().is_empty(),
-        "AP credentials must not reach US"
+
+    assert_eq!(error.code, exit_code::NOT_AUTHORIZED, "{error}");
+    assert!(error.message.ends_with(AUTH_HINT), "{error}");
+    assert!(!error.message.contains("ap_refresh"), "{error}");
+    assert_eq!(saved(root.path()).unwrap(), lapsed);
+
+    let expired = token(server.issuer(), "ap_lapsed", None, 1);
+    save(root.path(), &expired);
+    let error = auth::current_token(&credentials(root.path()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, exit_code::NOT_AUTHORIZED, "{error}");
+    assert_eq!(
+        server.requests_to(TOKEN_PATH).len(),
+        1,
+        "nothing to renew with"
     );
-    assert_eq!(refreshes.load(Ordering::SeqCst), 2);
+}
+
+/// A process waiting on the lock while another renews the token takes the renewed token
+/// instead of asking again, which a rotating server would refuse.
+#[tokio::test]
+async fn a_renewal_waits_for_the_one_under_way_and_takes_its_token() {
+    let root = tempfile::tempdir().unwrap();
+    let server = AuthorizationServer::start();
+    save(
+        root.path(),
+        &token(server.issuer(), "ap_lapsed", Some("ap_refresh"), 1),
+    );
+    let other_process = credentials(root.path()).lock_oauth().unwrap();
+    let waiting = tokio::spawn({
+        let credentials = credentials(root.path());
+        async move { auth::current_token(&credentials).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!waiting.is_finished(), "the renewal waits for the lock");
+    let renewed = token(
+        server.issuer(),
+        "ap_renewed",
+        Some("ap_rotated"),
+        now() + 3600,
+    );
+    other_process.save_token(&renewed).unwrap();
+    drop(other_process);
+
+    assert_eq!(waiting.await.unwrap().unwrap(), renewed);
+    assert!(server.requests_to(TOKEN_PATH).is_empty());
+}
+
+/// An SDK client renews its token through the saved file once the token enters the SDK's
+/// refresh window while it runs, and never starts a browser login.
+#[tokio::test]
+async fn a_running_sdk_client_renews_through_the_saved_token() {
+    let root = tempfile::tempdir().unwrap();
+    let server = AuthorizationServer::start();
+    let expires_at = now() + ACTIVE_FOR;
+    save(
+        root.path(),
+        &token(
+            server.issuer(),
+            "ap_running",
+            Some("ap_refresh"),
+            expires_at,
+        ),
+    );
+    let authorized = auth::authorized_oauth(&credentials(root.path()))
+        .await
+        .unwrap();
+    assert_eq!(authorized.oauth.access_token().await.unwrap(), "ap_running");
+    assert!(server.requests_to(TOKEN_PATH).is_empty());
+    while expires_at.saturating_sub(now()) >= 300 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    server.answer_polls([TokenReply::Approve]);
+
+    assert_eq!(authorized.oauth.access_token().await.unwrap(), "access-1");
+    assert_eq!(saved(root.path()).unwrap().access_token, "access-1");
+    assert_eq!(server.requests_to(TOKEN_PATH).len(), 1);
+}
+
+/// The API is reached through the network of the server the login was made with, and a US
+/// account's through the global one.
+#[tokio::test]
+async fn the_api_network_follows_the_login() {
+    let root = tempfile::tempdir().unwrap();
+    for (issuer, access_token, region) in [
+        ("https://openapi.longbridge.cn", "ap_token", Region::Cn),
+        ("https://openapi.longbridge.com", "ap_token", Region::Global),
+        ("https://openapi.longbridge.cn", "us_token", Region::Global),
+    ] {
+        save(
+            root.path(),
+            &token(issuer, access_token, None, now() + 3600),
+        );
+        let authorized = auth::authorized_oauth(&credentials(root.path()))
+            .await
+            .unwrap();
+        assert_eq!(authorized.region, region, "{issuer} {access_token}");
+    }
+}
+
+/// A token Tickloop's own login saved is what `tick-longbridge` uses.
+#[tokio::test]
+async fn a_token_tickloop_saved_is_used() {
+    let root = tempfile::tempdir().unwrap();
+    let server = AuthorizationServer::start();
+    server.answer_polls([TokenReply::Approve]);
+    let issuer = OAuthIssuer {
+        label: "Local".into(),
+        issuer: server.issuer().into(),
+    };
+    let login = tickloop_agent_packages::OAuthLogin::start(&credentials(root.path()), &issuer, &[])
+        .await
+        .unwrap();
+    login
+        .finish(&tokio_util::sync::CancellationToken::new())
+        .await
+        .unwrap();
+
+    let current = auth::current_token(&credentials(root.path()))
+        .await
+        .unwrap();
+    assert_eq!(current.access_token, "access-1");
+    auth::check_saved(&credentials(root.path())).unwrap();
+    assert_eq!(saved(root.path()).unwrap(), current);
 }

@@ -9282,6 +9282,12 @@ impl State {
         if self.ordinary_input_is_visible() {
             self.clear_prompt_suggestion();
         }
+        if self.menu.is_none()
+            && let Some(panel) = &mut self.ticks_panel
+        {
+            panel.paste(text);
+            return None;
+        }
         if self.request_layout.is_some() && self.menu.is_none()
             || self.workspace_trust.is_some()
             || self.full_review

@@ -1,6 +1,6 @@
 [package]
 name = "tickloop-tick-longbridge"
-description = "Longbridge quotes, trading account, news and community posts, with device-code OAuth and rate limits, and tick-longbridge, which runs the Ticks that read them and manages the login"
+description = "Longbridge quotes, trading account, news and community posts, with the package's OAuth login and rate limits, and tick-longbridge, which runs the Ticks that read them and can log in on its own"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -30,18 +30,21 @@ rust_decimal = { version = "1", features = ["serde-with-str"] }
 scraper = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tempfile = "3"
 tickloop-tick-command = { path = "../../tick/command" }
 tickloop-tick-market = { path = "../../tick/market" }
+tickloop-tick-packages = { path = "../../tick/packages" }
 tickloop-tick-provider = { path = "../../tick/provider" }
 tickloop-ui = { path = "../../ui" }
 time ={ version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
 time-tz = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync"] }
-toml_edit = "0.22"
+url = "2"
 
 [dev-dependencies]
-tickloop-tick-packages = { path = "../../tick/packages" }
+tempfile = "3"
+tickloop-agent-packages = { path = "../../agent/packages" }
+tickloop-agent-test-support = { path = "../../agent/test-support" }
 tickloop-tick-sdk = { path = "../../tick/sdk" }
 tokio = { version = "1", features = ["test-util"] }
+tokio-util = "0.7"
 vt100 = "0.16.2"

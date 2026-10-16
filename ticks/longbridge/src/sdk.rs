@@ -1,4 +1,4 @@
-use crate::{not_authorized, rate_limit::RateLimiter};
+use crate::{not_authorized, rate_limit::RateLimiter, region::Region};
 use async_trait::async_trait;
 use longbridge::{
     Config,
@@ -17,7 +17,7 @@ use tick_provider::{
         TradeApi, WatchlistGroup,
     },
     error::{Error, Result},
-    preferences::{Language, Region},
+    preferences::Language,
 };
 
 const INVALID_REQUEST: i64 = 301600;
@@ -46,24 +46,12 @@ struct QuoteTracking {
     observed: std::collections::BTreeMap<String, QuoteObservation>,
 }
 
-pub async fn config(
-    oauth: OAuth,
-    language: Language,
-    region: Option<Region>,
-) -> Result<Arc<Config>> {
-    let token = oauth
-        .access_token()
-        .await
-        .map_err(|_| not_authorized("authorization expired"))?;
-    let region = if token.starts_with("us_") {
-        Region::Global
-    } else {
-        region.unwrap_or(Region::Global)
-    };
+/// The SDK configuration of the login `oauth` reaching the API through `region`.
+pub fn config(oauth: OAuth, language: Language, region: Region) -> Arc<Config> {
     let endpoints = endpoints(region);
     // Set explicitly, so neither the SDK's LONGBRIDGE_* variables nor a `.env` file it loads
     // decide where the access token goes.
-    Ok(Arc::new(
+    Arc::new(
         Config::from_oauth(oauth)
             .http_url(endpoints.http)
             .quote_ws_url(endpoints.quote)
@@ -74,7 +62,7 @@ pub async fn config(
             })
             .push_candlestick_mode(longbridge::PushCandlestickMode::Realtime)
             .dont_print_quote_packages(),
-    ))
+    )
 }
 
 /// Longbridge's OpenAPI: its HTTP base and its quote and trade WebSockets.
@@ -143,22 +131,13 @@ pub struct SdkQuoteApi {
 }
 
 impl SdkQuoteApi {
-    pub async fn new(
+    pub fn new(
         config: Arc<Config>,
         oauth: OAuth,
         language: Language,
-        region: Option<Region>,
+        region: Region,
         limiter: Arc<RateLimiter>,
-    ) -> Result<Self> {
-        let token = oauth
-            .access_token()
-            .await
-            .map_err(|_| not_authorized("authorization expired"))?;
-        let region = if longbridge::DcRegion::from_credential(&token) == longbridge::DcRegion::Us {
-            Region::Global
-        } else {
-            region.unwrap_or(Region::Global)
-        };
+    ) -> Self {
         let signed_http =
             HttpClient::new(HttpClientConfig::from_oauth(oauth).http_url(endpoints(region).http))
                 .header("accept-language", language.as_str());
@@ -166,7 +145,7 @@ impl SdkQuoteApi {
         let fundamental_context = longbridge::FundamentalContext::new(config.clone());
         let calendar_context = longbridge::CalendarContext::new(config.clone());
         let (context, pushes) = QuoteContext::new(config);
-        Ok(Self {
+        Self {
             context,
             candle_subscriptions: Arc::default(),
             quote_tracking: Arc::default(),
@@ -178,7 +157,7 @@ impl SdkQuoteApi {
             language,
             limiter,
             pushes: tokio::sync::Mutex::new(Some(pushes)),
-        })
+        }
     }
 }
 
@@ -1105,26 +1084,5 @@ mod tests {
         let rejected = sdk_error(open_api(INVALID_REQUEST));
         assert_eq!(rejected.code, tick_provider::exit_code::NETWORK);
         assert!(!rejected.message.contains(crate::AUTH_HINT), "{rejected}");
-    }
-
-    #[tokio::test]
-    async fn a_lapsed_login_stops_the_sdk_setup_with_the_login_hint() {
-        let oauth = crate::auth::lapsing_oauth().await;
-        let Err(error) = config(oauth.clone(), Language::default(), None).await else {
-            panic!("a lapsed login configures no SDK");
-        };
-        assert!(asks_to_log_in(&error), "{error}");
-        let Err(error) = SdkQuoteApi::new(
-            Arc::new(Config::from_oauth(oauth.clone())),
-            oauth,
-            Language::default(),
-            None,
-            Arc::new(RateLimiter::default()),
-        )
-        .await
-        else {
-            panic!("a lapsed login opens no quote API");
-        };
-        assert!(asks_to_log_in(&error), "{error}");
     }
 }

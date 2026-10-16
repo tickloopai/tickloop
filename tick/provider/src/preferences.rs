@@ -1,4 +1,4 @@
-//! Request preferences a provider honors: the language of names and units, and the data center.
+//! Request preferences a provider honors: the language of names and units.
 
 use std::{fmt, str::FromStr};
 
@@ -9,12 +9,6 @@ pub enum Language {
     En,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Region {
-    Cn,
-    Global,
-}
-
 impl Language {
     pub const NAMES: &'static [&'static str] = &["zh-CN", "en"];
 
@@ -22,17 +16,6 @@ impl Language {
         match self {
             Self::ZhCn => "zh-CN",
             Self::En => "en",
-        }
-    }
-}
-
-impl Region {
-    pub const NAMES: &'static [&'static str] = &["cn", "global"];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Cn => "cn",
-            Self::Global => "global",
         }
     }
 }
@@ -49,25 +32,7 @@ impl FromStr for Language {
     }
 }
 
-impl FromStr for Region {
-    type Err = UnknownPreference;
-
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        match text {
-            "cn" => Ok(Self::Cn),
-            "global" => Ok(Self::Global),
-            other => Err(UnknownPreference::new(other, Self::NAMES)),
-        }
-    }
-}
-
 impl fmt::Display for Language {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl fmt::Display for Region {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }

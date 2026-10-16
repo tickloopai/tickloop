@@ -1,60 +1,47 @@
-use std::{
-    io::{BufRead, Write},
-    path::Path,
-    sync::atomic::{AtomicUsize, Ordering},
-    time::Duration,
-};
+//! The device login of `tick-longbridge auth`, made as Tickloop makes the package's login: the
+//! server's metadata (RFC 8414), a client registered once per server and shared with Tickloop
+//! (RFC 7591), and a device code the user approves (RFC 8628). The token is saved where
+//! Tickloop keeps it, so the Agent and every `tick-longbridge` use the one login.
 
-use longbridge::oauth::{StoredToken, TokenStorage};
-use reqwest::{Client, Response};
-use serde::{Deserialize, Serialize};
+use std::time::Duration;
+
+use reqwest::Url;
+use serde::Deserialize;
+use tick_packages::{OAuthToken, PackageCredentials};
+use tick_provider::error::{Error, Result};
 use tokio::{
-    sync::{mpsc, watch},
-    time::{Instant, sleep_until, timeout_at},
+    sync::mpsc,
+    time::{Instant, sleep_until},
 };
 
-use super::storage::{AuthStorage, atomic_write, now_seconds};
+use super::{
+    locked,
+    server::{DEVICE_CODE_GRANT, Endpoints, REFRESH_TOKEN_GRANT, Reply, Server, error_code, parse},
+};
 use crate::not_authorized;
-use tick_provider::{
-    error::{Error, Result},
-    preferences::Region,
-};
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-const DEFAULT_POLL_SECONDS: u64 = 5;
-const DEFAULT_TOKEN_LIFETIME_SECONDS: u64 = 3600;
-const SLOW_DOWN_SECONDS: u64 = 5;
 const CLIENT_NAME: &str = "Tickloop";
+/// Registered as Longbridge's earlier device client was, which it accepts for device logins.
 const REDIRECT_URI: &str = "http://localhost:60355/callback";
+/// RFC 8628: the interval when the server names none, and how much slower each `slow_down`
+/// makes the polling.
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const SLOW_DOWN_STEP: Duration = Duration::from_secs(5);
+/// Polling backs off up to this while the server cannot be reached.
+const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+/// A device code lives at most this long, whatever the server says.
+const MAX_DEVICE_CODE_LIFETIME: Duration = Duration::from_secs(3600);
+/// Longer user codes and pages than this are not shown to the user.
+const MAX_SHOWN_LENGTH: usize = 2048;
 
-#[derive(Clone)]
-pub struct AuthEndpoints {
-    pub ap: String,
-    pub us: String,
-}
-
-impl AuthEndpoints {
-    pub fn for_region(region: Region) -> Self {
-        Self {
-            ap: format!(
-                "{}/oauth2",
-                match region {
-                    Region::Cn => "https://openapi.longbridge.cn",
-                    Region::Global => "https://openapi.longbridge.com",
-                }
-            ),
-            us: "https://openapi.longbridge.com/oauth2".into(),
-        }
-    }
-}
-
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct Registration {
     client_id: String,
+    token_endpoint_auth_method: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct DeviceCode {
+struct DeviceAuthorization {
     device_code: String,
     user_code: String,
     verification_uri: String,
@@ -63,278 +50,24 @@ struct DeviceCode {
     interval: Option<u64>,
 }
 
+/// A device authorization waiting for the user, who opens [`Self::verification_uri`] and
+/// approves [`Self::user_code`]; [`Self::finish`] waits for the approval and saves the token.
 pub struct DeviceLogin {
+    server: Server,
+    credentials: PackageCredentials,
+    endpoints: Endpoints,
     client_id: String,
-    device: DeviceCode,
+    device_code: String,
+    user_code: String,
+    verification_uri: Url,
+    verification_uri_complete: Option<Url>,
+    interval: Duration,
     deadline: Instant,
 }
 
-impl DeviceLogin {
-    pub fn user_code(&self) -> &str {
-        &self.device.user_code
-    }
-
-    /// The verification page with the user code filled in when Longbridge offers one.
-    pub fn verification_uri(&self) -> &str {
-        self.device
-            .verification_uri_complete
-            .as_deref()
-            .filter(|uri| !uri.is_empty())
-            .unwrap_or(&self.device.verification_uri)
-    }
-
-    /// The verification page where the user enters the user code.
-    pub fn plain_verification_uri(&self) -> &str {
-        &self.device.verification_uri
-    }
-
-    pub fn expires_in(&self) -> u64 {
-        self.device.expires_in
-    }
-
-    pub fn remaining(&self) -> Duration {
-        self.deadline.saturating_duration_since(Instant::now())
-    }
-}
-
-#[derive(Deserialize)]
-pub(super) struct TokenResponse {
-    pub access_token: String,
-    pub refresh_token: Option<String>,
-    #[serde(default)]
-    pub expires_in: Option<u64>,
-}
-
-impl TokenResponse {
-    pub fn stored(self, client_id: String) -> Result<StoredToken> {
-        let expires_in = self.expires_in.unwrap_or(DEFAULT_TOKEN_LIFETIME_SECONDS);
-        if self.access_token.is_empty() || expires_in == 0 {
-            return Err(Error::network("invalid token response"));
-        }
-        Ok(StoredToken {
-            client_id,
-            access_token: self.access_token,
-            refresh_token: self.refresh_token,
-            expires_at: now_seconds().saturating_add(expires_in),
-        })
-    }
-}
-
-pub(super) fn http_client() -> Result<Client> {
-    Client::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("tickloop-ticks/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|_| Error::network("cannot create HTTP client"))
-}
-
-pub(super) async fn response_json<T: serde::de::DeserializeOwned>(
-    response: Response,
-    operation: &str,
-) -> Result<T> {
-    let status = response.status();
-    if !status.is_success() {
-        return Err(Error::network(format!("{operation} failed: HTTP {status}")));
-    }
-    response
-        .json()
-        .await
-        .map_err(|_| Error::network(format!("invalid {operation} response")))
-}
-
-/// Complete interactive input before installing asynchronous signal handlers.
-pub fn prepare_region(
-    configured: Option<Region>,
-    config_path: &Path,
-    input: &mut impl BufRead,
-    output: &mut impl Write,
-) -> Result<Region> {
-    match configured {
-        Some(region) => Ok(region),
-        None => {
-            writeln!(output, "Select region: cn (中国大陆) or global (全球)")?;
-            output.flush()?;
-            let mut choice = String::new();
-            input.read_line(&mut choice)?;
-            let region: Region = choice
-                .trim()
-                .parse()
-                .map_err(|_| Error::usage("enter cn or global to select a region"))?;
-            save_region(config_path, region)?;
-            Ok(region)
-        }
-    }
-}
-
-pub fn save_region(config_path: &Path, region: Region) -> Result<()> {
-    let existing = match std::fs::read_to_string(config_path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error.into()),
-    };
-    let mut document = existing
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|error| Error::usage(error.to_string()))?;
-    document["region"] = toml_edit::value(region.as_str());
-    atomic_write(config_path, document.to_string().as_bytes())?;
-    Ok(())
-}
-
-pub async fn begin_login(
-    region: Region,
-    storage: &AuthStorage,
-    endpoints: Option<AuthEndpoints>,
-) -> Result<DeviceLogin> {
-    let endpoints = endpoints.unwrap_or_else(|| AuthEndpoints::for_region(region));
-    let http = http_client()?;
-    let registration_path = storage.directory.join("client.json");
-    let registration: Registration = match std::fs::read(&registration_path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|_| Error::usage("invalid local client registration"))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let response = http
-                .post(format!("{}/register", endpoints.ap))
-                .json(&serde_json::json!({"client_name": CLIENT_NAME, "redirect_uris": [REDIRECT_URI]}))
-                .send()
-                .await
-                .map_err(|_| Error::network("client registration request failed"))?;
-            let registration: Registration = response_json(response, "client registration").await?;
-            if registration.client_id.is_empty() {
-                return Err(Error::network("missing client_id in registration"));
-            }
-            atomic_write(
-                &registration_path,
-                &serde_json::to_vec(&registration)
-                    .map_err(|error| Error::usage(error.to_string()))?,
-            )?;
-            registration
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let response = http
-        .post(format!("{}/device/authorize", endpoints.ap))
-        .form(&[("client_id", &registration.client_id)])
-        .send()
-        .await
-        .map_err(|_| Error::network("device authorization request failed"))?;
-    let device: DeviceCode = response_json(response, "device authorization").await?;
-    if device.device_code.is_empty()
-        || device.user_code.is_empty()
-        || device.verification_uri.is_empty()
-    {
-        return Err(Error::network("incomplete device authorization response"));
-    }
-    let deadline = Instant::now()
-        .checked_add(Duration::from_secs(device.expires_in))
-        .ok_or_else(|| Error::network("invalid device code expiry"))?;
-    Ok(DeviceLogin {
-        client_id: registration.client_id,
-        device,
-        deadline,
-    })
-}
-
-pub async fn complete_login(
-    region: Region,
-    storage: &AuthStorage,
-    endpoints: Option<AuthEndpoints>,
-    login: &DeviceLogin,
-    notices: &mpsc::UnboundedSender<LoginNotice>,
-) -> Result<()> {
-    let endpoints = endpoints.unwrap_or_else(|| AuthEndpoints::for_region(region));
-    let http = http_client()?;
-    let token = wait_for_token(
-        &http,
-        &endpoints,
-        &login.client_id,
-        &login.device,
-        login.deadline,
-        notices,
-    )
-    .await?;
-    storage
-        .save(&token)
-        .map_err(|error| Error::usage(error.to_string()))
-}
-
-pub async fn run_login(
-    configured: Option<Region>,
-    config_path: &Path,
-    storage: &AuthStorage,
-    endpoints: Option<AuthEndpoints>,
-    input: &mut impl BufRead,
-    output: &mut impl Write,
-) -> Result<()> {
-    let region = prepare_region(configured, config_path, input, output)?;
-    let login = begin_login(region, storage, endpoints.clone()).await?;
-    writeln!(
-        output,
-        "\nTickloop · Longbridge\n\n1. Open this link in your browser:\n   {}\n\n2. Confirm this device code and approve access:\n   {}\n\nWaiting for Longbridge to confirm (up to {}s). Ctrl+C cancels.",
-        login.verification_uri(),
-        login.user_code(),
-        login.expires_in()
-    )?;
-    output.flush()?;
-    let (notices, mut updates) = mpsc::unbounded_channel();
-    let polling = complete_login(region, storage, endpoints, &login, &notices);
-    tokio::pin!(polling);
-    loop {
-        tokio::select! {
-            result = &mut polling => break result?,
-            Some(notice) = updates.recv() => {
-                writeln!(output, "{}", notice.message())?;
-                output.flush()?;
-            }
-        }
-    }
-    writeln!(output, "\nLogged in. You can close the authorization page.")?;
-    Ok(())
-}
-
-async fn wait_for_token(
-    http: &Client,
-    endpoints: &AuthEndpoints,
-    client_id: &str,
-    device: &DeviceCode,
-    deadline: Instant,
-    notices: &mpsc::UnboundedSender<LoginNotice>,
-) -> Result<StoredToken> {
-    let (interval, _) = watch::channel(device.interval.unwrap_or(DEFAULT_POLL_SECONDS).max(1));
-    let poll = TokenPoll {
-        http,
-        client_id,
-        device,
-        deadline,
-        interval,
-        active_transient_failures: AtomicUsize::new(0),
-        notices,
-    };
-    let ap = poll.run(&endpoints.ap, "ap");
-    let us = poll.run(&endpoints.us, "us");
-    tokio::pin!(ap, us);
-    let (first, second) = tokio::select! {
-        result = &mut ap => (result, us),
-        result = &mut us => (result, ap),
-    };
-    match first {
-        Ok(token) => Ok(token),
-        Err(PollFailure::Terminal(error)) => Err(error),
-        Err(PollFailure::Unavailable(first_error)) => {
-            let _ = notices.send(LoginNotice::EndpointUnavailable);
-            second.await.map_err(|failure| match failure {
-                PollFailure::Terminal(error) => error,
-                PollFailure::Unavailable(error) => {
-                    Error::network(format!("{first_error}; {error}"))
-                }
-            })
-        }
-    }
-}
-
+/// What the waiting screen tells the user while the login goes on.
 pub enum LoginNotice {
     TemporaryFailureRetry,
-    EndpointUnavailable,
     SlowerPolling,
 }
 
@@ -344,9 +77,6 @@ impl LoginNotice {
             Self::TemporaryFailureRetry => {
                 "Longbridge authorization is temporarily unavailable; retrying automatically."
             }
-            Self::EndpointUnavailable => {
-                "One Longbridge authorization endpoint failed; checking the other endpoint."
-            }
             Self::SlowerPolling => {
                 "Longbridge requested less frequent checks; waiting for confirmation."
             }
@@ -354,152 +84,251 @@ impl LoginNotice {
     }
 }
 
-enum PollFailure {
-    Terminal(Error),
-    Unavailable(Error),
-}
-
-impl From<Error> for PollFailure {
-    fn from(error: Error) -> Self {
-        Self::Terminal(error)
-    }
-}
-
-struct TokenPoll<'a> {
-    http: &'a Client,
-    client_id: &'a str,
-    device: &'a DeviceCode,
-    deadline: Instant,
-    interval: watch::Sender<u64>,
-    active_transient_failures: AtomicUsize,
-    notices: &'a mpsc::UnboundedSender<LoginNotice>,
-}
-
-impl TokenPoll<'_> {
-    async fn run(&self, base: &str, center: &str) -> std::result::Result<StoredToken, PollFailure> {
-        let mut changes = self.interval.subscribe();
-        let mut previous_poll = Instant::now();
-        let mut has_transient_failure = false;
-        loop {
-            let next_poll = previous_poll
-                .checked_add(Duration::from_secs(*changes.borrow_and_update()))
-                .unwrap_or(self.deadline)
-                .min(self.deadline);
-            tokio::select! {
-                _ = sleep_until(next_poll) => (),
-                _ = changes.changed() => continue,
+impl DeviceLogin {
+    /// Discovers `issuer`'s endpoints, registers there unless Tickloop or this program did
+    /// before, and asks for a device code.
+    pub async fn start(credentials: &PackageCredentials, issuer: &str) -> Result<Self> {
+        let server = Server::new(issuer)?;
+        let endpoints = server.discover().await?;
+        let saved_client = locked(credentials, {
+            let issuer = issuer.to_owned();
+            move |files| files.client_id(&issuer)
+        })
+        .await?;
+        let is_saved_client = saved_client.is_some();
+        let mut client_id = match saved_client {
+            Some(client_id) => client_id,
+            None => register(&server, &endpoints, credentials).await?,
+        };
+        let mut authorization = authorize_device(&server, &endpoints, &client_id).await?;
+        if is_saved_client && authorization.is_none() {
+            // The server forgot the client registered before: register anew, once.
+            client_id = register(&server, &endpoints, credentials).await?;
+            authorization = authorize_device(&server, &endpoints, &client_id).await?;
+        }
+        let device = authorization.ok_or_else(|| {
+            not_authorized("Longbridge does not know the device login client (invalid_client)")
+        })?;
+        let is_shown = |text: &str| {
+            !text.is_empty()
+                && text.len() <= MAX_SHOWN_LENGTH
+                && !text.chars().any(char::is_control)
+        };
+        let shown_page = |page: &str, field| {
+            if is_shown(page) {
+                server.endpoint(page, field)
+            } else {
+                Err(server.invalid("device authorization"))
             }
-            if Instant::now() >= self.deadline {
-                return Err(if has_transient_failure {
-                    PollFailure::Unavailable(Error::network(format!(
-                        "cannot reach Longbridge authorization server ({center}); device code expired"
-                    )))
+        };
+        let verification_uri = shown_page(&device.verification_uri, "verification_uri")?;
+        let verification_uri_complete = device
+            .verification_uri_complete
+            .as_deref()
+            .filter(|page| !page.is_empty())
+            .map(|page| shown_page(page, "verification_uri_complete"))
+            .transpose()?;
+        if device.device_code.is_empty() || !is_shown(&device.user_code) || device.expires_in == 0 {
+            return Err(server.invalid("device authorization"));
+        }
+        let lifetime = Duration::from_secs(device.expires_in).min(MAX_DEVICE_CODE_LIFETIME);
+        Ok(Self {
+            server,
+            credentials: credentials.clone(),
+            endpoints,
+            client_id,
+            device_code: device.device_code,
+            user_code: device.user_code,
+            verification_uri,
+            verification_uri_complete,
+            interval: device.interval.map_or(DEFAULT_POLL_INTERVAL, |seconds| {
+                Duration::from_secs(seconds.max(1))
+            }),
+            deadline: Instant::now() + lifetime,
+        })
+    }
+
+    /// The code the user approves on the verification page.
+    pub fn user_code(&self) -> &str {
+        &self.user_code
+    }
+
+    /// The verification page with the user code filled in when Longbridge offers one.
+    pub fn verification_uri(&self) -> &str {
+        self.verification_uri_complete
+            .as_ref()
+            .unwrap_or(&self.verification_uri)
+            .as_str()
+    }
+
+    /// The verification page where the user enters the user code.
+    pub fn plain_verification_uri(&self) -> &str {
+        self.verification_uri.as_str()
+    }
+
+    pub fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    /// Polls until the user approves, refuses or the code expires, and saves the token on
+    /// approval. While the server cannot be reached the polling backs off and `notices` hears
+    /// so once; it hears too when the server asks for slower polling.
+    pub async fn finish(&self, notices: &mpsc::UnboundedSender<LoginNotice>) -> Result<()> {
+        let mut interval = self.interval;
+        let mut is_unreachable = false;
+        loop {
+            let next_poll = Instant::now() + interval;
+            if next_poll >= self.deadline {
+                return Err(if is_unreachable {
+                    Error::network(
+                        "cannot reach the Longbridge authorization server; the device code expired",
+                    )
                 } else {
-                    not_authorized("device code expired").into()
+                    not_authorized("device code expired")
                 });
             }
-            let response = timeout_at(
-                self.deadline,
-                self.http
-                    .post(format!("{base}/token"))
-                    .header("x-dc-region", center)
-                    .form(&[
-                        ("client_id", self.client_id),
-                        ("device_code", &self.device.device_code),
-                        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                    ])
-                    .send(),
-            )
-            .await
-            .map_err(|_| {
-                PollFailure::Unavailable(Error::network(format!(
-                    "Longbridge token request timed out ({center}); device code expired"
-                )))
-            })?;
-            previous_poll = Instant::now();
-            let response = match response {
-                Ok(response) if !response.status().is_server_error() => response,
-                _ => {
-                    if !has_transient_failure
-                        && self
-                            .active_transient_failures
-                            .fetch_add(1, Ordering::SeqCst)
-                            == 0
-                    {
-                        let _ = self.notices.send(LoginNotice::TemporaryFailureRetry);
-                    }
-                    has_transient_failure = true;
-                    self.interval
-                        .send_modify(|seconds| *seconds = seconds.saturating_mul(2).min(30));
-                    continue;
-                }
+            sleep_until(next_poll).await;
+            let request = self
+                .server
+                .http()
+                .post(self.endpoints.token.clone())
+                .form(&[
+                    ("grant_type", DEVICE_CODE_GRANT),
+                    ("device_code", &self.device_code),
+                    ("client_id", &self.client_id),
+                ]);
+            let reply = match self.server.request_token(request).await {
+                Ok(Reply::Unexpected(status)) if status.is_server_error() => None,
+                Ok(reply) => Some(reply),
+                Err(_) => None,
             };
-            if has_transient_failure {
-                self.active_transient_failures
-                    .fetch_sub(1, Ordering::SeqCst);
-                has_transient_failure = false;
-            }
-            if response.status().is_success() {
-                let token = timeout_at(
-                    self.deadline,
-                    response_json::<TokenResponse>(response, "token"),
-                )
-                .await
-                .map_err(|_| {
-                    PollFailure::Unavailable(Error::network(format!(
-                        "Longbridge token response timed out ({center}); device code expired"
-                    )))
-                })?
-                .map_err(PollFailure::Terminal)?;
-                return token
-                    .stored(self.client_id.to_owned())
-                    .map_err(PollFailure::Terminal);
-            }
-            let status = response.status();
-            let body: serde_json::Value = timeout_at(self.deadline, response.json())
-                .await
-                .map_err(|_| {
-                    PollFailure::Unavailable(Error::network(format!(
-                        "Longbridge token response timed out ({center}); device code expired"
-                    )))
-                })?
-                .map_err(|_| {
-                    PollFailure::Unavailable(Error::network(format!(
-                        "invalid token poll response ({center}; HTTP {status})"
-                    )))
-                })?;
-            match body["error"].as_str() {
-                Some("authorization_pending") => (),
-                Some("slow_down") => {
-                    self.interval.send_modify(|seconds| {
-                        *seconds = seconds.saturating_add(SLOW_DOWN_SECONDS)
-                    });
-                    let _ = self.notices.send(LoginNotice::SlowerPolling);
+            let Some(reply) = reply else {
+                if !is_unreachable {
+                    let _ = notices.send(LoginNotice::TemporaryFailureRetry);
                 }
-                Some("access_denied") => {
-                    return Err(not_authorized("authorization denied").into());
+                is_unreachable = true;
+                interval = (interval * 2).min(MAX_RETRY_INTERVAL);
+                continue;
+            };
+            is_unreachable = false;
+            match reply {
+                Reply::Token(response) => {
+                    let token = OAuthToken {
+                        refresh_token: response.refresh_token(),
+                        expires_at: response.expires_at(),
+                        access_token: response.access_token,
+                        token_type: response.token_type,
+                        scope: response.scope,
+                        issuer: self.server.issuer().to_owned(),
+                        client_id: self.client_id.clone(),
+                        token_endpoint: self.endpoints.token.to_string(),
+                        revocation_endpoint: self
+                            .endpoints
+                            .revocation
+                            .as_ref()
+                            .map(ToString::to_string),
+                    };
+                    return locked(&self.credentials, move |files| files.save_token(&token)).await;
                 }
-                Some("expired_token") => {
-                    return Err(not_authorized("device code expired").into());
-                }
-                Some("invalid_client") => {
-                    return Err(not_authorized(
-                        "device login client was rejected (invalid_client)",
-                    )
-                    .into());
-                }
-                Some("invalid_grant") => {
-                    return Err(not_authorized(
-                        "device authorization was rejected (invalid_grant)",
-                    )
-                    .into());
-                }
-                _ => {
-                    return Err(PollFailure::Unavailable(Error::network(format!(
-                        "device authorization failed ({center}; HTTP {status})"
-                    ))));
+                Reply::Refused(code) => match code.as_str() {
+                    "authorization_pending" => {}
+                    "slow_down" => {
+                        interval += SLOW_DOWN_STEP;
+                        let _ = notices.send(LoginNotice::SlowerPolling);
+                    }
+                    "access_denied" => return Err(not_authorized("authorization denied")),
+                    "expired_token" => return Err(not_authorized("device code expired")),
+                    code => {
+                        return Err(not_authorized(format!(
+                            "Longbridge refused the device authorization ({code})"
+                        )));
+                    }
+                },
+                Reply::Unexpected(status) => {
+                    return Err(Error::network(format!(
+                        "device authorization failed: {} answered HTTP {status}",
+                        self.endpoints.token
+                    )));
                 }
             }
         }
+    }
+}
+
+/// Registers as a public device client and keeps the `client_id` for the next login, Tickloop's
+/// included.
+async fn register(
+    server: &Server,
+    endpoints: &Endpoints,
+    credentials: &PackageCredentials,
+) -> Result<String> {
+    let endpoint = endpoints.registration.as_ref().ok_or_else(|| {
+        Error::network(format!(
+            "{} offers no client registration (registration_endpoint)",
+            server.issuer()
+        ))
+    })?;
+    let metadata = serde_json::json!({
+        "client_name": CLIENT_NAME,
+        "grant_types": [DEVICE_CODE_GRANT, REFRESH_TOKEN_GRANT],
+        "token_endpoint_auth_method": "none",
+        "redirect_uris": [REDIRECT_URI],
+    });
+    let (status, body) = server
+        .exchange(server.http().post(endpoint.clone()).json(&metadata))
+        .await
+        .map_err(|_| Error::network("client registration request failed"))?;
+    if !status.is_success() {
+        return Err(Error::network(format!(
+            "client registration failed: {endpoint} answered HTTP {status}"
+        )));
+    }
+    let registration: Registration =
+        parse(&body).ok_or_else(|| server.invalid("client registration"))?;
+    let is_public = registration
+        .token_endpoint_auth_method
+        .as_deref()
+        .is_none_or(|method| method == "none");
+    if registration.client_id.is_empty() || !is_public {
+        return Err(server.invalid("client registration"));
+    }
+    let client_id = registration.client_id;
+    locked(credentials, {
+        let (issuer, client_id) = (server.issuer().to_owned(), client_id.clone());
+        move |files| files.set_client_id(&issuer, Some(&client_id))
+    })
+    .await?;
+    Ok(client_id)
+}
+
+/// Asks for a device code; `None` when the server does not know `client_id`.
+async fn authorize_device(
+    server: &Server,
+    endpoints: &Endpoints,
+    client_id: &str,
+) -> Result<Option<DeviceAuthorization>> {
+    let endpoint = &endpoints.device_authorization;
+    let (status, body) = server
+        .exchange(
+            server
+                .http()
+                .post(endpoint.clone())
+                .form(&[("client_id", client_id)]),
+        )
+        .await
+        .map_err(|_| Error::network("device authorization request failed"))?;
+    if status.is_success() {
+        return parse(&body)
+            .map(Some)
+            .ok_or_else(|| server.invalid("device authorization"));
+    }
+    match error_code(&body).as_deref() {
+        Some("invalid_client") => Ok(None),
+        Some(code) => Err(not_authorized(format!(
+            "Longbridge refused the device authorization ({code})"
+        ))),
+        None => Err(Error::network(format!(
+            "device authorization failed: {endpoint} answered HTTP {status}"
+        ))),
     }
 }

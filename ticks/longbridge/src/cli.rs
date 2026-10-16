@@ -1,16 +1,15 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use tick_command::cli::{CONFIGURATION_HELP, GlobalArgs, TickCommand, parse_variant};
+use tick_command::cli::{CONFIGURATION_HELP, GlobalArgs, TickCommand};
 use tick_market::{
     args::{CommunityArgs, EarningsArgs, KlineArgs, NewsArgs, OnceArgs, QuoteArgs, WatchlistArgs},
     metadata::TickKind,
 };
-use tick_provider::preferences::Region;
 
 const ABOUT: &str = "Longbridge Ticks: quotes, watchlist, candlesticks, positions, news, earnings \
-     and community posts as standalone terminal commands; log in with `tickloop tick login \
-     longbridge`, which runs `tick-longbridge auth`";
+     and community posts as standalone terminal commands; log in with /ticks in the Agent or \
+     `tickloop tick login longbridge`, or with `tick-longbridge auth`, which shares that login";
 
 const EXAMPLES: &str = "Examples:
   tick-longbridge auth
@@ -50,9 +49,6 @@ pub const TICKS: [TickKind; 7] = [
 pub struct Cli {
     #[command(flatten)]
     pub global: GlobalArgs,
-    /// Longbridge data center: cn or global
-    #[arg(long, global = true, value_name = "REGION", value_parser = parse_variant::<Region>)]
-    pub region: Option<Region>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -109,15 +105,8 @@ impl From<LongbridgeTick> for TickCommand {
 #[derive(Subcommand, Clone, Copy, Debug)]
 pub enum AuthAction {
     /// Show login state, expiry time and region without refreshing
-    Status {
-        /// Print only the login state, as one JSON object read from this computer alone
-        #[arg(long)]
-        json: bool,
-    },
-    /// Verify stored authorization for a noninteractive workspace launch
-    #[command(hide = true)]
-    Check,
-    /// Delete the token stored on this computer
+    Status,
+    /// Delete the token saved on this computer, which Tickloop shares
     Logout,
 }
 

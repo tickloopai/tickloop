@@ -4968,6 +4968,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tickloop-agent-packages",
+ "tickloop-agent-test-support",
  "tickloop-tick-command",
  "tickloop-tick-market",
  "tickloop-tick-packages",
@@ -4977,7 +4979,8 @@ dependencies = [
  "time",
  "time-tz",
  "tokio",
- "toml_edit 0.22.27",
+ "tokio-util",
+ "url",
  "vt100",
 ]
 

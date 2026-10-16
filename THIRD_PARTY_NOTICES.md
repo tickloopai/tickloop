@@ -24,13 +24,13 @@ Current Tickloop connects to an independently running Herdr through its API; it 
 
 The adaptation adds configurable ambiguous width, grapheme-aware truncation, and Chinese units, and removes global state from the limiter. Longbridge Terminal is a source reference, not a build dependency. Other dependencies retain their own licenses.
 
-## Longbridge OpenAPI OAuth runtime refresh patch
+## Longbridge OpenAPI OAuth token refresher patch
 
 - Upstream: [Longbridge OpenAPI](https://github.com/longbridge/openapi).
 - Reference revision: `59294104c48a3812049158ee52124f32e5046008` (`5929410`).
 - Upstream source: `rust/crates/oauth`.
 - Vendored source: `vendor/longbridge-oauth`, patched through the root Cargo manifest.
-- Changes: explicit AP/US refresh endpoints, credential-derived refresh routing, and the `x-dc-region` header; standalone Cargo dependency declarations and unit-test constructor updates. Details are in [the patch README](./vendor/longbridge-oauth/README.md).
+- Changes: a `TokenRefresher` hook through which the application renews tokens in place of the client's own refresh; standalone Cargo dependency declarations and unit-test constructor updates. Details are in [the patch README](./vendor/longbridge-oauth/README.md).
 - Applicable licenses: MIT OR Apache License, Version 2.0. Unmodified copies are included in [LICENSE-MIT](./vendor/longbridge-oauth/LICENSE-MIT) and [LICENSE-APACHE](./vendor/longbridge-oauth/LICENSE-APACHE).
 
 ## CLI Candlestick Chart glyph rules

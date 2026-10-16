@@ -1,7 +1,6 @@
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
     io::IsTerminal,
-    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -10,79 +9,52 @@ use tick_command::{
     connecting::{self, DataSource},
     entry::{self, Running, Services},
 };
-use tick_market::{
-    config::{Overrides, Settings},
-    terminal::TerminalSession,
-};
+use tick_market::{config::Settings, terminal::TerminalSession};
+use tick_packages::PackageCredentials;
 use tick_provider::{
-    community::CommunityApi,
-    error::{Error, Result},
-    exit_code,
-    news::NewsApi,
-    preferences::{Language, Region},
+    community::CommunityApi, error::Result, exit_code, news::NewsApi, preferences::Language,
 };
 
 use crate::{
-    auth::{
-        self, AuthEndpoints,
-        storage::{AuthStorage, TOKEN_FILE_NAME},
-    },
-    cli::{AuthAction, Cli, Command, ProbeArgs, TICKS},
+    auth::{self, Authorized},
+    cli::{Cli, Command, ProbeArgs, TICKS},
     community_api::SdkCommunityApi,
     login,
     news_api::SdkNewsApi,
     not_authorized,
     rate_limit::RateLimiter,
+    region::Issuers,
     sdk::{SdkQuoteApi, SdkTradeApi},
 };
 
 pub async fn execute(cli: Cli) -> Result<()> {
-    let Cli {
-        global,
-        region,
-        command,
-    } = cli;
+    let Cli { global, command } = cli;
     match command {
         Command::Tick(tick) => {
             let tick = TickCommand::from(tick);
             if tick.is_once() {
                 entry::refuse_in_instance()?;
             }
-            let (mut settings, storage) = prepare(&global, region)?;
+            let (settings, credentials) = prepare(&global)?;
             if entry::in_instance() {
                 // Only what needs no network runs before the Tick answers its host.
-                auth::check_stored(&storage)?;
+                auth::check_saved(&credentials)?;
                 let source = Longbridge {
                     tick: tick.clone(),
                     settings: settings.clone(),
-                    storage,
-                    endpoints: None,
+                    credentials,
                 };
                 return connecting::run_hosted(tick, &settings, global.size, source).await;
             }
-            run_longbridge_tick(
-                tick,
-                &mut settings,
-                &config_path(&global)?,
-                &storage,
-                global.size,
-            )
-            .await
+            run_longbridge_tick(tick, &settings, &credentials, global.size).await
         }
         Command::Auth { action } => {
             entry::refuse_in_instance()?;
-            if let Some(AuthAction::Status { json: true }) = action {
-                // Read by Tickloop, so neither the locale nor the configuration may fail it.
-                return login::print_status_json(&auth::default_storage()?, &mut std::io::stdout());
-            }
-            let (settings, storage) = prepare(&global, region)?;
+            let (settings, credentials) = prepare(&global)?;
             match action {
-                Some(action) => {
-                    login::inspect(action, &storage, settings.region, &mut std::io::stdout())
-                }
-                None => match interactive_login(&settings, &config_path(&global)?, &storage).await?
-                {
-                    login::LoginOutcome::Authorized(_) => {
+                Some(action) => login::inspect(action, &credentials, &mut std::io::stdout()),
+                None => match interactive_login(&settings, &credentials).await? {
+                    login::LoginOutcome::Authorized => {
                         println!("Longbridge authorization saved.");
                         Ok(())
                     }
@@ -92,10 +64,9 @@ pub async fn execute(cli: Cli) -> Result<()> {
         }
         Command::ProbeFundamentals(args) => {
             entry::refuse_in_instance()?;
-            let (settings, storage) = prepare(&global, region)?;
-            let region = settings.region.unwrap_or(Region::Global);
-            let oauth = auth::authorized_oauth(&storage, region, None).await?;
-            run_fundamentals_probe(&args, oauth, &settings).await
+            let (settings, credentials) = prepare(&global)?;
+            let authorized = auth::authorized_oauth(&credentials).await?;
+            run_fundamentals_probe(&args, authorized, &settings).await
         }
         Command::Describe => {
             entry::refuse_in_instance()?;
@@ -104,57 +75,38 @@ pub async fn execute(cli: Cli) -> Result<()> {
     }
 }
 
-/// Checks the locale, then loads the configuration with the region this run asks for, and the
-/// stored Longbridge login.
-fn prepare(global: &GlobalArgs, region: Option<Region>) -> Result<(Settings, AuthStorage)> {
+/// Checks the locale, then loads the configuration and finds the saved Longbridge login.
+fn prepare(global: &GlobalArgs) -> Result<(Settings, PackageCredentials)> {
     entry::check_locale()?;
-    let settings = global.settings()?.with_overrides(Overrides {
-        region,
-        ..Overrides::default()
-    });
-    Ok((settings, auth::default_storage()?))
-}
-
-/// The configuration file a login saves the chosen region to.
-fn config_path(global: &GlobalArgs) -> Result<PathBuf> {
-    global
-        .config
-        .clone()
-        .or_else(tick_market::config::default_path)
-        .ok_or_else(|| Error::usage("cannot determine configuration path"))
+    Ok((global.settings()?, auth::credentials()?))
 }
 
 /// Runs a Longbridge Tick, opening the login screen first, and again whenever authorization
 /// lapses, when the Tick runs interactively.
 async fn run_longbridge_tick(
     tick: TickCommand,
-    settings: &mut Settings,
-    config_path: &Path,
-    storage: &AuthStorage,
+    settings: &Settings,
+    credentials: &PackageCredentials,
     size: Option<ratatui::layout::Size>,
 ) -> Result<()> {
-    let interactive = std::env::var_os(auth::NONINTERACTIVE_AUTH_ENV).is_none()
-        && !tick.is_once()
-        && std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal();
+    let interactive =
+        !tick.is_once() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let mut login_required = false;
     loop {
-        if login_required {
-            match interactive_login(settings, config_path, storage).await? {
-                login::LoginOutcome::Authorized(region) => settings.region = Some(region),
-                login::LoginOutcome::Cancelled => return Ok(()),
-            }
+        if login_required
+            && interactive_login(settings, credentials).await? == login::LoginOutcome::Cancelled
+        {
+            return Ok(());
         }
-        let region = settings.region.unwrap_or(Region::Global);
-        let oauth = match auth::authorized_oauth(storage, region, None).await {
-            Ok(oauth) => oauth,
+        let authorized = match auth::authorized_oauth(credentials).await {
+            Ok(authorized) => authorized,
             Err(error) if error.code == exit_code::NOT_AUTHORIZED && interactive => {
                 login_required = true;
                 continue;
             }
             Err(error) => return Err(error),
         };
-        match run_longbridge_market(tick.clone(), oauth, settings, size).await {
+        match run_longbridge_market(tick.clone(), authorized, settings, size).await {
             Err(error) if error.code == exit_code::NOT_AUTHORIZED && interactive => {
                 login_required = true;
             }
@@ -165,11 +117,11 @@ async fn run_longbridge_tick(
 
 async fn run_longbridge_market(
     tick: TickCommand,
-    oauth: longbridge::oauth::OAuth,
+    authorized: Authorized,
     settings: &Settings,
     size: Option<ratatui::layout::Size>,
 ) -> Result<()> {
-    let connection = connect(&tick, oauth, settings).await?;
+    let connection = connect(&tick, authorized, settings).await?;
     entry::run_tick(
         Running::Provider(tick, connection.services()),
         settings,
@@ -202,7 +154,7 @@ impl Connection {
 
 async fn connect(
     tick: &TickCommand,
-    oauth: longbridge::oauth::OAuth,
+    Authorized { oauth, region }: Authorized,
     settings: &Settings,
 ) -> Result<Connection> {
     let token = oauth
@@ -210,16 +162,15 @@ async fn connect(
         .await
         .map_err(|_| not_authorized("authorization expired"))?;
     let is_us = longbridge::DcRegion::from_credential(&token) == longbridge::DcRegion::Us;
-    let config = crate::sdk::config(oauth.clone(), settings.language, settings.region).await?;
+    let config = crate::sdk::config(oauth.clone(), settings.language, region);
     let limiter = Arc::new(RateLimiter::default());
     let quote = SdkQuoteApi::new(
         config.clone(),
         oauth.clone(),
         settings.language,
-        settings.region,
+        region,
         limiter.clone(),
-    )
-    .await?;
+    );
     let (trade_context, trade_events) = longbridge::trade::TradeContext::new(config.clone());
     let trade = SdkTradeApi {
         context: trade_context,
@@ -227,16 +178,13 @@ async fn connect(
         is_us,
     };
     let news = if matches!(tick, TickCommand::News(_)) {
-        Some(
-            SdkNewsApi::new(
-                config.clone(),
-                oauth,
-                settings.language,
-                settings.region,
-                limiter.clone(),
-            )
-            .await?,
-        )
+        Some(SdkNewsApi::new(
+            config.clone(),
+            oauth,
+            settings.language,
+            region,
+            limiter.clone(),
+        )?)
     } else {
         None
     };
@@ -254,14 +202,11 @@ async fn connect(
     })
 }
 
-/// Longbridge as the data source of a Tick its host launched, connected with the login stored on
-/// this computer.
+/// Longbridge as the data source of a Tick its host launched, connected with the saved login.
 struct Longbridge {
     tick: TickCommand,
     settings: Settings,
-    storage: AuthStorage,
-    /// Where the login is renewed; `None` for the region's own endpoints.
-    endpoints: Option<AuthEndpoints>,
+    credentials: PackageCredentials,
 }
 
 impl DataSource for Longbridge {
@@ -282,16 +227,15 @@ impl DataSource for Longbridge {
     }
 
     fn stored_login(&self) -> Option<u64> {
-        let saved = std::fs::read(self.storage.directory.join(TOKEN_FILE_NAME)).ok()?;
+        let saved = std::fs::read(self.credentials.oauth_token_path()).ok()?;
         let mut fingerprint = DefaultHasher::new();
         saved.hash(&mut fingerprint);
         Some(fingerprint.finish())
     }
 
     async fn connect(&mut self) -> Result<Connection> {
-        let region = self.settings.region.unwrap_or(Region::Global);
-        let oauth = auth::authorized_oauth(&self.storage, region, self.endpoints.clone()).await?;
-        connect(&self.tick, oauth, &self.settings).await
+        let authorized = auth::authorized_oauth(&self.credentials).await?;
+        connect(&self.tick, authorized, &self.settings).await
     }
 
     fn services(connection: &Connection) -> Services<'_> {
@@ -301,7 +245,7 @@ impl DataSource for Longbridge {
 
 async fn run_fundamentals_probe(
     args: &ProbeArgs,
-    oauth: longbridge::oauth::OAuth,
+    Authorized { oauth, region }: Authorized,
     settings: &Settings,
 ) -> Result<()> {
     let token = oauth
@@ -311,7 +255,7 @@ async fn run_fundamentals_probe(
     let data_center = longbridge::DcRegion::from_credential(&token)
         .as_str()
         .to_owned();
-    let config = crate::sdk::config(oauth, settings.language, settings.region).await?;
+    let config = crate::sdk::config(oauth, settings.language, region);
     crate::probe::run(
         &args.symbol,
         args.as_of,
@@ -325,16 +269,14 @@ async fn run_fundamentals_probe(
 
 async fn interactive_login(
     settings: &Settings,
-    config_path: &Path,
-    storage: &AuthStorage,
+    credentials: &PackageCredentials,
 ) -> Result<login::LoginOutcome> {
     let mut session = TerminalSession::enter()?;
     let input = tick_market::terminal::input_events()?;
     login::run(
         settings,
-        config_path,
-        storage,
-        None,
+        credentials,
+        &Issuers::default(),
         &mut session.terminal,
         input,
     )
@@ -344,18 +286,25 @@ async fn interactive_login(
 #[cfg(test)]
 mod tests {
     use tick_market::args::{OnceArgs, QuoteArgs};
+    use tick_packages::OAuthToken;
+    use tick_provider::error::Error;
 
     use super::*;
-    use crate::asks_to_log_in;
+    use crate::{asks_to_log_in, region::Region};
 
     #[tokio::test]
     async fn a_login_that_lapses_before_a_tick_or_probe_starts_asks_the_user_to_log_in_again() {
-        let oauth = crate::auth::lapsing_oauth().await;
+        let lapsing = || async {
+            Authorized {
+                oauth: crate::auth::lapsing_oauth().await,
+                region: Region::Global,
+            }
+        };
         let quote = TickCommand::Quote(QuoteArgs {
             symbols: vec!["TSLA.US".into()],
             output: OnceArgs::default(),
         });
-        let error = run_longbridge_market(quote, oauth.clone(), &Settings::default(), None)
+        let error = run_longbridge_market(quote, lapsing().await, &Settings::default(), None)
             .await
             .unwrap_err();
         assert!(asks_to_log_in(&error), "{error}");
@@ -364,13 +313,13 @@ mod tests {
             as_of: None,
             out: None,
         };
-        let error = run_fundamentals_probe(&probe, oauth, &Settings::default())
+        let error = run_fundamentals_probe(&probe, lapsing().await, &Settings::default())
             .await
             .unwrap_err();
         assert!(asks_to_log_in(&error), "{error}");
     }
 
-    /// The token endpoint of a stand-in for Longbridge that refuses every login it is asked to
+    /// A token endpoint of a stand-in for Longbridge that refuses every login it is asked to
     /// renew.
     async fn refusing_login_renewals() -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -395,59 +344,63 @@ mod tests {
         }
     }
 
+    /// A lapsed token whose server is `issuer`.
+    fn lapsed(issuer: &str, access_token: &str) -> OAuthToken {
+        OAuthToken {
+            access_token: access_token.into(),
+            token_type: "Bearer".into(),
+            refresh_token: Some("ap_refresh".into()),
+            scope: None,
+            issuer: issuer.into(),
+            client_id: "test".into(),
+            token_endpoint: format!("{issuer}/token"),
+            revocation_endpoint: None,
+            expires_at: 1,
+        }
+    }
+
     /// A hosted Tick tells a login Longbridge refuses to renew from a Longbridge it cannot
     /// reach, and notices on this computer alone when the user logged in again.
     #[tokio::test]
-    async fn renewing_the_stored_login_tells_a_refused_login_from_an_unreachable_longbridge() {
-        let home = tempfile::tempdir().unwrap();
-        let storage = AuthStorage::in_home(home.path());
+    async fn renewing_the_saved_login_tells_a_refused_login_from_an_unreachable_longbridge() {
+        let root = tempfile::tempdir().unwrap();
+        let credentials = PackageCredentials::in_config_root(root.path(), "longbridge").unwrap();
         let mut source = Longbridge {
             tick: TickCommand::Quote(QuoteArgs {
                 symbols: vec!["TSLA.US".into()],
                 output: OnceArgs::default(),
             }),
             settings: Settings::default(),
-            storage: storage.clone(),
-            endpoints: None,
+            credentials: credentials.clone(),
         };
         assert_eq!(source.stored_login(), None);
-        let token = storage.directory.join(TOKEN_FILE_NAME);
-        std::fs::create_dir_all(&storage.directory).unwrap();
-        std::fs::write(
-            &token,
-            r#"{"client_id":"test","access_token":"ap_lapsed","refresh_token":"ap_refresh","expires_at":1,"logged_in_at":1}"#,
-        )
-        .unwrap();
-        let lapsed = source.stored_login();
-        assert!(lapsed.is_some());
+        let save = |token: OAuthToken| {
+            credentials
+                .lock_oauth()
+                .unwrap()
+                .save_token(&token)
+                .unwrap()
+        };
 
         let refusing = refusing_login_renewals().await;
-        source.endpoints = Some(AuthEndpoints {
-            ap: refusing.clone(),
-            us: refusing,
-        });
+        save(lapsed(&refusing, "ap_lapsed"));
+        let lapsed_login = source.stored_login();
+        assert!(lapsed_login.is_some());
         let refused = connect_result(source.connect().await);
         assert!(asks_to_log_in(&refused), "{refused}");
 
         let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let unreachable = format!("http://{}", closed.local_addr().unwrap());
         drop(closed);
-        source.endpoints = Some(AuthEndpoints {
-            ap: unreachable.clone(),
-            us: unreachable,
-        });
+        save(lapsed(&unreachable, "ap_lapsed"));
         let failed = connect_result(source.connect().await);
         assert_eq!(failed.code, exit_code::NETWORK, "{failed}");
 
-        std::fs::write(
-            &token,
-            r#"{"client_id":"test","access_token":"ap_new","refresh_token":"ap_refresh","expires_at":1,"logged_in_at":2}"#,
-        )
-        .unwrap();
+        save(lapsed(&unreachable, "ap_new"));
         assert!(
             source
                 .stored_login()
-                .is_some_and(|login| Some(login) != lapsed)
+                .is_some_and(|login| Some(login) != lapsed_login)
         );
     }
 }

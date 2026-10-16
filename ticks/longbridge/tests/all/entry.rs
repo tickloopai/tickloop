@@ -12,7 +12,8 @@ const TICKS: [&str; 7] = [
     "earnings",
     "community",
 ];
-const AUTHORIZED_TOKEN: &str = r#"{"client_id":"test","access_token":"ap_fixture","refresh_token":null,"expires_at":4102444800,"logged_in_at":1}"#;
+/// Where Tickloop keeps the login under a home directory's default config root.
+const TOKEN_FILE: &str = ".tickloop/credentials/longbridge/oauth2.json";
 
 fn tick_longbridge() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tick-longbridge"));
@@ -30,15 +31,31 @@ fn scratch_dir(name: &str) -> PathBuf {
     dir
 }
 
-fn authorized_home(name: &str) -> PathBuf {
+/// A token of the global server, which expires at `expires_at`.
+fn token(expires_at: u64, refresh_token: Option<&str>) -> String {
+    serde_json::json!({
+        "access_token": "ap_fixture",
+        "token_type": "Bearer",
+        "refresh_token": refresh_token,
+        "issuer": "https://openapi.longbridge.com",
+        "client_id": "test",
+        "token_endpoint": "https://openapi.longbridge.com/oauth2/token",
+        "expires_at": expires_at,
+    })
+    .to_string()
+}
+
+/// A home directory whose default config root holds `saved` as the login.
+fn home_with_login(name: &str, saved: &str) -> PathBuf {
     let home = scratch_dir(name);
-    fs::create_dir_all(home.join(".tickloop/longbridge")).unwrap();
-    fs::write(
-        home.join(".tickloop/longbridge/auth.json"),
-        AUTHORIZED_TOKEN,
-    )
-    .unwrap();
+    let token_file = home.join(TOKEN_FILE);
+    fs::create_dir_all(token_file.parent().unwrap()).unwrap();
+    fs::write(token_file, saved).unwrap();
     home
+}
+
+fn authorized_home(name: &str) -> PathBuf {
+    home_with_login(name, &token(4102444800, None))
 }
 
 fn run(command: &mut Command) -> (i32, String, String) {
@@ -81,9 +98,13 @@ fn help_lists_every_tick_and_the_login_with_examples_and_exit_codes() {
         "{stdout}"
     );
     assert!(stdout.contains("4  network or API error"), "{stdout}");
-    for flag in ["--config", "--color-mode", "--region"] {
+    for flag in ["--config", "--color-mode"] {
         assert!(stdout.contains(flag), "missing {flag}:\n{stdout}");
     }
+    assert!(
+        !stdout.contains("--region"),
+        "a login picks the network: {stdout}"
+    );
 }
 
 #[test]
@@ -116,6 +137,15 @@ fn ticks_of_other_programs_and_removed_commands_are_unknown() {
             "{command:?}: {stderr}"
         );
         assert!(!stderr.contains(AUTH_HINT), "{stderr}");
+    }
+    for command in [
+        &["auth", "check"][..],
+        &["auth", "status", "--json"],
+        &["quote", "TSLA", "--region", "cn"],
+    ] {
+        let (code, stdout, stderr) = run(tick_longbridge().args(command));
+        assert_eq!(code, 2, "{command:?}: {stderr}");
+        assert!(stdout.is_empty(), "{command:?}: {stdout}");
     }
 }
 
@@ -252,161 +282,129 @@ fn hidden_fundamentals_probe_is_noninteractive_and_exits_three_without_authoriza
 }
 
 #[test]
-fn auth_status_and_logout_work_without_a_login_or_region_prompt() {
+fn auth_status_and_logout_work_without_a_login() {
     let (code, stdout, stderr) = run(tick_longbridge().args(["auth", "status"]));
     assert_eq!(code, 0, "{stderr}");
-    assert!(
-        stdout.contains(&format!("Not logged in; {AUTH_HINT}.")),
-        "{stdout}"
-    );
-    assert!(stdout.contains("Region: not configured"), "{stdout}");
-    let (code, stdout, stderr) = run(tick_longbridge().args(["auth", "status", "--region", "cn"]));
-    assert_eq!(code, 0, "{stderr}");
-    assert!(stdout.contains("Region: cn"), "{stdout}");
+    assert_eq!(stdout, format!("Not logged in; {AUTH_HINT}.\n"));
     let (code, stdout, stderr) = run(tick_longbridge().args(["auth", "logout"]));
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.contains("Logged out"), "{stdout}");
 }
 
+/// The status reads the saved login alone and renews nothing; a lapsed access token still
+/// counts as logged in while a refresh token can renew it.
 #[test]
-fn auth_status_json_reads_the_stored_login_alone() {
-    let token = |expires_at: u64, refresh_token: Option<&str>| {
-        serde_json::json!({
-            "client_id": "test",
-            "access_token": "ap_fixture",
-            "refresh_token": refresh_token,
-            "expires_at": expires_at,
-            "logged_in_at": 1,
-        })
-        .to_string()
-    };
-    let cases = [
-        ("auth-json-missing", None, r#"{"state":"logged_out"}"#),
-        (
-            "auth-json-authorized",
-            Some(AUTHORIZED_TOKEN.to_owned()),
-            r#"{"state":"logged_in"}"#,
-        ),
-        (
-            "auth-json-renewable",
-            Some(token(1, Some("ap_refresh"))),
-            r#"{"detail":"the access token is renewed when a Tick opens","state":"logged_in"}"#,
-        ),
-        (
-            "auth-json-expired",
-            Some(token(1, None)),
-            r#"{"detail":"expired at 1970-01-01T00:00:01Z","state":"expired"}"#,
-        ),
-        (
-            "auth-json-unreadable",
-            Some("{".to_owned()),
-            r#"{"detail":"the saved login cannot be read; log in again","state":"logged_out"}"#,
-        ),
-    ];
-    for (name, saved, expected) in cases {
-        let home = scratch_dir(name);
-        let token_path = home.join(".tickloop/longbridge/auth.json");
-        if let Some(saved) = &saved {
-            fs::create_dir_all(token_path.parent().unwrap()).unwrap();
-            fs::write(&token_path, saved).unwrap();
-        }
-        // Without a UTF-8 locale or a readable configuration, as Tickloop may run it.
-        let (code, stdout, stderr) = run(tick_longbridge()
-            .env("HOME", &home)
-            .env("LANG", "C")
-            .args(["auth", "status", "--json", "--config"])
-            .arg(home.join("missing.toml")));
-        assert_eq!(code, 0, "{name}: {stderr}");
-        assert_eq!(stdout, format!("{expected}\n"), "{name}");
-        assert!(stderr.is_empty(), "{name}: {stderr}");
-        assert_eq!(
-            fs::read_to_string(&token_path).ok(),
-            saved,
-            "{name}: the status refreshes nothing"
-        );
-    }
-}
-
-#[test]
-fn auth_status_text_agrees_with_the_json_state() {
-    let token = |expires_at: u64, refresh_token: Option<&str>| {
-        serde_json::json!({
-            "client_id": "test",
-            "access_token": "ap_fixture",
-            "refresh_token": refresh_token,
-            "expires_at": expires_at,
-            "logged_in_at": 1,
-        })
-        .to_string()
-    };
+fn auth_status_reads_the_saved_login_alone() {
     let cases = [
         (
             "auth-text-authorized",
-            AUTHORIZED_TOKEN.to_owned(),
-            "Logged in\nExpires: 2100-01-01T00:00:00Z\n",
-            "logged_in",
+            token(4102444800, None),
+            "Logged in\nExpires: 2100-01-01T00:00:00Z\nRegion: global\n",
         ),
         (
             "auth-text-renewable",
             token(1, Some("ap_refresh")),
             "Logged in; the access token is renewed when a Tick opens\n\
-             Access token expired: 1970-01-01T00:00:01Z\n",
-            "logged_in",
+             Access token expired: 1970-01-01T00:00:01Z\nRegion: global\n",
         ),
         (
             "auth-text-expired",
             token(1, None),
             "Authorization expired; log in with `tickloop tick login longbridge`, or with /ticks in \
-             the Agent.\nExpires: 1970-01-01T00:00:01Z\n",
-            "expired",
+             the Agent.\nExpires: 1970-01-01T00:00:01Z\nRegion: global\n",
         ),
     ];
-    for (name, saved, expected, state) in cases {
-        let home = scratch_dir(name);
-        let token_path = home.join(".tickloop/longbridge/auth.json");
-        fs::create_dir_all(token_path.parent().unwrap()).unwrap();
-        fs::write(&token_path, &saved).unwrap();
+    for (name, saved, expected) in cases {
+        let home = home_with_login(name, &saved);
         let (code, stdout, stderr) = run(tick_longbridge()
             .env("HOME", &home)
             .args(["auth", "status"]));
         assert_eq!(code, 0, "{name}: {stderr}");
+        assert_eq!(stdout, expected, "{name}");
         assert_eq!(
-            stdout,
-            format!("{expected}Region: not configured\n"),
-            "{name}"
+            fs::read_to_string(home.join(TOKEN_FILE)).unwrap(),
+            saved,
+            "{name}: the status renews nothing"
         );
-        let (code, stdout, stderr) = run(tick_longbridge()
-            .env("HOME", &home)
-            .args(["auth", "status", "--json"]));
-        assert_eq!(code, 0, "{name}: {stderr}");
-        assert!(
-            stdout.contains(&format!(r#""state":"{state}""#)),
-            "{name}: {stdout}"
-        );
-        assert_eq!(fs::read_to_string(&token_path).unwrap(), saved, "{name}");
     }
-}
 
-#[test]
-fn hidden_auth_check_uses_exit_status_for_noninteractive_callers() {
-    let missing_home = scratch_dir("auth-check-missing");
+    let home = home_with_login("auth-text-unreadable", "{");
     let (code, stdout, stderr) = run(tick_longbridge()
-        .env("HOME", missing_home)
-        .args(["auth", "check"]));
+        .env("HOME", &home)
+        .args(["auth", "status"]));
     assert_eq!(code, 3, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains(AUTH_HINT), "{stderr}");
 
     let (code, stdout, stderr) = run(tick_longbridge()
-        .env("HOME", authorized_home("auth-check-authorized"))
-        .args(["auth", "check"]));
+        .env("HOME", &home)
+        .args(["auth", "logout"]));
     assert_eq!(code, 0, "{stderr}");
-    assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.is_empty(), "{stderr}");
+    assert!(stdout.contains("Logged out"), "{stdout}");
+    assert!(!home.join(TOKEN_FILE).exists());
+}
 
-    let (code, stdout, stderr) = run(tick_longbridge().args(["auth", "--help"]));
-    assert_eq!(code, 0, "{stderr}");
-    assert!(!stdout.contains("check"), "{stdout}");
+/// The login is the one in the token file Tickloop names when it starts the program; run on its
+/// own, the program finds it in Tickloop's config root, which TICKLOOP_CONFIG_DIR moves.
+#[test]
+fn the_login_is_found_where_tickloop_keeps_it() {
+    let status = |command: &mut Command| {
+        let (code, stdout, stderr) = run(command.args(["auth", "status"]));
+        assert_eq!(code, 0, "{stderr}");
+        stdout
+    };
+    let logged_out = format!("Not logged in; {AUTH_HINT}.\n");
+    let home = authorized_home("login-in-home");
+    assert!(status(tick_longbridge().env("HOME", &home)).starts_with("Logged in\n"));
+
+    let config_root = scratch_dir("login-config-root");
+    assert_eq!(
+        status(
+            tick_longbridge()
+                .env("HOME", &home)
+                .env("TICKLOOP_CONFIG_DIR", &config_root)
+        ),
+        logged_out,
+        "TICKLOOP_CONFIG_DIR moves the config root"
+    );
+    assert!(
+        status(
+            tick_longbridge()
+                .env("HOME", &home)
+                .env("TICKLOOP_CONFIG_DIR", "")
+        )
+        .starts_with("Logged in\n"),
+        "an empty TICKLOOP_CONFIG_DIR is no config root"
+    );
+
+    let named = scratch_dir("login-named").join("credentials/longbridge/oauth2.json");
+    assert_eq!(
+        status(
+            tick_longbridge()
+                .env("HOME", &home)
+                .env("TICKLOOP_OAUTH_TOKEN_FILE", &named)
+        ),
+        logged_out,
+        "the named token file is the login"
+    );
+    fs::create_dir_all(named.parent().unwrap()).unwrap();
+    fs::write(&named, token(4102444800, None)).unwrap();
+    assert!(
+        status(
+            tick_longbridge()
+                .env("TICKLOOP_CONFIG_DIR", &config_root)
+                .env("TICKLOOP_OAUTH_TOKEN_FILE", &named)
+        )
+        .starts_with("Logged in\n")
+    );
+
+    for invalid in ["oauth2.json", "/tmp/token.json"] {
+        let (code, _, stderr) = run(tick_longbridge()
+            .env("TICKLOOP_OAUTH_TOKEN_FILE", invalid)
+            .args(["auth", "status"]));
+        assert_eq!(code, 2, "{invalid}: {stderr}");
+        assert!(stderr.contains("TICKLOOP_OAUTH_TOKEN_FILE"), "{stderr}");
+    }
 }
 
 #[test]

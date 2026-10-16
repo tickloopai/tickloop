@@ -26,6 +26,11 @@ pub const OAUTH_TOKEN_FILE_NAME: &str = "oauth2.json";
 pub const OAUTH_LOCK_FILE_NAME: &str = "oauth2.lock";
 /// The key of an `api_key` package.
 pub const API_KEY_FILE_NAME: &str = "api_key";
+/// Names the token file of an `oauth2` package to a program Tickloop starts.
+pub const OAUTH_TOKEN_FILE_VARIABLE: &str = "TICKLOOP_OAUTH_TOKEN_FILE";
+/// Moves the config root away from `~/.tickloop` when set and not empty.
+pub const CONFIG_ROOT_VARIABLE: &str = "TICKLOOP_CONFIG_DIR";
+const DEFAULT_CONFIG_ROOT: &str = ".tickloop";
 /// The `client_id` registered with each issuer, reused by the next login.
 const OAUTH_CLIENTS_FILE_NAME: &str = "oauth2-clients.json";
 /// Files are replaced through a temporary file with this prefix beside them.
@@ -150,8 +155,57 @@ impl PackageCredentials {
         })
     }
 
+    /// The credentials a program of the `oauth2` package `name` uses: those around the token file
+    /// [`OAUTH_TOKEN_FILE_VARIABLE`] names when Tickloop started the program, else the package's
+    /// own in the [`default_config_root`], so a program run on its own shares Tickloop's login.
+    pub fn for_program(name: &str) -> Result<Self, PackageError> {
+        let Some(token_file) = std::env::var_os(OAUTH_TOKEN_FILE_VARIABLE) else {
+            let config_root = default_config_root().ok_or_else(|| {
+                PackageError::Invalid("cannot find the home directory".to_owned())
+            })?;
+            return Self::in_config_root(&config_root, name);
+        };
+        let token_file = PathBuf::from(token_file);
+        match token_file.parent() {
+            Some(directory)
+                if token_file.is_absolute()
+                    && token_file.file_name() == Some(OAUTH_TOKEN_FILE_NAME.as_ref()) =>
+            {
+                Ok(Self {
+                    directory: directory.to_path_buf(),
+                })
+            }
+            _ => Err(PackageError::Invalid(format!(
+                "{OAUTH_TOKEN_FILE_VARIABLE} must be the absolute path of an {OAUTH_TOKEN_FILE_NAME} file"
+            ))),
+        }
+    }
+
     pub fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    /// The variables a program of a package that authenticates by `auth` starts with: an
+    /// `oauth2` program finds its token file in [`OAUTH_TOKEN_FILE_VARIABLE`], whether or not
+    /// the user logged in, and an `api_key` program its key in the variable the manifest names,
+    /// once the user entered one. The values must never be shown or logged.
+    pub fn launch_environment(&self, auth: &PackageAuth) -> Vec<(String, String)> {
+        match auth {
+            PackageAuth::None => Vec::new(),
+            PackageAuth::ApiKey { env, .. } => match self.api_key() {
+                Ok(Some(key)) => vec![(env.clone(), key.expose().to_owned())],
+                // A program without a usable key starts all the same and reports the failure.
+                Ok(None) | Err(_) => Vec::new(),
+            },
+            PackageAuth::OAuth2 { .. } => {
+                let token_file = self.oauth_token_path();
+                let token_file = std::path::absolute(&token_file).unwrap_or(token_file);
+                vec![(
+                    OAUTH_TOKEN_FILE_VARIABLE.to_owned(),
+                    token_file.to_string_lossy().into_owned(),
+                )]
+            }
+        }
     }
 
     pub fn oauth_token_path(&self) -> PathBuf {
@@ -323,6 +377,19 @@ impl LockedOAuth {
     fn clients_path(&self) -> PathBuf {
         self.credentials.directory.join(OAUTH_CLIENTS_FILE_NAME)
     }
+}
+
+/// The config root Tickloop uses: [`CONFIG_ROOT_VARIABLE`] when it is set and not empty, else
+/// `.tickloop` in the home directory; `None` when there is neither.
+pub fn default_config_root() -> Option<PathBuf> {
+    std::env::var_os(CONFIG_ROOT_VARIABLE)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::home_dir()
+                .filter(|home| !home.as_os_str().is_empty())
+                .map(|home| home.join(DEFAULT_CONFIG_ROOT))
+        })
 }
 
 pub(crate) fn now_seconds() -> u64 {

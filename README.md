@@ -45,7 +45,7 @@ Tick Command 以终端命令形式提供协议 Tick，一个可执行文件可�
 | 可执行文件 | 命令 | 来源 |
 | --- | --- | --- |
 | `tick-reader` | `tick-reader URL或文件 […]`、`tick-reader describe` | 随 Tickloop 安装 |
-| `tick-longbridge` | `tick-longbridge <quote\|watchlist\|kline\|positions\|news\|earnings\|community> …`、`tick-longbridge auth [status [--json]\|logout]`、`tick-longbridge describe` | Longbridge |
+| `tick-longbridge` | `tick-longbridge <quote\|watchlist\|kline\|positions\|news\|earnings\|community> …`、`tick-longbridge auth [status\|logout]`、`tick-longbridge describe` | Longbridge |
 | `tick-futu` | `tick-futu options SYMBOL […]`、`tick-futu describe` | Futu OpenD |
 
 Reader 读取原文与本地原文缓存，不需要登录；`describe` 是它唯一的子命令，名为 describe 的本地文件写成 `./describe`。每个 Tick 通过 Tick Instance 流输出 Tick Update，并在同一条流上声明和执行自己的 Tick Tool；既可以独立运行，也可以由 Agent 打开为 Tick。
@@ -89,7 +89,7 @@ tickloop tick uninstall longbridge
 
 凭据放在配置根的 `credentials/<包>/`（目录 0700、文件 0600），位置只由 Tickloop 按包名决定，清单不能指定：`oauth2` 为 `oauth2.json`，内容是 RFC 6749 令牌响应的字段（`access_token`、`token_type`、`refresh_token`、`scope`）加 `issuer`、`client_id`、`token_endpoint`、`revocation_endpoint` 与由 `expires_in` 换算的 `expires_at`（Unix 秒；服务器不给 `expires_in` 时按一小时）；每次写入都先取得同目录 `oauth2.lock` 的排他锁，再写同目录临时文件并 rename。各 issuer 注册得到的 `client_id` 存在 `oauth2-clients.json`，退出登录不删除；服务器不再认得它（`invalid_client`）时重新注册一次。`api_key` 为 `api_key` 文件。
 
-Agent 中的 `/ticks` 是同一套安装、更新、卸载与登录的管理界面，在输入对话框中分已安装与市场两页，`Tab` 或左右键切页，列表用 `j`／`k` 或 `Ctrl+N`／`Ctrl+P` 选择、`Enter` 确认、`Esc` 逐层返回。已安装页每行是包名、版本与登录状态，`Enter` 打开该包的操作：登录与退出登录（`auth` 不是 `none` 的包）、更新（市场版本不同时）和卸载（先确认，说明保存的登录保留，运行中的 Tick 不受影响）。市场页每行是包名与说明、最新版本、已装版本，以及当前平台能否安装，`Enter` 安装或更新。登录项目前提示在终端运行 `tickloop tick login <包>`，登录后按 `r` 重读状态；退出登录与 `tickloop tick logout` 相同（OAuth 令牌先撤销再删除）并刷新该包的状态。安装与更新与 `tickloop tick install` 共用同一份实现，校验与失败语义相同，进行中显示状态，完成后提示新建 Chat（`/clear`）才加载它的 Skill；`Esc` 关闭面板不中断已开始的操作，结果改在对话中显示。市场取不到时市场页显示原因，已安装页照常使用。
+Agent 中的 `/ticks` 是同一套安装、更新、卸载与登录的管理界面，在输入对话框中分已安装与市场两页，`Tab` 或左右键切页，列表用 `j`／`k` 或 `Ctrl+N`／`Ctrl+P` 选择、`Enter` 确认、`Esc` 逐层返回。已安装页每行是包名、版本与登录状态，`Enter` 打开该包的操作：登录与退出登录（`auth` 不是 `none` 的包）、更新（市场版本不同时）和卸载（先确认，说明保存的登录保留，运行中的 Tick 不受影响）。市场页每行是包名与说明、最新版本、已装版本，以及当前平台能否安装，`Enter` 安装或更新。登录在面板内完成，与 `/provider` 的设备码登录同样呈现：`oauth2` 的包显示验证链接（超链接）与验证码并等待授权，https 链接同时在浏览器中打开，多个 issuer 时操作菜单分列“Log in · <名称>”；`api_key` 的包在面板中以 `*` 遮掩输入密钥。`Esc` 取消进行中的登录。完成后该包的状态立即刷新，Agent 不需要重启，下一次请求就能看到。退出登录与 `tickloop tick logout` 相同（OAuth 令牌先撤销再删除）。安装与更新与 `tickloop tick install` 共用同一份实现，校验与失败语义相同，进行中显示状态，完成后提示新建 Chat（`/clear`）才加载它的 Skill；`Esc` 关闭面板不中断已开始的操作，结果改在对话中显示。市场取不到时市场页显示原因，已安装页照常使用。
 
 `install` 按当前平台（构建 `tickloop` 时的目标三元组）选择下载，存到 `ticks/` 下的临时文件，用 `marketplace.json` 中的 SHA-256 校验后安装，登记的来源是下载地址。目前只提供 macOS Apple Silicon（`aarch64-apple-darwin`）的预编译包，其他平台安装时报错，不回退到源码编译。已装市场中的同一版本时报告已安装、不做改动，版本不同则替换。市场与下载只接受 HTTPS（http 只限本机地址），连接和下载停顿都有超时，下载不超过 256 MiB；市场取不到、内容无效、包不在市场中、平台不支持、下载失败或 SHA-256 不符时都不留临时文件，原安装与登记不变。`TICKLOOP_TICK_MARKETPLACE` 可以把市场换成别的 HTTPS 地址或本地文件，供开发与测试使用。首个版本发布到市场之前，市场中还没有包，请用下面的本机安装。
 
@@ -115,23 +115,28 @@ tickloop tick uninstall longbridge
 
 Agent 从同一个配置根读取已安装的包，不需要改 PATH。每个新建的 Chat（以及换工作目录时）加载各包 `skills/` 中的 Skill，名字带包前缀，如 `longbridge:usage`，正文中的 `${TICK_PACKAGE_ROOT}` 换成包的安装目录；包 Skill 与用户 Skill 一样不带额外权限，带前缀的名字也不会与内置、用户或项目 Skill 重名，格式错误或重名的只产生 warning。
 
-打开 Tick 时，裸程序名依次在 Agent 旁的自带程序（`tick-reader`、`tickhost`）、已安装包的程序（`tick-<包>`）和 PATH 中查找；清单 `protocol` 为 true 的包程序不用传 `protocol: true` 就按协议 Tick 打开，审批摘要写明来自哪个包。新装的包马上可以打开，它的 Skill 在之后新建的 Chat 中出现。打开没装的包的程序（如 `tick-longbridge`）时报告包未安装并给出 `tickloop tick install <包>`，Agent 只提示用户运行，不自己安装。`make dev` 会先执行 `make install-ticks`，把本源码构建的包装进配置根（替换已装的同名包），再启动开发版 Agent。
+打开 Tick 时，裸程序名依次在 Agent 旁的自带程序（`tick-reader`、`tickhost`）、已安装包的程序（`tick-<包>`）和 PATH 中查找；清单 `protocol` 为 true 的包程序不用传 `protocol: true` 就按协议 Tick 打开，审批摘要写明来自哪个包。包的程序（按名称或路径打开都算）启动时由 Agent 守护进程按当时保存的登录补上凭据，只给这个实例：`oauth2` 包得到 `TICKLOOP_OAUTH_TOKEN_FILE`（`oauth2.json` 的绝对路径，未登录时也设置，由程序报告未授权），`api_key` 包在清单声明的变量中得到密钥（未登录时不设置）；Worker 环境中继承来的这两个变量一律让位，凭据只来自 Tickloop。重开丢失的实例时同样按当时的登录补上，登记中从不保存凭据。密钥只进入程序的环境，不进入审批摘要、审批依据、工具结果、Transcript 或 Monitor。新装的包马上可以打开，它的 Skill 在之后新建的 Chat 中出现。打开没装的包的程序（如 `tick-longbridge`）时报告包未安装并给出 `tickloop tick install <包>`，Agent 只提示用户运行，不自己安装。`make dev` 会先执行 `make install-ticks`，把本源码构建的包装进配置根（替换已装的同名包），再启动开发版 Agent。
 
 ## 授权
 
 ```sh
-tick-longbridge auth
+tickloop tick login longbridge     # 或在 Agent 的 /ticks 中登录
+tick-longbridge auth               # 独立运行时自己登录，与 Tickloop 共用同一份登录
 tick-longbridge auth status
 tick-longbridge auth logout
 ```
 
-授权在 TUI 中完成：方向键或 `j/k` 选择中国大陆或全球接入区域，Enter 确认；随后在固定画面中显示验证网址、用户码和剩余有效时间，不会逐行刷倒计时，并像 Agent 自己的设备码登录一样用系统浏览器（macOS 的 `open`，其他平台的 `xdg-open`）打开带设备码的验证网页；只打开 https 网址，打不开时照常显示链接，登录继续。画面随链接加宽，尽量把链接放在一行；放不下时，支持 OSC 8 超链接的终端（判断规则与 Agent 相同）中链接按行折开，每一行都链接到完整网址，点任何一行都打开整个链接；不支持的终端改为显示不带设备码的验证网址，在网页中输入画面上的用户码，避免点击只拿到半个链接。请在自己可操作的设备打开网址确认，终端会自动完成登录。远程 agent 无法代替用户完成网页步骤；登录界面需要终端，请在 Agent 的 `/ticks` 中登录，或在自己的终端运行 `tickloop tick login longbridge`（或 `tick-longbridge auth`）。Agent 里的 `!` 没有终端，显示不了这个界面。
+Longbridge 的登录由 Tickloop 保存（见上节）：Agent 打开 `tick-longbridge` 时经 `TICKLOOP_OAUTH_TOKEN_FILE` 告诉它令牌文件；独立运行时没有这个变量，程序按 Tickloop 的规则自己算出同一个位置：配置根（`TICKLOOP_CONFIG_DIR` 非空时为它，否则 `~/.tickloop`）下的 `credentials/longbridge/oauth2.json`，所以在哪里登录都只需一次。`TICKLOOP_OAUTH_TOKEN_FILE` 必须是名为 `oauth2.json` 的绝对路径，否则按用法错误退出。早先的 `~/.tickloop/longbridge/auth.json` 不再读取也不迁移，升级后重新登录一次即可。
 
-设备码确认期间，连接中断或授权端点返回 HTTP 5xx 会按原轮询间隔退避重试，保留当前端点并只提示一次连续故障；代理返回的 502 也按同一规则处理。重试以设备码原始有效期为限，明确拒绝或过期仍结束登录。
+API 走登录所用授权服务器的网络：issuer 为 `https://openapi.longbridge.cn` 时走中国大陆，`https://openapi.longbridge.com` 时走全球；美国账户的凭证（`us_` 开头）始终走全球。没有单独的区域设置。
+
+`tick-longbridge auth` 的登录在 TUI 中完成：方向键或 `j/k` 选择中国大陆或全球（即上面两个 issuer，默认是已保存登录所用的那个），Enter 确认。登录与 Tickloop 的做法相同：读授权服务器元数据（RFC 8414），按 RFC 7591 以公开设备客户端注册（与 Tickloop 共用 `oauth2-clients.json` 中的 `client_id`，服务器不认得时重新注册一次），再按 RFC 8628 申请设备码并轮询，令牌在 `oauth2.lock` 下写入 `oauth2.json`。随后在固定画面中显示验证网址、用户码和剩余有效时间，不会逐行刷倒计时，并像 Agent 自己的设备码登录一样用系统浏览器（macOS 的 `open`，其他平台的 `xdg-open`）打开带设备码的验证网页；只打开 https 网址，打不开时照常显示链接，登录继续。画面随链接加宽，尽量把链接放在一行；放不下时，支持 OSC 8 超链接的终端（判断规则与 Agent 相同）中链接按行折开，每一行都链接到完整网址，点任何一行都打开整个链接；不支持的终端改为显示不带设备码的验证网址，在网页中输入画面上的用户码，避免点击只拿到半个链接。请在自己可操作的设备打开网址确认，终端会自动完成登录。远程 agent 无法代替用户完成网页步骤；登录界面需要终端，Agent 里的 `!` 没有终端，请在 Agent 的 `/ticks` 中登录，或在自己的终端运行 `tickloop tick login longbridge`。
+
+设备码确认期间，连接中断或授权端点返回 HTTP 5xx 会加倍轮询间隔重试（最长 30 秒），连续故障只提示一次；服务器要求 `slow_down` 时间隔加 5 秒并提示。重试以设备码原始有效期为限，明确拒绝或过期仍结束登录。
 
 报价、自选、K 线、持仓和资讯的交互式命令共用这套授权界面。启动时未授权会先显示授权 TUI；运行中授权失效时先清理当前订阅，再进入授权 TUI。成功后继续或重启原来的 Tick Command。`--once` 和重定向输出属于非交互调用，不打开授权界面，提示用 `tickloop tick login longbridge` 或 Agent 的 `/ticks` 登录，并返回退出码 3。
 
-令牌存于 `~/.tickloop/longbridge/auth.json`，明文 JSON、0600 权限、原子替换。客户端注册信息单独保存并复用。启动及持续运行期间自动续期，授权失效会提示用 `tickloop tick login longbridge` 或 Agent 的 `/ticks` 重新登录（它们运行的就是 `tick-longbridge auth`），不会打开浏览器回调流程。`auth status` 仅读取本地状态，不发起续期，判定与 `--json` 一致：access token 已过期但有 refresh token 时显示已登录，并说明打开 Tick 时续期；`auth status --json` 同样只读本地，输出供 Tickloop 读取的 `{"state", "detail"?}`，不检查 locale 与配置文件：没有令牌或令牌文件无法读取为 `logged_out`，access token 未过期，或已过期但有 refresh token（打开 Tick 时会自动续期）为 `logged_in`，已过期且没有 refresh token 为 `expired`。`auth logout` 删除本地令牌。
+每个 `tick-longbridge` 进程自己续期，Tickloop 不在后台刷新：access token 进入 SDK 的五分钟刷新窗口时（启动时或运行中），进程先取得同目录 `oauth2.lock` 的排他锁，重读令牌文件；别的进程已续期就直接使用，否则用 refresh token 向令牌文件中的 `token_endpoint` 刷新（带凭证所属数据中心的 `x-dc-region`），服务器轮换的 refresh token 一并保存，经同目录临时文件原子写回后才释放锁。几个 Tick 同时到期时只有一个刷新请求。刷新被拒（HTTP 400／401 或 OAuth 错误）时提示用 `tickloop tick login longbridge` 或 Agent 的 `/ticks` 重新登录（退出码 3）；连不上授权服务器为网络错误（退出码 4）。续期不会打开浏览器回调流程。`auth status` 仅读取令牌文件，不发起续期：access token 已过期但有 refresh token 时显示已登录，并说明打开 Tick 时续期，同时显示登录所在的网络；令牌文件无法解析时按未授权退出。`auth logout` 在锁下删除令牌文件，Tickloop 随即显示需要登录（撤销令牌请用 `tickloop tick logout longbridge`）。
 
 ## 配置
 
@@ -141,10 +146,9 @@ tick-longbridge auth logout
 color_mode = "red-up"       # red-up / green-up
 language = "zh-CN"          # zh-CN / en
 ambiguous_width = "narrow"  # narrow / wide
-# region = "global"        # cn / global，默认未配置，授权时询问
 ```
 
-对应参数为 `--color-mode`、`--language`、`--ambiguous-width`（三个程序一致）与 `--region`（只属于 `tick-longbridge`）。语言影响 API 名称及数字单位；不承诺将新闻原文翻译为英文。区域是接入网络选择，AP/US 数据中心由账户凭证确定。
+对应参数为 `--color-mode`、`--language`、`--ambiguous-width`（三个程序一致）。语言影响 API 名称及数字单位；不承诺将新闻原文翻译为英文。Longbridge 的接入网络由登录决定（见“授权”），早先版本写入的 `region` 字段照常读入、不再生效。
 
 Tick Command 使用集中解析的终端渲染样式，容器外观由 Herdr 配置。
 
@@ -152,7 +156,7 @@ Tick Command 使用集中解析的终端渲染样式，容器外观由 Herdr 配
 
 | 命令 | 参数与行为 |
 | --- | --- |
-| `tick-longbridge auth [status [--json]\|logout]` | 设备码登录、查看本地状态（`--json` 供 Tickloop 读取）、退出登录 |
+| `tick-longbridge auth [status\|logout]` | 设备码登录、查看保存的登录、删除保存的登录；与 Tickloop 共用同一份登录 |
 | `tick-longbridge quote TSLA 700` | 一个或多个标的；纯字母补 `.US`，纯数字补 `.HK`；单标的错误显示在对应行 |
 | `tick-longbridge watchlist [--group ID或名称]` | 默认第一个自选分组；左右方向键或 `[` / `]` 切组 |
 | `tick-longbridge kline 700.HK [--period day] [--count 80] [--adjust none]` | 单标的 K 线；周期 `day/week/month/1m/5m/15m/30m/60m`；数量 1–1000；复权 `none/forward` |

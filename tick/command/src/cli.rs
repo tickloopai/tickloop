@@ -88,7 +88,6 @@ impl GlobalArgs {
             color_mode: self.color_mode,
             language: self.language,
             ambiguous_width: self.ambiguous_width,
-            ..Overrides::default()
         }
     }
 

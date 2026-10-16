@@ -6,16 +6,19 @@ use std::{
     process::Command,
 };
 
+use tick_longbridge::region::GLOBAL_ISSUER;
+
 /// Where a debug build of `tick-longbridge` finds a stand-in for Longbridge.
 const TEST_ENDPOINT_ENV: &str = "TICKLOOP_LONGBRIDGE_TEST_ENDPOINT";
 
-fn home(name: &str, token: Option<&str>) -> PathBuf {
+/// A home directory whose default config root holds `token` as the login.
+fn home(name: &str, token: Option<&tick_packages::OAuthToken>) -> PathBuf {
     let home =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&home);
-    fs::create_dir_all(home.join(".tickloop/longbridge")).unwrap();
+    fs::create_dir_all(&home).unwrap();
     if let Some(token) = token {
-        fs::write(home.join(".tickloop/longbridge/auth.json"), token).unwrap();
+        crate::support::login::save(&home.join(".tickloop"), token);
     }
     home
 }
@@ -42,8 +45,11 @@ fn hosted_longbridge(home: &Path, longbridge: &str, arguments: &[&str]) -> Comma
 /// or has lapsed with nothing to renew it, still fails the launch with how to log in.
 #[test]
 fn a_hosted_tick_without_a_usable_login_exits_three_before_speaking_the_protocol() {
-    let lapsed = r#"{"client_id":"test","access_token":"ap_fixture","refresh_token":null,"expires_at":1,"logged_in_at":1}"#;
-    for (name, token) in [("hosted-logged-out", None), ("hosted-lapsed", Some(lapsed))] {
+    let lapsed = crate::support::login::token(GLOBAL_ISSUER, "ap_fixture", None, 1);
+    for (name, token) in [
+        ("hosted-logged-out", None),
+        ("hosted-lapsed", Some(&lapsed)),
+    ] {
         let home = home(name, token);
         let output = hosted_longbridge(&home, "127.0.0.1:9", &["quote", "TSLA.US"])
             .output()
@@ -81,13 +87,26 @@ mod against_a_stand_in {
     };
 
     use serde_json::{Value, json};
+    use tick_packages::OAuthToken;
+    use tickloop_agent_test_support::authorization_server::{
+        AuthorizationServer, TOKEN_PATH, TokenReply,
+    };
 
-    use super::{home, hosted_longbridge};
-    use crate::support::hosted::{self, Hosted};
+    use super::{GLOBAL_ISSUER, home, hosted_longbridge};
+    use crate::support::{
+        hosted::{self, Hosted},
+        login,
+    };
 
     /// How long the stand-in holds each request it does not answer before closing it.
     const UNANSWERED_FOR: Duration = Duration::from_millis(1500);
-    const AUTHORIZED_TOKEN: &str = r#"{"client_id":"test","access_token":"ap_fixture","refresh_token":null,"expires_at":4102444800,"logged_in_at":1}"#;
+
+    fn authorized() -> Option<&'static OAuthToken> {
+        static AUTHORIZED: std::sync::LazyLock<OAuthToken> = std::sync::LazyLock::new(|| {
+            login::token(GLOBAL_ISSUER, "ap_fixture", None, 4102444800)
+        });
+        Some(&AUTHORIZED)
+    }
 
     /// What a stand-in for Longbridge answers.
     #[derive(Clone, Copy)]
@@ -157,7 +176,7 @@ mod against_a_stand_in {
     /// view says which attempt is under way and why the last one failed.
     #[test]
     fn a_hosted_tick_that_cannot_reach_longbridge_answers_at_once_and_reports_why_it_retries() {
-        let home = home("hosted-unreachable", Some(AUTHORIZED_TOKEN));
+        let home = home("hosted-unreachable", authorized());
         let (longbridge, _) = stand_in(Answers::Nothing);
         let mut tick = hosted::launch(hosted_longbridge(&home, &longbridge, &["quote", "TSLA.US"]));
 
@@ -201,6 +220,66 @@ mod against_a_stand_in {
         assert!(wait_for_exit(&mut tick).success(), "{}", tick.screen());
     }
 
+    /// Two Ticks starting at once with a due token renew it once: the one holding the token
+    /// file's lock asks the token endpoint and saves the rotated token, and the other takes that
+    /// token, as a rotating server would refuse the old refresh token. Both then reach
+    /// Longbridge with the renewed login, found in the file Tickloop names when it starts them.
+    #[test]
+    fn ticks_starting_together_with_a_due_token_renew_it_once() {
+        let server = AuthorizationServer::start();
+        server.answer_polls([TokenReply::Approve]);
+        let config_root = home("renewing-together", None).join("config");
+        login::save(
+            &config_root,
+            &login::token(server.issuer(), "ap_lapsed", Some("ap_refresh"), 1),
+        );
+        let token_file = login::credentials(&config_root).oauth_token_path();
+        let (longbridge, requests) = stand_in(Answers::SocketTokens);
+        let elsewhere = home("renewing-elsewhere", None);
+        let mut ticks: Vec<Hosted> = ["TSLA.US", "700.HK"]
+            .into_iter()
+            .map(|symbol| {
+                let mut command = hosted_longbridge(&elsewhere, &longbridge, &["quote", symbol]);
+                command.env("TICKLOOP_OAUTH_TOKEN_FILE", &token_file);
+                hosted::launch(command)
+            })
+            .collect();
+
+        // Each gets past the login to Longbridge, whose quote stream never answers.
+        for tick in &ticks {
+            let update = tick.frame_where(Duration::from_secs(15), |frame| {
+                frame["method"] == "tick/update"
+            });
+            assert_eq!(
+                update["params"]["data"]["connection"]["state"], "retrying",
+                "{update}"
+            );
+        }
+
+        assert_eq!(server.requests_to(TOKEN_PATH).len(), 1);
+        let renewed = login::saved(&config_root).unwrap();
+        assert_eq!(renewed.access_token, "access-1");
+        assert_eq!(renewed.refresh_token.as_deref(), Some("refresh-1"));
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.starts_with("GET /v1/socket/token"))
+                .count()
+                >= 2,
+            "both reached Longbridge"
+        );
+        assert!(
+            !elsewhere.join(".tickloop/credentials").exists(),
+            "the default config root is not used"
+        );
+        for tick in &mut ticks {
+            tick.tty.write_all(b"q").unwrap();
+            assert!(wait_for_exit(tick).success(), "{}", tick.screen());
+        }
+    }
+
     /// The SDK reads its own LONGBRIDGE_* endpoint settings from the environment and from a
     /// `.env` file in the working directory, which is the Agent's; the Tick sets its endpoints
     /// itself, so neither can send the access token anywhere else.
@@ -217,10 +296,10 @@ mod against_a_stand_in {
             ]
         };
 
-        let in_environment = home("endpoints-in-environment", Some(AUTHORIZED_TOKEN));
+        let in_environment = home("endpoints-in-environment", authorized());
         let mut command = hosted_longbridge(&in_environment, &longbridge, &["quote", "TSLA.US"]);
         command.envs(settings(&environment));
-        let in_dotenv = home("endpoints-in-dotenv", Some(AUTHORIZED_TOKEN));
+        let in_dotenv = home("endpoints-in-dotenv", authorized());
         let dotenv_file: String = settings(&dotenv)
             .iter()
             .map(|(name, value)| format!("{name}={value}\n"))
@@ -263,8 +342,8 @@ mod against_a_stand_in {
     #[test]
     fn a_dotenv_file_in_the_working_directory_sets_nothing_for_the_sdk() {
         let (longbridge, requests) = stand_in(Answers::SocketTokens);
-        let in_environment = home("logs-in-environment", Some(AUTHORIZED_TOKEN));
-        let in_dotenv = home("logs-in-dotenv", Some(AUTHORIZED_TOKEN));
+        let in_environment = home("logs-in-environment", authorized());
+        let in_dotenv = home("logs-in-dotenv", authorized());
         let environment_logs = in_environment.join("sdk-logs");
         let dotenv_logs = in_dotenv.join("sdk-logs");
         fs::write(
@@ -318,7 +397,7 @@ mod against_a_stand_in {
     /// open, the Agent learns the reason once and a Tick Tool call fails with it.
     #[test]
     fn a_hosted_tick_whose_request_longbridge_turns_down_shows_why_without_asking_again() {
-        let home = home("hosted-rejected", Some(AUTHORIZED_TOKEN));
+        let home = home("hosted-rejected", authorized());
         let (longbridge, requests) = stand_in(Answers::Rejections);
         let mut tick = hosted::launch(hosted_longbridge(&home, &longbridge, &["watchlist"]));
 
