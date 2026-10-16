@@ -34,7 +34,8 @@ tempfile = "3"
 tickloop-tick-command = { path = "../../tick/command" }
 tickloop-tick-market = { path = "../../tick/market" }
 tickloop-tick-provider = { path = "../../tick/provider" }
-time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
+tickloop-ui = { path = "../../ui" }
+time ={ version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
 time-tz = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync"] }
 toml_edit = "0.22"
@@ -43,3 +44,4 @@ toml_edit = "0.22"
 tickloop-tick-packages = { path = "../../tick/packages" }
 tickloop-tick-sdk = { path = "../../tick/sdk" }
 tokio = { version = "1", features = ["test-util"] }
+vt100 = "0.16.2"

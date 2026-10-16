@@ -1240,6 +1240,91 @@ mod tests {
         );
     }
 
+    /// A protocol Tick without content yet, whose first content arrives as the test sends it.
+    struct FirstContentFeed(std::sync::Mutex<Option<watch::Receiver<SessionObservation>>>);
+
+    #[async_trait::async_trait]
+    impl ProtocolFeed for FirstContentFeed {
+        async fn descriptor(&self) -> Result<tick_protocol::TickDescriptor, HostError> {
+            Ok(tick_protocol::TickDescriptor {
+                protocol: tick_protocol::NATIVE_PROTOCOL_VERSION,
+                kind: "example.loading".into(),
+                title: "Loading".into(),
+                description: "Has no content at first".into(),
+                revision: "1".into(),
+                tools: Vec::new(),
+                recover_with: None,
+                state: None,
+            })
+        }
+
+        async fn watch(
+            &self,
+        ) -> Result<
+            (
+                tick_protocol::TickState,
+                u64,
+                watch::Receiver<SessionObservation>,
+            ),
+            HostError,
+        > {
+            let observations = self.0.lock().unwrap().take().expect("one watch");
+            Ok((tick_protocol::TickState::empty(), 0, observations))
+        }
+    }
+
+    /// A watch that starts while its Tick reads as no content takes that as its baseline and
+    /// receives the first content once, as a change.
+    #[tokio::test]
+    async fn a_watch_that_starts_before_the_first_content_receives_it_once() {
+        let (publisher, mut events) = EventPublisher::channel();
+        let instance = InstanceRef::hosted(Uuid::new_v4());
+        let watch = Uuid::new_v4();
+        let (wanted_sender, mut wanted) = watch::channel(BTreeSet::from([watch]));
+        let (content, observations) = watch::channel(SessionObservation {
+            update: None,
+            received: 0,
+            state: SessionLinkState::Live,
+        });
+        let feed = FirstContentFeed(std::sync::Mutex::new(Some(observations)));
+        let mut ready = BTreeSet::new();
+        let observing = observe_protocol(
+            &feed,
+            &instance,
+            &mut wanted,
+            &publisher,
+            &mut ready,
+            &AdmitsAll,
+        );
+        let first_content = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            content
+                .send(SessionObservation {
+                    update: Some(tick_protocol::TickState {
+                        seq: 1,
+                        data: serde_json::json!({"value": 1}),
+                        at: None,
+                    }),
+                    received: 1,
+                    state: SessionLinkState::Live,
+                })
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(wanted_sender);
+        };
+        let (ended, ()) = tokio::join!(observing, first_content);
+        assert!(ended);
+        let mut delivered = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(100), events.recv()).await
+        {
+            if let TickStreamEvent::Observation { value, .. } = event {
+                delivered.push((value.sequence, value.data));
+            }
+        }
+        assert_eq!(delivered, [(1, serde_json::json!({"value": 1}))]);
+    }
+
     #[tokio::test]
     async fn a_new_watch_is_not_retired_with_a_worker_that_ended_before_it_joined() {
         let (publisher, _events) = EventPublisher::channel();

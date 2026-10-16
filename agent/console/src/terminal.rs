@@ -84,6 +84,8 @@ mod subscription_detail;
 mod task_access;
 mod thinking_preview;
 pub mod tick_actions;
+mod ticks_panel;
+mod ticks_work;
 mod transcript;
 mod workflows;
 mod workspace_trust;
@@ -388,6 +390,7 @@ fn command_timing(command: &str) -> CommandTiming {
                 | "/diff"
                 | "/status"
                 | "/artifacts"
+                | "/ticks"
                 | "/settings"
                 | "/permissions"
                 | "/auto-mode-setup"
@@ -773,15 +776,10 @@ async fn offer_tickhost_replacement(
                     }
                 ));
             }
-            if occupancy.connections > 0 {
+            if let Some(views) = occupancy.views.filter(|views| *views > 0) {
                 context.push(format!(
-                    "Its {} open {} close.",
-                    occupancy.connections,
-                    if occupancy.connections == 1 {
-                        "view"
-                    } else {
-                        "views"
-                    }
+                    "Its {views} open {} close.",
+                    if views == 1 { "view" } else { "views" }
                 ));
             }
         }
@@ -920,13 +918,13 @@ Usage: tickloop [--cwd DIRECTORY]
        tickloop daemon stop
        tickloop monitor popup install|remove --herdr-socket SOCKET
        tickloop monitor attach
-       tickloop tick install PACKAGE | install --path PATH | uninstall PACKAGE | list [--available]
+       tickloop tick install PACKAGE | install --path PATH | uninstall PACKAGE | login PACKAGE | logout PACKAGE | list [--available]
 
 daemon stop ends the local Agent daemon and all of its workers, which is every running Agent; saved history is kept and Ticks in the Tickhost keep running.
 Run tickloop again to start this build. TICKLOOP_DAEMON_RUNTIME_DIR selects the daemon.
 monitor popup install asks before registering Tickloop's popup plugin in that Herdr session and sets monitorPopup to enabled; remove asks before unregistering only that plugin and sets it to disabled. Running Ticks continue either way.
 monitor attach is the popup's attach client: it shows the hosted Tick its one-time view grant in TICKLOOP_MONITOR_ATTACH names until a lone esc closes it; when it cannot, it shows why until a key is pressed.
-tick installs a Tick package from the Tick marketplace or from its directory or archive, uninstalls one, or lists those installed or in the marketplace; tickloop tick --help explains them.
+tick installs a Tick package from the Tick marketplace or from its directory or archive, uninstalls one, logs one in or out of its data source, or lists those installed or in the marketplace; tickloop tick --help explains them.
 
 The working directory must exist; omitting --cwd uses the current directory.
 Unknown directories require interactive trust. --working-directory-is-trusted is an explicit host assertion for externally controlled automation and does not save trust.
@@ -965,6 +963,8 @@ Divider edge titles have a short rule beyond the text; the expanded Subagents li
 Chats you switch away from keep running their goals in this process.
 /tickloop [REQUEST] loads the system Workspace Skill; other discovered Skills also use /NAME [ARGUMENTS].
 /provider configures connections, sign-in and the separate Jev (TypeSafe) key without changing the Chat model.
+/ticks manages Tick packages: Installed shows each version and login state, where enter logs in or out, updates or uninstalls; Marketplace installs or updates. Tab or left/right switches pages.
+A /ticks login hands this terminal to the package's login program until it ends; a new Chat loads an installed or updated package's Skill.
 /model selects built-in models from configured connections; p opens Connection details. Model choices also apply to new Chats.
 /thinking opens the Thinking picker; /thinking LEVEL sets a supported level. Auto uses the model default; /settings toggles Thinking.
 /settings opens settings for this Chat; /permissions shows Auto, Ask and Full Access and a separate recent-activity entry.
@@ -1624,6 +1624,7 @@ async fn interact(
     let interactive = console.is_interactive();
     let mut menus = Menus::new(user_settings.clone(), config_root.clone());
     let mut artifact_loads = tokio::task::JoinSet::new();
+    let mut tick_package_tasks = ticks_work::TickPackageTasks::default();
     let mut suggestions: tokio::task::JoinSet<(
         prompt_suggestion::SuggestionRequest,
         prompt_suggestion::SuggestionResult,
@@ -2332,6 +2333,11 @@ async fn interact(
             result = artifact_loads.join_next(), if !artifact_loads.is_empty() => {
                 if let Some(Ok((request, result))) = result { console.artifact_page_loaded(&request, result)?; }
             },
+            result = tick_package_tasks.join_next(), if !tick_package_tasks.is_empty() => {
+                if let Some((panel, result)) = result && let Some(root) = config_root.as_deref() {
+                    ticks_work::finish(console, root, panel, result, &mut tick_package_tasks)?;
+                }
+            },
             result = suggestions.join_next(), if !suggestions.is_empty() => {
                 if let Some(Ok((request, mut result))) = result {
                     let suppression = if selected_chat != Some(request.chat) || overview_active {
@@ -2594,6 +2600,9 @@ async fn interact(
                 },
                 Some(InputEvent::ArtifactSignOut) => {
                     menus.confirm_artifact_sign_out(console, ConfigTarget::visible(selected_chat), false)?;
+                },
+                Some(InputEvent::TickPackages(work)) => {
+                    if let Some(root) = config_root.as_deref() { ticks_work::start(root, work, &mut tick_package_tasks); }
                 },
                 Some(InputEvent::TickAction { .. }) => {},
                 Some(InputEvent::OpenRewind) => {
@@ -3224,6 +3233,12 @@ async fn interact(
                                 },
                                 Err(error) => outln!(console, "Cannot configure Tickloop Artifacts: {}", safe_text(&error)),
                             }
+                        },
+                        command if command == "/ticks" || command.starts_with("/ticks ") => {
+                            if command.trim() != "/ticks" { outln!(console, "Use /ticks"); continue; }
+                            let Some(root) = config_root.as_deref() else { outln!(console, "Tick packages need a state directory; set TICKLOOP_CONFIG_DIR."); continue; };
+                            if !interactive { outln!(console, "/ticks needs an interactive terminal; run tickloop tick there instead."); continue; }
+                            if let Err(error) = ticks_work::open(console, root, selected_chat, &mut tick_package_tasks) { outln!(console, "Cannot open /ticks: {}", safe_text(&error)); }
                         },
                         command if is_rewind_command(command) => {
                             let is_busy=selected_chat.is_some_and(|chat| input_waits(chat,&pending,&foreground_shells)

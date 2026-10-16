@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use tick_packages::PackageManifest;
+use tick_packages::{PackageAuth, PackageManifest};
 
 #[test]
 fn the_package_manifest_runs_this_program_at_the_workspace_version() {
@@ -15,6 +15,6 @@ fn the_package_manifest_runs_this_program_at_the_workspace_version() {
         Path::new(env!("CARGO_BIN_EXE_tick-futu")).file_name()
     );
     assert!(manifest.protocol);
-    assert_eq!(manifest.credentials, None);
+    assert_eq!(manifest.auth, PackageAuth::None);
     assert!(package.join("skills").is_dir());
 }

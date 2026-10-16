@@ -87,7 +87,7 @@ impl SdkCommunityApi {
             .await
             .map_err(|_| Error::network("invalid community response"))?;
         if envelope.code != 0 {
-            return Err(Error::network(format!(
+            return Err(Error::rejected(format!(
                 "community request failed: {}",
                 envelope.message
             )));
@@ -233,7 +233,7 @@ fn member_post(kind: PostKind, target: Value) -> Result<MemberPost> {
 
 fn parse_id(id: &str, what: &str) -> Result<i64> {
     id.parse()
-        .map_err(|_| Error::network(format!("invalid community {what} ID {id:?}")))
+        .map_err(|_| Error::rejected(format!("invalid community {what} ID {id:?}")))
 }
 
 /// The post as plain text: each block element and line break starts a new line, and a

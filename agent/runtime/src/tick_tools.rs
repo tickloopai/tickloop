@@ -99,7 +99,7 @@ pub(crate) fn definitions(views: bool) -> Vec<ToolDefinition> {
     let target = json!({"tick_instance_id":{"type":"string","minLength":1}});
     definitions.push(ToolDefinition {
         name: READ_TICK.into(),
-        description: "Read a Tick this Chat opened using its complete hosted: instance identity. Protocol Ticks return their state (seq, at, and data, which is null until the Tick has content) and their declared tool catalog. Terminal Ticks return their screen as plain text (data.text, at most 200 lines and 64 KiB) and data.exit, null while the program runs and its exit code or signal once it ended. Reading never subscribes. For artifacts use ArtifactRead; for Shell tasks use Read on Bash's output_file.".into(),
+        description: "Read a Tick this Chat opened using its complete hosted: instance identity. Protocol Ticks return their state (seq, at, and data, which is null until the Tick has content: a Tick just opened may still be loading, so read it again shortly) and their declared tool catalog. Terminal Ticks return their screen as plain text (data.text, at most 200 lines and 64 KiB) and data.exit, null while the program runs and its exit code or signal once it ended. Reading never subscribes. For artifacts use ArtifactRead; for Shell tasks use Read on Bash's output_file.".into(),
         input_schema: json!({"type":"object","properties":target,"required":["tick_instance_id"],"additionalProperties":false}),
     });
     let mut call_properties = target.clone();

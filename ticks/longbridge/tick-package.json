@@ -4,5 +4,11 @@
   "description": "Longbridge quotes, watchlist, kline, positions, news, earnings and community posts",
   "executable": "bin/tick-longbridge",
   "protocol": true,
-  "credentials": "~/.tickloop/longbridge/"
+  "auth": {
+    "type": "oauth2",
+    "issuers": [
+      { "label": "China mainland", "issuer": "https://openapi.longbridge.cn" },
+      { "label": "Global", "issuer": "https://openapi.longbridge.com" }
+    ]
+  }
 }

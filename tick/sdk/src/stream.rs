@@ -3,6 +3,11 @@
 //! A hosted Tick speaks Tick protocol 3 on real stdin/stdout. A standalone
 //! terminal run has no protocol peer. Outbound traffic holds the latest update
 //! plus bounded responses so a slow consumer does not block the visible UI.
+//!
+//! The stream answers `tick/describe` and `tick/read` itself as they arrive, from the
+//! catalog and the latest published state, so a Tick still connecting or fetching its
+//! first content is ready for its host at once and reads as null data until then. Only
+//! `tick/call` waits for the runtime.
 
 use std::{
     collections::VecDeque,
@@ -115,25 +120,77 @@ pub enum InboundFrame {
     TooLarge,
 }
 
-pub struct Requests(Option<mpsc::Receiver<InboundFrame>>);
+type RequestQueue = Arc<tokio::sync::Mutex<mpsc::Receiver<InboundFrame>>>;
+
+pub struct Requests(Option<RequestQueue>);
 
 impl Requests {
     /// Resolves with the next raw request line, or `None` once the peer closed
     /// the stream. A Tick without an injected channel waits forever.
     pub async fn next(&mut self) -> Option<InboundFrame> {
-        match &mut self.0 {
-            Some(receiver) => receiver.recv().await,
+        match &self.0 {
+            Some(queue) => queue.lock().await.recv().await,
             None => std::future::pending().await,
         }
     }
 }
 
-pub struct TickStream {
+/// What the stream answers from without its runtime: the Tick's catalog and its latest state.
+struct Published {
     tick: Box<dyn Describe>,
     /// The latest published state; its data is null until the first Tick Update.
-    state: TickState,
+    state: Mutex<TickState>,
+}
+
+impl Published {
+    fn state(&self) -> std::sync::MutexGuard<'_, TickState> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn descriptor(&self) -> Result<TickDescriptor, RpcError> {
+        let descriptor = self
+            .tick
+            .descriptor()
+            .map_err(|error| RpcError::new(TOOL_FAILED, error))?;
+        descriptor
+            .validate()
+            .map_err(|error| RpcError::new(INVALID_REQUEST, error))?;
+        tick_protocol::check_encoded_size(
+            &descriptor,
+            tick_protocol::MAX_DESCRIPTION_BYTES,
+            "Tick description",
+        )
+        .map_err(|error| RpcError::new(FRAME_TOO_LARGE, error))?;
+        Ok(descriptor)
+    }
+
+    /// Answers `method` through `respond` when it is `tick/describe` or `tick/read`, which
+    /// need nothing from the runtime; any other method is left to the caller. A read is
+    /// answered under the state lock, so its answer is queued only after the update it reports.
+    fn answer(&self, method: &str, id: Value, respond: impl FnOnce(Vec<u8>)) -> bool {
+        match method {
+            DESCRIBE_METHOD => {
+                let answer = self.descriptor().and_then(|descriptor| {
+                    serde_json::to_value(descriptor)
+                        .map_err(|error| RpcError::new(TOOL_FAILED, error.to_string()))
+                });
+                respond(response_frame(id, answer));
+                true
+            }
+            READ_METHOD => {
+                let state = self.state();
+                respond(response_frame(id, Ok(json!(*state))));
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+pub struct TickStream {
+    published: Arc<Published>,
     outbound: Outbound,
-    requests: Option<mpsc::Receiver<InboundFrame>>,
+    requests: Option<RequestQueue>,
     reader: Option<JoinHandle<()>>,
 }
 
@@ -171,7 +228,7 @@ impl TickStream {
     }
 
     pub fn seq(&self) -> u64 {
-        self.state.seq
+        self.published.state().seq
     }
 
     /// The Tick Update records published so far; only in-memory Sessions keep them.
@@ -189,12 +246,14 @@ impl TickStream {
         if data.is_null() {
             return Err(io::Error::other("a Tick Update needs data"));
         }
-        if self.state.data == data {
+        // The update is offered under the state lock, so a read answered meanwhile never
+        // reaches the host ahead of the update it reports.
+        let mut state = self.published.state();
+        if state.data == data {
             return Ok(());
         }
-        let state = TickState {
-            seq: self
-                .state
+        let next = TickState {
+            seq: state
                 .seq
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("Tick Update seq exhausted"))?,
@@ -205,18 +264,19 @@ impl TickStream {
             &json!({
                 "jsonrpc": JSON_RPC_VERSION,
                 "method": UPDATE_METHOD,
-                "params": state,
+                "params": next,
             }),
             tick_protocol::MAX_UPDATE_BYTES,
         )?;
         self.outbound.offer_update(frame);
-        self.state = state;
+        *state = next;
         Ok(())
     }
 
-    /// Hands the inbound request lines to the runtime loop; later calls wait forever.
+    /// Hands the inbound request lines to a runtime loop. Every call shares one queue, so a
+    /// runtime that ends before the peer closed leaves the unread requests to the next one.
     pub fn take_requests(&mut self) -> Requests {
-        Requests(self.requests.take())
+        Requests(self.requests.clone())
     }
 
     /// Answers everything this protocol version owns and surfaces only the
@@ -273,27 +333,22 @@ impl TickStream {
             );
             return None;
         };
+        let Self {
+            published,
+            outbound,
+            ..
+        } = self;
+        if published.answer(method, id.clone(), |frame| outbound.enqueue_response(frame)) {
+            return None;
+        }
         match method {
-            DESCRIBE_METHOD => {
-                let answer = self.descriptor().and_then(|descriptor| {
-                    serde_json::to_value(descriptor)
-                        .map_err(|error| RpcError::new(TOOL_FAILED, error.to_string()))
-                });
-                self.answer(id, answer);
-                None
-            }
-            READ_METHOD => {
-                let state = json!(self.state);
-                self.answer(id, Ok(state));
-                None
-            }
             CALL_METHOD => {
                 let params = frame.get("params").cloned().unwrap_or(Value::Null);
                 let checked = match (
                     params.get("revision").and_then(Value::as_str),
                     params.get("tool").and_then(Value::as_str),
                 ) {
-                    (Some(revision), Some(tool)) => match self.descriptor() {
+                    (Some(revision), Some(tool)) => match self.published.descriptor() {
                         Ok(current) if current.revision == revision => Ok(tool),
                         Ok(_) => Err(RpcError::new(
                             REVISION_MISMATCH,
@@ -332,33 +387,7 @@ impl TickStream {
     }
 
     pub fn answer(&mut self, id: Value, result: Result<Value, RpcError>) {
-        let frame = match result {
-            Ok(value) => json!({"jsonrpc": JSON_RPC_VERSION, "id": id.clone(), "result": value}),
-            Err(error) => error.frame(id.clone()),
-        };
-        let frame =
-            encode_limited(&frame, tick_protocol::MAX_TOOL_RESPONSE_BYTES).unwrap_or_else(|_| {
-                encode(&RpcError::new(FRAME_TOO_LARGE, "Tick response too large").frame(id))
-                    .expect("bounded error frame")
-            });
-        self.outbound.enqueue_response(frame);
-    }
-
-    fn descriptor(&self) -> Result<TickDescriptor, RpcError> {
-        let descriptor = self
-            .tick
-            .descriptor()
-            .map_err(|error| RpcError::new(TOOL_FAILED, error))?;
-        descriptor
-            .validate()
-            .map_err(|error| RpcError::new(INVALID_REQUEST, error))?;
-        tick_protocol::check_encoded_size(
-            &descriptor,
-            tick_protocol::MAX_DESCRIPTION_BYTES,
-            "Tick description",
-        )
-        .map_err(|error| RpcError::new(FRAME_TOO_LARGE, error))?;
-        Ok(descriptor)
+        self.outbound.enqueue_response(response_frame(id, result));
     }
 
     /// Flushes whatever is still queued and stops the transport tasks.
@@ -377,12 +406,21 @@ impl TickStream {
         let queue = Arc::new(OutboundQueue::default());
         let writer = tokio::spawn(drain_outbound(Arc::clone(&queue), writer));
         let (sender, requests) = mpsc::channel(INBOUND_CAPACITY);
-        let reader = tokio::spawn(read_requests(reader, sender));
-        Self {
-            requests: Some(requests),
-            reader: Some(reader),
-            ..Self::with_outbound(tick, Outbound::Streamed { queue, writer })
-        }
+        let mut stream = Self::with_outbound(
+            tick,
+            Outbound::Streamed {
+                queue: Arc::clone(&queue),
+                writer,
+            },
+        );
+        stream.requests = Some(Arc::new(tokio::sync::Mutex::new(requests)));
+        stream.reader = Some(tokio::spawn(read_requests(
+            reader,
+            sender,
+            Arc::clone(&stream.published),
+            queue,
+        )));
+        stream
     }
 
     fn detached(tick: impl Describe + 'static) -> Self {
@@ -395,8 +433,10 @@ impl TickStream {
 
     fn with_outbound(tick: impl Describe + 'static, outbound: Outbound) -> Self {
         Self {
-            tick: Box::new(tick),
-            state: TickState::empty(),
+            published: Arc::new(Published {
+                tick: Box::new(tick),
+                state: Mutex::new(TickState::empty()),
+            }),
             outbound,
             requests: None,
             reader: None,
@@ -428,10 +468,7 @@ impl Outbound {
 
     fn enqueue_response(&mut self, frame: Vec<u8>) {
         match self {
-            Self::Streamed { queue, .. } => {
-                queue.state().responses.push_back(frame);
-                queue.ready.notify_one();
-            }
+            Self::Streamed { queue, .. } => queue.respond(frame),
             Self::Buffered(records) => records.push(frame),
             Self::Discarded => (),
         }
@@ -466,6 +503,11 @@ impl OutboundQueue {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
     }
+
+    fn respond(&self, frame: Vec<u8>) {
+        self.state().responses.push_back(frame);
+        self.ready.notify_one();
+    }
 }
 
 /// Writes the latest update before the responses queued with it: a read answered after that
@@ -496,7 +538,14 @@ async fn drain_outbound<W: AsyncWrite + Unpin>(queue: Arc<OutboundQueue>, mut wr
     }
 }
 
-async fn read_requests<R: AsyncRead + Unpin>(reader: R, sender: mpsc::Sender<InboundFrame>) {
+/// Reads request lines, answering `tick/describe` and `tick/read` at once and handing every
+/// other line to the runtime.
+async fn read_requests<R: AsyncRead + Unpin>(
+    reader: R,
+    sender: mpsc::Sender<InboundFrame>,
+    published: Arc<Published>,
+    queue: Arc<OutboundQueue>,
+) {
     let mut reader = BufReader::new(reader);
     let mut line = Vec::new();
     loop {
@@ -546,11 +595,41 @@ async fn read_requests<R: AsyncRead + Unpin>(reader: R, sender: mpsc::Sender<Inb
         }
         if complete {
             let text = String::from_utf8(std::mem::take(&mut line)).unwrap_or_default();
+            if answer_at_once(&published, &queue, &text) {
+                continue;
+            }
             if sender.send(InboundFrame::Line(text)).await.is_err() {
                 return;
             }
         }
     }
+}
+
+/// Answers a well-formed `tick/describe` or `tick/read` request line; anything else, including
+/// a malformed line, is left for the runtime's dispatch to answer.
+fn answer_at_once(published: &Published, queue: &OutboundQueue, line: &str) -> bool {
+    let Ok(frame) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+    if frame.get("jsonrpc").and_then(Value::as_str) != Some(JSON_RPC_VERSION) {
+        return false;
+    }
+    let Some(method) = frame.get("method").and_then(Value::as_str) else {
+        return false;
+    };
+    let id = frame.get("id").cloned().unwrap_or(Value::Null);
+    published.answer(method, id, |answer| queue.respond(answer))
+}
+
+fn response_frame(id: Value, result: Result<Value, RpcError>) -> Vec<u8> {
+    let frame = match result {
+        Ok(value) => json!({"jsonrpc": JSON_RPC_VERSION, "id": id.clone(), "result": value}),
+        Err(error) => error.frame(id.clone()),
+    };
+    encode_limited(&frame, tick_protocol::MAX_TOOL_RESPONSE_BYTES).unwrap_or_else(|_| {
+        encode(&RpcError::new(FRAME_TOO_LARGE, "Tick response too large").frame(id))
+            .expect("bounded error frame")
+    })
 }
 
 fn encode(frame: &Value) -> io::Result<Vec<u8>> {

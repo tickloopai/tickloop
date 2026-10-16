@@ -196,15 +196,24 @@ async fn selected_region_authorizes_and_saves_through_the_shared_tui() {
 
     let started = Instant::now();
     let mut device_response_at = None;
+    let opened_pages = Mutex::new(Vec::new());
     let outcome = {
         let settings = Settings::default();
-        let login = login::run(
+        let login = login::run_with_page_access(
             &settings,
             &config_path,
             &storage,
             Some(endpoints),
             &mut terminal,
             input,
+            login::PageAccess {
+                // A browser that does not open leaves the login going.
+                open: |page: &str| {
+                    opened_pages.lock().unwrap().push(page.to_owned());
+                    false
+                },
+                links: false,
+            },
         );
         tokio::pin!(login);
         let setup_deadline = started + SETUP_TIMEOUT;
@@ -256,7 +265,7 @@ async fn selected_region_authorizes_and_saves_through_the_shared_tui() {
             "authorized"
         } else if compact_screen.contains("申请设备码") {
             "requesting-device-code"
-        } else if compact_screen.contains("核对设备码并批准") {
+        } else if compact_screen.contains("设备码并批准") {
             "waiting-for-approval"
         } else if compact_screen.contains("选择接入区域") {
             "selecting-region"
@@ -294,6 +303,11 @@ async fn selected_region_authorizes_and_saves_through_the_shared_tui() {
         .unwrap();
 
     assert_eq!(outcome, LoginOutcome::Authorized(Region::Global));
+    assert_eq!(
+        *opened_pages.lock().unwrap(),
+        ["https://example.com/device"],
+        "the verification page opens in the browser once"
+    );
     assert!(
         std::fs::read_to_string(config_path)
             .unwrap()
@@ -308,4 +322,155 @@ async fn selected_region_authorizes_and_saves_through_the_shared_tui() {
     assert!(!screen.contains("ABCD"), "{screen}");
     assert!(!screen.contains("device-secret"), "{screen}");
     assert!(!screen.contains("ap_access"), "{screen}");
+}
+
+const PLAIN_PAGE: &str = "https://example.com/device";
+const PAGE_WITH_CODE: &str =
+    "https://example.com/oauth2/device/verify?user_code=ABCD-EFGH&client_id=tickloop-device";
+
+/// The waiting screen of an English login on a `columns`-wide terminal, whose browser opens a
+/// page when `opens` and which shows OSC 8 links when `links`, and the pages it was asked to
+/// open. The login is cancelled once the page was asked for.
+async fn waiting_screen(columns: u16, opens: bool, links: bool) -> (String, Vec<String>) {
+    use std::sync::{Arc, Mutex};
+    let stub = http::Stub::start(|request| {
+        if request.contains("/register ") {
+            (201, json!({"client_id":"client"}))
+        } else if request.contains("/device/authorize ") {
+            (
+                200,
+                json!({
+                    "device_code":"device-secret",
+                    "user_code":"ABCD-EFGH",
+                    "verification_uri":PLAIN_PAGE,
+                    "verification_uri_complete":PAGE_WITH_CODE,
+                    "expires_in":300,
+                    "interval":1
+                }),
+            )
+        } else {
+            (400, json!({"error":"authorization_pending"}))
+        }
+    })
+    .await;
+    let home = tempfile::tempdir().unwrap();
+    let storage = AuthStorage::in_home(home.path());
+    let endpoints = AuthEndpoints {
+        ap: format!("{}/oauth2", stub.url),
+        us: format!("{}/oauth2", stub.url),
+    };
+    let page_asked = Arc::new(tokio::sync::Notify::new());
+    let input = Box::pin(futures_util::stream::iter([key(KeyCode::Enter)]).chain(
+        futures_util::stream::once({
+            let page_asked = Arc::clone(&page_asked);
+            async move {
+                page_asked.notified().await;
+                key(KeyCode::Char('q'))
+            }
+        }),
+    ));
+    let opened_pages = Mutex::new(Vec::new());
+    let mut terminal = Terminal::new(TestBackend::new(columns, 18)).unwrap();
+    let settings = Settings {
+        language: tick_provider::preferences::Language::En,
+        ..Settings::default()
+    };
+
+    let outcome = login::run_with_page_access(
+        &settings,
+        &home.path().join(".tickloop/config.toml"),
+        &storage,
+        Some(endpoints),
+        &mut terminal,
+        input,
+        login::PageAccess {
+            open: |page: &str| {
+                opened_pages.lock().unwrap().push(page.to_owned());
+                page_asked.notify_one();
+                opens
+            },
+            links,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome, LoginOutcome::Cancelled);
+    (screen(&terminal), opened_pages.into_inner().unwrap())
+}
+
+#[tokio::test]
+async fn the_verification_page_opens_and_its_link_stays_on_one_line() {
+    let (screen, opened) = waiting_screen(120, true, false).await;
+    assert_eq!(opened, [PAGE_WITH_CODE]);
+    assert!(
+        screen.lines().any(|line| line.contains(PAGE_WITH_CODE)),
+        "the card widens for the whole link:\n{screen}"
+    );
+    assert!(
+        screen.contains("1  Opened in your browser; if it did not open, visit"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("2  Confirm and approve this code"),
+        "{screen}"
+    );
+    assert!(screen.contains("ABCD-EFGH"), "{screen}");
+}
+
+#[tokio::test]
+async fn without_links_a_page_too_long_for_the_terminal_gives_way_to_the_plain_page() {
+    let (screen, opened) = waiting_screen(70, false, false).await;
+    assert_eq!(
+        opened,
+        [PAGE_WITH_CODE],
+        "the browser still gets the page with the code"
+    );
+    assert!(
+        !screen.contains("user_code"),
+        "no link is broken across lines:\n{screen}"
+    );
+    assert!(
+        screen.lines().any(|line| line.contains(PLAIN_PAGE)),
+        "{screen}"
+    );
+    assert!(screen.contains("1  Open in your browser"), "{screen}");
+    assert!(
+        screen.contains("2  Enter this code and approve"),
+        "{screen}"
+    );
+    assert!(screen.contains("ABCD-EFGH"), "{screen}");
+}
+
+#[tokio::test]
+async fn every_row_of_a_wrapped_page_links_to_the_whole_page() {
+    let (screen, opened) = waiting_screen(70, true, true).await;
+    assert_eq!(opened, [PAGE_WITH_CODE]);
+    // The card fills the 70 columns; its borders leave 68 for the link.
+    let rows = tickloop_ui::hyperlink::split_rows(PAGE_WITH_CODE, 68);
+    assert!(rows.len() > 1, "the page wraps at 70 columns");
+    for row in &rows {
+        let linked = tickloop_ui::hyperlink::linked(PAGE_WITH_CODE, row);
+        assert_eq!(
+            screen.matches(&linked).count(),
+            1,
+            "{row:?} links to the whole page:\n{screen:?}"
+        );
+    }
+    assert!(
+        screen.contains("2  Confirm and approve this code"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn only_https_pages_open_in_the_browser() {
+    for page in [
+        "http://example.com/device",
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "example.com/device",
+    ] {
+        assert!(!login::open_in_browser(page), "{page}");
+    }
 }

@@ -1,6 +1,7 @@
 pub mod charts;
 pub mod format;
 pub mod highlight;
+pub mod hyperlink;
 pub mod icons;
 pub mod markdown;
 pub mod palette;

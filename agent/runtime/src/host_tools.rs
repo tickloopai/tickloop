@@ -251,6 +251,8 @@ pub struct WorkspaceTickPackage {
     pub version: String,
     pub description: String,
     pub executable: PathBuf,
+    /// Its login state, from the credentials Tickloop saved for it.
+    pub login: tick_packages::LoginState,
 }
 
 impl WorkspaceHostContext {
@@ -273,7 +275,8 @@ impl WorkspaceHostContext {
         self
     }
 
-    /// The same container, listing the usable Tick packages installed in `packages`.
+    /// The same container, listing the usable Tick packages installed in `packages` with their
+    /// login states, which reading the saved credentials gives at once.
     pub fn with_tick_packages(mut self, packages: &tick_packages::PackageStore) -> Self {
         self.tick_packages = packages
             .installed()
@@ -282,6 +285,7 @@ impl WorkspaceHostContext {
                     .packages
                     .into_iter()
                     .map(|package| WorkspaceTickPackage {
+                        login: packages.login_state(&package),
                         executable: package.executable(),
                         name: package.manifest.name,
                         version: package.manifest.version,

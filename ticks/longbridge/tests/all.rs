@@ -10,6 +10,8 @@ mod auth_ui;
 mod earnings_probe;
 #[path = "all/entry.rs"]
 mod entry;
+#[path = "all/hosted_startup.rs"]
+mod hosted_startup;
 #[path = "all/native_visible_stdio.rs"]
 mod native_visible_stdio;
 #[path = "all/package.rs"]

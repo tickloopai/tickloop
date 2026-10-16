@@ -75,7 +75,7 @@ fn package_skills_are_named_after_their_package_with_its_install_directory_in_th
                     &skill(
                         "guide",
                         "Open sample Ticks",
-                        "Log in with `! ${TICK_PACKAGE_ROOT}/bin/tick-sample auth`.",
+                        "The fields are listed in `${TICK_PACKAGE_ROOT}/docs/fields.md`.",
                     ),
                 ),
                 (
@@ -114,7 +114,7 @@ fn package_skills_are_named_after_their_package_with_its_install_directory_in_th
     assert_eq!(
         expansion.content,
         format!(
-            "Log in with `! {}/bin/tick-sample auth`.",
+            "The fields are listed in `{}/docs/fields.md`.",
             package.root.display()
         )
     );
@@ -241,8 +241,8 @@ fn an_unusable_package_or_registry_only_warns() {
     );
 }
 
-/// The `usage` Skills the `longbridge` and `futu` packages ship load as `<package>:usage` and point
-/// at the installed program.
+/// The `usage` Skills the `longbridge` and `futu` packages ship load as `<package>:usage`, open the
+/// installed program and leave logging in to the user, through `/ticks` or `tickloop tick login`.
 #[test]
 fn the_shipped_package_skills_load_from_an_installed_package() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -252,7 +252,7 @@ fn the_shipped_package_skills_load_from_an_installed_package() {
         let shipped =
             fs::read_to_string(repository.join(format!("ticks/{name}/skills/usage/SKILL.md")))
                 .unwrap();
-        let package = install(
+        install(
             &config_root,
             &package_source(directory.path(), name, &[("usage", &shipped)]),
         );
@@ -272,14 +272,23 @@ fn the_shipped_package_skills_load_from_an_installed_package() {
             .content;
         assert!(content.contains(&format!("[\"{program}\", ")), "{content}");
         assert!(!content.contains(PACKAGE_ROOT_VARIABLE), "{content}");
+        for retired in [
+            format!("bin/{program} auth"),
+            "auth status".into(),
+            "`! ".into(),
+        ] {
+            assert!(!content.contains(&retired), "{name}: {retired}");
+        }
         if name == "longbridge" {
-            assert!(
-                content.contains(&format!(
-                    "`! {}/bin/tick-longbridge auth`",
-                    package.root.display()
-                )),
-                "{content}"
-            );
+            for login in [
+                "`login` in `workspace_host.tick_packages`",
+                "`logged_in`",
+                "from `/ticks` in this Agent",
+                "`tickloop tick login longbridge`",
+                "never suggest `!` for it",
+            ] {
+                assert!(content.contains(login), "{login}");
+            }
         }
     }
 }

@@ -2,6 +2,8 @@
 
 #[path = "all/archive.rs"]
 mod archive;
+#[path = "all/credentials.rs"]
+mod credentials;
 #[path = "all/download.rs"]
 mod download;
 #[path = "all/install.rs"]

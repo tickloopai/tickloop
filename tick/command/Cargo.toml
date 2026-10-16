@@ -20,4 +20,9 @@ tickloop-tick-protocol = { path = "../protocol" }
 tickloop-tick-provider = { path = "../provider" }
 tickloop-tick-sdk = { path = "../sdk" }
 tickloop-ui = { path = "../../ui" }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["test-util"] }
+tokio-stream = "0.1"

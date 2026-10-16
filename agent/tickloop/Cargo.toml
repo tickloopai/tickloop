@@ -26,15 +26,15 @@ harness = false
 
 [dependencies]
 crossterm = "0.29"
-reqwest = { version = "0.12", default-features = false }
-tickloop-agent-base = { path = "../base" }
 tickloop-agent-client = { path = "../client" }
 tickloop-agent-config = { path = "../config" }
 tickloop-agent-console = { path = "../console" }
 tickloop-agent-daemon = { path = "../daemon" }
+tickloop-agent-packages = { path = "../packages" }
 tickloop-agent-protocol = { path = "../protocol" }
 tickloop-tick-packages = { path = "../../tick/packages" }
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 
 [dev-dependencies]
 async-trait = "0.1"

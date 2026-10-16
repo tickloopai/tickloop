@@ -15,8 +15,10 @@ pub mod us_positions;
 
 use tick_provider::error::Error;
 
-/// What an authorization failure asks the user to do.
-pub const AUTH_HINT: &str = "run `tick-longbridge auth`";
+/// What an authorization failure asks the user to do: log in through Tickloop, which runs
+/// `tick-longbridge auth` on a terminal.
+pub const AUTH_HINT: &str =
+    "log in with `tickloop tick login longbridge`, or with /ticks in the Agent";
 
 /// An authorization failure that tells the user how to log in again.
 pub fn not_authorized(message: impl std::fmt::Display) -> Error {

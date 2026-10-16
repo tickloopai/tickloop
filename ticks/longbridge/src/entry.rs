@@ -1,4 +1,5 @@
 use std::{
+    hash::{DefaultHasher, Hash, Hasher},
     io::IsTerminal,
     path::{Path, PathBuf},
     sync::Arc,
@@ -6,6 +7,7 @@ use std::{
 
 use tick_command::{
     cli::{GlobalArgs, TickCommand},
+    connecting::{self, DataSource},
     entry::{self, Running, Services},
 };
 use tick_market::{
@@ -17,12 +19,15 @@ use tick_provider::{
     error::{Error, Result},
     exit_code,
     news::NewsApi,
-    preferences::Region,
+    preferences::{Language, Region},
 };
 
 use crate::{
-    auth::{self, storage::AuthStorage},
-    cli::{Cli, Command, ProbeArgs, TICKS},
+    auth::{
+        self, AuthEndpoints,
+        storage::{AuthStorage, TOKEN_FILE_NAME},
+    },
+    cli::{AuthAction, Cli, Command, ProbeArgs, TICKS},
     community_api::SdkCommunityApi,
     login,
     news_api::SdkNewsApi,
@@ -44,6 +49,17 @@ pub async fn execute(cli: Cli) -> Result<()> {
                 entry::refuse_in_instance()?;
             }
             let (mut settings, storage) = prepare(&global, region)?;
+            if entry::in_instance() {
+                // Only what needs no network runs before the Tick answers its host.
+                auth::check_stored(&storage)?;
+                let source = Longbridge {
+                    tick: tick.clone(),
+                    settings: settings.clone(),
+                    storage,
+                    endpoints: None,
+                };
+                return connecting::run_hosted(tick, &settings, global.size, source).await;
+            }
             run_longbridge_tick(
                 tick,
                 &mut settings,
@@ -55,6 +71,10 @@ pub async fn execute(cli: Cli) -> Result<()> {
         }
         Command::Auth { action } => {
             entry::refuse_in_instance()?;
+            if let Some(AuthAction::Status { json: true }) = action {
+                // Read by Tickloop, so neither the locale nor the configuration may fail it.
+                return login::print_status_json(&auth::default_storage()?, &mut std::io::stdout());
+            }
             let (settings, storage) = prepare(&global, region)?;
             match action {
                 Some(action) => {
@@ -149,6 +169,42 @@ async fn run_longbridge_market(
     settings: &Settings,
     size: Option<ratatui::layout::Size>,
 ) -> Result<()> {
+    let connection = connect(&tick, oauth, settings).await?;
+    entry::run_tick(
+        Running::Provider(tick, connection.services()),
+        settings,
+        size,
+    )
+    .await
+}
+
+/// The Longbridge services a Tick reads, set up with one login.
+struct Connection {
+    quote: SdkQuoteApi,
+    trade: SdkTradeApi,
+    /// Kept for as long as the trade context: the SDK sends the account's pushes here.
+    _trade_events: tokio::sync::mpsc::UnboundedReceiver<longbridge::trade::PushEvent>,
+    news: Option<SdkNewsApi>,
+    community: Option<Arc<dyn CommunityApi>>,
+}
+
+impl Connection {
+    fn services(&self) -> Services<'_> {
+        Services {
+            quote: Some(&self.quote),
+            trade: Some(&self.trade),
+            news: self.news.as_ref().map(|news| news as &dyn NewsApi),
+            options: None,
+            community: self.community.clone(),
+        }
+    }
+}
+
+async fn connect(
+    tick: &TickCommand,
+    oauth: longbridge::oauth::OAuth,
+    settings: &Settings,
+) -> Result<Connection> {
     let token = oauth
         .access_token()
         .await
@@ -156,7 +212,7 @@ async fn run_longbridge_market(
     let is_us = longbridge::DcRegion::from_credential(&token) == longbridge::DcRegion::Us;
     let config = crate::sdk::config(oauth.clone(), settings.language, settings.region).await?;
     let limiter = Arc::new(RateLimiter::default());
-    let api = SdkQuoteApi::new(
+    let quote = SdkQuoteApi::new(
         config.clone(),
         oauth.clone(),
         settings.language,
@@ -164,7 +220,7 @@ async fn run_longbridge_market(
         limiter.clone(),
     )
     .await?;
-    let (trade_context, _trade_events) = longbridge::trade::TradeContext::new(config.clone());
+    let (trade_context, trade_events) = longbridge::trade::TradeContext::new(config.clone());
     let trade = SdkTradeApi {
         context: trade_context,
         limiter: limiter.clone(),
@@ -189,14 +245,58 @@ async fn run_longbridge_market(
     } else {
         None
     };
-    let services = Services {
-        quote: Some(&api),
-        trade: Some(&trade),
-        news: news.as_ref().map(|news| news as &dyn NewsApi),
-        options: None,
+    Ok(Connection {
+        quote,
+        trade,
+        _trade_events: trade_events,
+        news,
         community,
-    };
-    entry::run_tick(Running::Provider(tick, services), settings, size).await
+    })
+}
+
+/// Longbridge as the data source of a Tick its host launched, connected with the login stored on
+/// this computer.
+struct Longbridge {
+    tick: TickCommand,
+    settings: Settings,
+    storage: AuthStorage,
+    /// Where the login is renewed; `None` for the region's own endpoints.
+    endpoints: Option<AuthEndpoints>,
+}
+
+impl DataSource for Longbridge {
+    type Connection = Connection;
+
+    fn name(&self) -> &str {
+        match self.settings.language {
+            Language::ZhCn => "长桥",
+            Language::En => "Longbridge",
+        }
+    }
+
+    fn login_hint(&self) -> &str {
+        match self.settings.language {
+            Language::ZhCn => "在 Agent 中用 /ticks 或用 `tickloop tick login longbridge` 登录",
+            Language::En => "log in with /ticks in the Agent or `tickloop tick login longbridge`",
+        }
+    }
+
+    fn stored_login(&self) -> Option<u64> {
+        let saved = std::fs::read(self.storage.directory.join(TOKEN_FILE_NAME)).ok()?;
+        let mut fingerprint = DefaultHasher::new();
+        saved.hash(&mut fingerprint);
+        Some(fingerprint.finish())
+    }
+
+    async fn connect(&mut self) -> Result<Connection> {
+        let region = self.settings.region.unwrap_or(Region::Global);
+        let oauth = auth::authorized_oauth(&self.storage, region, self.endpoints.clone()).await?;
+        connect(&self.tick, oauth, &self.settings).await
+    }
+
+    fn services(connection: &Connection) -> Services<'_> {
+        connection.services()
+    }
 }
 
 async fn run_fundamentals_probe(
@@ -268,5 +368,86 @@ mod tests {
             .await
             .unwrap_err();
         assert!(asks_to_log_in(&error), "{error}");
+    }
+
+    /// The token endpoint of a stand-in for Longbridge that refuses every login it is asked to
+    /// renew.
+    async fn refusing_login_renewals() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut connection, _)) = listener.accept().await {
+                let mut request = [0; 4096];
+                let _ = connection.read(&mut request).await;
+                let _ = connection
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn connect_result(result: Result<Connection>) -> Error {
+        match result {
+            Ok(_) => panic!("connected without Longbridge"),
+            Err(error) => error,
+        }
+    }
+
+    /// A hosted Tick tells a login Longbridge refuses to renew from a Longbridge it cannot
+    /// reach, and notices on this computer alone when the user logged in again.
+    #[tokio::test]
+    async fn renewing_the_stored_login_tells_a_refused_login_from_an_unreachable_longbridge() {
+        let home = tempfile::tempdir().unwrap();
+        let storage = AuthStorage::in_home(home.path());
+        let mut source = Longbridge {
+            tick: TickCommand::Quote(QuoteArgs {
+                symbols: vec!["TSLA.US".into()],
+                output: OnceArgs::default(),
+            }),
+            settings: Settings::default(),
+            storage: storage.clone(),
+            endpoints: None,
+        };
+        assert_eq!(source.stored_login(), None);
+        let token = storage.directory.join(TOKEN_FILE_NAME);
+        std::fs::create_dir_all(&storage.directory).unwrap();
+        std::fs::write(
+            &token,
+            r#"{"client_id":"test","access_token":"ap_lapsed","refresh_token":"ap_refresh","expires_at":1,"logged_in_at":1}"#,
+        )
+        .unwrap();
+        let lapsed = source.stored_login();
+        assert!(lapsed.is_some());
+
+        let refusing = refusing_login_renewals().await;
+        source.endpoints = Some(AuthEndpoints {
+            ap: refusing.clone(),
+            us: refusing,
+        });
+        let refused = connect_result(source.connect().await);
+        assert!(asks_to_log_in(&refused), "{refused}");
+
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unreachable = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        source.endpoints = Some(AuthEndpoints {
+            ap: unreachable.clone(),
+            us: unreachable,
+        });
+        let failed = connect_result(source.connect().await);
+        assert_eq!(failed.code, exit_code::NETWORK, "{failed}");
+
+        std::fs::write(
+            &token,
+            r#"{"client_id":"test","access_token":"ap_new","refresh_token":"ap_refresh","expires_at":1,"logged_in_at":2}"#,
+        )
+        .unwrap();
+        assert!(
+            source
+                .stored_login()
+                .is_some_and(|login| Some(login) != lapsed)
+        );
     }
 }

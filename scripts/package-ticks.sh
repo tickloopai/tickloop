@@ -1,7 +1,8 @@
 #!/bin/sh
 # Builds each named Tick package under ticks/ for Apple Silicon, assembles its package directory
 # in dist/ticks/<package>/ and its release archive beside it, and prints the archive's SHA-256 and
-# the matching marketplace.json entry. It publishes nothing.
+# the matching marketplace.json entry. It publishes nothing. With TICK_PACKAGE_QUIET set it only
+# names each program it builds, for make install-ticks.
 set -eu
 
 target=aarch64-apple-darwin
@@ -32,7 +33,13 @@ for package in "$@"; do
         exit 1
     fi
     program=$(basename "$executable")
-    cargo build --locked --release --target "$target" \
+    if [ -n "${TICK_PACKAGE_QUIET:-}" ]; then
+        echo "Building ${program}…"
+        cargo_output=--quiet
+    else
+        cargo_output=
+    fi
+    cargo build --locked --release $cargo_output --target "$target" \
         --manifest-path "$source_directory/Cargo.toml" --bin "$program"
 
     package_directory=$dist_directory/$package
@@ -48,6 +55,9 @@ for package in "$@"; do
     COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --no-acls \
         --uid 0 --gid 0 --numeric-owner \
         -czf "$archive" -C "$package_directory" tick-package.json "${executable%%/*}" skills
+    if [ -n "${TICK_PACKAGE_QUIET:-}" ]; then
+        continue
+    fi
     sha256=$(shasum -a 256 "$archive" | cut -d ' ' -f 1)
     printf '\nPackage directory: %s\nArchive: %s\nSHA-256: %s\nmarketplace.json entry:\n' \
         "$package_directory" "$archive" "$sha256"

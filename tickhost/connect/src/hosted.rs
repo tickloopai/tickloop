@@ -165,8 +165,13 @@ pub struct HostOccupancy {
     /// to run something; `None` from a host older than this count, which may be starting one.
     #[serde(default)]
     pub pending: Option<usize>,
-    /// Its authenticated business connections, such as attached views and data clients.
+    /// Its authenticated business connections: attached views, data clients, its Ticks'
+    /// launchers and the daemon's own.
     pub connections: usize,
+    /// The views attached to its Ticks and Shell tasks, which stopping it closes; `None` from a
+    /// host older than this count.
+    #[serde(default)]
+    pub views: Option<usize>,
 }
 
 /// A connection on the frozen management channel, which any host answers whatever its build.

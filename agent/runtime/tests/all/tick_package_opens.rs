@@ -4,7 +4,7 @@
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 
 use serde_json::json;
-use tick_packages::{InstalledPackage, MANIFEST_FILE_NAME, PackageStore};
+use tick_packages::{InstalledPackage, LoginState, MANIFEST_FILE_NAME, PackageStore};
 use tickloop_agent_runtime::{
     host_tools::{HostToolProvider, WorkspaceTickPackage},
     hosted::{
@@ -126,12 +126,14 @@ async fn a_package_program_that_declares_the_protocol_opens_as_a_protocol_tick_u
                 version: "1.0.0".into(),
                 description: "The example counter".into(),
                 executable: counter.executable(),
+                login: LoginState::NotRequired,
             },
             WorkspaceTickPackage {
                 name: "plain".into(),
                 version: "1.0.0".into(),
                 description: "The example counter".into(),
                 executable: cwd.join("config/ticks/plain/bin/tick-plain"),
+                login: LoginState::NotRequired,
             },
         ]
     );

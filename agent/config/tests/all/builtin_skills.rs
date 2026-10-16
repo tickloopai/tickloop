@@ -24,8 +24,20 @@ fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
         "`<package>:usage`",
         "`<package>:<skill>`",
         "`tick-<package>`",
-        "`! tickloop tick install <package>`",
-        "Never install a package yourself",
+        "`login`",
+        "`logged_in`",
+        "`not_required`",
+        "from `/ticks` in this Agent",
+        "`tickloop tick login <package>`",
+        "`tickloop tick install <package>`",
+        "never suggest `!` for a login",
+        "never log in, log out, install, update or uninstall a package yourself",
+        "Null `data` means no content yet",
+        "read it again shortly",
+        "`data.connection`",
+        "`retrying`",
+        "`not_authorized`",
+        "`failed`",
     ] {
         assert!(TICKLOOP_SKILL.contains(contract), "{contract}");
     }
@@ -53,6 +65,11 @@ fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
         "MEMBER_ID",
         "TSLA.US",
         "on PATH",
+        "! tickloop tick",
+        "bin/tick-longbridge auth",
+        "TICK_PACKAGE_ROOT",
+        "auth status",
+        "login command the package's Skill names",
     ] {
         assert!(!TICKLOOP_SKILL.contains(retired), "{retired}");
     }

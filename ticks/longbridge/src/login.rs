@@ -1,6 +1,11 @@
 //! The Longbridge login screens and the `tick-longbridge auth` status commands.
 
-use std::{io::Write, path::Path};
+use std::{
+    io::Write,
+    path::Path,
+    process::{Command, Stdio},
+    thread,
+};
 
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use futures_util::{Stream, StreamExt};
@@ -15,10 +20,13 @@ use ratatui::{
 use tick_market::{config::Settings, runtime::is_exit};
 use tick_provider::{
     error::{Error, Result},
+    exit_code,
     preferences::{Language, Region},
 };
+use tickloop_ui::hyperlink;
 
 use crate::{
+    AUTH_HINT,
     auth::{
         check_noninteractive,
         device::{
@@ -33,6 +41,8 @@ const MINIMUM_COLUMNS: u16 = 36;
 const MINIMUM_ROWS: u16 = 10;
 const CARD_COLUMNS: u16 = 76;
 const CARD_ROWS: u16 = 18;
+/// The card's left and right borders.
+const CARD_BORDER_COLUMNS: u16 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoginOutcome {
@@ -47,28 +57,21 @@ pub fn inspect(
     output: &mut impl Write,
 ) -> Result<()> {
     match action {
-        AuthAction::Status => {
-            match storage.token()? {
-                None => writeln!(output, "Not logged in. Run `tick-longbridge auth`.")?,
-                Some(token) => {
-                    writeln!(
-                        output,
-                        "{}",
-                        if token.expires_at > now_seconds() {
-                            "Logged in"
-                        } else {
-                            "Authorization expired; run `tick-longbridge auth`"
-                        }
-                    )?;
-                    let expires =
-                        time::OffsetDateTime::from_unix_timestamp(token.expires_at as i64)
-                            .ok()
-                            .and_then(|date| {
-                                date.format(&time::format_description::well_known::Rfc3339)
-                                    .ok()
-                            })
-                            .unwrap_or_else(|| token.expires_at.to_string());
-                    writeln!(output, "Expires: {expires}")?;
+        AuthAction::Status { .. } => {
+            match stored_login(storage)? {
+                StoredLogin::None => writeln!(output, "Not logged in; {AUTH_HINT}.")?,
+                StoredLogin::Unreadable(error) => return Err(error),
+                StoredLogin::Current { expires_at } => {
+                    writeln!(output, "Logged in")?;
+                    writeln!(output, "Expires: {}", expiry_text(expires_at))?;
+                }
+                StoredLogin::Renewable { expires_at } => {
+                    writeln!(output, "Logged in; {ACCESS_TOKEN_RENEWS}")?;
+                    writeln!(output, "Access token expired: {}", expiry_text(expires_at))?;
+                }
+                StoredLogin::Expired { expires_at } => {
+                    writeln!(output, "Authorization expired; {AUTH_HINT}.")?;
+                    writeln!(output, "Expires: {}", expiry_text(expires_at))?;
                 }
             }
             writeln!(
@@ -86,17 +89,177 @@ pub fn inspect(
     Ok(())
 }
 
+/// What the token stored on this computer says about the login, read without refreshing it.
+enum StoredLogin {
+    None,
+    Unreadable(Error),
+    Current {
+        expires_at: u64,
+    },
+    /// The access token lapsed, and its refresh token renews it when a Tick opens.
+    Renewable {
+        expires_at: u64,
+    },
+    Expired {
+        expires_at: u64,
+    },
+}
+
+const ACCESS_TOKEN_RENEWS: &str = "the access token is renewed when a Tick opens";
+
+fn stored_login(storage: &AuthStorage) -> Result<StoredLogin> {
+    Ok(match storage.token() {
+        Ok(None) => StoredLogin::None,
+        Err(error) if error.code == exit_code::NOT_AUTHORIZED => StoredLogin::Unreadable(error),
+        Err(error) => return Err(error),
+        Ok(Some(token)) if token.expires_at > now_seconds() => StoredLogin::Current {
+            expires_at: token.expires_at,
+        },
+        Ok(Some(token))
+            if token
+                .refresh_token
+                .as_deref()
+                .is_some_and(|refresh| !refresh.is_empty()) =>
+        {
+            StoredLogin::Renewable {
+                expires_at: token.expires_at,
+            }
+        }
+        Ok(Some(token)) => StoredLogin::Expired {
+            expires_at: token.expires_at,
+        },
+    })
+}
+
+/// Prints the login state as one JSON object, `{"state": …, "detail"?: …}`, from the token stored
+/// on this computer alone: nothing is refreshed and nothing goes over the network. A lapsed access
+/// token still counts as logged in while a refresh token can renew it when a Tick opens.
+pub fn print_status_json(storage: &AuthStorage, output: &mut impl Write) -> Result<()> {
+    let (state, detail) = match stored_login(storage)? {
+        StoredLogin::None => ("logged_out", None),
+        StoredLogin::Unreadable(_) => (
+            "logged_out",
+            Some("the saved login cannot be read; log in again".to_owned()),
+        ),
+        StoredLogin::Current { .. } => ("logged_in", None),
+        StoredLogin::Renewable { .. } => ("logged_in", Some(ACCESS_TOKEN_RENEWS.to_owned())),
+        StoredLogin::Expired { expires_at } => (
+            "expired",
+            Some(format!("expired at {}", expiry_text(expires_at))),
+        ),
+    };
+    let mut report = serde_json::json!({ "state": state });
+    if let Some(detail) = detail {
+        report["detail"] = detail.into();
+    }
+    writeln!(output, "{report}")?;
+    Ok(())
+}
+
+fn expiry_text(expires_at: u64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(expires_at as i64)
+        .ok()
+        .and_then(|date| {
+            date.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| expires_at.to_string())
+}
+
+/// How the waiting screen hands over the verification page besides showing it.
+pub struct PageAccess<O: FnOnce(&str) -> bool> {
+    /// Opens the page in a browser and says whether it did; the login goes on either way.
+    pub open: O,
+    /// Whether the terminal shows OSC 8 links, so that every row of a wrapped link opens the
+    /// whole page.
+    pub links: bool,
+}
+
+impl PageAccess<fn(&str) -> bool> {
+    /// The system's browser and what this terminal's environment says about links.
+    pub fn of_this_terminal() -> Self {
+        Self {
+            open: open_in_browser,
+            links: hyperlink::supported(|name| std::env::var(name).ok()),
+        }
+    }
+}
+
+/// Whether `page` can be opened and linked: an https address with a host and no credentials, and
+/// nothing that could break out of an escape sequence.
+fn is_safe_page(page: &str) -> bool {
+    !page.chars().any(char::is_control)
+        && reqwest::Url::parse(page).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
+}
+
+/// Opens the verification page in the system's browser, as the Agent's own device logins do, and
+/// says whether it started the browser.
+pub fn open_in_browser(page: &str) -> bool {
+    if !is_safe_page(page) {
+        return false;
+    }
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let Ok(mut child) = Command::new(opener)
+        .arg(page)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    thread::spawn(move || child.wait());
+    true
+}
+
+/// The login screens, opening the verification page in the system's browser.
 pub async fn run<B, S>(
     settings: &Settings,
     config_path: &Path,
     storage: &AuthStorage,
     endpoints: Option<AuthEndpoints>,
     terminal: &mut Terminal<B>,
-    mut input: S,
+    input: S,
 ) -> Result<LoginOutcome>
 where
     B: Backend,
     S: Stream<Item = std::io::Result<Event>> + Unpin,
+{
+    run_with_page_access(
+        settings,
+        config_path,
+        storage,
+        endpoints,
+        terminal,
+        input,
+        PageAccess::of_this_terminal(),
+    )
+    .await
+}
+
+/// The login screens, handing over the verification page through `page_access`.
+pub async fn run_with_page_access<B, S, O>(
+    settings: &Settings,
+    config_path: &Path,
+    storage: &AuthStorage,
+    endpoints: Option<AuthEndpoints>,
+    terminal: &mut Terminal<B>,
+    mut input: S,
+    page_access: PageAccess<O>,
+) -> Result<LoginOutcome>
+where
+    B: Backend,
+    S: Stream<Item = std::io::Result<Event>> + Unpin,
+    O: FnOnce(&str) -> bool,
 {
     let mut region = settings.region.unwrap_or(Region::Cn);
     if let Some(token) = storage
@@ -157,6 +320,8 @@ where
     let Some(login) = login else {
         return Ok(LoginOutcome::Cancelled);
     };
+    let opened = (page_access.open)(login.verification_uri());
+    let links = page_access.links;
 
     clear(terminal)?;
     let (notices, mut updates) = tokio::sync::mpsc::unbounded_channel();
@@ -170,6 +335,8 @@ where
             settings,
             Screen::Waiting {
                 login: &login,
+                opened,
+                links,
                 status: &status,
             },
         )?;
@@ -242,6 +409,10 @@ enum Screen<'a> {
     Starting(Region),
     Waiting {
         login: &'a DeviceLogin,
+        /// Whether the verification page was opened in the browser.
+        opened: bool,
+        /// Whether the terminal shows OSC 8 links.
+        links: bool,
         status: &'a str,
     },
     Authorized,
@@ -281,7 +452,17 @@ fn render(frame: &mut Frame<'_>, settings: &Settings, screen: Screen<'_>) {
         return;
     }
 
-    let card = centered(area, CARD_COLUMNS, CARD_ROWS);
+    // The card widens for a verification link longer than it, so the link stays on one line
+    // where the terminal is wide enough.
+    let card_columns = match &screen {
+        Screen::Waiting { login, .. } => CARD_COLUMNS.max(
+            u16::try_from(Line::raw(login.verification_uri()).width())
+                .unwrap_or(u16::MAX)
+                .saturating_add(CARD_BORDER_COLUMNS),
+        ),
+        _ => CARD_COLUMNS,
+    };
+    let card = centered(area, card_columns, CARD_ROWS);
     frame.buffer_mut().set_style(card, styles.overlay_base());
     let title = match settings.language {
         Language::ZhCn => " 连接 Longbridge ",
@@ -300,7 +481,12 @@ fn render(frame: &mut Frame<'_>, settings: &Settings, screen: Screen<'_>) {
         }
         Screen::Region(region) => render_region(frame, inner, settings, region),
         Screen::Starting(region) => render_starting(frame, inner, settings, region),
-        Screen::Waiting { login, status } => render_waiting(frame, inner, settings, login, status),
+        Screen::Waiting {
+            login,
+            opened,
+            links,
+            status,
+        } => render_waiting(frame, inner, settings, login, opened, links, status),
         Screen::Authorized => render_authorized(frame, inner, settings),
     }
 }
@@ -429,23 +615,53 @@ fn render_waiting(
     area: Rect,
     settings: &Settings,
     login: &DeviceLogin,
+    opened: bool,
+    links: bool,
     status: &str,
 ) {
     let styles = settings.styles();
-    let (open, confirm, footer) = match settings.language {
-        Language::ZhCn => ("1  在浏览器中打开", "2  核对设备码并批准", "q 取消"),
-        Language::En => (
-            "1  Open in your browser",
-            "2  Confirm and approve this code",
-            "q cancel",
-        ),
+    let body = body_area(area);
+    let width = usize::from(body.width);
+    let fits = |link: &str| Line::raw(link).width() <= width;
+    let complete = login.verification_uri();
+    let plain = login.plain_verification_uri();
+    let is_linked = links && is_safe_page(complete);
+    // A terminal detects only the row it is clicked on of a link wrapped across rows, unless
+    // every row is an OSC 8 link to the whole page. Without those links, a page with the code
+    // filled in that does not fit gives way to the plain page, where the user enters the code.
+    let link = if fits(complete) || is_linked || !fits(plain) {
+        complete
+    } else {
+        plain
+    };
+    let has_code = link != plain;
+    let link_rows = hyperlink::split_rows(link, width);
+    let open = match (settings.language, opened) {
+        (Language::ZhCn, true) => "1  已在浏览器中打开；没有打开时请访问",
+        (Language::ZhCn, false) => "1  在浏览器中打开",
+        (Language::En, true) => "1  Opened in your browser; if it did not open, visit",
+        (Language::En, false) => "1  Open in your browser",
+    };
+    let footer = match settings.language {
+        Language::ZhCn => "q 取消",
+        Language::En => "q cancel",
+    };
+    let confirm = match (settings.language, has_code) {
+        (Language::ZhCn, true) => "2  核对设备码并批准",
+        (Language::ZhCn, false) => "2  输入设备码并批准",
+        (Language::En, true) => "2  Confirm and approve this code",
+        (Language::En, false) => "2  Enter this code and approve",
     };
     let remaining = login.remaining().as_secs();
     let minutes = remaining / 60;
     let seconds = remaining % 60;
-    let content = Text::from(vec![
-        Line::styled(open, styles.muted_text),
-        Line::styled(login.verification_uri(), styles.link),
+    let mut lines = vec![Line::styled(open, styles.muted_text)];
+    lines.extend(
+        link_rows
+            .iter()
+            .map(|row| Line::styled(row.as_str(), styles.link)),
+    );
+    lines.extend([
         Line::default(),
         Line::styled(confirm, styles.muted_text),
         Line::styled(login.user_code(), styles.strong),
@@ -456,11 +672,14 @@ fn render_waiting(
         ]),
     ]);
     frame.render_widget(
-        Paragraph::new(content)
+        Paragraph::new(Text::from(lines))
             .style(styles.overlay_base())
             .wrap(Wrap { trim: false }),
-        body_area(area),
+        body,
     );
+    if is_linked {
+        hyperlink::link_rows(frame.buffer_mut(), body, &link_rows, complete);
+    }
     render_footer(frame, area, settings, footer);
 }
 

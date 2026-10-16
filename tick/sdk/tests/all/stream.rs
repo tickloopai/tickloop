@@ -209,3 +209,97 @@ fn a_tick_update_needs_data() {
     assert_eq!(stream.seq(), 1, "unchanged data publishes nothing");
     assert_eq!(stream.records().len(), 1);
 }
+
+/// The lines a host reads back within `timeout`, while nothing dispatches the stream.
+async fn answers_without_dispatch(
+    host_requests: &mut tokio::io::DuplexStream,
+    host_responses: &mut tokio::io::Lines<tokio::io::BufReader<tokio::io::DuplexStream>>,
+    requests: &[Value],
+) -> Vec<Value> {
+    for request in requests {
+        host_requests
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    let mut answers = Vec::new();
+    while answers.len() < requests.len() {
+        let line = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            host_responses.next_line(),
+        )
+        .await
+        .expect("answered within a second without the runtime")
+        .unwrap()
+        .unwrap();
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        if frame["method"] != UPDATE_METHOD {
+            answers.push(frame);
+        }
+    }
+    answers
+}
+
+/// A Tick still connecting or fetching its first content never dispatches; its host still finds
+/// it ready, reading null data until the first Tick Update and that update afterwards.
+#[tokio::test]
+async fn describe_and_read_are_answered_while_the_runtime_never_dispatches() {
+    use tokio::io::AsyncBufReadExt;
+    let (mut host_requests, tick_requests) = tokio::io::duplex(8 * 1024);
+    let (tick_responses, host_responses) = tokio::io::duplex(64 * 1024);
+    let mut host_responses = tokio::io::BufReader::new(host_responses).lines();
+    let mut stream = TickStream::duplex(Counter::with_read_tool(), tick_requests, tick_responses);
+
+    let answers = answers_without_dispatch(
+        &mut host_requests,
+        &mut host_responses,
+        &[
+            json!({"jsonrpc": "2.0", "id": 1, "method": DESCRIBE_METHOD}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": READ_METHOD}),
+        ],
+    )
+    .await;
+    assert_eq!(answers[0]["id"], 1);
+    assert_eq!(answers[0]["result"]["kind"], "example.counter");
+    assert_eq!(answers[1]["id"], 2);
+    assert_eq!(answers[1]["result"], json!({"seq": 0, "data": null}));
+
+    stream.publish(json!({"value": 7})).unwrap();
+    let answers = answers_without_dispatch(
+        &mut host_requests,
+        &mut host_responses,
+        &[json!({"jsonrpc": "2.0", "id": 3, "method": READ_METHOD})],
+    )
+    .await;
+    assert_eq!(answers[0]["result"]["seq"], 1);
+    assert_eq!(answers[0]["result"]["data"], json!({"value": 7}));
+}
+
+/// A runtime that ends before its host closed the stream, such as a connection attempt that
+/// failed, leaves the calls it never read to the runtime that runs next.
+#[tokio::test]
+async fn calls_a_runtime_left_unread_reach_the_next_runtime() {
+    let (mut host_requests, tick_requests) = tokio::io::duplex(8 * 1024);
+    let (tick_responses, _host_responses) = tokio::io::duplex(64 * 1024);
+    let mut stream = TickStream::duplex(Counter::with_read_tool(), tick_requests, tick_responses);
+    drop(stream.take_requests());
+
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": CALL_METHOD, "params": {"tool": "current", "args": {}, "revision": "1"}});
+    host_requests
+        .write_all(format!("{call}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut requests = stream.take_requests();
+    let line = tokio::time::timeout(std::time::Duration::from_secs(1), requests.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stream.dispatch(line),
+        Some(ToolRequest {
+            id: json!(1),
+            tool: "current".into(),
+            args: json!({}),
+        })
+    );
+}

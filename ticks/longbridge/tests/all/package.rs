@@ -1,10 +1,9 @@
 use std::path::Path;
 
-use tick_longbridge::auth::storage::AuthStorage;
-use tick_packages::PackageManifest;
+use tick_packages::{OAuthIssuer, PackageAuth, PackageManifest};
 
 #[test]
-fn the_package_manifest_runs_this_program_at_the_workspace_version_and_names_its_credentials() {
+fn the_package_manifest_runs_this_program_at_the_workspace_version_and_logs_in_with_oauth2() {
     let package = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest =
         PackageManifest::parse(&std::fs::read(package.join("tick-package.json")).unwrap()).unwrap();
@@ -16,11 +15,21 @@ fn the_package_manifest_runs_this_program_at_the_workspace_version_and_names_its
         Path::new(env!("CARGO_BIN_EXE_tick-longbridge")).file_name()
     );
     assert!(manifest.protocol);
-    let home = Path::new("/home/user");
-    let credentials = manifest.credentials.unwrap();
     assert_eq!(
-        home.join(credentials.strip_prefix("~/").unwrap()),
-        AuthStorage::in_home(home).directory
+        manifest.auth,
+        PackageAuth::OAuth2 {
+            issuers: vec![
+                OAuthIssuer {
+                    label: "China mainland".into(),
+                    issuer: "https://openapi.longbridge.cn".into(),
+                },
+                OAuthIssuer {
+                    label: "Global".into(),
+                    issuer: "https://openapi.longbridge.com".into(),
+                },
+            ],
+            scopes: Vec::new(),
+        }
     );
     assert!(package.join("skills").is_dir());
 }

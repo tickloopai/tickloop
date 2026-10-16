@@ -1,0 +1,22 @@
+[package]
+name = "tickloop-agent-packages"
+description = "Installing, updating and removing Tick packages from the Tick marketplace or local files, and their OAuth 2.0 device login, shared by the Console and tickloop tick"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tickloop-agent-base = { path = "../base" }
+tickloop-tick-packages = { path = "../../tick/packages" }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+
+[dev-dependencies]
+tempfile = "3"
+tickloop-agent-test-support = { path = "../test-support" }

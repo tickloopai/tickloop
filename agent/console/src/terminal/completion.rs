@@ -147,6 +147,12 @@ const COMMANDS: &[CommandSpec] = &[
         menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {
+        command: "/ticks",
+        arguments: "",
+        description: "Install, update, log in to and uninstall Tick packages.",
+        menu_group: Some(CommandGroup::ToolsAndPermissions),
+    },
+    CommandSpec {
         command: "/clear",
         arguments: "",
         description: "Starts a New Agent from your next input; this Agent keeps running.",
@@ -606,8 +612,8 @@ mod tests {
     fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-        assert_eq!(completion.candidates().len(), 22);
-        assert_eq!(builtin_commands().len(), 42);
+        assert_eq!(completion.candidates().len(), 23);
+        assert_eq!(builtin_commands().len(), 43);
         assert_eq!(
             builtin_commands()
                 .iter()
@@ -616,7 +622,14 @@ mod tests {
             20
         );
         assert_eq!(completion.selected_index(), None);
-        for command in ["/help", "/cwd", "/details", "/tickloop", "/artifacts"] {
+        for command in [
+            "/help",
+            "/cwd",
+            "/details",
+            "/tickloop",
+            "/artifacts",
+            "/ticks",
+        ] {
             assert!(command_names(&completion).contains(&command));
         }
         for command in ["/tui", "/allow", "/operations", "/interrupt"] {

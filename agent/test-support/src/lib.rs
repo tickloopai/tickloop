@@ -1,8 +1,9 @@
 //! Test code shared by the Agent crates' unit and integration tests: a scripted model with its
 //! replies, runtime events, Transcript files, PTY screens, a terminal's kitty keyboard flags,
-//! transport limits and model HTTP servers. Helpers that only one crate's tests use stay in that
-//! crate.
+//! transport limits, model HTTP servers and an OAuth authorization server. Helpers that only one
+//! crate's tests use stay in that crate.
 
+pub mod authorization_server;
 pub mod input_dialog;
 pub mod kitty_keyboard;
 pub mod legacy_models;

@@ -1,7 +1,7 @@
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command, thread, time::Duration};
 
 use serde_json::json;
-use tick_packages::{InstallOutcome, PackageError, PackageStore};
+use tick_packages::{ApiKey, InstallOutcome, PackageError, PackageStore};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::support::{Fixture, MANIFEST, link, manifest};
@@ -159,15 +159,19 @@ fn a_broken_installation_is_listed_apart_and_installing_again_repairs_it() {
 #[test]
 fn uninstalling_removes_the_package_and_its_registration_and_names_the_kept_credentials() {
     let fixture = Fixture::new();
-    let mut with_credentials = manifest("sample", "1.0.0");
-    with_credentials["credentials"] = json!("~/.tickloop/sample/");
+    let mut with_key = manifest("sample", "1.0.0");
+    with_key["auth"] = json!({"type": "api_key", "env": "SAMPLE_KEY", "label": "Sample key"});
     let installed = fixture
         .store
-        .install_path(&fixture.package_with("one", &with_credentials))
+        .install_path(&fixture.package_with("one", &with_key))
         .unwrap();
     fixture
         .store
         .install_path(&fixture.package_with("other", &manifest("other", "3.0.0")))
+        .unwrap();
+    let credentials = fixture.store.credentials("sample").unwrap();
+    credentials
+        .save_api_key(&ApiKey::new("sample-secret").unwrap())
         .unwrap();
 
     let uninstalled = fixture.store.uninstall("sample").unwrap();
@@ -176,7 +180,11 @@ fn uninstalling_removes_the_package_and_its_registration_and_names_the_kept_cred
     assert_eq!(uninstalled.version, "1.0.0");
     assert_eq!(
         uninstalled.credentials.as_deref(),
-        Some("~/.tickloop/sample/")
+        Some(fixture.config_root().join("credentials/sample").as_path())
+    );
+    assert_eq!(
+        credentials.api_key().unwrap().unwrap().expose(),
+        "sample-secret"
     );
     assert!(!installed.package.root.exists());
     assert_eq!(
@@ -196,6 +204,7 @@ fn uninstalling_removes_the_package_and_its_registration_and_names_the_kept_cred
         .map(|package| package.manifest.name)
         .collect::<Vec<_>>();
     assert_eq!(names, ["other"]);
+    assert_eq!(fixture.store.uninstall("other").unwrap().credentials, None);
     assert!(matches!(
         fixture.store.uninstall("sample"),
         Err(PackageError::NotInstalled(name)) if name == "sample"

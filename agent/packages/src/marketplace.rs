@@ -31,6 +31,7 @@ const MAX_REDIRECTS: usize = 10;
 const CLIENT_NAME: &str = concat!("tickloop/", env!("CARGO_PKG_VERSION"));
 
 /// Where the Tick marketplace is read from.
+#[derive(Clone, Debug)]
 pub enum MarketplaceSource {
     Url(Url),
     File(PathBuf),

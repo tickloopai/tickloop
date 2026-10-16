@@ -14,8 +14,8 @@ TICKS_CHECKOUT ?= $(HOME)/github/ticks
 
 .PHONY: dev build install package package-ticks install-ticks publish-ticks test check release-docs prototype-earnings-review
 
-## Start in the current directory with the global configuration; example: make dev ARGS="-c"
-dev:
+## Install the Tick packages from this checkout, then start in the current directory with the global configuration; example: make dev ARGS="-c"
+dev: install-ticks
 	"$(DEV_LAUNCHER)" $(ARGS)
 
 build:
@@ -38,9 +38,12 @@ package-ticks:
 	scripts/package-ticks.sh $(TICK_PACKAGES)
 
 ## Package the Tick packages, then install each with the tickloop built from this checkout.
-install-ticks: package-ticks
-	for package in $(TICK_PACKAGES); do \
-		cargo run --locked -p tickloop-agent --bin tickloop -- tick install --path "dist/ticks/$$package" || exit 1; \
+install-ticks:
+	@TICK_PACKAGE_QUIET=1 scripts/package-ticks.sh $(TICK_PACKAGES)
+	@echo "Building tickloop…"
+	@cargo build --locked --quiet -p tickloop-agent --bin tickloop
+	@for package in $(TICK_PACKAGES); do \
+		cargo run --locked --quiet -p tickloop-agent --bin tickloop -- tick install --path "dist/ticks/$$package" || exit 1; \
 	done
 
 ## Prepare the release of the Tick packages in the tickloopai/ticks checkout TICKS_CHECKOUT and print the commands that publish it; it publishes nothing.

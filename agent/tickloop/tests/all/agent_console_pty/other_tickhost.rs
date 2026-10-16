@@ -12,7 +12,8 @@ const OTHER_TICKHOST_GUIDANCE: &str = "The running Tickhost is another version; 
 const SHOWN_GUIDANCE: &str = "The running Tickhost is another version; restart tickloop and choose to restart the Tickhost at the prompt";
 
 /// The fixture's daemon key, and a Tickhost of another build that runs a Tick and a Shell and is
-/// starting one more at the daemon's Tickhost endpoint.
+/// starting one more at the daemon's Tickhost endpoint. Its Tick's launcher and a data client
+/// are connected, but no view is attached.
 fn other_build_running_a_tick(fixture: &PrivateFixture) -> (String, OtherBuildHost) {
     let key = tickhost::host::random_token();
     std::fs::write(fixture.path("runtime/tickhost.key"), &key).unwrap();
@@ -30,7 +31,8 @@ fn other_build_running_a_tick(fixture: &PrivateFixture) -> (String, OtherBuildHo
                 ticks: vec!["Quote board".into()],
                 shells: 1,
                 pending: Some(1),
-                connections: 0,
+                connections: 2,
+                views: Some(0),
             },
         }),
     );
@@ -61,8 +63,9 @@ async fn actual_cli_restarting_a_tickhost_of_another_build_stops_it_and_runs_she
         menu.contains(&format!("Running Tickhost build {OTHER_BUILD}"))
             && menu.contains("Restarting it ends these Ticks: Quote board.")
             && menu.contains("It also ends 1 running Shell.")
-            && menu.contains("It also ends 1 Tick or Shell still starting."),
-        "the menu names the build and what restarting ends: {menu}"
+            && menu.contains("It also ends 1 Tick or Shell still starting.")
+            && !menu.contains("open view"),
+        "the menu names the build and what restarting ends, and no connection as a view: {menu}"
     );
     assert!(!host.was_stopped(), "nothing ends before the user chooses");
     view.send(b"k");
@@ -84,6 +87,88 @@ async fn actual_cli_restarting_a_tickhost_of_another_build_stops_it_and_runs_she
         hello.host.unwrap().build,
         tickhost::host::BUILD_IDENTITY,
         "the daemon started a Tickhost of its own build"
+    );
+    fixture.shutdown().await;
+}
+
+/// The tool results the Agent sent back so far, decoded.
+fn tool_results(request: &Value) -> Vec<Value> {
+    request["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|message| message["role"] == "tool")
+        .map(|message| {
+            message["content"]
+                .as_str()
+                .and_then(|content| serde_json::from_str(content).ok())
+                .unwrap_or_else(|| message["content"].clone())
+        })
+        .collect()
+}
+
+/// After the user restarts a Tickhost of another build, the Agent opens a protocol Tick in the
+/// Tickhost of this build and reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_cli_after_restarting_a_tickhost_of_another_build_opens_and_reads_a_protocol_tick() {
+    let fixture = PrivateFixture::new();
+    let (key, host) = other_build_running_a_tick(&fixture);
+    let counter = fixture.path("work/counter.py");
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tick/examples/counter.py"),
+        &counter,
+    )
+    .unwrap();
+    let open =
+        json!({"action":"open","command":["/usr/bin/python3", "-u", counter],"protocol":true});
+    let (base_url, mut requests) = model_http_support::serve_router(move |request| {
+        let results = tool_results(request);
+        match results.as_slice() {
+            [] => chat_reply(Some(("ModifyTick", "open-counter", open.clone())), ""),
+            [opened] => chat_reply(
+                Some((
+                    "ReadTick",
+                    "read-counter",
+                    json!({"tick_instance_id": opened["tick_instance_id"]}),
+                )),
+                "",
+            ),
+            _ => chat_reply(None, "The counter reads 0."),
+        }
+    })
+    .await;
+    fixture.set_chat_model(&base_url);
+    let mut view = PtyView::start_with_flags(&fixture, &["--dangerously-skip-permissions"]);
+
+    restart_menu(&mut view).await;
+    view.send(b"k");
+    view.send(b"\r");
+    view.wait_for("input ready", new_input_is_visible).await;
+    assert!(host.was_stopped());
+
+    view.send(b"Open the counter and read it.\r");
+    view.wait_for("the Agent's reply", |frame| {
+        frame.contains("The counter reads 0.")
+    })
+    .await;
+    let mut last = Value::Null;
+    while let Ok((_, request)) = requests.try_recv() {
+        last = request;
+    }
+    let results = tool_results(&last);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert_eq!(results[0]["status"], "opened", "{results:?}");
+    assert_eq!(results[1]["source"], "protocol", "{results:?}");
+    assert_eq!(results[1]["data"]["value"], 0, "{results:?}");
+    let hello = ManagementConnection::connect(&fixture.path("tickhost/host.sock"), &key)
+        .await
+        .unwrap()
+        .hello()
+        .clone();
+    assert_eq!(
+        hello.host.unwrap().build,
+        tickhost::host::BUILD_IDENTITY,
+        "the counter runs in a Tickhost of this build"
     );
     fixture.shutdown().await;
 }

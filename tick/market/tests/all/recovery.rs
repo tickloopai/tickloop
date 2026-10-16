@@ -143,10 +143,7 @@ async fn refresh_authentication_and_usage_errors_exit_instead_of_retrying() {
         let api = News {
             responses: Mutex::new(VecDeque::from([
                 Ok(items("Initial headline")),
-                Err(Error {
-                    code,
-                    message: "request rejected".into(),
-                }),
+                Err(Error::new(code, "request rejected")),
             ])),
             calls: Mutex::new(0),
             hang_on_call: None,
@@ -579,10 +576,7 @@ impl NewsApi for ArticleNews {
         let mut calls = self.article_calls.lock().unwrap();
         *calls += 1;
         if *calls == 1 {
-            return Err(Error {
-                code: self.error_code,
-                message: "article request failed".into(),
-            });
+            return Err(Error::new(self.error_code, "article request failed"));
         }
         Ok(NewsArticle {
             id: id.into(),

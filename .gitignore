@@ -7,6 +7,8 @@ prototypes/
 /vendor/*
 !/vendor/crossterm/
 !/vendor/crossterm/**
+!/vendor/dotenv/
+!/vendor/dotenv/**
 !/vendor/longbridge-oauth/
 !/vendor/longbridge-oauth/**
 target/

@@ -9,7 +9,8 @@ use tick_market::{
 use tick_provider::preferences::Region;
 
 const ABOUT: &str = "Longbridge Ticks: quotes, watchlist, candlesticks, positions, news, earnings \
-     and community posts as standalone terminal commands; log in with `tick-longbridge auth`";
+     and community posts as standalone terminal commands; log in with `tickloop tick login \
+     longbridge`, which runs `tick-longbridge auth`";
 
 const EXAMPLES: &str = "Examples:
   tick-longbridge auth
@@ -25,7 +26,7 @@ const EXAMPLES: &str = "Examples:
 const EXIT_CODES: &str = "Exit codes:
   0  success
   2  usage or configuration error
-  3  not authorized; run `tick-longbridge auth`
+  3  not authorized; log in with `tickloop tick login longbridge`, or with /ticks in the Agent
   4  network or API error";
 
 /// The Ticks `tick-longbridge` runs, in the order `describe` lists them.
@@ -108,7 +109,11 @@ impl From<LongbridgeTick> for TickCommand {
 #[derive(Subcommand, Clone, Copy, Debug)]
 pub enum AuthAction {
     /// Show login state, expiry time and region without refreshing
-    Status,
+    Status {
+        /// Print only the login state, as one JSON object read from this computer alone
+        #[arg(long)]
+        json: bool,
+    },
     /// Verify stored authorization for a noninteractive workspace launch
     #[command(hide = true)]
     Check,

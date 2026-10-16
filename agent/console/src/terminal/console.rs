@@ -293,6 +293,8 @@ pub(super) enum InputEvent {
     },
     ArtifactChoice(Box<super::artifacts_picker::ArtifactChoice>),
     ArtifactSignOut,
+    /// Work `/ticks` asks for, or the login state to read again once a login program ended.
+    TickPackages(super::ticks_panel::TickPackageWork),
     TickAction {
         chat: Uuid,
         action: super::tick_actions::PreparedTickAction,
@@ -351,6 +353,7 @@ impl fmt::Debug for InputEvent {
                 .field(choice)
                 .finish(),
             Self::ArtifactSignOut => formatter.write_str("ArtifactSignOut"),
+            Self::TickPackages(work) => formatter.debug_tuple("TickPackages").field(work).finish(),
             Self::TickAction { chat, action } => formatter
                 .debug_struct("TickAction")
                 .field("chat", chat)
@@ -781,6 +784,7 @@ pub(super) struct State {
     /// The `/resume` picker owns input while open; the
     /// draft and conversation underneath stay untouched.
     artifacts_picker: Option<super::artifacts_picker::ArtifactsPicker>,
+    ticks_panel: Option<super::ticks_panel::TicksPanel>,
     conversation_picker: Option<ConversationPicker>,
     menu_link: Option<(Uuid, String)>,
     menu_review: Option<MenuReviewState>,
@@ -1687,6 +1691,38 @@ impl Console {
         Ok(())
     }
 
+    pub(super) fn show_ticks_panel(
+        &self,
+        panel: super::ticks_panel::TicksPanel,
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if !state.interactive {
+            return Err("/ticks needs an interactive terminal".into());
+        }
+        state.install_ticks_panel(panel);
+        state.rendered_region = None;
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Hands `result` to the `/ticks` panel `panel`, shown or waiting; false once it is closed.
+    pub(super) fn apply_tick_package_result(
+        &self,
+        panel: Uuid,
+        result: super::ticks_panel::TickPackageResult,
+    ) -> Result<bool, String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        let Some(open) = state.ticks_panel_mut(panel) else {
+            return Ok(false);
+        };
+        open.apply(result);
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
     /// Whether the one-time offer to register the Herdr popup plugin is still to be made in
     /// this View; asking takes it.
     pub(super) fn take_popup_registration_offer(&self) -> Result<bool, String> {
@@ -2116,6 +2152,7 @@ impl Console {
             && !state.menu_submission_is_pending()
             && (state.input_dialog_visible()
                 || state.artifacts_picker.is_some()
+                || state.ticks_panel.is_some()
                 || state.conversation_picker.is_some()
                 || state.permissions_surface.is_some()
                 || state
@@ -5389,6 +5426,7 @@ impl State {
             picker_presentation: Default::default(),
             picker_search: None,
             artifacts_picker: None,
+            ticks_panel: None,
             conversation_picker: None,
             menu_link: None,
             menu_review: None,
@@ -5586,7 +5624,9 @@ impl State {
                 }
                 let body_row = row - rule_rows;
                 if self.menu.is_none()
-                    && (self.artifacts_picker.is_some() || self.conversation_picker.is_some())
+                    && (self.artifacts_picker.is_some()
+                        || self.ticks_panel.is_some()
+                        || self.conversation_picker.is_some())
                 {
                     match event.kind {
                         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -5600,6 +5640,8 @@ impl State {
                         MouseEventKind::Down(MouseButton::Left) => {
                             let selected = if let Some(picker) = &mut self.artifacts_picker {
                                 picker.select_at_row(body_row)
+                            } else if let Some(panel) = &mut self.ticks_panel {
+                                panel.select_at_row(body_row)
                             } else {
                                 self.conversation_picker
                                     .as_mut()
@@ -5991,6 +6033,7 @@ impl State {
                     && self.menu.is_none()
                     && self.conversation_picker.is_none()
                     && self.artifacts_picker.is_none()
+                    && self.ticks_panel.is_none()
                     && self.permissions_surface.is_none())
             && self.transcript.is_none()
             && self.diff_screen.is_none()
@@ -6369,6 +6412,7 @@ impl State {
             || self.footer.selected().is_some()
             || self.help_open
             || self.permissions_surface.is_some()
+            || self.ticks_panel.is_some()
             || (self.artifacts_picker.is_some() || self.conversation_picker.is_some())
                 && !self.dialog_cursor_visible
             || self.conversation_focused
@@ -9686,7 +9730,7 @@ impl State {
         self.screen_initialized = false;
         self.rendered_region = None;
         match restored {
-            Err(error) => self.status = format!("Cannot restore terminal after attach: {error}"),
+            Err(error) => self.status = format!("Cannot restore the terminal: {error}"),
             Ok(()) => {
                 if let Some(failure) = failure {
                     self.hold_status(failure);
@@ -10347,6 +10391,24 @@ impl State {
                     }
                     None
                 }
+            };
+        }
+        if self.menu.is_none()
+            && let Some(panel) = &mut self.ticks_panel
+        {
+            return match panel.key(key) {
+                super::ticks_panel::TicksPanelEffect::None => None,
+                super::ticks_panel::TicksPanelEffect::Close => {
+                    self.ticks_panel = None;
+                    self.rendered_region = None;
+                    None
+                }
+                super::ticks_panel::TicksPanelEffect::Work(request) => Some(
+                    InputEvent::TickPackages(super::ticks_panel::TickPackageWork {
+                        panel: panel.id(),
+                        request,
+                    }),
+                ),
             };
         }
         if self.menu.is_none() && self.conversation_picker.is_some() {

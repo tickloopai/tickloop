@@ -60,6 +60,51 @@ pub async fn config(
     } else {
         region.unwrap_or(Region::Global)
     };
+    let endpoints = endpoints(region);
+    // Set explicitly, so neither the SDK's LONGBRIDGE_* variables nor a `.env` file it loads
+    // decide where the access token goes.
+    Ok(Arc::new(
+        Config::from_oauth(oauth)
+            .http_url(endpoints.http)
+            .quote_ws_url(endpoints.quote)
+            .trade_ws_url(endpoints.trade)
+            .language(match language {
+                Language::ZhCn => longbridge::Language::ZH_CN,
+                Language::En => longbridge::Language::EN,
+            })
+            .push_candlestick_mode(longbridge::PushCandlestickMode::Realtime)
+            .dont_print_quote_packages(),
+    ))
+}
+
+/// Longbridge's OpenAPI: its HTTP base and its quote and trade WebSockets.
+pub(crate) struct Endpoints {
+    pub http: String,
+    pub quote: String,
+    pub trade: String,
+}
+
+/// `host:port` of a local stand-in for Longbridge that a debug build's tests connect to instead;
+/// release builds, which users install, have no such override.
+#[cfg(debug_assertions)]
+const TEST_ENDPOINT_ENV: &str = "TICKLOOP_LONGBRIDGE_TEST_ENDPOINT";
+
+/// Read on first use, which comes before any SDK configuration and so before the SDK can load a
+/// `.env` file into the environment.
+#[cfg(debug_assertions)]
+static TEST_ENDPOINT: std::sync::LazyLock<Option<String>> =
+    std::sync::LazyLock::new(|| std::env::var(TEST_ENDPOINT_ENV).ok());
+
+/// Longbridge's own endpoints for `region`.
+pub(crate) fn endpoints(region: Region) -> Endpoints {
+    #[cfg(debug_assertions)]
+    if let Some(address) = TEST_ENDPOINT.as_deref() {
+        return Endpoints {
+            http: format!("http://{address}"),
+            quote: format!("ws://{address}/v2"),
+            trade: format!("ws://{address}/v2"),
+        };
+    }
     let (http, quote, trade) = match region {
         Region::Cn => (
             "https://openapi.longbridge.cn",
@@ -72,18 +117,11 @@ pub async fn config(
             "wss://openapi-trade.longbridge.com/v2",
         ),
     };
-    Ok(Arc::new(
-        Config::from_oauth(oauth)
-            .http_url(http)
-            .quote_ws_url(quote)
-            .trade_ws_url(trade)
-            .language(match language {
-                Language::ZhCn => longbridge::Language::ZH_CN,
-                Language::En => longbridge::Language::EN,
-            })
-            .push_candlestick_mode(longbridge::PushCandlestickMode::Realtime)
-            .dont_print_quote_packages(),
-    ))
+    Endpoints {
+        http: http.into(),
+        quote: quote.into(),
+        trade: trade.into(),
+    }
 }
 
 type CandleSubscriptions = std::collections::BTreeMap<(String, CandlePeriod), Arc<CandleRequest>>;
@@ -121,12 +159,9 @@ impl SdkQuoteApi {
         } else {
             region.unwrap_or(Region::Global)
         };
-        let base = match region {
-            Region::Cn => "https://openapi.longbridge.cn",
-            Region::Global => "https://openapi.longbridge.com",
-        };
-        let signed_http = HttpClient::new(HttpClientConfig::from_oauth(oauth).http_url(base))
-            .header("accept-language", language.as_str());
+        let signed_http =
+            HttpClient::new(HttpClientConfig::from_oauth(oauth).http_url(endpoints(region).http))
+                .header("accept-language", language.as_str());
         let market_context = longbridge::MarketContext::new(config.clone());
         let fundamental_context = longbridge::FundamentalContext::new(config.clone());
         let calendar_context = longbridge::CalendarContext::new(config.clone());
@@ -152,6 +187,10 @@ pub fn sdk_error(error: longbridge::Error) -> Error {
         || matches!(&error, longbridge::Error::OAuth(_))
     {
         not_authorized("authorization expired or revoked")
+    } else if error.openapi_error_code().is_some()
+        || matches!(&error, longbridge::Error::InvalidSecuritySymbol { .. })
+    {
+        Error::rejected(error.to_string())
     } else {
         Error::network(error.to_string())
     }

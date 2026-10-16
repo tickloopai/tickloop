@@ -1,4 +1,5 @@
-//! OSC 8 hyperlinks, after Claude Code `utils/hyperlink.ts` and `ink/supports-hyperlinks.ts`.
+//! OSC 8 hyperlinks, after Claude Code `utils/hyperlink.ts`; which terminals show them is the
+//! shared rule in `tickloop_ui::hyperlink`.
 //!
 //! A link is a span attribute like its style: the text stays free of escape
 //! sequences, and the writer wraps the span in OSC 8 only when it reaches the
@@ -9,21 +10,10 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
-const OSC8_START: &str = "\x1b]8;;";
-/// BEL rather than ST, as Claude Code does: more terminals accept it.
-const OSC8_END: &str = "\x07";
-const FILE_URL_SCHEME: &str = "file://";
+pub(super) use tickloop_ui::hyperlink::supported;
+use tickloop_ui::hyperlink::{OSC8_END, OSC8_START};
 
-/// Terminals that `supports-hyperlinks` misses; Claude Code checks them against both
-/// `TERM_PROGRAM` and `LC_TERMINAL`, which survives inside tmux.
-const ADDITIONAL_HYPERLINK_TERMINALS: [&str; 6] = [
-    "ghostty",
-    "Hyper",
-    "kitty",
-    "alacritty",
-    "iTerm.app",
-    "iTerm2",
-];
+const FILE_URL_SCHEME: &str = "file://";
 
 /// A link target. Only `file://` URLs are built, with every byte outside the
 /// unreserved set percent-encoded, so the target can never carry a control
@@ -104,105 +94,9 @@ pub(super) fn runs<'a>(
     runs
 }
 
-/// Whether the terminal described by `variable` shows OSC 8 links: Claude Code
-/// `supportsHyperlinks`, the `supports-hyperlinks` rules for an interactive stdout
-/// followed by the terminals that library misses.
-pub(super) fn supported(variable: impl Fn(&str) -> Option<String>) -> bool {
-    let set = |name: &str| variable(name).filter(|value| !value.is_empty());
-    library_supports_links(&set)
-        || ["TERM_PROGRAM", "LC_TERMINAL"].into_iter().any(|name| {
-            set(name)
-                .is_some_and(|terminal| ADDITIONAL_HYPERLINK_TERMINALS.contains(&terminal.as_str()))
-        })
-        || set("TERM").is_some_and(|term| term.contains("kitty"))
-}
-
-/// `supports-hyperlinks` 3.2 for a terminal stdout on a Unix platform; `set` only
-/// returns non-empty values, matching the library's truthiness checks.
-fn library_supports_links(set: &impl Fn(&str) -> Option<String>) -> bool {
-    if let Some(forced) = set("FORCE_HYPERLINK") {
-        return leading_integer(&forced) != Some(0);
-    }
-    if set("NETLIFY").is_some() {
-        return true;
-    }
-    if colour_is_disabled(set) {
-        return false;
-    }
-    if set("WT_SESSION").is_some() {
-        return true;
-    }
-    if set("CI").is_some() || set("TEAMCITY_VERSION").is_some() {
-        return false;
-    }
-    if let Some(program) = set("TERM_PROGRAM") {
-        let (major, minor) = parse_version(set("TERM_PROGRAM_VERSION").as_deref().unwrap_or(""));
-        match program.as_str() {
-            "iTerm.app" => return major > 3 || (major == 3 && minor >= 1),
-            "WezTerm" => return major >= 20200620,
-            "vscode" => return major > 1 || (major == 1 && minor >= 72),
-            "ghostty" => return true,
-            _ => {}
-        }
-    }
-    if let Some(version) = set("VTE_VERSION") {
-        // 0.50.0 was meant to support links but crashes on them.
-        if version == "0.50.0" {
-            return false;
-        }
-        let (major, minor) = parse_version(&version);
-        return major > 0 || minor >= 50;
-    }
-    set("TERM").as_deref() == Some("alacritty")
-}
-
-/// `supports-color`'s refusals that apply to a terminal: `FORCE_COLOR=0` or `false`,
-/// and `TERM=dumb` unless colour is forced on.
-fn colour_is_disabled(set: &impl Fn(&str) -> Option<String>) -> bool {
-    match set("FORCE_COLOR").as_deref() {
-        Some("false") => true,
-        Some("true") => false,
-        Some(forced) => leading_integer(forced) == Some(0),
-        None => set("TERM").as_deref() == Some("dumb"),
-    }
-}
-
-/// JavaScript `parseInt(value, 10)` for the non-negative values these variables hold.
-fn leading_integer(value: &str) -> Option<u64> {
-    value
-        .trim_start()
-        .split(|character: char| !character.is_ascii_digit())
-        .next()
-        .and_then(|digits| digits.parse().ok())
-}
-
-/// `supports-hyperlinks` `parseVersion`: `"3.1.2"` is 3.1, and VTE's dotless `"5002"` is 0.50.
-fn parse_version(version: &str) -> (u64, u64) {
-    if (3..=4).contains(&version.len()) && version.bytes().all(|byte| byte.is_ascii_digit()) {
-        return (0, leading_integer(version).unwrap_or(0) / 100);
-    }
-    let mut parts = version
-        .split('.')
-        .map(|part| leading_integer(part).unwrap_or(0));
-    (parts.next().unwrap_or(0), parts.next().unwrap_or(0))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn environment(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let pairs = pairs
-            .iter()
-            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-            .collect::<Vec<_>>();
-        move |name| {
-            pairs
-                .iter()
-                .find(|(candidate, _)| candidate == name)
-                .map(|(_, value)| value.clone())
-        }
-    }
 
     #[test]
     fn file_urls_percent_encode_everything_outside_the_unreserved_set() {
@@ -226,60 +120,5 @@ mod tests {
             format!("{}[Image #1]{}", link.open(), Hyperlink::close()),
             "\x1b]8;;file:///cache/1.png\x07[Image #1]\x1b]8;;\x07"
         );
-    }
-
-    #[test]
-    fn terminals_that_show_links_are_detected_like_claude_code() {
-        for supported_terminal in [
-            &[
-                ("TERM_PROGRAM", "iTerm.app"),
-                ("TERM_PROGRAM_VERSION", "3.5.0"),
-            ][..],
-            &[
-                ("TERM_PROGRAM", "WezTerm"),
-                ("TERM_PROGRAM_VERSION", "20240203"),
-            ],
-            &[
-                ("TERM_PROGRAM", "vscode"),
-                ("TERM_PROGRAM_VERSION", "1.90.0"),
-            ],
-            &[("TERM_PROGRAM", "ghostty")],
-            &[("VTE_VERSION", "7600")],
-            &[("TERM", "alacritty")],
-            &[("TERM", "xterm-kitty")],
-            &[("TERM_PROGRAM", "tmux"), ("LC_TERMINAL", "iTerm2")],
-            &[("WT_SESSION", "1")],
-            &[("CI", "1"), ("TERM_PROGRAM", "kitty")],
-            &[("FORCE_HYPERLINK", "1")],
-            &[("FORCE_HYPERLINK", ""), ("TERM_PROGRAM", "ghostty")],
-        ] {
-            assert!(
-                supported(environment(supported_terminal)),
-                "{supported_terminal:?}"
-            );
-        }
-        for plain_terminal in [
-            &[][..],
-            &[("TERM_PROGRAM", "Apple_Terminal")],
-            &[
-                ("TERM_PROGRAM", "vscode"),
-                ("TERM_PROGRAM_VERSION", "1.71.0"),
-            ],
-            &[("VTE_VERSION", "0.50.0")],
-            &[("VTE_VERSION", "4901")],
-            &[("CI", "1"), ("TERM_PROGRAM", "WezTerm")],
-            &[("FORCE_HYPERLINK", "0"), ("TERM_PROGRAM", "WezTerm")],
-            &[
-                ("FORCE_COLOR", "0"),
-                ("TERM_PROGRAM", "vscode"),
-                ("TERM_PROGRAM_VERSION", "1.90.0"),
-            ],
-            &[("TERM", "dumb"), ("WT_SESSION", "1")],
-        ] {
-            assert!(
-                !supported(environment(plain_terminal)),
-                "{plain_terminal:?}"
-            );
-        }
     }
 }

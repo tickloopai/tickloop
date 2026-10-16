@@ -74,12 +74,18 @@ impl DeviceLogin {
         &self.device.user_code
     }
 
+    /// The verification page with the user code filled in when Longbridge offers one.
     pub fn verification_uri(&self) -> &str {
         self.device
             .verification_uri_complete
             .as_deref()
             .filter(|uri| !uri.is_empty())
             .unwrap_or(&self.device.verification_uri)
+    }
+
+    /// The verification page where the user enters the user code.
+    pub fn plain_verification_uri(&self) -> &str {
+        &self.device.verification_uri
     }
 
     pub fn expires_in(&self) -> u64 {

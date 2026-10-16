@@ -12,7 +12,7 @@ use time::{
     format_description::well_known::{Rfc2822, Rfc3339},
 };
 
-use crate::{not_authorized, rate_limit::RateLimiter};
+use crate::{not_authorized, rate_limit::RateLimiter, sdk::endpoints};
 use tick_provider::{
     error::{Error, Result},
     news::{NewsApi, NewsArticle, NewsItem},
@@ -48,12 +48,9 @@ impl SdkNewsApi {
         } else {
             region.unwrap_or(Region::Global)
         };
-        let base = match region {
-            Region::Cn => "https://openapi.longbridge.cn",
-            Region::Global => "https://openapi.longbridge.com",
-        };
-        let signed_http = HttpClient::new(HttpClientConfig::from_oauth(oauth).http_url(base))
-            .header("accept-language", language.as_str());
+        let signed_http =
+            HttpClient::new(HttpClientConfig::from_oauth(oauth).http_url(endpoints(region).http))
+                .header("accept-language", language.as_str());
         let public_http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .user_agent(concat!("tickloop-ticks/", env!("CARGO_PKG_VERSION")))

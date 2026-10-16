@@ -152,6 +152,8 @@ mod task_notification_runs;
 mod temp_storage;
 #[path = "all/tick_adapters.rs"]
 mod tick_adapters;
+#[path = "all/tick_package_logins.rs"]
+mod tick_package_logins;
 #[path = "all/tick_package_opens.rs"]
 mod tick_package_opens;
 #[path = "all/tick_subscriptions.rs"]

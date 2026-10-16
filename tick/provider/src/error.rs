@@ -6,29 +6,39 @@ use crate::exit_code;
 pub struct Error {
     pub code: u8,
     pub message: String,
+    /// The source answered and turned the request down, such as an unknown symbol or a missing
+    /// permission: asking again unchanged gets the same answer.
+    pub rejected: bool,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
-    pub fn usage(message: impl Into<String>) -> Self {
+    pub fn new(code: u8, message: impl Into<String>) -> Self {
         Self {
-            code: exit_code::USAGE,
+            code,
             message: message.into(),
+            rejected: false,
         }
+    }
+
+    pub fn usage(message: impl Into<String>) -> Self {
+        Self::new(exit_code::USAGE, message)
     }
 
     pub fn auth(message: impl Into<String>) -> Self {
-        Self {
-            code: exit_code::NOT_AUTHORIZED,
-            message: message.into(),
-        }
+        Self::new(exit_code::NOT_AUTHORIZED, message)
     }
 
     pub fn network(message: impl Into<String>) -> Self {
+        Self::new(exit_code::NETWORK, message)
+    }
+
+    /// A request the source turned down; it exits like any other API error.
+    pub fn rejected(message: impl Into<String>) -> Self {
         Self {
-            code: exit_code::NETWORK,
-            message: message.into(),
+            rejected: true,
+            ..Self::network(message)
         }
     }
 }

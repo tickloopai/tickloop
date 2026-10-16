@@ -141,7 +141,8 @@ pub struct HostedTickTools {
     bindings: Mutex<HashMap<(ChatId, InstanceRef), DataBinding>>,
     /// The Herdr Panes that show Ticks, for a worker in a Herdr View.
     views: Option<HerdrViews>,
-    /// The Tick packages installed in the worker's config root, whose programs an open finds.
+    /// The Tick packages installed in the worker's config root, whose programs an open finds and
+    /// whose login states each model request sees.
     packages: Option<PackageStore>,
 }
 
@@ -160,7 +161,7 @@ impl HostedTickTools {
     }
 
     /// The same tools, which also open the programs of the Tick packages installed in
-    /// `packages`.
+    /// `packages` and report their login states.
     pub fn with_tick_packages(mut self, packages: PackageStore) -> Self {
         self.packages = Some(packages);
         self

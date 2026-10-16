@@ -1,10 +1,12 @@
 //! Tick packages: the `tick-package.json` manifest every package carries, the
-//! `marketplace.json` of a Tick marketplace, and the packages installed under a Tickloop config
-//! root, in its `ticks/` directory with the `installed.json` registry.
+//! `marketplace.json` of a Tick marketplace, the packages installed under a Tickloop config
+//! root, in its `ticks/` directory with the `installed.json` registry, and the data source
+//! credentials Tickloop keeps for them in its `credentials/` directory.
 //!
 //! Installing only places files: nothing in a package runs, no Tick opens and no access is
 //! granted.
 
+mod credentials;
 mod manifest;
 mod marketplace;
 mod registry;
@@ -20,7 +22,13 @@ use std::{
 
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-pub use manifest::{MANIFEST_FILE_NAME, PackageManifest, validate_package_name};
+pub use credentials::{
+    API_KEY_FILE_NAME, ApiKey, CREDENTIALS_DIRECTORY, LockedOAuth, LoginState,
+    OAUTH_LOCK_FILE_NAME, OAUTH_TOKEN_FILE_NAME, OAuthToken, PackageCredentials,
+};
+pub use manifest::{
+    MANIFEST_FILE_NAME, OAuthIssuer, PackageAuth, PackageManifest, validate_package_name,
+};
 pub use marketplace::{
     CURRENT_TARGET, DEFAULT_MARKETPLACE_URL, InvalidMarketplace, MARKETPLACE_ENVIRONMENT_VARIABLE,
     Marketplace, MarketplaceOwner, MarketplacePackage, PackageDownload,
@@ -157,26 +165,42 @@ impl Write for DownloadFile {
 pub struct Uninstalled {
     pub name: String,
     pub version: String,
-    /// Where the package's program keeps its data source credentials, which stay.
-    pub credentials: Option<String>,
+    /// The directory of the package's data source credentials, which stay, when there is one.
+    pub credentials: Option<PathBuf>,
 }
 
-/// The Tick packages installed under one Tickloop config root. Installs and uninstalls hold a
-/// lock on the directory; a failed one leaves the previous package and the registry as they were.
+/// The Tick packages installed under one Tickloop config root, and the credentials kept for
+/// them there. Installs and uninstalls hold a lock on the directory; a failed one leaves the
+/// previous package and the registry as they were.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageStore {
+    config_root: PathBuf,
     directory: PathBuf,
 }
 
 impl PackageStore {
     pub fn in_config_root(config_root: &Path) -> Self {
         Self {
+            config_root: config_root.to_path_buf(),
             directory: config_root.join(PACKAGES_DIRECTORY),
         }
     }
 
     pub fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    /// Where the credentials of the package `name` are kept, whether or not it is installed.
+    pub fn credentials(&self, name: &str) -> Result<PackageCredentials, PackageError> {
+        PackageCredentials::in_config_root(&self.config_root, name)
+    }
+
+    /// The login state of `package`, from its saved credentials alone.
+    pub fn login_state(&self, package: &InstalledPackage) -> LoginState {
+        match self.credentials(&package.manifest.name) {
+            Ok(credentials) => credentials.login_state(&package.manifest.auth),
+            Err(_) => LoginState::Unknown,
+        }
     }
 
     /// Lists the registered packages, setting apart those whose files are missing or no longer
@@ -295,8 +319,7 @@ impl PackageStore {
         Ok(DownloadFile(file))
     }
 
-    /// Removes the package and its registration. Data its program keeps elsewhere, such as
-    /// data source credentials, stays.
+    /// Removes the package and its registration. Its data source credentials stay.
     pub fn uninstall(&self, name: &str) -> Result<Uninstalled, PackageError> {
         validate_package_name(name)?;
         if !self.directory.exists() {
@@ -310,10 +333,6 @@ impl PackageStore {
             .remove(name)
             .ok_or_else(|| PackageError::NotInstalled(name.to_owned()))?;
         let target = self.directory.join(name);
-        let credentials = fs::read(target.join(MANIFEST_FILE_NAME))
-            .ok()
-            .and_then(|bytes| PackageManifest::parse(&bytes).ok())
-            .and_then(|manifest| manifest.credentials);
         let staging = self.staging()?;
         let displaced = staging.path().join(DISPLACED_PACKAGE);
         let had_files = move_aside(&target, &displaced)?;
@@ -323,10 +342,11 @@ impl PackageStore {
             }
             return Err(error);
         }
+        let credentials = self.credentials(name)?.directory().to_path_buf();
         Ok(Uninstalled {
             name: name.to_owned(),
             version: entry.version,
-            credentials,
+            credentials: credentials.exists().then_some(credentials),
         })
     }
 

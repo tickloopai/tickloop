@@ -29,8 +29,10 @@ tickloop-agent-base = { path = "../base" }
 tickloop-agent-client = { path = "../client" }
 tickloop-agent-config = { path = "../config" }
 tickloop-agent-model = { path = "../model" }
+tickloop-agent-packages = { path = "../packages" }
 tickloop-agent-protocol = { path = "../protocol" }
 tickloop-agent-tools = { path = "../tools" }
+tickloop-tick-packages = { path = "../../tick/packages" }
 tickloop-tick-protocol = { path = "../../tick/protocol" }
 tickloop-tickhost-connect = { path = "../../tickhost/connect" }
 tickloop-ui = { path = "../../ui", features = ["code-highlight"] }

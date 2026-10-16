@@ -1,5 +1,7 @@
 use std::{fs, path::PathBuf, process::Command};
 
+use tick_longbridge::AUTH_HINT;
+
 const UTF8_LOCALE: &str = "en_US.UTF-8";
 const TICKS: [&str; 7] = [
     "quote",
@@ -75,7 +77,7 @@ fn help_lists_every_tick_and_the_login_with_examples_and_exit_codes() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("3  not authorized; run `tick-longbridge auth`"),
+        stdout.contains(&format!("3  not authorized; {AUTH_HINT}")),
         "{stdout}"
     );
     assert!(stdout.contains("4  network or API error"), "{stdout}");
@@ -113,7 +115,7 @@ fn ticks_of_other_programs_and_removed_commands_are_unknown() {
             stderr.contains("unrecognized subcommand"),
             "{command:?}: {stderr}"
         );
-        assert!(!stderr.contains("tick-longbridge auth"), "{stderr}");
+        assert!(!stderr.contains(AUTH_HINT), "{stderr}");
     }
 }
 
@@ -218,7 +220,7 @@ fn market_commands_without_authorization_explain_how_to_log_in() {
         assert_eq!(code, 3, "{command}: {stderr}");
         assert!(stdout.is_empty(), "{stdout}");
         assert!(stderr.starts_with("tick-longbridge: "), "{stderr}");
-        assert!(stderr.contains("run `tick-longbridge auth`"), "{stderr}");
+        assert!(stderr.contains(AUTH_HINT), "{stderr}");
     }
 }
 
@@ -234,7 +236,7 @@ fn hidden_fundamentals_probe_is_noninteractive_and_exits_three_without_authoriza
     ]));
     assert_eq!(code, 3, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("tick-longbridge auth"), "{stderr}");
+    assert!(stderr.contains(AUTH_HINT), "{stderr}");
     assert!(!report.exists(), "an unauthorized probe writes no report");
 
     let (code, stdout, _) = run(tick_longbridge().arg("--help"));
@@ -254,7 +256,7 @@ fn auth_status_and_logout_work_without_a_login_or_region_prompt() {
     let (code, stdout, stderr) = run(tick_longbridge().args(["auth", "status"]));
     assert_eq!(code, 0, "{stderr}");
     assert!(
-        stdout.contains("Not logged in. Run `tick-longbridge auth`."),
+        stdout.contains(&format!("Not logged in; {AUTH_HINT}.")),
         "{stdout}"
     );
     assert!(stdout.contains("Region: not configured"), "{stdout}");
@@ -267,6 +269,125 @@ fn auth_status_and_logout_work_without_a_login_or_region_prompt() {
 }
 
 #[test]
+fn auth_status_json_reads_the_stored_login_alone() {
+    let token = |expires_at: u64, refresh_token: Option<&str>| {
+        serde_json::json!({
+            "client_id": "test",
+            "access_token": "ap_fixture",
+            "refresh_token": refresh_token,
+            "expires_at": expires_at,
+            "logged_in_at": 1,
+        })
+        .to_string()
+    };
+    let cases = [
+        ("auth-json-missing", None, r#"{"state":"logged_out"}"#),
+        (
+            "auth-json-authorized",
+            Some(AUTHORIZED_TOKEN.to_owned()),
+            r#"{"state":"logged_in"}"#,
+        ),
+        (
+            "auth-json-renewable",
+            Some(token(1, Some("ap_refresh"))),
+            r#"{"detail":"the access token is renewed when a Tick opens","state":"logged_in"}"#,
+        ),
+        (
+            "auth-json-expired",
+            Some(token(1, None)),
+            r#"{"detail":"expired at 1970-01-01T00:00:01Z","state":"expired"}"#,
+        ),
+        (
+            "auth-json-unreadable",
+            Some("{".to_owned()),
+            r#"{"detail":"the saved login cannot be read; log in again","state":"logged_out"}"#,
+        ),
+    ];
+    for (name, saved, expected) in cases {
+        let home = scratch_dir(name);
+        let token_path = home.join(".tickloop/longbridge/auth.json");
+        if let Some(saved) = &saved {
+            fs::create_dir_all(token_path.parent().unwrap()).unwrap();
+            fs::write(&token_path, saved).unwrap();
+        }
+        // Without a UTF-8 locale or a readable configuration, as Tickloop may run it.
+        let (code, stdout, stderr) = run(tick_longbridge()
+            .env("HOME", &home)
+            .env("LANG", "C")
+            .args(["auth", "status", "--json", "--config"])
+            .arg(home.join("missing.toml")));
+        assert_eq!(code, 0, "{name}: {stderr}");
+        assert_eq!(stdout, format!("{expected}\n"), "{name}");
+        assert!(stderr.is_empty(), "{name}: {stderr}");
+        assert_eq!(
+            fs::read_to_string(&token_path).ok(),
+            saved,
+            "{name}: the status refreshes nothing"
+        );
+    }
+}
+
+#[test]
+fn auth_status_text_agrees_with_the_json_state() {
+    let token = |expires_at: u64, refresh_token: Option<&str>| {
+        serde_json::json!({
+            "client_id": "test",
+            "access_token": "ap_fixture",
+            "refresh_token": refresh_token,
+            "expires_at": expires_at,
+            "logged_in_at": 1,
+        })
+        .to_string()
+    };
+    let cases = [
+        (
+            "auth-text-authorized",
+            AUTHORIZED_TOKEN.to_owned(),
+            "Logged in\nExpires: 2100-01-01T00:00:00Z\n",
+            "logged_in",
+        ),
+        (
+            "auth-text-renewable",
+            token(1, Some("ap_refresh")),
+            "Logged in; the access token is renewed when a Tick opens\n\
+             Access token expired: 1970-01-01T00:00:01Z\n",
+            "logged_in",
+        ),
+        (
+            "auth-text-expired",
+            token(1, None),
+            "Authorization expired; log in with `tickloop tick login longbridge`, or with /ticks in \
+             the Agent.\nExpires: 1970-01-01T00:00:01Z\n",
+            "expired",
+        ),
+    ];
+    for (name, saved, expected, state) in cases {
+        let home = scratch_dir(name);
+        let token_path = home.join(".tickloop/longbridge/auth.json");
+        fs::create_dir_all(token_path.parent().unwrap()).unwrap();
+        fs::write(&token_path, &saved).unwrap();
+        let (code, stdout, stderr) = run(tick_longbridge()
+            .env("HOME", &home)
+            .args(["auth", "status"]));
+        assert_eq!(code, 0, "{name}: {stderr}");
+        assert_eq!(
+            stdout,
+            format!("{expected}Region: not configured\n"),
+            "{name}"
+        );
+        let (code, stdout, stderr) = run(tick_longbridge()
+            .env("HOME", &home)
+            .args(["auth", "status", "--json"]));
+        assert_eq!(code, 0, "{name}: {stderr}");
+        assert!(
+            stdout.contains(&format!(r#""state":"{state}""#)),
+            "{name}: {stdout}"
+        );
+        assert_eq!(fs::read_to_string(&token_path).unwrap(), saved, "{name}");
+    }
+}
+
+#[test]
 fn hidden_auth_check_uses_exit_status_for_noninteractive_callers() {
     let missing_home = scratch_dir("auth-check-missing");
     let (code, stdout, stderr) = run(tick_longbridge()
@@ -274,7 +395,7 @@ fn hidden_auth_check_uses_exit_status_for_noninteractive_callers() {
         .args(["auth", "check"]));
     assert_eq!(code, 3, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("tick-longbridge auth"), "{stderr}");
+    assert!(stderr.contains(AUTH_HINT), "{stderr}");
 
     let (code, stdout, stderr) = run(tick_longbridge()
         .env("HOME", authorized_home("auth-check-authorized"))
@@ -294,7 +415,7 @@ fn quote_once_json_without_auth_emits_no_snapshot_and_exits_three() {
         run(tick_longbridge().args(["quote", "TSLA", "700", "--once", "--format", "json"]));
     assert_eq!(code, 3, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("tick-longbridge auth"), "{stderr}");
+    assert!(stderr.contains(AUTH_HINT), "{stderr}");
 }
 
 #[test]
@@ -334,7 +455,7 @@ fn a_tick_instance_without_authorization_exits_three_before_speaking_the_protoco
         .args(["kline", "700.HK"]));
     assert_eq!(code, 3, "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
-    assert!(stderr.contains("run `tick-longbridge auth`"), "{stderr}");
+    assert!(stderr.contains(AUTH_HINT), "{stderr}");
 }
 
 #[test]

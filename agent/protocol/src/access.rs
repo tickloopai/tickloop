@@ -671,8 +671,9 @@ pub struct TickhostOccupancy {
     pub shells: usize,
     /// Ticks and Shells it is starting, which stopping it ends before they run.
     pub pending: usize,
-    /// Its other connections, such as attached views.
-    pub connections: usize,
+    /// The views attached to its Ticks and Shells, which stopping it closes; `None` from a
+    /// Tickhost too old to say.
+    pub views: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

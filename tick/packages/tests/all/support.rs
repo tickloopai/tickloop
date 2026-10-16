@@ -27,6 +27,10 @@ impl Fixture {
         self.directory.path().canonicalize().unwrap()
     }
 
+    pub fn config_root(&self) -> PathBuf {
+        self.directory.path().join("config")
+    }
+
     /// A valid package directory with a program, a Skill and the given manifest.
     pub fn package_with(&self, label: &str, manifest: &Value) -> PathBuf {
         let directory = self.root().join("sources").join(label);

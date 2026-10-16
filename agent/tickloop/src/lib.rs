@@ -1,6 +1,5 @@
 //! The process entries the `tickloop` executable dispatches before it starts the Console.
 
-mod marketplace;
 mod package_command;
 
 use std::ffi::OsString;
