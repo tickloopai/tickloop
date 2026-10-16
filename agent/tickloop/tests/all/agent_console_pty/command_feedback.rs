@@ -123,7 +123,7 @@ async fn run_new_agent_command_feedback(fixture: &PrivateFixture, command: Local
             FIRST_REPLY
         ]
     ));
-    assert_eq!(completed.matches("Tickloop v0.2.0").count(), 1);
+    assert_eq!(completed.matches(STARTUP_BANNER_TITLE).count(), 1);
     let completed_snapshot = wait_snapshot(
         &client,
         rows[0].execution,
@@ -142,7 +142,7 @@ async fn run_new_agent_command_feedback(fixture: &PrivateFixture, command: Local
         .await;
     assert!(body_shows_once_in_order(
         &draft,
-        &["Tickloop v0.2.0", "deepseek-flash · ChatCompletions"]
+        &[STARTUP_BANNER_TITLE, "deepseek-flash · ChatCompletions"]
     ));
     assert!(!conversation_body(&draft).contains(command.input()));
     assert!(!conversation_body(&draft).contains(command.result_prefix()));
@@ -184,7 +184,7 @@ async fn run_new_agent_command_feedback(fixture: &PrivateFixture, command: Local
             FIRST_REPLY
         ]
     ));
-    assert_eq!(returned.matches("Tickloop v0.2.0").count(), 1);
+    assert_eq!(returned.matches(STARTUP_BANNER_TITLE).count(), 1);
     assert!(!conversation_body(&returned).contains(OTHER_OUTPUT));
     eprintln!("[command-feedback after cached Agent return]\n{returned}\n[/command-feedback]");
     assert!(
@@ -317,7 +317,7 @@ async fn run_background_event_reset(fixture: &PrivateFixture) {
     eprintln!(
         "[command-feedback after real background event reset]\n{returned}\n[/command-feedback]"
     );
-    assert_eq!(returned.matches("Tickloop v0.2.0").count(), 1);
+    assert_eq!(returned.matches(STARTUP_BANNER_TITLE).count(), 1);
     assert!(
         body_shows_once_in_order(
             &returned,

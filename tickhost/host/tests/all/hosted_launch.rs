@@ -765,7 +765,15 @@ async fn closing_an_exited_terminal_tick_ends_what_its_program_left_running() {
         gone(background).await,
         "closing the Tick ends its program's process group"
     );
-    shutdown(&fixture).await;
+    tokio::time::timeout(Duration::from_secs(5), fixture.server)
+        .await
+        .expect("the host exits once its last Tick ended")
+        .unwrap()
+        .unwrap();
+    assert!(
+        !fixture.paths.socket().exists(),
+        "the emptied host removes its endpoint"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

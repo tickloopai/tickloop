@@ -23,6 +23,8 @@ use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
 
 mod agent_layout;
+mod file_index_worker;
+use file_index_worker::{FileIndexWorker, IndexRequest};
 #[cfg(test)]
 #[path = "console/connection_tests.rs"]
 mod connection_tests;
@@ -733,6 +735,8 @@ pub(super) struct State {
     pointer_input: Option<InputEvent>,
     completion: Completion,
     file_mentions: FileMentionState,
+    file_index_worker: Option<Arc<FileIndexWorker>>,
+    file_index_focused: bool,
     input_owner: Uuid,
     editor: Editor,
     editor_cache: HashMap<Option<Uuid>, ChatInput>,
@@ -2464,36 +2468,17 @@ impl Console {
         project: PathBuf,
         additional_directories: Vec<PathBuf>,
     ) -> Result<(), String> {
-        let (generation, owner) = {
-            let mut state = self.state.lock().map_err(|error| error.to_string())?;
-            (
-                state.file_mentions.request_index_generation(),
-                state.input_owner,
-            )
-        };
-        let state = Arc::clone(&self.state);
-        let stop = Arc::clone(&self._lifetime.stop);
-        thread::Builder::new()
-            .name("agent-file-index".into())
-            .spawn(move || {
-                let Ok(index) = FileMentionIndex::build(&project, &additional_directories) else {
-                    return;
-                };
-                if stop.load(Ordering::Acquire) {
-                    return;
-                }
-                let Ok(mut state) = state.lock() else {
-                    return;
-                };
-                if state.replace_file_index(owner, generation, index) {
-                    let draft = state.editor.draft().to_owned();
-                    let cursor = state.editor.cursor();
-                    state.file_mentions.update_at(&draft, cursor, 15);
-                    let _ = state.draw(&mut io::stdout().lock());
-                }
-            })
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.file_index_worker.is_none() {
+            state.file_index_worker = Some(
+                FileIndexWorker::start(Arc::downgrade(&self.state), self._lifetime.stop.clone())
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        state.mention_roots = Some((project, additional_directories));
+        state.file_mentions.clear_indexes();
+        state.refresh_completion();
+        Ok(())
     }
 
     pub fn select_chat(&self, chat: Option<Uuid>) -> Result<(), String> {
@@ -4693,6 +4678,9 @@ impl Drop for Lifetime {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.lock() {
             state.clear_prompt_suggestion();
+            if let Some(worker) = &state.file_index_worker {
+                worker.close();
+            }
         }
         self.stop.store(true, Ordering::Release);
         if let Ok(reader) = self.reader.get_mut()
@@ -5092,6 +5080,7 @@ impl State {
     }
 
     fn focus_lost(&mut self) {
+        self.file_index_focused = false;
         self.back_to_bottom_pressed = false;
         self.shell_background_chord_started_at = None;
         self.clear_footer_selection();
@@ -5099,6 +5088,7 @@ impl State {
     }
 
     fn focus_gained(&mut self, now: Instant) {
+        self.file_index_focused = true;
         if self.workspace_trust.is_some() {
             return;
         }
@@ -5404,6 +5394,8 @@ impl State {
             pointer_input: None,
             completion: Completion::default(),
             file_mentions: FileMentionState::default(),
+            file_index_worker: None,
+            file_index_focused: true,
             input_owner: Uuid::new_v4(),
             editor: Editor::new(),
             editor_cache: HashMap::new(),
@@ -6015,6 +6007,7 @@ impl State {
     }
 
     fn draw(&mut self, output: &mut impl Write) -> io::Result<()> {
+        self.schedule_file_index();
         if !self.interactive || self.terminal_lent {
             return Ok(());
         }
@@ -8559,6 +8552,47 @@ impl State {
         true
     }
 
+    fn schedule_file_index(&mut self) {
+        let Some(worker) = self.file_index_worker.clone() else {
+            return;
+        };
+        let input_visible = self.interactive
+            && self.file_index_focused
+            && self.prompt_enabled
+            && !self.terminal_lent
+            && self.workspace_trust.is_none()
+            && self.menu.is_none()
+            && self.conversation_picker.is_none()
+            && self.transcript.is_none()
+            && self.diff_screen.is_none()
+            && self.permissions_surface.is_none()
+            && self.history_search.is_none()
+            && !self.help_open
+            && !self.foreground_shell
+            && !self.review_focused
+            && self.footer.selected().is_none()
+            && self.shell_input.kind() == InputKind::Prompt
+            && (self.overview.projection.is_none() || self.overview.input_focused);
+        let directory = input_visible
+            .then(|| self.file_mentions.requested_directory())
+            .flatten();
+        let request = directory.and_then(|directory| {
+            let (project, additional) = self.mention_roots.clone()?;
+            let generation = self.file_mentions.request_directory(directory.clone())?;
+            Some(IndexRequest {
+                owner: self.input_owner,
+                generation,
+                project,
+                additional,
+                directory,
+            })
+        });
+        if request.is_none() {
+            self.file_mentions.cancel_index_request();
+        }
+        worker.request(request);
+    }
+
     fn refresh_completion(&mut self) {
         self.restored_contexts
             .retain(|context| draft_keeps_context(self.editor.draft(), context));
@@ -8599,6 +8633,7 @@ impl State {
             self.completion.dismiss();
             self.file_mentions.dismiss();
         }
+        self.schedule_file_index();
     }
 
     /// 进入 `!` 模式时载入，之后按 Claude Code 的 60 秒 TTL 复用；离开 `!` 模式（含提交）
@@ -9767,6 +9802,7 @@ impl State {
     /// taken back, while Agent events keep updating the state.
     fn lend_terminal(&mut self) -> io::Result<()> {
         self.terminal_lent = true;
+        self.schedule_file_index();
         let mut output = io::stdout().lock();
         self.surface
             .release(self.renderer, &mut output)

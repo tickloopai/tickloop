@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::ops::Range;
@@ -98,9 +99,19 @@ pub(super) enum FileMentionAction {
     ReplaceDraft { draft: String, cursor: usize },
 }
 
+const CACHED_DIRECTORY_LIMIT: usize = 16;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum MentionDirectory {
+    Roots,
+    Path(PathBuf),
+}
+
 #[derive(Debug, Default)]
 pub(super) struct FileMentionState {
     index: Option<FileMentionIndex>,
+    cached_indexes: VecDeque<FileMentionIndex>,
+    requested_directory: Option<MentionDirectory>,
     family_targets: Vec<FamilyMentionTarget>,
     accepted_family: Vec<AcceptedFamilyMention>,
     next_generation: u64,
@@ -116,6 +127,7 @@ pub(super) struct FileMentionState {
 
 #[derive(Clone, Debug)]
 pub(super) struct FileMentionIndex {
+    directory: MentionDirectory,
     allowed_roots: Vec<PathBuf>,
     entries: Vec<IndexedEntry>,
 }
@@ -130,8 +142,8 @@ struct IndexedEntry {
 
 #[derive(Clone, Debug)]
 struct IgnoreRule {
-    base: PathBuf,
-    pattern: String,
+    base_prefix: String,
+    pattern: Vec<char>,
     directory_only: bool,
     negated: bool,
     anchored: bool,
@@ -151,6 +163,61 @@ impl FileMentionState {
             self.family_targets = targets;
             self.refresh_completion();
         }
+    }
+
+    pub(super) fn clear_indexes(&mut self) {
+        self.cached_indexes.clear();
+        self.index = None;
+        self.cancel_index_request();
+        self.refresh_completion();
+    }
+
+    pub(super) fn cancel_index_request(&mut self) {
+        self.requested_generation = None;
+        self.requested_directory = None;
+    }
+
+    pub(super) fn requested_directory(&self) -> Option<MentionDirectory> {
+        if self.query_canceled {
+            return None;
+        }
+        MentionDirectory::for_query(&self.draft, self.cursor)
+    }
+
+    pub(super) fn request_directory(
+        &mut self,
+        directory: MentionDirectory,
+    ) -> Option<IndexGeneration> {
+        if self
+            .index
+            .as_ref()
+            .is_some_and(|index| index.directory == directory)
+        {
+            return None;
+        }
+        if self.requested_directory.as_ref() == Some(&directory) {
+            return self.requested_generation;
+        }
+        if let Some(index) = self.index.take() {
+            self.cached_indexes.push_back(index);
+            while self.cached_indexes.len() > CACHED_DIRECTORY_LIMIT {
+                self.cached_indexes.pop_front();
+            }
+        }
+        if let Some(position) = self
+            .cached_indexes
+            .iter()
+            .position(|index| index.directory == directory)
+        {
+            self.index = self.cached_indexes.remove(position);
+            self.cancel_index_request();
+            self.refresh_completion();
+            return None;
+        }
+        let generation = self.request_index_generation();
+        self.requested_directory = Some(directory);
+        self.refresh_completion();
+        Some(generation)
     }
 
     pub(super) fn request_index_generation(&mut self) -> IndexGeneration {
@@ -305,12 +372,16 @@ impl FileMentionState {
         if self.accepted.is_empty() {
             return Ok(Vec::new());
         }
-        let index = self.index.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotConnected,
-                "file mention index is not available",
-            )
-        })?;
+        let index = self
+            .index
+            .as_ref()
+            .or_else(|| self.cached_indexes.back())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "file mention index is not available",
+                )
+            })?;
 
         self.accepted
             .iter()
@@ -579,37 +650,127 @@ fn sync_accepted_range(
             .is_some_and(|token| token.start == range.start && token.end == range.end)
 }
 
+impl MentionDirectory {
+    pub(super) fn for_query(draft: &str, cursor: usize) -> Option<Self> {
+        let token = mention_token(draft, cursor)?;
+        let query = unescape_path_token(&draft[token.start + 1..token.cursor]);
+        let Some((parent, _)) = query.rsplit_once('/') else {
+            return Some(Self::Roots);
+        };
+        if query.starts_with('/') {
+            Some(Self::Path(PathBuf::from(if parent.is_empty() {
+                "/"
+            } else {
+                parent
+            })))
+        } else if parent == "." {
+            Some(Self::Roots)
+        } else {
+            Some(Self::Path(PathBuf::from(parent)))
+        }
+    }
+}
+
 impl FileMentionIndex {
+    #[cfg(test)]
     pub(super) fn build(
         working_directory: &Path,
         additional_directories: &[PathBuf],
     ) -> io::Result<Self> {
+        Self::build_directory(
+            working_directory,
+            additional_directories,
+            MentionDirectory::Roots,
+            &|| false,
+        )
+    }
+
+    pub(super) fn build_directory(
+        working_directory: &Path,
+        additional_directories: &[PathBuf],
+        directory: MentionDirectory,
+        canceled: &dyn Fn() -> bool,
+    ) -> io::Result<Self> {
+        check_scan_canceled(canceled)?;
         let working_directory = working_directory.canonicalize()?;
         let mut allowed_roots = vec![working_directory.clone()];
-
         for directory in additional_directories {
+            check_scan_canceled(canceled)?;
             let canonical = directory.canonicalize()?;
             if !allowed_roots.contains(&canonical) {
                 allowed_roots.push(canonical);
             }
         }
-
         let mut entries = Vec::new();
-        for (root_index, root) in allowed_roots.iter().enumerate() {
+        let directories = match &directory {
+            MentionDirectory::Roots => allowed_roots.clone(),
+            MentionDirectory::Path(path) => vec![if path.is_absolute() {
+                path.clone()
+            } else {
+                working_directory.join(path)
+            }],
+        };
+        for selected in directories {
+            check_scan_canceled(canceled)?;
+            let canonical = selected.canonicalize()?;
+            let Some((root_index, root)) = allowed_roots
+                .iter()
+                .enumerate()
+                .find(|(_, root)| canonical.starts_with(root))
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "file mention directory is outside the allowed roots",
+                ));
+            };
+            if canonical
+                .strip_prefix(root)
+                .unwrap()
+                .components()
+                .any(|component| component.as_os_str() == ".git")
+            {
+                return Ok(Self {
+                    directory,
+                    allowed_roots,
+                    entries,
+                });
+            }
+            let mut rules = Vec::new();
+            let mut ancestor = root.clone();
+            for component in selected
+                .strip_prefix(root)
+                .unwrap_or_else(|_| canonical.strip_prefix(root).unwrap())
+                .components()
+            {
+                check_scan_canceled(canceled)?;
+                rules.extend(read_ignore_rules(
+                    &ancestor,
+                    ancestor.strip_prefix(root).unwrap(),
+                )?);
+                ancestor.push(component);
+                if is_ignored(ancestor.strip_prefix(root).unwrap(), true, &rules) {
+                    return Ok(Self {
+                        directory,
+                        allowed_roots,
+                        entries,
+                    });
+                }
+            }
             scan_directory(
                 root,
-                root,
+                &selected,
                 root_index == 0,
                 &allowed_roots,
-                &[],
+                &rules,
                 &mut entries,
+                canceled,
             )?;
         }
-
+        check_scan_canceled(canceled)?;
         entries.sort_by(|left, right| left.absolute_path.cmp(&right.absolute_path));
         entries.dedup_by(|left, right| left.canonical_path == right.canonical_path);
-
         Ok(Self {
+            directory,
             allowed_roots,
             entries,
         })
@@ -621,6 +782,9 @@ impl FileMentionIndex {
         cursor: usize,
         limit: usize,
     ) -> Option<FileMentionCompletion> {
+        if MentionDirectory::for_query(draft, cursor).as_ref() != Some(&self.directory) {
+            return None;
+        }
         let token = mention_token(draft, cursor)?;
         let query = unescape_path_token(&draft[token.start + 1..token.cursor]);
         let uses_absolute_path = query.starts_with('/');
@@ -641,8 +805,22 @@ impl FileMentionIndex {
                 } else {
                     entry.relative_path.as_deref()?
                 };
-                fuzzy_score(indexed_path, &query_for_matching)
-                    .map(|score| (score, entry, indexed_path))
+                let (candidate, query) = if self.directory == MentionDirectory::Roots {
+                    (indexed_path, query_for_matching.as_str())
+                } else {
+                    (
+                        indexed_path
+                            .trim_end_matches('/')
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(indexed_path),
+                        query_for_matching
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&query_for_matching),
+                    )
+                };
+                fuzzy_score(candidate, query).map(|score| (score, entry, indexed_path))
             })
             .collect::<Vec<_>>();
 
@@ -864,15 +1042,22 @@ fn scan_directory(
     allowed_roots: &[PathBuf],
     inherited_rules: &[IgnoreRule],
     entries: &mut Vec<IndexedEntry>,
+    canceled: &dyn Fn() -> bool,
 ) -> io::Result<()> {
+    check_scan_canceled(canceled)?;
     let relative_directory = directory.strip_prefix(root).unwrap_or(Path::new(""));
     let mut rules = inherited_rules.to_vec();
     rules.extend(read_ignore_rules(directory, relative_directory)?);
 
-    let mut children = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+    let mut children = Vec::new();
+    for child in fs::read_dir(directory)? {
+        check_scan_canceled(canceled)?;
+        children.push(child?);
+    }
     children.sort_by_key(fs::DirEntry::file_name);
 
     for child in children {
+        check_scan_canceled(canceled)?;
         let file_name = child.file_name();
         if file_name == ".git" {
             continue;
@@ -929,20 +1114,20 @@ fn scan_directory(
             canonical_path,
             kind,
         });
-
-        if kind == MentionKind::Directory && !child.file_type()?.is_symlink() {
-            scan_directory(
-                root,
-                &path,
-                exposes_relative_paths,
-                allowed_roots,
-                &rules,
-                entries,
-            )?;
-        }
     }
 
     Ok(())
+}
+
+fn check_scan_canceled(canceled: &dyn Fn() -> bool) -> io::Result<()> {
+    if canceled() {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "file mention scan canceled",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn read_ignore_rules(directory: &Path, base: &Path) -> io::Result<Vec<IgnoreRule>> {
@@ -985,9 +1170,14 @@ fn parse_ignore_rule(base: &Path, line: &str) -> Option<IgnoreRule> {
         return None;
     }
 
+    let base = normalize_path(base);
     Some(IgnoreRule {
-        base: base.to_owned(),
-        pattern,
+        base_prefix: if base.is_empty() {
+            base
+        } else {
+            format!("{base}/")
+        },
+        pattern: pattern.chars().collect(),
         directory_only,
         negated,
         anchored,
@@ -995,8 +1185,9 @@ fn parse_ignore_rule(base: &Path, line: &str) -> Option<IgnoreRule> {
 }
 
 fn is_ignored(relative_path: &Path, is_directory: bool, rules: &[IgnoreRule]) -> bool {
+    let path = normalize_path(relative_path);
     rules.iter().fold(false, |ignored, rule| {
-        if rule.matches(relative_path, is_directory) {
+        if rule.matches(&path, is_directory) {
             !rule.negated
         } else {
             ignored
@@ -1005,20 +1196,18 @@ fn is_ignored(relative_path: &Path, is_directory: bool, rules: &[IgnoreRule]) ->
 }
 
 impl IgnoreRule {
-    fn matches(&self, relative_path: &Path, is_directory: bool) -> bool {
-        let Ok(path_from_base) = relative_path.strip_prefix(&self.base) else {
+    fn matches(&self, relative_path: &str, is_directory: bool) -> bool {
+        let Some(path) = relative_path.strip_prefix(&self.base_prefix) else {
             return false;
         };
-        let path = normalize_path(path_from_base);
         if path.is_empty() {
             return false;
         }
 
-        if self.pattern.contains('/') || self.anchored {
-            return glob_matches(&self.pattern, &path)
+        if self.pattern.contains(&'/') || self.anchored {
+            return glob_matches(&self.pattern, path)
                 || (self.directory_only
-                    && directory_prefixes(&path)
-                        .any(|prefix| glob_matches(&self.pattern, prefix)));
+                    && directory_prefixes(path).any(|prefix| glob_matches(&self.pattern, prefix)));
         }
 
         path.split('/').enumerate().any(|(index, component)| {
@@ -1034,40 +1223,46 @@ fn directory_prefixes(path: &str) -> impl Iterator<Item = &str> {
     path.match_indices('/').map(|(index, _)| &path[..index])
 }
 
-fn glob_matches(pattern: &str, candidate: &str) -> bool {
-    let pattern = pattern.chars().collect::<Vec<_>>();
+fn glob_matches(pattern: &[char], candidate: &str) -> bool {
+    if !pattern
+        .iter()
+        .any(|character| matches!(character, '*' | '?'))
+    {
+        return candidate.chars().eq(pattern.iter().copied());
+    }
     let candidate = candidate.chars().collect::<Vec<_>>();
-    let mut reachable = vec![vec![false; candidate.len() + 1]; pattern.len() + 1];
-    reachable[0][0] = true;
-
-    for pattern_index in 0..pattern.len() {
+    let mut reachable = vec![false; candidate.len() + 1];
+    let mut next = vec![false; candidate.len() + 1];
+    reachable[0] = true;
+    for (pattern_index, character) in pattern.iter().enumerate() {
+        next.fill(false);
         for candidate_index in 0..=candidate.len() {
-            if !reachable[pattern_index][candidate_index] {
+            if !reachable[candidate_index] {
                 continue;
             }
-            match pattern[pattern_index] {
+            match character {
                 '*' => {
-                    reachable[pattern_index + 1][candidate_index] = true;
+                    next[candidate_index] = true;
                     let crosses_directories = pattern.get(pattern_index + 1) == Some(&'*')
                         || pattern.get(pattern_index.wrapping_sub(1)) == Some(&'*');
                     if candidate_index < candidate.len()
                         && (crosses_directories || candidate[candidate_index] != '/')
                     {
-                        reachable[pattern_index][candidate_index + 1] = true;
+                        reachable[candidate_index + 1] = true;
                     }
                 }
                 '?' if candidate_index < candidate.len() && candidate[candidate_index] != '/' => {
-                    reachable[pattern_index + 1][candidate_index + 1] = true;
+                    next[candidate_index + 1] = true
                 }
-                literal if candidate.get(candidate_index) == Some(&literal) => {
-                    reachable[pattern_index + 1][candidate_index + 1] = true;
+                literal if candidate.get(candidate_index) == Some(literal) => {
+                    next[candidate_index + 1] = true
                 }
                 _ => {}
             }
         }
+        std::mem::swap(&mut reachable, &mut next);
     }
-
-    reachable[pattern.len()][candidate.len()]
+    reachable[candidate.len()]
 }
 
 fn fuzzy_score(candidate: &str, query: &str) -> Option<FuzzyScore> {
@@ -1224,6 +1419,16 @@ mod tests {
 
         fn index(&self) -> FileMentionIndex {
             FileMentionIndex::build(&self.root, &[]).unwrap()
+        }
+
+        fn index_for(&self, query: &str) -> FileMentionIndex {
+            FileMentionIndex::build_directory(
+                &self.root,
+                &[],
+                MentionDirectory::for_query(query, query.len()).unwrap(),
+                &|| false,
+            )
+            .unwrap()
         }
     }
 
@@ -1426,7 +1631,17 @@ mod tests {
         fixture.directory("docs/design");
         let index = fixture.index();
 
-        let completion = index.complete("inspect @fm", 11, 8).unwrap();
+        assert!(
+            index
+                .complete("inspect @fm", 11, 8)
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+        let nested = fixture.index_for("@src/terminal/fm");
+        let completion = nested
+            .complete("@src/terminal/fm", "@src/terminal/fm".len(), 8)
+            .unwrap();
 
         assert_eq!(completion.candidates.len(), 1);
         assert_eq!(
@@ -1456,8 +1671,8 @@ mod tests {
     fn applies_only_the_token_around_the_cursor() {
         let fixture = Fixture::new();
         fixture.file("src/model.rs");
-        let index = fixture.index();
-        let draft = "先看 @szz 后看 @modxx 再决定";
+        let index = fixture.index_for("@src/mod");
+        let draft = "先看 @szz 后看 @src/modxx 再决定";
         let cursor = draft.find("mod").unwrap() + "mod".len();
         let completion = index.complete(draft, cursor, 8).unwrap();
 
@@ -1475,10 +1690,10 @@ mod tests {
     fn ignores_email_addresses_and_handles_utf8_cursor_positions() {
         let fixture = Fixture::new();
         fixture.file("资料/模型说明.md");
-        let index = fixture.index();
+        let index = fixture.index_for("@资料/模");
 
         assert!(index.complete("name@example.com", 10, 8).is_none());
-        let draft = "检查 @模 后续";
+        let draft = "检查 @资料/模 后续";
         let cursor = draft.find('模').unwrap() + '模'.len_utf8();
         let completion = index.complete(draft, cursor, 8).unwrap();
         assert_eq!(completion.candidates[0].display_path, "资料/模型说明.md");
@@ -1488,9 +1703,10 @@ mod tests {
     fn escapes_spaces_and_can_complete_the_escaped_token_again() {
         let fixture = Fixture::new();
         fixture.file("notes/design review.md");
-        let index = fixture.index();
-        let completion = index.complete("read @review", 12, 8).unwrap();
-        let applied = completion.apply("read @review", 0).unwrap();
+        let index = fixture.index_for("@notes/review");
+        let draft = "read @notes/review";
+        let completion = index.complete(draft, draft.len(), 8).unwrap();
+        let applied = completion.apply(draft, 0).unwrap();
 
         assert_eq!(applied.draft, "read @notes/design\\ review.md");
         let refreshed = index.complete(&applied.draft, applied.cursor, 8).unwrap();
@@ -1523,7 +1739,18 @@ mod tests {
             .map(|candidate| candidate.display_path.as_str())
             .collect::<Vec<_>>();
         assert!(paths.contains(&"visible.txt"));
-        assert!(paths.contains(&"nested/public.txt"));
+        assert!(paths.contains(&"nested/"));
+        assert!(!paths.contains(&"nested/public.txt"));
+        let nested = fixture.index_for("@nested/");
+        let nested_paths = nested
+            .complete("@nested/", 8, 100)
+            .unwrap()
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display_path)
+            .collect::<Vec<_>>();
+        assert!(nested_paths.iter().any(|path| path == "nested/public.txt"));
+        assert!(!nested_paths.iter().any(|path| path == "nested/secret.txt"));
         assert!(!paths.contains(&"ignored.log"));
         assert!(!paths.contains(&"build/"));
         assert!(!paths.contains(&"nested/secret.txt"));
@@ -1534,9 +1761,9 @@ mod tests {
         let fixture = Fixture::new();
         fixture.directory("src");
         fixture.file("src/lib.rs");
-        let index = fixture.index();
         let prefix = normalize_path(&fixture.root.join("sr"));
         let draft = format!("open @{prefix}");
+        let index = fixture.index_for(&draft);
         let completion = index.complete(&draft, draft.len(), 8).unwrap();
 
         assert!(completion.candidates.iter().any(|candidate| {
@@ -1594,11 +1821,11 @@ mod tests {
     fn rejects_stale_completion_and_revalidates_selection() {
         let fixture = Fixture::new();
         fixture.file("src/lib.rs");
-        let index = fixture.index();
-        let completion = index.complete("@lib", 4, 8).unwrap();
-        assert!(completion.apply("@libs", 0).is_none());
+        let index = fixture.index_for("@src/lib");
+        let completion = index.complete("@src/lib", 8, 8).unwrap();
+        assert!(completion.apply("@src/libs", 0).is_none());
 
-        let applied = completion.apply("@lib", 0).unwrap();
+        let applied = completion.apply("@src/lib", 0).unwrap();
         assert_eq!(index.revalidate(&applied).unwrap(), applied.path);
         fs::remove_file(&applied.path).unwrap();
         assert_eq!(
@@ -1623,6 +1850,13 @@ mod tests {
                 .is_empty()
         );
         let absolute_query = format!("@{}", normalize_path(&additional.root.join("sha")));
+        let index = FileMentionIndex::build_directory(
+            &fixture.root,
+            std::slice::from_ref(&additional.root),
+            MentionDirectory::for_query(&absolute_query, absolute_query.len()).unwrap(),
+            &|| false,
+        )
+        .unwrap();
         assert!(
             index
                 .complete(&absolute_query, absolute_query.len(), 8)
@@ -1889,6 +2123,139 @@ mod tests {
                 .revalidate_all_for_submission("plain @unaccepted text")
                 .unwrap(),
             Vec::new()
+        );
+    }
+    #[test]
+    fn root_and_selected_directories_are_indexed_one_level_at_a_time() {
+        let fixture = Fixture::new();
+        fixture.file("src/lib.rs");
+        fixture.file("src/deep/hidden.rs");
+        fs::write(fixture.root.join("src/deep/.gitignore"), [0xff]).unwrap();
+        let root = fixture.index();
+        assert!(
+            root.complete("@hidden", 7, 10)
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+        let nested = fixture.index_for("@src/");
+        let paths = nested
+            .complete("@src/", 5, 100)
+            .unwrap()
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.display_path)
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"src/lib.rs".into()));
+        assert!(paths.contains(&"src/deep/".into()));
+        assert!(!paths.contains(&"src/deep/hidden.rs".into()));
+    }
+
+    #[test]
+    fn selected_directories_keep_ignore_and_authorized_root_boundaries() {
+        let fixture = Fixture::new();
+        let outside = Fixture::new();
+        fixture.file("blocked/hidden.txt");
+        fixture.file(".git/config");
+        fs::write(fixture.root.join(".gitignore"), "blocked/\n").unwrap();
+        assert!(
+            fixture
+                .index_for("@blocked/")
+                .complete("@blocked/", 9, 10)
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+        assert!(
+            fixture
+                .index_for("@.git/")
+                .complete("@.git/", 6, 10)
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+        assert_eq!(
+            FileMentionIndex::build_directory(
+                &fixture.root,
+                &[],
+                MentionDirectory::Path(outside.root.clone()),
+                &|| false
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn directory_scans_stop_before_io_and_during_directory_enumeration_when_canceled() {
+        assert_eq!(
+            FileMentionIndex::build_directory(
+                Path::new("/does-not-exist"),
+                &[],
+                MentionDirectory::Roots,
+                &|| true
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::Interrupted
+        );
+        let fixture = Fixture::new();
+        for index in 0..40 {
+            fixture.file(&format!("file-{index}.txt"));
+        }
+        let checks = std::cell::Cell::new(0);
+        let canceled = || {
+            checks.set(checks.get() + 1);
+            checks.get() > 12
+        };
+        assert_eq!(
+            FileMentionIndex::build_directory(
+                &fixture.root,
+                &[],
+                MentionDirectory::Roots,
+                &canceled
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(checks.get(), 13);
+    }
+
+    #[test]
+    fn returning_to_a_visited_directory_uses_its_cache_and_canceling_allows_a_new_request() {
+        let fixture = Fixture::new();
+        fixture.file("root.txt");
+        fixture.file("src/lib.rs");
+        let mut state = FileMentionState::with_index(fixture.index());
+        state.update_at("@src/", 5, 10);
+        let scope = state.requested_directory().unwrap();
+        let generation = state.request_directory(scope.clone()).unwrap();
+        state.cancel_index_request();
+        let replacement = state.request_directory(scope).unwrap();
+        assert_ne!(generation, replacement);
+        assert_eq!(
+            state.replace_index(generation, fixture.index_for("@src/")),
+            IndexReplacement::Stale
+        );
+        assert_eq!(
+            state.replace_index(replacement, fixture.index_for("@src/")),
+            IndexReplacement::Replaced
+        );
+        assert!(
+            state
+                .candidates()
+                .iter()
+                .any(|candidate| candidate.display_path == "src/lib.rs")
+        );
+        state.update_at("@root", 5, 10);
+        assert!(state.request_directory(MentionDirectory::Roots).is_none());
+        assert!(
+            state
+                .candidates()
+                .iter()
+                .any(|candidate| candidate.display_path == "root.txt")
         );
     }
 }

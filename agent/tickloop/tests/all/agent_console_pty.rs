@@ -44,6 +44,7 @@ use tickloop_agent_protocol::{
 };
 use tickloop_agent_test_support::screen;
 
+const STARTUP_BANNER_TITLE: &str = concat!("Tickloop v", env!("CARGO_PKG_VERSION"));
 const TERMINAL_WIDTH: usize = 100;
 const TERMINAL_HEIGHT: usize = 32;
 const UI_TIMEOUT: Duration = Duration::from_secs(10);
@@ -486,7 +487,7 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
         first.send(return_key);
         first
             .wait_for("current draft returns without creating an Agent", |frame| {
-                frame.contains("Tickloop v0.2.0") && !frame.contains("Agents · local")
+                frame.contains(STARTUP_BANNER_TITLE) && !frame.contains("Agents · local")
             })
             .await;
         assert!(catalog(&client).await.is_empty());
@@ -3695,7 +3696,7 @@ async fn run_sent_message_echo(fixture: &PrivateFixture, prompts: [&str; 2], gat
     let banner_model = format!("{} · {:?}", model.model, model.protocol);
     let banner_directory = fixture.path("work").to_string_lossy().into_owned();
     let assert_startup_banner = |frame: &str| {
-        assert!(frame.contains("Tickloop v0.2.0"), "{frame}");
+        assert!(frame.contains(STARTUP_BANNER_TITLE), "{frame}");
         assert!(frame.contains(&banner_model), "{frame}");
         assert!(frame.contains(&banner_directory), "{frame}");
     };
