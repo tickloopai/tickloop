@@ -516,11 +516,18 @@ async fn clarification_process_fixture() {
     let agent = Agent::open_embedded(
         directory.join("archive"),
         config(),
-        Arc::new(ScriptedModel::new(vec![call(
-            "clarify",
-            ASK_USER_QUESTION_TOOL_NAME,
-            single_question("Which report should I shorten?"),
-        )])),
+        Arc::new(ScriptedModel::new(vec![
+            call(
+                "clarify",
+                ASK_USER_QUESTION_TOOL_NAME,
+                single_question("Which report should I shorten?"),
+            ),
+            call(
+                "after-answer",
+                ASK_USER_QUESTION_TOOL_NAME,
+                single_question("Which report should I open next?"),
+            ),
+        ])),
     )
     .unwrap();
     let chat = agent.create_chat(directory.clone()).await.unwrap();
@@ -532,20 +539,23 @@ async fn clarification_process_fixture() {
     loop {
         match next_event(&mut events).await.kind {
             EventKind::QuestionAsked { request } => {
-                std::fs::write(
-                    directory.join("question.json"),
-                    serde_json::to_vec(&request).unwrap(),
-                )
-                .unwrap();
-                if std::env::var("TICKLOOP_INTERACTION_ANSWERED").as_deref() == Ok("yes") {
-                    agent
-                        .answer_question(
-                            chat,
-                            request.id,
-                            vec![QuestionAnswer::other("Weekly, preserve the totals.")],
-                        )
-                        .await
-                        .unwrap();
+                if request.call_id == "clarify" {
+                    std::fs::write(
+                        directory.join("question.json"),
+                        serde_json::to_vec(&request).unwrap(),
+                    )
+                    .unwrap();
+                    if std::env::var("TICKLOOP_INTERACTION_ANSWERED").as_deref() == Ok("yes") {
+                        agent
+                            .answer_question(
+                                chat,
+                                request.id,
+                                vec![QuestionAnswer::other("Weekly, preserve the totals.")],
+                            )
+                            .await
+                            .unwrap();
+                        continue;
+                    }
                 }
                 agent.flush_transcripts().await;
                 std::process::exit(0);
@@ -601,12 +611,33 @@ async fn a_question_expires_across_processes_and_manual_resume_drops_the_unanswe
                 .await
                 .is_err()
         );
-        // 照 Claude Code：没有工具结果的 tool_use 在恢复时从对话中过滤；操作记录不随 Chat 保存。
-        assert!(
-            !serde_json::to_string(&snapshot.conversation_messages().unwrap())
-                .unwrap()
-                .contains("clarify")
+        let conversation = snapshot.conversation_messages().unwrap();
+        assert_eq!(
+            conversation
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| { matches!(block, Content::ToolUse { id, .. } if id == "clarify") }),
+            answered
         );
+        let recorded_answer = conversation
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|block| match block {
+                Content::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if tool_use_id == "clarify" => {
+                    assert!(!is_error);
+                    Some(content.text())
+                }
+                _ => None,
+            });
+        assert_eq!(recorded_answer.as_deref(), answered.then_some("User has answered your questions: \"Which report should I shorten?\"=\"Weekly, preserve the totals.\". You can now continue with the user's answers in mind."));
+        assert!(!conversation.iter().flat_map(|message| &message.content).any(|block| {
+            matches!(block, Content::ToolUse { id, .. } if id == "after-answer")
+                || matches!(block, Content::ToolResult { tool_use_id, .. } if tool_use_id == "after-answer")
+        }));
         assert!(snapshot.operations.is_empty());
         let mut events = agent.subscribe();
         agent

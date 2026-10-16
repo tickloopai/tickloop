@@ -537,7 +537,12 @@ impl Agent {
             .operations
             .len();
         let outcome = self
-            .execute_registered_call_inner(receipt, assistant_message_id, invocation, cancel)
+            .execute_registered_call_inner(
+                receipt,
+                assistant_message_id,
+                invocation,
+                cancel.clone(),
+            )
             .await;
         let command_state = if is_shell {
             self.command_state_for_call(receipt, &call_id).await
@@ -559,6 +564,18 @@ impl Agent {
             use crate::host_tools::HostCallStatus;
             use tickloop_agent_protocol::CommandState;
 
+            if outcome.is_err()
+                && cancel.is_cancelled()
+                && operation.state == OperationState::Proposed
+            {
+                chat.snapshot.tool_call_recoveries.push(
+                    tickloop_agent_protocol::ToolCallRecovery {
+                        run_id: Some(receipt.run_id),
+                        call_id: call_id.clone(),
+                        was_admitted: Some(false),
+                    },
+                );
+            }
             let (result, state) = match &outcome {
                 Ok(outcome) => {
                     let state = match (outcome.host_call_status, command_state) {

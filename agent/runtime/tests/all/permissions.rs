@@ -2332,6 +2332,52 @@ async fn an_allow_comment_reaches_the_model_after_the_tool_result_without_adding
 }
 
 #[tokio::test]
+async fn interrupting_a_pending_permission_preserves_its_unadmitted_recovery_fact() {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new_embedded(
+        config(),
+        Arc::new(ScriptedModel::new(vec![call(
+            "write",
+            "Write",
+            json!({"file_path":"blocked.txt","content":"blocked"}),
+        )])),
+    );
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    require_workspace_write_approval(&agent, chat).await;
+    let mut events = agent.subscribe();
+    let receipt = agent.submit(chat, None, "Create it".into()).await.unwrap();
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::PermissionRequested { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    agent.interrupt(chat).await.unwrap();
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::Interrupted => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(!directory.path().join("blocked.txt").exists());
+    assert_eq!(snapshot.operations.len(), 1);
+    assert_eq!(
+        snapshot.operations[0].state,
+        tickloop_agent_protocol::OperationState::Failed
+    );
+    assert!(snapshot.operations[0].result.is_some());
+    assert!(snapshot.tool_call_recoveries.iter().any(|fact| {
+        fact.run_id == Some(receipt.run_id)
+            && fact.call_id == "write"
+            && fact.was_admitted == Some(false)
+    }));
+    agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn an_allow_comment_still_reaches_the_model_after_a_failed_tool_result() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
@@ -2378,6 +2424,14 @@ async fn an_allow_comment_still_reaches_the_model_after_a_failed_tool_result() {
         })
     };
     assert!(failed_result_precedes_comment);
+    assert!(
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .tool_call_recoveries
+            .is_empty()
+    );
     agent.shutdown().await;
 }
 
@@ -2437,6 +2491,7 @@ async fn a_deny_comment_explains_the_rejection_and_continues_but_empty_denial_st
         let snapshot = agent.snapshot(chat).await.unwrap();
         assert_eq!(snapshot.policy.rules.len(), 1);
         assert_eq!(snapshot.policy.rules[0].decision, Decision::Ask);
+        assert!(snapshot.tool_call_recoveries.is_empty());
         if !continues {
             assert_eq!(snapshot.loops[0].state, LoopState::Interrupted);
             assert!(
