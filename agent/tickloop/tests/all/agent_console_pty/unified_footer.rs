@@ -42,7 +42,7 @@ async fn run_shared_task_list(fixture: &PrivateFixture) {
     let client = fixture.client().await;
     pty.send(b"Inspect with a helper.\r");
     pty.wait_for("shared Task summary appears", |frame| {
-        frame.contains("Tasks") && frame.contains("0/1 completed")
+        frame.contains("1 tasks (0 done, 1 open)")
     })
     .await;
     let root = catalog(&client)
@@ -66,7 +66,9 @@ async fn run_shared_task_list(fixture: &PrivateFixture) {
     pty.send(b"\x14");
     pty.wait_for("Task list expands with owner and state", |frame| {
         frame.contains(TASK_TITLE)
-            && frame.contains("pending")
+            && !frame
+                .lines()
+                .any(|line| line.contains(TASK_TITLE) && line.contains("pending"))
             && !frame.contains("unassigned")
             && frame.contains("Enter details")
     })
@@ -93,7 +95,9 @@ async fn run_shared_task_list(fixture: &PrivateFixture) {
     .await;
     releases.remove(0).send(()).unwrap();
     pty.wait_for("shared Task persists while idle", |frame| {
-        frame.contains(TASK_REPLY) && frame.contains("0/1 completed") && frame.contains(TASK_DRAFT)
+        frame.contains(TASK_REPLY)
+            && frame.contains("1 tasks (0 done, 1 open)")
+            && frame.contains(TASK_DRAFT)
     })
     .await;
     let mut captured = Vec::new();
@@ -136,7 +140,7 @@ async fn run_shared_task_list(fixture: &PrivateFixture) {
     resumed
         .wait_for(
             "shared Task survives history load without model execution",
-            |frame| frame.contains("History opened.") && frame.contains("0/1 completed"),
+            |frame| frame.contains("History opened.") && frame.contains("1 tasks (0 done, 1 open)"),
         )
         .await;
     assert!(requests.try_recv().is_err());

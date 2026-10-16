@@ -104,9 +104,11 @@ async fn exercise_task_tools_setting(fixture: &PrivateFixture) {
     pty.send(b"Create a task and delegate its review.\r");
     pty.wait_for("shared task appears in the compact list", |frame| {
         frame.contains("ENABLED-ROOT-DONE")
-            && frame.split_once("Tasks ·").is_some_and(|(_, tasks)| {
-                tasks.contains("TASK-SAVED-WHEN-HIDDEN") && tasks.contains("Ctrl+T expand")
-            })
+            && frame
+                .split_once("1 tasks (0 done, 1 open)")
+                .is_some_and(|(_, tasks)| {
+                    tasks.contains("TASK-SAVED-WHEN-HIDDEN") && tasks.contains("Ctrl+T expand")
+                })
     })
     .await;
     for _ in 0..4 {
@@ -141,20 +143,20 @@ async fn exercise_task_tools_setting(fixture: &PrivateFixture) {
     child_view.resize(100, 50).await;
     child_view
         .wait_for("child View shares the task panel", |frame| {
-            frame.contains("TASK-SAVED-WHEN-HIDDEN") && frame.contains("Tasks ·")
+            frame.contains("TASK-SAVED-WHEN-HIDDEN") && frame.contains("1 tasks (0 done, 1 open)")
         })
         .await;
     toggle_task_tools(&mut pty, false).await;
     assert!(requests.try_recv().is_err());
     pty.wait_for(
         "disabling tools immediately hides the task panel",
-        |frame| !frame.contains("Tasks ·"),
+        |frame| !frame.contains("1 tasks (0 done, 1 open)"),
     )
     .await;
     child_view
         .wait_for(
             "idle child View hides tasks after the setting changes",
-            |frame| !frame.contains("Tasks ·"),
+            |frame| !frame.contains("1 tasks (0 done, 1 open)"),
         )
         .await;
     let saved: Value =
@@ -200,13 +202,13 @@ async fn exercise_task_tools_setting(fixture: &PrivateFixture) {
     assert!(requests.try_recv().is_err());
     pty.wait_for("reenabling tools restores the same task panel", |frame| {
         frame
-            .split_once("Tasks ·")
+            .split_once("1 tasks (0 done, 1 open)")
             .is_some_and(|(_, tasks)| tasks.contains("TASK-SAVED-WHEN-HIDDEN"))
     })
     .await;
     child_view
         .wait_for("idle child View restores tasks after reenabling", |frame| {
-            frame.contains("Tasks ·") && frame.contains("TASK-SAVED-WHEN-HIDDEN")
+            frame.contains("1 tasks (0 done, 1 open)") && frame.contains("TASK-SAVED-WHEN-HIDDEN")
         })
         .await;
     child_view.close().await;

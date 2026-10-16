@@ -1601,7 +1601,7 @@ impl AgentAccess for EmbeddedAgentAccess {
                         ),
                         workdir: summary.workdir,
                         run_id: super::summary::summary_run_id(&summary.loops, &state),
-                        run_started_at: super::summary::run_started_at(&summary.loops),
+                        run_started_at: super::summary::run_started_at(&summary.loops, &state),
                         state,
                         title: summary.title,
                         subagent: registration,

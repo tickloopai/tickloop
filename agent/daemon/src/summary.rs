@@ -23,7 +23,10 @@ pub(crate) fn updated_at(loops: &[LoopSnapshot], user_shells: &[UserShellRecord]
         .max()
 }
 
-pub(crate) fn run_started_at(loops: &[LoopSnapshot]) -> Option<u64> {
+pub(crate) fn run_started_at(loops: &[LoopSnapshot], state: &LoopState) -> Option<u64> {
+    if *state != LoopState::Running {
+        return None;
+    }
     loops
         .iter()
         .filter(|goal| goal.state == LoopState::Running)
@@ -48,11 +51,32 @@ mod tests {
             state_since: Some(25_000),
             event_sources: Vec::new(),
         };
-        assert_eq!(run_started_at(std::slice::from_ref(&goal)), Some(20_000));
+        assert_eq!(
+            run_started_at(std::slice::from_ref(&goal), &LoopState::Running),
+            Some(20_000)
+        );
+        assert_eq!(
+            run_started_at(std::slice::from_ref(&goal), &LoopState::WaitingQuestion),
+            None
+        );
+        let mut waiting = goal.clone();
+        waiting.id = uuid::Uuid::new_v4();
+        waiting.run_id = Some(uuid::Uuid::new_v4());
+        waiting.state = LoopState::WaitingQuestion;
+        let mixed = [waiting.clone(), goal.clone()];
+        let state = tickloop_agent_runtime::summary_state(&mixed, &[]);
+        assert_eq!(summary_run_id(&mixed, &state), waiting.run_id);
+        assert_eq!(run_started_at(&mixed, &state), None);
         goal.state_since = Some(30_000);
-        assert_eq!(run_started_at(std::slice::from_ref(&goal)), Some(20_000));
+        assert_eq!(
+            run_started_at(std::slice::from_ref(&goal), &LoopState::Running),
+            Some(20_000)
+        );
         goal.state = LoopState::Completed;
-        assert_eq!(run_started_at(std::slice::from_ref(&goal)), None);
+        assert_eq!(
+            run_started_at(std::slice::from_ref(&goal), &LoopState::Running),
+            None
+        );
         let shell: UserShellRecord = serde_json::from_value(serde_json::json!({
             "id": uuid::Uuid::new_v4(), "chat_id": uuid::Uuid::new_v4(),
             "command": "sleep 30", "cwd": "/work", "state": "Running",
@@ -66,7 +90,7 @@ mod tests {
             LoopState::Running
         );
         assert_eq!(
-            run_started_at(std::slice::from_ref(&goal)),
+            run_started_at(std::slice::from_ref(&goal), &LoopState::Running),
             None,
             "a user Shell must not reuse the completed model Run's timestamp"
         );
@@ -74,6 +98,9 @@ mod tests {
         goal.run_id = Some(uuid::Uuid::new_v4());
         goal.run_started_at = Some(90_000);
         goal.state_since = Some(91_000);
-        assert_eq!(run_started_at(std::slice::from_ref(&goal)), Some(90_000));
+        assert_eq!(
+            run_started_at(std::slice::from_ref(&goal), &LoopState::Running),
+            Some(90_000)
+        );
     }
 }

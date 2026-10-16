@@ -349,7 +349,10 @@ impl DaemonServer {
                     chat_id: snapshot.conversation.id,
                     workdir: snapshot.conversation.workdir.clone(),
                     run_id: super::summary::summary_run_id(&snapshot.conversation.loops, &state),
-                    run_started_at: super::summary::run_started_at(&snapshot.conversation.loops),
+                    run_started_at: super::summary::run_started_at(
+                        &snapshot.conversation.loops,
+                        &state,
+                    ),
                     state,
                     preview: chat_preview(&snapshot.conversation, &title),
                     title,
