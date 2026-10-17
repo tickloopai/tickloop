@@ -72,6 +72,10 @@ impl Agent {
         bookkeeping: &mut ChatBookkeeping,
     ) -> OutputStyle {
         let mut saved = self.inner.settings.as_ref().map(UserSettings::load);
+        snapshot.search_config = saved.as_mut().map_or_else(
+            tickloop_agent_protocol::SearchConfig::enabled_default,
+            |saved| saved.search_config(),
+        );
         let defaults = new_chat_settings(saved.as_mut(), &self.inner.host_options, &snapshot.model);
         snapshot.policy.mode = defaults.execution_mode;
         snapshot.task_tools_enabled = saved.as_ref().map_or_else(
@@ -301,7 +305,7 @@ impl Agent {
     }
 
     /// 设置写入包含 `sync_all`，在阻塞线程中进行。
-    async fn write_user_settings(
+    pub(super) async fn write_user_settings(
         &self,
         write: impl FnOnce(&UserSettings) -> Result<(), SettingsError> + Send + 'static,
     ) -> Result<(), AgentError> {

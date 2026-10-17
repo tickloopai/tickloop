@@ -735,6 +735,7 @@ fn answerable_permission_request(
 
 fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnapshot {
     ChatSnapshot {
+        search_config: tickloop_agent_protocol::SearchConfig::enabled_default(),
         task_tools_enabled: false,
         subagent_reports: BTreeMap::new(),
         failure_events: Vec::new(),
@@ -2581,7 +2582,7 @@ impl Agent {
                 record_invoked_skill(chat, invoked);
                 self.save(&chat.snapshot);
             }
-            registry.refresh_skills(chat);
+            registry.refresh(chat);
             request.tools = registry.definitions();
             (request.messages, request.history_sources) = context::model_history(chat)?;
             let replacements = tool_results::enforce_tool_result_budget(
@@ -2607,6 +2608,7 @@ impl Agent {
                 "goal": chat.snapshot.loops.iter().find(|goal| goal.id == receipt.loop_id),
                 "chat_goals": chat.snapshot.loops,
                 "execution_mode": chat.snapshot.policy.mode,
+                "web_search": { "enabled": chat.snapshot.search_config.is_some(), "settings_command": "/websearch" },
                 "plan": chat.snapshot.plans.iter().find(|plan| plan.loop_id == receipt.loop_id),
                 "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
             });
@@ -2724,7 +2726,9 @@ impl Agent {
         let invalid_call = response.output.content.iter().any(|content| {
             if let Content::ToolUse { id, name, input } = content {
                 id.is_empty()
-                    || (!available_tools.contains(name) && !shared_tasks::is_task_tool(name))
+                    || (!available_tools.contains(name)
+                        && !shared_tasks::is_task_tool(name)
+                        && name != tickloop_agent_tools::WEB_SEARCH_TOOL_NAME)
                     || !input.is_object()
                     || !used_calls.insert(id.clone())
             } else {
@@ -3853,6 +3857,11 @@ impl Agent {
         chat_id: ChatId,
         config: Option<tickloop_agent_protocol::SearchConfig>,
     ) -> Result<(), AgentError> {
+        let _gate = self.inner.settings_writes.lock().await;
+        if let Some(config) = &config {
+            tickloop_agent_tools::web_search::validate_config(config)
+                .map_err(AgentError::Invalid)?;
+        }
         let tools = self
             .inner
             .chats
@@ -3862,10 +3871,22 @@ impl Agent {
             .ok_or(AgentError::NotFound)?
             .tools
             .clone();
+        let saved = config.clone();
+        self.write_user_settings(move |settings| settings.save_search_config(saved.as_ref()))
+            .await?;
         tools
-            .set_search(config)
+            .set_search(config.clone())
             .await
-            .map_err(|error| AgentError::Invalid(error.to_string()))
+            .map_err(|error| AgentError::Invalid(error.to_string()))?;
+        self.inner
+            .chats
+            .lock()
+            .await
+            .get_mut(&chat_id)
+            .ok_or(AgentError::NotFound)?
+            .snapshot
+            .search_config = config;
+        Ok(())
     }
 
     pub async fn set_execution_mode(

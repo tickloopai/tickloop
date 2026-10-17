@@ -56,6 +56,7 @@ fn settings_ux_pty_fixture() {
             let mut poll = tokio::time::interval(Duration::from_millis(20));
             loop {
                 let discovery_active = menus.discovery_active();
+                let search_test_active = menus.search_test_active();
                 let login_updates_pending = login.as_ref().is_some_and(super::super::login::LoginFlow::updates_pending);
                 let event = tokio::select! {
                     _ = poll.tick() => {
@@ -75,9 +76,14 @@ fn settings_ux_pty_fixture() {
                         std::fs::write(directory.join("login-finished"), "finished").unwrap();
                         continue;
                     }
-                    result = menus.next_discovery(), if discovery_active => {
-                        menus.finish_discovery(&agent, &console, result).await.unwrap();
-                        std::fs::write(directory.join("discovery-finished"), "finished").unwrap();
+                    result = menus.next_provider_update(), if discovery_active || search_test_active => {
+                        match result {
+                            ProviderUpdate::Models(result) => {
+                                menus.finish_discovery(&agent, &console, result).await.unwrap();
+                                std::fs::write(directory.join("discovery-finished"), "finished").unwrap();
+                            },
+                            ProviderUpdate::Search(result) => menus.finish_search_test(&console, result).unwrap(),
+                        }
                         continue;
                     }
                     event = input.recv() => event.unwrap(),
@@ -86,6 +92,7 @@ fn settings_ux_pty_fixture() {
                 match event {
                     super::super::console::InputEvent::Line(line) | super::super::console::InputEvent::Prompt { text: line, .. } => match line.as_str() {
                         "/settings" => menus.settings(&agent, &console, ConfigTarget::Agent(chat)).await.unwrap(),
+                        "/websearch" => menus.search_settings(&agent, &console, ConfigTarget::Agent(chat), false).await.unwrap(),
                         "/model" => menus.models(&agent, &console, ConfigTarget::Agent(chat)).await.unwrap(),
                         "/provider" => menus.providers(&agent, &console, ConfigTarget::Agent(chat)).await.unwrap(),
                         "/exit" => break,
@@ -175,6 +182,46 @@ impl AgentAccess for FixtureAccess {
                     execution: Some(*execution),
                     sequence: 0,
                 },
+                None,
+            ));
+        }
+        if let ObservationRequest::Agent {
+            execution,
+            detail: AgentDetailQuery::TestSearch { .. },
+            ..
+        } = &query
+        {
+            let cursor = Cursor {
+                daemon_epoch: self.epoch,
+                execution: Some(*execution),
+                sequence: 0,
+            };
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            let directory = self.directory.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let status = if directory.join("reject-search").exists() {
+                    tickloop_agent_protocol::SearchTestStatus::Unavailable
+                } else {
+                    tickloop_agent_protocol::SearchTestStatus::Available
+                };
+                let _ = sender
+                    .send(tickloop_agent_protocol::ObservationUpdate {
+                        cursor,
+                        change: tickloop_agent_protocol::ObservationChange::SearchTest(
+                            tickloop_agent_protocol::SearchTestResult {
+                                status,
+                                detail: "Controlled fixture search test".into(),
+                            },
+                        ),
+                    })
+                    .await;
+            });
+            return Ok(Observation::new(
+                ObservationValue::SearchTestPending,
+                cursor,
+                None,
+                Some(receiver),
                 None,
             ));
         }
@@ -751,4 +798,107 @@ fn settings_scroll_pty_restores_parent_context_after_child_cancel_and_confirm_cl
     fixture.wait(|frame| {
         !frame.lines().any(|line| line == "Settings") && !frame.contains("Choose theme")
     });
+}
+
+#[test]
+fn search_pty_key_entry_is_masked_and_cancel_does_not_switch_sources() {
+    let mut fixture = Fixture::start();
+    fixture.send(b"/websearch\r");
+    fixture.wait(|frame| frame.lines().any(|line| line == "Web search"));
+    fixture.wait(|frame| frame.contains("DuckDuckGo · Free") && !frame.contains("no key needed"));
+    fixture.select("Tavily");
+    fixture.send(b"\r");
+    fixture.wait(|frame| frame.contains("API key · Tavily"));
+    fixture.send(b"discarded-search-secret");
+    fixture.wait(|frame| frame.contains("****") && !frame.contains("discarded-search-secret"));
+    fixture.send(b"\x1b");
+    fixture.wait(|frame| frame.contains("API key · Tavily") && frame.contains("tab edit API key"));
+    fixture.send(b"\x1b");
+    fixture.wait(|frame| frame.contains("Web search · Tavily"));
+    let root = fixture
+        .directory
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("config");
+    assert!(
+        tickloop_agent_model::credentials::load_api_key(&root, "TAVILY_API_KEY")
+            .unwrap()
+            .is_none()
+    );
+    fixture.select("Set or replace API key");
+    fixture.send(b"\r");
+    fixture.wait(|frame| frame.contains("API key · Tavily"));
+    fixture.send(b"fixture-search-secret");
+    let frame = fixture.wait(|frame| frame.contains("Save API key"));
+    assert!(!frame.contains("fixture-search-secret"));
+    fixture.send(b"\r");
+    fixture.wait(|frame| {
+        frame.contains("Web search · Tavily")
+            && frame.contains("Use this search provider")
+            && !frame.contains("(checking…)")
+            && !frame.contains("(unavailable)")
+    });
+    let root = fixture
+        .directory
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("config");
+    assert_eq!(
+        tickloop_agent_model::credentials::load_api_key(&root, "TAVILY_API_KEY")
+            .unwrap()
+            .as_deref(),
+        Some("fixture-search-secret")
+    );
+    assert_eq!(
+        UserSettings::in_root(&root).load().search_config(),
+        tickloop_agent_protocol::SearchConfig::enabled_default()
+    );
+    fixture.send(b"\x1b");
+    fixture.wait(|frame| frame.lines().any(|line| line == "Web search"));
+    fixture.select("Tavily");
+    fixture.send(b"\r");
+    fixture.wait(|frame| {
+        frame.contains("Web search · Tavily")
+            && !frame.contains("(checking…)")
+            && !frame.contains("(unavailable)")
+    });
+    fixture.send(b"\r");
+    fixture.wait(|frame| frame.contains("Tavily · key saved · active"));
+    assert_eq!(
+        UserSettings::in_root(&root)
+            .load()
+            .search_config()
+            .unwrap()
+            .provider,
+        tickloop_agent_protocol::SearchProviderKind::Tavily
+    );
+    std::fs::write(fixture.directory.path().join("reject-search"), "reject").unwrap();
+    fixture.select("Tavily");
+    fixture.send(b"\r");
+    let frame = fixture.wait(|frame| frame.contains("Use this search provider (unavailable)"));
+    assert!(frame.contains("Website: https://www.tavily.com/"));
+    assert!(!frame.contains("Test search connection"));
+    assert!(!frame.contains("Connection:") && !frame.contains("Credential:"));
+    fixture.send(b"\r");
+    fixture.wait(|frame| {
+        frame.contains("Web search · Tavily")
+            && frame.contains("Use this search provider (unavailable)")
+    });
+    fixture.send(b"\x1b");
+    fixture.wait(|frame| frame.contains("Tavily · key saved · unavailable · active"));
+    fixture.send(b"\x1b");
+    fixture.wait(|frame| !frame.lines().any(|line| line == "Web search"));
+    fixture.send(b"/settings\r");
+    fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));
+    fixture.select("Web search:");
+    fixture.send(b"\r");
+    fixture.wait(|frame| frame.lines().any(|line| line == "Web search"));
+    fixture.select("Off");
+    fixture.send(b"\r");
+    fixture.wait(|frame| frame.contains("Off · active"));
+    fixture.send(b"\x1b");
+    fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));
+    assert_eq!(UserSettings::in_root(&root).load().search_config(), None);
 }

@@ -22,8 +22,8 @@ use crate::{
     PendingCommand, PendingInput, PermissionChange, PermissionPolicy, PermissionRequest,
     PermissionRule, PermissionScope, PermissionsRevision, PermissionsView, ProviderPatch,
     QuestionAnswer, QuestionRequest, QueuedInput, ReasoningEffort, Receipt, RequestUsageLedger,
-    RewindDraft, RewindMode, RewindPoint, RunId, SavedChat, SearchConfig, ShellTask,
-    ShellTaskOutputChunk, SubagentRegistration, SummaryDirection, TakenBackPrompt,
+    RewindDraft, RewindMode, RewindPoint, RunId, SavedChat, SearchConfig, SearchTestResult,
+    ShellTask, ShellTaskOutputChunk, SubagentRegistration, SummaryDirection, TakenBackPrompt,
     TaskNotification, TickSubscriptionChange, TickSubscriptionStatus, ToolCallRecovery, Trigger,
     TriggerSource, UserShellReceipt, UserShellRecord, chat_status::ProcessState,
 };
@@ -50,10 +50,11 @@ use crate::{
 /// 23.0 adds manual TickUpdate delivery and subscription-independent Monitor observations.
 /// 24.0 distinguishes internal execution failures from model service failures in the request ledger.
 /// 25.0 selects historical feedback when adding an independent Artifact feedback receiver.
+/// 25.1 adds cancellable search connection checks in the selected Agent credential scope.
 /// Older business majors
 /// are refused before dispatch; the frozen daemon management protocol remains independent.
 pub const PROTOCOL_MAJOR: u16 = 25;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
@@ -625,6 +626,9 @@ pub enum AgentDetailQuery {
         after: u64,
     },
     ProviderCredentials,
+    TestSearch {
+        config: SearchConfig,
+    },
     AccountModels {
         config: Box<ModelConfig>,
         refresh: bool,
@@ -951,6 +955,7 @@ impl RequestRef {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ObservationValue {
+    SearchTestPending,
     AccountModelsPending,
     ProviderCredentials(Box<ProviderCredentialScope>),
     AccountModels(Result<AccountModelDirectory, String>),
@@ -986,6 +991,7 @@ pub struct ObservationUpdate {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum ObservationChange {
+    SearchTest(SearchTestResult),
     AccountModels(Result<AccountModelDirectory, String>),
     Event(Event),
     UserShell(UserShellRecord),

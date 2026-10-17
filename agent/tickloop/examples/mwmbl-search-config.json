@@ -1,4 +1,5 @@
 {
+  "provider": "searxng",
   "endpoint": "https://api.mwmbl.org/api/v2/search/",
   "api_key_env": null
 }

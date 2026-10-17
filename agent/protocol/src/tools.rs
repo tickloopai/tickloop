@@ -10,6 +10,20 @@ pub struct ToolResult {
     pub output_ref: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearchFailure {
+    pub reason: String,
+    pub suggestions: Vec<WebSearchSuggestion>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WebSearchSuggestion {
+    OpenVerification { url: String, note: String },
+    ChangeProvider { command: String },
+}
+
 /// What a Chat last saw of one file, following Claude Code's `readFileState` entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileReadRecord {
@@ -60,8 +74,143 @@ pub struct CommandSnapshot {
     pub updated_at_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchProviderKind {
+    Free,
+    Brave,
+    Tavily,
+    Exa,
+    #[serde(rename = "serpapi")]
+    SerpApi,
+    Serper,
+    Perplexity,
+    #[default]
+    Searxng,
+}
+
+impl SearchProviderKind {
+    fn is_searxng(&self) -> bool {
+        *self == Self::Searxng
+    }
+    pub const ALL: [Self; 8] = [
+        Self::Free,
+        Self::Brave,
+        Self::Tavily,
+        Self::Exa,
+        Self::SerpApi,
+        Self::Serper,
+        Self::Perplexity,
+        Self::Searxng,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Free => "DuckDuckGo · Free",
+            Self::Brave => "Brave",
+            Self::Tavily => "Tavily",
+            Self::Exa => "Exa",
+            Self::SerpApi => "SerpAPI",
+            Self::Serper => "Serper",
+            Self::Perplexity => "Perplexity",
+            Self::Searxng => "SearXNG / compatible JSON",
+        }
+    }
+
+    pub fn website(self) -> Option<&'static str> {
+        match self {
+            Self::Free => Some("https://duckduckgo.com/"),
+            Self::Brave => Some("https://brave.com/search/api/"),
+            Self::Tavily => Some("https://www.tavily.com/"),
+            Self::Exa => Some("https://exa.ai/"),
+            Self::SerpApi => Some("https://serpapi.com/"),
+            Self::Serper => Some("https://serper.dev/"),
+            Self::Perplexity => Some("https://www.perplexity.ai/api-platform"),
+            Self::Searxng => None,
+        }
+    }
+
+    pub fn default_endpoint(self) -> &'static str {
+        match self {
+            Self::Free => "",
+            Self::Brave => "https://api.search.brave.com/res/v1/web/search",
+            Self::Tavily => "https://api.tavily.com/search",
+            Self::Exa => "https://api.exa.ai/search",
+            Self::SerpApi => "https://serpapi.com/search.json",
+            Self::Serper => "https://google.serper.dev/search",
+            Self::Perplexity => "https://api.perplexity.ai/search",
+            Self::Searxng => "",
+        }
+    }
+
+    pub fn credential_env(self) -> Option<&'static str> {
+        match self {
+            Self::Brave => Some("BRAVE_API_KEY"),
+            Self::Tavily => Some("TAVILY_API_KEY"),
+            Self::Exa => Some("EXA_API_KEY"),
+            Self::SerpApi => Some("SERPAPI_API_KEY"),
+            Self::Serper => Some("SERPER_API_KEY"),
+            Self::Perplexity => Some("PERPLEXITY_API_KEY"),
+            Self::Free | Self::Searxng => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchTestStatus {
+    Available,
+    Unavailable,
+}
+
+impl SearchTestStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SearchTestResult {
+    pub status: SearchTestStatus,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SearchConfig {
+    #[serde(default, skip_serializing_if = "SearchProviderKind::is_searxng")]
+    pub provider: SearchProviderKind,
+    #[serde(default)]
     pub endpoint: String,
+    #[serde(default)]
     pub api_key_env: Option<String>,
+}
+
+impl SearchConfig {
+    pub fn for_provider(provider: SearchProviderKind) -> Self {
+        Self {
+            provider,
+            endpoint: provider.default_endpoint().into(),
+            api_key_env: provider.credential_env().map(str::to_owned),
+        }
+    }
+
+    pub fn enabled_default() -> Option<Self> {
+        Some(Self::default())
+    }
+
+    pub fn is_enabled_default(config: &Option<Self>) -> bool {
+        config
+            .as_ref()
+            .is_some_and(|config| *config == Self::default())
+    }
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self::for_provider(SearchProviderKind::Free)
+    }
 }

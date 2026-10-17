@@ -13,6 +13,8 @@
 mod auto_policy;
 pub mod new_chat;
 pub mod skills;
+#[cfg(test)]
+mod web_search_tests;
 
 use std::{
     collections::HashSet,
@@ -209,6 +211,26 @@ pub enum MonitorPopup {
 }
 
 impl LoadedSettings {
+    pub fn search_config(&mut self) -> Option<tickloop_agent_protocol::SearchConfig> {
+        let Some(value) = self.settings.get("webSearch").cloned() else {
+            return tickloop_agent_protocol::SearchConfig::enabled_default();
+        };
+        if value.is_null() {
+            return None;
+        }
+        match serde_json::from_value::<tickloop_agent_protocol::SearchConfig>(value) {
+            Ok(config) if tickloop_agent_tools::web_search::validate_config(&config).is_ok() => {
+                Some(config)
+            }
+            _ => {
+                self.warn(
+                    "`webSearch` is invalid; search is disabled until it is corrected".into(),
+                );
+                None
+            }
+        }
+    }
+
     pub fn status_lines(&mut self) -> Option<Vec<String>> {
         let value = self.settings.get("statusLines")?.clone();
         match serde_json::from_value::<Vec<String>>(value) {
@@ -907,6 +929,27 @@ impl UserSettings {
     pub fn save_task_tools_enabled(&self, enabled: bool) -> Result<(), SettingsError> {
         self.update(|settings| {
             settings.insert(TASK_TOOLS_ENABLED_KEY.into(), enabled.into());
+            Ok(())
+        })
+    }
+
+    pub fn save_search_config(
+        &self,
+        config: Option<&tickloop_agent_protocol::SearchConfig>,
+    ) -> Result<(), SettingsError> {
+        self.update(|settings| {
+            if let Some(config) = config {
+                tickloop_agent_tools::web_search::validate_config(config).map_err(|error| {
+                    InvalidEntry {
+                        key: "webSearch".into(),
+                        expected: error.to_string(),
+                    }
+                })?;
+            }
+            settings.insert(
+                "webSearch".into(),
+                serde_json::to_value(config).expect("search settings serialize"),
+            );
             Ok(())
         })
     }

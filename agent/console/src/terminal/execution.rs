@@ -1377,7 +1377,8 @@ impl ConsoleExecution {
                         }
                     }
                     Ok(ObservationUpdate {
-                        change: ObservationChange::AccountModels(_),
+                        change:
+                            ObservationChange::AccountModels(_) | ObservationChange::SearchTest(_),
                         ..
                     }) => {}
                     // A Resync stands for a change too large for the feed, such as an event with
@@ -1991,6 +1992,47 @@ impl ConsoleExecution {
         }
     }
 
+    pub(super) async fn test_search(
+        &self,
+        target: ConfigTarget,
+        config: tickloop_agent_protocol::SearchConfig,
+    ) -> Result<tickloop_agent_protocol::SearchTestResult, String> {
+        let ConfigTarget::Agent(chat) = target else {
+            return Ok(tickloop_agent_tools::web_search::test_connection(
+                &config,
+                self.inner.launch.config_root.as_deref(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await);
+        };
+        let execution = self
+            .reference(chat)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut observation = self
+            .inner
+            .access
+            .observe(ObservationRequest::Agent {
+                execution,
+                detail: AgentDetailQuery::TestSearch { config },
+                after: None,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        if !matches!(observation.initial, ObservationValue::SearchTestPending) {
+            return Err("Agent returned an invalid search test snapshot".into());
+        }
+        match observation
+            .recv()
+            .await
+            .map_err(|error| error.to_string())?
+            .change
+        {
+            ObservationChange::SearchTest(result) => Ok(result),
+            _ => Err("Agent returned an invalid search test update".into()),
+        }
+    }
+
     pub(super) async fn account_models(
         &self,
         target: ConfigTarget,
@@ -2111,6 +2153,9 @@ impl ConsoleExecution {
             }
             ConfigurationChange::TaskToolsEnabled { enabled } => {
                 save(&|settings| settings.save_task_tools_enabled(*enabled))?;
+            }
+            ConfigurationChange::Search { config } => {
+                save(&|settings| settings.save_search_config(config.as_ref()))?;
             }
             ConfigurationChange::ReasoningEffort { effort } => {
                 tickloop_agent_model::validate_reasoning_effort(&current.model, *effort)
@@ -2513,6 +2558,10 @@ impl ConsoleExecution {
         let mut saved = self.user_settings().map(|settings| settings.load());
         let defaults = new_chat_settings(saved.as_mut(), &launch.host_options, &model);
         AgentConfiguration {
+            search_config: saved.as_mut().map_or_else(
+                tickloop_agent_protocol::SearchConfig::enabled_default,
+                |saved| saved.search_config(),
+            ),
             model,
             pending_model: None,
             reasoning_effort: defaults.reasoning_effort,

@@ -342,6 +342,7 @@ async fn live_deepseek_searches_and_reads_official_documentation() {
         .set_search(
             chat,
             Some(tickloop_agent_protocol::SearchConfig {
+                provider: tickloop_agent_protocol::SearchProviderKind::Searxng,
                 endpoint: "https://api.mwmbl.org/api/v2/search/".into(),
                 api_key_env: None,
             }),

@@ -151,6 +151,10 @@ impl ToolRegistry {
         let is_delegated = chat.snapshot.delegation.is_some();
         let mut tools = tickloop_agent_tools::Tools::definitions()
             .into_iter()
+            .filter(|definition| {
+                chat.snapshot.search_config.is_some()
+                    || definition.name != tickloop_agent_tools::WEB_SEARCH_TOOL_NAME
+            })
             .map(|definition| RegisteredTool {
                 definition,
                 route: ToolRoute::BuiltIn,
@@ -267,7 +271,23 @@ impl ToolRegistry {
             .collect()
     }
 
-    pub(super) fn refresh_skills(&mut self, chat: &Chat) {
+    pub(super) fn refresh(&mut self, chat: &Chat) {
+        if chat.snapshot.search_config.is_none() {
+            self.tools
+                .retain(|tool| tool.definition.name != tickloop_agent_tools::WEB_SEARCH_TOOL_NAME);
+        } else if !self
+            .tools
+            .iter()
+            .any(|tool| tool.definition.name == tickloop_agent_tools::WEB_SEARCH_TOOL_NAME)
+            && let Some(definition) = tickloop_agent_tools::Tools::definitions()
+                .into_iter()
+                .find(|definition| definition.name == tickloop_agent_tools::WEB_SEARCH_TOOL_NAME)
+        {
+            self.tools.push(RegisteredTool {
+                definition,
+                route: ToolRoute::BuiltIn,
+            });
+        }
         if let Some(tool) = self
             .tools
             .iter_mut()
@@ -766,6 +786,20 @@ impl Agent {
         });
         if cancel.is_cancelled() {
             return Err("run interrupted before tool preparation".into());
+        }
+        if name == tickloop_agent_tools::WEB_SEARCH_TOOL_NAME
+            && (registration.is_none()
+                || self
+                    .inner
+                    .chats
+                    .lock()
+                    .await
+                    .get(&receipt.chat_id)
+                    .is_some_and(|chat| chat.snapshot.search_config.is_none()))
+        {
+            return Ok(ToolCallOutcome::not_admitted(
+                tickloop_agent_tools::web_search::DISABLED_MESSAGE.into(),
+            ));
         }
         if registration.is_none() && shared_tasks::is_task_tool(&name) {
             return Ok(ToolCallOutcome::not_admitted(
@@ -2216,6 +2250,35 @@ mod tests {
     use super::*;
 
     const SCHEMA_COMBINATORS: [&str; 3] = ["oneOf", "anyOf", "allOf"];
+
+    #[tokio::test]
+    async fn captured_registry_refreshes_search_visibility_in_both_directions() {
+        let directory = tempfile::tempdir().unwrap();
+        let agent = Agent::new_embedded(
+            tickloop_agent_test_support::config(),
+            Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![])),
+        );
+        let chat_id = agent.create_chat(directory.path().into()).await.unwrap();
+        {
+            let mut chats = agent.inner.chats.lock().await;
+            let chat = chats.get_mut(&chat_id).unwrap();
+            let mut registry = ToolRegistry::for_chat(
+                chat,
+                None,
+                false,
+                PromptPolicy::Interactive,
+                shared_tasks::TaskToolAccess::Disabled,
+            );
+            for enabled in [false, true, false] {
+                chat.snapshot.search_config =
+                    enabled.then(tickloop_agent_protocol::SearchConfig::default);
+                registry.refresh(chat);
+                assert_eq!(registry.resolve("WebSearch").is_some(), enabled);
+                assert!(registry.resolve("WebFetch").is_some());
+            }
+        }
+        agent.shutdown().await;
+    }
 
     #[tokio::test]
     async fn skill_catalog_tracks_the_active_model_context_and_learned_fallback() {

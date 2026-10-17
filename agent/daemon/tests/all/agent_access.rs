@@ -859,3 +859,129 @@ async fn embedded_monitor_commands_remove_members_of_the_selected_chat() {
     );
     runtime.shutdown().await;
 }
+
+#[tokio::test]
+async fn search_connection_check_uses_selected_agent_credentials_and_cancels_with_observation() {
+    use tickloop_agent_protocol::{
+        ObservationChange, SearchConfig, SearchProviderKind, SearchTestStatus,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap().join("credentials");
+    tickloop_agent_model::credentials::save_api_key(
+        &root,
+        "SCOPE_SEARCH_TEST_KEY",
+        "selected-agent-private-key",
+    )
+    .unwrap();
+    let runtime = Agent::new_embedded(
+        tickloop_agent_test_support::config(),
+        Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
+    );
+    let access = EmbeddedAgentAccess::new(runtime.clone());
+    let mut launch = LaunchSpec::embedded(directory.path().into());
+    launch.config_root = Some(root);
+    let created = access
+        .execute(CommandEnvelope {
+            daemon_epoch: access.daemon_epoch(),
+            command_id: Uuid::new_v4(),
+            command: AgentCommand::Create {
+                launch,
+                initial: None,
+                origin: None,
+            },
+        })
+        .await
+        .unwrap();
+    let Some(CommandResult::Created { execution, .. }) = created.result else {
+        panic!("execution missing");
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = SearchConfig {
+        provider: SearchProviderKind::Tavily,
+        endpoint: format!("http://{}/search", listener.local_addr().unwrap()),
+        api_key_env: Some("SCOPE_SEARCH_TEST_KEY".into()),
+    };
+    let mut observation = access
+        .observe(ObservationRequest::Agent {
+            execution,
+            detail: AgentDetailQuery::TestSearch {
+                config: config.clone(),
+            },
+            after: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        observation.initial,
+        ObservationValue::SearchTestPending
+    ));
+    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        headers.push(socket.read_u8().await.unwrap());
+    }
+    assert!(
+        String::from_utf8(headers)
+            .unwrap()
+            .to_lowercase()
+            .contains("authorization: bearer selected-agent-private-key")
+    );
+    let body = r#"{"results":[{"title":"Rust","url":"https://www.rust-lang.org/"}]}"#;
+    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+    let update = tokio::time::timeout(Duration::from_secs(5), observation.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(update.change, ObservationChange::SearchTest(result) if result.status == SearchTestStatus::Available)
+    );
+    assert!(
+        live(&access, execution)
+            .await
+            .conversation
+            .search_config
+            .is_some_and(|source| source.provider == SearchProviderKind::Free),
+        "testing does not enable the provider"
+    );
+    let observation = access
+        .observe(ObservationRequest::Agent {
+            execution,
+            detail: AgentDetailQuery::TestSearch { config },
+            after: None,
+        })
+        .await
+        .unwrap();
+    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        headers.push(socket.read_u8().await.unwrap());
+    }
+    let headers = String::from_utf8(headers).unwrap();
+    let length = headers
+        .lines()
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|length| length.trim().parse::<usize>().unwrap())
+        })
+        .unwrap();
+    let mut body = vec![0; length];
+    socket.read_exact(&mut body).await.unwrap();
+    drop(observation);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), socket.read_u8())
+            .await
+            .unwrap()
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::UnexpectedEof
+    );
+    runtime.shutdown().await;
+}

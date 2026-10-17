@@ -3,7 +3,7 @@ use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path};
 
-use tickloop_agent_base::private_fs::{
+use crate::private_fs::{
     OpenTarget, PRIVATE_DIRECTORY_MODE, PRIVATE_FILE_MODE, current_uid,
     open_without_following_links, replace_file_atomically, verify_private_directory,
 };
@@ -292,3 +292,7 @@ fn escape_value(value: &str) -> String {
         .replace('$', "\\$")
         .replace('`', "\\`")
 }
+
+#[cfg(test)]
+#[path = "credentials_tests.rs"]
+mod tests;

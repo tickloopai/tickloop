@@ -403,6 +403,7 @@ fn command_timing(command: &str) -> CommandTiming {
                 | "/auto-mode-setup"
                 | "/mode"
                 | "/model"
+                | "/websearch"
                 | "/provider"
                 | "/thinking"
                 | "/loops"
@@ -2392,6 +2393,7 @@ async fn interact(
             });
         }
         let discovery_active = menus.discovery_active();
+        let search_test_active = menus.search_test_active();
         let active_login = login::active_login_id(&logins, console)?;
         let login_active = active_login.is_some();
         let login_updates_pending = logins
@@ -2450,8 +2452,11 @@ async fn interact(
                     console.finish_prompt_suggestion(&request, result.text)?;
                 }
             },
-            result = menus.next_discovery(), if discovery_active => {
-                menus.finish_discovery(agent, console, result).await?;
+            result = menus.next_provider_update(), if discovery_active || search_test_active => {
+                match result {
+                    menus::ProviderUpdate::Search(result) => menus.finish_search_test(console, result)?,
+                    menus::ProviderUpdate::Models(result) => menus.finish_discovery(agent, console, result).await?,
+                }
                 status_dirty = true;
             },
             (login_id, update) = login::next_login_update(&mut logins), if login_updates_pending => {
@@ -3546,23 +3551,13 @@ async fn interact(
                                 }
                             }
                         },
-                        _ if line.starts_with("/search-config ") => {
-                            let target=ConfigTarget::visible(selected_chat);
-                            let path=line.trim_start_matches("/search-config ").trim();
-                            let result=async {
-                                let config=if path=="off" {None} else {
-                                    let bytes=std::fs::read(path).map_err(|_|"cannot read search configuration file")?;
-                                    Some(serde_json::from_slice::<tickloop_agent_protocol::SearchConfig>(&bytes).map_err(|_|"invalid search configuration JSON; provide endpoint and optional api_key_env")?)
-                                };
-                                agent.change_configuration(target,ConfigurationChange::Search {config:config.clone()}).await.map_err(|error|error.to_string())?;
-                                Ok::<_,String>(config)
-                            }.await;
-                            match result {
-                                Ok(Some(config))=>outln!(console, "Search service configured: {}",safe_text(&config.endpoint)),
-                                Ok(None)=>outln!(console, "Search service disabled."),
-                                Err(error)=>outln!(console, "Cannot configure search: {}",safe_text(&error)),
+                        _ if line == "/websearch" => {
+                            let target = ConfigTarget::visible(selected_chat);
+                            if let Err(error) = Box::pin(menus.search_settings(agent, console, target, false)).await {
+                                outln!(console, "Cannot open Web search: {}", safe_text(&error));
                             }
                         },
+                        _ if line.starts_with("/websearch ") => outln!(console, "Use /websearch to choose and configure a search source with the keyboard."),
                         _ if line=="/compact" || line.starts_with("/compact ") => {
                             if let Some(chat)=selected_chat {
                                 let agent=agent.clone();
@@ -5785,22 +5780,6 @@ async fn parse_after_turn(
                 instructions: (!arguments.is_empty()).then(|| arguments.to_owned()),
             },
         }),
-        "/search-config" => {
-            let config = if arguments == "off" {
-                None
-            } else {
-                let path = agent.snapshot(chat).await?.workdir.join(arguments);
-                let bytes = std::fs::read(path)
-                    .map_err(|_| invalid("cannot read search configuration file"))?;
-                Some(
-                    serde_json::from_slice(&bytes)
-                        .map_err(|_| invalid("invalid search configuration JSON"))?,
-                )
-            };
-            Ok(AfterTurnAction::Configure {
-                change: ConfigurationChange::Search { config },
-            })
-        }
         "/cwd" | "/add-dir" => {
             let mut snapshot = agent.snapshot(chat).await?;
             if name == "/cwd" {
@@ -8817,6 +8796,7 @@ mod tests {
         for command in [
             "/mode plan",
             "/model config.json",
+            "/websearch",
             "/settings",
             "/interrupt",
             "/diff",
@@ -8834,7 +8814,6 @@ mod tests {
             "/compact",
             "/cwd elsewhere",
             "/add-dir ../shared",
-            "/search-config search.json",
             "/loops schedule 00000000-0000-0000-0000-000000000000 60 check",
         ] {
             assert_eq!(

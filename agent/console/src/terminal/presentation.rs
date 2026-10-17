@@ -32,7 +32,7 @@ use tickloop_agent_protocol::{
     ChatSnapshot, CommandState, Event, EventKind, FamilyInputRecord, LocalMessage, LoopState,
     OperationRecord, PermissionApprovalSource, PermissionRequest, SEND_AGENT_MESSAGE_TOOL_NAME,
     SUBAGENT_TOOL_NAME, SubagentReportMessage, TaskNotificationStatus, TickDeliveryLine,
-    ToolResult, UserShellRecord, UserShellState,
+    ToolResult, UserShellRecord, UserShellState, WebSearchFailure, WebSearchSuggestion,
 };
 
 const RETAINED_TOOL_EVENTS: usize = 128;
@@ -724,6 +724,50 @@ fn transcript_arguments(name: &str, input: &Value) -> String {
     }
 }
 
+fn web_search_failure_lines(name: &str, content: &str) -> Option<Vec<ResultLine>> {
+    if name != WEB_SEARCH_TOOL_NAME {
+        return None;
+    }
+    let failure: WebSearchFailure = serde_json::from_str(content).ok()?;
+    let mut lines = vec![ResultLine::new("Failed", Some(Role::Error))];
+    lines.extend(text_lines(
+        &format!("Reason: {}", safe_text(&failure.reason)),
+        Some(Role::Error),
+    ));
+    if failure.suggestions.is_empty() {
+        return Some(lines);
+    }
+    lines.push(ResultLine::new("", None));
+    lines.push(ResultLine::new("Next steps", Some(Role::Strong)));
+    let mut notes = Vec::new();
+    for suggestion in failure.suggestions {
+        match suggestion {
+            WebSearchSuggestion::OpenVerification { url, note } => {
+                lines.push(ResultLine::new(
+                    "• Open the verification page in your browser, then retry:",
+                    None,
+                ));
+                lines.push(ResultLine::new(
+                    format!("  {}", safe_text(&url)),
+                    Some(Role::Link),
+                ));
+                notes.push(note);
+            }
+            WebSearchSuggestion::ChangeProvider { command } => lines.push(ResultLine {
+                spans: vec![
+                    ("• Choose another search provider: ".into(), None),
+                    (safe_text(&command), Some(Role::Accent)),
+                ],
+                fill: None,
+            }),
+        }
+    }
+    for note in notes {
+        lines.extend(text_lines(&safe_text(&note), Some(Role::MutedText)));
+    }
+    Some(lines)
+}
+
 /// A result in full: no line limit and no expansion hint.
 fn transcript_result_lines(
     name: &str,
@@ -738,6 +782,9 @@ fn transcript_result_lines(
         && let Some(value) = &value
     {
         return subagent_result_lines(input, value, elapsed_ms, report);
+    }
+    if is_error && let Some(lines) = web_search_failure_lines(name, content) {
+        return lines;
     }
     if is_error {
         let text = safe_text(content);
@@ -1661,11 +1708,22 @@ fn detailed_event(event: &Event, name: &str) -> Option<String> {
             safe_text(&input.to_string()),
         )),
         EventKind::ToolCompleted { call_id, result } => {
+            let content = if result.is_error {
+                web_search_failure_lines(name, &result.content).map(|lines| {
+                    lines
+                        .into_iter()
+                        .map(|line| joined(&line.spans))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+            } else {
+                None
+            };
             let mut text = format!(
                 "\nTool {} · {}\n{}\n",
                 safe_text(call_id),
                 tool_result_status(name, result),
-                safe_text(&result.content),
+                content.unwrap_or_else(|| safe_text(&result.content)),
             );
             if let Some(path) = &result.output_ref {
                 text.push_str(&format!(
@@ -2211,6 +2269,14 @@ fn compact_result_runs(
                 (path, Some(Role::MutedStrong)),
             ]),
             None => rows.row([(INTERRUPTED.into(), Some(Role::MutedText))]),
+        }
+        return rows.runs;
+    }
+    if result.is_error
+        && let Some(lines) = web_search_failure_lines(name, &result.content)
+    {
+        for line in lines {
+            rows.row(line.spans);
         }
         return rows.runs;
     }
@@ -3897,6 +3963,70 @@ mod tests {
             "",
             "the run's interruption notice stands for a failed question"
         );
+    }
+
+    #[test]
+    fn web_search_failure_keeps_recovery_actions_out_of_the_error_color_in_both_views() {
+        let failure = WebSearchFailure {
+            reason: "DuckDuckGo requires human verification".into(),
+            suggestions: vec![
+                WebSearchSuggestion::OpenVerification {
+                    url: "https://html.duckduckgo.com/html/?q=rust".into(),
+                    note: "Browser verification may not carry over to HTTP search.".into(),
+                },
+                WebSearchSuggestion::ChangeProvider {
+                    command: "/websearch".into(),
+                },
+            ],
+        };
+        let content = serde_json::to_string(&failure).unwrap();
+        let result = ToolResult {
+            content: content.clone(),
+            is_error: true,
+            output_ref: None,
+        };
+        let compact = compact_result_runs(
+            WEB_SEARCH_TOOL_NAME,
+            None,
+            &result,
+            "↳",
+            Path::new(""),
+            &CallFacts::default(),
+        );
+        let expanded =
+            transcript_result_lines(WEB_SEARCH_TOOL_NAME, None, &content, true, None, None)
+                .into_iter()
+                .flat_map(|line| line.spans)
+                .collect::<RoleRuns>();
+        for runs in [&compact, &expanded] {
+            assert!(
+                runs.iter()
+                    .any(|(text, role)| text.starts_with("Reason:") && *role == Some(Role::Error))
+            );
+            assert!(
+                runs.iter()
+                    .any(|(text, role)| text == "Next steps" && *role == Some(Role::Strong))
+            );
+            assert!(
+                runs.iter()
+                    .any(|(text, role)| text.contains("Open the verification page")
+                        && *role != Some(Role::Error))
+            );
+            assert!(
+                runs.iter()
+                    .any(|(text, role)| text.contains("https://html.duckduckgo.com/")
+                        && *role == Some(Role::Link))
+            );
+            assert!(
+                runs.iter()
+                    .any(|(text, role)| text == "/websearch" && *role == Some(Role::Accent))
+            );
+            assert!(
+                !joined(runs).contains(DETAILS_HINT),
+                "both actions stay visible without expansion"
+            );
+        }
+        assert!(web_search_failure_lines(WEB_FETCH_TOOL_NAME, &content).is_none());
     }
 
     #[test]

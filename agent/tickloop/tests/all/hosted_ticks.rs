@@ -1570,13 +1570,43 @@ for line in sys.stdin:
     /// Continuing the Chat restores only the Chat: the earlier Tick ends before it owns a new one.
     #[tokio::test(flavor = "multi_thread")]
     async fn continuing_a_chat_whose_stop_never_reached_the_host_ends_its_earlier_ticks_first() {
+        async fn open_at_step(
+            daemon: &Daemon,
+            tools: &HostedTickTools,
+            chat: Uuid,
+            step: &str,
+        ) -> Value {
+            match call_tool(tools, chat, "TickManage", counter_command(daemon)).await {
+                HostCallResult::Completed(result)
+                | HostCallResult::CompletedWithEffect(result, _) => {
+                    serde_json::from_str(&result.content).unwrap()
+                }
+                HostCallResult::NotDispatched(error) | HostCallResult::OutcomeUnknown(error) => {
+                    let owner = daemon.owner_state(chat);
+                    let host = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        daemon.controller.host_epoch(),
+                    )
+                    .await;
+                    let socket_exists = tickhost::paths::HostPaths {
+                        runtime: daemon.root.join("h"),
+                    }
+                    .socket()
+                    .exists();
+                    panic!(
+                        "TickManage open failed during {step}: {error}; owner={owner:?}; host={host:?}; socket_exists={socket_exists}"
+                    );
+                }
+            }
+        }
+
         let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
             tickloop_agent_test_support::text("Continued"),
         ]));
         let daemon = Daemon::start_with(model, super::support::hosted::IDLE_TIMEOUT, 1).await;
         let (runtime, chat) = (daemon.runtimes[0].clone(), daemon.chats[0]);
         let tools = daemon.tools();
-        let earlier = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
+        let earlier = open_at_step(&daemon, &tools, chat, "initial open").await;
         let earlier_pid = earlier["business_pid"].as_u64().unwrap() as u32;
         std::fs::write(
             daemon
@@ -1607,7 +1637,7 @@ for line in sys.stdin:
                 _ => {}
             }
         }
-        let reopened = run_tool(&tools, chat, "TickManage", counter_command(&daemon)).await;
+        let reopened = open_at_step(&daemon, &tools, chat, "open after Continue").await;
         assert!(
             super::gone(earlier_pid).await,
             "the Tick of the stopped Chat ends"

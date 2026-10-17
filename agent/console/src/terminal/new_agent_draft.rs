@@ -44,6 +44,7 @@ impl ConfigTarget {
 /// The configuration settings menus read, for a visible Agent or the New Agent draft.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct AgentConfiguration {
+    pub(super) search_config: Option<tickloop_agent_protocol::SearchConfig>,
     pub(super) model: ModelConfig,
     pub(super) pending_model: Option<ModelConfig>,
     pub(super) reasoning_effort: Option<ReasoningEffort>,
@@ -58,6 +59,7 @@ pub(super) struct AgentConfiguration {
 impl AgentConfiguration {
     pub(super) fn of(status: &ChatStatus) -> Self {
         Self {
+            search_config: status.search_config.clone(),
             model: status.model.clone(),
             pending_model: status.pending_model.clone(),
             reasoning_effort: status.reasoning_effort,
@@ -315,6 +317,7 @@ fn apply_preview(configuration: &mut AgentConfiguration, change: &ConfigurationC
             }
         }
         ConfigurationChange::ExecutionMode { mode } => configuration.execution_mode = *mode,
+        ConfigurationChange::Search { config } => configuration.search_config = config.clone(),
         _ => {}
     }
 }
@@ -332,6 +335,7 @@ mod tests {
 
     fn base() -> AgentConfiguration {
         AgentConfiguration {
+            search_config: tickloop_agent_protocol::SearchConfig::enabled_default(),
             model: model("deepseek-api", "deepseek-flash-chat-completions"),
             pending_model: None,
             reasoning_effort: None,

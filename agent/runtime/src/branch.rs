@@ -117,6 +117,7 @@ impl Agent {
         };
         let client = source.client.clone();
         let mut snapshot = ChatSnapshot {
+            search_config: source.snapshot.search_config.clone(),
             task_tools_enabled: false,
             subagent_reports: Default::default(),
             failure_events: Vec::new(),

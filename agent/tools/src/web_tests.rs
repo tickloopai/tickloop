@@ -102,7 +102,7 @@ fn web_tools_use_claude_code_names_and_parameters() {
     let search = search_definition();
     assert_eq!(search.input_schema["required"], json!(["query"]));
     assert_eq!(search.input_schema["properties"]["query"]["minLength"], 2);
-    for property in ["allowed_domains", "blocked_domains", "limit"] {
+    for property in ["allowed_domains", "blocked_domains"] {
         assert!(search.input_schema["properties"][property].is_object());
     }
     assert!(search.description.contains("The current month is "));
@@ -479,15 +479,13 @@ fn search_input_follows_claude_code_validation() {
     let (search, normalized) = search_input(json!({
         "query": "rust",
         "allowed_domains": ["*.Rust-Lang.ORG.", " docs.rs "],
-        "blocked_domains": [],
-        "limit": "5"
+        "blocked_domains": []
     }))
     .unwrap();
     assert_eq!(
         normalized,
-        json!({"query": "rust", "allowed_domains": ["rust-lang.org", "docs.rs"], "limit": 5})
+        json!({"query": "rust", "allowed_domains": ["rust-lang.org", "docs.rs"]})
     );
-    assert_eq!(search.limit, 5);
     assert_eq!(
         search.domains,
         DomainFilter::Allowed(vec!["rust-lang.org".into(), "docs.rs".into()])
@@ -496,7 +494,6 @@ fn search_input_follows_claude_code_validation() {
         search_input(json!({"query": "rust", "allowed_domains": null})).unwrap();
     assert_eq!(normalized, json!({"query": "rust"}));
     assert_eq!(search.domains, DomainFilter::Any);
-    assert_eq!(search.limit, DEFAULT_SEARCH_LIMIT);
 }
 
 #[test]
@@ -521,11 +518,13 @@ fn domain_filters_match_result_hosts_and_their_subdomains() {
 fn search_results_use_claude_codes_result_text() {
     let links = vec![
         SearchLink {
+            published_at: None,
             title: "Rust documentation".into(),
             url: "https://doc.rust-lang.org/".into(),
             summary: "Official \"docs\"".into(),
         },
         SearchLink {
+            published_at: None,
             title: "Docs.rs".into(),
             url: "https://docs.rs/".into(),
             summary: String::new(),
