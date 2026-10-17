@@ -62,12 +62,18 @@ fn main() {
         }
         if is_console {
             // Automatic checks must never prevent opening a Console.
-            let _ = tickloop_agent_updater::start_background(&arguments);
+            let _ = tickloop_agent_updater::start_background(
+                &arguments,
+                tickloop_agent_updater::BackgroundCheck::Startup,
+            );
             let background_arguments = arguments.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(tickloop_agent_updater::CHECK_INTERVAL).await;
-                    let _ = tickloop_agent_updater::start_background(&background_arguments);
+                    let _ = tickloop_agent_updater::start_background(
+                        &background_arguments,
+                        tickloop_agent_updater::BackgroundCheck::Periodic,
+                    );
                 }
             });
         }

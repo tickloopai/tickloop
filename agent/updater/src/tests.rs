@@ -6,7 +6,8 @@ use flate2::{Compression, write::GzEncoder};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Build, Installation, Lock, PROGRAMS, Source, UpdateState, bundle, is_due, release, source,
+    BackgroundCheck, Build, Installation, Lock, PROGRAMS, Source, UpdateState, bundle, is_due,
+    release, source,
 };
 
 fn build(version: &str) -> Build {
@@ -153,7 +154,11 @@ fn file_lock_excludes_concurrent_installers_and_recovers_after_drop() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("install.lock");
     let first = Lock::acquire(&path).unwrap();
-    assert!(Lock::acquire(&path).is_err());
+    let error = Lock::acquire(&path).err().unwrap();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
     drop(first);
     assert!(Lock::acquire(&path).is_ok());
 }
@@ -248,29 +253,36 @@ async fn update_transport_refuses_plaintext_before_network_access() {
 }
 
 #[test]
-fn checks_are_throttled_after_success_and_retried_after_failure() {
+fn periodic_checks_are_throttled_after_success_and_retried_after_failure() {
     let at = 100_000;
-    assert!(is_due(&UpdateState::default(), at));
+    assert!(is_due(
+        &UpdateState::default(),
+        at,
+        BackgroundCheck::Periodic
+    ));
     assert!(!is_due(
         &UpdateState {
             attempted_at: at - 1,
             ..Default::default()
         },
-        at
+        at,
+        BackgroundCheck::Periodic
     ));
     assert!(is_due(
         &UpdateState {
             attempted_at: at - 3601,
             ..Default::default()
         },
-        at
+        at,
+        BackgroundCheck::Periodic
     ));
     assert!(!is_due(
         &UpdateState {
             checked_at: at - 3601,
             ..Default::default()
         },
-        at
+        at,
+        BackgroundCheck::Periodic
     ));
 }
 
@@ -552,4 +564,23 @@ fn registry_payload_updates_preserve_cargo_entries_and_retained_runtime_versions
         matches!(record.source, Source::CargoRegistry { launcher: original, .. } if original == launcher)
     );
     assert_eq!(record.build.version, "1.2.4");
+}
+
+#[test]
+fn every_console_start_checks_again_even_after_a_recent_success_or_failure() {
+    let at = 100_000;
+    for state in [
+        UpdateState {
+            checked_at: at,
+            attempted_at: at,
+            ..Default::default()
+        },
+        UpdateState {
+            attempted_at: at,
+            ..Default::default()
+        },
+    ] {
+        assert!(is_due(&state, at, BackgroundCheck::Startup));
+        assert!(!is_due(&state, at, BackgroundCheck::Periodic));
+    }
 }

@@ -32,6 +32,7 @@ tickloop-agent-model = { path = "../model" }
 tickloop-agent-packages = { path = "../packages" }
 tickloop-agent-protocol = { path = "../protocol" }
 tickloop-agent-tools = { path = "../tools" }
+tickloop-agent-updater = { path = "../updater" }
 tickloop-tick-packages = { path = "../../tick/packages" }
 tickloop-tick-protocol = { path = "../../tick/protocol" }
 tickloop-tickhost-connect = { path = "../../tickhost/connect" }

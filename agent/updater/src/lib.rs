@@ -1,7 +1,9 @@
 //! Installation and updates belong to the executable, independently of Agent execution.
 
 mod bundle;
+mod notice;
 mod release;
+pub use notice::{UpdateMonitor, UpdateNotice};
 mod source;
 #[cfg(test)]
 mod tests;
@@ -26,6 +28,8 @@ use source::{Installation, Source};
 pub const PROGRAMS: [&str; 3] = ["tickloop", "tickhost", "tick-reader"];
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const SECONDS_PER_MINUTE: u64 = 60;
+const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const RUNTIME_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const HOMEBREW_FORMULA: &str = "tickloopai/tap/tickloop";
@@ -41,6 +45,25 @@ struct UpdateState {
     attempted_at: u64,
     checked_at: u64,
     message: String,
+    #[serde(default)]
+    activity: Option<UpdateActivity>,
+    #[serde(default)]
+    failed: bool,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum UpdateActivity {
+    Checking,
+    Installing,
+}
+
+impl UpdateState {
+    fn set_activity(&mut self, path: &Path, activity: UpdateActivity) -> Result<()> {
+        self.activity = Some(activity);
+        replace_file_atomically(path, &serde_json::to_vec(self)?, 0o600)?;
+        Ok(())
+    }
 }
 
 pub(crate) fn data_root() -> Result<PathBuf> {
@@ -154,8 +177,14 @@ pub fn prepare_launch(build: &Build) -> Result<Option<PathBuf>> {
     Ok(Some(destination.join("tickloop")))
 }
 
-/// Starts a detached, throttled update check only for an ordinary interactive Console.
-pub fn start_background(arguments: &[OsString]) -> Result<()> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundCheck {
+    Startup,
+    Periodic,
+}
+
+/// Starts a detached update check only for an ordinary interactive Console.
+pub fn start_background(arguments: &[OsString], trigger: BackgroundCheck) -> Result<()> {
     if !std::io::stdin().is_terminal()
         || !std::io::stdout().is_terminal()
         || arguments
@@ -179,19 +208,25 @@ pub fn start_background(arguments: &[OsString]) -> Result<()> {
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
-    if !is_due(&state, now()) {
+    if !is_due(&state, now(), trigger) {
         return Ok(());
     }
     let log = OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
+        .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(state_path.with_file_name("update.log"))?;
     let mut command = std::process::Command::new(executable);
     command
-        .args(["update", "--background"])
+        .args([
+            "update",
+            match trigger {
+                BackgroundCheck::Startup => "--background-startup",
+                BackgroundCheck::Periodic => "--background",
+            },
+        ])
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -217,9 +252,28 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-fn is_due(state: &UpdateState, at: u64) -> bool {
-    at.saturating_sub(state.checked_at) >= CHECK_INTERVAL.as_secs()
-        && at.saturating_sub(state.attempted_at) >= RETRY_INTERVAL.as_secs()
+fn is_due(state: &UpdateState, at: u64, trigger: BackgroundCheck) -> bool {
+    trigger == BackgroundCheck::Startup
+        || (at.saturating_sub(state.checked_at) >= CHECK_INTERVAL.as_secs()
+            && at.saturating_sub(state.attempted_at) >= RETRY_INTERVAL.as_secs())
+}
+
+fn check_age(timestamp: u64, at: u64) -> String {
+    if timestamp == 0 {
+        return "never".into();
+    }
+    let seconds = at.saturating_sub(timestamp);
+    if seconds >= SECONDS_PER_HOUR {
+        format!(
+            "{}h {}m ago",
+            seconds / SECONDS_PER_HOUR,
+            (seconds % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE
+        )
+    } else if seconds >= SECONDS_PER_MINUTE {
+        format!("{}m ago", seconds / SECONDS_PER_MINUTE)
+    } else {
+        format!("{seconds}s ago")
+    }
 }
 
 pub async fn command(arguments: &[OsString], build: Build) -> Result<()> {
@@ -239,10 +293,14 @@ pub async fn command(arguments: &[OsString], build: Build) -> Result<()> {
     if let ["--install-cargo", launcher] = args.as_slice() {
         return bundle::install_registry(build, Path::new(launcher));
     }
-    let background = args == ["--background"];
+    let background = match args.as_slice() {
+        ["--background-startup"] => Some(BackgroundCheck::Startup),
+        ["--background"] => Some(BackgroundCheck::Periodic),
+        _ => None,
+    };
     let check = args == ["--check"];
     let status = args == ["--status"];
-    if !args.is_empty() && !background && !check && !status {
+    if !args.is_empty() && background.is_none() && !check && !status {
         bail!("Usage: tickloop update [--check | --status]");
     }
     let executable = std::env::current_exe()?.canonicalize()?;
@@ -256,9 +314,11 @@ pub async fn command(arguments: &[OsString], build: Build) -> Result<()> {
         .unwrap_or_default();
     if status {
         println!(
-            "Running: {}\nSource: {}\n{}",
+            "Running: {}\nSource: {}\nLast attempt: {}\nLast successful check: {}\nCached result: {}",
             build.version,
             installation.source.label(),
+            check_age(state.attempted_at, now()),
+            check_age(state.checked_at, now()),
             if state.message.is_empty() {
                 "No update has been attempted."
             } else {
@@ -267,23 +327,46 @@ pub async fn command(arguments: &[OsString], build: Build) -> Result<()> {
         );
         return Ok(());
     }
-    let _lock = Lock::acquire(&directory.join("update.lock"))?;
+    let _lock = match Lock::acquire(&directory.join("update.lock")) {
+        Ok(lock) => lock,
+        Err(error)
+            if background.is_some()
+                && error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     state = std::fs::read(&state_path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
-    if background && !is_due(&state, now()) {
-        return Ok(());
+    if let Some(trigger) = background {
+        if !is_due(&state, now(), trigger) {
+            return Ok(());
+        }
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(directory.join("update.log"))?;
     }
     state.attempted_at = now();
-    replace_file_atomically(&state_path, &serde_json::to_vec(&state)?, 0o600)?;
-    let result = update(&installation, &build, check).await;
+    state.failed = false;
+    state.set_activity(&state_path, UpdateActivity::Checking)?;
+    let result = update(&installation, &build, check, &mut state, &state_path).await;
+    state.activity = None;
     match &result {
         Ok(message) => {
             state.checked_at = now();
             state.message = message.clone();
         }
         Err(error) => {
+            state.failed = true;
             state.message = format!("Update failed: {error:#}");
         }
     }
@@ -297,7 +380,13 @@ pub async fn command(arguments: &[OsString], build: Build) -> Result<()> {
     result.map(|_| ())
 }
 
-async fn update(installation: &Installation, build: &Build, check: bool) -> Result<String> {
+async fn update(
+    installation: &Installation,
+    build: &Build,
+    check: bool,
+    state: &mut UpdateState,
+    state_path: &Path,
+) -> Result<String> {
     match &installation.source {
         Source::Checkout { root } => bail!(
             "This Cargo installation comes from the local checkout {}. Update that checkout explicitly, then run make install there; automatic updates do not modify source worktrees.",
@@ -331,6 +420,7 @@ async fn update(installation: &Installation, build: &Build, check: bool) -> Resu
                     current.build.version, release.version
                 ));
             }
+            state.set_activity(state_path, UpdateActivity::Installing)?;
             bundle::download_install(root, &release, installation.source.clone()).await?;
             Ok(format!(
                 "Installed {}. Available on the next launch.",
@@ -345,6 +435,7 @@ async fn update(installation: &Installation, build: &Build, check: bool) -> Resu
             if check {
                 command.args(["outdated", "--verbose", HOMEBREW_FORMULA]);
             } else {
+                state.set_activity(state_path, UpdateActivity::Installing)?;
                 command
                     .args(["upgrade", HOMEBREW_FORMULA])
                     .env("HOMEBREW_NO_INSTALL_CLEANUP", "1")
@@ -376,6 +467,7 @@ async fn update(installation: &Installation, build: &Build, check: bool) -> Resu
             if check {
                 return Ok(format!("Available: {installed} → {}", release.version));
             }
+            state.set_activity(state_path, UpdateActivity::Installing)?;
             let stage = tempfile::Builder::new()
                 .prefix(".cargo-build-")
                 .tempdir_in(installation.state_directory()?)?;

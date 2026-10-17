@@ -89,6 +89,7 @@ mod tick_labels;
 mod ticks_panel;
 mod ticks_work;
 mod transcript;
+mod update_notice;
 mod workflows;
 mod workspace_trust;
 
@@ -1660,6 +1661,15 @@ async fn interact(
     let mut user_shell_events = agent.subscribe_user_shells();
     let mut task_notifications = agent.subscribe_task_notifications();
     let interactive = console.is_interactive();
+    let update_monitor = if interactive {
+        tickloop_agent_updater::UpdateMonitor::detect()
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let mut update_notice_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
+    update_notice_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut menus = Menus::new(user_settings.clone(), config_root.clone());
     let mut artifact_loads = tokio::task::JoinSet::new();
     let mut tick_package_tasks = ticks_work::TickPackageTasks::default();
@@ -4584,6 +4594,9 @@ async fn interact(
                         } else {console.set_connection_notice(daemon_unreachable.clone())?;}
                     }
                 }
+            },
+            _ = update_notice_refresh.tick(), if interactive && !visual_pacing_pending && update_monitor.is_some() => {
+                console.set_update_notice(update_monitor.as_ref().and_then(|monitor| monitor.notice()))?;
             },
             _ = animation_refresh.tick(), if interactive && !visual_pacing_pending && (thinking_frame_due || (!prefers_reduced_motion && (!pending.is_empty() || !directed_summaries.is_empty()))) => {
                 thinking_frame_due = false;

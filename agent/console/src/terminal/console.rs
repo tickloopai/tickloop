@@ -18,6 +18,7 @@ use crossterm::terminal::{self, Clear, ClearType, ScrollUp};
 use crossterm::{execute, queue};
 use tickloop_agent_config::DisplayPreferences;
 use tickloop_agent_tools::file_change::FileChangeReview;
+use tickloop_agent_updater::UpdateNotice;
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthChar;
 use uuid::Uuid;
@@ -67,6 +68,9 @@ mod send_now_pty;
 #[cfg(test)]
 #[path = "console/unified_footer_tests.rs"]
 mod unified_footer_tests;
+#[cfg(test)]
+#[path = "console/update_notice_tests.rs"]
+mod update_notice_tests;
 #[cfg(test)]
 #[path = "console/workspace_trust_tests.rs"]
 mod workspace_trust_tests;
@@ -848,6 +852,7 @@ pub(super) struct State {
     provider_failures: HashMap<Uuid, HashMap<String, tickloop_agent_protocol::ProviderHttpFailure>>,
     configured_status_lines: Option<Vec<String>>,
     background_status_notice: Option<BackgroundStatusNotice>,
+    update_notice: Option<UpdateNotice>,
     connection_notice: Option<String>,
     execution_connection_notice: Option<ExecutionConnectionNotice>,
     execution_losses: HashMap<Uuid, Vec<ExecutionLossNotice>>,
@@ -1826,6 +1831,17 @@ impl Console {
     pub(super) fn set_status_lines(&self, lines: Option<Vec<String>>) -> Result<(), String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
         state.configured_status_lines = lines;
+        state
+            .draw(&mut io::stdout().lock())
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn set_update_notice(&self, notice: Option<UpdateNotice>) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.update_notice == notice {
+            return Ok(());
+        }
+        state.update_notice = notice;
         state
             .draw(&mut io::stdout().lock())
             .map_err(|error| error.to_string())
@@ -5624,6 +5640,7 @@ impl State {
             provider_failures: HashMap::new(),
             configured_status_lines: None,
             background_status_notice: None,
+            update_notice: None,
             connection_notice: None,
             execution_connection_notice: None,
             execution_losses: HashMap::new(),
@@ -8035,6 +8052,11 @@ impl State {
                 self.status_area
                     .status_line_with_background(self.width, &notice, background)
             } else {
+                let showing_update_notice = notice.is_empty()
+                    && background.is_none()
+                    && compact_pending.is_none()
+                    && self.update_notice.is_some()
+                    && !self.help_open;
                 let mut notice_line =
                     self.connection_status_line(&notice, background, compact_pending.as_deref());
                 let overview_list_hint;
@@ -8105,6 +8127,20 @@ impl State {
                 } else {
                     "enter send · ctrl+g editor · ctrl+c clear"
                 };
+                if showing_update_notice {
+                    let shortcut_columns = hints
+                        .split(HINT_SEGMENT_SEPARATOR)
+                        .next()
+                        .map_or(0, display_width);
+                    let gap_columns = if shortcut_columns == 0 {
+                        0
+                    } else {
+                        HINT_NOTICE_GAP_COLUMNS
+                    };
+                    let available = self.width.saturating_sub(shortcut_columns + gap_columns);
+                    notice_line =
+                        super::update_notice::line(self.update_notice.as_ref().unwrap(), available);
+                }
                 if self.execution_connection_notice.is_some()
                     && self.ordinary_input_is_visible()
                     && !self.conversation_focused
@@ -8118,8 +8154,10 @@ impl State {
                     notice_line.push(EXECUTION_CONNECTION_DETAILS_HINT, Some(Role::MutedText));
                 }
                 // An overview refusal no key holds any more yields the row back to the hints.
-                let stale_overview_status =
-                    overview && leading_notice.is_empty() && !self.status_held;
+                let stale_overview_status = overview
+                    && leading_notice.is_empty()
+                    && !self.status_held
+                    && !showing_update_notice;
                 if stale_overview_status
                     && display_width(hints)
                         + HINT_NOTICE_GAP_COLUMNS
