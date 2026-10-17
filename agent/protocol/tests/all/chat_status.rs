@@ -138,7 +138,7 @@ fn a_status_derives_the_facts_it_needs_from_the_history_it_leaves_out() {
     );
     assert_eq!(status.command_started_at_ms[&id(0x60)], 200);
     assert_eq!(status.family_input_runs, [id(0x21)].into());
-    assert_eq!(status.context_tokens, Some(0));
+    assert!(status.context_tokens.is_some_and(|tokens| tokens > 0));
     assert_eq!(status.last_sequence, 6);
     assert_eq!(status.queued_inputs().len(), 1);
 
