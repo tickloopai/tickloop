@@ -2655,7 +2655,7 @@ impl Agent {
                 "goal": chat.snapshot.loops.iter().find(|goal| goal.id == receipt.loop_id),
                 "chat_goals": chat.snapshot.loops,
                 "execution_mode": chat.snapshot.policy.mode,
-                "web_search": { "enabled": chat.snapshot.search_config.is_some(), "settings_command": "/search" },
+                "web_search": { "enabled": chat.snapshot.search_config.is_some(), "settings_command": "/websearch" },
                 "plan": chat.snapshot.plans.iter().find(|plan| plan.loop_id == receipt.loop_id),
                 "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
             });

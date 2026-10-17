@@ -19,7 +19,8 @@ use tickloop_agent_base::{
     network::{HttpPolicy, build_http_client},
 };
 use tickloop_agent_protocol::{
-    SearchConfig, SearchProviderKind, SearchTestResult, SearchTestStatus,
+    SearchConfig, SearchProviderKind, SearchTestResult, SearchTestStatus, WebSearchFailure,
+    WebSearchSuggestion,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -28,8 +29,9 @@ const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_QUERY_BYTES: usize = 4096;
 const PERPLEXITY_MAX_DOMAIN_BYTES: usize = 253;
 pub const DEFAULT_RESULT_LIMIT: usize = 10;
-pub const DISABLED_MESSAGE: &str = "Web search is disabled for this request. The user can enable it with /search. This call was not executed.";
+pub const DISABLED_MESSAGE: &str = "Web search is disabled for this request. The user can enable it with /websearch. This call was not executed.";
 const DUCKDUCKGO_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
+const DUCKDUCKGO_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DomainFilter {
@@ -131,7 +133,7 @@ pub fn descriptor(kind: SearchProviderKind) -> SearchProviderDescriptor {
 pub enum SearchError {
     #[error("invalid search query: {0}")]
     InvalidQuery(&'static str),
-    #[error("search credentials are missing; configure the provider in /search")]
+    #[error("search credentials are missing; configure the provider in /websearch")]
     MissingCredential,
     #[error("saved search credentials are unavailable or unsafe")]
     Credential,
@@ -236,23 +238,63 @@ pub async fn test_connection(
             detail: "Test search returned a valid result. This is the latest test, not an ongoing availability check.".into(),
         },
         Ok(_) => SearchTestResult {
-            status: SearchTestStatus::NoResults,
+            status: SearchTestStatus::Unavailable,
             detail: "The service responded without results; search access could not be verified.".into(),
         },
         Err(error) => SearchTestResult {
-            status: match error {
-                SearchError::Authentication(_) => SearchTestStatus::AuthenticationFailed,
-                SearchError::UsageLimit(_) => SearchTestStatus::UsageLimited,
-                SearchError::RateLimited { .. } => SearchTestStatus::RateLimited,
-                SearchError::Network => SearchTestStatus::NetworkFailed,
-                SearchError::Timeout => SearchTestStatus::TimedOut,
-                SearchError::Challenge => SearchTestStatus::Challenge,
-                SearchError::MissingCredential | SearchError::Credential | SearchError::InvalidQuery(_) => SearchTestStatus::ConfigurationFailed,
-                _ => SearchTestStatus::ServiceFailed,
-            },
-            detail: error.to_string(),
+            status: SearchTestStatus::Unavailable,
+            detail: failure_message(config.provider, &request, &error),
         },
     }
+}
+
+pub fn failure_details(
+    kind: SearchProviderKind,
+    request: &SearchRequest,
+    error: &SearchError,
+) -> Option<WebSearchFailure> {
+    if kind != SearchProviderKind::Free || !matches!(error, SearchError::Challenge) {
+        return None;
+    }
+    let mut verification_url = Url::parse(DUCKDUCKGO_ENDPOINT).expect("valid engine");
+    verification_url
+        .query_pairs_mut()
+        .append_pair("q", &request.query);
+    Some(WebSearchFailure {
+        reason: format!("{}: {error}", kind.label()),
+        suggestions: vec![
+            WebSearchSuggestion::OpenVerification {
+                url: verification_url.to_string(),
+                note: "Use the same proxy/network as Tickloop. Browser verification may not carry over to HTTP search.".into(),
+            },
+            WebSearchSuggestion::ChangeProvider { command: "/websearch".into() },
+        ],
+    })
+}
+
+pub fn failure_message(
+    kind: SearchProviderKind,
+    request: &SearchRequest,
+    error: &SearchError,
+) -> String {
+    let Some(failure) = failure_details(kind, request, error) else {
+        return format!("{}: {error}", kind.label());
+    };
+    let mut message = failure.reason;
+    message.push_str("\n\nNext steps:");
+    for suggestion in failure.suggestions {
+        match suggestion {
+            WebSearchSuggestion::OpenVerification { url, note } => {
+                message.push_str(&format!("\nOpen this search in your browser to complete verification, then retry: {url}\n{note}"));
+            }
+            WebSearchSuggestion::ChangeProvider { command } => {
+                message.push_str(&format!(
+                    "\nOr use {command} to choose another search provider."
+                ));
+            }
+        }
+    }
+    message
 }
 
 pub fn validate_config(config: &SearchConfig) -> Result<(), String> {
@@ -457,10 +499,13 @@ async fn http(
             .saturating_duration_since(tokio::time::Instant::now()),
     );
     let (client, _) = build_http_client(&url, policy).map_err(|_| SearchError::Network)?;
-    let mut request = client.request(method, url).headers(headers).header(
-        reqwest::header::USER_AGENT,
-        concat!("Tickloop-Agent/", env!("CARGO_PKG_VERSION")),
-    );
+    let mut headers = headers;
+    headers
+        .entry(reqwest::header::USER_AGENT)
+        .or_insert_with(|| {
+            HeaderValue::from_static(concat!("Tickloop-Agent/", env!("CARGO_PKG_VERSION")))
+        });
+    let mut request = client.request(method, url).headers(headers);
     if let Some(body) = body {
         request = request.json(&body);
     }
@@ -928,7 +973,12 @@ impl SearchProvider for DuckDuckGoSearch {
         for query in request.domains.operator_queries(&request.query, "-") {
             let mut url = self.endpoint.clone();
             url.query_pairs_mut().append_pair("q", &query);
-            let (content_type, bytes) = http(url, Method::GET, HeaderMap::new(), None, context)
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                reqwest::header::USER_AGENT,
+                HeaderValue::from_static(DUCKDUCKGO_USER_AGENT),
+            );
+            let (content_type, bytes) = http(url, Method::GET, headers, None, context)
                 .await
                 .map_err(|error| match error {
                     SearchError::Authentication(status) => SearchError::Http(status),

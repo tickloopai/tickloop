@@ -279,6 +279,18 @@ async fn duckduckgo_is_the_only_free_destination_and_reports_its_source() {
         .unwrap();
     let wire = received.await.unwrap();
     assert!(wire.starts_with("GET "));
+    let user_agents: Vec<_> = wire
+        .lines()
+        .filter_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("user-agent: ")
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(
+        user_agents,
+        vec![DUCKDUCKGO_USER_AGENT.to_ascii_lowercase()]
+    );
     let target = wire.split_whitespace().nth(1).unwrap();
     let requested = Url::parse(&format!("http://localhost{target}")).unwrap();
     assert!(
@@ -472,26 +484,27 @@ async fn live_selected_search_provider() {
 
 #[tokio::test]
 async fn connection_tests_classify_real_adapter_responses_and_use_one_result() {
-    let root = tempfile::tempdir().unwrap();
-    credentials::save_api_key(root.path(), "TEST_SEARCH_KEY", "private-fixture-key").unwrap();
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    credentials::save_api_key(&root, "TEST_SEARCH_KEY", "private-fixture-key").unwrap();
     for (status, body, expected) in [
         (
             200,
             r#"{"results":[{"title":"Rust","url":"https://www.rust-lang.org/"}]}"#,
             SearchTestStatus::Available,
         ),
-        (200, r#"{"results":[]}"#, SearchTestStatus::NoResults),
-        (401, "unauthorized", SearchTestStatus::AuthenticationFailed),
-        (403, "forbidden", SearchTestStatus::AuthenticationFailed),
-        (402, "payment", SearchTestStatus::UsageLimited),
+        (200, r#"{"results":[]}"#, SearchTestStatus::Unavailable),
+        (401, "unauthorized", SearchTestStatus::Unavailable),
+        (403, "forbidden", SearchTestStatus::Unavailable),
+        (402, "payment", SearchTestStatus::Unavailable),
         (
             400,
             r#"{"message":"Not enough credits"}"#,
-            SearchTestStatus::UsageLimited,
+            SearchTestStatus::Unavailable,
         ),
-        (429, "limited", SearchTestStatus::RateLimited),
-        (503, "unavailable", SearchTestStatus::ServiceFailed),
-        (200, "invalid JSON", SearchTestStatus::ServiceFailed),
+        (429, "limited", SearchTestStatus::Unavailable),
+        (503, "unavailable", SearchTestStatus::Unavailable),
+        (200, "invalid JSON", SearchTestStatus::Unavailable),
     ] {
         let (url, received) = server(status, "application/json", body).await;
         let config = SearchConfig {
@@ -499,7 +512,7 @@ async fn connection_tests_classify_real_adapter_responses_and_use_one_result() {
             endpoint: url.to_string(),
             api_key_env: Some("TEST_SEARCH_KEY".into()),
         };
-        let result = test_connection(&config, Some(root.path()), CancellationToken::new()).await;
+        let result = test_connection(&config, Some(&root), CancellationToken::new()).await;
         assert_eq!(result.status, expected, "HTTP {status}");
         assert!(!result.detail.contains("private-fixture-key"));
         let wire = received.await.unwrap();
@@ -513,16 +526,73 @@ async fn connection_tests_classify_real_adapter_responses_and_use_one_result() {
         api_key_env: Some("TEST_SEARCH_KEY".into()),
     };
     assert_eq!(
-        test_connection(&config, Some(root.path()), CancellationToken::new())
+        test_connection(&config, Some(&root), CancellationToken::new())
             .await
             .status,
-        SearchTestStatus::NetworkFailed
+        SearchTestStatus::Unavailable
     );
-    credentials::remove_api_key(root.path(), "TEST_SEARCH_KEY").unwrap();
+    credentials::remove_api_key(&root, "TEST_SEARCH_KEY").unwrap();
     assert_eq!(
-        test_connection(&config, Some(root.path()), CancellationToken::new())
+        test_connection(&config, Some(&root), CancellationToken::new())
             .await
             .status,
-        SearchTestStatus::ConfigurationFailed
+        SearchTestStatus::Unavailable
     );
+}
+
+#[test]
+fn duckduckgo_challenge_offers_manual_verification_and_provider_settings_without_switching() {
+    let request = SearchRequest {
+        query: "故宫 预约 & official".into(),
+        domains: DomainFilter::Any,
+    };
+    let details =
+        failure_details(SearchProviderKind::Free, &request, &SearchError::Challenge).unwrap();
+    assert!(!details.reason.contains("/websearch"));
+    assert_eq!(details.suggestions.len(), 2);
+    assert!(matches!(
+        &details.suggestions[0],
+        WebSearchSuggestion::OpenVerification { .. }
+    ));
+    assert!(
+        matches!(&details.suggestions[1], WebSearchSuggestion::ChangeProvider { command } if command == "/websearch")
+    );
+    let message = failure_message(SearchProviderKind::Free, &request, &SearchError::Challenge);
+    assert!(message.contains("Open this search in your browser"));
+    assert!(message.contains("same proxy/network"));
+    assert!(message.contains("may not carry over"));
+    assert!(message.contains("/websearch"));
+    let url_text = message
+        .split_whitespace()
+        .find(|word| word.starts_with("https://"))
+        .unwrap();
+    let url = Url::parse(url_text).unwrap();
+    assert_eq!(url.host_str(), Some("html.duckduckgo.com"));
+    assert!(
+        url.query_pairs()
+            .any(|(key, value)| key == "q" && value == request.query)
+    );
+    let denied = failure_message(
+        SearchProviderKind::Tavily,
+        &request,
+        &SearchError::Authentication(401),
+    );
+    assert!(!denied.contains("Open this search"));
+}
+
+#[tokio::test]
+#[ignore = "explicit live DuckDuckGo reproduction of the user-reported Palace Museum query"]
+async fn live_duckduckgo_palace_museum_query() {
+    let request = SearchRequest {
+        query: "故宫博物院 www.dpm.org.cn 参观 预约 购票 官方".into(),
+        domains: DomainFilter::Any,
+    };
+    let plan = prepare(&SearchConfig::default(), &request, None).unwrap();
+    match plan.execute(&request, CancellationToken::new()).await {
+        Ok(response) => println!(
+            "LIVE Palace Museum query: results={}",
+            response.results.len()
+        ),
+        Err(error) => println!("LIVE Palace Museum query: unavailable={error}"),
+    }
 }

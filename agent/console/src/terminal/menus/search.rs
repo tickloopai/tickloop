@@ -5,6 +5,25 @@ use tickloop_agent_protocol::{
     ApiKeyStatus, SearchConfig, SearchProviderKind, SearchTestResult, SearchTestStatus,
 };
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SearchAction {
+    Use,
+    ConfigureKey,
+    RemoveKey,
+    ConfigureEndpoint,
+}
+
+impl SearchAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Use => "Use this search provider",
+            Self::ConfigureKey => "Set or replace API key",
+            Self::RemoveKey => "Remove saved API key",
+            Self::ConfigureEndpoint => "Set endpoint URL",
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct SearchSession {
     tests: Vec<SearchVerification>,
@@ -37,16 +56,6 @@ pub(super) struct SearchTestFlow {
 impl Drop for SearchTestFlow {
     fn drop(&mut self) {
         self.task.abort();
-    }
-}
-
-fn test_role(status: SearchTestStatus) -> Role {
-    match status {
-        SearchTestStatus::Available => Role::SuccessMark,
-        SearchTestStatus::AuthenticationFailed | SearchTestStatus::ConfigurationFailed => {
-            Role::ErrorMark
-        }
-        _ => Role::WarningMark,
     }
 }
 
@@ -99,7 +108,13 @@ impl Menus {
                         if needs_key {
                             self.search_key(console, target, config, return_to_settings)?;
                         } else {
-                            self.search_provider(console, target, config, return_to_settings)?;
+                            self.open_search_provider(
+                                agent,
+                                console,
+                                target,
+                                config,
+                                return_to_settings,
+                            )?;
                         }
                     }
                 } else if return_to_settings {
@@ -109,16 +124,35 @@ impl Menus {
             Selection::SearchProvider {
                 target,
                 config,
+                actions,
                 return_to_settings,
             } => {
-                self.provider.search.flow.take();
-                match index {
+                let action = index
+                    .map(|index| {
+                        actions
+                            .get(index)
+                            .copied()
+                            .ok_or("search action does not exist")
+                    })
+                    .transpose()?;
+                let checking = self
+                    .provider
+                    .search
+                    .flow
+                    .as_ref()
+                    .is_some_and(|flow| flow.config == config);
+                if action != Some(SearchAction::Use) || !checking {
+                    self.provider.search.flow.take();
+                }
+                match action {
                     None => {
                         self.search_settings(agent, console, target, return_to_settings)
                             .await?
                     }
-                    Some(0) => {
-                        if let Some(name) = config
+                    Some(SearchAction::Use) => {
+                        if checking {
+                            self.search_provider(console, target, config, return_to_settings)?;
+                        } else if let Some(name) = config
                             .api_key_env
                             .as_deref()
                             .or(config.provider.credential_env())
@@ -131,6 +165,8 @@ impl Menus {
                             && config.endpoint.is_empty()
                         {
                             self.search_endpoint(console, target, config, return_to_settings)?;
+                        } else if !self.search_provider_ready(&config) {
+                            self.search_provider(console, target, config, return_to_settings)?;
                         } else {
                             agent
                                 .change_configuration(
@@ -145,23 +181,13 @@ impl Menus {
                                 .await?;
                         }
                     }
-                    Some(1)
-                        if config.api_key_env.is_some()
-                            || config.provider.credential_env().is_some() =>
-                    {
+                    Some(SearchAction::ConfigureKey) => {
                         self.search_key(console, target, config, return_to_settings)?
                     }
-                    Some(1) if config.provider == SearchProviderKind::Free => {
-                        self.start_search_test(agent, console, target, config, return_to_settings)?;
+                    Some(SearchAction::ConfigureEndpoint) => {
+                        self.search_endpoint(console, target, config, return_to_settings)?
                     }
-                    Some(1) => self.search_endpoint(console, target, config, return_to_settings)?,
-                    Some(2)
-                        if config.api_key_env.is_none()
-                            && config.provider.credential_env().is_none() =>
-                    {
-                        self.start_search_test(agent, console, target, config, return_to_settings)?;
-                    }
-                    Some(2) => {
+                    Some(SearchAction::RemoveKey) => {
                         let root = self
                             .provider_root()
                             .ok_or("Agent settings directory is unavailable")?;
@@ -173,12 +199,14 @@ impl Menus {
                         tickloop_agent_model::credentials::remove_api_key(root, name)
                             .map_err(|error| error.to_string())?;
                         self.invalidate_search_test(config.provider);
-                        self.search_provider(console, target, config, return_to_settings)?;
+                        self.open_search_provider(
+                            agent,
+                            console,
+                            target,
+                            config,
+                            return_to_settings,
+                        )?;
                     }
-                    Some(3) => {
-                        self.start_search_test(agent, console, target, config, return_to_settings)?
-                    }
-                    _ => return Err("search action does not exist".into()),
                 }
             }
             Selection::SearchKey {
@@ -206,7 +234,7 @@ impl Menus {
                     self.invalidate_search_test(config.provider);
                     self.start_search_test(agent, console, target, config, return_to_settings)?;
                 } else {
-                    self.search_provider(console, target, config, return_to_settings)?;
+                    self.open_search_provider(agent, console, target, config, return_to_settings)?;
                 }
             }
             Selection::SearchEndpoint {
@@ -221,7 +249,7 @@ impl Menus {
                         return Err(error);
                     }
                 }
-                self.search_provider(console, target, config, return_to_settings)?;
+                self.open_search_provider(agent, console, target, config, return_to_settings)?;
             }
 
             _ => unreachable!("only search selections reach the search handler"),
@@ -269,7 +297,7 @@ impl Menus {
                         Err(_) => "credential unavailable",
                     }
                 } else if *kind == SearchProviderKind::Free {
-                    "no key needed"
+                    ""
                 } else {
                     "custom endpoint"
                 };
@@ -279,25 +307,38 @@ impl Menus {
                     .cloned()
                     .unwrap_or_else(|| SearchConfig::for_provider(*kind));
                 let tested = self.search_verification(&config);
-                row_roles.push(Some(tested.map_or_else(
-                    || {
-                        if status == "credential unavailable" {
-                            Role::ErrorMark
-                        } else {
-                            Role::MutedText
-                        }
-                    },
-                    |result| test_role(result.status),
-                )));
-                let test_status = tested.map_or("", |result| result.status.label());
-                let status = if test_status.is_empty() {
-                    format!("{status} · untested")
+                let active = current
+                    .as_ref()
+                    .is_some_and(|config| config.provider == *kind);
+                let role = match tested.map(|result| result.status) {
+                    Some(SearchTestStatus::Available) if active => Role::SuccessMark,
+                    Some(SearchTestStatus::Available) => Role::Text,
+                    Some(SearchTestStatus::Unavailable) => Role::MutedText,
+                    None if status == "credential unavailable" => Role::MutedText,
+                    None if status == "key needed" => Role::MutedText,
+                    None if active => Role::SuccessMark,
+                    None => Role::Text,
+                };
+                row_roles.push(Some(role));
+                let status = if tested
+                    .is_some_and(|result| result.status == SearchTestStatus::Unavailable)
+                {
+                    if status.is_empty() {
+                        "unavailable".into()
+                    } else {
+                        format!("{status} · unavailable")
+                    }
                 } else {
-                    format!("{status} · {test_status}")
+                    status.to_owned()
                 };
                 format!(
-                    "{} · {status}{}",
+                    "{}{}{}",
                     kind.label(),
+                    if status.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {status}")
+                    },
                     if current
                         .as_ref()
                         .is_some_and(|config| config.provider == *kind)
@@ -326,18 +367,7 @@ impl Menus {
             Menu {
                 id: Uuid::new_v4(),
                 title: "Web search".into(),
-                context: vec![
-                    format!(
-                        "Web search: {}",
-                        current
-                            .as_ref()
-                            .map_or("Off", |config| config.provider.label())
-                    ),
-                    "Select a source to set up, test or enable it. No Tickloop account needed."
-                        .into(),
-                    "Colors show the latest test in this View; active marks the selected source."
-                        .into(),
-                ],
+                context: Vec::new(),
                 options,
                 selected,
                 confirmation: false,
@@ -365,6 +395,41 @@ impl Menus {
         })
     }
 
+    fn open_search_provider(
+        &mut self,
+        agent: &Agent,
+        console: &Console,
+        target: ConfigTarget,
+        config: SearchConfig,
+        return_to_settings: bool,
+    ) -> Result<(), String> {
+        let has_key = config
+            .api_key_env
+            .as_deref()
+            .or(config.provider.credential_env())
+            .is_none_or(|name| {
+                matches!(
+                    self.search_key_status(name),
+                    Ok(ApiKeyStatus::Saved | ApiKeyStatus::Environment)
+                )
+            });
+        let has_endpoint =
+            config.provider != SearchProviderKind::Searxng || !config.endpoint.is_empty();
+        if has_key && has_endpoint {
+            self.start_search_test(agent, console, target, config, return_to_settings)
+        } else {
+            self.invalidate_search_test(config.provider);
+            self.search_provider(console, target, config, return_to_settings)
+        }
+    }
+
+    fn search_provider_ready(&self, config: &SearchConfig) -> bool {
+        self.search_verification(config)
+            .map_or(config.provider == SearchProviderKind::Free, |result| {
+                result.status == SearchTestStatus::Available
+            })
+    }
+
     pub(super) fn search_provider(
         &mut self,
         console: &Console,
@@ -372,57 +437,52 @@ impl Menus {
         config: SearchConfig,
         return_to_settings: bool,
     ) -> Result<(), String> {
-        let mut options = vec!["Use this search provider".into()];
-        let mut context = vec![
-            format!("Provider: {}", config.provider.label()),
-            format!("Endpoint: {}", safe_text(&config.endpoint)),
-        ];
+        let mut actions = vec![SearchAction::Use];
+        let mut context = config
+            .provider
+            .website()
+            .map(|website| vec![format!("Website: {website}")])
+            .unwrap_or_default();
+        if !config.endpoint.is_empty()
+            && (config.provider == SearchProviderKind::Searxng
+                || config.endpoint != config.provider.default_endpoint())
+        {
+            context.push(format!("Endpoint: {}", safe_text(&config.endpoint)));
+        }
         if let Some(name) = config
             .api_key_env
             .as_deref()
             .or(config.provider.credential_env())
         {
-            context.push(format!(
-                "Credential: {}",
-                match self.search_key_status(name) {
-                    Ok(ApiKeyStatus::Saved) => "saved privately",
-                    Ok(ApiKeyStatus::Environment) => "inherited environment",
-                    Ok(ApiKeyStatus::Missing) => "not configured",
-                    Err(_) => "unavailable or unsafe",
-                }
-            ));
-            options.extend([
-                "Set or replace API key".into(),
-                "Remove saved API key".into(),
-            ]);
+            actions.push(SearchAction::ConfigureKey);
+            if self.search_key_status(name) == Ok(ApiKeyStatus::Saved) {
+                actions.push(SearchAction::RemoveKey);
+            }
         } else if config.provider != SearchProviderKind::Free {
-            options.push("Set endpoint URL".into());
+            actions.push(SearchAction::ConfigureEndpoint);
         }
-        options.push("Test search connection".into());
         let checking = self
             .provider
             .search
             .flow
             .as_ref()
             .is_some_and(|flow| flow.config == config);
-        let result = self.search_verification(&config);
-        context.push(format!(
-            "Latest test: {}",
-            if checking {
-                "testing…"
-            } else {
-                result.map_or("untested", |result| result.status.label())
-            }
-        ));
-        if let Some(result) = result {
-            context.push(result.detail.clone());
-        }
-        context.push("Testing sends one real search and may use provider credits. Saving or testing does not enable this source.".into());
-        let row_role = if checking {
-            Role::MutedText
-        } else {
-            result.map_or(Role::MutedText, |result| test_role(result.status))
-        };
+        let ready = !checking && self.search_provider_ready(&config);
+        let options = actions
+            .iter()
+            .map(|action| {
+                if *action == SearchAction::Use && checking {
+                    format!("{} (checking…)", action.label())
+                } else if *action == SearchAction::Use && !ready {
+                    format!("{} (unavailable)", action.label())
+                } else if *action == SearchAction::Use {
+                    format!("{} (available)", action.label())
+                } else {
+                    action.label().to_owned()
+                }
+            })
+            .collect();
+        let row_role = if ready { Role::Text } else { Role::MutedText };
         let previous = self.active.as_ref().filter(|(_, selection)| {
             matches!(selection,
             Selection::SearchProvider { target: previous_target, config: previous, .. }
@@ -437,7 +497,10 @@ impl Menus {
                     .or(config.provider.credential_env())
                     .is_some_and(|name| self.search_key_status(name) == Ok(ApiKeyStatus::Missing))
                 {
-                    1
+                    actions
+                        .iter()
+                        .position(|action| *action == SearchAction::ConfigureKey)
+                        .unwrap_or(0)
                 } else {
                     0
                 }
@@ -464,6 +527,7 @@ impl Menus {
             Selection::SearchProvider {
                 target,
                 config,
+                actions,
                 return_to_settings,
             },
             vec![Some(row_role)],
@@ -494,9 +558,8 @@ impl Menus {
             context: vec![
                 format!("Saved privately as {name}; the existing key is kept until Save succeeds."),
                 "The key is hidden and is never added to command history.".into(),
-                "Saving starts one test search, which may use provider credits; it does not enable the source.".into(),
             ],
-            options: vec!["Save and test API key".into(), "Cancel".into()],
+            options: vec!["Save API key".into(), "Cancel".into()],
             selected: 0,
             confirmation: false,
         };
@@ -631,8 +694,8 @@ impl Menus {
             return Ok(());
         }
         let result = result.unwrap_or(SearchTestResult {
-            status: SearchTestStatus::ServiceFailed,
-            detail: "Search test could not complete. The key remains saved; retry the test.".into(),
+            status: SearchTestStatus::Unavailable,
+            detail: "Search check could not complete. Reopen this provider to retry.".into(),
         });
         if self.search_credential_stamp(&flow.config).ok().as_ref() == Some(&flow.credential) {
             self.provider.search.tests.push(SearchVerification {
@@ -648,5 +711,143 @@ impl Menus {
             flow.return_to_settings,
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn available() -> SearchTestResult {
+        SearchTestResult {
+            status: SearchTestStatus::Available,
+            detail: "Controlled successful test".into(),
+        }
+    }
+
+    fn pending(root: &std::path::Path) -> (Menus, Console, tokio::task::AbortHandle) {
+        let chat = Uuid::new_v4();
+        let console = Console::test_interactive_for_chat(chat);
+        let mut menus = Menus::new(None, Some(root.into()));
+        menus.sync_provider_chat(Some(chat));
+        let config = SearchConfig::for_provider(SearchProviderKind::Tavily);
+        let credential = menus.search_credential_stamp(&config).unwrap();
+        let (_sender, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(std::future::pending());
+        let abort = task.abort_handle();
+        menus.provider.search.flow = Some(SearchTestFlow {
+            id: Uuid::new_v4(),
+            target: ConfigTarget::Agent(chat),
+            config: config.clone(),
+            credential,
+            return_to_settings: false,
+            task,
+            receiver,
+        });
+        menus
+            .search_provider(&console, ConfigTarget::Agent(chat), config, false)
+            .unwrap();
+        (menus, console, abort)
+    }
+
+    #[tokio::test]
+    async fn search_test_results_are_invalidated_by_replaced_credentials_and_isolated_by_agent() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        tickloop_agent_model::credentials::save_api_key(
+            &root,
+            "TAVILY_API_KEY",
+            "first-private-key",
+        )
+        .unwrap();
+        let (mut menus, console, _) = pending(&root);
+        assert!(menus.search_test_active());
+        tickloop_agent_model::credentials::save_api_key(
+            &root,
+            "TAVILY_API_KEY",
+            "replacement-private-key",
+        )
+        .unwrap();
+        menus.finish_search_test(&console, Ok(available())).unwrap();
+        let config = SearchConfig::for_provider(SearchProviderKind::Tavily);
+        assert!(
+            menus.search_verification(&config).is_none(),
+            "a late result cannot verify a replacement key"
+        );
+        let id = menus.id().unwrap();
+        assert!(
+            console
+                .menu_snapshot(id)
+                .unwrap()
+                .unwrap()
+                .context
+                .iter()
+                .all(|line| !line.starts_with("Connection:") && !line.contains("untested"))
+        );
+        menus.provider.search.tests.push(SearchVerification {
+            config: config.clone(),
+            credential: menus.search_credential_stamp(&config).unwrap(),
+            result: available(),
+        });
+        assert!(menus.search_verification(&config).is_some());
+        let original_chat = menus.provider_chat.unwrap();
+        menus.sync_provider_chat(Some(Uuid::new_v4()));
+        assert!(menus.search_verification(&config).is_none());
+        menus.sync_provider_chat(original_chat);
+        assert!(menus.search_verification(&config).is_some());
+        let mut different_endpoint = config;
+        different_endpoint.endpoint = "https://example.org/search".into();
+        assert!(menus.search_verification(&different_endpoint).is_none());
+    }
+
+    #[tokio::test]
+    async fn search_tests_cancel_on_dismiss_and_cannot_repaint_another_menu() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let (mut menus, console, abort) = pending(&root);
+        menus.dismiss(&console).unwrap();
+        tokio::task::yield_now().await;
+        assert!(abort.is_finished());
+        assert!(menus.provider.search.flow.is_none());
+        let (mut menus, console, _) = pending(&root);
+        let original = menus.id().unwrap();
+        menus.provider.search.flow.as_mut().unwrap().id = Uuid::new_v4();
+        assert!(!menus.search_test_active());
+        menus.finish_search_test(&console, Ok(available())).unwrap();
+        assert_eq!(menus.id(), Some(original));
+        assert!(menus.provider.search.tests.is_empty());
+    }
+    #[tokio::test]
+    async fn a_preempting_request_suspends_search_test_without_consuming_its_result() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let (mut menus, console, abort) = pending(&root);
+        let chat = menus.provider_chat.unwrap().unwrap();
+        let request = Uuid::new_v4();
+        menus
+            .workflow(
+                &console,
+                (
+                    Menu {
+                        id: request,
+                        title: "Plan approval".into(),
+                        context: Vec::new(),
+                        options: vec!["Approve".into(), "Cancel".into()],
+                        selected: 1,
+                        confirmation: true,
+                    },
+                    workflows::Workflow::Plan {
+                        chat,
+                        goal: request,
+                        version: 1,
+                        request: None,
+                    },
+                ),
+            )
+            .unwrap();
+        assert!(menus.provider.search.flow.is_some());
+        assert!(!abort.is_finished());
+        assert!(!menus.search_test_active());
+        assert_eq!(menus.id(), Some(request));
     }
 }

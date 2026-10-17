@@ -251,7 +251,7 @@ CRITICAL REQUIREMENT - You MUST follow this:
 
 Usage notes:
   - Domain filtering is supported to include or block specific websites
-  - Search uses the source selected in /search; free search needs no account or API key
+  - Search uses the source selected in /websearch; free search needs no account or API key
   - Do not request more results by passing limit or offset; refine the query and read source pages with WebFetch
 
 IMPORTANT - Use the correct year in search queries:
@@ -541,14 +541,25 @@ pub(super) async fn search(
         .prepared
         .as_ref()
         .ok_or_else(|| ToolError::Network("search is not configured".into()))?;
-    let response =
-        prepared
-            .execute(&input.request(), cancel)
-            .await
-            .map_err(|error| match error {
+    let request = input.request();
+    let response = match prepared.execute(&request, cancel).await {
+        Ok(response) => response,
+        Err(error) => {
+            if let Some(failure) = web_search::failure_details(prepared.kind, &request, &error) {
+                return Ok(ToolResult {
+                    content: serde_json::to_string(&failure).expect("search failure serializes"),
+                    is_error: true,
+                    output_ref: None,
+                });
+            }
+            return Err(match error {
                 web_search::SearchError::Cancelled => ToolError::Cancelled,
-                other => ToolError::Network(format!("{}: {other}", prepared.kind.label())),
-            })?;
+                other => {
+                    ToolError::Network(web_search::failure_message(prepared.kind, &request, &other))
+                }
+            });
+        }
+    };
     let links = response
         .results
         .into_iter()

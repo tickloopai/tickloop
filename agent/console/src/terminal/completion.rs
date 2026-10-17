@@ -316,10 +316,10 @@ const COMMANDS: &[CommandSpec] = &[
         menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
-        command: "/search",
+        command: "/websearch",
         arguments: "",
-        description: "Chooses a search source and manages search API keys.",
-        menu_group: Some(CommandGroup::Advanced),
+        description: "Configures web search providers, API keys and connection tests.",
+        menu_group: Some(CommandGroup::ToolsAndPermissions),
     },
     CommandSpec {
         command: "/background",
@@ -619,14 +619,14 @@ mod tests {
     fn discovery_separates_public_commands_advanced_controls_and_skills() {
         let mut completion = Completion::default();
         completion.update("/");
-        assert_eq!(completion.candidates().len(), 24);
+        assert_eq!(completion.candidates().len(), 25);
         assert_eq!(builtin_commands().len(), 44);
         assert_eq!(
             builtin_commands()
                 .iter()
                 .filter(|spec| spec.menu_group == Some(CommandGroup::Advanced))
                 .count(),
-            20
+            19
         );
         assert_eq!(completion.selected_index(), None);
         for command in [
@@ -695,6 +695,29 @@ mod tests {
             vec!["/settings", "/slides", "/stop"]
         );
         completion.update("/operations");
+        assert!(!completion.is_open());
+    }
+
+    #[test]
+    fn websearch_is_discoverable_and_completes_the_canonical_command() {
+        let mut completion = Completion::default();
+        completion.update("/web");
+        assert_eq!(command_names(&completion), vec!["/websearch"]);
+        let candidate = completion.candidates().next().unwrap();
+        assert_eq!(
+            candidate.menu_group,
+            Some(CommandGroup::ToolsAndPermissions)
+        );
+        assert_eq!(
+            completion.handle_key(CompletionKey::Complete),
+            CompletionAction::ReplaceDraft {
+                draft: "/websearch".into(),
+                cursor: "/websearch".len(),
+            }
+        );
+        completion.update("/");
+        assert!(command_names(&completion).contains(&"/websearch"));
+        completion.update("/search");
         assert!(!completion.is_open());
     }
 

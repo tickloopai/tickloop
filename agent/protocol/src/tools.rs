@@ -10,6 +10,20 @@ pub struct ToolResult {
     pub output_ref: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearchFailure {
+    pub reason: String,
+    pub suggestions: Vec<WebSearchSuggestion>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WebSearchSuggestion {
+    OpenVerification { url: String, note: String },
+    ChangeProvider { command: String },
+}
+
 /// What a Chat last saw of one file, following Claude Code's `readFileState` entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileReadRecord {
@@ -103,6 +117,19 @@ impl SearchProviderKind {
         }
     }
 
+    pub fn website(self) -> Option<&'static str> {
+        match self {
+            Self::Free => Some("https://duckduckgo.com/"),
+            Self::Brave => Some("https://brave.com/search/api/"),
+            Self::Tavily => Some("https://www.tavily.com/"),
+            Self::Exa => Some("https://exa.ai/"),
+            Self::SerpApi => Some("https://serpapi.com/"),
+            Self::Serper => Some("https://serper.dev/"),
+            Self::Perplexity => Some("https://www.perplexity.ai/api-platform"),
+            Self::Searxng => None,
+        }
+    }
+
     pub fn default_endpoint(self) -> &'static str {
         match self {
             Self::Free => "",
@@ -133,30 +160,14 @@ impl SearchProviderKind {
 #[serde(rename_all = "snake_case")]
 pub enum SearchTestStatus {
     Available,
-    AuthenticationFailed,
-    UsageLimited,
-    RateLimited,
-    NetworkFailed,
-    TimedOut,
-    Challenge,
-    NoResults,
-    ConfigurationFailed,
-    ServiceFailed,
+    Unavailable,
 }
 
 impl SearchTestStatus {
     pub fn label(self) -> &'static str {
         match self {
             Self::Available => "available",
-            Self::AuthenticationFailed => "access denied",
-            Self::UsageLimited => "quota or plan limit",
-            Self::RateLimited => "rate limited",
-            Self::NetworkFailed => "network failed",
-            Self::TimedOut => "timed out",
-            Self::Challenge => "verification required",
-            Self::NoResults => "no results; unverified",
-            Self::ConfigurationFailed => "configuration needed",
-            Self::ServiceFailed => "service failed",
+            Self::Unavailable => "unavailable",
         }
     }
 }

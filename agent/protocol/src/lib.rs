@@ -165,7 +165,7 @@ pub use tick_subscriptions::{
 pub use tool::ToolDefinition;
 pub use tools::{
     CommandSnapshot, CommandState, FileReadRecord, SearchConfig, SearchProviderKind,
-    SearchTestResult, SearchTestStatus, ToolResult,
+    SearchTestResult, SearchTestStatus, ToolResult, WebSearchFailure, WebSearchSuggestion,
 };
 pub use usage::{
     CounterSummary, CounterTotal, LedgerError, ModelRequestKind, ModelUsageSummary,

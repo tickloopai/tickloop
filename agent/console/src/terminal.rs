@@ -402,6 +402,7 @@ fn command_timing(command: &str) -> CommandTiming {
                 | "/auto-mode-setup"
                 | "/mode"
                 | "/model"
+                | "/websearch"
                 | "/provider"
                 | "/thinking"
                 | "/loops"
@@ -3539,13 +3540,13 @@ async fn interact(
                                 }
                             }
                         },
-                        _ if line == "/search" => {
+                        _ if line == "/websearch" => {
                             let target = ConfigTarget::visible(selected_chat);
                             if let Err(error) = Box::pin(menus.search_settings(agent, console, target, false)).await {
                                 outln!(console, "Cannot open Web search: {}", safe_text(&error));
                             }
                         },
-                        _ if line.starts_with("/search ") => outln!(console, "Use /search to choose and configure a search source with the keyboard."),
+                        _ if line.starts_with("/websearch ") => outln!(console, "Use /websearch to choose and configure a search source with the keyboard."),
                         _ if line=="/compact" || line.starts_with("/compact ") => {
                             if let Some(chat)=selected_chat {
                                 let agent=agent.clone();
@@ -8775,6 +8776,7 @@ mod tests {
         for command in [
             "/mode plan",
             "/model config.json",
+            "/websearch",
             "/settings",
             "/interrupt",
             "/diff",

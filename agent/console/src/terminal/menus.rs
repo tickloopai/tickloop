@@ -59,6 +59,7 @@ enum Selection {
         return_to_settings: bool,
     },
     SearchProvider {
+        actions: Vec<search::SearchAction>,
         target: ConfigTarget,
         return_to_settings: bool,
         config: tickloop_agent_protocol::SearchConfig,
@@ -321,10 +322,12 @@ impl Selection {
             Self::SearchProvider {
                 target,
                 config,
+                actions,
                 return_to_settings,
             } => Self::SearchProvider {
                 target: *target,
                 config: config.clone(),
+                actions: actions.clone(),
                 return_to_settings: *return_to_settings,
             },
             Self::SettingsInfo { target } => Self::SettingsInfo { target: *target },
@@ -1582,7 +1585,14 @@ impl Menus {
                 title: "Settings".into(),
                 context,
                 options: vec![
-                    "Model".into(),
+                    format!(
+                        "Model: {}",
+                        safe_text(if snapshot.model.name.trim().is_empty() {
+                            &snapshot.model.model
+                        } else {
+                            &snapshot.model.name
+                        })
+                    ),
                     format!(
                         "Thinking: {}",
                         match tickloop_agent_model::cards::model_card(&snapshot.model)

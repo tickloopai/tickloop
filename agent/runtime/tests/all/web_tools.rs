@@ -834,7 +834,7 @@ async fn search_off_removes_the_tool_and_explains_how_to_enable_it_without_disab
             .join("\n");
         assert_eq!(system.contains("# Web search is disabled"), !enabled);
         if !enabled {
-            assert!(system.contains("enable it with /search"));
+            assert!(system.contains("enable it with /websearch"));
             assert!(system.contains("bypass this setting"));
         }
     }
@@ -960,7 +960,7 @@ async fn search_distinguishes_disabled_empty_rate_limited_and_invalid_responses(
     let run = run_web(disabled_model.clone(), None).await;
     assert!(run.failure.is_none(), "{:?}", run.failure);
     assert!(run.results[0].is_error && run.results[0].content.contains("disabled"));
-    assert!(run.results[0].content.contains("/search"));
+    assert!(run.results[0].content.contains("/websearch"));
     assert!(run.permission_requests.is_empty());
     assert!(
         disabled_model
