@@ -1,4 +1,9 @@
-//! A small launcher for official prebuilt Tickloop releases. No application source is bundled.
+#[path = "../bundle.rs"]
+mod bundle;
+
+mod embedded {
+    include!(concat!(env!("OUT_DIR"), "/payload.rs"));
+}
 
 pub fn run() {
     #[cfg(unix)]
@@ -15,18 +20,18 @@ pub fn run() {
 
 #[cfg(unix)]
 mod unix {
+    use crate::bundle::output;
     use std::fs::{File, OpenOptions};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     const VERSION: &str = env!("CARGO_PKG_VERSION");
     const PROGRAMS: [&str; 3] = ["tickloop", "tickhost", "tick-reader"];
-    const RELEASES: &str = "https://github.com/tickloopai/homebrew-tap/releases/download";
     const LOCK_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-    const MAX_DOWNLOAD_BYTES: &str = "268435456";
 
     unsafe extern "C" {
         fn geteuid() -> u32;
@@ -57,23 +62,21 @@ mod unix {
                 println!("{program} {VERSION}");
                 return Ok(());
             }
-            let target = match (std::env::consts::OS, std::env::consts::ARCH) {
-                ("macos", "aarch64") => "aarch64-apple-darwin",
-                ("macos", "x86_64") => "x86_64-apple-darwin",
-                _ => {
-                    return Err(
-                        "Tickloop currently supports macOS Apple Silicon and Intel only.".into(),
-                    );
-                }
-            };
+            let target = crate::embedded::TARGET;
             if !cargo_root.join(".crates2.json").is_file() {
                 return Err("Cargo installation metadata is missing; reinstall with cargo install tickloop.".into());
             }
             private_directory(&root)?;
             let _lock = installation_lock(&root)?;
             if !usable_runtime(&root, VERSION) {
-                eprintln!("Installing Tickloop {VERSION} for {target}…");
-                install_release(&root, &bin.join("tickloop"), target, VERSION, download)?;
+                install_release(
+                    &root,
+                    &bin.join("tickloop"),
+                    target,
+                    VERSION,
+                    crate::embedded::ARCHIVE,
+                    crate::embedded::CHECKSUM,
+                )?;
             }
         }
         let payload = root
@@ -175,61 +178,13 @@ mod unix {
         launcher: &Path,
         target: &str,
         version: &str,
-        fetch: impl Fn(&str, &Path) -> Result<(), String>,
+        archive_bytes: &[u8],
+        checksum: &str,
     ) -> Result<(), String> {
         let stage = Stage::create(root)?;
-        let archive_name = format!("tickloop-{target}.tar.gz");
-        let archive = stage.0.join(&archive_name);
-        let checksum_file = stage.0.join("checksum");
-        let base = format!("{RELEASES}/v{version}/{archive_name}");
-        fetch(&base, &archive)?;
-        fetch(&format!("{base}.sha256"), &checksum_file)?;
-        let checksum = std::fs::read_to_string(&checksum_file).map_err(display)?;
-        let fields = checksum.split_whitespace().collect::<Vec<_>>();
-        if fields.len() != 2
-            || fields[0].len() != 64
-            || !fields[0].bytes().all(|byte| byte.is_ascii_hexdigit())
-            || fields[1].trim_start_matches('*') != archive_name
-        {
-            return Err("Invalid release checksum file.".into());
-        }
-        let actual = output(
-            Command::new("/usr/bin/shasum")
-                .args(["-a", "256"])
-                .arg(&archive),
-        )?;
-        if actual
-            .split_whitespace()
-            .next()
-            .is_none_or(|value| !value.eq_ignore_ascii_case(fields[0]))
-        {
-            return Err(
-                "Release SHA-256 mismatch; the existing installation was not replaced.".into(),
-            );
-        }
-        let entries = output(Command::new("/usr/bin/tar").arg("-tzf").arg(&archive))?;
-        let mut names = entries.lines().collect::<Vec<_>>();
-        names.sort_unstable();
-        if names != ["tick-reader", "tickhost", "tickloop"] {
-            return Err("The release archive contains unexpected or missing files.".into());
-        }
-        let modes = output(Command::new("/usr/bin/tar").arg("-tvzf").arg(&archive))?;
-        if modes.lines().count() != PROGRAMS.len()
-            || modes.lines().any(|line| !line.starts_with('-'))
-        {
-            return Err("The release archive must contain only regular programs.".into());
-        }
-        let status = Command::new("/usr/bin/tar")
-            .arg("-xzf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&stage.0)
-            .stdin(Stdio::null())
-            .status()
-            .map_err(display)?;
-        if !status.success() {
-            return Err("Cannot extract the verified release.".into());
-        }
+        let archive = stage.0.join("release.tar.gz");
+        std::fs::write(&archive, archive_bytes).map_err(display)?;
+        crate::bundle::unpack(&archive, checksum, target, &stage.0)?;
         let program = stage.0.join("tickloop");
         let reported = output(Command::new(&program).arg("--version"))?;
         if reported.trim() != format!("tickloop {version}") {
@@ -247,46 +202,11 @@ mod unix {
         Ok(())
     }
 
-    fn download(url: &str, destination: &Path) -> Result<(), String> {
-        let status = Command::new("/usr/bin/curl")
-            .args([
-                "--proto",
-                "=https",
-                "--proto-redir",
-                "=https",
-                "--tlsv1.2",
-                "-fsSL",
-                "--connect-timeout",
-                "15",
-                "--max-time",
-                "600",
-                "--max-filesize",
-                MAX_DOWNLOAD_BYTES,
-            ])
-            .arg(url)
-            .arg("-o")
-            .arg(destination)
-            .stdin(Stdio::null())
-            .status()
-            .map_err(display)?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err("Cannot download the official release. Check your connection and try launching again.".into())
-        }
-    }
-
-    fn output(command: &mut Command) -> Result<String, String> {
-        let result = command.stdin(Stdio::null()).output().map_err(display)?;
-        if !result.status.success() {
-            return Err(format!("Release validation failed: {}", result.status));
-        }
-        String::from_utf8(result.stdout).map_err(display)
-    }
-
     fn display(error: impl std::fmt::Display) -> String {
         error.to_string()
     }
+
+    static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
 
     struct Stage(PathBuf);
     impl Stage {
@@ -295,7 +215,11 @@ mod unix {
                 .duration_since(UNIX_EPOCH)
                 .map_err(display)?
                 .as_nanos();
-            let directory = root.join(format!(".bootstrap-{}-{nonce}", std::process::id()));
+            let sequence = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
+            let directory = root.join(format!(
+                ".bootstrap-{}-{nonce}-{sequence}",
+                std::process::id()
+            ));
             std::fs::DirBuilder::new()
                 .mode(0o700)
                 .create(&directory)
@@ -312,7 +236,6 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::io::Write;
 
         #[test]
         fn versions_are_numeric_and_reject_incomplete_or_prerelease_versions() {
@@ -339,7 +262,7 @@ mod unix {
         }
 
         #[test]
-        fn unverified_download_never_executes_or_replaces_runtime() {
+        fn unverified_bundle_never_executes_or_replaces_runtime() {
             let parent = Stage::create(&std::env::temp_dir()).unwrap();
             std::fs::write(parent.0.join("keep"), b"existing").unwrap();
             let result = install_release(
@@ -347,20 +270,8 @@ mod unix {
                 Path::new("/unused/launcher"),
                 "aarch64-apple-darwin",
                 "0.2.4",
-                |url, target| {
-                    let mut file = File::create(target).map_err(display)?;
-                    if url.ends_with(".sha256") {
-                        write!(
-                            file,
-                            "{}  tickloop-aarch64-apple-darwin.tar.gz",
-                            "0".repeat(64)
-                        )
-                        .map_err(display)?;
-                    } else {
-                        file.write_all(b"corrupt").map_err(display)?;
-                    }
-                    Ok(())
-                },
+                b"corrupt",
+                &format!("{}  tickloop-aarch64-apple-darwin.tar.gz", "0".repeat(64)),
             );
             assert!(result.unwrap_err().contains("SHA-256 mismatch"));
             assert_eq!(std::fs::read(parent.0.join("keep")).unwrap(), b"existing");
@@ -425,22 +336,11 @@ pwd -P > "$runtime/installer-cwd"
                 &launcher,
                 "aarch64-apple-darwin",
                 "1.2.3",
-                |url, destination| {
-                    assert!(url.starts_with(&format!("{RELEASES}/v1.2.3/")));
-                    if url.ends_with(".sha256") {
-                        std::fs::write(
-                            destination,
-                            format!(
-                                "{}  tickloop-aarch64-apple-darwin.tar.gz\n",
-                                digest.split_whitespace().next().unwrap()
-                            ),
-                        )
-                        .map_err(display)?;
-                    } else {
-                        std::fs::copy(&archive, destination).map_err(display)?;
-                    }
-                    Ok(())
-                },
+                &std::fs::read(&archive).unwrap(),
+                &format!(
+                    "{}  tickloop-aarch64-apple-darwin.tar.gz\n",
+                    digest.split_whitespace().next().unwrap()
+                ),
             )
             .unwrap();
             assert_eq!(std::fs::read(launcher).unwrap(), b"Cargo-owned launcher");

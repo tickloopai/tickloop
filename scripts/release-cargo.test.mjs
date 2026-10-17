@@ -60,3 +60,19 @@ test("a post-upload checksum mismatch fails without retrying the upload", async 
   assert.equal(uploads, 1);
   assert.equal(reads, 2);
 });
+
+test("new releases audit the crate before archives exist and compile only after publication", async () => {
+  const { readFileSync } = await import("node:fs");
+  const workflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
+  const prepare = workflow.slice(workflow.indexOf("\n  prepare:"), workflow.indexOf("\n  build:"));
+  assert.match(prepare, /release-cargo\.mjs --check/);
+  assert.doesNotMatch(prepare, /cargo (?:test|clippy|install).*distribution\/cargo/);
+  const registry = workflow.slice(workflow.indexOf("\n  cargo-registry:"));
+  assert.match(registry, /cargo test --locked --manifest-path distribution\/cargo\/Cargo.toml/);
+  assert.equal((registry.match(/sandbox-exec.*deny network\*/g) || []).length, 2);
+  const publisher = readFileSync(new URL("./release-cargo.mjs", import.meta.url), "utf8");
+  assert.match(publisher, /mode === "--check" \? \["--no-verify"\]/);
+  const launcher = readFileSync(new URL("../distribution/cargo/src/lib.rs", import.meta.url), "utf8");
+  assert.match(launcher, /crate::embedded::ARCHIVE/);
+  assert.doesNotMatch(launcher, /curl|https:\/\//);
+});

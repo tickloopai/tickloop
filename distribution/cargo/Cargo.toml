@@ -8,7 +8,7 @@ homepage = "https://tickloop.ai"
 readme = "README.md"
 license-file = "LICENSE"
 publish = ["crates-io"]
-include = ["Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "src/lib.rs", "src/main.rs", "src/bin/tl.rs", "src/bin/tickhost.rs", "src/bin/tick-reader.rs"]
+include = ["build.rs", "bundle.rs", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "src/lib.rs", "src/main.rs", "src/bin/tl.rs", "src/bin/tickhost.rs", "src/bin/tick-reader.rs"]
 autobins = false
 
 [workspace]

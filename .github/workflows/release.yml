@@ -47,8 +47,6 @@ jobs:
 
       - name: Verify the standalone public Cargo package
         run: |
-          cargo test --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher
-          cargo clippy --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher --all-targets -- -D warnings
           node scripts/release-cargo.mjs --check
 
       - name: Check the Cargo publishing credential
@@ -269,10 +267,15 @@ jobs:
           rustup update --no-self-update stable
           rustup default stable
 
+      - name: Test the complete installer against the published application
+        run: |
+          cargo test --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher
+          cargo clippy --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher --all-targets -- -D warnings
+
       - name: Verify installation against the published application
         run: |
           cargo install --locked --path distribution/cargo --root "$RUNNER_TEMP/cargo-smoke" --target-dir target/cargo-launcher
-          "$RUNNER_TEMP/cargo-smoke/bin/tickloop" --help
+          /usr/bin/sandbox-exec -p '(version 1) (allow default) (deny network*)' "$RUNNER_TEMP/cargo-smoke/bin/tickloop" --help
           "$RUNNER_TEMP/cargo-smoke/bin/tickhost" --help
           "$RUNNER_TEMP/cargo-smoke/bin/tick-reader" --help
           "$RUNNER_TEMP/cargo-smoke/bin/tl" --version
@@ -285,7 +288,7 @@ jobs:
       - name: Verify anonymous installation from crates.io
         run: |
           cargo install --locked --registry crates-io --version "${RELEASE_TAG#v}" --root "$RUNNER_TEMP/cargo-registry-smoke" --target-dir target/cargo-launcher tickloop
-          "$RUNNER_TEMP/cargo-registry-smoke/bin/tickloop" --help
+          /usr/bin/sandbox-exec -p '(version 1) (allow default) (deny network*)' "$RUNNER_TEMP/cargo-registry-smoke/bin/tickloop" --help
           "$RUNNER_TEMP/cargo-registry-smoke/bin/tickhost" --help
           "$RUNNER_TEMP/cargo-registry-smoke/bin/tick-reader" --help
           "$RUNNER_TEMP/cargo-registry-smoke/bin/tl" --version

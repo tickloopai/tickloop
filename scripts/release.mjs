@@ -91,8 +91,7 @@ function checkReleaseTargets(products) {
 function checksFor(channel, products) {
   if (channel === "binary") return [
     ["make", ["build"]],
-    ["cargo", ["test", "--locked", "--manifest-path", "distribution/cargo/Cargo.toml", "--target-dir", "target/cargo-launcher"]],
-    ["cargo", ["package", "--locked", "--allow-dirty", "--manifest-path", "distribution/cargo/Cargo.toml", "--target-dir", "target/cargo-launcher"]],
+    ["cargo", ["package", "--locked", "--allow-dirty", "--no-verify", "--manifest-path", "distribution/cargo/Cargo.toml", "--target-dir", "target/cargo-launcher"]],
   ];
   if (channel === "ticks") return [["cargo", ["check", "--locked", ...products.flatMap(product => ["-p", product.cargoName]), "--bins"]]];
   const directory = channel === "artifacts" ? "artifact" : "site";

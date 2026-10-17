@@ -80,7 +80,7 @@ crates.io 安装启动器随下次二进制发行自动发布；发布后可用�
 cargo install --locked tickloop
 ```
 
-这个公开 crate 只包含小型安装启动器，不包含主程序源码。Cargo 编译启动器；首次运行 `tickloop` 时下载并校验同版本的官方 macOS 完整预编译包，保存到 Cargo 安装根的 `.tickloop/versions/`，由 `current` 选择当前版本。`tickloop`、`tl`、`tickhost`、`tick-reader` 四个 Cargo 入口均使用这份运行包，支持 `cargo install --root`；不会覆盖原生或 Homebrew 的安装入口。主程序源码保持私有。
+这个公开 crate 只包含小型安装启动器，不包含主程序源码。Cargo 安装期间下载、校验并嵌入同版本的官方 macOS 完整预编译包；安装失败会直接报错，安装完成后无需再次下载即可启动。首次启动仅在本地释放到 Cargo 安装根的 `.tickloop/versions/`，由 `current` 选择当前版本。`tickloop`、`tl`、`tickhost`、`tick-reader` 四个 Cargo 入口均使用这份运行包，支持 `cargo install --root`；不会覆盖原生或 Homebrew 的安装入口。主程序源码保持私有。
 
 拥有私有源码仓库读取权限的开发者仍可从 Git 编译，默认使用默认分支，或用 `--tag vX.Y.Z` 固定版本：
 

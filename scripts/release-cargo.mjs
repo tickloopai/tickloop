@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const manifest = "distribution/cargo/Cargo.toml";
 const target = "target/cargo-launcher";
-const sourceFiles = ["Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "src/lib.rs", "src/main.rs", "src/bin/tl.rs", "src/bin/tickhost.rs", "src/bin/tick-reader.rs"];
+const sourceFiles = ["build.rs", "bundle.rs", "Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "src/lib.rs", "src/main.rs", "src/bin/tl.rs", "src/bin/tickhost.rs", "src/bin/tick-reader.rs"];
 export const packageFiles = [...sourceFiles, "Cargo.toml.orig", ".cargo_vcs_info.json"];
 
 export function auditFiles(files) {
@@ -73,7 +73,7 @@ async function main() {
   const dirty = mode === "--check" ? ["--allow-dirty"] : [];
   const files = cargo(["package", ...base, ...dirty, "--list"]).split("\n");
   auditFiles(files);
-  cargo(["package", ...base, ...dirty]);
+  cargo(["package", ...base, ...dirty, ...(mode === "--check" ? ["--no-verify"] : [])]);
   const archive = join(root, target, "package", `tickloop-${version}.crate`);
   const listing = spawnSync("tar", ["-tzf", archive], { encoding: "utf8", maxBuffer: 1024 * 1024 });
   if (listing.status !== 0) throw new Error("Cannot inspect the packaged crate archive.");
@@ -83,10 +83,10 @@ async function main() {
   auditFiles(archived.map(file => file.slice(prefix.length)));
   const checksum = createHash("sha256").update(readFileSync(archive)).digest("hex");
   if (mode === "--check") {
-    cargo(["publish", ...base, ...dirty, "--registry", "crates-io", "--dry-run"]);
     process.stdout.write(`Checked tickloop ${version}: ${files.length} installer-only files, SHA-256 ${checksum}.\n`);
     return;
   }
+  cargo(["publish", ...base, "--registry", "crates-io", "--dry-run"]);
   const result = await publishImmutable(version, checksum, () => cargo(["publish", ...base, "--registry", "crates-io"]));
   process.stdout.write(`tickloop ${version}: ${result}, verified SHA-256 ${checksum}.\n`);
 }
