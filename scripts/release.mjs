@@ -39,12 +39,16 @@ function preflight() {
     const path = gitOutput(["rev-parse", "--git-path", state], "Could not inspect Git operation state.");
     if (existsSync(path)) throw new Error("Finish the active Git operation before releasing.");
   }
-  if (gitOutput(["status", "--porcelain=v1", "--untracked-files=all"], "Could not inspect the working tree.")) throw new Error("Release requires a clean working tree, including staged and untracked files. Only version files belong in the release commit.");
   for (const args of [["remote", "get-url", "--all", "origin"], ["remote", "get-url", "--push", "--all", "origin"]]) {
     const urls = gitOutput(args, "The origin remote must be configured.").split("\n");
     if (urls.length !== 1 || !allowedRemoteUrls.has(urls[0])) throw new Error(`origin must have exactly one fetch and one push URL for github.com/${expectedRepository}.`);
   }
   return { commit, branch, root };
+}
+
+function assertVersionFilesUnchanged(paths) {
+  const changes = gitOutput(["status", "--porcelain=v1", "--untracked-files=all", "--", ...paths], "Could not inspect the release version files.");
+  if (changes) throw new Error(`Release version files have local edits that would be overwritten; other working-tree changes are allowed:\n${changes}`);
 }
 
 function assertUnusedTag(tag, remote = "origin") {
@@ -98,13 +102,20 @@ function checksFor(channel, products) {
   return [["npm", ["--prefix", directory, "ci"]], ...(channel === "artifacts" ? [["npm", ["--prefix", directory, "run", "typecheck"]]] : []), ["npm", ["--prefix", directory, "run", "build"]]];
 }
 
-function prepareAndCheck(channel, products, state) {
+function prepareAndCheck(channel, state, mode) {
   const parent = mkdtempSync(join(tmpdir(), "tickloop-release-"));
   const snapshot = join(parent, "snapshot");
   const added = git(["worktree", "add", "--detach", snapshot, state.commit], { readOnly: false });
   try {
     if (added.status !== 0) throw new Error(`Could not create the release checkout: ${added.stderr.trim()}`);
+    const products = readProducts(snapshot, channel, process.env.TICK_PACKAGES).map(product => {
+      const version = nextVersion(product, process.env.VERSION);
+      return { ...product, nextVersion: version, tag: `${product.tagPrefix}${version}` };
+    });
+    checkReleaseTargets(products);
     const changes = versionChanges(snapshot, products);
+    assertVersionFilesUnchanged([...changes.keys()]);
+    if (mode) return { products, changes };
     for (const [path, content] of changes) writeFileSync(join(snapshot, path), content);
     const env = { ...process.env, CARGO_TARGET_DIR: process.env.CARGO_TARGET_DIR || join(state.root, "target") };
     for (const [program, args] of checksFor(channel, products)) {
@@ -114,7 +125,7 @@ function prepareAndCheck(channel, products, state) {
     const changed = gitOutput(["diff", "--name-only", "HEAD"], "Could not inspect the checked release files.", { cwd: snapshot }).split("\n");
     if (changed.length !== changes.size || changed.some(path => !changes.has(path))) throw new Error("Release checks modified files outside the version plan.");
     for (const [path, content] of changes) if (readFileSync(join(snapshot, path), "utf8") !== content) throw new Error(`Release checks changed ${path} after its version was prepared.`);
-    return changes;
+    return { products, changes };
   } finally {
     if (added.status !== 0 || git(["worktree", "remove", "--force", snapshot], { readOnly: false }).status === 0) rmSync(parent, { recursive: true, force: true });
     else process.stderr.write(`Could not remove the temporary worktree at ${snapshot}.\n`);
@@ -126,6 +137,7 @@ function finalizeRelease(products, state, changes) {
   if (current.commit !== state.commit || current.branch !== state.branch) throw new Error("HEAD or branch changed during checks; no version commit or release tag was created.");
   checkReleaseTargets(products);
   const paths = [...changes.keys()];
+  assertVersionFilesUnchanged(paths);
   const description = products.map(product => `${product.label} ${product.nextVersion}`).join(", ");
   for (const [path, content] of changes) writeFileSync(join(state.root, path), content);
   const created = git(["commit", "--only", "-m", `chore(release): ${description}`, "--", ...paths], { readOnly: false });
@@ -156,14 +168,9 @@ try {
   const [channel, mode, ...extra] = process.argv.slice(2);
   if (!channels.has(channel) || extra.length || mode && !["--check", "--dry-run"].includes(mode)) throw new Error("Usage: [VERSION=X.Y.Z] [TICK_PACKAGES='longbridge futu'] node scripts/release.mjs binary|artifacts|site|ticks [--check|--dry-run]");
   const state = preflight();
-  const products = readProducts(state.root, channel, process.env.TICK_PACKAGES).map(product => {
-    const version = nextVersion(product, process.env.VERSION);
-    return { ...product, nextVersion: version, tag: `${product.tagPrefix}${version}` };
-  });
-  checkReleaseTargets(products);
-  versionChanges(state.root, products);
+  const { products, changes } = prepareAndCheck(channel, state, mode);
   if (mode) process.stdout.write(`Ready to bump ${products.map(product => `${product.label} ${product.version} → ${product.nextVersion}`).join(", ")}, create one version commit and tags ${products.map(product => product.tag).join(", ")}, then push ${state.branch.slice("refs/heads/".length)} and tags. No changes were made.\n`);
-  else finalizeRelease(products, state, prepareAndCheck(channel, products, state));
+  else finalizeRelease(products, state, changes);
 } catch (error) {
   process.stderr.write(`${error.message}\n`);
   process.exitCode = 1;

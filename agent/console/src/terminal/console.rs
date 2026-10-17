@@ -6172,10 +6172,16 @@ impl State {
         if self.input_dialog_visible() && self.prompt_suggestion_request.is_some() {
             self.clear_prompt_suggestion();
         }
-        if self.held_frames > 0 {
+        // The next question must not look ready while queued keys still belong to its predecessor.
+        let question_transition = self.question_menu.is_some()
+            && self
+                .menu_submission_pending
+                .is_some_and(|pending| self.menu.as_ref().is_some_and(|menu| menu.id != pending));
+        if self.held_frames > 0 || question_transition {
             self.frame_deferred = true;
             return Ok(());
         }
+        self.frame_deferred = false;
         if !self.synchronized_output {
             return self.draw_frame(output);
         }
@@ -9084,7 +9090,7 @@ impl State {
             return true;
         }
         if self.menu.as_ref().is_none_or(|menu| menu.id != id) {
-            return self.shows_cursor() != cursor_was_visible;
+            return self.frame_deferred || self.shows_cursor() != cursor_was_visible;
         }
         self.reset_active_menu();
         self.resume_dialog();

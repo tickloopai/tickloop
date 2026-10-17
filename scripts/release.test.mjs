@@ -175,14 +175,52 @@ test("local and remote future tags reject stale version files rather than silent
   assert.equal(release(setup, "site", "--check", { VERSION: "0.2.0" }).status, 0);
 });
 
-test("refuses dirty, staged and untracked work without creating a release commit", t => {
-  for (const state of ["dirty", "staged", "untracked"]) {
-    const setup = fixture(t); writeFileSync(join(setup.repo, state === "untracked" ? "extra.txt" : "snapshot.txt"), "user work\n");
-    if (state === "staged") git(["add", "snapshot.txt"], setup);
-    const before = git(["status", "--porcelain"], setup);
-    const result = release(setup, "site"); assert.equal(result.status, 1); assert.match(result.stderr, /clean working tree/);
-    assert.equal(git(["status", "--porcelain"], setup), before); assert.equal(git(["rev-parse", "HEAD"], setup), setup.initial);
+for (const scenario of scenarios) {
+  test(`${scenario.channel}: unrelated staged, unstaged and untracked changes survive release`, t => {
+    const setup = fixture(t);
+    writeFileSync(join(setup.repo, "snapshot.txt"), "staged work\n");
+    git(["add", "snapshot.txt"], setup);
+    writeFileSync(join(setup.repo, "snapshot.txt"), "unstaged work on top\n");
+    writeFileSync(join(setup.repo, "untracked.txt"), "untracked work\n");
+    const status = git(["status", "--porcelain"], setup);
+    const staged = git(["diff", "--cached", "--binary"], setup);
+    const unstaged = git(["diff", "--binary"], setup);
+    const checked = release(setup, scenario.channel, "--check");
+    assert.equal(checked.status, 0, checked.stderr);
+    assert.equal(git(["status", "--porcelain"], setup), status);
+    assert.equal(git(["rev-parse", "HEAD"], setup), setup.initial);
+    const result = release(setup, scenario.channel);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(git(["diff", "--name-only", "HEAD^", "HEAD"], setup).split("\n"), scenario.paths);
+    assert.equal(git(["status", "--porcelain"], setup), status);
+    assert.equal(git(["diff", "--cached", "--binary"], setup), staged);
+    assert.equal(git(["diff", "--binary"], setup), unstaged);
+    assert.equal(readFileSync(join(setup.repo, "untracked.txt"), "utf8"), "untracked work\n");
+    assert.equal(git(["show", "HEAD:snapshot.txt"], setup), "business code");
+  });
+}
+
+test("only selected release version files must be unchanged", t => {
+  for (const scenario of scenarios) {
+    const setup = fixture(t);
+    const path = scenario.paths[0];
+    const value = readFileSync(join(setup.repo, path), "utf8") + "\nuser version edits\n";
+    writeFileSync(join(setup.repo, path), value);
+    const result = release(setup, scenario.channel);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Release version files have local edits/);
+    assert.ok(result.stderr.includes(path));
+    assert.equal(readFileSync(join(setup.repo, path), "utf8"), value);
+    assert.equal(git(["rev-parse", "HEAD"], setup), setup.initial);
   }
+});
+
+test("unrelated edits made while checks run are retained", t => {
+  const setup = fixture(t);
+  const result = release(setup, "site", undefined, { RELEASE_TEST_DIRTY_ROOT: "1" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(readFileSync(join(setup.repo, "snapshot.txt"), "utf8"), "user edit\n");
+  assert.equal(git(["show", "HEAD:snapshot.txt"], setup), "business code");
 });
 
 test("rejects detached HEAD, unknown channels, bad selections and unexpected destinations", t => {
@@ -203,14 +241,13 @@ test("requires its workflow and consistent version mirrors in the committed snap
   assert.match(release(setup, "ticks").stderr, /must match its Cargo/);
 });
 
-test("root edits, branch moves, unexpected build edits and racing tags stop finalization", t => {
-  for (const variable of ["RELEASE_TEST_DIRTY_ROOT", "RELEASE_TEST_MOVE_HEAD", "RELEASE_TEST_SWITCH_BRANCH", "RELEASE_TEST_DIRTY_SNAPSHOT", "RELEASE_TEST_ADD_TAG"]) {
+test("branch moves, unexpected build edits and racing tags stop finalization", t => {
+  for (const variable of ["RELEASE_TEST_MOVE_HEAD", "RELEASE_TEST_SWITCH_BRANCH", "RELEASE_TEST_DIRTY_SNAPSHOT", "RELEASE_TEST_ADD_TAG"]) {
     const setup = fixture(t);
     const result = release(setup, "site", undefined, { [variable]: variable === "RELEASE_TEST_ADD_TAG" ? "site-v0.1.7" : "1" });
     assert.equal(result.status, 1, variable);
     assert.equal(readProducts(setup.repo, "site")[0].version, "0.1.6");
     assert.equal(git(["ls-remote", "--refs", "origin"], setup), "");
-    if (variable === "RELEASE_TEST_DIRTY_ROOT") assert.equal(readFileSync(join(setup.repo, "snapshot.txt"), "utf8"), "user edit\n");
   }
 });
 
