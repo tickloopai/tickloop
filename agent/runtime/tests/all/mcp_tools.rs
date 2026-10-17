@@ -16,8 +16,8 @@ use tickloop_agent_protocol::{
 use tickloop_agent_runtime::{
     Agent,
     host_tools::{
-        HostCallResult, HostEffect, HostToolPermission, HostToolProvider, PreparedHostCall,
-        WorkspaceHostContext, WorkspaceHostName, WorkspaceIntegration,
+        HostCallResult, HostCallScope, HostEffect, HostToolPermission, HostToolProvider,
+        PreparedHostCall, WorkspaceHostContext, WorkspaceHostName, WorkspaceIntegration,
     },
     mcp_tools::McpHostToolProvider,
 };
@@ -80,6 +80,7 @@ async fn remote_skills_are_lazy_reference_context_and_persist_across_turns() {
             "artifact-diagramming",
             "artifact-dataviz",
             "artifact-draft",
+            "artifact-slides",
         ] {
             assert!(
                 first
@@ -599,7 +600,7 @@ async fn linked_chat(
 }
 
 #[tokio::test]
-async fn directory_presents_exactly_the_three_artifact_tools_as_built_ins() {
+async fn directory_presents_exactly_the_three_artifact_tools_and_the_host_upload_as_built_ins() {
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
     let account = service.login(directory.path()).await;
@@ -611,7 +612,12 @@ async fn directory_presents_exactly_the_three_artifact_tools_as_built_ins() {
             .iter()
             .map(|tool| tool.name.as_str())
             .collect::<Vec<_>>(),
-        ["ArtifactComment", "ArtifactEdit", "ArtifactRead"]
+        [
+            "ArtifactComment",
+            "ArtifactEdit",
+            "ArtifactRead",
+            "ArtifactUpload"
+        ]
     );
     let chat = uuid::Uuid::new_v4();
     assert_eq!(
@@ -640,7 +646,12 @@ async fn directory_presents_exactly_the_three_artifact_tools_as_built_ins() {
     agent.shutdown().await;
     let requests = model.requests.lock().unwrap();
     let names = tool_names(&requests[0]);
-    for name in ["ArtifactRead", "ArtifactEdit", "ArtifactComment"] {
+    for name in [
+        "ArtifactRead",
+        "ArtifactEdit",
+        "ArtifactComment",
+        "ArtifactUpload",
+    ] {
         assert!(names.contains(&name), "{name}");
     }
     assert!(
@@ -1320,6 +1331,7 @@ async fn model_tool_inventory_keeps_artifact_shell_and_tick_names() {
         prompt.contains("a doc for writing")
             && prompt.contains("a page for visual explanations")
             && prompt.contains("use ArtifactEdit to create the matching type")
+            && prompt.contains("Before writing any Slide, whether creating Slides or patching or replacing them, load the tickloop-artifacts:artifact-slides Skill.")
             && prompt.contains("Honor an explicit local-file or chat-only destination")
     );
     assert!(!tool_names(&requests[0]).contains(&"ArtifactLogin"));
@@ -1506,18 +1518,19 @@ impl HostToolProvider for NativeFixture {
         }))
     }
 
-    async fn prepare_call_in_context(
+    async fn prepare_call_in_scope(
         &self,
         chat_id: tickloop_agent_protocol::ChatId,
-        context: &HostCallContext,
+        scope: &HostCallScope<'_>,
         name: &str,
         input: &Value,
         cancel: CancellationToken,
     ) -> Result<PreparedHostCall, String> {
-        Ok(self
-            .prepare_call(chat_id, name, input, cancel)
-            .await?
-            .with_payload(context.clone()))
+        let prepared = self.prepare_call(chat_id, name, input, cancel).await?;
+        Ok(match scope.context {
+            Some(context) => prepared.with_payload(context.clone()),
+            None => prepared,
+        })
     }
 
     fn definitions(&self) -> Vec<ToolDefinition> {
@@ -1585,10 +1598,21 @@ async fn native_tools_and_workspace_metadata_survive_mcp_composition() {
         workspace_id: Some("work-context".into()),
         interaction: None,
     };
+    let local_files = tickloop_agent_tools::Tools::new(directory.path().join("chat"))
+        .local_file_reader(
+            &tickloop_agent_tools::Workspace {
+                workdir: directory.path().into(),
+                additional_directories: Vec::new(),
+            },
+            Arc::new(NoLocalReads),
+        );
     let prepared = provider
-        .prepare_call_in_context(
+        .prepare_call_in_scope(
             uuid::Uuid::new_v4(),
-            &context,
+            &HostCallScope {
+                local_files: &local_files,
+                context: Some(&context),
+            },
             "native_fixture",
             &json!({}),
             CancellationToken::new(),
@@ -2424,6 +2448,7 @@ async fn a_read_artifact_preserves_response_roles_and_supported_formats() {
         ("page", "edit", "html", "editor"),
         ("page", "view", "html", "viewer"),
         ("doc", "view", "markdown", "viewer"),
+        ("slides", "edit", "slides", "editor"),
     ] {
         *service.control.read_result.lock().unwrap() =
             Some(artifact_body_result(&service, format, role));
@@ -2459,6 +2484,10 @@ fn artifact_body_result(service: &ArtifactService, format: &str, role: &str) -> 
     if format == "doc" {
         body["blocks"] = json!([{"id":"b1","hash":"h1","text":"# Fixture"}]);
         body["next_cursor"] = Value::Null;
+    } else if format == "slides" {
+        body["blocks"] = json!([{"id":"cover","hash":"c1","text":"<section id=\"cover\" style=\"background:#ffffff\"><h1>Fixture</h1></section>"}]);
+        body["next_cursor"] = Value::Null;
+        body["assets"] = json!([]);
     } else {
         body["source"] = json!("<h1>Fixture</h1>");
     }
@@ -2748,7 +2777,7 @@ async fn a_resumed_chat_is_told_once_which_host_tools_became_available() {
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert!(
             notices[0].contains(
-                "host tools available in this conversation now: ArtifactComment, ArtifactEdit, ArtifactRead."
+                "host tools available in this conversation now: ArtifactComment, ArtifactEdit, ArtifactRead, ArtifactUpload."
             ),
             "{}",
             notices[0]
@@ -2829,8 +2858,9 @@ async fn signing_out_announces_the_removed_tools_and_offers_sign_in() {
     assert_eq!(notices.len(), 1);
     assert!(
         notices[0].contains("Now available: ArtifactLogin.")
-            && notices[0]
-                .contains("No longer available: ArtifactComment, ArtifactEdit, ArtifactRead."),
+            && notices[0].contains(
+                "No longer available: ArtifactComment, ArtifactEdit, ArtifactRead, ArtifactUpload."
+            ),
         "{}",
         notices[0]
     );
@@ -2940,8 +2970,9 @@ async fn artifact_login_returns_the_link_and_code_and_approval_brings_the_tools(
     let notices = host_notices(&requests[3]);
     assert_eq!(notices.len(), 1);
     assert!(
-        notices[0].contains("Now available: ArtifactComment, ArtifactEdit, ArtifactRead.")
-            && notices[0].contains("No longer available: ArtifactLogin."),
+        notices[0].contains(
+            "Now available: ArtifactComment, ArtifactEdit, ArtifactRead, ArtifactUpload."
+        ) && notices[0].contains("No longer available: ArtifactLogin."),
         "{}",
         notices[0]
     );
@@ -3168,7 +3199,7 @@ async fn a_request_after_compaction_still_carries_the_tool_notice() {
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(
         notices[0].contains(
-            "host tools available in this conversation now: ArtifactComment, ArtifactEdit, ArtifactRead."
+            "host tools available in this conversation now: ArtifactComment, ArtifactEdit, ArtifactRead, ArtifactUpload."
         ),
         "{}",
         notices[0]
@@ -3487,4 +3518,1158 @@ async fn remote_skill_post_compaction_refresh_can_be_cancelled_while_the_server_
     cancelled.expect("cancellation waited for the blocked service refresh");
     assert_eq!(model.inner.requests.lock().unwrap().len(), 3);
     agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn created_slides_join_monitor_as_slides_and_link_to_the_creating_loop() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "create",
+            "ArtifactEdit",
+            json!({"action":"create","title":"Launch","format":"slides","content":"<section id=\"cover\" style=\"background:#ffffff\"><h1>Launch</h1></section>"}),
+        ),
+        text("Created."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "做个 PPT 介绍这次发布".into())
+        .await
+        .unwrap();
+    eventually(async || {
+        agent
+            .snapshot(chat)
+            .await
+            .unwrap()
+            .loops
+            .last()
+            .is_some_and(|goal| goal.state == LoopState::WaitingTrigger)
+    })
+    .await;
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event.kind, EventKind::PermissionRequested { .. }),
+            "a new private Slides takes the first-party creation fast path"
+        );
+    }
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert_eq!(snapshot.artifact_ticks.len(), 1);
+    assert_eq!(snapshot.artifact_ticks[0].artifact_id, CREATED_ARTIFACT);
+    assert_eq!(snapshot.artifact_ticks[0].format, "slides");
+    let goal = snapshot.loops.last().unwrap();
+    assert_eq!(goal.event_sources[0].artifact_id, CREATED_ARTIFACT);
+    assert_eq!(
+        service.link(CREATED_ARTIFACT).unwrap().loop_id,
+        goal.id.to_string()
+    );
+    agent.shutdown().await;
+}
+
+fn png(label: &[u8]) -> Vec<u8> {
+    [&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a][..], label].concat()
+}
+
+/// The fixture artifact is a Slides published to `audience`.
+fn slides_published_to(service: &ArtifactService, audience: &str) {
+    *service.control.metadata_format.lock().unwrap() = Some("slides".into());
+    *service.control.publication.lock().unwrap() =
+        Some(json!({"audience":audience,"membership_revision":1}));
+}
+
+fn upload_call(id: &str, path: &std::path::Path) -> Vec<Content> {
+    call(
+        id,
+        "ArtifactUpload",
+        json!({"artifact_id":"deck","file_path":path}),
+    )
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+#[tokio::test]
+async fn an_upload_from_the_workspace_sends_the_read_bytes_once_and_returns_only_the_reference() {
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "private");
+    let directory = tempfile::tempdir().unwrap();
+    let image = png(b"workspace chart pixels");
+    let path = directory.path().join("chart.png");
+    std::fs::write(&path, &image).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        upload_call("upload", &path),
+        text("Uploaded."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    submit_and_wait(&agent, chat, "Put the chart on the Slides").await;
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event.kind, EventKind::PermissionRequested { .. }),
+            "a workspace image for private Slides is a first-party private write"
+        );
+    }
+    let uploads = service.uploads();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].artifact_id, "deck");
+    assert_eq!(uploads[0].content_type, "image/png");
+    assert_eq!(uploads[0].bytes, image);
+    assert!(uuid::Uuid::parse_str(&uploads[0].operation_id).is_ok());
+    let result: Value = serde_json::from_str(&tool_result_text(
+        &model.requests.lock().unwrap()[1],
+        "upload",
+    ))
+    .unwrap();
+    assert_eq!(
+        result,
+        json!({"asset_id":"asset-1","ref":"asset:asset-1","content_type":"image/png","bytes":image.len(),"width":640,"height":360})
+    );
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    let operation = snapshot
+        .operations
+        .iter()
+        .find(|operation| operation.name == "ArtifactUpload")
+        .unwrap();
+    assert_eq!(operation.state, OperationState::Completed);
+    assert_eq!(
+        operation.input,
+        json!({"artifact_id":"deck","file_path":path.canonicalize().unwrap(),"content_type":"image/png","bytes":image.len(),"sha256":sha256(&image)})
+    );
+    let saved = serde_json::to_string(&snapshot).unwrap();
+    assert!(
+        !saved.contains("workspace chart pixels"),
+        "the file's contents never enter the Chat"
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_upload_whose_metadata_the_service_strips_reports_the_stored_image() {
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "private");
+    service
+        .control
+        .strip_upload_metadata
+        .store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let image = png(b"tEXt camera serial and location");
+    let path = directory.path().join("photo.png");
+    std::fs::write(&path, &image).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        upload_call("upload", &path),
+        text("Uploaded."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    submit_and_wait(&agent, chat, "Put the photo on the Slides").await;
+    assert_eq!(service.uploads()[0].bytes, image);
+    let result: Value = serde_json::from_str(&tool_result_text(
+        &model.requests.lock().unwrap()[1],
+        "upload",
+    ))
+    .unwrap();
+    assert_eq!(result["ref"], "asset:asset-1");
+    assert_eq!(result["bytes"], 8, "the size of the stored, stripped image");
+    assert!(
+        service
+            .lifecycle_requests("GET /artifact/api/v1/artifacts/deck/operations/")
+            .is_empty(),
+        "the direct receipt confirms the upload"
+    );
+    let operation = agent
+        .snapshot(chat)
+        .await
+        .unwrap()
+        .operations
+        .into_iter()
+        .find(|operation| operation.name == "ArtifactUpload")
+        .unwrap();
+    assert_eq!(operation.state, OperationState::Completed);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_upload_from_outside_the_workspace_asks_once_with_the_file_facts_but_not_its_contents() {
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "private");
+    let directory = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let image = png(b"holiday photo pixels");
+    let path = elsewhere.path().join("photo.png");
+    std::fs::write(&path, &image).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        upload_call("upload", &path),
+        text("Uploaded."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Add my photo to the Slides".into())
+        .await
+        .unwrap();
+    let permission = next_permission(&mut events).await;
+    assert_eq!(permission.name, "ArtifactUpload");
+    assert_eq!(
+        permission.input,
+        json!({"artifact_id":"deck","file_path":path.canonicalize().unwrap(),"content_type":"image/png","bytes":image.len(),"sha256":sha256(&image)})
+    );
+    assert!(
+        service.uploads().is_empty(),
+        "nothing is sent before approval"
+    );
+    agent
+        .answer_permission(chat, permission.id, true)
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    assert_eq!(service.uploads().len(), 1);
+    assert_eq!(service.uploads()[0].bytes, image);
+    let history = agent.approval_history_view(chat).await.unwrap();
+    assert!(
+        history
+            .records
+            .iter()
+            .any(|record| record.tool == "ArtifactUpload")
+    );
+    let recorded = serde_json::to_string(&history).unwrap()
+        + &serde_json::to_string(&agent.snapshot(chat).await.unwrap()).unwrap();
+    assert!(!recorded.contains("holiday photo pixels"));
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn plan_mode_asks_for_a_private_slides_upload_as_it_does_for_artifact_edits() {
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "private");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("logo.png");
+    std::fs::write(&path, png(b"logo")).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        upload_call("upload", &path),
+        text("Uploaded while planning."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Plan)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Plan the Slides with the logo".into())
+        .await
+        .unwrap();
+    let permission = next_permission(&mut events).await;
+    assert_eq!(permission.name, "ArtifactUpload");
+    agent
+        .answer_permission(chat, permission.id, true)
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    assert_eq!(service.uploads().len(), 1);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn sensitive_paths_non_images_and_non_slides_artifacts_are_refused_before_anything_is_sent() {
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "private");
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("secrets")).unwrap();
+    let secret = directory.path().join("secrets/chart.png");
+    std::fs::write(&secret, png(b"secret")).unwrap();
+    let notes = directory.path().join("notes.txt");
+    std::fs::write(&notes, "plain notes").unwrap();
+    let logo = directory.path().join("logo.png");
+    std::fs::write(&logo, png(b"logo")).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        upload_call("secret", &secret),
+        upload_call("notes", &notes),
+        text("Refused."),
+        upload_call("doc", &logo),
+        text("Refused again."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    submit_and_wait(&agent, chat, "Add the files").await;
+    *service.control.metadata_format.lock().unwrap() = Some("markdown".into());
+    submit_and_wait(&agent, chat, "Add the logo to the report").await;
+    {
+        let requests = model.requests.lock().unwrap();
+        assert!(
+            tool_result_text(&requests[2], "secret").contains("credentials or secrets"),
+            "{}",
+            tool_result_text(&requests[2], "secret")
+        );
+        assert!(
+            tool_result_text(&requests[2], "notes")
+                .contains("is not a PNG, JPEG, GIF, WebP or SVG image")
+        );
+        assert!(
+            tool_result_text(&requests[4], "doc")
+                .contains("adds images to Slides only; this artifact is a Doc")
+        );
+    }
+    assert!(service.uploads().is_empty());
+    assert!(
+        service
+            .lifecycle_requests("POST /artifact/api/v1/artifacts/")
+            .is_empty()
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_lost_upload_response_is_settled_by_its_operation_receipt_and_never_sent_again() {
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "private");
+    service
+        .control
+        .drop_upload_response
+        .store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("chart.png");
+    std::fs::write(&path, png(b"chart")).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        upload_call("confirmed", &path),
+        text("Confirmed."),
+        upload_call("unconfirmed", &path),
+        text("Unknown."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    submit_and_wait(&agent, chat, "Add the chart").await;
+    let posts = || {
+        service
+            .lifecycle_requests("POST /artifact/api/v1/artifacts/deck/assets?operation_id=")
+            .len()
+    };
+    let receipts = || {
+        service
+            .lifecycle_requests("GET /artifact/api/v1/artifacts/deck/operations/")
+            .len()
+    };
+    assert_eq!((posts(), receipts()), (1, 1));
+    let confirmed = tool_result_text(&model.requests.lock().unwrap()[1], "confirmed");
+    assert!(
+        confirmed.contains("\"ref\":\"asset:asset-1\""),
+        "{confirmed}"
+    );
+
+    service
+        .control
+        .forget_upload_operations
+        .store(true, Ordering::SeqCst);
+    submit_and_wait(&agent, chat, "Add it once more").await;
+    assert_eq!(
+        (posts(), receipts()),
+        (2, 2),
+        "one send and one receipt each"
+    );
+    let unconfirmed = tool_result_text(&model.requests.lock().unwrap()[3], "unconfirmed");
+    assert!(
+        unconfirmed.contains("outcome unknown")
+            && unconfirmed.contains("read the Slides with ArtifactRead"),
+        "{unconfirmed}"
+    );
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert_eq!(
+        snapshot
+            .operations
+            .iter()
+            .filter(|operation| operation.name == "ArtifactUpload")
+            .map(|operation| operation.state.clone())
+            .collect::<Vec<_>>(),
+        [OperationState::Completed, OperationState::Unknown]
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_admitted_slides_write_still_asks_before_sending_a_file_from_outside_the_workspace() {
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "private");
+    let directory = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let inside = directory.path().join("chart.png");
+    std::fs::write(&inside, png(b"chart")).unwrap();
+    let outside = elsewhere.path().join("photo.png");
+    std::fs::write(&outside, png(b"photo")).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        upload_call("inside", &inside),
+        upload_call("outside", &outside),
+        text("Both uploaded."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Add the chart and my photo".into())
+        .await
+        .unwrap();
+    let permission = next_permission(&mut events).await;
+    assert_eq!(
+        permission.input["file_path"],
+        json!(outside.canonicalize().unwrap())
+    );
+    assert_eq!(
+        service.uploads().len(),
+        1,
+        "the workspace file went first without asking"
+    );
+    agent
+        .answer_permission(chat, permission.id, true)
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    assert_eq!(service.uploads().len(), 2);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_upload_allow_rule_still_asks_before_reading_a_file_from_outside_the_workspace() {
+    use tickloop_agent_protocol::Decision;
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "private");
+    let directory = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let path = elsewhere.path().join("photo.png");
+    std::fs::write(&path, png(b"photo")).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        upload_call("upload", &path),
+        text("Uploaded."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut allow_upload = read_rule(Decision::Allow, None);
+    allow_upload.tool = "ArtifactUpload".into();
+    agent
+        .set_permission_rules(chat, vec![allow_upload])
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Add my photo to the Slides".into())
+        .await
+        .unwrap();
+    let permission = next_permission(&mut events).await;
+    assert_eq!(permission.name, "ArtifactUpload");
+    assert!(
+        service.uploads().is_empty(),
+        "nothing is sent before approval"
+    );
+    agent
+        .answer_permission(chat, permission.id, true)
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    assert_eq!(service.uploads().len(), 1);
+    agent.shutdown().await;
+}
+
+fn read_rule(
+    decision: tickloop_agent_protocol::Decision,
+    input: Option<Value>,
+) -> tickloop_agent_protocol::PermissionRule {
+    tickloop_agent_protocol::PermissionRule {
+        id: uuid::Uuid::new_v4(),
+        decision,
+        tool: "Read".into(),
+        specifier: None,
+        input,
+        loop_id: None,
+        persistent: false,
+    }
+}
+
+#[tokio::test]
+async fn a_subagent_uploads_only_files_its_own_read_could_take() {
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "private");
+    let directory = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let inside = directory.path().join("chart.png");
+    std::fs::write(&inside, png(b"workspace chart")).unwrap();
+    let outside = elsewhere.path().join("hosts");
+    std::fs::write(&outside, "127.0.0.1 localhost").unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "delegate",
+            "Subagent",
+            json!({"task":"Put the images on the Slides"}),
+        ),
+        upload_call("inside", &inside),
+        upload_call("outside", &outside),
+        text("Child uploaded what it could."),
+        text("Done."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    submit_and_wait(&agent, chat, "Delegate the images").await;
+    let uploads = service.uploads();
+    assert_eq!(uploads.len(), 1, "only the file inside the delegated scope");
+    assert_eq!(uploads[0].bytes, png(b"workspace chart"));
+    let requests = model.requests.lock().unwrap();
+    assert!(tool_result_text(&requests[2], "inside").contains("\"ref\":\"asset:asset-1\""));
+    let refused = tool_result_text(&requests[3], "outside");
+    assert!(
+        refused.contains("outside the delegated resource scope")
+            && !refused.contains("is not a PNG"),
+        "the file is refused before it is opened: {refused}"
+    );
+}
+
+#[tokio::test]
+async fn read_rules_govern_the_file_an_upload_sends() {
+    use tickloop_agent_protocol::Decision;
+    let exact_read =
+        |path: &std::path::Path| Some(json!({"file_path": path.canonicalize().unwrap()}));
+    for (decision, is_exact, prompts, sent) in [
+        (Decision::Deny, false, 0, 0),
+        (Decision::Deny, true, 0, 0),
+        (Decision::Ask, true, 1, 1),
+    ] {
+        let service = ArtifactService::start().await;
+        slides_published_to(&service, "private");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("chart.png");
+        let mut image = png(b"chart");
+        if decision == Decision::Deny {
+            image.resize(tickloop_agent_artifacts::MAX_IMAGE_BYTES + 1, 0);
+        }
+        std::fs::write(&path, image).unwrap();
+        let rule = read_rule(decision, if is_exact { exact_read(&path) } else { None });
+        let model = Arc::new(ScriptedModel::new(vec![
+            upload_call("upload", &path),
+            text("Finished."),
+        ]));
+        let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+            .await
+            .unwrap();
+        agent.set_permission_rules(chat, vec![rule]).await.unwrap();
+        let mut events = agent.subscribe();
+        agent
+            .submit(chat, None, "Put the chart on the Slides".into())
+            .await
+            .unwrap();
+        let mut prompted = 0;
+        loop {
+            match tickloop_agent_test_support::next_event(&mut events)
+                .await
+                .kind
+            {
+                EventKind::PermissionRequested { request } => {
+                    prompted += 1;
+                    assert_eq!(request.name, "ArtifactUpload");
+                    agent
+                        .answer_permission(chat, request.id, true)
+                        .await
+                        .unwrap();
+                }
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert_eq!((prompted, service.uploads().len()), (prompts, sent));
+        if sent == 0 {
+            let refused = tool_result_text(&model.requests.lock().unwrap()[1], "upload");
+            assert!(
+                refused.contains("is denied, so the file is not sent")
+                    && !refused.contains("exceeds"),
+                "the denial comes before the file is measured: {refused}"
+            );
+        }
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn a_parent_read_denial_frozen_into_the_delegation_refuses_a_subagent_upload() {
+    use tickloop_agent_protocol::Decision;
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "private");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("chart.png");
+    std::fs::write(&path, png(b"chart")).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "delegate",
+            "Subagent",
+            json!({"task":"Put the chart on the Slides"}),
+        ),
+        call(
+            "ready",
+            tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME,
+            json!({"questions":[{"question":"Upload the chart now?","header":"Chart","options":[
+                {"label":"Yes","description":"Upload it"},
+                {"label":"No","description":"Wait"}
+            ]}]}),
+        ),
+        upload_call("child-upload", &path),
+        text("The child could not send it."),
+        text("Done."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let parent = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(parent, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    agent
+        .set_permission_rules(
+            parent,
+            vec![read_rule(
+                Decision::Deny,
+                Some(json!({"file_path": path.canonicalize().unwrap()})),
+            )],
+        )
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(parent, None, "Delegate the chart".into())
+        .await
+        .unwrap();
+    let (child, question) = loop {
+        let event = tickloop_agent_test_support::next_event(&mut events).await;
+        if let EventKind::QuestionAsked { request } = event.kind {
+            break (event.chat_id, request);
+        }
+    };
+    agent
+        .set_permission_rules(parent, Vec::new())
+        .await
+        .unwrap();
+    agent
+        .answer_question(
+            child,
+            question.id,
+            vec![tickloop_agent_protocol::QuestionAnswer::option("Yes")],
+        )
+        .await
+        .unwrap();
+    wait_for_completion(&agent, parent).await;
+    assert!(service.uploads().is_empty());
+    let refused = tool_result_text(&model.requests.lock().unwrap()[3], "child-upload");
+    assert!(
+        refused.contains("delegated authorization ceiling denies this operation"),
+        "{refused}"
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_frozen_parent_session_denial_of_reading_the_file_refuses_a_subagent_upload() {
+    use tickloop_agent_protocol::PermissionScope;
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "private");
+    let directory = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let path = elsewhere.path().join("photo.png");
+    std::fs::write(&path, png(b"photo")).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("parent-read", "Read", json!({"file_path": path})),
+        call(
+            "delegate",
+            "Subagent",
+            json!({"task":"Put the photo on the Slides"}),
+        ),
+        upload_call("child-upload", &path),
+        text("The child could not send it."),
+        text("Done."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let parent = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(parent, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    let denied = agent
+        .submit(parent, None, "Read the photo".into())
+        .await
+        .unwrap();
+    let request = next_permission(&mut events).await;
+    assert_eq!(request.name, "Read");
+    agent
+        .answer_permission_with_scope(parent, request.id, false, PermissionScope::Session)
+        .await
+        .unwrap();
+    wait_for_loop_state(&agent, parent, denied.loop_id, LoopState::Interrupted).await;
+    agent
+        .set_execution_mode(parent, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    agent
+        .submit(parent, Some(denied.loop_id), "Delegate the photo".into())
+        .await
+        .unwrap();
+    wait_for_completion(&agent, parent).await;
+    assert!(service.uploads().is_empty());
+    let refused = tool_result_text(&model.requests.lock().unwrap()[3], "child-upload");
+    assert!(
+        refused.contains("frozen parent Session denial"),
+        "{refused}"
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn auto_mode_uploads_a_file_from_outside_the_workspace_to_private_slides_without_review() {
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "private");
+    let directory = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let path = elsewhere.path().join("photo.png");
+    std::fs::write(&path, png(b"photo")).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        upload_call("upload", &path),
+        text("Uploaded."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model).await;
+    let reviewer = Arc::new(ScriptedModel::new(vec![text(
+        &tickloop_agent_test_support::auto_classification(false).to_string(),
+    )]));
+    agent.set_auto_reviewer(reviewer.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Add my photo to the Slides".into())
+        .await
+        .unwrap();
+    loop {
+        match tickloop_agent_test_support::next_event(&mut events)
+            .await
+            .kind
+        {
+            EventKind::ApprovalAssessed { .. } => panic!("the upload needs no review"),
+            EventKind::PermissionRequested { .. } => panic!("the upload needs no approval"),
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert!(reviewer.requests.lock().unwrap().is_empty());
+    assert_eq!(service.uploads().len(), 1);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn shared_slides_uploads_are_reviewable_and_plan_mode_refuses_them() {
+    for (mode, prompts, sent) in [
+        (ExecutionMode::AcceptEdits, 1, 1),
+        (ExecutionMode::Plan, 0, 0),
+    ] {
+        let service = ArtifactService::start().await;
+        slides_published_to(&service, "shared");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("chart.png");
+        std::fs::write(&path, png(b"chart")).unwrap();
+        let model = Arc::new(ScriptedModel::new(vec![
+            upload_call("upload", &path),
+            text("Finished."),
+        ]));
+        let agent = signed_in_agent(&service, directory.path(), model).await;
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent.set_execution_mode(chat, mode).await.unwrap();
+        let mut events = agent.subscribe();
+        agent
+            .submit(chat, None, "Add the chart to the team's Slides".into())
+            .await
+            .unwrap();
+        let mut prompted = 0;
+        loop {
+            match tickloop_agent_test_support::next_event(&mut events)
+                .await
+                .kind
+            {
+                EventKind::PermissionRequested { request } => {
+                    prompted += 1;
+                    agent
+                        .answer_permission(chat, request.id, true)
+                        .await
+                        .unwrap();
+                }
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            (prompted, service.uploads().len()),
+            (prompts, sent),
+            "{mode:?}"
+        );
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn public_slides_ask_before_the_first_upload_and_continue_without_asking() {
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "public");
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("chart.png");
+    std::fs::write(&first, png(b"chart")).unwrap();
+    let second = directory.path().join("logo.png");
+    std::fs::write(&second, png(b"logo")).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        upload_call("first", &first),
+        upload_call("second", &second),
+        text("Both uploaded."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Add both images to the public Slides".into())
+        .await
+        .unwrap();
+    let permission = next_permission(&mut events).await;
+    assert_eq!(
+        permission.input["file_path"],
+        json!(first.canonicalize().unwrap())
+    );
+    agent
+        .answer_permission(chat, permission.id, true)
+        .await
+        .unwrap();
+    loop {
+        match tickloop_agent_test_support::next_event(&mut events)
+            .await
+            .kind
+        {
+            EventKind::PermissionRequested { .. } => {
+                panic!("the admitted public audience continues without asking")
+            }
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(service.uploads().len(), 2);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_audience_change_after_approval_stops_the_upload_before_it_is_sent() {
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "private");
+    let directory = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let path = elsewhere.path().join("photo.png");
+    std::fs::write(&path, png(b"photo")).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        upload_call("upload", &path),
+        text("Not uploaded."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Add my photo to the Slides".into())
+        .await
+        .unwrap();
+    let permission = next_permission(&mut events).await;
+    slides_published_to(&service, "public");
+    agent
+        .answer_permission(chat, permission.id, true)
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    assert!(service.uploads().is_empty());
+    let refused = tool_result_text(&model.requests.lock().unwrap()[1], "upload");
+    assert!(refused.contains("Artifact audience changed"), "{refused}");
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_read_ask_added_after_approval_stops_the_upload_before_it_is_sent() {
+    use tickloop_agent_protocol::Decision;
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "private");
+    let directory = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let path = elsewhere.path().join("photo.png");
+    std::fs::write(&path, png(b"photo")).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        upload_call("upload", &path),
+        text("Not uploaded."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Add my photo to the Slides".into())
+        .await
+        .unwrap();
+    let permission = next_permission(&mut events).await;
+    // The upload itself stays allowed outright; only its Read now asks.
+    let mut allow_upload = read_rule(Decision::Allow, None);
+    allow_upload.tool = "ArtifactUpload".into();
+    agent
+        .set_permission_rules(
+            chat,
+            vec![
+                allow_upload,
+                read_rule(
+                    Decision::Ask,
+                    Some(json!({"file_path": path.canonicalize().unwrap()})),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    agent
+        .answer_permission(chat, permission.id, true)
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    assert!(service.uploads().is_empty());
+    let refused = tool_result_text(&model.requests.lock().unwrap()[1], "upload");
+    assert!(
+        refused.contains("now needs approval, so the file was not sent"),
+        "{refused}"
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_upload_cancelled_after_it_was_sent_is_unknown_and_never_sent_again() {
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "private");
+    service
+        .control
+        .hold_upload_response
+        .store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("chart.png");
+    std::fs::write(&path, png(b"chart")).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        upload_call("upload", &path),
+        text("Stopped."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    let receipt = agent
+        .submit(chat, None, "Add the chart".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, service.control.upload_held.notified())
+        .await
+        .unwrap();
+    agent.interrupt(chat).await.unwrap();
+    wait_for_loop_state(&agent, chat, receipt.loop_id, LoopState::Interrupted).await;
+    let operation = agent
+        .snapshot(chat)
+        .await
+        .unwrap()
+        .operations
+        .into_iter()
+        .find(|operation| operation.name == "ArtifactUpload")
+        .unwrap();
+    assert_eq!(operation.state, OperationState::Unknown);
+    let content = operation.result.unwrap().content;
+    assert!(
+        content.contains("cancelled after it was sent")
+            && content.contains("read the Slides with ArtifactRead"),
+        "{content}"
+    );
+    assert_eq!(service.uploads().len(), 1);
+    assert_eq!(
+        service
+            .lifecycle_requests("POST /artifact/api/v1/artifacts/deck/assets?operation_id=")
+            .len(),
+        1
+    );
+    assert!(
+        service
+            .lifecycle_requests("GET /artifact/api/v1/artifacts/deck/operations/")
+            .is_empty()
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_busy_service_refusal_tells_the_model_it_may_upload_again_after_a_moment() {
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "private");
+    *service.control.refuse_uploads.lock().unwrap() = Some((
+        429,
+        "asset_busy".into(),
+        "These Slides already have 4 uploads in progress".into(),
+    ));
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("chart.png");
+    std::fs::write(&path, png(b"chart")).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        upload_call("upload", &path),
+        text("Will retry."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model.clone()).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    submit_and_wait(&agent, chat, "Add the chart").await;
+    let refused = tool_result_text(&model.requests.lock().unwrap()[1], "upload");
+    assert_eq!(
+        refused,
+        "Tickloop Artifacts refused the upload (HTTP 429 asset_busy): These Slides already have 4 uploads in progress. Nothing was stored; wait a moment, then upload the same file again."
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn slides_guidance_continues_into_the_next_run_after_sign_in_and_no_further() {
+    const SLIDES_GUIDANCE: &str = "The user ran /slides to make a new Slides artifact.";
+    let service = ArtifactService::start().await;
+    service
+        .control
+        .hold_device_approval
+        .store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("login", "ArtifactLogin", json!({})),
+        text("Open the link and confirm the code, then tell me."),
+        call(
+            "create",
+            "ArtifactEdit",
+            json!({"action":"create","title":"Q3 review","format":"slides","content":"<section id=\"cover\" style=\"background:#ffffff\"><h1>Q3 review</h1></section>"}),
+        ),
+        text("Created."),
+        text("You're welcome."),
+    ]));
+    let agent = Agent::new_embedded(config(), model.clone());
+    agent
+        .install_host_tools(Arc::new(McpHostToolProvider::new(
+            service.client(directory.path()),
+            None,
+        )))
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let invocation = agent
+        .invoke_skill(chat, None, "slides", "the Q3 review")
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    service
+        .control
+        .hold_device_approval
+        .store(false, Ordering::SeqCst);
+    let account = service.client(directory.path());
+    eventually(async || matches!(account.credential_snapshot(), Ok(Some(_)))).await;
+    for follow_up in ["Signed in", "Thanks"] {
+        agent
+            .submit(chat, Some(invocation.loop_id), follow_up.into())
+            .await
+            .unwrap();
+        // The created Slides keep the Loop waiting for their @tickloop requests.
+        eventually(async || {
+            agent
+                .snapshot(chat)
+                .await
+                .unwrap()
+                .loops
+                .iter()
+                .any(|goal| {
+                    goal.id == invocation.loop_id
+                        && matches!(goal.state, LoopState::Completed | LoopState::WaitingTrigger)
+                })
+        })
+        .await;
+    }
+    agent.shutdown().await;
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    let guided = requests
+        .iter()
+        .map(|request| {
+            serde_json::to_string(&request.messages)
+                .unwrap()
+                .contains(SLIDES_GUIDANCE)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        guided,
+        [true, true, true, true, false],
+        "the run after sign-in carries /slides; the run after it does not"
+    );
+    assert!(tool_names(&requests[2]).contains(&"ArtifactEdit"));
+    let calls = service.tool_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["arguments"]["format"], "slides");
+}
+
+/// Refuses every local file read; the host calls these tests prepare send no file.
+struct NoLocalReads;
+
+#[async_trait]
+impl tickloop_agent_tools::LocalReadAdmission for NoLocalReads {
+    async fn admit(&self, _: &tickloop_agent_tools::PreparedTool) -> Result<bool, String> {
+        Err("no local file is read here".into())
+    }
 }

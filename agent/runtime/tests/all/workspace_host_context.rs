@@ -22,7 +22,7 @@ use tickloop_agent_protocol::{
 };
 use tickloop_agent_runtime::{
     Agent,
-    host_tools::{HostToolPermission, HostToolProvider, PreparedHostCall},
+    host_tools::{HostCallScope, HostToolPermission, HostToolProvider, PreparedHostCall},
     hosted::{
         tools::HostedTickTools,
         views::HerdrViews,
@@ -124,14 +124,17 @@ impl HostToolProvider for CapturedHostSource {
         HostToolPermission::ReadOnly
     }
 
-    async fn prepare_call_in_context(
+    async fn prepare_call_in_scope(
         &self,
-        _: uuid::Uuid,
-        context: &HostCallContext,
+        chat: uuid::Uuid,
+        scope: &HostCallScope<'_>,
         name: &str,
         input: &Value,
-        _: CancellationToken,
+        cancel: CancellationToken,
     ) -> Result<PreparedHostCall, String> {
+        let Some(context) = scope.context else {
+            return self.prepare_call(chat, name, input, cancel).await;
+        };
         Ok(PreparedHostCall::new(
             name.into(),
             input.clone(),

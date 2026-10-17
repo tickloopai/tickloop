@@ -97,6 +97,7 @@ async fn a_created_artifact_attaches_to_its_chat_without_creating_a_subscription
     });
     assert_eq!(projected.len(), 1);
     assert_eq!(projected[0].title, "Created title");
+    assert_eq!(projected[0].kind, "Artifact·Doc");
     assert_eq!(
         projected[0].instance.as_str(),
         artifact("title").instance_id()
@@ -353,5 +354,42 @@ async fn repeated_body_reads_show_one_monitor_row_without_feedback_or_subscripti
             .iter()
             .all(|goal| goal.event_sources.is_empty())
     );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn created_slides_attach_to_monitor_under_their_type_name() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
+        tickloop_agent_test_support::call("create", "create_custom_document", json!({})),
+        tickloop_agent_test_support::text("done"),
+    ]));
+    let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model);
+    let mut slides = artifact("Launch review");
+    slides.format = "slides".into();
+    agent
+        .install_host_tools(Arc::new(ArtifactEffects(std::sync::Mutex::new(
+            [HostCallResult::CompletedWithEffect(
+                ToolResult {
+                    content: "Created".into(),
+                    is_error: false,
+                    output_ref: None,
+                },
+                Box::new(HostEffect::CreatedArtifact(slides.clone())),
+            )]
+            .into(),
+        ))))
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    run_artifact_tool(&agent, chat, "做几页幻灯片讲发布").await;
+    assert_eq!(agent.artifact_ticks(chat).await.unwrap(), vec![slides]);
+    let projected = tickloop_agent_console::monitor_rows::MonitorRowsRegistry::builtin().list(
+        &tickloop_agent_console::monitor_rows::MonitorContext {
+            chat: Some(std::sync::Arc::new(agent.status(chat).await.unwrap())),
+            ..Default::default()
+        },
+    );
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].kind, "Artifact·Slides");
     agent.shutdown().await;
 }

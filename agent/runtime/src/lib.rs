@@ -482,6 +482,7 @@ struct HostAdmission<'a> {
     policy_revision: u64,
     ancestor_revisions: &'a [(ChatId, u64)],
     host_permission: Option<crate::host_tools::HostToolPermission>,
+    local_read: Option<&'a tickloop_agent_tools::PreparedTool>,
     approval_path: ApprovalPath,
     direct_basis: denials::DirectApprovalBasis,
     approval_source: Option<PermissionApprovalSource>,
@@ -890,7 +891,7 @@ impl Agent {
         let mut names = HashSet::new();
         for definition in provider.definitions() {
             let is_artifact_tool =
-                crate::mcp_tools::ARTIFACT_TOOL_NAMES.contains(&definition.name.as_str());
+                crate::mcp_tools::ARTIFACT_ACCOUNT_TOOL_NAMES.contains(&definition.name.as_str());
             if definition.name.trim().is_empty()
                 || (reserved.contains(&definition.name)
                     && definition.name != crate::tick_tools::TICK_MANAGE
@@ -2281,9 +2282,6 @@ impl Agent {
         let mut candidate = original.clone();
         let chat = &mut candidate;
         let is_skill_invocation = invoked_skill.is_some();
-        if let Some(invoked_skill) = invoked_skill {
-            record_invoked_skill(chat, invoked_skill);
-        }
 
         let loop_id = if let Some(id) = goal {
             if !chat.snapshot.loops.iter().any(|goal| goal.id == id) {
@@ -2313,6 +2311,16 @@ impl Agent {
             loop_id,
             run_id,
         };
+        if let Some(mut invoked_skill) = invoked_skill {
+            if invoked_skill.source == tickloop_agent_protocol::SkillSource::BuiltIn
+                && chat.skills.is_user_only(&invoked_skill.name)
+            {
+                invoked_skill.run_id = Some(run_id);
+            }
+            record_invoked_skill(chat, invoked_skill);
+        } else if trigger_source.is_none() && agent_message.is_none() {
+            carry_user_skills_past_sign_in(chat, loop_id, run_id);
+        }
         let requested_receipt = receipt.clone();
         if trigger_source.is_none() {
             self.apply_pending_model(chat)?;
@@ -2842,6 +2850,13 @@ impl Agent {
                 if pending.agent_message.is_none() {
                     self.merge_host_context(active, &receipt);
                 }
+                for skill in &mut candidate.snapshot.invoked_skills {
+                    if skill.source == tickloop_agent_protocol::SkillSource::BuiltIn
+                        && skill.run_id == Some(receipt.run_id)
+                    {
+                        skill.run_id = Some(active.run_id);
+                    }
+                }
                 self.append_input_message(&mut candidate, pending);
                 candidate.snapshot.last_sequence += 1;
                 let event = Event {
@@ -2924,7 +2939,10 @@ impl Agent {
             receipt,
             operation,
             permission_input,
-            admission.host_permission,
+            delegation::HostCallPermission {
+                permission: admission.host_permission,
+                local_read: admission.local_read,
+            },
             admission.session_evaluation.decision,
         )?;
         let chat = chats.get_mut(&receipt.chat_id).unwrap();
@@ -4648,8 +4666,41 @@ pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
         .chain(std::iter::once(
             tickloop_agent_config::skills::SKILL_TOOL_NAME.into(),
         ))
-        .chain(crate::mcp_tools::ARTIFACT_TOOL_NAMES.map(String::from))
+        .chain(crate::mcp_tools::ARTIFACT_ACCOUNT_TOOL_NAMES.map(String::from))
         .collect()
+}
+
+/// A built-in Skill only the user invokes, such as /slides, guides the run its invocation started.
+/// When that run stopped at Artifact sign-in before creating an artifact, the user's next input
+/// to the same Loop continues the work, so the Skill guides that run instead.
+fn carry_user_skills_past_sign_in(chat: &mut Chat, loop_id: LoopId, run_id: RunId) {
+    let operations = &chat.snapshot.operations;
+    let stopped_at_sign_in = |run: RunId| {
+        let mut in_run = operations
+            .iter()
+            .filter(|operation| operation.run_id == run);
+        let started_sign_in = in_run.clone().any(|operation| {
+            operation.loop_id == loop_id && operation.name == crate::mcp_tools::ARTIFACT_LOGIN_TOOL
+        });
+        started_sign_in
+            && !in_run.any(|operation| {
+                operation.name == crate::mcp_tools::ARTIFACT_EDIT_TOOL
+                    && operation.input["action"] == "create"
+                    && matches!(
+                        operation.state,
+                        OperationState::Completed | OperationState::Unknown
+                    )
+            })
+    };
+    for skill in &mut chat.snapshot.invoked_skills {
+        if skill.source == tickloop_agent_protocol::SkillSource::BuiltIn
+            && let Some(bound) = skill.run_id
+            && chat.active_run != Some(bound)
+            && stopped_at_sign_in(bound)
+        {
+            skill.run_id = Some(run_id);
+        }
+    }
 }
 
 fn record_invoked_skill(chat: &mut Chat, invoked: tickloop_agent_protocol::InvokedSkill) -> bool {

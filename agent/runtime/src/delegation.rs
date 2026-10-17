@@ -21,7 +21,7 @@ fn record_artifact_account(
     host_tools: &mut BTreeMap<String, BTreeSet<HostToolAuthority>>,
     provider: &dyn HostToolProvider,
 ) -> Result<bool, String> {
-    let names = crate::mcp_tools::ARTIFACT_TOOL_NAMES;
+    let names = crate::mcp_tools::ARTIFACT_ACCOUNT_TOOL_NAMES;
     if names.iter().any(|name| host_tools.contains_key(*name)) {
         return Ok(false);
     }
@@ -96,9 +96,12 @@ mod ancestry_authority_tests {
                 &receipt,
                 &operation,
                 &input,
-                Some(crate::host_tools::HostToolPermission::Classified {
-                    allow_rule_bypasses_review: false,
-                }),
+                HostCallPermission {
+                    permission: Some(crate::host_tools::HostToolPermission::Classified {
+                        allow_rule_bypasses_review: false,
+                    }),
+                    local_read: None,
+                },
                 None,
             )
             .unwrap();
@@ -462,13 +465,21 @@ pub(super) fn effective_policy(
     Ok(policy)
 }
 
+/// What a prepared host call contributes to its approval: the host's permission class, and the
+/// local file it sends, whose `Read` approval the call also needs.
+#[derive(Clone, Copy)]
+pub(super) struct HostCallPermission<'a> {
+    pub(super) permission: Option<crate::host_tools::HostToolPermission>,
+    pub(super) local_read: Option<&'a PreparedTool>,
+}
+
 pub(super) fn host_authority(
     chats: &HashMap<ChatId, Chat>,
     sessions: &session_permissions::SessionPermissionContext,
     receipt: &Receipt,
     operation: &OperationRecord,
     permission_input: &Value,
-    permission: Option<crate::host_tools::HostToolPermission>,
+    host_call: HostCallPermission<'_>,
     session: Option<tickloop_agent_tools::permissions::SessionPermissionDecision>,
 ) -> Result<
     (
@@ -477,6 +488,10 @@ pub(super) fn host_authority(
     ),
     String,
 > {
+    let HostCallPermission {
+        permission,
+        local_read,
+    } = host_call;
     let policy = effective_policy(chats, receipt)?;
     let decide = |policy: &tickloop_agent_protocol::PermissionPolicy, loop_id, session, human| {
         let explicit =
@@ -521,6 +536,20 @@ pub(super) fn host_authority(
             decision = decision.stricter(ancestor_decision);
             explicit_ask |= ancestor_ask;
         }
+    }
+    // A call that sends a local file needs whatever approval a `Read` of that file would.
+    if let Some(read) = local_read {
+        let read_operation =
+            SessionPermissionOperation::from_prepared(read, &configured_workspace_for_chat(own))
+                .map_err(|error| error.to_string())?;
+        let owner = PermissionOwner::new(receipt.chat_id, receipt.loop_id)
+            .map_err(|error| error.to_string())?;
+        let read_session = sessions.evaluate(owner, &read_operation).decision;
+        let read_authority =
+            permission_authority(chats, sessions, receipt, read, read_session, None)
+                .ok_or("chat is unavailable")?;
+        decision = decision.stricter(read_authority.decision);
+        explicit_ask |= read_authority.explicit_ask;
     }
 
     Ok((
@@ -888,6 +917,49 @@ impl Agent {
             prepared,
             plan_file.as_deref(),
         )
+    }
+
+    /// A host call that sends a local file elsewhere answers to the rules of its `Read` of that
+    /// file: the delegated scope and every ancestor's denials refuse it, and so does an explicit
+    /// Deny the Chat is under. `Ok(true)` reports an explicit Ask, which the call's one approval
+    /// then has to satisfy.
+    pub(super) async fn check_local_read(
+        &self,
+        receipt: &Receipt,
+        read: &PreparedTool,
+    ) -> Result<bool, String> {
+        self.check_delegated_call(receipt, &read.name, &read.input, Some(read))
+            .await?;
+        let chats = self.inner.chats.lock().await;
+        let chat = chats.get(&receipt.chat_id).ok_or("chat is unavailable")?;
+        let owner = PermissionOwner::new(receipt.chat_id, receipt.loop_id)
+            .map_err(|error| error.to_string())?;
+        let operation =
+            SessionPermissionOperation::from_prepared(read, &configured_workspace_for_chat(chat))
+                .map_err(|error| error.to_string())?;
+        let session = self
+            .inner
+            .session_permissions
+            .lock()
+            .await
+            .evaluate(owner, &operation)
+            .decision;
+        match effective_policy(&chats, receipt)?.explicit_match_with_session(
+            &read.name,
+            &read.input,
+            receipt.loop_id,
+            session,
+        ) {
+            Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Deny) => {
+                Err(format!(
+                    "{} of {} is denied, so the file is not sent",
+                    read.name,
+                    read.input["file_path"].as_str().unwrap_or("this file")
+                ))
+            }
+            Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Ask) => Ok(true),
+            _ => Ok(false),
+        }
     }
 
     pub(super) fn subagent_tool<'a>(

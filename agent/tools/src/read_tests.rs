@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::{FileReadState, ToolError, Tools, Workspace, permissions::PermissionPolicyExt};
+use crate::{
+    FileReadState, READ_TOOL_NAME, ToolError, Tools, Workspace, permissions::PermissionPolicyExt,
+};
 use tickloop_agent_protocol::{FileReadRecord, ToolResult};
 
 fn workspace(path: &Path) -> Workspace {
@@ -979,5 +981,86 @@ async fn prepared_quoted_literal_glob_rechecks_replaced_symlink() {
     assert!(matches!(
         tools.execute(prepared, CancellationToken::new()).await,
         Err(ToolError::PathChanged(_))
+    ));
+}
+
+/// Refuses the `Read` of a file named `refused.png`, asks for one named `asked.png`, and admits the
+/// rest.
+struct AdmissionByName;
+
+#[async_trait::async_trait]
+impl crate::LocalReadAdmission for AdmissionByName {
+    async fn admit(&self, read: &crate::PreparedTool) -> Result<bool, String> {
+        match Path::new(read.input["file_path"].as_str().unwrap())
+            .file_name()
+            .and_then(|name| name.to_str())
+        {
+            Some("refused.png") => Err("Read of refused.png is denied".into()),
+            Some("asked.png") => Ok(true),
+            _ => Ok(false),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_local_file_sent_elsewhere_follows_read_rules_and_refuses_sensitive_paths() {
+    let parent = tempfile::tempdir().unwrap();
+    let project = parent.path().join("token-service");
+    std::fs::create_dir(&project).unwrap();
+    let project = project.canonicalize().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let files = chat_tools(&output)
+        .local_file_reader(&workspace(&project), std::sync::Arc::new(AdmissionByName));
+    std::fs::write(project.join("chart.png"), b"chart").unwrap();
+    std::fs::write(elsewhere.path().join("photo.png"), b"photo").unwrap();
+
+    let inside = files.read("chart.png", 16).await.unwrap();
+    assert_eq!(inside.path, project.join("chart.png"));
+    assert_eq!(inside.read.name, READ_TOOL_NAME);
+    assert!(inside.read.in_workspace && !inside.read.requires_permission);
+    assert!(inside.read.is_supported_in_delegated_scope());
+    assert!(!inside.read_asks);
+    assert_eq!(inside.bytes, b"chart");
+    let outside = files
+        .read(elsewhere.path().join("photo.png").to_str().unwrap(), 16)
+        .await
+        .unwrap();
+    assert!(!outside.read.in_workspace && outside.read.requires_permission);
+    assert!(
+        !outside.read.is_supported_in_delegated_scope(),
+        "a Subagent's own Read would refuse it"
+    );
+    assert!(matches!(
+        files.read("chart.png", 4).await,
+        Err(ToolError::Rejected(message)) if message.contains("exceeds maximum allowed size")
+    ));
+    std::fs::write(project.join("refused.png"), b"far too large").unwrap();
+    assert!(
+        matches!(
+            files.read("refused.png", 4).await,
+            Err(ToolError::Rejected(message)) if message == "Read of refused.png is denied"
+        ),
+        "a refused Read is decided before the file is opened or measured"
+    );
+    std::fs::write(project.join("asked.png"), b"asked").unwrap();
+    assert!(files.read("asked.png", 16).await.unwrap().read_asks);
+
+    std::fs::create_dir(project.join(".ssh")).unwrap();
+    std::fs::write(project.join(".ssh/id.png"), b"key").unwrap();
+    std::fs::write(project.join("api_token.png"), b"key").unwrap();
+    std::os::unix::fs::symlink(project.join(".ssh/id.png"), project.join("innocent.png")).unwrap();
+    for sensitive in [".ssh/id.png", "api_token.png", "innocent.png"] {
+        assert!(
+            matches!(
+                files.read(sensitive, 16).await,
+                Err(ToolError::Rejected(message)) if message.contains("credentials or secrets")
+            ),
+            "{sensitive}"
+        );
+    }
+    assert!(matches!(
+        files.read(".", 16).await,
+        Err(ToolError::Rejected(message)) if message.starts_with("EISDIR")
     ));
 }

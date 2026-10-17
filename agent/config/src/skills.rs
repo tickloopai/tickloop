@@ -6,7 +6,9 @@ use tick_packages::{InstalledPackage, PackageStore};
 use tickloop_agent_protocol::{InvokedSkill, RemoteSkillDefinition, SkillSource, ToolDefinition};
 
 pub const TICKLOOP_SKILL: &str = include_str!("../skills/tickloop/SKILL.md");
-pub const BUILTIN_SKILLS: [&str; 1] = [TICKLOOP_SKILL];
+/// `/slides`: only the user invokes it, and its body guides only the run it starts.
+pub const SLIDES_SKILL: &str = include_str!("../skills/slides/SKILL.md");
+pub const BUILTIN_SKILLS: [&str; 2] = [TICKLOOP_SKILL, SLIDES_SKILL];
 pub const SKILL_TOOL_NAME: &str = "Skill";
 /// In the body of a Tick package's Skill, the directory the package is installed in.
 pub const PACKAGE_ROOT_VARIABLE: &str = "${TICK_PACKAGE_ROOT}";
@@ -166,6 +168,13 @@ impl SkillRegistry {
     pub fn contains(&self, name: &str) -> bool {
         self.skills
             .contains_key(name.trim().trim_start_matches('/'))
+    }
+
+    /// Whether the Skill named `name` disables model invocation, so only the user invokes it.
+    pub fn is_user_only(&self, name: &str) -> bool {
+        self.skills
+            .get(name)
+            .is_some_and(|skill| skill.disable_model_invocation)
     }
 
     pub fn model_listing(&self) -> String {

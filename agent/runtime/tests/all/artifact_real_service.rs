@@ -544,7 +544,7 @@ fn agent_messages(thread: &Value) -> Vec<String> {
 
 fn service_code(error: ArtifactError) -> String {
     match error {
-        ArtifactError::Service { status, code } => format!("{status} {code}"),
+        ArtifactError::Service { status, code, .. } => format!("{status} {code}"),
         other => panic!("expected a service error, got {other}"),
     }
 }

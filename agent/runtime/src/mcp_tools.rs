@@ -25,15 +25,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     host_tools::{
-        EventToolContext, HostCallResult, HostEffect, HostToolPermission, HostToolProvider,
-        PreparedHostCall, WorkspaceHostContext,
+        EventToolContext, HostCallResult, HostCallScope, HostEffect, HostToolPermission,
+        HostToolProvider, PreparedHostCall, WorkspaceHostContext,
     },
     mcp_http::McpHttpClient,
 };
-use tickloop_agent_artifacts::{ArtifactClient, ArtifactError, CredentialSnapshot, mcp_endpoint};
+use tickloop_agent_artifacts::{
+    ArtifactClient, ArtifactError, CredentialSnapshot, IMAGE_ARTIFACT_FORMAT, MAX_IMAGE_BYTES,
+    artifact_image_type, artifact_type, artifact_type_for_tool, mcp_endpoint,
+};
 use tickloop_agent_protocol::{
-    ArtifactAudience, ArtifactPublication, ChatId, HostCallContext, HostEndpointIdentity,
-    HostToolAuthority, RemoteSkillDefinition, SkillSource, ToolDefinition, ToolResult,
+    ArtifactAudience, ArtifactPublication, ChatId, HostEndpointIdentity, HostToolAuthority,
+    RemoteSkillDefinition, SkillSource, ToolDefinition, ToolResult,
 };
 
 pub const ARTIFACT_READ_TOOL: &str = "ArtifactRead";
@@ -41,11 +44,21 @@ pub const ARTIFACT_EDIT_TOOL: &str = "ArtifactEdit";
 pub const ARTIFACT_COMMENT_TOOL: &str = "ArtifactComment";
 /// Offered instead of the Artifact tools while no account is signed in.
 pub const ARTIFACT_LOGIN_TOOL: &str = "ArtifactLogin";
+/// Uploads a local image to a Slides artifact; the host defines it and offers it along with the
+/// directory's tools.
+pub const ARTIFACT_UPLOAD_TOOL: &str = "ArtifactUpload";
 /// The only tools taken from the service directory; the host reserves these names.
 pub const ARTIFACT_TOOL_NAMES: [&str; 3] = [
     ARTIFACT_READ_TOOL,
     ARTIFACT_EDIT_TOOL,
     ARTIFACT_COMMENT_TOOL,
+];
+/// Every tool that acts for the signed-in Artifact account.
+pub const ARTIFACT_ACCOUNT_TOOL_NAMES: [&str; 4] = [
+    ARTIFACT_READ_TOOL,
+    ARTIFACT_EDIT_TOOL,
+    ARTIFACT_COMMENT_TOOL,
+    ARTIFACT_UPLOAD_TOOL,
 ];
 
 const SERVER_NAME: &str = "tickloop-artifacts";
@@ -60,13 +73,38 @@ const MAX_APPROVAL_COLLECTION_ITEMS: usize = 64;
 const MAX_APPROVAL_DEPTH: usize = 8;
 const MAX_IDENTIFIER_BYTES: usize = 256;
 const MAX_ARTIFACT_TITLE_UTF16_UNITS: usize = 200;
-const ARTIFACT_LOGIN_DESCRIPTION: &str = "Tickloop Artifacts is not signed in. Call this when the user wants a doc or page; it starts sign-in and returns a link and code for the user. After the user approves, ArtifactRead, ArtifactEdit and ArtifactComment become available automatically.";
+/// The service is busy with this Slides artifact's other uploads; a later upload may succeed.
+const UPLOAD_BUSY_STATUS: u16 = 429;
+const ARTIFACT_LOGIN_DESCRIPTION: &str = "Tickloop Artifacts is not signed in. Call this when the user wants a doc, page or slides; it starts sign-in and returns a link and code for the user. After the user approves, ArtifactRead, ArtifactEdit, ArtifactComment and ArtifactUpload become available automatically.";
+const ARTIFACT_UPLOAD_DESCRIPTION: &str = "Upload a local image file to a Slides artifact so its Slides can show it. Tickloop reads the file at file_path and sends it; its contents never reach you. PNG, JPEG, GIF, WebP or SVG, at most 5 MiB (an SVG at most 2 MiB); a file outside the workspace needs the user's approval. The result gives asset_id, ref (asset:<asset_id>), content_type, bytes, width and height (null when unknown); show the image in a Slide as <img src=\"<ref>\" alt=\"...\">. Upload each file once; a refused upload stores nothing, and after an unknown outcome read the Slides with ArtifactRead to see its images before uploading again.";
 
 pub(crate) fn login_definition() -> ToolDefinition {
     ToolDefinition {
         name: ARTIFACT_LOGIN_TOOL.into(),
         description: ARTIFACT_LOGIN_DESCRIPTION.into(),
         input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+    }
+}
+
+pub(crate) fn upload_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: ARTIFACT_UPLOAD_TOOL.into(),
+        description: ARTIFACT_UPLOAD_DESCRIPTION.into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "artifact_id": {
+                    "type": "string",
+                    "description": "The Slides artifact: the artifact_id ArtifactRead or ArtifactEdit returned, or the id in its /artifact/<artifact_id> URL"
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "The absolute path to the image file"
+                }
+            },
+            "required": ["artifact_id", "file_path"],
+            "additionalProperties": false
+        }),
     }
 }
 
@@ -126,7 +164,7 @@ impl PendingLogin {
             .as_secs()
             .div_ceil(60);
         format!(
-            "{heading} Give the user this link and code: open {} and confirm the code {}. The code expires in about {minutes} minutes. Once the user approves, ArtifactRead, ArtifactEdit and ArtifactComment become available automatically on a later request; the user can also sign in by running /artifacts.",
+            "{heading} Give the user this link and code: open {} and confirm the code {}. The code expires in about {minutes} minutes. Once the user approves, ArtifactRead, ArtifactEdit, ArtifactComment and ArtifactUpload become available automatically on a later request; the user can also sign in by running /artifacts.",
             self.verification_uri, self.user_code
         )
     }
@@ -138,6 +176,19 @@ struct PreparedMcpCall {
     arguments: Value,
     publication: Option<ArtifactPublication>,
     read_owned: Option<bool>,
+}
+
+/// One approved image upload: exactly the bytes read and reviewed at preparation, sent once under
+/// its operation ID.
+struct PreparedArtifactUpload {
+    credential: CredentialSnapshot,
+    /// The artifact as the call named it, which publication admissions key on.
+    requested_id: String,
+    artifact_id: String,
+    content_type: &'static str,
+    bytes: Vec<u8>,
+    operation_id: uuid::Uuid,
+    publication: Option<ArtifactPublication>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -251,6 +302,65 @@ impl McpHostToolProvider {
         }
     }
 
+    /// The permission of a write to `artifact` in this Chat, when its metadata reports a private
+    /// or public audience: the first write to that audience, or a continuation of one this Chat
+    /// already made.
+    fn audience_permission(
+        &self,
+        chat_id: ChatId,
+        credential: &CredentialSnapshot,
+        artifact: &str,
+        publication: Option<&ArtifactPublication>,
+    ) -> Option<HostToolPermission> {
+        let audience = publication?.audience;
+        if !matches!(
+            audience,
+            ArtifactAudience::Private | ArtifactAudience::Public
+        ) {
+            return None;
+        }
+        let admission = ArtifactPublicationAdmission {
+            chat: chat_id,
+            account: credential.account_id.clone(),
+            origin: credential.origin.clone(),
+            artifact: artifact.to_owned(),
+            audience,
+        };
+        Some(
+            if self
+                .publication_admissions
+                .read()
+                .unwrap()
+                .contains(&admission)
+            {
+                HostToolPermission::ArtifactContinuation
+            } else if audience == ArtifactAudience::Private {
+                HostToolPermission::PrivateArtifactWrite
+            } else {
+                HostToolPermission::PublicArtifactWrite
+            },
+        )
+    }
+
+    fn admit_publication(
+        &self,
+        chat_id: ChatId,
+        credential: &CredentialSnapshot,
+        artifact: String,
+        audience: ArtifactAudience,
+    ) {
+        self.publication_admissions
+            .write()
+            .unwrap()
+            .insert(ArtifactPublicationAdmission {
+                chat: chat_id,
+                account: credential.account_id.clone(),
+                origin: credential.origin.clone(),
+                artifact,
+                audience,
+            });
+    }
+
     fn operation_permission(tool: &DiscoveredTool, input: &Value) -> HostToolPermission {
         let ordinary_creation = tool.definition.name == ARTIFACT_EDIT_TOOL
             && has_action(input, "create")
@@ -264,7 +374,9 @@ impl McpHostToolProvider {
                 !title.trim().is_empty()
                     && title.encode_utf16().count() <= MAX_ARTIFACT_TITLE_UTF16_UNITS
             })
-            && matches!(input["format"].as_str(), Some("doc" | "page"))
+            && input["format"]
+                .as_str()
+                .is_some_and(|format| artifact_type_for_tool(format).is_some())
             && input["content"].is_string();
         if ordinary_creation {
             HostToolPermission::PrivateArtifactWrite
@@ -615,11 +727,7 @@ impl McpHostToolProvider {
         }
         let title = structured.get("title")?.as_str()?;
         // Tool results use public format names; Monitor retains storage names.
-        let format = match structured.get("format")?.as_str()? {
-            "doc" => "markdown",
-            "page" => "html",
-            _ => return None,
-        };
+        let format = artifact_type_for_tool(structured.get("format")?.as_str()?)?.stored_format;
         let url = structured.get("url")?.as_str()?;
         let parsed_url = reqwest::Url::parse(url).ok()?;
         let origin = reqwest::Url::parse(&prepared.credential.origin).ok()?;
@@ -686,10 +794,11 @@ impl McpHostToolProvider {
         }
         read.get("revision")?.as_u64()?;
         let format = match read.get("format")?.as_str()? {
-            "doc" if read.get("blocks")?.is_array() => "markdown",
-            "page" if read.get("source")?.is_string() => "html",
+            format @ ("doc" | "slides") if read.get("blocks")?.is_array() => format,
+            format @ "page" if read.get("source")?.is_string() => format,
             _ => return None,
         };
+        let format = artifact_type_for_tool(format)?.stored_format;
         let access_role = match read.get("access_role")?.as_str()? {
             "owner" => "owner",
             "edit" => "editor",
@@ -742,6 +851,252 @@ impl McpHostToolProvider {
             content,
             is_error: result.is_error == Some(true),
             output_ref: None,
+        }
+    }
+
+    /// `ArtifactUpload` is offered while the signed-in account's Artifact tools are.
+    fn offers_upload(&self) -> bool {
+        self.directory.read().unwrap().is_some()
+    }
+
+    /// Resolves the file by the calling Chat's `Read` rules and reads it whole, so the approval
+    /// covers the exact bytes later sent. The approval joins the write to the Slides, judged by
+    /// the Artifact's audience like `ArtifactEdit`, with the decision a `Read` of the file gets.
+    async fn prepare_upload(
+        &self,
+        chat_id: ChatId,
+        scope: &HostCallScope<'_>,
+        input: &Value,
+        cancel: CancellationToken,
+    ) -> Result<PreparedHostCall, String> {
+        if cancel.is_cancelled() {
+            return Err("ArtifactUpload was cancelled".into());
+        }
+        let expected_key = self
+            .directory
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|directory| directory.credential_key)
+            .ok_or("ArtifactUpload needs the Artifact tools, which are unavailable now")?;
+        let requested = bounded_identifier(input.get("artifact_id"))
+            .filter(|id| !id.contains(['/', '?', '#', '%']))
+            .ok_or("artifact_id must name one artifact")?;
+        let file_path = input["file_path"]
+            .as_str()
+            .ok_or("file_path must be a string")?;
+        let credential = self
+            .artifact
+            .credential_snapshot()
+            .map_err(|_| "Artifact credential unavailable")?
+            .ok_or("Artifact login is no longer active")?;
+        if Self::credential_key(&credential) != expected_key {
+            return Err("Artifact account changed before the upload was prepared".into());
+        }
+        let file = scope
+            .local_files
+            .read(file_path, MAX_IMAGE_BYTES)
+            .await
+            .map_err(|error| error.to_string())?;
+        let content_type = artifact_image_type(&file.bytes)
+            .map_err(|reason| format!("{} cannot be uploaded: {reason}", file.path.display()))?;
+        let metadata = tokio::select! {
+            () = cancel.cancelled() => return Err("ArtifactUpload was cancelled".into()),
+            result = self.artifact.read_with_credential(requested, &credential) => {
+                result.map_err(|error| format!("Artifact unavailable: {error}"))?
+            }
+        };
+        if metadata.format != IMAGE_ARTIFACT_FORMAT {
+            return Err(format!(
+                "ArtifactUpload adds images to Slides only; this artifact is a {}",
+                artifact_type(&metadata.format).map_or(metadata.format.as_str(), |kind| kind.name)
+            ));
+        }
+        let permission = self
+            .audience_permission(
+                chat_id,
+                &credential,
+                requested,
+                metadata.publication.as_ref(),
+            )
+            .unwrap_or(HostToolPermission::Reviewable);
+        let approval_input = json!({
+            "artifact_id": requested,
+            "file_path": file.path,
+            "content_type": content_type,
+            "bytes": file.bytes.len(),
+            "sha256": format!("{:x}", Sha256::digest(&file.bytes)),
+        });
+        let summary = format!(
+            "Upload {} ({content_type}, {}) to Slides {requested} at {}{}",
+            file.path.display(),
+            tickloop_agent_tools::format_file_size(file.bytes.len()),
+            credential.origin,
+            if file.read.requires_permission {
+                "; the file is outside the workspace"
+            } else {
+                ""
+            }
+        );
+        let facts = tickloop_agent_protocol::PreparedApprovalFacts {
+            artifact_publication: metadata.publication.clone(),
+            normalized_input: approval_input.clone(),
+            canonical_path: Some(file.path.clone()),
+            in_workspace: Some(file.read.in_workspace),
+            read_only: Some(false),
+            ..Default::default()
+        };
+        Ok(PreparedHostCall::new(
+            ARTIFACT_UPLOAD_TOOL.into(),
+            input.clone(),
+            approval_input,
+            permission,
+            summary,
+        )
+        .with_approval_facts(facts)
+        .with_permission_input(json!({"artifact_id": requested, "file_path": file.path}))
+        .with_local_read(file.read, file.read_asks)
+        .with_payload(PreparedArtifactUpload {
+            credential,
+            requested_id: requested.to_owned(),
+            artifact_id: metadata.id,
+            content_type,
+            bytes: file.bytes,
+            operation_id: uuid::Uuid::new_v4(),
+            publication: metadata.publication,
+        }))
+    }
+
+    async fn revalidate_upload(
+        &self,
+        upload: &PreparedArtifactUpload,
+        cancel: CancellationToken,
+    ) -> Result<(), String> {
+        if cancel.is_cancelled() {
+            return Err("ArtifactUpload was cancelled".into());
+        }
+        let current = self
+            .artifact
+            .credential_snapshot()
+            .map_err(|_| "Artifact credential unavailable")?
+            .ok_or("Artifact login ended before the upload")?;
+        if !upload.credential.identity_matches(&current) {
+            return Err("Artifact account changed before the upload".into());
+        }
+        let metadata = tokio::select! {
+            () = cancel.cancelled() => return Err("ArtifactUpload was cancelled".into()),
+            result = self.artifact.read_with_credential(&upload.artifact_id, &current) => {
+                result.map_err(|error| format!("Artifact unavailable: {error}"))?
+            }
+        };
+        if metadata.publication != upload.publication {
+            return Err(
+                "Artifact audience changed before the upload; prepare and check permission again"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Sends the approved bytes once. A lost response is settled by the service's receipt for the
+    /// upload's operation, never by sending the image again.
+    async fn upload(
+        &self,
+        chat_id: ChatId,
+        upload: PreparedArtifactUpload,
+        cancel: CancellationToken,
+    ) -> HostCallResult {
+        if cancel.is_cancelled() {
+            return HostCallResult::NotDispatched("ArtifactUpload was cancelled".into());
+        }
+        if !self.credential_is_current(&upload.credential) {
+            return HostCallResult::NotDispatched(
+                "Artifact account changed before the upload".into(),
+            );
+        }
+        let unknown = "read the Slides with ArtifactRead to see whether the image arrived before uploading it again";
+        let outcome = tokio::select! {
+            () = cancel.cancelled() => {
+                return HostCallResult::OutcomeUnknown(format!("the upload was cancelled after it was sent; {unknown}"));
+            }
+            result = self.artifact.upload_image(
+                &upload.artifact_id,
+                upload.content_type,
+                upload.bytes,
+                upload.operation_id,
+                &upload.credential,
+            ) => result,
+        };
+        let refused = |content: String| {
+            HostCallResult::Completed(ToolResult {
+                content,
+                is_error: true,
+                output_ref: None,
+            })
+        };
+        match outcome {
+            Ok(image) => {
+                if let Some(publication) = upload.publication.filter(|publication| {
+                    matches!(
+                        publication.audience,
+                        ArtifactAudience::Private | ArtifactAudience::Public
+                    )
+                }) {
+                    self.admit_publication(
+                        chat_id,
+                        &upload.credential,
+                        upload.requested_id,
+                        publication.audience,
+                    );
+                }
+                HostCallResult::Completed(ToolResult {
+                    content: json!({
+                        "asset_id": image.asset_id,
+                        "ref": image.reference,
+                        "content_type": image.content_type,
+                        "bytes": image.bytes,
+                        "width": image.width,
+                        "height": image.height,
+                    })
+                    .to_string(),
+                    is_error: false,
+                    output_ref: None,
+                })
+            }
+            Err(ArtifactError::AccountChanged) => {
+                HostCallResult::NotDispatched("Artifact account changed before the upload".into())
+            }
+            Err(
+                error @ (ArtifactError::Storage
+                | ArtifactError::InvalidOrigin
+                | ArtifactError::InvalidResponse),
+            ) => HostCallResult::NotDispatched(format!("the upload was not sent: {error}")),
+            Err(ArtifactError::Service {
+                status,
+                code,
+                message,
+            }) => {
+                let explanation = if message.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", message.trim_end_matches('.'))
+                };
+                let next_step = if status == UPLOAD_BUSY_STATUS {
+                    " Nothing was stored; wait a moment, then upload the same file again."
+                } else {
+                    ""
+                };
+                refused(format!(
+                    "Tickloop Artifacts refused the upload (HTTP {status} {code}){explanation}.{next_step}"
+                ))
+            }
+            Err(ArtifactError::AccessDenied) => refused(
+                "Tickloop Artifacts no longer accepts this sign-in; nothing was uploaded. The user can sign in again with /artifacts".into(),
+            ),
+            Err(ArtifactError::OutcomeUnknown { outcome, .. }) => HostCallResult::OutcomeUnknown(
+                format!("the upload's result could not be confirmed ({outcome}); {unknown}"),
+            ),
+            Err(error) => HostCallResult::OutcomeUnknown(format!("{error}; {unknown}")),
         }
     }
 
@@ -839,8 +1194,8 @@ impl McpHostToolProvider {
 
 #[async_trait]
 impl HostToolProvider for McpHostToolProvider {
-    /// Native tools never take the Artifact names; only the service directory provides them, and
-    /// the provider itself offers sign-in while signed out.
+    /// Native tools never take the Artifact names; only the service directory provides them,
+    /// together with the provider's own upload, and the provider offers sign-in while signed out.
     fn definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = self
             .native
@@ -848,11 +1203,12 @@ impl HostToolProvider for McpHostToolProvider {
             .map(|provider| provider.definitions())
             .unwrap_or_default();
         definitions.retain(|definition| {
-            !ARTIFACT_TOOL_NAMES.contains(&definition.name.as_str())
+            !ARTIFACT_ACCOUNT_TOOL_NAMES.contains(&definition.name.as_str())
                 && definition.name != ARTIFACT_LOGIN_TOOL
         });
         if let Some(directory) = self.directory.read().unwrap().as_ref() {
             definitions.extend(directory.tools.iter().map(|tool| tool.definition.clone()));
+            definitions.push(upload_definition());
         } else if self.offers_login() {
             definitions.push(login_definition());
         }
@@ -873,7 +1229,7 @@ impl HostToolProvider for McpHostToolProvider {
 
     /// The Artifact names belong to the signed-in account even while its directory is unavailable.
     fn tool_authorities(&self, name: &str) -> Result<BTreeSet<HostToolAuthority>, String> {
-        if self.is_mcp_name(name) || ARTIFACT_TOOL_NAMES.contains(&name) {
+        if self.is_mcp_name(name) || ARTIFACT_ACCOUNT_TOOL_NAMES.contains(&name) {
             return Ok(self.mcp_authority()?.into_iter().collect());
         }
         if name == ARTIFACT_LOGIN_TOOL {
@@ -889,7 +1245,7 @@ impl HostToolProvider for McpHostToolProvider {
         name: &str,
         input: &Value,
     ) -> Result<Option<HostToolAuthority>, String> {
-        if self.is_mcp_name(name) {
+        if self.is_mcp_name(name) || name == ARTIFACT_UPLOAD_TOOL && self.offers_upload() {
             return self.mcp_authority();
         }
         if name == ARTIFACT_LOGIN_TOOL {
@@ -1123,6 +1479,9 @@ impl HostToolProvider for McpHostToolProvider {
                 .then_some(())
                 .ok_or_else(|| format!("{ARTIFACT_LOGIN_TOOL} takes no input"));
         }
+        if name == ARTIFACT_UPLOAD_TOOL {
+            return crate::validate_host_schema_input(name, schema, input);
+        }
         if !self.is_mcp_name(name) {
             return self
                 .native
@@ -1144,6 +1503,9 @@ impl HostToolProvider for McpHostToolProvider {
         if name == ARTIFACT_LOGIN_TOOL {
             return HostToolPermission::Automatic;
         }
+        if name == ARTIFACT_UPLOAD_TOOL {
+            return HostToolPermission::Reviewable;
+        }
         self.native
             .as_ref()
             .map_or(HostToolPermission::Reviewable, |native| {
@@ -1151,21 +1513,23 @@ impl HostToolProvider for McpHostToolProvider {
             })
     }
 
-    async fn prepare_call_in_context(
+    async fn prepare_call_in_scope(
         &self,
         chat_id: ChatId,
-        context: &HostCallContext,
+        scope: &HostCallScope<'_>,
         name: &str,
         input: &Value,
         cancel: CancellationToken,
     ) -> Result<PreparedHostCall, String> {
-        if self.is_mcp_name(name) || name == ARTIFACT_LOGIN_TOOL {
+        if name == ARTIFACT_UPLOAD_TOOL {
+            self.prepare_upload(chat_id, scope, input, cancel).await
+        } else if self.is_mcp_name(name) || name == ARTIFACT_LOGIN_TOOL {
             self.prepare_call(chat_id, name, input, cancel).await
         } else {
             self.native
                 .as_ref()
                 .ok_or_else(|| "Host tool unavailable".to_owned())?
-                .prepare_call_in_context(chat_id, context, name, input, cancel)
+                .prepare_call_in_scope(chat_id, scope, name, input, cancel)
                 .await
         }
     }
@@ -1195,6 +1559,11 @@ impl HostToolProvider for McpHostToolProvider {
                 ),
             )
             .with_payload(PreparedArtifactLogin));
+        }
+        if name == ARTIFACT_UPLOAD_TOOL {
+            return Err(format!(
+                "{ARTIFACT_UPLOAD_TOOL} reads its file in the calling Chat's workspace"
+            ));
         }
         let Some((tool, fingerprint, expected_key)) = self.directory_tool(name) else {
             return self
@@ -1240,32 +1609,11 @@ impl HostToolProvider for McpHostToolProvider {
                 HostToolPermission::Confirmation
             }
         } else {
-            match publication.as_ref().map(|state| state.audience) {
-                Some(audience @ (ArtifactAudience::Private | ArtifactAudience::Public)) => {
-                    let admission = ArtifactPublicationAdmission {
-                        chat: chat_id,
-                        account: credential.account_id.clone(),
-                        origin: credential.origin.clone(),
-                        artifact: artifact_update_id(name, input)
-                            .expect("publication belongs to an update")
-                            .to_owned(),
-                        audience,
-                    };
-                    if self
-                        .publication_admissions
-                        .read()
-                        .unwrap()
-                        .contains(&admission)
-                    {
-                        HostToolPermission::ArtifactContinuation
-                    } else if audience == ArtifactAudience::Private {
-                        HostToolPermission::PrivateArtifactWrite
-                    } else {
-                        HostToolPermission::PublicArtifactWrite
-                    }
-                }
-                _ => Self::operation_permission(&tool, input),
-            }
+            artifact_update_id(name, input)
+                .and_then(|artifact| {
+                    self.audience_permission(chat_id, &credential, artifact, publication.as_ref())
+                })
+                .unwrap_or_else(|| Self::operation_permission(&tool, input))
         };
         let summary = if name == ARTIFACT_EDIT_TOOL && has_action(input, "create") {
             format!(
@@ -1320,6 +1668,9 @@ impl HostToolProvider for McpHostToolProvider {
             } else {
                 Ok(())
             };
+        }
+        if let Some(upload) = call.payload::<PreparedArtifactUpload>() {
+            return self.revalidate_upload(upload, cancel).await;
         }
         let Some(prepared) = call.payload::<PreparedMcpCall>() else {
             return self
@@ -1397,6 +1748,10 @@ impl HostToolProvider for McpHostToolProvider {
             }
             return HostCallResult::Completed(self.start_login(cancel).await);
         }
+        let call = match call.into_payload::<PreparedArtifactUpload>() {
+            Ok(upload) => return self.upload(chat_id, upload, cancel).await,
+            Err(call) => *call,
+        };
         if call.payload::<PreparedMcpCall>().is_none() {
             return match &self.native {
                 Some(native) => native.execute_prepared(chat_id, call, cancel).await,
@@ -1516,16 +1871,7 @@ impl HostToolProvider for McpHostToolProvider {
                 }),
             };
             if let Some((artifact, audience)) = admitted {
-                self.publication_admissions
-                    .write()
-                    .unwrap()
-                    .insert(ArtifactPublicationAdmission {
-                        chat: chat_id,
-                        account: prepared.credential.account_id.clone(),
-                        origin: prepared.credential.origin.clone(),
-                        artifact,
-                        audience,
-                    });
+                self.admit_publication(chat_id, &prepared.credential, artifact, audience);
             }
         }
         let mut tool_result = Self::model_result(result, &prepared.credential.access_token);
@@ -1548,7 +1894,11 @@ impl HostToolProvider for McpHostToolProvider {
         cancel: CancellationToken,
     ) -> ToolResult {
         match &self.native {
-            Some(native) if !self.is_mcp_name(name) && name != ARTIFACT_LOGIN_TOOL => {
+            Some(native)
+                if !self.is_mcp_name(name)
+                    && name != ARTIFACT_LOGIN_TOOL
+                    && name != ARTIFACT_UPLOAD_TOOL =>
+            {
                 native.execute(chat_id, name, input, cancel).await
             }
             _ => ToolResult {

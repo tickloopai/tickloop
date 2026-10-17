@@ -9,7 +9,9 @@ use tickloop_agent_model::{
     ModelError, ModelFailureKind, ModelOutput, ModelRequest, ModelResponseRejection,
     REQUEST_OVERHEAD_TOKENS, StructuredOutput,
 };
-use tickloop_agent_protocol::{ApprovalStage, AutoPolicy, ChatSnapshot, Content, Message, Role};
+use tickloop_agent_protocol::{
+    AUTO_REJECTION_PREFIX, ApprovalStage, AutoPolicy, ChatSnapshot, Content, Message, Role,
+};
 
 pub(super) const CLASSIFIER_RESULT_NAME: &str = "classify_result";
 /// Invalid classifier output gets one further classification attempt.
@@ -194,9 +196,16 @@ pub(super) fn classifier_retry_request(request: &ModelRequest, reason: &str) -> 
 
 const DENIAL_WORKAROUND_GUIDANCE: &str = "IMPORTANT: You *may* attempt to accomplish this action using other tools that might naturally be used to accomplish this goal, e.g. using head instead of cat. But you *should not* attempt to work around this denial in malicious ways, e.g. do not use your ability to run tests to execute non-test actions. You should only try to work around this restriction in reasonable ways that do not attempt to bypass the intent behind this denial. If you believe this capability is essential to complete the user's request, STOP and explain to the user what you were trying to do and why you need this permission. Let the user decide how to proceed.";
 
-pub(super) fn rejection_message(reason: &str) -> String {
+/// Claude Code's `buildYoloRejectionMessage`. Its closing hint names the blocked tool instead of
+/// Bash, and is left out when an allow rule for that tool would still be reviewed.
+pub(super) fn rejection_message(reason: &str, allow_rule_tool: Option<&str>) -> String {
+    let allow_rule_hint = allow_rule_tool.map_or_else(String::new, |tool| {
+        format!(
+            " To allow this type of action in the future, the user can add an allow rule for {tool} with /permissions."
+        )
+    });
     format!(
-        "Permission for this action has been denied. Reason: {reason}. If you have other tasks that don't depend on this action, continue working on those. {DENIAL_WORKAROUND_GUIDANCE} To allow this type of action in the future, the user can add a Bash permission rule to their settings."
+        "{AUTO_REJECTION_PREFIX}{reason}. If you have other tasks that don't depend on this action, continue working on those. {DENIAL_WORKAROUND_GUIDANCE}{allow_rule_hint}"
     )
 }
 

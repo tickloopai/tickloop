@@ -239,16 +239,13 @@ impl MonitorRows for ArtifactRows {
                         group: TickGroup::Artifacts,
                         glyph: TickGlyph::Artifact,
                         title,
-                        kind: if metadata
-                            .map(|metadata| metadata.format.as_str())
-                            .unwrap_or(&tick.format)
-                            == "html"
-                        {
-                            "Artifact·HTML"
-                        } else {
-                            "Artifact·MD"
-                        }
-                        .into(),
+                        kind: tickloop_agent_artifacts::artifact_type(
+                            metadata.map_or(&tick.format, |metadata| &metadata.format),
+                        )
+                        .map_or_else(
+                            || "Artifact".into(),
+                            |artifact_type| format!("Artifact·{}", artifact_type.name),
+                        ),
                         status: status.into(),
                         // An association here is the row's default subscription and needs no
                         // words or mark; feedback paused or going elsewhere is not a state the
@@ -1161,6 +1158,42 @@ mod tests {
             "the mark counts nothing"
         );
         assert_eq!(quote_row.update.as_ref().unwrap().at_ms, 5_000);
+    }
+
+    #[test]
+    fn artifact_rows_name_their_type_and_the_catalog_format_wins_over_the_joined_one() {
+        let mut chat = empty_chat();
+        chat.artifact_ticks = [("doc", "markdown"), ("page", "html"), ("deck", "slides")]
+            .into_iter()
+            .map(|(id, format)| {
+                serde_json::from_value(serde_json::json!({"artifact_id":id,"origin":"https://tickloop.ai","title":id,"format":format,"url":format!("https://tickloop.ai/artifact/{id}"),"access_role":"owner","added_at_ms":1})).unwrap()
+            })
+            .collect();
+        let mut context = MonitorContext {
+            chat: Some(Arc::new(chat)),
+            ..Default::default()
+        };
+        let kinds = |context: &MonitorContext| {
+            MonitorRowsRegistry::builtin()
+                .list(context)
+                .into_iter()
+                .map(|row| (row.title, row.kind))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            kinds(&context),
+            [
+                ("deck".to_owned(), "Artifact·Slides".to_owned()),
+                ("doc".to_owned(), "Artifact·Doc".to_owned()),
+                ("page".to_owned(), "Artifact·Page".to_owned()),
+            ]
+            .into()
+        );
+        context.metadata.insert(
+            InstanceRef::artifact("https://tickloop.ai", "doc").unwrap().to_string(),
+            Some(serde_json::from_value(serde_json::json!({"id":"doc","title":"doc","format":"slides","access_role":"owner"})).unwrap()),
+        );
+        assert_eq!(kinds(&context)["doc"], "Artifact·Slides");
     }
 
     #[test]

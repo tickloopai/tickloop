@@ -69,7 +69,7 @@ fn post_login_account_failure_preserves_the_view_and_artifacts_can_retry() {
             } else {
                 (
                     200,
-                    serde_json::json!({"artifacts":[{"id":"doc","title":"Retry worked","format":"markdown","access_role":"owner","url":format!("{endpoint}/a/doc")}],"next_cursor":null}),
+                    serde_json::json!({"artifacts":[{"id":"doc","title":"Retry worked","format":"markdown","access_role":"owner","url":format!("{endpoint}/a/doc")},{"id":"deck","title":"Launch review","format":"slides","access_role":"editor","url":format!("{endpoint}/a/deck")}],"next_cursor":null}),
                 )
             };
             let body = body.to_string();
@@ -126,7 +126,10 @@ fn post_login_account_failure_preserves_the_view_and_artifacts_can_retry() {
     let output = output.lock().unwrap();
     assert!(alive, "post-login refresh closed the View: {output}");
     assert!(
-        status.success() && output.contains("HTTP 503") && output.contains("Retry worked"),
+        status.success()
+            && output.contains("HTTP 503")
+            && output.contains("Retry worked · Doc · owner")
+            && output.contains("Launch review · Slides · editor"),
         "{output}"
     );
 }

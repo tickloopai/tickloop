@@ -1,4 +1,6 @@
-use tickloop_agent_config::skills::{SkillCaller, SkillRegistry, TICKLOOP_SKILL};
+use tickloop_agent_config::skills::{
+    SLIDES_SKILL, SkillCaller, SkillError, SkillRegistry, TICKLOOP_SKILL,
+};
 
 #[test]
 fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
@@ -35,6 +37,12 @@ fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
         "`retrying`",
         "`not_authorized`",
         "`failed`",
+        "a doc, a page or slides",
+        "PPT, 幻灯片, 演示文稿, deck, slides or presentation means slides",
+        "one picture per Slide, so its text cannot be edited",
+        "`ArtifactUpload` sends a local image file to a Slides artifact",
+        "`asset:<asset_id>`",
+        "when the user wants a doc, page or slides",
     ] {
         assert!(TICKLOOP_SKILL.contains(contract), "{contract}");
     }
@@ -67,6 +75,7 @@ fn the_tickloop_skill_teaches_only_ticks_that_run_in_the_tickhost() {
         "TICK_PACKAGE_ROOT",
         "auth status",
         "login command the package's Skill names",
+        "doc or page",
     ] {
         assert!(!TICKLOOP_SKILL.contains(retired), "{retired}");
     }
@@ -83,4 +92,50 @@ fn artifact_guidance_is_not_duplicated_in_the_builtin_registry() {
             .is_err()
     );
     assert!(registry.model_listing().contains("tickloop"));
+}
+
+#[test]
+fn slides_is_a_user_only_skill_that_starts_from_the_artifact_slides_guidance() {
+    let directory = tempfile::tempdir().unwrap();
+    let registry = SkillRegistry::discover(directory.path(), None);
+    assert!(registry.is_user_only("slides"));
+    assert!(!registry.is_user_only("tickloop"));
+    assert!(!registry.model_listing().contains("slides"));
+    assert!(
+        registry
+            .tool_definition()
+            .unwrap()
+            .description
+            .lines()
+            .all(|line| !line.starts_with("- slides"))
+    );
+    assert_eq!(
+        registry.expand("slides", "", SkillCaller::Model),
+        Err(SkillError::ModelInvocationDisabled("slides".into()))
+    );
+    let expansion = registry
+        .expand("/slides", "Q3 revenue review", SkillCaller::User)
+        .unwrap();
+    assert!(
+        expansion.content.contains(
+            "The user ran /slides to make a new Slides artifact. Topic: Q3 revenue review"
+        )
+    );
+    for step in [
+        "ask the user with AskUserQuestion what these Slides should present",
+        "such as the audience or the length, so every answer comes back while you work on these Slides",
+        "call ArtifactLogin and give the user its link and code; then ask with AskUserQuestion whether they have signed in",
+        "load `tickloop-artifacts:artifact-slides` with the Skill tool",
+        "Create the Slides with ArtifactEdit (`action: \"create\"`, `format: \"slides\"`)",
+        "upload it with ArtifactUpload",
+    ] {
+        assert!(SLIDES_SKILL.contains(step), "{step}");
+    }
+    assert!(
+        registry
+            .expand("slides", "", SkillCaller::User)
+            .unwrap()
+            .content
+            .contains("Topic: \n")
+    );
 }

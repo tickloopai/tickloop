@@ -136,6 +136,7 @@ fn has_dedicated_projection(tool: &str) -> bool {
             | "ArtifactEdit"
             | "ArtifactComment"
             | "ArtifactLogin"
+            | "ArtifactUpload"
     )
 }
 
@@ -394,6 +395,10 @@ mod tests {
             (
                 "ArtifactComment",
                 json!({"action":"done","artifact_id":"doc","outcome":"done","summary":"all summary"}),
+            ),
+            (
+                "ArtifactUpload",
+                json!({"artifact_id":"slides","file_path":"/project/chart.png","content_type":"image/png","bytes":12,"sha256":"ab"}),
             ),
             (
                 "mcp__unknown",

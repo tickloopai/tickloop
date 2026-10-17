@@ -847,6 +847,7 @@ mod tests {
         let service = |status| ArtifactError::Service {
             status,
             code: "code".into(),
+            message: String::new(),
         };
         assert!(is_definite_failure(&service(404)));
         assert!(is_definite_failure(&service(409)));
@@ -863,6 +864,7 @@ mod tests {
         let service = |status, code: &str| ArtifactError::Service {
             status,
             code: code.into(),
+            message: String::new(),
         };
         assert!(ends_the_link(&service(409, "agent_link_missing")));
         assert!(ends_the_link(&ArtifactError::AccountChanged));

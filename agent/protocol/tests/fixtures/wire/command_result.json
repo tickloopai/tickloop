@@ -82,6 +82,15 @@
         "url": "https://claude.ai/artifact/doc",
         "access_role": "writer",
         "added_at_ms": 1000
+      },
+      {
+        "artifact_id": "deck",
+        "origin": "https://claude.ai",
+        "title": "Launch review",
+        "format": "slides",
+        "url": "https://claude.ai/artifact/deck",
+        "access_role": "editor",
+        "added_at_ms": 2000
       }
     ]
   },

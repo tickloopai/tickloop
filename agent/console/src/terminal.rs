@@ -968,6 +968,7 @@ Divider edge titles have a short rule beyond the text; the expanded Subagents li
 /resume opens the Chat picker; /resume CHAT switches to that Chat without running it.
 Chats you switch away from keep running their goals in this process.
 /tickloop [REQUEST] loads the system Workspace Skill; other discovered Skills also use /NAME [ARGUMENTS].
+/slides [TOPIC] makes new Slides in Tickloop Artifacts; without a topic the Agent asks for one.
 /provider configures connections, sign-in and the separate Jev (TypeSafe) key without changing the Chat model.
 /ticks manages Tick packages: Installed shows each version and login state, where enter logs in or out, updates or uninstalls; Marketplace installs or updates. Tab or left/right switches pages.
 A /ticks login hands this terminal to the package's login program until it ends; a new Chat loads an installed or updated package's Skill.

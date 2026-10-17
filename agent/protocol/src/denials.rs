@@ -9,6 +9,9 @@ use crate::{
 };
 
 pub const MAX_RECENT_DENIALS: usize = 100;
+/// Claude Code's `AUTO_MODE_REJECTION_PREFIX`: an Auto review block's tool result starts with it,
+/// so a terminal can show the block as one line while the model keeps the whole message.
+pub const AUTO_REJECTION_PREFIX: &str = "Permission for this action has been denied. Reason: ";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
