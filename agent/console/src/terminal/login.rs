@@ -1293,7 +1293,7 @@ mod tests {
                 let visible = screen::visible_screen(completed.unwrap_or(&text), 150, 40);
                 let input_restored = completed.is_some()
                     && visible.contains("Tickloop v")
-                    && visible.contains("Input 0% (last)")
+                    && visible.contains("Context 0% used")
                     && visible.lines().any(|line| line.trim() == "❯")
                     && [
                         "Choose model",

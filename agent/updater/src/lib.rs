@@ -109,7 +109,12 @@ pub fn prepare_launch(build: &Build) -> Result<Option<PathBuf>> {
     let Some(installation) = Installation::detect(&executable)? else {
         return Ok(None);
     };
-    if installation.pinned || matches!(installation.source, Source::Native { .. }) {
+    if installation.pinned
+        || matches!(
+            installation.source,
+            Source::Native { .. } | Source::CargoRegistry { .. }
+        )
+    {
         if installation.build.identity != build.identity
             || installation.build.version != build.version
         {
@@ -231,6 +236,9 @@ pub async fn command(arguments: &[OsString], build: Build) -> Result<()> {
     if args == ["--install"] {
         return bundle::install_native(build).await;
     }
+    if let ["--install-cargo", launcher] = args.as_slice() {
+        return bundle::install_registry(build, Path::new(launcher));
+    }
     let background = args == ["--background"];
     let check = args == ["--check"];
     let status = args == ["--status"];
@@ -295,14 +303,18 @@ async fn update(installation: &Installation, build: &Build, check: bool) -> Resu
             "This Cargo installation comes from the local checkout {}. Update that checkout explicitly, then run make install there; automatic updates do not modify source worktrees.",
             root.display()
         ),
-        Source::Native { root } => {
+        Source::Native { root } | Source::CargoRegistry { root, .. } => {
+            if let Source::CargoRegistry { launcher, .. } = &installation.source
+                && source::registry_runtime(launcher)?.0 != *root
+            {
+                bail!("The Cargo launcher belongs to another installation root");
+            }
             private_directory(root)?;
             let _lock = Lock::acquire(&root.join("install.lock"))?;
             bundle::remove_staging(root, &[".install-", ".download-", ".activate-"])?;
             let release = release::latest().await?;
             let current = Installation::read(&root.join("current"))?;
-            if !matches!(&current.source, Source::Native { root: current_root } if current_root == root)
-            {
+            if current.source != installation.source {
                 bail!(
                     "The installation source changed; run the current installation's update command instead"
                 );
@@ -319,7 +331,7 @@ async fn update(installation: &Installation, build: &Build, check: bool) -> Resu
                     current.build.version, release.version
                 ));
             }
-            bundle::download_install(root, &release).await?;
+            bundle::download_install(root, &release, installation.source.clone()).await?;
             Ok(format!(
                 "Installed {}. Available on the next launch.",
                 release.version

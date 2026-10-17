@@ -122,6 +122,8 @@ pub struct RequestUsageRecord {
     pub usage: Usage,
     #[serde(skip)]
     pub serialized_request_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_measurement: Option<crate::ContextMeasurement>,
 }
 
 impl RequestUsageRecord {
@@ -321,6 +323,7 @@ impl RequestUsageLedger {
             outcome: RequestOutcome::InFlight,
             usage: Usage::default(),
             serialized_request_bytes: None,
+            context_measurement: None,
         });
         self.last_sequence = sequence.0;
         Ok(sequence)
@@ -408,6 +411,27 @@ impl RequestUsageLedger {
         bytes: usize,
     ) -> Result<(), LedgerError> {
         self.in_flight(sequence)?.serialized_request_bytes = Some(bytes);
+        Ok(())
+    }
+
+    pub fn record_context_measurement(
+        &mut self,
+        sequence: RequestSequence,
+        measurement: crate::ContextMeasurement,
+    ) -> Result<(), LedgerError> {
+        self.in_flight(sequence)?.context_measurement = Some(measurement);
+        Ok(())
+    }
+
+    pub fn add_context_output_bytes(
+        &mut self,
+        sequence: RequestSequence,
+        bytes: usize,
+    ) -> Result<(), LedgerError> {
+        if let Some(measurement) = &mut self.in_flight(sequence)?.context_measurement {
+            measurement.streamed_output_bytes =
+                measurement.streamed_output_bytes.saturating_add(bytes);
+        }
         Ok(())
     }
 

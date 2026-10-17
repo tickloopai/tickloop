@@ -7,12 +7,13 @@ use tickloop_agent_base::private_fs::replace_file_atomically;
 
 use crate::{Build, data_root, private_directory};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Source {
     Native { root: PathBuf },
     Homebrew { executable: PathBuf },
     Cargo { root: PathBuf, repository: String },
+    CargoRegistry { root: PathBuf, launcher: PathBuf },
     Checkout { root: PathBuf },
 }
 
@@ -22,6 +23,7 @@ impl Source {
             Self::Native { .. } => "native",
             Self::Homebrew { .. } => "Homebrew",
             Self::Cargo { .. } => "Cargo (Git)",
+            Self::CargoRegistry { .. } => "Cargo (official prebuilt)",
             Self::Checkout { .. } => "Cargo (local checkout)",
         }
     }
@@ -262,4 +264,41 @@ pub(crate) fn cargo_revision(root: &Path) -> Result<String> {
         revision = Some(sha.to_owned());
     }
     revision.context("Missing Cargo revision")
+}
+
+pub(crate) fn registry_runtime(launcher: &Path) -> Result<(PathBuf, semver::Version)> {
+    let launcher = launcher
+        .canonicalize()
+        .context("Cannot find the Cargo launcher")?;
+    let bin = launcher
+        .parent()
+        .context("Cargo launcher has no directory")?;
+    if launcher.file_name().is_none_or(|name| name != "tickloop")
+        || bin.file_name().is_none_or(|name| name != "bin")
+    {
+        bail!("Expected the Cargo-installed tickloop launcher");
+    }
+    let cargo_root = bin
+        .parent()
+        .context("Cargo launcher has no installation root")?;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cargo_root.join(".crates2.json"))?)?;
+    let installs = metadata["installs"]
+        .as_object()
+        .context("Cargo installation metadata is missing")?;
+    let registrations = installs
+        .keys()
+        .filter(|key| key.starts_with("tickloop "))
+        .collect::<Vec<_>>();
+    if registrations.len() != 1 {
+        bail!("Cargo must record exactly one tickloop launcher installation");
+    }
+    let version = registrations[0]
+        .split_whitespace()
+        .nth(1)
+        .context("Cargo launcher has no version")?;
+    Ok((
+        cargo_root.join(".tickloop"),
+        semver::Version::parse(version)?,
+    ))
 }

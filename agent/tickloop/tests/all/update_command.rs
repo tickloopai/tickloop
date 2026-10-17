@@ -49,3 +49,71 @@ fn update_rejects_unknown_flags_and_unmanaged_development_builds() {
     assert!(!root.path().join("daemon").exists());
     assert!(!root.path().join("config").exists());
 }
+
+#[test]
+fn cargo_installer_activates_the_runtime_without_replacing_cargo_owned_entries() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("downloaded");
+    let cargo_root = root.path().join("Cargo install root");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir_all(cargo_root.join("bin")).unwrap();
+    let payload = source.join("tickloop");
+    std::fs::copy(env!("CARGO_BIN_EXE_tickloop"), &payload).unwrap();
+    let identity = Command::new(&payload)
+        .arg("--build-identity")
+        .output()
+        .unwrap();
+    assert!(identity.status.success());
+    let identity = String::from_utf8(identity.stdout).unwrap();
+    let identity = identity.trim();
+    let version = env!("CARGO_PKG_VERSION");
+    for name in ["tickhost", "tick-reader"] {
+        let program = source.join(name);
+        std::fs::write(&program, format!("#!/bin/sh\ncase \"$1\" in\n--version) echo '{name} {version}';;\n--build-identity) echo '{identity}';;\n*) exit 2;;\nesac\n")).unwrap();
+        std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let launcher = cargo_root.join("bin/tickloop");
+    std::fs::write(&launcher, b"Cargo owns the launcher").unwrap();
+    let metadata = serde_json::json!({"installs": {format!("tickloop {version} (registry+https://github.com/rust-lang/crates.io-index)"): {"bins":["tickloop","tl","tickhost","tick-reader"]}}});
+    let metadata = serde_json::to_vec(&metadata).unwrap();
+    std::fs::write(cargo_root.join(".crates2.json"), &metadata).unwrap();
+    let output = Command::new(&payload)
+        .args(["update", "--install-cargo"])
+        .arg(&launcher)
+        .env("TICKLOOP_CONFIG_DIR", root.path().join("config"))
+        .env("TICKLOOP_DAEMON_RUNTIME_DIR", root.path().join("daemon"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&launcher).unwrap(),
+        b"Cargo owns the launcher"
+    );
+    assert_eq!(
+        std::fs::read(cargo_root.join(".crates2.json")).unwrap(),
+        metadata
+    );
+    let runtime = cargo_root.join(".tickloop/current");
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(runtime.join("installation.json")).unwrap()).unwrap();
+    assert_eq!(record["source"]["kind"], "cargo_registry");
+    assert_eq!(record["build"]["identity"], identity);
+    for name in ["tickloop", "tickhost", "tick-reader"] {
+        let output = Command::new(runtime.join(name))
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            format!("{name} {version}")
+        );
+    }
+    assert!(!root.path().join("config").exists());
+    assert!(!root.path().join("daemon").exists());
+}

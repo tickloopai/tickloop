@@ -1179,7 +1179,10 @@ mod tests {
     #[tokio::test]
     async fn a_call_beyond_the_response_budget_is_busy_before_dispatch() {
         let directory = tempfile::tempdir().unwrap();
-        let counter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tick/examples/counter.py");
+        let counter = PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets the test package directory"),
+        )
+        .join("../../tick/examples/counter.py");
         let session = spawn_python(directory.path(), &counter).await;
         let in_flight = RESPONSE_BUDGET_BYTES - tick_protocol::MAX_TOOL_RESPONSE_BYTES + 1;
         let answers = Arc::clone(&session.core.response_budget)

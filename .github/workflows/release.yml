@@ -15,8 +15,7 @@ concurrency:
 
 env:
   RELEASE_TAG: ${{ github.ref_name }}
-  # The source repository stays private until it is open-sourced, and Homebrew cannot download
-  # private release assets, so the archives are released on the public tap instead.
+  # Application source stays private; all installers download archives from the public tap.
   TAP_REPOSITORY: tickloopai/homebrew-tap
   FORMULA_TEMPLATE: .github/homebrew/tickloop.rb.in
 
@@ -39,7 +38,27 @@ jobs:
           node-version: '22'
 
       - name: Test the release script
-        run: node --test scripts/release.test.mjs scripts/release-ticks.test.mjs scripts/install.test.mjs
+        run: node --test scripts/release.test.mjs scripts/release-ticks.test.mjs scripts/install.test.mjs scripts/release-cargo.test.mjs
+
+      - name: Install stable Rust for the Cargo launcher
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+
+      - name: Verify the standalone public Cargo package
+        run: |
+          cargo test --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher
+          cargo clippy --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher --all-targets -- -D warnings
+          node scripts/release-cargo.mjs --check
+
+      - name: Check the Cargo publishing credential
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo '::error::Configure CARGO_REGISTRY_TOKEN with permission to publish tickloop before releasing.'
+            exit 1
+          fi
 
       - name: Validate release tag against the workspace version
         run: |
@@ -227,4 +246,51 @@ jobs:
             printf '### Tickloop %s\n\n' "$RELEASE_TAG"
             printf 'Archives: https://github.com/%s/releases/tag/%s\n\n' "$TAP_REPOSITORY" "$RELEASE_TAG"
             printf 'Homebrew: brew install tickloopai/tap/tickloop\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  cargo-registry:
+    name: Publish the Cargo installer
+    needs: publish
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+
+      - name: Install stable Rust
+        run: |
+          rustup update --no-self-update stable
+          rustup default stable
+
+      - name: Verify installation against the published application
+        run: |
+          cargo install --locked --path distribution/cargo --root "$RUNNER_TEMP/cargo-smoke" --target-dir target/cargo-launcher
+          "$RUNNER_TEMP/cargo-smoke/bin/tickloop" --help
+          "$RUNNER_TEMP/cargo-smoke/bin/tickhost" --help
+          "$RUNNER_TEMP/cargo-smoke/bin/tick-reader" --help
+          "$RUNNER_TEMP/cargo-smoke/bin/tl" --version
+
+      - name: Publish only the installer crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: node scripts/release-cargo.mjs --publish
+
+      - name: Verify anonymous installation from crates.io
+        run: |
+          cargo install --locked --registry crates-io --version "${RELEASE_TAG#v}" --root "$RUNNER_TEMP/cargo-registry-smoke" --target-dir target/cargo-launcher tickloop
+          "$RUNNER_TEMP/cargo-registry-smoke/bin/tickloop" --help
+          "$RUNNER_TEMP/cargo-registry-smoke/bin/tickhost" --help
+          "$RUNNER_TEMP/cargo-registry-smoke/bin/tick-reader" --help
+          "$RUNNER_TEMP/cargo-registry-smoke/bin/tl" --version
+          {
+            printf '### Cargo installer %s\n\n' "$RELEASE_TAG"
+            printf 'https://crates.io/crates/tickloop/%s\n\n' "${RELEASE_TAG#v}"
+            printf 'Install: cargo install --locked tickloop\n'
           } >> "$GITHUB_STEP_SUMMARY"

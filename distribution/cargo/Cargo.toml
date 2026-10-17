@@ -1,0 +1,33 @@
+[package]
+name = "tickloop"
+version = "0.2.4"
+edition = "2024"
+rust-version = "1.89"
+description = "Installer and launcher for the official Tickloop terminal agent"
+homepage = "https://tickloop.ai"
+readme = "README.md"
+license-file = "LICENSE"
+publish = ["crates-io"]
+include = ["Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "src/lib.rs", "src/main.rs", "src/bin/tl.rs", "src/bin/tickhost.rs", "src/bin/tick-reader.rs"]
+autobins = false
+
+[workspace]
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "tickloop"
+path = "src/main.rs"
+
+[[bin]]
+name = "tl"
+path = "src/bin/tl.rs"
+
+[[bin]]
+name = "tickhost"
+path = "src/bin/tickhost.rs"
+
+[[bin]]
+name = "tick-reader"
+path = "src/bin/tick-reader.rs"

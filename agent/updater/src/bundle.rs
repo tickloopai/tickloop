@@ -156,12 +156,28 @@ pub(crate) fn unpack(bytes: &[u8], checksum: &str, directory: &Path) -> Result<(
 }
 
 pub(crate) fn activate(root: &Path, directory: &Path, build: &Build) -> Result<()> {
+    activate_source(
+        root,
+        directory,
+        build,
+        Source::Native {
+            root: root.to_owned(),
+        },
+    )
+}
+
+pub(crate) fn activate_source(
+    root: &Path,
+    directory: &Path,
+    build: &Build,
+    source: Source,
+) -> Result<()> {
     let versions = root.join("versions");
     private_directory(&versions)?;
     let destination = versions.join(&build.version);
     if destination.exists() {
         let previous = Installation::read(&destination)?;
-        if previous.build.identity != build.identity {
+        if previous.build.identity != build.identity || previous.source != source {
             bail!("This release version already exists with another build");
         }
         for program in PROGRAMS {
@@ -173,9 +189,7 @@ pub(crate) fn activate(root: &Path, directory: &Path, build: &Build) -> Result<(
         }
     } else {
         Installation {
-            source: Source::Native {
-                root: root.to_owned(),
-            },
+            source,
             build: build.clone(),
             pinned: false,
         }
@@ -193,7 +207,11 @@ pub(crate) fn activate(root: &Path, directory: &Path, build: &Build) -> Result<(
     Ok(())
 }
 
-pub(crate) async fn download_install(root: &Path, candidate: &release::Candidate) -> Result<()> {
+pub(crate) async fn download_install(
+    root: &Path,
+    candidate: &release::Candidate,
+    source: Source,
+) -> Result<()> {
     let name = candidate
         .archive
         .path_segments()
@@ -213,7 +231,7 @@ pub(crate) async fn download_install(root: &Path, candidate: &release::Candidate
             bail!("Archive reports another release version");
         }
         verify(stage.path(), &build)?;
-        activate(&root, stage.path(), &build)
+        activate_source(&root, stage.path(), &build, source)
     })
     .await??;
     Ok(())
@@ -270,6 +288,47 @@ pub(crate) async fn install_native(build: Build) -> Result<()> {
         build.version,
         root.display(),
         bin.display()
+    );
+    Ok(())
+}
+
+pub(crate) fn install_registry(build: Build, launcher: &Path) -> Result<()> {
+    let launcher = launcher
+        .canonicalize()
+        .context("Cannot find the Cargo launcher")?;
+    let (root, registered) = crate::source::registry_runtime(&launcher)?;
+    if registered.to_string() != build.version {
+        bail!("The downloaded application does not match the Cargo launcher version");
+    }
+    let source = Source::CargoRegistry {
+        root: root.clone(),
+        launcher,
+    };
+    private_directory(&root)?;
+    let _lock = Lock::acquire(&root.join("install.lock"))?;
+    remove_staging(&root, &[".install-", ".download-", ".activate-"])?;
+    if let Ok(current) = Installation::read(&root.join("current")) {
+        if current.source != source {
+            bail!("The Cargo runtime belongs to another installation");
+        }
+        if semver::Version::parse(&current.build.version)? > semver::Version::parse(&build.version)?
+        {
+            return Ok(());
+        }
+    }
+    let stage = tempfile::Builder::new()
+        .prefix(".install-")
+        .tempdir_in(&root)?;
+    let executable = std::env::current_exe()?.canonicalize()?;
+    copy_programs(
+        executable.parent().context("executable has no parent")?,
+        stage.path(),
+    )?;
+    verify(stage.path(), &build)?;
+    activate_source(&root, stage.path(), &build, source)?;
+    println!(
+        "Installed Tickloop {} for the Cargo launcher.",
+        build.version
     );
     Ok(())
 }

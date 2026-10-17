@@ -36,7 +36,10 @@ async fn spawn_python(directory: &Path, source: &str) -> Result<TickSession, Ses
 #[tokio::test]
 async fn the_example_counter_is_described_read_called_and_updates_through_its_standard_streams() {
     let directory = tempfile::tempdir().unwrap();
-    let counter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tick/examples/counter.py");
+    let counter = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets the test package directory"),
+    )
+    .join("../../tick/examples/counter.py");
     let session = spawn(
         directory.path(),
         vec![
@@ -120,7 +123,10 @@ async fn the_example_counter_is_described_read_called_and_updates_through_its_st
 /// and keeps serving the requests after it.
 #[test]
 fn the_example_counter_drops_lines_it_cannot_answer() {
-    let counter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tick/examples/counter.py");
+    let counter = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets the test package directory"),
+    )
+    .join("../../tick/examples/counter.py");
     let mut child = std::process::Command::new("python3")
         .arg("-u")
         .arg(counter)

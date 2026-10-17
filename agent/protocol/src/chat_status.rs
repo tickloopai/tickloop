@@ -8,10 +8,9 @@ use uuid::Uuid;
 
 use crate::{
     ArtifactTick, BranchOrigin, ChatId, ChatSnapshot, CommandSnapshot, DelegationMetadata, Event,
-    EventKind, LoopSnapshot, ModelConfig, ModelRequestKind, MonitorMembership, PendingCommand,
-    PendingInput, PermissionPolicy, PermissionRequest, Plan, Progress, ProviderHttpFailure,
-    QuestionRequest, QueuedInput, ReasoningEffort, RequestOutcome, RequestUsageLedger, RunId,
-    UserShellRecord,
+    EventKind, LoopSnapshot, ModelConfig, MonitorMembership, PendingCommand, PendingInput,
+    PermissionPolicy, PermissionRequest, Plan, Progress, ProviderHttpFailure, QuestionRequest,
+    QueuedInput, ReasoningEffort, RequestUsageLedger, RunId, UserShellRecord,
     chat::{fallback_title, highest_pasted_image_id, queued_inputs},
 };
 
@@ -52,8 +51,7 @@ pub struct ChatStatus {
     pub artifact_ticks: Vec<ArtifactTick>,
     pub provider_failures: HashMap<String, ProviderHttpFailure>,
     pub context_window_tokens: Option<usize>,
-    /// The input tokens of the current model's latest conversation request; `None` when that
-    /// request finished without reporting them.
+    /// Estimated tokens occupied by the active context, calibrated with service usage when known.
     pub context_tokens: Option<u64>,
     /// The highest `[Image #N]` pasted into the conversation, sent or queued.
     pub highest_pasted_image_id: Option<u32>,
@@ -179,7 +177,11 @@ impl ChatStatus {
             artifact_ticks: conversation.artifact_ticks.clone(),
             provider_failures: conversation.provider_failures.clone(),
             context_window_tokens: process.context_window_tokens,
-            context_tokens: context_tokens(process.request_usage, process.model),
+            context_tokens: crate::context_usage::current_context_tokens(
+                conversation,
+                process.request_usage,
+                process.model,
+            ),
             highest_pasted_image_id: highest_pasted_image_id(
                 &conversation.message_contexts,
                 process.pending_inputs,
@@ -215,23 +217,4 @@ impl ChatStatus {
             .or_else(|| self.generated_title.clone())
             .unwrap_or_else(|| fallback_title(&self.loops, &self.user_shells))
     }
-}
-
-/// The input tokens of `model`'s latest conversation request: none sent yet counts as empty, and
-/// one still in flight as empty until it reports.
-fn context_tokens(ledger: &RequestUsageLedger, model: &ModelConfig) -> Option<u64> {
-    let identity = model.identity();
-    let mut matching = ledger
-        .entries()
-        .iter()
-        .rev()
-        .filter(|entry| entry.kind == ModelRequestKind::Conversation && entry.model == identity)
-        .peekable();
-    let Some(latest) = matching.peek() else {
-        return Some(0);
-    };
-    let in_flight = latest.outcome == RequestOutcome::InFlight;
-    matching
-        .find_map(|entry| entry.context_input_tokens())
-        .or(in_flight.then_some(0))
 }

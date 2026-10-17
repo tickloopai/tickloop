@@ -533,6 +533,167 @@ async fn failed_compaction_keeps_the_last_valid_context_and_raw_history() {
 }
 
 #[tokio::test]
+async fn context_status_tracks_the_active_window_and_drops_immediately_after_compaction() {
+    let directory = tempfile::tempdir().unwrap();
+    let client = Arc::new(ScriptedModel::with_usages(
+        vec![
+            text(&"older material ".repeat(3000)),
+            text("A compact summary"),
+        ],
+        vec![Usage {
+            input_tokens: Some(40_000),
+            output_tokens: Some(10_000),
+            ..Usage::default()
+        }],
+    ));
+    let agent = Agent::new_embedded(config(), client);
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent.set_context_window(chat, 1_000_000).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Collect the material".into())
+        .await
+        .unwrap();
+    wait_for_completion(&mut events).await;
+    let before = agent.status(chat).await.unwrap().context_tokens.unwrap();
+    assert!(
+        before > 40_000,
+        "the completed reply must consume current context: {before}"
+    );
+    agent.compact(chat).await.unwrap();
+    let after = agent.status(chat).await.unwrap().context_tokens.unwrap();
+    assert!(
+        after < before,
+        "compaction must immediately reduce current context: {before} -> {after}"
+    );
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    assert!(
+        snapshot.messages.iter().any(|message| message
+            .content
+            .iter()
+            .any(|content| matches!(content, Content::Text {text} if text.len() > 30_000))),
+        "raw history is retained"
+    );
+    let execution = tickloop_agent_protocol::ExecutionRef {
+        daemon_epoch: Uuid::new_v4(),
+        agent_id: Uuid::new_v4(),
+        generation: 1,
+    };
+    let live =
+        tickloop_agent_protocol::LiveChatSnapshot::from_snapshot(execution, snapshot, Vec::new());
+    let restored: tickloop_agent_protocol::LiveChatSnapshot =
+        serde_json::from_value(serde_json::to_value(&live).unwrap()).unwrap();
+    assert_eq!(live.status().chat.context_tokens, Some(after));
+    assert_eq!(restored.status().chat.context_tokens, Some(after));
+    let mut reopened = live.conversation.clone();
+    reopened.request_usage = Default::default();
+    let estimated = tickloop_agent_protocol::ChatStatus::of(&reopened)
+        .context_tokens
+        .unwrap();
+    assert!(
+        estimated > 0 && estimated < before,
+        "restored history must exclude archived context: {estimated}"
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn context_status_counts_tool_results_streamed_usage_and_model_changes() {
+    use tickloop_agent_protocol::{
+        ChatStatus, Content, ContextMeasurement, Message, ModelRequestKind, RequestOutcome,
+        RequestOwner, Role, ToolResultContent,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(Vec::new())));
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut snapshot = agent.snapshot(chat).await.unwrap();
+    snapshot.messages.push(Message {
+        role: Role::User,
+        content: text("Read the source"),
+    });
+    snapshot.message_ids.insert(0, Uuid::new_v4());
+    let sequence = snapshot
+        .request_usage
+        .start(
+            RequestOwner {
+                chat_id: chat,
+                loop_id: Some(Uuid::new_v4()),
+                run_id: Some(Uuid::new_v4()),
+            },
+            ModelRequestKind::Conversation,
+            snapshot.model.identity(),
+        )
+        .unwrap();
+    let measurement = ContextMeasurement::capture(&snapshot, 10_000, 2_000);
+    snapshot
+        .request_usage
+        .record_context_measurement(sequence, measurement)
+        .unwrap();
+    snapshot
+        .request_usage
+        .observe(
+            sequence,
+            Usage {
+                input_tokens: Some(20_000),
+                output_tokens: None,
+                ..Usage::default()
+            },
+        )
+        .unwrap();
+    snapshot
+        .request_usage
+        .add_context_output_bytes(sequence, 4000)
+        .unwrap();
+    assert_eq!(ChatStatus::of(&snapshot).context_tokens, Some(22_000));
+    snapshot
+        .request_usage
+        .observe(
+            sequence,
+            Usage {
+                output_tokens: Some(3000),
+                ..Usage::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(ChatStatus::of(&snapshot).context_tokens, Some(23_000));
+    snapshot
+        .request_usage
+        .finish(sequence, RequestOutcome::Accepted)
+        .unwrap();
+    snapshot.messages.extend([
+        Message {
+            role: Role::Assistant,
+            content: vec![Content::ToolUse {
+                id: "read".into(),
+                name: "Read".into(),
+                input: serde_json::json!({"file_path":"source.txt"}),
+            }],
+        },
+        Message {
+            role: Role::User,
+            content: vec![Content::ToolResult {
+                tool_use_id: "read".into(),
+                content: ToolResultContent::Text {
+                    text: "source material ".repeat(3000),
+                },
+                is_error: false,
+            }],
+        },
+    ]);
+    assert!(ChatStatus::of(&snapshot).context_tokens.unwrap() > 23_000);
+    snapshot.model.name = "another model".into();
+    let switched = ChatStatus::of(&snapshot).context_tokens;
+    snapshot.request_usage = Default::default();
+    assert_eq!(
+        switched,
+        ChatStatus::of(&snapshot).context_tokens,
+        "another model's calibration must not be reused"
+    );
+    assert!(switched.unwrap() > 0);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn conversation_output_budget_is_bounded_on_the_actual_http_request() {
     let directory = tempfile::tempdir().unwrap();
     let (endpoint, captured) = tickloop_agent_test_support::model_http_support::serve_response(

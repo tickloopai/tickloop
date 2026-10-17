@@ -62,10 +62,13 @@ test:
 	NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost \
 	env $$(env | grep -o '^HERDR_[A-Za-z0-9_]*' | sed 's/^/-u /') \
 	cargo nextest run --locked --workspace --no-fail-fast
+	cargo test --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher
 
 check:
 	cargo fmt --all --check
+	cargo fmt --manifest-path distribution/cargo/Cargo.toml -- --check
 	cargo clippy --locked --workspace --all-targets -- -D warnings
+	cargo clippy --locked --manifest-path distribution/cargo/Cargo.toml --target-dir target/cargo-launcher --all-targets -- -D warnings
 	$(MAKE) test
 
 ## Tickloop 版本 patch +1，检查后提交版本文件并推送分支与标签；VERSION 可指定更高版本

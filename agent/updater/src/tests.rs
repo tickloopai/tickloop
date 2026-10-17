@@ -505,3 +505,51 @@ fn publisher_system_tar_format_round_trips_through_the_strict_installer() {
     bundle::unpack(&bytes, &format!("{:x}", Sha256::digest(&bytes)), &extracted).unwrap();
     bundle::verify(&extracted, &build("1.2.3")).unwrap();
 }
+
+#[test]
+fn registry_launcher_keeps_its_own_payload_root_and_detects_uninstallation() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("bin")).unwrap();
+    let launcher = root.path().join("bin/tickloop");
+    std::fs::write(&launcher, b"installer fixture").unwrap();
+    let metadata = root.path().join(".crates2.json");
+    std::fs::write(&metadata, r#"{"installs":{"tickloop 0.2.4 (registry+https://github.com/rust-lang/crates.io-index)":{}}}"#).unwrap();
+    let (payload_root, version) = source::registry_runtime(&launcher).unwrap();
+    assert_eq!(
+        payload_root,
+        root.path().canonicalize().unwrap().join(".tickloop")
+    );
+    assert_eq!(version.to_string(), "0.2.4");
+    std::fs::write(metadata, r#"{"installs":{}}"#).unwrap();
+    assert!(source::registry_runtime(&launcher).is_err());
+}
+
+#[test]
+fn registry_payload_updates_preserve_cargo_entries_and_retained_runtime_versions() {
+    let cargo_root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(cargo_root.path().join("bin")).unwrap();
+    let launcher = cargo_root.path().join("bin/tickloop");
+    std::fs::write(&launcher, b"Cargo owns this launcher").unwrap();
+    let root = cargo_root.path().join(".tickloop");
+    crate::private_directory(&root).unwrap();
+    let source = Source::CargoRegistry {
+        root: root.clone(),
+        launcher: launcher.clone(),
+    };
+    for version in ["1.2.3", "1.2.4"] {
+        let stage = tempfile::tempdir_in(&root).unwrap();
+        programs(stage.path(), &build(version));
+        bundle::verify(stage.path(), &build(version)).unwrap();
+        bundle::activate_source(&root, stage.path(), &build(version), source.clone()).unwrap();
+    }
+    assert_eq!(
+        std::fs::read(&launcher).unwrap(),
+        b"Cargo owns this launcher"
+    );
+    assert!(root.join("versions/1.2.3/tickhost").is_file());
+    let record = Installation::read(&root.join("current")).unwrap();
+    assert!(
+        matches!(record.source, Source::CargoRegistry { launcher: original, .. } if original == launcher)
+    );
+    assert_eq!(record.build.version, "1.2.4");
+}

@@ -957,7 +957,7 @@ async fn run_resize_matrix(fixture: &PrivateFixture) {
                 })
                 .await;
             assert!(
-                !help.lines().last().unwrap().contains("Input"),
+                !help.lines().last().unwrap().contains("Context"),
                 "{height}×{width}: {help}"
             );
             view.send(b"\x1b");

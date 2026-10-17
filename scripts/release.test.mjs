@@ -84,6 +84,9 @@ if [ -n "$RELEASE_TEST_MARKET" ]; then printf '%s\\n' "$RELEASE_TEST_MARKET"; el
   }
   locked.push('[[package]]\nname = "external"\nversion = "0.2.0"\nsource = "registry+https://example.invalid"\n');
   writeFileSync(join(repo, "Cargo.lock"), 'version = 4\n\n' + locked.join("\n"));
+  mkdirSync(join(repo, "distribution/cargo"), { recursive: true });
+  writeFileSync(join(repo, "distribution/cargo/Cargo.toml"), '[package]\nname = "tickloop"\nversion = "0.2.0"\n');
+  writeFileSync(join(repo, "distribution/cargo/Cargo.lock"), 'version = 4\n\n[[package]]\nname = "tickloop"\nversion = "0.2.0"\n');
   for (const [directory, version] of [["artifact", "0.1.34"], ["site", "0.1.6"]]) {
     json(join(repo, directory, "package.json"), { name: directory, version });
     json(join(repo, directory, "package-lock.json"), { name: directory, version, lockfileVersion: 3, packages: { "": { name: directory, version } } });
@@ -102,7 +105,7 @@ function release(setup, channel, mode, env = {}) {
 }
 
 const scenarios = [
-  { channel: "binary", tags: ["v0.2.1"], paths: ["Cargo.lock", "Cargo.toml"] },
+  { channel: "binary", tags: ["v0.2.1"], paths: ["Cargo.lock", "Cargo.toml", "distribution/cargo/Cargo.lock", "distribution/cargo/Cargo.toml"] },
   { channel: "site", tags: ["site-v0.1.7"], paths: ["site/package-lock.json", "site/package.json"] },
   { channel: "artifacts", tags: ["artifacts-v0.1.35"], paths: ["artifact/package-lock.json", "artifact/package.json"] },
   { channel: "ticks", tags: ["tick-futu-v0.4.1", "tick-longbridge-v0.2.1"], paths: ["Cargo.lock", "ticks/futu/Cargo.toml", "ticks/futu/tick-package.json", "ticks/longbridge/Cargo.toml", "ticks/longbridge/tick-package.json"] },

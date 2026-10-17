@@ -316,6 +316,9 @@ impl Agent {
                     let chat = chats
                         .get_mut(&receipt.chat_id)
                         .ok_or(AgentError::NotFound)?;
+                    chat.snapshot
+                        .request_usage
+                        .add_context_output_bytes(sequence, text.len())?;
                     chat.snapshot.last_sequence += 1;
                     let event = Event {
                         sequence: chat.snapshot.last_sequence,
@@ -339,6 +342,9 @@ impl Agent {
                     let chat = chats
                         .get_mut(&receipt.chat_id)
                         .ok_or(AgentError::NotFound)?;
+                    chat.snapshot
+                        .request_usage
+                        .add_context_output_bytes(sequence, thinking.len())?;
                     chat.snapshot
                         .pending_thinking
                         .entry(receipt.run_id)
@@ -631,9 +637,25 @@ impl Agent {
                     .run_id
                     .is_some_and(|run| chat.active_run != Some(run));
             if !was_cancelled && let Some(bytes) = request_bytes {
+                let measurement = tickloop_agent_protocol::ContextMeasurement::capture(
+                    &chat.snapshot,
+                    super::context::serialized_request_bytes(&request.messages, &request.tools),
+                    super::context::serialized_request_bytes(
+                        &request.messages[..usize::from(
+                            request
+                                .messages
+                                .first()
+                                .is_some_and(|message| message.role == Role::System),
+                        )],
+                        &request.tools,
+                    ),
+                );
                 chat.snapshot
                     .request_usage
                     .record_serialized_request_bytes(sequence, bytes)?;
+                chat.snapshot
+                    .request_usage
+                    .record_context_measurement(sequence, measurement)?;
             }
             was_cancelled
         };

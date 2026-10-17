@@ -8660,8 +8660,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             context_usage(&tickloop_agent_protocol::ChatStatus::of(&without_report)),
-            None
+            Some((0, 1_000_000))
         );
+        let measurement =
+            tickloop_agent_protocol::ContextMeasurement::capture(&snapshot, 1000, 1000);
+        snapshot
+            .request_usage
+            .record_context_measurement(request, measurement)
+            .unwrap();
         snapshot
             .request_usage
             .observe(

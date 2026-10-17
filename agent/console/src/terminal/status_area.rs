@@ -453,9 +453,9 @@ impl StatusArea {
             Some((used, limit)) => {
                 let percent =
                     used.saturating_mul(100).saturating_add(limit as u64 / 2) / limit as u64;
-                (format!("Input {percent}% (last)"), Role::Success)
+                (format!("Context {percent}% used"), Role::Success)
             }
-            None => ("Input unknown".into(), Role::MutedText),
+            None => ("Context unknown".into(), Role::MutedText),
         };
         let necessary_background = background.filter(|notice| notice.necessary);
         let ordinary_background = background.filter(|notice| !notice.necessary);
@@ -1323,7 +1323,7 @@ mod tests {
         area.update("Auto".into(), "model".into(), Some((0, 200_000)), None);
         assert_eq!(
             area.status_line(80, "").text(),
-            "⏵⏵ Auto · model · Input 0% (last)"
+            "⏵⏵ Auto · model · Context 0% used"
         );
     }
 
@@ -1333,7 +1333,7 @@ mod tests {
         area.update("Auto".into(), "model".into(), Some((999, 200_000)), None);
         assert_eq!(
             area.status_line(80, "").text(),
-            "⏵⏵ Auto · model · Input 0% (last)"
+            "⏵⏵ Auto · model · Context 0% used"
         );
     }
 
@@ -1344,7 +1344,7 @@ mod tests {
             area.update("Auto".into(), "model".into(), context, None);
             assert_eq!(
                 area.status_line(80, "").text(),
-                "⏵⏵ Auto · model · Input unknown"
+                "⏵⏵ Auto · model · Context unknown"
             );
         }
     }
@@ -1355,13 +1355,13 @@ mod tests {
         area.update("Auto".into(), "model".into(), Some((1000, 200_000)), None);
         assert_eq!(
             area.status_line(80, "").text(),
-            "⏵⏵ Auto · model · Input 1% (last)"
+            "⏵⏵ Auto · model · Context 1% used"
         );
         assert_eq!(area.status_line(16, "").text(), "⏵⏵ Auto · model");
         area.update("Auto".into(), "model".into(), None, None);
         assert_eq!(
             area.status_line(80, "Not saved").text(),
-            "⏵⏵ Auto · model · Input unknown · Not saved"
+            "⏵⏵ Auto · model · Context unknown · Not saved"
         );
     }
 
@@ -1371,7 +1371,7 @@ mod tests {
         area.update("Auto".into(), "gpt-5.6".into(), None, None);
         assert_eq!(
             area.status_line(80, "").text(),
-            "⏵⏵ Auto · gpt-5.6 · Input unknown"
+            "⏵⏵ Auto · gpt-5.6 · Context unknown"
         );
         let narrow = area.status_line(24, "Not saved").text();
         assert!(narrow.starts_with("⏵⏵ Auto · Not saved"));
@@ -1379,7 +1379,7 @@ mod tests {
         area.update("Auto".into(), "gpt-5.6".into(), Some((0, 200_000)), None);
         assert_eq!(
             area.status_line(80, "").text(),
-            "⏵⏵ Auto · gpt-5.6 · Input 0% (last)"
+            "⏵⏵ Auto · gpt-5.6 · Context 0% used"
         );
         area.update(
             "Auto".into(),
@@ -1389,7 +1389,7 @@ mod tests {
         );
         assert_eq!(
             area.status_line(80, "").text(),
-            "⏵⏵ Auto · gpt-5.6 · Input 21% (last)"
+            "⏵⏵ Auto · gpt-5.6 · Context 21% used"
         );
     }
 
@@ -1399,7 +1399,7 @@ mod tests {
             area.status_line(80, "")
                 .spans
                 .iter()
-                .find(|span| span.text.contains("Input"))
+                .find(|span| span.text.contains("Context"))
                 .and_then(|span| span.role)
         };
         let mut area = StatusArea::default();

@@ -50,7 +50,12 @@ function withTomlVersion(text, name, version) {
 
 export function readProducts(root, channel, selection = "") {
   const read = path => readFileSync(join(root, path), "utf8");
-  if (channel === "binary") return [{ id: "binary", label: "Tickloop", scope: "tickloop", kind: "workspace", manifest: "Cargo.toml", version: tomlValue(read("Cargo.toml"), "workspace.package", "version"), tagPrefix: "v", workflow: ".github/workflows/release.yml" }];
+  if (channel === "binary") {
+    const version = tomlValue(read("Cargo.toml"), "workspace.package", "version");
+    const launcherManifest = "distribution/cargo/Cargo.toml";
+    if (tomlValue(read(launcherManifest), "package", "name") !== "tickloop" || tomlValue(read(launcherManifest), "package", "version") !== version) throw new Error("The Cargo launcher must be named tickloop and match the workspace version.");
+    return [{ id: "binary", label: "Tickloop", scope: "tickloop", kind: "workspace", manifest: "Cargo.toml", launcherManifest, version, tagPrefix: "v", workflow: ".github/workflows/release.yml" }];
+  }
   if (channel === "artifacts" || channel === "site") {
     const directory = channel === "artifacts" ? "artifact" : "site";
     const manifest = `${directory}/package.json`;
@@ -93,6 +98,11 @@ export function versionChanges(root, products) {
     } else {
       const workspace = read(product.manifest);
       changes.set(product.manifest, withTomlVersion(workspace, "workspace.package", product.nextVersion));
+      changes.set(product.launcherManifest, withTomlVersion(read(product.launcherManifest), "package", product.nextVersion));
+      const launcherLock = "distribution/cargo/Cargo.lock";
+      const lockText = read(launcherLock);
+      if (tomlValue(lockText, "[package]", "name") !== "tickloop" || tomlValue(lockText, "[package]", "version") !== product.version) throw new Error("The Cargo launcher lock version must match the workspace version.");
+      changes.set(launcherLock, withTomlVersion(lockText, "[package]", product.nextVersion));
       const { lines, start, end } = section(workspace, "workspace");
       const members = lines.slice(start, end).join("\n").match(/\bmembers\s*=\s*\[([\s\S]*?)\]/)?.[1];
       if (!members) throw new Error("Workspace members are missing");

@@ -8,6 +8,7 @@ mod auto_settings;
 mod auto_setup;
 mod chat;
 mod chat_status;
+mod context_usage;
 pub mod daemon_management;
 mod denials;
 mod family;
@@ -81,6 +82,9 @@ pub use chat::{
     short_chat_title,
 };
 pub use chat_status::ChatStatus;
+pub use context_usage::{
+    ContextMeasurement, ESTIMATED_CONTEXT_BYTES_PER_TOKEN, serialized_context_bytes,
+};
 pub use denials::{
     AUTO_REJECTION_PREFIX, ApprovalHistoryView, ApprovalPath, ApprovalRecord, ApprovalResult,
     DenialAutoFinding, DenialAutoRuleSummary, DenialCategory, DenialPersistence, DenialRecord,

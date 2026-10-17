@@ -11,9 +11,8 @@ use tickloop_agent_model::{
 use tickloop_agent_protocol::projection;
 use tickloop_agent_protocol::{
     ChatId, ChatSnapshot, CompactBoundary, CompactTrigger, CompactionOutcome, CompactionStatus,
-    Content, EventKind, ImageSource, Message, ModelChange, ModelConfig, ModelRequestKind,
-    ReasoningEffort, Receipt, RequestOutcome, ResponseRejection, Role, RunId, ToolDefinition,
-    ToolResultBlock, ToolResultContent,
+    Content, EventKind, Message, ModelChange, ModelConfig, ModelRequestKind, ReasoningEffort,
+    Receipt, RequestOutcome, ResponseRejection, Role, RunId, ToolDefinition,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -652,11 +651,9 @@ fn pinned_state(snapshot: &ChatSnapshot) -> serde_json::Value {
     })
 }
 
-pub(super) const ESTIMATED_UTF8_BYTES_PER_TOKEN: usize = 2;
+pub(super) use tickloop_agent_protocol::ESTIMATED_CONTEXT_BYTES_PER_TOKEN as ESTIMATED_UTF8_BYTES_PER_TOKEN;
 const CALIBRATED_USAGE_HEADROOM_PERCENT: u128 = 20;
 const COMPACTION_INPUT_PERCENT: usize = 80;
-/// Anthropic's image token estimate: width × height / 750.
-const IMAGE_PIXELS_PER_TOKEN: usize = 750;
 
 pub(super) fn context_window(snapshot: &ChatSnapshot) -> Option<usize> {
     snapshot
@@ -725,53 +722,7 @@ pub(super) fn estimate_request_tokens(messages: &[Message]) -> usize {
 
 /// Serialized request bytes, except that each image counts as the bytes of its pixel-based
 /// token estimate: its base64 size says nothing about its token cost.
-pub(super) fn serialized_request_bytes(messages: &[Message], tools: &[ToolDefinition]) -> usize {
-    let (base64_bytes, image_bytes) = messages
-        .iter()
-        .flat_map(|message| &message.content)
-        .flat_map(|content| match content {
-            Content::Image {
-                source: ImageSource::Base64 { data, .. },
-                width,
-                height,
-            } => vec![(data.len(), *width, *height)],
-            Content::ToolResult {
-                content: ToolResultContent::Blocks(blocks),
-                ..
-            } => blocks
-                .iter()
-                .filter_map(|block| match block {
-                    ToolResultBlock::Image {
-                        source: ImageSource::Base64 { data, .. },
-                        width,
-                        height,
-                    } => Some((data.len(), *width, *height)),
-                    ToolResultBlock::Text { .. } => None,
-                })
-                .collect(),
-            _ => Vec::new(),
-        })
-        .fold(
-            (0usize, 0usize),
-            |(base64, estimated), (data, width, height)| {
-                (
-                    base64.saturating_add(data),
-                    estimated.saturating_add(
-                        image_tokens(width, height).saturating_mul(ESTIMATED_UTF8_BYTES_PER_TOKEN),
-                    ),
-                )
-            },
-        );
-    serde_json::to_vec(messages)
-        .map_or(usize::MAX, |bytes| bytes.len())
-        .saturating_sub(base64_bytes)
-        .saturating_add(image_bytes)
-        .saturating_add(serde_json::to_vec(tools).map_or(usize::MAX, |bytes| bytes.len()))
-}
-
-fn image_tokens(width: u32, height: u32) -> usize {
-    (width as usize).saturating_mul(height as usize) / IMAGE_PIXELS_PER_TOKEN
-}
+pub(super) use tickloop_agent_protocol::serialized_context_bytes as serialized_request_bytes;
 
 fn estimate_request_tokens_for_snapshot(snapshot: &ChatSnapshot, messages: &[Message]) -> usize {
     estimate_tokens_for_request(
