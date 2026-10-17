@@ -29,7 +29,7 @@ install:
 package:
 	cargo build --locked --release $(CARGO_PACKAGE) -p tickloop-tickhost -p tickloop-tick-reader --bins --target "$(PACKAGE_TARGET)" --target-dir target
 	@mkdir -p dist
-	tar -czf "$(PACKAGE_ARCHIVE)" -C "target/$(PACKAGE_TARGET)/release" tickloop tickhost tick-reader
+	COPYFILE_DISABLE=1 tar --format=ustar -czf "$(PACKAGE_ARCHIVE)" -C "target/$(PACKAGE_TARGET)/release" tickloop tickhost tick-reader
 	@printf 'Package: %s\n' "$(PACKAGE_ARCHIVE)"
 
 ## 在本地构建官网，输出到 site/dist

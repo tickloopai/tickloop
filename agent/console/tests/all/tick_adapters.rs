@@ -741,7 +741,7 @@ async fn artifact_rows_show_where_feedback_is_linked_and_the_newest_request() {
             )),
             ..Default::default()
         };
-        context.metadata.insert(tick.instance_id(), Some(serde_json::from_value(json!({"id":"doc","title":"Linked","format":"markdown","access_role":"owner","human_updated_at":"2026-10-08T09:00:00.000Z","agent_link":remote.map(|binding_id| json!({"binding_id":binding_id,"chat_id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"epoch":2}))})).unwrap()));
+        context.metadata.insert(tick.instance_id(), Some(serde_json::from_value(json!({"id":"doc","title":"Linked","format":"markdown","access_role":"owner","human_updated_at":"2026-10-08T09:00:00.000Z","agent_links":remote.map(|binding_id| vec![json!({"binding_id":binding_id,"chat_id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"epoch":2})]).unwrap_or_default()})).unwrap()));
         MonitorRowsRegistry::builtin().list(&context).remove(0)
     };
     assert_eq!(row(None, None).status, "");
@@ -758,8 +758,8 @@ async fn artifact_rows_show_where_feedback_is_linked_and_the_newest_request() {
         "an association here is the row's default subscription and needs no words"
     );
     assert_eq!(row(Some(false), Some(here)).subscription, None);
-    assert_eq!(row(Some(true), Some(here)).status, "feedback paused");
-    assert_eq!(row(Some(true), Some(here)).notes, ["feedback paused"]);
+    assert_eq!(row(Some(true), Some(here)).status, "feedback unavailable");
+    assert_eq!(row(Some(true), Some(here)).notes, ["feedback unavailable"]);
     assert_eq!(row(Some(true), Some(here)).subscription, None);
     let x_label = |paused, remote| {
         row(paused, remote)

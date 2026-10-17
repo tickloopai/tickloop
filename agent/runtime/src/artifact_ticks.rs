@@ -83,6 +83,12 @@ impl Agent {
         chat_id: ChatId,
         instance_id: &str,
     ) -> Result<Vec<ArtifactTick>, AgentError> {
+        if let Ok(instance) = instance_id.parse::<tick_protocol::InstanceRef>()
+            && let Some((origin, artifact_id)) = instance.artifact_parts()
+        {
+            self.unlink_feedback_receivers(chat_id, None, Some((origin, artifact_id)))
+                .await?;
+        }
         let (ticks, released_loops) = {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;

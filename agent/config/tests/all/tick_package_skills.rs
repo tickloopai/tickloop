@@ -111,13 +111,14 @@ fn package_skills_are_named_after_their_package_with_its_install_directory_in_th
     let expansion = registry
         .expand("sample:guide", "", SkillCaller::Model)
         .unwrap();
-    assert_eq!(
-        expansion.content,
-        format!(
-            "The fields are listed in `{}/docs/fields.md`.",
-            package.root.display()
-        )
-    );
+    assert!(expansion.content.contains(&format!(
+        "Base directory for this skill: {}",
+        package.root.join("skills/guide").display()
+    )));
+    assert!(expansion.content.ends_with(&format!(
+        "The fields are listed in `{}/docs/fields.md`.",
+        package.root.display()
+    )));
     assert_eq!(
         expansion.source,
         SkillSource::TickPackage {
@@ -132,13 +133,17 @@ fn package_skills_are_named_after_their_package_with_its_install_directory_in_th
             .content,
         expansion.content
     );
-    assert_eq!(
-        registry
-            .expand("guide", "", SkillCaller::User)
-            .unwrap()
-            .content,
-        format!("User body {PACKAGE_ROOT_VARIABLE}"),
+    let user_expansion = registry.expand("guide", "", SkillCaller::User).unwrap();
+    assert!(
+        user_expansion
+            .content
+            .ends_with(&format!("User body {PACKAGE_ROOT_VARIABLE}")),
         "only a package's own Skills see its install directory"
+    );
+    assert!(
+        !user_expansion
+            .content
+            .contains(package.root.to_string_lossy().as_ref())
     );
     assert!(matches!(
         registry

@@ -30,7 +30,7 @@ pub struct ArtifactMetadata {
     pub metadata_revision: u64,
     /// This account's Agent link to the artifact, whichever Chat holds it.
     #[serde(default)]
-    pub agent_link: Option<AgentLinkMetadata>,
+    pub agent_links: Vec<AgentLinkMetadata>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

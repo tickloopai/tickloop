@@ -79,9 +79,18 @@ pub(super) async fn tick_action(
             }
         }
         'c' => console.copy_artifact_link(&tick.url)?,
-        'f' => {
+        'f' => return console.confirm_artifact_feedback(chat, id),
+        'F' | 'H' => {
             agent
-                .link_artifact(chat, tick)
+                .link_artifact(
+                    chat,
+                    tick,
+                    if action == 'H' {
+                        tickloop_agent_protocol::ArtifactFeedbackHistory::All
+                    } else {
+                        tickloop_agent_protocol::ArtifactFeedbackHistory::NewOnly
+                    },
+                )
                 .await
                 .map_err(|error| error.to_string())?;
             console.set_status("Artifact feedback linked here")?;
@@ -242,7 +251,7 @@ async fn apply_choice_with_client(
     use super::artifacts_picker::ArtifactPickerAction;
     let artifact = choice.artifact;
     match choice.action {
-        ArtifactPickerAction::Add => {
+        ArtifactPickerAction::Add(history) => {
             let chat = chat.ok_or("Select a Chat before adding an artifact")?;
             let tick = artifact.tick(
                 client.origin(),
@@ -250,7 +259,7 @@ async fn apply_choice_with_client(
             );
             let id = tick.instance_id();
             agent
-                .link_artifact(chat, tick.clone())
+                .link_artifact(chat, tick.clone(), history)
                 .await
                 .map_err(|error| error.to_string())?;
             agent
@@ -367,7 +376,7 @@ mod tests {
                         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
                     serde_json::json!({"artifact_id":"doc","binding_id":input["binding_id"],"epoch":2})
                 } else {
-                    serde_json::json!({"id":"doc","title":"Shared document","format":"markdown","access_role":"owner","url":format!("{endpoint}/a/doc"),"agent_link":{"binding_id":Uuid::new_v4(),"chat_id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"epoch":1}})
+                    serde_json::json!({"id":"doc","title":"Shared document","format":"markdown","access_role":"owner","url":format!("{endpoint}/a/doc"),"agent_links":[{"binding_id":Uuid::new_v4(),"chat_id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"epoch":1}]})
                 };
                 let body = body.to_string();
                 socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
@@ -443,7 +452,7 @@ mod tests {
             console.test_clipboard_contents(),
             vec![format!("{origin}/a/doc")]
         );
-        tick_action(&agent, &console, Some(&root), chat, id, 'f')
+        tick_action(&agent, &console, Some(&root), chat, id, 'F')
             .await
             .unwrap();
         assert!(
@@ -555,7 +564,7 @@ mod tests {
             Some(directory.path()),
             chat,
             tick.instance_id(),
-            'f',
+            'F',
         )
         .await;
         assert!(
@@ -596,7 +605,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn feedback_key_links_the_artifact_through_the_agent_without_a_prompt() {
+    async fn feedback_key_asks_for_history_before_linking_the_artifact() {
         let directory = tempfile::tempdir().unwrap();
         let model = Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new()));
         let runtime = tickloop_agent_runtime::Agent::new_embedded(
@@ -633,6 +642,14 @@ mod tests {
         tick_action(&agent, &console, None, chat, tick.instance_id(), 'f')
             .await
             .unwrap();
+        assert!(remote.linked.lock().unwrap().is_empty());
+        assert_eq!(
+            console.test_status_text(),
+            "Receive this artifact's feedback here?"
+        );
+        tick_action(&agent, &console, None, chat, tick.instance_id(), 'F')
+            .await
+            .unwrap();
         assert_eq!(*remote.linked.lock().unwrap(), vec![tick]);
         assert_eq!(console.test_status_text(), "Artifact feedback linked here");
         assert!(model.requests.lock().unwrap().is_empty());
@@ -650,7 +667,7 @@ mod tests {
         let id = tick.instance_id();
         agent.add_artifact_tick(chat, tick).await.unwrap();
         let console = Console::test_for_chat(chat);
-        tick_action(&agent, &console, Some(&root), chat, id.clone(), 'f')
+        tick_action(&agent, &console, Some(&root), chat, id.clone(), 'F')
             .await
             .unwrap();
 

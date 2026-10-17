@@ -17246,7 +17246,7 @@ mod tests {
             core.starts_with('─')
                 && core.contains("⏵⏵ Auto")
                 && core.contains("claude-fable-5-1")
-                && core.contains("Context unknown"),
+                && core.contains("Input unknown"),
             "{core:?}"
         );
         assert_eq!(
@@ -17661,7 +17661,7 @@ mod tests {
                 assert!(
                     returned.contains("Auto")
                         && returned.contains("loss-model")
-                        && returned.contains("Context unknown"),
+                        && returned.contains("Input unknown"),
                     "{focus}: {returned}"
                 );
                 assert!(
@@ -19292,7 +19292,7 @@ mod tests {
         let status = &state.rendered_screen[state.height - 2];
         assert_eq!(status.matches("⏵⏵ Auto").count(), 1);
         assert_eq!(status.matches("deepseek-flash").count(), 1);
-        assert_eq!(status.matches("Context 1% used").count(), 1);
+        assert_eq!(status.matches("Input 1% (last)").count(), 1);
         assert!(!status.contains("Scrolled up"));
         assert!(!status.contains("ctrl+end: latest"));
     }

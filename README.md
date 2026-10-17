@@ -66,15 +66,47 @@ brew install tickloopai/tap/tickloop
 
 Homebrew 同时安装短命令 `tl`，与 `tickloop` 等效，例如 `tl`、`tl --help`、`tl tick list`。它是可执行文件的软链接，不修改 Shell 配置。
 
+原生安装器随官网发布到 `https://tickloop.ai/install.sh`（本次代码尚未部署）：
+
+```sh
+curl -fsSL https://tickloop.ai/install.sh | sh
+```
+
+原生安装使用 `~/.local/bin` 下的入口和 `~/.local/share/tickloop/versions/` 下的完整版本目录。安装器选择当前 Mac 架构，固定发行标签、校验 SHA-256 后安装三个程序；遇到其他来源的已有安装会报告冲突，不自动接管。
+
 开发者也可以用 cargo 从源码安装（源码公开后可用），默认安装默认分支的最新提交，加 `--tag vX.Y.Z` 安装某个发布版本：
 
 ```sh
 cargo install --locked --git https://github.com/tickloopai/tickloop tickloop-agent tickloop-tickhost tickloop-tick-reader
 ```
 
-两种方式都把 `tickloop`、`tickhost` 与 `tick-reader` 装进同一目录；daemon 只拉起与自己同目录、同构建的 `tickhost`，所以三者要一起安装和升级。
+这些安装方式都把 `tickloop`、`tickhost` 与 `tick-reader` 装进同一目录；daemon 只拉起与自己同目录、同构建的 `tickhost`，所以三者要一起安装和升级。
 
-`make release` 先在 HEAD 的临时 worktree 里运行 `make build`（共用本仓库的 target 目录），再为 `Cargo.toml` 的 workspace 版本打 `vX.Y.Z` 标签并推送；GitHub Actions 构建两个 macOS 压缩包，发布到公开仓库 `tickloopai/homebrew-tap` 的同名 GitHub Release（源码仓库私有期间 Homebrew 下载不到它的 Release 资源），再更新该仓库的 Formula。`VERSION` 可省略，给出时必须与 workspace 版本相同。
+已有源码时，可以直接在仓库根目录用 Cargo 安装（需要当前 Rust stable）：
+
+```sh
+cargo install --locked --path agent/tickloop --bin tickloop
+cargo install --locked --path tickhost/host --bin tickhost
+cargo install --locked --path tick/reader --bin tick-reader
+```
+
+这三个目标也可用 `make install` 一起执行。默认安装到 `~/.cargo/bin`，安装三个程序期间保持源码不变。workspace 当前不发布 crates.io，不能省略 `--git`／`--path` 改用 `cargo install tickloop`。
+
+### 更新
+
+```sh
+tickloop update           # 立即按当前安装来源升级完整套件
+tickloop update --check   # 检查，不安装；brew 会刷新渠道元数据
+tickloop update --status  # 查看最近一次自动／主动更新结果
+```
+
+原生和 Homebrew 安装在交互启动后及运行中每 6 小时后台更新；失败至少等待 1 小时再尝试，不阻塞界面。后台结果保存在安装来源独立的状态目录，用 `--status` 查看。
+
+原生更新从官方公开 tap Release 下载整包，校验后原子切换 `current`；旧版本暂不自动清理。Homebrew 更新只调用 `brew update` 与指定 Tickloop 的 `brew upgrade`，尊重 brew pin，并为本次升级禁用自动 cleanup。Cargo Git 安装只主动更新：先在临时目录按目标发行标签编译并核对三个程序，再按已核实的 commit 经 Cargo 安装并检查结果；保留原 Git 来源，不转换成预编译安装。Cargo 最终写入由 Cargo 管理，不承诺三包原子替换，失败须检查报告后重试。本地 `--path` 安装提示回原源码目录更新并执行 `make install`，不自动改工作区。
+
+Homebrew／Cargo 安装的 Console 在启动前保留完整固定运行副本，防止升级或 brew cleanup 删除后台 daemon 仍需执行的程序。更新不停止 daemon、Worker、Shell 或 Tickhost；新启动遇到旧版本时仍按现有界面选择。每次发行继续成套安装三个程序，即使 Tickhost 无单独业务改动；安装文件与替换有实例的运行中 Tickhost 分别处理。安装及运行副本不包含独立 Tick 包，更新也不自动升级它们。设计与验证边界见[自动更新设计](docs/design/auto-updates.md)。
+
+`make release` 默认把 workspace 产品版本 patch 加一，在临时 checkout 中构建验证后创建专门的版本提交和 `vX.Y.Z` 标签并推送；`VERSION=X.Y.Z` 可指定更高版本。GitHub Actions 构建两个 macOS 压缩包，先将完整附件发布到公开仓库 `tickloopai/homebrew-tap` 的 draft Release，再公开发行并更新 Formula；同版本附件不可替换为不同内容。源码仓库私有期间，Homebrew 和原生更新器均从公开 tap 下载。详细步骤见[发布设计](docs/design/releases.md)。
 
 在仓库检出中可直接构建并离线体验：
 

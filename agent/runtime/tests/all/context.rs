@@ -533,6 +533,128 @@ async fn failed_compaction_keeps_the_last_valid_context_and_raw_history() {
 }
 
 #[tokio::test]
+async fn conversation_output_budget_is_bounded_on_the_actual_http_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let (endpoint, captured) = tickloop_agent_test_support::model_http_support::serve_response(
+        400,
+        serde_json::json!({"error":{"message":"fixture refusal"}}).to_string(),
+    )
+    .await;
+    let mut model = tickloop_agent_test_support::config_with_window(200_000);
+    model.base_url = endpoint;
+    model.max_output_tokens = 128_000;
+    model.card.as_mut().unwrap().max_output_tokens = 128_000;
+    let client = Arc::new(tickloop_agent_model::HttpModelClient::new(model.clone()).unwrap());
+    let agent = Agent::new_embedded(model, client);
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "source ".repeat(35_000))
+        .await
+        .unwrap();
+    loop {
+        if matches!(next_event(&mut events).await.kind, EventKind::Failed(_)) {
+            break;
+        }
+    }
+    let (_, body) = captured.await.unwrap();
+    assert!(
+        body["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty())
+    );
+    let limit = body["max_tokens"].as_u64().unwrap();
+    assert!((1..80_000).contains(&limit), "{limit}");
+    assert_eq!(
+        agent.snapshot(chat).await.unwrap().model.max_output_tokens,
+        128_000
+    );
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn large_output_limits_do_not_consume_the_input_compaction_budget() {
+    for (provider, model_id) in [
+        ("openai-codex", "gpt-6.1-sol"),
+        ("github-copilot", "gpt-6-astra"),
+        ("kimi-code-oauth", "k3-256k"),
+        ("anthropic-api", "claude-haiku-4-5-20251001"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let client = Arc::new(ScriptedModel::new(vec![
+            text("First"),
+            text("Second"),
+            text("Continue"),
+        ]));
+        let mut model = ModelCatalog::defaults().get(provider, model_id).unwrap();
+        if provider == "anthropic-api" {
+            model.base_url = "http://127.0.0.1:9".into();
+            model.api_key_env.clear();
+        }
+        let agent = Agent::new_embedded(model, client.clone());
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let mut events = agent.subscribe();
+        let receipt = agent.submit(chat, None, "Hello".into()).await.unwrap();
+        wait_for_completion(&mut events).await;
+        agent
+            .submit(chat, Some(receipt.loop_id), "source ".repeat(35_000))
+            .await
+            .unwrap();
+        wait_for_completion(&mut events).await;
+        assert!(
+            agent
+                .snapshot(chat)
+                .await
+                .unwrap()
+                .latest_compact_summary()
+                .is_none(),
+            "{provider}/{model_id}"
+        );
+        assert_eq!(client.requests.lock().unwrap().len(), 2);
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn kimi_k3_context_variants_use_their_own_compaction_thresholds() {
+    for (model_id, should_compact) in [("k3", false), ("k3-256k", true)] {
+        let directory = tempfile::tempdir().unwrap();
+        let client = Arc::new(ScriptedModel::new(vec![
+            text("Initial answer"),
+            text("Follow-up answer or compact summary"),
+            text("Continue"),
+        ]));
+        let model = ModelCatalog::defaults()
+            .get("kimi-code-oauth", model_id)
+            .unwrap();
+        let agent = Agent::new_embedded(model, client.clone());
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let mut events = agent.subscribe();
+        let receipt = agent
+            .submit(chat, None, "source ".repeat(6_000))
+            .await
+            .unwrap();
+        wait_for_completion(&mut events).await;
+        agent
+            .submit(chat, Some(receipt.loop_id), "source ".repeat(70_000))
+            .await
+            .unwrap();
+        wait_for_completion(&mut events).await;
+        let snapshot = agent.snapshot(chat).await.unwrap();
+        assert_eq!(
+            snapshot.latest_compact_summary().is_some(),
+            should_compact,
+            "{model_id}"
+        );
+        assert_eq!(
+            client.requests.lock().unwrap().len(),
+            if should_compact { 3 } else { 2 }
+        );
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn automatic_compaction_does_not_treat_serialized_bytes_as_tokens() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::with_usages(
@@ -693,7 +815,7 @@ async fn automatic_compaction_uses_the_configured_window_and_preserves_recent_to
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("note.txt"), "source value").unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
-        text(&"older material ".repeat(2000)),
+        text(&"older material ".repeat(23_000)),
         text("Second response"),
         text("Third response"),
         text("Compact summary with instructions"),
@@ -719,7 +841,7 @@ async fn automatic_compaction_uses_the_configured_window_and_preserves_recent_to
             .unwrap();
         wait_for_completion(&mut events).await;
     }
-    agent.set_context_window(chat, 20_000).await.unwrap();
+    agent.set_context_window(chat, 200_000).await.unwrap();
     agent
         .submit(chat, Some(receipt.loop_id), "Read note.txt".into())
         .await
@@ -840,7 +962,7 @@ fn summary_message_text(request: &tickloop_agent_model::ModelRequest) -> String 
 async fn automatic_compaction_tells_the_model_to_continue_but_manual_compaction_does_not() {
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![
-        text(&"older material ".repeat(2000)),
+        text(&"older material ".repeat(23_000)),
         text("Automatic summary"),
         text("Answer after automatic compaction"),
         text("Manual summary"),
@@ -854,7 +976,7 @@ async fn automatic_compaction_tells_the_model_to_continue_but_manual_compaction_
         .await
         .unwrap();
     wait_for_completion(&mut events).await;
-    agent.set_context_window(chat, 20_000).await.unwrap();
+    agent.set_context_window(chat, 200_000).await.unwrap();
     agent
         .submit(chat, Some(receipt.loop_id), "Keep going".into())
         .await

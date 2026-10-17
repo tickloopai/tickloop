@@ -1702,6 +1702,8 @@ fn tool_summary(name: &str, input: &Value, cwd: &Path) -> String {
     let asked_questions;
     let primary = match name {
         "Skill" => input["skill"].as_str(),
+        "ReadMcpResourceTool" => input["uri"].as_str(),
+        "ListMcpResourcesTool" => input["server"].as_str(),
         SEND_AGENT_MESSAGE_TOOL_NAME => input["message"].as_str(),
         BASH_TOOL_NAME => input["description"]
             .as_str()

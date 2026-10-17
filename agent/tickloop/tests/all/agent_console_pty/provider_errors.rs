@@ -35,7 +35,7 @@ async fn kimi_http_refusal_shows_its_message_next_steps_and_clickable_link() {
             .wait_for("Kimi account refusal explained", |frame| {
                 frame.contains("HTTP 403")
                     && frame.contains("monthly usage limit")
-                    && frame.contains("kimi-for-coding")
+                    && frame.contains("K3 plan access")
                     && frame.contains("Usage limit OR")
             })
             .await;
@@ -78,7 +78,8 @@ async fn kimi_http_refusal_shows_its_message_next_steps_and_clickable_link() {
         eprintln!("[provider-error-details]\n{details}\n[/provider-error-details]");
         let dialog = details.split_once("Connection ·").unwrap().1;
         assert!(
-            dialog.contains("higher Kimi Code plan") && dialog.contains("kimi-for-coding"),
+            dialog.contains("higher Kimi Code plan")
+                && dialog.contains("plan access and usage limits"),
             "{dialog}"
         );
         view.send(b"\x1b");

@@ -3183,11 +3183,19 @@ impl ConsoleExecution {
         &self,
         chat: Uuid,
         tick: tickloop_agent_protocol::ArtifactTick,
+        history: tickloop_agent_protocol::ArtifactFeedbackHistory,
     ) -> Result<(), AccessError> {
         let execution = self.reference(chat).await?;
-        self.command(AgentCommand::LinkArtifact { execution, tick }, None)
-            .await
-            .map(|_| ())
+        self.command(
+            AgentCommand::LinkArtifact {
+                execution,
+                tick,
+                history,
+            },
+            None,
+        )
+        .await
+        .map(|_| ())
     }
     pub(super) async fn remove_artifact_tick(
         &self,

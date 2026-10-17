@@ -44,7 +44,7 @@ pub struct PreparedHostCall {
     permission: HostToolPermission,
     approval_summary: String,
     payload: Option<Box<dyn Any + Send + Sync>>,
-    event_context: Option<EventToolContext>,
+    artifact_account: Option<ArtifactAccountContext>,
     policy_identity: Option<HostPolicyIdentity>,
     approval_facts: tickloop_agent_protocol::PreparedApprovalFacts,
     local_read: Option<(tickloop_agent_tools::PreparedTool, bool)>,
@@ -81,7 +81,7 @@ impl PreparedHostCall {
             permission,
             approval_summary,
             payload: None,
-            event_context: None,
+            artifact_account: None,
             policy_identity: None,
             local_read: None,
         }
@@ -124,13 +124,13 @@ impl PreparedHostCall {
         self.local_read.as_ref().is_some_and(|(_, asks)| *asks)
     }
 
-    pub(crate) fn with_event_context(mut self, context: EventToolContext) -> Self {
-        self.event_context = Some(context);
+    pub(crate) fn with_artifact_account(mut self, context: ArtifactAccountContext) -> Self {
+        self.artifact_account = Some(context);
         self
     }
 
-    pub(crate) fn event_context(&self) -> Option<&EventToolContext> {
-        self.event_context.as_ref()
+    pub(crate) fn artifact_account(&self) -> Option<&ArtifactAccountContext> {
+        self.artifact_account.as_ref()
     }
 
     pub fn payload<T: Any + Send + Sync>(&self) -> Option<&T> {
@@ -216,22 +216,13 @@ pub enum HostEffect {
         instance: tick_protocol::InstanceRef,
         title: Option<String>,
     },
-    /// The service confirmed `done` for the claimed feedback request of the calling run, which
-    /// therefore needs no release.
-    FinishedFeedbackRequest { request_id: String },
 }
 
-/// The claimed feedback request a run is handling; every MCP call of that run carries it.
+/// The Artifact account that supplied an input; switching credentials cannot redirect its writes.
 #[derive(Clone)]
-pub(crate) struct EventToolContext {
+pub(crate) struct ArtifactAccountContext {
     pub origin: String,
     pub account_id: String,
-    pub artifact_id: String,
-    pub binding_id: uuid::Uuid,
-    pub epoch: u64,
-    pub request_id: String,
-    pub claim_id: String,
-    pub fencing_token: String,
 }
 
 /// What the calling Chat lends one host call: read-only access to its local files by the `Read`
@@ -395,6 +386,12 @@ impl HostCallResult {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpResourceServer {
+    pub name: String,
+    pub authority: HostToolAuthority,
+}
+
 #[async_trait]
 pub trait HostToolProvider: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
@@ -407,6 +404,26 @@ pub trait HostToolProvider: Send + Sync {
 
     async fn refresh(&self, _cancel: CancellationToken) -> Result<(), String> {
         Ok(())
+    }
+
+    fn mcp_resource_server(&self) -> Option<McpResourceServer> {
+        None
+    }
+
+    async fn list_mcp_resources(
+        &self,
+        _cursor: Option<&str>,
+        _cancel: CancellationToken,
+    ) -> Result<Value, String> {
+        Err("MCP resources are unavailable".into())
+    }
+
+    async fn read_mcp_resource(
+        &self,
+        _uri: &str,
+        _cancel: CancellationToken,
+    ) -> Result<Value, String> {
+        Err("MCP resources are unavailable".into())
     }
 
     fn remote_skills(&self) -> Vec<tickloop_agent_protocol::RemoteSkillDefinition> {

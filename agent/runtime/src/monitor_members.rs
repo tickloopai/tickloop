@@ -258,10 +258,8 @@ impl Agent {
                     .filter_map(|item| serde_json::from_value(item["instance"].clone()).ok()),
             );
         }
-        if let Some(claim) = chat.active_event_claims.get(&pending.receipt.run_id) {
-            instances.extend(
-                InstanceRef::artifact(&claim.source.origin, &claim.source.artifact_id).ok(),
-            );
+        if let Some(claim) = chat.feedback_inputs.get(&pending.receipt.run_id) {
+            instances.extend(InstanceRef::artifact(&claim.origin, &claim.artifact_id).ok());
         }
         if let Some(source) = pending
             .trigger_source

@@ -56,6 +56,7 @@ pub struct ServiceControl {
     pub reject_mcp: AtomicBool,
     pub directory_unavailable: AtomicBool,
     pub skills_enabled: AtomicBool,
+    pub resources_enabled: AtomicBool,
     pub skill_revision: AtomicUsize,
     pub skill_reference_bytes: AtomicUsize,
     pub tamper_skill: AtomicBool,
@@ -96,7 +97,8 @@ pub struct ServiceControl {
     pub upload_held: Notify,
     pub links: Mutex<BTreeMap<String, Link>>,
     pub pending: Mutex<Vec<(String, String)>>,
-    pub running: Mutex<BTreeMap<String, String>>,
+    pub deliveries: Mutex<BTreeMap<String, (String, String, String, bool)>>,
+    pub claims: Mutex<BTreeMap<String, String>>,
     pub releases: Mutex<Vec<(String, String)>>,
     pub finished: Mutex<Vec<(String, String)>>,
 }
@@ -172,7 +174,7 @@ fn call_tool(control: &ServiceControl, origin: &str, params: &Value) -> Value {
             json!({"artifact_id":artifact_id,"title":"Fixture","format":"doc","url":artifact_url(origin, artifact_id),"access_role":"owner","revision":3,"blocks":[{"id":"b1","hash":"h1","text":"# Fixture body"}],"next_cursor":null})
         }
         ("ArtifactRead", "threads") => {
-            json!({"threads":[{"thread_id":"thread-1","status":"open","anchor":thread_anchor(),"anchor_description":ANCHOR_DESCRIPTION,"messages":[{"message_id":"m1","author":{"name":"One","kind":"human"},"text":"@tickloop tighten this","created_at":REQUEST_CREATED_AT}],"request":{"request_id":"request-1","status":"pending","requested_by":"One"}}],"next_cursor":null})
+            json!({"threads":[{"thread_id":"thread-1","status":"open","anchor":thread_anchor(),"anchor_description":ANCHOR_DESCRIPTION,"messages":[{"message_id":"m1","author":{"name":"One","kind":"human"},"text":"@tickloop tighten this","created_at":REQUEST_CREATED_AT}],"feedback_id":"request-1"}],"next_cursor":null})
         }
         ("ArtifactRead", _) => json!({"items":[],"next_cursor":null}),
         ("ArtifactEdit", "create") => {
@@ -203,23 +205,6 @@ fn call_tool(control: &ServiceControl, origin: &str, params: &Value) -> Value {
         ("ArtifactEdit", _) => json!({"artifact_id":artifact_id,"revision":4}),
         ("ArtifactComment", "reply") => {
             json!({"thread_id":arguments["thread_id"],"message_id":"m2"})
-        }
-        ("ArtifactComment", "done") => {
-            let context = &params["_meta"]["tickloop.ai/event-bridge"];
-            let Some(request_id) = context["event_id"].as_str() else {
-                return tool_error(
-                    "invalid_request",
-                    "done needs the context of the claimed @tickloop request",
-                );
-            };
-            let outcome = arguments["outcome"].as_str().unwrap_or("done").to_owned();
-            control.running.lock().unwrap().remove(request_id);
-            control
-                .finished
-                .lock()
-                .unwrap()
-                .push((request_id.to_owned(), outcome.clone()));
-            json!({"request_id":request_id,"status":outcome})
         }
         _ => json!({}),
     };
@@ -261,11 +246,37 @@ fn mcp(control: &ServiceControl, origin: &str, body: &Value) -> Value {
         .unwrap()
         .clone()
         .unwrap_or_else(|| "tickloop-artifacts".into());
+    if body["method"] == "resources/read" {
+        let uri = body["params"]["uri"].as_str().unwrap_or("");
+        let is_fixture = matches!(
+            uri,
+            "fixture://tickloop-artifacts/info" | "fixture://tickloop-artifacts/details"
+        );
+        let is_skill = skill_entries(
+            control.skill_revision.load(Ordering::SeqCst),
+            control.skill_reference_bytes.load(Ordering::SeqCst),
+        )
+        .iter()
+        .any(|entry| {
+            entry["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|resource| resource["uri"] == uri)
+        });
+        if !is_fixture && !is_skill {
+            return json!({"jsonrpc":"2.0","id":body["id"],"error":{"code":-32002,"message":"Resource not found"}});
+        }
+    }
     let mut result = match body["method"].as_str().unwrap_or("") {
         "server/discover" => {
             let mut capabilities = json!({"tools":{"listChanged":true}});
-            if control.skills_enabled.load(Ordering::SeqCst) {
+            if control.resources_enabled.load(Ordering::SeqCst)
+                || control.skills_enabled.load(Ordering::SeqCst)
+            {
                 capabilities["resources"] = json!({});
+            }
+            if control.skills_enabled.load(Ordering::SeqCst) {
                 capabilities["extensions"] = json!({"io.modelcontextprotocol/skills":{}});
             }
             json!({"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":capabilities,"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":name,"version":"1"}}})
@@ -275,6 +286,20 @@ fn mcp(control: &ServiceControl, origin: &str, body: &Value) -> Value {
         }
         "skills/get" => {
             json!({"resultType":"complete","skill":skill_entries(control.skill_revision.load(Ordering::SeqCst), control.skill_reference_bytes.load(Ordering::SeqCst)).into_iter().find(|entry| entry["uri"] == body["params"]["uri"]).unwrap(),"ttlMs":0,"cacheScope":"private"})
+        }
+        "resources/list" => {
+            if body["params"]["cursor"] == "next-page" {
+                json!({"resources":[{"uri":"fixture://tickloop-artifacts/details","name":"details","mimeType":"text/plain"}]})
+            } else {
+                json!({"resources":[{"uri":"fixture://tickloop-artifacts/info","name":"info","mimeType":"text/plain"}],"nextCursor":"next-page"})
+            }
+        }
+        "resources/read"
+            if body["params"]["uri"]
+                .as_str()
+                .is_some_and(|uri| uri.starts_with("fixture://tickloop-artifacts/")) =>
+        {
+            json!({"contents":[{"uri":body["params"]["uri"],"mimeType":"text/plain","text":"Ordinary MCP resource fixture"}]})
         }
         "resources/read" => {
             let uri = body["params"]["uri"].as_str().unwrap();
@@ -377,82 +402,110 @@ fn lifecycle(control: &ServiceControl, method: &str, target: &str, body: &Value)
                 );
             }
             let mut links = control.links.lock().unwrap();
-            let mut link = Link {
+            let previous = links
+                .iter()
+                .find(|(key, current)| {
+                    key.starts_with(&format!("{artifact_id}:"))
+                        && current.chat_id == body["chat_id"]
+                        && current.loop_id == body["loop_id"]
+                })
+                .map(|(key, link)| (key.clone(), link.clone()));
+            let link = Link {
                 binding_id: body["binding_id"].as_str().unwrap().to_owned(),
                 client_instance_id: body["client_instance_id"].as_str().unwrap().to_owned(),
                 chat_id: body["chat_id"].as_str().unwrap().to_owned(),
                 loop_id: body["loop_id"].as_str().unwrap().to_owned(),
-                epoch: 1,
+                epoch: previous.as_ref().map_or(1, |(_, old)| {
+                    old.epoch + u64::from(old.binding_id != body["binding_id"])
+                }),
             };
-            if let Some(current) = links.get(*artifact_id) {
-                let unchanged = current.binding_id == link.binding_id
-                    && current.client_instance_id == link.client_instance_id
-                    && current.chat_id == link.chat_id
-                    && current.loop_id == link.loop_id;
-                link.epoch = current.epoch + u64::from(!unchanged);
+            if let Some((key, _)) = previous {
+                links.remove(&key);
             }
-            let epoch = link.epoch;
-            links.insert((*artifact_id).to_owned(), link.clone());
+            let key = format!("{artifact_id}:{}", link.binding_id);
+            if !links.contains_key(&key) && body["history"] == "all" {
+                for (artifact, feedback) in control
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(id, _)| id == artifact_id)
+                {
+                    control.deliveries.lock().unwrap().insert(
+                        uuid::Uuid::new_v4().to_string(),
+                        (
+                            artifact.clone(),
+                            feedback.clone(),
+                            link.binding_id.clone(),
+                            false,
+                        ),
+                    );
+                }
+            }
+            links.insert(key, link.clone());
             (
                 200,
-                json!({"artifact_id":artifact_id,"binding_id":link.binding_id,"epoch":epoch}),
+                json!({"artifact_id":artifact_id,"binding_id":link.binding_id,"epoch":link.epoch}),
             )
         }
-        ("GET", ["", "api", "v1", "agent", "requests"]) => {
+        ("DELETE", ["", "api", "v1", "agent", "links", artifact_id]) => {
+            let key = format!("{artifact_id}:{}", body["binding_id"].as_str().unwrap());
+            control.links.lock().unwrap().remove(&key);
+            (200, json!({"removed":true}))
+        }
+        ("GET", ["", "api", "v1", "agent", "feedback"]) => {
             let query = query(target);
-            let artifact_id = query.get("artifact_id").cloned().unwrap_or_default();
-            let current = control.links.lock().unwrap().get(&artifact_id).cloned();
-            if current.is_none_or(|link| {
-                Some(&link.binding_id) != query.get("binding_id")
-                    || Some(&link.epoch.to_string()) != query.get("epoch")
-            }) {
+            let artifact = query.get("artifact_id").cloned().unwrap_or_default();
+            let binding = query.get("binding_id").cloned().unwrap_or_default();
+            let current = control
+                .links
+                .lock()
+                .unwrap()
+                .get(&format!("{artifact}:{binding}"))
+                .cloned();
+            if current.is_none_or(|link| Some(&link.epoch.to_string()) != query.get("epoch")) {
                 return (
                     409,
                     json!({"error":{"code":"agent_link_missing","message":"link replaced"}}),
                 );
             }
-            let items = control
-                .pending
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(artifact, _)| *artifact == artifact_id)
-                .map(|(_, request_id)| json!({"request_id":request_id,"thread_id":"thread-1","created_at":REQUEST_CREATED_AT}))
-                .collect::<Vec<_>>();
+            let items = control.deliveries.lock().unwrap().iter().filter(|(_, (id, _, receiver, ack))| *id == artifact && *receiver == binding && !ack)
+                .map(|(delivery, (_, feedback, _, _))| json!({"delivery_id":delivery,"feedback_id":feedback,"thread_id":"thread-1","created_at":REQUEST_CREATED_AT})).collect::<Vec<_>>();
             (200, json!({"items":items,"next_cursor":null}))
         }
-        ("POST", ["", "api", "v1", "agent", "requests", request_id, "claim"]) => {
-            let artifact_id = body["artifact_id"].as_str().unwrap_or_default().to_owned();
-            let current = control.links.lock().unwrap().get(&artifact_id).cloned();
+        ("POST", ["", "api", "v1", "agent", "feedback", delivery, "claim"]) => {
+            let artifact = body["artifact_id"].as_str().unwrap_or_default();
+            let binding = body["binding_id"].as_str().unwrap_or_default();
+            let current = control
+                .links
+                .lock()
+                .unwrap()
+                .get(&format!("{artifact}:{binding}"))
+                .cloned();
             if current.is_none_or(|link| {
-                body["binding_id"] != link.binding_id.as_str()
-                    || body["epoch"] != link.epoch
-                    || body["client_instance_id"] != link.client_instance_id.as_str()
+                body["epoch"] != link.epoch || body["client_instance_id"] != link.client_instance_id
             }) {
                 return (
                     409,
                     json!({"error":{"code":"agent_link_missing","message":"link replaced"}}),
                 );
             }
-            let mut pending = control.pending.lock().unwrap();
-            let Some(index) = pending
-                .iter()
-                .position(|(artifact, request)| *artifact == artifact_id && request == request_id)
-            else {
-                return (
-                    409,
-                    json!({"error":{"code":"claim_conflict","message":"not pending"}}),
-                );
+            let deliveries = control.deliveries.lock().unwrap();
+            let Some((id, feedback, receiver, ack)) = deliveries.get(*delivery) else {
+                return (404, json!({"error":{"code":"not_found"}}));
             };
-            pending.remove(index);
-            control
-                .running
-                .lock()
-                .unwrap()
-                .insert((*request_id).to_owned(), artifact_id.clone());
+            if id != artifact || receiver != binding || *ack {
+                return (409, json!({"error":{"code":"claim_conflict"}}));
+            }
+            let mut claims = control.claims.lock().unwrap();
+            if claims.contains_key(*delivery) {
+                return (409, json!({"error":{"code":"claim_conflict"}}));
+            }
+            let claim = uuid::Uuid::new_v4().to_string();
+            claims.insert((*delivery).to_owned(), claim.clone());
             (
                 200,
-                json!({"request_id":request_id,"claim_id":format!("claim-{request_id}"),"fencing_token":format!("fence-{request_id}"),"lease_expires_at":"2099-01-01T00:00:00Z","input":{"artifact_id":artifact_id,"thread_id":"thread-1","text":"@tickloop tighten the introduction","anchor":thread_anchor(),"anchor_description":ANCHOR_DESCRIPTION,"requested_by":"One","access_role":"owner","messages":[{"message_id":"m1","author":{"name":"One","kind":"human"},"text":"@tickloop tighten the introduction","created_at":REQUEST_CREATED_AT}]}}),
+                json!({"delivery_id":delivery,"feedback_id":feedback,"claim_id":claim,"fencing_token":format!("fence-{delivery}"),"lease_expires_at":"2099-01-01T00:00:00Z","input":{"artifact_id":artifact,"thread_id":"thread-1","text":"@tickloop tighten the introduction","anchor":thread_anchor(),"anchor_description":ANCHOR_DESCRIPTION,"requested_by":"One","access_role":"owner","messages":[]}}),
             )
         }
         (
@@ -462,46 +515,46 @@ fn lifecycle(control: &ServiceControl, method: &str, target: &str, body: &Value)
                 "api",
                 "v1",
                 "agent",
-                "requests",
-                request_id,
-                "renew" | "release",
+                "feedback",
+                delivery,
+                action @ ("ack" | "release"),
             ],
-        ) if body["claim_id"] != format!("claim-{request_id}")
-            || body["fencing_token"] != format!("fence-{request_id}")
-            || !control.running.lock().unwrap().contains_key(*request_id) =>
-        {
-            (
-                409,
-                json!({"error":{"code":"claim_expired","message":"Feedback claim expired or was replaced"}}),
-            )
-        }
-        ("POST", ["", "api", "v1", "agent", "requests", _, "renew"]) => {
-            (200, json!({"lease_expires_at":"2099-01-01T00:00:00Z"}))
-        }
-        ("POST", ["", "api", "v1", "agent", "requests", request_id, "release"]) => {
-            let outcome = body["outcome"].as_str().unwrap_or_default().to_owned();
-            let artifact_id = control.running.lock().unwrap().remove(*request_id);
-            if outcome == "retry"
-                && let Some(artifact_id) = artifact_id
-            {
-                control
-                    .pending
-                    .lock()
-                    .unwrap()
-                    .push((artifact_id, (*request_id).to_owned()));
-            }
-            control
-                .releases
+        ) => {
+            if control
+                .claims
                 .lock()
                 .unwrap()
-                .push(((*request_id).to_owned(), outcome.clone()));
-            (
-                200,
-                json!({"request_id":request_id,"status":if outcome == "retry" {"pending"} else {"failed"}}),
-            )
+                .get(*delivery)
+                .is_none_or(|claim| body["claim_id"] != *claim)
+                || body["fencing_token"] != format!("fence-{delivery}")
+            {
+                return (409, json!({"error":{"code":"claim_expired"}}));
+            }
+            if *action == "release" {
+                control.claims.lock().unwrap().remove(*delivery);
+                control
+                    .releases
+                    .lock()
+                    .unwrap()
+                    .push(((*delivery).to_owned(), "released".into()));
+                return (200, json!({"delivery_id":delivery,"released":true}));
+            }
+            if let Some((_, feedback, _, ack)) =
+                control.deliveries.lock().unwrap().get_mut(*delivery)
+            {
+                if !*ack {
+                    control
+                        .finished
+                        .lock()
+                        .unwrap()
+                        .push((feedback.clone(), "received".into()));
+                }
+                *ack = true;
+            }
+            (200, json!({"delivery_id":delivery,"accepted":true}))
         }
         ("GET", ["", "api", "v1", "artifacts", artifact_id]) => {
-            let link = control.links.lock().unwrap().get(*artifact_id).cloned();
+            let links = control.links.lock().unwrap().iter().filter(|(key, _)| key.starts_with(&format!("{artifact_id}:"))).map(|(_, link)| json!({"binding_id":link.binding_id,"chat_id":link.chat_id,"loop_id":link.loop_id,"epoch":link.epoch})).collect::<Vec<_>>();
             let canonical_id = control
                 .read_result
                 .lock()
@@ -513,7 +566,7 @@ fn lifecycle(control: &ServiceControl, method: &str, target: &str, body: &Value)
                 .to_owned();
             (
                 200,
-                json!({"id":canonical_id,"title":"Fixture","format":control.metadata_format.lock().unwrap().as_deref().unwrap_or("markdown"),"access_role":"owner","publication":control.publication.lock().unwrap().clone(),"agent_link":link.map(|link| json!({"binding_id":link.binding_id,"chat_id":link.chat_id,"loop_id":link.loop_id,"epoch":link.epoch}))}),
+                json!({"id":canonical_id,"title":"Fixture","format":control.metadata_format.lock().unwrap().as_deref().unwrap_or("markdown"),"access_role":"owner","publication":control.publication.lock().unwrap().clone(),"agent_links":links}),
             )
         }
         (
@@ -668,8 +721,10 @@ impl ArtifactService {
                     {
                         (400, error)
                     } else if is_mcp {
-                        if body["method"] == "resources/read"
-                            && control.hold_skill_response.load(Ordering::SeqCst)
+                        if matches!(
+                            body["method"].as_str(),
+                            Some("resources/read" | "resources/list")
+                        ) && control.hold_skill_response.load(Ordering::SeqCst)
                         {
                             control.skill_response_started.notify_one();
                             control.release_skill_response.notified().await;
@@ -744,16 +799,45 @@ impl ArtifactService {
             .lock()
             .unwrap()
             .push((artifact_id.into(), request_id.into()));
+        for (key, link) in self
+            .control
+            .links
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| key.starts_with(&format!("{artifact_id}:")))
+        {
+            let _ = key;
+            self.control.deliveries.lock().unwrap().insert(
+                uuid::Uuid::new_v4().to_string(),
+                (
+                    artifact_id.into(),
+                    request_id.into(),
+                    link.binding_id.clone(),
+                    false,
+                ),
+            );
+        }
     }
 
     pub fn link(&self, artifact_id: &str) -> Option<Link> {
-        self.control.links.lock().unwrap().get(artifact_id).cloned()
+        self.control
+            .links
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(key, _)| key.starts_with(&format!("{artifact_id}:")))
+            .map(|(_, link)| link.clone())
     }
 
     /// Another Chat of the same account takes over the artifact's link.
     pub fn replace_link(&self, artifact_id: &str) {
         let mut links = self.control.links.lock().unwrap();
-        let link = links.get_mut(artifact_id).unwrap();
+        let link = links
+            .iter_mut()
+            .find(|(key, _)| key.starts_with(&format!("{artifact_id}:")))
+            .unwrap()
+            .1;
         link.binding_id = uuid::Uuid::new_v4().to_string();
         link.epoch += 1;
     }
@@ -765,6 +849,13 @@ impl ArtifactService {
             .unwrap()
             .iter()
             .any(|(_, pending)| pending == request_id)
+            && !self
+                .control
+                .finished
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(id, _)| id == request_id)
     }
 
     pub fn releases(&self) -> Vec<(String, String)> {

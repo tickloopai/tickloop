@@ -42,6 +42,7 @@ enum ToolRoute {
     Interaction,
     /// The Skills whose listing the request sent, which its Skill calls expand against.
     Skill(Arc<tickloop_agent_config::skills::SkillRegistry>),
+    McpResource(Arc<dyn crate::host_tools::HostToolProvider>),
     TickSubscription,
     TickManage(Option<Arc<dyn crate::host_tools::HostToolProvider>>),
     Delegation,
@@ -52,6 +53,7 @@ enum ToolRoute {
 }
 
 enum PreparedLocalCall {
+    McpResource(crate::mcp_resources::PreparedResourceCall),
     Family(agent_messages::PreparedFamilyCall),
     Delegation(delegation::PreparedDelegation),
     Handback(crate::handback::PreparedHandback),
@@ -60,6 +62,7 @@ enum PreparedLocalCall {
 impl PreparedLocalCall {
     fn policy_input(&self) -> &Value {
         match self {
+            Self::McpResource(call) => &call.input,
             Self::Family(call) => call.policy_input(),
             Self::Delegation(call) => &call.input,
             Self::Handback(call) => &call.input,
@@ -225,6 +228,18 @@ impl ToolRegistry {
                 }),
         );
         if let Some(provider) = host_provider {
+            if provider.mcp_resource_server().is_some_and(|server| {
+                crate::mcp_resource_authority_allowed(chat, &server.authority)
+            }) {
+                tools.extend(
+                    crate::mcp_resources::definitions()
+                        .into_iter()
+                        .map(|definition| RegisteredTool {
+                            definition,
+                            route: ToolRoute::McpResource(provider.clone()),
+                        }),
+                );
+            }
             tools.extend(
                 provider
                     .definitions()
@@ -563,10 +578,24 @@ impl Agent {
                     .await
             }
             ToolRoute::Delegation => {
+                let feedback_account = self.feedback_account_context(receipt).await?;
                 let Some(PreparedLocalCall::Delegation(prepared)) = prepared_local else {
                     return Err("Subagent was not prepared".into());
                 };
-                self.subagent_tool(receipt, &operation.call_id, prepared, cancel)
+                self.subagent_tool(
+                    receipt,
+                    &operation.call_id,
+                    prepared,
+                    feedback_account,
+                    cancel,
+                )
+                .await
+            }
+            ToolRoute::McpResource(provider) => {
+                let Some(PreparedLocalCall::McpResource(prepared)) = prepared_local else {
+                    return Err("MCP resource call was not prepared".into());
+                };
+                self.mcp_resource_tool(receipt, provider, prepared, cancel)
                     .await
             }
             ToolRoute::Skill(skills) => self.skill_tool(receipt, skills, &operation.input).await,
@@ -808,23 +837,10 @@ impl Agent {
         let host_tools = registration
             .as_ref()
             .and_then(|registered| registered.host_provider());
-        let event_context = self
-            .inner
-            .chats
-            .lock()
-            .await
-            .get(&receipt.chat_id)
-            .and_then(|chat| chat.active_event_claims.get(&receipt.run_id))
-            .map(|active| crate::host_tools::EventToolContext {
-                origin: active.source.origin.clone(),
-                account_id: active.source.account_id.clone(),
-                artifact_id: active.source.artifact_id.clone(),
-                binding_id: active.source.binding_id,
-                epoch: active.source.epoch,
-                request_id: active.claim.request_id.clone(),
-                claim_id: active.claim.claim_id.clone(),
-                fencing_token: active.claim.fencing_token.clone(),
-            });
+        let artifact_account = match self.feedback_account_context(receipt).await {
+            Ok(context) => context,
+            Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),
+        };
         let prepared_host_call = if let Some(provider) = host_tools.as_ref() {
             if let Err(error) = self
                 .check_delegated_host_call(receipt, provider.as_ref(), &name, &input)
@@ -871,8 +887,8 @@ impl Agent {
                     {
                         return Ok(ToolCallOutcome::not_admitted(error));
                     }
-                    Some(match event_context {
-                        Some(context) => prepared.with_event_context(context),
+                    Some(match artifact_account {
+                        Some(context) => prepared.with_artifact_account(context),
                         None => prepared,
                     })
                 }
@@ -934,7 +950,18 @@ impl Agent {
         let local_read_asks = prepared_host_call
             .as_ref()
             .is_some_and(|call| call.local_read_asks());
-        let prepared_local = if matches!(
+        let prepared_local = if let Some(ToolRoute::McpResource(provider)) =
+            registration.as_ref().map(|tool| &tool.route)
+        {
+            match crate::mcp_resources::PreparedResourceCall::prepare(
+                provider.as_ref(),
+                &name,
+                &input,
+            ) {
+                Ok(prepared) => Some(PreparedLocalCall::McpResource(prepared)),
+                Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),
+            }
+        } else if matches!(
             name.as_str(),
             SEND_AGENT_MESSAGE_TOOL_NAME | agent_messages::STOP_SUBAGENT_TOOL_NAME
         ) && matches!(
@@ -974,7 +1001,7 @@ impl Agent {
             .map(|call| call.permission())
             .or_else(|| {
                 let route = &registration.as_ref()?.route;
-                if matches!(route, ToolRoute::SharedTask) {
+                if matches!(route, ToolRoute::SharedTask | ToolRoute::McpResource(_)) {
                     return Some(crate::host_tools::HostToolPermission::ReadOnly);
                 }
                 (matches!(route, ToolRoute::Delegation)
@@ -2272,6 +2299,7 @@ mod tests {
             .chain([crate::handback::definition()])
             .chain(tick_subscriptions::definitions())
             .chain(skills.tool_definition())
+            .chain(crate::mcp_resources::definitions())
             .chain(
                 [false, true]
                     .into_iter()
@@ -2293,6 +2321,8 @@ mod tests {
         for name in [
             "Read",
             "Skill",
+            "ReadMcpResourceTool",
+            "ListMcpResourcesTool",
             "Subagent",
             "TickDescribe",
             "TickRead",

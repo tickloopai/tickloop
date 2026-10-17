@@ -128,12 +128,12 @@ fn listing_discloses_only_model_invocable_skill_metadata() {
             .unwrap_err(),
         SkillError::ModelInvocationDisabled("manual".into())
     );
-    assert_eq!(
+    assert!(
         registry
             .expand("manual", "", SkillCaller::User)
             .unwrap()
-            .content,
-        "Manual body"
+            .content
+            .ends_with("Manual body")
     );
 }
 
@@ -168,7 +168,8 @@ fn expansion_applies_arguments_allowed_tools_and_invocation_gates() {
     let expansion = registry
         .expand("/analyze", "report.md", SkillCaller::Model)
         .unwrap();
-    assert_eq!(expansion.content, "Analyze report.md carefully.");
+    assert!(expansion.content.contains("Base directory for this skill:"));
+    assert!(expansion.content.ends_with("Analyze report.md carefully."));
     assert_eq!(expansion.allowed_tools, ["Read", "Grep"]);
     assert_eq!(
         registry
@@ -318,7 +319,7 @@ async fn model_passes_skill_arguments_through_the_args_parameter() {
             .unwrap()
             .keys()
             .collect::<Vec<_>>(),
-        ["args", "resource", "skill"]
+        ["args", "skill"]
     );
     assert_eq!(skill_tool.input_schema["required"], json!(["skill"]));
     assert_eq!(

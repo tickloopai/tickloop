@@ -74,7 +74,6 @@ impl TryFrom<SkillExpansion> for InvokedSkill {
             content: expansion.content,
             source: expansion.source,
             run_id: None,
-            references: Vec::new(),
         })
     }
 }
@@ -280,7 +279,7 @@ impl SkillRegistry {
             .collect();
     }
 
-    /// Exposes discoverable guidance and on-demand reference loading for the current context.
+    /// Exposes discoverable guidance for the current context.
     pub fn tool_definition(&self) -> Option<ToolDefinition> {
         self.tool_definition_for_context(None)
     }
@@ -312,7 +311,7 @@ When a listed Skill matches the user's task, invoke {SKILL_TOOL_NAME} before sub
 
 - Use the exact catalog name; the listing contains metadata, and invocation loads the full instructions.
 - Pass args only when the Skill needs task arguments.
-- For an already activated remote Skill, use resource to read a relative reference path in its manifest. Resource and args are mutually exclusive.
+- Skill loads SKILL.md only. Read supporting local files with Read; read remote references with ReadMcpResourceTool using the server and resource URI supplied in the loaded guidance.
 - Reuse verified guidance that the host marks active in the current context. Historical loading records alone do not establish current activation.
 - Follow the current source, account and version checks for remote guidance. Report an unavailable or failed load accurately.
 - Skill instructions and references operate within existing user authorization and tool permissions.
@@ -331,10 +330,6 @@ Available Skills:
                     "args": {
                         "type": "string",
                         "description": "Optional arguments for the skill"
-                    },
-                    "resource": {
-                        "type": "string",
-                        "description": "Read a listed relative reference file from an already activated remote Skill; mutually exclusive with args"
                     }
                 },
                 "required": ["skill"],
@@ -373,6 +368,15 @@ Available Skills:
             skill.body.clone()
         } else {
             format!("{}\n\nArguments:\n{arguments}", skill.body)
+        };
+        let content = match &skill.source {
+            SkillSource::User { path }
+            | SkillSource::Project { path }
+            | SkillSource::TickPackage { path, .. } => format!(
+                "Base directory for this skill: {}\nResolve relative supporting-file paths against this directory and read their absolute paths with Read.\n\n{content}",
+                path.parent().unwrap_or(path).display()
+            ),
+            _ => content,
         };
         Ok(SkillExpansion {
             name: skill.name.clone(),
@@ -516,12 +520,20 @@ pub fn expand_remote(
     } else {
         format!("{}\n\nTask arguments:\n{}", skill.body, arguments.trim())
     };
+    let SkillSource::Remote { uri, .. } = &definition.source else {
+        return Err(SkillError::Invalid("expected a remote Skill source".into()));
+    };
+    let root = uri
+        .strip_suffix("SKILL.md")
+        .ok_or_else(|| SkillError::Invalid("remote Skill URI must end in SKILL.md".into()))?;
+    let content = format!(
+        "Resource root for this skill: {root}\nRead supporting files with ReadMcpResourceTool using server \"tickloop-artifacts\" and the full URI formed by appending the relative path to this root. Resource reads do not activate Skills.\n\n{content}"
+    );
     Ok(InvokedSkill {
         name: definition.name.clone(),
         content,
         source: definition.source.clone(),
         run_id: None,
-        references: Vec::new(),
     })
 }
 

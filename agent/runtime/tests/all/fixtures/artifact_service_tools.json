@@ -200,7 +200,7 @@
     },
     {
       "name": "ArtifactComment",
-      "description": "Write in an artifact's comment threads as the user's Agent. reply: answer in a thread, with thread_id from ArtifactRead threads; a reply does not finish a request. done: call only once you have finished the @tickloop request you are handling, or cannot; outcome done or failed, and a non-empty summary is added to its thread. done needs the request context Tickloop sends while you handle that request.",
+      "description": "Reply once in an Artifact discussion with a useful answer.",
       "inputSchema": {
         "type": "object",
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -208,8 +208,7 @@
           "action": {
             "type": "string",
             "enum": [
-              "reply",
-              "done"
+              "reply"
             ]
           },
           "artifact_id": {
@@ -221,21 +220,13 @@
           "text": {
             "type": "string",
             "minLength": 1
-          },
-          "outcome": {
-            "type": "string",
-            "enum": [
-              "done",
-              "failed"
-            ]
-          },
-          "summary": {
-            "type": "string"
           }
         },
         "required": [
           "action",
-          "artifact_id"
+          "artifact_id",
+          "thread_id",
+          "text"
         ],
         "additionalProperties": false
       },

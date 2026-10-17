@@ -51,6 +51,10 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    if std::env::args_os().skip(1).collect::<Vec<_>>() == ["--build-identity"] {
+        println!("{}", env!("TICKLOOP_BUILD_IDENTITY"));
+        return ExitCode::SUCCESS;
+    }
     entry::run(execute)
 }
 

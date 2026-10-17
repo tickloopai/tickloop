@@ -25,8 +25,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     host_tools::{
-        EventToolContext, HostCallResult, HostCallScope, HostEffect, HostToolPermission,
-        HostToolProvider, PreparedHostCall, WorkspaceHostContext,
+        HostCallResult, HostCallScope, HostEffect, HostToolPermission, HostToolProvider,
+        PreparedHostCall, WorkspaceHostContext,
     },
     mcp_http::McpHttpClient,
 };
@@ -62,7 +62,6 @@ pub const ARTIFACT_ACCOUNT_TOOL_NAMES: [&str; 4] = [
 ];
 
 const SERVER_NAME: &str = "tickloop-artifacts";
-const EVENT_CONTEXT_META: &str = "tickloop.ai/event-bridge";
 const PUBLICATION_META: &str = "tickloop.ai/publication";
 const MAX_TOOLS: usize = 128;
 const DIRECTORY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -128,6 +127,7 @@ struct Directory {
     tools: Vec<DiscoveredTool>,
     skills: Vec<RemoteSkillDefinition>,
     skill_error: Option<String>,
+    supports_resources: bool,
 }
 
 struct PreparedArtifactLogin;
@@ -607,20 +607,20 @@ impl McpHostToolProvider {
                     ));
                 }
             };
+        let capabilities = serde_json::to_value(&peer.capabilities)
+            .map_err(|_| DirectoryFailure::Rejected("invalid MCP capabilities".into()))?;
+        let supports_resources = capabilities.get("resources").is_some();
         let supports_skills = protocol_version == ProtocolVersion::V_2026_07_28
-            && serde_json::to_value(&peer.capabilities)
-                .ok()
-                .is_some_and(|capabilities| {
-                    capabilities["extensions"]
-                        .get(crate::remote_skills::EXTENSION)
-                        .is_some()
-                        && capabilities.get("resources").is_some()
-                });
+            && supports_resources
+            && capabilities["extensions"]
+                .get(crate::remote_skills::EXTENSION)
+                .is_some();
         let mut directory = self
             .validate_directory(tools, credential, protocol_version)
             .map_err(DirectoryFailure::Rejected)?;
+        directory.supports_resources = supports_resources;
         if supports_skills {
-            match Self::skill_request(&service, "skills/list", json!({}))
+            match Self::mcp_request(&service, "skills/list", json!({}))
                 .await
                 .and_then(|value| crate::remote_skills::parse_directory(&value, credential))
             {
@@ -636,7 +636,7 @@ impl McpHostToolProvider {
         Ok(directory)
     }
 
-    async fn skill_request(
+    async fn mcp_request(
         service: &RunningService<RoleClient, ClientConfig>,
         method: &str,
         params: Value,
@@ -644,9 +644,54 @@ impl McpHostToolProvider {
         let request = ClientRequest::CustomRequest(CustomRequest::new(method, Some(params)));
         let result = tokio::time::timeout(DIRECTORY_TIMEOUT, service.peer().send_request(request))
             .await
-            .map_err(|_| "Skill resource request timed out")?
-            .map_err(|_| "Skill resource request failed")?;
-        serde_json::to_value(result).map_err(|_| "invalid Skill response".into())
+            .map_err(|_| "MCP request timed out")?
+            .map_err(|_| "MCP request failed")?;
+        serde_json::to_value(result).map_err(|_| "invalid MCP response".into())
+    }
+
+    async fn resource_request(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: CancellationToken,
+    ) -> Result<Value, String> {
+        let source = self
+            .mcp_resource_server()
+            .ok_or("MCP resource source unavailable")?;
+        let credential = self
+            .artifact
+            .credential_snapshot()
+            .map_err(|_| "MCP credential unavailable")?
+            .ok_or("Artifact account signed out")?;
+        let operation = async {
+            let (service, http) = self.open_session(&credential).await?;
+            let peer = service
+                .peer()
+                .peer_info()
+                .ok_or("MCP discovery incomplete")?;
+            if peer.server_info.as_ref().map(|info| info.name.as_str()) != Some(SERVER_NAME)
+                || serde_json::to_value(&peer.capabilities)
+                    .ok()
+                    .is_none_or(|capabilities| capabilities.get("resources").is_none())
+            {
+                return Err("MCP resource source or capabilities changed".into());
+            }
+            let result = Self::mcp_request(&service, method, params).await;
+            if http.unauthorized() {
+                self.invalidate(&credential.access_token).await;
+            }
+            result
+        };
+        let result = tokio::select! {
+            () = cancel.cancelled() => return Err("MCP resource request cancelled".into()),
+            result = operation => result?,
+        };
+        if !self.credential_is_current(&credential)
+            || self.mcp_resource_server().as_ref() != Some(&source)
+        {
+            return Err("MCP resource source changed during reading".into());
+        }
+        Ok(result)
     }
 
     async fn invalidate(&self, token: &str) {
@@ -709,6 +754,7 @@ impl McpHostToolProvider {
             tools: mapped,
             skills: Vec::new(),
             skill_error: None,
+            supports_resources: false,
         })
     }
 
@@ -825,21 +871,6 @@ impl McpHostToolProvider {
                 added_at_ms: tickloop_agent_base::private_fs::unix_time_milliseconds(),
             },
         ))
-    }
-
-    /// A confirmed `ArtifactComment` done for the request this run claimed.
-    fn finished_request_effect(
-        result: &rmcp::model::CallToolResult,
-        arguments: &Value,
-        context: &EventToolContext,
-    ) -> Option<HostEffect> {
-        if result.is_error == Some(true) || !has_action(arguments, "done") {
-            return None;
-        }
-        let request_id = bounded_identifier(result.structured_content.as_ref()?.get("request_id"))?;
-        (request_id == context.request_id).then(|| HostEffect::FinishedFeedbackRequest {
-            request_id: request_id.to_owned(),
-        })
     }
 
     /// Serializes a result for the model and transcript with the bearer token redacted.
@@ -1314,6 +1345,69 @@ impl HostToolProvider for McpHostToolProvider {
         Some(self.artifact.clone())
     }
 
+    fn mcp_resource_server(&self) -> Option<crate::host_tools::McpResourceServer> {
+        let credential = self.artifact.credential_snapshot().ok()??;
+        let directory = self.directory.read().unwrap();
+        let directory = directory.as_ref()?;
+        if !directory.supports_resources
+            || directory.credential_key != Self::credential_key(&credential)
+        {
+            return None;
+        }
+        Some(crate::host_tools::McpResourceServer {
+            name: SERVER_NAME.into(),
+            authority: HostToolAuthority::Mcp {
+                server_id: credential.origin,
+                account_id: credential.account_id,
+            },
+        })
+    }
+
+    async fn list_mcp_resources(
+        &self,
+        cursor: Option<&str>,
+        cancel: CancellationToken,
+    ) -> Result<Value, String> {
+        let params = cursor.map_or_else(|| json!({}), |cursor| json!({"cursor":cursor}));
+        let result = self
+            .resource_request("resources/list", params, cancel)
+            .await?;
+        let resources = result["resources"]
+            .as_array()
+            .ok_or("invalid MCP resource directory")?;
+        if resources.iter().any(|resource| {
+            resource["uri"].as_str().is_none() || resource["name"].as_str().is_none()
+        }) || result
+            .get("nextCursor")
+            .is_some_and(|cursor| !cursor.is_string())
+        {
+            return Err("invalid MCP resource directory".into());
+        }
+        Ok(result)
+    }
+
+    async fn read_mcp_resource(
+        &self,
+        uri: &str,
+        cancel: CancellationToken,
+    ) -> Result<Value, String> {
+        let result = self
+            .resource_request("resources/read", json!({"uri":uri}), cancel)
+            .await?;
+        let contents = result["contents"]
+            .as_array()
+            .ok_or("invalid MCP resource content")?;
+        if contents.is_empty()
+            || contents.iter().any(|content| {
+                content["uri"] != uri
+                    || !(content["text"].is_string() || content["blob"].is_string())
+            })
+        {
+            return Err("invalid MCP resource content".into());
+        }
+        Ok(result)
+    }
+
     fn remote_skills(&self) -> Vec<RemoteSkillDefinition> {
         let Ok(Some(credential)) = self.artifact.credential_snapshot() else {
             return Vec::new();
@@ -1359,7 +1453,7 @@ impl HostToolProvider for McpHostToolProvider {
         let operation = async {
             let (service, http) = self.open_session(&credential).await?;
             let result =
-                Self::skill_request(&service, "resources/read", json!({"uri": resource.uri})).await;
+                Self::mcp_request(&service, "resources/read", json!({"uri": resource.uri})).await;
             if http.unauthorized() {
                 self.invalidate(&credential.access_token).await;
             }
@@ -1670,6 +1764,12 @@ impl HostToolProvider for McpHostToolProvider {
             };
         }
         if let Some(upload) = call.payload::<PreparedArtifactUpload>() {
+            if call.artifact_account().is_some_and(|context| {
+                context.origin != upload.credential.origin
+                    || context.account_id != upload.credential.account_id
+            }) {
+                return Err("Feedback input belongs to another Artifact account".into());
+            }
             return self.revalidate_upload(upload, cancel).await;
         }
         let Some(prepared) = call.payload::<PreparedMcpCall>() else {
@@ -1700,11 +1800,11 @@ impl HostToolProvider for McpHostToolProvider {
         {
             return Err("MCP tool directory changed before dispatch".into());
         }
-        if call.event_context().is_some_and(|context| {
+        if call.artifact_account().is_some_and(|context| {
             context.origin != prepared.credential.origin
                 || context.account_id != prepared.credential.account_id
         }) {
-            return Err("MCP feedback claim belongs to another Artifact account".into());
+            return Err("Feedback input belongs to another Artifact account".into());
         }
         if let Some(expected) = prepared.read_owned {
             let id = artifact_read_id(call.name(), &prepared.arguments)
@@ -1760,7 +1860,6 @@ impl HostToolProvider for McpHostToolProvider {
         }
         let name = call.name().to_owned();
         let permission = call.permission();
-        let event_context = call.event_context().cloned();
         let Ok(prepared) = call.into_payload::<PreparedMcpCall>() else {
             unreachable!()
         };
@@ -1787,20 +1886,6 @@ impl HostToolProvider for McpHostToolProvider {
                 .0
                 .0
                 .insert(PUBLICATION_META.into(), json!(publication));
-        }
-        if let Some(context) = &event_context {
-            metadata.0.0.insert(
-                EVENT_CONTEXT_META.into(),
-                json!({
-                    "version": 1,
-                    "source_key": context.artifact_id,
-                    "binding_id": context.binding_id.to_string(),
-                    "association_epoch": context.epoch,
-                    "event_id": context.request_id,
-                    "claim_id": context.claim_id,
-                    "fencing_token": context.fencing_token,
-                }),
-            );
         }
         if !metadata.0.0.is_empty() {
             params.meta = Some(metadata);
@@ -1846,9 +1931,6 @@ impl HostToolProvider for McpHostToolProvider {
             ARTIFACT_EDIT_TOOL => Self::creation_effect(&result, &prepared)
                 .map(HostEffect::CreatedArtifact)
                 .or_else(|| Self::rename_effect(&result, &prepared)),
-            ARTIFACT_COMMENT_TOOL => event_context.as_ref().and_then(|context| {
-                Self::finished_request_effect(&result, &prepared.arguments, context)
-            }),
             _ => None,
         };
         if result.is_error != Some(true) {
@@ -1874,12 +1956,7 @@ impl HostToolProvider for McpHostToolProvider {
                 self.admit_publication(chat_id, &prepared.credential, artifact, audience);
             }
         }
-        let mut tool_result = Self::model_result(result, &prepared.credential.access_token);
-        if let Some(context) = &event_context {
-            tool_result.content = tool_result
-                .content
-                .replace(&context.fencing_token, "[redacted]");
-        }
+        let tool_result = Self::model_result(result, &prepared.credential.access_token);
         match effect {
             Some(effect) => HostCallResult::CompletedWithEffect(tool_result, Box::new(effect)),
             None => HostCallResult::Completed(tool_result),

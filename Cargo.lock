@@ -4600,6 +4600,7 @@ dependencies = [
  "tickloop-agent-protocol",
  "tickloop-agent-runtime",
  "tickloop-agent-test-support",
+ "tickloop-agent-updater",
  "tickloop-tick-packages",
  "tickloop-tick-protocol",
  "tickloop-tick-test-support",
@@ -4911,6 +4912,24 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+]
+
+[[package]]
+name = "tickloop-agent-updater"
+version = "0.2.4"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "libc",
+ "reqwest 0.12.28",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "tickloop-agent-base",
+ "tokio",
 ]
 
 [[package]]

@@ -87,7 +87,7 @@ fn agent_layout_background_notice_preserves_the_regular_status_and_result() {
     let frame = frame_lines(&console);
     let status = line_with(&frame, "⏵⏵ Auto").unwrap();
     assert!(status.contains("deepseek-flash"), "{frame:#?}");
-    assert!(status.contains("Context 4% used"), "{frame:#?}");
+    assert!(status.contains("Input 4% (last)"), "{frame:#?}");
     assert!(
         status.starts_with('─') || status.contains("Agents "),
         "{frame:#?}"
@@ -196,7 +196,7 @@ fn agent_layout_background_titles_use_display_columns_without_family_reading_num
             let frame = frame_lines(&console);
             let status = line_with(&frame, "⏵⏵ Auto").unwrap();
             assert!(
-                status.contains("deepseek-flash") && status.contains("Context 4% used"),
+                status.contains("deepseek-flash") && status.contains("Input 4% (last)"),
                 "{width} columns: {frame:#?}"
             );
             assert!(

@@ -123,15 +123,11 @@ impl Agent {
             .loops
             .iter_mut()
             .find(|goal| goal.id == receipt.loop_id && goal.run_id == Some(receipt.run_id))
+            && !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
         {
-            if !matches!(goal.state, LoopState::Stopped | LoopState::Expired) {
-                goal.set_state(LoopState::Failed);
-            }
-            for source in &mut goal.event_sources {
-                source.resume_required = true;
-            }
+            goal.set_state(LoopState::Failed);
         }
-        let claim = chat.active_event_claims.remove(&receipt.run_id);
+        chat.feedback_inputs.remove(&receipt.run_id);
         chat.family_finishing.remove(&receipt.run_id);
         let message = if history_recovered {
             INTERNAL_COMPLETION_ERROR
@@ -148,12 +144,6 @@ impl Agent {
             .runs
             .remove(&receipt.run_id);
         let cleanup = AssertUnwindSafe(async {
-            self.disarm_feedback_lease(receipt.chat_id, receipt.loop_id)
-                .await;
-            if let Some(claim) = claim.filter(|claim| !claim.settled) {
-                self.release_event_claim(&claim, tickloop_agent_artifacts::ReleaseOutcome::Failed)
-                    .await;
-            }
             self.settle_task_claims(receipt).await;
             if snapshot.delegation.is_some() {
                 self.record_family_completion(receipt, &snapshot).await;

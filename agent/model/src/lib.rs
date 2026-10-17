@@ -259,6 +259,7 @@ pub enum ModelDelta {
 pub struct ModelRequestContext {
     used_attempts: Arc<AtomicUsize>,
     max_attempts: usize,
+    output_token_limit: Option<u32>,
 }
 
 impl ModelRequestContext {
@@ -266,7 +267,13 @@ impl ModelRequestContext {
         Self {
             used_attempts: Arc::new(AtomicUsize::new(0)),
             max_attempts,
+            output_token_limit: None,
         }
+    }
+
+    pub fn with_output_token_limit(mut self, tokens: u32) -> Self {
+        self.output_token_limit = Some(tokens);
+        self
     }
 
     pub fn try_begin_attempt(&self) -> bool {
@@ -1203,13 +1210,22 @@ impl HttpModelClient {
         }
         let structured_response =
             structured_response::StructuredResponsePolicy::for_request(&request)?;
+        let mut request_config = self.config.clone();
+        if let Some(limit) = context.and_then(|context| context.output_token_limit) {
+            if limit == 0 {
+                return Err(ModelError::Configuration(
+                    "output token limit must be positive".into(),
+                ));
+            }
+            request_config.max_output_tokens = request_config.max_output_tokens.min(limit);
+        }
         let (endpoint, mut body) = match self.config.adapter() {
             Adapter::Messages | Adapter::DeepseekMessages | Adapter::MinimaxMessages => {
-                ("v1/messages", messages_request(&self.config, request)?)
+                ("v1/messages", messages_request(&request_config, request)?)
             }
             Adapter::Responses => (
                 "responses",
-                responses::encode_request(&self.config, request)?,
+                responses::encode_request(&request_config, request)?,
             ),
             Adapter::ChatCompletions
             | Adapter::DeepseekChatCompletions
@@ -1217,9 +1233,9 @@ impl HttpModelClient {
             | Adapter::KimiChatCompletions
             | Adapter::QwenChatCompletions => (
                 "chat/completions",
-                chat_completions::encode_request(&self.config, request)?,
+                chat_completions::encode_request(&request_config, request)?,
             ),
-            Adapter::Google => ("", google::encode_request(&self.config, request)?),
+            Adapter::Google => ("", google::encode_request(&request_config, request)?),
             Adapter::SystemOne => {
                 return Err(ModelError::UnsupportedProtocol(Protocol::SystemOne));
             }

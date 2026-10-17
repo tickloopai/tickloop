@@ -86,7 +86,8 @@ async fn kimi_monthly_limit_explains_the_account_problem() {
         );
         assert!(text.contains("https://www.kimi.com/membership/subscription?tab=quota"));
         assert!(text.contains("/provider"));
-        assert!(text.contains("Usage limit OR") && text.contains("kimi-for-coding"));
+        assert!(text.contains("Usage limit OR") && text.contains("Check K3 plan access"));
+        assert!(!text.contains("Try kimi-for-coding"));
         assert_eq!(
             error.provider_failure().unwrap().class,
             ProviderFailureClass::UsageOrPlan
@@ -255,14 +256,20 @@ fn request() -> ModelRequest {
 }
 
 #[test]
-fn kimi_code_recommends_the_model_available_on_every_plan() {
+fn kimi_code_only_recommends_k3_variants_and_keeps_legacy_history_loadable() {
     let catalog = tickloop_agent_model::cards::ModelCatalog::defaults();
     assert!(catalog.get("kimi-code-oauth", "kimi-for-coding").is_some());
     assert_eq!(
         tickloop_agent_model::access::AccessCatalog::defaults()
             .recommended_model("kimi-code-oauth"),
-        Some("kimi-for-coding")
+        Some("k3")
     );
+    let visible = tickloop_agent_model::cards::built_in_model_profiles()
+        .into_iter()
+        .filter(|model| model.provider_id == "kimi-code-oauth")
+        .map(|model| model.model)
+        .collect::<Vec<_>>();
+    assert_eq!(visible, vec!["k3", "k3-256k"]);
 }
 
 #[tokio::test]

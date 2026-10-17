@@ -732,7 +732,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             menus.provider.focused_model,
-            Some(("kimi-code-oauth".into(), "kimi-for-coding".into()))
+            Some(("kimi-code-oauth".into(), "k3".into()))
         );
         menus.dismiss(&console).unwrap();
         menus
@@ -882,7 +882,7 @@ mod tests {
                 status: 403,
                 class: tickloop_agent_protocol::ProviderFailureClass::UsageOrPlan,
                 message: "Monthly usage limit reached".into(),
-                hint: "Usage limit OR plan access; try kimi-for-coding".into(),
+                hint: "Usage limit OR plan access; check K3 plan access".into(),
                 retry_after: None,
                 retryable: false,
             };
@@ -3264,7 +3264,7 @@ pub(in crate::terminal) fn provider_failure_context(
     failure: &tickloop_agent_protocol::ProviderHttpFailure,
 ) -> Vec<String> {
     let next_step = if failure.class == tickloop_agent_protocol::ProviderFailureClass::UsageOrPlan {
-        "Other models may require a higher Kimi Code plan; try kimi-for-coding.".into()
+        "K3 may require a higher Kimi Code plan; check plan access and usage limits.".into()
     } else {
         failure.hint.clone()
     };

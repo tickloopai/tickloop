@@ -198,9 +198,15 @@ impl MonitorRows for ArtifactRows {
                 let metadata = context.metadata.get(&id);
                 let binding = feedback_binding(chat, &tick.origin, &tick.artifact_id);
                 let is_linked_here = binding.is_some_and(|binding| !binding.resume_required);
-                let remote_link = metadata
-                    .and_then(Option::as_ref)
-                    .and_then(|metadata| metadata.agent_link.as_ref());
+                let remote_link = metadata.and_then(Option::as_ref).and_then(|metadata| {
+                    metadata
+                        .agent_links
+                        .iter()
+                        .find(|link| {
+                            binding.is_some_and(|binding| binding.binding_id == link.binding_id)
+                        })
+                        .or_else(|| metadata.agent_links.first())
+                });
                 let unavailable = metadata.is_some_and(Option::is_none);
                 let refresh_failed = context.metadata_failures.contains_key(&id);
                 let feedback = if is_linked_here {
@@ -210,7 +216,7 @@ impl MonitorRows for ArtifactRows {
                 }) {
                     Some("feedback elsewhere")
                 } else if binding.is_some() {
-                    Some("feedback paused")
+                    Some("feedback unavailable")
                 } else {
                     None
                 };
@@ -248,7 +254,7 @@ impl MonitorRows for ArtifactRows {
                         ),
                         status: status.into(),
                         // An association here is the row's default subscription and needs no
-                        // words or mark; feedback paused or going elsewhere is not a state the
+                        // words or mark; feedback unavailable or going elsewhere is not a state the
                         // glyph's colour tells, so it stays in words.
                         notes: feedback
                             .filter(|_| !is_linked_here)

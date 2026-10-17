@@ -49,9 +49,10 @@ use crate::{
 /// TickRead returns state without repeating the capability catalog.
 /// 23.0 adds manual TickUpdate delivery and subscription-independent Monitor observations.
 /// 24.0 distinguishes internal execution failures from model service failures in the request ledger.
+/// 25.0 selects historical feedback when adding an independent Artifact feedback receiver.
 /// Older business majors
 /// are refused before dispatch; the frozen daemon management protocol remains independent.
-pub const PROTOCOL_MAJOR: u16 = 24;
+pub const PROTOCOL_MAJOR: u16 = 25;
 pub const PROTOCOL_MINOR: u16 = 0;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
@@ -263,6 +264,7 @@ pub enum AgentCommand {
     LinkArtifact {
         execution: ExecutionRef,
         tick: ArtifactTick,
+        history: crate::ArtifactFeedbackHistory,
     },
     ListArtifactTicks {
         execution: ExecutionRef,

@@ -39,7 +39,7 @@ jobs:
           node-version: '22'
 
       - name: Test the release script
-        run: node --test scripts/release.test.mjs scripts/release-ticks.test.mjs
+        run: node --test scripts/release.test.mjs scripts/release-ticks.test.mjs scripts/install.test.mjs
 
       - name: Validate release tag against the workspace version
         run: |
@@ -106,6 +106,9 @@ jobs:
           fi
           unpacked=$(mktemp -d)
           tar -xzf "dist/tickloop-$PACKAGE_TARGET.tar.gz" -C "$unpacked"
+          printf '%s\n' tick-reader tickhost tickloop > "$unpacked/expected-files"
+          tar -tzf "dist/tickloop-$PACKAGE_TARGET.tar.gz" | LC_ALL=C sort > "$unpacked/archive-files"
+          cmp "$unpacked/expected-files" "$unpacked/archive-files"
           for executable in tickloop tickhost tick-reader; do
             arch "-$architecture" "$unpacked/$executable" --help > /dev/null
           done
@@ -141,19 +144,32 @@ jobs:
         working-directory: dist
         run: sha256sum --check --strict -- *.sha256
 
-      # A re-run finds the release an earlier attempt created and replaces its archives.
+      # A published version is immutable; a re-run may only add missing identical assets.
       - name: Publish the release on the tap
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           if gh release view "$RELEASE_TAG" --repo "$TAP_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/* --repo "$TAP_REPOSITORY" --clobber
+            scratch=$(mktemp -d)
+            trap 'rm -rf "$scratch"' EXIT
+            gh release view "$RELEASE_TAG" --repo "$TAP_REPOSITORY" --json assets --jq '.assets[].name' > "$scratch/assets"
+            for asset in dist/*; do
+              name=${asset##*/}
+              if grep -Fxq "$name" "$scratch/assets"; then
+                gh release download "$RELEASE_TAG" --repo "$TAP_REPOSITORY" --pattern "$name" --dir "$scratch"
+                cmp "$asset" "$scratch/$name" || { echo "::error::Published asset $name differs; release a new version instead."; exit 1; }
+              else
+                gh release upload "$RELEASE_TAG" "$asset" --repo "$TAP_REPOSITORY"
+              fi
+            done
             gh release edit "$RELEASE_TAG" --repo "$TAP_REPOSITORY" --draft=false
           else
             gh release create "$RELEASE_TAG" dist/* \
               --repo "$TAP_REPOSITORY" \
+              --draft \
               --title "Tickloop ${RELEASE_TAG#v}" \
               --notes "Prebuilt macOS archives of Tickloop ${RELEASE_TAG#v}. Install with: brew install tickloopai/tap/tickloop"
+            gh release edit "$RELEASE_TAG" --repo "$TAP_REPOSITORY" --draft=false
           fi
 
   tap:

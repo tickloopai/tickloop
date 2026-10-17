@@ -2731,6 +2731,9 @@ impl Agent {
                 recorder.adopt_restored_loops(&snapshot, &bookkeeping, &plan_checkpoints);
             }
             RestoreTarget::NewChat { .. } => {
+                for goal in &mut snapshot.loops {
+                    goal.event_sources.clear();
+                }
                 // 照 Claude Code `copyPlanForFork`：以新 chatId 恢复时使用新的 slug 并复制计划文件。
                 super::plan::copy_plans_to_new_slug(
                     &mut snapshot,
@@ -2804,7 +2807,8 @@ impl Agent {
                 user_shell_queue: Arc::new(Notify::new()),
                 trigger_cancellations: HashMap::new(),
                 event_cancellations: HashMap::new(),
-                active_event_claims: HashMap::new(),
+                feedback_inputs: HashMap::new(),
+                feedback_cleanup_started: false,
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: HashSet::new(),
                 output_style,
@@ -2820,6 +2824,7 @@ impl Agent {
             self.set_host_work_context(chat_id, context).await?;
         }
         self.save(&snapshot);
+        self.start_feedback_cleanup(chat_id).await;
 
         Ok(snapshot)
     }

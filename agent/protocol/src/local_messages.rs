@@ -252,9 +252,13 @@ impl LocalMessage {
                 command: command.to_owned(),
             });
         }
-        if let Some(rest) = text.strip_prefix("@tickloop request ")
+        if let Some(rest) = text
+            .strip_prefix("@tickloop feedback ")
+            .or_else(|| text.strip_prefix("@tickloop request "))
             && let Some((request_id, rest)) = rest.split_once(" on artifact ")
-            && let Some((artifact_id, _)) = rest.split_once(". Request input JSON:\n")
+            && let Some((artifact_id, _)) = rest
+                .split_once(". Delivery ")
+                .or_else(|| rest.split_once(". Request input JSON:\n"))
             && !request_id.is_empty()
             && !artifact_id.is_empty()
             && !request_id.chars().any(char::is_whitespace)

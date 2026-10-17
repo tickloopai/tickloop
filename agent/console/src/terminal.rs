@@ -921,6 +921,7 @@ Usage: tickloop [--cwd DIRECTORY]
        [--working-directory-is-trusted]
        [-c | --continue | -r [CHAT] | --resume [CHAT] | --chat-id CHAT] [--fork-session]
        [--no-session-persistence]
+       tickloop update [--check | --status]
        tickloop daemon stop
        tickloop monitor popup install|remove --herdr-socket SOCKET
        tickloop monitor attach
@@ -2666,7 +2667,7 @@ async fn interact(
                 Some(InputEvent::ArtifactChoice(choice)) => {
                     let Some(root) = config_root.as_deref() else { continue; };
                     if !console.artifact_picker_matches(choice.picker)? { continue; }
-                    if matches!(choice.action, artifacts_picker::ArtifactPickerAction::Add) && selected_chat.is_none() {
+                    if matches!(choice.action, artifacts_picker::ArtifactPickerAction::Add(_)) && selected_chat.is_none() {
                         let _ = ensure_chat(console, agent, &mut selected_chat, &workdir).await?;
                     }
                     match artifact_ui::apply_choice(agent, console, root, selected_chat, *choice).await {

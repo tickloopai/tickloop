@@ -54,7 +54,7 @@ async fn artifact_service() -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::Joi
                     json!({"id":"document","title":CREATED_TITLE,"format":"markdown","access_role":"owner","url":format!("{origin}/artifact/document"),"publication":{"audience":"private","membership_revision":0}})
                 } else if path.starts_with("PUT /artifact/api/v1/agent/links/document ") {
                     json!({"artifact_id":"document","binding_id":body["binding_id"],"epoch":1})
-                } else if path.starts_with("GET /artifact/api/v1/agent/requests?") {
+                } else if path.starts_with("GET /artifact/api/v1/agent/feedback?") {
                     json!({"items":[],"next_cursor":null})
                 } else if path.starts_with("POST /artifact/mcp ") {
                     let result = match body["method"].as_str().unwrap() {

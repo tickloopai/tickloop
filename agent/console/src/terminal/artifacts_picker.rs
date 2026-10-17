@@ -29,7 +29,7 @@ pub(super) struct ArtifactLoad {
 }
 #[derive(Clone, Debug)]
 pub(super) enum ArtifactPickerAction {
-    Add,
+    Add(tickloop_agent_protocol::ArtifactFeedbackHistory),
     Open,
     Copy,
     Pin(bool),
@@ -69,6 +69,8 @@ pub(super) struct ArtifactsPicker {
     row_targets: Vec<(std::ops::Range<usize>, usize)>,
     rename: Option<(ArtifactMetadata, ConversationPicker)>,
     delete: Option<ArtifactMetadata>,
+    feedback_history: Option<(ArtifactMetadata, usize)>,
+    feedback_history_visible: bool,
 }
 
 impl ArtifactsPicker {
@@ -91,6 +93,8 @@ impl ArtifactsPicker {
             row_targets: Vec::new(),
             rename: None,
             delete: None,
+            feedback_history: None,
+            feedback_history_visible: false,
         }
     }
     pub(super) fn id(&self) -> Uuid {
@@ -207,6 +211,9 @@ impl ArtifactsPicker {
         }
     }
     pub(super) fn paste(&mut self, text: &str) {
+        if self.feedback_history.is_some() {
+            return;
+        }
         if let Some((_, picker)) = &mut self.rename {
             picker.paste(text);
         } else {
@@ -217,6 +224,30 @@ impl ArtifactsPicker {
         }
     }
     pub(super) fn key(&mut self, key: KeyEvent) -> ArtifactPickerEffect {
+        if let Some((artifact, selected)) = &mut self.feedback_history {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) => {
+                    self.feedback_history = None;
+                }
+                (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE)
+                | (KeyCode::Char('n'), KeyModifiers::CONTROL) => *selected = 1,
+                (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
+                | (KeyCode::Char('p'), KeyModifiers::CONTROL) => *selected = 0,
+                (KeyCode::Enter, KeyModifiers::NONE) if self.feedback_history_visible => {
+                    let artifact = artifact.clone();
+                    let history = if *selected == 0 {
+                        tickloop_agent_protocol::ArtifactFeedbackHistory::NewOnly
+                    } else {
+                        tickloop_agent_protocol::ArtifactFeedbackHistory::All
+                    };
+                    self.feedback_history = None;
+                    return self.choice(artifact, ArtifactPickerAction::Add(history));
+                }
+                _ => {}
+            }
+            return ArtifactPickerEffect::None;
+        }
+
         if let Some(artifact) = self.delete.clone() {
             if key.code == KeyCode::Esc {
                 self.delete = None;
@@ -309,7 +340,9 @@ impl ArtifactsPicker {
         match self.picker.key(key) {
             ConversationPickerEffect::Open(index) => {
                 if let Some(artifact) = self.entries.get(index) {
-                    return self.choice(artifact.clone(), ArtifactPickerAction::Add);
+                    self.feedback_history = Some((artifact.clone(), 0));
+                    self.feedback_history_visible = false;
+                    return ArtifactPickerEffect::None;
                 }
             }
             ConversationPickerEffect::Cancel => return ArtifactPickerEffect::Close,
@@ -340,6 +373,14 @@ impl ArtifactsPicker {
         self.reload(false);
     }
     pub(super) fn select_at_row(&mut self, row: usize) -> bool {
+        if let Some((_, selected)) = &mut self.feedback_history {
+            if self.feedback_history_visible && (2..=3).contains(&row) {
+                *selected = row - 2;
+                return true;
+            }
+            return false;
+        }
+
         if self.rename.is_some() {
             return false;
         }
@@ -358,6 +399,9 @@ impl ArtifactsPicker {
     }
 
     pub(super) fn minimum_frame_rows(&self) -> usize {
+        if self.feedback_history.is_some() {
+            return 5;
+        }
         3 + if self.picker.matching_indices().is_empty() {
             1
         } else {
@@ -366,6 +410,9 @@ impl ArtifactsPicker {
     }
 
     pub(super) fn content_rows(&self) -> usize {
+        if self.feedback_history.is_some() {
+            return 5;
+        }
         let mut previous_group = None;
         let mut rows = 0;
         for index in self.picker.matching_indices() {
@@ -385,6 +432,39 @@ impl ArtifactsPicker {
         height: usize,
         display: DisplayProfile,
     ) -> super::conversation_picker::ConversationPickerFrame {
+        if let Some((artifact, selected)) = &self.feedback_history {
+            self.feedback_history_visible = height >= 5 && width >= 20;
+            let mut lines = vec![
+                RoleLine::role("Receive feedback", Role::Emphasis),
+                RoleLine::role(super::safe_line(&artifact.title), Role::MutedText),
+            ];
+            if self.feedback_history_visible {
+                for (index, label) in ["New feedback only", "Include history"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    lines.push(RoleLine::role(
+                        format!("{} {label}", if index == *selected { "❯" } else { " " }),
+                        if index == *selected {
+                            Role::Selection
+                        } else {
+                            Role::Text
+                        },
+                    ));
+                }
+                lines.push(RoleLine::role("enter link · esc back", Role::MutedText));
+            } else {
+                lines.push(RoleLine::role("Resize · esc back", Role::MutedText));
+            }
+            lines.truncate(height);
+            for line in &mut lines {
+                line.truncate(width);
+            }
+            return super::conversation_picker::ConversationPickerFrame {
+                lines,
+                cursor: None,
+            };
+        }
         let mut header = tab_header_line("Artifacts", self.tab, &TABS, width);
         let spare = width.saturating_sub(
             unicode_width::UnicodeWidthStr::width(header.text().as_str()) + self.email.len() + 2,
@@ -533,6 +613,28 @@ impl ArtifactsPicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn linking_defaults_to_new_feedback_and_requires_a_visible_history_choice() {
+        let mut picker = ArtifactsPicker::new(None, String::new(), HashSet::new());
+        load(&mut picker, vec![artifact("a", "Research", "owner")]);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(picker.key(enter), ArtifactPickerEffect::None));
+        picker.frame(12, 3, DisplayProfile::default());
+        assert!(matches!(picker.key(enter), ArtifactPickerEffect::None));
+        picker.frame(80, 8, DisplayProfile::default());
+        assert!(
+            matches!(picker.key(enter), ArtifactPickerEffect::Choice(choice)
+            if matches!(choice.action, ArtifactPickerAction::Add(tickloop_agent_protocol::ArtifactFeedbackHistory::NewOnly)))
+        );
+        picker.key(enter);
+        picker.frame(80, 8, DisplayProfile::default());
+        picker.key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(
+            matches!(picker.key(enter), ArtifactPickerEffect::Choice(choice)
+            if matches!(choice.action, ArtifactPickerAction::Add(tickloop_agent_protocol::ArtifactFeedbackHistory::All)))
+        );
+    }
+
     #[test]
     fn pinned_search_matches_titles_only_and_hides_basic_navigation_hints() {
         let mut picker = ArtifactsPicker::new(None, "owner@example.test".into(), HashSet::new());

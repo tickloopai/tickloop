@@ -22,4 +22,5 @@ mod provider_picker;
 mod terminal;
 mod tick_package_commands;
 mod ticks_panel_pty;
+mod update_command;
 mod workspace_trust_pty;

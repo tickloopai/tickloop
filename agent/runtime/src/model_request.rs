@@ -657,7 +657,30 @@ impl Agent {
                         .generate_title(request, sender, request_cancel.clone())
                         .await;
                 }
-                match tracking.model_context {
+                let mut model_context = tracking.model_context;
+                if matches!(
+                    context.kind,
+                    ModelRequestKind::Conversation
+                        | ModelRequestKind::CompactionAutomatic
+                        | ModelRequestKind::CompactionManual
+                        | ModelRequestKind::CompactionDirected
+                ) {
+                    let chats = self.inner.chats.lock().await;
+                    if let Some(chat) = chats.get(&context.owner.chat_id)
+                        && let Some(limit) = super::context::request_output_token_limit(
+                            &chat.snapshot,
+                            &request,
+                            context.kind,
+                        )?
+                    {
+                        model_context = Some(
+                            model_context
+                                .unwrap_or_else(|| ModelRequestContext::new(1))
+                                .with_output_token_limit(limit),
+                        );
+                    }
+                }
+                match model_context {
                     Some(model_context) => {
                         client
                             .complete_for_chat_with_context(

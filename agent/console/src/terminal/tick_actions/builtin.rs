@@ -890,6 +890,24 @@ impl TickActionBackend for RefreshBackend {
     }
 }
 impl Console {
+    pub(in crate::terminal) fn confirm_artifact_feedback(
+        &self,
+        chat: Uuid,
+        id: String,
+    ) -> Result<(), String> {
+        self.confirm_tick_action_with_option(
+            chat,
+            id.clone(),
+            artifact(&id, 'H'),
+            "Receive this artifact's feedback here?",
+            Some(super::super::monitor::ConfirmationOption {
+                label: "Include earlier feedback".into(),
+                is_chosen: false,
+                action_without: artifact(&id, 'F'),
+            }),
+        )
+    }
+
     /// Asks before `x` takes out an artifact whose association still delivers here; confirming
     /// unlinks it.
     pub(in crate::terminal) fn confirm_artifact_unlink(

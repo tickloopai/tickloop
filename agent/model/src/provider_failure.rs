@@ -180,7 +180,7 @@ impl ProviderHttpFailureExt for ProviderHttpFailure {
                 .is_none_or(|delay| delay <= Duration::from_secs(MAX_RETRY_AFTER_SECONDS));
         self.hint = match class {
             ProviderFailureClass::UsageLimit => "Usage limit reached. Check the provider's allowance/reset or upgrade options; switch Provider via /provider to continue.".into(),
-            ProviderFailureClass::UsageOrPlan => "Usage limit OR the current plan does not include this model. Try kimi-for-coding via /model; check the provider's subscription link, or switch Provider via /provider. Other Kimi Code models may require a higher Kimi Code plan.".into(),
+            ProviderFailureClass::UsageOrPlan => "Usage limit OR the current plan does not include this model. Check K3 plan access and usage limits via the provider's subscription link, or switch Provider via /provider. K3 may require a higher Kimi Code plan.".into(),
             ProviderFailureClass::Billing => "Billing / insufficient balance. Review the provider's billing or add balance; switch Provider via /provider to continue.".into(),
             ProviderFailureClass::Authentication => "Credentials expired or invalid. Open this connection in /provider to sign in again or replace its API key.".into(),
             ProviderFailureClass::RateLimit => match self.retry_after {

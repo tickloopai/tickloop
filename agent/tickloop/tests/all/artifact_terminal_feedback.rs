@@ -98,11 +98,11 @@ async fn console_creation_links_the_artifact_and_shows_only_the_artifact_tools()
                         json!({"user":user,"expires_at":"2099-01-01T00:00:00Z"}).to_string(),
                     )
                 } else if path.starts_with("GET /artifact/api/v1/artifacts/fixture-artifact ") {
-                    ("application/json", json!({"id":"fixture-artifact","title":FIXTURE_ARTIFACT_TITLE,"format":"markdown","access_role":"owner","url":format!("{origin}/a/fixture-artifact"),"agent_link":null}).to_string())
+                    ("application/json", json!({"id":"fixture-artifact","title":FIXTURE_ARTIFACT_TITLE,"format":"markdown","access_role":"owner","url":format!("{origin}/a/fixture-artifact"),"agent_links":[]}).to_string())
                 } else if path.starts_with("PUT /artifact/api/v1/agent/links/fixture-artifact ") {
                     observed.linked.store(true, Ordering::SeqCst);
                     ("application/json", json!({"artifact_id":"fixture-artifact","binding_id":request["binding_id"],"epoch":1}).to_string())
-                } else if path.starts_with("GET /artifact/api/v1/agent/requests?") {
+                } else if path.starts_with("GET /artifact/api/v1/agent/feedback?") {
                     observed.listened.store(true, Ordering::SeqCst);
                     (
                         "application/json",

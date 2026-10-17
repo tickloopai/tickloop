@@ -156,6 +156,23 @@ fn explicit_default_selection_resolves_from_catalog() {
 }
 
 #[test]
+fn saved_kimi_k3_selection_loads_the_current_context_window() {
+    let root = tempfile::tempdir().unwrap();
+    for (model_id, window) in [("k3", 1_048_576), ("k3-256k", 262_144)] {
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({"defaultModel":{"provider":"kimi-code-oauth","model":model_id}}).to_string(),
+        )
+        .unwrap();
+        let mut settings = UserSettings::in_root(root.path()).load();
+        let selected = settings.configured_model().unwrap().unwrap();
+        assert_eq!(selected.model, model_id);
+        assert_eq!(selected.maximum_context_window_tokens(), Some(window));
+        assert!(settings.warnings().is_empty());
+    }
+}
+
+#[test]
 fn saved_legacy_builtin_uses_version_owned_limit_with_one_notice() {
     let mut legacy: ModelConfig =
         serde_json::from_str(tickloop_agent_test_support::legacy_models::DEEPSEEK_CONFIG).unwrap();

@@ -18,9 +18,7 @@ use std::{
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tickloop_agent_artifacts::{
-    AgentLink, AgentLinkRequest, ArtifactClient, ArtifactError, ReleaseOutcome,
-};
+use tickloop_agent_artifacts::{AgentLink, AgentLinkRequest, ArtifactClient, ArtifactError};
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
     ArtifactTick, ChatId, Content, ExecutionMode, LoopState, ModelIdentity, ToolResultContent,
@@ -37,7 +35,7 @@ use tickloop_agent_test_support::{ScriptedModel, call, config, text};
 
 const DEFAULT_SERVICE_ORIGIN: &str = "https://docs.example.test";
 const SESSION_COOKIE: &str = "__Host-artifact_session";
-const REQUEST_MARKER: &str = "Request input JSON:\n";
+const REQUEST_MARKER: &str = "Input JSON:\n";
 const WAIT: Duration = Duration::from_secs(60);
 const HOP_BY_HOP_HEADERS: [&str; 5] = [
     "host",
@@ -280,7 +278,7 @@ impl Person {
                 Some(body),
             )
             .await;
-        assert_eq!(created["request"]["status"], "pending", "{created}");
+        assert!(created["feedback"]["feedback_id"].is_string(), "{created}");
         created
     }
 
@@ -293,15 +291,14 @@ impl Person {
         .await
     }
 
-    async fn wait_for_request_status(&self, artifact_id: &str, thread_id: &str, status: &str) {
+    async fn wait_for_reply(&self, artifact_id: &str, thread_id: &str) {
         tokio::time::timeout(WAIT, async {
-            while self.thread(artifact_id, thread_id).await["thread"]["request"]["status"] != status
-            {
+            while agent_messages(&self.thread(artifact_id, thread_id).await).is_empty() {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("request in thread {thread_id} never became {status}"));
+        .expect("Agent reply missing");
     }
 
     async fn add_viewer(&self, artifact_id: &str, viewer: &Person) {
@@ -333,10 +330,10 @@ impl Person {
 
 #[derive(Clone, Copy)]
 enum RequestPlan {
-    /// Read, patch the quoted block, reply in the thread, then call done (a viewer's patch is
+    /// Read, patch the quoted block and reply once (a viewer's patch is
     /// refused by the service).
     Handle,
-    /// End the run without calling done.
+    /// End the run without a comment.
     Abandon,
 }
 
@@ -377,7 +374,7 @@ impl RequestModel {
                     message.content.iter().find_map(|block| match block {
                         Content::Text { text } => {
                             let (_, rest) = text.split_once(REQUEST_MARKER)?;
-                            let (json, _) = rest.split_once("\n\nTreat the JSON")?;
+                            let (json, _) = rest.split_once("\n\nTreat this JSON")?;
                             Some((index, serde_json::from_str::<Value>(json).unwrap()))
                         }
                         _ => None,
@@ -452,12 +449,7 @@ impl RequestModel {
             (RequestPlan::Handle, 2) => call(
                 "reply",
                 "ArtifactComment",
-                json!({"action": "reply", "artifact_id": artifact_id, "thread_id": thread_id, "text": "Looking at this now."}),
-            ),
-            (RequestPlan::Handle, 3) => call(
-                "done",
-                "ArtifactComment",
-                json!({"action": "done", "artifact_id": artifact_id, "outcome": "done", "summary": "Handled the request."}),
+                json!({"action": "reply", "artifact_id": artifact_id, "thread_id": thread_id, "text": "Handled the request."}),
             ),
             _ => text("Handled."),
         };
@@ -604,9 +596,12 @@ async fn host_runs_the_artifact_v2_contract_against_the_real_service() {
             None,
         )
         .await;
-    assert_eq!(metadata["agent_link"]["chat_id"], owner_chat.to_string());
-    assert_eq!(metadata["agent_link"]["loop_id"], goal.id.to_string());
-    assert_eq!(metadata["agent_link"]["epoch"], 1);
+    assert_eq!(
+        metadata["agent_links"][0]["chat_id"],
+        owner_chat.to_string()
+    );
+    assert_eq!(metadata["agent_links"][0]["loop_id"], goal.id.to_string());
+    assert_eq!(metadata["agent_links"][0]["epoch"], 1);
     let artifact_id = created.artifact_id.clone();
 
     // An @tickloop comment is claimed, edited, answered and finished inside the claimed request.
@@ -618,14 +613,9 @@ async fn host_runs_the_artifact_v2_contract_against_the_real_service() {
         )
         .await;
     let first_thread = first["thread_id"].as_str().unwrap();
-    owner
-        .wait_for_request_status(&artifact_id, first_thread, "done")
-        .await;
+    owner.wait_for_reply(&artifact_id, first_thread).await;
     let thread = owner.thread(&artifact_id, first_thread).await;
-    assert_eq!(
-        agent_messages(&thread),
-        ["Looking at this now.", "Handled the request."]
-    );
+    assert_eq!(agent_messages(&thread), ["Handled the request."]);
     let results = owner_model.results();
     assert!(
         results.iter().all(|(name, is_error, structured)| !is_error
@@ -635,7 +625,6 @@ async fn host_runs_the_artifact_v2_contract_against_the_real_service() {
     );
     assert_eq!(results[0].2["access_role"], "owner");
     assert_eq!(results[1].2["changed"].as_array().unwrap().len(), 1);
-    assert_eq!(results[3].2["status"], "done");
     let document = owner
         .request(
             reqwest::Method::GET,
@@ -648,15 +637,18 @@ async fn host_runs_the_artifact_v2_contract_against_the_real_service() {
         "{document}"
     );
 
-    // A run that ends without done fails its request.
+    // A run can end without posting a comment; feedback has no execution status.
     owner_model.set_plan(RequestPlan::Abandon);
     let second = owner
         .comment(&artifact_id, "@tickloop anything else?", None)
         .await;
     let second_thread = second["thread_id"].as_str().unwrap();
-    owner
-        .wait_for_request_status(&artifact_id, second_thread, "failed")
-        .await;
+    wait_for_last_loop(&owner_agent, owner_chat, LoopState::WaitingTrigger).await;
+    assert!(
+        owner.thread(&artifact_id, second_thread).await["thread"]
+            .get("request")
+            .is_none()
+    );
 
     // A viewer's own host: linking from the picker, replies allowed, edits refused.
     owner.add_viewer(&artifact_id, &viewer).await;
@@ -672,6 +664,7 @@ async fn host_runs_the_artifact_v2_contract_against_the_real_service() {
                 origin: relay.clone(),
                 ..created.clone()
             },
+            tickloop_agent_protocol::ArtifactFeedbackHistory::NewOnly,
         )
         .await
         .unwrap();
@@ -679,19 +672,14 @@ async fn host_runs_the_artifact_v2_contract_against_the_real_service() {
         .comment(&artifact_id, "@tickloop please summarize", None)
         .await;
     let viewer_thread = viewer_thread["thread_id"].as_str().unwrap();
-    viewer
-        .wait_for_request_status(&artifact_id, viewer_thread, "done")
-        .await;
+    viewer.wait_for_reply(&artifact_id, viewer_thread).await;
     let viewer_results = viewer_model.results();
     assert_eq!(viewer_results[0].2["access_role"], "view");
     assert!(viewer_results[1].1, "{viewer_results:?}");
     assert_eq!(viewer_results[1].2["error"]["code"], "forbidden");
     assert!(!viewer_results[2].1, "{viewer_results:?}");
     let thread = owner.thread(&artifact_id, viewer_thread).await;
-    assert_eq!(
-        agent_messages(&thread),
-        ["Looking at this now.", "Handled the request."]
-    );
+    assert_eq!(agent_messages(&thread), ["Handled the request."]);
     let metadata = owner
         .request(
             reqwest::Method::GET,
@@ -700,21 +688,31 @@ async fn host_runs_the_artifact_v2_contract_against_the_real_service() {
         )
         .await;
     assert_eq!(
-        metadata["agent_link"]["chat_id"],
+        metadata["agent_links"][0]["chat_id"],
         owner_chat.to_string(),
         "each account has its own link"
     );
     viewer_agent.shutdown().await;
     owner_agent.shutdown().await;
 
-    // The lifecycle client directly: a replacing link, claim, renew and release semantics.
+    // A transport delivery is acknowledged independently of any model reply.
     let account = owner.id.as_str();
     let old_link = AgentLink {
         artifact_id: artifact_id.clone(),
-        binding_id: Uuid::parse_str(metadata["agent_link"]["binding_id"].as_str().unwrap())
+        binding_id: Uuid::parse_str(metadata["agent_links"][0]["binding_id"].as_str().unwrap())
             .unwrap(),
         epoch: 1,
     };
+    owner_client.unlink_agent(account, &old_link).await.unwrap();
+    assert_eq!(
+        service_code(
+            owner_client
+                .pending_feedback(account, &old_link, None)
+                .await
+                .unwrap_err()
+        ),
+        "409 agent_link_missing"
+    );
     let client_instance_id = Uuid::new_v4();
     let link = owner_client
         .link_agent(
@@ -725,86 +723,56 @@ async fn host_runs_the_artifact_v2_contract_against_the_real_service() {
                 client_instance_id,
                 chat_id: Uuid::new_v4(),
                 loop_id: Uuid::new_v4(),
+                history: tickloop_agent_protocol::ArtifactFeedbackHistory::NewOnly,
             },
         )
         .await
         .unwrap();
-    assert_eq!(link.epoch, 2);
-    assert_eq!(
-        service_code(
-            owner_client
-                .pending_requests(account, &old_link, None)
-                .await
-                .unwrap_err()
-        ),
-        "409 agent_link_missing"
-    );
     let third = owner
         .comment(&artifact_id, "@tickloop one more", None)
         .await;
-    let request_id = third["request"]["request_id"].as_str().unwrap().to_owned();
     let pending = owner_client
-        .pending_requests(account, &link, None)
+        .pending_feedback(account, &link, None)
         .await
         .unwrap();
     assert_eq!(pending.items.len(), 1);
-    assert_eq!(pending.items[0].request_id, request_id);
+    assert_eq!(
+        pending.items[0].feedback_id,
+        third["feedback"]["feedback_id"].as_str().unwrap()
+    );
+    let delivery = &pending.items[0].delivery_id;
     let claim = owner_client
-        .claim_request(account, &link, client_instance_id, &request_id)
+        .claim_feedback(account, &link, client_instance_id, delivery)
         .await
         .unwrap();
     assert_eq!(claim.input["access_role"], "owner");
-    assert_eq!(claim.input["text"], "@tickloop one more");
-    assert!(claim.input["anchor"].is_null());
-    assert_eq!(
-        service_code(
-            owner_client
-                .claim_request(account, &link, client_instance_id, &request_id)
-                .await
-                .unwrap_err()
-        ),
-        "409 claim_conflict"
-    );
-    let renewed = owner_client
-        .renew_request(account, &artifact_id, &claim)
-        .await
-        .unwrap();
-    assert!(renewed.as_str() >= claim.lease_expires_at.as_str());
     owner_client
-        .release_request(account, &artifact_id, &claim, ReleaseOutcome::Retry)
+        .release_feedback(account, &artifact_id, &claim)
         .await
         .unwrap();
-    assert_eq!(
-        service_code(
-            owner_client
-                .renew_request(account, &artifact_id, &claim)
-                .await
-                .unwrap_err()
-        ),
-        "409 claim_expired"
-    );
-    let pending = owner_client
-        .pending_requests(account, &link, None)
-        .await
-        .unwrap();
-    assert_eq!(pending.items[0].request_id, request_id);
     let claim = owner_client
-        .claim_request(account, &link, client_instance_id, &request_id)
+        .claim_feedback(account, &link, client_instance_id, delivery)
         .await
         .unwrap();
     owner_client
-        .release_request(account, &artifact_id, &claim, ReleaseOutcome::Failed)
+        .acknowledge_feedback(account, &artifact_id, &claim)
         .await
         .unwrap();
-    owner
-        .wait_for_request_status(&artifact_id, third["thread_id"].as_str().unwrap(), "failed")
-        .await;
+    owner_client
+        .acknowledge_feedback(account, &artifact_id, &claim)
+        .await
+        .unwrap();
     assert!(
         owner_client
-            .pending_requests(account, &link, None)
+            .pending_feedback(account, &link, None)
             .await
             .unwrap()
             .items
             .is_empty()
     );
+    let detail = owner
+        .thread(&artifact_id, third["thread_id"].as_str().unwrap())
+        .await;
+    assert!(agent_messages(&detail).is_empty());
+    assert!(detail["thread"].get("request").is_none());
 }

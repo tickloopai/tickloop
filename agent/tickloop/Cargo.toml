@@ -32,6 +32,7 @@ tickloop-agent-console = { path = "../console" }
 tickloop-agent-daemon = { path = "../daemon" }
 tickloop-agent-packages = { path = "../packages" }
 tickloop-agent-protocol = { path = "../protocol" }
+tickloop-agent-updater = { path = "../updater" }
 tickloop-tick-packages = { path = "../../tick/packages" }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"

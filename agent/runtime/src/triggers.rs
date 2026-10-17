@@ -214,7 +214,7 @@ impl Agent {
                 || pending.trigger_source.as_ref().is_none_or(|source| {
                     matches!(
                         source.source.as_str(),
-                        super::event_sources::ARTIFACT_REQUEST_SOURCE
+                        super::event_sources::ARTIFACT_FEEDBACK_SOURCE
                             | TICK_SUBSCRIPTION_SOURCE
                             | TICK_MANUAL_SOURCE
                     )
@@ -349,6 +349,8 @@ impl Agent {
         state: LoopState,
         expected: Option<&CancellationToken>,
     ) -> Result<Vec<OperationRecord>, AgentError> {
+        self.unlink_feedback_receivers(chat_id, Some(loop_id), None)
+            .await?;
         let reason = if state == LoopState::Expired {
             "deadline reached"
         } else {
@@ -427,17 +429,6 @@ impl Agent {
         if let Some(trigger) = &mut goal.trigger {
             trigger.armed = false;
         }
-        // An ended Loop hands every unfinished request back for another attempt, including one
-        // whose queued run never starts.
-        let event_releases = chat
-            .active_event_claims
-            .values_mut()
-            .filter(|active| active.loop_id == loop_id && !active.settled)
-            .map(|active| {
-                active.settled = true;
-                active.clone()
-            })
-            .collect::<Vec<_>>();
         let mut cancelled_shells = HashSet::new();
         for shell in &mut chat.snapshot.user_shells {
             if shell.loop_id == Some(loop_id)
@@ -511,10 +502,6 @@ impl Agent {
         self.inner.loop_leases.release(chat_id, loop_id);
         self.warn_loop_run_state_failure(chat_id, loop_id, recorded);
         self.sync_tick_subscriptions().await;
-        for active in &event_releases {
-            self.release_event_claim(active, tickloop_agent_artifacts::ReleaseOutcome::Retry)
-                .await;
-        }
         for command in tools.stop_loop(loop_id).await {
             self.record_command(chat_id, command).await?;
         }

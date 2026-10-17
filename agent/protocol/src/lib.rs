@@ -61,7 +61,7 @@ pub use approvals::{
     ApprovalReviewerKind, ApprovalStage, AutoReviewerHealth, OriginalUserInput,
     PreparedApprovalFacts,
 };
-pub use artifact::{ArtifactAudience, ArtifactPublication, ArtifactTick};
+pub use artifact::{ArtifactAudience, ArtifactFeedbackHistory, ArtifactPublication, ArtifactTick};
 pub use auto_rules::{
     AutoBlockKind, AutoEnvironment, AutoEnvironmentSource, AutoPolicy, AutoRule, AutoRuleSource,
     RuleApplicability, RuleFinding, SoftDenyClearance, TaskScopeFinding, VerdictEvidence,

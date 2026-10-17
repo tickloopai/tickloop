@@ -17,9 +17,24 @@ models:
   display_name: Kimi for Coding (K2.8 Preview)
   adapter: kimi_chat_completions
   max_output_tokens: 4096
+  context_window_tokens: 1048576
 - id: k3
   service_model_id: k3
   display_name: Kimi K3
+  adapter: kimi_chat_completions
+  max_output_tokens: 131072
+  context_window_tokens: 1048576
+  thinking: always_on
+  effort_levels:
+  - low
+  - high
+  - max
+  input_modalities:
+  - text
+  - image
+- id: k3-256k
+  service_model_id: k3-256k
+  display_name: Kimi K3 (256K)
   adapter: kimi_chat_completions
   max_output_tokens: 131072
   context_window_tokens: 262144

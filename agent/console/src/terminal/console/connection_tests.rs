@@ -69,7 +69,7 @@ fn execution_connection_facts_fit_custom_status_help_and_short_screens() {
                             assert!(
                                 text.contains("⏵⏵ Auto")
                                     && text.contains("loss-model")
-                                    && text.contains("Context unknown"),
+                                    && text.contains("Input unknown"),
                                 "{text}"
                             );
                         }
@@ -117,7 +117,7 @@ fn connection_recovery_removes_the_short_notice_and_restores_core() {
     assert!(
         frame.contains("⏵⏵ Auto")
             && frame.contains("loss-model")
-            && frame.contains("Context unknown"),
+            && frame.contains("Input unknown"),
         "{frame}"
     );
 }

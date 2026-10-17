@@ -2,7 +2,7 @@ use tickloop_agent_test_support::model_http_support;
 
 use serde_json::{Value, json};
 use tickloop_agent_model::{
-    ModelFailureKind, ModelRequest, StructuredOutput,
+    ModelConfigExt, ModelFailureKind, ModelRequest, ModelRequestContext, StructuredOutput,
     cards::{ModelCatalog, built_in_model_profiles},
     credentials::save_api_key,
     model_client,
@@ -33,6 +33,26 @@ fn chat_reply(delta: Value, reason: &str) -> String {
         "data: {}\n\ndata: [DONE]\n\n",
         json!({"id":"fixture","choices":[{"index":0,"delta":delta,"finish_reason":reason}],"usage":{"prompt_tokens":100,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":50,"cache_write_tokens":10}}})
     )
+}
+
+#[test]
+fn kimi_code_k3_context_variants_are_distinct_and_selectable() {
+    let catalog = ModelCatalog::defaults();
+    let visible = built_in_model_profiles();
+    for (model_id, window) in [("k3", 1_048_576), ("k3-256k", 262_144)] {
+        let model = catalog.get("kimi-code-oauth", model_id).unwrap();
+        assert_eq!(model.model, model_id);
+        assert_eq!(model.maximum_context_window_tokens(), Some(window));
+        assert!(visible.contains(&model));
+    }
+}
+
+#[test]
+fn kimi_for_coding_has_a_verified_context_window() {
+    let model = ModelCatalog::defaults()
+        .get("kimi-code-oauth", "kimi-for-coding")
+        .unwrap();
+    assert_eq!(model.maximum_context_window_tokens(), Some(1_048_576));
 }
 
 #[test]
@@ -67,6 +87,62 @@ fn new_catalogs_are_visible_and_keep_retired_anthropic_cards_resolvable() {
             .count(),
         4
     );
+}
+
+#[tokio::test]
+async fn request_output_budget_reaches_every_http_encoder_without_changing_the_next_request() {
+    for (provider, model_id, field) in [
+        ("anthropic-api", "claude-haiku-4-5-20251001", "max_tokens"),
+        ("openai-api", "gpt-6.1-sol", "max_output_tokens"),
+        ("kimi-global-api", "kimi-k3", "max_completion_tokens"),
+        ("deepseek-api", "deepseek-flash", "max_tokens"),
+        ("google-gemini-api", "gemini-3.8-flash", "maxOutputTokens"),
+    ] {
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let refusal = json!({"error":{"message":"fixture refusal"}}).to_string();
+        let (endpoint, mut captured) =
+            model_http_support::serve_responses(vec![(400, refusal.clone()), (400, refusal)]).await;
+        let mut model = ModelCatalog::defaults().get(provider, model_id).unwrap();
+        let original_limit = model.max_output_tokens;
+        model.base_url = endpoint;
+        save_api_key(root.path(), &model.api_key_env, "fixture-budget-key").unwrap();
+        let client = model_client(model, Some(root.path())).unwrap();
+        let chat = uuid::Uuid::new_v4();
+        for limit in [Some(4096), None] {
+            let context = ModelRequestContext::new(1);
+            let context = limit.map_or_else(
+                || context.clone(),
+                |limit| context.clone().with_output_token_limit(limit),
+            );
+            let (events, _) = mpsc::unbounded_channel();
+            assert!(
+                client
+                    .complete_for_chat_with_context(
+                        chat,
+                        request(Some(ReasoningEffort::High)),
+                        events,
+                        CancellationToken::new(),
+                        context
+                    )
+                    .await
+                    .is_err()
+            );
+            let (_, body) = captured.recv().await.unwrap();
+            let encoded = if field == "maxOutputTokens" {
+                &body["generationConfig"][field]
+            } else {
+                &body[field]
+            };
+            assert_eq!(
+                encoded,
+                &json!(limit.unwrap_or(original_limit)),
+                "{provider}: {body}"
+            );
+            if provider == "anthropic-api" && limit.is_some() {
+                assert_eq!(body["thinking"]["budget_tokens"], 3072);
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -338,7 +414,8 @@ async fn kimi_code_403_preserves_safe_provider_text_and_ambiguous_plan_guidance(
         {
             assert!(message.contains("purchase extra usage"));
             assert!(message.contains("https://www.kimi.com/membership/subscription?tab=quota"));
-            assert!(message.contains("kimi-for-coding"));
+            assert!(message.contains("Check K3 plan access"));
+            assert!(!message.contains("Try kimi-for-coding"));
         }
         assert!(!message.contains("remote-secret-diagnostic"), "{message}");
     }

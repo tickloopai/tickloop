@@ -126,6 +126,7 @@ impl TranscriptWriter {
         if !file.materialized {
             if !accepted.iter().any(|line| {
                 line.is_conversation_message()
+                    || matches!(line, Line::System(entry) if entry.loop_record.as_ref().is_some_and(|record| !record.event_sources.is_empty()))
                     || matches!(line, Line::ArtifactTicks(entry) if entry.cwd.is_some() && (!entry.artifact_ticks.is_empty() || !entry.removed_artifact_ticks.is_empty()))
                     || matches!(line, Line::MonitorMembers(entry) if entry.materializes_chat())
             }) {

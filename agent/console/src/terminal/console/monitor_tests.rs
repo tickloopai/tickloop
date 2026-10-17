@@ -1548,7 +1548,7 @@ fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_other
     subscribed.group = TickGroup::Ticks;
     subscribed.instance = "calendar:quotes".parse().unwrap();
     subscribed.status = "live".into();
-    subscribed.notes = vec!["feedback paused".into()];
+    subscribed.notes = vec!["feedback unavailable".into()];
     subscribed.subscription = Some(crate::monitor_rows::SubscriptionMark {
         frequency: tickloop_agent_protocol::TickSubscriptionFrequency::High,
         is_waiting: true,
@@ -1563,8 +1563,8 @@ fn monitor_rows_take_one_line_when_the_status_fits_beside_the_name_and_two_other
     for (width, preferred, entry, details, two_lines) in [
         (140, None, &finished, "101", false),
         (80, None, &finished, "101", false),
-        (140, None, &subscribed, "feedback paused", true),
-        (200, Some(80), &subscribed, "feedback paused", false),
+        (140, None, &subscribed, "feedback unavailable", true),
+        (200, Some(80), &subscribed, "feedback unavailable", false),
     ] {
         let mut state = State::new(true, width, 25);
         state.switch_view_chat(Some(Uuid::new_v4()));
@@ -2773,7 +2773,7 @@ fn an_artifact_linked_here_shows_no_subscription_mark_and_x_unlinks_it() {
 }
 
 #[test]
-fn a_paused_association_stays_in_words() {
+fn an_unavailable_association_stays_in_words() {
     let (mut state, artifact) = linked_artifact_fixture(true);
     let mut subscription = tests::subscription_row(3);
     subscription.instance = artifact;
@@ -2782,7 +2782,7 @@ fn a_paused_association_stays_in_words() {
     let text = monitor_text(&mut state);
     let row = text.lines().find(|line| line.contains("Brief")).unwrap();
     assert!(
-        row.contains("feedback paused") && !row.contains('↻'),
+        row.contains("feedback unavailable") && !row.contains('↻'),
         "{row}"
     );
     assert_eq!(action_labels(&state)[1], ('x', "unlink"));

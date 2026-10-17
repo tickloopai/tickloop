@@ -23,6 +23,7 @@ pub mod hosted;
 mod jev_review;
 mod loop_lease;
 mod mcp_http;
+mod mcp_resources;
 pub mod mcp_tools;
 mod model_request;
 mod persistence;
@@ -46,6 +47,7 @@ mod delegation;
 mod denials;
 mod directed_summary;
 mod event_sources;
+mod feedback_inbox;
 #[cfg(test)]
 mod file_read_tests;
 mod input_context;
@@ -107,15 +109,15 @@ use tickloop_agent_protocol::{
     ApprovalFailureKind, ApprovalFallbackReason, ApprovalOutcome, ApprovalPath,
     ApprovalReviewerKind, AutoBlockKind, AutoReviewerHealth, ChatId, ChatSnapshot,
     CompactionMarker, Content, Decision, DelegationMetadata, DenialReference, DirectedHumanSource,
-    DirectoryTrustPolicy, Event, EventKind, EventSourceBinding, ExecutionMode, HostCallContext,
-    InputContext, LedgerError, LoopId, LoopSnapshot, LoopState, Message, ModelConfig,
-    ModelRequestKind, MonitorMembership, OperationRecord, OperationState, PendingCommand,
-    PendingInput, PermissionApprovalSource, PermissionExecution, PermissionPolicy,
-    PermissionRequest, PermissionRule, PermissionScope, PromptPolicy, ProposedToolCall,
-    QueuedInput, QueuedInputKind, ReasoningEffort, Receipt, RequestOutcome, RequestUsageLedger,
-    ResponseRejection, Role, RunId, SubagentRegistration, TICK_MANUAL_SOURCE,
-    TICK_SUBSCRIPTION_SOURCE, TaskNotification, ToolResultBlock, ToolResultContent, TriggerSource,
-    Usage, UserShellRecord, UserShellState, VerdictEvidence, projection,
+    DirectoryTrustPolicy, Event, EventKind, ExecutionMode, HostCallContext, InputContext,
+    LedgerError, LoopId, LoopSnapshot, LoopState, Message, ModelConfig, ModelRequestKind,
+    MonitorMembership, OperationRecord, OperationState, PendingCommand, PendingInput,
+    PermissionApprovalSource, PermissionExecution, PermissionPolicy, PermissionRequest,
+    PermissionRule, PermissionScope, PromptPolicy, ProposedToolCall, QueuedInput, QueuedInputKind,
+    ReasoningEffort, Receipt, RequestOutcome, RequestUsageLedger, ResponseRejection, Role, RunId,
+    SubagentRegistration, TICK_MANUAL_SOURCE, TICK_SUBSCRIPTION_SOURCE, TaskNotification,
+    ToolResultBlock, ToolResultContent, TriggerSource, Usage, UserShellRecord, UserShellState,
+    VerdictEvidence, projection,
 };
 use tickloop_agent_tools::permissions::SessionPermissionDecision;
 use tickloop_agent_tools::{
@@ -403,7 +405,8 @@ struct Chat {
     user_shell_queue: Arc<Notify>,
     trigger_cancellations: HashMap<LoopId, CancellationToken>,
     event_cancellations: HashMap<LoopId, CancellationToken>,
-    active_event_claims: HashMap<RunId, ActiveEventClaim>,
+    feedback_inputs: HashMap<RunId, feedback_inbox::FeedbackIdentity>,
+    feedback_cleanup_started: bool,
     /// 等待写入对话的本地消息；Chat 正在执行、等待或运行前台 `!` 命令时暂存，空闲或到达工具边界时写入。
     deferred_messages: Vec<Message>,
     /// 由用户中断或停止而取消的 Run；只有这些 Run 保留部分回复并写中断标记。
@@ -435,15 +438,6 @@ struct ParkedRun {
     sequence: u64,
 }
 
-#[derive(Clone)]
-struct ActiveEventClaim {
-    loop_id: LoopId,
-    source: EventSourceBinding,
-    claim: tickloop_agent_artifacts::ClaimedRequest,
-    /// The service finished the request or already took the claim back; nothing to release.
-    settled: bool,
-}
-
 #[derive(Default)]
 struct SubmissionOptions {
     task_delegation: Option<Receipt>,
@@ -454,7 +448,7 @@ struct SubmissionOptions {
     denial_reference: Option<DenialReference>,
     trigger_source: Option<TriggerSource>,
     trigger_cancel: Option<CancellationToken>,
-    event_claim: Option<ActiveEventClaim>,
+    feedback_input: Option<feedback_inbox::FeedbackIdentity>,
     invoked_skill: Option<tickloop_agent_protocol::InvokedSkill>,
     host_context: Option<HostCallContext>,
     agent_message: Option<AgentMessageSource>,
@@ -920,7 +914,6 @@ impl Agent {
         struct SkillInput {
             skill: String,
             args: Option<String>,
-            resource: Option<String>,
         }
 
         let input = serde_json::from_value::<SkillInput>(input.clone()).map_err(|error| {
@@ -929,21 +922,10 @@ impl Agent {
                 tickloop_agent_config::skills::SKILL_TOOL_NAME
             )
         })?;
-        if input.resource.is_some() && input.args.is_some() {
-            return Err("Skill resource and args are mutually exclusive".into());
-        }
         if input.skill.starts_with("tickloop-artifacts:") {
             return self
-                .remote_skill_tool(
-                    receipt,
-                    &input.skill,
-                    input.args.as_deref().unwrap_or(""),
-                    input.resource.as_deref(),
-                )
+                .remote_skill_tool(receipt, &input.skill, input.args.as_deref().unwrap_or(""))
                 .await;
-        }
-        if input.resource.is_some() {
-            return Err("resource requires an activated remote Skill".into());
         }
         let mut chats = self.inner.chats.lock().await;
         let chat = chats
@@ -977,7 +959,6 @@ impl Agent {
         receipt: &Receipt,
         name: &str,
         arguments: &str,
-        resource: Option<&str>,
     ) -> Result<tickloop_agent_protocol::ToolResult, String> {
         let provider = self
             .inner
@@ -991,7 +972,7 @@ impl Agent {
             .into_iter()
             .find(|definition| definition.name == name)
             .ok_or("unknown or unavailable remote Skill")?;
-        let (cancel, policy_revision, active) = {
+        let (cancel, policy_revision) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or("chat unavailable")?;
             if chat.active_run != Some(receipt.run_id)
@@ -999,49 +980,18 @@ impl Agent {
             {
                 return Err("remote Skill is outside this Run's service authority".into());
             }
-            let active = chat.snapshot.invoked_skills.iter().find(|skill| {
-                skill.name == name
-                    && skill.source == definition.source
-                    && skill.run_id == Some(receipt.run_id)
-            });
-            if let Some(path) = resource {
-                let active = active.ok_or("activate the Skill before reading a reference")?;
-                if active.references.iter().any(|reference| reference == path)
-                    && !chat.bookkeeping.restored_skill_names.contains(name)
-                {
-                    return Ok(tickloop_agent_protocol::ToolResult {
-                        content: format!("Already loaded {name}/{path} · Tickloop Artifacts"),
-                        is_error: false,
-                        output_ref: None,
-                    });
-                }
-            }
             (
                 chat.active.clone().ok_or("Run ended")?,
                 chat.snapshot.policy.revision,
-                active.cloned(),
             )
         };
         let content = provider
-            .read_remote_skill(&definition, resource, cancel.clone())
+            .read_remote_skill(&definition, None, cancel.clone())
             .await?;
-        let invoked = if resource.is_none() {
-            let mut invoked =
-                tickloop_agent_config::skills::expand_remote(&content, &definition, arguments)
-                    .map_err(|error| error.to_string())?;
-            invoked.run_id = Some(receipt.run_id);
-            if let Some(active) = active {
-                for reference in active.references {
-                    let content = provider
-                        .read_remote_skill(&definition, Some(&reference), cancel.clone())
-                        .await?;
-                    append_skill_reference(&mut invoked, &reference, &content)?;
-                }
-            }
-            Some(invoked)
-        } else {
-            None
-        };
+        let mut invoked =
+            tickloop_agent_config::skills::expand_remote(&content, &definition, arguments)
+                .map_err(|error| error.to_string())?;
+        invoked.run_id = Some(receipt.run_id);
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&receipt.chat_id).ok_or("chat unavailable")?;
         if chat.snapshot.policy.revision != policy_revision {
@@ -1054,33 +1004,12 @@ impl Agent {
         {
             return Err("Skill source or Run changed during loading".into());
         }
-        let changed = if let Some(invoked) = invoked {
-            record_invoked_skill(chat, invoked)
-        } else if let Some(path) = resource {
-            let active = chat
-                .snapshot
-                .invoked_skills
-                .iter_mut()
-                .find(|skill| {
-                    skill.name == name
-                        && skill.source == definition.source
-                        && skill.run_id == Some(receipt.run_id)
-                })
-                .ok_or("Skill activation ended")?;
-            if !active.references.iter().any(|reference| reference == path) {
-                append_skill_reference(active, path, &content)?;
-            }
-            chat.bookkeeping.restored_skill_names.remove(name);
-            true
-        } else {
-            false
-        };
+        let changed = record_invoked_skill(chat, invoked);
         self.save(&chat.snapshot);
         Ok(tickloop_agent_protocol::ToolResult {
             content: format!(
-                "{} {name}{} · Tickloop Artifacts",
-                if changed { "Loaded" } else { "Already loaded" },
-                resource.map(|path| format!("/{path}")).unwrap_or_default()
+                "{} {name} · Tickloop Artifacts",
+                if changed { "Loaded" } else { "Already loaded" }
             ),
             is_error: false,
             output_ref: None,
@@ -1114,13 +1043,6 @@ impl Agent {
                 tickloop_agent_protocol::SkillSource::Remote { .. } => {
                     definitions.iter().any(|definition| {
                         definition.name == skill.name && definition.source == skill.source
-                    }) && skill.references.iter().all(|resource| {
-                        chat.snapshot.policy.explicit_decision_with_session(
-                            tickloop_agent_config::skills::SKILL_TOOL_NAME,
-                            &serde_json::json!({"skill":skill.name,"resource":resource}),
-                            receipt.loop_id,
-                            None,
-                        ) != Some(Decision::Deny)
                     }) && provider
                         .as_ref()
                         .is_some_and(|provider| provider.remote_skill_is_current(&skill.source))
@@ -1962,7 +1884,8 @@ impl Agent {
                 user_shell_queue: Arc::new(Notify::new()),
                 trigger_cancellations: HashMap::new(),
                 event_cancellations: HashMap::new(),
-                active_event_claims: HashMap::new(),
+                feedback_inputs: HashMap::new(),
+                feedback_cleanup_started: false,
                 deferred_messages: Vec::new(),
                 user_cancelled_runs: HashSet::new(),
                 output_style,
@@ -2232,13 +2155,15 @@ impl Agent {
             denial_reference,
             trigger_source,
             trigger_cancel,
-            event_claim,
+            feedback_input,
             invoked_skill,
             host_context,
             agent_message,
             directed_human,
             goal_title,
         } = options;
+        let is_feedback = feedback_input.is_some();
+        let resumes_feedback = trigger_source.is_none() && agent_message.is_none();
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(AgentError::Invalid("agent host has shut down".into()));
         }
@@ -2256,6 +2181,34 @@ impl Agent {
         let original = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         if original.family_stopping {
             return Err(AgentError::Invalid("Subagent subtree is stopping".into()));
+        }
+        if let Some(identity) = &feedback_input {
+            if let Some(pending) = original
+                .snapshot
+                .pending_inputs
+                .iter()
+                .find(|pending| pending.receipt.run_id == identity.delivery_id)
+            {
+                return Ok(pending.receipt.clone());
+            }
+            if original
+                .snapshot
+                .message_runs
+                .values()
+                .any(|run| *run == identity.delivery_id)
+                || original
+                    .snapshot
+                    .messages
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|content| matches!(content, Content::Text { text } if text == &input))
+            {
+                return Ok(Receipt {
+                    chat_id,
+                    loop_id: identity.loop_id,
+                    run_id: identity.delivery_id,
+                });
+            }
         }
         if family_generation.is_some_and(|expected| {
             expected != original.family_generation
@@ -2306,7 +2259,9 @@ impl Agent {
             );
             id
         };
-        let run_id = Uuid::new_v4();
+        let run_id = feedback_input
+            .as_ref()
+            .map_or_else(Uuid::new_v4, |feedback| feedback.delivery_id);
         let receipt = Receipt {
             chat_id,
             loop_id,
@@ -2382,7 +2337,7 @@ impl Agent {
                 "this Loop cannot take a manual update".into(),
             ));
         }
-        if trigger_source.is_some() && !is_manual_tick {
+        if trigger_source.is_some() && !is_manual_tick && !is_feedback {
             if trigger_cancel
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
@@ -2409,10 +2364,6 @@ impl Agent {
                 })
                 .map(|pending| pending.receipt.clone());
             if let Some(pending_receipt) = pending_receipt {
-                // A claimed feedback request is never merged into another queued Trigger input.
-                if event_claim.is_some() {
-                    return Err(AgentError::Busy);
-                }
                 *original = candidate;
                 drop(chats);
                 let next = self.next_run(chat_id).await?;
@@ -2461,9 +2412,8 @@ impl Agent {
                 attached_file_reads,
             },
         );
-        let carries_event_claim = event_claim.is_some();
-        if let Some(event_claim) = event_claim {
-            chat.active_event_claims.insert(receipt.run_id, event_claim);
+        if let Some(feedback_input) = feedback_input {
+            chat.feedback_inputs.insert(receipt.run_id, feedback_input);
         }
         let watch = (!chat.watching_commands).then(|| chat.tools.clone());
         chat.watching_commands = true;
@@ -2498,9 +2448,6 @@ impl Agent {
         let next = match self.next_run(chat_id).await {
             Ok(next) => next,
             Err(error) => {
-                if carries_event_claim {
-                    self.withdraw_feedback_input(&receipt).await;
-                }
                 return Err(error);
             }
         };
@@ -2529,6 +2476,9 @@ impl Agent {
         }
 
         self.inner.input_wakeup.send_replace(());
+        if resumes_feedback {
+            Box::pin(self.resume_feedback_sources(chat_id)).await;
+        }
         self.start_title_generation(chat_id).await;
         Ok(requested_receipt)
     }
@@ -2583,7 +2533,10 @@ impl Agent {
         self.acknowledge_task_assignments(receipt)
             .await
             .map_err(AgentError::Invalid)?;
-        if self.maybe_compact(receipt, cancel.clone()).await? {
+        if self
+            .maybe_compact(receipt, &registry.definitions(), cancel.clone())
+            .await?
+        {
             let provider = self.inner.host_tools.read().unwrap().clone();
             if let Some(provider) = provider {
                 tokio::select! {
@@ -2826,8 +2779,20 @@ impl Agent {
                 .enumerate()
                 .filter(|(_, pending)| {
                     pending.armed
-                        && pending.trigger_source.is_none()
+                        && (pending.trigger_source.is_none()
+                            || event_sources::is_feedback_input(pending))
                         && pending.receipt.loop_id == active.loop_id
+                        && candidate
+                            .feedback_inputs
+                            .get(&pending.receipt.run_id)
+                            .is_none_or(|queued| {
+                                candidate.feedback_inputs.get(&active.run_id).is_none_or(
+                                    |running| {
+                                        queued.origin == running.origin
+                                            && queued.account_id == running.account_id
+                                    },
+                                )
+                            })
                         && (pending.agent_message.is_some()
                             || queue_barrier
                                 .is_none_or(|sequence| pending.queued_sequence < sequence))
@@ -3004,6 +2969,8 @@ impl Agent {
         let mut used_calls = HashSet::new();
         async {
             loop {
+                self.checkpoint_feedback_inputs(receipt.chat_id).await?;
+                self.feedback_account_context(&receipt).await?;
                 *is_awaiting_model = true;
                 let host_provider = self.inner.host_tools.read().unwrap().clone();
                 if let Some(provider) = host_provider {
@@ -3134,13 +3101,6 @@ impl Agent {
                                 }
                                 self.record_opened_tick(chat, instance.clone(), title.clone(), *is_terminal);
                             },
-                            Some(crate::host_tools::HostEffect::FinishedFeedbackRequest { request_id }) => {
-                                if let Some(active) = chat.active_event_claims.get_mut(&receipt.run_id)
-                                    && active.claim.request_id == *request_id
-                                {
-                                    active.settled = true;
-                                }
-                            }
                             None => {}
                         }
                     }
@@ -3185,7 +3145,7 @@ impl Agent {
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&receipt.chat_id)?;
         chat.family_finishing.insert(receipt.run_id);
-        let finished_claim = chat.active_event_claims.remove(&receipt.run_id);
+        chat.feedback_inputs.remove(&receipt.run_id);
         run_supervision::clear_run_state(chat, receipt.run_id);
         if internal_failure {
             chat.snapshot.request_usage.fail_in_flight_requests(
@@ -3249,30 +3209,6 @@ impl Agent {
                     EventKind::Failed(error)
                 }
             };
-        // An interrupted or failed Loop stops listening until an explicit Continue links it again.
-        let pauses_feedback = matches!(goal.state, LoopState::Interrupted | LoopState::Failed)
-            && goal
-                .event_sources
-                .iter()
-                .any(|source| !source.resume_required);
-        if pauses_feedback {
-            for source in &mut goal.event_sources {
-                source.resume_required = true;
-            }
-        }
-        let disarms_feedback =
-            pauses_feedback && Self::settle_without_listening(goal, LoopState::Interrupted);
-        // A run that ended without `done` hands its request back: an interrupted run for another
-        // attempt, a finished or failed one as failed.
-        if let Some(claim) = finished_claim.filter(|claim| !claim.settled) {
-            let outcome = if cancel.is_cancelled() && !internal_failure {
-                tickloop_agent_artifacts::ReleaseOutcome::Retry
-            } else {
-                tickloop_agent_artifacts::ReleaseOutcome::Failed
-            };
-            let agent = self.clone();
-            tokio::spawn(async move { agent.release_event_claim(&claim, outcome).await });
-        }
         let is_deliverable = chat
             .snapshot
             .loops
@@ -3298,10 +3234,6 @@ impl Agent {
         }
         let finished_snapshot = chat.snapshot.clone();
         drop(chats);
-        if disarms_feedback {
-            self.disarm_feedback_lease(receipt.chat_id, receipt.loop_id)
-                .await;
-        }
         self.settle_task_claims(&receipt).await;
         self.flush_subagent_notifications(receipt.chat_id).await;
         self.record_directed_replies(&receipt, &finished_snapshot)
@@ -3419,6 +3351,11 @@ impl Agent {
     /// mode and create a pending file snapshot as a rewind point. The run completes snapshots
     /// outside the lock through `complete_file_history_snapshots`.
     fn append_input_message(&self, chat: &mut Chat, pending: PendingInput) {
+        if let Some(identity) = chat.feedback_inputs.remove(&pending.receipt.run_id) {
+            let active = chat.active_run.unwrap_or(pending.receipt.run_id);
+            chat.feedback_inputs.entry(active).or_insert(identity);
+        }
+
         if pending.task_continuation {
             chat.bookkeeping
                 .run_loops
@@ -3627,11 +3564,10 @@ impl Agent {
                     .as_ref()
                     .is_some_and(|source| source.source == TICK_MANUAL_SOURCE)
                     && !tick_subscriptions::can_take_manual_update(goal))
-                || (pending
-                    .trigger_source
-                    .as_ref()
-                    .is_some_and(|source| source.source != TICK_MANUAL_SOURCE)
-                    && !triggers::can_trigger(goal))
+                || (pending.trigger_source.as_ref().is_some_and(|source| {
+                    source.source != TICK_MANUAL_SOURCE
+                        && source.source != event_sources::ARTIFACT_FEEDBACK_SOURCE
+                }) && !triggers::can_trigger(goal))
             {
                 candidate.snapshot.pending_inputs.remove(index);
                 continue;
@@ -4665,6 +4601,11 @@ pub(crate) fn reserved_host_tool_names() -> HashSet<String> {
         .chain(std::iter::once(
             tickloop_agent_config::skills::SKILL_TOOL_NAME.into(),
         ))
+        .chain(
+            mcp_resources::definitions()
+                .into_iter()
+                .map(|tool| tool.name),
+        )
         .chain(crate::mcp_tools::ARTIFACT_ACCOUNT_TOOL_NAMES.map(String::from))
         .collect()
 }
@@ -4707,7 +4648,6 @@ fn record_invoked_skill(chat: &mut Chat, invoked: tickloop_agent_protocol::Invok
         existing.name == invoked.name
             && existing.source == invoked.source
             && existing.content == invoked.content
-            && existing.references == invoked.references
     });
     let restored = chat.bookkeeping.restored_skill_names.remove(&invoked.name);
     chat.snapshot
@@ -4715,21 +4655,6 @@ fn record_invoked_skill(chat: &mut Chat, invoked: tickloop_agent_protocol::Invok
         .retain(|existing| existing.name != invoked.name);
     chat.snapshot.invoked_skills.push(invoked);
     !identical || restored
-}
-
-fn append_skill_reference(
-    skill: &mut tickloop_agent_protocol::InvokedSkill,
-    path: &str,
-    content: &str,
-) -> Result<(), String> {
-    const MAX_ACTIVE_SKILL_BYTES: usize = 1024 * 1024;
-    let reference = format!("\n\nReference file: {path}\n\n{content}");
-    if skill.content.len().saturating_add(reference.len()) > MAX_ACTIVE_SKILL_BYTES {
-        return Err("active Skill reference context is too large".into());
-    }
-    skill.content.push_str(&reference);
-    skill.references.push(path.to_owned());
-    Ok(())
 }
 
 fn remote_skill_allowed(chat: &Chat, source: &tickloop_agent_protocol::SkillSource) -> bool {
@@ -4741,17 +4666,25 @@ fn remote_skill_allowed(chat: &Chat, source: &tickloop_agent_protocol::SkillSour
     else {
         return false;
     };
+    mcp_resource_authority_allowed(
+        chat,
+        &tickloop_agent_protocol::HostToolAuthority::Mcp {
+            server_id: server_id.clone(),
+            account_id: account_id.clone(),
+        },
+    )
+}
+
+fn mcp_resource_authority_allowed(
+    chat: &Chat,
+    authority: &tickloop_agent_protocol::HostToolAuthority,
+) -> bool {
     chat.snapshot.delegation.as_ref().is_none_or(|delegation| {
         delegation
             .ceiling
             .host_tools
             .get(crate::mcp_tools::ARTIFACT_READ_TOOL)
-            .is_some_and(|authorities| {
-                authorities.contains(&tickloop_agent_protocol::HostToolAuthority::Mcp {
-                    server_id: server_id.clone(),
-                    account_id: account_id.clone(),
-                })
-            })
+            .is_some_and(|authorities| authorities.contains(authority))
     })
 }
 

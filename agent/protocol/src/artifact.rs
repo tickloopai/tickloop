@@ -1,5 +1,14 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ArtifactFeedbackHistory {
+    #[default]
+    #[serde(rename = "new")]
+    NewOnly,
+    #[serde(rename = "all")]
+    All,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactAudience {

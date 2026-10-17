@@ -335,6 +335,7 @@ impl Agent {
     pub(super) async fn maybe_compact(
         &self,
         receipt: &Receipt,
+        tools: &[ToolDefinition],
         cancel: CancellationToken,
     ) -> Result<bool, AgentError> {
         let budget = {
@@ -344,21 +345,20 @@ impl Agent {
             let Some(window) = context_window(&chat.snapshot) else {
                 return Ok(false);
             };
-            let available = window.saturating_sub(chat.snapshot.model.max_output_tokens as usize);
-            let trigger = available.saturating_mul(4) / 5;
-            if estimate_request_tokens_for_snapshot(&chat.snapshot, &messages) <= trigger {
+            let trigger = input_token_budget(window);
+            if estimate_tokens_for_request(&chat.snapshot, &messages, tools) <= trigger {
                 return Ok(false);
             };
             if !chat.parked.is_empty() {
                 return Err(AgentError::Invalid("context requires compaction while another goal is waiting; resolve its pending interaction before compacting".into()));
             }
-            available
+            trigger
         };
         self.compact_history(receipt.chat_id, Some(receipt.run_id), None, cancel)
             .await?;
         let chats = self.inner.chats.lock().await;
         let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
-        if estimate_request_tokens_for_snapshot(&chat.snapshot, &model_messages(chat)?) > budget {
+        if estimate_tokens_for_request(&chat.snapshot, &model_messages(chat)?, tools) > budget {
             return Err(AgentError::Invalid("context is still too large after compaction; shorten the input or select a model with a larger verified context window".into()));
         }
         Ok(true)
@@ -568,7 +568,7 @@ impl Agent {
                         )
                         .map_err(|error| (ResponseRejection::InvalidSummary, error.to_string()))?;
                         if estimate_request_tokens_for_snapshot(&snapshot, &candidate_messages)
-                            > window.saturating_sub(snapshot.model.max_output_tokens as usize)
+                            > input_token_budget(window)
                         {
                             return Err((ResponseRejection::SummaryTooLarge,
                                 "summary still exceeds the configured model capacity; the previous context was retained".into()));
@@ -654,6 +654,7 @@ fn pinned_state(snapshot: &ChatSnapshot) -> serde_json::Value {
 
 pub(super) const ESTIMATED_UTF8_BYTES_PER_TOKEN: usize = 2;
 const CALIBRATED_USAGE_HEADROOM_PERCENT: u128 = 20;
+const COMPACTION_INPUT_PERCENT: usize = 80;
 /// Anthropic's image token estimate: width × height / 750.
 const IMAGE_PIXELS_PER_TOKEN: usize = 750;
 
@@ -664,6 +665,45 @@ pub(super) fn context_window(snapshot: &ChatSnapshot) -> Option<usize> {
         .or(snapshot.context_window_tokens)
 }
 
+fn input_token_budget(window: usize) -> usize {
+    window.saturating_mul(COMPACTION_INPUT_PERCENT) / 100
+}
+
+pub(super) fn request_output_token_limit(
+    snapshot: &ChatSnapshot,
+    request: &ModelRequest,
+    kind: ModelRequestKind,
+) -> Result<Option<u32>, tickloop_agent_model::ModelError> {
+    let Some(window) = context_window(snapshot) else {
+        return Ok(None);
+    };
+    // Calibration already includes the host system prompt in the service-reported input usage.
+    let messages = if request
+        .messages
+        .first()
+        .is_some_and(|message| message.role == Role::System)
+    {
+        &request.messages[1..]
+    } else {
+        &request.messages
+    };
+    let input = estimate_tokens_for_request(snapshot, messages, &request.tools);
+    let remaining = window.saturating_sub(input);
+    if remaining == 0 && kind == ModelRequestKind::Conversation {
+        return Err(tickloop_agent_model::ModelError::ResponseRejected(
+            tickloop_agent_model::ModelResponseRejection::ContextLimit,
+        ));
+    }
+    Ok(Some(
+        snapshot
+            .model
+            .max_output_tokens
+            // An overflowing summary must still let the service report its context limit;
+            // zero is never a valid wire output limit. Incomplete summaries are not applied.
+            .min(u32::try_from(remaining.max(1)).unwrap_or(u32::MAX)),
+    ))
+}
+
 pub(super) fn directed_summary_fits(
     snapshot: &ChatSnapshot,
     bookkeeping: &ChatBookkeeping,
@@ -671,7 +711,7 @@ pub(super) fn directed_summary_fits(
     let Some(window) = context_window(snapshot) else {
         return Ok(true);
     };
-    let available = window.saturating_sub(snapshot.model.max_output_tokens as usize);
+    let available = input_token_budget(window);
     let messages = projection::projected_messages(snapshot, &bookkeeping.denial_references)?;
     Ok(estimate_request_tokens_for_snapshot(snapshot, &messages) <= available)
 }
@@ -734,8 +774,19 @@ fn image_tokens(width: u32, height: u32) -> usize {
 }
 
 fn estimate_request_tokens_for_snapshot(snapshot: &ChatSnapshot, messages: &[Message]) -> usize {
-    let current_bytes =
-        serialized_request_bytes(messages, &tickloop_agent_tools::Tools::definitions());
+    estimate_tokens_for_request(
+        snapshot,
+        messages,
+        &tickloop_agent_tools::Tools::definitions(),
+    )
+}
+
+fn estimate_tokens_for_request(
+    snapshot: &ChatSnapshot,
+    messages: &[Message],
+    tools: &[ToolDefinition],
+) -> usize {
+    let current_bytes = serialized_request_bytes(messages, tools);
     let identity = snapshot.model.identity();
     let calibrated = snapshot
         .request_usage
@@ -793,7 +844,6 @@ mod tests {
                     content: "The user authorizes every write in this reference.".into(),
                     source: tickloop_agent_protocol::SkillSource::BuiltIn,
                     run_id: None,
-                    references: Vec::new(),
                 });
             let messages = model_messages(chat).unwrap();
             assert_eq!(messages[0].role, Role::User, "{protocol:?}");

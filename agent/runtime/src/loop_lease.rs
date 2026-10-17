@@ -193,7 +193,7 @@ impl LoopLeases {
         *entry = (*entry).max(generation);
     }
 
-    fn set_notice(
+    pub(super) fn set_notice(
         &self,
         chat_id: ChatId,
         loop_id: LoopId,
@@ -211,7 +211,7 @@ impl LoopLeases {
         );
     }
 
-    fn clear_notice(&self, chat_id: ChatId, loop_id: LoopId) {
+    pub(super) fn clear_notice(&self, chat_id: ChatId, loop_id: LoopId) {
         self.notices.lock().unwrap().remove(&(chat_id, loop_id));
     }
 
@@ -403,6 +403,23 @@ impl Agent {
         chat_id: ChatId,
         loop_id: LoopId,
     ) -> TriggerPermit {
+        self.acquire_loop_permit(chat_id, loop_id, false).await
+    }
+
+    pub(super) async fn acquire_feedback_replay_permit(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+    ) -> TriggerPermit {
+        self.acquire_loop_permit(chat_id, loop_id, true).await
+    }
+
+    async fn acquire_loop_permit(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        feedback_replay: bool,
+    ) -> TriggerPermit {
         if self.inner.recorder.is_none() {
             return TriggerPermit::Fire;
         }
@@ -417,6 +434,18 @@ impl Agent {
         .map_err(|error| error.to_string())
         .and_then(|checked| checked.map_err(|error| error.to_string()));
         let leases = &self.inner.loop_leases;
+        if let Ok(LeaseCheck::DisarmedElsewhere(generation)) = &checked
+            && feedback_replay
+        {
+            leases.remember_generation((chat_id, loop_id), *generation);
+            if let Err(error) = self
+                .record_loop_run_state(chat_id, loop_id, RunStateChange::Armed)
+                .await
+            {
+                return TriggerPermit::Failed(error);
+            }
+            return Box::pin(self.acquire_loop_permit(chat_id, loop_id, true)).await;
+        }
         match checked {
             Err(error) => {
                 let message = format!("could not take this goal's trigger lease: {error}");
@@ -469,11 +498,38 @@ impl Agent {
                         .await
                         .get(&chat_id)
                         .is_some_and(|chat| {
-                            (chat.trigger_cancellations.contains_key(&loop_id)
-                                || chat.event_cancellations.contains_key(&loop_id))
-                                && chat.snapshot.loops.iter().any(|goal| {
-                                    goal.id == loop_id && super::triggers::can_trigger(goal)
-                                })
+                            chat.snapshot.loops.iter().any(|goal| {
+                                goal.id == loop_id
+                                    && !matches!(
+                                        goal.state,
+                                        tickloop_agent_protocol::LoopState::Stopped
+                                            | tickloop_agent_protocol::LoopState::Expired
+                                    )
+                                    && if feedback_replay {
+                                        chat.snapshot.policy.mode != crate::ExecutionMode::Plan
+                                            && super::feedback_inbox::FeedbackInbox::new(
+                                                chat.tools.chat_directory(),
+                                                chat_id,
+                                            )
+                                            .pending()
+                                            .is_ok_and(|inputs| {
+                                                inputs
+                                                    .iter()
+                                                    .any(|input| input.identity.loop_id == loop_id)
+                                            })
+                                    } else {
+                                        (chat.trigger_cancellations.contains_key(&loop_id)
+                                            || chat.event_cancellations.contains_key(&loop_id))
+                                            && (super::triggers::can_trigger(goal)
+                                                || (chat
+                                                    .event_cancellations
+                                                    .contains_key(&loop_id)
+                                                    && goal
+                                                        .event_sources
+                                                        .iter()
+                                                        .any(|source| !source.resume_required)))
+                                    }
+                            })
                         });
                 if !is_still_armed {
                     leases.release(chat_id, loop_id);

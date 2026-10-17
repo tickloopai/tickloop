@@ -303,7 +303,7 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
             } else if request.starts_with(&format!("PUT /artifact/api/v1/agent/links/{id} ")) {
                 let link: serde_json::Value = serde_json::from_slice(&request_body).unwrap();
                 json!({"artifact_id":id,"binding_id":link["binding_id"],"epoch":1})
-            } else if request.starts_with("GET /artifact/api/v1/agent/requests?") {
+            } else if request.starts_with("GET /artifact/api/v1/agent/feedback?") {
                 json!({"items":[],"next_cursor":null})
             } else {
                 artifact
@@ -333,6 +333,8 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
         session.wait("ABCD");
         session.wait("[All]");
         session.wait("PTY Research");
+        session.send(b"\r");
+        session.wait("Receive feedback");
         session.send(b"\r");
         session.wait("Artifacts (1)");
         session.wait("Monitor 1");

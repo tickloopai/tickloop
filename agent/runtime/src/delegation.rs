@@ -967,6 +967,7 @@ impl Agent {
         parent: &'a Receipt,
         call_id: &'a str,
         prepared: &'a PreparedDelegation,
+        feedback_account: Option<crate::host_tools::ArtifactAccountContext>,
         cancel: CancellationToken,
     ) -> Pin<Box<dyn Future<Output = Result<ToolResult, String>> + Send + 'a>> {
         Box::pin(async move {
@@ -1103,6 +1104,15 @@ impl Agent {
                         .collect();
                     if let Some(provider) = self.inner.host_tools.read().unwrap().as_ref() {
                         record_artifact_account(&mut host_tools, provider.as_ref())?;
+                    }
+                    if let Some(account) = &feedback_account {
+                        let authority = HostToolAuthority::Mcp {
+                            server_id: account.origin.clone(),
+                            account_id: account.account_id.clone(),
+                        };
+                        for name in crate::mcp_tools::ARTIFACT_ACCOUNT_TOOL_NAMES {
+                            host_tools.insert(name.to_owned(), BTreeSet::from([authority.clone()]));
+                        }
                     }
                     if let Some(context) = &mut host_context {
                         context.interaction = None;

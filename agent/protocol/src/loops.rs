@@ -58,7 +58,7 @@ pub struct EventSourceBinding {
     pub binding_id: Uuid,
     pub client_instance_id: Uuid,
     pub epoch: u64,
-    /// Listening waits for an explicit Continue, which links the artifact again.
+    /// Historical restoration or unavailable account access requires explicit continuation.
     pub resume_required: bool,
     /// Unix milliseconds of the newest feedback request delivered through this link.
     #[serde(default, skip_serializing_if = "Option::is_none")]

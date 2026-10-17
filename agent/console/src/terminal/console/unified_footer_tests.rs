@@ -393,7 +393,7 @@ fn subagents_robot_prefix_preserves_divider_bounds_and_hints_in_both_states() {
             let (row, column) = (target.row, target.categories[0].0.start);
             let lower = &rendered[target.row];
             assert!(lower.starts_with(&format!("─ {label} ")), "{lower}");
-            assert!(lower.ends_with("Context 21% used ─"), "{lower}");
+            assert!(lower.ends_with("Input 21% (last) ─"), "{lower}");
             assert_eq!(display_width(lower), state.width);
             assert_eq!(target.categories[0].0, 2..15);
             assert_eq!(
@@ -450,9 +450,9 @@ fn divider_edges_use_short_rules_and_exact_label_targets_with_narrow_fallbacks()
         }],
     );
     for (width, prefix, suffix) in [
-        (80, "─ ⏺ Subagents 1 ", "Context 21% used ─"),
-        (55, "⏺ Subagents 1 ", "Context 21% used ─"),
-        (53, "⏺ Subagents 1 ", "Context 21% used"),
+        (80, "─ ⏺ Subagents 1 ", "Input 21% (last) ─"),
+        (55, "⏺ Subagents 1 ", "Input 21% (last) ─"),
+        (53, "⏺ Subagents 1 ", "Input 21% (last)"),
     ] {
         console.state.lock().unwrap().resize(width, 24);
         let rendered = frame(&console);
@@ -511,8 +511,8 @@ fn subagents_and_context_colors_resolve_from_theme_roles() {
             )
             .unwrap();
         for (context, text, context_role) in [
-            (Some((0, 200_000)), "Context 0% used", Role::Success),
-            (None, "Context unknown", Role::MutedText),
+            (Some((0, 200_000)), "Input 0% (last)", Role::Success),
+            (None, "Input unknown", Role::MutedText),
         ] {
             console
                 .update_status_area("Auto".into(), "fixture".into(), context, None)
@@ -678,7 +678,7 @@ fn core_status_floats_on_the_lower_divider_with_roles_and_preserved_fallback_not
         .position(|row| row.contains("keep literal jk draft"))
         .unwrap();
     assert!(
-        lines[editor + 1].starts_with('─') && lines[editor + 1].ends_with("Context 21% used ─"),
+        lines[editor + 1].starts_with('─') && lines[editor + 1].ends_with("Input 21% (last) ─"),
         "{lines:?}"
     );
     assert_eq!(
@@ -702,7 +702,7 @@ fn core_status_floats_on_the_lower_divider_with_roles_and_preserved_fallback_not
     let (styled, _, _) = state.normal_styled_frame();
     let lower = styled
         .iter()
-        .find(|line| line.text().contains("Context 21% used"))
+        .find(|line| line.text().contains("Input 21% (last)"))
         .unwrap();
     assert!(
         lower
@@ -714,7 +714,7 @@ fn core_status_floats_on_the_lower_divider_with_roles_and_preserved_fallback_not
         lower
             .spans
             .iter()
-            .any(|span| span.text.contains("Context 21% used") && span.role == Some(Role::Success))
+            .any(|span| span.text.contains("Input 21% (last)") && span.role == Some(Role::Success))
     );
     drop(state);
     console.set_connection_notice(None).unwrap();
@@ -747,7 +747,7 @@ fn core_status_is_always_right_aligned_with_styled_content_and_fallback() {
             .unwrap();
         let divider = &rendered[editor + 1];
         assert!(
-            divider.starts_with('─') && divider.ends_with("模型 fixture · Context unknown ─"),
+            divider.starts_with('─') && divider.ends_with("模型 fixture · Input unknown ─"),
             "{rendered:?}"
         );
         assert_eq!(display_width(divider), 79);
@@ -810,7 +810,7 @@ fn agents_entry_is_on_lower_divider_and_family_is_expanded_by_default() {
         .unwrap();
     assert!(
         rendered[editor + 1].contains("Subagents 1")
-            && rendered[editor + 1].ends_with("Context 21% used ─"),
+            && rendered[editor + 1].ends_with("Input 21% (last) ─"),
         "{rendered:?}"
     );
     assert_eq!(

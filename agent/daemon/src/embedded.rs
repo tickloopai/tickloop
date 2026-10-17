@@ -441,9 +441,13 @@ impl EmbeddedAgentAccess {
                         .await?,
                 ))
             }
-            AgentCommand::LinkArtifact { execution, tick } => {
+            AgentCommand::LinkArtifact {
+                execution,
+                tick,
+                history,
+            } => {
                 let chat = self.chat(execution).await?;
-                self.inner.agent.link_artifact(chat, &tick).await?;
+                self.inner.agent.link_artifact(chat, &tick, history).await?;
                 Ok(CommandResult::Done)
             }
             AgentCommand::ListArtifactTicks { execution } => {

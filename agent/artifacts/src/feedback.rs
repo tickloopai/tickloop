@@ -1,8 +1,7 @@
-//! The host lifecycle of @tickloop feedback requests: an account's Agent link to an artifact and
-//! the pending, claim, renew and release calls under `/api/v1/agent/*`.
+//! Independent Artifact feedback delivery for each receiving Agent; acknowledgements confirm transport, not model work.
 
 use reqwest::Method;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -21,6 +20,7 @@ pub struct AgentLinkRequest {
     pub client_instance_id: Uuid,
     pub chat_id: Uuid,
     pub loop_id: Uuid,
+    pub history: tickloop_agent_protocol::ArtifactFeedbackHistory,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -31,48 +31,38 @@ pub struct AgentLink {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct PendingRequest {
-    pub request_id: String,
+pub struct FeedbackDelivery {
+    pub delivery_id: String,
+    pub feedback_id: String,
+    pub thread_id: String,
     pub created_at: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct PendingRequestPage {
-    pub items: Vec<PendingRequest>,
+pub struct FeedbackPage {
+    pub items: Vec<FeedbackDelivery>,
     #[serde(default)]
     pub next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct ClaimedRequest {
-    pub request_id: String,
+pub struct ClaimedFeedback {
+    pub delivery_id: String,
+    pub feedback_id: String,
     pub claim_id: String,
     pub fencing_token: String,
     pub lease_expires_at: String,
     pub input: Value,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReleaseOutcome {
-    /// The request returns to pending and is delivered again.
-    Retry,
-    Failed,
-}
-
-#[derive(Deserialize)]
-struct RenewedLease {
-    lease_expires_at: String,
-}
-
 fn is_identifier(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_IDENTIFIER_BYTES
 }
 
-fn request_path(request_id: &str, action: &str) -> Result<String, ArtifactError> {
+fn delivery_path(delivery_id: &str, action: &str) -> Result<String, ArtifactError> {
     Ok(format!(
-        "/api/v1/agent/requests/{}/{action}",
-        path_segment(request_id)?
+        "/api/v1/agent/feedback/{}/{action}",
+        path_segment(delivery_id)?
     ))
 }
 
@@ -107,6 +97,7 @@ impl ArtifactClient {
                     "client_instance_id": request.client_instance_id,
                     "chat_id": request.chat_id,
                     "loop_id": request.loop_id,
+                    "history": request.history,
                 })),
                 MAX_RESPONSE_BYTES,
                 &credential,
@@ -121,12 +112,12 @@ impl ArtifactClient {
         Ok(link)
     }
 
-    pub async fn pending_requests(
+    pub async fn pending_feedback(
         &self,
         account_id: &str,
         link: &AgentLink,
         cursor: Option<&str>,
-    ) -> Result<PendingRequestPage, ArtifactError> {
+    ) -> Result<FeedbackPage, ArtifactError> {
         let credential = self.account_credential(account_id)?;
         let binding_id = link.binding_id.to_string();
         let epoch = link.epoch.to_string();
@@ -138,10 +129,10 @@ impl ArtifactClient {
         if let Some(cursor) = cursor {
             query.push(("cursor", cursor));
         }
-        let page: PendingRequestPage = self
+        let page: FeedbackPage = self
             .catalog_request_with_credential(
                 Method::GET,
-                "/api/v1/agent/requests",
+                "/api/v1/agent/feedback",
                 &query,
                 None,
                 MAX_RESPONSE_BYTES,
@@ -150,7 +141,9 @@ impl ArtifactClient {
             .await?;
         if page.items.len() > MAX_REQUESTS_PER_PAGE
             || page.items.iter().any(|item| {
-                !is_identifier(&item.request_id) || path_segment(&item.request_id).is_err()
+                Uuid::parse_str(&item.delivery_id).is_err()
+                    || !is_identifier(&item.feedback_id)
+                    || !is_identifier(&item.thread_id)
             })
             || page
                 .next_cursor
@@ -162,18 +155,18 @@ impl ArtifactClient {
         Ok(page)
     }
 
-    pub async fn claim_request(
+    pub async fn claim_feedback(
         &self,
         account_id: &str,
         link: &AgentLink,
         client_instance_id: Uuid,
-        request_id: &str,
-    ) -> Result<ClaimedRequest, ArtifactError> {
+        delivery_id: &str,
+    ) -> Result<ClaimedFeedback, ArtifactError> {
         let credential = self.account_credential(account_id)?;
-        let claim: ClaimedRequest = self
+        let claim: ClaimedFeedback = self
             .catalog_request_with_credential(
                 Method::POST,
-                &request_path(request_id, "claim")?,
+                &delivery_path(delivery_id, "claim")?,
                 &[],
                 Some(json!({
                     "artifact_id": link.artifact_id,
@@ -185,7 +178,7 @@ impl ArtifactClient {
                 &credential,
             )
             .await?;
-        if claim.request_id != request_id
+        if claim.delivery_id != delivery_id
             || !is_identifier(&claim.claim_id)
             || !is_identifier(&claim.fencing_token)
             || claim.lease_expires_at.is_empty()
@@ -198,56 +191,67 @@ impl ArtifactClient {
         Ok(claim)
     }
 
-    /// Extends the claim's lease and returns its new expiry.
-    pub async fn renew_request(
+    pub async fn release_feedback(
         &self,
         account_id: &str,
         artifact_id: &str,
-        claim: &ClaimedRequest,
-    ) -> Result<String, ArtifactError> {
-        let credential = self.account_credential(account_id)?;
-        let renewed: RenewedLease = self
-            .catalog_request_with_credential(
-                Method::POST,
-                &request_path(&claim.request_id, "renew")?,
-                &[],
-                Some(json!({
-                    "artifact_id": artifact_id,
-                    "claim_id": claim.claim_id,
-                    "fencing_token": claim.fencing_token,
-                })),
-                MAX_RESPONSE_BYTES,
-                &credential,
-            )
-            .await?;
-        if renewed.lease_expires_at.is_empty() || renewed.lease_expires_at.len() > MAX_LEASE_BYTES {
-            return Err(ArtifactError::InvalidResponse);
-        }
-        Ok(renewed.lease_expires_at)
-    }
-
-    pub async fn release_request(
-        &self,
-        account_id: &str,
-        artifact_id: &str,
-        claim: &ClaimedRequest,
-        outcome: ReleaseOutcome,
+        claim: &ClaimedFeedback,
     ) -> Result<(), ArtifactError> {
         let credential = self.account_credential(account_id)?;
         self.catalog_request_with_credential::<Value>(
             Method::POST,
-            &request_path(&claim.request_id, "release")?,
+            &delivery_path(&claim.delivery_id, "release")?,
             &[],
             Some(json!({
                 "artifact_id": artifact_id,
                 "claim_id": claim.claim_id,
                 "fencing_token": claim.fencing_token,
-                "outcome": outcome,
             })),
             MAX_RESPONSE_BYTES,
             &credential,
         )
         .await
         .map(|_| ())
+    }
+    pub async fn acknowledge_feedback(
+        &self,
+        account_id: &str,
+        artifact_id: &str,
+        claim: &ClaimedFeedback,
+    ) -> Result<(), ArtifactError> {
+        let credential = self.account_credential(account_id)?;
+        let value: Value = self.catalog_request_with_credential(
+            Method::POST, &delivery_path(&claim.delivery_id, "ack")?, &[],
+            Some(json!({"artifact_id": artifact_id, "claim_id": claim.claim_id, "fencing_token": claim.fencing_token})),
+            MAX_RESPONSE_BYTES, &credential,
+        ).await?;
+        if value.get("delivery_id").and_then(Value::as_str) != Some(claim.delivery_id.as_str())
+            || value.get("accepted").and_then(Value::as_bool) != Some(true)
+        {
+            return Err(ArtifactError::InvalidResponse);
+        }
+        Ok(())
+    }
+
+    pub async fn unlink_agent(
+        &self,
+        account_id: &str,
+        link: &AgentLink,
+    ) -> Result<(), ArtifactError> {
+        let credential = self.account_credential(account_id)?;
+        let value: Value = self
+            .catalog_request_with_credential(
+                Method::DELETE,
+                &format!("/api/v1/agent/links/{}", path_segment(&link.artifact_id)?),
+                &[],
+                Some(json!({"binding_id": link.binding_id, "epoch": link.epoch})),
+                MAX_RESPONSE_BYTES,
+                &credential,
+            )
+            .await?;
+        if value.get("removed").and_then(Value::as_bool) != Some(true) {
+            return Err(ArtifactError::InvalidResponse);
+        }
+        Ok(())
     }
 }

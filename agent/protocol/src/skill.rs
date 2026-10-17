@@ -60,6 +60,4 @@ pub struct InvokedSkill {
     pub source: SkillSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<RunId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub references: Vec<String>,
 }
