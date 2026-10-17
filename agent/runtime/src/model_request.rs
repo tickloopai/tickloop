@@ -852,49 +852,76 @@ fn model_error_retry_delay(
 }
 
 pub(super) fn model_failure_outcome(error: &ModelError) -> RequestOutcome {
-    match error {
-        ModelError::AtStage { error, .. } => model_failure_outcome(error),
-        ModelError::Cancelled => RequestOutcome::Cancelled,
-        ModelError::TimedOut => RequestOutcome::TimedOut,
-        ModelError::ResponseRejected(reason) => RequestOutcome::HostRejected(match reason {
-            ModelResponseRejection::InvalidToolCall
-            | ModelResponseRejection::UnexpectedToolOperation => ResponseRejection::InvalidToolCall,
-            ModelResponseRejection::MalformedStructuredOutput => ResponseRejection::InvalidVerdict,
-            ModelResponseRejection::OutputLimit => ResponseRejection::OutputLimit,
-            ModelResponseRejection::ContextLimit => ResponseRejection::ContextLimit,
-            ModelResponseRejection::ContentFilter => ResponseRejection::ContentFilter,
-            ModelResponseRejection::Refusal => ResponseRejection::Refusal,
-            ModelResponseRejection::UnsupportedContinuation => {
-                ResponseRejection::UnsupportedContinuation
+    use tickloop_agent_protocol::ProviderFailureClass;
+
+    let failure = match error {
+        ModelError::AtStage { error, .. } => return model_failure_outcome(error),
+        ModelError::Cancelled => return RequestOutcome::Cancelled,
+        ModelError::TimedOut | ModelError::TimedOutAt { .. } => return RequestOutcome::TimedOut,
+        ModelError::ResponseRejected(reason) => {
+            return RequestOutcome::HostRejected(match reason {
+                ModelResponseRejection::InvalidToolCall
+                | ModelResponseRejection::UnexpectedToolOperation => {
+                    ResponseRejection::InvalidToolCall
+                }
+                ModelResponseRejection::MalformedStructuredOutput => {
+                    ResponseRejection::InvalidVerdict
+                }
+                ModelResponseRejection::OutputLimit => ResponseRejection::OutputLimit,
+                ModelResponseRejection::ContextLimit => ResponseRejection::ContextLimit,
+                ModelResponseRejection::ContentFilter => ResponseRejection::ContentFilter,
+                ModelResponseRejection::Refusal => ResponseRejection::Refusal,
+                ModelResponseRejection::UnsupportedContinuation => {
+                    ResponseRejection::UnsupportedContinuation
+                }
+            });
+        }
+        ModelError::Configuration(_) | ModelError::UnsupportedProtocol(_) => {
+            RequestFailure::LocalConfiguration
+        }
+        ModelError::Authentication
+        | ModelError::AuthenticationAt { .. }
+        | ModelError::CodexNotLoggedIn
+        | ModelError::MiniMaxNotLoggedIn
+        | ModelError::CopilotNotLoggedIn
+        | ModelError::CodexAuthentication
+        | ModelError::MiniMaxAuthentication
+        | ModelError::CopilotAuthentication => RequestFailure::Authentication,
+        ModelError::InsufficientBalance => RequestFailure::Http { status: 402 },
+        ModelError::QuotaExhausted { status, .. }
+        | ModelError::EntitlementDenied { status, .. } => RequestFailure::Http { status: *status },
+        ModelError::RateLimited => RequestFailure::RateLimited,
+        ModelError::Connection | ModelError::ConnectionAt { .. } => RequestFailure::Connection,
+        ModelError::StreamInterrupted | ModelError::StreamInterruptedAfterOutput => {
+            RequestFailure::StreamInterrupted
+        }
+        ModelError::InvalidResponse(_) => {
+            RequestFailure::Protocol(ProtocolFailure::InvalidResponse)
+        }
+        ModelError::ProviderFailure | ModelError::RequestBudgetExhausted { .. } => {
+            RequestFailure::ProviderFailure
+        }
+        ModelError::Http { status } | ModelError::HttpResponse { status, .. } => {
+            if *status == 429 {
+                RequestFailure::RateLimited
+            } else {
+                RequestFailure::Http { status: *status }
             }
-        }),
-        _ => RequestOutcome::Failed(match error.kind() {
-            ModelFailureKind::Configuration => RequestFailure::LocalConfiguration,
-            ModelFailureKind::AuthenticationRequired | ModelFailureKind::AuthenticationFailed => {
-                RequestFailure::Authentication
-            }
-            ModelFailureKind::QuotaExhausted => RequestFailure::Http {
-                status: error.status().unwrap_or(402),
+        }
+        ModelError::ProviderHttp(failure) => match failure.class {
+            ProviderFailureClass::Authentication => RequestFailure::Authentication,
+            ProviderFailureClass::RateLimit => RequestFailure::RateLimited,
+            ProviderFailureClass::UsageLimit
+            | ProviderFailureClass::Billing
+            | ProviderFailureClass::UsageOrPlan
+            | ProviderFailureClass::ModelUnavailable
+            | ProviderFailureClass::ServerError
+            | ProviderFailureClass::Refused => RequestFailure::Http {
+                status: failure.status,
             },
-            ModelFailureKind::EntitlementDenied => RequestFailure::Http {
-                status: error.status().unwrap_or(403),
-            },
-            ModelFailureKind::RateLimited => RequestFailure::RateLimited,
-            ModelFailureKind::Connection => RequestFailure::Connection,
-            ModelFailureKind::StreamInterrupted => RequestFailure::StreamInterrupted,
-            ModelFailureKind::InvalidResponse => {
-                RequestFailure::Protocol(ProtocolFailure::InvalidResponse)
-            }
-            ModelFailureKind::ProviderFailure => error
-                .status()
-                .map_or(RequestFailure::ProviderFailure, |status| {
-                    RequestFailure::Http { status }
-                }),
-            ModelFailureKind::Cancelled
-            | ModelFailureKind::Timeout
-            | ModelFailureKind::ResponseRejected => unreachable!(),
-        }),
-    }
+        },
+    };
+    RequestOutcome::Failed(failure)
 }
 
 #[cfg(test)]
@@ -915,6 +942,24 @@ mod tests {
             let expected = model_failure_outcome(&plain);
             let staged = plain.at_stage(tickloop_agent_model::ModelRequestStage::ResponseHeaders);
             assert_eq!(model_failure_outcome(&staged), expected);
+        }
+    }
+
+    #[test]
+    fn transport_timeouts_preserve_their_outcome_without_panicking() {
+        use tickloop_agent_model::ModelRequestStage;
+
+        for stage in [
+            ModelRequestStage::Connect,
+            ModelRequestStage::ResponseHeaders,
+            ModelRequestStage::ResponseStream,
+        ] {
+            for error in [
+                ModelError::TimedOutAt { stage },
+                ModelError::TimedOutAt { stage }.at_stage(stage),
+            ] {
+                assert_eq!(model_failure_outcome(&error), RequestOutcome::TimedOut);
+            }
         }
     }
 

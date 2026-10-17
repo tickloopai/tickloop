@@ -57,6 +57,7 @@ mod request_failure_tests;
 #[cfg(test)]
 mod request_race_tests;
 mod rewind;
+mod run_supervision;
 mod session_permissions;
 mod shell_description;
 mod shell_task_center;
@@ -2992,18 +2993,18 @@ impl Agent {
         Ok(())
     }
 
-    async fn run(
+    async fn execute_run(
         &self,
         receipt: Receipt,
         mut request: ModelRequest,
         cancel: CancellationToken,
-    ) -> Option<(Receipt, ModelRequest, CancellationToken)> {
+        is_awaiting_model: &mut bool,
+    ) -> Result<Usage, String> {
         self.complete_file_history_snapshots(receipt.chat_id).await;
         let mut used_calls = HashSet::new();
-        let mut is_awaiting_model = true;
-        let mut result:Result<Usage,String> = async {
+        async {
             loop {
-                is_awaiting_model = true;
+                *is_awaiting_model = true;
                 let host_provider = self.inner.host_tools.read().unwrap().clone();
                 if let Some(provider) = host_provider {
                     let _ = provider.refresh(cancel.clone()).await;
@@ -3026,7 +3027,7 @@ impl Agent {
                 };
                 request.tools = registry.definitions();
                 let output = self.model_request(&receipt,request,&mut registry,cancel.clone(),&mut used_calls).await.map_err(|error|error.to_string())?;
-                is_awaiting_model = false;
+                *is_awaiting_model = false;
                 let assistant_message_id = Uuid::new_v4();
                 let calls = output.content.iter().filter_map(|content| {
                     if let Content::ToolUse {id,name,input}=content {Some(ProposedToolCall {call_id:id.clone(),name:name.clone(),input:input.clone()})} else {None}
@@ -3170,18 +3171,29 @@ impl Agent {
                 let chat=chats.get(&receipt.chat_id).unwrap();
                 request = self.continuation_request(chat)?;
             }
-        }.await;
+        }.await
+    }
+
+    async fn finish_run(
+        &self,
+        receipt: Receipt,
+        cancel: CancellationToken,
+        mut result: Result<Usage, String>,
+        is_awaiting_model: bool,
+        internal_failure: bool,
+    ) -> Option<(Receipt, ModelRequest, CancellationToken)> {
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&receipt.chat_id)?;
         chat.family_finishing.insert(receipt.run_id);
         let finished_claim = chat.active_event_claims.remove(&receipt.run_id);
-        chat.snapshot.pending_thinking.remove(&receipt.run_id);
-        if chat.active_run == Some(receipt.run_id) {
-            chat.active = None;
-            chat.active_run = None;
+        run_supervision::clear_run_state(chat, receipt.run_id);
+        if internal_failure {
+            chat.snapshot.request_usage.fail_in_flight_requests(
+                receipt.run_id,
+                tickloop_agent_protocol::RequestFailure::Internal,
+            );
+            self.clear_run_interactions(chat, receipt.run_id).await;
         }
-        chat.parked.remove(&receipt.run_id);
-        chat.ready_runs.retain(|id| *id != receipt.run_id);
         if let Err(error) =
             recovery::close_dangling_tool_calls(&mut chat.snapshot, Some(receipt.run_id))
         {
@@ -3207,7 +3219,11 @@ impl Agent {
                 _ if matches!(goal.state, LoopState::Stopped | LoopState::Expired) => {
                     EventKind::Interrupted
                 }
-                Ok(usage) if !cancel.is_cancelled() => {
+                _ if cancel.is_cancelled() && !internal_failure => {
+                    goal.set_state(LoopState::Interrupted);
+                    EventKind::Interrupted
+                }
+                Ok(usage) => {
                     goal.set_state(
                         if chat.snapshot.policy.mode == ExecutionMode::Plan
                             && chat.snapshot.plans.iter().any(|plan| {
@@ -3228,15 +3244,10 @@ impl Agent {
                     );
                     EventKind::Completed { usage }
                 }
-                _ if cancel.is_cancelled() => {
-                    goal.set_state(LoopState::Interrupted);
-                    EventKind::Interrupted
-                }
                 Err(error) => {
                     goal.set_state(LoopState::Failed);
                     EventKind::Failed(error)
                 }
-                Ok(_) => unreachable!(),
             };
         // An interrupted or failed Loop stops listening until an explicit Continue links it again.
         let pauses_feedback = matches!(goal.state, LoopState::Interrupted | LoopState::Failed)
@@ -3254,7 +3265,7 @@ impl Agent {
         // A run that ended without `done` hands its request back: an interrupted run for another
         // attempt, a finished or failed one as failed.
         if let Some(claim) = finished_claim.filter(|claim| !claim.settled) {
-            let outcome = if cancel.is_cancelled() {
+            let outcome = if cancel.is_cancelled() && !internal_failure {
                 tickloop_agent_artifacts::ReleaseOutcome::Retry
             } else {
                 tickloop_agent_artifacts::ReleaseOutcome::Failed
@@ -3275,7 +3286,7 @@ impl Agent {
         self.inner
             .host_contexts
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .runs
             .remove(&receipt.run_id);
         if is_deliverable {
@@ -3292,16 +3303,6 @@ impl Agent {
                 .await;
         }
         self.settle_task_claims(&receipt).await;
-        let next = match self.next_run(receipt.chat_id).await {
-            Ok(next) => next,
-            Err(error) => {
-                let mut chats = self.inner.chats.lock().await;
-                if let Some(chat) = chats.get_mut(&receipt.chat_id) {
-                    self.emit(chat, &receipt, EventKind::Failed(error.to_string()));
-                }
-                None
-            }
-        };
         self.flush_subagent_notifications(receipt.chat_id).await;
         self.record_directed_replies(&receipt, &finished_snapshot)
             .await;
@@ -3312,7 +3313,19 @@ impl Agent {
         if let Some(chat) = self.inner.chats.lock().await.get_mut(&receipt.chat_id) {
             chat.family_finishing.remove(&receipt.run_id);
         }
-        next
+        if internal_failure {
+            return None;
+        }
+        match self.next_run(receipt.chat_id).await {
+            Ok(next) => next,
+            Err(error) => {
+                let mut chats = self.inner.chats.lock().await;
+                if let Some(chat) = chats.get_mut(&receipt.chat_id) {
+                    self.emit(chat, &receipt, EventKind::Failed(error.to_string()));
+                }
+                None
+            }
+        }
     }
 
     fn continuation_request(&self, chat: &Chat) -> Result<ModelRequest, String> {
@@ -3326,20 +3339,6 @@ impl Agent {
             temperature: None,
             reasoning_effort: chat.snapshot.effective_reasoning_effort(),
         })
-    }
-
-    fn run_task(
-        &self,
-        first: (Receipt, ModelRequest, CancellationToken),
-    ) -> tokio::task::JoinHandle<()> {
-        let agent = self.clone();
-        // Boxed so spawning does not stage the large run future on the caller's stack.
-        tokio::spawn(Box::pin(async move {
-            let mut next = Some(first);
-            while let Some((receipt, request, cancel)) = next {
-                next = agent.run(receipt, request, cancel).await;
-            }
-        }))
     }
 
     fn park_run(

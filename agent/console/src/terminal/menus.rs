@@ -3284,6 +3284,7 @@ fn request_outcome_label(outcome: &RequestOutcome) -> String {
         }
         RequestOutcome::Failed(reason) => {
             let reason = match reason {
+                RequestFailure::Internal => "internal error".into(),
                 RequestFailure::LocalConfiguration => "local configuration".into(),
                 RequestFailure::Authentication => "authentication".into(),
                 RequestFailure::RateLimited => "rate limited".into(),

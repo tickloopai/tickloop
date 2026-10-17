@@ -88,6 +88,7 @@ pub enum ProtocolFailure {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestFailure {
+    Internal,
     LocalConfiguration,
     Authentication,
     RateLimited,
@@ -393,6 +394,14 @@ impl RequestUsageLedger {
         &self.entries
     }
 
+    pub fn fail_in_flight_requests(&mut self, run_id: RunId, failure: RequestFailure) {
+        for request in &mut self.entries {
+            if request.run_id == Some(run_id) && request.outcome == RequestOutcome::InFlight {
+                request.outcome = RequestOutcome::Failed(failure);
+            }
+        }
+    }
+
     pub fn record_serialized_request_bytes(
         &mut self,
         sequence: RequestSequence,
@@ -501,6 +510,69 @@ mod tests {
             protocol: Protocol::Messages,
             requested_model: "fixture-model".into(),
         }
+    }
+
+    #[test]
+    fn internal_failure_finishes_only_the_failed_runs_pending_requests() {
+        let mut ledger = RequestUsageLedger::new();
+        let completed = ledger
+            .start(owner(), ModelRequestKind::Conversation, identity())
+            .unwrap();
+        ledger.finish(completed, RequestOutcome::Accepted).unwrap();
+        let pending = ledger
+            .start(owner(), ModelRequestKind::PermissionCheck, identity())
+            .unwrap();
+        let usage = Usage {
+            input_tokens: Some(17),
+            ..Usage::default()
+        };
+        ledger.observe(pending, usage.clone()).unwrap();
+        let other = ledger
+            .start(
+                RequestOwner {
+                    run_id: Some(Uuid::new_v4()),
+                    ..owner()
+                },
+                ModelRequestKind::Conversation,
+                identity(),
+            )
+            .unwrap();
+        let title = ledger
+            .start(
+                RequestOwner {
+                    run_id: None,
+                    loop_id: None,
+                    ..owner()
+                },
+                ModelRequestKind::Title,
+                identity(),
+            )
+            .unwrap();
+
+        ledger.fail_in_flight_requests(owner().run_id.unwrap(), RequestFailure::Internal);
+        ledger.fail_in_flight_requests(owner().run_id.unwrap(), RequestFailure::Internal);
+        let outcomes = ledger
+            .entries()
+            .iter()
+            .map(|entry| (entry.sequence, entry.outcome))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(outcomes[&completed], RequestOutcome::Accepted);
+        assert_eq!(
+            outcomes[&pending],
+            RequestOutcome::Failed(RequestFailure::Internal)
+        );
+        assert_eq!(outcomes[&other], RequestOutcome::InFlight);
+        assert_eq!(outcomes[&title], RequestOutcome::InFlight);
+        assert_eq!(ledger.entries()[1].usage, usage);
+        let wire = serde_json::to_value(&ledger).unwrap();
+        assert_eq!(
+            wire["entries"][1]["outcome"],
+            serde_json::json!({"failed":"internal"})
+        );
+        assert_eq!(
+            serde_json::from_value::<RequestUsageLedger>(wire).unwrap(),
+            ledger
+        );
     }
 
     fn request(

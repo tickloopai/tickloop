@@ -60,6 +60,13 @@ pub(super) fn close_dangling_tool_calls(
             });
         }
     }
+    for operation in &mut snapshot.operations {
+        if only_run.is_none_or(|run| operation.run_id == run)
+            && operation.state == OperationState::Admitted
+        {
+            operation.state = OperationState::Unknown;
+        }
+    }
     let calls = projection::history_calls(snapshot)?;
     let mut groups: std::collections::BTreeMap<Option<RunId>, Vec<Content>> =
         std::collections::BTreeMap::new();

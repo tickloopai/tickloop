@@ -42,6 +42,8 @@ struct ResolvedTargetTool {
     target: AtomicUsize,
     executed: Mutex<Vec<usize>>,
     uncertain: std::sync::atomic::AtomicBool,
+    panics: std::sync::atomic::AtomicBool,
+    panics_before_admission: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -65,6 +67,10 @@ impl HostToolProvider for ResolvedTargetTool {
         input: &Value,
         _: CancellationToken,
     ) -> Result<PreparedHostCall, String> {
+        assert!(
+            !self.panics_before_admission.load(Ordering::SeqCst),
+            "fixture-private-host-panic"
+        );
         let target = self.target.load(Ordering::SeqCst);
         Ok(PreparedHostCall::new(
             name.into(),
@@ -97,6 +103,10 @@ impl HostToolProvider for ResolvedTargetTool {
     ) -> HostCallResult {
         let target = call.into_payload::<usize>().unwrap();
         self.executed.lock().unwrap().push(target);
+        assert!(
+            !self.panics.load(Ordering::SeqCst),
+            "fixture-private-host-panic"
+        );
         if self.uncertain.load(Ordering::SeqCst) {
             return HostCallResult::OutcomeUnknown("connection lost after dispatch".into());
         }
@@ -243,6 +253,72 @@ async fn dispatched_host_call_with_lost_response_keeps_unknown_outcome() {
     );
     assert_eq!(provider.executed.lock().unwrap().as_slice(), [7]);
     agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_host_panic_preserves_admission_and_does_not_repeat_the_operation() {
+    for before_admission in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ResolvedTargetTool::default());
+        provider.target.store(7, Ordering::SeqCst);
+        provider.panics.store(true, Ordering::SeqCst);
+        provider
+            .panics_before_admission
+            .store(before_admission, Ordering::SeqCst);
+        let model = Arc::new(ScriptedModel::new(vec![call(
+            "panicked",
+            "change_current",
+            json!({}),
+        )]));
+        let agent = Agent::new_embedded(config(), model.clone());
+        agent.install_host_tools(provider.clone()).unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        let mut events = agent.subscribe();
+        agent
+            .submit(chat, None, "Change current".into())
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await.unwrap().kind {
+                    EventKind::PermissionRequested { request } => {
+                        assert!(!before_admission);
+                        agent
+                            .answer_permission(chat, request.id, true)
+                            .await
+                            .unwrap();
+                    }
+                    EventKind::Failed(error) => break error,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("host panic left the run Running");
+        assert!(error.contains("internal"), "{error}");
+        let snapshot = agent.snapshot(chat).await.unwrap();
+        assert_eq!(snapshot.loops[0].state, LoopState::Failed);
+        if before_admission {
+            assert!(snapshot.operations.is_empty());
+        } else {
+            assert_eq!(snapshot.operations[0].state, OperationState::Unknown);
+        }
+        assert_eq!(
+            snapshot.current_operation_uncertainties().len(),
+            usize::from(!before_admission)
+        );
+        assert_eq!(
+            provider.executed.lock().unwrap().as_slice(),
+            if before_admission { &[][..] } else { &[7][..] }
+        );
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains("fixture-private-host-panic")
+        );
+        agent.shutdown().await;
+    }
 }
 
 #[async_trait]
