@@ -993,7 +993,7 @@
         ],
         "provider_failures": {},
         "context_window_tokens": 200000,
-        "context_tokens": 0,
+        "context_tokens": null,
         "highest_pasted_image_id": null,
         "request_order": [],
         "command_started_at_ms": {},

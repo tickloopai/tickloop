@@ -673,9 +673,7 @@ async fn context_status_counts_tool_results_streamed_usage_and_model_changes() {
             role: Role::User,
             content: vec![Content::ToolResult {
                 tool_use_id: "read".into(),
-                content: ToolResultContent::Text {
-                    text: "source material ".repeat(3000),
-                },
+                content: ToolResultContent::Text("source material ".repeat(3000)),
                 is_error: false,
             }],
         },
