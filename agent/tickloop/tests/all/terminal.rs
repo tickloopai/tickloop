@@ -2182,22 +2182,18 @@ async fn terminal_can_configure_a_search_service_and_return_source_links() {
     });
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("model.json"),serde_json::to_vec(&json!({"name":"fixture","protocol":"messages","base_url":format!("http://{address}"),"model":"fixture","api_key_env":"","max_output_tokens":256})).unwrap()).unwrap();
-    let search_config = directory.path().join("search.json");
-    std::fs::write(
-        &search_config,
-        serde_json::to_vec(
-            &json!({"endpoint":format!("http://{search_address}/search"),"api_key_env":null}),
-        )
-        .unwrap(),
-    )
-    .unwrap();
+    let search_config = tickloop_agent_protocol::SearchConfig {
+        provider: tickloop_agent_protocol::SearchProviderKind::Searxng,
+        endpoint: format!("http://{search_address}/search"),
+        api_key_env: None,
+    };
+    UserSettings::in_root(&directory.path().join("config-root"))
+        .save_search_config(Some(&search_config))
+        .unwrap();
     let output = run_with_config(
         directory.path(),
         &["--no-session-persistence"],
-        &format!(
-            "/search-config {}\n/rule allow *\n/mode acceptEdits\nFind a source\n",
-            search_config.display()
-        ),
+        "/rule allow *\n/mode acceptEdits\nFind a source\n",
     )
     .await;
     assert!(

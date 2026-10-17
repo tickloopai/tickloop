@@ -22,6 +22,11 @@ use crate::{
 /// computed where the history is.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChatStatus {
+    #[serde(
+        default = "crate::SearchConfig::enabled_default",
+        skip_serializing_if = "crate::SearchConfig::is_enabled_default"
+    )]
+    pub search_config: Option<crate::SearchConfig>,
     #[serde(default)]
     pub task_tools_enabled: bool,
     #[serde(default)]
@@ -153,6 +158,7 @@ impl ChatStatus {
             .collect();
         Self {
             task_tools_enabled: conversation.task_tools_enabled,
+            search_config: conversation.search_config.clone(),
             task_board: conversation.task_board.clone(),
             task_boards: conversation.task_boards.clone(),
             id: conversation.id,

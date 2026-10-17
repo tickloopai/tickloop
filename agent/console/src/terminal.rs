@@ -3535,23 +3535,13 @@ async fn interact(
                                 }
                             }
                         },
-                        _ if line.starts_with("/search-config ") => {
-                            let target=ConfigTarget::visible(selected_chat);
-                            let path=line.trim_start_matches("/search-config ").trim();
-                            let result=async {
-                                let config=if path=="off" {None} else {
-                                    let bytes=std::fs::read(path).map_err(|_|"cannot read search configuration file")?;
-                                    Some(serde_json::from_slice::<tickloop_agent_protocol::SearchConfig>(&bytes).map_err(|_|"invalid search configuration JSON; provide endpoint and optional api_key_env")?)
-                                };
-                                agent.change_configuration(target,ConfigurationChange::Search {config:config.clone()}).await.map_err(|error|error.to_string())?;
-                                Ok::<_,String>(config)
-                            }.await;
-                            match result {
-                                Ok(Some(config))=>outln!(console, "Search service configured: {}",safe_text(&config.endpoint)),
-                                Ok(None)=>outln!(console, "Search service disabled."),
-                                Err(error)=>outln!(console, "Cannot configure search: {}",safe_text(&error)),
+                        _ if line == "/search" => {
+                            let target = ConfigTarget::visible(selected_chat);
+                            if let Err(error) = Box::pin(menus.search_settings(agent, console, target, false)).await {
+                                outln!(console, "Cannot open Web search: {}", safe_text(&error));
                             }
                         },
+                        _ if line.starts_with("/search ") => outln!(console, "Use /search to choose and configure a search source with the keyboard."),
                         _ if line=="/compact" || line.starts_with("/compact ") => {
                             if let Some(chat)=selected_chat {
                                 let agent=agent.clone();
@@ -5771,22 +5761,6 @@ async fn parse_after_turn(
                 instructions: (!arguments.is_empty()).then(|| arguments.to_owned()),
             },
         }),
-        "/search-config" => {
-            let config = if arguments == "off" {
-                None
-            } else {
-                let path = agent.snapshot(chat).await?.workdir.join(arguments);
-                let bytes = std::fs::read(path)
-                    .map_err(|_| invalid("cannot read search configuration file"))?;
-                Some(
-                    serde_json::from_slice(&bytes)
-                        .map_err(|_| invalid("invalid search configuration JSON"))?,
-                )
-            };
-            Ok(AfterTurnAction::Configure {
-                change: ConfigurationChange::Search { config },
-            })
-        }
         "/cwd" | "/add-dir" => {
             let mut snapshot = agent.snapshot(chat).await?;
             if name == "/cwd" {
@@ -8814,7 +8788,6 @@ mod tests {
             "/compact",
             "/cwd elsewhere",
             "/add-dir ../shared",
-            "/search-config search.json",
             "/loops schedule 00000000-0000-0000-0000-000000000000 60 check",
         ] {
             assert_eq!(

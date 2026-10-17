@@ -60,8 +60,92 @@ pub struct CommandSnapshot {
     pub updated_at_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchProviderKind {
+    Free,
+    Brave,
+    Tavily,
+    Exa,
+    #[default]
+    Searxng,
+}
+
+impl SearchProviderKind {
+    fn is_searxng(&self) -> bool {
+        *self == Self::Searxng
+    }
+    pub const ALL: [Self; 5] = [
+        Self::Free,
+        Self::Brave,
+        Self::Tavily,
+        Self::Exa,
+        Self::Searxng,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Free => "Free search",
+            Self::Brave => "Brave",
+            Self::Tavily => "Tavily",
+            Self::Exa => "Exa",
+            Self::Searxng => "SearXNG / compatible JSON",
+        }
+    }
+
+    pub fn default_endpoint(self) -> &'static str {
+        match self {
+            Self::Free => "",
+            Self::Brave => "https://api.search.brave.com/res/v1/web/search",
+            Self::Tavily => "https://api.tavily.com/search",
+            Self::Exa => "https://api.exa.ai/search",
+            Self::Searxng => "",
+        }
+    }
+
+    pub fn credential_env(self) -> Option<&'static str> {
+        match self {
+            Self::Brave => Some("BRAVE_API_KEY"),
+            Self::Tavily => Some("TAVILY_API_KEY"),
+            Self::Exa => Some("EXA_API_KEY"),
+            Self::Free | Self::Searxng => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SearchConfig {
+    #[serde(default, skip_serializing_if = "SearchProviderKind::is_searxng")]
+    pub provider: SearchProviderKind,
+    #[serde(default)]
     pub endpoint: String,
+    #[serde(default)]
     pub api_key_env: Option<String>,
+}
+
+impl SearchConfig {
+    pub fn for_provider(provider: SearchProviderKind) -> Self {
+        Self {
+            provider,
+            endpoint: provider.default_endpoint().into(),
+            api_key_env: provider.credential_env().map(str::to_owned),
+        }
+    }
+
+    pub fn enabled_default() -> Option<Self> {
+        Some(Self::default())
+    }
+
+    pub fn is_enabled_default(config: &Option<Self>) -> bool {
+        config
+            .as_ref()
+            .is_some_and(|config| *config == Self::default())
+    }
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self::for_provider(SearchProviderKind::Free)
+    }
 }

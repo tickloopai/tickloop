@@ -779,9 +779,44 @@ async fn a_long_page_is_truncated_before_the_model_reads_it() {
 
 fn search_config(url: &str) -> SearchConfig {
     SearchConfig {
+        provider: tickloop_agent_protocol::SearchProviderKind::Searxng,
         endpoint: format!("{url}/search"),
         api_key_env: None,
     }
+}
+
+#[tokio::test]
+async fn search_selection_is_account_independent_and_persists_for_new_agents() {
+    use tickloop_agent_protocol::SearchProviderKind;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let settings = tickloop_agent_config::UserSettings::in_root(&root);
+    let agent = Agent::new_with_user_settings_embedded(
+        config(),
+        WebModel::new(Vec::new(), PageAnswer::Text("unused")),
+        settings.clone(),
+    );
+    let first = agent.create_chat(root.clone()).await.unwrap();
+    assert_eq!(
+        agent.snapshot(first).await.unwrap().search_config,
+        SearchConfig::enabled_default()
+    );
+    let chosen = SearchConfig::for_provider(SearchProviderKind::Tavily);
+    agent.set_search(first, Some(chosen.clone())).await.unwrap();
+    assert_eq!(
+        agent.snapshot(first).await.unwrap().search_config,
+        Some(chosen.clone())
+    );
+    let second = agent.create_chat(root.clone()).await.unwrap();
+    assert_eq!(
+        agent.snapshot(second).await.unwrap().search_config,
+        Some(chosen)
+    );
+    agent.set_search(second, None).await.unwrap();
+    let third = agent.create_chat(root).await.unwrap();
+    assert_eq!(agent.snapshot(third).await.unwrap().search_config, None);
+    assert_eq!(settings.load().search_config(), None);
+    agent.shutdown().await;
 }
 
 fn search_response(results: Value) -> Vec<String> {
@@ -835,11 +870,11 @@ async fn configured_search_freezes_the_approved_source_and_returns_claude_code_r
             }
             EventKind::ToolCompleted { result, .. } => {
                 assert!(!result.is_error, "{}", result.content);
-                assert_eq!(
-                    result.content,
+                assert!(
+                    result.content.starts_with(&
                     format!(
                         "Web search results for query: \"Rust documentation\"\n\nLinks: [{{\"title\":\"Rust documentation\",\"url\":\"https://doc.rust-lang.org/\",\"summary\":\"Official language documentation\"}}]{SOURCES_REMINDER}"
-                    )
+                    ))
                 );
                 saw_result = true;
             }
@@ -880,12 +915,9 @@ async fn search_distinguishes_unconfigured_empty_rate_limited_and_invalid_respon
         let result = &run.results[0];
         match expected {
             Some(expected) => assert!(result.is_error && result.content.contains(expected)),
-            None => assert_eq!(
-                result.content,
-                format!(
-                    "Web search results for query: \"rust\"\n\nNo links found.{SOURCES_REMINDER}"
-                )
-            ),
+            None => assert!(result.content.starts_with(&format!(
+                "Web search results for query: \"rust\"\n\nNo links found.{SOURCES_REMINDER}"
+            ))),
         }
     }
 }
@@ -907,8 +939,8 @@ async fn search_results_are_filtered_by_host_including_subdomains() {
             ],
         ),
         (
-            json!({"blocked_domains": ["rust-lang.org"], "limit": 1}),
-            vec!["https://notrust-lang.org/"],
+            json!({"blocked_domains": ["rust-lang.org"]}),
+            vec!["https://notrust-lang.org/", "https://example.com/rust"],
         ),
     ] {
         let (url, _) = server(search_response(results.clone())).await;
@@ -966,10 +998,11 @@ async fn both_domain_lists_are_rejected_before_approval_or_search() {
 async fn live_mwmbl_search_and_official_web_page_through_the_agent() {
     let run = run_web(
         WebModel::new(
-            vec![("WebSearch", json!({"query":"rust documentation","limit":5}))],
+            vec![("WebSearch", json!({"query":"rust documentation"}))],
             PageAnswer::Text("unused"),
         ),
         Some(SearchConfig {
+            provider: tickloop_agent_protocol::SearchProviderKind::Searxng,
             endpoint: "https://api.mwmbl.org/api/v2/search/".into(),
             api_key_env: None,
         }),

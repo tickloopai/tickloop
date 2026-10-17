@@ -163,7 +163,9 @@ pub use tick_subscriptions::{
     TickSubscriptionFrequency, TickSubscriptionStatus,
 };
 pub use tool::ToolDefinition;
-pub use tools::{CommandSnapshot, CommandState, FileReadRecord, SearchConfig, ToolResult};
+pub use tools::{
+    CommandSnapshot, CommandState, FileReadRecord, SearchConfig, SearchProviderKind, ToolResult,
+};
 pub use usage::{
     CounterSummary, CounterTotal, LedgerError, ModelRequestKind, ModelUsageSummary,
     ObservationEffect, ProtocolFailure, RequestFailure, RequestOutcome, RequestOwner,

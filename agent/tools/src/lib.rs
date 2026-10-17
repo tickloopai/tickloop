@@ -34,6 +34,7 @@ pub use shell::{
     TASK_STOP_TOOL_NAME, UserCommandSnapshot,
 };
 mod web;
+pub mod web_search;
 pub use web::SecondaryModel;
 pub use web::{WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME};
 mod write;
@@ -463,6 +464,7 @@ pub struct Tools {
     commands: shell::Registry,
     search: std::sync::Arc<tokio::sync::RwLock<Option<SearchConfig>>>,
     fetched_pages: web::FetchCache,
+    search_credential_root: Option<PathBuf>,
     file_reads: FileReadState,
 }
 
@@ -505,10 +507,21 @@ impl Tools {
             task_output_dir,
             family_temp,
             commands,
-            search: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            search: std::sync::Arc::new(tokio::sync::RwLock::new(SearchConfig::enabled_default())),
             fetched_pages: web::FetchCache::default(),
+            search_credential_root: None,
             file_reads: FileReadState::default(),
         }
+    }
+
+    pub fn with_search_configuration(
+        mut self,
+        config: Option<SearchConfig>,
+        credential_root: Option<PathBuf>,
+    ) -> Self {
+        self.search = std::sync::Arc::new(tokio::sync::RwLock::new(config));
+        self.search_credential_root = credential_root;
+        self
     }
 
     pub async fn prepare(
@@ -573,8 +586,16 @@ impl Tools {
                 .await
                 .clone()
                 .ok_or_else(|| ToolError::Network("search is not configured".into()))?;
-            prepared.input["endpoint"] = json!(config.endpoint);
-            search.config = Some(config);
+            let plan = web_search::prepare(
+                &config,
+                &search.request(),
+                self.search_credential_root.as_deref(),
+            )
+            .map_err(|error| ToolError::Network(error.to_string()))?;
+            prepared.input["provider"] = json!(config.provider);
+            prepared.input["endpoint"] = json!(plan.endpoints.first());
+            prepared.input["endpoints"] = json!(plan.endpoints);
+            search.prepared = Some(plan);
         }
         Ok(prepared)
     }

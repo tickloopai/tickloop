@@ -1,6 +1,7 @@
 use super::execution::ConsoleExecution as Agent;
 mod judgment;
 pub(super) mod providers;
+mod search;
 #[cfg(test)]
 mod settings_ux_pty;
 use providers::{ModelChoice, ProviderModels, ProviderRow};
@@ -49,8 +50,28 @@ pub(super) const PERMISSIONS_SETTING_INDEX: usize = 11;
 const ARTIFACT_SIGN_OUT_SETTING_INDEX: usize = 12;
 const PROMPT_SUGGESTION_SETTING_INDEX: usize = 13;
 const TASK_TOOLS_SETTING_INDEX: usize = 14;
+const SEARCH_SETTING_INDEX: usize = 15;
 
 enum Selection {
+    Search {
+        target: ConfigTarget,
+        return_to_settings: bool,
+    },
+    SearchProvider {
+        target: ConfigTarget,
+        return_to_settings: bool,
+        config: tickloop_agent_protocol::SearchConfig,
+    },
+    SearchKey {
+        target: ConfigTarget,
+        return_to_settings: bool,
+        config: tickloop_agent_protocol::SearchConfig,
+    },
+    SearchEndpoint {
+        target: ConfigTarget,
+        return_to_settings: bool,
+        config: tickloop_agent_protocol::SearchConfig,
+    },
     ArtifactSignOut {
         target: ConfigTarget,
         return_to_settings: bool,
@@ -289,6 +310,22 @@ impl Selection {
     fn configuration_retry(&self) -> Option<Self> {
         Some(match self {
             Self::Settings { target } => Self::Settings { target: *target },
+            Self::Search {
+                target,
+                return_to_settings,
+            } => Self::Search {
+                target: *target,
+                return_to_settings: *return_to_settings,
+            },
+            Self::SearchProvider {
+                target,
+                config,
+                return_to_settings,
+            } => Self::SearchProvider {
+                target: *target,
+                config: config.clone(),
+                return_to_settings: *return_to_settings,
+            },
             Self::SettingsInfo { target } => Self::SettingsInfo { target: *target },
             Self::Theme { settings_target } => Self::Theme {
                 settings_target: *settings_target,
@@ -389,6 +426,10 @@ impl Selection {
     fn config_target(&self) -> Option<ConfigTarget> {
         match self {
             Self::Provider { target, .. }
+            | Self::Search { target, .. }
+            | Self::SearchProvider { target, .. }
+            | Self::SearchKey { target, .. }
+            | Self::SearchEndpoint { target, .. }
             | Self::ConnectionDetails { target, .. }
             | Self::ConnectionConfirm { target, .. }
             | Self::CredentialDetails { target }
@@ -988,6 +1029,8 @@ impl Menus {
                     | Selection::JudgmentSettings { .. }
                     | Selection::PermissionMode { .. }
                     | Selection::Settings { .. }
+                    | Selection::Search { .. }
+                    | Selection::SearchProvider { .. }
                     | Selection::SettingsInfo { .. }
                     | Selection::Effort { .. }
                     | Selection::Mode { .. }
@@ -1599,6 +1642,13 @@ impl Menus {
                         } else {
                             "Off"
                         }
+                    ),
+                    format!(
+                        "Web search: {}",
+                        snapshot
+                            .search_config
+                            .as_ref()
+                            .map_or("Off", |config| config.provider.label())
                     ),
                 ],
                 selected,
@@ -2369,7 +2419,7 @@ impl Menus {
         } else {
             None
         };
-        let outcome: Result<MenuOutcome, String> = async {
+        let outcome: Result<MenuOutcome, String> = Box::pin(async {
             match selection {
                 Selection::Locations { generation, views } => {
                     if let Some(index) = index {
@@ -2548,6 +2598,9 @@ impl Menus {
                     });
                 }
                 Selection::SettingsInfo { target } => self.settings(agent, console, target).await?,
+                selection @ (Selection::Search { .. } | Selection::SearchProvider { .. } | Selection::SearchKey { .. } | Selection::SearchEndpoint { .. }) => {
+                    Box::pin(self.choose_search(agent, console, selection, index, comment)).await?;
+                }
                 Selection::Rewind { chat, mut points } => {
                     match index {
                         None => console
@@ -2882,6 +2935,7 @@ impl Menus {
                     }
                 },
                 Selection::Settings { target } => match index {
+                    Some(SEARCH_SETTING_INDEX) => Box::pin(self.search_settings(agent, console, target, true)).await?,
                     Some(TASK_TOOLS_SETTING_INDEX) => {
                         let configuration = agent.configuration(target).await.map_err(|error| error.to_string())?;
                         agent.change_configuration(target, ConfigurationChange::TaskToolsEnabled {
@@ -3109,7 +3163,7 @@ impl Menus {
                 }
             }
             Ok(MenuOutcome::default())
-        }
+        })
         .await;
         if outcome.is_err()
             && self.active.is_none()

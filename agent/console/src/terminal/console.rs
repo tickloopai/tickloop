@@ -20414,6 +20414,7 @@ mod tests {
                         "Artifacts",
                         "Prompt suggestions",
                         "Task tools",
+                        "Web search",
                     ]
                 );
                 settings.id

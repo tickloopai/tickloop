@@ -24,6 +24,11 @@ pub type RunId = Uuid;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChatSnapshot {
+    #[serde(
+        default = "crate::SearchConfig::enabled_default",
+        skip_serializing_if = "crate::SearchConfig::is_enabled_default"
+    )]
+    pub search_config: Option<crate::SearchConfig>,
     #[serde(default)]
     pub task_tools_enabled: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

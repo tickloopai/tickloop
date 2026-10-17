@@ -16,10 +16,9 @@ use serde_json::{Value, json};
 use tickloop_agent_base::network::{HttpPolicy, NetworkDiagnostic, build_http_client};
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    Operation, ToolDefinition, ToolError, read::semantic_integer, shell::BASH_TOOL_NAME,
-    utf16_length,
-};
+use super::web_search::DomainFilter;
+use super::web_search::{self, PreparedSearch, SearchRequest};
+use super::{Operation, ToolDefinition, ToolError, shell::BASH_TOOL_NAME, utf16_length};
 use tickloop_agent_protocol::{SearchConfig, ToolResult};
 
 pub const WEB_FETCH_TOOL_NAME: &str = "WebFetch";
@@ -31,7 +30,6 @@ const MAX_URL_LENGTH: usize = 2000;
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 /// Claude Code `FETCH_TIMEOUT_MS`.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
-const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 5;
 /// Claude Code `MAX_MARKDOWN_LENGTH`, counted in UTF-16 code units as JavaScript does.
 const MAX_MARKDOWN_LENGTH: usize = 100_000;
@@ -47,8 +45,6 @@ const SECONDARY_MODEL_GUIDELINES: &str = "Provide a concise response based only 
  - Never produce or reproduce exact song lyrics.";
 const MIN_QUERY_LENGTH: usize = 2;
 const MAX_QUERY_BYTES: usize = 4096;
-const DEFAULT_SEARCH_LIMIT: usize = 10;
-const MAX_SEARCH_LIMIT: usize = 50;
 const NO_LINKS_FOUND: &str = "No links found.";
 const SOURCES_REMINDER: &str = "REMINDER: You MUST include the sources above in your response to the user using markdown hyperlinks.";
 const BOTH_DOMAIN_LISTS_ERROR: &str =
@@ -73,35 +69,7 @@ pub(super) struct FetchInput {
 pub(super) struct SearchInput {
     query: String,
     domains: DomainFilter,
-    limit: usize,
-    pub(super) config: Option<SearchConfig>,
-}
-
-/// Which result hosts a search keeps; each domain also covers its subdomains.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum DomainFilter {
-    Any,
-    Allowed(Vec<String>),
-    Blocked(Vec<String>),
-}
-
-impl DomainFilter {
-    fn admits(&self, url: &Url) -> bool {
-        let host = url.host_str().unwrap_or_default().trim_end_matches('.');
-        let is_listed = |domains: &[String]| {
-            domains.iter().any(|domain| {
-                host == domain
-                    || host
-                        .strip_suffix(domain.as_str())
-                        .is_some_and(|subdomain| subdomain.ends_with('.'))
-            })
-        };
-        match self {
-            Self::Any => true,
-            Self::Allowed(domains) => is_listed(domains),
-            Self::Blocked(domains) => !is_listed(domains),
-        }
-    }
+    pub(super) prepared: Option<Arc<PreparedSearch>>,
 }
 
 /// Claude Code's `URL_CACHE`: the Markdown of pages fetched in the last 15 minutes by requested
@@ -283,7 +251,8 @@ CRITICAL REQUIREMENT - You MUST follow this:
 
 Usage notes:
   - Domain filtering is supported to include or block specific websites
-  - Searching requires a configured search service; an unconfigured service is reported as an error
+  - Search uses the source selected in /search; free search needs no account or API key
+  - Do not request more results by passing limit or offset; refine the query and read source pages with WebFetch
 
 IMPORTANT - Use the correct year in search queries:
   - The current month is {current_month}. You MUST use this year when searching for recent information, documentation, or current events.
@@ -306,12 +275,6 @@ IMPORTANT - Use the correct year in search queries:
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Never include search results from these domains"
-                },
-                "limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": MAX_SEARCH_LIMIT,
-                    "description": format!("The maximum number of results to return (default {DEFAULT_SEARCH_LIMIT})")
                 }
             },
             "required": ["query"],
@@ -352,8 +315,6 @@ pub(super) fn prepare_search(input: &Value) -> Result<(String, Operation, Value)
         allowed_domains: Option<Vec<String>>,
         #[serde(default)]
         blocked_domains: Option<Vec<String>>,
-        #[serde(default, deserialize_with = "semantic_integer")]
-        limit: Option<usize>,
     }
     let parsed: SearchParameters = serde_json::from_value(input.clone())
         .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
@@ -372,14 +333,6 @@ pub(super) fn prepare_search(input: &Value) -> Result<(String, Operation, Value)
     if !allowed.is_empty() && !blocked.is_empty() {
         return Err(ToolError::Rejected(BOTH_DOMAIN_LISTS_ERROR.into()));
     }
-    if parsed
-        .limit
-        .is_some_and(|limit| limit == 0 || limit > MAX_SEARCH_LIMIT)
-    {
-        return Err(ToolError::InvalidInput(format!(
-            "search limit must be between 1 and {MAX_SEARCH_LIMIT} results"
-        )));
-    }
     let mut normalized_input = json!({"query": parsed.query});
     let domains = if !allowed.is_empty() {
         let domains = normalize_domains("allowed_domains", &allowed)?;
@@ -392,16 +345,12 @@ pub(super) fn prepare_search(input: &Value) -> Result<(String, Operation, Value)
     } else {
         DomainFilter::Any
     };
-    if let Some(limit) = parsed.limit {
-        normalized_input["limit"] = json!(limit);
-    }
     Ok((
         ".".into(),
         Operation::WebSearch(SearchInput {
             query: parsed.query,
             domains,
-            limit: parsed.limit.unwrap_or(DEFAULT_SEARCH_LIMIT),
-            config: None,
+            prepared: None,
         }),
         normalized_input,
     ))
@@ -410,6 +359,11 @@ pub(super) fn prepare_search(input: &Value) -> Result<(String, Operation, Value)
 /// Reduces each entry to the lowercase host it names; a leading `*.` or `.` is accepted as
 /// another way to say the domain and its subdomains.
 fn normalize_domains(field: &str, entries: &[String]) -> Result<Vec<String>, ToolError> {
+    if entries.len() > 10 {
+        return Err(ToolError::InvalidInput(format!(
+            "{field} accepts at most 10 domains per call"
+        )));
+    }
     entries
         .iter()
         .map(|entry| {
@@ -439,17 +393,16 @@ fn normalize_domains(field: &str, entries: &[String]) -> Result<Vec<String>, Too
 }
 
 pub(super) fn validate_search(config: &SearchConfig) -> Result<(), ToolError> {
-    validate_url(&config.endpoint, true)?;
-    if config
-        .api_key_env
-        .as_ref()
-        .is_some_and(|name| name.is_empty() || name.contains('='))
-    {
-        return Err(ToolError::InvalidInput(
-            "search credentials must name an environment variable".into(),
-        ));
+    web_search::validate_config(config).map_err(ToolError::InvalidInput)
+}
+
+impl SearchInput {
+    pub(super) fn request(&self) -> SearchRequest {
+        SearchRequest {
+            query: self.query.clone(),
+            domains: self.domains.clone(),
+        }
     }
-    Ok(())
 }
 
 /// Claude Code `WebFetchTool.call`: the page comes from the cache or the network, and only the
@@ -584,86 +537,41 @@ pub(super) async fn search(
     input: SearchInput,
     cancel: CancellationToken,
 ) -> Result<ToolResult, ToolError> {
-    #[derive(Deserialize)]
-    struct Response {
-        results: Vec<Hit>,
-    }
-    #[derive(Deserialize)]
-    struct Hit {
-        title: String,
-        url: String,
-        #[serde(default)]
-        content: String,
-    }
-    let config = input
-        .config
-        .ok_or_else(|| ToolError::Network("search is not configured".into()))?;
-    let mut url = validate_url(&config.endpoint, true)?;
-    url.query_pairs_mut()
-        .append_pair("q", &input.query)
-        .append_pair("format", "json");
-    let key = config
-        .api_key_env
+    let prepared = input
+        .prepared
         .as_ref()
-        .map(|name| {
-            std::env::var(name).map_err(|_| {
-                ToolError::Network(format!(
-                    "search credential environment variable {name} is unavailable"
-                ))
-            })
+        .ok_or_else(|| ToolError::Network("search is not configured".into()))?;
+    let response =
+        prepared
+            .execute(&input.request(), cancel)
+            .await
+            .map_err(|error| match error {
+                web_search::SearchError::Cancelled => ToolError::Cancelled,
+                other => ToolError::Network(format!("{}: {other}", prepared.kind.label())),
+            })?;
+    let links = response
+        .results
+        .into_iter()
+        .map(|hit| SearchLink {
+            title: hit.title,
+            url: hit.url,
+            summary: hit.snippet.unwrap_or_default(),
+            published_at: hit.published_at,
         })
-        .transpose()?;
-    let search = async {
-        let (content_type, bytes) = match request(url, key.as_deref(), SEARCH_TIMEOUT).await? {
-            HttpResponse::Body {
-                content_type,
-                bytes,
-            } => (content_type, bytes),
-            HttpResponse::Redirect(redirect) => {
-                return Err(ToolError::Network(format!(
-                    "redirect requires a separately approved URL: {}",
-                    redirect.target
-                )));
-            }
-        };
-        if !content_type.starts_with("application/json") {
-            return Err(ToolError::Network(
-                "search service did not return JSON".into(),
-            ));
+        .collect::<Vec<_>>();
+    let source = response.engine.unwrap_or(response.provider.label());
+    let at = time::OffsetDateTime::from(response.searched_at)
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("current timestamp has RFC3339 representation");
+    Ok(text_result(format!(
+        "{}\n\nSearch source: {source}\nSearched at: {at}{}",
+        search_result_text(&response.query, &links),
+        if response.truncated {
+            "\nAdditional results were omitted."
+        } else {
+            ""
         }
-        let response: Response = serde_json::from_slice(&bytes).map_err(|_| {
-            ToolError::Network("search response has invalid JSON or missing result fields".into())
-        })?;
-        let mut links = Vec::new();
-        for hit in response.results {
-            let url = Url::parse(&hit.url)
-                .map_err(|_| ToolError::Network("search returned an invalid source URL".into()))?;
-            if !matches!(url.scheme(), "https" | "http")
-                || !url.username().is_empty()
-                || url.password().is_some()
-            {
-                return Err(ToolError::Network(
-                    "search returned an unsupported source URL".into(),
-                ));
-            }
-            if input.domains.admits(&url) {
-                links.push(SearchLink {
-                    title: hit.title,
-                    url: url.to_string(),
-                    summary: hit.content,
-                });
-            }
-        }
-        links.truncate(input.limit);
-        Ok(text_result(search_result_text(&input.query, &links)))
-    };
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => Err(ToolError::Cancelled),
-        result = tokio::time::timeout(SEARCH_TIMEOUT, search) => {
-            result.map_err(|_| ToolError::Network("request timed out".into()))?
-        }
-    }
+    )))
 }
 
 /// One hit in Claude Code's `Links:` list, with the summary the configured service provides.
@@ -673,6 +581,8 @@ struct SearchLink {
     url: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    published_at: Option<String>,
 }
 
 /// Claude Code `WebSearchTool.mapToolResultToToolResultBlockParam` for one search.

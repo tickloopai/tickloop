@@ -316,9 +316,9 @@ const COMMANDS: &[CommandSpec] = &[
         menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {
-        command: "/search-config",
-        arguments: "FILE|off",
-        description: "Configures or disables web search.",
+        command: "/search",
+        arguments: "",
+        description: "Chooses a search source and manages search API keys.",
         menu_group: Some(CommandGroup::Advanced),
     },
     CommandSpec {

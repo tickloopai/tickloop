@@ -38,7 +38,7 @@ mod codex;
 pub mod codex_test_support;
 pub mod connection;
 pub mod copilot;
-pub mod credentials;
+pub use tickloop_agent_base::credentials;
 mod glm;
 mod google;
 pub mod history;

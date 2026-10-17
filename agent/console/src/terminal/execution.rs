@@ -2112,6 +2112,9 @@ impl ConsoleExecution {
             ConfigurationChange::TaskToolsEnabled { enabled } => {
                 save(&|settings| settings.save_task_tools_enabled(*enabled))?;
             }
+            ConfigurationChange::Search { config } => {
+                save(&|settings| settings.save_search_config(config.as_ref()))?;
+            }
             ConfigurationChange::ReasoningEffort { effort } => {
                 tickloop_agent_model::validate_reasoning_effort(&current.model, *effort)
                     .map_err(|error| invalid(&error))?;
@@ -2513,6 +2516,10 @@ impl ConsoleExecution {
         let mut saved = self.user_settings().map(|settings| settings.load());
         let defaults = new_chat_settings(saved.as_mut(), &launch.host_options, &model);
         AgentConfiguration {
+            search_config: saved.as_mut().map_or_else(
+                tickloop_agent_protocol::SearchConfig::enabled_default,
+                |saved| saved.search_config(),
+            ),
             model,
             pending_model: None,
             reasoning_effort: defaults.reasoning_effort,

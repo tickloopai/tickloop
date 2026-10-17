@@ -741,6 +741,7 @@ fn answerable_permission_request(
 
 fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnapshot {
     ChatSnapshot {
+        search_config: tickloop_agent_protocol::SearchConfig::enabled_default(),
         task_tools_enabled: false,
         subagent_reports: BTreeMap::new(),
         failure_events: Vec::new(),
@@ -3917,6 +3918,11 @@ impl Agent {
         chat_id: ChatId,
         config: Option<tickloop_agent_protocol::SearchConfig>,
     ) -> Result<(), AgentError> {
+        let _gate = self.inner.settings_writes.lock().await;
+        if let Some(config) = &config {
+            tickloop_agent_tools::web_search::validate_config(config)
+                .map_err(AgentError::Invalid)?;
+        }
         let tools = self
             .inner
             .chats
@@ -3926,10 +3932,22 @@ impl Agent {
             .ok_or(AgentError::NotFound)?
             .tools
             .clone();
+        let saved = config.clone();
+        self.write_user_settings(move |settings| settings.save_search_config(saved.as_ref()))
+            .await?;
         tools
-            .set_search(config)
+            .set_search(config.clone())
             .await
-            .map_err(|error| AgentError::Invalid(error.to_string()))
+            .map_err(|error| AgentError::Invalid(error.to_string()))?;
+        self.inner
+            .chats
+            .lock()
+            .await
+            .get_mut(&chat_id)
+            .ok_or(AgentError::NotFound)?
+            .snapshot
+            .search_config = config;
+        Ok(())
     }
 
     pub async fn set_execution_mode(

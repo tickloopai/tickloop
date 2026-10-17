@@ -75,12 +75,18 @@ impl Agent {
             |project| PrivateDirectory::trusted(project).join(chat_id.to_string()),
         );
         let task_output_directory = temporary_chat.join(TASK_OUTPUT_SUBDIRECTORY);
-        Arc::new(Tools::for_chat(
-            chat_directory,
-            task_output_directory,
-            family_temp,
-            self.inner.shells.for_chat(chat_id),
-        ))
+        Arc::new(
+            Tools::for_chat(
+                chat_directory,
+                task_output_directory,
+                family_temp,
+                self.inner.shells.for_chat(chat_id),
+            )
+            .with_search_configuration(
+                snapshot.search_config.clone(),
+                self.inner.config_root.clone(),
+            ),
+        )
     }
 
     /// 工具结果写入对话前按阈值外存；外存后结果内容换成替换文本，未自带输出引用的结果

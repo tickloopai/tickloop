@@ -86,6 +86,7 @@ fn settings_ux_pty_fixture() {
                 match event {
                     super::super::console::InputEvent::Line(line) | super::super::console::InputEvent::Prompt { text: line, .. } => match line.as_str() {
                         "/settings" => menus.settings(&agent, &console, ConfigTarget::Agent(chat)).await.unwrap(),
+                        "/search" => menus.search_settings(&agent, &console, ConfigTarget::Agent(chat), false).await.unwrap(),
                         "/model" => menus.models(&agent, &console, ConfigTarget::Agent(chat)).await.unwrap(),
                         "/provider" => menus.providers(&agent, &console, ConfigTarget::Agent(chat)).await.unwrap(),
                         "/exit" => break,
@@ -751,4 +752,87 @@ fn settings_scroll_pty_restores_parent_context_after_child_cancel_and_confirm_cl
     fixture.wait(|frame| {
         !frame.lines().any(|line| line == "Settings") && !frame.contains("Choose theme")
     });
+}
+
+#[test]
+fn search_pty_key_entry_is_masked_and_cancel_does_not_switch_sources() {
+    let mut fixture = Fixture::start();
+    fixture.send(b"/search\r");
+    fixture.wait(|frame| frame.lines().any(|line| line == "Web search"));
+    fixture.select("Tavily");
+    fixture.send(b"\r");
+    fixture.wait(|frame| frame.contains("Web search · Tavily"));
+    fixture.select("Set or replace API key");
+    fixture.send(b"\r");
+    fixture.wait(|frame| frame.contains("API key · Tavily"));
+    fixture.send(b"discarded-search-secret");
+    fixture.wait(|frame| frame.contains("****") && !frame.contains("discarded-search-secret"));
+    fixture.send(b"\x1b");
+    fixture.wait(|frame| frame.contains("API key · Tavily") && frame.contains("tab edit API key"));
+    fixture.send(b"\x1b");
+    fixture.wait(|frame| frame.contains("Web search · Tavily"));
+    let root = fixture
+        .directory
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("config");
+    assert!(
+        tickloop_agent_model::credentials::load_api_key(&root, "TAVILY_API_KEY")
+            .unwrap()
+            .is_none()
+    );
+    fixture.select("Set or replace API key");
+    fixture.send(b"\r");
+    fixture.wait(|frame| frame.contains("API key · Tavily"));
+    fixture.send(b"fixture-search-secret");
+    let frame = fixture.wait(|frame| frame.contains("Save API key"));
+    assert!(!frame.contains("fixture-search-secret"));
+    fixture.send(b"\r");
+    fixture
+        .wait(|frame| frame.contains("Web search · Tavily") && frame.contains("saved privately"));
+    let root = fixture
+        .directory
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("config");
+    assert_eq!(
+        tickloop_agent_model::credentials::load_api_key(&root, "TAVILY_API_KEY")
+            .unwrap()
+            .as_deref(),
+        Some("fixture-search-secret")
+    );
+    assert_eq!(
+        UserSettings::in_root(&root).load().search_config(),
+        tickloop_agent_protocol::SearchConfig::enabled_default()
+    );
+    fixture.send(b"\x1b");
+    fixture.wait(|frame| frame.lines().any(|line| line == "Web search"));
+    fixture.select("Tavily");
+    fixture.send(b"\r");
+    fixture.wait(|frame| frame.contains("Web search · Tavily"));
+    fixture.send(b"\r");
+    fixture.wait(|frame| frame.contains("Tavily · key saved · active"));
+    assert_eq!(
+        UserSettings::in_root(&root)
+            .load()
+            .search_config()
+            .unwrap()
+            .provider,
+        tickloop_agent_protocol::SearchProviderKind::Tavily
+    );
+    fixture.send(b"\x1b");
+    fixture.wait(|frame| !frame.lines().any(|line| line == "Web search"));
+    fixture.send(b"/settings\r");
+    fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));
+    fixture.select("Web search:");
+    fixture.send(b"\r");
+    fixture.wait(|frame| frame.lines().any(|line| line == "Web search"));
+    fixture.select("Off");
+    fixture.send(b"\r");
+    fixture.wait(|frame| frame.contains("Off · active"));
+    fixture.send(b"\x1b");
+    fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));
+    assert_eq!(UserSettings::in_root(&root).load().search_config(), None);
 }
