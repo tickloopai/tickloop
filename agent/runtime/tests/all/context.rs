@@ -537,12 +537,12 @@ async fn context_status_tracks_the_active_window_and_drops_immediately_after_com
     let directory = tempfile::tempdir().unwrap();
     let client = Arc::new(ScriptedModel::with_usages(
         vec![
-            text(&"older material ".repeat(3000)),
+            text(&"older material ".repeat(10_000)),
             text("A compact summary"),
         ],
         vec![Usage {
             input_tokens: Some(40_000),
-            output_tokens: Some(10_000),
+            output_tokens: Some(50_000),
             ..Usage::default()
         }],
     ));
@@ -556,9 +556,9 @@ async fn context_status_tracks_the_active_window_and_drops_immediately_after_com
         .unwrap();
     wait_for_completion(&mut events).await;
     let before = agent.status(chat).await.unwrap().context_tokens.unwrap();
-    assert!(
-        before > 40_000,
-        "the completed reply must consume current context: {before}"
+    assert_eq!(
+        before, 90_000,
+        "current context includes measured input and the completed reply"
     );
     agent.compact(chat).await.unwrap();
     let after = agent.status(chat).await.unwrap().context_tokens.unwrap();

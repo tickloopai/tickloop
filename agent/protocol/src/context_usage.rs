@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::{
     ChatSnapshot, Content, ImageSource, Message, ModelConfig, ModelRequestKind, RequestOutcome,
-    RequestUsageLedger, ToolDefinition, ToolResultBlock, ToolResultContent,
+    RequestUsageLedger, Role, ToolDefinition, ToolResultBlock, ToolResultContent, Usage,
 };
 
 pub const ESTIMATED_CONTEXT_BYTES_PER_TOKEN: usize = 2;
@@ -40,7 +40,11 @@ impl ContextMeasurement {
         }
     }
 
-    fn current_request_bytes(&self, snapshot: &ChatSnapshot) -> Option<usize> {
+    fn current_context(
+        &self,
+        snapshot: &ChatSnapshot,
+        completed_usage: Option<&Usage>,
+    ) -> Option<(usize, u64)> {
         let anchor = self
             .message_end
             .checked_sub(1)
@@ -50,11 +54,27 @@ impl ContextMeasurement {
             && self.message_end <= snapshot.messages.len()
             && self.message_anchor == anchor
         {
-            let added = serialized_context_bytes(&snapshot.messages[self.message_end..], &[])
+            let completed_output = completed_usage
+                .filter(|usage| {
+                    snapshot
+                        .messages
+                        .get(self.message_end)
+                        .is_some_and(|message| message.role == Role::Assistant)
+                        && snapshot.message_usage.get(&self.message_end) == Some(*usage)
+                })
+                .and_then(|usage| usage.output_tokens);
+            let tail_start = self.message_end + usize::from(completed_output.is_some());
+            let added = serialized_context_bytes(&snapshot.messages[tail_start..], &[])
                 .saturating_sub(EMPTY_CONTEXT_BYTES);
-            return Some(self.request_bytes.saturating_add(added));
+            return Some((
+                self.request_bytes.saturating_add(added),
+                completed_output.unwrap_or(0),
+            ));
         }
-        Some(active_history_bytes(snapshot)?.saturating_add(self.overhead_bytes))
+        Some((
+            active_history_bytes(snapshot)?.saturating_add(self.overhead_bytes),
+            0,
+        ))
     }
 }
 
@@ -76,10 +96,17 @@ pub(crate) fn current_context_tokens(
             })
         };
     let latest = records().next();
-    let bytes = match records().find_map(|entry| entry.context_measurement.as_ref()) {
-        Some(measurement) => measurement.current_request_bytes(snapshot)?,
-        None => active_history_bytes(snapshot)?.saturating_sub(EMPTY_CONTEXT_BYTES),
-    };
+    let (bytes, completed_output) =
+        match records().find(|entry| entry.context_measurement.is_some()) {
+            Some(entry) => entry.context_measurement.as_ref()?.current_context(
+                snapshot,
+                (entry.outcome == RequestOutcome::Accepted).then_some(&entry.usage),
+            )?,
+            None => (
+                active_history_bytes(snapshot)?.saturating_sub(EMPTY_CONTEXT_BYTES),
+                0,
+            ),
+        };
     let calibration = records().find_map(|entry| {
         let measurement = entry.context_measurement.as_ref()?;
         let input = entry.context_input_tokens().filter(|tokens| *tokens > 0)?;
@@ -109,6 +136,7 @@ pub(crate) fn current_context_tokens(
     Some(
         u64::try_from(tokens)
             .unwrap_or(u64::MAX)
+            .saturating_add(completed_output)
             .saturating_add(output),
     )
 }
