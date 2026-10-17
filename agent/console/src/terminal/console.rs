@@ -14819,6 +14819,57 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn the_next_question_is_not_published_as_ready_while_previous_input_is_frozen() {
+        let mut state = State::new(true, 100, 40);
+        state.prompt_enabled = true;
+        state.request_layout = Some(Uuid::new_v4());
+        let console = InteractiveConsoleFixture::new(state);
+        let first = question_menu(&["Yes", "No", "Other"]);
+        let first_id = first.id;
+        let keys = QuestionMenu {
+            entry_option: None,
+            entry_text: String::new(),
+            multi_select: false,
+            navigable: true,
+        };
+        console.show_question_menu(first, keys.clone()).unwrap();
+        {
+            let mut state = console.state.lock().unwrap();
+            assert!(matches!(
+                state.key(key(KeyCode::Enter)),
+                Some(InputEvent::Choice { .. })
+            ));
+            assert_eq!(state.menu_submission_pending, Some(first_id));
+        }
+        let mut review = question_menu(&["Submit answers", "Cancel"]);
+        review.title = "Review your answers".into();
+        let review_id = review.id;
+        console.show_question_menu(review, keys).unwrap();
+        let mut state = console.state.lock().unwrap();
+        let visible = state.rendered_screen.join("\n");
+        assert!(
+            !visible.contains("Review your answers") || !visible.contains("enter select"),
+            "the next step claims to accept Enter while the previous submission still discards it: {visible}"
+        );
+        assert!(
+            state.key(key(KeyCode::Enter)).is_none(),
+            "queued input from the old step stays frozen"
+        );
+        state.mark_menu_submission_finished(first_id);
+        assert!(state.release_finished_submissions());
+        state.draw(&mut Vec::new()).unwrap();
+        assert!(
+            state
+                .rendered_screen
+                .join("\n")
+                .contains("Review your answers")
+        );
+        assert!(
+            matches!(state.key(key(KeyCode::Enter)), Some(InputEvent::Choice { menu_id, index: 0, .. }) if menu_id == review_id)
+        );
+    }
+
     #[tokio::test]
     async fn the_question_dialog_answers_every_question_through_menu_keys() {
         use crate::terminal::menus::Menus;

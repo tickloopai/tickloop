@@ -469,6 +469,7 @@ async fn cancelling_an_installer_stops_its_own_descendant_process_group() {
     .unwrap();
     let task_started = started.clone();
     let task_finished = finished.clone();
+    let test_started = std::time::Instant::now();
     let task = tokio::spawn(async move {
         let mut command = tokio::process::Command::new("/bin/sh");
         command.arg(script).arg(task_started).arg(task_finished);
@@ -482,6 +483,11 @@ async fn cancelling_an_installer_stops_its_own_descendant_process_group() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    let finished_before_cancel = finished.exists();
+    eprintln!(
+        "[DEBUG-cancel-91af] abort_at={:?} finished_before_cancel={finished_before_cancel}",
+        test_started.elapsed()
+    );
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     tokio::time::sleep(std::time::Duration::from_millis(1300)).await;

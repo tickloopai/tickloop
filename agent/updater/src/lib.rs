@@ -566,9 +566,17 @@ impl Drop for ProcessGroup {
     fn drop(&mut self) {
         if self.is_armed {
             // This is the dedicated process group we created for this installer, never a user PID.
-            unsafe {
-                libc::kill(-(self.process_id as i32), libc::SIGKILL);
-            }
+            let group = unsafe { libc::getpgid(self.process_id as i32) };
+            let result = unsafe { libc::kill(-(self.process_id as i32), libc::SIGKILL) };
+            eprintln!(
+                "[DEBUG-cancel-91af] pid={} actual_group={group} kill_result={result} error={}",
+                self.process_id,
+                if result < 0 {
+                    std::io::Error::last_os_error().to_string()
+                } else {
+                    "none".into()
+                }
+            );
         }
     }
 }
