@@ -469,7 +469,6 @@ async fn cancelling_an_installer_stops_its_own_descendant_process_group() {
     .unwrap();
     let task_started = started.clone();
     let task_finished = finished.clone();
-    let test_started = std::time::Instant::now();
     let task = tokio::spawn(async move {
         let mut command = tokio::process::Command::new("/bin/sh");
         command.arg(script).arg(task_started).arg(task_finished);
@@ -483,10 +482,9 @@ async fn cancelling_an_installer_stops_its_own_descendant_process_group() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    let finished_before_cancel = finished.exists();
-    eprintln!(
-        "[DEBUG-cancel-91af] abort_at={:?} finished_before_cancel={finished_before_cancel}",
-        test_started.elapsed()
+    assert!(
+        !finished.exists(),
+        "the fixture finished before cancellation was requested"
     );
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
@@ -588,5 +586,47 @@ fn every_console_start_checks_again_even_after_a_recent_success_or_failure() {
     ] {
         assert!(is_due(&state, at, BackgroundCheck::Startup));
         assert!(!is_due(&state, at, BackgroundCheck::Periodic));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_cleans_up_children_forked_as_the_installer_is_killed() {
+    let root = tempfile::tempdir().unwrap();
+    let script = root.path().join("forking.sh");
+    std::fs::write(
+        &script,
+        "printf started > \"$1\"\n(sleep 0.02; printf leaked > \"$2\") &\nwait\n",
+    )
+    .unwrap();
+    for attempt in 0..48 {
+        let started = root.path().join(format!("started-{attempt}"));
+        let finished = root.path().join(format!("finished-{attempt}"));
+        let task_started = started.clone();
+        let task_finished = finished.clone();
+        let script = script.clone();
+        let task = tokio::spawn(async move {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.arg(script).arg(task_started).arg(task_finished);
+            crate::run_process(&mut command).await
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !started.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "installer did not start"
+            );
+            std::hint::spin_loop();
+        }
+        assert!(
+            !finished.exists(),
+            "fixture already finished before cancellation on attempt {attempt}"
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        assert!(
+            !finished.exists(),
+            "a child escaped cancellation during fork on attempt {attempt}"
+        );
     }
 }
