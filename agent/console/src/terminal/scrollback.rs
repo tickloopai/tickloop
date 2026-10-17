@@ -1,9 +1,10 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ops::Range,
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use tickloop_agent_protocol::ModelRequestKind;
 use tickloop_ui::{
     markdown::{MarkdownLine, Marks, StreamingLayout},
     settings::AmbiguousWidth,
@@ -140,6 +141,11 @@ struct CollapsedGroup {
     lead: String,
 }
 
+struct ModelRetryNotice {
+    line: usize,
+    attempt: usize,
+}
+
 /// An assistant reply held as Markdown source and laid out again for each
 /// width. The whole reply is one logical line whose text stays empty; its rows
 /// come from the layout, with `lead` in front of the first row and a hanging
@@ -228,6 +234,7 @@ pub(super) struct Scrollback {
     tool_call_headers: HashMap<String, ToolCallHeader>,
     running_shimmer: RunningShimmer,
     completion_notice: Option<Range<usize>>,
+    model_retries: BTreeMap<(Uuid, ModelRequestKind), ModelRetryNotice>,
     /// Logical lines of each input echo, oldest first.
     inputs: Vec<(u64, Range<usize>)>,
     next_input: u64,
@@ -264,6 +271,7 @@ impl Default for Scrollback {
             tool_call_headers: HashMap::new(),
             running_shimmer: RunningShimmer::default(),
             completion_notice: None,
+            model_retries: BTreeMap::new(),
             inputs: Vec::new(),
             next_input: 0,
             flashes_since_ms: 0,
@@ -446,6 +454,35 @@ impl Scrollback {
         self.completion_notice = Some(first_line..end.max(first_line));
     }
 
+    pub(super) fn set_model_retry(
+        &mut self,
+        run_id: Uuid,
+        kind: ModelRequestKind,
+        attempt: usize,
+        spans: &[(String, Option<Role>)],
+    ) {
+        let key = (run_id, kind);
+        let line = match self.model_retries.get(&key) {
+            Some(previous) if attempt > previous.attempt => previous.line,
+            _ => {
+                self.open_group = None;
+                if !self.lines.last().unwrap().is_empty() {
+                    self.start_line();
+                }
+                let line = self.lines.len() - 1;
+                self.start_line();
+                line
+            }
+        };
+        let spans = spans
+            .iter()
+            .map(|(text, role)| (text.as_str(), *role))
+            .collect::<Vec<_>>();
+        self.set_line(line, &spans);
+        self.model_retries
+            .insert(key, ModelRetryNotice { line, attempt });
+    }
+
     /// Starts a block: later text begins on a line of its own with exactly one blank row above
     /// it, as Claude Code gives every message a top margin, whatever hidden lines lie between it
     /// and the visible content above.
@@ -557,6 +594,9 @@ impl Scrollback {
         }
         for line in &mut self.foreground_command_hint_lines {
             shift(line);
+        }
+        for notice in self.model_retries.values_mut() {
+            shift(&mut notice.line);
         }
         let shift_range = |range: &mut Range<usize>| {
             if range.start >= at {
@@ -2075,6 +2115,116 @@ mod tests {
                 ""
             ]
         );
+    }
+
+    #[test]
+    fn model_retry_updates_its_original_row_and_reflows_without_stale_text() {
+        let mut scrollback = Scrollback::new();
+        let run = Uuid::new_v4();
+        let kind = ModelRequestKind::Conversation;
+        scrollback.append("Tool failed\n");
+        scrollback.set_model_retry(
+            run,
+            kind,
+            1,
+            &[
+                (
+                    "Model request: a long connection error".into(),
+                    Some(Role::Error),
+                ),
+                (" · attempt 2/11".into(), Some(Role::MutedText)),
+            ],
+        );
+        scrollback.append("Other output\n");
+        assert!(scrollback.frame(20, 20).lines.len() > 4);
+        scrollback.set_model_retry(
+            run,
+            kind,
+            2,
+            &[
+                ("Model request: lost".into(), Some(Role::Error)),
+                (" · attempt 3/11".into(), Some(Role::MutedText)),
+            ],
+        );
+        let frame = scrollback.frame(80, 20);
+        assert_eq!(
+            frame.lines,
+            [
+                "Tool failed",
+                "Model request: lost · attempt 3/11",
+                "Other output",
+                ""
+            ]
+        );
+        assert_eq!(
+            roles_of(&frame.styled[1]),
+            [
+                ("Model request: lost".into(), Some(Role::Error)),
+                (" · attempt 3/11".into(), Some(Role::MutedText)),
+            ]
+        );
+        assert_eq!(
+            scrollback.frame(20, 20).lines,
+            [
+                "Tool failed",
+                "Model request:",
+                "lost · attempt 3/11",
+                "Other output",
+                ""
+            ]
+        );
+    }
+
+    #[test]
+    fn model_retry_keeps_other_requests_and_new_retry_sequences_separate() {
+        let mut scrollback = Scrollback::new();
+        let run = Uuid::new_v4();
+        let other_run = Uuid::new_v4();
+        let conversation = ModelRequestKind::Conversation;
+        let review = ModelRequestKind::PermissionCheck;
+        for (run, kind, attempt, text) in [
+            (run, conversation, 1, "old attempt"),
+            (run, review, 1, "review attempt"),
+            (other_run, conversation, 1, "other run"),
+            (run, conversation, 2, "latest attempt"),
+            (run, conversation, 1, "new request attempt"),
+            (run, conversation, 2, "new request latest"),
+        ] {
+            scrollback.set_model_retry(run, kind, attempt, &[(text.into(), None)]);
+        }
+        scrollback.append("Failed: final failure\n");
+        assert_eq!(
+            scrollback.frame(80, 20).lines,
+            [
+                "latest attempt",
+                "review attempt",
+                "other run",
+                "new request latest",
+                "Failed: final failure",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn model_retry_tracks_insertions_before_its_row() {
+        let mut scrollback = Scrollback::new();
+        let run = Uuid::new_v4();
+        let kind = ModelRequestKind::Conversation;
+        scrollback.set_tool_call(
+            run,
+            "call",
+            &[("Tool".into(), None)],
+            ToolCallState::Running,
+            None,
+        );
+        scrollback.set_model_retry(run, kind, 1, &[("old attempt".into(), None)]);
+        scrollback.append_tool_result("call", &[("Tool result\n".into(), None)]);
+        scrollback.set_model_retry(run, kind, 2, &[("latest attempt".into(), None)]);
+        let text = scrollback.frame(80, 20).lines.join("\n");
+        assert!(text.contains("Tool result"), "{text}");
+        assert!(text.contains("latest attempt"), "{text}");
+        assert!(!text.contains("old attempt"), "{text}");
     }
 
     #[test]

@@ -3252,6 +3252,20 @@ impl Console {
         })
     }
 
+    pub(super) fn write_model_retry(
+        &self,
+        run_id: Uuid,
+        kind: tickloop_agent_protocol::ModelRequestKind,
+        attempt: usize,
+        spans: &[(String, Option<Role>)],
+    ) -> Result<(), String> {
+        let mut output = spans.to_vec();
+        output.push(("\n".into(), None));
+        self.write_scrollback_spans(&output, |scrollback| {
+            scrollback.set_model_retry(run_id, kind, attempt, spans)
+        })
+    }
+
     pub(super) fn write_tool_call(
         &self,
         run_id: Uuid,

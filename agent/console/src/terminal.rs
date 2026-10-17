@@ -4207,14 +4207,10 @@ async fn interact(
                         EventKind::ModelRetry { kind, error, attempt, max_retries, delay_ms } => {
                             let (failure, retry) =
                                 model_retry_parts(kind, &error, attempt, max_retries, delay_ms);
-                            if interactive {
-                                console.write_roles(&[
-                                    (failure, Some(Role::Error)),
-                                    (format!("{retry}\n"), Some(Role::MutedText)),
-                                ])?;
-                            } else {
-                                console.write(&format!("{failure}{retry}\n"))?;
-                            }
+                            console.write_model_retry(event.run_id, kind, attempt, &[
+                                (failure, Some(Role::Error)),
+                                (retry, Some(Role::MutedText)),
+                            ])?;
                         },
                         EventKind::Interrupted => {
                             if suggestible_runs.remove(&event.run_id) {
@@ -5484,7 +5480,12 @@ fn render_restored_observation(
                 } => {
                     let (failure, retry) =
                         model_retry_parts(*kind, error, *attempt, *max_retries, *delay_ms);
-                    outln!(console, "{failure}{retry}")
+                    console.write_model_retry(
+                        event.run_id,
+                        *kind,
+                        *attempt,
+                        &[(failure, Some(Role::Error)), (retry, Some(Role::MutedText))],
+                    )?;
                 }
                 EventKind::Interrupted if console.is_interactive() => {
                     if !interrupted_by_rejection {
@@ -7408,7 +7409,7 @@ fn model_retry_parts(
         _ => "Model request",
     };
     (
-        format!("{request}: {}", safe_text(error)),
+        format!("{request}: {}", safe_text(error).replace('\n', " ")),
         format!(
             " · Retrying in {:.1}s… (attempt {}/{})",
             delay_ms as f64 / 1000.0,

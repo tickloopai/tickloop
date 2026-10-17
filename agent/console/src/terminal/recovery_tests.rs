@@ -104,6 +104,82 @@ mod working_activity_tests;
 
 use tickloop_agent_test_support::screen;
 
+#[tokio::test]
+async fn model_retry_replay_updates_the_live_row_and_preserves_final_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::new_embedded(
+        tickloop_agent_test_support::config(),
+        Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![])),
+    );
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let run_id = Uuid::new_v4();
+    let loop_id = Uuid::new_v4();
+    let console = Console::test_interactive_for_chat(chat);
+    let mut observation = agent.observe(chat, 0).await.unwrap();
+    let retry = |sequence, attempt| Event {
+        chat_id: chat,
+        loop_id,
+        run_id,
+        sequence,
+        kind: EventKind::ModelRetry {
+            kind: ModelRequestKind::Conversation,
+            error: "connection lost\nplease retry".into(),
+            attempt,
+            max_retries: 10,
+            delay_ms: 500,
+        },
+    };
+    let (failure, retry_text) = model_retry_parts(
+        ModelRequestKind::Conversation,
+        "connection lost\nplease retry",
+        1,
+        10,
+        500,
+    );
+    console
+        .write_model_retry(
+            run_id,
+            ModelRequestKind::Conversation,
+            1,
+            &[
+                (failure, Some(Role::Error)),
+                (retry_text, Some(Role::MutedText)),
+            ],
+        )
+        .unwrap();
+    observation.events = vec![
+        retry(2, 2),
+        retry(3, 3),
+        Event {
+            chat_id: chat,
+            loop_id,
+            run_id,
+            sequence: 4,
+            kind: EventKind::Failed("final failure".into()),
+        },
+    ];
+    render_restored_observation(
+        &console,
+        &mut ToolPresentation::new(true),
+        chat,
+        1,
+        &mut HashMap::new(),
+        &mut MessageGroups::default(),
+        observation,
+    )
+    .unwrap();
+    let text = console.test_conversation_text();
+    assert_eq!(text.matches("Model request:").count(), 1, "{text}");
+    assert!(text.contains("connection lost please retry"), "{text}");
+    assert!(text.contains("attempt 4/11"), "{text}");
+    assert!(
+        !text.contains("attempt 2/11") && !text.contains("attempt 3/11"),
+        "{text}"
+    );
+    assert!(text.contains("Failed: final failure"), "{text}");
+    agent.shutdown().await;
+}
+
 const REPLY: &str = "child follow-up acknowledged";
 const FIRST_REPLY_DELTA: &str = "child follow-";
 const FIXTURE_VARIABLE: &str = "TICKLOOP_REPLY_RECOVERY_FIXTURE";
