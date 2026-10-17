@@ -359,7 +359,9 @@ fn a_busy_turn_in_a_long_chat_reads_no_whole_chat() {
         writer,
         output,
         _master: pair.master,
-        timeout: Duration::from_secs(20),
+        // The fixture starts a second copy of this test binary and loads a long Chat; under a fully
+        // loaded test run that alone can take most of a minute.
+        timeout: Duration::from_secs(60),
     };
     fixture.wait_for("Enter a message to");
     fixture.send(b"Work through the busy input.\r");

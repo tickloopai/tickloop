@@ -24,9 +24,6 @@ pub enum HostToolPermission {
     PublicArtifactWrite,
     /// A subsequent write to an Artifact with the same admitted audience in this conversation.
     ArtifactContinuation,
-    /// An image upload to an Artifact of a file from outside the workspace, reviewed like a first
-    /// public write whatever the Artifact's audience.
-    ArtifactUploadFromOutside,
     /// A mutation governed by the Chat execution mode and ordinary approval policy.
     Reviewable,
     /// A host requirement for human confirmation, independent of execution mode.

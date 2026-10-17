@@ -96,9 +96,12 @@ mod ancestry_authority_tests {
                 &receipt,
                 &operation,
                 &input,
-                Some(crate::host_tools::HostToolPermission::Classified {
-                    allow_rule_bypasses_review: false,
-                }),
+                HostCallPermission {
+                    permission: Some(crate::host_tools::HostToolPermission::Classified {
+                        allow_rule_bypasses_review: false,
+                    }),
+                    local_read: None,
+                },
                 None,
             )
             .unwrap();
@@ -467,13 +470,21 @@ pub(super) fn effective_policy(
     Ok(policy)
 }
 
+/// What a prepared host call contributes to its approval: the host's permission class, and the
+/// local file it sends, whose `Read` approval the call also needs.
+#[derive(Clone, Copy)]
+pub(super) struct HostCallPermission<'a> {
+    pub(super) permission: Option<crate::host_tools::HostToolPermission>,
+    pub(super) local_read: Option<&'a PreparedTool>,
+}
+
 pub(super) fn host_authority(
     chats: &HashMap<ChatId, Chat>,
     sessions: &session_permissions::SessionPermissionContext,
     receipt: &Receipt,
     operation: &OperationRecord,
     permission_input: &Value,
-    permission: Option<crate::host_tools::HostToolPermission>,
+    host_call: HostCallPermission<'_>,
     session: Option<tickloop_agent_tools::permissions::SessionPermissionDecision>,
 ) -> Result<
     (
@@ -482,6 +493,10 @@ pub(super) fn host_authority(
     ),
     String,
 > {
+    let HostCallPermission {
+        permission,
+        local_read,
+    } = host_call;
     let policy = effective_policy(chats, receipt)?;
     let decide = |policy: &tickloop_agent_protocol::PermissionPolicy, loop_id, session, human| {
         let explicit =
@@ -526,6 +541,20 @@ pub(super) fn host_authority(
             decision = decision.stricter(ancestor_decision);
             explicit_ask |= ancestor_ask;
         }
+    }
+    // A call that sends a local file needs whatever approval a `Read` of that file would.
+    if let Some(read) = local_read {
+        let read_operation =
+            SessionPermissionOperation::from_prepared(read, &configured_workspace_for_chat(own))
+                .map_err(|error| error.to_string())?;
+        let owner = PermissionOwner::new(receipt.chat_id, receipt.loop_id)
+            .map_err(|error| error.to_string())?;
+        let read_session = sessions.evaluate(owner, &read_operation).decision;
+        let read_authority =
+            permission_authority(chats, sessions, receipt, read, read_session, None)
+                .ok_or("chat is unavailable")?;
+        decision = decision.stricter(read_authority.decision);
+        explicit_ask |= read_authority.explicit_ask;
     }
 
     Ok((

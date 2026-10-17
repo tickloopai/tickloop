@@ -860,9 +860,8 @@ impl McpHostToolProvider {
     }
 
     /// Resolves the file by the calling Chat's `Read` rules and reads it whole, so the approval
-    /// covers the exact bytes later sent. The approval joins the file read with the write to the
-    /// Slides: a file outside the workspace keeps it reviewed even where the Artifact's audience
-    /// alone would not.
+    /// covers the exact bytes later sent. The approval joins the write to the Slides, judged by
+    /// the Artifact's audience like `ArtifactEdit`, with the decision a `Read` of the file gets.
     async fn prepare_upload(
         &self,
         chat_id: ChatId,
@@ -913,18 +912,14 @@ impl McpHostToolProvider {
                 artifact_type(&metadata.format).map_or(metadata.format.as_str(), |kind| kind.name)
             ));
         }
-        let permission = match self.audience_permission(
-            chat_id,
-            &credential,
-            requested,
-            metadata.publication.as_ref(),
-        ) {
-            Some(_) if file.read.requires_permission => {
-                HostToolPermission::ArtifactUploadFromOutside
-            }
-            Some(permission) => permission,
-            None => HostToolPermission::Reviewable,
-        };
+        let permission = self
+            .audience_permission(
+                chat_id,
+                &credential,
+                requested,
+                metadata.publication.as_ref(),
+            )
+            .unwrap_or(HostToolPermission::Reviewable);
         let approval_input = json!({
             "artifact_id": requested,
             "file_path": file.path,

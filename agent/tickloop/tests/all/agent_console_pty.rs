@@ -3051,8 +3051,19 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
             .any(|line| line.starts_with("New Agent · cwd") && line.ends_with("work")),
         "{frame}"
     );
-    let rows = catalog(&client).await;
-    assert_eq!(rows.len(), 3);
+    // An Agent is listed as soon as it exists and takes its first input's title just after, so
+    // wait until both launch-directory Shells carry theirs.
+    let rows = tokio::time::timeout(UI_TIMEOUT, async {
+        loop {
+            let rows = catalog(&client).await;
+            if rows.len() == 3 && rows.iter().filter(|row| row.title == "!pwd").count() == 2 {
+                break rows;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both launch-directory Shells are titled by their command");
     let created = rows
         .iter()
         .find(|row| row.execution != older.execution && row.execution != bravo.execution)
@@ -3063,8 +3074,6 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
         "no execution hash names the created Agent: {frame}"
     );
     assert_eq!(created.workdir, launch);
-    assert_eq!(created.title, "!pwd");
-    assert_eq!(older.title, created.title);
     view.send(b"\x1b[A");
     view.wait_for("empty Up keeps the monitored selection", |frame| {
         selected_row_title(frame).is_some_and(|title| title.starts_with("!printf bravo"))

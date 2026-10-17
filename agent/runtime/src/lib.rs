@@ -482,6 +482,7 @@ struct HostAdmission<'a> {
     policy_revision: u64,
     ancestor_revisions: &'a [(ChatId, u64)],
     host_permission: Option<crate::host_tools::HostToolPermission>,
+    local_read: Option<&'a tickloop_agent_tools::PreparedTool>,
     approval_path: ApprovalPath,
     direct_basis: denials::DirectApprovalBasis,
     approval_source: Option<PermissionApprovalSource>,
@@ -546,7 +547,6 @@ fn host_tool_decision(
         host_permission,
         Some(
             crate::host_tools::HostToolPermission::PublicArtifactWrite
-                | crate::host_tools::HostToolPermission::ArtifactUploadFromOutside
                 | crate::host_tools::HostToolPermission::ArtifactContinuation
         )
     ) {
@@ -2924,7 +2924,10 @@ impl Agent {
             receipt,
             operation,
             permission_input,
-            admission.host_permission,
+            delegation::HostCallPermission {
+                permission: admission.host_permission,
+                local_read: admission.local_read,
+            },
             admission.session_evaluation.decision,
         )?;
         let chat = chats.get_mut(&receipt.chat_id).unwrap();

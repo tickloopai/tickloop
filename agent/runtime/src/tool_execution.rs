@@ -986,7 +986,12 @@ impl Agent {
                     receipt,
                     &operation,
                     permission_input,
-                    host_permission,
+                    delegation::HostCallPermission {
+                        permission: host_permission,
+                        local_read: prepared_host_call
+                            .as_ref()
+                            .and_then(|call| call.local_read()),
+                    },
                     session_evaluation.decision,
                 )?;
                 (
@@ -1072,8 +1077,20 @@ impl Agent {
                         },
                     );
                 }
+                let allow_rule_skips_review = !matches!(
+                    host_permission,
+                    Some(crate::host_tools::HostToolPermission::Classified {
+                        allow_rule_bypasses_review: false
+                    })
+                );
                 let reviewed = self
-                    .resolve_auto_assessment(receipt, &operation, &policy, &mut assessment)
+                    .resolve_auto_assessment(
+                        receipt,
+                        &operation,
+                        &policy,
+                        &mut assessment,
+                        allow_rule_skips_review,
+                    )
                     .await?;
                 assessment_details = Some(assessment.details.clone());
                 decision = reviewed.decision;
@@ -1271,6 +1288,9 @@ impl Agent {
                                     policy_revision: revision,
                                     ancestor_revisions: &ancestor_revisions,
                                     host_permission,
+                                    local_read: prepared_host_call
+                                        .as_ref()
+                                        .and_then(|call| call.local_read()),
                                     approval_path: if was_approved_by_human {
                                         ApprovalPath::Human
                                     } else {
@@ -1602,6 +1622,7 @@ impl Agent {
                                     &operation,
                                     &policy,
                                     &mut assessment,
+                                    true,
                                 )
                                 .await?;
                             assessment_details = Some(assessment.details.clone());
@@ -1936,6 +1957,7 @@ impl Agent {
         operation: &OperationRecord,
         policy: &PermissionPolicy,
         assessment: &mut approval_assessment::ApprovalAssessment,
+        allow_rule_skips_review: bool,
     ) -> Result<AutoPermissionDecision, ToolCallError> {
         let decision;
         let mut approval_reason = None;
@@ -2043,7 +2065,10 @@ impl Agent {
                     }
                     _ => {
                         decision = Decision::Deny;
-                        auto_denial_message = Some(auto_mode::rejection_message(&reason));
+                        auto_denial_message = Some(auto_mode::rejection_message(
+                            &reason,
+                            allow_rule_skips_review.then_some(operation.name.as_str()),
+                        ));
                     }
                 }
             }

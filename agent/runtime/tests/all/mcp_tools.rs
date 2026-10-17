@@ -3956,6 +3956,51 @@ async fn an_admitted_slides_write_still_asks_before_sending_a_file_from_outside_
     agent.shutdown().await;
 }
 
+#[tokio::test]
+async fn an_upload_allow_rule_still_asks_before_reading_a_file_from_outside_the_workspace() {
+    use tickloop_agent_protocol::Decision;
+    let service = ArtifactService::start().await;
+    slides_published_to(&service, "private");
+    let directory = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let path = elsewhere.path().join("photo.png");
+    std::fs::write(&path, png(b"photo")).unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![
+        upload_call("upload", &path),
+        text("Uploaded."),
+    ]));
+    let agent = signed_in_agent(&service, directory.path(), model).await;
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::AcceptEdits)
+        .await
+        .unwrap();
+    let mut allow_upload = read_rule(Decision::Allow, None);
+    allow_upload.tool = "ArtifactUpload".into();
+    agent
+        .set_permission_rules(chat, vec![allow_upload])
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(chat, None, "Add my photo to the Slides".into())
+        .await
+        .unwrap();
+    let permission = next_permission(&mut events).await;
+    assert_eq!(permission.name, "ArtifactUpload");
+    assert!(
+        service.uploads().is_empty(),
+        "nothing is sent before approval"
+    );
+    agent
+        .answer_permission(chat, permission.id, true)
+        .await
+        .unwrap();
+    wait_for_completion(&agent, chat).await;
+    assert_eq!(service.uploads().len(), 1);
+    agent.shutdown().await;
+}
+
 fn read_rule(
     decision: tickloop_agent_protocol::Decision,
     input: Option<Value>,
@@ -4212,7 +4257,7 @@ async fn a_frozen_parent_session_denial_of_reading_the_file_refuses_a_subagent_u
 }
 
 #[tokio::test]
-async fn auto_mode_reviews_an_upload_from_outside_the_workspace_instead_of_asking() {
+async fn auto_mode_uploads_a_file_from_outside_the_workspace_to_private_slides_without_review() {
     let service = ArtifactService::start().await;
     slides_published_to(&service, "private");
     let directory = tempfile::tempdir().unwrap();
@@ -4238,21 +4283,19 @@ async fn auto_mode_reviews_an_upload_from_outside_the_workspace_instead_of_askin
         .submit(chat, None, "Add my photo to the Slides".into())
         .await
         .unwrap();
-    let mut assessed = false;
     loop {
         match tickloop_agent_test_support::next_event(&mut events)
             .await
             .kind
         {
-            EventKind::ApprovalAssessed { .. } => assessed = true,
-            EventKind::PermissionRequested { .. } => panic!("Auto reviews instead of asking"),
+            EventKind::ApprovalAssessed { .. } => panic!("the upload needs no review"),
+            EventKind::PermissionRequested { .. } => panic!("the upload needs no approval"),
             EventKind::Completed { .. } => break,
             EventKind::Failed(error) => panic!("{error}"),
             _ => {}
         }
     }
-    assert!(assessed);
-    assert_eq!(reviewer.requests.lock().unwrap().len(), 1);
+    assert!(reviewer.requests.lock().unwrap().is_empty());
     assert_eq!(service.uploads().len(), 1);
     agent.shutdown().await;
 }

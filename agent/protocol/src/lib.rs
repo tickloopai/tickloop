@@ -82,10 +82,10 @@ pub use chat::{
 };
 pub use chat_status::ChatStatus;
 pub use denials::{
-    ApprovalHistoryView, ApprovalPath, ApprovalRecord, ApprovalResult, DenialAutoFinding,
-    DenialAutoRuleSummary, DenialCategory, DenialPersistence, DenialRecord, DenialReference,
-    DenialReviewFacts, DenialRuleSource, DenialRuleSummary, DenialsView, DisplaySummary,
-    MAX_RECENT_DENIALS, render_reference,
+    AUTO_REJECTION_PREFIX, ApprovalHistoryView, ApprovalPath, ApprovalRecord, ApprovalResult,
+    DenialAutoFinding, DenialAutoRuleSummary, DenialCategory, DenialPersistence, DenialRecord,
+    DenialReference, DenialReviewFacts, DenialRuleSource, DenialRuleSummary, DenialsView,
+    DisplaySummary, MAX_RECENT_DENIALS, render_reference,
 };
 pub use family::{
     AgentColor, AgentMessageSource, DelegationCeiling, DelegationMetadata, DelegationParent,

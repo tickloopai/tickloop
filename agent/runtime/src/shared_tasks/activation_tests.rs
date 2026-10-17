@@ -566,6 +566,7 @@ async fn host_admission_rechecks_task_binding_after_waiting_for_the_commit_lock(
             policy_revision: revision,
             ancestor_revisions: &[],
             host_permission: Some(crate::host_tools::HostToolPermission::ReadOnly),
+            local_read: None,
             approval_path: ApprovalPath::Direct,
             direct_basis: denials::DirectApprovalBasis::ReadOnly,
             approval_source: None,
