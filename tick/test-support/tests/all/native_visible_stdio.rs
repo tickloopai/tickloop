@@ -243,13 +243,18 @@ fn visible_kline_keyboard_and_tool_share_the_same_stdio_instance() {
             }
         }
     };
-    let oversized = next_answer();
-    assert_eq!(
-        oversized["id"], 14,
-        "lines naming no request id go unanswered"
-    );
+    // The read fast path can overtake the runtime's oversized-frame error.
+    let answers = [next_answer(), next_answer()];
+    let mut ids = answers
+        .iter()
+        .map(|answer| answer["id"].as_u64().expect("a request id"))
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, [12, 14], "lines naming no request id go unanswered");
+    let oversized = answers.iter().find(|answer| answer["id"] == 14).unwrap();
     assert_eq!(oversized["error"]["code"], FRAME_TOO_LARGE);
-    assert_eq!(next_answer()["id"], 12);
+    let read = answers.iter().find(|answer| answer["id"] == 12).unwrap();
+    assert_eq!(read["result"]["data"]["period"], "day");
 
     tty.write_all(b"5").unwrap();
     let switched = loop {

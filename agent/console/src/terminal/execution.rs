@@ -1377,7 +1377,8 @@ impl ConsoleExecution {
                         }
                     }
                     Ok(ObservationUpdate {
-                        change: ObservationChange::AccountModels(_),
+                        change:
+                            ObservationChange::AccountModels(_) | ObservationChange::SearchTest(_),
                         ..
                     }) => {}
                     // A Resync stands for a change too large for the feed, such as an event with
@@ -1988,6 +1989,47 @@ impl ConsoleExecution {
         {
             ObservationValue::ProviderCredentials(scope) => Ok(*scope),
             _ => Err(unexpected()),
+        }
+    }
+
+    pub(super) async fn test_search(
+        &self,
+        target: ConfigTarget,
+        config: tickloop_agent_protocol::SearchConfig,
+    ) -> Result<tickloop_agent_protocol::SearchTestResult, String> {
+        let ConfigTarget::Agent(chat) = target else {
+            return Ok(tickloop_agent_tools::web_search::test_connection(
+                &config,
+                self.inner.launch.config_root.as_deref(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await);
+        };
+        let execution = self
+            .reference(chat)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut observation = self
+            .inner
+            .access
+            .observe(ObservationRequest::Agent {
+                execution,
+                detail: AgentDetailQuery::TestSearch { config },
+                after: None,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        if !matches!(observation.initial, ObservationValue::SearchTestPending) {
+            return Err("Agent returned an invalid search test snapshot".into());
+        }
+        match observation
+            .recv()
+            .await
+            .map_err(|error| error.to_string())?
+            .change
+        {
+            ObservationChange::SearchTest(result) => Ok(result),
+            _ => Err("Agent returned an invalid search test update".into()),
         }
     }
 

@@ -786,6 +786,62 @@ fn search_config(url: &str) -> SearchConfig {
 }
 
 #[tokio::test]
+async fn search_off_removes_the_tool_and_explains_how_to_enable_it_without_disabling_fetch() {
+    let directory = tempfile::tempdir().unwrap();
+    let model = WebModel::new(Vec::new(), PageAnswer::Text("unused"));
+    let agent = Agent::new_embedded(config(), model.clone());
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    let mut events = agent.subscribe();
+    for enabled in [true, false, true] {
+        agent
+            .set_search(chat, enabled.then(SearchConfig::default))
+            .await
+            .unwrap();
+        agent
+            .submit(chat, None, "Check web search availability".into())
+            .await
+            .unwrap();
+        loop {
+            match tokio::time::timeout(EVENT_TIMEOUT, events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .kind
+            {
+                EventKind::Completed { .. } => break,
+                EventKind::Failed(error) => panic!("{error}"),
+                EventKind::PermissionRequested { .. } => panic!("no tool was requested"),
+                _ => {}
+            }
+        }
+        let requests = model.conversation_requests.lock().unwrap();
+        let request = requests.last().unwrap();
+        assert_eq!(
+            request.tools.iter().any(|tool| tool.name == "WebSearch"),
+            enabled
+        );
+        assert!(request.tools.iter().any(|tool| tool.name == "WebFetch"));
+        let system = request
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::System)
+            .flat_map(|message| &message.content)
+            .filter_map(|content| match content {
+                Content::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(system.contains("# Web search is disabled"), !enabled);
+        if !enabled {
+            assert!(system.contains("enable it with /search"));
+            assert!(system.contains("bypass this setting"));
+        }
+    }
+    agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn search_selection_is_account_independent_and_persists_for_new_agents() {
     use tickloop_agent_protocol::SearchProviderKind;
     let directory = tempfile::tempdir().unwrap();
@@ -871,7 +927,12 @@ async fn configured_search_freezes_the_approved_source_and_returns_claude_code_r
             EventKind::ToolCompleted { result, .. } => {
                 assert!(!result.is_error, "{}", result.content);
                 assert!(
-                    result.content.starts_with(&
+                    result
+                        .content
+                        .starts_with("Search source: SearXNG / compatible JSON\nSearched at: ")
+                );
+                assert!(
+                    result.content.contains(&
                     format!(
                         "Web search results for query: \"Rust documentation\"\n\nLinks: [{{\"title\":\"Rust documentation\",\"url\":\"https://doc.rust-lang.org/\",\"summary\":\"Official language documentation\"}}]{SOURCES_REMINDER}"
                     ))
@@ -888,16 +949,27 @@ async fn configured_search_freezes_the_approved_source_and_returns_claude_code_r
 }
 
 #[tokio::test]
-async fn search_distinguishes_unconfigured_empty_rate_limited_and_invalid_responses() {
+async fn search_distinguishes_disabled_empty_rate_limited_and_invalid_responses() {
     let search = || {
         WebModel::new(
             vec![("WebSearch", json!({"query":"rust"}))],
             PageAnswer::Text("unused"),
         )
     };
-    let run = run_web(search(), None).await;
+    let disabled_model = search();
+    let run = run_web(disabled_model.clone(), None).await;
     assert!(run.failure.is_none(), "{:?}", run.failure);
-    assert!(run.results[0].is_error && run.results[0].content.contains("not configured"));
+    assert!(run.results[0].is_error && run.results[0].content.contains("disabled"));
+    assert!(run.results[0].content.contains("/search"));
+    assert!(run.permission_requests.is_empty());
+    assert!(
+        disabled_model
+            .conversation_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| { !request.tools.iter().any(|tool| tool.name == "WebSearch") })
+    );
     for (status, body, expected) in [
         (200, "{\"results\":[]}", None),
         (429, "busy", Some("rate limited")),
@@ -915,7 +987,7 @@ async fn search_distinguishes_unconfigured_empty_rate_limited_and_invalid_respon
         let result = &run.results[0];
         match expected {
             Some(expected) => assert!(result.is_error && result.content.contains(expected)),
-            None => assert!(result.content.starts_with(&format!(
+            None => assert!(result.content.contains(&format!(
                 "Web search results for query: \"rust\"\n\nNo links found.{SOURCES_REMINDER}"
             ))),
         }

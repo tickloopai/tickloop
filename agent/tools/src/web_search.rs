@@ -18,15 +18,17 @@ use tickloop_agent_base::{
     credentials,
     network::{HttpPolicy, build_http_client},
 };
-use tickloop_agent_protocol::{SearchConfig, SearchProviderKind};
+use tickloop_agent_protocol::{
+    SearchConfig, SearchProviderKind, SearchTestResult, SearchTestStatus,
+};
 use tokio_util::sync::CancellationToken;
 
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
-const FREE_ENGINE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_QUERY_BYTES: usize = 4096;
+const PERPLEXITY_MAX_DOMAIN_BYTES: usize = 253;
 pub const DEFAULT_RESULT_LIMIT: usize = 10;
-const BING_ENDPOINT: &str = "https://www.bing.com/search";
+pub const DISABLED_MESSAGE: &str = "Web search is disabled for this request. The user can enable it with /search. This call was not executed.";
 const DUCKDUCKGO_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,15 +57,23 @@ impl DomainFilter {
     }
 
     fn operator_queries(&self, query: &str, exclusion_prefix: &str) -> Vec<String> {
+        let constrained_query = if query
+            .split_whitespace()
+            .any(|word| word.eq_ignore_ascii_case("OR") || word == "|")
+        {
+            format!("({query})")
+        } else {
+            query.to_owned()
+        };
         match self {
             Self::Any => vec![query.to_owned()],
             // Separate requests avoid relying on engine-specific OR precedence for a whitelist.
             Self::Allowed(domains) => domains
                 .iter()
-                .map(|domain| format!("({query}) site:{domain}"))
+                .map(|domain| format!("{constrained_query} site:{domain}"))
                 .collect(),
             Self::Blocked(domains) => vec![format!(
-                "({query}) {}",
+                "{constrained_query} {}",
                 domains
                     .iter()
                     .map(|domain| format!("{exclusion_prefix}site:{domain}"))
@@ -128,9 +138,9 @@ pub enum SearchError {
     #[error("service access denied (HTTP {0}); check the selected provider credentials")]
     Authentication(u16),
     #[error(
-        "search provider usage or plan limit (HTTP 402); check the account balance or subscription"
+        "search provider usage or plan limit (HTTP {0}); check the account balance or subscription"
     )]
-    UsageLimit,
+    UsageLimit(u16),
     #[error("service rate limited the request (HTTP 429)")]
     RateLimited { retry_after: Option<Duration> },
     #[error("search engine requires human verification; no search results were returned")]
@@ -151,11 +161,6 @@ pub enum SearchError {
     Redirect,
     #[error("search service returned HTTP {0}")]
     Http(u16),
-    #[error("free search failed: Bing: {bing}; DuckDuckGo: {duckduckgo}")]
-    FreeUnavailable {
-        bing: Box<SearchError>,
-        duckduckgo: Box<SearchError>,
-    },
 }
 
 #[async_trait]
@@ -188,10 +193,20 @@ impl PreparedSearch {
         request: &SearchRequest,
         cancel: CancellationToken,
     ) -> Result<SearchResponse, SearchError> {
+        self.execute_with_limit(request, cancel, DEFAULT_RESULT_LIMIT)
+            .await
+    }
+
+    async fn execute_with_limit(
+        &self,
+        request: &SearchRequest,
+        cancel: CancellationToken,
+        max_results: usize,
+    ) -> Result<SearchResponse, SearchError> {
         let context = SearchContext {
             cancel,
             deadline: tokio::time::Instant::now() + SEARCH_TIMEOUT,
-            max_results: DEFAULT_RESULT_LIMIT,
+            max_results,
         };
         tokio::select! {
             biased;
@@ -201,10 +216,49 @@ impl PreparedSearch {
     }
 }
 
+/// Runs one ordinary search through the selected adapter without changing configuration.
+pub async fn test_connection(
+    config: &SearchConfig,
+    credential_root: Option<&Path>,
+    cancel: CancellationToken,
+) -> SearchTestResult {
+    let request = SearchRequest {
+        query: "Rust programming language".into(),
+        domains: DomainFilter::Any,
+    };
+    let result = match prepare(config, &request, credential_root) {
+        Ok(prepared) => prepared.execute_with_limit(&request, cancel, 1).await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(response) if !response.results.is_empty() => SearchTestResult {
+            status: SearchTestStatus::Available,
+            detail: "Test search returned a valid result. This is the latest test, not an ongoing availability check.".into(),
+        },
+        Ok(_) => SearchTestResult {
+            status: SearchTestStatus::NoResults,
+            detail: "The service responded without results; search access could not be verified.".into(),
+        },
+        Err(error) => SearchTestResult {
+            status: match error {
+                SearchError::Authentication(_) => SearchTestStatus::AuthenticationFailed,
+                SearchError::UsageLimit(_) => SearchTestStatus::UsageLimited,
+                SearchError::RateLimited { .. } => SearchTestStatus::RateLimited,
+                SearchError::Network => SearchTestStatus::NetworkFailed,
+                SearchError::Timeout => SearchTestStatus::TimedOut,
+                SearchError::Challenge => SearchTestStatus::Challenge,
+                SearchError::MissingCredential | SearchError::Credential | SearchError::InvalidQuery(_) => SearchTestStatus::ConfigurationFailed,
+                _ => SearchTestStatus::ServiceFailed,
+            },
+            detail: error.to_string(),
+        },
+    }
+}
+
 pub fn validate_config(config: &SearchConfig) -> Result<(), String> {
     if config.provider == SearchProviderKind::Free {
         if !config.endpoint.is_empty() || config.api_key_env.is_some() {
-            return Err("free search uses its fixed engine endpoints and no API key".into());
+            return Err("DuckDuckGo uses its fixed endpoint and no API key".into());
         }
         return Ok(());
     }
@@ -253,61 +307,92 @@ pub fn prepare(
         return Err(SearchError::InvalidQuery("query is too long"));
     }
     let kind = config.provider;
-    let (provider, endpoints): (Arc<dyn SearchProvider>, Vec<String>) =
-        if kind == SearchProviderKind::Free {
-            let urls = vec![BING_ENDPOINT.to_owned(), DUCKDUCKGO_ENDPOINT.to_owned()];
-            let queries = request.domains.operator_queries(&request.query, "-");
-            validate_queries(&queries, MAX_QUERY_BYTES, None)?;
-            (
-                Arc::new(FreeSearch {
-                    bing: Url::parse(BING_ENDPOINT).expect("valid engine"),
-                    duckduckgo: Url::parse(DUCKDUCKGO_ENDPOINT).expect("valid engine"),
-                }),
-                urls,
-            )
-        } else {
-            let url = endpoint(config)?;
-            let name = config.api_key_env.as_deref().or(kind.credential_env());
-            let key = name
-                .map(|name| {
-                    let saved = credential_root
-                        .map(|root| credentials::load_api_key(root, name))
-                        .transpose()
-                        .map_err(|_| SearchError::Credential)?
-                        .flatten();
-                    saved
-                        .or_else(|| std::env::var(name).ok())
-                        .filter(|key| !key.trim().is_empty())
-                        .ok_or(SearchError::MissingCredential)
-                })
-                .transpose()?;
-            let connection = Connection {
-                url: url.clone(),
-                key,
-            };
-            let provider: Arc<dyn SearchProvider> = match kind {
-                SearchProviderKind::Brave => {
-                    validate_queries(
-                        &request.domains.operator_queries(&request.query, "NOT "),
-                        600,
-                        Some(75),
-                    )?;
-                    Arc::new(Brave(connection))
-                }
-                SearchProviderKind::Tavily => Arc::new(Tavily(connection)),
-                SearchProviderKind::Exa => Arc::new(Exa(connection)),
-                SearchProviderKind::Searxng => {
-                    validate_queries(
-                        &request.domains.operator_queries(&request.query, "-"),
-                        MAX_QUERY_BYTES,
-                        None,
-                    )?;
-                    Arc::new(Searxng(connection))
-                }
-                SearchProviderKind::Free => unreachable!(),
-            };
-            (provider, vec![url.to_string()])
+    let (provider, endpoints): (Arc<dyn SearchProvider>, Vec<String>) = if kind
+        == SearchProviderKind::Free
+    {
+        let queries = request.domains.operator_queries(&request.query, "-");
+        validate_queries(&queries, MAX_QUERY_BYTES, None)?;
+        (
+            Arc::new(DuckDuckGoSearch {
+                endpoint: Url::parse(DUCKDUCKGO_ENDPOINT).expect("valid engine"),
+            }),
+            vec![DUCKDUCKGO_ENDPOINT.to_owned()],
+        )
+    } else {
+        let url = endpoint(config)?;
+        let name = config.api_key_env.as_deref().or(kind.credential_env());
+        let key = name
+            .map(|name| {
+                let saved = credential_root
+                    .map(|root| credentials::load_api_key(root, name))
+                    .transpose()
+                    .map_err(|_| SearchError::Credential)?
+                    .flatten();
+                saved
+                    .or_else(|| std::env::var(name).ok())
+                    .filter(|key| !key.trim().is_empty())
+                    .ok_or(SearchError::MissingCredential)
+            })
+            .transpose()?;
+        let connection = Connection {
+            url: url.clone(),
+            key,
         };
+        let provider: Arc<dyn SearchProvider> = match kind {
+            SearchProviderKind::Brave => {
+                validate_queries(
+                    &request.domains.operator_queries(&request.query, "NOT "),
+                    600,
+                    Some(75),
+                )?;
+                Arc::new(Brave(connection))
+            }
+            SearchProviderKind::Tavily => Arc::new(Tavily(connection)),
+            SearchProviderKind::Exa => Arc::new(Exa(connection)),
+            SearchProviderKind::SerpApi => {
+                validate_queries(
+                    &request.domains.operator_queries(&request.query, "-"),
+                    MAX_QUERY_BYTES,
+                    None,
+                )?;
+                Arc::new(SerpApi(connection))
+            }
+            SearchProviderKind::Serper => {
+                validate_queries(
+                    &request.domains.operator_queries(&request.query, "-"),
+                    MAX_QUERY_BYTES,
+                    None,
+                )?;
+                Arc::new(Serper(connection))
+            }
+            SearchProviderKind::Perplexity => {
+                let (domains, prefix_length): (&[String], usize) = match &request.domains {
+                    DomainFilter::Any => (&[], 0),
+                    DomainFilter::Allowed(domains) => (domains, 0),
+                    DomainFilter::Blocked(domains) => (domains, 1),
+                };
+                if domains
+                    .iter()
+                    .any(|domain| domain.len() + prefix_length > PERPLEXITY_MAX_DOMAIN_BYTES)
+                {
+                    return Err(SearchError::InvalidQuery(
+                        "Perplexity domains including exclusion prefixes must not exceed 253 bytes",
+                    ));
+                }
+                Arc::new(Perplexity(connection))
+            }
+            SearchProviderKind::Searxng => {
+                validate_queries(
+                    &request.domains.operator_queries(&request.query, "-"),
+                    MAX_QUERY_BYTES,
+                    None,
+                )?;
+                Arc::new(Searxng(connection))
+            }
+            SearchProviderKind::Free => unreachable!(),
+        };
+        (provider, vec![url.to_string()])
+    };
     Ok(Arc::new(PreparedSearch {
         provider,
         endpoints,
@@ -393,7 +478,7 @@ async fn http(
         }
         match status.as_u16() {
             401 | 403 => return Err(SearchError::Authentication(status.as_u16())),
-            402 => return Err(SearchError::UsageLimit),
+            402 => return Err(SearchError::UsageLimit(402)),
             429 => {
                 return Err(SearchError::RateLimited {
                     retry_after: response
@@ -406,7 +491,7 @@ async fn http(
             }
             _ => {}
         }
-        if !status.is_success() {
+        if !status.is_success() && status != reqwest::StatusCode::BAD_REQUEST {
             return Err(SearchError::Http(status.as_u16()));
         }
         if response
@@ -427,6 +512,27 @@ async fn http(
                 return Err(SearchError::TooLarge);
             }
             bytes.extend_from_slice(&chunk);
+        }
+        if status == reqwest::StatusCode::BAD_REQUEST {
+            let error: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            let message = error
+                .get("message")
+                .or_else(|| error.get("error"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if [
+                "not enough credits",
+                "insufficient credits",
+                "quota exceeded",
+                "run out of searches",
+            ]
+            .iter()
+            .any(|marker| message.contains(marker))
+            {
+                return Err(SearchError::UsageLimit(status.as_u16()));
+            }
+            return Err(SearchError::Http(status.as_u16()));
         }
         Ok((content_type, bytes))
     };
@@ -486,6 +592,9 @@ fn response(
 struct Brave(Connection);
 struct Tavily(Connection);
 struct Exa(Connection);
+struct SerpApi(Connection);
+struct Serper(Connection);
+struct Perplexity(Connection);
 struct Searxng(Connection);
 
 #[async_trait]
@@ -515,7 +624,7 @@ impl SearchProvider for Brave {
             .await?;
             let entries = value.pointer("/web/results").and_then(Value::as_array);
             if let Some(entries) = entries {
-                hits.extend(json_hits(entries, "description", "page_age")?);
+                hits.extend(json_hits(entries, "url", "description", "page_age")?);
             } else if value.get("query").is_none() {
                 return Err(SearchError::InvalidResponse);
             }
@@ -560,7 +669,7 @@ impl SearchProvider for Tavily {
             request,
             SearchProviderKind::Tavily,
             None,
-            json_hits(entries, "content", "published_date")?,
+            json_hits(entries, "url", "content", "published_date")?,
             context,
         )
     }
@@ -595,7 +704,7 @@ impl SearchProvider for Exa {
             .get("results")
             .and_then(Value::as_array)
             .ok_or(SearchError::InvalidResponse)?;
-        let mut hits = json_hits(entries, "text", "publishedDate")?;
+        let mut hits = json_hits(entries, "url", "text", "publishedDate")?;
         for (hit, entry) in hits.iter_mut().zip(entries) {
             if let Some(highlights) = entry.get("highlights").and_then(Value::as_array) {
                 let snippets = highlights
@@ -608,6 +717,120 @@ impl SearchProvider for Exa {
             }
         }
         response(request, SearchProviderKind::Exa, None, hits, context)
+    }
+}
+
+#[async_trait]
+impl SearchProvider for SerpApi {
+    fn descriptor(&self) -> SearchProviderDescriptor {
+        descriptor(SearchProviderKind::SerpApi)
+    }
+    async fn search(
+        &self,
+        request: &SearchRequest,
+        context: &SearchContext,
+    ) -> Result<SearchResponse, SearchError> {
+        let mut hits = Vec::new();
+        for query in request.domains.operator_queries(&request.query, "-") {
+            let mut url = self.0.url.clone();
+            url.query_pairs_mut()
+                .append_pair("engine", "google")
+                .append_pair("q", &query)
+                .append_pair("num", &context.max_results.to_string())
+                .append_pair(
+                    "api_key",
+                    self.0
+                        .key
+                        .as_deref()
+                        .ok_or(SearchError::MissingCredential)?,
+                );
+            let value = http_json(url, Method::GET, HeaderMap::new(), None, context).await?;
+            if let Some(entries) = value.get("organic_results").and_then(Value::as_array) {
+                hits.extend(json_hits(entries, "link", "snippet", "date")?);
+            } else if value
+                .pointer("/search_information/organic_results_state")
+                .and_then(Value::as_str)
+                != Some("Fully empty")
+            {
+                return Err(SearchError::InvalidResponse);
+            }
+        }
+        response(request, SearchProviderKind::SerpApi, None, hits, context)
+    }
+}
+
+#[async_trait]
+impl SearchProvider for Serper {
+    fn descriptor(&self) -> SearchProviderDescriptor {
+        descriptor(SearchProviderKind::Serper)
+    }
+    async fn search(
+        &self,
+        request: &SearchRequest,
+        context: &SearchContext,
+    ) -> Result<SearchResponse, SearchError> {
+        let mut hits = Vec::new();
+        for query in request.domains.operator_queries(&request.query, "-") {
+            let value = http_json(
+                self.0.url.clone(),
+                Method::POST,
+                self.0.headers("x-api-key", false)?,
+                Some(json!({"q": query, "num": context.max_results})),
+                context,
+            )
+            .await?;
+            let entries = value
+                .get("organic")
+                .and_then(Value::as_array)
+                .ok_or(SearchError::InvalidResponse)?;
+            hits.extend(json_hits(entries, "link", "snippet", "date")?);
+        }
+        response(request, SearchProviderKind::Serper, None, hits, context)
+    }
+}
+
+#[async_trait]
+impl SearchProvider for Perplexity {
+    fn descriptor(&self) -> SearchProviderDescriptor {
+        descriptor(SearchProviderKind::Perplexity)
+    }
+    async fn search(
+        &self,
+        request: &SearchRequest,
+        context: &SearchContext,
+    ) -> Result<SearchResponse, SearchError> {
+        let mut body = json!({"query": request.query, "max_results": context.max_results, "search_type": "web"});
+        match &request.domains {
+            DomainFilter::Any => {}
+            DomainFilter::Allowed(domains) => body["search_domain_filter"] = json!(domains),
+            DomainFilter::Blocked(domains) => {
+                body["search_domain_filter"] = json!(
+                    domains
+                        .iter()
+                        .map(|domain| format!("-{domain}"))
+                        .collect::<Vec<_>>()
+                )
+            }
+        }
+        let value = http_json(
+            self.0.url.clone(),
+            Method::POST,
+            self.0.headers("authorization", true)?,
+            Some(body),
+            context,
+        )
+        .await?;
+        let entries = value
+            .get("results")
+            .and_then(Value::as_array)
+            .ok_or(SearchError::InvalidResponse)?;
+        response(
+            request,
+            SearchProviderKind::Perplexity,
+            None,
+            json_hits(entries, "url", "snippet", "date")?,
+            context,
+        )
     }
 }
 
@@ -639,7 +862,7 @@ impl SearchProvider for Searxng {
                 .get("results")
                 .and_then(Value::as_array)
                 .ok_or(SearchError::InvalidResponse)?;
-            hits.extend(json_hits(entries, "content", "publishedDate")?);
+            hits.extend(json_hits(entries, "url", "content", "publishedDate")?);
         }
         response(request, SearchProviderKind::Searxng, None, hits, context)
     }
@@ -655,6 +878,7 @@ fn add_domains(body: &mut Value, domains: &DomainFilter, allowed: &str, blocked:
 
 fn json_hits(
     entries: &[Value],
+    url: &str,
     snippet: &str,
     published: &str,
 ) -> Result<Vec<SearchHit>, SearchError> {
@@ -668,7 +892,7 @@ fn json_hits(
                     .ok_or(SearchError::InvalidResponse)?
                     .to_owned(),
                 url: entry
-                    .get("url")
+                    .get(url)
                     .and_then(Value::as_str)
                     .ok_or(SearchError::InvalidResponse)?
                     .to_owned(),
@@ -686,19 +910,12 @@ fn json_hits(
         .collect()
 }
 
-struct FreeSearch {
-    bing: Url,
-    duckduckgo: Url,
-}
-
-#[derive(Clone, Copy)]
-enum FreeEngine {
-    Bing,
-    DuckDuckGo,
+struct DuckDuckGoSearch {
+    endpoint: Url,
 }
 
 #[async_trait]
-impl SearchProvider for FreeSearch {
+impl SearchProvider for DuckDuckGoSearch {
     fn descriptor(&self) -> SearchProviderDescriptor {
         descriptor(SearchProviderKind::Free)
     }
@@ -707,81 +924,40 @@ impl SearchProvider for FreeSearch {
         request: &SearchRequest,
         context: &SearchContext,
     ) -> Result<SearchResponse, SearchError> {
-        let engine_context = SearchContext {
-            cancel: context.cancel.clone(),
-            deadline: (tokio::time::Instant::now() + FREE_ENGINE_TIMEOUT).min(context.deadline),
-            max_results: context.max_results,
-        };
-        let bing_result = tokio::time::timeout_at(
-            engine_context.deadline,
-            free_search(FreeEngine::Bing, &self.bing, request, &engine_context),
-        )
-        .await
-        .unwrap_or(Err(SearchError::Timeout));
-        match bing_result {
-            Ok(result) => Ok(result),
-            Err(SearchError::Cancelled) => Err(SearchError::Cancelled),
-            Err(bing) => {
-                match free_search(FreeEngine::DuckDuckGo, &self.duckduckgo, request, context).await
-                {
-                    Ok(result) => Ok(result),
-                    Err(SearchError::Cancelled) => Err(SearchError::Cancelled),
-                    Err(duckduckgo) => Err(SearchError::FreeUnavailable {
-                        bing: Box::new(bing),
-                        duckduckgo: Box::new(duckduckgo),
-                    }),
-                }
+        let mut hits = Vec::new();
+        for query in request.domains.operator_queries(&request.query, "-") {
+            let mut url = self.endpoint.clone();
+            url.query_pairs_mut().append_pair("q", &query);
+            let (content_type, bytes) = http(url, Method::GET, HeaderMap::new(), None, context)
+                .await
+                .map_err(|error| match error {
+                    SearchError::Authentication(status) => SearchError::Http(status),
+                    other => other,
+                })?;
+            if !content_type.starts_with("text/html") {
+                return Err(SearchError::InvalidPage);
             }
+            let text = String::from_utf8(bytes).map_err(|_| SearchError::InvalidPage)?;
+            hits.extend(parse_search_page(&text)?);
         }
+        response(
+            request,
+            SearchProviderKind::Free,
+            Some("DuckDuckGo"),
+            hits,
+            context,
+        )
     }
 }
 
-async fn free_search(
-    engine: FreeEngine,
-    endpoint: &Url,
-    request: &SearchRequest,
-    context: &SearchContext,
-) -> Result<SearchResponse, SearchError> {
-    let mut hits = Vec::new();
-    for query in request.domains.operator_queries(&request.query, "-") {
-        let mut url = endpoint.clone();
-        url.query_pairs_mut().append_pair("q", &query);
-        let (content_type, bytes) = http(url, Method::GET, HeaderMap::new(), None, context).await?;
-        if !content_type.starts_with("text/html") {
-            return Err(SearchError::InvalidPage);
-        }
-        let text = String::from_utf8(bytes).map_err(|_| SearchError::InvalidPage)?;
-        hits.extend(parse_search_page(engine, &text)?);
-    }
-    response(
-        request,
-        SearchProviderKind::Free,
-        Some(match engine {
-            FreeEngine::Bing => "Bing",
-            FreeEngine::DuckDuckGo => "DuckDuckGo",
-        }),
-        hits,
-        context,
-    )
-}
-
-fn parse_search_page(engine: FreeEngine, text: &str) -> Result<Vec<SearchHit>, SearchError> {
+fn parse_search_page(text: &str) -> Result<Vec<SearchHit>, SearchError> {
     let document = Html::parse_document(text);
     let selector = |s: &str| Selector::parse(s).expect("static search selector");
     let lower = text.to_ascii_lowercase();
-    let (rows, link, snippet, empty) = match engine {
-        FreeEngine::Bing => ("li.b_algo", "h2 a", ".b_caption p", ".b_no"),
-        FreeEngine::DuckDuckGo => (
-            ".result",
-            "a.result__a",
-            ".result__snippet",
-            ".no-results, .result--no-result",
-        ),
-    };
-    let link = selector(link);
-    let snippet = selector(snippet);
+    let link = selector("a.result__a");
+    let snippet = selector(".result__snippet");
     let mut hits = Vec::new();
-    for row in document.select(&selector(rows)) {
+    for row in document.select(&selector(".result")) {
         let Some(anchor) = row.select(&link).next() else {
             continue;
         };
@@ -795,7 +971,7 @@ fn parse_search_page(engine: FreeEngine, text: &str) -> Result<Vec<SearchHit>, S
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        let url = resolve_search_link(engine, address)?;
+        let url = resolve_search_link(address)?;
         if title.is_empty() {
             continue;
         }
@@ -824,23 +1000,24 @@ fn parse_search_page(engine: FreeEngine, text: &str) -> Result<Vec<SearchHit>, S
     {
         return Err(SearchError::Challenge);
     }
-    if hits.is_empty() && document.select(&selector(empty)).next().is_none() {
+    if hits.is_empty()
+        && document
+            .select(&selector(".no-results, .result--no-result"))
+            .next()
+            .is_none()
+    {
         return Err(SearchError::InvalidPage);
     }
     Ok(hits)
 }
 
-fn resolve_search_link(engine: FreeEngine, address: &str) -> Result<String, SearchError> {
+fn resolve_search_link(address: &str) -> Result<String, SearchError> {
     let address = if address.starts_with("//") {
         format!("https:{address}")
     } else {
         address.to_owned()
     };
-    let base = match engine {
-        FreeEngine::Bing => BING_ENDPOINT,
-        FreeEngine::DuckDuckGo => DUCKDUCKGO_ENDPOINT,
-    };
-    let url = Url::parse(base)
+    let url = Url::parse(DUCKDUCKGO_ENDPOINT)
         .expect("valid engine")
         .join(&address)
         .map_err(|_| SearchError::InvalidPage)?;
@@ -850,25 +1027,6 @@ fn resolve_search_link(engine: FreeEngine, address: &str) -> Result<String, Sear
         && let Some((_, target)) = url.query_pairs().find(|(key, _)| key == "uddg")
     {
         return Ok(target.into_owned());
-    }
-    if url
-        .host_str()
-        .is_some_and(|host| host == "bing.com" || host.ends_with(".bing.com"))
-        && url.path().starts_with("/ck/")
-    {
-        let target = url
-            .query_pairs()
-            .find(|(key, _)| key == "u")
-            .map(|(_, value)| value.into_owned())
-            .ok_or(SearchError::InvalidPage)?;
-        if let Some(encoded) = target.strip_prefix("a1") {
-            use base64::Engine;
-            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(encoded.trim_end_matches('='))
-                .map_err(|_| SearchError::InvalidPage)?;
-            return String::from_utf8(bytes).map_err(|_| SearchError::InvalidPage);
-        }
-        return Ok(target);
     }
     Ok(url.to_string())
 }

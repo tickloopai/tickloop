@@ -1422,6 +1422,7 @@ pub(super) enum ConnectionAction {
 
 #[derive(Default)]
 pub(super) struct ProviderSession {
+    pub(super) search: super::search::SearchSession,
     pub(super) provider_failures:
         std::collections::HashMap<String, tickloop_agent_protocol::ProviderHttpFailure>,
     pub(super) login_return: Option<(ConfigTarget, ProviderModels)>,
@@ -3101,6 +3102,24 @@ impl Menus {
         )
     }
 
+    pub(in crate::terminal) async fn next_provider_update(&mut self) -> ProviderUpdate {
+        let search_active = self.search_test_active();
+        let discovery_active = self.discovery_active();
+        let (search, discovery) = (
+            &mut self.provider.search.flow,
+            &mut self.provider.discovery_flow,
+        );
+        tokio::select! {
+            result = async { (&mut search.as_mut().expect("active search test").receiver).await }, if search_active => {
+                ProviderUpdate::Search(result.unwrap_or_else(|_| Err("Search test ended without a result".into())))
+            },
+            result = async { discovery.as_mut().expect("active model discovery").receiver.recv().await }, if discovery_active => {
+                ProviderUpdate::Models(result)
+            },
+        }
+    }
+
+    #[cfg(test)]
     pub(in crate::terminal) async fn next_discovery(&mut self) -> Option<ModelDirectories> {
         self.provider.discovery_flow.as_mut()?.receiver.recv().await
     }
@@ -3204,6 +3223,11 @@ impl Drop for DiscoveryFlow {
         self.cancel.cancel();
         self.task.abort();
     }
+}
+
+pub(in crate::terminal) enum ProviderUpdate {
+    Models(Option<ModelDirectories>),
+    Search(Result<tickloop_agent_protocol::SearchTestResult, String>),
 }
 
 type ModelDirectories = Vec<(ProviderModels, Result<AccountModelDirectory, String>)>;

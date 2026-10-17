@@ -564,7 +564,7 @@ pub(super) async fn search(
         .format(&time::format_description::well_known::Rfc3339)
         .expect("current timestamp has RFC3339 representation");
     Ok(text_result(format!(
-        "{}\n\nSearch source: {source}\nSearched at: {at}{}",
+        "Search source: {source}\nSearched at: {at}\n\n{}{}",
         search_result_text(&response.query, &links),
         if response.truncated {
             "\nAdditional results were omitted."

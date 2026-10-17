@@ -1,6 +1,7 @@
 use super::execution::ConsoleExecution as Agent;
 mod judgment;
 pub(super) mod providers;
+pub(super) use providers::ProviderUpdate;
 mod search;
 #[cfg(test)]
 mod settings_ux_pty;
@@ -942,6 +943,15 @@ impl Menus {
     pub(super) fn dismiss(&mut self, console: &Console) -> Result<(), String> {
         if let Some((id, _)) = self.active.take() {
             self.cancel_model_discovery(id);
+            if self
+                .provider
+                .search
+                .flow
+                .as_ref()
+                .is_some_and(|flow| flow.id == id)
+            {
+                self.provider.search.flow.take();
+            }
             console.clear_menu(id)?;
         }
         Ok(())
@@ -983,6 +993,16 @@ impl Menus {
     }
 
     fn show(&mut self, console: &Console, menu: Menu, selection: Selection) -> Result<(), String> {
+        self.show_with_roles(console, menu, selection, Vec::new())
+    }
+
+    fn show_with_roles(
+        &mut self,
+        console: &Console,
+        menu: Menu,
+        selection: Selection,
+        row_roles: Vec<Option<super::style::Role>>,
+    ) -> Result<(), String> {
         let discovery = (self.id() == Some(menu.id))
             .then(|| self.provider.discovery_flow.take())
             .flatten();
@@ -1058,6 +1078,7 @@ impl Menus {
                     PickerKind::Actions,
                     super::console::PickerPresentation {
                         hint: hint.into(),
+                        row_roles,
                         failure_target: selection.config_target().and_then(|target| target.agent()),
                         failure_connections: if let Selection::ConnectionDetails {
                             provider,

@@ -2381,6 +2381,7 @@ async fn interact(
             });
         }
         let discovery_active = menus.discovery_active();
+        let search_test_active = menus.search_test_active();
         let active_login = login::active_login_id(&logins, console)?;
         let login_active = active_login.is_some();
         let login_updates_pending = logins
@@ -2439,8 +2440,11 @@ async fn interact(
                     console.finish_prompt_suggestion(&request, result.text)?;
                 }
             },
-            result = menus.next_discovery(), if discovery_active => {
-                menus.finish_discovery(agent, console, result).await?;
+            result = menus.next_provider_update(), if discovery_active || search_test_active => {
+                match result {
+                    menus::ProviderUpdate::Search(result) => menus.finish_search_test(console, result)?,
+                    menus::ProviderUpdate::Models(result) => menus.finish_discovery(agent, console, result).await?,
+                }
                 status_dirty = true;
             },
             (login_id, update) = login::next_login_update(&mut logins), if login_updates_pending => {

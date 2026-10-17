@@ -585,7 +585,7 @@ impl Tools {
                 .read()
                 .await
                 .clone()
-                .ok_or_else(|| ToolError::Network("search is not configured".into()))?;
+                .ok_or_else(|| ToolError::Network(web_search::DISABLED_MESSAGE.into()))?;
             let plan = web_search::prepare(
                 &config,
                 &search.request(),

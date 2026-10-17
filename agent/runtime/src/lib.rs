@@ -2629,7 +2629,7 @@ impl Agent {
                 record_invoked_skill(chat, invoked);
                 self.save(&chat.snapshot);
             }
-            registry.refresh_skills(chat);
+            registry.refresh(chat);
             request.tools = registry.definitions();
             (request.messages, request.history_sources) = context::model_history(chat)?;
             let replacements = tool_results::enforce_tool_result_budget(
@@ -2655,6 +2655,7 @@ impl Agent {
                 "goal": chat.snapshot.loops.iter().find(|goal| goal.id == receipt.loop_id),
                 "chat_goals": chat.snapshot.loops,
                 "execution_mode": chat.snapshot.policy.mode,
+                "web_search": { "enabled": chat.snapshot.search_config.is_some(), "settings_command": "/search" },
                 "plan": chat.snapshot.plans.iter().find(|plan| plan.loop_id == receipt.loop_id),
                 "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
             });
@@ -2772,7 +2773,9 @@ impl Agent {
         let invalid_call = response.output.content.iter().any(|content| {
             if let Content::ToolUse { id, name, input } = content {
                 id.is_empty()
-                    || (!available_tools.contains(name) && !shared_tasks::is_task_tool(name))
+                    || (!available_tools.contains(name)
+                        && !shared_tasks::is_task_tool(name)
+                        && name != tickloop_agent_tools::WEB_SEARCH_TOOL_NAME)
                     || !input.is_object()
                     || !used_calls.insert(id.clone())
             } else {

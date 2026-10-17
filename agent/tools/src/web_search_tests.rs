@@ -57,6 +57,9 @@ async fn native_adapters_map_credentials_filters_and_results_without_a_model() {
         SearchProviderKind::Brave,
         SearchProviderKind::Tavily,
         SearchProviderKind::Exa,
+        SearchProviderKind::SerpApi,
+        SearchProviderKind::Serper,
+        SearchProviderKind::Perplexity,
     ] {
         let body = match kind {
             SearchProviderKind::Brave => {
@@ -64,6 +67,16 @@ async fn native_adapters_map_credentials_filters_and_results_without_a_model() {
             }
             SearchProviderKind::Tavily => {
                 json!({"results":[{"title":"Rust", "url":"https://doc.rust-lang.org/", "content":"Reference"}, {"title":"Wrong host", "url":"https://example.org/"}]})
+            }
+            SearchProviderKind::SerpApi | SearchProviderKind::Serper => {
+                let entries = json!([{"title":"Rust", "link":"https://doc.rust-lang.org/", "snippet":"Reference", "date":"2026-10-17"}, {"title":"Wrong host", "link":"https://example.org/"}]);
+                match kind {
+                    SearchProviderKind::SerpApi => json!({"organic_results": entries}),
+                    _ => json!({"organic": entries}),
+                }
+            }
+            SearchProviderKind::Perplexity => {
+                json!({"results":[{"title":"Rust", "url":"https://doc.rust-lang.org/", "snippet":"Reference", "date":"2026-10-17"}, {"title":"Wrong host", "url":"https://example.org/"}]})
             }
             _ => {
                 json!({"results":[{"title":"Rust", "url":"https://doc.rust-lang.org/", "highlights":["Reference"], "publishedDate":"2026-10-17T00:00:00Z"}, {"title":"Wrong host", "url":"https://example.org/"}]})
@@ -118,9 +131,103 @@ async fn native_adapters_map_credentials_filters_and_results_without_a_model() {
                     Some("2026-10-17T00:00:00Z")
                 );
             }
+            SearchProviderKind::SerpApi => {
+                assert!(wire.starts_with("GET "));
+                assert!(wire.contains("engine=google"));
+                assert!(wire.contains("api_key=fixture-original-secret"));
+                assert!(wire.contains("site%3Arust-lang.org"));
+                assert_eq!(
+                    result.results[0].published_at.as_deref(),
+                    Some("2026-10-17")
+                );
+            }
+            SearchProviderKind::Serper => {
+                assert!(wire.contains("x-api-key: fixture-original-secret"));
+                let body: Value =
+                    serde_json::from_str(wire.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                assert_eq!(body["q"], "rust documentation site:rust-lang.org");
+                assert_eq!(body["num"], DEFAULT_RESULT_LIMIT);
+            }
+            SearchProviderKind::Perplexity => {
+                assert!(wire.contains("authorization: Bearer fixture-original-secret"));
+                let body: Value =
+                    serde_json::from_str(wire.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                assert_eq!(body["search_domain_filter"], json!(["rust-lang.org"]));
+                assert_eq!(body["search_type"], "web");
+                assert_eq!(
+                    result.results[0].published_at.as_deref(),
+                    Some("2026-10-17")
+                );
+            }
             _ => unreachable!(),
         }
     }
+}
+
+#[tokio::test]
+async fn additional_providers_send_blocked_domains_and_keep_empty_results_empty() {
+    for kind in [
+        SearchProviderKind::SerpApi,
+        SearchProviderKind::Serper,
+        SearchProviderKind::Perplexity,
+    ] {
+        let payload = match kind {
+            SearchProviderKind::SerpApi => {
+                json!({"search_information": {"organic_results_state":"Fully empty"}})
+            }
+            SearchProviderKind::Serper => json!({"organic": []}),
+            _ => json!({"results": []}),
+        };
+        let (url, received) = server(200, "application/json", &payload.to_string()).await;
+        let connection = Connection {
+            url,
+            key: Some("fixture-search-key".into()),
+        };
+        let provider: Box<dyn SearchProvider> = match kind {
+            SearchProviderKind::SerpApi => Box::new(SerpApi(connection)),
+            SearchProviderKind::Serper => Box::new(Serper(connection)),
+            _ => Box::new(Perplexity(connection)),
+        };
+        let result = provider
+            .search(
+                &request(DomainFilter::Blocked(vec!["example.org".into()])),
+                &context(),
+            )
+            .await
+            .unwrap();
+        assert!(result.results.is_empty());
+        let wire = received.await.unwrap();
+        if kind == SearchProviderKind::SerpApi {
+            let target = wire.split_whitespace().nth(1).unwrap();
+            let url = Url::parse(&format!("http://localhost{target}")).unwrap();
+            assert!(
+                url.query_pairs()
+                    .any(|(key, value)| key == "q" && value.ends_with(" -site:example.org"))
+            );
+        } else {
+            let body: Value = serde_json::from_str(wire.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            if kind == SearchProviderKind::Perplexity {
+                assert_eq!(body["search_domain_filter"], json!(["-example.org"]));
+            } else {
+                assert!(body["q"].as_str().unwrap().ends_with(" -site:example.org"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn insufficient_credits_report_a_typed_error_without_echoing_the_response() {
+    let (url, received) = server(
+        400,
+        "application/json",
+        r#"{"message":"Not enough credits PRIVATE-UPSTREAM-DETAIL"}"#,
+    )
+    .await;
+    let result = http_json(url, Method::POST, HeaderMap::new(), None, &context()).await;
+    let error = result.unwrap_err();
+    assert!(matches!(error, SearchError::UsageLimit(400)));
+    assert!(!error.to_string().contains("PRIVATE-UPSTREAM-DETAIL"));
+    received.await.unwrap();
 }
 
 #[test]
@@ -150,59 +257,118 @@ fn request_limits_never_discard_domain_constraints() {
         DomainFilter::Allowed(vec!["a.com".into(), "b.com".into()]).operator_queries("a OR b", "-"),
         vec!["(a OR b) site:a.com", "(a OR b) site:b.com"]
     );
+    assert_eq!(
+        DomainFilter::Allowed(vec!["rust-lang.org".into()])
+            .operator_queries("rust documentation", "-"),
+        vec!["rust documentation site:rust-lang.org"]
+    );
+    assert_eq!(
+        DomainFilter::Blocked(vec!["example.org".into()]).operator_queries("a | b", "-"),
+        vec!["(a | b) -site:example.org"]
+    );
 }
 
 #[tokio::test]
-async fn free_mode_falls_back_on_challenges_and_reports_the_actual_engine() {
-    let (bing, first) = server(200, "text/html", "<form id=\"challenge-form\"></form>").await;
+async fn duckduckgo_is_the_only_free_destination_and_reports_its_source() {
     let html = r#"<div class="result"><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fdoc">A &amp; B</a><a class="result__snippet">A useful source</a></div>"#;
-    let (duckduckgo, second) = server(200, "text/html", html).await;
-    let provider = FreeSearch { bing, duckduckgo };
+    let (endpoint, received) = server(200, "text/html", html).await;
+    let provider = DuckDuckGoSearch { endpoint };
     let result = provider
         .search(&request(DomainFilter::Any), &context())
         .await
         .unwrap();
-    first.await.unwrap();
-    second.await.unwrap();
+    let wire = received.await.unwrap();
+    assert!(wire.starts_with("GET "));
+    let target = wire.split_whitespace().nth(1).unwrap();
+    let requested = Url::parse(&format!("http://localhost{target}")).unwrap();
+    assert!(
+        requested
+            .query_pairs()
+            .any(|(key, value)| key == "q" && value == "rust documentation")
+    );
     assert_eq!(result.engine, Some("DuckDuckGo"));
     assert_eq!(result.results[0].url, "https://example.org/doc");
     assert_eq!(result.results[0].title, "A & B");
     let prepared = prepare(&SearchConfig::default(), &request(DomainFilter::Any), None).unwrap();
-    assert_eq!(prepared.endpoints, vec![BING_ENDPOINT, DUCKDUCKGO_ENDPOINT]);
+    assert_eq!(prepared.endpoints, vec![DUCKDUCKGO_ENDPOINT]);
+    assert_eq!(prepared.kind.label(), "DuckDuckGo · Free");
 }
 
 #[test]
 fn html_parsing_distinguishes_zero_results_challenges_and_layout_changes() {
     assert!(
-        parse_search_page(FreeEngine::Bing, "<div class='b_no'>No results</div>")
+        parse_search_page("<div class='no-results'>Nothing</div>")
             .unwrap()
             .is_empty()
     );
-    assert!(
-        parse_search_page(
-            FreeEngine::DuckDuckGo,
-            "<div class='no-results'>Nothing</div>"
-        )
-        .unwrap()
-        .is_empty()
-    );
     assert!(matches!(
-        parse_search_page(FreeEngine::DuckDuckGo, "<form id='challenge-form'></form>"),
+        parse_search_page("<form id='challenge-form'></form>"),
         Err(SearchError::Challenge)
     ));
     assert!(matches!(
-        parse_search_page(FreeEngine::Bing, "<html>New incompatible layout</html>"),
+        parse_search_page("<html>New incompatible layout</html>"),
         Err(SearchError::InvalidPage)
     ));
-    use base64::Engine;
-    let encoded =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("https://example.org/page");
-    let html = format!(
-        "<li class='b_algo'><h2><a href='https://www.bing.com/ck/a?u=a1{encoded}'>Source</a></h2><div class='b_caption'><p>Summary</p></div></li>"
-    );
     assert_eq!(
-        parse_search_page(FreeEngine::Bing, &html).unwrap()[0].url,
+        resolve_search_link("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fpage").unwrap(),
         "https://example.org/page"
+    );
+}
+
+#[tokio::test]
+async fn duckduckgo_challenges_are_errors_without_switching_to_another_engine() {
+    let (endpoint, received) = server(202, "text/html", "<form id='challenge-form'></form>").await;
+    let provider = DuckDuckGoSearch { endpoint };
+    assert!(matches!(
+        provider
+            .search(&request(DomainFilter::Any), &context())
+            .await,
+        Err(SearchError::Challenge)
+    ));
+    received.await.unwrap();
+}
+
+#[tokio::test]
+async fn duckduckgo_access_denials_do_not_ask_for_an_api_key() {
+    let (endpoint, received) = server(403, "text/html", "Denied").await;
+    let provider = DuckDuckGoSearch { endpoint };
+    let Err(error) = provider
+        .search(&request(DomainFilter::Any), &context())
+        .await
+    else {
+        panic!("expected DuckDuckGo access denial")
+    };
+    assert!(matches!(error, SearchError::Http(403)));
+    assert!(!error.to_string().contains("credentials"));
+    received.await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "explicit live reproduction of the user-reported Rust workspace query; no API key"]
+async fn live_duckduckgo_rust_workspace_query_without_domain_filters() {
+    let request = SearchRequest {
+        query: "Rust Cargo workspaces official documentation doc.rust-lang.org cargo reference workspaces".into(),
+        domains: DomainFilter::Any,
+    };
+    let prepared = prepare(&SearchConfig::default(), &request, None).unwrap();
+    assert_eq!(prepared.endpoints, vec![DUCKDUCKGO_ENDPOINT]);
+    let result = prepared
+        .execute(&request, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(result.engine, Some("DuckDuckGo"));
+    let first = result.results.first().expect("a Rust workspace source");
+    assert!(
+        first.url.contains("rust-lang.org"),
+        "unexpected first result host"
+    );
+    assert!(
+        first.title.to_ascii_lowercase().contains("workspace"),
+        "unexpected first result topic"
+    );
+    println!(
+        "LIVE exact user query: source=DuckDuckGo results={} first_source_is_official=true",
+        result.results.len()
     );
 }
 
@@ -245,7 +411,7 @@ fn filtered_results_are_deduplicated_bounded_and_keep_unknown_dates_unknown() {
     let result = response(
         &request(DomainFilter::Allowed(vec!["example.org".into()])),
         SearchProviderKind::Free,
-        Some("Bing"),
+        Some("DuckDuckGo"),
         hits,
         &context(),
     )
@@ -263,6 +429,9 @@ async fn live_selected_search_provider() {
         "tavily" => SearchProviderKind::Tavily,
         "exa" => SearchProviderKind::Exa,
         "brave" => SearchProviderKind::Brave,
+        "serpapi" => SearchProviderKind::SerpApi,
+        "serper" => SearchProviderKind::Serper,
+        "perplexity" => SearchProviderKind::Perplexity,
         "free" => SearchProviderKind::Free,
         _ => panic!("unsupported live provider"),
     };
@@ -299,4 +468,61 @@ async fn live_selected_search_provider() {
         }
         Err(error) => panic!("live provider failed: {error}"),
     }
+}
+
+#[tokio::test]
+async fn connection_tests_classify_real_adapter_responses_and_use_one_result() {
+    let root = tempfile::tempdir().unwrap();
+    credentials::save_api_key(root.path(), "TEST_SEARCH_KEY", "private-fixture-key").unwrap();
+    for (status, body, expected) in [
+        (
+            200,
+            r#"{"results":[{"title":"Rust","url":"https://www.rust-lang.org/"}]}"#,
+            SearchTestStatus::Available,
+        ),
+        (200, r#"{"results":[]}"#, SearchTestStatus::NoResults),
+        (401, "unauthorized", SearchTestStatus::AuthenticationFailed),
+        (403, "forbidden", SearchTestStatus::AuthenticationFailed),
+        (402, "payment", SearchTestStatus::UsageLimited),
+        (
+            400,
+            r#"{"message":"Not enough credits"}"#,
+            SearchTestStatus::UsageLimited,
+        ),
+        (429, "limited", SearchTestStatus::RateLimited),
+        (503, "unavailable", SearchTestStatus::ServiceFailed),
+        (200, "invalid JSON", SearchTestStatus::ServiceFailed),
+    ] {
+        let (url, received) = server(status, "application/json", body).await;
+        let config = SearchConfig {
+            provider: SearchProviderKind::Tavily,
+            endpoint: url.to_string(),
+            api_key_env: Some("TEST_SEARCH_KEY".into()),
+        };
+        let result = test_connection(&config, Some(root.path()), CancellationToken::new()).await;
+        assert_eq!(result.status, expected, "HTTP {status}");
+        assert!(!result.detail.contains("private-fixture-key"));
+        let wire = received.await.unwrap();
+        let body: Value = serde_json::from_str(wire.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body["max_results"], 1);
+        assert_eq!(body["query"], "Rust programming language");
+    }
+    let config = SearchConfig {
+        provider: SearchProviderKind::Tavily,
+        endpoint: "http://127.0.0.1:1/search".into(),
+        api_key_env: Some("TEST_SEARCH_KEY".into()),
+    };
+    assert_eq!(
+        test_connection(&config, Some(root.path()), CancellationToken::new())
+            .await
+            .status,
+        SearchTestStatus::NetworkFailed
+    );
+    credentials::remove_api_key(root.path(), "TEST_SEARCH_KEY").unwrap();
+    assert_eq!(
+        test_connection(&config, Some(root.path()), CancellationToken::new())
+            .await
+            .status,
+        SearchTestStatus::ConfigurationFailed
+    );
 }

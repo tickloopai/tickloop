@@ -1349,6 +1349,49 @@ impl EmbeddedAgentAccess {
         ))
     }
 
+    async fn observe_search_test(
+        &self,
+        execution: ExecutionRef,
+        config: tickloop_agent_protocol::SearchConfig,
+    ) -> Result<Observation, AccessError> {
+        self.chat(execution).await?;
+        let root = self
+            .inner
+            .launches
+            .lock()
+            .await
+            .get(&execution)
+            .and_then(|launch| launch.config_root.clone());
+        let cursor = Cursor {
+            daemon_epoch: self.inner.epoch,
+            execution: Some(execution),
+            sequence: self.inner.sequence.load(Ordering::SeqCst),
+        };
+        let (sender, receiver) = mpsc::channel(1);
+        tokio::spawn(async move {
+            let cancel = CancellationToken::new();
+            let _guard = cancel.clone().drop_guard();
+            let result = tokio::select! {
+                biased;
+                () = sender.closed() => return,
+                result = tickloop_agent_tools::web_search::test_connection(&config, root.as_deref(), cancel.clone()) => result,
+            };
+            let _ = sender
+                .send(ObservationUpdate {
+                    cursor,
+                    change: ObservationChange::SearchTest(result),
+                })
+                .await;
+        });
+        Ok(Observation::new(
+            ObservationValue::SearchTestPending,
+            cursor,
+            None,
+            Some(receiver),
+            None,
+        ))
+    }
+
     /// The answer to an Agent query other than the Chat itself.
     async fn detail_value(
         &self,
@@ -1366,8 +1409,8 @@ impl EmbeddedAgentAccess {
                     ),
                 ))
             }
-            AgentDetailQuery::AccountModels { .. } => {
-                unreachable!("account queries return their own observation")
+            AgentDetailQuery::AccountModels { .. } | AgentDetailQuery::TestSearch { .. } => {
+                unreachable!("provider checks return their own observation")
             }
             AgentDetailQuery::Snapshot | AgentDetailQuery::Status => {
                 unreachable!("Chat answers are read with their feed watermark")
@@ -1451,6 +1494,9 @@ impl EmbeddedAgentAccess {
             return self
                 .observe_account_models(execution, *config.clone(), *refresh)
                 .await;
+        }
+        if let AgentDetailQuery::TestSearch { config } = &detail {
+            return self.observe_search_test(execution, config.clone()).await;
         }
         let mut receiver = self.inner.changes.subscribe();
         let sequence = self.inner.sequence.load(Ordering::SeqCst);

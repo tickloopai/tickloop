@@ -4891,7 +4891,6 @@ name = "tickloop-agent-tools"
 version = "0.2.4"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
  "grep-printer",
  "grep-regex",
  "grep-searcher",

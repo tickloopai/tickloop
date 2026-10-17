@@ -67,6 +67,10 @@ pub enum SearchProviderKind {
     Brave,
     Tavily,
     Exa,
+    #[serde(rename = "serpapi")]
+    SerpApi,
+    Serper,
+    Perplexity,
     #[default]
     Searxng,
 }
@@ -75,20 +79,26 @@ impl SearchProviderKind {
     fn is_searxng(&self) -> bool {
         *self == Self::Searxng
     }
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 8] = [
         Self::Free,
         Self::Brave,
         Self::Tavily,
         Self::Exa,
+        Self::SerpApi,
+        Self::Serper,
+        Self::Perplexity,
         Self::Searxng,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Free => "Free search",
+            Self::Free => "DuckDuckGo · Free",
             Self::Brave => "Brave",
             Self::Tavily => "Tavily",
             Self::Exa => "Exa",
+            Self::SerpApi => "SerpAPI",
+            Self::Serper => "Serper",
+            Self::Perplexity => "Perplexity",
             Self::Searxng => "SearXNG / compatible JSON",
         }
     }
@@ -99,6 +109,9 @@ impl SearchProviderKind {
             Self::Brave => "https://api.search.brave.com/res/v1/web/search",
             Self::Tavily => "https://api.tavily.com/search",
             Self::Exa => "https://api.exa.ai/search",
+            Self::SerpApi => "https://serpapi.com/search.json",
+            Self::Serper => "https://google.serper.dev/search",
+            Self::Perplexity => "https://api.perplexity.ai/search",
             Self::Searxng => "",
         }
     }
@@ -108,9 +121,50 @@ impl SearchProviderKind {
             Self::Brave => Some("BRAVE_API_KEY"),
             Self::Tavily => Some("TAVILY_API_KEY"),
             Self::Exa => Some("EXA_API_KEY"),
+            Self::SerpApi => Some("SERPAPI_API_KEY"),
+            Self::Serper => Some("SERPER_API_KEY"),
+            Self::Perplexity => Some("PERPLEXITY_API_KEY"),
             Self::Free | Self::Searxng => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchTestStatus {
+    Available,
+    AuthenticationFailed,
+    UsageLimited,
+    RateLimited,
+    NetworkFailed,
+    TimedOut,
+    Challenge,
+    NoResults,
+    ConfigurationFailed,
+    ServiceFailed,
+}
+
+impl SearchTestStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::AuthenticationFailed => "access denied",
+            Self::UsageLimited => "quota or plan limit",
+            Self::RateLimited => "rate limited",
+            Self::NetworkFailed => "network failed",
+            Self::TimedOut => "timed out",
+            Self::Challenge => "verification required",
+            Self::NoResults => "no results; unverified",
+            Self::ConfigurationFailed => "configuration needed",
+            Self::ServiceFailed => "service failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SearchTestResult {
+    pub status: SearchTestStatus,
+    pub detail: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

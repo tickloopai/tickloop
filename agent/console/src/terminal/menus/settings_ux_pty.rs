@@ -56,6 +56,7 @@ fn settings_ux_pty_fixture() {
             let mut poll = tokio::time::interval(Duration::from_millis(20));
             loop {
                 let discovery_active = menus.discovery_active();
+                let search_test_active = menus.search_test_active();
                 let login_updates_pending = login.as_ref().is_some_and(super::super::login::LoginFlow::updates_pending);
                 let event = tokio::select! {
                     _ = poll.tick() => {
@@ -75,9 +76,14 @@ fn settings_ux_pty_fixture() {
                         std::fs::write(directory.join("login-finished"), "finished").unwrap();
                         continue;
                     }
-                    result = menus.next_discovery(), if discovery_active => {
-                        menus.finish_discovery(&agent, &console, result).await.unwrap();
-                        std::fs::write(directory.join("discovery-finished"), "finished").unwrap();
+                    result = menus.next_provider_update(), if discovery_active || search_test_active => {
+                        match result {
+                            ProviderUpdate::Models(result) => {
+                                menus.finish_discovery(&agent, &console, result).await.unwrap();
+                                std::fs::write(directory.join("discovery-finished"), "finished").unwrap();
+                            },
+                            ProviderUpdate::Search(result) => menus.finish_search_test(&console, result).unwrap(),
+                        }
                         continue;
                     }
                     event = input.recv() => event.unwrap(),
@@ -176,6 +182,46 @@ impl AgentAccess for FixtureAccess {
                     execution: Some(*execution),
                     sequence: 0,
                 },
+                None,
+            ));
+        }
+        if let ObservationRequest::Agent {
+            execution,
+            detail: AgentDetailQuery::TestSearch { .. },
+            ..
+        } = &query
+        {
+            let cursor = Cursor {
+                daemon_epoch: self.epoch,
+                execution: Some(*execution),
+                sequence: 0,
+            };
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            let directory = self.directory.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let status = if directory.join("reject-search").exists() {
+                    tickloop_agent_protocol::SearchTestStatus::AuthenticationFailed
+                } else {
+                    tickloop_agent_protocol::SearchTestStatus::Available
+                };
+                let _ = sender
+                    .send(tickloop_agent_protocol::ObservationUpdate {
+                        cursor,
+                        change: tickloop_agent_protocol::ObservationChange::SearchTest(
+                            tickloop_agent_protocol::SearchTestResult {
+                                status,
+                                detail: "Controlled fixture search test".into(),
+                            },
+                        ),
+                    })
+                    .await;
+            });
+            return Ok(Observation::new(
+                ObservationValue::SearchTestPending,
+                cursor,
+                None,
+                Some(receiver),
                 None,
             ));
         }
@@ -759,10 +805,8 @@ fn search_pty_key_entry_is_masked_and_cancel_does_not_switch_sources() {
     let mut fixture = Fixture::start();
     fixture.send(b"/search\r");
     fixture.wait(|frame| frame.lines().any(|line| line == "Web search"));
+    fixture.wait(|frame| frame.contains("DuckDuckGo · Free") && frame.contains("no key needed"));
     fixture.select("Tavily");
-    fixture.send(b"\r");
-    fixture.wait(|frame| frame.contains("Web search · Tavily"));
-    fixture.select("Set or replace API key");
     fixture.send(b"\r");
     fixture.wait(|frame| frame.contains("API key · Tavily"));
     fixture.send(b"discarded-search-secret");
@@ -786,11 +830,12 @@ fn search_pty_key_entry_is_masked_and_cancel_does_not_switch_sources() {
     fixture.send(b"\r");
     fixture.wait(|frame| frame.contains("API key · Tavily"));
     fixture.send(b"fixture-search-secret");
-    let frame = fixture.wait(|frame| frame.contains("Save API key"));
+    let frame = fixture.wait(|frame| frame.contains("Save and test API key"));
     assert!(!frame.contains("fixture-search-secret"));
     fixture.send(b"\r");
-    fixture
-        .wait(|frame| frame.contains("Web search · Tavily") && frame.contains("saved privately"));
+    fixture.wait(|frame| {
+        frame.contains("Web search · Tavily") && frame.contains("Latest test: available")
+    });
     let root = fixture
         .directory
         .path()
@@ -813,7 +858,7 @@ fn search_pty_key_entry_is_masked_and_cancel_does_not_switch_sources() {
     fixture.send(b"\r");
     fixture.wait(|frame| frame.contains("Web search · Tavily"));
     fixture.send(b"\r");
-    fixture.wait(|frame| frame.contains("Tavily · key saved · active"));
+    fixture.wait(|frame| frame.contains("Tavily · key saved · available · active"));
     assert_eq!(
         UserSettings::in_root(&root)
             .load()
@@ -822,6 +867,15 @@ fn search_pty_key_entry_is_masked_and_cancel_does_not_switch_sources() {
             .provider,
         tickloop_agent_protocol::SearchProviderKind::Tavily
     );
+    fixture.select("Tavily");
+    fixture.send(b"\r");
+    fixture.wait(|frame| frame.contains("Web search · Tavily"));
+    std::fs::write(fixture.directory.path().join("reject-search"), "reject").unwrap();
+    fixture.select("Test search connection");
+    fixture.send(b"\r");
+    fixture.wait(|frame| frame.contains("Latest test: access denied"));
+    fixture.send(b"\x1b");
+    fixture.wait(|frame| frame.contains("Tavily · key saved · access denied · active"));
     fixture.send(b"\x1b");
     fixture.wait(|frame| !frame.lines().any(|line| line == "Web search"));
     fixture.send(b"/settings\r");
@@ -831,7 +885,7 @@ fn search_pty_key_entry_is_masked_and_cancel_does_not_switch_sources() {
     fixture.wait(|frame| frame.lines().any(|line| line == "Web search"));
     fixture.select("Off");
     fixture.send(b"\r");
-    fixture.wait(|frame| frame.contains("Off · active"));
+    fixture.wait(|frame| frame.contains("Off · active") && frame.contains("Web search: Off"));
     fixture.send(b"\x1b");
     fixture.wait(|frame| frame.lines().any(|line| line == "Settings"));
     assert_eq!(UserSettings::in_root(&root).load().search_config(), None);

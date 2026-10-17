@@ -9,9 +9,14 @@ fn search_defaults_and_explicit_off_survive_settings_reload() {
         settings.load().search_config(),
         SearchConfig::enabled_default()
     );
-    let config = SearchConfig::for_provider(SearchProviderKind::Exa);
-    settings.save_search_config(Some(&config)).unwrap();
-    assert_eq!(settings.load().search_config(), Some(config));
+    for provider in SearchProviderKind::ALL {
+        let mut config = SearchConfig::for_provider(provider);
+        if provider == SearchProviderKind::Searxng {
+            config.endpoint = "https://search.example.test/search".into();
+        }
+        settings.save_search_config(Some(&config)).unwrap();
+        assert_eq!(settings.load().search_config(), Some(config));
+    }
     settings.save_search_config(None).unwrap();
     assert_eq!(settings.load().search_config(), None);
     let value: Value =
