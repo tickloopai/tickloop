@@ -2413,7 +2413,10 @@ async fn run_stashed_image_payload(fixture: &PrivateFixture, switch_roots: bool)
                 |frame| {
                     frame.contains(&expected)
                         && frame.contains("[Image #2]")
-                        && frame.contains(anchor)
+                        && frame
+                            .lines()
+                            .find(|line| line.contains("image history"))
+                            .is_some_and(|line| line.trim() == anchor)
                 },
             )
             .await;

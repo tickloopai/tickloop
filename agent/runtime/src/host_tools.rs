@@ -396,6 +396,11 @@ pub struct McpResourceServer {
 pub trait HostToolProvider: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
 
+    /// Scheduling capability only; preparation and permission checks remain authoritative.
+    fn is_concurrency_safe(&self, _name: &str, _input: &Value) -> bool {
+        false
+    }
+
     /// The Tickloop Artifacts client whose account the MCP tools act for; it also carries the
     /// feedback request lifecycle.
     fn artifact_client(&self) -> Option<std::sync::Arc<tickloop_agent_artifacts::ArtifactClient>> {

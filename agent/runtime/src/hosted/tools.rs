@@ -1554,6 +1554,13 @@ fn completed(value: Value) -> HostCallResult {
 
 #[async_trait]
 impl HostToolProvider for HostedTickTools {
+    fn is_concurrency_safe(&self, name: &str, _input: &Value) -> bool {
+        matches!(
+            name,
+            crate::tick_tools::TICK_READ | crate::tick_tools::TICK_DESCRIBE | READ_WORKSPACE
+        )
+    }
+
     fn definitions(&self) -> Vec<ToolDefinition> {
         crate::tick_tools::definitions(self.views.is_some())
     }

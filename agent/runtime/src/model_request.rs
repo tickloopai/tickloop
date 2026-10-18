@@ -604,10 +604,13 @@ impl Agent {
         context: RequestContext,
         sequence: RequestSequence,
         client: Arc<dyn ModelClient>,
-        request: ModelRequest,
+        mut request: ModelRequest,
         cancel: CancellationToken,
         tracking: RequestTracking<'_>,
     ) -> Result<PendingModelResponse, AgentError> {
+        if context.kind != ModelRequestKind::Conversation {
+            request.reasoning_effort = client.minimum_reasoning_effort();
+        }
         let request_bytes = (context.kind == ModelRequestKind::Conversation).then(|| {
             let messages = if request
                 .messages
@@ -1182,6 +1185,130 @@ mod tests {
         let agent = Agent::open_embedded(directory.path().join("state"), config, model).unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         (directory, agent, chat)
+    }
+
+    #[tokio::test]
+    async fn auxiliary_requests_use_the_lowest_supported_effort_and_leave_conversation_unchanged() {
+        struct EffortModel {
+            supports_off: bool,
+            requests: std::sync::Mutex<Vec<ModelRequest>>,
+        }
+
+        #[async_trait::async_trait]
+        impl ModelClient for EffortModel {
+            fn identity(&self) -> ModelIdentity {
+                tickloop_agent_test_support::config().identity()
+            }
+
+            fn supports_reasoning_effort(
+                &self,
+                effort: tickloop_agent_protocol::ReasoningEffort,
+            ) -> bool {
+                use tickloop_agent_protocol::ReasoningEffort;
+                matches!(effort, ReasoningEffort::Low | ReasoningEffort::High)
+                    || self.supports_off && effort == ReasoningEffort::Off
+            }
+
+            async fn complete(
+                &self,
+                request: ModelRequest,
+                _: mpsc::UnboundedSender<ModelDelta>,
+                _: CancellationToken,
+            ) -> Result<ModelOutput, ModelError> {
+                self.requests.lock().unwrap().push(request);
+                Ok(ModelOutput {
+                    private_source: None,
+                    content: vec![Content::Text {
+                        text: "response".into(),
+                    }],
+                    usage: Default::default(),
+                    stop_reason: "end_turn".into(),
+                })
+            }
+        }
+
+        for supports_off in [true, false] {
+            let model = Arc::new(EffortModel {
+                supports_off,
+                requests: Default::default(),
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let agent = Agent::new_embedded(tickloop_agent_test_support::config(), model.clone());
+            let chat_id = agent.create_chat(directory.path().into()).await.unwrap();
+            let loop_id = uuid::Uuid::new_v4();
+            let run_id = uuid::Uuid::new_v4();
+            agent
+                .inner
+                .chats
+                .lock()
+                .await
+                .get_mut(&chat_id)
+                .unwrap()
+                .active_run = Some(run_id);
+            for kind in [
+                ModelRequestKind::Conversation,
+                ModelRequestKind::Title,
+                ModelRequestKind::AutoSetup,
+                ModelRequestKind::CompactionAutomatic,
+                ModelRequestKind::CompactionManual,
+                ModelRequestKind::CompactionDirected,
+                ModelRequestKind::PermissionCheck,
+                ModelRequestKind::WebFetch,
+                ModelRequestKind::ShellDescription,
+            ] {
+                let run_owned = matches!(
+                    kind,
+                    ModelRequestKind::Conversation
+                        | ModelRequestKind::CompactionAutomatic
+                        | ModelRequestKind::PermissionCheck
+                        | ModelRequestKind::WebFetch
+                );
+                let context = RequestContext {
+                    owner: RequestOwner {
+                        chat_id,
+                        loop_id: run_owned.then_some(loop_id),
+                        run_id: run_owned.then_some(run_id),
+                    },
+                    kind,
+                };
+                let mut request = empty_request();
+                request.reasoning_effort = Some(tickloop_agent_protocol::ReasoningEffort::High);
+                let response = agent
+                    .tracked_model_request(
+                        context,
+                        model.clone(),
+                        request,
+                        CancellationToken::new(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let actual = model
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .reasoning_effort;
+                let expected = if kind == ModelRequestKind::Conversation {
+                    tickloop_agent_protocol::ReasoningEffort::High
+                } else if supports_off {
+                    tickloop_agent_protocol::ReasoningEffort::Off
+                } else {
+                    tickloop_agent_protocol::ReasoningEffort::Low
+                };
+                assert_eq!(
+                    actual,
+                    Some(expected),
+                    "{kind:?}, supports_off={supports_off}"
+                );
+                agent
+                    .finish_model_request(chat_id, response.sequence, RequestOutcome::Accepted)
+                    .await
+                    .unwrap();
+            }
+            agent.shutdown().await;
+        }
     }
 
     fn empty_request() -> ModelRequest {

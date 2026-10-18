@@ -585,6 +585,19 @@ pub trait ModelClient: Send + Sync {
         false
     }
 
+    fn minimum_reasoning_effort(&self) -> Option<ReasoningEffort> {
+        [
+            ReasoningEffort::Off,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+        ]
+        .into_iter()
+        .find(|effort| self.supports_reasoning_effort(*effort))
+    }
+
     async fn generate_title(
         &self,
         request: ModelRequest,

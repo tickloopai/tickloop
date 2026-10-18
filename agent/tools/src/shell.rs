@@ -90,6 +90,16 @@ impl DirectoryIdentity {
     }
 }
 
+pub(super) fn is_read_only_input(workspace: &super::Workspace, value: &Value) -> bool {
+    let Ok(input) = serde_json::from_value::<ShellInput>(value.clone()) else {
+        return false;
+    };
+    let directory = workspace.workdir.join(input.cwd.as_deref().unwrap_or("."));
+    directory
+        .canonicalize()
+        .is_ok_and(|cwd| input.is_read_only(&cwd, workspace))
+}
+
 impl ShellInput {
     /// Claude Code's rule-free read-only admission, evaluated with default-mode path checks.
     pub(super) fn is_read_only(&self, cwd: &Path, workspace: &super::Workspace) -> bool {

@@ -5,6 +5,7 @@ use tickloop_agent_protocol::{
     TaskExecutionBinding, TaskMutationReceipt, TaskOwner, TaskReport, ToolDefinition, ToolResult,
 };
 
+use super::tool_execution::ToolInvocation;
 use super::*;
 
 const MAX_TASKS: usize = 256;

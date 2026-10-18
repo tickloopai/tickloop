@@ -64,10 +64,11 @@ mod session_permissions;
 mod shell_description;
 mod shell_task_center;
 mod system_prompt;
+mod tool_batch;
 mod tool_execution;
 mod tool_results;
 mod web_fetch;
-use tool_execution::{ToolCallOutcome, ToolInvocation, ToolRegistry};
+use tool_execution::ToolRegistry;
 mod commands;
 mod permission_management;
 mod plan;
@@ -116,8 +117,7 @@ use tickloop_agent_protocol::{
     PermissionRule, PermissionScope, PromptPolicy, ProposedToolCall, QueuedInput, QueuedInputKind,
     ReasoningEffort, Receipt, RequestOutcome, RequestUsageLedger, ResponseRejection, Role, RunId,
     SubagentRegistration, TICK_MANUAL_SOURCE, TICK_SUBSCRIPTION_SOURCE, TaskNotification,
-    ToolResultBlock, ToolResultContent, TriggerSource, Usage, UserShellRecord, UserShellState,
-    VerdictEvidence, projection,
+    TriggerSource, Usage, UserShellRecord, UserShellState, VerdictEvidence, projection,
 };
 use tickloop_agent_tools::permissions::SessionPermissionDecision;
 use tickloop_agent_tools::{
@@ -2980,7 +2980,9 @@ impl Agent {
                 if let Some(provider) = host_provider {
                     let _ = provider.refresh(cancel.clone()).await;
                 }
-                self.refresh_task_tools_setting().await.map_err(|error| error.to_string())?;
+                self.refresh_task_tools_setting()
+                    .await
+                    .map_err(|error| error.to_string())?;
                 self.ensure_handback_requirement(&receipt).await?;
                 self.pin_delegated_artifact_account(receipt.chat_id).await?;
                 self.rediscover_skills(receipt.chat_id).await;
@@ -2997,33 +2999,77 @@ impl Agent {
                     )
                 };
                 request.tools = registry.definitions();
-                let output = self.model_request(&receipt,request,&mut registry,cancel.clone(),&mut used_calls).await.map_err(|error|error.to_string())?;
+                let output = self
+                    .model_request(
+                        &receipt,
+                        request,
+                        &mut registry,
+                        cancel.clone(),
+                        &mut used_calls,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
                 *is_awaiting_model = false;
                 let assistant_message_id = Uuid::new_v4();
-                let calls = output.content.iter().filter_map(|content| {
-                    if let Content::ToolUse {id,name,input}=content {Some(ProposedToolCall {call_id:id.clone(),name:name.clone(),input:input.clone()})} else {None}
-                }).collect::<Vec<_>>();
+                let calls = output
+                    .content
+                    .iter()
+                    .filter_map(|content| {
+                        if let Content::ToolUse { id, name, input } = content {
+                            Some(ProposedToolCall {
+                                call_id: id.clone(),
+                                name: name.clone(),
+                                input: input.clone(),
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
                 {
                     let mut chats = self.inner.chats.lock().await;
-                    let chat=chats.get_mut(&receipt.chat_id).unwrap();
+                    let chat = chats.get_mut(&receipt.chat_id).unwrap();
                     chat.snapshot.pending_thinking.remove(&receipt.run_id);
-                    chat.snapshot.message_runs.insert(chat.snapshot.messages.len(),receipt.run_id);
-                    chat.snapshot.message_ids.insert(chat.snapshot.messages.len(),assistant_message_id);
-                    chat.snapshot.message_usage.insert(chat.snapshot.messages.len(),output.usage);
+                    chat.snapshot
+                        .message_runs
+                        .insert(chat.snapshot.messages.len(), receipt.run_id);
+                    chat.snapshot
+                        .message_ids
+                        .insert(chat.snapshot.messages.len(), assistant_message_id);
+                    chat.snapshot
+                        .message_usage
+                        .insert(chat.snapshot.messages.len(), output.usage);
                     let index = chat.snapshot.messages.len();
-                    chat.snapshot.message_models.insert(index, chat.snapshot.model.identity());
-                    if let Some(source) = output.private_source.or_else(|| chat.snapshot.model.private_history_source()) {
+                    chat.snapshot
+                        .message_models
+                        .insert(index, chat.snapshot.model.identity());
+                    if let Some(source) = output
+                        .private_source
+                        .or_else(|| chat.snapshot.model.private_history_source())
+                    {
                         chat.snapshot.message_sources.insert(index, source);
                     }
-                    chat.snapshot.messages.push(Message {role:Role::Assistant,content:output.content});
-                    chat.snapshot.last_model_run=Some(receipt.run_id);
-                    self.emit(chat, &receipt, EventKind::AssistantMessageCommitted { message_id: assistant_message_id, tool_calls: calls.clone() });
+                    chat.snapshot.messages.push(Message {
+                        role: Role::Assistant,
+                        content: output.content,
+                    });
+                    chat.snapshot.last_model_run = Some(receipt.run_id);
+                    self.emit(
+                        chat,
+                        &receipt,
+                        EventKind::AssistantMessageCommitted {
+                            message_id: assistant_message_id,
+                            tool_calls: calls.clone(),
+                        },
+                    );
                 }
                 if calls.is_empty() {
                     if self.wait_for_subagents(&receipt, &cancel).await?
                         || self.wait_for_task_commands(&receipt, &cancel).await?
                     {
-                        self.merge_queued_messages(&receipt).await.map_err(|error| error.to_string())?;
+                        self.merge_queued_messages(&receipt)
+                            .await
+                            .map_err(|error| error.to_string())?;
                         let chats = self.inner.chats.lock().await;
                         request = self.continuation_request(&chats[&receipt.chat_id])?;
                         continue;
@@ -3035,107 +3081,46 @@ impl Agent {
                         request = self.continuation_request(chat)?;
                         continue;
                     }
-                    return chat.snapshot.request_usage.run_conversation_usage(receipt.run_id).map_err(|error|error.to_string());
+                    return chat
+                        .snapshot
+                        .request_usage
+                        .run_conversation_usage(receipt.run_id)
+                        .map_err(|error| error.to_string());
                 }
-                for ProposedToolCall {call_id:id,name,input} in calls {
-                    let tool_use = monitor_members::ToolUse::of(&name, &input);
-                    let invocation = ToolInvocation::new(
-                        id.clone(), name.clone(), input, registry.resolve(&name),
-                    );
-                    let outcome = self.execute_registered_call(
-                        &receipt, assistant_message_id, invocation, cancel.clone(),
-                    ).await;
-                    let outcome = match outcome {
-                        Ok(outcome) => outcome,
-                        Err(error) => {
-                            if let Some(record) = error.denial {
-                                self.record_final_denial(record).await;
-                            }
-                            return Err(error.message);
-                        }
-                    };
-                    let ToolCallOutcome { result, host_call_status, host_effect, images: result_images, permission_comment, continue_after_denial, is_rejected_by_user, denial } = outcome;
-                    if let Some(record) = denial {
-                        self.record_final_denial(record).await;
-                    }
-                    let mut result = result;
-                    if let Some(crate::host_tools::HostEffect::CreatedArtifact(tick)) = &host_effect
-                        && !result.is_error
-                        && host_call_status == Some(crate::host_tools::HostCallStatus::Completed)
-                        && let Err(error) = self.link_created_artifact(&receipt, tick).await
-                    {
-                        result.content.push_str(&format!("\n\nThe artifact was created, but linking it for @tickloop requests failed: {error}. The user can press f on it in Monitor to link it."));
-                    }
-                    let result = self.persist_large_tool_result(&receipt,&name,&id,result).await.map_err(|error|error.to_string())?;
-                    let mut chats=self.inner.chats.lock().await;
-                    let chat=chats.get_mut(&receipt.chat_id).unwrap();
-                    let model_result=if !continue_after_denial {
-                        permission_comment.as_deref().map_or_else(||result.content.clone(),|comment|format!("{}\n\nThe user approved this action with this comment: {comment}",result.content))
-                    } else {result.content.clone()};
-                    let content=if result_images.is_empty() {model_result.into()} else {
-                        ToolResultContent::Blocks(std::iter::once(ToolResultBlock::Text {text:model_result}).chain(result_images.into_iter().map(ToolResultBlock::from)).collect())
-                    };
-                    let block=Content::ToolResult {tool_use_id:id.clone(),content,is_error:result.is_error};
-                    let last_index=chat.snapshot.messages.len().checked_sub(1);
-                    let same_run=!chat.start_new_tool_result_message && last_index.is_some_and(|index|chat.snapshot.message_runs.get(&index)==Some(&receipt.run_id));
-                    if let Some(message)=chat.snapshot.messages.last_mut().filter(|message|same_run && message.role==Role::User && message.content.iter().all(|content|matches!(content,Content::ToolResult{..}))) {message.content.push(block);} else {chat.snapshot.message_runs.insert(chat.snapshot.messages.len(),receipt.run_id);chat.snapshot.messages.push(Message {role:Role::User,content:vec![block]});}
-                    chat.start_new_tool_result_message = false;
-                    if let Some(operation) = chat.snapshot.operations.iter_mut().find(|operation|operation.run_id==receipt.run_id && operation.call_id==id) {
-                        operation.result=Some(result.clone());
-                    }
-                    if !result.is_error && let Some(tool_use) = tool_use {
-                        self.mark_tool_use(chat, tool_use);
-                    }
-                    if !result.is_error && host_call_status == Some(crate::host_tools::HostCallStatus::Completed) {
-                        match &host_effect {
-                            Some(crate::host_tools::HostEffect::CreatedArtifact(tick)) => {
-                                if let Some(instance) = self.auto_attach_artifact_tick(chat, tick.clone()) {
-                                    self.mark_joined(chat, [instance]);
-                                }
-                            },
-                            Some(crate::host_tools::HostEffect::ReadArtifact(tick)) => {
-                                if let Some(instance) = self.auto_attach_artifact_tick(chat, tick.clone()) {
-                                    self.mark_taken_in(chat, [instance]);
-                                }
-                            },
-                            Some(crate::host_tools::HostEffect::RenamedArtifact { instance, title }) => self.retitle_artifact_tick(chat, instance, title),
-                            Some(crate::host_tools::HostEffect::OpenedTick { instance, title, is_terminal }) => {
-                                if let Some(operation) = chat.snapshot.operations.iter().find(|operation| operation.run_id == receipt.run_id && operation.call_id == id && operation.state == OperationState::Completed) {
-                                    chat.bookkeeping.tick_creation_receipts.push(approval_context::TickCreationReceipt { loop_id: receipt.loop_id, operation_id: operation.id, instance: instance.clone() });
-                                }
-                                self.record_opened_tick(chat, instance.clone(), title.clone(), *is_terminal);
-                            },
-                            None => {}
-                        }
-                    }
-                    self.save(&chat.snapshot);
-                    self.emit(chat,&receipt,EventKind::ToolCompleted {call_id:id.clone(),result:result.clone()});
-                    // Tool errors go back to the model; a bare user denial or stopped foreground command ends the run.
-                    if is_rejected_by_user && !continue_after_denial {
-                        chat.user_cancelled_runs.insert(receipt.run_id);
-                    }
-                    if chat.user_cancelled_runs.contains(&receipt.run_id) {
-                        cancel.cancel();
-                        return Err(result.content);
-                    }
-                }
+                self.execute_tool_batch(
+                    &receipt,
+                    assistant_message_id,
+                    calls,
+                    &registry,
+                    cancel.clone(),
+                )
+                .await?;
                 {
-                    let mut chats=self.inner.chats.lock().await;
-                    let chat=chats.get_mut(&receipt.chat_id).unwrap();
-                    self.flush_deferred_messages(chat,MessageBoundary::ToolResults).map_err(|error|error.to_string())?;
-                    if matches!(chat.snapshot.subagent_reports.get(&receipt.run_id), Some(tickloop_agent_protocol::SubagentReport::Delivered { .. })) {
-                        return chat.snapshot.request_usage.run_conversation_usage(receipt.run_id).map_err(|error|error.to_string());
+                    let mut chats = self.inner.chats.lock().await;
+                    let chat = chats.get_mut(&receipt.chat_id).unwrap();
+                    self.flush_deferred_messages(chat, MessageBoundary::ToolResults)
+                        .map_err(|error| error.to_string())?;
+                    if matches!(
+                        chat.snapshot.subagent_reports.get(&receipt.run_id),
+                        Some(tickloop_agent_protocol::SubagentReport::Delivered { .. })
+                    ) {
+                        return chat
+                            .snapshot
+                            .request_usage
+                            .run_conversation_usage(receipt.run_id)
+                            .map_err(|error| error.to_string());
                     }
                 }
                 self.merge_queued_messages(&receipt)
                     .await
                     .map_err(|error| error.to_string())?;
                 self.complete_file_history_snapshots(receipt.chat_id).await;
-                let chats=self.inner.chats.lock().await;
-                let chat=chats.get(&receipt.chat_id).unwrap();
+                let chats = self.inner.chats.lock().await;
+                let chat = chats.get(&receipt.chat_id).unwrap();
                 request = self.continuation_request(chat)?;
             }
-        }.await
+        }
+        .await
     }
 
     async fn finish_run(
@@ -3768,6 +3753,7 @@ impl Agent {
         session_operation: SessionPermissionOperation,
         cancel: CancellationToken,
     ) -> Result<PermissionAnswer, String> {
+        tool_batch::serialize_permission_prompt(&cancel).await?;
         let model_receipt = request.execution.run_id().map(|run_id| Receipt {
             chat_id,
             loop_id: request.loop_id,
@@ -3791,7 +3777,11 @@ impl Agent {
                     .find(|goal| goal.id == receipt.loop_id)
                     .ok_or("permission Loop is unavailable")?
                     .set_state(LoopState::WaitingPermission);
-                self.park_run(chat, receipt, cancel.clone())
+                let run_cancel = chat
+                    .run_cancel(receipt.run_id)
+                    .cloned()
+                    .ok_or("permission Run is unavailable")?;
+                self.park_run(chat, receipt, run_cancel)
                     .map_err(|error| error.to_string())?;
             } else if let PermissionExecution::UserShell { command_id } = request.execution
                 && !chat.snapshot.user_shells.iter().any(|shell| {

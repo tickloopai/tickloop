@@ -1,9 +1,7 @@
 use super::{Agent, approval_context};
 use std::{sync::atomic::Ordering, time::Duration};
-use tickloop_agent_model::{ModelOutput, ModelRequest, ReasoningEffortExt};
-use tickloop_agent_protocol::{
-    ChatId, Content, Message, ModelConfig, ReasoningEffort, Role, short_chat_title,
-};
+use tickloop_agent_model::{ModelOutput, ModelRequest};
+use tickloop_agent_protocol::{ChatId, Content, Message, Role, short_chat_title};
 
 const TITLE_TIMEOUT: Duration = Duration::from_secs(15);
 const TITLE_PROMPT_CHARACTERS: usize = 1000;
@@ -14,7 +12,7 @@ impl Agent {
         if pending.contains(&chat_id) || self.inner.closed.load(Ordering::SeqCst) {
             return;
         }
-        let (client, prompt, message_id, reasoning_effort) = {
+        let (client, prompt, message_id) = {
             let chats = self.inner.chats.lock().await;
             let Some(chat) = chats.get(&chat_id) else {
                 return;
@@ -48,7 +46,6 @@ impl Agent {
                     .rev()
                     .collect::<String>(),
                 original.message_id,
-                side_request_effort(&chat.snapshot.model),
             )
         };
         pending.insert(chat_id);
@@ -72,7 +69,7 @@ impl Agent {
                 tools: Vec::new(),
                 structured_output: None,
                 temperature: None,
-                reasoning_effort,
+                reasoning_effort: None,
             };
             let cancel = agent.inner.shutdown.child_token();
             let output = agent
@@ -111,15 +108,6 @@ impl Agent {
             agent.inner.title_requests.lock().await.remove(&chat_id);
         });
         self.inner.tasks.lock().await.push(task);
-    }
-}
-
-/// The cheapest reasoning effort the Chat's model accepts, for short side requests such as titles.
-pub(super) fn side_request_effort(model: &ModelConfig) -> Option<ReasoningEffort> {
-    if tickloop_agent_model::validate_reasoning_effort(model, Some(ReasoningEffort::Off)).is_ok() {
-        Some(ReasoningEffort::Off)
-    } else {
-        ReasoningEffort::choices(model).first().copied()
     }
 }
 

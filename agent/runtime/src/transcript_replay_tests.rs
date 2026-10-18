@@ -287,6 +287,7 @@ async fn live_recorded_artifact_reviews_without_dispatch() {
                 },
                 "attempts":result.attempts, "failure":result.failure,
                 "block_reason":reason,
+                "requested_reasoning_effort":llm.as_ref().and_then(|client| client.minimum_reasoning_effort()),
                 "reviewer":result.reviewer, "elapsed_ms":start.elapsed().as_millis(),
                 "original_body_bytes":original["content"].as_str().unwrap().len(),
                 "current_input_json_bytes":serde_json::to_vec(&operation.input).unwrap().len(),

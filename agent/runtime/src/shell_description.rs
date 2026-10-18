@@ -2,11 +2,7 @@ use std::{sync::atomic::Ordering, time::Duration};
 
 use uuid::Uuid;
 
-use super::{
-    Agent,
-    chat_title::{side_request_effort, side_request_text},
-    model_request::RequestContext,
-};
+use super::{Agent, chat_title::side_request_text, model_request::RequestContext};
 use tickloop_agent_model::ModelRequest;
 use tickloop_agent_protocol::{ChatId, Content, Message, Role};
 
@@ -34,15 +30,12 @@ impl Agent {
             }
             generated.insert(task_id, None);
         }
-        let (client, reasoning_effort) = {
+        let client = {
             let chats = self.inner.chats.lock().await;
             let Some(chat) = chats.get(&chat_id) else {
                 return;
             };
-            (
-                chat.client.clone(),
-                side_request_effort(&chat.snapshot.model),
-            )
+            chat.client.clone()
         };
         let request = ModelRequest {
             history_sources: Vec::new(),
@@ -66,7 +59,7 @@ impl Agent {
             tools: Vec::new(),
             structured_output: None,
             temperature: None,
-            reasoning_effort,
+            reasoning_effort: None,
         };
         let agent = self.clone();
         let task = tokio::spawn(async move {

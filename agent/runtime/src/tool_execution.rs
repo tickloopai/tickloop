@@ -320,6 +320,24 @@ impl ToolRegistry {
             .find(|tool| tool.definition.name == name)
             .cloned()
     }
+
+    pub(super) fn is_concurrency_safe(
+        &self,
+        name: &str,
+        input: &Value,
+        workspace: &tickloop_agent_tools::Workspace,
+    ) -> bool {
+        let Some(tool) = self.tools.iter().find(|tool| tool.definition.name == name) else {
+            return false;
+        };
+        match &tool.route {
+            ToolRoute::BuiltIn => tickloop_agent_tools::is_concurrency_safe(workspace, name, input),
+            ToolRoute::Host(provider) => provider.is_concurrency_safe(name, input),
+            ToolRoute::Delegation | ToolRoute::McpResource(_) => true,
+            ToolRoute::SharedTask => matches!(name, "TaskGet" | "TaskList"),
+            _ => false,
+        }
+    }
 }
 
 fn validate_tool_input(definition: &ToolDefinition, input: &Value) -> Result<(), String> {

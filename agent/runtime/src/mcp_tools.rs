@@ -1225,6 +1225,16 @@ impl McpHostToolProvider {
 
 #[async_trait]
 impl HostToolProvider for McpHostToolProvider {
+    fn is_concurrency_safe(&self, name: &str, input: &Value) -> bool {
+        if ARTIFACT_ACCOUNT_TOOL_NAMES.contains(&name) || name == ARTIFACT_LOGIN_TOOL {
+            name == ARTIFACT_READ_TOOL
+        } else {
+            self.native
+                .as_ref()
+                .is_some_and(|provider| provider.is_concurrency_safe(name, input))
+        }
+    }
+
     /// Native tools never take the Artifact names; only the service directory provides them,
     /// together with the provider's own upload, and the provider offers sign-in while signed out.
     fn definitions(&self) -> Vec<ToolDefinition> {

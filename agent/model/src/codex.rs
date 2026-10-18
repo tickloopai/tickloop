@@ -338,6 +338,10 @@ impl ModelClient for CodexModelClient {
         self.config.identity()
     }
 
+    fn supports_reasoning_effort(&self, effort: ReasoningEffort) -> bool {
+        validate_reasoning_effort(&self.config, Some(effort)).is_ok()
+    }
+
     async fn close_chat(&self, chat_id: tickloop_agent_protocol::ChatId) {
         self.websocket_cache.close_chat(chat_id).await;
     }
