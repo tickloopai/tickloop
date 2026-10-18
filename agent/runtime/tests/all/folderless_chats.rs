@@ -4,6 +4,7 @@
 use std::{path::Path, sync::Arc};
 
 use serde_json::json;
+use tickloop_agent_base::network::Reach;
 use tickloop_agent_protocol::{
     AgentHostOptions, Content, Decision, EventKind, ImageContext, ImageOrigin, InputContext,
     PermissionRule, PromptPolicy, Role,
@@ -31,9 +32,9 @@ fn allow_web_fetch() -> PermissionRule {
     }
 }
 
-/// The stage-one cloud assembly: no Folder, WebFetch alone, an explicit WebFetch allow, and no
-/// prompt that waits for a person.
-fn folderless_agent(model: Arc<ScriptedModel>) -> Agent {
+/// The stage-one cloud assembly: no Folder, WebFetch alone reaching `reach`, an explicit
+/// WebFetch allow, and no prompt that waits for a person.
+fn folderless_agent(model: Arc<ScriptedModel>, reach: Reach) -> Agent {
     Agent::with_seams(
         HarnessSeams {
             transcripts: None,
@@ -47,7 +48,10 @@ fn folderless_agent(model: Arc<ScriptedModel>) -> Agent {
                 prompt_policy: PromptPolicy::DenyOnPrompt,
                 ..AgentHostOptions::product_defaults()
             },
-            tools: ToolPolicy::web_fetch_only(),
+            tools: ToolPolicy {
+                folderless_reach: reach,
+                ..ToolPolicy::web_fetch_only()
+            },
             host_rules: vec![allow_web_fetch()],
         },
     )
@@ -164,7 +168,7 @@ async fn a_folderless_chat_offers_web_fetch_alone_and_hears_of_nothing_else() {
         call("first", "WebSearch", json!({"query": "news"})),
         text("done"),
     ]));
-    let agent = folderless_agent(model.clone());
+    let agent = folderless_agent(model.clone(), Reach::PublicAddresses);
     let chat = agent.create_chat_without_folder().await.unwrap();
     assert_eq!(agent.snapshot(chat).await.unwrap().folder, None);
     let events = run_turn(&agent, chat, "what is new").await;
@@ -204,7 +208,7 @@ async fn excepted_tool_names_return_disabled_results_without_any_wait() {
         .concat(),
         text("done"),
     ]));
-    let agent = folderless_agent(model.clone());
+    let agent = folderless_agent(model.clone(), Reach::PublicAddresses);
     let chat = agent.create_chat_without_folder().await.unwrap();
     let events = run_turn(&agent, chat, "go").await;
     assert!(matches!(events.last(), Some(EventKind::Completed { .. })));
@@ -240,7 +244,7 @@ async fn web_fetch_is_allowed_by_the_host_rule_without_review_and_reaches_only_p
         text("done"),
     ]));
     let reviewer = Arc::new(ScriptedModel::new(Vec::new()));
-    let agent = folderless_agent(model.clone());
+    let agent = folderless_agent(model.clone(), Reach::PublicAddresses);
     agent.set_auto_reviewer(reviewer.clone()).await;
     let chat = agent.create_chat_without_folder().await.unwrap();
     let events = run_turn(&agent, chat, "read it").await;
@@ -268,9 +272,57 @@ async fn web_fetch_is_allowed_by_the_host_rule_without_review_and_reaches_only_p
 }
 
 #[tokio::test]
+async fn a_host_that_lets_folderless_chats_reach_anywhere_fetches_a_loopback_page() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let length = socket.read(&mut buffer).await.unwrap();
+            request.extend_from_slice(&buffer[..length]);
+        }
+        let body = "<p>Delivery is on Friday.</p>";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    });
+    let model = Arc::new(ScriptedModel::new(vec![
+        call(
+            "fetch",
+            "WebFetch",
+            json!({"url": format!("http://localhost:{port}/delivery"), "prompt": "When?"}),
+        ),
+        text("Friday."),
+        text("done"),
+    ]));
+    let agent = folderless_agent(model.clone(), Reach::Anywhere);
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    let events = run_turn(&agent, chat, "read it").await;
+    assert!(matches!(events.last(), Some(EventKind::Completed { .. })));
+    let completed = events
+        .iter()
+        .find_map(|event| match event {
+            EventKind::ToolCompleted { call_id, result } if call_id == "fetch" => Some(result),
+            _ => None,
+        })
+        .expect("WebFetch ran");
+    assert!(
+        !completed.is_error && completed.content == "Friday.",
+        "{completed:?}"
+    );
+    server.await.unwrap();
+    agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_folderless_chat_refuses_local_shells_files_and_attachments() {
     let model = Arc::new(ScriptedModel::new(Vec::new()));
-    let agent = folderless_agent(model.clone());
+    let agent = folderless_agent(model.clone(), Reach::PublicAddresses);
     let chat = agent.create_chat_without_folder().await.unwrap();
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("notes.txt"), "secret").unwrap();
@@ -399,7 +451,10 @@ async fn local_folder_apis_refuse_a_folderless_harness_before_reading_anything()
         "---\nname: project-workflow\ndescription: A project Skill\n---\nBody",
     )
     .unwrap();
-    let agent = folderless_agent(Arc::new(ScriptedModel::new(Vec::new())));
+    let agent = folderless_agent(
+        Arc::new(ScriptedModel::new(Vec::new())),
+        Reach::PublicAddresses,
+    );
     let refused = |result: Result<(), AgentError>| matches!(result, Err(AgentError::Invalid(message)) if message.starts_with("Unsupported: this Agent has no Execution Environment"));
     assert!(refused(agent.check_user_skill(
         project.path(),
@@ -489,7 +544,7 @@ async fn folderless_turn_in_child() {
         call("search", "WebSearch", json!({"query": "rust"})),
         text("done"),
     ]));
-    let agent = folderless_agent(model.clone());
+    let agent = folderless_agent(model.clone(), Reach::PublicAddresses);
     agent.install_own_tickhost();
     let chat = agent.create_chat_without_folder().await.unwrap();
     let events = run_turn(&agent, chat, "fetch and search").await;

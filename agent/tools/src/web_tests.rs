@@ -609,7 +609,7 @@ fn a_public_only_fetch_refuses_redirects_to_addresses_that_are_not_public() {
 
 #[tokio::test]
 async fn folderless_tools_prepare_only_web_fetch_of_public_addresses_and_write_nothing() {
-    let tools = crate::Tools::folderless();
+    let tools = crate::Tools::folderless(Reach::PublicAddresses);
     let workspace = crate::Workspace {
         folder: None,
         additional_directories: Vec::new(),
@@ -676,7 +676,8 @@ async fn folderless_tools_bind_web_search_to_the_chats_search_service() {
         endpoint: "http://127.0.0.1:8888/search".into(),
         api_key_env: None,
     };
-    let tools = crate::Tools::folderless().with_search_configuration(Some(config), None);
+    let tools = crate::Tools::folderless(Reach::PublicAddresses)
+        .with_search_configuration(Some(config), None);
     let prepared = tools
         .prepare(&workspace, WEB_SEARCH_TOOL_NAME, &input)
         .await
@@ -688,9 +689,103 @@ async fn folderless_tools_bind_web_search_to_the_chats_search_service() {
         crate::Operation::WebSearch(search) if search.prepared.is_some()
     ));
 
-    let disabled = crate::Tools::folderless().with_search_configuration(None, None);
+    let disabled =
+        crate::Tools::folderless(Reach::PublicAddresses).with_search_configuration(None, None);
     assert!(matches!(
         disabled.prepare(&workspace, WEB_SEARCH_TOOL_NAME, &input).await,
         Err(ToolError::Network(message)) if message == web_search::DISABLED_MESSAGE
     ));
+}
+
+#[tokio::test]
+async fn folderless_tools_fetch_a_private_address_only_when_the_host_chooses_anywhere() {
+    let (base, connections) = serve(vec![http_response(
+        "200 OK",
+        "Content-Type: text/html\r\n",
+        "<h1>Delivery</h1><p>Friday</p>",
+    )])
+    .await;
+    let port = url(&base).port().unwrap();
+    let workspace = crate::Workspace {
+        folder: None,
+        additional_directories: Vec::new(),
+    };
+    let input = json!({"url": format!("http://localhost:{port}/delivery"), "prompt": "When?"});
+    let context = || crate::ExecutionContext {
+        operation_id: uuid::Uuid::new_v4(),
+        loop_id: uuid::Uuid::nil(),
+        accepts_images: false,
+    };
+    let model = RecordingModel::default();
+
+    let public_only = crate::Tools::folderless(Reach::PublicAddresses);
+    let prepared = public_only
+        .prepare(&workspace, WEB_FETCH_TOOL_NAME, &input)
+        .await
+        .unwrap();
+    let refused = public_only
+        .execute_with_context(prepared, CancellationToken::new(), context(), &model)
+        .await
+        .result;
+    assert!(
+        matches!(
+            &refused,
+            Err(ToolError::Rejected(message))
+                if message.starts_with("localhost resolves to ")
+                    && message.contains("which is not a public address")
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(connections.load(Ordering::SeqCst), 0);
+
+    let anywhere = crate::Tools::folderless(Reach::Anywhere);
+    let prepared = anywhere
+        .prepare(&workspace, WEB_FETCH_TOOL_NAME, &input)
+        .await
+        .unwrap();
+    let fetched = anywhere
+        .execute_with_context(prepared, CancellationToken::new(), context(), &model)
+        .await
+        .result
+        .unwrap();
+    assert!(!fetched.is_error, "{fetched:?}");
+    assert_eq!(fetched.content, "The delivery is on Friday.");
+    assert_eq!(connections.load(Ordering::SeqCst), 1);
+}
+
+/// The search service is the host's choice, not the model's, so a Chat's reach does not limit it.
+#[tokio::test]
+async fn folderless_web_search_requests_the_hosts_search_service_whatever_the_reach() {
+    let workspace = crate::Workspace {
+        folder: None,
+        additional_directories: Vec::new(),
+    };
+    let input = json!({"query": "rust release notes"});
+    for reach in [Reach::PublicAddresses, Reach::Anywhere] {
+        let (base, connections) = serve(vec![http_response(
+            "200 OK",
+            "Content-Type: application/json\r\n",
+            r#"{"results":[{"title":"Rust 1.90","url":"https://blog.rust-lang.org/1.90","content":"Release notes"}]}"#,
+        )])
+        .await;
+        let config = tickloop_agent_protocol::SearchConfig {
+            provider: tickloop_agent_protocol::SearchProviderKind::Searxng,
+            endpoint: format!("{base}/search"),
+            api_key_env: None,
+        };
+        let tools = crate::Tools::folderless(reach).with_search_configuration(Some(config), None);
+        let prepared = tools
+            .prepare(&workspace, WEB_SEARCH_TOOL_NAME, &input)
+            .await
+            .unwrap();
+        let result = tools
+            .execute(prepared, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error && result.content.contains("https://blog.rust-lang.org/1.90"),
+            "{reach:?}: {result:?}"
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), 1, "{reach:?}");
+    }
 }

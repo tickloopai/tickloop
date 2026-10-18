@@ -3,6 +3,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use tickloop_agent_base::network::Reach;
 use tickloop_agent_model::{ModelClient, ModelClients, ModelError};
 use tickloop_agent_protocol::{
     AgentHostOptions, ChatId, ModelConfig, PermissionRule, UserShellState,
@@ -40,9 +41,9 @@ pub struct HarnessOptions {
     pub host_rules: Vec<PermissionRule>,
 }
 
-/// Which of the Agent's own capabilities its Chats offer the model. The file tools, Bash and
-/// TaskStop also need a Folder; each capability still follows its own settings, such as Task
-/// tools or web search.
+/// Which of the Agent's own capabilities its Chats offer the model, and where WebFetch may reach
+/// without a Folder. The file tools, Bash and TaskStop also need a Folder; each capability still
+/// follows its own settings, such as Task tools or web search.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ToolPolicy {
     pub web_fetch: bool,
@@ -62,6 +63,9 @@ pub struct ToolPolicy {
     /// The host's tools, such as the Artifact and Tick tools, and its MCP resources.
     pub artifacts: bool,
     pub tick_subscriptions: bool,
+    /// The addresses WebFetch reaches in a Chat without a Folder; a Chat with a Folder reaches
+    /// anywhere. Both constructors choose public addresses only.
+    pub folderless_reach: Reach,
 }
 
 impl ToolPolicy {
@@ -79,6 +83,7 @@ impl ToolPolicy {
             goals: true,
             artifacts: true,
             tick_subscriptions: true,
+            folderless_reach: Reach::PublicAddresses,
         }
     }
 
@@ -96,6 +101,7 @@ impl ToolPolicy {
             goals: false,
             artifacts: false,
             tick_subscriptions: false,
+            folderless_reach: Reach::PublicAddresses,
         }
     }
 }

@@ -57,10 +57,13 @@ impl Agent {
     /// access to other families in the same project. A Chat without a Folder has no directory.
     pub(super) fn create_chat_tools(&self, snapshot: &ChatSnapshot) -> Arc<Tools> {
         if snapshot.folder.is_none() {
-            return Arc::new(Tools::folderless().with_search_configuration(
-                snapshot.search_config.clone(),
-                self.inner.config_root.clone(),
-            ));
+            return Arc::new(
+                Tools::folderless(self.inner.tool_policy.folderless_reach)
+                    .with_search_configuration(
+                        snapshot.search_config.clone(),
+                        self.inner.config_root.clone(),
+                    ),
+            );
         }
         let chat_id = snapshot.id;
         let family_id = snapshot

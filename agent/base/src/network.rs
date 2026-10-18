@@ -46,7 +46,7 @@ pub enum Reach {
     /// connects only to those, and no proxy resolves names where they cannot be checked. The
     /// client follows no redirect itself; its caller checks each target with
     /// [`check_public_url`] before requesting it. A Chat without a Folder reaches the network
-    /// this way.
+    /// this way unless its host chooses otherwise.
     PublicAddresses,
 }
 

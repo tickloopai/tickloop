@@ -509,13 +509,9 @@ impl Tools {
     }
 
     /// The tools of a Chat without a Folder: they touch no local file, run no command, and fetch
-    /// from public addresses only.
-    pub fn folderless() -> Self {
-        Self::with_commands(
-            None,
-            shell::Registry::without_folder(),
-            Reach::PublicAddresses,
-        )
+    /// only from the addresses `reach` admits.
+    pub fn folderless(reach: Reach) -> Self {
+        Self::with_commands(None, shell::Registry::without_folder(), reach)
     }
 
     fn with_commands(
