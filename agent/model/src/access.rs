@@ -266,6 +266,11 @@ mod tests {
                     ("GLM (5.3)".to_string(), "GLM-5.3".to_string()),
                     ("GLM Flash (5.3)".to_string(), "GLM-5.3-Flash".to_string()),
                     ("GLM FlashX (5.3)".to_string(), "GLM-5.3-FlashX".to_string()),
+                    ("GLM Air (4.5)".to_string(), "GLM-4.5-Air".to_string()),
+                    (
+                        "GLM Flash 30B (4.7)".to_string(),
+                        "GLM-4.7-Flash".to_string()
+                    ),
                 ]
             );
             assert_eq!(catalog.recommended_model(provider), Some("glm-5.3"));

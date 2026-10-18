@@ -40,3 +40,13 @@ models:
   input_modalities:
   - text
   - image
+- id: gemini-4-argon
+  service_model_id: gemini-4-argon
+  display_name: Gemini 4 Argon
+  adapter: google
+  max_output_tokens: 65536
+  context_window_tokens: 1048576
+  thinking: always_on
+  effort_levels: [low, medium, high]
+  input_modalities: [text, image]
+  temperature_control: unsupported

@@ -22,3 +22,6 @@ mod model_usage_observations;
 mod openai_models;
 #[path = "all/provider_expansion.rs"]
 mod provider_expansion;
+
+#[path = "all/model_tiers.rs"]
+mod model_tiers;

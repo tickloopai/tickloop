@@ -428,10 +428,17 @@ impl GoogleAuth {
             let location =
                 setting(&self.root, "GOOGLE_CLOUD_LOCATION")?.unwrap_or_else(|| "global".into());
             validate_identifier(&location)?;
-            let host = if location == "global" {
-                "aiplatform.googleapis.com".to_owned()
-            } else {
-                format!("{location}-aiplatform.googleapis.com")
+            if config.model == "gemini-4-argon"
+                && !matches!(location.as_str(), "global" | "us" | "eu")
+            {
+                return Err(configuration(
+                    "Gemini 4 Argon on Vertex requires location global, us or eu",
+                ));
+            }
+            let host = match location.as_str() {
+                "global" => "aiplatform.googleapis.com".to_owned(),
+                "us" | "eu" => format!("aiplatform.{location}.rep.googleapis.com"),
+                _ => format!("{location}-aiplatform.googleapis.com"),
             };
             format!("https://{host}/v1/projects/{project}/locations/{location}/publishers/google")
         } else {
@@ -727,6 +734,35 @@ mod tests {
                 .unwrap()
                 .contains("refresh_token=refresh")
         );
+        for (location, host) in [
+            ("us", "aiplatform.us.rep.googleapis.com"),
+            ("eu", "aiplatform.eu.rep.googleapis.com"),
+            ("us-central1", "us-central1-aiplatform.googleapis.com"),
+        ] {
+            credentials::save_api_key(root.path(), "GOOGLE_CLOUD_LOCATION", location).unwrap();
+            let access = auth.resolve(&config, &cancel, None).await.unwrap();
+            assert_eq!(
+                access.base_url,
+                format!(
+                    "https://{host}/v1/projects/fixture-project/locations/{location}/publishers/google"
+                )
+            );
+        }
+        let argon = ModelCatalog::defaults()
+            .get("google-vertex-oauth", "gemini-4-argon")
+            .unwrap();
+        assert!(
+            auth.resolve(&argon, &cancel, None)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("requires location global, us or eu")
+        );
+        for location in ["global", "us", "eu"] {
+            credentials::save_api_key(root.path(), "GOOGLE_CLOUD_LOCATION", location).unwrap();
+            assert!(auth.resolve(&argon, &cancel, None).await.is_ok());
+        }
         auth.logout(&cancel).await.unwrap();
         assert!(!auth.has_saved_login().unwrap());
         assert!(auth.resolve(&config, &cancel, None).await.is_err());

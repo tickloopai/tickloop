@@ -9,6 +9,7 @@ use tickloop_agent_protocol::{ReasoningEffort, Role};
 /// Applies the GLM-specific fields to an encoded Chat Completions body.
 pub(super) fn shape_request(
     body: &mut Value,
+    model: &str,
     effort: Option<ReasoningEffort>,
     structured_output: Option<StructuredOutput>,
 ) -> Result<(), ModelError> {
@@ -19,11 +20,18 @@ pub(super) fn shape_request(
     } else {
         "enabled"
     };
-    body["thinking"] = json!({"type": thinking_type, "clear_thinking": false});
-    if let Some(effort) = effort.filter(|effort| *effort != ReasoningEffort::Off) {
+    body["thinking"] = json!({"type": thinking_type});
+    // GLM-4.5-Air predates Preserved Thinking and streamed function arguments.
+    let supports_preserved_thinking = model != "glm-4.5-air";
+    if supports_preserved_thinking {
+        body["thinking"]["clear_thinking"] = json!(false);
+    }
+    if let Some(effort) =
+        effort.filter(|effort| !matches!(effort, ReasoningEffort::Off | ReasoningEffort::On))
+    {
         body["reasoning_effort"] = json!(effort.label());
     }
-    if body.get("tools").is_some() {
+    if supports_preserved_thinking && body.get("tools").is_some() {
         body["tool_stream"] = json!(true);
     }
     if let Some(format) = structured_output {

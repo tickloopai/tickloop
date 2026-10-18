@@ -218,13 +218,14 @@ pub fn validate_reasoning_effort(
     effort: Option<ReasoningEffort>,
 ) -> Result<(), ModelError> {
     let is_supported = effort.is_none_or(|effort| match effort {
-        ReasoningEffort::On => {
-            matches!(
-                config.adapter(),
-                Adapter::MinimaxMessages | Adapter::QwenChatCompletions
-            ) && cards::model_card(config)
-                .is_some_and(|card| card.thinking == ThinkingControl::Toggle)
-        }
+        ReasoningEffort::On => cards::model_card(config).is_some_and(|card| {
+            card.thinking == ThinkingControl::Toggle
+                && (matches!(
+                    config.adapter(),
+                    Adapter::MinimaxMessages | Adapter::QwenChatCompletions
+                ) || config.adapter() == Adapter::GlmChatCompletions
+                    && card.effort_levels.is_empty())
+        }),
         ReasoningEffort::Off => {
             cards::model_card(config).is_some_and(|card| card.thinking == ThinkingControl::Toggle)
         }
@@ -1948,6 +1949,7 @@ pub(crate) fn uses_prompted_structured_output(
         config.adapter(),
         Adapter::DeepseekMessages | Adapter::MinimaxMessages
     ) || config.provider_id == "kimi-code-oauth"
+        || config.adapter() == Adapter::KimiChatCompletions && config.model == kimi::CODE_MODEL_ID
         || config.adapter() == Adapter::QwenChatCompletions
             && request
                 .messages

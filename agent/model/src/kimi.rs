@@ -6,6 +6,7 @@ use super::ModelError;
 
 const ACCESS_TERMINATED: &str = "access_terminated_error";
 const USAGE_LIMIT_PHRASE: &str = "usage limit";
+pub(super) const CODE_MODEL_ID: &str = "kimi-k2.7-code";
 
 /// Kimi Code answers HTTP 403 `access_terminated_error` with a "monthly usage limit" message both
 /// when the plan allowance is spent and when the plan does not include the requested model

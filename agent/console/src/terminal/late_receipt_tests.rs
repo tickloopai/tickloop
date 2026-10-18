@@ -866,7 +866,9 @@ fn an_edited_input_held_behind_an_unknown_one_is_shown_only_once_it_is_sent() {
             .lines()
             .rfind(|line| line.trim_start().starts_with('❯'))
             .unwrap_or_default();
-        composer.contains(EDITED) && frame.matches("unknown acceptance").count() >= 2
+        composer.contains(EDITED)
+            && frame.matches("unknown acceptance").count() >= 2
+            && conversation_body(frame).contains(FIRST)
     });
     let body = conversation_body(&frame);
     assert_eq!(body.matches(FIRST).count(), 1, "{frame}");

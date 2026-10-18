@@ -20,6 +20,20 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn lightweight_glm_models_offer_auto_off_and_on_without_fictitious_effort_levels() {
+        let catalog = tickloop_agent_model::cards::ModelCatalog::defaults();
+        for provider in ["zhipu-cn-api", "zai-global-api"] {
+            for model in ["glm-4.5-air", "glm-4.7-flash"] {
+                let config = catalog.get(provider, model).unwrap();
+                assert_eq!(
+                    thinking_choices(&config),
+                    vec![None, Some(ReasoningEffort::Off), Some(ReasoningEffort::On)]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn scoped_discovery_preserves_other_and_newer_refreshes_until_check_completion() {
         let catalog = tickloop_agent_model::cards::ModelCatalog::defaults();
         let providers = ProviderModels::group(vec![
@@ -1326,7 +1340,11 @@ pub(super) fn thinking_choices(model: &ModelConfig) -> Vec<Option<ReasoningEffor
         .is_some_and(|card| card.thinking == tickloop_agent_protocol::ThinkingControl::Toggle)
     {
         choices.push(Some(ReasoningEffort::Off));
-        if model.adapter() == Adapter::MinimaxMessages {
+        if model.adapter() == Adapter::MinimaxMessages
+            || ReasoningEffort::choices(model).is_empty()
+                && tickloop_agent_model::validate_reasoning_effort(model, Some(ReasoningEffort::On))
+                    .is_ok()
+        {
             choices.push(Some(ReasoningEffort::On));
         }
     }

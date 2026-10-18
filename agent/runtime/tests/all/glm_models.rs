@@ -108,6 +108,8 @@ fn definition_catalog_keeps_concrete_cards_and_access_catalog_binds_one_per_seri
                 ("GLM-5.3-Flash", "glm-5.3-flash"),
                 ("GLM-5.3-FlashX", "glm-5.3-flashx"),
                 ("GLM-5.2", "glm-5.2"),
+                ("GLM-4.5-Air", "glm-4.5-air"),
+                ("GLM-4.7-Flash", "glm-4.7-flash"),
             ]
         );
         let series = cards
@@ -124,6 +126,11 @@ fn definition_catalog_keeps_concrete_cards_and_access_catalog_binds_one_per_seri
                 ("GLM (5.3)".to_string(), "GLM-5.3".to_string()),
                 ("GLM Flash (5.3)".to_string(), "GLM-5.3-Flash".to_string()),
                 ("GLM FlashX (5.3)".to_string(), "GLM-5.3-FlashX".to_string()),
+                ("GLM Air (4.5)".to_string(), "GLM-4.5-Air".to_string()),
+                (
+                    "GLM Flash 30B (4.7)".to_string(),
+                    "GLM-4.7-Flash".to_string()
+                ),
             ]
         );
         for card in &cards {
@@ -134,6 +141,9 @@ fn definition_catalog_keeps_concrete_cards_and_access_catalog_binds_one_per_seri
             assert_eq!(card.protocol, Protocol::ChatCompletions);
             assert_eq!(card.base_url, endpoint);
             assert_eq!(card.api_key_env, key_env);
+            if matches!(card.model.as_str(), "glm-4.5-air" | "glm-4.7-flash") {
+                continue;
+            }
             assert_eq!(card.max_output_tokens, 131072);
             let model_card = card.card.as_ref().unwrap();
             assert_eq!(model_card.context_window_tokens, Some(1_000_000));

@@ -29,3 +29,13 @@ models:
   input_modalities:
   - text
   - image
+- id: kimi-k2.7-code
+  service_model_id: kimi-k2.7-code
+  display_name: Kimi K2.7 Code
+  adapter: kimi_chat_completions
+  max_output_tokens: 32768
+  context_window_tokens: 262144
+  thinking: always_on
+  effort_levels: []
+  input_modalities: [text, image]
+  temperature_control: unsupported

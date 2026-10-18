@@ -6,3 +6,8 @@ series:
   version: K3
   model: kimi-k3
   capability_order: 0
+- id: kimi-code
+  name: Kimi Code
+  version: K2.7
+  model: kimi-k2.7-code
+  capability_order: 1

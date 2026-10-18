@@ -57,3 +57,21 @@ models:
     adaptive_by_default: false
     effort_levels: ["high", "max"]
     input_modalities: ["text"]
+  - id: "glm-4.5-air"
+    service_model_id: "glm-4.5-air"
+    display_name: "GLM-4.5-Air"
+    adapter: "glm_chat_completions"
+    max_output_tokens: 98304
+    context_window_tokens: 131072
+    thinking: "toggle"
+    effort_levels: []
+    input_modalities: ["text"]
+  - id: "glm-4.7-flash"
+    service_model_id: "glm-4.7-flash"
+    display_name: "GLM-4.7-Flash"
+    adapter: "glm_chat_completions"
+    max_output_tokens: 131072
+    context_window_tokens: 200000
+    thinking: "toggle"
+    effort_levels: []
+    input_modalities: ["text"]
