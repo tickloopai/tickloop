@@ -30,7 +30,7 @@ pub(super) enum LoginMethod {
 impl LoginMethod {
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::Artifact => "Artifacts",
+            Self::Artifact => "Tickloop Accounts",
             Self::MiniMax(region) => region.label(),
             Self::Copilot => "GitHub Copilot",
             Self::Google => "Google OAuth",
@@ -397,6 +397,10 @@ impl LoginFlow {
         ))
     }
 
+    pub(super) fn is_artifact(&self) -> bool {
+        matches!(self.method, LoginMethod::Artifact)
+    }
+
     pub(super) fn show_device(
         &self,
         console: &Console,
@@ -405,7 +409,7 @@ impl LoginFlow {
     ) -> Result<(), String> {
         let mut context = vec![
             if matches!(self.method, LoginMethod::Artifact) {
-                "Open this Tickloop Artifacts link in your own browser:".into()
+                "Open this Tickloop Accounts link in your own browser:".into()
             } else {
                 "Opening your browser. If no page appears, open this link on your own device:"
                     .into()
@@ -415,7 +419,7 @@ impl LoginFlow {
             format!("Enter code: {}", safe_text(code)),
         ];
         if let LoginMethod::Artifact = self.method {
-            context.push("In your browser, sign in with Google and approve this device for your Tickloop Artifacts account.".into());
+            context.push("In your browser, sign in to Tickloop Accounts, check that this code matches, and approve this device.".into());
         } else if let LoginMethod::MiniMax(_) = self.method {
             context.push("Approve access on the MiniMax Portal. The consent page identifies the registered Portal client.".into());
         } else if let LoginMethod::Subscription(provider) = self.method {

@@ -68,9 +68,13 @@ fn delivery_path(delivery_id: &str, action: &str) -> Result<String, ArtifactErro
 
 impl ArtifactClient {
     /// The current credential when it still belongs to `account_id`.
-    fn account_credential(&self, account_id: &str) -> Result<CredentialSnapshot, ArtifactError> {
+    async fn account_credential(
+        &self,
+        account_id: &str,
+    ) -> Result<CredentialSnapshot, ArtifactError> {
         let credential = self
-            .credential_snapshot()?
+            .access_snapshot()
+            .await?
             .ok_or(ArtifactError::AccessDenied)?;
         if credential.account_id != account_id {
             return Err(ArtifactError::AccountChanged);
@@ -86,7 +90,7 @@ impl ArtifactClient {
         artifact_id: &str,
         request: &AgentLinkRequest,
     ) -> Result<AgentLink, ArtifactError> {
-        let credential = self.account_credential(account_id)?;
+        let credential = self.account_credential(account_id).await?;
         let link: AgentLink = self
             .catalog_request_with_credential(
                 Method::PUT,
@@ -118,7 +122,7 @@ impl ArtifactClient {
         link: &AgentLink,
         cursor: Option<&str>,
     ) -> Result<FeedbackPage, ArtifactError> {
-        let credential = self.account_credential(account_id)?;
+        let credential = self.account_credential(account_id).await?;
         let binding_id = link.binding_id.to_string();
         let epoch = link.epoch.to_string();
         let mut query = vec![
@@ -162,7 +166,7 @@ impl ArtifactClient {
         client_instance_id: Uuid,
         delivery_id: &str,
     ) -> Result<ClaimedFeedback, ArtifactError> {
-        let credential = self.account_credential(account_id)?;
+        let credential = self.account_credential(account_id).await?;
         let claim: ClaimedFeedback = self
             .catalog_request_with_credential(
                 Method::POST,
@@ -197,7 +201,7 @@ impl ArtifactClient {
         artifact_id: &str,
         claim: &ClaimedFeedback,
     ) -> Result<(), ArtifactError> {
-        let credential = self.account_credential(account_id)?;
+        let credential = self.account_credential(account_id).await?;
         self.catalog_request_with_credential::<Value>(
             Method::POST,
             &delivery_path(&claim.delivery_id, "release")?,
@@ -219,7 +223,7 @@ impl ArtifactClient {
         artifact_id: &str,
         claim: &ClaimedFeedback,
     ) -> Result<(), ArtifactError> {
-        let credential = self.account_credential(account_id)?;
+        let credential = self.account_credential(account_id).await?;
         let value: Value = self.catalog_request_with_credential(
             Method::POST, &delivery_path(&claim.delivery_id, "ack")?, &[],
             Some(json!({"artifact_id": artifact_id, "claim_id": claim.claim_id, "fencing_token": claim.fencing_token})),
@@ -238,7 +242,7 @@ impl ArtifactClient {
         account_id: &str,
         link: &AgentLink,
     ) -> Result<(), ArtifactError> {
-        let credential = self.account_credential(account_id)?;
+        let credential = self.account_credential(account_id).await?;
         let value: Value = self
             .catalog_request_with_credential(
                 Method::DELETE,

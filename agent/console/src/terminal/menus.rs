@@ -982,7 +982,7 @@ impl Menus {
             console,
             Menu {
                 id: Uuid::new_v4(),
-                title: "Sign out of Tickloop Artifacts?".into(),
+                title: "Sign out of Tickloop Accounts?".into(),
                 context: vec!["Stops feedback listening before revoking the credential.".into()],
                 options: vec!["Cancel".into(), "Sign out".into()],
                 selected: 0,
@@ -1566,7 +1566,7 @@ impl Menus {
         }
         let artifact_account = if let Some(root) = &self.config_root {
             match tickloop_agent_artifacts::ArtifactClient::new(root) {
-                Ok(client) => match client.status().await {
+                Ok(client) => match Box::pin(client.status()).await {
                     Ok(Some(user)) => {
                         format!("{} · Sign out", super::safe_text(user.display_name()))
                     }
@@ -2959,8 +2959,8 @@ impl Menus {
                         let root = self.config_root.as_ref().ok_or("Tickloop Artifacts needs a state directory")?;
                         agent.disable_event_sources().await.map_err(|error| error.to_string())?;
                         let client = tickloop_agent_artifacts::ArtifactClient::new(root).map_err(|error| error.to_string())?;
-                        client.logout().await.map_err(|error| error.to_string())?;
-                        console.write("Signed out of Tickloop Artifacts.\n")?;
+                        Box::pin(client.logout()).await.map_err(|error| error.to_string())?;
+                        console.write("Signed out of Tickloop Accounts.\n")?;
                     } else if return_to_settings {
                         self.settings(agent, console, target).await?;
                     }

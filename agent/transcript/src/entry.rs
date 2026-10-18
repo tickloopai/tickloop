@@ -725,7 +725,9 @@ pub enum InputState {
     Accepted,
     /// Its Run started. Only an input whose prompt does not carry its id records this.
     Started,
-    Settled { outcome: SettledOutcome },
+    Settled {
+        outcome: SettledOutcome,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

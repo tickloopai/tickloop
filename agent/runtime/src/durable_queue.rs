@@ -61,7 +61,10 @@ impl Agent {
                 Some(_) => continue,
                 // A prompt in the conversation whose Run never started an answer.
                 None if entry.op != InputOp::RegenerateAnswer
-                    && chat.bookkeeping.lifecycle.state(entry.input_id, &chat.snapshot, |_| false)
+                    && chat
+                        .bookkeeping
+                        .lifecycle
+                        .state(entry.input_id, &chat.snapshot, |_| false)
                         .is_some_and(|state| state.prompt_in_conversation) =>
                 {
                     Some(entry.input_id)

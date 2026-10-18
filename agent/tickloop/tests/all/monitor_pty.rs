@@ -78,6 +78,7 @@ impl Session {
         command.env("TICKLOOP_AGENT_TUI", "fullscreen");
         if let Some(origin) = origin {
             command.env("TICKLOOP_ARTIFACT_ORIGIN", origin);
+            command.env("TICKLOOP_ACCOUNTS_ISSUER", origin);
         }
         if let Some(bin) = bin {
             command.env(
@@ -290,12 +291,14 @@ fn artifact_login_opens_picker_adds_tick_and_uses_a_substitute_browser() {
             drop(reader);
             let user = json!({"id":"owner","name":"Owner","email":"owner@example.test"});
             let artifact = json!({"id":id,"title":"PTY Research","format":"markdown","access_role":"owner","url":"https://docs.example/a/test","updated_at":"2026-10-06T00:00:00Z","metadata_revision":1});
-            let body = if request.starts_with("POST /artifact/api/v1/auth/device ") {
+            let body = if request.starts_with("GET /.well-known/oauth-authorization-server ") {
+                json!({"issuer":endpoint,"token_endpoint":format!("{endpoint}/token"),"device_authorization_endpoint":format!("{endpoint}/device"),"userinfo_endpoint":format!("{endpoint}/userinfo"),"revocation_endpoint":format!("{endpoint}/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]})
+            } else if request.starts_with("POST /device ") {
                 json!({"device_code":"test-device","user_code":"ABCD","verification_uri":format!("{endpoint}/artifact/device?code=ABCD"),"expires_in":60,"interval":1})
-            } else if request.starts_with("POST /artifact/api/v1/auth/device/token ") {
-                json!({"access_token":"isolated-test-token","token_type":"Bearer","expires_in":600,"user":user})
-            } else if request.starts_with("GET /artifact/api/v1/auth/session ") {
-                json!({"user":user,"expires_at":"2099-01-01T00:00:00Z"})
+            } else if request.starts_with("POST /token ") {
+                json!({"access_token":"isolated-test-token","token_type":"Bearer","expires_in":600,"refresh_token":"fixture-refresh"})
+            } else if request.starts_with("GET /userinfo ") {
+                json!({"sub":user["id"],"name":user["name"],"email":user["email"]})
             } else if request.starts_with("GET /artifact/api/v1/artifacts/pinned ") {
                 json!({"artifacts":[],"next_cursor":null})
             } else if request.starts_with("GET /artifact/api/v1/artifacts?") {

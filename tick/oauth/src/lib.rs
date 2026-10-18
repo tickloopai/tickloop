@@ -1,20 +1,21 @@
-//! The OAuth 2.0 client of Tick package logins, the one Tickloop and a package's own program
-//! both use: the server's metadata (RFC 8414), a client registered once per server (RFC 7591),
-//! a device code the user approves (RFC 8628), token refresh (RFC 6749 section 6) and revocation
-//! (RFC 7009). Server addresses must use https, or http when the server is on this machine.
+//! A caller-configured OAuth 2.0 client: RFC 8414 discovery, preregistered public clients or
+//! RFC 7591 registration, RFC 8628 device login, RFC 6749 refresh with RFC 8707 resources,
+//! RFC 7009 revocation and OIDC userinfo. HTTPS is required except on this machine.
 //!
-//! The caller supplies the HTTP client, configured as its own network policy requires, and the
-//! package's credentials, where the registered client and the token are kept under their lock.
-//! Errors name servers, steps, statuses and OAuth error codes, never codes or tokens.
+//! The caller supplies its HTTP policy and credential store. Tick packages use their existing
+//! locked files; other clients implement [`CredentialStore`]. Errors never include tokens.
 
+mod credentials;
 mod device;
 mod server;
 mod token;
 
 use std::fmt;
 
-pub use device::{DeviceLogin, Progress};
-pub use token::{RefreshError, refresh, revoke};
+pub use credentials::CredentialStore;
+pub use device::{ClientRegistration, DeviceLogin, Progress};
+pub use tick_packages::OAuthToken;
+pub use token::{RefreshError, UserInfo, refresh, refresh_for_resource, revoke, user_info};
 
 /// Why a login ended without saving a token.
 #[derive(Clone, Debug, PartialEq, Eq)]

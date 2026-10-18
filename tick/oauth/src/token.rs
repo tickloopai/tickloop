@@ -39,16 +39,31 @@ pub async fn refresh(
     refresh_token: &str,
     adjust: impl FnOnce(RequestBuilder) -> RequestBuilder,
 ) -> Result<OAuthToken, RefreshError> {
+    refresh_for_resource(http, token, refresh_token, None, adjust).await
+}
+
+/// Refreshes for a single RFC 8707 resource; omitting it retains the server's default audience.
+pub async fn refresh_for_resource(
+    http: &Client,
+    token: &OAuthToken,
+    refresh_token: &str,
+    resource: Option<&str>,
+    adjust: impl FnOnce(RequestBuilder) -> RequestBuilder,
+) -> Result<OAuthToken, RefreshError> {
     let failed = |error: LoginError| RefreshError::Failed(error.to_string());
     let server = Server::new(http.clone(), &token.issuer).map_err(failed)?;
     let endpoint = server
         .endpoint(&token.token_endpoint, "token_endpoint")
         .map_err(failed)?;
-    let request = adjust(server.http.post(endpoint.clone()).form(&[
+    let mut form = vec![
         ("grant_type", REFRESH_TOKEN_GRANT),
         ("refresh_token", refresh_token),
         ("client_id", &token.client_id),
-    ]));
+    ];
+    if let Some(resource) = resource {
+        form.push(("resource", resource));
+    }
+    let request = adjust(server.http.post(endpoint.clone()).form(&form));
     let body = match server
         .exchange(request, &endpoint)
         .await
@@ -102,5 +117,44 @@ pub async fn revoke(http: &Client, token: &OAuthToken) -> Result<(), String> {
         Answer::Success(_) => Ok(()),
         Answer::Refused(code) => Err(format!("{endpoint} refused the revocation: {code}")),
         Answer::Unexpected(status) => Err(format!("{endpoint} answered HTTP {status}")),
+    }
+}
+
+/// The account identified by an issuer-audience access token. ID tokens are never treated as
+/// verified identity merely by decoding their claims.
+#[derive(Clone, serde::Deserialize)]
+pub struct UserInfo {
+    pub sub: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub email: String,
+}
+
+pub async fn user_info(http: &Client, token: &OAuthToken) -> Result<UserInfo, RefreshError> {
+    let failed = |error: LoginError| RefreshError::Failed(error.to_string());
+    let server = Server::new(http.clone(), &token.issuer).map_err(failed)?;
+    let endpoint = server
+        .discover()
+        .await
+        .map_err(failed)?
+        .userinfo
+        .ok_or_else(|| RefreshError::Failed("the issuer offers no userinfo endpoint".into()))?;
+    let request = server
+        .http
+        .get(endpoint.clone())
+        .bearer_auth(&token.access_token);
+    match server
+        .exchange(request, &endpoint)
+        .await
+        .map_err(RefreshError::Failed)?
+    {
+        Answer::Success(body) => parse(&body)
+            .filter(|user: &UserInfo| !user.sub.is_empty())
+            .ok_or_else(|| failed(server.invalid("userinfo"))),
+        Answer::Refused(code) => Err(RefreshError::Refused(code)),
+        Answer::Unexpected(status) => Err(RefreshError::Failed(format!(
+            "{endpoint} answered HTTP {status}"
+        ))),
     }
 }

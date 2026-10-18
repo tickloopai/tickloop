@@ -30,6 +30,8 @@ pub enum TokenReply {
     Expired,
     /// A token response with `access-<n>` and `refresh-<n>`, valid for an hour.
     Approve,
+    /// Consumes an approved device code but drops the response; replay is invalid_grant.
+    LostExchange,
     /// The token response as given.
     Token(Value),
     /// An OAuth error response with this status and code.
@@ -48,9 +50,13 @@ pub struct Request {
     /// A JSON body.
     pub json: Option<Value>,
     pub at: Instant,
+    pub authorization: Option<String>,
+    pub form_pairs: Vec<(String, String)>,
 }
 
 struct Script {
+    issuer_path: String,
+    userinfo: (u16, Value),
     metadata: Value,
     registration: Option<(u16, Value)>,
     device: Value,
@@ -71,15 +77,26 @@ impl AuthorizationServer {
     /// Starts a server whose device codes last ten minutes and are polled every second; polls
     /// are pending until [`Self::answer_polls`] says otherwise.
     pub fn start() -> Self {
+        Self::start_with_path("")
+    }
+
+    pub fn start_with_path(path: &str) -> Self {
+        assert!(path.is_empty() || path.starts_with('/') && !path.ends_with('/'));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let issuer = format!("http://{}{path}", listener.local_addr().unwrap());
         let script = Arc::new(Mutex::new(Script {
+            issuer_path: path.to_owned(),
+            userinfo: (
+                200,
+                json!({"sub": "account-1", "name": "A User", "email": "a@example.test"}),
+            ),
             metadata: json!({
                 "issuer": issuer,
                 "token_endpoint": format!("{issuer}{TOKEN_PATH}"),
                 "device_authorization_endpoint": format!("{issuer}{DEVICE_AUTHORIZATION_PATH}"),
                 "registration_endpoint": format!("{issuer}{REGISTRATION_PATH}"),
                 "revocation_endpoint": format!("{issuer}{REVOCATION_PATH}"),
+                "userinfo_endpoint": format!("{issuer}/userinfo"),
                 "grant_types_supported": ["refresh_token", DEVICE_CODE_GRANT],
                 "token_endpoint_auth_methods_supported": ["none"],
             }),
@@ -134,11 +151,23 @@ impl AuthorizationServer {
         self.script.lock().unwrap().token_replies.extend(replies);
     }
 
+    pub fn answer_userinfo(&self, status: u16, body: Value) {
+        self.script.lock().unwrap().userinfo = (status, body);
+    }
+
     pub fn answer_revocations(&self, status: u16) {
         self.script.lock().unwrap().revocation_status = status;
     }
 
     /// Makes the server answer `invalid_client` for the clients it registered so far.
+    pub fn reject_client(&self, client_id: &str) {
+        self.script
+            .lock()
+            .unwrap()
+            .forgotten_clients
+            .insert(client_id.to_owned());
+    }
+
     pub fn forget_clients(&self) {
         let mut script = self.script.lock().unwrap();
         let registered = script.registered;
@@ -153,6 +182,12 @@ impl AuthorizationServer {
 
     /// The requests to `path`.
     pub fn requests_to(&self, path: &str) -> Vec<Request> {
+        let issuer_path = self.script.lock().unwrap().issuer_path.clone();
+        let path = if path == METADATA_PATH {
+            format!("{path}{issuer_path}")
+        } else {
+            format!("{issuer_path}{path}")
+        };
         self.requests()
             .into_iter()
             .filter(|request| request.path == path)
@@ -169,6 +204,10 @@ fn answer(mut stream: TcpStream, script: &Mutex<Script>) {
         script.requests.push(request.clone());
         reply(&mut script, &request)
     };
+    if status == 0 {
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    }
     let body = body.map_or_else(String::new, |body| body.to_string());
     let _ = stream.write_all(
         format!(
@@ -183,8 +222,15 @@ fn answer(mut stream: TcpStream, script: &Mutex<Script>) {
 
 fn reply(script: &mut Script, request: &Request) -> (u16, Option<Value>) {
     let client = request.form.get("client_id").cloned().unwrap_or_default();
-    match (request.method.as_str(), request.path.as_str()) {
-        ("GET", METADATA_PATH) => (200, Some(script.metadata.clone())),
+    if request.method == "GET" && request.path == format!("{METADATA_PATH}{}", script.issuer_path) {
+        return (200, Some(script.metadata.clone()));
+    }
+    let path = request
+        .path
+        .strip_prefix(&script.issuer_path)
+        .unwrap_or(&request.path);
+    match (request.method.as_str(), path) {
+        ("GET", "/userinfo") => (script.userinfo.0, Some(script.userinfo.1.clone())),
         ("POST", REGISTRATION_PATH) => {
             if let Some((status, body)) = &script.registration {
                 return (*status, Some(body.clone()));
@@ -209,6 +255,13 @@ fn reply(script: &mut Script, request: &Request) -> (u16, Option<Value>) {
                 .pop_front()
                 .unwrap_or(TokenReply::Pending)
             {
+                TokenReply::LostExchange => {
+                    script.issued += 1;
+                    script
+                        .token_replies
+                        .push_front(TokenReply::Error(400, "invalid_grant".into()));
+                    (0, None)
+                }
                 TokenReply::Pending => error(400, "authorization_pending"),
                 TokenReply::SlowDown => error(400, "slow_down"),
                 TokenReply::Denied => error(400, "access_denied"),
@@ -244,10 +297,16 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
     let method = words.next()?.to_owned();
     let path = words.next()?.to_owned();
     let mut length = 0;
+    let mut authorization = None;
     loop {
         let mut header = String::new();
         if reader.read_line(&mut header).ok()? == 0 || header == "\r\n" {
             break;
+        }
+        if let Some((name, value)) = header.split_once(':')
+            && name.eq_ignore_ascii_case("authorization")
+        {
+            authorization = Some(value.trim().to_owned());
         }
         if let Some((name, value)) = header.split_once(':')
             && name.eq_ignore_ascii_case("content-length")
@@ -263,5 +322,7 @@ fn read_request(stream: &TcpStream) -> Option<Request> {
         form: url::form_urlencoded::parse(&body).into_owned().collect(),
         json: serde_json::from_slice(&body).ok(),
         at: Instant::now(),
+        authorization,
+        form_pairs: url::form_urlencoded::parse(&body).into_owned().collect(),
     })
 }

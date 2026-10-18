@@ -1,11 +1,11 @@
 //! A device login (RFC 8628): the server's metadata, the client registered there, a device code
 //! the user approves on another device, and the token saved under the credentials' lock.
 
-use std::{fmt, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
+use crate::{CredentialStore, OAuthToken};
 use reqwest::{Client, Url, header::CONTENT_TYPE};
 use serde::Deserialize;
-use tick_packages::{LockedOAuth, OAuthToken, PackageCredentials, PackageError};
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 
@@ -31,6 +31,13 @@ const MAX_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_DEVICE_CODE_LIFETIME: Duration = Duration::from_secs(3600);
 /// Longer user codes and links than this are not shown to the user.
 const MAX_SHOWN_LENGTH: usize = 2048;
+
+/// How a public client obtains its identity at an issuer.
+#[derive(Clone, Copy, Debug)]
+pub enum ClientRegistration<'a> {
+    Dynamic,
+    Preregistered(&'a str),
+}
 
 /// What a login tells its caller while it waits for the user.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,7 +69,7 @@ struct DeviceAuthorization {
 /// [`Self::user_code`]; [`Self::finish`] waits for the approval and saves the token.
 pub struct DeviceLogin {
     server: Server,
-    credentials: PackageCredentials,
+    credentials: Arc<dyn CredentialStore>,
     endpoints: Endpoints,
     client_id: String,
     device_code: String,
@@ -90,32 +97,60 @@ impl DeviceLogin {
     /// default).
     pub async fn start(
         http: Client,
-        credentials: &PackageCredentials,
+        credentials: &(impl CredentialStore + Clone + 'static),
         issuer: &str,
         scopes: &[String],
     ) -> Result<Self, LoginError> {
+        Self::start_with(
+            http,
+            credentials,
+            issuer,
+            scopes,
+            ClientRegistration::Dynamic,
+            &[],
+        )
+        .await
+    }
+
+    /// Uses an explicit public client and optional RFC 8707 resources. A preregistered client
+    /// never falls back to registration, including when the server refuses its identity.
+    pub async fn start_with(
+        http: Client,
+        credentials: &(impl CredentialStore + Clone + 'static),
+        issuer: &str,
+        scopes: &[String],
+        registration: ClientRegistration<'_>,
+        resources: &[String],
+    ) -> Result<Self, LoginError> {
         let server = Server::new(http, issuer)?;
         let endpoints = server.discover().await?;
-        let saved_client = locked(credentials, {
-            let issuer = issuer.to_owned();
-            move |files| files.client_id(&issuer)
-        })
-        .await?;
-        let is_saved_client = saved_client.is_some();
+        let saved_client = match registration {
+            ClientRegistration::Dynamic => credentials.client_id(issuer).await?,
+            ClientRegistration::Preregistered(client_id) if !client_id.is_empty() => {
+                Some(client_id.to_owned())
+            }
+            ClientRegistration::Preregistered(_) => {
+                return Err(LoginError::Failed(
+                    "the preregistered client ID is empty".into(),
+                ));
+            }
+        };
+        let can_register_again =
+            saved_client.is_some() && matches!(registration, ClientRegistration::Dynamic);
         let mut client_id = match saved_client {
             Some(client_id) => client_id,
             None => register(&server, &endpoints, credentials).await?,
         };
-        let mut device = authorize_device(&server, &endpoints, &client_id, scopes).await?;
-        if is_saved_client && device.is_none() {
-            // The server forgot the client registered before: register anew, once.
+        let mut device =
+            authorize_device(&server, &endpoints, &client_id, scopes, resources).await?;
+        if can_register_again && device.is_none() {
             client_id = register(&server, &endpoints, credentials).await?;
-            device = authorize_device(&server, &endpoints, &client_id, scopes).await?;
+            device = authorize_device(&server, &endpoints, &client_id, scopes, resources).await?;
         }
         let device = device.ok_or_else(|| LoginError::Refused {
             code: "invalid_client".to_owned(),
             message: format!(
-                "{} does not know the client Tickloop registered (invalid_client)",
+                "{} refused the public client (invalid_client)",
                 server.issuer
             ),
         })?;
@@ -144,16 +179,19 @@ impl DeviceLogin {
         let expires_in = Duration::from_secs(device.expires_in).min(MAX_DEVICE_CODE_LIFETIME);
         Ok(Self {
             server,
-            credentials: credentials.clone(),
+            credentials: Arc::new(credentials.clone()),
             endpoints,
             client_id,
             device_code: device.device_code,
             user_code: device.user_code,
             verification_uri,
             verification_uri_complete,
-            interval: device.interval.map_or(DEFAULT_POLL_INTERVAL, |seconds| {
-                Duration::from_secs(seconds.max(1))
-            }),
+            interval: device
+                .interval
+                .map_or(DEFAULT_POLL_INTERVAL, |seconds| {
+                    Duration::from_secs(seconds.max(1))
+                })
+                .min(expires_in),
             expires_in,
             deadline: Instant::now() + expires_in,
         })
@@ -198,8 +236,19 @@ impl DeviceLogin {
     pub async fn finish(
         &self,
         cancellation: &CancellationToken,
-        mut progress: impl FnMut(Progress),
+        progress: impl FnMut(Progress),
     ) -> Result<(), LoginError> {
+        let token = self.authorize(cancellation, progress).await?;
+        self.credentials.save_token(&token).await
+    }
+
+    /// Completes the exchange without persisting, for callers that must verify an account and
+    /// obtain resource tokens before atomically replacing their saved login.
+    pub async fn authorize(
+        &self,
+        cancellation: &CancellationToken,
+        mut progress: impl FnMut(Progress),
+    ) -> Result<OAuthToken, LoginError> {
         let token_endpoint = &self.endpoints.token;
         let mut interval = self.interval;
         let mut unreachable: Option<String> = None;
@@ -236,7 +285,7 @@ impl DeviceLogin {
                     if cancellation.is_cancelled() {
                         return Err(LoginError::Cancelled);
                     }
-                    return locked(&self.credentials, move |files| files.save_token(&token)).await;
+                    return Ok(token);
                 }
                 Ok(Answer::Refused(code)) => {
                     unreachable = None;
@@ -264,7 +313,7 @@ impl DeviceLogin {
                 progress(Progress::Unreachable);
             }
             unreachable = Some(failure);
-            interval = (interval * 2).min(MAX_RETRY_INTERVAL);
+            interval = (interval * 2).min(MAX_RETRY_INTERVAL.max(interval));
         }
     }
 
@@ -293,7 +342,7 @@ impl DeviceLogin {
 async fn register(
     server: &Server,
     endpoints: &Endpoints,
-    credentials: &PackageCredentials,
+    credentials: &impl CredentialStore,
 ) -> Result<String, LoginError> {
     let endpoint = endpoints.registration.as_ref().ok_or_else(|| {
         LoginError::Failed(format!(
@@ -340,11 +389,9 @@ async fn register(
         return Err(server.invalid("client registration"));
     }
     let client_id = registration.client_id;
-    locked(credentials, {
-        let (issuer, client_id) = (server.issuer.clone(), client_id.clone());
-        move |files| files.set_client_id(&issuer, Some(&client_id))
-    })
-    .await?;
+    credentials
+        .save_client_id(&server.issuer, &client_id)
+        .await?;
     Ok(client_id)
 }
 
@@ -354,12 +401,18 @@ async fn authorize_device(
     endpoints: &Endpoints,
     client_id: &str,
     scopes: &[String],
+    resources: &[String],
 ) -> Result<Option<DeviceAuthorization>, LoginError> {
     let endpoint = &endpoints.device_authorization;
     let mut form = vec![("client_id", client_id.to_owned())];
     if !scopes.is_empty() {
         form.push(("scope", scopes.join(" ")));
     }
+    form.extend(
+        resources
+            .iter()
+            .map(|resource| ("resource", resource.clone())),
+    );
     let request = server.http.post(endpoint.clone()).form(&form);
     match server
         .exchange(request, endpoint)
@@ -378,17 +431,4 @@ async fn authorize_device(
             "{endpoint} answered HTTP {status}"
         ))),
     }
-}
-
-/// Runs `change` on the package's OAuth files under their lock, off the async threads, since
-/// the lock waits while another process changes the token.
-async fn locked<T: Send + 'static>(
-    credentials: &PackageCredentials,
-    change: impl FnOnce(&LockedOAuth) -> Result<T, PackageError> + Send + 'static,
-) -> Result<T, LoginError> {
-    let credentials = credentials.clone();
-    tokio::task::spawn_blocking(move || change(&credentials.lock_oauth()?))
-        .await
-        .map_err(|error| LoginError::Failed(error.to_string()))?
-        .map_err(LoginError::from)
 }

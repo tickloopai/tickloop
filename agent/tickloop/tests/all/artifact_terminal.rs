@@ -46,24 +46,31 @@ fn post_login_account_failure_preserves_the_view_and_artifacts_can_retry() {
             let request = String::from_utf8_lossy(&bytes[..count]);
             let user =
                 serde_json::json!({"id":"owner","name":"Owner","email":"owner@example.test"});
-            let (status, body) = if request.starts_with("POST /artifact/api/v1/auth/device ") {
+            let (status, body) = if request
+                .starts_with("GET /.well-known/oauth-authorization-server ")
+            {
+                (
+                    200,
+                    serde_json::json!({"issuer":endpoint,"token_endpoint":format!("{endpoint}/token"),"device_authorization_endpoint":format!("{endpoint}/device"),"userinfo_endpoint":format!("{endpoint}/userinfo"),"revocation_endpoint":format!("{endpoint}/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]}),
+                )
+            } else if request.starts_with("POST /device ") {
                 (
                     200,
                     serde_json::json!({"device_code":"device","user_code":"CODE","verification_uri":format!("{endpoint}/artifact/device?code=CODE"),"expires_in":60,"interval":1}),
                 )
-            } else if request.starts_with("POST /artifact/api/v1/auth/device/token ") {
+            } else if request.starts_with("POST /token ") {
                 (
                     200,
-                    serde_json::json!({"access_token":"test-token","token_type":"Bearer","expires_in":600,"user":user}),
+                    serde_json::json!({"access_token":"test-token","token_type":"Bearer","expires_in":600,"refresh_token":"test-refresh"}),
                 )
-            } else if request.starts_with("GET /artifact/api/v1/auth/session ") {
+            } else if request.starts_with("GET /userinfo ") {
                 sessions += 1;
-                if sessions == 1 {
+                if sessions == 2 {
                     (503, serde_json::json!({"error":"temporarily_unavailable"}))
                 } else {
                     (
                         200,
-                        serde_json::json!({"user":user,"expires_at":"2099-01-01T00:00:00Z"}),
+                        serde_json::json!({"sub":user["id"],"name":user["name"],"email":user["email"]}),
                     )
                 }
             } else {
@@ -86,6 +93,7 @@ fn post_login_account_failure_preserves_the_view_and_artifacts_can_retry() {
         .arg(directory.path())
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("state"))
         .env("TICKLOOP_ARTIFACT_ORIGIN", &origin)
+        .env("TICKLOOP_ACCOUNTS_ISSUER", &origin)
         .env_remove("HERDR_ENV")
         .env_remove("HERDR_PANE_ID")
         .env_remove("HERDR_SOCKET_PATH")
@@ -102,7 +110,7 @@ fn post_login_account_failure_preserves_the_view_and_artifacts_can_retry() {
     stdin.write_all(b"/artifacts\n").unwrap();
     stdin.flush().unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
-    while !output.lock().unwrap().contains("HTTP 503") && Instant::now() < deadline {
+    while !output.lock().unwrap().contains("connection failed") && Instant::now() < deadline {
         if child.try_wait().unwrap().is_some() {
             break;
         }
@@ -127,7 +135,7 @@ fn post_login_account_failure_preserves_the_view_and_artifacts_can_retry() {
     assert!(alive, "post-login refresh closed the View: {output}");
     assert!(
         status.success()
-            && output.contains("HTTP 503")
+            && output.contains("connection failed")
             && output.contains("Retry worked · Doc · owner")
             && output.contains("Launch review · Slides · editor"),
         "{output}"
@@ -136,26 +144,12 @@ fn post_login_account_failure_preserves_the_view_and_artifacts_can_retry() {
 
 #[test]
 fn artifact_commands_are_visible_and_device_login_can_be_cancelled_without_a_model_or_herdr() {
-    let service = TcpListener::bind("127.0.0.1:0").unwrap();
-    let origin = format!("http://{}", service.local_addr().unwrap());
-    let server_origin = origin.clone();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = service.accept().unwrap();
-        let mut request = [0_u8; 4096];
-        let count = stream.read(&mut request).unwrap();
-        assert!(
-            String::from_utf8_lossy(&request[..count])
-                .starts_with("POST /artifact/api/v1/auth/device ")
-        );
-        let body = format!(
-            r#"{{"device_code":"private-code","user_code":"ABCD","verification_uri":"{server_origin}/artifact/device?code=ABCD","expires_in":30,"interval":2}}"#
-        );
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(response.as_bytes()).unwrap();
+    let server = tick_test_support::authorization_server::AuthorizationServer::start();
+    server.edit_device_authorization(|device| {
+        device["user_code"] = serde_json::json!("ABCD");
+        device["verification_uri_complete"] = serde_json::Value::Null;
     });
+    let origin = server.issuer().to_owned();
     let directory = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_tickloop"))
         .env(
@@ -166,6 +160,7 @@ fn artifact_commands_are_visible_and_device_login_can_be_cancelled_without_a_mod
         .arg(directory.path())
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("state"))
         .env("TICKLOOP_ARTIFACT_ORIGIN", &origin)
+        .env("TICKLOOP_ACCOUNTS_ISSUER", &origin)
         .env_remove("HERDR_ENV")
         .env_remove("HERDR_PANE_ID")
         .env_remove("HERDR_SOCKET_PATH")
@@ -203,7 +198,12 @@ fn artifact_commands_are_visible_and_device_login_can_be_cancelled_without_a_mod
         thread::sleep(Duration::from_millis(20));
     };
     reader.join().unwrap();
-    server.join().unwrap();
+    assert_eq!(
+        server
+            .requests_to(tick_test_support::authorization_server::DEVICE_AUTHORIZATION_PATH)
+            .len(),
+        1
+    );
     let output = output.lock().unwrap();
     assert!(status.success(), "terminal exited with {status}");
     assert!(

@@ -647,12 +647,10 @@ impl ArtifactService {
                     let line = head.lines().next().unwrap_or("").to_owned();
                     let mut parts = line.split_whitespace();
                     let method = parts.next().unwrap_or("").to_owned();
-                    // Every service route lives under the base path; a request outside it matches nothing.
-                    let target = parts
-                        .next()
-                        .unwrap_or("")
+                    let raw_target = parts.next().unwrap_or("");
+                    let target = raw_target
                         .strip_prefix(APP_BASE_PATH)
-                        .unwrap_or("/outside-the-service")
+                        .unwrap_or(raw_target)
                         .to_owned();
                     let body: Value =
                         serde_json::from_slice(&bytes[header_end + 4..]).unwrap_or(Value::Null);
@@ -661,8 +659,6 @@ impl ArtifactService {
                         .lock()
                         .unwrap()
                         .push(json!({"path":line,"headers":head,"body":body}));
-                    let user =
-                        json!({"id":account(&control),"name":"One","email":"one@example.test"});
                     let is_mcp = method == "POST" && target == "/mcp";
                     if is_mcp && body.get("id").is_none() {
                         let _ = stream
@@ -688,32 +684,37 @@ impl ArtifactService {
                             std::future::pending::<()>().await;
                         }
                         (status, receipt)
-                    } else if target == "/api/v1/auth/device" {
+                    } else if target == "/.well-known/oauth-authorization-server" {
+                        (
+                            200,
+                            json!({"issuer":origin,"token_endpoint":format!("{origin}/token"),"device_authorization_endpoint":format!("{origin}/device"),"userinfo_endpoint":format!("{origin}/userinfo"),"revocation_endpoint":format!("{origin}/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]}),
+                        )
+                    } else if target == "/device" {
                         (
                             200,
                             json!({"device_code":"test-device","user_code":"TEST","verification_uri":format!("{origin}/artifact/device?code=TEST"),"expires_in":30,"interval":1}),
                         )
-                    } else if target == "/api/v1/auth/device/token"
+                    } else if target == "/token"
                         && control.hold_device_approval.load(Ordering::SeqCst)
                     {
-                        (400, json!({"error":{"code":"authorization_pending"}}))
-                    } else if target == "/api/v1/auth/device/token" {
+                        (400, json!({"error":"authorization_pending"}))
+                    } else if target == "/token" {
                         control.signed_out.store(false, Ordering::SeqCst);
                         let revision = control.credential_revision.load(Ordering::SeqCst);
                         (
                             200,
-                            json!({"access_token":format!("test-service-token-{revision}"),"token_type":"Bearer","expires_in":600,"user":user}),
+                            json!({"access_token":format!("test-service-token-{revision}"),"token_type":"Bearer","expires_in":600,"refresh_token":format!("refresh-{revision}")}),
                         )
-                    } else if target == "/api/v1/auth/session" {
+                    } else if target == "/userinfo" {
                         if control.hold_status_response.load(Ordering::SeqCst) {
                             control.status_response_started.notify_one();
                             control.release_status_response.notified().await;
                         }
                         (
                             200,
-                            json!({"user":user,"expires_at":"2099-01-01T00:00:00Z"}),
+                            json!({"sub":account(&control),"name":"One","email":"one@example.test"}),
                         )
-                    } else if target == "/api/v1/auth/logout" {
+                    } else if target == "/revoke" {
                         control.signed_out.store(true, Ordering::SeqCst);
                         (200, json!({"revoked":true}))
                     } else if let Some(error) =
@@ -740,16 +741,16 @@ impl ArtifactService {
                     };
                     if (is_mcp && control.reject_mcp.load(Ordering::SeqCst))
                         || (control.signed_out.load(Ordering::SeqCst)
-                            && (is_mcp || target == "/api/v1/auth/session"))
+                            && (is_mcp || target == "/userinfo"))
                     {
                         status = 401;
                     } else if (is_mcp && control.directory_unavailable.load(Ordering::SeqCst))
-                        || (target == "/api/v1/auth/session"
+                        || (target == "/userinfo"
                             && control.session_unavailable.load(Ordering::SeqCst))
                     {
                         status = 503;
                     }
-                    if target == "/api/v1/auth/session"
+                    if target == "/userinfo"
                         && control.hold_session_response.swap(false, Ordering::SeqCst)
                     {
                         control.session_response_started.notify_one();
@@ -773,12 +774,12 @@ impl ArtifactService {
 
     /// Device authorizations the service has started.
     pub fn device_logins_started(&self) -> usize {
-        self.lifecycle_requests("POST /artifact/api/v1/auth/device ")
-            .len()
+        self.lifecycle_requests("POST /device ").len()
     }
 
     pub fn client(&self, root: &Path) -> ArtifactClient {
-        ArtifactClient::for_origin(root.canonicalize().unwrap(), &self.origin).unwrap()
+        ArtifactClient::for_endpoints(root.canonicalize().unwrap(), &self.origin, &self.origin)
+            .unwrap()
     }
 
     /// Signs in through device authorization and returns the signed-in client.
