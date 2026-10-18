@@ -460,12 +460,41 @@ async fn xai_oauth_uses_responses_proxy_headers_and_preserves_encrypted_replay()
         .await
         .unwrap();
     let (headers, first) = captured.recv().await.unwrap();
-    let (_, second) = captured.recv().await.unwrap();
-    assert!(headers.starts_with("POST /anthropic/responses "));
-    let headers = headers.to_lowercase();
-    assert!(headers.contains("x-xai-token-auth: xai-grok-cli"));
-    assert!(headers.contains("x-grok-model-override: grok-4.6"));
-    assert!(headers.contains("authorization: bearer fxm72vq84ep61aw9k"));
+    let (second_headers, second) = captured.recv().await.unwrap();
+    for headers in [headers, second_headers] {
+        assert!(headers.starts_with("POST /anthropic/responses "));
+        let headers = headers.to_lowercase();
+        assert!(headers.contains("x-xai-token-auth: xai-grok-cli"));
+        assert!(headers.contains("x-grok-client-version: 1.0.62"));
+        assert!(headers.contains("user-agent: xai-grok-workspace/1.0.62"));
+        assert!(headers.contains("x-grok-model-override: grok-4.6"));
+        assert!(headers.contains("authorization: bearer fxm72vq84ep61aw9k"));
+    }
     assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
     assert!(second.to_string().contains("opaque-xai-fixture"));
+}
+
+#[tokio::test]
+async fn xai_api_does_not_send_grok_subscription_headers() {
+    let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    let (endpoint, captured) =
+        model_http_support::serve_response(400, json!({"error":"fixture refusal"}).to_string())
+            .await;
+    let mut config = ModelCatalog::defaults().get("xai-api", "grok-4.7").unwrap();
+    config.base_url = endpoint;
+    save_api_key(root.path(), &config.api_key_env, "fixture-xai-api-key").unwrap();
+    let (events, _) = mpsc::unbounded_channel();
+    model_client(config, Some(root.path()))
+        .unwrap()
+        .complete(request(None), events, CancellationToken::new())
+        .await
+        .unwrap_err();
+    let (headers, _) = captured.await.unwrap();
+    let headers = headers.to_lowercase();
+    assert!(headers.starts_with("post /anthropic/responses "));
+    assert!(headers.contains("authorization: bearer fixture-xai-api-key"));
+    assert!(!headers.contains("x-xai-token-auth:"));
+    assert!(!headers.contains("x-grok-client-version:"));
+    assert!(!headers.contains("x-grok-model-override:"));
+    assert!(!headers.contains("xai-grok-workspace/"));
 }

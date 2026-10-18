@@ -57,6 +57,8 @@ const MAX_SSE_EVENT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_STREAM_BYTES: usize = 64 * 1024 * 1024;
 const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
+// The subscription proxy enforces a CLI version floor; https://x.ai/cli/stable on 2026-10-18.
+const XAI_GROK_CLIENT_VERSION: &str = "1.0.62";
 
 /// Model-card and endpoint lookups for a [`ModelConfig`]; the data lives in the protocol crate.
 /// Tokens a request needs beyond its messages and output: system prompt framing and tool schemas.
@@ -1306,6 +1308,11 @@ impl HttpModelClient {
         if self.config.auth_source == ModelAuthSource::XaiOAuth {
             outgoing = outgoing
                 .header("X-XAI-Token-Auth", "xai-grok-cli")
+                .header("x-grok-client-version", XAI_GROK_CLIENT_VERSION)
+                .header(
+                    reqwest::header::USER_AGENT,
+                    format!("xai-grok-workspace/{XAI_GROK_CLIENT_VERSION}"),
+                )
                 .header("x-grok-model-override", &self.config.model);
         }
         if copilot_auth {
