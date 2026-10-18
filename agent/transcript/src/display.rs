@@ -3,14 +3,14 @@
 //! Display nodes are prompts and answers. A prompt's display id is its earliest source id
 //! (`originalMessageId`, else its uuid; a prompt submitted under a ledger input has that input's
 //! id). An answer's display id is its response id. Entries a compaction rewrote only alias the
-//! node they copy. Internal entries (Loop records, compaction markers, host notes, model-only
-//! blocks) are folded away: a prompt hangs under the display node its physical parent belongs to,
+//! node they copy. Internal entries (Loop records, compaction markers, host notes, protocol
+//! data) are folded away: a prompt hangs under the display node its physical parent belongs to,
 //! and an answer under the prompt its lifecycle record names.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use tickloop_agent_protocol::{Content, ImageContext, InputContext, Role};
+use tickloop_agent_protocol::{Content, ImageContext, InputContext, Protocol, Role};
 use uuid::Uuid;
 
 use crate::entry::{ChainEntry, InterruptedBy, Line, ResponseEnding, ResponseEntry, ResponseState};
@@ -45,6 +45,12 @@ pub enum DisplayKind {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum DisplayBlock {
     Text {
+        text: String,
+    },
+    /// The model's visible reasoning before or between its answer text and tool calls. The
+    /// Transcript does not record when it started or ended; a host that wants its duration
+    /// measures the streamed `Thinking` events.
+    Thinking {
         text: String,
     },
     Image(ImageContext),
@@ -275,13 +281,54 @@ fn prompt_images(entry: &ChainEntry) -> Vec<ImageContext> {
         .collect()
 }
 
-/// An answer shows its model text and tool cards; thinking, protocol data and host-written user
-/// text stay out.
+/// Thinking continues the block right before it (Gemini stores each streamed thought part as
+/// its own content), so one stretch of thinking is one block; a block never starts with only
+/// whitespace.
+fn add_thinking(node: &mut DisplayNode, text: &str) {
+    match node.blocks.last_mut() {
+        Some(DisplayBlock::Thinking { text: shown }) => shown.push_str(text),
+        _ if !text.trim().is_empty() => node.blocks.push(DisplayBlock::Thinking {
+            text: text.to_owned(),
+        }),
+        _ => {}
+    }
+}
+
+/// The readable text of a Responses reasoning item: its reasoning text, else its summary.
+fn responses_reasoning_text(item: &serde_json::Value) -> String {
+    let texts = |field: &str| -> Vec<&str> {
+        item[field]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|part| part["text"].as_str())
+            .filter(|text| !text.is_empty())
+            .collect()
+    };
+    let content = texts("content");
+    let parts = if content.is_empty() {
+        texts("summary")
+    } else {
+        content
+    };
+    parts.join("\n\n")
+}
+
+/// An answer shows its model text, its thinking (including Responses reasoning summaries) and
+/// its tool cards; other protocol data and host-written user text stay out.
 fn add_answer_content(node: &mut DisplayNode, entry: &ChainEntry) {
+    let is_model_output = entry.message.role == Role::Assistant;
     for content in &entry.message.content {
         match content {
-            Content::Text { text } if entry.message.role == Role::Assistant => {
+            Content::Text { text } if is_model_output => {
                 node.blocks.push(DisplayBlock::Text { text: text.clone() });
+            }
+            Content::Thinking { thinking, .. } if is_model_output => add_thinking(node, thinking),
+            Content::ProtocolData {
+                protocol: Protocol::Responses,
+                value,
+            } if is_model_output && value["type"] == "reasoning" => {
+                add_thinking(node, &responses_reasoning_text(value));
             }
             Content::ToolUse { id, name, input } => node.blocks.push(DisplayBlock::ToolCall {
                 call_id: id.clone(),
@@ -353,6 +400,144 @@ mod tests {
             content: format!("result {id}").into(),
             is_error: false,
         }
+    }
+
+    fn thinking(text: &str) -> Content {
+        Content::Thinking {
+            thinking: text.into(),
+            signature: Some("signed".into()),
+        }
+    }
+
+    /// Thinking shows where the model wrote it, once per model call, and empty thinking (a
+    /// signature or redacted reasoning without text) shows nothing.
+    #[test]
+    fn an_answer_shows_its_thinking_in_order_and_skips_empty_thinking() {
+        let prompt = Uuid::new_v4();
+        let response = Uuid::new_v4();
+        let mut prompt_entry = entry(
+            prompt,
+            None,
+            Role::User,
+            vec![Content::Text {
+                text: "question".into(),
+            }],
+        );
+        prompt_entry.execution_mode = Some(serde_json::json!("default"));
+        let first_call = Uuid::new_v4();
+        let mut call = entry(
+            first_call,
+            Some(prompt),
+            Role::Assistant,
+            vec![thinking("Look it up first."), tool_use("a")],
+        );
+        call.response_id = Some(response);
+        let results = Uuid::new_v4();
+        let mut result = entry(
+            results,
+            Some(first_call),
+            Role::User,
+            vec![tool_result("a")],
+        );
+        result.response_id = Some(response);
+        let mut reply = entry(
+            Uuid::new_v4(),
+            Some(results),
+            Role::Assistant,
+            vec![
+                thinking(" \n"),
+                thinking("The result "),
+                Content::ProtocolData {
+                    protocol: Protocol::Google,
+                    value: serde_json::json!({ "paired": true }),
+                },
+                thinking("answers it."),
+                Content::Text {
+                    text: "Answer.".into(),
+                },
+            ],
+        );
+        reply.response_id = Some(response);
+
+        let nodes = project(
+            &[prompt_entry, call, result, reply]
+                .into_iter()
+                .map(|entry| Line::chain(entry.message.role, entry))
+                .collect::<Vec<_>>(),
+        );
+        let answer = &nodes[1];
+        assert_eq!(answer.id, response);
+        let shown = answer
+            .blocks
+            .iter()
+            .map(|block| match block {
+                DisplayBlock::Thinking { text } => format!("thinking: {text}"),
+                DisplayBlock::Text { text } => format!("text: {text}"),
+                DisplayBlock::ToolCall { call_id, .. } => format!("tool: {call_id}"),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shown,
+            [
+                "thinking: Look it up first.",
+                "tool: a",
+                "thinking: The result answers it.",
+                "text: Answer.",
+            ]
+        );
+        let serialized = serde_json::to_string(&nodes).unwrap();
+        assert!(!serialized.contains("signed"), "signatures stay out");
+    }
+
+    #[test]
+    fn a_responses_reasoning_item_shows_its_text_or_summary() {
+        let reasoning = |value: serde_json::Value| Content::ProtocolData {
+            protocol: Protocol::Responses,
+            value,
+        };
+        let mut node = DisplayNode {
+            id: Uuid::new_v4(),
+            parent: None,
+            kind: DisplayKind::Answer {
+                input_id: None,
+                attempt: 1,
+            },
+            blocks: Vec::new(),
+            status: DisplayStatus::Streaming,
+            timestamp: String::new(),
+        };
+        let mut reply = entry(
+            Uuid::new_v4(),
+            None,
+            Role::Assistant,
+            vec![
+                reasoning(serde_json::json!({
+                    "type": "reasoning", "encrypted_content": "opaque",
+                    "summary": [{ "type": "summary_text", "text": "Plan." },
+                                { "type": "summary_text", "text": "Check." }],
+                })),
+                reasoning(serde_json::json!({ "type": "reasoning", "summary": [] })),
+                Content::Text {
+                    text: "Done.".into(),
+                },
+                reasoning(serde_json::json!({ "type": "message", "content": [{ "text": "no" }] })),
+            ],
+        );
+        reply.response_id = Some(node.id);
+        add_answer_content(&mut node, &reply);
+        assert_eq!(
+            node.blocks,
+            [
+                DisplayBlock::Thinking {
+                    text: "Plan.\n\nCheck.".into()
+                },
+                DisplayBlock::Text {
+                    text: "Done.".into()
+                },
+            ]
+        );
+        assert!(!serde_json::to_string(&node).unwrap().contains("opaque"));
     }
 
     /// A compaction's copy of an answer entry only aliases it, while a fragment appended to the

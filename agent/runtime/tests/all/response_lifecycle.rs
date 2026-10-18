@@ -765,7 +765,7 @@ async fn a_prompt_merged_at_a_tool_boundary_is_a_follow_up_inside_the_answer() {
         )),
         Step::Reply(vec![
             Content::Thinking {
-                thinking: "private reasoning".into(),
+                thinking: "visible reasoning".into(),
                 signature: Some("signature".into()),
             },
             Content::ProtocolData {
@@ -819,16 +819,21 @@ async fn a_prompt_merged_at_a_tool_boundary_is_a_follow_up_inside_the_answer() {
         [
             DisplayBlock::ToolCall { result: Some(_), .. },
             DisplayBlock::FollowUp { prompt_id, input_id, text, images },
+            DisplayBlock::Thinking { text: thinking },
             DisplayBlock::Text { text: final_text },
         ] if *prompt_id == follow_up
             && *input_id == Some(follow_up)
             && text == "also mention the date"
             && images.iter().map(|image| InputContext::Image(image.clone())).collect::<Vec<_>>() == [image.clone()]
+            && thinking == "visible reasoning"
             && final_text == "read it, and noted the follow-up"
     ));
     let serialized = serde_json::to_string(&nodes).unwrap();
-    assert!(!serialized.contains("private reasoning"));
     assert!(!serialized.contains("private state"));
+    assert!(
+        !serialized.contains("signature"),
+        "thinking signatures stay out"
+    );
     agent.shutdown().await;
 }
 
