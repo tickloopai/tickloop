@@ -4,6 +4,8 @@
 mod advance;
 #[path = "all/agent_approval_routing.rs"]
 mod agent_approval_routing;
+#[path = "all/durable_waits.rs"]
+mod durable_waits;
 
 #[path = "all/response_lifecycle.rs"]
 mod response_lifecycle;

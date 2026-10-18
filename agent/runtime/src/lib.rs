@@ -17,7 +17,10 @@ mod family_tree;
 pub mod file_history;
 mod handback;
 mod harness;
-pub use harness::{HarnessOptions, HarnessSeams, ToolPolicy};
+pub use harness::{
+    HarnessOptions, HarnessSeams, PersonWait, PersonWaitKind, Quiescence, ToolPolicy, WaitHosting,
+    Waits,
+};
 mod host_context;
 mod host_notes;
 pub mod host_tools;
@@ -68,6 +71,7 @@ mod run_supervision;
 mod session_permissions;
 mod shell_description;
 mod shell_task_center;
+mod suspension;
 mod system_prompt;
 mod tool_batch;
 mod tool_execution;
@@ -85,8 +89,8 @@ mod tick_trim;
 mod triggers;
 mod turn;
 pub use turn::{
-    Delivery, MessageId, ParentSelection, SkillInvocation, Turn, TurnOp, TurnOutcome, TurnRequest,
-    TurnWait, UserMessage,
+    Delivery, MessageId, ParentSelection, QuestionReply, SkillInvocation, Turn, TurnOp,
+    TurnOutcome, TurnRequest, TurnWait, UserMessage,
 };
 mod user_shell;
 #[cfg(test)]
@@ -312,6 +316,7 @@ struct Inner {
     /// 用户设置文件；不写设置的 Agent（测试等）为 `None`。
     settings: Option<tickloop_agent_config::UserSettings>,
     host_options: AgentHostOptions,
+    waits: WaitHosting,
     /// 设置文件所在的配置根；用户 Skill 与已安装 Tick 包的 Skill 从这里加载。
     config_root: Option<PathBuf>,
     /// 本进程内设置读写的次序：写入设置并同步已加载的 Chat、以及读取设置并加入新 Chat 都在
@@ -347,7 +352,7 @@ struct Inner {
     /// 本进程持有的 Trigger 租约；Inner 释放时随之归还。
     loop_leases: loop_lease::LoopLeases,
     approvals: Mutex<HashMap<Uuid, PendingApproval>>,
-    question_answers: Mutex<HashMap<Uuid, oneshot::Sender<interaction::QuestionReply>>>,
+    question_answers: Mutex<HashMap<Uuid, oneshot::Sender<interaction::PendingReply>>>,
     closed: AtomicBool,
     auto_reviewer: Mutex<Option<Arc<dyn ModelClient>>>,
     judgment: Mutex<Option<Arc<dyn tickloop_agent_model::judgment::JudgmentClient>>>,
@@ -429,6 +434,9 @@ struct Chat {
     active: Option<CancellationToken>,
     active_run: Option<RunId>,
     parked: HashMap<RunId, ParkedRun>,
+    /// The release of each Run waiting durably, parked or holding the execution slot. A released
+    /// Run leaves this instance without writing anything; it goes on wherever the Chat loads next.
+    releases: HashMap<RunId, CancellationToken>,
     ready_runs: VecDeque<RunId>,
     client: Arc<dyn ModelClient>,
     pending_client: Option<Arc<dyn ModelClient>>,
@@ -772,6 +780,7 @@ fn local_options(
         host,
         tools: ToolPolicy::local(),
         host_rules: Vec::new(),
+        waits: WaitHosting::Process,
     }
 }
 
@@ -1754,6 +1763,7 @@ impl Agent {
             host: host_options,
             tools: tool_policy,
             host_rules,
+            waits,
         } = options;
         let model = tickloop_agent_model::cards::model_for_persistent_selection(model);
         let config_root = settings
@@ -1772,6 +1782,7 @@ impl Agent {
                 models,
                 settings,
                 host_options,
+                waits,
                 config_root,
                 settings_writes: Mutex::new(()),
                 task_tools_enabled: AtomicBool::new(task_tools_enabled),
@@ -2030,6 +2041,7 @@ impl Agent {
                 active: None,
                 active_run: None,
                 parked: HashMap::new(),
+                releases: HashMap::new(),
                 ready_runs: VecDeque::new(),
                 client,
                 pending_client: None,
@@ -3312,9 +3324,9 @@ impl Agent {
         let mut used_calls = self.calls_on_chain(&receipt).await;
         let mut request = match start {
             RunStart::Request(request) => request,
-            RunStart::Resume(point) => {
+            RunStart::Resume { at, result } => {
                 *is_awaiting_model = false;
-                match self.reenter_batch(&receipt, point, &cancel).await? {
+                match self.reenter_batch(&receipt, at, result, &cancel).await? {
                     BatchExit::Continue(request) => request,
                     BatchExit::Ended(usage) => return Ok(usage),
                 }
@@ -3407,6 +3419,7 @@ impl Agent {
                     ToolBatch {
                         message_id: assistant_message_id,
                         calls,
+                        is_reentered: false,
                     },
                     0,
                     None,
@@ -3625,6 +3638,7 @@ impl Agent {
             .ok_or_else(|| "waiting run expired".to_string())?
             .resume
             .clone();
+        let release = Self::release_of(chat, receipt.run_id);
         if !chat.ready_runs.contains(&receipt.run_id) {
             chat.ready_runs.push_back(receipt.run_id);
         }
@@ -3636,7 +3650,12 @@ impl Agent {
         if let Some(next) = next {
             self.run_task(next);
         }
-        tokio::select! {biased;_ = cancel.cancelled()=>Err("waiting run was cancelled".into()),_ = resume.notified()=>Ok(())}
+        tokio::select! {
+            biased;
+            _ = release.cancelled() => Err(suspension::RUN_RELEASED.into()),
+            _ = cancel.cancelled() => Err("waiting run was cancelled".into()),
+            _ = resume.notified() => Ok(()),
+        }
     }
 
     fn admit_operation(&self, chat: &mut Chat, operation_id: Uuid) -> Result<(), AgentError> {
@@ -4894,12 +4913,7 @@ impl Agent {
             }
         }
         for chat in self.inner.chats.lock().await.values() {
-            if let Some(cancel) = &chat.active {
-                cancel.cancel();
-            }
-            for waiting in chat.parked.values() {
-                waiting.cancel.cancel();
-            }
+            self.stop_runs_at_shutdown(chat);
             for cancel in chat.event_cancellations.values() {
                 cancel.cancel();
             }

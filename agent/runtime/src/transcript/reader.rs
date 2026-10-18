@@ -25,7 +25,7 @@ pub(crate) struct LoadedTranscript {
     pub warnings: Vec<String>,
     /// The store position of the snapshot these Lines came from.
     pub position: StorePosition,
-    /// The answer lifecycle and input ledger records, in store order.
+    /// The answer lifecycle, input ledger and wait records, in store order.
     pub lifecycle: Vec<Line>,
 }
 
@@ -189,7 +189,7 @@ pub(crate) fn assemble(
                 content_replacements.push(entry.clone());
                 continue;
             }
-            Line::Response(_) | Line::Input(_) => {
+            Line::Response(_) | Line::Input(_) | Line::Wait(_) => {
                 lifecycle.push(line.clone());
                 continue;
             }

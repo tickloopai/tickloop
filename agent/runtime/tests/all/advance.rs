@@ -185,6 +185,7 @@ fn harness(
             host,
             tools: ToolPolicy::local(),
             host_rules,
+            waits: tickloop_agent_runtime::WaitHosting::Process,
         },
     )
     .unwrap()

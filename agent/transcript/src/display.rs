@@ -149,7 +149,9 @@ impl DisplayProjector {
             attempt: response.attempt,
         };
         node.status = match &response.state {
-            ResponseState::Started => DisplayStatus::Streaming,
+            ResponseState::Started | ResponseState::Suspended | ResponseState::Resumed => {
+                DisplayStatus::Streaming
+            }
             ResponseState::Ended { ending } => match ending {
                 ResponseEnding::Completed => DisplayStatus::Complete,
                 ResponseEnding::Interrupted { by } => DisplayStatus::Interrupted { by: *by },

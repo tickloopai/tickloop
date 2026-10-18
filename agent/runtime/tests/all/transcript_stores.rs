@@ -271,6 +271,7 @@ fn options(tools: ToolPolicy) -> HarnessOptions {
         host: AgentHostOptions::embedded_defaults(),
         tools,
         host_rules: Vec::new(),
+        waits: tickloop_agent_runtime::WaitHosting::Process,
     }
 }
 

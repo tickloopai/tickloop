@@ -14,8 +14,9 @@ use tickloop_agent_tools::ASK_USER_QUESTION_TOOL_NAME;
 use tokio::sync::broadcast::Receiver;
 use tokio_util::sync::CancellationToken;
 
-use super::{CallResult, ResumePoint, RunStart};
+use super::RunStart;
 use crate::Agent;
+use tickloop_agent_transcript::{ModelVisibleResult, ResumePoint};
 
 const PROMPT: &str = "Prepare the report.";
 const FOLLOW_UP: &str = "Also keep it brief.";
@@ -350,11 +351,26 @@ impl OwnedRun {
             .unwrap()
     }
 
-    fn resume(&self, point: ResumePoint, cancel: CancellationToken) -> tokio::task::JoinHandle<()> {
+    fn resume(
+        &self,
+        at: ResumePoint,
+        result: ModelVisibleResult,
+        cancel: CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
         let agent = self.agent.clone();
         let receipt = self.receipt.clone();
         tokio::spawn(async move {
-            if let Some(next) = agent.run(receipt, RunStart::Resume(point), cancel).await {
+            if let Some(next) = agent
+                .run(
+                    receipt,
+                    RunStart::Resume {
+                        at,
+                        result: Some(result),
+                    },
+                    cancel,
+                )
+                .await
+            {
                 agent.run_task(next);
             }
         })
@@ -373,8 +389,8 @@ fn result_text(finished: &Finished, call_id: &str) -> String {
         .unwrap()
 }
 
-fn answered(text: String) -> CallResult {
-    CallResult {
+fn answered(text: String) -> ModelVisibleResult {
+    ModelVisibleResult {
         tool: ToolResult {
             content: text.clone(),
             is_error: false,
@@ -408,12 +424,12 @@ async fn reentered(
         .happen(&run.agent, &mut run.events, &run.receipt)
         .await;
     let cancel = run.take_slot(&question).await;
-    let point = ResumePoint::InBatch {
+    let at = ResumePoint::InBatch {
         assistant_message: run.batch_message(&question.call_id).await,
         call_id: question.call_id.clone(),
-        result: Some(answered(result_text(reference, &question.call_id))),
     };
-    let resumed = run.resume(point, cancel);
+    let result = answered(result_text(reference, &question.call_id));
+    let resumed = run.resume(at, result, cancel);
     let completed_calls =
         answer_until_completed(&run.agent, &mut run.events, &run.receipt, None).await;
     resumed.await.unwrap();
@@ -543,12 +559,12 @@ async fn a_reentered_run_reusing_a_call_id_fails_without_invalidating_the_chat()
     .await;
     let question = run.lose_task_at_question().await;
     let cancel = run.take_slot(&question).await;
-    let point = ResumePoint::InBatch {
+    let at = ResumePoint::InBatch {
         assistant_message: run.batch_message("q").await,
         call_id: "q".into(),
-        result: Some(answered("Weekly".into())),
     };
-    let resumed = run.resume(point, cancel);
+    let result = answered("Weekly".into());
+    let resumed = run.resume(at, result, cancel);
     let failure = loop {
         let event = next_event(&mut run.events).await;
         match event.kind {
@@ -620,20 +636,20 @@ async fn a_reentered_declined_question_ends_the_run_as_in_process() {
     let question = run.lose_task_at_question().await;
     let cancel = run.take_slot(&question).await;
     let declined = result_text(&reference, "q");
-    let point = ResumePoint::InBatch {
+    let at = ResumePoint::InBatch {
         assistant_message: run.batch_message("q").await,
         call_id: "q".into(),
-        result: Some(CallResult {
-            tool: ToolResult {
-                content: declined.clone(),
-                is_error: true,
-                output_ref: None,
-            },
-            content: ToolResultContent::from(declined),
-            ends_run: true,
-        }),
     };
-    let resumed = run.resume(point, cancel);
+    let result = ModelVisibleResult {
+        tool: ToolResult {
+            content: declined.clone(),
+            is_error: true,
+            output_ref: None,
+        },
+        content: ToolResultContent::from(declined),
+        ends_run: true,
+    };
+    let resumed = run.resume(at, result, cancel);
     assert!(matches!(
         run_end(&mut run.events, &run.receipt).await,
         EventKind::Interrupted

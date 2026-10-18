@@ -14,6 +14,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::WaitHosting;
 use super::denials::DenialWindow;
 use super::{
     Agent, AgentError, Chat, ChatBookkeeping,
@@ -2076,6 +2077,7 @@ fn recover_transcript(
     restored: &RestoredChain,
     removed: &BTreeSet<usize>,
     source_chat_id: ChatId,
+    waits: WaitHosting,
 ) -> Result<RecoveredSnapshot, AgentError> {
     let kept = restored.without(removed);
     let folder = match loaded.chain.last() {
@@ -2192,7 +2194,7 @@ fn recover_transcript(
             .find_map(|entry| entry.compact_metadata.as_ref()?.display_leaf),
     );
     kept.fill_conversation(&mut snapshot, &mut bookkeeping);
-    recover_snapshot_for_resume(snapshot, bookkeeping, kept.meta_messages.clone())
+    recover_snapshot_for_resume(snapshot, bookkeeping, kept.meta_messages.clone(), waits)
 }
 
 /// Branch 来源元数据属于写入这份 Transcript 的 Chat；名称取标题，没有有效标题时使用默认名称。
@@ -2345,14 +2347,39 @@ impl RestoredChain {
 /// Restores conversation and chain-backed state. Process-local state, including execution mode,
 /// pending interactions, queued input, operations, and usage, starts from defaults.
 /// Removed assistant messages take their tool calls with them, so no operation state is migrated.
+/// Under durable wait hosting, a suspended Run that is rebuilt keeps its Loop, its batch and the
+/// end of the conversation as they were.
 fn recover_snapshot_for_resume(
     mut snapshot: ChatSnapshot,
     bookkeeping: ChatBookkeeping,
     mut meta_messages: HashSet<usize>,
+    waits: WaitHosting,
 ) -> Result<RecoveredSnapshot, AgentError> {
-    super::triggers::recover_loops(&mut snapshot);
-    super::recovery::close_dangling_tool_calls(&mut snapshot, None)?;
-    append_interruption_messages(&mut snapshot, &mut meta_messages);
+    let rebuilt_runs = |snapshot: &ChatSnapshot| {
+        super::suspension::rebuilt_waits(waits, &bookkeeping.lifecycle, snapshot)
+            .into_iter()
+            .map(|wait| wait.run_id)
+            .collect::<HashSet<_>>()
+    };
+    let rebuilt = rebuilt_runs(&snapshot);
+    let rebuilt_loops = snapshot
+        .loops
+        .iter()
+        .filter(|goal| goal.run_id.is_some_and(|run| rebuilt.contains(&run)))
+        .map(|goal| goal.id)
+        .collect::<HashSet<_>>();
+    super::triggers::recover_loops_keeping(&mut snapshot, &rebuilt_loops);
+    // A kept Loop whose deadline passed meanwhile expired: its Run is not rebuilt after all.
+    let rebuilt = rebuilt_runs(&snapshot);
+    super::recovery::close_dangling_tool_calls_except(&mut snapshot, &rebuilt)?;
+    let ends_with_rebuilt_run = (0..snapshot.messages.len())
+        .rev()
+        .find(|index| snapshot.messages[*index].role != Role::System)
+        .and_then(|index| snapshot.message_runs.get(&index))
+        .is_some_and(|run| rebuilt.contains(run));
+    if !ends_with_rebuilt_run {
+        append_interruption_messages(&mut snapshot, &mut meta_messages);
+    }
     super::branch::validate_snapshot(&snapshot)?;
     super::shared_tasks::validate_restored_boards(&snapshot).map_err(AgentError::Invalid)?;
     projection::projected_messages(&snapshot, &bookkeeping.denial_references)?;
@@ -2364,8 +2391,12 @@ fn recover_snapshot_for_resume(
 }
 
 /// Remove unanswered tool-only turns and blank text; keep private blocks in the archive.
-/// Target projection decides whether those blocks can be sent to the selected model.
-fn unrecoverable_assistant_messages(messages: &[Message]) -> BTreeSet<usize> {
+/// Target projection decides whether those blocks can be sent to the selected model. A call a
+/// durable wait is on counts as answered: its Run goes on there.
+fn unrecoverable_assistant_messages(
+    messages: &[Message],
+    waited_calls: &HashSet<String>,
+) -> BTreeSet<usize> {
     let resolved = messages
         .iter()
         .flat_map(|message| message.content.iter())
@@ -2373,6 +2404,7 @@ fn unrecoverable_assistant_messages(messages: &[Message]) -> BTreeSet<usize> {
             Content::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
             _ => None,
         })
+        .chain(waited_calls.iter().map(String::as_str))
         .collect::<HashSet<_>>();
     messages
         .iter()
@@ -3034,12 +3066,14 @@ impl Agent {
         chat_id: ChatId,
         loaded: &mut LoadedTranscript,
         source_chat_id: ChatId,
+        waits: WaitHosting,
     ) -> Result<RestoredConversation, AgentError> {
         let (restored, execution_mode_warnings) = restore_chain(&loaded.chain);
         loaded.warnings.extend(execution_mode_warnings);
-        let removed = unrecoverable_assistant_messages(&restored.messages);
+        let waited_calls = super::suspension::waited_calls(waits, &loaded.lifecycle);
+        let removed = unrecoverable_assistant_messages(&restored.messages, &waited_calls);
         let mut recovered =
-            recover_transcript(chat_id, loaded, &restored, &removed, source_chat_id)?;
+            recover_transcript(chat_id, loaded, &restored, &removed, source_chat_id, waits)?;
         let folder = recovered.snapshot.folder.clone();
         match (&folder, &self.inner.environment) {
             (Some(folder), Some(_)) => self.require_working_directory_trust(folder)?,
@@ -3117,7 +3151,7 @@ impl Agent {
             folder,
             content_replacements,
             ..
-        } = self.restore_conversation(chat_id, &mut loaded, chat_id)?;
+        } = self.restore_conversation(chat_id, &mut loaded, chat_id, WaitHosting::Process)?;
         let file_history = folder.as_deref().map(|folder| {
             FileHistory::restore(
                 self.file_history_directory(chat_id, folder),
@@ -3127,9 +3161,11 @@ impl Agent {
         let (recorded_loops, created_loops) =
             recorded_loop_entries(&snapshot, &bookkeeping, &plan_checkpoints);
         let recorded_lifecycle = bookkeeping.lifecycle.revision();
-        bookkeeping
-            .lifecycle
-            .settle_after_load(&snapshot, &bookkeeping.message_responses.clone());
+        bookkeeping.lifecycle.settle_after_load(
+            &snapshot,
+            &bookkeeping.message_responses.clone(),
+            &HashSet::new(),
+        );
         let parent_cursor = adopted_parent_cursor(&links, &loaded);
         Ok(StagedBranch {
             snapshot,
@@ -3163,6 +3199,11 @@ impl Agent {
             RestoreTarget::NewChat { source } => *source,
         };
         let mut loaded = loaded;
+        // A copy under a new Chat id goes on with none of the source's Runs.
+        let waits = match &target {
+            RestoreTarget::Resume => self.inner.waits,
+            RestoreTarget::NewChat { .. } => WaitHosting::Process,
+        };
         let registrations = if chat_id == source_chat_id {
             loaded
                 .metadata
@@ -3185,7 +3226,7 @@ impl Agent {
             mut folder,
             content_replacements,
             replacement_records,
-        } = self.restore_conversation(chat_id, &mut loaded, source_chat_id)?;
+        } = self.restore_conversation(chat_id, &mut loaded, source_chat_id, waits)?;
         // 与设置写入互斥到 Chat 加入本进程为止，期间写入的持久规则改动不会漏掉这个 Chat。
         let _settings_gate = self.inner.settings_writes.lock().await;
         let (client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
@@ -3266,9 +3307,15 @@ impl Agent {
                 }
             }
         }
-        bookkeeping
-            .lifecycle
-            .settle_after_load(&snapshot, &bookkeeping.message_responses.clone());
+        let rebuilt = super::suspension::rebuilt_waits(waits, &bookkeeping.lifecycle, &snapshot)
+            .into_iter()
+            .map(|wait| wait.response_id)
+            .collect();
+        bookkeeping.lifecycle.settle_after_load(
+            &snapshot,
+            &bookkeeping.message_responses.clone(),
+            &rebuilt,
+        );
         self.checkpoint_transcript(&snapshot, &bookkeeping)
             .await
             .map_err(AgentError::Storage)?;
@@ -3293,6 +3340,7 @@ impl Agent {
                 active: None,
                 active_run: None,
                 parked: HashMap::new(),
+                releases: HashMap::new(),
                 ready_runs: VecDeque::new(),
                 client,
                 pending_client: None,
@@ -3325,7 +3373,9 @@ impl Agent {
         }
         self.save(&snapshot);
         self.start_feedback_cleanup(chat_id).await;
-
+        if waits == WaitHosting::Durable {
+            self.rebuild_suspended_runs(chat_id).await;
+        }
         Ok(snapshot)
     }
 }
@@ -3442,7 +3492,7 @@ mod history_tests {
             },
         ];
         assert_eq!(
-            unrecoverable_assistant_messages(&messages),
+            unrecoverable_assistant_messages(&messages, &HashSet::new()),
             BTreeSet::from([2])
         );
     }

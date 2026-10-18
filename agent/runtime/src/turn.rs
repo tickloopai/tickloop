@@ -13,7 +13,8 @@ use std::time::Duration;
 use serde::Serialize;
 use tickloop_agent_protocol::{
     ChatId, ExecutionMode, HostCallContext, InputContext, InputId, LoopId, LoopState,
-    OperationRecord, OperationState, PermissionRequest, QuestionRequest, Receipt, RunId, Usage,
+    OperationRecord, OperationState, PermissionRequest, QuestionAnswer, QuestionRequest, Receipt,
+    RunId, Usage,
 };
 use uuid::Uuid;
 
@@ -66,6 +67,18 @@ pub enum TurnOp {
         target_loop: Option<LoopId>,
         skill: SkillInvocation,
     },
+    /// The user's reply to the question `request` a Run waits on; it joins that Run.
+    Answer { request: Uuid, reply: QuestionReply },
+}
+
+/// How the user settles a question.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum QuestionReply {
+    /// One answer per question, in the order the questions were asked.
+    Answered(Vec<QuestionAnswer>),
+    /// The question is declined, as Esc does in its dialog; the waiting Run ends there.
+    Declined,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -339,6 +352,7 @@ impl TurnOp {
             Self::ReplacePrompt { .. } => InputOp::ReplacePrompt,
             Self::RegenerateAnswer { .. } => InputOp::RegenerateAnswer,
             Self::Skill { .. } => InputOp::Skill,
+            Self::Answer { .. } => InputOp::Answer,
         }
     }
 }
@@ -398,11 +412,16 @@ impl Agent {
         delivery: Delivery,
         host_context: Option<HostCallContext>,
     ) -> Result<Receipt, AgentError> {
-        let placement = match &op {
-            TurnOp::Continue { after, .. } | TurnOp::Skill { after, .. } => placement(*after),
-            TurnOp::ReplacePrompt { prompt, .. } => Some(Placement::Replacing(*prompt)),
+        let placement = match op {
+            TurnOp::Continue { after, .. } | TurnOp::Skill { after, .. } => placement(after),
+            TurnOp::ReplacePrompt { prompt, .. } => Some(Placement::Replacing(prompt)),
             TurnOp::RegenerateAnswer { answer } => {
-                return self.regenerate(chat_id, *answer, ledger, delivery).await;
+                return self.regenerate(chat_id, answer, ledger, delivery).await;
+            }
+            TurnOp::Answer { request, reply } => {
+                return self
+                    .reply_to_question(chat_id, request, reply, Some(ledger))
+                    .await;
             }
         };
         let turn = match self
@@ -446,7 +465,9 @@ impl Agent {
                 self.submit_skill(chat_id, target_loop, skill, host_context, ledger, turn)
                     .await
             }
-            TurnOp::RegenerateAnswer { .. } => unreachable!("regenerated above"),
+            TurnOp::RegenerateAnswer { .. } | TurnOp::Answer { .. } => {
+                unreachable!("regenerated or answered above")
+            }
         };
         // A refused input leaves the Chat as it was: the branch it staged is not installed.
         if accepted.is_err()
@@ -1215,7 +1236,7 @@ pub(crate) fn placement_cut(
         Placement::After(id) => {
             let lifecycle = &chat.bookkeeping.lifecycle;
             match lifecycle.response(id) {
-                Some(response) if response.state == ResponseState::Started => {
+                Some(response) if !response.state.is_ended() => {
                     return Err(answer_not_ended());
                 }
                 Some(_) => {}
@@ -1247,7 +1268,7 @@ pub(crate) fn placement_cut(
 fn answered_prompt(chat: &Chat, answer: MessageId) -> Result<MessageId, AgentError> {
     let lifecycle = &chat.bookkeeping.lifecycle;
     let response = lifecycle.response(answer).ok_or_else(unknown_node)?;
-    if response.state == ResponseState::Started {
+    if !response.state.is_ended() {
         return Err(answer_not_ended());
     }
     response

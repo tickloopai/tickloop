@@ -1,4 +1,5 @@
 use super::*;
+use crate::QuestionReply;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use tickloop_agent_protocol::{
@@ -9,6 +10,7 @@ use tickloop_agent_tools::{
     ASK_USER_QUESTION_TOOL_NAME, DECLINED_QUESTIONS_RESULT, EXIT_PLAN_MODE_TOOL_NAME,
     START_GOAL_TOOL_NAME,
 };
+use tickloop_agent_transcript::ModelVisibleResult;
 
 const QUESTION_HEADER_MAX_CHARACTERS: usize = 12;
 const MIN_QUESTIONS: usize = 1;
@@ -20,8 +22,8 @@ const UNIQUENESS_ERROR: &str =
     "Question texts must be unique, option labels must be unique within each question";
 const QUESTION_SETTLED: &str = "question was already answered";
 
-/// How the user settled a pending `AskUserQuestion` call.
-pub(super) enum QuestionReply {
+/// How the user settled a pending `AskUserQuestion` call, as its waiting Run receives it.
+pub(crate) enum PendingReply {
     /// The tool result that reports the answers.
     Answered(String),
     /// Esc in the question dialog, as Claude Code's cancel: the call is rejected and the run
@@ -93,6 +95,19 @@ fn ensure_question_waits(chat: &Chat, request: &QuestionRequest) -> Result<(), A
         Ok(())
     } else {
         Err(AgentError::Invalid("question was cancelled".into()))
+    }
+}
+
+/// A question call's result as the conversation records it.
+fn reported_result(text: String, ends_run: bool) -> ModelVisibleResult {
+    ModelVisibleResult {
+        tool: ToolResult {
+            content: text.clone(),
+            is_error: ends_run,
+            output_ref: None,
+        },
+        content: text.into(),
+        ends_run,
     }
 }
 
@@ -272,50 +287,9 @@ impl Agent {
         request_id: Uuid,
         answers: Vec<QuestionAnswer>,
     ) -> Result<(), AgentError> {
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        let request = pending_question(chat, request_id)?;
-        if answers.len() != request.questions.len() {
-            return Err(AgentError::Invalid(format!(
-                "answer each of the {} questions",
-                request.questions.len()
-            )));
-        }
-        for (question, answer) in request.questions.iter().zip(&answers) {
-            validate_answer(answer, question).map_err(AgentError::Invalid)?;
-        }
-        let result = answered_questions_result(&request.questions, &answers);
-        if result.len() > MAX_ANSWER_BYTES {
-            return Err(AgentError::Invalid(format!(
-                "answers must fit in {MAX_ANSWER_BYTES} bytes"
-            )));
-        }
-        ensure_question_waits(chat, &request)?;
-        let mut pending_answers = self.inner.question_answers.lock().await;
-        if !pending_answers.contains_key(&request_id) {
-            return Err(AgentError::Invalid(QUESTION_SETTLED.into()));
-        }
-        let mut snapshot = chat.snapshot.clone();
-        snapshot
-            .questions
-            .retain(|request| request.id != request_id);
-        if let Some(operation) = snapshot.operations.iter_mut().find(|operation| {
-            operation.run_id == request.run_id && operation.call_id == request.call_id
-        }) {
-            operation.state = OperationState::Completed;
-            operation.result = Some(ToolResult {
-                content: result.clone(),
-                is_error: false,
-                output_ref: None,
-            });
-        }
-        self.save(&snapshot);
-        chat.snapshot = snapshot;
-        pending_answers
-            .remove(&request_id)
-            .unwrap()
-            .send(QuestionReply::Answered(result))
-            .map_err(|_| AgentError::Invalid("question expired".into()))
+        self.reply_to_question(chat_id, request_id, QuestionReply::Answered(answers), None)
+            .await
+            .map(|_| ())
     }
 
     /// Declines a pending `AskUserQuestion` call, as Esc does in Claude Code's question dialog:
@@ -326,26 +300,102 @@ impl Agent {
         chat_id: ChatId,
         request_id: Uuid,
     ) -> Result<(), AgentError> {
+        self.reply_to_question(chat_id, request_id, QuestionReply::Declined, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Ends the wait of a pending question with `reply`. The result the call reports is decided
+    /// now and recorded with the wait, with the ledger input `ledger` the reply came as, merged
+    /// into the waiting Run; the Run puts the result on the chain once it holds the execution
+    /// slot again. Gives the reply's receipt.
+    pub(crate) async fn reply_to_question(
+        &self,
+        chat_id: ChatId,
+        request_id: Uuid,
+        reply: QuestionReply,
+        ledger: Option<lifecycle::LedgerInput>,
+    ) -> Result<Receipt, AgentError> {
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        let request = pending_question(chat, request_id)?;
+        // A repeated reply, even one racing the first, finds it in the ledger under this lock.
+        if let Some(replayed) = ledger
+            .as_ref()
+            .and_then(|input| chat.bookkeeping.lifecycle.replay(chat_id, input))
+        {
+            return replayed;
+        }
+        let request = pending_question(chat, request_id).map_err(|error| match ledger {
+            Some(_) => AgentError::Invalid("the question is no longer pending".into()),
+            None => error,
+        })?;
+        let (pending, result) = match reply {
+            QuestionReply::Answered(answers) => {
+                if answers.len() != request.questions.len() {
+                    return Err(AgentError::Invalid(format!(
+                        "answer each of the {} questions",
+                        request.questions.len()
+                    )));
+                }
+                for (question, answer) in request.questions.iter().zip(&answers) {
+                    validate_answer(answer, question).map_err(AgentError::Invalid)?;
+                }
+                let text = answered_questions_result(&request.questions, &answers);
+                if text.len() > MAX_ANSWER_BYTES {
+                    return Err(AgentError::Invalid(format!(
+                        "answers must fit in {MAX_ANSWER_BYTES} bytes"
+                    )));
+                }
+                (
+                    PendingReply::Answered(text.clone()),
+                    reported_result(text, false),
+                )
+            }
+            QuestionReply::Declined => (
+                PendingReply::Declined,
+                reported_result(DECLINED_QUESTIONS_RESULT.into(), true),
+            ),
+        };
         ensure_question_waits(chat, &request)?;
-        let reply = self
-            .inner
-            .question_answers
-            .lock()
-            .await
-            .remove(&request_id)
-            .ok_or_else(|| AgentError::Invalid(QUESTION_SETTLED.into()))?;
+        let mut pending_answers = self.inner.question_answers.lock().await;
+        let Some(waiting) = pending_answers.get(&request_id) else {
+            return Err(AgentError::Invalid(QUESTION_SETTLED.into()));
+        };
+        // Nothing is recorded for a Run that no longer waits here, such as one just released.
+        if waiting.is_closed() || Self::release_of(chat, request.run_id).is_cancelled() {
+            return Err(AgentError::Invalid("question expired".into()));
+        }
         let mut snapshot = chat.snapshot.clone();
         snapshot
             .questions
             .retain(|request| request.id != request_id);
+        if let PendingReply::Answered(_) = &pending
+            && let Some(operation) = snapshot.operations.iter_mut().find(|operation| {
+                operation.run_id == request.run_id && operation.call_id == request.call_id
+            })
+        {
+            operation.state = OperationState::Completed;
+            operation.result = Some(result.tool.clone());
+        }
+        let receipt = Receipt {
+            chat_id,
+            loop_id: request.loop_id,
+            run_id: Uuid::new_v4(),
+        };
+        let lifecycle = &mut chat.bookkeeping.lifecycle;
+        lifecycle.resolve_wait(request_id, result, ledger.as_ref().map(|input| input.id));
+        if let Some(input) = &ledger {
+            lifecycle.record_merged(input, &receipt, request.run_id);
+            self.inner.ledger_changes.send_replace(());
+        }
         self.save(&snapshot);
         chat.snapshot = snapshot;
-        reply
-            .send(QuestionReply::Declined)
-            .map_err(|_| AgentError::Invalid("question expired".into()))
+        pending_answers
+            .remove(&request_id)
+            .unwrap()
+            .send(pending)
+            .map_err(|_| AgentError::Invalid("question expired".into()))?;
+        Ok(receipt)
     }
 
     pub(super) async fn interaction_tool(
@@ -478,7 +528,7 @@ impl Agent {
             questions: parsed.questions,
         };
         let (sender, receiver) = oneshot::channel();
-        {
+        let release = {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats
                 .get_mut(&receipt.chat_id)
@@ -505,8 +555,10 @@ impl Agent {
             snapshot.questions.push(request.clone());
             self.save(&snapshot);
             chat.snapshot = snapshot;
+            let release = self.suspend_for_question(chat, receipt, &request);
             self.park_run(chat, receipt, cancel.clone())
                 .map_err(|error| error.to_string())?;
+            self.save_now(&chat.snapshot);
             self.inner
                 .question_answers
                 .lock()
@@ -519,7 +571,8 @@ impl Agent {
                     request: request.clone(),
                 },
             );
-        }
+            release
+        };
         let next = self
             .next_run(receipt.chat_id)
             .await
@@ -529,6 +582,7 @@ impl Agent {
         }
         let reply = tokio::select! {
             biased;
+            _ = release.cancelled() => return Err(super::suspension::RUN_RELEASED.into()),
             _ = cancel.cancelled() => Err("question was cancelled".to_string()),
             reply = receiver => reply.map_err(|_| "question expired".to_string()),
         };
@@ -537,6 +591,9 @@ impl Agent {
         } else {
             Ok(())
         };
+        if release.is_cancelled() {
+            return Err(super::suspension::RUN_RELEASED.into());
+        }
         let mut chats = self.inner.chats.lock().await;
         let chat = chats
             .get_mut(&receipt.chat_id)
@@ -562,13 +619,13 @@ impl Agent {
         }
         resumed?;
         match reply? {
-            QuestionReply::Answered(content) => Ok(ToolResult {
+            PendingReply::Answered(content) => Ok(ToolResult {
                 content,
                 is_error: false,
                 output_ref: None,
             }),
             // As a declined permission: the result reaches the conversation, then the run ends.
-            QuestionReply::Declined => {
+            PendingReply::Declined => {
                 chat.user_cancelled_runs.insert(receipt.run_id);
                 Ok(ToolResult {
                     content: DECLINED_QUESTIONS_RESULT.into(),

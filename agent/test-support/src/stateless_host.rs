@@ -13,7 +13,12 @@
 //!    appended once the local deadline has passed.
 //! 7. A publish that fails, or events the Harness broadcast dropped, owe a resync marker.
 //! 8. The task is acknowledged only after `sync` succeeded, every event is published and no
-//!    marker is owed; a fence or a stale epoch stops the holder without acknowledging.
+//!    marker is owed; a fence or a stale epoch stops the holder without acknowledging. What the
+//!    Chat waits on once quiet is written with the acknowledgement, so the host knows when to
+//!    come back.
+//!
+//! A Harness whose waits are durable leaves a Run that waits for a person suspended in the
+//! Transcript; the holding that delivers the reply rebuilds it from there.
 //!
 //! Lines and `last_seq` commit together, so a client that loads the history at `last_seq` and
 //! follows the stream after it sees every commit exactly once.
@@ -29,7 +34,7 @@ use tickloop_agent_runtime::transcript::{
     AppendAck, AppendBatch, BatchId, ChatPlacement, LoadRange, StorePosition, StoredTranscript,
     TranscriptError, TranscriptStore,
 };
-use tickloop_agent_runtime::{Agent, AgentError, TurnOutcome, TurnRequest};
+use tickloop_agent_runtime::{Agent, AgentError, Quiescence, TurnOutcome, TurnRequest, Waits};
 use tickloop_agent_transcript::Line;
 use tokio::sync::{Notify, broadcast, watch};
 use tokio::task::JoinHandle;
@@ -112,6 +117,8 @@ struct ChatRow {
     harness_chat: Option<ChatId>,
     committed: HashSet<BatchId>,
     acknowledged: HashMap<Uuid, usize>,
+    /// What the Chat waited on when its last task was acknowledged; `None` when it was idle.
+    waiting: Option<Waits>,
 }
 
 impl ChatRow {
@@ -246,6 +253,15 @@ impl DurableChats {
             .and_then(|row| row.harness_chat)
     }
 
+    /// What the Chat waited on when its last task was acknowledged.
+    pub fn waiting(&self, chat: Uuid) -> Option<Waits> {
+        self.rows
+            .lock()
+            .unwrap()
+            .get(&chat)
+            .and_then(|row| row.waiting.clone())
+    }
+
     /// How many times the task of `input` was acknowledged.
     pub fn acknowledgements(&self, chat: Uuid, input: Uuid) -> usize {
         self.rows
@@ -306,9 +322,15 @@ impl DurableChats {
         })
     }
 
-    fn complete_task(&self, lease: &Lease, input: Uuid) -> Result<(), TranscriptError> {
+    fn complete_task(
+        &self,
+        lease: &Lease,
+        input: Uuid,
+        waiting: Option<Waits>,
+    ) -> Result<(), TranscriptError> {
         self.holding(lease, |row| {
             *row.acknowledged.entry(input).or_default() += 1;
+            row.waiting = waiting;
             Ok(())
         })
     }
@@ -376,6 +398,8 @@ pub struct TurnReport {
     pub halt: Option<Halt>,
     pub acknowledged: bool,
     pub harness_chat: Option<ChatId>,
+    /// What the Chat waited on once quiet, if the holder got that far.
+    pub waiting: Option<Waits>,
 }
 
 type HarnessBuilder = Arc<dyn Fn(Arc<dyn TranscriptStore>) -> Agent + Send + Sync>;
@@ -522,6 +546,7 @@ impl Holding {
             halt: None,
             acknowledged: false,
             harness_chat: None,
+            waiting: None,
         };
         if let Err(halt) = self.take_over() {
             report.halt = Some(halt);
@@ -554,7 +579,7 @@ impl Holding {
             }
             Err(halt) => Err(halt),
         };
-        let acknowledged = drained.and_then(|()| self.acknowledge(input));
+        let acknowledged = drained.and_then(|()| self.acknowledge(input, report.waiting.clone()));
         stop.cancel();
         if let Some(pump) = pump {
             pump.await.unwrap();
@@ -635,7 +660,9 @@ impl Holding {
         if matches!(outcome, TurnOutcome::Fenced) {
             return Err(self.shared.halt_or(Halt::Fenced));
         }
-        self.until_halted(agent.quiesce(chat)).await?;
+        if let Quiescence::Waiting(waits) = self.until_halted(agent.quiesce(chat)).await? {
+            report.waiting = Some(waits);
+        }
         Ok(outcome)
     }
 
@@ -689,7 +716,7 @@ impl Holding {
         }
     }
 
-    fn acknowledge(&self, input: Uuid) -> Result<(), Halt> {
+    fn acknowledge(&self, input: Uuid, waiting: Option<Waits>) -> Result<(), Halt> {
         self.shared.check_deadline()?;
         if matches!(
             self.shared.state.lock().unwrap().crash,
@@ -699,7 +726,7 @@ impl Holding {
         }
         self.shared
             .chats
-            .complete_task(&self.shared.lease, input)
+            .complete_task(&self.shared.lease, input, waiting)
             .map_err(|_| self.shared.halt_or(Halt::Fenced))
     }
 }

@@ -558,6 +558,7 @@ pub async fn build_runtime_with_models(
             host: launch.host_options,
             tools: ToolPolicy::local(),
             host_rules: Vec::new(),
+            waits: tickloop_agent_runtime::WaitHosting::Process,
         },
     )
     .map_err(|error| error.to_string())?;

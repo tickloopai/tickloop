@@ -4892,6 +4892,7 @@ dependencies = [
  "async-trait",
  "regex",
  "serde_json",
+ "tickloop-agent-base",
  "tickloop-agent-config",
  "tickloop-agent-model",
  "tickloop-agent-protocol",

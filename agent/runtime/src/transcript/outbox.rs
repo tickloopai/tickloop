@@ -468,4 +468,28 @@ mod tests {
         assert!(outbox.next_batch(chat, true).is_none());
         assert_eq!(outbox.refusal(chat), Some(TranscriptError::Fenced));
     }
+
+    /// A result's chain entry and the lifecycle records of the same change, such as a resumed
+    /// answer, are enqueued as one group: they commit together or not at all.
+    #[test]
+    fn a_group_enqueued_together_is_never_split_across_batches() {
+        let outbox = TranscriptOutbox::default();
+        let chat = Uuid::new_v4();
+        outbox.register(chat, StorePosition(0));
+        outbox.enqueue(chat, vec![chain(Uuid::new_v4(), Role::User), title()], None);
+        let first = outbox.next_batch(chat, false).unwrap();
+        assert_eq!(first.lines.len(), 2);
+        let group = vec![chain(Uuid::new_v4(), Role::User), title(), title()];
+        outbox.enqueue(chat, group.clone(), None);
+        assert_eq!(outbox.next_batch(chat, false).unwrap().id, first.id);
+        outbox.settle(
+            chat,
+            first.id,
+            Ok(AppendAck {
+                position: StorePosition(2),
+            }),
+        );
+        let second = outbox.next_batch(chat, false).unwrap();
+        assert_eq!(second.lines.len(), group.len());
+    }
 }

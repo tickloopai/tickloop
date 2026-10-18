@@ -40,6 +40,7 @@ fn harness(
             host: AgentHostOptions::embedded_defaults(),
             tools: ToolPolicy::local(),
             host_rules: Vec::new(),
+            waits: crate::WaitHosting::Process,
         },
     )
     .unwrap()

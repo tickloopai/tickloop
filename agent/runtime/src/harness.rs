@@ -9,6 +9,8 @@ use tickloop_agent_protocol::{
     AgentHostOptions, ChatId, ModelConfig, PermissionRule, UserShellState,
 };
 
+use uuid::Uuid;
+
 use crate::{
     Agent, AgentError, environment::ExecutionEnvironment, persistence::ChatRecorder,
     transcript::TranscriptStore,
@@ -39,6 +41,19 @@ pub struct HarnessOptions {
     /// Permission rules the host imposes on every Chat, at the level of session rules and never
     /// saved.
     pub host_rules: Vec<PermissionRule>,
+    pub waits: WaitHosting,
+}
+
+/// Who keeps a Run that waits for a person. The waits are recorded either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WaitHosting {
+    /// This process: a load ends the waits it finds and a shutdown cancels them, as a local
+    /// Worker always has.
+    #[default]
+    Process,
+    /// The Transcript: a load rebuilds each suspended Run, and a shutdown releases a suspended
+    /// Run without writing anything, so another instance can go on with it.
+    Durable,
 }
 
 /// Which of the Agent's own capabilities its Chats offer the model, and where WebFetch may reach
@@ -117,13 +132,37 @@ impl ModelClients for OneClient {
 }
 
 /// What remains of a Chat once `quiesce` returns.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Quiescence {
     /// Nothing of the Chat runs or waits to run.
     Idle,
     /// Nothing runs, but a Run waits for a person, or a Loop waits for its Trigger or event
     /// source.
-    Waiting,
+    Waiting(Waits),
+}
+
+/// What a quiet Chat waits on, as a host keeps it to know when to come back.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Waits {
+    /// The requests that wait for a person, in the order they were made.
+    pub people: Vec<PersonWait>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PersonWait {
+    pub chat: ChatId,
+    /// The question's or permission's request id, or the user shell's operation id.
+    pub request: Uuid,
+    pub kind: PersonWaitKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersonWaitKind {
+    Question,
+    /// Waits in this process only.
+    Permission,
+    /// Waits in this process only.
+    UserShell,
 }
 
 impl Agent {
@@ -167,19 +206,32 @@ impl Agent {
                         .iter()
                         .any(|record| states.contains(&record.state))
                 };
+                // A parked Run whose person answered is about to take the execution slot again.
+                let waits_for_person = |run: &tickloop_agent_protocol::RunId| {
+                    chat.snapshot
+                        .questions
+                        .iter()
+                        .any(|request| request.run_id == *run)
+                        || chat
+                            .snapshot
+                            .permissions
+                            .iter()
+                            .any(|request| request.execution.run_id() == Some(*run))
+                };
                 let runs = chat.active.is_some()
                     || chat.active_run.is_some()
                     || !chat.ready_runs.is_empty()
+                    || chat.parked.keys().any(|run| !waits_for_person(run))
                     || user_shell_in(&[UserShellState::Running, UserShellState::Cancelling]);
                 let waits = !chat.parked.is_empty()
                     || !chat.trigger_cancellations.is_empty()
                     || !chat.event_cancellations.is_empty()
                     || user_shell_in(&[UserShellState::WaitingPermission]);
-                (runs, waits)
+                (runs, waits.then(|| waits_of(chat_id, &chat.snapshot)))
             });
             match state {
                 Some((true, _)) if !self.inner.shutdown.is_cancelled() => {}
-                Some((_, true)) => break Quiescence::Waiting,
+                Some((_, Some(waits))) => break Quiescence::Waiting(waits),
                 _ => break Quiescence::Idle,
             }
             tokio::select! {
@@ -204,6 +256,31 @@ impl Agent {
             title.done.cancelled().await;
         }
         quiescence
+    }
+}
+
+fn waits_of(chat: ChatId, snapshot: &tickloop_agent_protocol::ChatSnapshot) -> Waits {
+    let questions = snapshot.questions.iter().map(|request| PersonWait {
+        chat,
+        request: request.id,
+        kind: PersonWaitKind::Question,
+    });
+    let permissions = snapshot.permissions.iter().map(|request| PersonWait {
+        chat,
+        request: request.id,
+        kind: PersonWaitKind::Permission,
+    });
+    let user_shells = snapshot
+        .user_shells
+        .iter()
+        .filter(|record| record.state == UserShellState::WaitingPermission)
+        .map(|record| PersonWait {
+            chat,
+            request: record.id,
+            kind: PersonWaitKind::UserShell,
+        });
+    Waits {
+        people: questions.chain(permissions).chain(user_shells).collect(),
     }
 }
 

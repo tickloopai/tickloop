@@ -8,8 +8,9 @@ use std::{collections::HashSet, sync::atomic::Ordering};
 use tickloop_agent_model::ModelRequest;
 use tickloop_agent_protocol::{
     ChatSnapshot, Content, EventKind, Message, OperationState, ProposedToolCall, Receipt, Role,
-    RunId, SubagentReport, ToolResult, ToolResultBlock, ToolResultContent, Usage,
+    RunId, SubagentReport, ToolResultBlock, ToolResultContent, Usage,
 };
+use tickloop_agent_transcript::{ModelVisibleResult, ResumePoint};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -23,15 +24,12 @@ use super::{
 pub(crate) enum RunStart {
     /// With a model request, as a new Run or a continuation does.
     Request(ModelRequest),
-    /// Inside the conversation it already has.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "a suspended Run rebuilt from its records re-enters here (H09b)"
-        )
-    )]
-    Resume(ResumePoint),
+    /// Inside the conversation it already has, at `at`. A given `result` is appended as the
+    /// result of the call `at` names; without one that call runs.
+    Resume {
+        at: ResumePoint,
+        result: Option<ModelVisibleResult>,
+    },
 }
 
 impl From<ModelRequest> for RunStart {
@@ -40,42 +38,13 @@ impl From<ModelRequest> for RunStart {
     }
 }
 
-/// Where a Run continues.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "a suspended Run rebuilt from its records re-enters here (H09b)"
-    )
-)]
-pub(crate) enum ResumePoint {
-    /// In the tool batch of the assistant message whose canonical (earliest source) id is
-    /// `assistant_message`, at its call `call_id`. A given `result` is appended as that call's
-    /// result; without one the call runs. The calls after it run next, then the end of the batch.
-    InBatch {
-        assistant_message: Uuid,
-        call_id: String,
-        result: Option<CallResult>,
-    },
-}
-
-/// A call's result as the conversation records it.
-#[derive(Clone)]
-pub(crate) struct CallResult {
-    /// The tool's own result, which its operation record and `ToolCompleted` carry.
-    pub tool: ToolResult,
-    /// What the model sees: the tool's text with any approval comment, then its images.
-    pub content: ToolResultContent,
-    /// The Run ends after this result, as it does after a bare user denial, a stopped foreground
-    /// command or a declined question.
-    pub ends_run: bool,
-}
-
 /// The calls of one assistant message, which a Run makes in order.
 pub(crate) struct ToolBatch {
     /// The assistant message's current id, which file changes made by its calls belong to.
     pub message_id: Uuid,
     pub calls: Vec<ProposedToolCall>,
+    /// The batch is entered again: a call whose result the chain already holds is done.
+    pub is_reentered: bool,
 }
 
 /// How a tool batch ends.
@@ -126,18 +95,18 @@ impl Agent {
         ))
     }
 
-    /// Re-enters the Run's tool batch at `point` with freshly prepared tools.
+    /// Re-enters the Run's tool batch at `at` with freshly prepared tools.
     pub(super) async fn reenter_batch(
         &self,
         receipt: &Receipt,
-        point: ResumePoint,
+        at: ResumePoint,
+        result: Option<ModelVisibleResult>,
         cancel: &CancellationToken,
     ) -> Result<BatchExit, String> {
         let ResumePoint::InBatch {
             assistant_message,
             call_id,
-            result,
-        } = point;
+        } = at;
         let (batch, start) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats
@@ -159,7 +128,7 @@ impl Agent {
         registry: &ToolRegistry,
         batch: ToolBatch,
         start: usize,
-        mut first_result: Option<CallResult>,
+        mut first_result: Option<ModelVisibleResult>,
         cancel: &CancellationToken,
     ) -> Result<BatchExit, String> {
         for ProposedToolCall {
@@ -171,6 +140,19 @@ impl Agent {
             let tool_use = monitor_members::ToolUse::of(&name, &input);
             let (result, host_effect, is_resumed) = match first_result.take() {
                 Some(result) => (result, None, true),
+                None if batch.is_reentered
+                    && self
+                        .inner
+                        .chats
+                        .lock()
+                        .await
+                        .get(&receipt.chat_id)
+                        .is_some_and(|chat| {
+                            has_result_on_chain(&chat.snapshot, receipt.run_id, &call_id)
+                        }) =>
+                {
+                    continue;
+                }
                 None => {
                     let invocation = ToolInvocation::new(
                         call_id.clone(),
@@ -194,8 +176,15 @@ impl Agent {
             };
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&receipt.chat_id).unwrap();
-            append_call_result(chat, receipt.run_id, &call_id, &result);
+            // A Run released while it waited leaves without its result: from the release on it
+            // writes nothing.
+            if Agent::release_of(chat, receipt.run_id).is_cancelled() {
+                return Err(super::suspension::RUN_RELEASED.into());
+            }
+            let is_appended =
+                append_call_result(chat, receipt.run_id, &call_id, &result, batch.is_reentered);
             if is_resumed
+                && is_appended
                 && let Some(operation) = chat.snapshot.operations.iter_mut().find(|operation| {
                     operation.run_id == receipt.run_id && operation.call_id == call_id
                 })
@@ -207,7 +196,8 @@ impl Agent {
                     OperationState::Completed
                 };
             }
-            if !result.tool.is_error
+            if is_appended
+                && !result.tool.is_error
                 && let Some(tool_use) = tool_use
             {
                 self.mark_tool_use(chat, tool_use);
@@ -249,14 +239,16 @@ impl Agent {
                 None => {}
             }
             self.save(&chat.snapshot);
-            self.emit(
-                chat,
-                receipt,
-                EventKind::ToolCompleted {
-                    call_id: call_id.clone(),
-                    result: result.tool.clone(),
-                },
-            );
+            if is_appended {
+                self.emit(
+                    chat,
+                    receipt,
+                    EventKind::ToolCompleted {
+                        call_id: call_id.clone(),
+                        result: result.tool.clone(),
+                    },
+                );
+            }
             // Tool errors go back to the model; a bare user denial or stopped foreground command ends the run.
             if result.ends_run {
                 chat.user_cancelled_runs.insert(receipt.run_id);
@@ -277,7 +269,7 @@ impl Agent {
         call_id: &str,
         name: &str,
         outcome: Result<ToolCallOutcome, super::tool_execution::ToolCallError>,
-    ) -> Result<(CallResult, Option<HostEffect>), String> {
+    ) -> Result<(ModelVisibleResult, Option<HostEffect>), String> {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -330,7 +322,7 @@ impl Agent {
         let host_effect = host_effect
             .filter(|_| !result.is_error && host_call_status == Some(HostCallStatus::Completed));
         Ok((
-            CallResult {
+            ModelVisibleResult {
                 tool: result,
                 content,
                 ends_run: is_rejected_by_user && !continue_after_denial,
@@ -371,8 +363,23 @@ impl Agent {
 }
 
 /// Appends a call's result to the conversation: into the Run's trailing message of tool results,
-/// or as a new message when the conversation moved on since, and onto the call's operation.
-fn append_call_result(chat: &mut Chat, run_id: RunId, call_id: &str, result: &CallResult) {
+/// or as a new message when the conversation moved on since, and onto the call's operation. A
+/// wait on the call is done and its answer goes on, in the same change. A result the chain
+/// already holds is not appended again: `false` then.
+fn append_call_result(
+    chat: &mut Chat,
+    run_id: RunId,
+    call_id: &str,
+    result: &ModelVisibleResult,
+    is_reentered: bool,
+) -> bool {
+    // Only a Run that suspended has waits.
+    if chat.releases.contains_key(&run_id) {
+        chat.bookkeeping.lifecycle.resume_after(run_id, call_id);
+    }
+    if is_reentered && has_result_on_chain(&chat.snapshot, run_id, call_id) {
+        return false;
+    }
     let block = Content::ToolResult {
         tool_use_id: call_id.into(),
         content: result.content.clone(),
@@ -409,6 +416,19 @@ fn append_call_result(chat: &mut Chat, run_id: RunId, call_id: &str, result: &Ca
     {
         operation.result = Some(result.tool.clone());
     }
+    true
+}
+
+fn has_result_on_chain(snapshot: &ChatSnapshot, run_id: RunId, call_id: &str) -> bool {
+    snapshot
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| snapshot.message_runs.get(index) == Some(&run_id))
+        .flat_map(|(_, message)| &message.content)
+        .any(|content| {
+            matches!(content, Content::ToolResult { tool_use_id, .. } if tool_use_id == call_id)
+        })
 }
 
 /// The calls an assistant message makes, in order.
@@ -443,7 +463,7 @@ fn run_call_ids(snapshot: &ChatSnapshot, run_id: RunId) -> HashSet<String> {
 /// The batch of the Run's assistant message with canonical id `assistant_message` on the current
 /// chain, and the position of `call_id` in it. Compaction may give kept
 /// messages new ids; the canonical id is the earliest source id, which it keeps.
-fn locate_batch_call(
+pub(crate) fn locate_batch_call(
     snapshot: &ChatSnapshot,
     run_id: RunId,
     assistant_message: Uuid,
@@ -473,7 +493,14 @@ fn locate_batch_call(
         .get(&index)
         .copied()
         .unwrap_or(assistant_message);
-    Ok((ToolBatch { message_id, calls }, start))
+    Ok((
+        ToolBatch {
+            message_id,
+            calls,
+            is_reentered: true,
+        },
+        start,
+    ))
 }
 
 #[cfg(test)]

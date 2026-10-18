@@ -18,6 +18,7 @@ pub(super) fn clear_run_state(chat: &mut Chat, run: RunId) {
         chat.active_run = None;
     }
     chat.parked.remove(&run);
+    chat.releases.remove(&run);
     chat.ready_runs.retain(|id| *id != run);
 }
 
@@ -48,6 +49,9 @@ impl Agent {
         ))
         .catch_unwind()
         .await;
+        if self.leave_if_released(&receipt).await {
+            return None;
+        }
         let internal_failure = execution.is_err();
         let result = execution.unwrap_or_else(|_| Err(INTERNAL_RUN_ERROR.into()));
         if internal_failure {

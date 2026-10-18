@@ -46,6 +46,7 @@ fn opened_with_models(state: &Path, models: Arc<ChosenModels>) -> Agent {
             host: tickloop_agent_protocol::AgentHostOptions::embedded_defaults(),
             tools: crate::ToolPolicy::local(),
             host_rules: Vec::new(),
+            waits: crate::WaitHosting::Process,
         },
     )
     .unwrap()

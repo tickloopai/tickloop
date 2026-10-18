@@ -6,7 +6,8 @@ use uuid::Uuid;
 use tickloop_agent_protocol::{
     AgentMessageSource, DelegationMetadata, DirectedHumanSource, FamilyCompletion,
     FamilyInputRecord, Message, ModelIdentity, MonitorMembership, OriginalUserInput,
-    PrivateHistorySource, Role, SubagentRegistration, ToolCallRecovery, Usage,
+    PrivateHistorySource, QuestionRequest, Role, SubagentRegistration, ToolCallRecovery,
+    ToolResult, ToolResultContent, Usage,
 };
 
 /// Transcript 中的一行。未知类型原样跳过，保证旧版本能读取新版本写入的文件。
@@ -37,6 +38,8 @@ pub enum Line {
     Response(ResponseEntry),
     /// The input ledger; the latest record of an input id wins.
     Input(InputEntry),
+    /// A Run's durable wait; the latest record of a wait id wins.
+    Wait(WaitEntry),
     #[serde(other)]
     Unknown,
 }
@@ -65,6 +68,7 @@ pub enum MetadataKind {
     ContentReplacement,
     Response,
     Input,
+    Wait,
     #[serde(other)]
     Other,
 }
@@ -132,6 +136,7 @@ impl Line {
             Self::ContentReplacement(_) => MetadataKind::ContentReplacement,
             Self::Response(_) => MetadataKind::Response,
             Self::Input(_) => MetadataKind::Input,
+            Self::Wait(_) => MetadataKind::Wait,
             Self::Unknown => MetadataKind::Other,
         }
     }
@@ -533,7 +538,19 @@ pub struct ResponseEntry {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ResponseState {
     Started,
-    Ended { ending: ResponseEnding },
+    /// Its Run waits durably: a [`WaitEntry`] of the answer says on what and where it continues.
+    Suspended,
+    /// Its Run continued after a wait, in the change that put the wait's result on the chain.
+    Resumed,
+    Ended {
+        ending: ResponseEnding,
+    },
+}
+
+impl ResponseState {
+    pub fn is_ended(&self) -> bool {
+        matches!(self, Self::Ended { .. })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -551,6 +568,8 @@ pub enum InterruptedBy {
     User,
     /// The host went away, as on shutdown or a crash; the input may be continued.
     Host,
+    /// A voluntary handover's host ended it at its ceiling; the input may be continued.
+    Handover,
 }
 
 /// One ledger record of an input. Every record repeats what was accepted, so the latest record
@@ -584,6 +603,8 @@ pub enum InputOp {
     ReplacePrompt,
     /// Another answer to the prompt of an earlier answer, as its sibling.
     RegenerateAnswer,
+    /// The user's reply to a question a Run waits on; it joins that Run.
+    Answer,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -623,6 +644,92 @@ pub enum DiscardReason {
     LoopEnded,
     /// Its Loop was stopped while it waited.
     Stopped,
+}
+
+/// A Run's durable wait: a point in the Run that only an outside event ends, and where the Run
+/// continues once it ends.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitEntry {
+    /// A question's wait id is its request id.
+    pub wait_id: Uuid,
+    pub chat_id: Uuid,
+    pub loop_id: Uuid,
+    pub run_id: Uuid,
+    pub response_id: Uuid,
+    pub kind: WaitKind,
+    pub resume: ResumePoint,
+    pub timestamp: String,
+    pub state: WaitState,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum WaitKind {
+    /// An `AskUserQuestion` call waits for the user's reply.
+    #[serde(rename_all = "camelCase")]
+    Question {
+        request: QuestionRequest,
+        /// The call's operation, which a rebuilt Run restores so a cancellation reads as it would
+        /// have in the process that asked.
+        operation_id: Uuid,
+    },
+}
+
+/// Where a Run continues.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ResumePoint {
+    /// In the tool batch of the assistant message whose canonical (earliest source) id is
+    /// `assistant_message`, at its call `call_id`; the calls after it run next, then the end of
+    /// the batch. Re-entry fails when the loaded chain does not hold that message.
+    #[serde(rename_all = "camelCase")]
+    InBatch {
+        assistant_message: Uuid,
+        call_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum WaitState {
+    Open,
+    /// The wait ended with `result`, which is not on the chain yet; `by_input` is the ledger input
+    /// that ended it.
+    #[serde(rename_all = "camelCase")]
+    Resolved {
+        result: ModelVisibleResult,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by_input: Option<Uuid>,
+    },
+    /// The result is on the chain, written in the same change as the answer's `Resumed`.
+    Appended,
+    Abandoned {
+        reason: AbandonReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AbandonReason {
+    /// The Run was interrupted, stopped or failed while it waited.
+    Interrupted,
+    /// The host that held the Run went away and its successor does not rebuild waits.
+    HostLost,
+}
+
+/// A call's result as the conversation records it, decided when the wait on the call ends.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelVisibleResult {
+    /// The tool's own result, which its operation record and `ToolCompleted` carry.
+    pub tool: ToolResult,
+    /// What the model sees: the tool's text with any approval comment, then its images.
+    pub content: ToolResultContent,
+    /// The Run ends after this result, as it does after a bare user denial, a stopped foreground
+    /// command or a declined question.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ends_run: bool,
 }
 
 #[cfg(test)]
@@ -732,6 +839,30 @@ mod tests {
                 run_id: Uuid::nil(),
                 timestamp: "2026-01-01T00:00:00.000Z".into(),
                 state: InputState::Accepted,
+            }),
+            Line::Wait(WaitEntry {
+                wait_id: Uuid::nil(),
+                chat_id,
+                loop_id: Uuid::nil(),
+                run_id: Uuid::nil(),
+                response_id: Uuid::nil(),
+                kind: WaitKind::Question {
+                    request: QuestionRequest {
+                        id: Uuid::nil(),
+                        chat_id,
+                        loop_id: Uuid::nil(),
+                        run_id: Uuid::nil(),
+                        call_id: "call".into(),
+                        questions: Vec::new(),
+                    },
+                    operation_id: Uuid::nil(),
+                },
+                resume: ResumePoint::InBatch {
+                    assistant_message: Uuid::nil(),
+                    call_id: "call".into(),
+                },
+                timestamp: "2026-01-01T00:00:00.000Z".into(),
+                state: WaitState::Open,
             }),
         ];
         for line in lines {

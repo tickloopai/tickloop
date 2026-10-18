@@ -265,6 +265,7 @@ impl Agent {
                 active: Some(tokio_util::sync::CancellationToken::new()),
                 active_run: None,
                 parked: Default::default(),
+                releases: Default::default(),
                 ready_runs: Default::default(),
                 client,
                 pending_client: None,

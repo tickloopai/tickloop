@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use super::AgentError;
 use tickloop_agent_model::validate_model_for_resume_in_root;
 use tickloop_agent_protocol::projection;
@@ -50,6 +52,22 @@ pub(super) fn close_dangling_tool_calls(
     snapshot: &mut ChatSnapshot,
     only_run: Option<RunId>,
 ) -> Result<(), AgentError> {
+    close_calls(snapshot, only_run, &HashSet::new())
+}
+
+/// Closes the dangling calls of every Run except those in `kept`, whose Runs are rebuilt.
+pub(super) fn close_dangling_tool_calls_except(
+    snapshot: &mut ChatSnapshot,
+    kept: &HashSet<RunId>,
+) -> Result<(), AgentError> {
+    close_calls(snapshot, None, kept)
+}
+
+fn close_calls(
+    snapshot: &mut ChatSnapshot,
+    only_run: Option<RunId>,
+    kept: &HashSet<RunId>,
+) -> Result<(), AgentError> {
     for operation in &mut snapshot.operations {
         if only_run.is_none_or(|run| operation.run_id == run)
             && operation.name == ASK_USER_QUESTION_TOOL_NAME
@@ -77,10 +95,11 @@ pub(super) fn close_dangling_tool_calls(
     let calls = projection::history_calls(snapshot)?;
     let mut groups: std::collections::BTreeMap<Option<RunId>, Vec<Content>> =
         std::collections::BTreeMap::new();
-    for call in calls
-        .into_iter()
-        .filter(|call| call.result.is_none() && only_run.is_none_or(|run| call.run_id == Some(run)))
-    {
+    for call in calls.into_iter().filter(|call| {
+        call.result.is_none()
+            && only_run.is_none_or(|run| call.run_id == Some(run))
+            && call.run_id.is_none_or(|run| !kept.contains(&run))
+    }) {
         let matching = snapshot
             .operations
             .iter()

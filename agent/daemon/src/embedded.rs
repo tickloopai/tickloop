@@ -26,7 +26,9 @@ use tickloop_agent_protocol::{
     TaskNotification, TaskOrigin, TaskRef, TranscriptRef, UserInput, UserShellRecord,
     bounded_update,
 };
-use tickloop_agent_runtime::{Agent, ShellTaskCenter};
+use tickloop_agent_runtime::{
+    Agent, Delivery, QuestionReply, ShellTaskCenter, TurnOp, TurnRequest,
+};
 
 #[derive(Clone)]
 pub struct EmbeddedAgentAccess {
@@ -778,9 +780,12 @@ impl EmbeddedAgentAccess {
                     .await?;
                 let chat = self.chat(request.execution).await?;
                 if let Err(error) = self
-                    .inner
-                    .agent
-                    .answer_question(chat, request.request_id, answers)
+                    .reply_to_question(
+                        chat,
+                        envelope.command_id,
+                        request.request_id,
+                        QuestionReply::Answered(answers),
+                    )
                     .await
                 {
                     self.release_answer(request).await;
@@ -793,9 +798,12 @@ impl EmbeddedAgentAccess {
                     .await?;
                 let chat = self.chat(request.execution).await?;
                 if let Err(error) = self
-                    .inner
-                    .agent
-                    .decline_question(chat, request.request_id)
+                    .reply_to_question(
+                        chat,
+                        envelope.command_id,
+                        request.request_id,
+                        QuestionReply::Declined,
+                    )
                     .await
                 {
                     self.release_answer(request).await;
@@ -886,6 +894,30 @@ impl EmbeddedAgentAccess {
                 "only the Agent daemon replaces its Tickhost",
             )),
         }
+    }
+
+    /// A reply to a question is a ledger input under the command's id, so a repeated command
+    /// replies once.
+    async fn reply_to_question(
+        &self,
+        chat: Uuid,
+        command_id: Uuid,
+        request: Uuid,
+        reply: QuestionReply,
+    ) -> Result<(), tickloop_agent_runtime::AgentError> {
+        self.inner
+            .agent
+            .advance(
+                chat,
+                TurnRequest {
+                    input_id: command_id,
+                    op: TurnOp::Answer { request, reply },
+                    delivery: Delivery::Queue,
+                    host_context: None,
+                },
+            )
+            .await
+            .map(|_| ())
     }
 
     async fn claim_answer(

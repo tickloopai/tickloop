@@ -394,6 +394,7 @@ mod channel {
                             host: AgentHostOptions::embedded_defaults(),
                             tools: ToolPolicy::local(),
                             host_rules: Vec::new(),
+                            waits: tickloop_agent_runtime::WaitHosting::Process,
                         },
                     )
                     .map_err(|error| AccessError::unavailable(error.to_string()))?;

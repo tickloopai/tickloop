@@ -1,10 +1,10 @@
-//! A Chat's answer lifecycle records and input ledger.
+//! A Chat's answer lifecycle records, input ledger and durable waits.
 //!
-//! Both live in the Chat's bookkeeping and change in the same snapshot change as the work they
+//! They live in the Chat's bookkeeping and change in the same snapshot change as the work they
 //! describe; the recorder writes every record whose revision it has not written yet, after the
 //! chain entries of the same batch.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 use tickloop_agent_base::private_fs::unix_time_milliseconds;
@@ -16,8 +16,9 @@ use uuid::Uuid;
 
 use crate::{Agent, AgentError, Chat};
 use tickloop_agent_transcript::{
-    InputEntry, InputOp, InputState, InterruptedBy, Line, ResponseEnding, ResponseEntry,
-    ResponseState, SettledOutcome,
+    AbandonReason, InputEntry, InputOp, InputState, InterruptedBy, Line, ModelVisibleResult,
+    ResponseEnding, ResponseEntry, ResponseState, ResumePoint, SettledOutcome, WaitEntry, WaitKind,
+    WaitState,
 };
 
 /// A ledger input a submission carries: its id, operation and payload digest.
@@ -80,6 +81,7 @@ struct ActiveResponse {
 pub(crate) struct Lifecycle {
     inputs: BTreeMap<InputId, Revised<InputEntry>>,
     responses: BTreeMap<ResponseId, Revised<ResponseEntry>>,
+    waits: BTreeMap<Uuid, Revised<WaitEntry>>,
     /// Accepted inputs that have not settled, by the Run of their receipt.
     open_inputs: HashMap<RunId, InputId>,
     /// Started responses by Run.
@@ -172,6 +174,31 @@ impl Lifecycle {
             input.revision = revision;
         }
         true
+    }
+
+    /// Records the ledger input `input` of a reply that ended a wait of the Run `into`, settled
+    /// as merged into it from the start: the reply has no Run of its own, so `receipt`'s Run is
+    /// only its identity.
+    pub(crate) fn record_merged(&mut self, input: &LedgerInput, receipt: &Receipt, into: RunId) {
+        let revision = self.next_revision();
+        self.inputs.insert(
+            input.id,
+            Revised {
+                record: InputEntry {
+                    input_id: input.id,
+                    op: input.op,
+                    digest: input.digest.clone(),
+                    display_parent: input.display_parent,
+                    loop_id: receipt.loop_id,
+                    run_id: receipt.run_id,
+                    timestamp: now(),
+                    state: InputState::Settled {
+                        outcome: SettledOutcome::Merged { into },
+                    },
+                },
+                revision,
+            },
+        );
     }
 
     /// The input of `run` the ledger still has open.
@@ -291,12 +318,182 @@ impl Lifecycle {
         let without_messages = !message_responses
             .values()
             .any(|response| *response == active.response_id);
+        let abandoned = match &ending {
+            ResponseEnding::Interrupted {
+                by: InterruptedBy::Handover,
+            } => None,
+            ResponseEnding::Interrupted {
+                by: InterruptedBy::Host,
+            } => Some(AbandonReason::HostLost),
+            _ => Some(AbandonReason::Interrupted),
+        };
         let response = self.responses.get_mut(&active.response_id)?;
         response.record.state = ResponseState::Ended { ending };
         response.record.without_messages = without_messages;
         response.record.timestamp = now();
         response.revision = revision;
-        Some(response.record.clone())
+        let ended = response.record.clone();
+        if let Some(reason) = abandoned {
+            self.abandon_waits(active.response_id, reason);
+        }
+        Some(ended)
+    }
+
+    /// Starts a durable wait of `receipt`'s Run: its answer is suspended until the wait ends.
+    /// `None` when the Run has no started answer.
+    pub(crate) fn suspend(
+        &mut self,
+        receipt: &Receipt,
+        kind: WaitKind,
+        resume: ResumePoint,
+    ) -> Option<Uuid> {
+        let response_id = self.active.get(&receipt.run_id)?.response_id;
+        let wait_id = match &kind {
+            WaitKind::Question { request, .. } => request.id,
+        };
+        let revision = self.next_revision();
+        let response = self.responses.get_mut(&response_id)?;
+        response.record.state = ResponseState::Suspended;
+        response.record.timestamp = now();
+        response.revision = revision;
+        let revision = self.next_revision();
+        self.waits.insert(
+            wait_id,
+            Revised {
+                record: WaitEntry {
+                    wait_id,
+                    chat_id: receipt.chat_id,
+                    loop_id: receipt.loop_id,
+                    run_id: receipt.run_id,
+                    response_id,
+                    kind,
+                    resume,
+                    timestamp: now(),
+                    state: WaitState::Open,
+                },
+                revision,
+            },
+        );
+        Some(wait_id)
+    }
+
+    pub(crate) fn wait(&self, id: Uuid) -> Option<&WaitEntry> {
+        self.waits.get(&id).map(|wait| &wait.record)
+    }
+
+    /// Ends the open wait `id` with `result`, decided now; the answer stays suspended until the
+    /// result is on the chain. `false` when the wait is not open.
+    pub(crate) fn resolve_wait(
+        &mut self,
+        id: Uuid,
+        result: ModelVisibleResult,
+        by_input: Option<Uuid>,
+    ) -> bool {
+        let revision = self.next_revision();
+        let Some(wait) = self
+            .waits
+            .get_mut(&id)
+            .filter(|wait| matches!(wait.record.state, WaitState::Open))
+        else {
+            return false;
+        };
+        wait.record.state = WaitState::Resolved { result, by_input };
+        wait.record.timestamp = now();
+        wait.revision = revision;
+        true
+    }
+
+    /// The result of the call `call_id` of `run` is on the chain: a wait on that call is done and
+    /// its answer goes on, in the same change. A wait no reply ended was interrupted: its call
+    /// reports the error it ended in. `false` when no wait of the Run is on that call.
+    pub(crate) fn resume_after(&mut self, run: RunId, call_id: &str) -> bool {
+        let Some(wait_id) = self
+            .waits
+            .values()
+            .find(|wait| {
+                wait.record.run_id == run
+                    && matches!(wait.record.state, WaitState::Open | WaitState::Resolved { .. })
+                    && matches!(&wait.record.resume, ResumePoint::InBatch { call_id: waited, .. } if waited == call_id)
+            })
+            .map(|wait| wait.record.wait_id)
+        else {
+            return false;
+        };
+        let revision = self.next_revision();
+        let wait = self.waits.get_mut(&wait_id).unwrap();
+        wait.record.state = match wait.record.state {
+            WaitState::Open => WaitState::Abandoned {
+                reason: AbandonReason::Interrupted,
+            },
+            _ => WaitState::Appended,
+        };
+        wait.record.timestamp = now();
+        wait.revision = revision;
+        let response_id = wait.record.response_id;
+        let revision = self.next_revision();
+        if let Some(response) = self
+            .responses
+            .get_mut(&response_id)
+            .filter(|response| response.record.state == ResponseState::Suspended)
+        {
+            response.record.state = ResponseState::Resumed;
+            response.record.timestamp = now();
+            response.revision = revision;
+        }
+        true
+    }
+
+    fn abandon_waits(&mut self, response_id: ResponseId, reason: AbandonReason) {
+        let open = self
+            .waits
+            .values()
+            .filter(|wait| {
+                wait.record.response_id == response_id
+                    && matches!(
+                        wait.record.state,
+                        WaitState::Open | WaitState::Resolved { .. }
+                    )
+            })
+            .map(|wait| wait.record.wait_id)
+            .collect::<Vec<_>>();
+        for id in open {
+            let revision = self.next_revision();
+            let wait = self.waits.get_mut(&id).unwrap();
+            wait.record.state = WaitState::Abandoned { reason };
+            wait.record.timestamp = now();
+            wait.revision = revision;
+        }
+    }
+
+    /// The waits of suspended answers that have not ended, in the order they began.
+    pub(crate) fn suspended_waits(&self) -> Vec<WaitEntry> {
+        let mut waits = self
+            .waits
+            .values()
+            .filter(|wait| {
+                matches!(
+                    wait.record.state,
+                    WaitState::Open | WaitState::Resolved { .. }
+                ) && self
+                    .responses
+                    .get(&wait.record.response_id)
+                    .is_some_and(|response| response.record.state == ResponseState::Suspended)
+            })
+            .collect::<Vec<_>>();
+        waits.sort_by_key(|wait| wait.revision);
+        waits.into_iter().map(|wait| wait.record.clone()).collect()
+    }
+
+    /// A suspended answer restored from its records goes on in this instance: the messages its
+    /// Run appends from `next_message` on belong to it.
+    pub(crate) fn reactivate(&mut self, run: RunId, response_id: ResponseId, next_message: usize) {
+        self.active.insert(
+            run,
+            ActiveResponse {
+                response_id,
+                next_message,
+            },
+        );
     }
 
     /// The conversation was cut: the answer started last is no longer on it.
@@ -360,6 +557,12 @@ impl Lifecycle {
                     .values()
                     .filter(|response| response.revision > written)
                     .map(|response| (response.revision, Line::Response(response.record.clone()))),
+            )
+            .chain(
+                self.waits
+                    .values()
+                    .filter(|wait| wait.revision > written)
+                    .map(|wait| (wait.revision, Line::Wait(wait.record.clone()))),
             )
             .collect::<Vec<_>>();
         lines.sort_by_key(|(revision, _)| *revision);
@@ -440,26 +643,41 @@ impl Lifecycle {
                         },
                     );
                 }
+                Line::Wait(entry) => {
+                    lifecycle.waits.insert(
+                        entry.wait_id,
+                        Revised {
+                            record: entry.clone(),
+                            revision,
+                        },
+                    );
+                }
                 _ => {}
             }
         }
         lifecycle
     }
 
-    /// After a load: an answer that started and never ended lost its host. Then the answer
-    /// without messages that hangs where the loaded chain ends, if any, is its display leaf.
+    /// After a load: an answer that never ended lost its host, unless it is a suspended answer
+    /// in `rebuilt`, which goes on in this instance; the waits of the lost ones are abandoned.
+    /// Then the answer without messages that hangs where the loaded chain ends, if any, is its
+    /// display leaf.
     pub(crate) fn settle_after_load(
         &mut self,
         snapshot: &ChatSnapshot,
         message_responses: &BTreeMap<usize, ResponseId>,
+        rebuilt: &HashSet<ResponseId>,
     ) {
         let orphaned = self
             .responses
             .values()
-            .filter(|response| response.record.state == ResponseState::Started)
+            .filter(|response| {
+                !response.record.state.is_ended() && !rebuilt.contains(&response.record.response_id)
+            })
             .map(|response| response.record.response_id)
             .collect::<Vec<_>>();
         for id in &orphaned {
+            self.abandon_waits(*id, AbandonReason::HostLost);
             let revision = self.next_revision();
             let response = self.responses.get_mut(id).unwrap();
             response.record.state = ResponseState::Ended {

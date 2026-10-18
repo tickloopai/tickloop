@@ -29,8 +29,17 @@ pub(super) fn can_trigger(goal: &LoopSnapshot) -> bool {
 /// Loop 进入一个新进程（重启恢复、`--fork-session` 或 Branch 复制）时的恢复规则：运行或等待中的 Loop 转为
 /// 已中断；过期的 Trigger 标为已过期；武装中的 Trigger 解除武装，记入手动恢复时重新武装。
 pub(super) fn recover_loops(snapshot: &mut ChatSnapshot) {
+    recover_loops_keeping(snapshot, &HashSet::new());
+}
+
+/// [`recover_loops`], except that the Loops in `kept` keep their state: their Runs are rebuilt.
+pub(super) fn recover_loops_keeping(snapshot: &mut ChatSnapshot, kept: &HashSet<LoopId>) {
     recover_triggers(snapshot);
-    for goal in &mut snapshot.loops {
+    for goal in snapshot
+        .loops
+        .iter_mut()
+        .filter(|goal| !kept.contains(&goal.id))
+    {
         if !goal.event_sources.is_empty() {
             for source in &mut goal.event_sources {
                 source.resume_required = true;
