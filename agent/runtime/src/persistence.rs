@@ -2838,6 +2838,10 @@ enum RestoreTarget {
 }
 
 #[cfg(test)]
+#[path = "transcript_replay_tests.rs"]
+mod transcript_replay_tests;
+
+#[cfg(test)]
 mod history_tests {
     use super::*;
 

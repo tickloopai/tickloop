@@ -1722,7 +1722,11 @@ impl HostToolProvider for McpHostToolProvider {
         } else {
             format!("Call {name} at {}", credential.origin)
         };
-        let approval_input = Self::approval_input(input)?;
+        let approval_input = if name == ARTIFACT_EDIT_TOOL {
+            input.clone()
+        } else {
+            Self::approval_input(input)?
+        };
         let facts = tickloop_agent_protocol::PreparedApprovalFacts {
             artifact_publication: publication.clone(),
             normalized_input: approval_input.clone(),
