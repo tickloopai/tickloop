@@ -1549,3 +1549,41 @@ async fn concurrent_duplicates_of_a_lost_answer_continue_it_once() {
     next.shutdown().await;
     first.shutdown().await;
 }
+
+/// A provider may number calls from the start again in a new attempt. A call id the lost attempt
+/// already used fails the continued attempt instead of repeating a call within the Run, which
+/// would leave the Chat's conversation invalid.
+#[tokio::test]
+async fn a_continued_answer_reusing_a_call_id_of_its_lost_attempt_fails_and_the_chat_stays_usable()
+{
+    let fixture = fixture();
+    std::fs::write(fixture.folder.join("notes.txt"), "the notes").unwrap();
+    let read_notes = || call("read", "Read", json!({"file_path": "notes.txt"}));
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = Script::new(vec![Step::Reply(read_notes()), Step::Hang]);
+    let first = agent(store.clone(), model.clone());
+    let chat = first.create_chat(fixture.folder.clone()).await.unwrap();
+    let request = after_leaf("summarize my notes");
+    first.advance(chat, request.clone()).await.unwrap();
+    model.until_holding().await;
+    first.sync().await.unwrap();
+    let crashed = Arc::new(InMemoryTranscriptStore::new());
+    crashed.seed(chat, store.lines(chat), StorePosition(1));
+
+    let model = Script::new(vec![
+        Step::Reply(read_notes()),
+        Step::Reply(text("a later answer")),
+    ]);
+    let next = agent(crashed.clone(), model.clone());
+    let continued = next.advance(chat, request).await.unwrap();
+    match outcome(&continued).await {
+        TurnOutcome::Failed { error } => assert!(error.contains("repeated tool call"), "{error}"),
+        other => panic!("{other:?}"),
+    }
+    let snapshot = next.snapshot(chat).await.unwrap();
+    tickloop_agent_protocol::projection::history_calls(&snapshot)
+        .expect("the conversation stays valid");
+    complete(&next, chat, after_leaf("try again")).await;
+    next.shutdown().await;
+    first.shutdown().await;
+}

@@ -5,7 +5,7 @@ use tickloop_agent_model::ModelRequest;
 use tickloop_agent_protocol::{EventKind, LoopState, Receipt, RequestFailure, RunId};
 use tokio_util::sync::CancellationToken;
 
-use super::{Agent, Chat, LoopSnapshotExt, recovery};
+use super::{Agent, Chat, LoopSnapshotExt, RunStart, recovery};
 use tickloop_agent_transcript::ResponseEnding;
 
 const INTERNAL_RUN_ERROR: &str = "Agent internal error: execution panicked. The run stopped without automatically retrying. Review any operations with unknown outcomes before continuing.";
@@ -35,14 +35,14 @@ impl Agent {
     pub(super) async fn run(
         &self,
         receipt: Receipt,
-        request: ModelRequest,
+        start: impl Into<RunStart>,
         cancel: CancellationToken,
     ) -> Option<(Receipt, ModelRequest, CancellationToken)> {
         let mut is_awaiting_model = true;
         // Drop execution and its guards before reconciling shared state; panic payloads may contain secrets.
         let execution = AssertUnwindSafe(self.execute_run(
             receipt.clone(),
-            request,
+            start.into(),
             cancel.clone(),
             &mut is_awaiting_model,
         ))
