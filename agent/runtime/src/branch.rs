@@ -284,6 +284,7 @@ impl Agent {
                 user_cancelled_runs: std::collections::HashSet::new(),
                 output_style,
                 auto_denials: super::auto_mode::DenialTracking::default(),
+                branch_reservation: None,
                 denial_window: super::denials::DenialWindow::default(),
             },
         );

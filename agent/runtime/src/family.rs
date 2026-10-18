@@ -473,6 +473,7 @@ pub(super) struct ContextSubmission {
     pub directed_source: Option<DirectedHumanSource>,
     pub target_generation: Option<u64>,
     pub ledger: Option<crate::lifecycle::LedgerInput>,
+    pub turn: crate::TurnAdmission,
 }
 
 impl Agent {
@@ -552,6 +553,7 @@ impl Agent {
             directed_source: Some(source),
             target_generation: Some(target_generation),
             ledger: None,
+            turn: Default::default(),
         })
         .await
     }

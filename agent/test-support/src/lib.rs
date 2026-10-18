@@ -1,8 +1,9 @@
 //! Test code shared by the Agent crates' unit and integration tests: a scripted model with its
-//! replies, runtime events, Transcript files and stores, PTY screens, a terminal's kitty keyboard flags,
-//! transport limits and model HTTP servers. Helpers that only one crate's tests use stay in that
-//! crate.
+//! replies, runtime events, Transcript files and stores, a reference stateless host with its
+//! Event Stream, PTY screens, a terminal's kitty keyboard flags, transport limits and model HTTP
+//! servers. Helpers that only one crate's tests use stay in that crate.
 
+pub mod event_stream;
 pub mod harness;
 pub mod input_dialog;
 pub mod kitty_keyboard;
@@ -10,6 +11,7 @@ pub mod legacy_models;
 pub mod model_http_support;
 pub mod routed;
 pub mod screen;
+pub mod stateless_host;
 pub mod transcripts;
 
 use async_trait::async_trait;

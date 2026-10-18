@@ -69,6 +69,11 @@ impl CompactionLayout {
         let rewrites_existing = !self.keeps_existing_prefix(snapshot.messages.len());
         let mut compacted = snapshot.clone();
         let mut compacted_bookkeeping = bookkeeping.clone();
+        compacted_bookkeeping.lifecycle.remember_compacted_leaf(
+            bookkeeping
+                .lifecycle
+                .display_leaf(snapshot, &bookkeeping.message_responses),
+        );
         compacted.messages = Vec::with_capacity(self.sources.len());
         compacted.message_runs = BTreeMap::new();
         compacted.message_contexts = BTreeMap::new();

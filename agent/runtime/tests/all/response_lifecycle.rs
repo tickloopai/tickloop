@@ -9,9 +9,9 @@ use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use tickloop_agent_base::image::prepare;
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
-    AgentHostOptions, ChatId, Content, DirectedSummaryRequest, Event, EventKind, ImageContext,
-    ImageOrigin, InputContext, LoopState, Message, ModelIdentity, Protocol, RewindMode, Role,
-    SummaryDirection, Trigger, TriggerPromptSource, Usage,
+    AgentHostOptions, ChatId, Content, DirectedSummaryRequest, Event, EventKind, HostCallContext,
+    ImageContext, ImageOrigin, InputContext, LoopState, Message, ModelIdentity, Protocol, Receipt,
+    RewindMode, Role, SummaryDirection, Trigger, TriggerPromptSource, Usage,
 };
 use tickloop_agent_runtime::transcript::display::{
     DisplayBlock, DisplayKind, DisplayNode, DisplayProjector, DisplayStatus, project,
@@ -22,7 +22,8 @@ use tickloop_agent_runtime::transcript::{
     ResponseState, SettledOutcome, StorePosition, TranscriptStore,
 };
 use tickloop_agent_runtime::{
-    Agent, AgentError, HarnessOptions, HarnessSeams, ToolPolicy, environment::LocalEnvironment,
+    Agent, AgentError, Delivery, HarnessOptions, HarnessSeams, ParentSelection, ToolPolicy, TurnOp,
+    TurnRequest, UserMessage, environment::LocalEnvironment,
 };
 use tickloop_agent_test_support::transcripts::InMemoryTranscriptStore;
 use tickloop_agent_test_support::{call, config, next_event, text};
@@ -162,19 +163,53 @@ fn agent(store: Arc<dyn TranscriptStore>, model: Arc<dyn ModelClient>) -> Agent 
     .unwrap()
 }
 
-async fn submit(agent: &Agent, chat: ChatId, input: Uuid, goal: Option<Uuid>, prompt: &str) {
-    agent
-        .submit_with_input_id(
+/// Queues a prompt after the current leaf under the host's input id.
+#[allow(clippy::too_many_arguments)]
+async fn submit_input(
+    agent: &Agent,
+    chat: ChatId,
+    input: Uuid,
+    goal: Option<Uuid>,
+    text: String,
+    contexts: Vec<InputContext>,
+    paths: Vec<PathBuf>,
+    host_context: Option<HostCallContext>,
+) -> Result<Receipt, AgentError> {
+    let turn = agent
+        .advance(
             chat,
-            input,
-            goal,
-            prompt.into(),
-            Vec::new(),
-            Vec::new(),
-            None,
+            TurnRequest {
+                input_id: input,
+                op: TurnOp::Continue {
+                    after: ParentSelection::CurrentLeaf,
+                    target_loop: goal,
+                    message: UserMessage {
+                        text,
+                        contexts,
+                        paths,
+                    },
+                },
+                delivery: Delivery::Queue,
+                host_context,
+            },
         )
-        .await
-        .unwrap();
+        .await?;
+    Ok(turn.receipt().clone())
+}
+
+async fn submit(agent: &Agent, chat: ChatId, input: Uuid, goal: Option<Uuid>, prompt: &str) {
+    submit_input(
+        agent,
+        chat,
+        input,
+        goal,
+        prompt.into(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    )
+    .await
+    .unwrap();
 }
 
 async fn until_ended(
@@ -504,18 +539,18 @@ async fn an_input_settled_before_a_crash_is_not_run_again() {
     let model = StagedModel::new(Vec::new());
     let next = agent(store.clone(), model.clone());
     next.resume_chat(chat).await.unwrap();
-    let receipt = next
-        .submit_with_input_id(
-            chat,
-            input,
-            None,
-            "do it once".into(),
-            Vec::new(),
-            Vec::new(),
-            None,
-        )
-        .await
-        .unwrap();
+    let receipt = submit_input(
+        &next,
+        chat,
+        input,
+        None,
+        "do it once".into(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(receipt.run_id, original.entry.run_id);
     assert!(matches!(
         next.input_state(chat, input)
@@ -529,7 +564,8 @@ async fn an_input_settled_before_a_crash_is_not_run_again() {
         }
     ));
     assert!(matches!(
-        next.submit_with_input_id(
+        submit_input(
+            &next,
             chat,
             input,
             None,
@@ -746,18 +782,18 @@ async fn a_prompt_merged_at_a_tool_boundary_is_a_follow_up_inside_the_answer() {
     let state = agent.input_state(chat, first).await.unwrap().unwrap();
     let follow_up = Uuid::new_v4();
     let image = pasted_image(1);
-    agent
-        .submit_with_input_id(
-            chat,
-            follow_up,
-            Some(state.entry.loop_id),
-            "also mention the date".into(),
-            vec![image.clone()],
-            Vec::new(),
-            None,
-        )
-        .await
-        .unwrap();
+    submit_input(
+        &agent,
+        chat,
+        follow_up,
+        Some(state.entry.loop_id),
+        "also mention the date".into(),
+        vec![image.clone()],
+        Vec::new(),
+        None,
+    )
+    .await
+    .unwrap();
     model.release.notify_one();
     assert_eq!(
         agent.settled_input(chat, follow_up).await.unwrap(),
@@ -971,6 +1007,7 @@ async fn a_large_jsonl_tail_load_keeps_lifecycle_and_ledger_records() {
         state: ResponseState::Ended {
             ending: ResponseEnding::Completed,
         },
+        without_messages: false,
     };
     let big = Uuid::new_v4();
     let boundary = Uuid::new_v4();
@@ -1184,34 +1221,34 @@ async fn replaying_an_input_after_rewind_removed_its_loop_returns_its_receipt() 
             .all(|goal| goal.id != loop_id),
         "the rewind removed the Loop"
     );
-    let receipt = agent
-        .submit_with_input_id(
-            chat,
-            continued,
-            Some(loop_id),
-            "continue the loop".into(),
-            Vec::new(),
-            Vec::new(),
-            None,
-        )
-        .await
-        .unwrap();
+    let receipt = submit_input(
+        &agent,
+        chat,
+        continued,
+        Some(loop_id),
+        "continue the loop".into(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         (receipt.loop_id, receipt.run_id),
         (original.entry.loop_id, original.entry.run_id)
     );
     assert!(matches!(
-        agent
-            .submit_with_input_id(
-                chat,
-                continued,
-                Some(loop_id),
-                "another payload".into(),
-                Vec::new(),
-                Vec::new(),
-                None
-            )
-            .await,
+        submit_input(
+            &agent,
+            chat,
+            continued,
+            Some(loop_id),
+            "another payload".into(),
+            Vec::new(),
+            Vec::new(),
+            None
+        )
+        .await,
         Err(AgentError::Invalid(_))
     ));
     assert_eq!(model.requests(), 2);
@@ -1229,7 +1266,8 @@ async fn replaying_an_input_after_its_attachment_was_deleted_returns_its_receipt
     let chat = agent.create_chat(fixture.folder.clone()).await.unwrap();
     let input = Uuid::new_v4();
     let submit_attached = || {
-        agent.submit_with_input_id(
+        submit_input(
+            &agent,
             chat,
             input,
             None,
@@ -1349,7 +1387,8 @@ async fn an_input_queued_on_an_expiring_loop_settles_discarded_loop_ended() {
             }
         }
     );
-    next.submit_with_input_id(
+    submit_input(
+        &next,
         chat,
         queued,
         Some(loop_id),

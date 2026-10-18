@@ -165,6 +165,53 @@ pub(super) struct ChatLoad {
 /// Loop 条目记录的内容：完整状态与 run id。
 type LoopEntryContent = (LoopRecord, Option<RunId>);
 
+/// 之后的条目接在链上最后一个条目之后，包括叶子之后接回的尾随 Loop 条目（例如一轮回复
+/// 结束后写出的停止）；接在最后一条消息之后会让这些 Loop 条目脱离新链，已停止的 Loop 复活。
+/// 恢复时过滤掉的消息不作为父条目。
+fn adopted_parent_cursor(links: &[MessageLink], loaded: &LoadedTranscript) -> Option<Uuid> {
+    let kept_uuids = links
+        .iter()
+        .flat_map(|link| link.uuids.iter())
+        .collect::<HashSet<_>>();
+    loaded
+        .chain
+        .iter()
+        .rev()
+        .find(|entry| entry.is_loop_record() || kept_uuids.contains(&entry.uuid))
+        .map(|entry| entry.uuid)
+}
+
+/// The Loop records a restored chain already holds, with the plan state actually recorded, and
+/// the Loops it created.
+fn recorded_loop_entries(
+    snapshot: &ChatSnapshot,
+    bookkeeping: &ChatBookkeeping,
+    checkpoints: &[super::plan::PlanCheckpoint],
+) -> (HashMap<LoopId, LoopEntryContent>, HashSet<LoopId>) {
+    let recorded_plans = checkpoints
+        .iter()
+        .filter_map(|checkpoint| {
+            checkpoint
+                .plan_version
+                .map(|version| (checkpoint.loop_id, (version, checkpoint.approval_pending)))
+        })
+        .collect::<HashMap<_, _>>();
+    let records = snapshot
+        .loops
+        .iter()
+        .map(|goal| {
+            let (mut record, run) = loop_entry_content(snapshot, bookkeeping, goal);
+            record.plan_version = recorded_plans.get(&goal.id).map(|(version, _)| *version);
+            record.plan_approval_pending = recorded_plans
+                .get(&goal.id)
+                .is_some_and(|(_, pending)| *pending);
+            (goal.id, (record, run))
+        })
+        .collect();
+    let created = snapshot.loops.iter().map(|goal| goal.id).collect();
+    (records, created)
+}
+
 #[derive(Clone)]
 struct MessageLink {
     uuids: Vec<Uuid>,
@@ -892,6 +939,12 @@ impl ChatRecorder {
 
     fn enqueue_sync(&self, snapshot: &ChatSnapshot, bookkeeping: &ChatBookkeeping) {
         if let Some(lines) = self.sync_chat(snapshot, bookkeeping) {
+            self.outbox.set_display_leaf(
+                snapshot.id,
+                bookkeeping
+                    .lifecycle
+                    .display_leaf(snapshot, &bookkeeping.message_responses),
+            );
             self.outbox
                 .enqueue(snapshot.id, lines, Some(snapshot.last_sequence));
         }
@@ -1104,19 +1157,7 @@ impl ChatRecorder {
         meta_messages: HashSet<usize>,
         loaded: LoadedTranscript,
     ) {
-        // 之后的条目接在链上最后一个条目之后，包括叶子之后接回的尾随 Loop 条目（例如一轮回复
-        // 结束后写出的停止）；接在最后一条消息之后会让这些 Loop 条目脱离新链，已停止的 Loop 复活。
-        // 恢复时过滤掉的消息不作为父条目。
-        let kept_uuids = links
-            .iter()
-            .flat_map(|link| link.uuids.iter())
-            .collect::<HashSet<_>>();
-        let parent_cursor = loaded
-            .chain
-            .iter()
-            .rev()
-            .find(|entry| entry.is_loop_record() || kept_uuids.contains(&entry.uuid))
-            .map(|entry| entry.uuid);
+        let parent_cursor = adopted_parent_cursor(&links, &loaded);
         self.outbox
             .adopt(chat_id, loaded.position, loaded.uuids, loaded.metadata);
         self.logs.lock().unwrap().insert(
@@ -1168,6 +1209,30 @@ impl ChatRecorder {
             .copied()
     }
 
+    /// A staged branch replaces the Chat's conversation: later entries follow the branch's leaf,
+    /// what the store already holds of it is not written again, and Lines queued meanwhile stay
+    /// queued.
+    pub(super) fn adopt_branch(&self, chat_id: ChatId, log: StagedLog) {
+        self.outbox.remember_written(chat_id, log.uuids);
+        let mut logs = self.logs.lock().unwrap();
+        let last_entry_milliseconds = logs
+            .get(&chat_id)
+            .map_or(0, |log| log.last_entry_milliseconds);
+        logs.insert(
+            chat_id,
+            ChatLog {
+                links: log.links,
+                meta_messages: log.meta_messages,
+                parent_cursor: log.parent_cursor,
+                load_warnings: log.load_warnings,
+                last_entry_milliseconds,
+                recorded_loops: log.recorded_loops,
+                created_loops: log.created_loops,
+                recorded_lifecycle: log.recorded_lifecycle,
+            },
+        );
+    }
+
     /// The restored lifecycle and ledger records are already stored.
     fn adopt_lifecycle(&self, chat_id: ChatId, lifecycle: &super::lifecycle::Lifecycle) {
         if let Some(log) = self.logs.lock().unwrap().get_mut(&chat_id) {
@@ -1183,28 +1248,9 @@ impl ChatRecorder {
         bookkeeping: &ChatBookkeeping,
         checkpoints: &[super::plan::PlanCheckpoint],
     ) {
-        let recorded_plans = checkpoints
-            .iter()
-            .filter_map(|checkpoint| {
-                checkpoint
-                    .plan_version
-                    .map(|version| (checkpoint.loop_id, (version, checkpoint.approval_pending)))
-            })
-            .collect::<HashMap<_, _>>();
         if let Some(log) = self.logs.lock().unwrap().get_mut(&snapshot.id) {
-            log.recorded_loops = snapshot
-                .loops
-                .iter()
-                .map(|goal| {
-                    let (mut record, run) = loop_entry_content(snapshot, bookkeeping, goal);
-                    record.plan_version = recorded_plans.get(&goal.id).map(|(version, _)| *version);
-                    record.plan_approval_pending = recorded_plans
-                        .get(&goal.id)
-                        .is_some_and(|(_, pending)| *pending);
-                    (goal.id, (record, run))
-                })
-                .collect();
-            log.created_loops = snapshot.loops.iter().map(|goal| goal.id).collect();
+            (log.recorded_loops, log.created_loops) =
+                recorded_loop_entries(snapshot, bookkeeping, checkpoints);
         }
     }
 
@@ -1403,7 +1449,9 @@ fn chain_entry(
             .and_then(|contexts| serde_json::to_value(contexts).ok()),
         continues_message: false,
         subtype: boundary.map(|_| COMPACT_BOUNDARY_SUBTYPE.to_owned()),
-        compact_metadata: boundary.map(compact_metadata_entry),
+        compact_metadata: boundary.map(|boundary| {
+            compact_metadata_entry(boundary, bookkeeping.lifecycle.compacted_leaf())
+        }),
         is_compact_summary: summarize_metadata.is_some(),
         summarize_metadata: summarize_metadata.and_then(Option::as_ref).map(|metadata| {
             SummarizeMetadataEntry {
@@ -1589,8 +1637,12 @@ fn record_loop(
 }
 
 /// Tickloop 不写 `preservedSegment`（见 `ChatRecorder::compact`）；读取时仍兼容带区段的文件。
-fn compact_metadata_entry(boundary: &CompactBoundary) -> CompactMetadata {
+fn compact_metadata_entry(
+    boundary: &CompactBoundary,
+    display_leaf: Option<Uuid>,
+) -> CompactMetadata {
     CompactMetadata {
+        display_leaf,
         trigger: match boundary.trigger {
             CompactTrigger::Manual => CompactTriggerEntry::Manual,
             CompactTrigger::Auto => CompactTriggerEntry::Auto,
@@ -2135,6 +2187,13 @@ fn recover_transcript(
         ),
         ..ChatBookkeeping::default()
     };
+    bookkeeping.lifecycle.remember_compacted_leaf(
+        loaded
+            .chain
+            .iter()
+            .rev()
+            .find_map(|entry| entry.compact_metadata.as_ref()?.display_leaf),
+    );
     kept.fill_conversation(&mut snapshot, &mut bookkeeping);
     recover_snapshot_for_resume(snapshot, bookkeeping, kept.meta_messages.clone())
 }
@@ -2347,6 +2406,16 @@ fn is_unrecoverable_assistant(message: &Message, resolved: &HashSet<&str>) -> bo
             .all(|content| matches!(content, Content::Text { text } if text.trim().is_empty()))
 }
 
+/// The assistant sentinel recovery appends after a conversation that ends with a user message.
+pub(super) fn is_recovery_sentinel(message: &Message) -> bool {
+    message.role == Role::Assistant
+        && matches!(message.content.as_slice(), [Content::Text { text }] if text == NO_RESPONSE_REQUESTED)
+}
+
+fn no_store_to_switch() -> AgentError {
+    AgentError::Invalid("this Chat keeps no Transcript to select another branch from".into())
+}
+
 /// 照 Claude Code `deserializeMessagesWithInterruptDetection`：末尾是工具结果时先追加
 /// "从中断处继续"的 meta 消息；之后只要末尾是 user 消息，就追加不请求回复的哨兵。
 /// meta 消息不参与中断判定。
@@ -2476,6 +2545,28 @@ impl Agent {
     /// Every Line the store keeps of a recorded Chat.
     pub(super) async fn stored_lines(&self, chat_id: ChatId) -> Option<Vec<Line>> {
         self.inner.recorder.as_ref()?.stored_lines(chat_id).await
+    }
+
+    /// Every Line the store keeps of the Chat, read in full.
+    pub(super) async fn read_stored_lines(&self, chat_id: ChatId) -> Result<Vec<Line>, AgentError> {
+        let recorder = self
+            .inner
+            .recorder
+            .as_ref()
+            .ok_or_else(no_store_to_switch)?;
+        let stored = recorder
+            .load_stored(chat_id, LoadRange::Full)
+            .await?
+            .ok_or(AgentError::NotFound)?;
+        Ok(stored.retained.into_iter().chain(stored.lines).collect())
+    }
+
+    /// A newer holder owns this Harness's Chats: nothing more reaches their store.
+    pub(super) fn transcripts_fenced(&self) -> bool {
+        self.inner
+            .recorder
+            .as_ref()
+            .is_some_and(|recorder| recorder.outbox.is_fenced())
     }
 
     pub(super) fn record_artifact_ticks(
@@ -2939,37 +3030,20 @@ impl Agent {
         recorder.load_chat(chat_id, ChatLoad::default()).await
     }
 
-    async fn insert_restored_chat(
+    /// The conversation a loaded chain restores, before it joins this instance: what resuming a
+    /// Chat and selecting another of its branches share.
+    fn restore_conversation(
         &self,
         chat_id: ChatId,
-        loaded: LoadedTranscript,
-        target: RestoreTarget,
-    ) -> Result<ChatSnapshot, AgentError> {
-        let recorder = self.inner.recorder.as_ref().ok_or(AgentError::NotFound)?;
-        // 替换决定、文件回滚备份与元数据都属于写入这份 Transcript 的 Chat：恢复时是自己，以新 chatId 恢复时是源 Chat。
-        let source_chat_id = match &target {
-            RestoreTarget::Resume => chat_id,
-            RestoreTarget::NewChat { source } => *source,
-        };
-        let mut loaded = loaded;
-        let registrations = if chat_id == source_chat_id {
-            loaded
-                .metadata
-                .subagents
-                .as_ref()
-                .filter(|entry| entry.chat_id == chat_id)
-                .map(|entry| entry.subagents.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
+        loaded: &mut LoadedTranscript,
+        source_chat_id: ChatId,
+    ) -> Result<RestoredConversation, AgentError> {
         let (restored, execution_mode_warnings) = restore_chain(&loaded.chain);
         loaded.warnings.extend(execution_mode_warnings);
         let removed = unrecoverable_assistant_messages(&restored.messages);
         let mut recovered =
-            recover_transcript(chat_id, &loaded, &restored, &removed, source_chat_id)?;
-        let mut folder = recovered.snapshot.folder.clone();
+            recover_transcript(chat_id, loaded, &restored, &removed, source_chat_id)?;
+        let folder = recovered.snapshot.folder.clone();
         match (&folder, &self.inner.environment) {
             (Some(folder), Some(_)) => self.require_working_directory_trust(folder)?,
             (None, None) => {}
@@ -3002,13 +3076,119 @@ impl Agent {
             &recovered.snapshot,
             &replacement_records,
         );
-        let mut snapshot = recovered.snapshot;
         let mut bookkeeping = recovered.bookkeeping;
-        bookkeeping.restored_skill_names = snapshot
+        bookkeeping.restored_skill_names = recovered
+            .snapshot
             .invoked_skills
             .iter()
             .map(|skill| skill.name.clone())
             .collect();
+        Ok(RestoredConversation {
+            snapshot: recovered.snapshot,
+            bookkeeping,
+            links: restored.without(&removed).links,
+            meta_messages: recovered.meta_messages,
+            plan_checkpoints,
+            plans_directory,
+            folder,
+            content_replacements,
+            replacement_records,
+        })
+    }
+
+    /// Restores the stored chain that ends at the physical entry `leaf` beside the Chat in
+    /// memory, which stays in place until [`StagedBranch::install`]. Nothing is written.
+    pub(super) async fn stage_branch(
+        &self,
+        chat_id: ChatId,
+        leaf: Uuid,
+    ) -> Result<StagedBranch, AgentError> {
+        let recorder = self
+            .inner
+            .recorder
+            .as_ref()
+            .ok_or_else(no_store_to_switch)?;
+        let mut loaded = recorder
+            .load_chat(chat_id, ChatLoad { leaf: Some(leaf) })
+            .await?;
+        let RestoredConversation {
+            snapshot,
+            mut bookkeeping,
+            links,
+            meta_messages,
+            plan_checkpoints,
+            folder,
+            content_replacements,
+            ..
+        } = self.restore_conversation(chat_id, &mut loaded, chat_id)?;
+        let file_history = folder.as_deref().map(|folder| {
+            FileHistory::restore(
+                self.file_history_directory(chat_id, folder),
+                file_history_snapshots(&loaded),
+            )
+        });
+        let (recorded_loops, created_loops) =
+            recorded_loop_entries(&snapshot, &bookkeeping, &plan_checkpoints);
+        let recorded_lifecycle = bookkeeping.lifecycle.revision();
+        bookkeeping
+            .lifecycle
+            .settle_after_load(&snapshot, &bookkeeping.message_responses.clone());
+        let parent_cursor = adopted_parent_cursor(&links, &loaded);
+        Ok(StagedBranch {
+            snapshot,
+            bookkeeping,
+            content_replacements,
+            file_history,
+            leaf,
+            log: StagedLog {
+                links,
+                meta_messages,
+                parent_cursor,
+                load_warnings: loaded.warnings,
+                uuids: loaded.uuids,
+                recorded_loops,
+                created_loops,
+                recorded_lifecycle,
+            },
+        })
+    }
+
+    async fn insert_restored_chat(
+        &self,
+        chat_id: ChatId,
+        loaded: LoadedTranscript,
+        target: RestoreTarget,
+    ) -> Result<ChatSnapshot, AgentError> {
+        let recorder = self.inner.recorder.as_ref().ok_or(AgentError::NotFound)?;
+        // 替换决定、文件回滚备份与元数据都属于写入这份 Transcript 的 Chat：恢复时是自己，以新 chatId 恢复时是源 Chat。
+        let source_chat_id = match &target {
+            RestoreTarget::Resume => chat_id,
+            RestoreTarget::NewChat { source } => *source,
+        };
+        let mut loaded = loaded;
+        let registrations = if chat_id == source_chat_id {
+            loaded
+                .metadata
+                .subagents
+                .as_ref()
+                .filter(|entry| entry.chat_id == chat_id)
+                .map(|entry| entry.subagents.clone())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let RestoredConversation {
+            mut snapshot,
+            mut bookkeeping,
+            links,
+            meta_messages,
+            plan_checkpoints,
+            plans_directory,
+            mut folder,
+            content_replacements,
+            replacement_records,
+        } = self.restore_conversation(chat_id, &mut loaded, source_chat_id)?;
         // 与设置写入互斥到 Chat 加入本进程为止，期间写入的持久规则改动不会漏掉这个 Chat。
         let _settings_gate = self.inner.settings_writes.lock().await;
         let (client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
@@ -3040,12 +3220,7 @@ impl Agent {
         let mut denial_window = DenialWindow::default();
         match target {
             RestoreTarget::Resume => {
-                recorder.adopt(
-                    chat_id,
-                    restored.without(&removed).links,
-                    recovered.meta_messages,
-                    loaded,
-                );
+                recorder.adopt(chat_id, links, meta_messages, loaded);
                 recorder.adopt_restored_loops(&snapshot, &bookkeeping, &plan_checkpoints);
                 recorder.adopt_lifecycle(chat_id, &bookkeeping.lifecycle);
                 denial_window = recorder.load_denials(chat_id);
@@ -3064,7 +3239,7 @@ impl Agent {
                     .register_resumed_copy(
                         chat_id,
                         folder.as_deref(),
-                        recovered.meta_messages,
+                        meta_messages,
                         loaded.metadata,
                         loaded.warnings,
                     )
@@ -3094,7 +3269,9 @@ impl Agent {
                 }
             }
         }
-        bookkeeping.lifecycle.end_orphaned_responses();
+        bookkeeping
+            .lifecycle
+            .settle_after_load(&snapshot, &bookkeeping.message_responses.clone());
         self.checkpoint_transcript(&snapshot, &bookkeeping)
             .await
             .map_err(AgentError::Storage)?;
@@ -3139,6 +3316,7 @@ impl Agent {
                 output_style,
                 auto_denials: super::auto_mode::DenialTracking::default(),
                 denial_window,
+                branch_reservation: None,
             },
         );
         if let Some(context) = snapshot
@@ -3152,6 +3330,84 @@ impl Agent {
         self.start_feedback_cleanup(chat_id).await;
 
         Ok(snapshot)
+    }
+}
+
+struct RestoredConversation {
+    snapshot: ChatSnapshot,
+    bookkeeping: ChatBookkeeping,
+    links: Vec<MessageLink>,
+    meta_messages: HashSet<usize>,
+    plan_checkpoints: Vec<super::plan::PlanCheckpoint>,
+    plans_directory: Option<PathBuf>,
+    folder: Option<PathBuf>,
+    content_replacements: super::tool_results::ContentReplacementState,
+    replacement_records: Vec<ContentReplacementRecord>,
+}
+
+/// Another stored branch of a Chat in memory, restored and waiting to replace its conversation.
+pub(super) struct StagedBranch {
+    snapshot: ChatSnapshot,
+    bookkeeping: ChatBookkeeping,
+    content_replacements: super::tool_results::ContentReplacementState,
+    file_history: Option<FileHistory>,
+    /// The physical entry the branch ends at.
+    leaf: Uuid,
+    log: StagedLog,
+}
+
+/// The recorder's view of a staged branch: what is already stored of it.
+pub(super) struct StagedLog {
+    links: Vec<MessageLink>,
+    meta_messages: HashSet<usize>,
+    parent_cursor: Option<Uuid>,
+    load_warnings: Vec<String>,
+    uuids: HashSet<Uuid>,
+    recorded_loops: HashMap<LoopId, LoopEntryContent>,
+    created_loops: HashSet<LoopId>,
+    recorded_lifecycle: u64,
+}
+
+impl StagedBranch {
+    /// The Chat on the staged branch: its conversation and what derives from it come from the
+    /// store; the instance's own state (tools, model, permissions, settings, events, operations
+    /// and shells) stays the Chat's in memory. Nothing is installed yet.
+    pub(super) fn into_chat(self, current: &Chat) -> (Chat, StagedLog, Uuid) {
+        let mut chat = current.clone();
+        let mut snapshot = self.snapshot;
+        let previous = &current.snapshot;
+        snapshot.model = previous.model.clone();
+        snapshot.reasoning_effort = previous.reasoning_effort;
+        snapshot.thinking_enabled = previous.thinking_enabled;
+        snapshot.policy = previous.policy.clone();
+        snapshot.search_config = previous.search_config.clone();
+        snapshot.task_tools_enabled = previous.task_tools_enabled;
+        if previous.generated_title.is_some() {
+            snapshot.generated_title = previous.generated_title.clone();
+        }
+        snapshot.events = previous.events.clone();
+        snapshot.failure_events = previous.failure_events.clone();
+        snapshot.last_sequence = snapshot.last_sequence.max(previous.last_sequence);
+        snapshot.last_queue_sequence = snapshot
+            .last_queue_sequence
+            .max(previous.last_queue_sequence);
+        snapshot.operations = previous.operations.clone();
+        snapshot.request_usage = previous.request_usage.clone();
+        snapshot.provider_failures = previous.provider_failures.clone();
+        snapshot.user_shells = previous.user_shells.clone();
+        snapshot.pending_commands = previous.pending_commands.clone();
+        if snapshot.plans.iter().any(|plan| plan.approval_pending) {
+            snapshot.policy.mode = ExecutionMode::Plan;
+        }
+        chat.snapshot = snapshot;
+        chat.bookkeeping = self.bookkeeping;
+        chat.content_replacements = self.content_replacements;
+        chat.file_history = self.file_history;
+        chat.needs_plan_mode_exit_notice = false;
+        chat.start_new_tool_result_message = false;
+        chat.branch_reservation = None;
+        chat.active = None;
+        (chat, self.log, self.leaf)
     }
 }
 

@@ -932,3 +932,40 @@ async fn a_command_barrier_or_another_loop_keeps_an_input_out_of_the_merge() {
     );
     busy.runtime.shutdown().await;
 }
+
+/// Worker submissions go through `advance`: each is a ledger input whose prompt id is its input
+/// id, settled with the run that answered it.
+#[tokio::test]
+async fn worker_submissions_are_ledger_inputs_settled_by_their_answers() {
+    let directory = tempfile::tempdir().unwrap();
+    let busy = Busy::start(
+        directory.path(),
+        vec![text("started"), text("answered with the attachment")],
+    )
+    .await;
+    let (_, accepted) = busy.submit(&busy.submit_command(INPUTS[0], None)).await;
+    busy.release_and_settle().await;
+    assert!(
+        format!("{:?}", busy.model.requests.lock().unwrap()[1].messages).contains(SOURCE_CONTENT)
+    );
+    let chat = busy.active.chat_id;
+    let snapshot = busy.runtime.snapshot(chat).await.unwrap();
+    let mut settled = Vec::new();
+    for (index, id) in &snapshot.message_ids {
+        if !snapshot.prompt_execution_modes.contains_key(index) {
+            continue;
+        }
+        let state = busy.runtime.input_state(chat, *id).await.unwrap().unwrap();
+        settled.push((state.entry.run_id, state.entry.state));
+    }
+    assert_eq!(
+        settled.iter().map(|(run, _)| *run).collect::<Vec<_>>(),
+        vec![busy.active.run_id, accepted.run_id]
+    );
+    assert!(settled.iter().all(|(_, state)| matches!(
+        state,
+        tickloop_agent_runtime::transcript::InputState::Settled {
+            outcome: tickloop_agent_runtime::transcript::SettledOutcome::Completed { .. }
+        }
+    )));
+}

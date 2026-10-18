@@ -93,6 +93,8 @@ struct ChatOutbox {
     /// The position the store acknowledged last, or gave at registration or load.
     position: StorePosition,
     events_through: u64,
+    /// The display node the conversation ended at when the queued Lines were formed.
+    display_leaf: Option<Uuid>,
     /// The last failure, until an append succeeds.
     write_failure: Option<String>,
     /// The store refused this holder for good: nothing more is written.
@@ -119,6 +121,7 @@ impl ChatOutbox {
             metadata: CachedMetadata::default(),
             position,
             events_through: 0,
+            display_leaf: None,
             write_failure: None,
             refusal: None,
         }
@@ -171,6 +174,20 @@ impl TranscriptOutbox {
         outbox.written_uuids = uuids;
         outbox.metadata = metadata;
         self.insert(chat, outbox);
+    }
+
+    /// The store already holds these chain entries of the Chat: they are not written again.
+    pub(crate) fn remember_written(&self, chat: ChatId, uuids: HashSet<Uuid>) {
+        if let Some(outbox) = self.chats.lock().unwrap().get_mut(&chat) {
+            outbox.written_uuids.extend(uuids);
+        }
+    }
+
+    /// The display node the conversation ends at as of the Lines queued next.
+    pub(crate) fn set_display_leaf(&self, chat: ChatId, leaf: Option<Uuid>) {
+        if let Some(outbox) = self.chats.lock().unwrap().get_mut(&chat) {
+            outbox.display_leaf = leaf;
+        }
     }
 
     pub(crate) fn enqueue(&self, chat: ChatId, lines: Vec<Line>, events_through: Option<u64>) {
@@ -297,7 +314,7 @@ impl TranscriptOutbox {
             expected: Some(outbox.position),
             lines: std::mem::take(&mut outbox.queued),
             events_through: outbox.events_through,
-            display_leaf: None,
+            display_leaf: outbox.display_leaf,
             durable,
         };
         outbox.pending = Some(batch.clone());
@@ -408,7 +425,10 @@ mod tests {
         let uuid = Uuid::new_v4();
         outbox.enqueue(chat, vec![chain(uuid, Role::User)], Some(9));
         outbox.enqueue(chat, vec![chain(uuid, Role::User)], None);
+        let leaf = Uuid::new_v4();
+        outbox.set_display_leaf(chat, Some(leaf));
         let batch = outbox.next_batch(chat, false).unwrap();
+        assert_eq!(batch.display_leaf, Some(leaf));
         assert_eq!(batch.lines.len(), 2);
         assert!(matches!(batch.lines[0], Line::CustomTitle(_)));
         assert_eq!(batch.expected, Some(StorePosition(3)));

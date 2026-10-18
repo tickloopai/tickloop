@@ -81,6 +81,11 @@ mod tick_content;
 mod tick_subscriptions;
 mod tick_trim;
 mod triggers;
+mod turn;
+pub use turn::{
+    Delivery, MessageId, ParentSelection, SkillInvocation, Turn, TurnOp, TurnOutcome, TurnRequest,
+    TurnWait, UserMessage,
+};
 mod user_shell;
 #[cfg(test)]
 mod user_shell_tests;
@@ -114,7 +119,7 @@ use tickloop_agent_protocol::{
     ApprovalFailureKind, ApprovalFallbackReason, ApprovalOutcome, ApprovalPath,
     ApprovalReviewerKind, AutoBlockKind, AutoReviewerHealth, ChatId, ChatSnapshot,
     CompactionMarker, Content, Decision, DelegationMetadata, DenialReference, DirectedHumanSource,
-    DirectoryTrustPolicy, Event, EventKind, ExecutionMode, HostCallContext, InputContext, InputId,
+    DirectoryTrustPolicy, Event, EventKind, ExecutionMode, HostCallContext, InputContext,
     LedgerError, LoopId, LoopSnapshot, LoopState, Message, ModelConfig, ModelRequestKind,
     MonitorMembership, OperationRecord, OperationState, PendingCommand, PendingInput,
     PermissionApprovalSource, PermissionExecution, PermissionPolicy, PermissionRequest,
@@ -452,6 +457,9 @@ struct Chat {
     /// Claude Code-style Auto classifier denial counts for this in-process Chat.
     auto_denials: auto_mode::DenialTracking,
     denial_window: denials::DenialWindow,
+    /// Another stored branch of the Chat is being restored to replace its conversation: until the
+    /// reservation's own input installs it, or the reservation ends, the Chat takes no input.
+    branch_reservation: Option<Uuid>,
 }
 
 enum RunAdmission {
@@ -491,6 +499,44 @@ struct SubmissionOptions {
     directed_human: Option<DirectedHumanSource>,
     goal_title: Option<String>,
     ledger: Option<lifecycle::LedgerInput>,
+    turn: TurnAdmission,
+}
+
+/// How a turn's input is admitted beyond queuing it.
+#[derive(Default)]
+pub(crate) struct TurnAdmission {
+    /// Interrupt the work ahead of it in the same change that queues it.
+    pub send_now: bool,
+    /// The explicitly selected place it goes: the Chat must be idle, and the conversation is
+    /// cut there in the same change that accepts it.
+    pub placement: Option<turn::Placement>,
+    /// The stored branch that place is on, staged under a reservation of the Chat and installed
+    /// in the same change that accepts the input.
+    pub branch: Option<turn::BranchSwitch>,
+}
+
+/// Queues a Run that continues the conversation without a message of its own.
+fn queue_continuation(chat: &mut Chat, receipt: Receipt) {
+    chat.snapshot.last_queue_sequence += 1;
+    let queued_sequence = chat.snapshot.last_queue_sequence;
+    chat.snapshot.pending_inputs.push(PendingInput {
+        receipt,
+        input: String::new(),
+        contexts: Vec::new(),
+        agent_message: None,
+        directed_human: None,
+        denial_reference: None,
+        trigger_source: None,
+        armed: true,
+        queued_sequence,
+        task_continuation: true,
+        is_skill_invocation: false,
+        attached_file_reads: Vec::new(),
+    });
+}
+
+pub(crate) fn chat_is_busy() -> AgentError {
+    AgentError::Invalid("chat is busy".into())
 }
 
 #[derive(Clone, Copy)]
@@ -2002,6 +2048,7 @@ impl Agent {
                 output_style,
                 auto_denials: auto_mode::DenialTracking::default(),
                 denial_window: denials::DenialWindow::default(),
+                branch_reservation: None,
             },
         );
         Ok(id)
@@ -2013,24 +2060,8 @@ impl Agent {
         goal: Option<LoopId>,
         input: String,
     ) -> Result<Receipt, AgentError> {
-        let ledger = lifecycle::LedgerInput::new(
-            Uuid::new_v4(),
-            transcript::InputOp::Continue,
-            goal,
-            &input,
-            &[],
-            &[],
-        );
-        self.submit_internal(
-            chat_id,
-            goal,
-            input,
-            SubmissionOptions {
-                ledger: Some(ledger),
-                ..Default::default()
-            },
-        )
-        .await
+        let request = TurnRequest::after_current_leaf(goal, input, Vec::new(), Vec::new(), None);
+        Ok(self.advance(chat_id, request).await?.receipt().clone())
     }
 
     pub async fn invoke_skill(
@@ -2044,6 +2075,8 @@ impl Agent {
             .await
     }
 
+    /// Queues a user Skill invocation after the current leaf as a new input, as the Worker's
+    /// Skill does.
     pub async fn invoke_skill_in_host_context(
         &self,
         chat_id: ChatId,
@@ -2052,32 +2085,55 @@ impl Agent {
         arguments: &str,
         host_context: Option<HostCallContext>,
     ) -> Result<Receipt, AgentError> {
+        let turn = self
+            .advance(
+                chat_id,
+                TurnRequest {
+                    input_id: Uuid::new_v4(),
+                    op: TurnOp::Skill {
+                        after: ParentSelection::CurrentLeaf,
+                        target_loop: goal,
+                        skill: SkillInvocation {
+                            name: name.into(),
+                            arguments: arguments.into(),
+                        },
+                    },
+                    delivery: Delivery::Queue,
+                    host_context,
+                },
+            )
+            .await?;
+        Ok(turn.receipt().clone())
+    }
+
+    /// Expands a user Skill and submits its invocation.
+    async fn submit_skill(
+        &self,
+        chat_id: ChatId,
+        goal: Option<LoopId>,
+        skill: SkillInvocation,
+        host_context: Option<HostCallContext>,
+        ledger: lifecycle::LedgerInput,
+        turn: TurnAdmission,
+    ) -> Result<Receipt, AgentError> {
         self.rediscover_skills(chat_id).await;
         let invoked = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
             chat.skills
                 .expand(
-                    name,
-                    arguments,
+                    &skill.name,
+                    &skill.arguments,
                     tickloop_agent_config::skills::SkillCaller::User,
                 )
                 .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
                 .map_err(|error| AgentError::Invalid(error.to_string()))?
         };
-        let input = if arguments.trim().is_empty() {
+        let input = if skill.arguments.trim().is_empty() {
             format!("/{}", invoked.name)
         } else {
-            format!("/{} {}", invoked.name, arguments.trim())
+            format!("/{} {}", invoked.name, skill.arguments.trim())
         };
-        let ledger = lifecycle::LedgerInput::new(
-            Uuid::new_v4(),
-            transcript::InputOp::Skill,
-            goal,
-            &input,
-            &[],
-            &[],
-        );
         self.submit_internal(
             chat_id,
             goal,
@@ -2086,6 +2142,7 @@ impl Agent {
                 invoked_skill: Some(invoked),
                 host_context,
                 ledger: Some(ledger),
+                turn,
                 ..Default::default()
             },
         )
@@ -2145,8 +2202,8 @@ impl Agent {
         input: String,
         paths: Vec<PathBuf>,
     ) -> Result<Receipt, AgentError> {
-        self.submit_with_input_contexts(chat_id, goal, input, Vec::new(), paths)
-            .await
+        let request = TurnRequest::after_current_leaf(goal, input, Vec::new(), paths, None);
+        Ok(self.advance(chat_id, request).await?.receipt().clone())
     }
 
     /// Submits a prompt with attachments already in hand, such as pasted images or those
@@ -2159,10 +2216,11 @@ impl Agent {
         contexts: Vec<InputContext>,
         paths: Vec<PathBuf>,
     ) -> Result<Receipt, AgentError> {
-        self.submit_with_input_contexts_in_host_context(chat_id, goal, input, contexts, paths, None)
-            .await
+        let request = TurnRequest::after_current_leaf(goal, input, contexts, paths, None);
+        Ok(self.advance(chat_id, request).await?.receipt().clone())
     }
 
+    /// Queues a prompt after the current leaf as a new input, as the Worker's Submit does.
     pub async fn submit_with_input_contexts_in_host_context(
         &self,
         chat_id: ChatId,
@@ -2172,53 +2230,8 @@ impl Agent {
         paths: Vec<PathBuf>,
         host_context: Option<HostCallContext>,
     ) -> Result<Receipt, AgentError> {
-        self.submit_with_input_id(
-            chat_id,
-            Uuid::new_v4(),
-            goal,
-            input,
-            contexts,
-            paths,
-            host_context,
-        )
-        .await
-    }
-
-    /// Submits a prompt under the host's own input id, recorded in the Chat's input ledger. The
-    /// prompt's message id, and so its display id, is the input id. Submitting an id again with
-    /// the same payload returns its original receipt without running it again; with another
-    /// payload it is refused.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn submit_with_input_id(
-        &self,
-        chat_id: ChatId,
-        input_id: InputId,
-        goal: Option<LoopId>,
-        input: String,
-        contexts: Vec<InputContext>,
-        paths: Vec<PathBuf>,
-        host_context: Option<HostCallContext>,
-    ) -> Result<Receipt, AgentError> {
-        let ledger = lifecycle::LedgerInput::new(
-            input_id,
-            transcript::InputOp::Continue,
-            goal,
-            &input,
-            &contexts,
-            &paths,
-        );
-        self.submit_contexts(family::ContextSubmission {
-            chat_id,
-            goal,
-            input,
-            contexts,
-            paths,
-            host_context,
-            directed_source: None,
-            target_generation: None,
-            ledger: Some(ledger),
-        })
-        .await
+        let request = TurnRequest::after_current_leaf(goal, input, contexts, paths, host_context);
+        Ok(self.advance(chat_id, request).await?.receipt().clone())
     }
 
     async fn submit_contexts(
@@ -2235,6 +2248,7 @@ impl Agent {
             directed_source,
             target_generation,
             ledger,
+            turn,
         } = submission;
         if contexts.len().saturating_add(paths.len()) > input_context::MAX_REFERENCES {
             return Err(AgentError::Invalid(format!(
@@ -2256,7 +2270,10 @@ impl Agent {
                 return replay;
             }
             let snapshot = &chat.snapshot;
-            if goal.is_some_and(|id| !snapshot.loops.iter().any(|existing| existing.id == id)) {
+            // A staged branch holds its own Loops; the input is checked against them on acceptance.
+            if turn.branch.is_none()
+                && goal.is_some_and(|id| !snapshot.loops.iter().any(|existing| existing.id == id))
+            {
                 return Err(AgentError::NotFound);
             }
             if snapshot.folder.is_none() {
@@ -2277,6 +2294,7 @@ impl Agent {
                             family_generation: target_generation,
                             host_context,
                             ledger,
+                            turn,
                             ..Default::default()
                         },
                     )
@@ -2305,7 +2323,7 @@ impl Agent {
             admission
         };
         let workspace = admission.workspace.clone();
-        let paths = admission
+        let paths: Vec<PathBuf> = admission
             .reads
             .iter()
             .take(paths.len())
@@ -2317,13 +2335,20 @@ impl Agent {
                 )
             })
             .collect();
-        let loaded = tokio::task::spawn_blocking(move || input_context::load(&workspace, paths))
-            .await
-            .map_err(|_| AgentError::Invalid("referenced paths could not be loaded".into()))?
-            .map_err(AgentError::Invalid)?;
-        for context in loaded.contexts {
-            contexts.retain(|existing| existing.path() != context.path());
-            contexts.push(context);
+        let mut attached_file_reads = Vec::new();
+        if !paths.is_empty() {
+            let loaded =
+                tokio::task::spawn_blocking(move || input_context::load(&workspace, paths))
+                    .await
+                    .map_err(|_| {
+                        AgentError::Invalid("referenced paths could not be loaded".into())
+                    })?
+                    .map_err(AgentError::Invalid)?;
+            for context in loaded.contexts {
+                contexts.retain(|existing| existing.path() != context.path());
+                contexts.push(context);
+            }
+            attached_file_reads = loaded.file_reads;
         }
         self.submit_internal(
             chat_id,
@@ -2331,12 +2356,13 @@ impl Agent {
             input,
             SubmissionOptions {
                 contexts,
-                attached_file_reads: loaded.file_reads,
+                attached_file_reads,
                 directed_human: directed_source,
                 family_generation: target_generation,
                 attachment_admission: Some(admission),
                 host_context,
                 ledger,
+                turn,
                 ..Default::default()
             },
         )
@@ -2366,9 +2392,13 @@ impl Agent {
             directed_human,
             goal_title,
             ledger,
+            mut turn,
         } = options;
         let is_feedback = feedback_input.is_some();
         let resumes_feedback = trigger_source.is_none() && agent_message.is_none();
+        // Held through every task this submission starts: `shutdown` either refuses it or waits
+        // for those tasks.
+        let _admission = self.inner.tasks.token();
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(AgentError::Invalid("agent host has shut down".into()));
         }
@@ -2399,6 +2429,21 @@ impl Agent {
         if original.family_stopping {
             return Err(AgentError::Invalid("Subagent subtree is stopping".into()));
         }
+        let staged = match (turn.branch.take(), original.branch_reservation) {
+            (Some(switch), Some(reserved)) if switch.reservation() == reserved => {
+                Some(switch.into_chat(original))
+            }
+            (None, None) => None,
+            _ => return Err(chat_is_busy()),
+        };
+        let base = staged.as_ref().map_or(&*original, |staged| &staged.chat);
+        let cut = match turn.placement {
+            Some(placement) => {
+                rewind::ensure_idle(base).map_err(|_| chat_is_busy())?;
+                turn::placement_cut(base, placement)?
+            }
+            None => None,
+        };
         if let Some(identity) = &feedback_input {
             if let Some(pending) = original
                 .snapshot
@@ -2448,9 +2493,11 @@ impl Agent {
                 "directed target changed while preparing the input".into(),
             ));
         }
+        let base = staged.as_ref().map_or(&*original, |staged| &staged.chat);
         let inherit_branch_session =
-            goal.is_none() && trigger_source.is_none() && original.snapshot.branch_origin.is_some();
-        let mut candidate = original.clone();
+            goal.is_none() && trigger_source.is_none() && base.snapshot.branch_origin.is_some();
+        let mut candidate = base.clone();
+        let loops_at_start = Self::prepare_cut(base, &mut candidate, cut)?;
         let chat = &mut candidate;
         let is_skill_invocation = invoked_skill.is_some();
 
@@ -2652,7 +2699,23 @@ impl Agent {
             session_context = Some(context);
             session_candidate = Some(candidate);
         }
+        let selected_leaf = staged.map(|staged| self.install_branch(original, staged));
+        if let Some((index, _)) = cut {
+            self.commit_cut(original, &mut candidate, index);
+        }
         *original = candidate;
+        if cut.is_none()
+            && let Some(leaf) = selected_leaf
+        {
+            self.emit_conversation_rewound(original, Uuid::nil(), leaf);
+        }
+        let removed_loops = match cut {
+            Some(_) => rewind::stop_listening_to_removed_loops(original, loops_at_start),
+            None => Vec::new(),
+        };
+        if turn.send_now && (original.active.is_some() || !original.parked.is_empty()) {
+            original.interrupt();
+        }
         if let Some(source) = directed_origin {
             let source_chat = chats
                 .get_mut(&source.source_chat_id)
@@ -2664,6 +2727,10 @@ impl Agent {
             *context = candidate;
         }
         drop(chats);
+        if !removed_loops.is_empty() {
+            // Boxed: rarely needed, and every submission path awaits this future inline.
+            Box::pin(self.retire_cut_loops(chat_id, removed_loops)).await;
+        }
         if let Some(parent) = task_delegation {
             self.bind_task_delegate(&parent, &receipt)
                 .await
@@ -2687,6 +2754,8 @@ impl Agent {
         if let Some(tools) = watch {
             self.watch_commands(chat_id, tools).await;
         }
+        #[cfg(test)]
+        turn::admission_pause::wait_if_paused(chat_id).await;
         if let Some(next) = next {
             self.run_task(next);
         }
@@ -4824,26 +4893,12 @@ impl Agent {
         ) {
             goal.set_state(LoopState::Queued);
         }
-        chat.snapshot.last_queue_sequence += 1;
-        let queued_sequence = chat.snapshot.last_queue_sequence;
-        chat.snapshot.pending_inputs.push(PendingInput {
-            receipt: Receipt {
-                chat_id: chat.snapshot.id,
-                loop_id,
-                run_id: Uuid::new_v4(),
-            },
-            input: String::new(),
-            contexts: Vec::new(),
-            agent_message: None,
-            directed_human: None,
-            denial_reference: None,
-            trigger_source: None,
-            armed: true,
-            queued_sequence,
-            task_continuation: true,
-            is_skill_invocation: false,
-            attached_file_reads: Vec::new(),
-        });
+        let receipt = Receipt {
+            chat_id: chat.snapshot.id,
+            loop_id,
+            run_id: Uuid::new_v4(),
+        };
+        queue_continuation(chat, receipt);
         true
     }
 

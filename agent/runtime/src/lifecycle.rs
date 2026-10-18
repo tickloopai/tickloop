@@ -10,8 +10,7 @@ use sha2::{Digest, Sha256};
 use tickloop_agent_base::private_fs::unix_time_milliseconds;
 use tickloop_agent_base::timestamp::format_timestamp;
 use tickloop_agent_protocol::{
-    ChatId, ChatSnapshot, EventKind, InputContext, InputId, LoopId, PendingInput, Receipt,
-    ResponseId, RunId, Usage,
+    ChatId, ChatSnapshot, EventKind, InputId, PendingInput, Receipt, ResponseId, RunId, Usage,
 };
 use uuid::Uuid;
 
@@ -27,29 +26,27 @@ pub(crate) struct LedgerInput {
     pub id: InputId,
     pub op: InputOp,
     pub digest: String,
+    /// The display node the input was accepted under.
+    pub display_parent: Option<Uuid>,
+    /// The Run of an earlier acceptance of this input that was lost before it started: this
+    /// acceptance replaces it.
+    pub replaces: Option<RunId>,
 }
 
 impl LedgerInput {
-    pub(crate) fn new(
-        id: InputId,
-        op: InputOp,
-        goal: Option<LoopId>,
-        text: &str,
-        contexts: &[InputContext],
-        paths: &[std::path::PathBuf],
-    ) -> Self {
-        let payload = serde_json::json!({
-            "op": op,
-            "loop": goal,
-            "text": text,
-            "contexts": contexts,
-            "paths": paths,
-        });
-        let digest = Sha256::digest(payload.to_string().as_bytes())
+    pub(crate) fn new(id: InputId, op: InputOp, payload: &impl serde::Serialize) -> Self {
+        let payload = serde_json::to_string(payload).expect("an input payload is serializable");
+        let digest = Sha256::digest(payload.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        Self { id, op, digest }
+        Self {
+            id,
+            op,
+            digest,
+            display_parent: None,
+            replaces: None,
+        }
     }
 }
 
@@ -87,6 +84,15 @@ pub(crate) struct Lifecycle {
     open_inputs: HashMap<RunId, InputId>,
     /// Started responses by Run.
     active: HashMap<RunId, ActiveResponse>,
+    /// The display node a queued Run's answer hangs under instead of where the conversation ends:
+    /// another attempt at an answer is its sibling.
+    answer_parents: HashMap<RunId, Uuid>,
+    /// The answer started last on the current chain; it is the display leaf while no message of
+    /// its own stands for it.
+    tail_answer: Option<ResponseId>,
+    /// The display leaf when the conversation was last compacted, for a chain whose remaining
+    /// messages show no display node.
+    compacted_leaf: Option<Uuid>,
     revision: u64,
 }
 
@@ -118,6 +124,9 @@ impl Lifecycle {
                 "input id reused with a different payload".into(),
             )));
         }
+        if accepted.state == InputState::Accepted && input.replaces == Some(accepted.run_id) {
+            return None;
+        }
         Some(Ok(Receipt {
             chat_id,
             loop_id: accepted.loop_id,
@@ -131,6 +140,7 @@ impl Lifecycle {
 
     pub(crate) fn accept(&mut self, input: &LedgerInput, receipt: &Receipt) {
         let revision = self.next_revision();
+        self.open_inputs.retain(|_, open| *open != input.id);
         self.open_inputs.insert(receipt.run_id, input.id);
         self.inputs.insert(
             input.id,
@@ -139,7 +149,7 @@ impl Lifecycle {
                     input_id: input.id,
                     op: input.op,
                     digest: input.digest.clone(),
-                    display_parent: None,
+                    display_parent: input.display_parent,
                     loop_id: receipt.loop_id,
                     run_id: receipt.run_id,
                     timestamp: now(),
@@ -167,6 +177,22 @@ impl Lifecycle {
     /// The input of `run` the ledger still has open.
     pub(crate) fn open_input(&self, run: RunId) -> Option<InputId> {
         self.open_inputs.get(&run).copied()
+    }
+
+    pub(crate) fn response(&self, id: ResponseId) -> Option<&ResponseEntry> {
+        self.responses.get(&id).map(|response| &response.record)
+    }
+
+    /// Some answer, on any branch, hangs under the display node `node`.
+    pub(crate) fn has_answer_under(&self, node: Uuid) -> bool {
+        self.responses
+            .values()
+            .any(|response| response.record.display_parent == Some(node))
+    }
+
+    /// The answer `run` starts next hangs under `parent`.
+    pub(crate) fn answer_under(&mut self, run: RunId, parent: Uuid) {
+        self.answer_parents.insert(run, parent);
     }
 
     pub(crate) fn responses_of(&self, input: InputId) -> Vec<ResponseEntry> {
@@ -204,10 +230,15 @@ impl Lifecycle {
             attempt,
             run_id: receipt.run_id,
             loop_id: receipt.loop_id,
-            display_parent: self.latest_display_node(snapshot, message_responses),
+            display_parent: self
+                .answer_parents
+                .remove(&receipt.run_id)
+                .or_else(|| self.display_leaf(snapshot, message_responses)),
             timestamp: now(),
             state: ResponseState::Started,
+            without_messages: false,
         };
+        self.tail_answer = Some(record.response_id);
         let revision = self.next_revision();
         self.active.insert(
             receipt.run_id,
@@ -257,11 +288,52 @@ impl Lifecycle {
         self.claim(snapshot, message_responses);
         let active = self.active.remove(&run)?;
         let revision = self.next_revision();
+        let without_messages = !message_responses
+            .values()
+            .any(|response| *response == active.response_id);
         let response = self.responses.get_mut(&active.response_id)?;
         response.record.state = ResponseState::Ended { ending };
+        response.record.without_messages = without_messages;
         response.record.timestamp = now();
         response.revision = revision;
         Some(response.record.clone())
+    }
+
+    /// The conversation was cut: the answer started last is no longer on it.
+    pub(crate) fn forget_tail_answer(&mut self) {
+        self.tail_answer = None;
+    }
+
+    /// The conversation is being compacted while `leaf` is its display leaf.
+    pub(crate) fn remember_compacted_leaf(&mut self, leaf: Option<Uuid>) {
+        if leaf.is_some() {
+            self.compacted_leaf = leaf;
+        }
+    }
+
+    pub(crate) fn compacted_leaf(&self) -> Option<Uuid> {
+        self.compacted_leaf
+    }
+
+    /// The display node the Chat shows as current: where the conversation's messages end, or the
+    /// answer started after it that no message stands for yet (awaiting its first delta, or
+    /// ended without content).
+    pub(crate) fn display_leaf(
+        &self,
+        snapshot: &ChatSnapshot,
+        message_responses: &BTreeMap<usize, ResponseId>,
+    ) -> Option<Uuid> {
+        let anchor = self
+            .latest_display_node(snapshot, message_responses)
+            .or(self.compacted_leaf);
+        self.tail_answer
+            .filter(|answer| {
+                self.responses
+                    .get(answer)
+                    .is_some_and(|response| response.record.display_parent == anchor)
+                    && !message_responses.values().any(|claimed| claimed == answer)
+            })
+            .or(anchor)
     }
 
     /// Message indexes moved: every message before `messages` is already claimed.
@@ -311,7 +383,7 @@ impl Lifecycle {
     /// The display node the conversation ends at: the latest prompt that is not part of an
     /// answer, or the answer of a later message. A Run without a prompt of its own answers after
     /// it.
-    fn latest_display_node(
+    pub(crate) fn latest_display_node(
         &self,
         snapshot: &ChatSnapshot,
         message_responses: &BTreeMap<usize, ResponseId>,
@@ -374,9 +446,13 @@ impl Lifecycle {
         lifecycle
     }
 
-    /// After a load: an answer that started and never ended lost its host. Gives the ids it
-    /// ended.
-    pub(crate) fn end_orphaned_responses(&mut self) -> Vec<ResponseId> {
+    /// After a load: an answer that started and never ended lost its host. Then the answer
+    /// without messages that hangs where the loaded chain ends, if any, is its display leaf.
+    pub(crate) fn settle_after_load(
+        &mut self,
+        snapshot: &ChatSnapshot,
+        message_responses: &BTreeMap<usize, ResponseId>,
+    ) {
         let orphaned = self
             .responses
             .values()
@@ -391,10 +467,22 @@ impl Lifecycle {
                     by: InterruptedBy::Host,
                 },
             };
+            response.record.without_messages =
+                !message_responses.values().any(|claimed| claimed == id);
             response.record.timestamp = now();
             response.revision = revision;
         }
-        orphaned
+        let anchor = self
+            .latest_display_node(snapshot, message_responses)
+            .or(self.compacted_leaf);
+        self.tail_answer = self
+            .responses
+            .values()
+            .filter(|response| {
+                response.record.without_messages && response.record.display_parent == anchor
+            })
+            .max_by_key(|response| response.revision)
+            .map(|response| response.record.response_id);
     }
 
     pub(crate) fn state(
@@ -416,6 +504,21 @@ impl Lifecycle {
             entry,
         })
     }
+}
+
+pub(crate) fn ledger_state(chat: &Chat, input: InputId) -> Option<InputLedgerState> {
+    chat.bookkeeping
+        .lifecycle
+        .state(input, &chat.snapshot, |run| {
+            chat.active_run == Some(run)
+                || chat.parked.contains_key(&run)
+                || chat.bookkeeping.lifecycle.active_response(run).is_some()
+                || chat
+                    .snapshot
+                    .pending_inputs
+                    .iter()
+                    .any(|pending| pending.receipt.run_id == run)
+        })
 }
 
 pub(crate) fn claim_response_messages(chat: &mut Chat) {
@@ -498,19 +601,7 @@ impl Agent {
     ) -> Result<Option<InputLedgerState>, AgentError> {
         let chats = self.inner.chats.lock().await;
         let chat = chats.get(&chat).ok_or(AgentError::NotFound)?;
-        Ok(chat
-            .bookkeeping
-            .lifecycle
-            .state(input, &chat.snapshot, |run| {
-                chat.active_run == Some(run)
-                    || chat.parked.contains_key(&run)
-                    || chat.bookkeeping.lifecycle.active_response(run).is_some()
-                    || chat
-                        .snapshot
-                        .pending_inputs
-                        .iter()
-                        .any(|pending| pending.receipt.run_id == run)
-            }))
+        Ok(ledger_state(chat, input))
     }
 
     /// Waits until the ledger settles `input`. Fails when the ledger has no record of it or the

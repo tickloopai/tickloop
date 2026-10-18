@@ -704,6 +704,7 @@ mod tests {
             messages_summarized: Some(2),
             preserved_segment: segment,
             original_user_inputs: None,
+            display_leaf: None,
         });
         Line::System(entry)
     }

@@ -297,6 +297,9 @@ pub struct CompactMetadata {
     pub preserved_segment: Option<PreservedSegmentEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_user_inputs: Option<Vec<OriginalUserInput>>,
+    /// The display node the Chat showed as current when it was compacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_leaf: Option<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -525,6 +528,9 @@ pub struct ResponseEntry {
     pub display_parent: Option<Uuid>,
     pub timestamp: String,
     pub state: ResponseState,
+    /// It ended without a message of its own, so no chain entry stands for it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub without_messages: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -578,6 +584,10 @@ pub enum InputOp {
     Continue,
     /// A user Skill invocation.
     Skill,
+    /// A prompt in place of an earlier one, as its sibling.
+    ReplacePrompt,
+    /// Another answer to the prompt of an earlier answer, as its sibling.
+    RegenerateAnswer,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
