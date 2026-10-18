@@ -13,10 +13,8 @@ use tickloop_agent_protocol::{
     AgentHostOptions, ChatId, Content, Decision, DirectedSummaryRequest, EventKind, LoopState,
     ModelIdentity, PermissionRule, PromptPolicy, Protocol, Role, SummaryDirection, Usage,
 };
-use tickloop_agent_runtime::transcript::display::{DisplayKind, DisplayNode, project};
 use tickloop_agent_runtime::transcript::{
-    AppendAck, AppendBatch, ChatPlacement, InputState, InterruptedBy, Line, LoadRange,
-    ResponseEnding, ResponseState, SettledOutcome, StorePosition, StoredTranscript,
+    AppendAck, AppendBatch, ChatPlacement, LoadRange, StorePosition, StoredTranscript,
     TranscriptError, TranscriptStore,
 };
 use tickloop_agent_runtime::{
@@ -26,6 +24,10 @@ use tickloop_agent_runtime::{
 };
 use tickloop_agent_test_support::transcripts::{FaultyTranscriptStore, InMemoryTranscriptStore};
 use tickloop_agent_test_support::{call, config, next_event, text};
+use tickloop_agent_transcript::display::{DisplayKind, DisplayNode, project};
+use tickloop_agent_transcript::{
+    InputState, InterruptedBy, Line, ResponseEnding, ResponseState, SettledOutcome,
+};
 use tokio::sync::{Notify, mpsc::UnboundedSender, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;

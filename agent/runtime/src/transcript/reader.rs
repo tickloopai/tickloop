@@ -4,8 +4,10 @@ use uuid::Uuid;
 
 use tickloop_agent_base::timestamp::parse_timestamp_ms;
 use tickloop_agent_protocol::{Content, OriginalUserInput, Role, Usage};
+use tickloop_agent_transcript::{
+    ChainEntry, ContentReplacementEntry, FileHistorySnapshotEntry, Line,
+};
 
-use super::entry::{ChainEntry, ContentReplacementEntry, FileHistorySnapshotEntry, Line};
 use super::outbox::CachedMetadata;
 use super::store::{StorePosition, StoredTranscript};
 
@@ -537,12 +539,13 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::transcript::entry::{
-        COMPACT_BOUNDARY_SUBTYPE, CompactMetadata, CompactTriggerEntry, PreservedSegmentEntry,
-    };
     use crate::transcript::jsonl::{SKIP_PRECOMPACT_THRESHOLD, load_file as load};
     use tickloop_agent_base::timestamp::format_timestamp;
     use tickloop_agent_protocol::Message;
+    use tickloop_agent_transcript::{
+        COMPACT_BOUNDARY_SUBTYPE, CompactMetadata, CompactTriggerEntry, FamilyInputsEntry,
+        PreservedSegmentEntry, TaskBoardsEntry,
+    };
 
     fn entry(
         uuid: Uuid,
@@ -897,11 +900,11 @@ mod tests {
         write(
             &path,
             &[
-                Line::FamilyInputs(crate::transcript::FamilyInputsEntry {
+                Line::FamilyInputs(FamilyInputsEntry {
                     chat_id: Uuid::nil(),
                     inputs: [(message_id, record)].into(),
                 }),
-                Line::TaskBoards(crate::transcript::TaskBoardsEntry {
+                Line::TaskBoards(TaskBoardsEntry {
                     chat_id: Uuid::nil(),
                     boards: [(
                         message_id,

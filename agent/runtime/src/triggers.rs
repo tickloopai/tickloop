@@ -5,6 +5,7 @@ use tickloop_agent_protocol::{
     ChatSnapshot, EventKind, LoopId, LoopSnapshot, LoopState, OperationRecord, OperationState,
     Receipt, TICK_SUBSCRIPTION_SOURCE, Trigger, TriggerSource, UserShellState,
 };
+use tickloop_agent_transcript::{DiscardReason, SettledOutcome};
 
 pub(super) fn can_trigger(goal: &LoopSnapshot) -> bool {
     (goal.trigger.as_ref().is_some_and(|trigger| {
@@ -451,11 +452,11 @@ impl Agent {
         self.settle_removed_inputs(
             &mut chat,
             &discarded,
-            crate::transcript::SettledOutcome::Discarded {
+            SettledOutcome::Discarded {
                 reason: if state == LoopState::Stopped {
-                    crate::transcript::DiscardReason::Stopped
+                    DiscardReason::Stopped
                 } else {
-                    crate::transcript::DiscardReason::LoopEnded
+                    DiscardReason::LoopEnded
                 },
             },
         );

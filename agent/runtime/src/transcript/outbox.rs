@@ -6,12 +6,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tickloop_agent_protocol::ChatId;
+use tickloop_agent_transcript::{
+    AiTitleEntry, ArtifactTicksEntry, BranchOriginEntry, CustomTitleEntry, DelegationEntry,
+    FamilyCompletionsEntry, FamilyInputsEntry, LastPromptEntry, Line, MonitorMembersEntry,
+    SentAgentMessagesEntry, SubagentsEntry, TaskBoardsEntry,
+};
 use uuid::Uuid;
 
-use super::entry::{
-    AiTitleEntry, BranchOriginEntry, CustomTitleEntry, DelegationEntry, LastPromptEntry, Line,
-    SubagentsEntry,
-};
 use super::store::{AppendAck, AppendBatch, BatchId, StorePosition, TranscriptError};
 
 /// 照 Claude Code `FLUSH_INTERVAL_MS`：条目先排队，最多每 100ms 批量追加一次。
@@ -20,15 +21,15 @@ pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 /// 同类元数据的最后一条；退出时重新追加到 Transcript 末尾，让列表只读尾部就能取到。
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CachedMetadata {
-    pub task_boards: Option<super::entry::TaskBoardsEntry>,
-    pub artifact_ticks: Option<super::entry::ArtifactTicksEntry>,
-    pub monitor_members: Option<super::entry::MonitorMembersEntry>,
+    pub task_boards: Option<TaskBoardsEntry>,
+    pub artifact_ticks: Option<ArtifactTicksEntry>,
+    pub monitor_members: Option<MonitorMembersEntry>,
     pub custom_title: Option<CustomTitleEntry>,
     pub ai_title: Option<AiTitleEntry>,
     pub subagents: Option<SubagentsEntry>,
-    pub family_completions: Option<super::entry::FamilyCompletionsEntry>,
-    pub family_inputs: Option<super::entry::FamilyInputsEntry>,
-    pub sent_agent_messages: Option<super::entry::SentAgentMessagesEntry>,
+    pub family_completions: Option<FamilyCompletionsEntry>,
+    pub family_inputs: Option<FamilyInputsEntry>,
+    pub sent_agent_messages: Option<SentAgentMessagesEntry>,
     pub last_prompt: Option<LastPromptEntry>,
     pub branch_origin: Option<BranchOriginEntry>,
     pub delegation: Option<DelegationEntry>,

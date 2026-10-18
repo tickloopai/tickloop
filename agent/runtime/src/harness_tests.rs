@@ -18,8 +18,8 @@ use super::*;
 use crate::{
     Delivery, ParentSelection, TurnOp, TurnOutcome, TurnRequest, UserMessage,
     environment::LocalEnvironment,
-    transcript::{InterruptedBy, ResponseState},
 };
+use tickloop_agent_transcript::{InterruptedBy, ResponseEnding, ResponseState};
 
 const LEAK_CYCLES: usize = 200;
 
@@ -285,11 +285,11 @@ async fn shutdown_waits_for_a_submission_admitted_before_it_registered_its_run()
     assert!(matches!(
         state.responses[0].state,
         ResponseState::Ended {
-            ending: crate::transcript::ResponseEnding::Interrupted {
+            ending: ResponseEnding::Interrupted {
                 by: InterruptedBy::Host
             }
         } | ResponseState::Ended {
-            ending: crate::transcript::ResponseEnding::Completed
+            ending: ResponseEnding::Completed
         }
     ));
 }

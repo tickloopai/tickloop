@@ -5,6 +5,7 @@ use tickloop_agent_protocol::{ChatId, DelegationParent, MAX_SUBAGENT_DEPTH};
 use crate::Chat;
 use crate::{Agent, AgentError};
 use tickloop_agent_protocol::{CommandState, LoopState, OperationRecord, Receipt, UserShellState};
+use tickloop_agent_transcript::{DiscardReason, SettledOutcome};
 use tokio_util::sync::CancellationToken;
 
 #[derive(serde::Serialize)]
@@ -137,8 +138,8 @@ impl Agent {
                 self.settle_removed_inputs(
                     child,
                     &discarded,
-                    crate::transcript::SettledOutcome::Discarded {
-                        reason: crate::transcript::DiscardReason::Stopped,
+                    SettledOutcome::Discarded {
+                        reason: DiscardReason::Stopped,
                     },
                 );
                 child.ready_runs.clear();

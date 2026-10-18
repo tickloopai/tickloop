@@ -964,8 +964,8 @@ async fn worker_submissions_are_ledger_inputs_settled_by_their_answers() {
     );
     assert!(settled.iter().all(|(_, state)| matches!(
         state,
-        tickloop_agent_runtime::transcript::InputState::Settled {
-            outcome: tickloop_agent_runtime::transcript::SettledOutcome::Completed { .. }
+        tickloop_agent_transcript::InputState::Settled {
+            outcome: tickloop_agent_transcript::SettledOutcome::Completed { .. }
         }
     )));
 }

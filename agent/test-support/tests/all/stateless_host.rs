@@ -13,9 +13,7 @@ use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, Mod
 use tickloop_agent_protocol::{
     AgentHostOptions, Content, EventKind, ModelIdentity, PromptPolicy, Protocol, Usage,
 };
-use tickloop_agent_runtime::transcript::{
-    InputState, Line, ResponseState, SettledOutcome, TranscriptStore,
-};
+use tickloop_agent_runtime::transcript::TranscriptStore;
 use tickloop_agent_runtime::{
     Agent, Delivery, HarnessOptions, HarnessSeams, ParentSelection, ToolPolicy, TurnOp,
     TurnOutcome, TurnRequest, UserMessage,
@@ -28,6 +26,7 @@ use tickloop_agent_test_support::stateless_host::{
     CrashPoint, DurableChats, Halt, HostConfig, LeaseError, ManualClock, ReferenceHost,
     StreamFollower, TurnReport,
 };
+use tickloop_agent_transcript::{InputState, Line, ResponseState, SettledOutcome};
 use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;

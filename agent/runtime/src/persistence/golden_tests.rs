@@ -13,7 +13,8 @@ use uuid::Uuid;
 
 use super::ChatRecorder;
 use crate::ChatBookkeeping;
-use crate::transcript::{ContentReplacementRecord, JsonlTranscriptStore};
+use crate::transcript::JsonlTranscriptStore;
+use tickloop_agent_transcript::ContentReplacementRecord;
 
 const GOLDEN: &str = include_str!("golden_transcript.jsonl");
 

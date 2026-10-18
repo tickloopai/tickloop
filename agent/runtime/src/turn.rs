@@ -18,13 +18,13 @@ use tickloop_agent_protocol::{
 use uuid::Uuid;
 
 use crate::lifecycle::{LedgerInput, ledger_state};
-use crate::transcript::display::{DisplayKind, DisplayNode, DisplayStatus, project};
-use crate::transcript::{
-    DiscardReason, InputEntry, InputOp, InputState, InterruptedBy, Line, ResponseEnding,
-    ResponseState, SettledOutcome,
-};
 use crate::{
     Agent, AgentError, Chat, LoopSnapshotExt, TurnAdmission, WeakAgent, chat_is_busy, rewind,
+};
+use tickloop_agent_transcript::display::{DisplayKind, DisplayNode, DisplayStatus, project};
+use tickloop_agent_transcript::{
+    DiscardReason, InputEntry, InputOp, InputState, InterruptedBy, Line, ResponseEnding,
+    ResponseState, SettledOutcome,
 };
 
 /// A display node's id: a prompt's earliest source id, or an answer's response id.

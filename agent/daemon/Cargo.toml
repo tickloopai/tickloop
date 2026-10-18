@@ -38,6 +38,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 tempfile = "3"
 tickloop-agent-base = { path = "../base" }
 tickloop-agent-test-support = { path = "../test-support" }
+tickloop-agent-transcript = { path = "../transcript" }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 unicode-width = "0.2"

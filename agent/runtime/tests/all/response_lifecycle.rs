@@ -13,13 +13,9 @@ use tickloop_agent_protocol::{
     ImageContext, ImageOrigin, InputContext, LoopState, Message, ModelIdentity, Protocol, Receipt,
     RewindMode, Role, SummaryDirection, Trigger, TriggerPromptSource, Usage,
 };
-use tickloop_agent_runtime::transcript::display::{
-    DisplayBlock, DisplayKind, DisplayNode, DisplayProjector, DisplayStatus, project,
-};
 use tickloop_agent_runtime::transcript::{
-    AppendBatch, BatchId, ChatPlacement, DiscardReason, InputEntry, InputOp, InputState,
-    InterruptedBy, JsonlTranscriptStore, Line, LoadRange, ResponseEnding, ResponseEntry,
-    ResponseState, SettledOutcome, StorePosition, TranscriptStore,
+    AppendBatch, BatchId, ChatPlacement, JsonlTranscriptStore, LoadRange, StorePosition,
+    TranscriptStore,
 };
 use tickloop_agent_runtime::{
     Agent, AgentError, Delivery, HarnessOptions, HarnessSeams, ParentSelection, ToolPolicy, TurnOp,
@@ -27,6 +23,13 @@ use tickloop_agent_runtime::{
 };
 use tickloop_agent_test_support::transcripts::InMemoryTranscriptStore;
 use tickloop_agent_test_support::{call, config, next_event, text};
+use tickloop_agent_transcript::display::{
+    DisplayBlock, DisplayKind, DisplayNode, DisplayProjector, DisplayStatus, project,
+};
+use tickloop_agent_transcript::{
+    DiscardReason, InputEntry, InputOp, InputState, InterruptedBy, Line, ResponseEnding,
+    ResponseEntry, ResponseState, SettledOutcome,
+};
 use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;

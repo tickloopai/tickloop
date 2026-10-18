@@ -14,6 +14,7 @@ use super::ChatBookkeeping;
 use tickloop_agent_protocol::{
     AutoPolicy, ChatSnapshot, CompactionMarker, Content, OperationRecord, OriginalUserInput, Role,
 };
+use tickloop_agent_transcript::{ChainEntry, Line};
 
 mod budget;
 pub(super) mod input_projection;
@@ -168,7 +169,7 @@ fn tool_history(snapshot: &ChatSnapshot, operation: &OperationRecord) -> ToolHis
 pub(super) fn recovered_tool_history(
     snapshot: &ChatSnapshot,
     operation: &OperationRecord,
-    ancestors: Option<&[crate::transcript::ChainEntry]>,
+    ancestors: Option<&[ChainEntry]>,
 ) -> ToolHistory {
     let compact_boundary = snapshot
         .message_compactions
@@ -657,8 +658,8 @@ impl crate::Agent {
     pub(super) async fn approval_history_ancestors(
         &self,
         snapshot: &ChatSnapshot,
-        lines: Option<&[crate::transcript::Line]>,
-    ) -> Option<Vec<crate::transcript::ChainEntry>> {
+        lines: Option<&[Line]>,
+    ) -> Option<Vec<ChainEntry>> {
         let boundary = snapshot
             .message_compactions
             .iter()

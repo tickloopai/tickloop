@@ -4756,6 +4756,7 @@ dependencies = [
  "tickloop-agent-runtime",
  "tickloop-agent-test-support",
  "tickloop-agent-tools",
+ "tickloop-agent-transcript",
  "tickloop-tick-packages",
  "tickloop-tick-protocol",
  "tickloop-tickhost",
@@ -4872,6 +4873,7 @@ dependencies = [
  "tickloop-agent-protocol",
  "tickloop-agent-test-support",
  "tickloop-agent-tools",
+ "tickloop-agent-transcript",
  "tickloop-tick-packages",
  "tickloop-tick-protocol",
  "tickloop-tickhost",
@@ -4894,6 +4896,7 @@ dependencies = [
  "tickloop-agent-model",
  "tickloop-agent-protocol",
  "tickloop-agent-runtime",
+ "tickloop-agent-transcript",
  "tokio",
  "tokio-util",
  "unicode-width",
@@ -4925,6 +4928,16 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "tickloop-agent-transcript"
+version = "0.2.8"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tickloop-agent-protocol",
  "uuid",
 ]
 

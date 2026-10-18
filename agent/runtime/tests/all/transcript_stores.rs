@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use tickloop_agent_protocol::{AgentHostOptions, ChatId, Content, EventKind, Message, Role};
 use tickloop_agent_runtime::transcript::{
-    AppendBatch, BatchId, ChainEntry, ChatPlacement, CustomTitleEntry, JsonlTranscriptStore, Line,
-    LoadRange, StorePosition, TranscriptError, TranscriptStore,
+    AppendBatch, BatchId, ChatPlacement, JsonlTranscriptStore, LoadRange, StorePosition,
+    TranscriptError, TranscriptStore,
 };
 use tickloop_agent_runtime::{
     Agent, AgentError, HarnessOptions, HarnessSeams, ToolPolicy, environment::LocalEnvironment,
@@ -15,6 +15,7 @@ use tickloop_agent_runtime::{
 use tickloop_agent_test_support::harness::ChosenModels;
 use tickloop_agent_test_support::transcripts::{FaultyTranscriptStore, InMemoryTranscriptStore};
 use tickloop_agent_test_support::{ScriptedModel, next_event, text};
+use tickloop_agent_transcript::{ChainEntry, CustomTitleEntry, Line};
 use uuid::Uuid;
 
 /// A store under test, with what it needs to place a Chat.

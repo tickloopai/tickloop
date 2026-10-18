@@ -14,11 +14,11 @@ use tickloop_agent_protocol::{
 };
 use uuid::Uuid;
 
-use crate::transcript::{
+use crate::{Agent, AgentError, Chat};
+use tickloop_agent_transcript::{
     InputEntry, InputOp, InputState, InterruptedBy, Line, ResponseEnding, ResponseEntry,
     ResponseState, SettledOutcome,
 };
-use crate::{Agent, AgentError, Chat};
 
 /// A ledger input a submission carries: its id, operation and payload digest.
 #[derive(Clone, Debug)]

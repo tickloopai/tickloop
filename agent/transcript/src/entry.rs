@@ -41,9 +41,11 @@ pub enum Line {
     Unknown,
 }
 
-#[derive(Deserialize)]
+/// The kind of a Line read from its top-level `type` alone, without parsing the rest of it.
+/// [`Line::kind`] maps every Line variant to the kind of the same name.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum MetadataKind {
+pub enum MetadataKind {
     User,
     Assistant,
     System,
@@ -67,19 +69,20 @@ pub(crate) enum MetadataKind {
     Other,
 }
 impl MetadataKind {
-    pub(crate) fn is_chain(&self) -> bool {
+    pub fn is_chain(&self) -> bool {
         matches!(self, Self::User | Self::Assistant | Self::System)
     }
-    pub(crate) fn is_retained(&self) -> bool {
+    pub fn is_retained(&self) -> bool {
         !self.is_chain() && !matches!(self, Self::Other)
     }
 }
-#[derive(Deserialize)]
-pub(crate) struct MetadataHeader {
+/// The fields of a Line a store reads before, or instead of, parsing the whole Line.
+#[derive(Debug, Deserialize)]
+pub struct MetadataHeader {
     #[serde(rename = "type")]
-    pub(crate) kind: MetadataKind,
+    pub kind: MetadataKind,
     #[serde(rename = "agentMessageOrigin")]
-    pub(crate) agent_origin: Option<serde_json::Value>,
+    pub agent_origin: Option<serde_json::Value>,
 }
 
 impl Line {
@@ -105,7 +108,32 @@ impl Line {
     /// Chat-level records outside the conversation chain. A load from the latest compact
     /// boundary keeps the ones written before it.
     pub fn is_retained(&self) -> bool {
-        self.chain_entry().is_none() && !matches!(self, Self::Unknown)
+        self.kind().is_retained()
+    }
+
+    pub fn kind(&self) -> MetadataKind {
+        match self {
+            Self::User(_) => MetadataKind::User,
+            Self::Assistant(_) => MetadataKind::Assistant,
+            Self::System(_) => MetadataKind::System,
+            Self::ArtifactTicks(_) => MetadataKind::ArtifactTicks,
+            Self::MonitorMembers(_) => MetadataKind::MonitorMembers,
+            Self::CustomTitle(_) => MetadataKind::CustomTitle,
+            Self::AiTitle(_) => MetadataKind::AiTitle,
+            Self::Subagents(_) => MetadataKind::Subagents,
+            Self::TaskBoards(_) => MetadataKind::TaskBoards,
+            Self::FamilyCompletions(_) => MetadataKind::FamilyCompletions,
+            Self::FamilyInputs(_) => MetadataKind::FamilyInputs,
+            Self::SentAgentMessages(_) => MetadataKind::SentAgentMessages,
+            Self::LastPrompt(_) => MetadataKind::LastPrompt,
+            Self::BranchOrigin(_) => MetadataKind::BranchOrigin,
+            Self::Delegation(_) => MetadataKind::Delegation,
+            Self::FileHistorySnapshot(_) => MetadataKind::FileHistorySnapshot,
+            Self::ContentReplacement(_) => MetadataKind::ContentReplacement,
+            Self::Response(_) => MetadataKind::Response,
+            Self::Input(_) => MetadataKind::Input,
+            Self::Unknown => MetadataKind::Other,
+        }
     }
 }
 
@@ -179,7 +207,7 @@ pub struct ChainEntry {
     pub is_compact_summary: bool,
     /// 照 Claude Code：定向摘要保留了消息时，摘要消息记录被摘要的消息数、用户补充说明和方向。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summarize_metadata: Option<SummarizeMetadata>,
+    pub summarize_metadata: Option<SummarizeMetadataEntry>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_visible_in_transcript_only: bool,
     /// assistant 条目的用量（Claude Code 记在 `message.usage`，Tickloop 的消息结构没有该字段）。
@@ -320,7 +348,7 @@ pub struct PreservedSegmentEntry {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct SummarizeMetadata {
+pub struct SummarizeMetadataEntry {
     pub messages_summarized: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_context: Option<String>,
@@ -426,17 +454,6 @@ impl ContentReplacementRecord {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unknown_line_types_are_accepted_and_ignored() {
-        let line: Line = serde_json::from_str(r#"{"type":"future-kind","value":1}"#).unwrap();
-        assert!(matches!(line, Line::Unknown));
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactTicksEntry {
@@ -477,27 +494,6 @@ pub struct FamilyCompletionsEntry {
 pub struct FamilyInputsEntry {
     pub chat_id: Uuid,
     pub inputs: std::collections::BTreeMap<Uuid, FamilyInputRecord>,
-}
-
-#[cfg(test)]
-mod record_type_tests {
-    use super::MetadataHeader;
-    fn is_chain(raw: &[u8]) -> bool {
-        serde_json::from_slice::<MetadataHeader>(raw)
-            .unwrap()
-            .kind
-            .is_chain()
-    }
-
-    #[test]
-    fn chain_classification_uses_the_top_level_type_independently_of_field_order() {
-        assert!(is_chain(br#"{"message":{},"type":"user"}"#));
-        assert!(is_chain(br#"{"type":"assistant","message":{}}"#));
-        assert!(is_chain(br#"{"message":{},"type":"\u0075ser"}"#));
-        assert!(!is_chain(
-            br#"{"inputs":{"example":{"type":"user"}},"type":"family-inputs"}"#
-        ));
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -627,4 +623,138 @@ pub enum DiscardReason {
     LoopEnded,
     /// Its Loop was stopped while it waited.
     Stopped,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_line_types_are_accepted_and_ignored() {
+        let line: Line = serde_json::from_str(r#"{"type":"future-kind","value":1}"#).unwrap();
+        assert!(matches!(line, Line::Unknown));
+    }
+
+    /// A store classifying a written Line by its header alone reads the kind the Line has.
+    #[test]
+    fn the_header_of_a_written_line_reads_as_its_kind() {
+        let chat_id = Uuid::nil();
+        let user: ChainEntry = serde_json::from_value(serde_json::json!({
+            "uuid": Uuid::nil(),
+            "parentUuid": null,
+            "chatId": chat_id,
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "version": "test",
+            "message": {"role": "user", "content": []},
+            "humanFamilyOrigin": null,
+        }))
+        .unwrap();
+        let lines = [
+            Line::User(user.clone()),
+            Line::Assistant(user.clone()),
+            Line::System(user),
+            Line::ArtifactTicks(ArtifactTicksEntry {
+                chat_id,
+                cwd: None,
+                artifact_ticks: Vec::new(),
+                removed_artifact_ticks: Default::default(),
+            }),
+            Line::MonitorMembers(MonitorMembersEntry {
+                chat_id,
+                cwd: None,
+                monitor: Default::default(),
+            }),
+            Line::CustomTitle(CustomTitleEntry {
+                chat_id,
+                custom_title: "title".into(),
+            }),
+            Line::AiTitle(AiTitleEntry {
+                chat_id,
+                ai_title: "title".into(),
+            }),
+            Line::Subagents(SubagentsEntry {
+                chat_id,
+                subagents: Vec::new(),
+            }),
+            Line::TaskBoards(TaskBoardsEntry {
+                chat_id,
+                boards: Default::default(),
+            }),
+            Line::FamilyCompletions(FamilyCompletionsEntry {
+                chat_id,
+                completions: Vec::new(),
+            }),
+            Line::FamilyInputs(FamilyInputsEntry {
+                chat_id,
+                inputs: Default::default(),
+            }),
+            Line::SentAgentMessages(SentAgentMessagesEntry {
+                chat_id,
+                messages: Default::default(),
+            }),
+            Line::LastPrompt(LastPromptEntry {
+                chat_id,
+                last_prompt: "prompt".into(),
+            }),
+            Line::BranchOrigin(BranchOriginEntry {
+                chat_id,
+                forked_from: ForkedFrom {
+                    chat_id,
+                    message_uuid: None,
+                },
+            }),
+            Line::FileHistorySnapshot(FileHistorySnapshotEntry {
+                message_id: Uuid::nil(),
+                snapshot: serde_json::json!({}),
+                is_snapshot_update: false,
+            }),
+            Line::ContentReplacement(ContentReplacementEntry {
+                chat_id,
+                replacements: Vec::new(),
+            }),
+            Line::Response(ResponseEntry {
+                response_id: Uuid::nil(),
+                input_id: None,
+                attempt: 1,
+                run_id: Uuid::nil(),
+                loop_id: Uuid::nil(),
+                display_parent: None,
+                timestamp: "2026-01-01T00:00:00.000Z".into(),
+                state: ResponseState::Started,
+                without_messages: false,
+            }),
+            Line::Input(InputEntry {
+                input_id: Uuid::nil(),
+                op: InputOp::Continue,
+                digest: String::new(),
+                display_parent: None,
+                loop_id: Uuid::nil(),
+                run_id: Uuid::nil(),
+                timestamp: "2026-01-01T00:00:00.000Z".into(),
+                state: InputState::Accepted,
+            }),
+        ];
+        for line in lines {
+            let raw = serde_json::to_vec(&line).unwrap();
+            let header = serde_json::from_slice::<MetadataHeader>(&raw).unwrap();
+            assert_eq!(header.kind, line.kind());
+        }
+    }
+
+    fn is_chain(raw: &[u8]) -> bool {
+        serde_json::from_slice::<MetadataHeader>(raw)
+            .unwrap()
+            .kind
+            .is_chain()
+    }
+
+    #[test]
+    fn chain_classification_uses_the_top_level_type_independently_of_field_order() {
+        assert!(is_chain(br#"{"message":{},"type":"user"}"#));
+        assert!(is_chain(br#"{"type":"assistant","message":{}}"#));
+        assert!(is_chain(br#"{"message":{},"type":"\u0075ser"}"#));
+        assert!(!is_chain(
+            br#"{"inputs":{"example":{"type":"user"}},"type":"family-inputs"}"#
+        ));
+    }
 }

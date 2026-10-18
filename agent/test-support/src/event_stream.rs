@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use tickloop_agent_protocol::Event;
-use tickloop_agent_runtime::transcript::Line;
+use tickloop_agent_transcript::Line;
 use uuid::Uuid;
 
 /// What one stream entry carries to clients.

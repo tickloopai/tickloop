@@ -18,6 +18,7 @@ tickloop-agent-model = { path = "../model", features = ["test-support"] }
 tickloop-agent-protocol = { path = "../protocol" }
 # The in-memory Transcript store implements the runtime's TranscriptStore seam.
 tickloop-agent-runtime = { path = "../runtime" }
+tickloop-agent-transcript = { path = "../transcript" }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 unicode-width = "0.2"

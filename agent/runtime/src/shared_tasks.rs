@@ -4,6 +4,7 @@ use tickloop_agent_protocol::{
     OperationRecord, SharedTask, SharedTaskStatus as Status, TaskAssignment, TaskBoard, TaskClaim,
     TaskExecutionBinding, TaskMutationReceipt, TaskOwner, TaskReport, ToolDefinition, ToolResult,
 };
+use tickloop_agent_transcript::{Line, TaskBoardsEntry};
 
 use super::*;
 
@@ -838,7 +839,7 @@ impl Agent {
     pub(super) async fn persist_task_boards(&self, root: &mut Chat) -> Result<(), String> {
         self.record_chat_metadata(
             root.snapshot.id,
-            crate::transcript::Line::TaskBoards(crate::transcript::TaskBoardsEntry {
+            Line::TaskBoards(TaskBoardsEntry {
                 chat_id: root.snapshot.id,
                 boards: root.snapshot.task_boards.clone(),
             }),

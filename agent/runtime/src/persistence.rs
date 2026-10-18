@@ -21,13 +21,8 @@ use super::{
 };
 use crate::file_history::{FileHistory, FileHistorySnapshot};
 use crate::transcript::{
-    ArtifactTicksEntry, BranchOriginEntry, COMPACT_BOUNDARY_SUBTYPE, CachedMetadata, ChainEntry,
-    ChatPlacement, CompactMetadata, CompactTriggerEntry, ContentReplacementEntry,
-    ContentReplacementRecord, CustomTitleEntry, DelegationEntry, FLUSH_INTERVAL,
-    FileHistorySnapshotEntry, ForkedFrom, JsonlTranscriptStore, LOOP_CREATED_SUBTYPE,
-    LOOP_ENDED_SUBTYPE, LOOP_STATE_SUBTYPE, LOOP_TRIGGER_SUBTYPE, LastPromptEntry, Line, LoadRange,
-    LoadedTranscript, LoopRecord, MonitorMembersEntry, PartialCompactDirection, Settled,
-    StorePosition, StoredTranscript, SummarizeMetadataEntry, TranscriptError, TranscriptOutbox,
+    CachedMetadata, ChatPlacement, FLUSH_INTERVAL, JsonlTranscriptStore, LoadRange,
+    LoadedTranscript, Settled, StorePosition, StoredTranscript, TranscriptError, TranscriptOutbox,
     TranscriptStore, assemble,
 };
 use tickloop_agent_base::private_fs::unix_time_milliseconds;
@@ -41,6 +36,15 @@ use tickloop_agent_protocol::{
     Message, ModelConfig, MonitorMembership, PrivateHistorySource, Role, RunId, SavedChat,
     SubagentRegistration, SummarizeMetadata, SummaryDirection, TodoItem, ToolCallRecovery, Trigger,
     Usage,
+};
+use tickloop_agent_transcript::{
+    AiTitleEntry, ArtifactTicksEntry, BranchOriginEntry, COMPACT_BOUNDARY_SUBTYPE, ChainEntry,
+    CompactMetadata, CompactTriggerEntry, ContentReplacementEntry, ContentReplacementRecord,
+    CustomTitleEntry, DelegationEntry, FamilyCompletionsEntry, FamilyInputsEntry,
+    FileHistorySnapshotEntry, ForkedFrom, LOOP_CREATED_SUBTYPE, LOOP_ENDED_SUBTYPE,
+    LOOP_STATE_SUBTYPE, LOOP_TRIGGER_SUBTYPE, LastPromptEntry, Line, LoopRecord,
+    MonitorMembersEntry, PartialCompactDirection, SentAgentMessagesEntry, SubagentsEntry,
+    SummarizeMetadataEntry,
 };
 
 /// 照 Claude Code：恢复时末尾是工具结果，追加这条 meta user 消息表示从中断处继续。
@@ -291,10 +295,7 @@ impl ChatRecorder {
     pub(super) fn record_subagents(&self, chat_id: ChatId, subagents: Vec<SubagentRegistration>) {
         self.outbox.enqueue(
             chat_id,
-            vec![Line::Subagents(crate::transcript::SubagentsEntry {
-                chat_id,
-                subagents,
-            })],
+            vec![Line::Subagents(SubagentsEntry { chat_id, subagents })],
             None,
         );
     }
@@ -306,9 +307,10 @@ impl ChatRecorder {
     ) {
         self.outbox.enqueue(
             chat_id,
-            vec![Line::SentAgentMessages(
-                crate::transcript::SentAgentMessagesEntry { chat_id, messages },
-            )],
+            vec![Line::SentAgentMessages(SentAgentMessagesEntry {
+                chat_id,
+                messages,
+            })],
             None,
         );
     }
@@ -320,10 +322,7 @@ impl ChatRecorder {
     ) {
         self.outbox.enqueue(
             chat_id,
-            vec![Line::FamilyInputs(crate::transcript::FamilyInputsEntry {
-                chat_id,
-                inputs,
-            })],
+            vec![Line::FamilyInputs(FamilyInputsEntry { chat_id, inputs })],
             None,
         );
     }
@@ -335,12 +334,10 @@ impl ChatRecorder {
     ) {
         self.outbox.enqueue(
             chat_id,
-            vec![Line::FamilyCompletions(
-                crate::transcript::FamilyCompletionsEntry {
-                    chat_id,
-                    completions,
-                },
-            )],
+            vec![Line::FamilyCompletions(FamilyCompletionsEntry {
+                chat_id,
+                completions,
+            })],
             None,
         );
     }
@@ -348,7 +345,7 @@ impl ChatRecorder {
     pub(super) fn record_ai_title(&self, chat_id: ChatId, title: String) {
         self.outbox.enqueue(
             chat_id,
-            vec![Line::AiTitle(crate::transcript::AiTitleEntry {
+            vec![Line::AiTitle(AiTitleEntry {
                 chat_id,
                 ai_title: title,
             })],

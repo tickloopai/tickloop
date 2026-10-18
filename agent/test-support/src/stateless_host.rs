@@ -26,10 +26,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tickloop_agent_protocol::{ChatId, Event};
 use tickloop_agent_runtime::transcript::{
-    AppendAck, AppendBatch, BatchId, ChatPlacement, Line, LoadRange, StorePosition,
-    StoredTranscript, TranscriptError, TranscriptStore,
+    AppendAck, AppendBatch, BatchId, ChatPlacement, LoadRange, StorePosition, StoredTranscript,
+    TranscriptError, TranscriptStore,
 };
 use tickloop_agent_runtime::{Agent, AgentError, TurnOutcome, TurnRequest};
+use tickloop_agent_transcript::Line;
 use tokio::sync::{Notify, broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;

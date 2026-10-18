@@ -133,6 +133,7 @@ use tickloop_agent_tools::permissions::SessionPermissionDecision;
 use tickloop_agent_tools::{
     file_change::load_file_change_review, permissions::PermissionPolicyExt,
 };
+use tickloop_agent_transcript::{DiscardReason, InterruptedBy, ResponseEnding, SettledOutcome};
 
 const EVENT_REPLAY_LIMIT: usize = 1024;
 const MAX_OUTPUT_LIMIT_CONTINUATIONS: usize = 3;
@@ -3161,7 +3162,7 @@ impl Agent {
                 self.settle_input(
                     &mut candidate,
                     receipt.run_id,
-                    transcript::SettledOutcome::Merged {
+                    SettledOutcome::Merged {
                         into: active.run_id,
                     },
                 );
@@ -3553,22 +3554,20 @@ impl Agent {
             };
         let is_closed = self.inner.closed.load(Ordering::SeqCst);
         let (ending, usage) = match &event {
-            EventKind::Completed { usage } => {
-                (transcript::ResponseEnding::Completed, usage.clone())
-            }
+            EventKind::Completed { usage } => (ResponseEnding::Completed, usage.clone()),
             EventKind::Failed(error) if !is_closed => (
-                transcript::ResponseEnding::Failed {
+                ResponseEnding::Failed {
                     error: error.clone(),
                 },
                 Usage::default(),
             ),
             // A Run that fails or stops while the host shuts down lost its host.
             _ => (
-                transcript::ResponseEnding::Interrupted {
+                ResponseEnding::Interrupted {
                     by: if is_closed {
-                        transcript::InterruptedBy::Host
+                        InterruptedBy::Host
                     } else {
-                        transcript::InterruptedBy::User
+                        InterruptedBy::User
                     },
                 },
                 Usage::default(),
@@ -3946,8 +3945,8 @@ impl Agent {
                 self.settle_removed_inputs(
                     &mut candidate,
                     [&discarded],
-                    transcript::SettledOutcome::Discarded {
-                        reason: transcript::DiscardReason::LoopEnded,
+                    SettledOutcome::Discarded {
+                        reason: DiscardReason::LoopEnded,
                     },
                 );
                 continue;
@@ -4060,7 +4059,7 @@ impl Agent {
                 self.settle_input(
                     &mut candidate,
                     consumed.run_id,
-                    transcript::SettledOutcome::Merged {
+                    SettledOutcome::Merged {
                         into: receipt.run_id,
                     },
                 );
@@ -4665,11 +4664,7 @@ impl Agent {
             });
             for entry in &taken {
                 if entry.kind == QueuedInputKind::Message {
-                    self.settle_input(
-                        &mut candidate,
-                        entry.id,
-                        transcript::SettledOutcome::Withdrawn,
-                    );
+                    self.settle_input(&mut candidate, entry.id, SettledOutcome::Withdrawn);
                 }
             }
             candidate

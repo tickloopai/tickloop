@@ -24,7 +24,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use super::{Agent, AgentError};
-use crate::transcript::{ContentReplacementRecord, private_family_temp_directory};
+use crate::transcript::private_family_temp_directory;
 use tickloop_agent_base::private_fs::{PRIVATE_FILE_MODE, PrivateDirectory};
 use tickloop_agent_protocol::projection;
 use tickloop_agent_protocol::{
@@ -35,6 +35,7 @@ use tickloop_agent_tools::{
     READ_TOOL_NAME, SAVED_TO_LABEL, TASK_OUTPUT_SUBDIRECTORY, Tools, generate_preview,
     large_output_message, utf16_length,
 };
+use tickloop_agent_transcript::ContentReplacementRecord;
 
 /// Chat 目录中大工具结果的子目录。
 const TOOL_RESULTS_SUBDIRECTORY: &str = "tool-results";

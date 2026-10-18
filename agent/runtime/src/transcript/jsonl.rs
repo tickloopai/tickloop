@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use async_trait::async_trait;
 use tickloop_agent_base::private_fs::{PRIVATE_FILE_MODE, create_private_directory};
 use tickloop_agent_protocol::ChatId;
+use tickloop_agent_transcript::{Line, MetadataHeader, MetadataKind};
 
-use super::entry::{Line, MetadataHeader, MetadataKind};
 use super::listing::{LITE_READ_BUF_SIZE, TranscriptSummary, last_json_string_field, list_project};
 use super::path::{locate, project_directory, transcript_path};
 use super::reader::{LoadedTranscript, assemble};

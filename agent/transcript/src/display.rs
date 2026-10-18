@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tickloop_agent_protocol::{Content, ImageContext, InputContext, Role};
 use uuid::Uuid;
 
-use super::entry::{ChainEntry, InterruptedBy, Line, ResponseEnding, ResponseEntry, ResponseState};
+use crate::entry::{ChainEntry, InterruptedBy, Line, ResponseEnding, ResponseEntry, ResponseState};
 
 /// The longest tool result text a tool card carries.
 pub const DISPLAY_TOOL_RESULT_CHARS: usize = 4096;

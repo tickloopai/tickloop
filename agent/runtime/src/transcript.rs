@@ -1,12 +1,8 @@
-//! Transcript: an append-only sequence of Lines per Chat, following Claude Code's session format.
-//!
-//! User, assistant and system entries form a `uuid`/`parentUuid` chain. Metadata stays outside
-//! the chain, with the latest entry winning for each kind. Concurrent continuations can branch;
-//! loading follows the branch with the newest leaf. A `TranscriptStore` keeps the Lines; the
-//! local one writes a JSONL file per Chat.
+//! Transcript storage and assembly. The record format, `Line` and its entries, and the display
+//! projection live in `tickloop_agent_transcript`. A `TranscriptStore` keeps a Chat's Lines; the
+//! local one writes a JSONL file per Chat. Concurrent continuations can branch; loading follows
+//! the branch with the newest leaf.
 
-pub mod display;
-mod entry;
 mod jsonl;
 mod listing;
 mod outbox;
@@ -15,16 +11,6 @@ mod reader;
 pub mod records;
 mod store;
 
-pub use entry::{
-    AiTitleEntry, ArtifactTicksEntry, BranchOriginEntry, COMPACT_BOUNDARY_SUBTYPE, ChainEntry,
-    CompactMetadata, CompactTriggerEntry, ContentReplacementEntry, ContentReplacementRecord,
-    CustomTitleEntry, DelegationEntry, DiscardReason, FamilyCompletionsEntry, FamilyInputsEntry,
-    FileHistorySnapshotEntry, ForkedFrom, InputEntry, InputOp, InputState, InterruptedBy,
-    LOOP_CREATED_SUBTYPE, LOOP_ENDED_SUBTYPE, LOOP_STATE_SUBTYPE, LOOP_TRIGGER_SUBTYPE,
-    LastPromptEntry, Line, LoopRecord, MonitorMembersEntry, PartialCompactDirection,
-    PreservedSegmentEntry, ResponseEnding, ResponseEntry, ResponseState, SentAgentMessagesEntry,
-    SettledOutcome, SubagentsEntry, SummarizeMetadata as SummarizeMetadataEntry, TaskBoardsEntry,
-};
 pub use jsonl::JsonlTranscriptStore;
 pub use listing::TranscriptSummary;
 pub use store::{

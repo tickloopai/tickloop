@@ -8,9 +8,8 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tickloop_agent_protocol::ChatId;
+use tickloop_agent_transcript::{ChainEntry, Line};
 use uuid::Uuid;
-
-use super::entry::{ChainEntry, Line};
 
 #[async_trait]
 pub trait TranscriptStore: std::any::Any + Send + Sync {

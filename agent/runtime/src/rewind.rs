@@ -26,6 +26,7 @@ use tickloop_agent_protocol::{
     RunId, TakenBackPrompt, UserShellRecord, UserShellState,
 };
 use tickloop_agent_tools::Tools;
+use tickloop_agent_transcript::{DiscardReason, SettledOutcome};
 
 impl Agent {
     /// 照 Claude Code 的 Rewind 选择器：按模式恢复代码、对话或两者。先恢复代码，再截断对话；
@@ -535,8 +536,8 @@ pub(super) fn conversation_before(
         if removed_loops.contains(&pending.receipt.loop_id) {
             candidate_bookkeeping.lifecycle.settle(
                 pending.receipt.run_id,
-                crate::transcript::SettledOutcome::Discarded {
-                    reason: crate::transcript::DiscardReason::LoopEnded,
+                SettledOutcome::Discarded {
+                    reason: DiscardReason::LoopEnded,
                 },
             );
         }

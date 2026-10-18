@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tickloop_agent_protocol::ChatId;
 use tickloop_agent_runtime::transcript::{
-    AppendAck, AppendBatch, BatchId, ChatPlacement, Line, LoadRange, StorePosition,
-    StoredTranscript, TranscriptError, TranscriptStore,
+    AppendAck, AppendBatch, BatchId, ChatPlacement, LoadRange, StorePosition, StoredTranscript,
+    TranscriptError, TranscriptStore,
 };
+use tickloop_agent_transcript::Line;
 
 /// A store in memory that enforces expected positions, can leave gaps between positions, as a
 /// store numbering events as well as Lines does, and can be fenced by a newer holder.

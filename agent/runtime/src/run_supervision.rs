@@ -6,7 +6,7 @@ use tickloop_agent_protocol::{EventKind, LoopState, Receipt, RequestFailure, Run
 use tokio_util::sync::CancellationToken;
 
 use super::{Agent, Chat, LoopSnapshotExt, recovery};
-use crate::transcript::ResponseEnding;
+use tickloop_agent_transcript::ResponseEnding;
 
 const INTERNAL_RUN_ERROR: &str = "Agent internal error: execution panicked. The run stopped without automatically retrying. Review any operations with unknown outcomes before continuing.";
 const INTERNAL_COMPLETION_ERROR: &str = "Agent internal error while finishing the run. The run stopped without automatically retrying. Review any operations with unknown outcomes before continuing.";
