@@ -3554,7 +3554,7 @@ async fn signed_out_offers_only_artifact_login() {
 /// and no credential is saved, though the Agent is still held.
 #[tokio::test]
 async fn shutdown_ends_a_pending_artifact_sign_in_before_it_can_save_a_credential() {
-    const TOKEN_POLL: &str = "POST /token ";
+    const TOKEN_POLL: &str = "POST /accounts/token ";
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
     service
@@ -3623,7 +3623,7 @@ async fn artifact_login_returns_the_link_and_code_and_approval_brings_the_tools(
         let started = tool_result_text(&requests[1], "login");
         assert!(started.starts_with("Sign-in started."), "{started}");
         assert!(
-            started.contains(&format!("{}/artifact/device?code=TEST", service.origin))
+            started.contains(&format!("{}/accounts/device?code=TEST", service.origin))
                 && started.contains("confirm the code TEST"),
             "{started}"
         );

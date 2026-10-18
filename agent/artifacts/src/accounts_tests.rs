@@ -27,10 +27,9 @@ impl Fixture {
                 .unwrap()
                 .remove("registration_endpoint");
         });
-        let client = ArtifactClient::for_endpoints(
+        let client = ArtifactClient::for_origin(
             directory.path().canonicalize().unwrap(),
-            "https://artifacts.example",
-            server.issuer(),
+            server.issuer().strip_suffix("/accounts").unwrap(),
         )
         .unwrap();
         Self {
@@ -112,7 +111,7 @@ async fn accounts_login_discovers_path_issuer_refreshes_artifacts_and_revokes_th
     assert!(!tokens[0].form.contains_key("resource"));
     assert_eq!(
         tokens[2].form["resource"],
-        "https://artifacts.example/artifact"
+        format!("{}/artifact", fixture.client.origin())
     );
     assert_eq!(tokens[2].form["refresh_token"], "refresh-1");
     assert!(tokens.iter().all(|request| request.authorization.is_none()));
@@ -134,23 +133,20 @@ async fn accounts_login_discovers_path_issuer_refreshes_artifacts_and_revokes_th
 async fn resource_caches_share_a_rotating_refresh_token_and_serialize_concurrent_refreshes() {
     let fixture = Fixture::new();
     fixture.login().await;
-    let second = ArtifactClient::for_endpoints(
-        fixture.directory.path().canonicalize().unwrap(),
-        "https://second.example",
-        fixture.server.issuer(),
-    )
-    .unwrap();
+    let second_resource = format!("{}/another-resource", fixture.client.origin());
     fixture.server.answer_polls([TokenReply::Approve]);
     let first = fixture.client.credential_snapshot().unwrap().unwrap();
-    assert_eq!(
-        second
-            .access_snapshot()
+    {
+        let _lock = fixture.client.lock().await.unwrap();
+        let mut account = fixture.client.read_account().unwrap().unwrap();
+        fixture
+            .client
+            .renew_resource(&mut account, &second_resource)
             .await
-            .unwrap()
-            .unwrap()
-            .access_token,
-        "access-3"
-    );
+            .unwrap();
+        assert_eq!(account.resources[&second_resource].access_token, "access-3");
+        fixture.client.save_account(&account).unwrap();
+    }
     assert_eq!(
         fixture
             .client
@@ -192,13 +188,13 @@ async fn resource_caches_share_a_rotating_refresh_token_and_serialize_concurrent
     assert_eq!(account.oauth.refresh_token(), Some("refresh-4"));
     assert_eq!(account.resources.len(), 2);
     assert_eq!(account.oauth.access_token, "access-1");
-    let other_issuer = ArtifactClient::for_endpoints(
+    let other = ArtifactClient::for_origin(
         fixture.directory.path().canonicalize().unwrap(),
-        "https://artifacts.example",
-        "https://other.example/accounts",
+        "https://other.example",
     )
     .unwrap();
-    assert!(other_issuer.credential_snapshot().unwrap().is_none());
+    assert_eq!(other.accounts_issuer(), "https://other.example/accounts");
+    assert!(other.credential_snapshot().unwrap().is_none());
 }
 
 #[tokio::test]
@@ -486,26 +482,27 @@ async fn an_old_token_cannot_invalidate_a_replaced_login() {
 async fn a_refused_resource_does_not_remove_the_account_or_another_cached_audience() {
     let fixture = Fixture::new();
     fixture.login().await;
-    let other = ArtifactClient::for_endpoints(
-        fixture.directory.path().canonicalize().unwrap(),
-        "https://ungranted.example",
-        fixture.server.issuer(),
-    )
-    .unwrap();
+    let second_resource = format!("{}/another-resource", fixture.client.origin());
+    let mut account = fixture.client.read_account().unwrap().unwrap();
+    account.resources.remove(&fixture.client.resource());
+    account.resources.insert(
+        second_resource.clone(),
+        ResourceToken {
+            access_token: "other-access".into(),
+            expires_at: now_seconds() + 600,
+        },
+    );
+    fixture.client.save_account(&account).unwrap();
     fixture
         .server
         .answer_polls([TokenReply::Error(400, "invalid_target".into())]);
-    assert!(
-        matches!(other.access_snapshot().await, Err(ArtifactError::Login(LoginError::Refused { code, .. })) if code == "invalid_target")
-    );
+    assert!(matches!(fixture.client.access_snapshot().await,
+        Err(ArtifactError::Login(LoginError::Refused { code, .. })) if code == "invalid_target"));
+    let saved = fixture.client.read_account().unwrap().unwrap();
+    assert_eq!(saved.oauth.refresh_token(), Some("refresh-2"));
     assert_eq!(
-        fixture
-            .client
-            .credential_snapshot()
-            .unwrap()
-            .unwrap()
-            .access_token,
-        "access-2"
+        saved.resources[&second_resource].access_token,
+        "other-access"
     );
 }
 
@@ -618,4 +615,25 @@ async fn userinfo_redirects_do_not_forward_the_account_token() {
             .is_err()
     );
     serving.await.unwrap();
+}
+
+#[test]
+fn accounts_and_artifacts_follow_the_same_validated_tickloop_origin() {
+    let directory = tempfile::tempdir().unwrap();
+    for (configured, expected) in [
+        (DEFAULT_ORIGIN, "https://tickloop.ai"),
+        (
+            "https://service.example:8443/",
+            "https://service.example:8443",
+        ),
+        ("http://127.0.0.1:12345/", "http://127.0.0.1:12345"),
+    ] {
+        let client = ArtifactClient::for_origin(directory.path(), configured).unwrap();
+        assert_eq!(client.accounts_issuer(), format!("{expected}/accounts"));
+        assert_eq!(client.resource(), format!("{expected}/artifact"));
+        assert_eq!(
+            mcp_endpoint(client.origin()),
+            format!("{expected}/artifact/mcp")
+        );
+    }
 }

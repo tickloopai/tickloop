@@ -47,23 +47,23 @@ fn post_login_account_failure_preserves_the_view_and_artifacts_can_retry() {
             let user =
                 serde_json::json!({"id":"owner","name":"Owner","email":"owner@example.test"});
             let (status, body) = if request
-                .starts_with("GET /.well-known/oauth-authorization-server ")
+                .starts_with("GET /.well-known/oauth-authorization-server/accounts ")
             {
                 (
                     200,
-                    serde_json::json!({"issuer":endpoint,"token_endpoint":format!("{endpoint}/token"),"device_authorization_endpoint":format!("{endpoint}/device"),"userinfo_endpoint":format!("{endpoint}/userinfo"),"revocation_endpoint":format!("{endpoint}/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]}),
+                    serde_json::json!({"issuer":format!("{endpoint}/accounts"),"token_endpoint":format!("{endpoint}/accounts/token"),"device_authorization_endpoint":format!("{endpoint}/accounts/device"),"userinfo_endpoint":format!("{endpoint}/accounts/userinfo"),"revocation_endpoint":format!("{endpoint}/accounts/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]}),
                 )
-            } else if request.starts_with("POST /device ") {
+            } else if request.starts_with("POST /accounts/device ") {
                 (
                     200,
-                    serde_json::json!({"device_code":"device","user_code":"CODE","verification_uri":format!("{endpoint}/artifact/device?code=CODE"),"expires_in":60,"interval":1}),
+                    serde_json::json!({"device_code":"device","user_code":"CODE","verification_uri":format!("{endpoint}/accounts/device?code=CODE"),"expires_in":60,"interval":1}),
                 )
-            } else if request.starts_with("POST /token ") {
+            } else if request.starts_with("POST /accounts/token ") {
                 (
                     200,
                     serde_json::json!({"access_token":"test-token","token_type":"Bearer","expires_in":600,"refresh_token":"test-refresh"}),
                 )
-            } else if request.starts_with("GET /userinfo ") {
+            } else if request.starts_with("GET /accounts/userinfo ") {
                 sessions += 1;
                 if sessions == 2 {
                     (503, serde_json::json!({"error":"temporarily_unavailable"}))
@@ -93,7 +93,6 @@ fn post_login_account_failure_preserves_the_view_and_artifacts_can_retry() {
         .arg(directory.path())
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("state"))
         .env("TICKLOOP_ARTIFACT_ORIGIN", &origin)
-        .env("TICKLOOP_ACCOUNTS_ISSUER", &origin)
         .env_remove("HERDR_ENV")
         .env_remove("HERDR_PANE_ID")
         .env_remove("HERDR_SOCKET_PATH")
@@ -144,12 +143,17 @@ fn post_login_account_failure_preserves_the_view_and_artifacts_can_retry() {
 
 #[test]
 fn artifact_commands_are_visible_and_device_login_can_be_cancelled_without_a_model_or_herdr() {
-    let server = tick_test_support::authorization_server::AuthorizationServer::start();
+    let server =
+        tick_test_support::authorization_server::AuthorizationServer::start_with_path("/accounts");
     server.edit_device_authorization(|device| {
         device["user_code"] = serde_json::json!("ABCD");
         device["verification_uri_complete"] = serde_json::Value::Null;
     });
-    let origin = server.issuer().to_owned();
+    let origin = server
+        .issuer()
+        .strip_suffix("/accounts")
+        .unwrap()
+        .to_owned();
     let directory = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_tickloop"))
         .env(
@@ -160,7 +164,6 @@ fn artifact_commands_are_visible_and_device_login_can_be_cancelled_without_a_mod
         .arg(directory.path())
         .env("TICKLOOP_CONFIG_DIR", directory.path().join("state"))
         .env("TICKLOOP_ARTIFACT_ORIGIN", &origin)
-        .env("TICKLOOP_ACCOUNTS_ISSUER", &origin)
         .env_remove("HERDR_ENV")
         .env_remove("HERDR_PANE_ID")
         .env_remove("HERDR_SOCKET_PATH")

@@ -7,39 +7,10 @@ use tick_oauth::{
 
 use super::*;
 
-pub(crate) const ISSUER_ENV: &str = "TICKLOOP_ACCOUNTS_ISSUER";
-pub(crate) const DEFAULT_ISSUER: &str = "https://tickloop.ai/accounts";
+const ACCOUNTS_BASE_PATH: &str = "/accounts";
 pub(crate) const CLIENT_ID: &str = "tickloop-cli";
 const SCOPES: &str = "openid profile email offline_access artifacts.agent artifacts.console";
 const REFRESH_MARGIN_SECONDS: u64 = 60;
-
-#[derive(Clone)]
-pub(super) struct Accounts {
-    pub(super) issuer: String,
-    http: Client,
-}
-
-impl Accounts {
-    pub(super) fn new(issuer: &str) -> Result<Self, ArtifactError> {
-        let url = Url::parse(issuer).map_err(|_| ArtifactError::InvalidIssuer)?;
-        if (url.scheme() != "https" && !(url.scheme() == "http" && is_loopback(&url)))
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            return Err(ArtifactError::InvalidIssuer);
-        }
-        let mut policy = HttpPolicy::new(Policy::none());
-        policy.timeout = Some(REQUEST_TIMEOUT);
-        let (http, _) = build_http_client(&url, policy).map_err(|_| ArtifactError::Connection)?;
-        Ok(Self {
-            issuer: issuer.to_owned(),
-            http,
-        })
-    }
-}
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct ResourceToken {
@@ -67,6 +38,10 @@ impl CredentialStore for ArtifactClient {
 }
 
 impl ArtifactClient {
+    pub(super) fn accounts_issuer(&self) -> String {
+        format!("{}{ACCOUNTS_BASE_PATH}", self.origin())
+    }
+
     pub(super) fn resource(&self) -> String {
         format!("{}{APP_BASE_PATH}", self.origin())
     }
@@ -77,9 +52,9 @@ impl ArtifactClient {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         let login = DeviceLogin::start_with(
-            self.accounts.http.clone(),
+            self.http.clone(),
             self,
-            &self.accounts.issuer,
+            &self.accounts_issuer(),
             &scopes,
             ClientRegistration::Preregistered(CLIENT_ID),
             &[],
@@ -131,14 +106,14 @@ impl ArtifactClient {
         if cancellation.is_cancelled() {
             return Err(ArtifactError::Cancelled);
         }
-        if token.issuer != self.accounts.issuer
+        if token.issuer != self.accounts_issuer()
             || token.client_id != CLIENT_ID
             || !token.token_type.eq_ignore_ascii_case("Bearer")
             || token.refresh_token().is_none()
         {
             return Err(ArtifactError::InvalidResponse);
         }
-        let user = tick_oauth::user_info(&self.accounts.http, &token)
+        let user = tick_oauth::user_info(&self.http, &token)
             .await
             .map_err(refresh_error)?;
         let mut account = AccountCredential {
@@ -155,12 +130,12 @@ impl ArtifactClient {
             .map_err(refresh_error)?;
         let _lock = self.lock().await?;
         if cancellation.is_cancelled() {
-            let _ = tick_oauth::revoke(&self.accounts.http, &account.oauth).await;
+            let _ = tick_oauth::revoke(&self.http, &account.oauth).await;
             return Err(ArtifactError::Cancelled);
         }
         if only_if_absent && self.read_account()?.is_some() {
             // The unused device family should not outlive the abandoned sign-in.
-            let _ = tick_oauth::revoke(&self.accounts.http, &account.oauth).await;
+            let _ = tick_oauth::revoke(&self.http, &account.oauth).await;
             return Ok(None);
         }
         self.save_account(&account)?;
@@ -173,7 +148,7 @@ impl ArtifactClient {
         resource: &str,
     ) -> Result<(), RefreshError> {
         let token = tick_oauth::refresh_for_resource(
-            &self.accounts.http,
+            &self.http,
             &account.oauth,
             account
                 .oauth
@@ -237,7 +212,7 @@ impl ArtifactClient {
         };
         if account.oauth.expires_at <= now_seconds().saturating_add(REFRESH_MARGIN_SECONDS) {
             let refreshed = tick_oauth::refresh_for_resource(
-                &self.accounts.http,
+                &self.http,
                 &account.oauth,
                 account
                     .oauth
@@ -262,7 +237,7 @@ impl ArtifactClient {
             }
         }
         drop(_lock);
-        let verified = tick_oauth::user_info(&self.accounts.http, &account.oauth).await;
+        let verified = tick_oauth::user_info(&self.http, &account.oauth).await;
         let _lock = self.lock().await?;
         let Some(mut current) = self.read_account()? else {
             return Err(ArtifactError::AccountChanged);
@@ -317,7 +292,7 @@ impl ArtifactClient {
         if account.oauth.revocation_endpoint.is_none() {
             return Err(ArtifactError::RevocationUnknown);
         }
-        tick_oauth::revoke(&self.accounts.http, &account.oauth)
+        tick_oauth::revoke(&self.http, &account.oauth)
             .await
             .map_err(|_| ArtifactError::RevocationUnknown)?;
         std::fs::remove_file(self.credential_path()).map_err(|_| ArtifactError::Storage)?;

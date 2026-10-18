@@ -97,8 +97,6 @@ pub enum ArtifactError {
         "invalid Tickloop Artifacts origin; use an HTTPS origin or an HTTP loopback test endpoint"
     )]
     InvalidOrigin,
-    #[error("invalid Tickloop Accounts issuer")]
-    InvalidIssuer,
     #[error("login interrupted, try again")]
     LoginInterrupted,
     #[error("{0}")]
@@ -215,7 +213,6 @@ pub struct ArtifactClient {
     origin: Url,
     http: Client,
     state_root: PathBuf,
-    accounts: accounts::Accounts,
 }
 
 pub struct CredentialSnapshot {
@@ -251,24 +248,12 @@ impl ArtifactClient {
 
     pub fn new(state_root: impl Into<PathBuf>) -> Result<Self, ArtifactError> {
         let origin = std::env::var(ORIGIN_ENV).unwrap_or_else(|_| DEFAULT_ORIGIN.to_owned());
-        let issuer = std::env::var(accounts::ISSUER_ENV)
-            .unwrap_or_else(|_| accounts::DEFAULT_ISSUER.to_owned());
-        Self::for_endpoints(state_root, &origin, &issuer)
+        Self::for_origin(state_root, &origin)
     }
 
     pub fn for_origin(
         state_root: impl Into<PathBuf>,
         configured_origin: &str,
-    ) -> Result<Self, ArtifactError> {
-        let issuer = std::env::var(accounts::ISSUER_ENV)
-            .unwrap_or_else(|_| accounts::DEFAULT_ISSUER.to_owned());
-        Self::for_endpoints(state_root, configured_origin, &issuer)
-    }
-
-    pub fn for_endpoints(
-        state_root: impl Into<PathBuf>,
-        configured_origin: &str,
-        issuer: &str,
     ) -> Result<Self, ArtifactError> {
         let origin = Url::parse(configured_origin).map_err(|_| ArtifactError::InvalidOrigin)?;
         if (origin.scheme() != "https" && !(origin.scheme() == "http" && is_loopback(&origin)))
@@ -290,7 +275,6 @@ impl ArtifactClient {
             origin,
             http,
             state_root: state_root.into(),
-            accounts: accounts::Accounts::new(issuer)?,
         })
     }
 
@@ -350,7 +334,7 @@ impl ArtifactClient {
     }
 
     fn credential_path(&self) -> PathBuf {
-        let digest = Sha256::digest(self.accounts.issuer.as_bytes());
+        let digest = Sha256::digest(self.accounts_issuer().as_bytes());
         let name = digest
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -383,7 +367,7 @@ impl ArtifactClient {
             .map_err(|_| ArtifactError::Storage)?;
         let credential: accounts::AccountCredential =
             serde_json::from_slice(&bytes).map_err(|_| ArtifactError::Storage)?;
-        if credential.oauth.issuer != self.accounts.issuer
+        if credential.oauth.issuer != self.accounts_issuer()
             || credential.oauth.client_id != accounts::CLIENT_ID
             || credential.oauth.access_token.is_empty()
             || !credential.oauth.token_type.eq_ignore_ascii_case("Bearer")
@@ -595,15 +579,15 @@ mod tests {
         client
             .save_account(&accounts::AccountCredential {
                 oauth: tick_oauth::OAuthToken {
-                    issuer: client.accounts.issuer.clone(),
+                    issuer: client.accounts_issuer(),
                     client_id: accounts::CLIENT_ID.into(),
                     access_token: "userinfo-token".into(),
                     token_type: "Bearer".into(),
                     refresh_token: Some("refresh-token".into()),
                     scope: None,
                     expires_at: now_seconds() + 600,
-                    token_endpoint: "https://issuer.example/token".into(),
-                    revocation_endpoint: Some("https://issuer.example/revoke".into()),
+                    token_endpoint: format!("{}/token", client.accounts_issuer()),
+                    revocation_endpoint: Some(format!("{}/revoke", client.accounts_issuer())),
                 },
                 user: ArtifactUser {
                     id: "owner".into(),

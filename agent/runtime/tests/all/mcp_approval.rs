@@ -93,13 +93,15 @@ async fn service() -> (String, Arc<ServiceControl>) {
                     control.release_call_response.notified().await;
                 }
                 let account = control.account.load(Ordering::SeqCst);
-                let response = if path.starts_with("GET /.well-known/oauth-authorization-server ") {
-                    json!({"issuer":origin,"token_endpoint":format!("{origin}/token"),"device_authorization_endpoint":format!("{origin}/device"),"userinfo_endpoint":format!("{origin}/userinfo"),"revocation_endpoint":format!("{origin}/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]})
-                } else if path.starts_with("POST /device ") {
-                    json!({"device_code":"test-device","user_code":"TEST","verification_uri":format!("{origin}/artifact/device?code=TEST"),"expires_in":30,"interval":1})
-                } else if path.starts_with("POST /token ") {
+                let response = if path
+                    .starts_with("GET /.well-known/oauth-authorization-server/accounts ")
+                {
+                    json!({"issuer":format!("{origin}/accounts"),"token_endpoint":format!("{origin}/accounts/token"),"device_authorization_endpoint":format!("{origin}/accounts/device"),"userinfo_endpoint":format!("{origin}/accounts/userinfo"),"revocation_endpoint":format!("{origin}/accounts/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]})
+                } else if path.starts_with("POST /accounts/device ") {
+                    json!({"device_code":"test-device","user_code":"TEST","verification_uri":format!("{origin}/accounts/device?code=TEST"),"expires_in":30,"interval":1})
+                } else if path.starts_with("POST /accounts/token ") {
                     json!({"access_token":format!("token-{account}"),"token_type":"Bearer","expires_in":600,"refresh_token":format!("refresh-{account}")})
-                } else if path.starts_with("GET /userinfo ") {
+                } else if path.starts_with("GET /accounts/userinfo ") {
                     json!({"sub":format!("user-{account}"),"name":"Test","email":"test@example.test"})
                 } else if path.starts_with("GET /artifact/api/v1/artifacts/doc ") {
                     json!({"id":"doc","title":"Report","format":"html","access_role":control.access_role.lock().unwrap().as_deref().unwrap_or("owner"),"publication":control.publication.lock().unwrap().clone()})
@@ -162,12 +164,8 @@ async fn three_large_artifact_edits_do_not_exhaust_the_following_bash_review() {
             Some(json!({"audience":"private","membership_revision":0}));
         control.confirm_writes.store(true, Ordering::SeqCst);
         let directory = tempfile::tempdir().unwrap();
-        let account = ArtifactClient::for_endpoints(
-            directory.path().canonicalize().unwrap(),
-            &origin,
-            &origin,
-        )
-        .unwrap();
+        let account =
+            ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
         login(&account).await;
         let provider = Arc::new(McpHostToolProvider::new(account, None));
         provider.refresh(CancellationToken::new()).await.unwrap();
@@ -292,12 +290,9 @@ async fn first_party_private_artifact_writes_skip_classifier_but_plan_and_rules_
             *control.publication.lock().unwrap() =
                 Some(json!({"audience":"private","membership_revision":0}));
             let directory = tempfile::tempdir().unwrap();
-            let account = ArtifactClient::for_endpoints(
-                directory.path().canonicalize().unwrap(),
-                &origin,
-                &origin,
-            )
-            .unwrap();
+            let account =
+                ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin)
+                    .unwrap();
             login(&account).await;
             let provider = Arc::new(McpHostToolProvider::new(account, None));
             provider.refresh(CancellationToken::new()).await.unwrap();
@@ -397,8 +392,7 @@ async fn artifact_preparation_distinguishes_private_shared_public_and_unknown_au
     let (origin, control) = service().await;
     let directory = tempfile::tempdir().unwrap();
     let account =
-        ArtifactClient::for_endpoints(directory.path().canonicalize().unwrap(), &origin, &origin)
-            .unwrap();
+        ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
     login(&account).await;
     let provider = McpHostToolProvider::new(account, None);
     provider.refresh(CancellationToken::new()).await.unwrap();
@@ -480,12 +474,8 @@ async fn artifact_creation_from_an_automated_turn_does_not_inherit_the_human_fas
         let (origin, control) = service().await;
         control.confirm_writes.store(true, Ordering::SeqCst);
         let directory = tempfile::tempdir().unwrap();
-        let account = ArtifactClient::for_endpoints(
-            directory.path().canonicalize().unwrap(),
-            &origin,
-            &origin,
-        )
-        .unwrap();
+        let account =
+            ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
         login(&account).await;
         let provider = Arc::new(McpHostToolProvider::new(account, None));
         provider.refresh(CancellationToken::new()).await.unwrap();
@@ -615,12 +605,8 @@ async fn extra_artifact_creation_arguments_cannot_borrow_the_private_write_fast_
     ] {
         let (origin, control) = service().await;
         let directory = tempfile::tempdir().unwrap();
-        let account = ArtifactClient::for_endpoints(
-            directory.path().canonicalize().unwrap(),
-            &origin,
-            &origin,
-        )
-        .unwrap();
+        let account =
+            ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
         login(&account).await;
         let provider = Arc::new(McpHostToolProvider::new(account, None));
         provider.refresh(CancellationToken::new()).await.unwrap();
@@ -691,12 +677,8 @@ async fn artifact_first_publication_consent_is_conversation_scoped_and_rules_sti
             Some(json!({"audience":audience,"membership_revision":0}));
         control.confirm_writes.store(true, Ordering::SeqCst);
         let directory = tempfile::tempdir().unwrap();
-        let account = ArtifactClient::for_endpoints(
-            directory.path().canonicalize().unwrap(),
-            &origin,
-            &origin,
-        )
-        .unwrap();
+        let account =
+            ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
         login(&account).await;
         let provider = Arc::new(McpHostToolProvider::new(account, None));
         provider.refresh(CancellationToken::new()).await.unwrap();
@@ -870,12 +852,8 @@ async fn artifact_content_without_verified_ownership_requires_human_confirmation
         let (origin, control) = service().await;
         *control.access_role.lock().unwrap() = Some(role.into());
         let directory = tempfile::tempdir().unwrap();
-        let account = ArtifactClient::for_endpoints(
-            directory.path().canonicalize().unwrap(),
-            &origin,
-            &origin,
-        )
-        .unwrap();
+        let account =
+            ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
         login(&account).await;
         let provider = Arc::new(McpHostToolProvider::new(account, None));
         provider.refresh(CancellationToken::new()).await.unwrap();
@@ -969,8 +947,7 @@ async fn artifact_read_ownership_is_revalidated_before_content_dispatch() {
     let (origin, control) = service().await;
     let directory = tempfile::tempdir().unwrap();
     let account =
-        ArtifactClient::for_endpoints(directory.path().canonicalize().unwrap(), &origin, &origin)
-            .unwrap();
+        ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
     login(&account).await;
     let provider = McpHostToolProvider::new(account, None);
     provider.refresh(CancellationToken::new()).await.unwrap();
@@ -1016,8 +993,7 @@ async fn a_private_artifact_that_becomes_public_while_asking_is_not_dispatched()
         Some(json!({"audience":"private","membership_revision":0}));
     let directory = tempfile::tempdir().unwrap();
     let account =
-        ArtifactClient::for_endpoints(directory.path().canonicalize().unwrap(), &origin, &origin)
-            .unwrap();
+        ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
     login(&account).await;
     let provider = Arc::new(McpHostToolProvider::new(account, None));
     provider.refresh(CancellationToken::new()).await.unwrap();
@@ -1101,8 +1077,7 @@ async fn artifact_publication_admissions_require_confirmed_success_and_keep_acco
     control.confirm_writes.store(true, Ordering::SeqCst);
     let directory = tempfile::tempdir().unwrap();
     let account =
-        ArtifactClient::for_endpoints(directory.path().canonicalize().unwrap(), &origin, &origin)
-            .unwrap();
+        ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
     login(&account).await;
     let provider = McpHostToolProvider::new(account.clone(), None);
     provider.refresh(CancellationToken::new()).await.unwrap();
@@ -1239,7 +1214,7 @@ async fn prepared_approval_shows_every_short_argument_and_bounds_private_content
     let (origin, _) = service().await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
-    let account = ArtifactClient::for_endpoints(&root, &origin, &origin).unwrap();
+    let account = ArtifactClient::for_origin(&root, &origin).unwrap();
     login(&account).await;
     let provider = McpHostToolProvider::new(account, None);
     provider.refresh(CancellationToken::new()).await.unwrap();
@@ -1280,7 +1255,7 @@ async fn account_change_during_mcp_handshake_prevents_old_account_mutation() {
     let (origin, control) = service().await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
-    let account = ArtifactClient::for_endpoints(&root, &origin, &origin).unwrap();
+    let account = ArtifactClient::for_origin(&root, &origin).unwrap();
     login(&account).await;
     let provider = Arc::new(McpHostToolProvider::new(account, None));
     provider.refresh(CancellationToken::new()).await.unwrap();
@@ -1307,7 +1282,7 @@ async fn account_change_during_mcp_handshake_prevents_old_account_mutation() {
     .await
     .unwrap();
     control.account.store(1, Ordering::SeqCst);
-    let new_account = ArtifactClient::for_endpoints(&root, &origin, &origin).unwrap();
+    let new_account = ArtifactClient::for_origin(&root, &origin).unwrap();
     login(&new_account).await;
     control.release_discovery.notify_one();
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch)
@@ -1332,7 +1307,7 @@ async fn agent_approval_and_operation_record_keep_bounded_review_arguments() {
     let (origin, control) = service().await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
-    let account = ArtifactClient::for_endpoints(&root, &origin, &origin).unwrap();
+    let account = ArtifactClient::for_origin(&root, &origin).unwrap();
     login(&account).await;
     let source = "private body ".repeat(400);
     let model = Arc::new(ScriptedModel::new(vec![call(
@@ -1384,7 +1359,7 @@ async fn account_change_after_tool_reaches_server_is_outcome_unknown() {
     let (origin, control) = service().await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
-    let account = ArtifactClient::for_endpoints(&root, &origin, &origin).unwrap();
+    let account = ArtifactClient::for_origin(&root, &origin).unwrap();
     login(&account).await;
     let provider = Arc::new(McpHostToolProvider::new(account, None));
     provider.refresh(CancellationToken::new()).await.unwrap();
@@ -1411,7 +1386,7 @@ async fn account_change_after_tool_reaches_server_is_outcome_unknown() {
     .await
     .unwrap();
     control.account.store(1, Ordering::SeqCst);
-    let new_account = ArtifactClient::for_endpoints(&root, &origin, &origin).unwrap();
+    let new_account = ArtifactClient::for_origin(&root, &origin).unwrap();
     login(&new_account).await;
     control.release_call_response.notify_one();
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), dispatch)
@@ -1436,7 +1411,7 @@ async fn exact_deny_rule_matches_frozen_arguments_even_when_review_redacts_them(
     let (origin, control) = service().await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
-    let account = ArtifactClient::for_endpoints(&root, &origin, &origin).unwrap();
+    let account = ArtifactClient::for_origin(&root, &origin).unwrap();
     login(&account).await;
     let input = json!({"mode":"fixed","share_token":"secret-capability","source":"private body ".repeat(400)});
     let model = Arc::new(ScriptedModel::new(vec![
@@ -1506,7 +1481,7 @@ async fn exact_allow_rule_survives_final_admission_with_bounded_operation_record
     let (origin, control) = service().await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
-    let account = ArtifactClient::for_endpoints(&root, &origin, &origin).unwrap();
+    let account = ArtifactClient::for_origin(&root, &origin).unwrap();
     login(&account).await;
     let input = json!({"mode":"fixed","share_token":"secret-capability","source":"private body ".repeat(400)});
     let model = Arc::new(ScriptedModel::new(vec![
@@ -1588,7 +1563,7 @@ async fn deeply_structured_private_input_cannot_fill_the_operation_record() {
     let (origin, control) = service().await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
-    let account = ArtifactClient::for_endpoints(&root, &origin, &origin).unwrap();
+    let account = ArtifactClient::for_origin(&root, &origin).unwrap();
     login(&account).await;
     let provider = McpHostToolProvider::new(account, None);
     provider.refresh(CancellationToken::new()).await.unwrap();
