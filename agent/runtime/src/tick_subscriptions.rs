@@ -2190,6 +2190,13 @@ impl Agent {
     }
 
     pub(super) fn finish_discarded_trigger_input(&self, chat: &mut Chat, receipt: &Receipt) {
+        self.settle_input(
+            chat,
+            receipt.run_id,
+            SettledOutcome::Discarded {
+                reason: tickloop_agent_transcript::DiscardReason::LoopEnded,
+            },
+        );
         self.inner
             .host_contexts
             .lock()

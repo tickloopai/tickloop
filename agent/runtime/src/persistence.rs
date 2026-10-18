@@ -1156,8 +1156,13 @@ impl ChatRecorder {
         loaded: LoadedTranscript,
     ) {
         let parent_cursor = adopted_parent_cursor(&links, &loaded);
-        self.outbox
-            .adopt(chat_id, loaded.position, loaded.uuids, loaded.metadata);
+        self.outbox.adopt(
+            chat_id,
+            loaded.position,
+            loaded.uuids,
+            loaded.metadata,
+            loaded.retained,
+        );
         self.logs.lock().unwrap().insert(
             chat_id,
             ChatLog {
@@ -1211,7 +1216,8 @@ impl ChatRecorder {
     /// what the store already holds of it is not written again, and Lines queued meanwhile stay
     /// queued.
     pub(super) fn adopt_branch(&self, chat_id: ChatId, log: StagedLog) {
-        self.outbox.remember_written(chat_id, log.uuids);
+        self.outbox
+            .remember_written(chat_id, log.uuids, log.retained);
         let mut logs = self.logs.lock().unwrap();
         let last_entry_milliseconds = logs
             .get(&chat_id)
@@ -3182,6 +3188,7 @@ impl Agent {
                 recorded_loops,
                 created_loops,
                 recorded_lifecycle,
+                retained: loaded.retained,
             },
         })
     }
@@ -3373,9 +3380,7 @@ impl Agent {
         }
         self.save(&snapshot);
         self.start_feedback_cleanup(chat_id).await;
-        if waits == WaitHosting::Durable {
-            self.rebuild_suspended_runs(chat_id).await;
-        }
+        self.restore_after_load(chat_id, waits).await;
         Ok(snapshot)
     }
 }
@@ -3413,6 +3418,7 @@ pub(super) struct StagedLog {
     recorded_loops: HashMap<LoopId, LoopEntryContent>,
     created_loops: HashSet<LoopId>,
     recorded_lifecycle: u64,
+    retained: super::transcript::RetainedFold,
 }
 
 impl StagedBranch {

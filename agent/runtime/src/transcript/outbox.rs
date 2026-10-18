@@ -13,6 +13,7 @@ use tickloop_agent_transcript::{
 };
 use uuid::Uuid;
 
+use super::retained::RetainedFold;
 use super::store::{AppendAck, AppendBatch, BatchId, StorePosition, TranscriptError};
 
 /// 照 Claude Code `FLUSH_INTERVAL_MS`：条目先排队，最多每 100ms 批量追加一次。
@@ -91,6 +92,8 @@ struct ChatOutbox {
     pending: Option<AppendBatch>,
     written_uuids: HashSet<Uuid>,
     metadata: CachedMetadata,
+    /// The retained state of everything queued or loaded, which snapshots are made from.
+    retained: RetainedFold,
     /// The position the store acknowledged last, or gave at registration or load.
     position: StorePosition,
     events_through: u64,
@@ -120,6 +123,7 @@ impl ChatOutbox {
             pending: None,
             written_uuids: HashSet::new(),
             metadata: CachedMetadata::default(),
+            retained: RetainedFold::default(),
             position,
             events_through: 0,
             display_leaf: None,
@@ -168,19 +172,28 @@ impl TranscriptOutbox {
         position: StorePosition,
         uuids: HashSet<Uuid>,
         metadata: CachedMetadata,
+        retained: RetainedFold,
     ) {
         let mut outbox = ChatOutbox::new(position);
         outbox.materialized = true;
         outbox.stored = true;
         outbox.written_uuids = uuids;
         outbox.metadata = metadata;
+        outbox.retained = retained;
         self.insert(chat, outbox);
     }
 
-    /// The store already holds these chain entries of the Chat: they are not written again.
-    pub(crate) fn remember_written(&self, chat: ChatId, uuids: HashSet<Uuid>) {
+    /// The store already holds these chain entries of the Chat, the branch `retained` was
+    /// folded from: they are not written again, and later snapshots keep what that branch needs.
+    pub(crate) fn remember_written(
+        &self,
+        chat: ChatId,
+        uuids: HashSet<Uuid>,
+        retained: RetainedFold,
+    ) {
         if let Some(outbox) = self.chats.lock().unwrap().get_mut(&chat) {
             outbox.written_uuids.extend(uuids);
+            outbox.retained = retained;
         }
     }
 
@@ -213,7 +226,19 @@ impl TranscriptOutbox {
                 continue;
             }
             outbox.metadata.remember(&line);
+            outbox.retained.apply(&line);
             accepted.push(line);
+        }
+        // A new start of the chain, or enough retained Lines since the last snapshot, are folded
+        // into one in the same group.
+        if accepted.iter().any(|line| {
+            line.chain_entry()
+                .is_some_and(tickloop_agent_transcript::ChainEntry::restarts_chain)
+        }) || outbox.retained.is_due()
+        {
+            let snapshot = outbox.retained.snapshot(chat);
+            outbox.retained.apply(&snapshot);
+            accepted.push(snapshot);
         }
         if !outbox.materialized {
             if !accepted.iter().any(|line| {
@@ -248,6 +273,9 @@ impl TranscriptOutbox {
         }
         let lines = outbox.metadata.lines();
         let queued = !lines.is_empty();
+        for line in &lines {
+            outbox.retained.apply(line);
+        }
         outbox.queued.extend(lines);
         queued
     }

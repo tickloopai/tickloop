@@ -13,5 +13,6 @@
 {"type":"system","uuid":"<U12>","parentUuid":null,"logicalParentUuid":"<U11>","isSidechain":false,"chatId":"<U1>","timestamp":"<TIME>","cwd":"<FOLDER>","version":"<VERSION>","message":{"role":"system","content":[{"type":"text","text":"summary boundary"}]},"humanFamilyOrigin":null,"subtype":"compact_boundary","compactMetadata":{"trigger":"manual","preTokens":42,"messagesSummarized":2}}
 {"type":"user","uuid":"<U13>","parentUuid":"<U12>","isSidechain":false,"chatId":"<U1>","timestamp":"<TIME>","cwd":"<FOLDER>","version":"<VERSION>","message":{"role":"user","content":[{"type":"text","text":"after the boundary"}]},"humanFamilyOrigin":null}
 {"type":"last-prompt","chatId":"<U1>","lastPrompt":"after the boundary"}
+{"type":"retained-snapshot","chatId":"<U1>","lines":[{"type":"ai-title","chatId":"<U1>","aiTitle":"A golden Chat"},{"type":"last-prompt","chatId":"<U1>","lastPrompt":"after the boundary"}]}
 {"type":"ai-title","chatId":"<U1>","aiTitle":"A golden Chat"}
 {"type":"last-prompt","chatId":"<U1>","lastPrompt":"after the boundary"}

@@ -386,7 +386,7 @@ async fn a_reply_committed_before_its_result_reached_the_chain_is_appended_by_th
     let (chat, turn, reply, replied, _) = replied_while_the_slot_was_held().await;
     let store = lost_store(chat, replied);
     assert_eq!(wait_states(&store.lines(chat)), ["open", "resolved"]);
-    let model = Arc::new(ScriptedModel::new(vec![text(DONE)]));
+    let model = Arc::new(ScriptedModel::new(vec![text(DONE), text("Held again.")]));
     let next = harness(store.clone(), model.clone(), WaitHosting::Durable);
     // The repeated reply only attaches; loading the Chat rebuilds the Run, which goes on.
     let repeated = next.advance(chat, reply).await.unwrap();
@@ -398,8 +398,10 @@ async fn a_reply_committed_before_its_result_reached_the_chain_is_appended_by_th
         next.settled_input(chat, turn.input_id()).await.unwrap(),
         SettledOutcome::Completed { .. }
     ));
-    assert_eq!(model.requests.lock().unwrap().len(), 1);
-    assert!(format!("{:?}", model.requests.lock().unwrap()[0].messages).contains("Weekly"));
+    // The rebuilt Run goes first; the slot holder lost its host and goes on after it.
+    let requests = model.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert!(format!("{:?}", requests[0].messages).contains("Weekly"));
     let snapshot = next.snapshot(chat).await.unwrap();
     assert_eq!(results_of(&snapshot.messages, QUESTION_CALL).len(), 1);
     next.sync().await.unwrap();
@@ -430,7 +432,7 @@ async fn a_result_on_the_chain_whose_resume_was_lost_is_not_appended_again() {
             .1,
         ResponseState::Suspended
     );
-    let model = Arc::new(ScriptedModel::new(vec![text(DONE)]));
+    let model = Arc::new(ScriptedModel::new(vec![text(DONE), text("Held again.")]));
     let next = harness(store.clone(), model.clone(), WaitHosting::Durable);
     next.advance(chat, reply).await.unwrap();
     assert!(matches!(

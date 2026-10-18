@@ -162,12 +162,9 @@ impl TranscriptStore for InMemoryTranscriptStore {
                 .rposition(|line| matches!(line, Line::System(entry) if entry.restarts_chain()))
                 .unwrap_or(0),
         };
+        // The chain from the latest compact boundary, the retained Lines from the latest snapshot.
         Ok(Some(StoredTranscript {
-            retained: stored.lines[..start]
-                .iter()
-                .filter(|line| line.is_retained())
-                .cloned()
-                .collect(),
+            retained: tickloop_agent_runtime::transcript::retained_before(&stored.lines, start),
             lines: stored.lines[start..].to_vec(),
             position: stored.position,
             warnings: Vec::new(),

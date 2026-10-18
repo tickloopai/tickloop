@@ -7,5 +7,6 @@
 
 pub mod display;
 mod entry;
+pub mod input_ids;
 
 pub use entry::*;

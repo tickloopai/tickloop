@@ -10,7 +10,7 @@ use tickloop_agent_protocol::{
     ToolResult, ToolResultContent, Usage,
 };
 
-/// Transcript 中的一行。未知类型原样跳过，保证旧版本能读取新版本写入的文件。
+/// Transcript 中的一行。未知类型原样保留并原样写回，保证旧版本能读取、也不丢掉新版本写入的记录。
 /// A store keeps each Line as its JSON; the local store writes one per line of a JSONL file.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -40,13 +40,74 @@ pub enum Line {
     Input(InputEntry),
     /// A Run's durable wait; the latest record of a wait id wins.
     Wait(WaitEntry),
-    #[serde(other)]
+    /// The retained state of the Chat as of this Line: loading it stands for every retained Line
+    /// before it.
+    RetainedSnapshot(RetainedSnapshotEntry),
+    /// A Line of a kind this version does not know, kept as it was written.
+    #[serde(untagged)]
+    Unknown(UnknownLine),
+}
+
+/// A Line of a kind this version does not know: its `type` and its whole JSON.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnknownLine {
+    pub kind: String,
+    pub value: serde_json::Value,
+}
+
+impl Serialize for UnknownLine {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for UnknownLine {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let kind = value["type"]
+            .as_str()
+            .ok_or_else(|| serde::de::Error::custom("a Line has a type"))?
+            .to_owned();
+        // A known kind that does not parse is a broken Line, not an unknown one.
+        if serde_json::from_value::<MetadataKind>(serde_json::Value::String(kind.clone()))
+            .is_ok_and(|known| known != MetadataKind::Other)
+        {
+            return Err(serde::de::Error::custom(format!("invalid {kind} Line")));
+        }
+        Ok(Self { kind, value })
+    }
+}
+
+/// The retained Lines that stand for the retained state of a Chat: the latest of each kind
+/// whose latest Line wins, the records by id still needed, the live accumulating Lines, and the
+/// newest Lines of each unknown kind.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetainedSnapshotEntry {
+    pub chat_id: Uuid,
+    pub lines: Vec<Line>,
+}
+
+/// How a load keeps a kind of Line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Retention {
+    /// The conversation chain, read from the latest compact boundary.
+    Chain,
+    /// The latest Line of the kind stands for the Chat.
+    ChatLatest,
+    /// The latest Line of each id wins.
+    LatestById,
+    /// Every Line still adds to the Chat's state.
+    Accumulating,
+    /// Kept as written, the newest few of each kind.
     Unknown,
+    /// Stands for every retained Line before it.
+    Snapshot,
 }
 
 /// The kind of a Line read from its top-level `type` alone, without parsing the rest of it.
 /// [`Line::kind`] maps every Line variant to the kind of the same name.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum MetadataKind {
     User,
@@ -69,15 +130,38 @@ pub enum MetadataKind {
     Response,
     Input,
     Wait,
+    RetainedSnapshot,
     #[serde(other)]
     Other,
 }
 impl MetadataKind {
+    /// Every kind decides here how a load keeps it; a new kind must be classified.
+    pub fn retention(&self) -> Retention {
+        match self {
+            Self::User | Self::Assistant | Self::System => Retention::Chain,
+            Self::CustomTitle
+            | Self::AiTitle
+            | Self::LastPrompt
+            | Self::BranchOrigin
+            | Self::Delegation
+            | Self::ArtifactTicks
+            | Self::MonitorMembers
+            | Self::Subagents
+            | Self::FamilyInputs
+            | Self::SentAgentMessages
+            | Self::TaskBoards
+            | Self::FamilyCompletions => Retention::ChatLatest,
+            Self::Response | Self::Input | Self::Wait => Retention::LatestById,
+            Self::FileHistorySnapshot | Self::ContentReplacement => Retention::Accumulating,
+            Self::RetainedSnapshot => Retention::Snapshot,
+            Self::Other => Retention::Unknown,
+        }
+    }
     pub fn is_chain(&self) -> bool {
-        matches!(self, Self::User | Self::Assistant | Self::System)
+        self.retention() == Retention::Chain
     }
     pub fn is_retained(&self) -> bool {
-        !self.is_chain() && !matches!(self, Self::Other)
+        !self.is_chain()
     }
 }
 /// The fields of a Line a store reads before, or instead of, parsing the whole Line.
@@ -137,7 +221,8 @@ impl Line {
             Self::Response(_) => MetadataKind::Response,
             Self::Input(_) => MetadataKind::Input,
             Self::Wait(_) => MetadataKind::Wait,
-            Self::Unknown => MetadataKind::Other,
+            Self::RetainedSnapshot(_) => MetadataKind::RetainedSnapshot,
+            Self::Unknown(_) => MetadataKind::Other,
         }
     }
 }
@@ -590,6 +675,9 @@ pub struct InputEntry {
     pub run_id: Uuid,
     pub timestamp: String,
     pub state: InputState,
+    /// While `Accepted`: the queued input as it waits, enough to queue it again after a load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -605,12 +693,38 @@ pub enum InputOp {
     RegenerateAnswer,
     /// The user's reply to a question a Run waits on; it joins that Run.
     Answer,
+    /// A Trigger, Tick update or other source that continues a Loop.
+    Trigger,
+    /// An @tickloop request on an Artifact.
+    Feedback,
+    /// A message from another Agent of the family, such as a completion notification.
+    AgentMessage,
+    /// A goal the model registered with StartGoal.
+    Goal,
+}
+
+impl InputOp {
+    /// The host or the user sends it under its own id, which repeating it must find again; the
+    /// others come from the Agent itself.
+    pub fn is_external(&self) -> bool {
+        matches!(
+            self,
+            Self::Continue
+                | Self::Skill
+                | Self::ReplacePrompt
+                | Self::RegenerateAnswer
+                | Self::Answer
+                | Self::Feedback
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum InputState {
     Accepted,
+    /// Its Run started. Only an input whose prompt does not carry its id records this.
+    Started,
     Settled { outcome: SettledOutcome },
 }
 
@@ -737,9 +851,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unknown_line_types_are_accepted_and_ignored() {
-        let line: Line = serde_json::from_str(r#"{"type":"future-kind","value":1}"#).unwrap();
-        assert!(matches!(line, Line::Unknown));
+    fn unknown_line_types_are_kept_as_written() {
+        let raw = r#"{"type":"future-kind","value":1}"#;
+        let line: Line = serde_json::from_str(raw).unwrap();
+        assert!(matches!(&line, Line::Unknown(unknown) if unknown.kind == "future-kind"));
+        assert_eq!(line.kind(), MetadataKind::Other);
+        assert!(line.is_retained());
+        assert_eq!(
+            serde_json::to_value(&line).unwrap(),
+            serde_json::from_str::<serde_json::Value>(raw).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_broken_line_of_a_known_kind_is_not_unknown() {
+        assert!(serde_json::from_str::<Line>(r#"{"type":"user","uuid":7}"#).is_err());
     }
 
     /// A store classifying a written Line by its header alone reads the kind the Line has.
@@ -839,6 +965,7 @@ mod tests {
                 run_id: Uuid::nil(),
                 timestamp: "2026-01-01T00:00:00.000Z".into(),
                 state: InputState::Accepted,
+                queued: None,
             }),
             Line::Wait(WaitEntry {
                 wait_id: Uuid::nil(),

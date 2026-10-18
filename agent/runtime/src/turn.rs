@@ -519,6 +519,21 @@ impl Agent {
         }
     }
 
+    /// Brings the Chat into this instance when it does not hold it yet; a resident Chat is not
+    /// loaded again. With durable wait hosting the load rebuilds its suspended Runs, continues
+    /// the inputs a lost host was answering and queues again what was queued. It records
+    /// nothing of its own, so a host may wake a Chat as often as it likes. `_due_at` is when the
+    /// host's scheduler was asked to wake it; the Triggers due by then fire with H09f.
+    pub async fn wake(
+        &self,
+        chat_id: ChatId,
+        _due_at: Option<std::time::SystemTime>,
+    ) -> Result<(), AgentError> {
+        let _admission = self.inner.tasks.token();
+        self.refuse_when_closed()?;
+        self.make_resident(chat_id).await
+    }
+
     /// Loads a saved Chat this instance does not hold yet.
     async fn make_resident(&self, chat_id: ChatId) -> Result<(), AgentError> {
         if self.inner.chats.lock().await.contains_key(&chat_id) {
@@ -901,8 +916,15 @@ impl Agent {
                 loop_id,
                 run_id: Uuid::new_v4(),
             };
-            chat.bookkeeping.lifecycle.accept(&ledger, &receipt);
             self.queue_answer_run(chat, &receipt, Some(prompt))?;
+            let queued = chat
+                .snapshot
+                .pending_inputs
+                .iter()
+                .find(|pending| pending.receipt.run_id == receipt.run_id)
+                .expect("the answer's Run is queued")
+                .clone();
+            chat.bookkeeping.lifecycle.accept(&ledger, &queued);
             (receipt, removed_loops)
         };
         self.retire_cut_loops(chat_id, removed_loops).await;
@@ -934,20 +956,7 @@ impl Agent {
                 Admission::Run { .. } => return Err(moved_on()),
             }
             rewind::ensure_idle(chat).map_err(|_| chat_is_busy())?;
-            let bookkeeping = &chat.bookkeeping;
-            let tail = bookkeeping
-                .lifecycle
-                .latest_display_node(&chat.snapshot, &bookkeeping.message_responses);
-            let attempts = bookkeeping.lifecycle.responses_of(entry.input_id);
-            let is_at_tail = tail.is_some_and(|tail| {
-                tail == entry.input_id
-                    || Some(tail) == answer_parent
-                    || attempts.iter().any(|attempt| attempt.response_id == tail)
-            });
-            if !is_at_tail {
-                return Err(moved_on());
-            }
-            admit_answer_loop(chat, entry.loop_id)?;
+            admit_continuation(chat, &entry, answer_parent)?;
             let receipt = Receipt {
                 chat_id,
                 loop_id: entry.loop_id,
@@ -963,7 +972,7 @@ impl Agent {
     /// Queues a Run that answers the conversation as it stands, without a prompt of its own. A
     /// sentinel recovery appended after a trailing user message goes first, so the Run answers
     /// that message.
-    fn queue_answer_run(
+    pub(crate) fn queue_answer_run(
         &self,
         chat: &mut Chat,
         receipt: &Receipt,
@@ -1048,10 +1057,10 @@ impl Agent {
                         SettledOutcome::Withdrawn => TurnOutcome::Withdrawn,
                         SettledOutcome::Discarded { reason } => TurnOutcome::Discarded { reason },
                     }),
-                    InputState::Accepted if is_live => {
+                    InputState::Accepted | InputState::Started if is_live => {
                         waiting_for_person(chat, run).map(TurnOutcome::Waiting)
                     }
-                    InputState::Accepted => Some(TurnOutcome::Interrupted {
+                    InputState::Accepted | InputState::Started => Some(TurnOutcome::Interrupted {
                         by: InterruptedBy::Host,
                         uncertain_operations: uncertain(),
                     }),
@@ -1278,6 +1287,29 @@ fn answered_prompt(chat: &Chat, answer: MessageId) -> Result<MessageId, AgentErr
 }
 
 /// The answer's Loop may take another Run: it has ended its last one without ending itself.
+/// Another attempt may continue `entry`: the conversation still ends at it, its prompt or one of
+/// its answers, and its Loop may take another Run.
+pub(crate) fn admit_continuation(
+    chat: &Chat,
+    entry: &InputEntry,
+    answer_parent: Option<Uuid>,
+) -> Result<(), AgentError> {
+    let bookkeeping = &chat.bookkeeping;
+    let tail = bookkeeping
+        .lifecycle
+        .latest_display_node(&chat.snapshot, &bookkeeping.message_responses);
+    let attempts = bookkeeping.lifecycle.responses_of(entry.input_id);
+    let is_at_tail = tail.is_some_and(|tail| {
+        tail == entry.input_id
+            || Some(tail) == answer_parent
+            || attempts.iter().any(|attempt| attempt.response_id == tail)
+    });
+    if !is_at_tail {
+        return Err(moved_on());
+    }
+    admit_answer_loop(chat, entry.loop_id)
+}
+
 fn admit_answer_loop(chat: &Chat, loop_id: LoopId) -> Result<(), AgentError> {
     let goal = chat
         .snapshot

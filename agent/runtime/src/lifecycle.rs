@@ -140,7 +140,10 @@ impl Lifecycle {
         self.inputs.contains_key(&id)
     }
 
-    pub(crate) fn accept(&mut self, input: &LedgerInput, receipt: &Receipt) {
+    /// Accepts `input` as the queued input `queued`, whose content the record keeps until it
+    /// starts, so a load can queue it again.
+    pub(crate) fn accept(&mut self, input: &LedgerInput, queued: &PendingInput) {
+        let receipt = &queued.receipt;
         let revision = self.next_revision();
         self.open_inputs.retain(|_, open| *open != input.id);
         self.open_inputs.insert(receipt.run_id, input.id);
@@ -156,10 +159,50 @@ impl Lifecycle {
                     run_id: receipt.run_id,
                     timestamp: now(),
                     state: InputState::Accepted,
+                    queued: Some(
+                        serde_json::to_value(queued).expect("a queued input is serializable"),
+                    ),
                 },
                 revision,
             },
         );
+    }
+
+    /// The Run of `run`'s open input started. An input whose prompt does not carry its id
+    /// records it; for the others their prompt in the conversation shows it.
+    pub(crate) fn start_input(&mut self, run: RunId) {
+        let Some(id) = self.open_inputs.get(&run).copied() else {
+            return;
+        };
+        let revision = self.next_revision();
+        if let Some(input) = self.inputs.get_mut(&id) {
+            input.record.queued = None;
+            if !matches!(
+                input.record.op,
+                InputOp::Continue | InputOp::Skill | InputOp::ReplacePrompt | InputOp::RegenerateAnswer
+            ) {
+                input.record.state = InputState::Started;
+            }
+            input.record.timestamp = now();
+            input.revision = revision;
+        }
+    }
+
+    /// The inputs accepted and not yet started, in the order they were queued: what a load
+    /// queues again.
+    pub(crate) fn queued_inputs(&self) -> Vec<PendingInput> {
+        let mut queued = self
+            .inputs
+            .values()
+            .filter(|input| input.record.state == InputState::Accepted)
+            .filter_map(|input| {
+                serde_json::from_value::<PendingInput>(input.record.queued.clone()?).ok()
+            })
+            // Another attempt at an answer is the continuation of its input, not a queued input.
+            .filter(|pending| !pending.task_continuation)
+            .collect::<Vec<_>>();
+        queued.sort_by_key(|pending| pending.queued_sequence);
+        queued
     }
 
     /// Settles the open input of `run`; `false` when it has none.
@@ -170,6 +213,7 @@ impl Lifecycle {
         let revision = self.next_revision();
         if let Some(input) = self.inputs.get_mut(&id) {
             input.record.state = InputState::Settled { outcome };
+            input.record.queued = None;
             input.record.timestamp = now();
             input.revision = revision;
         }
@@ -195,10 +239,22 @@ impl Lifecycle {
                     state: InputState::Settled {
                         outcome: SettledOutcome::Merged { into },
                     },
+                    queued: None,
                 },
                 revision,
             },
         );
+    }
+
+    /// Every input the ledger has open: accepted or started, and not settled.
+    pub(crate) fn open_entries(&self) -> Vec<InputEntry> {
+        let mut open = self
+            .inputs
+            .values()
+            .filter(|input| !matches!(input.record.state, InputState::Settled { .. }))
+            .collect::<Vec<_>>();
+        open.sort_by_key(|input| input.revision);
+        open.into_iter().map(|input| input.record.clone()).collect()
     }
 
     /// The input of `run` the ledger still has open.
@@ -621,9 +677,9 @@ impl Lifecycle {
             let revision = lifecycle.next_revision();
             match line {
                 Line::Input(entry) if keeps_inputs => {
-                    if entry.state == InputState::Accepted {
+                    if matches!(entry.state, InputState::Accepted | InputState::Started) {
                         lifecycle.open_inputs.insert(entry.run_id, entry.input_id);
-                    } else {
+                    } else if lifecycle.open_inputs.get(&entry.run_id) == Some(&entry.input_id) {
                         lifecycle.open_inputs.remove(&entry.run_id);
                     }
                     lifecycle.inputs.insert(

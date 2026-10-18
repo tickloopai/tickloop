@@ -128,6 +128,13 @@ impl DisplayProjector {
     }
 
     pub fn apply(&mut self, line: &Line) -> Vec<DisplayChange> {
+        if let Line::RetainedSnapshot(snapshot) = line {
+            return snapshot
+                .lines
+                .iter()
+                .flat_map(|line| self.apply(line))
+                .collect();
+        }
         let changed = match line {
             Line::Response(response) => Some(self.apply_response(response)),
             _ => match line.chain_entry() {

@@ -1401,7 +1401,7 @@ async fn resume_filtering_after_a_compaction_keeps_the_boundary_chain_stable() {
 }
 
 /// 规格"会话内容的表示"中列出的 Transcript 条目类型。
-const SPECIFIED_LINE_TYPES: [&str; 15] = [
+const SPECIFIED_LINE_TYPES: [&str; 17] = [
     "user",
     "assistant",
     "system",
@@ -1417,6 +1417,8 @@ const SPECIFIED_LINE_TYPES: [&str; 15] = [
     "content-replacement",
     "response",
     "input",
+    "wait",
+    "retained-snapshot",
 ];
 
 /// Loop id、目标、计划（版本与内容）与进度步骤。

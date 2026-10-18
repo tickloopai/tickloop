@@ -920,8 +920,9 @@ async fn compaction_keeps_display_ids_stable_and_projects_nothing_twice() {
         );
     }
 
-    // A load from the latest boundary still holds every ended answer's lifecycle, and the
-    // ledger keeps the inputs that settled before it.
+    // A load from the latest boundary holds the lifecycle of every answer on the chain it loads
+    // (H09 §4.6): an answer a full compaction summarized is left to a Full read, which still
+    // shows it.
     let tail = store
         .load(chat, LoadRange::FromLatestBoundary)
         .await
@@ -939,11 +940,16 @@ async fn compaction_keeps_display_ids_stable_and_projects_nothing_twice() {
         .iter()
         .find(|node| texts(node) == ["first answer"])
         .unwrap();
-    let kept = tail_nodes
+    let kept = after
         .iter()
         .find(|node| node.id == first_answer.id)
-        .expect("the ended answer before the boundary stays visible");
+        .expect("a Full read still shows the ended answer before the full compaction");
     assert_eq!(kept.parent, Some(prompts[0]));
+    assert_eq!(kept.status, DisplayStatus::Complete);
+    let kept = tail_nodes
+        .iter()
+        .find(|node| node.id == third_answer)
+        .expect("the answer the directed summary kept on the chain keeps its lifecycle");
     assert_eq!(kept.status, DisplayStatus::Complete);
     let third = tail_nodes
         .iter()
@@ -1004,6 +1010,7 @@ async fn a_large_jsonl_tail_load_keeps_lifecycle_and_ledger_records() {
         run_id: Uuid::new_v4(),
         timestamp: "2026-01-01T00:00:00.000Z".into(),
         state: InputState::Accepted,
+        queued: None,
     };
     let response = ResponseEntry {
         response_id: Uuid::new_v4(),

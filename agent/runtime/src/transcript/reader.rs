@@ -9,6 +9,7 @@ use tickloop_agent_transcript::{
 };
 
 use super::outbox::CachedMetadata;
+use super::retained::RetainedFold;
 use super::store::{StorePosition, StoredTranscript};
 
 pub(crate) struct LoadedTranscript {
@@ -27,6 +28,55 @@ pub(crate) struct LoadedTranscript {
     pub position: StorePosition,
     /// The answer lifecycle, input ledger and wait records, in store order.
     pub lifecycle: Vec<Line>,
+    /// The retained state the Lines fold into, which the next snapshot is made from.
+    pub retained: RetainedFold,
+}
+
+/// What the retained Lines a load reads restore: the latest metadata, the file history and
+/// content replacement records, and the lifecycle records.
+#[derive(Default)]
+struct RetainedState {
+    metadata: CachedMetadata,
+    file_history_snapshots: HashMap<Uuid, FileHistorySnapshotEntry>,
+    content_replacements: Vec<ContentReplacementEntry>,
+    lifecycle: Vec<Line>,
+}
+
+impl RetainedState {
+    fn absorb(&mut self, line: &Line) {
+        match line {
+            Line::ArtifactTicks(entry) => self.metadata.artifact_ticks = Some(entry.clone()),
+            Line::MonitorMembers(entry) => self.metadata.monitor_members = Some(entry.clone()),
+            Line::CustomTitle(entry) => self.metadata.custom_title = Some(entry.clone()),
+            Line::AiTitle(entry) => self.metadata.ai_title = Some(entry.clone()),
+            Line::Subagents(entry) => self.metadata.subagents = Some(entry.clone()),
+            Line::SentAgentMessages(entry) => {
+                self.metadata.sent_agent_messages = Some(entry.clone())
+            }
+            Line::FamilyInputs(entry) => self.metadata.family_inputs = Some(entry.clone()),
+            Line::TaskBoards(entry) => self.metadata.task_boards = Some(entry.clone()),
+            Line::FamilyCompletions(entry) => {
+                self.metadata.family_completions = Some(entry.clone())
+            }
+            Line::LastPrompt(entry) => self.metadata.last_prompt = Some(entry.clone()),
+            Line::BranchOrigin(entry) => self.metadata.branch_origin = Some(entry.clone()),
+            Line::Delegation(entry) => self.metadata.delegation = Some(entry.clone()),
+            Line::FileHistorySnapshot(entry) => {
+                self.file_history_snapshots
+                    .insert(entry.message_id, entry.clone());
+            }
+            Line::ContentReplacement(entry) => self.content_replacements.push(entry.clone()),
+            Line::Response(_) | Line::Input(_) | Line::Wait(_) => self.lifecycle.push(line.clone()),
+            // The snapshot repeats what a load from it needs; a load of everything also reads the
+            // Lines before it, which older branches may still need.
+            Line::RetainedSnapshot(snapshot) => {
+                for line in &snapshot.lines {
+                    self.absorb(line);
+                }
+            }
+            Line::User(_) | Line::Assistant(_) | Line::System(_) | Line::Unknown(_) => {}
+        }
+    }
 }
 
 struct IndexedEntry {
@@ -124,76 +174,18 @@ pub(crate) fn assemble(
     leaf: Option<Uuid>,
 ) -> (Option<LoadedTranscript>, bool) {
     let mut entries: HashMap<Uuid, IndexedEntry> = HashMap::new();
-    let mut metadata = CachedMetadata::default();
-    let mut file_history_snapshots = HashMap::new();
-    let mut content_replacements = Vec::new();
-    let mut lifecycle = Vec::new();
+    let mut state = RetainedState::default();
+    let mut retained = RetainedFold::default();
     for (file_index, line) in stored.retained.iter().chain(&stored.lines).enumerate() {
+        retained.apply(line);
         let role = match line {
             Line::User(_) => Role::User,
             Line::Assistant(_) => Role::Assistant,
             Line::System(_) => Role::System,
-            Line::ArtifactTicks(entry) => {
-                metadata.artifact_ticks = Some(entry.clone());
+            line => {
+                state.absorb(line);
                 continue;
             }
-            Line::MonitorMembers(entry) => {
-                metadata.monitor_members = Some(entry.clone());
-                continue;
-            }
-            Line::CustomTitle(entry) => {
-                metadata.custom_title = Some(entry.clone());
-                continue;
-            }
-            Line::AiTitle(entry) => {
-                metadata.ai_title = Some(entry.clone());
-                continue;
-            }
-            Line::Subagents(entry) => {
-                metadata.subagents = Some(entry.clone());
-                continue;
-            }
-            Line::SentAgentMessages(entry) => {
-                metadata.sent_agent_messages = Some(entry.clone());
-                continue;
-            }
-            Line::FamilyInputs(entry) => {
-                metadata.family_inputs = Some(entry.clone());
-                continue;
-            }
-            Line::TaskBoards(entry) => {
-                metadata.task_boards = Some(entry.clone());
-                continue;
-            }
-            Line::FamilyCompletions(entry) => {
-                metadata.family_completions = Some(entry.clone());
-                continue;
-            }
-            Line::LastPrompt(entry) => {
-                metadata.last_prompt = Some(entry.clone());
-                continue;
-            }
-            Line::BranchOrigin(entry) => {
-                metadata.branch_origin = Some(entry.clone());
-                continue;
-            }
-            Line::Delegation(entry) => {
-                metadata.delegation = Some(entry.clone());
-                continue;
-            }
-            Line::FileHistorySnapshot(entry) => {
-                file_history_snapshots.insert(entry.message_id, entry.clone());
-                continue;
-            }
-            Line::ContentReplacement(entry) => {
-                content_replacements.push(entry.clone());
-                continue;
-            }
-            Line::Response(_) | Line::Input(_) | Line::Wait(_) => {
-                lifecycle.push(line.clone());
-                continue;
-            }
-            Line::Unknown => continue,
         };
         let entry = line.chain_entry().expect("chain line").clone();
         entries.insert(
@@ -205,6 +197,12 @@ pub(crate) fn assemble(
             },
         );
     }
+    let RetainedState {
+        metadata,
+        file_history_snapshots,
+        content_replacements,
+        lifecycle,
+    } = state;
     let uuids = entries.keys().copied().collect::<HashSet<_>>();
     let mut warnings = stored.warnings.clone();
     let prune = apply_preserved_segment_relinks(&mut entries).unwrap_or_else(|warning| {
@@ -264,6 +262,7 @@ pub(crate) fn assemble(
             warnings,
             position: stored.position,
             lifecycle,
+            retained,
         });
         return (loaded, true);
     };
@@ -303,6 +302,7 @@ pub(crate) fn assemble(
         warnings,
         position: stored.position,
         lifecycle,
+        retained,
     };
     (Some(loaded), reaches_root)
 }

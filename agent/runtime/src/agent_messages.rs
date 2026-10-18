@@ -737,23 +737,29 @@ impl Agent {
             .iter()
             .position(|pending| pending.trigger_source.is_some())
             .unwrap_or(receiver.snapshot.pending_inputs.len());
-        receiver.snapshot.pending_inputs.insert(
-            index,
-            PendingInput {
-                receipt: receipt.clone(),
-                input,
-                contexts: Vec::new(),
-                agent_message: Some(source.clone()),
-                directed_human: None,
-                denial_reference: None,
-                trigger_source: None,
-                armed: true,
-                queued_sequence,
-                task_continuation: false,
-                is_skill_invocation: false,
-                attached_file_reads: Vec::new(),
-            },
+        let queued = PendingInput {
+            receipt: receipt.clone(),
+            input,
+            contexts: Vec::new(),
+            agent_message: Some(source.clone()),
+            directed_human: None,
+            denial_reference: None,
+            trigger_source: None,
+            armed: true,
+            queued_sequence,
+            task_continuation: false,
+            is_skill_invocation: false,
+            attached_file_reads: Vec::new(),
+        };
+        receiver.bookkeeping.lifecycle.accept(
+            &super::lifecycle::LedgerInput::new(
+                source.message_id,
+                tickloop_agent_transcript::InputOp::AgentMessage,
+                &queued.input,
+            ),
+            &queued,
         );
+        receiver.snapshot.pending_inputs.insert(index, queued);
         self.remember_host_context(&receipt, None);
         self.emit(
             receiver,

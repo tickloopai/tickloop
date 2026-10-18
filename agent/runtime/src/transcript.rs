@@ -9,10 +9,12 @@ mod outbox;
 mod path;
 mod reader;
 pub mod records;
+mod retained;
 mod store;
 
 pub use jsonl::JsonlTranscriptStore;
 pub use listing::TranscriptSummary;
+pub use retained::retained_before;
 pub use store::{
     AppendAck, AppendBatch, BatchId, ChatPlacement, LoadRange, StorePosition, StoredTranscript,
     TranscriptError, TranscriptStore,
@@ -23,6 +25,7 @@ pub(crate) use path::{
     TICKHOST_RUNTIME_SUBDIRECTORY, private_family_temp_directory, private_project_temp_directory,
     private_tickhost_directory,
 };
+pub(crate) use retained::RetainedFold;
 pub(crate) use reader::{
     LoadedTranscript, assemble, load_compaction_ancestors, load_original_user_inputs,
 };

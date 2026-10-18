@@ -476,23 +476,29 @@ impl Agent {
             .unwrap_or(snapshot.pending_inputs.len());
         snapshot.last_queue_sequence += 1;
         let queued_sequence = snapshot.last_queue_sequence;
-        snapshot.pending_inputs.insert(
-            index,
-            PendingInput {
-                receipt: new_receipt.clone(),
-                input: parsed.goal,
-                contexts: Vec::new(),
-                agent_message: None,
-                directed_human: None,
-                denial_reference: None,
-                trigger_source: None,
-                armed: true,
-                queued_sequence,
-                task_continuation: false,
-                is_skill_invocation: false,
-                attached_file_reads: Vec::new(),
-            },
+        let queued = PendingInput {
+            receipt: new_receipt.clone(),
+            input: parsed.goal,
+            contexts: Vec::new(),
+            agent_message: None,
+            directed_human: None,
+            denial_reference: None,
+            trigger_source: None,
+            armed: true,
+            queued_sequence,
+            task_continuation: false,
+            is_skill_invocation: false,
+            attached_file_reads: Vec::new(),
+        };
+        chat.bookkeeping.lifecycle.accept(
+            &lifecycle::LedgerInput::new(
+                tickloop_agent_transcript::input_ids::goal(new_receipt.loop_id),
+                tickloop_agent_transcript::InputOp::Goal,
+                &queued.input,
+            ),
+            &queued,
         );
+        snapshot.pending_inputs.insert(index, queued);
         let result = ToolResult {content: json!({"chat_id":new_receipt.chat_id,"loop_id":new_receipt.loop_id,"run_id":new_receipt.run_id,"state":"queued"}).to_string(), is_error: false, output_ref: None};
         if let Some(operation) = snapshot
             .operations

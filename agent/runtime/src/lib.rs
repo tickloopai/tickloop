@@ -71,6 +71,7 @@ mod run_supervision;
 mod session_permissions;
 mod shell_description;
 mod shell_task_center;
+mod durable_queue;
 mod suspension;
 mod system_prompt;
 mod tool_batch;
@@ -138,7 +139,9 @@ use tickloop_agent_tools::permissions::SessionPermissionDecision;
 use tickloop_agent_tools::{
     file_change::load_file_change_review, permissions::PermissionPolicyExt,
 };
-use tickloop_agent_transcript::{DiscardReason, InterruptedBy, ResponseEnding, SettledOutcome};
+use tickloop_agent_transcript::{
+    DiscardReason, InputOp, InterruptedBy, ResponseEnding, SettledOutcome,
+};
 
 const EVENT_REPLAY_LIMIT: usize = 1024;
 const MAX_OUTPUT_LIMIT_CONTINUATIONS: usize = 3;
@@ -2410,6 +2413,25 @@ impl Agent {
         } = options;
         let is_feedback = feedback_input.is_some();
         let resumes_feedback = trigger_source.is_none() && agent_message.is_none();
+        // Every queued input has its ledger record; one the Agent queues for itself is named by
+        // its source where the source names it.
+        let ledger = ledger.unwrap_or_else(|| {
+            let (id, op) = match (&agent_message, &directed_human, &feedback_input) {
+                (Some(source), _, _) => (source.message_id, InputOp::AgentMessage),
+                (_, Some(source), _) => (source.message_id, InputOp::AgentMessage),
+                (_, _, Some(feedback)) => (
+                    tickloop_agent_transcript::input_ids::feedback(
+                        &feedback.origin,
+                        &feedback.account_id,
+                        feedback.delivery_id,
+                    ),
+                    InputOp::Feedback,
+                ),
+                _ if trigger_source.is_some() => (Uuid::new_v4(), InputOp::Trigger),
+                _ => (Uuid::new_v4(), InputOp::Continue),
+            };
+            lifecycle::LedgerInput::new(id, op, &input)
+        });
         // Held through every task this submission starts: `shutdown` either refuses it or waits
         // for those tasks.
         let _admission = self.inner.tasks.token();
@@ -2425,13 +2447,12 @@ impl Agent {
         }
         // Checked again under this lock: a concurrent first submission of the same input may
         // have been accepted while this one was being prepared.
-        if let Some(ledger) = &ledger
-            && let Some(replay) = chats
-                .get(&chat_id)
-                .ok_or(AgentError::NotFound)?
-                .bookkeeping
-                .lifecycle
-                .replay(chat_id, ledger)
+        if let Some(replay) = chats
+            .get(&chat_id)
+            .ok_or(AgentError::NotFound)?
+            .bookkeeping
+            .lifecycle
+            .replay(chat_id, &ledger)
         {
             return replay;
         }
@@ -2673,26 +2694,22 @@ impl Agent {
         chat.snapshot.last_queue_sequence += 1;
         let queued_sequence = chat.snapshot.last_queue_sequence;
         let directed_origin = directed_human.clone();
-        if let Some(ledger) = &ledger {
-            chat.bookkeeping.lifecycle.accept(ledger, &receipt);
-        }
-        chat.snapshot.pending_inputs.insert(
-            index,
-            PendingInput {
-                receipt: receipt.clone(),
-                input,
-                contexts,
-                agent_message,
-                directed_human,
-                denial_reference,
-                trigger_source,
-                armed: true,
-                queued_sequence,
-                task_continuation: false,
-                is_skill_invocation,
-                attached_file_reads,
-            },
-        );
+        let queued = PendingInput {
+            receipt: receipt.clone(),
+            input,
+            contexts,
+            agent_message,
+            directed_human,
+            denial_reference,
+            trigger_source,
+            armed: true,
+            queued_sequence,
+            task_continuation: false,
+            is_skill_invocation,
+            attached_file_reads,
+        };
+        chat.bookkeeping.lifecycle.accept(&ledger, &queued);
+        chat.snapshot.pending_inputs.insert(index, queued);
         if let Some(feedback_input) = feedback_input {
             chat.feedback_inputs.insert(receipt.run_id, feedback_input);
         }
@@ -3991,6 +4008,13 @@ impl Agent {
                     {
                         let receipt = queued.receipt.clone();
                         self.append_input_message(&mut candidate, queued);
+                        self.settle_input(
+                            &mut candidate,
+                            receipt.run_id,
+                            SettledOutcome::Merged {
+                                into: pending.receipt.run_id,
+                            },
+                        );
                         agent_message_receipts.push(receipt);
                     } else {
                         retained.push(queued);
@@ -4012,6 +4036,7 @@ impl Agent {
             candidate.active_run = Some(pending.receipt.run_id);
             let receipt = pending.receipt.clone();
             self.mark_run_inputs_handled(&mut candidate, &pending);
+            candidate.bookkeeping.lifecycle.start_input(receipt.run_id);
             self.append_input_message(&mut candidate, pending);
             let mut merged_receipts = Vec::with_capacity(merged_inputs.len());
             for queued in merged_inputs {

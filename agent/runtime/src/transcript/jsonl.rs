@@ -378,6 +378,19 @@ pub(crate) fn read_file(path: &Path, range: LoadRange) -> io::Result<StoredTrans
         }
         _ => 0,
     };
+    // The retained Lines before the boundary are read from the latest snapshot on; a snapshot
+    // after the boundary stands for all of them.
+    let retained_from = match skip_before {
+        0 => 0,
+        _ => lines
+            .iter()
+            .rev()
+            .find(|(_, raw)| {
+                serde_json::from_slice::<MetadataHeader>(raw)
+                    .is_ok_and(|header| header.kind == MetadataKind::RetainedSnapshot)
+            })
+            .map_or(0, |(offset, _)| (*offset).min(skip_before)),
+    };
     let mut stored = StoredTranscript {
         position: StorePosition(bytes.len() as u64),
         ..StoredTranscript::default()
@@ -388,8 +401,9 @@ pub(crate) fn read_file(path: &Path, range: LoadRange) -> io::Result<StoredTrans
         }
         let before_boundary = offset < skip_before;
         if before_boundary
-            && !serde_json::from_slice::<MetadataHeader>(raw)
-                .is_ok_and(|header| header.kind.is_retained())
+            && (offset < retained_from
+                || !serde_json::from_slice::<MetadataHeader>(raw)
+                    .is_ok_and(|header| header.kind.is_retained()))
         {
             continue;
         }
