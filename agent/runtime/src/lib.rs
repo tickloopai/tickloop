@@ -4914,6 +4914,10 @@ impl Agent {
         self.stop_transcript_flushing();
         self.inner.tasks.close();
         self.inner.tasks.wait().await;
+        let host_tools = self.inner.host_tools.read().unwrap().clone();
+        if let Some(host_tools) = host_tools {
+            host_tools.shutdown().await;
+        }
         let chat_clients = self
             .inner
             .chats

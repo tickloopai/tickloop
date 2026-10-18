@@ -2923,7 +2923,9 @@ async fn cancelled_watch_removes_queued_tick_without_removing_user_input() {
 
 async fn chat_reading_final_admission(cancel_during_check: bool) {
     use tickloop_agent_protocol::HostToolAuthority;
-    use tickloop_agent_runtime::tick_stream::{TickStreamHandle, TickStreamPort, WatchId};
+    use tickloop_agent_runtime::tick_stream::{
+        StreamTasks, TickStreamHandle, TickStreamPort, WatchId,
+    };
     struct ChatReadingStream {
         updates: InMemoryTickStream,
         agent: std::sync::Weak<Agent>,
@@ -2939,8 +2941,8 @@ async fn chat_reading_final_admission(cancel_during_check: bool) {
         ) {
             self.updates.set_watch_authorities(authorities);
         }
-        fn open(&self) -> TickStreamHandle {
-            self.updates.open()
+        fn open(&self, tasks: &StreamTasks) -> TickStreamHandle {
+            self.updates.open(tasks)
         }
         async fn revalidate_watch(
             &self,
@@ -3587,8 +3589,11 @@ impl RefillingStream {
 
 #[async_trait::async_trait]
 impl tickloop_agent_runtime::tick_stream::TickStreamPort for RefillingStream {
-    fn open(&self) -> tickloop_agent_runtime::tick_stream::TickStreamHandle {
-        self.inner.open()
+    fn open(
+        &self,
+        tasks: &tickloop_agent_runtime::tick_stream::StreamTasks,
+    ) -> tickloop_agent_runtime::tick_stream::TickStreamHandle {
+        self.inner.open(tasks)
     }
     fn set_watch_authorities(
         &self,

@@ -3550,6 +3550,48 @@ async fn signed_out_offers_only_artifact_login() {
     );
 }
 
+/// Shutdown ends a sign-in still waiting for approval: approving it afterwards reaches no poll,
+/// and no credential is saved, though the Agent is still held.
+#[tokio::test]
+async fn shutdown_ends_a_pending_artifact_sign_in_before_it_can_save_a_credential() {
+    const TOKEN_POLL: &str = "POST /artifact/api/v1/auth/device/token ";
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    service
+        .control
+        .hold_device_approval
+        .store(true, Ordering::SeqCst);
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("login", "ArtifactLogin", json!({})),
+        text("Open the link and confirm the code."),
+    ]));
+    let agent = Agent::new_embedded(config(), model);
+    agent
+        .install_host_tools(Arc::new(McpHostToolProvider::new(
+            service.client(directory.path()),
+            None,
+        )))
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Make me a design").await;
+    eventually(async || !service.lifecycle_requests(TOKEN_POLL).is_empty()).await;
+
+    agent.shutdown().await;
+    let polls = service.lifecycle_requests(TOKEN_POLL).len();
+    service
+        .control
+        .hold_device_approval
+        .store(false, Ordering::SeqCst);
+    // The fixture asks for a poll every second.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(service.lifecycle_requests(TOKEN_POLL).len(), polls);
+    assert!(matches!(
+        service.client(directory.path()).credential_snapshot(),
+        Ok(None)
+    ));
+    drop(agent);
+}
+
 #[tokio::test]
 async fn artifact_login_returns_the_link_and_code_and_approval_brings_the_tools() {
     let service = ArtifactService::start().await;

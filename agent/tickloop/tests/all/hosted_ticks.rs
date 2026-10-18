@@ -2029,7 +2029,7 @@ for line in sys.stdin:
             (first, authority.clone()),
             (second, authority),
         ]));
-        let mut handle = stream.open();
+        let mut handle = stream.open(&Default::default());
         let target: tick_protocol::InstanceRef = serde_json::from_value(instance.clone()).unwrap();
         handle
             .desired
@@ -3427,7 +3427,7 @@ for line in sys.stdin:
             (large, authority.clone()),
             (small, authority),
         ]));
-        let mut handle = stream.open();
+        let mut handle = stream.open(&Default::default());
         handle.desired.send_replace(BTreeMap::from([
             (
                 large,

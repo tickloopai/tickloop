@@ -15,9 +15,35 @@ use serde::{Deserialize, Serialize};
 use tick_protocol::InstanceRef;
 use tickloop_agent_protocol::{HostToolAuthority, ObservationKind};
 use tokio::sync::{Notify, mpsc, watch};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
 
 pub type WatchId = Uuid;
+
+/// Where an opened Tick stream runs its tasks: the Agent's own, which cancels them and waits for
+/// them when it shuts down. The default belongs to no Agent: its tasks end with their channels.
+#[derive(Clone, Default)]
+pub struct StreamTasks {
+    tracker: TaskTracker,
+    cancel: CancellationToken,
+}
+
+impl StreamTasks {
+    pub fn new(tracker: TaskTracker, cancel: CancellationToken) -> Self {
+        Self { tracker, cancel }
+    }
+
+    /// Runs `task` until it ends or the stream's owner cancels it.
+    pub fn spawn(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        let cancel = self.cancel.clone();
+        self.tracker.spawn(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = task => {}
+            }
+        });
+    }
+}
 const STREAM_CAPACITY: usize = 128;
 /// A watch connects to its Tick once and reconnects at most this often in an Agent process;
 /// then it stays Disconnected until it is subscribed again, which makes a new watch.
@@ -217,7 +243,8 @@ impl PreparedTickWatch {
 
 #[async_trait::async_trait]
 pub trait TickStreamPort: Send + Sync + 'static {
-    fn open(&self) -> TickStreamHandle;
+    /// Opens the stream; every task it starts runs under `tasks`.
+    fn open(&self, tasks: &StreamTasks) -> TickStreamHandle;
     /// Caller identities for active watches, including restored subscriptions.
     fn set_watch_chats(&self, _chats: BTreeMap<WatchId, Uuid>) {}
     /// Prepare subscription admission with the native query policy and stable target ownership.
@@ -323,14 +350,14 @@ impl EventPublisher {
             }
         }
     }
-    pub fn channel() -> (Self, mpsc::Receiver<TickStreamEvent>) {
+    pub fn channel(tasks: &StreamTasks) -> (Self, mpsc::Receiver<TickStreamEvent>) {
         let publisher = Self {
             state: Arc::new(Mutex::new(EventMailbox::default())),
             wake: Arc::new(Notify::new()),
         };
         let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
         let draining = publisher.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             loop {
                 let event = {
                     let mut mailbox = draining
@@ -615,14 +642,14 @@ impl TickStreamPort for InMemoryTickStream {
         }
         Ok(())
     }
-    fn open(&self) -> TickStreamHandle {
+    fn open(&self, tasks: &StreamTasks) -> TickStreamHandle {
         let (desired, watched) = watch::channel(BTreeMap::new());
-        let (sender, events) = EventPublisher::channel();
+        let (sender, events) = EventPublisher::channel(tasks);
         let mut state = self.state();
         if state.auto_ready {
             let mut ready_watches = watched.clone();
             let ready_sender = sender.clone();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 let mut seen = BTreeSet::new();
                 loop {
                     let current = ready_watches.borrow_and_update().clone();
@@ -668,6 +695,7 @@ trait InstanceObserver: WatchAdmission + Clone + 'static {
         instance: InstanceRef,
         wanted: watch::Receiver<BTreeSet<WatchId>>,
         publisher: EventPublisher,
+        tasks: StreamTasks,
     );
 }
 
@@ -770,6 +798,7 @@ async fn follow_instances<O: InstanceObserver>(
     mut scope: O,
     mut desired: watch::Receiver<BTreeMap<WatchId, InstanceRef>>,
     publisher: EventPublisher,
+    tasks: StreamTasks,
 ) {
     struct Worker {
         sender: watch::Sender<BTreeSet<WatchId>>,
@@ -848,8 +877,11 @@ async fn follow_instances<O: InstanceObserver>(
             let scope = scope.clone();
             let publisher = publisher.clone();
             let finished_sender = finished_sender.clone();
-            tokio::spawn(async move {
-                scope.observe(instance.clone(), receiver, publisher).await;
+            let observer_tasks = tasks.clone();
+            tasks.spawn(async move {
+                scope
+                    .observe(instance.clone(), receiver, publisher, observer_tasks)
+                    .await;
                 let _ = finished_sender.send((instance, generation));
             });
         }
@@ -1194,7 +1226,7 @@ mod tests {
     /// Whether observing an [`EndingFeed`] that answers `answers` times ended the watch, and the
     /// last connection state it published.
     async fn observe_ending(answers: usize) -> (bool, TickConnectionState) {
-        let (publisher, mut events) = EventPublisher::channel();
+        let (publisher, mut events) = EventPublisher::channel(&StreamTasks::default());
         let instance = InstanceRef::hosted(Uuid::new_v4());
         let watch = Uuid::new_v4();
         let (_wanted_sender, mut wanted) = watch::channel(BTreeSet::from([watch]));
@@ -1277,7 +1309,7 @@ mod tests {
     /// receives the first content once, as a change.
     #[tokio::test]
     async fn a_watch_that_starts_before_the_first_content_receives_it_once() {
-        let (publisher, mut events) = EventPublisher::channel();
+        let (publisher, mut events) = EventPublisher::channel(&StreamTasks::default());
         let instance = InstanceRef::hosted(Uuid::new_v4());
         let watch = Uuid::new_v4();
         let (wanted_sender, mut wanted) = watch::channel(BTreeSet::from([watch]));
@@ -1327,7 +1359,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_watch_is_not_retired_with_a_worker_that_ended_before_it_joined() {
-        let (publisher, _events) = EventPublisher::channel();
+        let (publisher, _events) = EventPublisher::channel(&StreamTasks::default());
         let instance = InstanceRef::hosted(Uuid::new_v4());
         let old = Uuid::new_v4();
         let fresh = Uuid::new_v4();

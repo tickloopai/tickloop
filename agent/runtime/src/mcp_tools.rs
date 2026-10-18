@@ -274,6 +274,8 @@ pub struct McpHostToolProvider {
     publication_admissions: RwLock<HashSet<ArtifactPublicationAdmission>>,
     pending_login: Arc<Mutex<Option<PendingLogin>>>,
     next_login_id: std::sync::atomic::AtomicU64,
+    /// The background polling of device sign-ins, which outlives the tool call that started it.
+    login_polls: tokio_util::task::TaskTracker,
 }
 
 impl Drop for McpHostToolProvider {
@@ -394,6 +396,7 @@ impl McpHostToolProvider {
             publication_admissions: RwLock::new(HashSet::new()),
             pending_login: Arc::new(Mutex::new(None)),
             next_login_id: std::sync::atomic::AtomicU64::new(0),
+            login_polls: tokio_util::task::TaskTracker::new(),
         }
     }
 
@@ -468,7 +471,7 @@ impl McpHostToolProvider {
         drop(pending_login);
         let artifact = self.artifact.clone();
         let pending_login = self.pending_login.clone();
-        tokio::spawn(async move {
+        self.login_polls.spawn(async move {
             let _ = artifact
                 .finish_background_device_login(device, &poll_cancel)
                 .await;
@@ -1226,6 +1229,15 @@ impl McpHostToolProvider {
 
 #[async_trait]
 impl HostToolProvider for McpHostToolProvider {
+    async fn shutdown(&self) {
+        self.cancel_pending_login();
+        self.login_polls.close();
+        self.login_polls.wait().await;
+        if let Some(native) = &self.native {
+            native.shutdown().await;
+        }
+    }
+
     /// Native tools never take the Artifact names; only the service directory provides them,
     /// together with the provider's own upload, and the provider offers sign-in while signed out.
     fn definitions(&self) -> Vec<ToolDefinition> {

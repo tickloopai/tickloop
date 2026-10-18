@@ -906,8 +906,12 @@ impl TickDeliveries {
 
 impl Agent {
     /// Installs the Tick observation stream and enables the subscription actions of `TickManage`.
+    /// The stream's tasks are this Agent's: `shutdown` cancels them and waits for them.
     pub async fn install_tick_stream(&self, port: Arc<dyn TickStreamPort>) {
-        let handle = port.open();
+        let handle = port.open(&crate::tick_stream::StreamTasks::new(
+            self.inner.tasks.clone(),
+            self.inner.shutdown.clone(),
+        ));
         {
             let mut deliveries = self.tick_deliveries();
             deliveries.desired = Some(handle.desired);

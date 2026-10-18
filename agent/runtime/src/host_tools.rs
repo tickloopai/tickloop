@@ -491,6 +491,10 @@ pub trait HostToolProvider: Send + Sync {
         true
     }
 
+    /// Ends the work the provider keeps running between tool calls, and waits for it, when its
+    /// Agent shuts down.
+    async fn shutdown(&self) {}
+
     fn permission(&self, chat_id: ChatId, name: &str, input: &Value) -> HostToolPermission;
 
     async fn prepare(
