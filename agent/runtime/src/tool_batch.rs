@@ -103,10 +103,24 @@ impl Agent {
         result: Option<ModelVisibleResult>,
         cancel: &CancellationToken,
     ) -> Result<BatchExit, String> {
-        let ResumePoint::InBatch {
-            assistant_message,
-            call_id,
-        } = at;
+        let (assistant_message, call_id) = match at {
+            ResumePoint::InBatch {
+                assistant_message,
+                call_id,
+            } => (assistant_message, call_id),
+            // As after a wait at the end of a turn: what was queued to the Loop meanwhile joins
+            // the conversation before the next model request.
+            ResumePoint::BeforeModelRequest => {
+                self.merge_queued_messages(receipt)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let chats = self.inner.chats.lock().await;
+                let chat = chats
+                    .get(&receipt.chat_id)
+                    .ok_or_else(|| "chat is unavailable".to_string())?;
+                return self.continuation_request(chat).map(BatchExit::Continue);
+            }
+        };
         let (batch, start) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats

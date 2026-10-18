@@ -48,25 +48,33 @@ pub(super) fn before_resume(
     Ok(())
 }
 
+/// The result a load finds recorded for a dangling call whose effect stayed inside the family,
+/// such as the child a `Subagent` call delegated; `None` when its outcome is unknown.
+pub(super) type CallReconciler<'a> =
+    dyn Fn(&ChatSnapshot, &projection::HistoryCall) -> Option<ToolResult> + 'a;
+
 pub(super) fn close_dangling_tool_calls(
     snapshot: &mut ChatSnapshot,
     only_run: Option<RunId>,
 ) -> Result<(), AgentError> {
-    close_calls(snapshot, only_run, &HashSet::new())
+    close_calls(snapshot, only_run, &HashSet::new(), &|_, _| None)
 }
 
-/// Closes the dangling calls of every Run except those in `kept`, whose Runs are rebuilt.
+/// Closes the dangling calls of every Run except those in `kept`, whose Runs are rebuilt; a call
+/// `reconcile` finds the result of gets that result instead of an unknown outcome.
 pub(super) fn close_dangling_tool_calls_except(
     snapshot: &mut ChatSnapshot,
     kept: &HashSet<RunId>,
+    reconcile: &CallReconciler<'_>,
 ) -> Result<(), AgentError> {
-    close_calls(snapshot, None, kept)
+    close_calls(snapshot, None, kept, reconcile)
 }
 
 fn close_calls(
     snapshot: &mut ChatSnapshot,
     only_run: Option<RunId>,
     kept: &HashSet<RunId>,
+    reconcile: &CallReconciler<'_>,
 ) -> Result<(), AgentError> {
     for operation in &mut snapshot.operations {
         if only_run.is_none_or(|run| operation.run_id == run)
@@ -100,6 +108,7 @@ fn close_calls(
             && only_run.is_none_or(|run| call.run_id == Some(run))
             && call.run_id.is_none_or(|run| !kept.contains(&run))
     }) {
+        let reconciled = reconcile(snapshot, &call);
         let matching = snapshot
             .operations
             .iter()
@@ -120,12 +129,14 @@ fn close_calls(
             .as_ref()
             .map(|operation| operation.run_id)
             .or(call.run_id);
-        if recorded.as_ref().is_none_or(|operation| {
-            !matches!(
-                operation.state,
-                OperationState::Completed | OperationState::Failed
-            )
-        }) {
+        if reconciled.is_none()
+            && recorded.as_ref().is_none_or(|operation| {
+                !matches!(
+                    operation.state,
+                    OperationState::Completed | OperationState::Failed
+                )
+            })
+        {
             snapshot.tool_call_recoveries.push(ToolCallRecovery {
                 run_id: result_run,
                 call_id: call.call_id.clone(),
@@ -137,11 +148,22 @@ fn close_calls(
                 }),
             });
         }
-        let result = match recorded {
-            Some(operation) if matches!(operation.state, OperationState::Completed | OperationState::Failed) => operation.result.clone().ok_or_else(|| AgentError::Invalid(format!("completed operation {} has no durable result", operation.id)))?,
-            Some(operation) if matches!(operation.state, OperationState::Admitted | OperationState::Unknown) => {
-                operation.state = OperationState::Unknown;
-                ToolResult { content: format!("Operation {} has an unknown outcome after interruption. Do not automatically repeat it; inspect current state before proposing it again.", operation.id), is_error: true, output_ref: None }
+        let result = if let Some(result) = reconciled {
+            if let Some(operation) = recorded {
+                operation.state = if result.is_error {
+                    OperationState::Failed
+                } else {
+                    OperationState::Completed
+                };
+                operation.result = Some(result.clone());
+            }
+            result
+        } else {
+            match recorded {
+                Some(operation) if matches!(operation.state, OperationState::Completed | OperationState::Failed) => operation.result.clone().ok_or_else(|| AgentError::Invalid(format!("completed operation {} has no durable result", operation.id)))?,
+                Some(operation) if matches!(operation.state, OperationState::Admitted | OperationState::Unknown) => {
+                    operation.state = OperationState::Unknown;
+                    ToolResult { content: format!("Operation {} has an unknown outcome after interruption. Do not automatically repeat it; inspect current state before proposing it again.", operation.id), is_error: true, output_ref: None }
             }
             Some(operation) => {
                 let result = interrupted_before_admission();
@@ -150,6 +172,7 @@ fn close_calls(
                 result
             }
             None => ToolResult { content: "Tool call was interrupted and its outcome is unknown; inspect current state before proposing it again.".into(), is_error: true, output_ref: None },
+            }
         };
         groups
             .entry(result_run)

@@ -608,6 +608,7 @@ mod tests {
             triggering_message_ids: Vec::new(),
             notification: SubagentNotificationDelivery::Queued,
             usage: Default::default(),
+            run_status: None,
         }
     }
 

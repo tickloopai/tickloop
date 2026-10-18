@@ -409,6 +409,7 @@ impl Lifecycle {
         let response_id = self.active.get(&receipt.run_id)?.response_id;
         let wait_id = match &kind {
             WaitKind::Question { request, .. } => request.id,
+            WaitKind::Subagent { .. } | WaitKind::Children { .. } => Uuid::new_v4(),
         };
         let revision = self.next_revision();
         let response = self.responses.get_mut(&response_id)?;
@@ -438,6 +439,58 @@ impl Lifecycle {
 
     pub(crate) fn wait(&self, id: Uuid) -> Option<&WaitEntry> {
         self.waits.get(&id).map(|wait| &wait.record)
+    }
+
+    /// The open wait of `run` that `matches` picks, if the Run waits on one.
+    pub(crate) fn open_wait_of(
+        &self,
+        run: RunId,
+        matches: impl Fn(&WaitKind) -> bool,
+    ) -> Option<&WaitEntry> {
+        self.waits.values().map(|wait| &wait.record).find(|wait| {
+            wait.run_id == run && matches!(wait.state, WaitState::Open) && matches(&wait.kind)
+        })
+    }
+
+    /// The open wait of a foreground `Subagent` call on the child run `child_run`.
+    pub(crate) fn open_subagent_wait(&self, child_run: RunId) -> Option<&WaitEntry> {
+        self.waits.values().map(|wait| &wait.record).find(|wait| {
+            matches!(wait.state, WaitState::Open)
+                && matches!(wait.kind, WaitKind::Subagent { child_run: waited, .. } if waited == child_run)
+        })
+    }
+
+    /// The wait `id`, which no call's result ends, is over: its answer goes on, in the same
+    /// change. `false` when the wait is not open.
+    pub(crate) fn end_wait(&mut self, id: Uuid) -> bool {
+        let Some(response_id) = self
+            .waits
+            .get(&id)
+            .filter(|wait| matches!(wait.record.state, WaitState::Open))
+            .map(|wait| wait.record.response_id)
+        else {
+            return false;
+        };
+        let revision = self.next_revision();
+        let wait = self.waits.get_mut(&id).unwrap();
+        wait.record.state = WaitState::Appended;
+        wait.record.timestamp = now();
+        wait.revision = revision;
+        self.mark_resumed(response_id);
+        true
+    }
+
+    fn mark_resumed(&mut self, response_id: ResponseId) {
+        let revision = self.next_revision();
+        if let Some(response) = self
+            .responses
+            .get_mut(&response_id)
+            .filter(|response| response.record.state == ResponseState::Suspended)
+        {
+            response.record.state = ResponseState::Resumed;
+            response.record.timestamp = now();
+            response.revision = revision;
+        }
     }
 
     /// Ends the open wait `id` with `result`, decided now; the answer stays suspended until the
@@ -471,8 +524,11 @@ impl Lifecycle {
             .values()
             .find(|wait| {
                 wait.record.run_id == run
-                    && matches!(wait.record.state, WaitState::Open | WaitState::Resolved { .. })
-                    && matches!(&wait.record.resume, ResumePoint::InBatch { call_id: waited, .. } if waited == call_id)
+                    && matches!(
+                        wait.record.state,
+                        WaitState::Open | WaitState::Resolved { .. }
+                    )
+                    && wait.record.resume.call_id() == Some(call_id)
             })
             .map(|wait| wait.record.wait_id)
         else {
@@ -489,16 +545,7 @@ impl Lifecycle {
         wait.record.timestamp = now();
         wait.revision = revision;
         let response_id = wait.record.response_id;
-        let revision = self.next_revision();
-        if let Some(response) = self
-            .responses
-            .get_mut(&response_id)
-            .filter(|response| response.record.state == ResponseState::Suspended)
-        {
-            response.record.state = ResponseState::Resumed;
-            response.record.timestamp = now();
-            response.revision = revision;
-        }
+        self.mark_resumed(response_id);
         true
     }
 

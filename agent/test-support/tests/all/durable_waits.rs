@@ -171,7 +171,7 @@ fn normalized_requests(model: &ScriptedModel) -> Vec<String> {
         .collect()
 }
 
-fn normalized(text: &str) -> String {
+pub(super) fn normalized(text: &str) -> String {
     const UUID_LENGTH: usize = 36;
     let mut ids = Vec::new();
     let mut normalized = String::new();
@@ -250,10 +250,10 @@ fn recorded_question(chats: &DurableChats, chat: Uuid, wait: Uuid) -> QuestionRe
         .into_iter()
         .rev()
         .find_map(|line| match line {
-            Line::Wait(entry) if entry.wait_id == wait => {
-                let WaitKind::Question { request, .. } = entry.kind;
-                Some(request)
-            }
+            Line::Wait(entry) if entry.wait_id == wait => match entry.kind {
+                WaitKind::Question { request, .. } => Some(request),
+                _ => None,
+            },
             _ => None,
         })
         .expect("the question's wait is recorded")

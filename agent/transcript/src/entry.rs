@@ -802,6 +802,18 @@ pub enum WaitKind {
         /// have in the process that asked.
         operation_id: Uuid,
     },
+    /// A foreground `Subagent` call waits for its child's run to end and report.
+    #[serde(rename_all = "camelCase")]
+    Subagent {
+        child_chat: Uuid,
+        child_loop: Uuid,
+        child_run: Uuid,
+        /// The call's operation, which a rebuilt Run restores.
+        operation_id: Uuid,
+    },
+    /// A delegated member waits until every child it delegated has reported.
+    #[serde(rename_all = "camelCase")]
+    Children { children: Vec<Uuid> },
 }
 
 /// Where a Run continues.
@@ -816,6 +828,19 @@ pub enum ResumePoint {
         assistant_message: Uuid,
         call_id: String,
     },
+    /// Before the Run's next model request: the messages queued to its Loop meanwhile join the
+    /// conversation first.
+    BeforeModelRequest,
+}
+
+impl ResumePoint {
+    /// The call the Run waits on, when it waits inside a tool batch.
+    pub fn call_id(&self) -> Option<&str> {
+        match self {
+            Self::InBatch { call_id, .. } => Some(call_id),
+            Self::BeforeModelRequest => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -830,7 +855,8 @@ pub enum WaitState {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         by_input: Option<Uuid>,
     },
-    /// The result is on the chain, written in the same change as the answer's `Resumed`.
+    /// The result is on the chain, or a wait without a call's result is over: written in the same
+    /// change as the answer's `Resumed`.
     Appended,
     Abandoned {
         reason: AbandonReason,

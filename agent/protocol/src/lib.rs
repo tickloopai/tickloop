@@ -92,12 +92,12 @@ pub use denials::{
     DisplaySummary, MAX_RECENT_DENIALS, render_reference,
 };
 pub use family::{
-    AgentColor, AgentMessageSource, DelegationCeiling, DelegationMetadata, DelegationParent,
-    DirectedHumanSource, FamilyCompletion, FamilyInputRecord, FamilyMessageRejection,
-    FamilyMessageRejectionCode, MAX_SUBAGENT_DEPTH, MessageCause, SEND_AGENT_MESSAGE_TOOL_NAME,
-    SUBAGENT_HANDBACK_TOOL_NAME, SUBAGENT_MISSING_REPORT, SUBAGENT_REPORT_RECEIPT,
-    SUBAGENT_TOOL_NAME, SubagentNotificationDelivery, SubagentRegistration, SubagentReport,
-    VerifiedUserRelay,
+    AgentColor, AgentMessageSource, ChildRunStatus, DelegationCeiling, DelegationMetadata,
+    DelegationParent, DirectedHumanSource, FamilyCompletion, FamilyInputRecord,
+    FamilyMessageRejection, FamilyMessageRejectionCode, MAX_SUBAGENT_DEPTH, MessageCause,
+    SEND_AGENT_MESSAGE_TOOL_NAME, SUBAGENT_HANDBACK_TOOL_NAME, SUBAGENT_MISSING_REPORT,
+    SUBAGENT_REPORT_RECEIPT, SUBAGENT_TOOL_NAME, SubagentNotificationDelivery,
+    SubagentRegistration, SubagentReport, VerifiedUserRelay,
 };
 pub use file_change::{
     FileChangeAction, FileChangeArtifactRef, FileChangeReviewSummary, FileIdentity, FileVersion,

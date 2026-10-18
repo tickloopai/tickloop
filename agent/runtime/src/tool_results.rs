@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-use super::{Agent, AgentError};
+use super::{Agent, AgentError, Chat};
 use crate::transcript::private_family_temp_directory;
 use tickloop_agent_base::private_fs::{PRIVATE_FILE_MODE, PrivateDirectory};
 use tickloop_agent_protocol::projection;
@@ -146,6 +146,22 @@ impl Agent {
             AgentError::Storage(format!("tool result storage did not finish: {error}"))
         })
     }
+}
+
+/// The result a call that ends while its Run waits records for the model, without the store a
+/// Chat with a Folder writes large results to: cut as [`Agent::persist_large_tool_result`] cuts
+/// it in a Chat without one, and as it is otherwise.
+pub(super) fn waited_call_result(
+    chat: &Chat,
+    tool_name: &str,
+    mut result: ToolResult,
+) -> ToolResult {
+    if chat.tools.chat_directory().is_none()
+        && let Some(truncated) = truncate_large_tool_result(tool_name, &result.content)
+    {
+        result.content = truncated;
+    }
+    result
 }
 
 /// 工具的外存阈值；`None` 表示从不外存（Claude Code 的 Read 声明为 Infinity：

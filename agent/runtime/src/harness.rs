@@ -1,7 +1,7 @@
 //! How a host assembles an Agent: the seams it reaches the outside through, and the options it
 //! imposes on every Chat.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use tickloop_agent_base::network::Reach;
 use tickloop_agent_model::{ModelClient, ModelClients, ModelError};
@@ -12,7 +12,7 @@ use tickloop_agent_protocol::{
 use uuid::Uuid;
 
 use crate::{
-    Agent, AgentError, environment::ExecutionEnvironment, persistence::ChatRecorder,
+    Agent, AgentError, Chat, environment::ExecutionEnvironment, persistence::ChatRecorder,
     transcript::TranscriptStore,
 };
 
@@ -194,45 +194,22 @@ impl Agent {
         ))
     }
 
-    /// Waits until the Chat has no active or ready Run and the title request of its submissions
-    /// that have returned has ended: one still running after ten seconds is cancelled and awaited.
+    /// Waits until nothing of the Chat's family runs: no member has an active or ready Run that
+    /// does not wait, and the title request of each member's submissions that have returned has
+    /// ended: one still running after ten seconds is cancelled and awaited. A Run holding its
+    /// slot while it waits for a child counts as waiting: the family runs while that child does.
     pub async fn quiesce(&self, chat_id: ChatId) -> Quiescence {
         let mut events = self.subscribe();
-        let quiescence = loop {
-            let state = self.inner.chats.lock().await.get(&chat_id).map(|chat| {
-                let user_shell_in = |states: &[UserShellState]| {
-                    chat.snapshot
-                        .user_shells
-                        .iter()
-                        .any(|record| states.contains(&record.state))
-                };
-                // A parked Run whose person answered is about to take the execution slot again.
-                let waits_for_person = |run: &tickloop_agent_protocol::RunId| {
-                    chat.snapshot
-                        .questions
-                        .iter()
-                        .any(|request| request.run_id == *run)
-                        || chat
-                            .snapshot
-                            .permissions
-                            .iter()
-                            .any(|request| request.execution.run_id() == Some(*run))
-                };
-                let runs = chat.active.is_some()
-                    || chat.active_run.is_some()
-                    || !chat.ready_runs.is_empty()
-                    || chat.parked.keys().any(|run| !waits_for_person(run))
-                    || user_shell_in(&[UserShellState::Running, UserShellState::Cancelling]);
-                let waits = !chat.parked.is_empty()
-                    || !chat.trigger_cancellations.is_empty()
-                    || !chat.event_cancellations.is_empty()
-                    || user_shell_in(&[UserShellState::WaitingPermission]);
-                (runs, waits.then(|| waits_of(chat_id, &chat.snapshot)))
-            });
+        let (quiescence, members) = loop {
+            let (state, members) = {
+                let chats = self.inner.chats.lock().await;
+                let members = family_members(&chats, chat_id);
+                (family_state(&chats, &members), members)
+            };
             match state {
                 Some((true, _)) if !self.inner.shutdown.is_cancelled() => {}
-                Some((_, Some(waits))) => break Quiescence::Waiting(waits),
-                _ => break Quiescence::Idle,
+                Some((_, Some(waits))) => break (Quiescence::Waiting(waits), members),
+                _ => break (Quiescence::Idle, members),
             }
             tokio::select! {
                 _ = events.recv() => {}
@@ -240,23 +217,98 @@ impl Agent {
                 _ = self.inner.shutdown.cancelled() => {}
             }
         };
-        let title = self
-            .inner
-            .title_requests
-            .lock()
-            .await
-            .get(&chat_id)
-            .cloned();
-        if let Some(title) = title
-            && tokio::time::timeout(TITLE_SETTLE_LIMIT, title.done.cancelled())
-                .await
-                .is_err()
-        {
-            title.cancel.cancel();
-            title.done.cancelled().await;
+        for member in members {
+            let title = self.inner.title_requests.lock().await.get(&member).cloned();
+            if let Some(title) = title
+                && tokio::time::timeout(TITLE_SETTLE_LIMIT, title.done.cancelled())
+                    .await
+                    .is_err()
+            {
+                title.cancel.cancel();
+                title.done.cancelled().await;
+            }
         }
         quiescence
     }
+}
+
+/// The Chat and every other member of its family, the root first.
+fn family_members(chats: &HashMap<ChatId, Chat>, chat_id: ChatId) -> Vec<ChatId> {
+    let Ok(root) = crate::family_tree::root(chats, chat_id) else {
+        return vec![chat_id];
+    };
+    let mut members = vec![root];
+    members.extend(crate::family_tree::descendants(chats, root).unwrap_or_default());
+    members
+}
+
+/// Whether anything of the family runs, and what it waits on; `None` when no member is here.
+fn family_state(
+    chats: &HashMap<ChatId, Chat>,
+    members: &[ChatId],
+) -> Option<(bool, Option<Waits>)> {
+    let mut found = false;
+    let mut runs = false;
+    let mut waits: Option<Waits> = None;
+    for member in members {
+        let Some(chat) = chats.get(member) else {
+            continue;
+        };
+        found = true;
+        let (member_runs, member_waits) = chat_state(*member, chat);
+        runs |= member_runs;
+        if let Some(member_waits) = member_waits {
+            waits
+                .get_or_insert_with(Waits::default)
+                .people
+                .extend(member_waits.people);
+        }
+    }
+    found.then_some((runs, waits))
+}
+
+fn chat_state(chat_id: ChatId, chat: &Chat) -> (bool, Option<Waits>) {
+    let user_shell_in = |states: &[UserShellState]| {
+        chat.snapshot
+            .user_shells
+            .iter()
+            .any(|record| states.contains(&record.state))
+    };
+    // A parked Run whose person answered is about to take the execution slot again.
+    let waits_for_person = |run: &tickloop_agent_protocol::RunId| {
+        chat.snapshot
+            .questions
+            .iter()
+            .any(|request| request.run_id == *run)
+            || chat
+                .snapshot
+                .permissions
+                .iter()
+                .any(|request| request.execution.run_id() == Some(*run))
+    };
+    // A Run holding the slot while it waits for a child or its children.
+    let waits_for_member = chat.active_run.is_some_and(|run| {
+        chat.bookkeeping
+            .lifecycle
+            .open_wait_of(run, |kind| {
+                matches!(
+                    kind,
+                    tickloop_agent_transcript::WaitKind::Subagent { .. }
+                        | tickloop_agent_transcript::WaitKind::Children { .. }
+                )
+            })
+            .is_some()
+    });
+    let runs = ((chat.active.is_some() || chat.active_run.is_some()) && !waits_for_member)
+        || !chat.ready_runs.is_empty()
+        || chat.parked.keys().any(|run| !waits_for_person(run))
+        || user_shell_in(&[UserShellState::Running, UserShellState::Cancelling]);
+    let waits = !chat.parked.is_empty()
+        || waits_for_member
+        || !chat.trigger_cancellations.is_empty()
+        || !chat.event_cancellations.is_empty()
+        || user_shell_in(&[UserShellState::WaitingPermission]);
+    (runs, waits.then(|| waits_of(chat_id, &chat.snapshot)))
 }
 
 fn waits_of(chat: ChatId, snapshot: &tickloop_agent_protocol::ChatSnapshot) -> Waits {

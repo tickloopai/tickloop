@@ -8049,6 +8049,7 @@ mod tests {
             started_at: Some(1),
             finished_at: 2,
             triggering_message_ids: vec![],
+            run_status: None,
         };
         let mut snapshot: super::ChatSnapshot = serde_json::from_value(
             serde_json::json!({"id":chat,"folder":"/test","messages":[],"loops":[]}),
@@ -8150,6 +8151,7 @@ mod tests {
             started_at: Some(1),
             finished_at: 2,
             triggering_message_ids: vec![],
+            run_status: None,
         };
         let mut snapshot: super::ChatSnapshot = serde_json::from_value(
             serde_json::json!({"id":chat,"folder":"/test","messages":[],"loops":[]}),
@@ -8256,6 +8258,7 @@ mod tests {
             started_at: Some(1),
             finished_at: 2,
             triggering_message_ids: vec![],
+            run_status: None,
         };
         let mut snapshot: super::ChatSnapshot = serde_json::from_value(
             serde_json::json!({"id":chat,"folder":"/test","messages":[],"loops":[]}),
@@ -8357,6 +8360,7 @@ mod tests {
             triggering_message_ids: Vec::new(),
             notification: tickloop_agent_protocol::SubagentNotificationDelivery::Queued,
             usage: Default::default(),
+            run_status: None,
         };
         for report_first in [true, false] {
             let chat = uuid::Uuid::new_v4();

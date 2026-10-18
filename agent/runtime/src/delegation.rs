@@ -303,7 +303,7 @@ fn check_direct_call(
         name.to_owned(),
         input.clone(),
         super::session_permissions::capture_workspace_scope(&Workspace {
-            folder: Some(ceiling.folder.clone()),
+            folder: ceiling.folder.clone(),
             additional_directories: ceiling.additional_directories.clone(),
         })
         .map_err(|error| error.to_string())?,
@@ -340,7 +340,7 @@ fn check_direct_call(
     }
     if let Some(prepared) = prepared {
         let workspace = Workspace {
-            folder: Some(ceiling.folder.clone()),
+            folder: ceiling.folder.clone(),
             additional_directories: ceiling.additional_directories.clone(),
         };
         let is_plan_file_access = plan_file.is_some_and(|path| prepared.accesses_file(path))
@@ -657,7 +657,7 @@ fn direct_permission_authority(
         return Some(own);
     };
     let workspace = Workspace {
-        folder: Some(delegation.ceiling.folder.clone()),
+        folder: delegation.ceiling.folder.clone(),
         additional_directories: delegation.ceiling.additional_directories.clone(),
     };
     let frozen = delegation.ceiling.policy.decide_with_plan_file(
@@ -1080,10 +1080,8 @@ impl Agent {
                             rule.persistent = false;
                         }
                     }
-                    let folder = require_folder(&snapshot)
-                        .map_err(|error| error.to_string())?
-                        .to_path_buf();
-                    let mut host_context = self.host_call_context(parent, Some(&folder));
+                    let folder = snapshot.folder.clone();
+                    let mut host_context = self.host_call_context(parent, folder.as_deref());
                     let mut host_tools: BTreeMap<_, _> = self
                         .inner
                         .host_tools
@@ -1206,7 +1204,7 @@ impl Agent {
                     let child_id = self
                         .create_chat_with_delegation(
                             registration.child_chat_id,
-                            Some(folder),
+                            folder,
                             Some((metadata.clone(), snapshot, client, output_style)),
                         )
                         .await
@@ -1265,6 +1263,9 @@ impl Agent {
                         )
                         .await
                         .map_err(|error| error.to_string())?;
+                    // The child and its task are durable before anything of the parent tells
+                    // of it, so a load finds every child its parent's records name.
+                    self.make_durable(&[parent.chat_id, child_id]).await?;
                     let invocation = SubagentInvocation {
                         receipt,
                         run_in_background,
@@ -1280,34 +1281,16 @@ impl Agent {
                     .await
                     .map_err(|error| error.to_string())?
                     .ok_or("child handle is unavailable")?;
-                return Ok(ToolResult {
-                    content: json!({"status":"async_launched", "child_chat_id":child.chat_id,
-                        "child_loop_id":child.loop_id,"child_run_id":child.run_id,
-                        "handle":registration.handle,"description":registration.description,
-                        "created_at":registration.created_at})
-                    .to_string(),
-                    is_error: false,
-                    output_ref: None,
-                });
+                return Ok(launched_result(&child, &registration));
             }
+            let release = self.suspend_for_subagent(parent, call_id, &child).await?;
             loop {
-                let snapshot = self
-                    .snapshot(child.chat_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let registration = self
-                    .subagent_registration(child.chat_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if let Some(result) = agent_messages::child_run_result(
-                    &snapshot,
-                    &child,
-                    parent,
-                    registration.as_ref(),
-                ) {
+                if let Some(result) = self.recorded_child_result(parent.chat_id, &child).await? {
                     return Ok(result);
                 }
                 tokio::select! {
+                    biased;
+                    _ = release.cancelled() => return Err(super::suspension::RUN_RELEASED.into()),
                     _ = cancel.cancelled() => {
                         return self.end_interrupted_observation(parent, call_id, &child).await;
                     }
@@ -1324,33 +1307,48 @@ impl Agent {
     /// this call's result; otherwise the call stops returning that run, so its completion
     /// notifies the parent like background work. Deciding under the invocation lock that
     /// classifying the run's completion also holds leaves each run either returned or notified.
-    async fn end_interrupted_observation(
+    pub(super) async fn end_interrupted_observation(
         &self,
         parent: &Receipt,
         call_id: &str,
         child: &Receipt,
     ) -> Result<ToolResult, String> {
         let mut invocations = self.inner.subagent_invocations.lock().await;
-        let snapshot = self
-            .snapshot(child.chat_id)
-            .await
-            .map_err(|error| error.to_string())?;
+        if let Some(result) = self.recorded_child_result(parent.chat_id, child).await? {
+            return Ok(result);
+        }
         let registration = self
             .subagent_registration(child.chat_id)
             .await
             .map_err(|error| error.to_string())?;
-        if let Some(result) =
-            agent_messages::child_run_result(&snapshot, child, parent, registration.as_ref())
-        {
-            return Ok(result);
-        }
         if let Some(invocation) = invocations.get_mut(&(parent.run_id, call_id.to_owned())) {
             invocation.run_in_background = true;
         }
-        Ok(ToolResult {
-            content: json!({"status":"interrupted","child_chat_id":child.chat_id,"handle":registration.as_ref().map(|registration|registration.handle.as_str()),"description":registration.as_ref().map(|registration|registration.description.as_str()),"created_at":registration.as_ref().map(|registration|registration.created_at),"child_loop_id":child.loop_id,"child_run_id":child.run_id,"error":"Foreground observation interrupted; the child Agent remains independently active and its completion arrives as a task notification."}).to_string(),
-            is_error: true,
-            output_ref: None,
-        })
+        Ok(interrupted_observation_result(child, registration.as_ref()))
+    }
+}
+
+/// What a background `Subagent` call returns: the child it launched.
+pub(super) fn launched_result(child: &Receipt, registration: &SubagentRegistration) -> ToolResult {
+    ToolResult {
+        content: json!({"status":"async_launched", "child_chat_id":child.chat_id,
+            "child_loop_id":child.loop_id,"child_run_id":child.run_id,
+            "handle":registration.handle,"description":registration.description,
+            "created_at":registration.created_at})
+        .to_string(),
+        is_error: false,
+        output_ref: None,
+    }
+}
+
+/// What a foreground `Subagent` call returns when it stops observing a child that goes on.
+pub(super) fn interrupted_observation_result(
+    child: &Receipt,
+    registration: Option<&SubagentRegistration>,
+) -> ToolResult {
+    ToolResult {
+        content: json!({"status":"interrupted","child_chat_id":child.chat_id,"handle":registration.map(|registration|registration.handle.as_str()),"description":registration.map(|registration|registration.description.as_str()),"created_at":registration.map(|registration|registration.created_at),"child_loop_id":child.loop_id,"child_run_id":child.run_id,"error":"Foreground observation interrupted; the child Agent remains independently active and its completion arrives as a task notification."}).to_string(),
+        is_error: true,
+        output_ref: None,
     }
 }

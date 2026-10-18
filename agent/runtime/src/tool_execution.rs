@@ -1069,7 +1069,7 @@ impl Agent {
             registration.as_ref().map(|registered| &registered.route),
             Some(ToolRoute::Handback)
         ) {
-            match self.prepare_handback(receipt, &input).await {
+            match self.prepare_handback(receipt, &id, &input).await {
                 Ok(prepared) => Some(PreparedLocalCall::Handback(prepared)),
                 Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),
             }

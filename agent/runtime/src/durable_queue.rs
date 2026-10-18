@@ -20,25 +20,32 @@ impl Agent {
     /// hosting, the inputs the Agent queued for itself are lost with the process, as they always
     /// were.
     pub(crate) async fn restore_after_load(&self, chat_id: ChatId, waits: WaitHosting) {
-        {
-            let mut chats = self.inner.chats.lock().await;
-            let Some(chat) = chats.get_mut(&chat_id) else {
-                return;
-            };
-            match waits {
-                WaitHosting::Process => self.forget_inputs(chat, |_| true),
-                WaitHosting::Durable => {
-                    // A queued @tickloop request is delivered again by its source (H09g).
-                    self.forget_inputs(chat, |op| op == InputOp::Feedback);
-                    self.continue_lost_inputs(chat);
-                    self.requeue_inputs(chat);
-                }
+        match waits {
+            WaitHosting::Process => {
+                let mut chats = self.inner.chats.lock().await;
+                let Some(chat) = chats.get_mut(&chat_id) else {
+                    return;
+                };
+                self.forget_inputs(chat, |_| true);
+                self.save(&chat.snapshot);
             }
-            self.save(&chat.snapshot);
+            WaitHosting::Durable => self.restore_family_after_load(&[chat_id], Vec::new()).await,
         }
-        if waits == WaitHosting::Durable {
-            self.rebuild_suspended_runs(chat_id).await;
-        }
+    }
+
+    /// With durable wait hosting, the work a loaded Chat had comes back, none of it running yet:
+    /// another attempt continues each input whose answer lost its host, unless it lost its host
+    /// three times in a row, and the inputs that were queued are queued again after them.
+    pub(crate) async fn queue_after_load(&self, chat_id: ChatId) {
+        let mut chats = self.inner.chats.lock().await;
+        let Some(chat) = chats.get_mut(&chat_id) else {
+            return;
+        };
+        // A queued @tickloop request is delivered again by its source (H09g).
+        self.forget_inputs(chat, |op| op == InputOp::Feedback);
+        self.continue_lost_inputs(chat);
+        self.requeue_inputs(chat);
+        self.save(&chat.snapshot);
     }
 
     /// The open inputs of `ops` that the user did not send are lost with their host: nothing

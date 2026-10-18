@@ -308,6 +308,19 @@ impl TranscriptOutbox {
         self.chats.lock().unwrap().keys().copied().collect()
     }
 
+    /// The Chat is stored from now on, before a conversation message would store it: what it
+    /// buffered is queued first.
+    pub(crate) fn materialize(&self, chat: ChatId) {
+        if let Some(outbox) = self.chats.lock().unwrap().get_mut(&chat)
+            && !outbox.materialized
+            && outbox.refusal.is_none()
+        {
+            outbox.materialized = true;
+            let buffered = std::mem::take(&mut outbox.buffered);
+            outbox.queued.splice(0..0, buffered);
+        }
+    }
+
     pub(crate) fn is_materialized(&self, chat: ChatId) -> bool {
         self.chats
             .lock()

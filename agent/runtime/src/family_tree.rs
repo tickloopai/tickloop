@@ -273,13 +273,19 @@ impl Agent {
         })
     }
 
+    /// Waits until every child the member's Loop delegated has reported, without polling the
+    /// model: `Ok(true)` when it waited. The wait suspends the Run where it waits, at the call
+    /// `at_call` or else before its next model request; a release ends it for another instance
+    /// to go on with.
     pub(super) async fn wait_for_subagents(
         &self,
         receipt: &Receipt,
         cancel: &CancellationToken,
+        at_call: Option<&str>,
     ) -> Result<bool, String> {
         let mut events = self.subscribe();
         let mut waited = false;
+        let mut release = None;
         loop {
             let foreground = self
                 .inner
@@ -290,7 +296,7 @@ impl Agent {
                 .filter(|invocation| !invocation.run_in_background)
                 .map(|invocation| invocation.receipt.run_id)
                 .collect::<HashSet<_>>();
-            let (pending, parent_cancel) = {
+            let (pending, children, parent_cancel) = {
                 let chats = self.inner.chats.lock().await;
                 let parent = chats.get(&receipt.chat_id).ok_or("parent is unavailable")?;
                 if parent.snapshot.delegation.is_none() {
@@ -305,6 +311,7 @@ impl Agent {
                     return Err("delegating run was interrupted".into());
                 }
                 let mut pending = false;
+                let mut children = Vec::new();
                 for child in chats.values().filter(|child| {
                     child
                         .snapshot
@@ -315,6 +322,7 @@ impl Agent {
                                 && delegation.parent_loop_id == receipt.loop_id
                         })
                 }) {
+                    children.push(child.snapshot.id);
                     let live = child.active_run.is_some() || !child.parked.is_empty();
                     pending |= live;
                     for run in child.snapshot.loops.iter().filter_map(|goal| goal.run_id) {
@@ -347,16 +355,25 @@ impl Agent {
                         pending = true;
                     }
                 }
+                children.sort();
                 (
                     pending,
+                    children,
                     parent.active.clone().unwrap_or_else(|| cancel.clone()),
                 )
             };
             if !pending {
+                self.end_children_wait(receipt).await;
                 return Ok(waited);
             }
             waited = true;
+            let release = match &release {
+                Some(release) => release,
+                None => release.insert(self.suspend_for_children(receipt, children, at_call).await),
+            };
             tokio::select! {
+                biased;
+                _ = release.cancelled() => return Err(super::suspension::RUN_RELEASED.into()),
                 _ = cancel.cancelled() => return Err("waiting for Subagents was interrupted".into()),
                 _ = parent_cancel.cancelled() => return Err("delegating run was interrupted".into()),
                 event = events.recv() => match event {

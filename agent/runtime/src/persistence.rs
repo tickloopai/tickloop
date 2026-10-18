@@ -70,7 +70,7 @@ pub(super) struct ChatRecorder {
     /// Cuts the flush loop's wait short.
     flush_now: Arc<Notify>,
     closed: CancellationToken,
-    resume_lock: tokio::sync::Mutex<()>,
+    pub(super) resume_lock: tokio::sync::Mutex<()>,
     denial_flush_gate: Arc<StdMutex<()>>,
     denial_saved_revisions: Arc<StdMutex<HashMap<ChatId, u64>>>,
 }
@@ -2084,6 +2084,7 @@ fn recover_transcript(
     removed: &BTreeSet<usize>,
     source_chat_id: ChatId,
     waits: WaitHosting,
+    family: Option<&super::family_load::FamilyRecords>,
 ) -> Result<RecoveredSnapshot, AgentError> {
     let kept = restored.without(removed);
     let folder = match loaded.chain.last() {
@@ -2200,7 +2201,13 @@ fn recover_transcript(
             .find_map(|entry| entry.compact_metadata.as_ref()?.display_leaf),
     );
     kept.fill_conversation(&mut snapshot, &mut bookkeeping);
-    recover_snapshot_for_resume(snapshot, bookkeeping, kept.meta_messages.clone(), waits)
+    recover_snapshot_for_resume(
+        snapshot,
+        bookkeeping,
+        kept.meta_messages.clone(),
+        waits,
+        family,
+    )
 }
 
 /// Branch 来源元数据属于写入这份 Transcript 的 Chat；名称取标题，没有有效标题时使用默认名称。
@@ -2360,6 +2367,7 @@ fn recover_snapshot_for_resume(
     bookkeeping: ChatBookkeeping,
     mut meta_messages: HashSet<usize>,
     waits: WaitHosting,
+    family: Option<&super::family_load::FamilyRecords>,
 ) -> Result<RecoveredSnapshot, AgentError> {
     let rebuilt_runs = |snapshot: &ChatSnapshot| {
         super::suspension::rebuilt_waits(waits, &bookkeeping.lifecycle, snapshot)
@@ -2377,7 +2385,12 @@ fn recover_snapshot_for_resume(
     super::triggers::recover_loops_keeping(&mut snapshot, &rebuilt_loops);
     // A kept Loop whose deadline passed meanwhile expired: its Run is not rebuilt after all.
     let rebuilt = rebuilt_runs(&snapshot);
-    super::recovery::close_dangling_tool_calls_except(&mut snapshot, &rebuilt)?;
+    // A family call's effect is in the family's records: its result is what they say.
+    let message_responses = bookkeeping.message_responses.clone();
+    let reconcile = |snapshot: &ChatSnapshot, call: &projection::HistoryCall| {
+        family.and_then(|family| family.reconcile(snapshot, &message_responses, call))
+    };
+    super::recovery::close_dangling_tool_calls_except(&mut snapshot, &rebuilt, &reconcile)?;
     let ends_with_rebuilt_run = (0..snapshot.messages.len())
         .rev()
         .find(|index| snapshot.messages[*index].role != Role::System)
@@ -2543,6 +2556,37 @@ impl Agent {
             .map_err(|error| error.to_string())
     }
 
+    /// Under durable wait hosting, every Line of the Chats so far is committed now, their first
+    /// ones included, before the caller records what depends on them; another instance that
+    /// loads the family then finds them. A process host records nothing ahead of its
+    /// conversation.
+    pub(super) async fn make_durable(&self, chat_ids: &[ChatId]) -> Result<(), String> {
+        if self.inner.waits != WaitHosting::Durable {
+            return Ok(());
+        }
+        let Some(recorder) = &self.inner.recorder else {
+            return Ok(());
+        };
+        {
+            let chats = self.inner.chats.lock().await;
+            for chat_id in chat_ids {
+                let Some(chat) = chats.get(chat_id) else {
+                    continue;
+                };
+                recorder.outbox.materialize(*chat_id);
+                recorder.enqueue_sync(&chat.snapshot, &chat.bookkeeping);
+            }
+        }
+        let _appends = recorder.appends.lock().await;
+        for chat_id in chat_ids {
+            recorder
+                .append_queued(*chat_id, true)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     /// The durability barrier: every Line produced so far is committed, or the error that
     /// stopped it. Gives each recorded Chat's committed position. A local store is best effort
     /// otherwise; this is where its failures surface.
@@ -2652,7 +2696,9 @@ impl Agent {
         self.ensure_flush_loop(recorder);
     }
 
-    pub(super) fn record_delegation(&self, child_id: ChatId, delegation: DelegationMetadata) {
+    pub(super) fn record_delegation(&self, child_id: ChatId, mut delegation: DelegationMetadata) {
+        // The host's rules apply as the loading host has them; the record keeps the user's.
+        self.strip_host_rules(&mut delegation.ceiling.policy);
         if let Some(recorder) = &self.inner.recorder {
             recorder.outbox.enqueue(
                 child_id,
@@ -2941,6 +2987,13 @@ impl Agent {
     /// 按 id 恢复 Chat。已在本进程内存中时直接返回该实例；否则从 Transcript 加载，
     /// 执行恢复后处理，但不自动继续任何工作。
     pub async fn resume_chat(&self, chat_id: ChatId) -> Result<ChatSnapshot, AgentError> {
+        // A durable host holds a family whole: every member comes in with the Chat.
+        if self.inner.waits == WaitHosting::Durable {
+            Box::pin(self.resume_family(chat_id)).await?;
+            super::family_tree::lineage(&*self.inner.chats.lock().await, chat_id)
+                .map_err(AgentError::Invalid)?;
+            return self.snapshot(chat_id).await;
+        }
         {
             let chats = self.inner.chats.lock().await;
             if let Some(chat) = chats.get(&chat_id) {
@@ -3022,7 +3075,7 @@ impl Agent {
         }
         for (id, loaded) in pending.into_iter().rev() {
             // Boxed: restoring a Chat is a large future, and resuming awaits it in a loop.
-            Box::pin(self.insert_restored_chat(id, loaded, RestoreTarget::Resume)).await?;
+            Box::pin(self.insert_restored_chat(id, loaded, RestoreTarget::Resume, None)).await?;
         }
         super::family_tree::lineage(&*self.inner.chats.lock().await, chat_id)
             .map_err(AgentError::Invalid)?;
@@ -3056,11 +3109,15 @@ impl Agent {
             RestoreTarget::NewChat {
                 source: source_chat_id,
             },
+            None,
         ))
         .await
     }
 
-    async fn load_saved_transcript(&self, chat_id: ChatId) -> Result<LoadedTranscript, AgentError> {
+    pub(super) async fn load_saved_transcript(
+        &self,
+        chat_id: ChatId,
+    ) -> Result<LoadedTranscript, AgentError> {
         let recorder = self.inner.recorder.as_ref().ok_or(AgentError::NotFound)?;
         recorder.load_chat(chat_id, ChatLoad::default()).await
     }
@@ -3073,13 +3130,26 @@ impl Agent {
         loaded: &mut LoadedTranscript,
         source_chat_id: ChatId,
         waits: WaitHosting,
+        family: Option<&super::family_load::FamilyRecords>,
     ) -> Result<RestoredConversation, AgentError> {
         let (restored, execution_mode_warnings) = restore_chain(&loaded.chain);
         loaded.warnings.extend(execution_mode_warnings);
-        let waited_calls = super::suspension::waited_calls(waits, &loaded.lifecycle);
+        let mut waited_calls = super::suspension::waited_calls(waits, &loaded.lifecycle);
+        // A family call's effect may be in the family's records: its batch stays, and the load
+        // settles the call by them.
+        if family.is_some() {
+            waited_calls.extend(super::family_load::family_call_ids(&restored.messages));
+        }
         let removed = unrecoverable_assistant_messages(&restored.messages, &waited_calls);
-        let mut recovered =
-            recover_transcript(chat_id, loaded, &restored, &removed, source_chat_id, waits)?;
+        let mut recovered = recover_transcript(
+            chat_id,
+            loaded,
+            &restored,
+            &removed,
+            source_chat_id,
+            waits,
+            family,
+        )?;
         let folder = recovered.snapshot.folder.clone();
         match (&folder, &self.inner.environment) {
             (Some(folder), Some(_)) => self.require_working_directory_trust(folder)?,
@@ -3157,7 +3227,7 @@ impl Agent {
             folder,
             content_replacements,
             ..
-        } = self.restore_conversation(chat_id, &mut loaded, chat_id, WaitHosting::Process)?;
+        } = self.restore_conversation(chat_id, &mut loaded, chat_id, WaitHosting::Process, None)?;
         let file_history = folder.as_deref().map(|folder| {
             FileHistory::restore(
                 self.file_history_directory(chat_id, folder),
@@ -3193,11 +3263,15 @@ impl Agent {
         })
     }
 
-    async fn insert_restored_chat(
+    /// Restores a loaded Chat into this instance. A family member restored with the records of
+    /// its whole family settles its family calls by them, and leaves going on with its work to
+    /// the family's restore, once every member is in.
+    pub(super) async fn insert_restored_chat(
         &self,
         chat_id: ChatId,
         loaded: LoadedTranscript,
         target: RestoreTarget,
+        family: Option<&super::family_load::FamilyRecords>,
     ) -> Result<ChatSnapshot, AgentError> {
         let recorder = self.inner.recorder.as_ref().ok_or(AgentError::NotFound)?;
         // 替换决定、文件回滚备份与元数据都属于写入这份 Transcript 的 Chat：恢复时是自己，以新 chatId 恢复时是源 Chat。
@@ -3233,15 +3307,17 @@ impl Agent {
             mut folder,
             content_replacements,
             replacement_records,
-        } = self.restore_conversation(chat_id, &mut loaded, source_chat_id, waits)?;
+        } = self.restore_conversation(chat_id, &mut loaded, source_chat_id, waits, family)?;
         // 与设置写入互斥到 Chat 加入本进程为止，期间写入的持久规则改动不会漏掉这个 Chat。
         let _settings_gate = self.inner.settings_writes.lock().await;
         let (client, output_style) = self.apply_chat_defaults(&mut snapshot, &mut bookkeeping);
-        if let Some(delegation) = &snapshot.delegation {
-            folder = Some(delegation.ceiling.folder.clone());
+        if let Some(delegation) = &mut snapshot.delegation {
+            self.apply_host_rules(&mut delegation.ceiling.policy);
+            folder = delegation.ceiling.folder.clone();
+            let ceiling = delegation.ceiling.clone();
             snapshot.folder = folder.clone();
-            snapshot.additional_directories = delegation.ceiling.additional_directories.clone();
-            snapshot.policy = delegation.ceiling.policy.clone();
+            snapshot.additional_directories = ceiling.additional_directories;
+            snapshot.policy = ceiling.policy;
         }
         if snapshot.plans.iter().any(|plan| plan.approval_pending) {
             snapshot.policy.mode = ExecutionMode::Plan;
@@ -3380,7 +3456,9 @@ impl Agent {
         }
         self.save(&snapshot);
         self.start_feedback_cleanup(chat_id).await;
-        self.restore_after_load(chat_id, waits).await;
+        if family.is_none() {
+            self.restore_after_load(chat_id, waits).await;
+        }
         Ok(snapshot)
     }
 }
@@ -3464,7 +3542,7 @@ impl StagedBranch {
     }
 }
 
-enum RestoreTarget {
+pub(super) enum RestoreTarget {
     /// 继续写入原 Transcript。
     Resume,
     /// 写入新 chatId 的 Transcript。

@@ -13,6 +13,7 @@ mod auto_settings;
 mod auto_setup;
 mod branch;
 mod family;
+mod family_load;
 mod family_tree;
 pub mod file_history;
 mod handback;
@@ -1997,6 +1998,8 @@ impl Agent {
                 snapshot.thinking_enabled = parent.thinking_enabled;
                 snapshot.task_tools_enabled = parent.task_tools_enabled;
                 snapshot.additional_directories = metadata.ceiling.additional_directories.clone();
+                let mut metadata = metadata;
+                self.apply_host_rules(&mut metadata.ceiling.policy);
                 snapshot.policy = metadata.ceiling.policy.clone();
                 snapshot.delegation = Some(metadata);
                 (client, output_style)
@@ -3401,7 +3404,7 @@ impl Agent {
                 );
             }
             if calls.is_empty() {
-                if self.wait_for_subagents(&receipt, &cancel).await?
+                if self.wait_for_subagents(&receipt, &cancel, None).await?
                     || self.wait_for_task_commands(&receipt, &cancel).await?
                 {
                     self.merge_queued_messages(&receipt)
@@ -3541,6 +3544,13 @@ impl Agent {
                 Usage::default(),
             ),
         };
+        // A durable host goes on with an answer whose host it lost: its input has not settled,
+        // so its child run has no completion yet.
+        let is_settled = !(self.inner.waits == WaitHosting::Durable
+            && ending
+                == ResponseEnding::Interrupted {
+                    by: InterruptedBy::Host,
+                });
         self.end_response(chat, receipt.run_id, ending, usage);
         let is_deliverable = chat
             .snapshot
@@ -3571,7 +3581,7 @@ impl Agent {
         self.flush_subagent_notifications(receipt.chat_id).await;
         self.record_directed_replies(&receipt, &finished_snapshot)
             .await;
-        if finished_snapshot.delegation.is_some() {
+        if finished_snapshot.delegation.is_some() && is_settled {
             self.record_family_completion(&receipt, &finished_snapshot)
                 .await;
         }
@@ -4909,6 +4919,9 @@ impl Agent {
 
     pub async fn shutdown(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
+        for chat in self.inner.chats.lock().await.values() {
+            self.release_runs_at_shutdown(chat);
+        }
         self.inner.shutdown.cancel();
         // Inputs a lost answer leaves open stay open; waiters on them learn of the shutdown.
         self.inner.ledger_changes.send_replace(());

@@ -20,6 +20,10 @@
 //! A Harness whose waits are durable leaves a Run that waits for a person suspended in the
 //! Transcript; the holding that delivers the reply rebuilds it from there.
 //!
+//! The lease is the root Chat's and covers its whole family: the members its Runs delegate write
+//! through the same holding, and a task may target any of them. The stream carries the root
+//! Chat's commits and events.
+//!
 //! Lines and `last_seq` commit together, so a client that loads the history at `last_seq` and
 //! follows the stream after it sees every commit exactly once.
 
@@ -113,8 +117,10 @@ struct ChatRow {
     epoch: u64,
     lease: Option<LeaseRow>,
     last_seq: u64,
-    /// The Harness's id of the Chat, from its first committed Lines on.
+    /// The Harness's id of the root Chat, from its creation on.
     harness_chat: Option<ChatId>,
+    /// The other members of the root Chat's family that committed Lines.
+    members: HashSet<ChatId>,
     committed: HashSet<BatchId>,
     acknowledged: HashMap<Uuid, usize>,
     /// What the Chat waited on when its last task was acknowledged; `None` when it was idle.
@@ -122,12 +128,10 @@ struct ChatRow {
 }
 
 impl ChatRow {
-    /// A holding records the one Harness Chat its lease is for.
-    fn serves(&self, chat: ChatId) -> Result<(), TranscriptError> {
-        match self.harness_chat {
-            Some(harness_chat) if harness_chat != chat => Err(TranscriptError::Unsupported),
-            _ => Ok(()),
-        }
+    /// A holding writes the root Chat its lease is for, the first it writes, and the members of
+    /// its family.
+    fn serves(&mut self, chat: ChatId) {
+        self.harness_chat.get_or_insert(chat);
     }
 }
 
@@ -245,6 +249,21 @@ impl DurableChats {
             .map_or(0, |row| row.last_seq)
     }
 
+    /// The members of the Chat's family other than its root that committed Lines.
+    pub fn members(&self, chat: Uuid) -> HashSet<ChatId> {
+        self.rows
+            .lock()
+            .unwrap()
+            .get(&chat)
+            .map(|row| row.members.clone())
+            .unwrap_or_default()
+    }
+
+    /// Every Line committed of the family member `member` of the Chat.
+    pub fn member_lines(&self, member: ChatId) -> Vec<Line> {
+        self.transcripts.lines(member)
+    }
+
     pub fn harness_chat(&self, chat: Uuid) -> Option<ChatId> {
         self.rows
             .lock()
@@ -286,7 +305,18 @@ impl DurableChats {
     }
 
     fn check_chat(&self, lease: &Lease, chat: ChatId) -> Result<(), TranscriptError> {
-        self.holding(lease, |row| row.serves(chat))
+        self.holding(lease, |row| {
+            row.serves(chat);
+            Ok(())
+        })
+    }
+
+    /// The Harness created the root Chat of the lease's row.
+    fn bind_root(&self, lease: &Lease, chat: ChatId) -> Result<(), TranscriptError> {
+        self.holding(lease, |row| {
+            row.harness_chat.get_or_insert(chat);
+            Ok(())
+        })
     }
 
     /// Commits the batch and, when it adds Lines, makes `seq` the committed `last_seq`.
@@ -298,16 +328,18 @@ impl DurableChats {
         seq: u64,
     ) -> Result<Commit, TranscriptError> {
         self.holding(lease, |row| {
-            row.serves(chat)?;
+            row.serves(chat);
             // The durable side keys retries by batch, as a database would by the batch id.
             let is_new = !row.committed.contains(&batch.id);
             let ack = self.transcripts.append_blocking(chat, batch)?;
             if is_new {
                 row.committed.insert(batch.id);
-                if !batch.lines.is_empty() {
+                // The stream carries the root Chat's commits.
+                if !batch.lines.is_empty() && row.harness_chat == Some(chat) {
                     assert!(seq > row.last_seq, "seqs only grow");
-                    row.harness_chat = Some(chat);
                     row.last_seq = seq;
+                } else if !batch.lines.is_empty() {
+                    row.members.insert(chat);
                 }
             }
             Ok(Commit { ack, is_new })
@@ -473,6 +505,17 @@ impl ReferenceHost {
     ) -> Result<TurnReport, LeaseError> {
         Ok(self.acquire(chat)?.run(request).await)
     }
+
+    /// One delivery of a task for the family member `member` of the Chat, such as the reply to
+    /// a question a child asked: a holding of the Chat's lease that runs it.
+    pub async fn deliver_to(
+        &self,
+        chat: Uuid,
+        member: ChatId,
+        request: TurnRequest,
+    ) -> Result<TurnReport, LeaseError> {
+        Ok(self.acquire(chat)?.run_on(Some(member), request).await)
+    }
 }
 
 fn deadline(sent: Duration, config: HostConfig) -> Duration {
@@ -538,6 +581,11 @@ impl Holding {
 
     /// Steps 2 to 8 for one task; a holding runs one.
     pub async fn run(&self, request: TurnRequest) -> TurnReport {
+        self.run_on(None, request).await
+    }
+
+    /// Steps 2 to 8 for one task of the family member `member`, or of the root Chat.
+    pub async fn run_on(&self, member: Option<ChatId>, request: TurnRequest) -> TurnReport {
         let input = request.input_id;
         let lease = self.shared.lease.clone();
         let mut report = TurnReport {
@@ -556,7 +604,7 @@ impl Holding {
         let stop = CancellationToken::new();
         let mut pump = None;
         let reached = self
-            .reach_outcome(&agent, request, &stop, &mut pump, &mut report)
+            .reach_outcome(&agent, member, request, &stop, &mut pump, &mut report)
             .await;
         agent.shutdown().await;
         let synced = match reached {
@@ -629,6 +677,7 @@ impl Holding {
     async fn reach_outcome(
         &self,
         agent: &Agent,
+        member: Option<ChatId>,
         request: TurnRequest,
         stop: &CancellationToken,
         pump: &mut Option<JoinHandle<()>>,
@@ -643,6 +692,11 @@ impl Holding {
         };
         report.harness_chat = Some(chat);
         self.shared.state.lock().unwrap().harness_chat = Some(chat);
+        self.shared
+            .chats
+            .bind_root(&self.shared.lease, chat)
+            .map_err(|_| self.shared.halt_or(Halt::Fenced))?;
+        let target = member.unwrap_or(chat);
         *pump = Some(tokio::spawn(publish_events(
             self.shared.clone(),
             agent.subscribe(),
@@ -650,7 +704,7 @@ impl Holding {
             self.config.retry_delay,
         )));
         let turn = self
-            .until_halted(agent.advance(chat, request))
+            .until_halted(agent.advance(target, request))
             .await?
             .map_err(|error| self.agent_failure(error))?;
         let outcome = self
@@ -660,7 +714,7 @@ impl Holding {
         if matches!(outcome, TurnOutcome::Fenced) {
             return Err(self.shared.halt_or(Halt::Fenced));
         }
-        if let Quiescence::Waiting(waits) = self.until_halted(agent.quiesce(chat)).await? {
+        if let Quiescence::Waiting(waits) = self.until_halted(agent.quiesce(target)).await? {
             report.waiting = Some(waits);
         }
         Ok(outcome)
@@ -926,12 +980,16 @@ impl Shared {
             .chats
             .commit(&self.lease, chat, batch, seq)
             .inspect_err(|error| self.fenced_by(&mut state, error))?;
-        if commit.is_new && !batch.lines.is_empty() {
+        // A member's Lines and events are its own: only the root Chat's go out on the stream.
+        let is_root = state.harness_chat == Some(chat);
+        if commit.is_new && !batch.lines.is_empty() && is_root {
             state.allocate(StreamItem::Committed {
                 lines: batch.lines.clone(),
             });
         }
-        state.cover(batch.events_through);
+        if is_root {
+            state.cover(batch.events_through);
+        }
         if commit.is_new
             && let Some(CrashPoint::AfterCommit(matches)) = state.crash
             && matches(&batch.lines)

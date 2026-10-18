@@ -66,6 +66,26 @@ impl Agent {
         (client, output_style)
     }
 
+    /// Puts the host's rules into `policy` as they are now, in place of any copy it holds.
+    pub(super) fn apply_host_rules(&self, policy: &mut tickloop_agent_protocol::PermissionPolicy) {
+        self.strip_host_rules(policy);
+        policy
+            .rules
+            .extend(self.inner.host_rules.iter().map(|rule| PermissionRule {
+                persistent: false,
+                ..rule.clone()
+            }));
+    }
+
+    /// Takes the host's rules out of `policy`, which is about to be recorded: they are host
+    /// configuration that every load applies as it then is, never a grant to keep.
+    pub(super) fn strip_host_rules(&self, policy: &mut tickloop_agent_protocol::PermissionPolicy) {
+        let host_rules = &self.inner.host_rules;
+        policy
+            .rules
+            .retain(|rule| !host_rules.iter().any(|host_rule| host_rule.id == rule.id));
+    }
+
     pub(super) fn apply_new_chat_settings(
         &self,
         snapshot: &mut ChatSnapshot,
@@ -78,18 +98,7 @@ impl Agent {
         );
         let defaults = new_chat_settings(saved.as_mut(), &self.inner.host_options, &snapshot.model);
         snapshot.policy.mode = defaults.execution_mode;
-        let host_rules = &self.inner.host_rules;
-        snapshot
-            .policy
-            .rules
-            .retain(|rule| !host_rules.iter().any(|host_rule| host_rule.id == rule.id));
-        snapshot
-            .policy
-            .rules
-            .extend(host_rules.iter().map(|rule| PermissionRule {
-                persistent: false,
-                ..rule.clone()
-            }));
+        self.apply_host_rules(&mut snapshot.policy);
         snapshot.task_tools_enabled = saved.as_ref().map_or_else(
             || {
                 self.inner

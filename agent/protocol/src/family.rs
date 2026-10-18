@@ -132,6 +132,25 @@ impl SubagentNotificationDelivery {
     }
 }
 
+/// How a child's run ended, as the run that delegated it learns.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildRunStatus {
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+impl ChildRunStatus {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FamilyCompletion {
     pub child_chat_id: ChatId,
@@ -146,6 +165,23 @@ pub struct FamilyCompletion {
     pub triggering_message_ids: Vec<Uuid>,
     pub notification: SubagentNotificationDelivery,
     pub usage: Usage,
+    /// How the run ended; completions recorded before it was kept have none, and their `state`
+    /// stands for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_status: Option<ChildRunStatus>,
+}
+
+impl FamilyCompletion {
+    /// How the run ended, from the Loop state a completion recorded without one.
+    pub fn status(&self) -> ChildRunStatus {
+        self.run_status.unwrap_or(match self.state {
+            LoopState::Completed | LoopState::WaitingTrigger | LoopState::Idle => {
+                ChildRunStatus::Completed
+            }
+            LoopState::Failed => ChildRunStatus::Failed,
+            _ => ChildRunStatus::Interrupted,
+        })
+    }
 }
 
 pub const SUBAGENT_TOOL_NAME: &str = "Subagent";
@@ -198,7 +234,9 @@ impl AgentColor {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DelegationCeiling {
-    pub folder: PathBuf,
+    /// `None` for a family whose Chats have no Folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<PathBuf>,
     pub additional_directories: Vec<PathBuf>,
     pub policy: PermissionPolicy,
     #[serde(default)]

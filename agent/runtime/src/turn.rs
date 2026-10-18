@@ -6,7 +6,7 @@
 //! selected display node is checked when the input is accepted, and the Chat must be idle for it;
 //! a node off the current chain is reached by rebuilding the Chat on that branch from its store.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -154,6 +154,12 @@ pub enum TurnOutcome {
 pub enum TurnWait {
     Permission(PermissionRequest),
     Question(QuestionRequest),
+    /// The answer waits for the member `chat` of its family, as a foreground `Subagent` call or
+    /// a member waiting for its children does, and that member waits for a person.
+    Member {
+        chat: ChatId,
+        wait: Box<TurnWait>,
+    },
 }
 
 impl Turn {
@@ -1058,7 +1064,7 @@ impl Agent {
                         SettledOutcome::Discarded { reason } => TurnOutcome::Discarded { reason },
                     }),
                     InputState::Accepted | InputState::Started if is_live => {
-                        waiting_for_person(chat, run).map(TurnOutcome::Waiting)
+                        waiting_for_person(&chats, chat, run).map(TurnOutcome::Waiting)
                     }
                     InputState::Accepted | InputState::Started => Some(TurnOutcome::Interrupted {
                         by: InterruptedBy::Host,
@@ -1304,10 +1310,34 @@ pub(crate) fn admit_continuation(
             || Some(tail) == answer_parent
             || attempts.iter().any(|attempt| attempt.response_id == tail)
     });
-    if !is_at_tail {
+    if !is_at_tail && !ends_the_conversation(chat, entry) {
         return Err(moved_on());
     }
     admit_answer_loop(chat, entry.loop_id)
+}
+
+/// An Agent message is no display node of its own: its answer is where the conversation ends
+/// when nothing but that answer's Run, and what a load added, follows the message.
+fn ends_the_conversation(chat: &Chat, entry: &InputEntry) -> bool {
+    if entry.op != InputOp::AgentMessage {
+        return false;
+    }
+    let snapshot = &chat.snapshot;
+    let Some(start) = snapshot
+        .message_ids
+        .iter()
+        .filter(|(_, id)| **id == entry.input_id)
+        .map(|(index, _)| *index)
+        .max()
+    else {
+        return false;
+    };
+    (start + 1..snapshot.messages.len()).all(|index| {
+        snapshot
+            .message_runs
+            .get(&index)
+            .is_none_or(|run| *run == entry.run_id)
+    })
 }
 
 fn admit_answer_loop(chat: &Chat, loop_id: LoopId) -> Result<(), AgentError> {
@@ -1370,7 +1400,10 @@ fn uncertain_operations(chat: &Chat, run: RunId) -> Vec<OperationRecord> {
 }
 
 /// What the Run waits for when it is parked on a person.
-fn waiting_for_person(chat: &Chat, run: RunId) -> Option<TurnWait> {
+fn waiting_for_person(chats: &HashMap<ChatId, Chat>, chat: &Chat, run: RunId) -> Option<TurnWait> {
+    if chat.active_run == Some(run) {
+        return waiting_member(chats, chat, run);
+    }
     if !chat.parked.contains_key(&run) {
         return None;
     }
@@ -1389,6 +1422,44 @@ fn waiting_for_person(chat: &Chat, run: RunId) -> Option<TurnWait> {
                 .cloned()
                 .map(TurnWait::Question)
         })
+}
+
+/// The person a Run holding its slot waits for through the members it waits on: the child of
+/// its foreground call, or each child it waits to report.
+fn waiting_member(chats: &HashMap<ChatId, Chat>, chat: &Chat, run: RunId) -> Option<TurnWait> {
+    let wait = chat.bookkeeping.lifecycle.open_wait_of(run, |kind| {
+        matches!(
+            kind,
+            tickloop_agent_transcript::WaitKind::Subagent { .. }
+                | tickloop_agent_transcript::WaitKind::Children { .. }
+        )
+    })?;
+    let runs = match &wait.kind {
+        tickloop_agent_transcript::WaitKind::Subagent {
+            child_chat,
+            child_run,
+            ..
+        } => vec![(*child_chat, *child_run)],
+        tickloop_agent_transcript::WaitKind::Children { children } => children
+            .iter()
+            .filter_map(|child| chats.get(child))
+            .flat_map(|child| {
+                child
+                    .snapshot
+                    .loops
+                    .iter()
+                    .filter_map(|goal| Some((child.snapshot.id, goal.run_id?)))
+            })
+            .collect(),
+        tickloop_agent_transcript::WaitKind::Question { .. } => Vec::new(),
+    };
+    runs.into_iter().find_map(|(member, run)| {
+        let wait = waiting_for_person(chats, chats.get(&member)?, run)?;
+        Some(TurnWait::Member {
+            chat: member,
+            wait: Box::new(wait),
+        })
+    })
 }
 
 /// Test seam: holds an admitted submission of a Chat after its Run was selected and before its

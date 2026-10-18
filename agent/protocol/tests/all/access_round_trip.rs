@@ -51,6 +51,7 @@ fn monitor_members_and_required_push_completion_fields_share_one_snapshot_wire()
             started_at: Some(1),
             finished_at: 2,
             triggering_message_ids: vec![],
+            run_status: None,
         });
         let response = CommandResult::Loaded {
             execution,
