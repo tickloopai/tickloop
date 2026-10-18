@@ -5,7 +5,11 @@
   </picture>
 </h1>
 
-Tickloop 提供完整的终端 Agent 和 example Tick。Tick 由 Tickhost 运行，可以在 Monitor 中或原生 Herdr 的 Pane 里查看；Agent 可以读取 Tick、调用它的工具，并通过明确订阅让内容变化推动 Loop 继续执行。
+Tickloop 是面向代码与办公的终端 AI Agent，可以理解项目、修改代码、运行测试，整理资料、撰写文档、制作页面与演示，并根据执行结果和反馈继续推进工作。
+
+Tickloop 同时提供 example Tick。Tick 由 Tickhost 运行，可以在 Monitor 中或原生 Herdr 的 Pane 里查看；Agent 可以读取 Tick、调用它的工具，并通过明确订阅让内容变化推动 Loop 继续执行。
+
+官网源码在 `site/`。五个中英文工作台演示由 `site/locales/` 的场景数据和 `site/src/partials/home.js` 驱动，页面结构共用 `home-demo.html`；演示使用模拟数据，Tick 概念示例不等于已发布的集成。`npm --prefix site run check` 检查构建与双语一致性，`npm --prefix site run check:browser` 验证交互与布局，`npm --prefix site run record:demos` 导出十段 24 秒 MP4；后两项需要 Playwright Chromium（`cd site && npx playwright install chromium`），录制还需要 PATH 中可用的 FFmpeg。截图、录制与检查结果保存在忽略的 `site/.results/`。
 
 主命令是 `tickloop`。Herdr 内外都能打开、操作和订阅 Tick；在 Pane 中显示 Tick 目前只支持 Herdr。
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -57,6 +57,14 @@ printf '%s %s\\n' "$(basename "$0")" "$*" >> "$RELEASE_TEST_LOG"
 if [ "$RELEASE_TEST_DIRTY_ROOT" = 1 ]; then printf 'user edit\\n' > "$RELEASE_TEST_REPO/snapshot.txt"; fi
 if [ "$RELEASE_TEST_DIRTY_SNAPSHOT" = 1 ]; then printf 'unexpected\\n' > snapshot.txt; fi
 if [ "$RELEASE_TEST_MOVE_HEAD" = 1 ]; then git -C "$RELEASE_TEST_REPO" commit --allow-empty -qm 'Concurrent work'; fi
+if [ "$RELEASE_TEST_MOVE_HEAD_ONCE" = 1 ] && [ ! -f "$RELEASE_TEST_REPO/.git/check-moved-head" ]; then
+  touch "$RELEASE_TEST_REPO/.git/check-moved-head"
+  git -C "$RELEASE_TEST_REPO" commit --allow-empty -qm 'Concurrent work'
+fi
+if [ -n "$RELEASE_TEST_GATE" ]; then
+  printf ready > "$RELEASE_TEST_GATE.started"
+  while [ ! -f "$RELEASE_TEST_GATE.continue" ]; do sleep 0.01; done
+fi
 if [ "$RELEASE_TEST_SWITCH_BRANCH" = 1 ]; then git -C "$RELEASE_TEST_REPO" checkout -q -B switched; fi
 if [ -n "$RELEASE_TEST_ADD_TAG" ]; then git -C "$RELEASE_TEST_REPO" tag -f "$RELEASE_TEST_ADD_TAG"; fi
 `;
@@ -288,4 +296,61 @@ test("Cargo version edits leave external dependency versions untouched and enfor
   assert.match(changes.get("Cargo.lock"), /name = "tickloop-agent"\nversion = "0.3.0"/);
   assert.equal(nextVersion({ ...product, tagPrefix: "artifacts-v", version: `1.0.${"9".repeat(16)}` }), `1.0.1${"0".repeat(16)}`);
   assert.throws(() => nextVersion({ ...product, tagPrefix: "artifacts-v", version: `1.0.${"9".repeat(17)}` }), /exceeds/);
+});
+
+
+test("an advancing HEAD on the same branch is checked again before creating a version commit", t => {
+  const setup = fixture(t);
+  const result = release(setup, "site", undefined, { RELEASE_TEST_MOVE_HEAD_ONCE: "1" });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /HEAD advanced during checks/);
+  assert.equal(git(["rev-list", "--count", `${setup.initial}..HEAD`], setup), "2");
+  assert.equal(git(["log", "-1", "--format=%s", "HEAD^"], setup), "Concurrent work");
+  assert.equal(git(["rev-parse", "site-v0.1.7^{}"], setup), git(["rev-parse", "HEAD"], setup));
+});
+
+function startRelease(setup, channel, gate) {
+  const child = spawn(process.execPath, [releaseScript, channel], {
+    cwd: setup.repo, env: { ...setup.env, RELEASE_TEST_GATE: gate }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "", stderr = "";
+  child.stdout.on("data", value => stdout += value);
+  child.stderr.on("data", value => stderr += value);
+  const done = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", status => resolve({ status, stdout, stderr }));
+  });
+  return { done, stderr: () => stderr };
+}
+
+async function waitUntil(predicate) {
+  const deadline = Date.now() + 10_000;
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, "timed out waiting for release synchronization");
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+}
+
+test("concurrent product releases wait for one shared lock and preserve both version commits", async t => {
+  const setup = fixture(t);
+  const firstGate = join(setup.base, "site-gate"), secondGate = join(setup.base, "artifacts-gate");
+  writeFileSync(`${secondGate}.continue`, "ready");
+  const first = startRelease(setup, "site", firstGate);
+  let second;
+  try {
+    await waitUntil(() => existsSync(`${firstGate}.started`));
+    second = startRelease(setup, "artifacts", secondGate);
+    await waitUntil(() => second.stderr().includes("waiting for the shared release lock"));
+    assert.ok(!existsSync(`${secondGate}.started`), "the queued release must not check an obsolete HEAD");
+  } finally {
+    writeFileSync(`${firstGate}.continue`, "ready");
+  }
+  const firstResult = await first.done;
+  const secondResult = await second.done;
+  assert.equal(firstResult.status, 0, firstResult.stderr);
+  assert.equal(secondResult.status, 0, secondResult.stderr);
+  assert.equal(git(["rev-list", "--count", `${setup.initial}..HEAD`], setup), "2");
+  assert.equal(git(["rev-parse", "site-v0.1.7^{}"], setup), git(["rev-parse", "HEAD^"], setup));
+  assert.equal(git(["rev-parse", "artifacts-v0.1.35^{}"], setup), git(["rev-parse", "HEAD"], setup));
+  assert.ok(!existsSync(join(setup.repo, ".git/tickloop-release.lock")));
 });

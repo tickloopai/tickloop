@@ -32,6 +32,8 @@ const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const RUNTIME_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+const PROCESS_GROUP_KILL_GRACE: Duration = Duration::from_millis(50);
+const PROCESS_GROUP_KILL_POLL: Duration = Duration::from_millis(1);
 const HOMEBREW_FORMULA: &str = "tickloopai/tap/tickloop";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -534,14 +536,15 @@ async fn run_process(command: &mut tokio::process::Command) -> Result<()> {
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .process_group(0);
-    let mut child = command.spawn()?;
+    let child = command.spawn()?;
     let mut group = ProcessGroup {
         process_id: child.id().context("Installer has no process id")?,
+        child,
         is_armed: true,
     };
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let status = tokio::select! {
-        result = tokio::time::timeout(COMMAND_TIMEOUT, child.wait()) => {
+        result = tokio::time::timeout(COMMAND_TIMEOUT, group.child.wait()) => {
             result.context("Update command timed out; inspect the installer before retrying")??
         }
         signal = tokio::signal::ctrl_c() => {
@@ -558,6 +561,7 @@ async fn run_process(command: &mut tokio::process::Command) -> Result<()> {
 }
 
 struct ProcessGroup {
+    child: tokio::process::Child,
     process_id: u32,
     is_armed: bool,
 }
@@ -565,9 +569,17 @@ struct ProcessGroup {
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
         if self.is_armed {
-            // This is the dedicated process group we created for this installer, never a user PID.
-            unsafe {
-                libc::kill(-(self.process_id as i32), libc::SIGKILL);
+            // Keep the leader unreaped so its PID cannot be reused during this bounded cleanup.
+            // A child can finish forking after the first group signal was enumerated.
+            let deadline = std::time::Instant::now() + PROCESS_GROUP_KILL_GRACE;
+            loop {
+                unsafe {
+                    libc::kill(-(self.process_id as i32), libc::SIGKILL);
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(PROCESS_GROUP_KILL_POLL);
             }
         }
     }

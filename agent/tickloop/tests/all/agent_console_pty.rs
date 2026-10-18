@@ -2881,25 +2881,46 @@ async fn select_overview_row(view: &mut PtyView, title: &str) {
             .collect::<Vec<_>>()
     };
     view.send(&b"k".repeat(MAX_KEYS / 2));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    view.wait_for("overview selection reaches its first row", |frame| {
+        frame
+            .lines()
+            .nth(2)
+            .is_some_and(|line| line.starts_with(SELECTED_MARK))
+    })
+    .await;
     for _ in 0..MAX_KEYS {
         let lines = list(&view.frame());
-        let Some(selected) = lines.iter().find(|line| line.starts_with(SELECTED_MARK)) else {
-            view.send(b"j");
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            continue;
-        };
+        let selected_index = lines
+            .iter()
+            .position(|line| line.starts_with(SELECTED_MARK))
+            .unwrap_or_else(|| panic!("no overview row is selected: {}", view.frame()));
+        let selected = &lines[selected_index];
         if row_title(selected).contains(title)
             && !selected.starts_with(&format!("{SELECTED_MARK} ▾ "))
         {
             return;
         }
-        view.send(if selected.starts_with(&format!("{SELECTED_MARK} ▸ ")) {
-            b"\r"
+        if selected.starts_with(&format!("{SELECTED_MARK} ▸ ")) {
+            let opened = selected.replacen('▸', "▾", 1);
+            view.send(b"\r");
+            view.wait_for("the selected overview group opens", |frame| {
+                frame.lines().any(|line| line == opened)
+            })
+            .await;
         } else {
-            b"j"
-        });
-        tokio::time::sleep(Duration::from_millis(40)).await;
+            let next = lines
+                .get(selected_index + 1)
+                .map(|line| row_title(line).split(" · ").next().unwrap())
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| panic!("no overview row below {selected:?}: {}", view.frame()))
+                .to_owned();
+            view.send(b"j");
+            view.wait_for("overview navigation selects the next listed row", |frame| {
+                selected_row_title(frame).and_then(|title| title.split(" · ").next())
+                    == Some(next.as_str())
+            })
+            .await;
+        }
     }
     panic!("overview never selected {title}: {}", view.frame());
 }

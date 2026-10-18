@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compareVersions, nextVersion, readProducts, versionChanges } from "./release-versions.mjs";
@@ -13,6 +14,8 @@ const allowedRemoteUrls = new Set([
 ]);
 // GitHub does not create tag-push events when a push updates more than three tags.
 const maximumTagsPerPush = 3;
+const maximumSnapshotAttempts = 3;
+const releaseLockPollMilliseconds = 100;
 const channels = new Set(["binary", "artifacts", "site", "ticks"]);
 
 function command(program, args, options = {}) {
@@ -29,6 +32,61 @@ function gitOutput(args, failureMessage, options) {
   const result = git(args, options);
   if (result.status !== 0) throw new Error(`${failureMessage}${result.stderr?.trim() ? ` ${result.stderr.trim()}` : ""}`);
   return result.stdout.trim();
+}
+
+function acquireReleaseLock() {
+  const directory = gitOutput(["rev-parse", "--path-format=absolute", "--git-common-dir"], "Could not locate the shared Git directory.");
+  const path = join(directory, "tickloop-release.lock");
+  const token = randomUUID();
+  let waiting = false;
+  let incompleteReads = 0;
+  while (true) {
+    let descriptor;
+    try {
+      descriptor = openSync(path, "wx", 0o600);
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      let owner;
+      try { owner = JSON.parse(readFileSync(path, "utf8")); }
+      catch (error) {
+        if (error.code === "ENOENT") continue;
+        if (++incompleteReads >= 10) throw new Error(`Release lock ${path} has no readable owner; inspect it before removing it.`);
+      }
+      if (owner) {
+        incompleteReads = 0;
+        if (!Number.isInteger(owner.pid) || owner.pid <= 0) throw new Error(`Release lock ${path} has an invalid owner.`);
+        try { process.kill(owner.pid, 0); }
+        catch (error) {
+          if (error.code === "ESRCH") throw new Error(`Release lock ${path} belongs to exited process ${owner.pid}; inspect and remove that stale lock before retrying.`);
+          if (error.code !== "EPERM") throw error;
+        }
+      }
+      if (!waiting) { process.stderr.write("Another release is running; waiting for the shared release lock.\n"); waiting = true; }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, releaseLockPollMilliseconds);
+      continue;
+    }
+    try { writeFileSync(descriptor, JSON.stringify({ pid: process.pid, token })); }
+    catch (error) { closeSync(descriptor); unlinkSync(path); throw error; }
+    closeSync(descriptor);
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      try { if (JSON.parse(readFileSync(path, "utf8")).token === token) unlinkSync(path); }
+      catch (error) { if (error.code !== "ENOENT") process.stderr.write(`Could not release ${path}: ${error.message}\n`); }
+    };
+    process.once("exit", release);
+    return () => {
+      release();
+      process.off("exit", release);
+    };
+  }
+}
+
+function releaseSnapshotIsCurrent(state) {
+  const current = preflight();
+  if (current.branch !== state.branch) throw new Error("The branch changed during checks; no version commit or release tag was created.");
+  return current.commit === state.commit;
 }
 
 function preflight() {
@@ -133,11 +191,11 @@ function prepareAndCheck(channel, state, mode) {
 }
 
 function finalizeRelease(products, state, changes) {
-  const current = preflight();
-  if (current.commit !== state.commit || current.branch !== state.branch) throw new Error("HEAD or branch changed during checks; no version commit or release tag was created.");
+  if (!releaseSnapshotIsCurrent(state)) return false;
   checkReleaseTargets(products);
   const paths = [...changes.keys()];
   assertVersionFilesUnchanged(paths);
+  if (!releaseSnapshotIsCurrent(state)) return false;
   const description = products.map(product => `${product.label} ${product.nextVersion}`).join(", ");
   for (const [path, content] of changes) writeFileSync(join(state.root, path), content);
   const created = git(["commit", "--only", "-m", `chore(release): ${description}`, "--", ...paths], { readOnly: false });
@@ -162,15 +220,30 @@ function finalizeRelease(products, state, changes) {
     if (pushed.status !== 0) throw new Error(`Push failed; release commit ${commit} and local tags remain. Earlier tag batches may already be published. Inspect remote refs with git ls-remote origin ${state.branch} ${products.map(product => `refs/tags/${product.tag}`).join(" ")}, then retry only the missing refs with git push --atomic origin ${refspecs.join(" ")}. Do not rerun release to bump versions again. ${pushed.stderr.trim()}`);
   }
   process.stdout.write(`Committed ${description} as ${commit}. Published ${products.map(product => product.tag).join(", ")} with ${state.branch.slice("refs/heads/".length)}. GitHub Actions will build and deploy the releases.\n`);
+  return true;
 }
 
 try {
   const [channel, mode, ...extra] = process.argv.slice(2);
   if (!channels.has(channel) || extra.length || mode && !["--check", "--dry-run"].includes(mode)) throw new Error("Usage: [VERSION=X.Y.Z] [TICK_PACKAGES='longbridge futu'] node scripts/release.mjs binary|artifacts|site|ticks [--check|--dry-run]");
-  const state = preflight();
-  const { products, changes } = prepareAndCheck(channel, state, mode);
-  if (mode) process.stdout.write(`Ready to bump ${products.map(product => `${product.label} ${product.version} → ${product.nextVersion}`).join(", ")}, create one version commit and tags ${products.map(product => product.tag).join(", ")}, then push ${state.branch.slice("refs/heads/".length)} and tags. No changes were made.\n`);
-  else finalizeRelease(products, state, changes);
+  const releaseLock = acquireReleaseLock();
+  try {
+    const initial = preflight();
+    for (let attempt = 0; attempt < maximumSnapshotAttempts; attempt++) {
+      const state = preflight();
+      if (state.branch !== initial.branch) throw new Error("The release branch changed while preparing the snapshot.");
+      const { products, changes } = prepareAndCheck(channel, state, mode);
+      if (mode) {
+        process.stdout.write(`Ready to bump ${products.map(product => `${product.label} ${product.version} → ${product.nextVersion}`).join(", ")}, create one version commit and tags ${products.map(product => product.tag).join(", ")}, then push ${state.branch.slice("refs/heads/".length)} and tags. No changes were made.\n`);
+        break;
+      }
+      if (finalizeRelease(products, state, changes)) break;
+      if (attempt + 1 === maximumSnapshotAttempts) throw new Error("HEAD kept advancing during release checks; no version commit or release tag was created. Retry when commits have settled.");
+      process.stderr.write("HEAD advanced during checks; preparing and checking the latest committed snapshot again.\n");
+    }
+  } finally {
+    releaseLock();
+  }
 } catch (error) {
   process.stderr.write(`${error.message}\n`);
   process.exitCode = 1;
