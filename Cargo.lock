@@ -4833,6 +4833,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tickloop-agent-recurrence"
+version = "0.2.8"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "tickloop-agent-runtime"
 version = "0.2.8"
 dependencies = [
