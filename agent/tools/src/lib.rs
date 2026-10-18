@@ -562,7 +562,7 @@ impl Tools {
             if let Operation::WebFetch(fetch) = &prepared.operation {
                 web::check_reach(&fetch.url, self.reach)?;
             }
-            return Ok(prepared);
+            return self.bind_search(prepared).await;
         };
         let owned_workspace = workspace.clone();
         let owned_name = name.to_owned();
@@ -582,7 +582,7 @@ impl Tools {
         let file_reads = self.file_reads.clone();
         let output_dir = directory.chat;
         let join_error_path = output_dir.path().to_path_buf();
-        let mut prepared = tokio::task::spawn_blocking(move || {
+        let prepared = tokio::task::spawn_blocking(move || {
             let mut prepared = prepare_with_readable_directories(
                 &owned_workspace,
                 &owned_name,
@@ -613,6 +613,12 @@ impl Tools {
         if let Operation::TaskStop(input) = &prepared.operation {
             self.commands.stoppable_task(&input.task_id).await?;
         }
+        self.bind_search(prepared).await
+    }
+
+    /// Binds a `WebSearch` call to the Chat's search service and its credential before
+    /// approval, with or without a Folder.
+    async fn bind_search(&self, mut prepared: PreparedTool) -> Result<PreparedTool, ToolError> {
         if let Operation::WebSearch(search) = &mut prepared.operation {
             let config = self
                 .search

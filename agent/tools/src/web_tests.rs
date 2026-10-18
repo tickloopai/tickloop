@@ -663,3 +663,34 @@ async fn folderless_tools_prepare_only_web_fetch_of_public_addresses_and_write_n
         );
     }
 }
+
+#[tokio::test]
+async fn folderless_tools_bind_web_search_to_the_chats_search_service() {
+    let workspace = crate::Workspace {
+        folder: None,
+        additional_directories: Vec::new(),
+    };
+    let input = json!({"query": "rust release notes"});
+    let config = tickloop_agent_protocol::SearchConfig {
+        provider: tickloop_agent_protocol::SearchProviderKind::Searxng,
+        endpoint: "http://127.0.0.1:8888/search".into(),
+        api_key_env: None,
+    };
+    let tools = crate::Tools::folderless().with_search_configuration(Some(config), None);
+    let prepared = tools
+        .prepare(&workspace, WEB_SEARCH_TOOL_NAME, &input)
+        .await
+        .unwrap();
+    assert!(prepared.requires_permission && !prepared.in_workspace);
+    assert_eq!(prepared.input["endpoint"], "http://127.0.0.1:8888/search");
+    assert!(matches!(
+        &prepared.operation,
+        crate::Operation::WebSearch(search) if search.prepared.is_some()
+    ));
+
+    let disabled = crate::Tools::folderless().with_search_configuration(None, None);
+    assert!(matches!(
+        disabled.prepare(&workspace, WEB_SEARCH_TOOL_NAME, &input).await,
+        Err(ToolError::Network(message)) if message == web_search::DISABLED_MESSAGE
+    ));
+}
