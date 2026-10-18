@@ -764,6 +764,7 @@ impl Agent {
             return Err(AgentError::Busy);
         }
         let mut snapshot = chat.snapshot.clone();
+        let plans_directory = self.plans_directory(super::require_folder(&snapshot)?);
         let goal = snapshot
             .loops
             .iter()
@@ -787,13 +788,12 @@ impl Agent {
                 "plan approval was already processed".into(),
             ));
         }
-        let directory = self.plans_directory(&snapshot.workdir);
         let slug = chat
             .bookkeeping
             .plan_slug
             .as_deref()
             .ok_or_else(|| AgentError::Invalid("the plan file cannot be located".into()))?;
-        let file = read_plan_file(directory.path(), slug, loop_id).map_err(|error| {
+        let file = read_plan_file(plans_directory.path(), slug, loop_id).map_err(|error| {
             AgentError::Invalid(format!("cannot verify the reviewed plan: {error}"))
         })?;
         if file.version != Some(version) || !file.is_submitted || file.markdown != plan.markdown {
@@ -812,12 +812,8 @@ impl Agent {
         plan.approved_execution_mode = Some(mode);
         plan.approval_pending = false;
         let markdown = plan.markdown.clone();
-        let plan_file = current_plan_file(
-            &chat.bookkeeping,
-            self.plans_directory(&snapshot.workdir).path(),
-            loop_id,
-        )
-        .ok_or_else(|| AgentError::Invalid("the plan file cannot be located".into()))?;
+        let plan_file = current_plan_file(&chat.bookkeeping, plans_directory.path(), loop_id)
+            .ok_or_else(|| AgentError::Invalid("the plan file cannot be located".into()))?;
         snapshot.policy.mode = mode;
         snapshot.policy.revision += 1;
         self.save(&snapshot);
@@ -844,12 +840,17 @@ impl Agent {
         Ok(Some(prompts::approved_plan(&plan_file, &markdown)))
     }
 
-    /// The directory of plan files: `<root>/plans` when Chats are saved, otherwise `plans` under
+    /// The directory of plan files: `<root>/plans` when Chats are saved locally, otherwise `plans` under
     /// the project's private temporary directory, like File History.
-    pub(super) fn plans_directory(&self, workdir: &Path) -> PrivateDirectory {
-        match &self.inner.recorder {
-            Some(recorder) => PrivateDirectory::trusted(recorder.plans_directory()),
-            None => private_project_temp_directory(workdir).join(PLANS_DIRECTORY),
+    pub(super) fn plans_directory(&self, folder: &Path) -> PrivateDirectory {
+        match self
+            .inner
+            .recorder
+            .as_ref()
+            .and_then(|recorder| recorder.plans_directory())
+        {
+            Some(directory) => PrivateDirectory::trusted(directory),
+            None => private_project_temp_directory(folder).join(PLANS_DIRECTORY),
         }
     }
 
@@ -863,7 +864,8 @@ impl Agent {
         if chat.snapshot.delegation.is_some() {
             return Some(prompts::DELEGATED_PLAN_MODE_REMINDER.into());
         }
-        let directory = self.plans_directory(&chat.snapshot.workdir);
+        // A Chat without a Folder has no plan file; Plan mode there only reads.
+        let directory = self.plans_directory(chat.snapshot.folder.as_deref()?);
         // The model's Write would create a missing plans directory with ordinary permissions, so
         // the private one is created first; if that fails, ExitPlanMode reports the reason.
         let _ = directory.create();
@@ -977,7 +979,13 @@ impl Agent {
                 .ok_or("plan is unavailable")?;
             let path = current_plan_file(
                 &chat.bookkeeping,
-                self.plans_directory(&chat.snapshot.workdir).path(),
+                self.plans_directory(
+                    chat.snapshot
+                        .folder
+                        .as_deref()
+                        .ok_or("plan file is unavailable")?,
+                )
+                .path(),
                 receipt.loop_id,
             )
             .ok_or("plan file is unavailable")?;
@@ -1051,7 +1059,12 @@ impl Agent {
         if snapshot.policy.mode != ExecutionMode::Plan {
             return Err(prompts::NOT_IN_PLAN_MODE.into());
         }
-        let directory = self.plans_directory(&snapshot.workdir);
+        let directory = self.plans_directory(
+            snapshot
+                .folder
+                .as_deref()
+                .ok_or("this Chat has no Folder for a plan file")?,
+        );
         directory
             .create()
             .map_err(|error| format!("cannot prepare the plans directory: {error}"))?;

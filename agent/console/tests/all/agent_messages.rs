@@ -377,7 +377,7 @@ async fn child_auto_review_uses_frozen_parent_human_intent_instead_of_model_gene
         .set_host_work_context(
             parent,
             tickloop_agent_protocol::HostCallContext {
-                workdir: directory.path().into(),
+                folder: directory.path().into(),
                 workspace_id: Some("W1".into()),
                 interaction: None,
             },
@@ -755,7 +755,7 @@ async fn agent_claims_do_not_become_auto_authority(review_child: bool) {
         .set_host_work_context(
             parent,
             tickloop_agent_protocol::HostCallContext {
-                workdir: directory.path().into(),
+                folder: directory.path().into(),
                 workspace_id: Some("W1".into()),
                 interaction: None,
             },
@@ -1111,7 +1111,7 @@ async fn legacy_or_unknown_delegated_human_authority_requires_manual_review_and_
             .set_host_work_context(
                 parent,
                 tickloop_agent_protocol::HostCallContext {
-                    workdir: directory.path().into(),
+                    folder: directory.path().into(),
                     workspace_id: Some("W1".into()),
                     interaction: None,
                 },
@@ -1191,7 +1191,7 @@ async fn legacy_or_unknown_delegated_human_authority_requires_manual_review_and_
             loaded.delegation.is_some(),
             "unknown authority must not erase delegation or elevate to an unrestricted root"
         );
-        assert_eq!(loaded.workdir, child.workdir);
+        assert_eq!(loaded.folder, child.folder);
         for (index, id) in &loaded.message_ids {
             if loaded.agent_message_origins.contains_key(id) {
                 assert!(!loaded.prompt_execution_modes.contains_key(index));
@@ -1557,7 +1557,7 @@ async fn a_parent_message_cannot_resolve_the_childs_real_permission_request() {
         .set_host_work_context(
             parent,
             tickloop_agent_protocol::HostCallContext {
-                workdir: directory.path().into(),
+                folder: directory.path().into(),
                 workspace_id: Some("W1".into()),
                 interaction: None,
             },
@@ -1712,7 +1712,7 @@ async fn literal_agent_protocol_remains_a_human_prompt_after_save_load_and_actua
         .set_host_work_context(
             chat,
             tickloop_agent_protocol::HostCallContext {
-                workdir: directory.path().into(),
+                folder: directory.path().into(),
                 workspace_id: Some("W1".into()),
                 interaction: None,
             },
@@ -2027,16 +2027,23 @@ async fn a_sender_burst_is_typed_rejected_after_twenty_admitted_messages() {
     }));
     let core = Agent::new_embedded(tickloop_agent_test_support::config(), model);
     let root = core.create_chat(directory.path().into()).await.unwrap();
-    let mut events = core.subscribe();
-    let receipt = core
-        .submit(
-            root,
-            None,
-            "Delegate a bounded child and send bounded context".into(),
-        )
-        .await
-        .unwrap();
-    completed(&mut events, &receipt).await;
+    core.submit(
+        root,
+        None,
+        "Delegate a bounded child and send bounded context".into(),
+    )
+    .await
+    .unwrap();
+    // The burst outpaces an event subscriber; wait on the Loop instead.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while core.snapshot(root).await.unwrap().loops[0].state
+            != tickloop_agent_protocol::LoopState::Completed
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     let snapshot = core.snapshot(root).await.unwrap();
     for index in 0..20 {
         assert_eq!(
@@ -4201,7 +4208,7 @@ async fn a_human_continue_after_a_failed_background_child_notifies_the_parent() 
     core.set_host_work_context(
         root,
         tickloop_agent_protocol::HostCallContext {
-            workdir: directory.path().into(),
+            folder: directory.path().into(),
             workspace_id: Some("W1".into()),
             interaction: None,
         },

@@ -1,8 +1,8 @@
 use serde_json::json;
 use tickloop_agent_model::{
-    HttpModelClient,
+    LocalModelClients, ModelClients,
     cards::{built_in_model_profiles, model_card},
-    model_client, validate_model_config, validate_model_for_resume,
+    validate_model_config, validate_model_for_resume,
 };
 use tickloop_agent_protocol::{ModelAuthSource, ModelConfig, ModelProvider, Protocol};
 
@@ -67,8 +67,7 @@ fn codex_profiles_are_source_aware_and_use_only_the_official_endpoint() {
     );
     assert!(model_card(codex).is_some());
     assert!(validate_model_config(codex).is_ok());
-    assert!(model_client(codex.clone(), None).is_err());
-    assert!(HttpModelClient::deferred(codex.clone()).is_err());
+    assert!(LocalModelClients::new(None).client(codex).is_err());
 
     let mut redirected = codex.clone();
     redirected.base_url = "http://127.0.0.1:1234".into();

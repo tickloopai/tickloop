@@ -2068,14 +2068,14 @@ async fn native_tools_and_workspace_metadata_survive_mcp_composition() {
         NativeFixture.host_endpoint().unwrap()
     );
     let context = HostCallContext {
-        workdir: directory.path().into(),
+        folder: directory.path().into(),
         workspace_id: Some("work-context".into()),
         interaction: None,
     };
     let local_files = tickloop_agent_tools::Tools::new(directory.path().join("chat"))
         .local_file_reader(
             &tickloop_agent_tools::Workspace {
-                workdir: directory.path().into(),
+                folder: Some(directory.path().into()),
                 additional_directories: Vec::new(),
             },
             Arc::new(NoLocalReads),
@@ -2084,7 +2084,7 @@ async fn native_tools_and_workspace_metadata_survive_mcp_composition() {
         .prepare_call_in_scope(
             uuid::Uuid::new_v4(),
             &HostCallScope {
-                local_files: &local_files,
+                local_files: local_files.as_ref(),
                 context: Some(&context),
             },
             "native_fixture",
@@ -2096,7 +2096,7 @@ async fn native_tools_and_workspace_metadata_survive_mcp_composition() {
     let captured = prepared
         .payload::<HostCallContext>()
         .expect("Native preparation receives its context");
-    assert_eq!(captured.workdir, context.workdir);
+    assert_eq!(captured.folder, context.folder);
     assert_eq!(captured.workspace_id, context.workspace_id);
 }
 

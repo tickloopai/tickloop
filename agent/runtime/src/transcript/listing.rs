@@ -13,7 +13,7 @@ pub(super) const LITE_READ_BUF_SIZE: usize = 64 * 1024;
 const FORKED_FROM_PATTERN: &str = "\"forkedFrom\":{";
 
 #[derive(Clone, Debug)]
-pub(crate) struct TranscriptSummary {
+pub struct TranscriptSummary {
     pub chat_id: Uuid,
     pub modified: SystemTime,
     pub cwd: Option<PathBuf>,

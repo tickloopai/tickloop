@@ -18,6 +18,7 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tickloop-agent-protocol = { path = "../protocol" }
 time = { version = "0.3", features = ["formatting", "parsing"] }
+tokio = { version = "1", features = ["net"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]

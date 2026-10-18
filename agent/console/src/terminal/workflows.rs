@@ -1360,7 +1360,7 @@ fn append_public_message(
                         presentation::tool_call_roles(
                             name,
                             input,
-                            &history.chat.workdir,
+                            super::shown_folder(history.chat.folder.as_deref()),
                             display,
                             &history.tick_labels,
                         )
@@ -1390,7 +1390,7 @@ fn append_public_message(
                         presentation::archived_tool_call(
                             name,
                             input,
-                            &history.chat.workdir,
+                            super::shown_folder(history.chat.folder.as_deref()),
                             display,
                             &history.tick_labels,
                         ),
@@ -1434,7 +1434,7 @@ fn append_public_message(
                         let spans = presentation::tool_call_roles(
                             name,
                             input,
-                            &history.chat.workdir,
+                            super::shown_folder(history.chat.folder.as_deref()),
                             display,
                             &history.tick_labels,
                         );
@@ -1464,7 +1464,7 @@ fn append_public_message(
                     name,
                     input,
                     &result,
-                    &history.chat.workdir,
+                    super::shown_folder(history.chat.folder.as_deref()),
                     display,
                     &facts,
                 );
@@ -1708,7 +1708,7 @@ mod tests {
         };
         let mut snapshot: ChatSnapshot = serde_json::from_value(json!({
             "id": chat_id,
-            "workdir": "/workspace",
+            "folder": "/workspace",
             "model": ModelConfig {
                 provider: tickloop_agent_protocol::ModelProvider::Api,
                 auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
@@ -1783,7 +1783,7 @@ mod tests {
     fn delivery_history(reply: &str, payload: serde_json::Value) -> ChatSnapshot {
         serde_json::from_value(json!({
             "id": Uuid::from_u128(701),
-            "workdir": "/workspace",
+            "folder": "/workspace",
             "messages": [
                 user_text(&tickloop_agent_protocol::local_messages::tick_delivery(&payload, &tickloop_agent_protocol::Trigger::for_loop_goal("watch 700.HK"))),
                 Message {
@@ -1889,7 +1889,7 @@ mod tests {
             .unwrap();
         let snapshot: ChatSnapshot = serde_json::from_value(json!({
             "id": chat,
-            "workdir": "/workspace",
+            "folder": "/workspace",
             "messages": [
                 user_text("compare [Image #1] with [Image #2]"),
                 Message {
@@ -1941,7 +1941,7 @@ mod tests {
     fn resumed_history_hides_interruption_placeholders() {
         let snapshot: ChatSnapshot = serde_json::from_value(json!({
             "id": Uuid::from_u128(600),
-            "workdir": "/workspace",
+            "folder": "/workspace",
             "messages": [
                 user_text("run the slow command"),
                 Message {

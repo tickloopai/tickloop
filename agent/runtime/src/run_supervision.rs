@@ -6,6 +6,7 @@ use tickloop_agent_protocol::{EventKind, LoopState, Receipt, RequestFailure, Run
 use tokio_util::sync::CancellationToken;
 
 use super::{Agent, Chat, LoopSnapshotExt, recovery};
+use crate::transcript::ResponseEnding;
 
 const INTERNAL_RUN_ERROR: &str = "Agent internal error: execution panicked. The run stopped without automatically retrying. Review any operations with unknown outcomes before continuing.";
 const INTERNAL_COMPLETION_ERROR: &str = "Agent internal error while finishing the run. The run stopped without automatically retrying. Review any operations with unknown outcomes before continuing.";
@@ -21,17 +22,14 @@ pub(super) fn clear_run_state(chat: &mut Chat, run: RunId) {
 }
 
 impl Agent {
-    pub(super) fn run_task(
-        &self,
-        first: (Receipt, ModelRequest, CancellationToken),
-    ) -> tokio::task::JoinHandle<()> {
+    pub(super) fn run_task(&self, first: (Receipt, ModelRequest, CancellationToken)) {
         let agent = self.clone();
-        tokio::spawn(Box::pin(async move {
+        self.inner.tasks.spawn(Box::pin(async move {
             let mut next = Some(first);
             while let Some((receipt, request, cancel)) = next {
                 next = agent.run(receipt, request, cancel).await;
             }
-        }))
+        }));
     }
 
     pub(super) async fn run(
@@ -134,6 +132,14 @@ impl Agent {
         } else {
             "Agent internal error while finishing the run. Tool history recovery also failed; reconcile pending operations before continuing. The run was not automatically retried."
         };
+        self.end_response(
+            chat,
+            receipt.run_id,
+            ResponseEnding::Failed {
+                error: message.into(),
+            },
+            Default::default(),
+        );
         self.emit(chat, receipt, EventKind::Failed(message.into()));
         let snapshot = chat.snapshot.clone();
         drop(chats);

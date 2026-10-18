@@ -148,7 +148,7 @@ impl TickLabels {
             &snapshot.commands,
             &snapshot.user_shells,
             &snapshot.artifact_ticks,
-            &snapshot.workdir,
+            super::shown_folder(snapshot.folder.as_deref()),
         );
         for goal in &snapshot.loops {
             for subscription in goal

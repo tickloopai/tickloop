@@ -55,7 +55,7 @@
           "parent_call_id": "call-subagent",
           "task": "Audit the counter",
           "ceiling": {
-            "workdir": "/work/project",
+            "folder": "/work/project",
             "additional_directories": [
               "/work/shared"
             ],
@@ -107,13 +107,13 @@
                 "tool": "Bash",
                 "identity_sha256": "abababababababababababababababababababababababababababababababab",
                 "workspace": {
-                  "workdir": "/work/project",
+                  "folder": "/work/project",
                   "additional_directories": []
                 }
               }
             ],
             "host_context": {
-              "workdir": "/work/project",
+              "folder": "/work/project",
               "workspace_id": "w1",
               "interaction": {
                 "socket": "/run/herdr.sock",
@@ -194,7 +194,7 @@
           }
         ],
         "generated_title": "Counter check",
-        "workdir": "/work/project",
+        "folder": "/work/project",
         "messages": [
           {
             "role": "system",
@@ -530,7 +530,7 @@
           "generation": 3
         },
         "chat_id": "00000000-0000-0000-0000-0000000000c1",
-        "workdir": "/work/project",
+        "folder": "/work/project",
         "state": "Running",
         "run_id": "00000000-0000-0000-0000-000000000020",
         "run_started_at": 1000,
@@ -657,7 +657,7 @@
         "task_board": null,
         "task_boards": {},
         "id": "00000000-0000-0000-0000-0000000000c1",
-        "workdir": "/work/project",
+        "folder": "/work/project",
         "additional_directories": [
           "/work/shared"
         ],
@@ -671,7 +671,7 @@
           "parent_call_id": "call-subagent",
           "task": "Audit the counter",
           "ceiling": {
-            "workdir": "/work/project",
+            "folder": "/work/project",
             "additional_directories": [
               "/work/shared"
             ],
@@ -723,13 +723,13 @@
                 "tool": "Bash",
                 "identity_sha256": "abababababababababababababababababababababababababababababababab",
                 "workspace": {
-                  "workdir": "/work/project",
+                  "folder": "/work/project",
                   "additional_directories": []
                 }
               }
             ],
             "host_context": {
-              "workdir": "/work/project",
+              "folder": "/work/project",
               "workspace_id": "w1",
               "interaction": {
                 "socket": "/run/herdr.sock",

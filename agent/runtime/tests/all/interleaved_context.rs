@@ -111,7 +111,7 @@ async fn raw_legacy_model_name_change_keeps_same_source_private_history() {
     let second_client = Arc::new(ScriptedModel::new(vec![text("Second answer")]));
     assert_eq!(
         agent
-            .set_model(chat, renamed, second_client.clone())
+            .set_model(chat, renamed)
             .await
             .unwrap(),
         ModelChange::Applied
@@ -242,7 +242,7 @@ async fn waiting_goals_project_paired_history_without_changing_raw_tool_identity
         profile.card.as_mut().unwrap().display_name = profile.name.clone();
         assert_eq!(
             agent
-                .set_model(chat, profile.clone(), replacement.clone())
+                .set_model(chat, profile.clone())
                 .await
                 .unwrap(),
             ModelChange::Pending

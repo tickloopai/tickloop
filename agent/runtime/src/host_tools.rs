@@ -228,7 +228,8 @@ pub(crate) struct ArtifactAccountContext {
 /// What the calling Chat lends one host call: read-only access to its local files by the `Read`
 /// path rules in its workspace, and the host context of the View or Work Context it serves.
 pub struct HostCallScope<'a> {
-    pub local_files: &'a tickloop_agent_tools::LocalFileReader,
+    /// The calling Chat's local files; `None` for a Chat without a Folder.
+    pub local_files: Option<&'a tickloop_agent_tools::LocalFileReader>,
     pub context: Option<&'a HostCallContext>,
 }
 

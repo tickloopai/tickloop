@@ -266,7 +266,7 @@ fn messages() -> Vec<Message> {
 fn chat_snapshot() -> ChatSnapshot {
     let mut snapshot: ChatSnapshot = serde_json::from_value(json!({
         "id": id(0xc1),
-        "workdir": "/work/project",
+        "folder": "/work/project",
         "messages": messages(),
         "generated_title": "Counter check",
         "artifact_ticks": [{
@@ -286,16 +286,16 @@ fn chat_snapshot() -> ChatSnapshot {
             "parent_call_id": "call-subagent",
             "task": "Audit the counter",
             "ceiling": {
-                "workdir": "/work/project",
+                "folder": "/work/project",
                 "additional_directories": ["/work/shared"],
                 "policy": permission_policy(),
                 "session_denials": [{
                     "tool": "Bash",
                     "identity_sha256": "ab".repeat(32),
-                    "workspace": {"workdir": "/work/project", "additional_directories": []},
+                    "workspace": {"folder": "/work/project", "additional_directories": []},
                 }],
                 "host_context": {
-                    "workdir": "/work/project",
+                    "folder": "/work/project",
                     "workspace_id": "w1",
                     "interaction": {
                         "socket": "/run/herdr.sock",
@@ -392,7 +392,7 @@ fn live_chat_snapshot() -> LiveChatSnapshot {
 
 fn launch_spec() -> LaunchSpec {
     LaunchSpec {
-        workdir: "/work/project".into(),
+        folder: "/work/project".into(),
         config_root: Some("/home/user/.tickloop".into()),
         model: Some(model_config()),
         host_options: AgentHostOptions::embedded_defaults(),
@@ -628,7 +628,7 @@ fn observation_requests_keep_their_recorded_wire() {
         &vec![
             ObservationRequest::Overview {
                 filter: AgentFilter {
-                    workdir: Some("/work/project".into()),
+                    folder: Some("/work/project".into()),
                     workspace: None,
                 },
                 page: Page {
@@ -695,7 +695,7 @@ fn observation_values_keep_their_recorded_wire() {
         availability: ExecutionAvailability::Live,
         execution: execution(),
         chat_id: id(0xc1),
-        workdir: "/work/project".into(),
+        folder: Some("/work/project".into()),
         state: tickloop_agent_protocol::LoopState::Running,
         run_id: Some(id(0x20)),
         title: "Counter check".into(),

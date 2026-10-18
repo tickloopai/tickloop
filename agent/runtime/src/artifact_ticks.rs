@@ -20,7 +20,7 @@ impl Agent {
         upsert_artifact_tick(chat, tick);
         self.record_artifact_ticks(
             chat.snapshot.id,
-            &chat.snapshot.workdir,
+            chat.snapshot.folder.as_deref(),
             chat.snapshot.artifact_ticks.clone(),
             chat.snapshot.removed_artifact_ticks.clone(),
         );
@@ -47,7 +47,7 @@ impl Agent {
         tick.title = title.to_owned();
         self.record_artifact_ticks(
             chat.snapshot.id,
-            &chat.snapshot.workdir,
+            chat.snapshot.folder.as_deref(),
             chat.snapshot.artifact_ticks.clone(),
             chat.snapshot.removed_artifact_ticks.clone(),
         );
@@ -69,7 +69,7 @@ impl Agent {
         let ticks = chat.snapshot.artifact_ticks.clone();
         self.record_artifact_ticks(
             chat_id,
-            &chat.snapshot.workdir,
+            chat.snapshot.folder.as_deref(),
             ticks.clone(),
             chat.snapshot.removed_artifact_ticks.clone(),
         );
@@ -109,7 +109,7 @@ impl Agent {
             let ticks = chat.snapshot.artifact_ticks.clone();
             self.record_artifact_ticks(
                 chat_id,
-                &chat.snapshot.workdir,
+                chat.snapshot.folder.as_deref(),
                 ticks.clone(),
                 chat.snapshot.removed_artifact_ticks.clone(),
             );

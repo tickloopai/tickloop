@@ -925,7 +925,7 @@ mod tests {
             let mut chat = ChatStatus::of(
                 &serde_json::from_value(serde_json::json!({
                     "id": shell.chat_id,
-                    "workdir": "/fixture",
+                    "folder": "/fixture",
                     "messages": [],
                     "loops": []
                 }))
@@ -1043,7 +1043,7 @@ mod tests {
         ChatStatus::of(
             &serde_json::from_value(serde_json::json!({
                 "id": Uuid::from_u128(1),
-                "workdir": "/fixture",
+                "folder": "/fixture",
                 "messages": [],
                 "loops": []
             }))

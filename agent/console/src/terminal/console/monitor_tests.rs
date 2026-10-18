@@ -35,7 +35,7 @@ fn shell(id: Uuid, title: &str) -> MonitorEntry {
 fn chat_snapshot(chat: Uuid) -> ChatSnapshot {
     serde_json::from_value(serde_json::json!({
         "id": chat,
-        "workdir": "/fixture",
+        "folder": "/fixture",
         "messages": [],
         "loops": []
     }))
@@ -2151,7 +2151,7 @@ fn subscribed_fixture(subscriptions: usize) -> State {
         })
         .collect();
     let mut snapshot: tickloop_agent_protocol::ChatSnapshot = serde_json::from_value(
-        serde_json::json!({"id":Uuid::from_u128(77),"workdir":"/fixture","messages":[],"loops":[]}),
+        serde_json::json!({"id":Uuid::from_u128(77),"folder":"/fixture","messages":[],"loops":[]}),
     )
     .unwrap();
     snapshot.monitor.record_opened(
@@ -2703,7 +2703,7 @@ fn linked_artifact_fixture(resume_required: bool) -> (State, tick_protocol::Inst
     state.prompt_enabled = true;
     let snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
         "id": chat,
-        "workdir": "/fixture",
+        "folder": "/fixture",
         "messages": [],
         "artifact_ticks": [{"artifact_id":"doc","origin":"https://docs.example","title":"Brief","format":"markdown","url":"https://docs.example/a/doc","access_role":"owner","added_at_ms":1}],
         "loops": [{"id":Uuid::from_u128(900),"goal":"Write a brief","state":"WaitingTrigger","run_id":null,"run_started_at":null,"event_sources":[{"origin":"https://docs.example","account_id":"owner","artifact_id":"doc","binding_id":Uuid::from_u128(5),"client_instance_id":Uuid::from_u128(6),"epoch":1,"resume_required":resume_required,"last_request_at_ms":null}]}]
@@ -2822,7 +2822,7 @@ fn refresh_status(
     console
         .set_input_context(
             Some(chat),
-            &snapshot.workdir,
+            snapshot.folder.as_deref().unwrap(),
             &snapshot.additional_directories,
         )
         .unwrap();

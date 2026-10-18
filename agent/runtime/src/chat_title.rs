@@ -4,14 +4,23 @@ use tickloop_agent_model::{ModelOutput, ModelRequest, ReasoningEffortExt};
 use tickloop_agent_protocol::{
     ChatId, Content, Message, ModelConfig, ReasoningEffort, Role, short_chat_title,
 };
+use tokio_util::sync::CancellationToken;
 
 const TITLE_TIMEOUT: Duration = Duration::from_secs(15);
 const TITLE_PROMPT_CHARACTERS: usize = 1000;
 
+/// A Chat's title request in flight.
+#[derive(Clone)]
+pub(super) struct TitleJob {
+    pub(super) cancel: CancellationToken,
+    /// Cancelled once the request's task has ended.
+    pub(super) done: CancellationToken,
+}
+
 impl Agent {
     pub(super) async fn start_title_generation(&self, chat_id: ChatId) {
         let mut pending = self.inner.title_requests.lock().await;
-        if pending.contains(&chat_id) || self.inner.closed.load(Ordering::SeqCst) {
+        if pending.contains_key(&chat_id) || self.inner.closed.load(Ordering::SeqCst) {
             return;
         }
         let (client, prompt, message_id, reasoning_effort) = {
@@ -51,10 +60,15 @@ impl Agent {
                 side_request_effort(&chat.snapshot.model),
             )
         };
-        pending.insert(chat_id);
+        let job = TitleJob {
+            cancel: self.inner.shutdown.child_token(),
+            done: CancellationToken::new(),
+        };
+        pending.insert(chat_id, job.clone());
         drop(pending);
         let agent = self.clone();
-        let task = tokio::spawn(async move {
+        self.inner.tasks.spawn(async move {
+            let _done = job.done.drop_guard();
             let request = ModelRequest {
                 history_sources: Vec::new(),
                 messages: vec![
@@ -74,7 +88,7 @@ impl Agent {
                 temperature: None,
                 reasoning_effort,
             };
-            let cancel = agent.inner.shutdown.child_token();
+            let cancel = job.cancel;
             let output = agent
                 .tracked_model_request(
                     super::model_request::RequestContext::title(chat_id),
@@ -110,7 +124,6 @@ impl Agent {
             }
             agent.inner.title_requests.lock().await.remove(&chat_id);
         });
-        self.inner.tasks.lock().await.push(task);
     }
 }
 

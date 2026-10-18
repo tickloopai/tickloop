@@ -926,6 +926,7 @@ impl McpHostToolProvider {
         }
         let file = scope
             .local_files
+            .ok_or("This Chat has no Folder to upload a local file from")?
             .read(file_path, MAX_IMAGE_BYTES)
             .await
             .map_err(|error| error.to_string())?;

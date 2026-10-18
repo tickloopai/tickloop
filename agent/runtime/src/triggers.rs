@@ -199,11 +199,7 @@ impl Agent {
             .record_loop_run_state(chat_id, loop_id, RunStateChange::Armed)
             .await;
         self.warn_loop_run_state_failure(chat_id, loop_id, recorded);
-        self.inner
-            .tasks
-            .lock()
-            .await
-            .push(self.trigger_task(chat_id, loop_id, trigger, cancel));
+        self.trigger_task(chat_id, loop_id, trigger, cancel);
         Ok(())
     }
 
@@ -269,7 +265,7 @@ impl Agent {
         loop_id: LoopId,
         trigger: Trigger,
         cancel: CancellationToken,
-    ) -> tokio::task::JoinHandle<()> {
+    ) {
         let agent = self.clone();
         let started = tokio::time::Instant::now();
         let deadline = trigger.expires_at_ms.map(|deadline| {
@@ -279,7 +275,7 @@ impl Agent {
                         .saturating_sub(tickloop_agent_base::private_fs::unix_time_milliseconds()),
                 )
         });
-        tokio::spawn(async move {
+        self.inner.tasks.spawn(async move {
             // 拿不到租约时下一次重试获取的时间；期间到点的触发直接跳过。
             let mut lease_retry_at: Option<tokio::time::Instant> = None;
             let mut interval = trigger.interval_seconds.map(|seconds| {
@@ -339,7 +335,7 @@ impl Agent {
                     }
                 }
             }
-        })
+        });
     }
 
     pub(super) async fn end_goal(
@@ -448,9 +444,21 @@ impl Agent {
             cancelled_shells.contains(&command_id)
         })
         .await;
-        chat.snapshot
-            .pending_inputs
-            .retain(|pending| pending.receipt.loop_id != loop_id);
+        let (discarded, kept) = std::mem::take(&mut chat.snapshot.pending_inputs)
+            .into_iter()
+            .partition::<Vec<_>, _>(|pending| pending.receipt.loop_id == loop_id);
+        chat.snapshot.pending_inputs = kept;
+        self.settle_removed_inputs(
+            &mut chat,
+            &discarded,
+            crate::transcript::SettledOutcome::Discarded {
+                reason: if state == LoopState::Stopped {
+                    crate::transcript::DiscardReason::Stopped
+                } else {
+                    crate::transcript::DiscardReason::LoopEnded
+                },
+            },
+        );
         chat.snapshot
             .permissions
             .retain(|permission| permission.loop_id != loop_id);

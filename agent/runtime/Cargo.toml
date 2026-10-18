@@ -36,7 +36,7 @@ tickloop-tickhost = { path = "../../tickhost/host" }
 tickloop-tickhost-connect = { path = "../../tickhost/connect" }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]

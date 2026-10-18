@@ -303,7 +303,7 @@ fn check_direct_call(
         name.to_owned(),
         input.clone(),
         super::session_permissions::capture_workspace_scope(&Workspace {
-            workdir: ceiling.workdir.clone(),
+            folder: Some(ceiling.folder.clone()),
             additional_directories: ceiling.additional_directories.clone(),
         })
         .map_err(|error| error.to_string())?,
@@ -340,7 +340,7 @@ fn check_direct_call(
     }
     if let Some(prepared) = prepared {
         let workspace = Workspace {
-            workdir: ceiling.workdir.clone(),
+            folder: Some(ceiling.folder.clone()),
             additional_directories: ceiling.additional_directories.clone(),
         };
         let is_plan_file_access = plan_file.is_some_and(|path| prepared.accesses_file(path))
@@ -657,7 +657,7 @@ fn direct_permission_authority(
         return Some(own);
     };
     let workspace = Workspace {
-        workdir: delegation.ceiling.workdir.clone(),
+        folder: Some(delegation.ceiling.folder.clone()),
         additional_directories: delegation.ceiling.additional_directories.clone(),
     };
     let frozen = delegation.ceiling.policy.decide_with_plan_file(
@@ -746,7 +746,7 @@ impl Agent {
             return Ok(entries.clone());
         }
         let entries = match &self.inner.recorder {
-            Some(recorder) => recorder.read_subagents(parent)?,
+            Some(recorder) => recorder.read_subagents(parent).await?,
             None => return Err(AgentError::NotFound),
         };
         registry.insert(parent, entries.clone());
@@ -904,7 +904,8 @@ impl Agent {
         let plan_file = chats.get(&receipt.chat_id).and_then(|chat| {
             super::plan::current_plan_file(
                 &chat.bookkeeping,
-                self.plans_directory(&chat.snapshot.workdir).path(),
+                self.plans_directory(chat.snapshot.folder.as_deref()?)
+                    .path(),
                 receipt.loop_id,
             )
         });
@@ -1079,7 +1080,10 @@ impl Agent {
                             rule.persistent = false;
                         }
                     }
-                    let mut host_context = self.host_call_context(parent, &snapshot.workdir);
+                    let folder = require_folder(&snapshot)
+                        .map_err(|error| error.to_string())?
+                        .to_path_buf();
+                    let mut host_context = self.host_call_context(parent, Some(&folder));
                     let mut host_tools: BTreeMap<_, _> = self
                         .inner
                         .host_tools
@@ -1151,7 +1155,7 @@ impl Agent {
                             .get_or_insert_with(Vec::new)
                             .extend(inherited);
                     }
-                    let history_ancestors = self.approval_history_ancestors(&snapshot).await;
+                    let history_ancestors = self.approval_history_ancestors(&snapshot, None).await;
                     let trusted_reply_history = trusted_user_inputs.as_ref().and_then(|inputs| {
                         serde_json::to_value(approval_context::capture_reply_history(
                             &snapshot,
@@ -1174,7 +1178,7 @@ impl Agent {
                             .and_then(|inputs| serde_json::to_value(inputs).ok()),
                         trusted_reply_history,
                         ceiling: DelegationCeiling {
-                            workdir: snapshot.workdir.clone(),
+                            folder: folder.clone(),
                             additional_directories: snapshot.additional_directories.clone(),
                             policy,
                             session_denials: Some(session_denials),
@@ -1202,7 +1206,7 @@ impl Agent {
                     let child_id = self
                         .create_chat_with_delegation(
                             registration.child_chat_id,
-                            snapshot.workdir.clone(),
+                            Some(folder),
                             Some((metadata.clone(), snapshot, client, output_style)),
                         )
                         .await

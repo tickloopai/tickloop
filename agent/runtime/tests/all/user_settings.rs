@@ -236,12 +236,7 @@ async fn model_and_thinking_selection_saves_together_and_failed_save_changes_nei
     std::fs::write(&settings_path, invalid).unwrap();
     assert!(
         agent
-            .set_model_with_thinking(
-                chat,
-                selected.clone(),
-                Arc::new(ScriptedModel::new(Vec::new())),
-                Some(ReasoningEffort::High),
-            )
+            .set_model_with_thinking(chat, selected.clone(), Some(ReasoningEffort::High))
             .await
             .is_err()
     );
@@ -257,12 +252,7 @@ async fn model_and_thinking_selection_saves_together_and_failed_save_changes_nei
 
     std::fs::write(&settings_path, b"{\"futureSetting\":true}").unwrap();
     agent
-        .set_model_with_thinking(
-            chat,
-            selected.clone(),
-            Arc::new(ScriptedModel::new(Vec::new())),
-            Some(ReasoningEffort::High),
-        )
+        .set_model_with_thinking(chat, selected.clone(), Some(ReasoningEffort::High))
         .await
         .unwrap();
     let saved = settings_json(&root);
@@ -275,12 +265,7 @@ async fn model_and_thinking_selection_saves_together_and_failed_save_changes_nei
     let before_unsupported = std::fs::read(&settings_path).unwrap();
     assert!(
         agent
-            .set_model_with_thinking(
-                chat,
-                selected.clone(),
-                Arc::new(ScriptedModel::new(Vec::new())),
-                Some(ReasoningEffort::Medium),
-            )
+            .set_model_with_thinking(chat, selected.clone(), Some(ReasoningEffort::Medium))
             .await
             .is_err()
     );
@@ -291,12 +276,7 @@ async fn model_and_thinking_selection_saves_together_and_failed_save_changes_nei
     );
 
     agent
-        .set_model_with_thinking(
-            chat,
-            selected.clone(),
-            Arc::new(ScriptedModel::new(Vec::new())),
-            Some(ReasoningEffort::Off),
-        )
+        .set_model_with_thinking(chat, selected.clone(), Some(ReasoningEffort::Off))
         .await
         .unwrap();
     assert_eq!(settings_json(&root)["effortLevel"], "off");
@@ -306,12 +286,7 @@ async fn model_and_thinking_selection_saves_together_and_failed_save_changes_nei
     assert!(!disabled.thinking_enabled);
 
     agent
-        .set_model_with_thinking(
-            chat,
-            selected,
-            Arc::new(ScriptedModel::new(Vec::new())),
-            None,
-        )
+        .set_model_with_thinking(chat, selected, None)
         .await
         .unwrap();
     let saved = settings_json(&root);
@@ -466,7 +441,7 @@ async fn builtin_model_and_rules_apply_after_restart_without_context_tuning() {
     ]));
     assert_eq!(
         first
-            .set_model(chat, selected_model(), selected_client)
+            .set_model(chat, selected_model())
             .await
             .unwrap(),
         ModelChange::Applied
@@ -720,11 +695,7 @@ async fn an_explicit_host_model_takes_precedence_over_the_saved_selection() {
     .unwrap();
     let chat = first.create_chat(workdir.clone()).await.unwrap();
     first
-        .set_model(
-            chat,
-            selected_model(),
-            Arc::new(ScriptedModel::new(Vec::new())),
-        )
+        .set_model(chat, selected_model())
         .await
         .unwrap();
     first.shutdown().await;
@@ -788,11 +759,7 @@ async fn settings_writes_merge_unknown_keys_replace_atomically_and_refuse_invali
 
     let inode = std::fs::metadata(&path).unwrap().ino();
     first
-        .set_model(
-            first_chat,
-            selected_model(),
-            Arc::new(ScriptedModel::new(Vec::new())),
-        )
+        .set_model(first_chat, selected_model())
         .await
         .unwrap();
     assert_ne!(
@@ -1183,11 +1150,7 @@ async fn invalid_settings_are_reported_and_never_overwritten() {
     );
     assert!(
         reopened
-            .set_model(
-                chat,
-                selected_model(),
-                Arc::new(ScriptedModel::new(Vec::new()))
-            )
+            .set_model(chat, selected_model())
             .await
             .is_err()
     );

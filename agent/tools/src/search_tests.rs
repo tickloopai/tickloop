@@ -10,7 +10,7 @@ use crate::{GLOB_TOOL_NAME, GREP_TOOL_NAME, ToolError, Tools, Workspace};
 
 fn workspace(path: &Path) -> Workspace {
     Workspace {
-        workdir: path.to_path_buf(),
+        folder: Some(path.to_path_buf()),
         additional_directories: Vec::new(),
     }
 }

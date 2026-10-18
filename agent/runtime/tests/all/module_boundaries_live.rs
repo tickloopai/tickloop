@@ -1,6 +1,6 @@
 use std::{path::Path, time::Duration};
 
-use tickloop_agent_model::{cards::ModelCatalog, model_client};
+use tickloop_agent_model::{LocalModelClients, ModelClients, cards::ModelCatalog};
 use tickloop_agent_protocol::{
     ChatId, Decision, EventKind, ExecutionMode, ModelConfig, ModelRequestKind, PermissionRule,
     RequestOutcome,
@@ -71,7 +71,7 @@ fn open_agent(archive: &Path, auth_root: &Path, config: &ModelConfig) -> Agent {
     Agent::open_embedded(
         archive.to_owned(),
         config.clone(),
-        model_client(config.clone(), Some(auth_root)).unwrap(),
+        LocalModelClients::new(Some(auth_root.to_path_buf())).client(&config).unwrap(),
     )
     .unwrap()
 }
@@ -242,7 +242,7 @@ async fn environment_proxy_text_requests() {
         let config = ModelCatalog::defaults().get(provider, model).unwrap();
         let agent = Agent::new_embedded(
             config.clone(),
-            model_client(config, Some(&auth_root)).unwrap(),
+            LocalModelClients::new(Some(auth_root.to_path_buf())).client(&config).unwrap(),
         );
         let chat = agent
             .create_chat(directory.path().to_owned())

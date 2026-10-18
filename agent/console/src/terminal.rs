@@ -216,6 +216,11 @@ const TURN_COMPLETION_VERBS: [&str; 8] = [
 /// A finished turn's line restored without its duration.
 const RESTORED_TURN_SUMMARY: &str = "Done";
 
+/// The Folder a Chat's paths show against; empty for a Chat without one, whose paths show whole.
+fn shown_folder(folder: Option<&std::path::Path>) -> &std::path::Path {
+    folder.unwrap_or(std::path::Path::new(""))
+}
+
 /// What a finished turn's line starts with, live with its duration or restored without it.
 #[cfg(test)]
 fn turn_summary_markers() -> impl Iterator<Item = String> {
@@ -1256,7 +1261,7 @@ pub async fn run_with_arguments(arguments: impl Iterator<Item = String>) -> Resu
     };
     let herdr_socket = view_host.as_ref().map(|view| view.socket.clone());
     let launch = LaunchSpec {
-        workdir: workdir.clone(),
+        folder: workdir.clone(),
         config_root: config_root.clone(),
         model: Some(config.clone()),
         host_options,
@@ -1672,6 +1677,10 @@ async fn interact(
     let mut update_notice_refresh = tokio::time::interval(std::time::Duration::from_secs(1));
     update_notice_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut menus = Menus::new(user_settings.clone(), config_root.clone());
+    // Prompt suggestions reach the Chat's model directly with this View's credentials.
+    let suggestion_models = Arc::new(tickloop_agent_model::LocalModelClients::new(
+        config_root.clone(),
+    ));
     let mut artifact_loads = tokio::task::JoinSet::new();
     let mut tick_package_tasks = ticks_work::TickPackageTasks::default();
     let mut suggestions: tokio::task::JoinSet<(
@@ -2049,7 +2058,7 @@ async fn interact(
                 let _frame_hold = console.hold_frames()?;
                 console.set_input_context(
                     Some(chat),
-                    &status.workdir,
+                    shown_folder(status.folder.as_deref()),
                     &status.additional_directories,
                 )?;
                 console.set_visible_delegation(status.delegation.is_some())?;
@@ -3596,17 +3605,21 @@ async fn interact(
                                 continue;
                             };
                             let mut snapshot = agent.snapshot(chat).await.map_err(|error|error.to_string())?;
+                            let Some(mut folder) = snapshot.folder.clone() else {
+                                outln!(console, "This Agent has no working directory");
+                                continue;
+                            };
                             if line=="/cwd" {
-                                outln!(console, "Working directory: {}",safe_text(&snapshot.workdir.to_string_lossy()));
+                                outln!(console, "Working directory: {}",safe_text(&folder.to_string_lossy()));
                                 for directory in snapshot.additional_directories {outln!(console, "Additional directory: {}",safe_text(&directory.to_string_lossy()));}
                                 continue;
                             }
-                            if let Some(path) = line.strip_prefix("/cwd ") { snapshot.workdir = snapshot.workdir.join(path.trim()); }
-                            if let Some(path) = line.strip_prefix("/add-dir ") { snapshot.additional_directories.push(snapshot.workdir.join(path.trim())); }
-                            match agent.set_directories(chat,snapshot.workdir,snapshot.additional_directories).await {
+                            if let Some(path) = line.strip_prefix("/cwd ") { folder = folder.join(path.trim()); }
+                            if let Some(path) = line.strip_prefix("/add-dir ") { snapshot.additional_directories.push(folder.join(path.trim())); }
+                            match agent.set_directories(chat,folder,snapshot.additional_directories).await {
                                 Ok(()) => {
                                     let snapshot = agent.snapshot(chat).await.map_err(|error|error.to_string())?;
-                                    outln!(console, "Working directory: {}",safe_text(&snapshot.workdir.to_string_lossy()));
+                                    outln!(console, "Working directory: {}",safe_text(&shown_folder(snapshot.folder.as_deref()).to_string_lossy()));
                                     for directory in snapshot.additional_directories {outln!(console, "Additional directory: {}",safe_text(&directory.to_string_lossy()));}
                                     show_settings_warnings(console, agent.user_settings_warnings(chat))?;
                                 },
@@ -4172,12 +4185,12 @@ async fn interact(
                                         suggestion_diagnostics.insert(event.chat_id, (event.run_id, reason));
                                     } else if let Some(request) = console.begin_prompt_suggestion(event.chat_id)? {
                                         suggestion_diagnostics.insert(event.chat_id, (request.id, "generating"));
-                                        let root = config_root.clone();
+                                        let models = suggestion_models.clone();
                                         // A suggestion is drawn from the conversation it follows.
                                         let conversation = turn_snapshot.read(agent, event.chat_id).await;
                                         suggestions.spawn(async move {
                                             let result = match conversation {
-                                                Ok(snapshot) => prompt_suggestion::generate(&request, &snapshot, root).await,
+                                                Ok(snapshot) => prompt_suggestion::generate(&request, &snapshot, models.as_ref()).await,
                                                 Err(_) => prompt_suggestion::SuggestionResult::empty("suppressed: Agent unavailable"),
                                             };
                                             (request, result)
@@ -4251,7 +4264,7 @@ async fn interact(
                                 outln!(console, "Queued input joined run {into_run_id}.");
                             }
                         },
-                        EventKind::InputTakenBack => {},
+                        EventKind::InputTakenBack | EventKind::ResponseStarted { .. } => {},
                         EventKind::ConversationRewound { .. } => unreachable!(),
                         EventKind::GoalEnded {reason,operations} => print_goal_end(console, event.loop_id,&reason,&operations)?,
                         EventKind::Started => {
@@ -5782,16 +5795,20 @@ async fn parse_after_turn(
         }),
         "/cwd" | "/add-dir" => {
             let mut snapshot = agent.snapshot(chat).await?;
+            let mut folder = snapshot.folder.clone().ok_or_else(|| {
+                AccessError::new(
+                    AccessErrorCode::Unsupported,
+                    "this Agent has no working directory",
+                )
+            })?;
             if name == "/cwd" {
-                snapshot.workdir = snapshot.workdir.join(arguments);
+                folder = folder.join(arguments);
             } else {
-                snapshot
-                    .additional_directories
-                    .push(snapshot.workdir.join(arguments));
+                snapshot.additional_directories.push(folder.join(arguments));
             }
             Ok(AfterTurnAction::Configure {
                 change: ConfigurationChange::Directories {
-                    workdir: snapshot.workdir,
+                    folder,
                     additional: snapshot.additional_directories,
                 },
             })
@@ -6855,7 +6872,7 @@ async fn stage_draft_directories(
                 .change_configuration(
                     ConfigTarget::NewDraft,
                     ConfigurationChange::Directories {
-                        workdir: directory.clone(),
+                        folder: directory.clone(),
                         additional: additional.clone(),
                     },
                 )
@@ -7600,7 +7617,9 @@ fn agent_rows(rows: &[AgentSummary], aggregate: bool) -> Vec<console::AgentRow> 
                 title: safe_line(&row.title),
                 status: agent_status_label(row).into(),
                 state: row.state.clone(),
-                project: row.workdir.to_string_lossy().into_owned(),
+                project: shown_folder(row.folder.as_deref())
+                    .to_string_lossy()
+                    .into_owned(),
                 workspace: row.workspace.clone(),
                 approvals: row.waiting_permissions,
                 questions: row.waiting_questions,
@@ -7753,7 +7772,7 @@ async fn navigate_agent(
                 }
                 console.set_input_context(
                     Some(chat),
-                    &snapshot.workdir,
+                    shown_folder(snapshot.folder.as_deref()),
                     &snapshot.additional_directories,
                 )?;
                 console.set_visible_delegation(snapshot.delegation.is_some())?;
@@ -7930,7 +7949,7 @@ mod tests {
                    parent: Option<tickloop_agent_protocol::ExecutionRef>,
                    title: &str,
                    questions: usize| {
-            serde_json::from_value::<tickloop_agent_protocol::AgentSummary>(serde_json::json!({"execution":execution,"chat_id":execution.agent_id,"workdir":"/test","state":"Completed","title":title,"has_work":true,"waiting_permissions":0,"waiting_questions":questions,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"subagent":parent.map(|_|serde_json::json!({"child_chat_id":child.agent_id,"handle":"audit","description":"Audit source","created_at":100000}))})).unwrap()
+            serde_json::from_value::<tickloop_agent_protocol::AgentSummary>(serde_json::json!({"execution":execution,"chat_id":execution.agent_id,"folder":"/test","state":"Completed","title":title,"has_work":true,"waiting_permissions":0,"waiting_questions":questions,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"subagent":parent.map(|_|serde_json::json!({"child_chat_id":child.agent_id,"handle":"audit","description":"Audit source","created_at":100000}))})).unwrap()
         };
         let projection = crate::agent_console::Projection {
             overview: true,
@@ -7967,7 +7986,7 @@ mod tests {
             ..root
         };
         let make_row = |execution, parent, state, questions| {
-            serde_json::from_value::<tickloop_agent_protocol::AgentSummary>(serde_json::json!({"execution":execution,"chat_id":uuid::Uuid::new_v4(),"workdir":"/test","state":state,"title":"Title","has_work":true,"waiting_permissions":0,"waiting_questions":questions,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[]})).unwrap()
+            serde_json::from_value::<tickloop_agent_protocol::AgentSummary>(serde_json::json!({"execution":execution,"chat_id":uuid::Uuid::new_v4(),"folder":"/test","state":state,"title":"Title","has_work":true,"waiting_permissions":0,"waiting_questions":questions,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[]})).unwrap()
         };
         let rows = super::agent_rows(
             &[
@@ -7996,7 +8015,7 @@ mod tests {
             agent_id: uuid::Uuid::new_v4(),
             ..child
         };
-        let row: tickloop_agent_protocol::AgentSummary = serde_json::from_value(serde_json::json!({"execution":child,"chat_id":child.agent_id,"workdir":"/test","state":"Completed","title":"Title","has_work":true,"waiting_permissions":0,"waiting_questions":0,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"subagent":{"child_chat_id":child.agent_id,"handle":"audit","description":"Check \u{001b}[2J evidence","created_at":1}})).unwrap();
+        let row: tickloop_agent_protocol::AgentSummary = serde_json::from_value(serde_json::json!({"execution":child,"chat_id":child.agent_id,"folder":"/test","state":"Completed","title":"Title","has_work":true,"waiting_permissions":0,"waiting_questions":0,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"subagent":{"child_chat_id":child.agent_id,"handle":"audit","description":"Check \u{001b}[2J evidence","created_at":1}})).unwrap();
         let row = super::agent_rows(&[row], false).pop().unwrap();
         let display = super::display::DisplayProfile::default();
         let line = super::subagent_panel::family_line(&row, false, false, (80, 5, display, 1000));
@@ -8032,7 +8051,7 @@ mod tests {
             triggering_message_ids: vec![],
         };
         let mut snapshot: super::ChatSnapshot = serde_json::from_value(
-            serde_json::json!({"id":chat,"workdir":"/test","messages":[],"loops":[]}),
+            serde_json::json!({"id":chat,"folder":"/test","messages":[],"loops":[]}),
         )
         .unwrap();
         snapshot.events = vec![
@@ -8133,7 +8152,7 @@ mod tests {
             triggering_message_ids: vec![],
         };
         let mut snapshot: super::ChatSnapshot = serde_json::from_value(
-            serde_json::json!({"id":chat,"workdir":"/test","messages":[],"loops":[]}),
+            serde_json::json!({"id":chat,"folder":"/test","messages":[],"loops":[]}),
         )
         .unwrap();
         snapshot.events = vec![
@@ -8239,7 +8258,7 @@ mod tests {
             triggering_message_ids: vec![],
         };
         let mut snapshot: super::ChatSnapshot = serde_json::from_value(
-            serde_json::json!({"id":chat,"workdir":"/test","messages":[],"loops":[]}),
+            serde_json::json!({"id":chat,"folder":"/test","messages":[],"loops":[]}),
         )
         .unwrap();
         snapshot.events = vec![
@@ -8343,7 +8362,7 @@ mod tests {
             let chat = uuid::Uuid::new_v4();
             let run = uuid::Uuid::new_v4();
             let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
-                "id":chat,"workdir":"/work","loops":[],
+                "id":chat,"folder":"/work","loops":[],
                 "messages":[{"role":"user","content":[{"type":"text","text":text}]}]
             }))
             .unwrap();
@@ -8385,7 +8404,7 @@ mod tests {
             &tickloop_agent_protocol::Trigger::for_loop_goal("watch"),
         );
         let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
-            "id":chat,"workdir":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"loops":[]
+            "id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"loops":[]
         })).unwrap();
         snapshot.message_ids.insert(0, uuid::Uuid::new_v4());
         snapshot.message_runs.insert(0, run);
@@ -8452,7 +8471,7 @@ mod tests {
             &serde_json::json!({"items":[{"instance":"hosted:feed","title":"Feed","seq":"1","updates":1,"data":{}}]}),
             &tickloop_agent_protocol::Trigger::for_loop_goal("watch"),
         );
-        let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({"id":chat,"workdir":"/work","messages":[{"role":"user","content":[{"type":"text","text":"@tickloop request req on artifact doc. Request input JSON:\n{}"},{"type":"text","text":tick}]}],"loops":[]})).unwrap();
+        let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({"id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":"@tickloop request req on artifact doc. Request input JSON:\n{}"},{"type":"text","text":tick}]}],"loops":[]})).unwrap();
         snapshot.message_runs.insert(0, run);
         let console = Console::test_interactive_for_chat(chat);
         for _ in 0..2 {
@@ -8474,7 +8493,7 @@ mod tests {
         let run = uuid::Uuid::new_v4();
         let text = "@tickloop request req-1 on artifact doc. Request input JSON:\n{\"message\":\"please update\"}";
         let mut snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
-            "id":chat,"workdir":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"loops":[]
+            "id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"loops":[]
         })).unwrap();
         snapshot.artifact_ticks.push(serde_json::from_value(serde_json::json!({"artifact_id":"doc","origin":"https://docs.example","title":"doc","format":"html","url":"https://docs.example/artifact/doc","access_role":"owner","added_at_ms":1})).unwrap());
         snapshot.monitor.mark_taken_in(
@@ -8562,7 +8581,7 @@ mod tests {
             "<agent-message>{}</agent-message>",
             serde_json::json!({"source":{"sender_relationship":"child","sender_handle":"audit","sender_label":"Report check","is_result":false},"message":"Which year should I use?"})
         );
-        let mut snapshot:ChatSnapshot=serde_json::from_value(serde_json::json!({"id":chat,"workdir":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"loops":[]})).unwrap();
+        let mut snapshot:ChatSnapshot=serde_json::from_value(serde_json::json!({"id":chat,"folder":"/work","messages":[{"role":"user","content":[{"type":"text","text":text}]}],"loops":[]})).unwrap();
         snapshot.message_ids.insert(0, source);
         snapshot.message_runs.insert(0, run);
         snapshot
@@ -9615,7 +9634,7 @@ mod tests {
                 generation: 1,
             },
             chat_id: chat,
-            workdir: PathBuf::new(),
+            folder: Some(PathBuf::new()),
             state: tickloop_agent_protocol::LoopState::WaitingPermission,
             run_id: None,
             title: "Lost child".into(),

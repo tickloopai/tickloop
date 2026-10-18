@@ -1103,7 +1103,7 @@ async fn assert_pending_model_after_summary(
     });
     assert_eq!(
         agent
-            .set_model(chat, replacement.clone(), replacement_client)
+            .set_model(chat, replacement.clone())
             .await
             .unwrap(),
         ModelChange::Pending

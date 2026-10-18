@@ -41,11 +41,13 @@ use tickloop_agent_client::{
     worker_link,
 };
 use tickloop_agent_config::UserSettings;
-use tickloop_agent_model::{ModelClient, cards::launch_model, model_client};
+use tickloop_agent_model::{LocalModelClients, ModelClients, cards::launch_model};
 use tickloop_agent_protocol::{
     AccessError, AccessErrorCode, AccessLimits, AgentAccess, LaunchSpec, OtherTickhost,
 };
-use tickloop_agent_runtime::Agent;
+use tickloop_agent_runtime::{
+    Agent, HarnessOptions, HarnessSeams, ToolPolicy, environment::LocalEnvironment,
+};
 
 mod chunked;
 pub mod daemon_control;
@@ -61,7 +63,7 @@ mod views;
 pub mod worker_control;
 
 pub use daemon_server::{DaemonServer, WorkerFactory};
-pub use embedded::{EmbeddedAgentAccess, ModelClientFactory};
+pub use embedded::EmbeddedAgentAccess;
 pub use ipc::{serve_connection, serve_daemon_listener, serve_listener, serve_worker_listener};
 
 /// How often a daemon checks that clients can still reach it through its runtime directory.
@@ -142,7 +144,7 @@ impl WorkerFactory for ProcessWorkerFactory {
         command
             .arg(WORKER_ARGUMENT)
             .arg(&endpoint)
-            .current_dir(&launch.workdir)
+            .current_dir(&launch.folder)
             .env_clear();
         for entry in &launch.environment {
             command.env(
@@ -463,20 +465,19 @@ pub async fn build_runtime(
     launch: &LaunchSpec,
     control: Option<tickloop_agent_runtime::hosted::worker_control::WorkerControlGrant>,
 ) -> Result<Agent, String> {
-    let model = launch_model(launch);
-    let client =
-        model_client(model, launch.config_root.as_deref()).map_err(|error| error.to_string())?;
+    // One set of model clients per Worker: their private-history provenance lives as long as it.
+    let models = Arc::new(LocalModelClients::new(launch.config_root.clone()));
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    build_runtime_with_client(launch, client, control, &executable).await
+    build_runtime_with_models(launch, models, control, &executable).await
 }
 
-/// Build the same version-owned runtime with a caller-supplied model transport. `executable` is
-/// the `tickloop` whose attach client a Herdr Pane showing a Tick runs.
+/// Build the same version-owned runtime with caller-supplied model clients. `executable` is the
+/// `tickloop` whose attach client a Herdr Pane showing a Tick runs.
 /// Integration fixtures use this seam without adding definition-file loading to the CLI.
 #[doc(hidden)]
-pub async fn build_runtime_with_client(
+pub async fn build_runtime_with_models(
     launch: &LaunchSpec,
-    client: Arc<dyn ModelClient>,
+    models: Arc<dyn ModelClients>,
     control: Option<tickloop_agent_runtime::hosted::worker_control::WorkerControlGrant>,
     executable: &Path,
 ) -> Result<Agent, String> {
@@ -485,44 +486,23 @@ pub async fn build_runtime_with_client(
         .config_root
         .as_ref()
         .map(|root| UserSettings::in_root(root));
-    let agent = if launch.session_persistence {
+    let transcripts = if launch.session_persistence {
         let root = launch
             .config_root
-            .as_ref()
+            .clone()
             .ok_or("saved sessions require a config root")?;
-        Agent::open_with_user_settings_and_options(
-            root.clone(),
-            model,
-            client,
-            settings.expect("settings root"),
-            launch.host_options,
-        )
-    } else if let Some(settings) = settings {
-        Ok(Agent::new_with_user_settings_and_options(
-            model,
-            client,
-            settings,
-            launch.host_options,
-        ))
+        let store = tickloop_agent_runtime::transcript::JsonlTranscriptStore::open(root)
+            .map_err(|error| format!("storage failure: {error}"))?;
+        Some(Arc::new(store)
+            as Arc<
+                dyn tickloop_agent_runtime::transcript::TranscriptStore,
+            >)
     } else {
-        Ok(Agent::new_with_options(model, client, launch.host_options))
-    }
-    .map_err(|error| error.to_string())?;
-    use tickloop_agent_runtime::tick_adapter::TickAdapters;
-    if let (Some(grant), Some(_)) = (&control, &launch.config_root) {
-        agent.install_stopped_child_hook(Arc::new(
-            tickloop_agent_runtime::hosted::lifecycle::DaemonLifecycle::new(grant.clone()),
-        ));
-    }
-    // A worker's shell commands run in its daemon's Tickhost, under spawns and views the daemon
-    // grants.
-    if let Some(grant) = &control {
-        agent.install_shell_grants(Arc::new(
-            tickloop_agent_runtime::hosted::worker_control::DaemonControl::new(grant.clone()),
-        ));
-    }
-    // Every worker the daemon granted a Tickhost runs its Ticks there, with its host's own
-    // authority; a worker in a Herdr View can also show them in Herdr Panes.
+        None
+    };
+    // Every worker the daemon granted a Tickhost runs its shell commands and Ticks there, under
+    // spawns and views the daemon grants and with its host's own authority; a worker in a Herdr
+    // View can also show them in Herdr Panes.
     let views = launch.host_work_context.as_ref().map(|work| {
         tickloop_agent_runtime::hosted::views::HerdrViews::new(
             tickhost_connect::layout::HerdrLayout::new(
@@ -531,9 +511,9 @@ pub async fn build_runtime_with_client(
             executable,
         )
     });
-    let hosted = control.map(|grant| {
+    let hosted = control.as_ref().map(|grant| {
         let tools = tickloop_agent_runtime::hosted::tools::HostedTickTools::new(
-            tickloop_agent_runtime::hosted::worker_control::DaemonControl::new(grant),
+            tickloop_agent_runtime::hosted::worker_control::DaemonControl::new(grant.clone()),
             launch
                 .environment
                 .iter()
@@ -557,12 +537,39 @@ pub async fn build_runtime_with_client(
             None => tools,
         })
     });
+    let environment = match (&control, &hosted) {
+        (Some(grant), Some(hosted)) => LocalEnvironment::with(
+            Arc::new(
+                tickloop_agent_runtime::hosted::worker_control::DaemonControl::new(grant.clone()),
+            ),
+            hosted.clone(),
+        ),
+        _ => LocalEnvironment::bare(),
+    };
+    let agent = Agent::with_seams(
+        HarnessSeams {
+            transcripts,
+            environment: Some(Arc::new(environment)),
+            models,
+        },
+        HarnessOptions {
+            model,
+            settings,
+            host: launch.host_options,
+            tools: ToolPolicy::local(),
+            host_rules: Vec::new(),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    use tickloop_agent_runtime::tick_adapter::TickAdapters;
+    if let (Some(grant), Some(_)) = (&control, &launch.config_root) {
+        agent.install_stopped_child_hook(Arc::new(
+            tickloop_agent_runtime::hosted::lifecycle::DaemonLifecycle::new(grant.clone()),
+        ));
+    }
     let tick_tools = hosted
         .clone()
         .map(|hosted| hosted as Arc<dyn tickloop_agent_runtime::host_tools::HostToolProvider>);
-    if let Some(hosted) = &hosted {
-        agent.install_hosted_ticks(hosted.clone());
-    }
     let adapters = Arc::new(TickAdapters::builtin(agent.clone(), hosted));
     agent.install_tick_stream(adapters.clone()).await;
     if let Some(root) = launch.config_root.as_ref()

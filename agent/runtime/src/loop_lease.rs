@@ -393,7 +393,7 @@ impl Agent {
             .lock()
             .await
             .get(&chat_id)
-            .map(|chat| chat.tools.chat_directory().join(LEASE_DIRECTORY))
+            .and_then(|chat| Some(chat.tools.chat_directory()?.join(LEASE_DIRECTORY)))
     }
 
     /// Trigger 触发前调用：持有租约、读取停止状态，并确认 Loop 仍可触发。停止状态显示已在其他

@@ -10,9 +10,10 @@ use tickloop_agent_protocol::{
 };
 
 /// Transcript 中的一行。未知类型原样跳过，保证旧版本能读取新版本写入的文件。
+/// A store keeps each Line as its JSON; the local store writes one per line of a JSONL file.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
-pub(crate) enum Line {
+pub enum Line {
     User(ChainEntry),
     Assistant(ChainEntry),
     System(ChainEntry),
@@ -32,6 +33,10 @@ pub(crate) enum Line {
     FileHistorySnapshot(FileHistorySnapshotEntry),
     /// 照 Claude Code：大工具结果的替换决定，恢复时重建，同一 Chat 的条目逐条累积。
     ContentReplacement(ContentReplacementEntry),
+    /// An answer's lifecycle; the latest record of a response id wins.
+    Response(ResponseEntry),
+    /// The input ledger; the latest record of an input id wins.
+    Input(InputEntry),
     #[serde(other)]
     Unknown,
 }
@@ -56,6 +61,8 @@ pub(crate) enum MetadataKind {
     FamilyCompletions,
     FileHistorySnapshot,
     ContentReplacement,
+    Response,
+    Input,
     #[serde(other)]
     Other,
 }
@@ -76,7 +83,7 @@ pub(crate) struct MetadataHeader {
 }
 
 impl Line {
-    pub(crate) fn chain(role: Role, entry: ChainEntry) -> Self {
+    pub fn chain(role: Role, entry: ChainEntry) -> Self {
         match role {
             Role::User => Self::User(entry),
             Role::Assistant => Self::Assistant(entry),
@@ -84,21 +91,27 @@ impl Line {
         }
     }
 
-    pub(crate) fn chain_entry(&self) -> Option<&ChainEntry> {
+    pub fn chain_entry(&self) -> Option<&ChainEntry> {
         match self {
             Self::User(entry) | Self::Assistant(entry) | Self::System(entry) => Some(entry),
             _ => None,
         }
     }
 
-    pub(crate) fn is_conversation_message(&self) -> bool {
+    pub fn is_conversation_message(&self) -> bool {
         matches!(self, Self::User(_) | Self::Assistant(_))
+    }
+
+    /// Chat-level records outside the conversation chain. A load from the latest compact
+    /// boundary keeps the ones written before it.
+    pub fn is_retained(&self) -> bool {
+        self.chain_entry().is_none() && !matches!(self, Self::Unknown)
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ChainEntry {
+pub struct ChainEntry {
     pub uuid: Uuid,
     pub parent_uuid: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,7 +120,10 @@ pub(crate) struct ChainEntry {
     pub is_sidechain: bool,
     pub chat_id: Uuid,
     pub timestamp: String,
-    pub cwd: PathBuf,
+    /// The Chat's Folder. A Chat without a Folder writes none, and a chain whose last entry has
+    /// none restores as a Chat without a Folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_branch: Option<String>,
@@ -182,6 +198,13 @@ pub(crate) struct ChainEntry {
     /// 恢复时按链上第一个 slug 关联计划文件。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slug: Option<String>,
+    /// The answer this entry is part of: its assistant messages, tool results, interruption
+    /// marker and the prompts merged into it at a tool boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<Uuid>,
+    /// The ledger input this user prompt entered with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_id: Option<Uuid>,
     /// Loop 条目（system，subtype 为 `loop_*`）记录的 Loop 完整状态；run id 记在 `runId`。
     /// 这类条目挂在对话链上，但不是对话消息，不进入发给模型的消息。
     #[serde(rename = "loop", default, skip_serializing_if = "Option::is_none")]
@@ -189,27 +212,38 @@ pub(crate) struct ChainEntry {
 }
 
 impl ChainEntry {
-    pub(crate) fn is_compact_boundary(&self) -> bool {
+    pub fn is_compact_boundary(&self) -> bool {
         self.message.role == Role::System
             && self.subtype.as_deref() == Some(COMPACT_BOUNDARY_SUBTYPE)
     }
 
-    pub(crate) fn is_loop_record(&self) -> bool {
+    /// A compact boundary the conversation chain starts again at, which a load from the latest
+    /// boundary may begin with: no parent, and no preserved segment before it.
+    pub fn restarts_chain(&self) -> bool {
+        self.is_compact_boundary()
+            && self.parent_uuid.is_none()
+            && self
+                .compact_metadata
+                .as_ref()
+                .is_none_or(|metadata| metadata.preserved_segment.is_none())
+    }
+
+    pub fn is_loop_record(&self) -> bool {
         self.message.role == Role::System && self.loop_record.is_some()
     }
 }
 
-pub(crate) const COMPACT_BOUNDARY_SUBTYPE: &str = "compact_boundary";
+pub const COMPACT_BOUNDARY_SUBTYPE: &str = "compact_boundary";
 /// Loop 条目的 subtype。恢复时每条都按 Loop id 以完整状态覆盖，subtype 只说明写入原因。
-pub(crate) const LOOP_CREATED_SUBTYPE: &str = "loop_created";
-pub(crate) const LOOP_STATE_SUBTYPE: &str = "loop_state";
-pub(crate) const LOOP_TRIGGER_SUBTYPE: &str = "loop_trigger";
-pub(crate) const LOOP_ENDED_SUBTYPE: &str = "loop_ended";
+pub const LOOP_CREATED_SUBTYPE: &str = "loop_created";
+pub const LOOP_STATE_SUBTYPE: &str = "loop_state";
+pub const LOOP_TRIGGER_SUBTYPE: &str = "loop_trigger";
+pub const LOOP_ENDED_SUBTYPE: &str = "loop_ended";
 
 /// Loop 在对话链上的完整状态。状态与 Trigger 按原始 JSON 保存，本模块不解析其结构。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct LoopRecord {
+pub struct LoopRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_report: Option<tickloop_agent_protocol::SubagentReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -241,7 +275,7 @@ pub(crate) struct LoopRecord {
 
 impl LoopRecord {
     /// Progress remains a separate checkpoint; plan changes are part of the Loop state.
-    pub(crate) fn without_progress(&self) -> Self {
+    pub fn without_progress(&self) -> Self {
         Self {
             progress: None,
             ..self.clone()
@@ -252,7 +286,7 @@ impl LoopRecord {
 /// 照 Claude Code `compactMetadata`。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CompactMetadata {
+pub struct CompactMetadata {
     pub trigger: CompactTriggerEntry,
     pub pre_tokens: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -267,7 +301,7 @@ pub(crate) struct CompactMetadata {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum CompactTriggerEntry {
+pub enum CompactTriggerEntry {
     Manual,
     Auto,
 }
@@ -275,7 +309,7 @@ pub(crate) enum CompactTriggerEntry {
 /// 照 Claude Code `preservedSegment`：保留的消息不重写，加载时据此重接父指针。
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct PreservedSegmentEntry {
+pub struct PreservedSegmentEntry {
     pub head_uuid: Uuid,
     pub anchor_uuid: Uuid,
     pub tail_uuid: Uuid,
@@ -283,7 +317,7 @@ pub(crate) struct PreservedSegmentEntry {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SummarizeMetadata {
+pub struct SummarizeMetadata {
     pub messages_summarized: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_context: Option<String>,
@@ -293,56 +327,56 @@ pub(crate) struct SummarizeMetadata {
 /// 照 Claude Code `PartialCompactDirection`。
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum PartialCompactDirection {
+pub enum PartialCompactDirection {
     From,
     UpTo,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CustomTitleEntry {
+pub struct CustomTitleEntry {
     pub chat_id: Uuid,
     pub custom_title: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct AiTitleEntry {
+pub struct AiTitleEntry {
     pub chat_id: Uuid,
     pub ai_title: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SubagentsEntry {
+pub struct SubagentsEntry {
     pub chat_id: Uuid,
     pub subagents: Vec<SubagentRegistration>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct LastPromptEntry {
+pub struct LastPromptEntry {
     pub chat_id: Uuid,
     pub last_prompt: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct BranchOriginEntry {
+pub struct BranchOriginEntry {
     pub chat_id: Uuid,
     pub forked_from: ForkedFrom,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct DelegationEntry {
+pub struct DelegationEntry {
     pub chat_id: Uuid,
     pub delegation: DelegationMetadata,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ForkedFrom {
+pub struct ForkedFrom {
     pub chat_id: Uuid,
     #[serde(default)]
     pub message_uuid: Option<Uuid>,
@@ -353,7 +387,7 @@ pub(crate) struct ForkedFrom {
 /// 快照本体按原始 JSON 保存，本模块不解析其结构。
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct FileHistorySnapshotEntry {
+pub struct FileHistorySnapshotEntry {
     pub message_id: Uuid,
     pub snapshot: serde_json::Value,
     pub is_snapshot_update: bool,
@@ -361,7 +395,7 @@ pub(crate) struct FileHistorySnapshotEntry {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ContentReplacementEntry {
+pub struct ContentReplacementEntry {
     pub chat_id: Uuid,
     pub replacements: Vec<ContentReplacementRecord>,
 }
@@ -370,7 +404,7 @@ pub(crate) struct ContentReplacementEntry {
 /// 不按当前代码重新生成。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
-pub(crate) enum ContentReplacementRecord {
+pub enum ContentReplacementRecord {
     #[serde(rename_all = "camelCase")]
     ToolResult {
         tool_use_id: String,
@@ -381,7 +415,7 @@ pub(crate) enum ContentReplacementRecord {
 }
 
 impl ContentReplacementRecord {
-    pub(crate) fn tool_use_id(&self) -> &str {
+    pub fn tool_use_id(&self) -> &str {
         match self {
             Self::ToolResult { tool_use_id, .. } => tool_use_id,
             Self::Unknown => "",
@@ -402,7 +436,7 @@ mod tests {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ArtifactTicksEntry {
+pub struct ArtifactTicksEntry {
     pub chat_id: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<std::path::PathBuf>,
@@ -415,7 +449,7 @@ pub(crate) struct ArtifactTicksEntry {
 /// materializes its Transcript so the membership survives a restart.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct MonitorMembersEntry {
+pub struct MonitorMembersEntry {
     pub chat_id: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<std::path::PathBuf>,
@@ -423,21 +457,21 @@ pub(crate) struct MonitorMembersEntry {
 }
 
 impl MonitorMembersEntry {
-    pub(crate) fn materializes_chat(&self) -> bool {
+    pub fn materializes_chat(&self) -> bool {
         self.cwd.is_some() && !self.monitor.is_empty()
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct FamilyCompletionsEntry {
+pub struct FamilyCompletionsEntry {
     pub chat_id: Uuid,
     pub completions: Vec<FamilyCompletion>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct FamilyInputsEntry {
+pub struct FamilyInputsEntry {
     pub chat_id: Uuid,
     pub inputs: std::collections::BTreeMap<Uuid, FamilyInputRecord>,
 }
@@ -465,14 +499,122 @@ mod record_type_tests {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct SentAgentMessagesEntry {
+pub struct SentAgentMessagesEntry {
     pub chat_id: Uuid,
     pub messages: std::collections::BTreeMap<Uuid, AgentMessageSource>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct TaskBoardsEntry {
+pub struct TaskBoardsEntry {
     pub chat_id: Uuid,
     pub boards: std::collections::BTreeMap<Uuid, tickloop_agent_protocol::TaskBoard>,
+}
+
+/// One answer: one attempt of one Run. Written when it starts and again when it ends.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseEntry {
+    pub response_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_id: Option<Uuid>,
+    pub attempt: u32,
+    pub run_id: Uuid,
+    pub loop_id: Uuid,
+    /// The display id of the prompt the answer belongs under: the latest prompt when it started.
+    pub display_parent: Option<Uuid>,
+    pub timestamp: String,
+    pub state: ResponseState,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ResponseState {
+    Started,
+    Ended { ending: ResponseEnding },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ResponseEnding {
+    Completed,
+    Interrupted { by: InterruptedBy },
+    Failed { error: String },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum InterruptedBy {
+    /// The user interrupted or stopped it.
+    User,
+    /// The host went away, as on shutdown or a crash; the input may be continued.
+    Host,
+}
+
+/// One ledger record of an input. Every record repeats what was accepted, so the latest record
+/// of an input id is enough on its own.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InputEntry {
+    pub input_id: Uuid,
+    pub op: InputOp,
+    /// SHA-256 of the input's payload, hex encoded; reusing the id with another payload is
+    /// refused.
+    pub digest: String,
+    /// The display node the input was accepted under; `None` when it joins the conversation
+    /// wherever it ends when the input starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_parent: Option<Uuid>,
+    pub loop_id: Uuid,
+    pub run_id: Uuid,
+    pub timestamp: String,
+    pub state: InputState,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum InputOp {
+    /// A prompt continuing the conversation.
+    Continue,
+    /// A user Skill invocation.
+    Skill,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum InputState {
+    Accepted,
+    Settled { outcome: SettledOutcome },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SettledOutcome {
+    Completed {
+        usage: Usage,
+    },
+    Interrupted {
+        by: InterruptedBy,
+    },
+    Failed {
+        error: String,
+    },
+    /// Answered by the Run `into`, which it joined before or while that Run went on.
+    Merged {
+        into: Uuid,
+    },
+    /// Taken back from the queue before it started.
+    Withdrawn,
+    Discarded {
+        reason: DiscardReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DiscardReason {
+    /// Its Loop ended before the input started.
+    LoopEnded,
+    /// Its Loop was stopped while it waited.
+    Stopped,
 }

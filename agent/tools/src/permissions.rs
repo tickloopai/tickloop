@@ -731,7 +731,7 @@ mod tests {
 
     fn prepared_tool(directory: &std::path::Path) -> (Workspace, PreparedTool) {
         let workspace = Workspace {
-            workdir: directory.to_path_buf(),
+            folder: Some(directory.to_path_buf()),
             additional_directories: Vec::new(),
         };
         let operation = crate::prepare(

@@ -3,6 +3,9 @@
 #[path = "all/agent_approval_routing.rs"]
 mod agent_approval_routing;
 
+#[path = "all/response_lifecycle.rs"]
+mod response_lifecycle;
+
 #[path = "all/approval_budget.rs"]
 mod approval_budget;
 #[path = "all/approval_stages.rs"]
@@ -62,6 +65,8 @@ mod explicit_ask_scopes;
 mod failed_replies;
 #[path = "all/file_tools.rs"]
 mod file_tools;
+#[path = "all/folderless_chats.rs"]
+mod folderless_chats;
 #[path = "all/glm_models.rs"]
 mod glm_models;
 #[path = "all/goal_routing_live.rs"]
@@ -166,6 +171,8 @@ mod tickhost_shells;
 mod tickhost_versions;
 #[path = "all/tool_results.rs"]
 mod tool_results;
+#[path = "all/transcript_stores.rs"]
+mod transcript_stores;
 #[path = "all/transcripts.rs"]
 mod transcripts;
 #[path = "all/triggers.rs"]

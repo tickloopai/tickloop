@@ -16,6 +16,8 @@ mod model_credentials;
 mod model_messages;
 #[path = "all/model_protocols.rs"]
 mod model_protocols;
+#[path = "all/model_seams.rs"]
+mod model_seams;
 #[path = "all/model_usage_observations.rs"]
 mod model_usage_observations;
 #[path = "all/openai_models.rs"]

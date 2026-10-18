@@ -12,22 +12,29 @@ pub(super) fn before_resume(
     loop_id: LoopId,
     state_root: Option<&std::path::Path>,
 ) -> Result<(), AgentError> {
-    for directory in std::iter::once(&snapshot.workdir).chain(&snapshot.additional_directories) {
-        let resolved = directory.canonicalize().map_err(|_| {
-            AgentError::Invalid(format!(
-                "working or authorized directory is unavailable: {}",
-                directory.display()
-            ))
-        })?;
-        if resolved != *directory || !resolved.is_dir() {
-            return Err(AgentError::Invalid(format!(
-                "working or authorized directory changed: {}",
-                directory.display()
-            )));
+    // A Chat without a Folder has no local directory or credential to check.
+    if snapshot.folder.is_some() {
+        for directory in snapshot
+            .folder
+            .iter()
+            .chain(&snapshot.additional_directories)
+        {
+            let resolved = directory.canonicalize().map_err(|_| {
+                AgentError::Invalid(format!(
+                    "working or authorized directory is unavailable: {}",
+                    directory.display()
+                ))
+            })?;
+            if resolved != *directory || !resolved.is_dir() {
+                return Err(AgentError::Invalid(format!(
+                    "working or authorized directory changed: {}",
+                    directory.display()
+                )));
+            }
         }
+        validate_model_for_resume_in_root(&snapshot.model, state_root)
+            .map_err(|error| AgentError::Invalid(error.to_string()))?;
     }
-    validate_model_for_resume_in_root(&snapshot.model, state_root)
-        .map_err(|error| AgentError::Invalid(error.to_string()))?;
     for pending in &mut snapshot.pending_inputs {
         if pending.receipt.loop_id == loop_id
             && pending.trigger_source.is_none()

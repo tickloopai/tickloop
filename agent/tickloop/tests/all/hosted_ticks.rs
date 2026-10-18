@@ -282,12 +282,13 @@ mod channel {
     use tickloop_agent_model::ModelClient;
     use tickloop_agent_protocol::ToolResult;
     use tickloop_agent_protocol::{
-        AccessError, AgentAccess, AgentCommand, CommandEnvelope, CommandResult, EnvironmentValue,
-        EventKind, HostEndpointIdentity, HostToolAuthority, HostWorkContext, LaunchSpec,
-        TickLinkState, TickSubscriptionChange,
+        AccessError, AgentAccess, AgentCommand, AgentHostOptions, CommandEnvelope, CommandResult,
+        EnvironmentValue, EventKind, HostEndpointIdentity, HostToolAuthority, HostWorkContext,
+        LaunchSpec, TickLinkState, TickSubscriptionChange,
     };
     use tickloop_agent_runtime::{
-        Agent,
+        Agent, HarnessOptions, HarnessSeams, ToolPolicy,
+        environment::LocalEnvironment,
         host_tools::{HostCallResult, HostToolProvider},
         hosted::{
             controller::HostController,
@@ -367,12 +368,6 @@ mod channel {
                     .map_err(AccessError::unavailable)?
                 }
                 None => {
-                    let runtime = Agent::new_embedded(
-                        tickloop_agent_test_support::config(),
-                        self.model.clone(),
-                    );
-                    runtime
-                        .install_stopped_child_hook(Arc::new(DaemonLifecycle::new(grant.clone())));
                     let mut tools =
                         HostedTickTools::new(DaemonControl::new(grant.clone()), tick_environment());
                     // As the production worker does, an open finds the programs of the Tick
@@ -383,8 +378,27 @@ mod channel {
                         );
                     }
                     let tools = Arc::new(tools);
+                    let runtime = Agent::with_seams(
+                        HarnessSeams {
+                            transcripts: None,
+                            environment: Some(Arc::new(LocalEnvironment::with(
+                                Arc::new(DaemonControl::new(grant.clone())),
+                                tools.clone(),
+                            ))),
+                        },
+                        HarnessOptions {
+                            model: tickloop_agent_test_support::config(),
+                            client: self.model.clone(),
+                            settings: None,
+                            host: AgentHostOptions::embedded_defaults(),
+                            tools: ToolPolicy::local(),
+                            host_rules: Vec::new(),
+                        },
+                    )
+                    .map_err(|error| AccessError::unavailable(error.to_string()))?;
+                    runtime
+                        .install_stopped_child_hook(Arc::new(DaemonLifecycle::new(grant.clone())));
                     runtime.install_host_tools(tools.clone()).unwrap();
-                    runtime.install_hosted_ticks(tools.clone());
                     runtime
                         .install_tick_stream(Arc::new(TickAdapters::builtin(
                             runtime.clone(),

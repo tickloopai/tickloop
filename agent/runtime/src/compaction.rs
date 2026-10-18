@@ -73,6 +73,10 @@ impl CompactionLayout {
         compacted.message_runs = BTreeMap::new();
         compacted.message_contexts = BTreeMap::new();
         compacted_bookkeeping.denial_references = BTreeMap::new();
+        compacted_bookkeeping.message_responses = BTreeMap::new();
+        compacted_bookkeeping
+            .lifecycle
+            .restart_claims_at(self.sources.len());
         compacted.message_ids = BTreeMap::new();
         compacted.original_message_ids = BTreeMap::new();
         compacted.prompt_execution_modes = BTreeMap::new();
@@ -91,6 +95,11 @@ impl CompactionLayout {
                     }
                     if let Some(contexts) = snapshot.message_contexts.get(&original) {
                         compacted.message_contexts.insert(index, contexts.clone());
+                    }
+                    if let Some(response) = bookkeeping.message_responses.get(&original) {
+                        compacted_bookkeeping
+                            .message_responses
+                            .insert(index, *response);
                     }
                     if let Some(reference) = bookkeeping.denial_references.get(&original) {
                         compacted_bookkeeping

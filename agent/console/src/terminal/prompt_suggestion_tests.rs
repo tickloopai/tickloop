@@ -1,8 +1,9 @@
 use super::prompt_suggestion::{SuggestionRequest, generate};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use tickloop_agent_model::HttpModelClient;
+use tickloop_agent_model::{LocalModelClients, ModelClients};
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_test_support::harness::{ChosenModels, embedded_agent};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -135,7 +136,7 @@ async fn prompt_suggestion_responses_completion_reasoning_is_bounded_without_cou
         model.protocol = tickloop_agent_protocol::Protocol::Responses;
         let context = snapshot(model, conversation()).await;
         let request = request();
-        let output = generate(&request, &context, None).await;
+        let output = generate(&request, &context, &LocalModelClients::new(None)).await;
         assert_eq!(
             output.text.is_some(),
             accepted,
@@ -188,13 +189,13 @@ async fn prompt_suggestion_completion_backstop_counts_protocol_readable_reasonin
 async fn prompt_suggestion_compaction_then_provider_switch_never_resends_sensitive_original() {
     const ORIGINAL: &str = "sensitive original fixture credential excluded from public summary";
     let directory = tempfile::tempdir().unwrap();
-    let agent = Agent::new_embedded(
-        tickloop_agent_test_support::config(),
-        Arc::new(tickloop_agent_test_support::ScriptedModel::new(vec![
+    let models = ChosenModels::new(Arc::new(tickloop_agent_test_support::ScriptedModel::new(
+        vec![
             tickloop_agent_test_support::text(ORIGINAL),
             tickloop_agent_test_support::text("Public compacted summary."),
-        ])),
-    );
+        ],
+    )));
+    let agent = embedded_agent(tickloop_agent_test_support::config(), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let initial = agent
@@ -226,14 +227,8 @@ async fn prompt_suggestion_compaction_then_provider_switch_never_resends_sensiti
     model.base_url = url;
     model.provider_id = "fixture-next-provider".into();
     model.name = "Next Provider fixture".into();
-    agent
-        .set_model(
-            chat,
-            model.clone(),
-            Arc::new(HttpModelClient::new(model).unwrap()),
-        )
-        .await
-        .unwrap();
+    models.choose(LocalModelClients::new(None).client(&model).unwrap());
+    agent.set_model(chat, model).await.unwrap();
     let next = agent
         .submit(chat, None, "Check the public summary.".into())
         .await
@@ -257,7 +252,7 @@ async fn prompt_suggestion_compaction_then_provider_switch_never_resends_sensiti
             .flat_map(|message| &message.content)
             .any(|content| matches!(content, Content::Text { text } if text.contains(ORIGINAL)))
     );
-    assert!(generate(&request(), &snapshot, None).await.text.is_some());
+    assert!(generate(&request(), &snapshot, &LocalModelClients::new(None)).await.text.is_some());
     let (_, suggestion) = captured.recv().await.unwrap();
     assert!(
         !suggestion.to_string().contains(ORIGINAL),
@@ -301,7 +296,7 @@ async fn prompt_suggestion_openai_stream_hits_the_output_budget_before_the_deadl
     let context = snapshot(model, conversation()).await;
     let request = request();
     let running = request.clone();
-    let generation = tokio::spawn(async move { generate(&running, &context, None).await });
+    let generation = tokio::spawn(async move { generate(&running, &context, &LocalModelClients::new(None)).await });
     received.await.unwrap();
     let result = tokio::time::timeout(std::time::Duration::from_millis(500), generation).await;
     assert!(
@@ -343,7 +338,7 @@ async fn prompt_suggestion_http_uses_current_model_without_tools_or_private_hist
         input: json!({"file_path":"private tool fixture"}),
     });
     assert_eq!(
-        generate(&request(), &snapshot(model, messages).await, None)
+        generate(&request(), &snapshot(model, messages).await, &LocalModelClients::new(None))
             .await
             .text
             .as_deref(),
@@ -382,7 +377,7 @@ async fn prompt_suggestion_http_filters_meta_errors_formatting_and_tool_proposal
         let mut model = tickloop_agent_test_support::config();
         model.base_url = url;
         assert!(
-            generate(&request(), &snapshot(model, conversation()).await, None)
+            generate(&request(), &snapshot(model, conversation()).await, &LocalModelClients::new(None))
                 .await
                 .text
                 .is_none(),
@@ -393,7 +388,7 @@ async fn prompt_suggestion_http_filters_meta_errors_formatting_and_tool_proposal
     let mut model = tickloop_agent_test_support::config();
     model.base_url = url;
     assert!(
-        generate(&request(), &snapshot(model, conversation()).await, None)
+        generate(&request(), &snapshot(model, conversation()).await, &LocalModelClients::new(None))
             .await
             .text
             .is_none()
@@ -416,7 +411,7 @@ async fn prompt_suggestion_http_cancellation_and_deadline_drop_a_delayed_result(
         let request = request();
         let running = request.clone();
         let generation = tokio::spawn(async move {
-            generate(&running, &snapshot(model, conversation()).await, None).await
+            generate(&running, &snapshot(model, conversation()).await, &LocalModelClients::new(None)).await
         });
         received.recv().await.unwrap();
         if timeout {
@@ -465,7 +460,7 @@ async fn prompt_suggestion_diagnostics_distinguish_empty_filtered_and_incomplete
             http::serve_response(200, response(json!({"type":"text","text":text}), stop)).await;
         let mut model = tickloop_agent_test_support::config();
         model.base_url = url;
-        let result = generate(&request(), &snapshot(model, conversation()).await, None).await;
+        let result = generate(&request(), &snapshot(model, conversation()).await, &LocalModelClients::new(None)).await;
         assert_eq!(result.diagnostic, diagnostic);
         assert_eq!(result.text.as_deref(), expected);
         received.await.unwrap();
@@ -477,7 +472,7 @@ async fn prompt_suggestion_http_errors_are_silent_and_pre_cancelled_requests_nev
     let (url, received) = http::serve_response(500, "fixture private error payload".into()).await;
     let mut model = tickloop_agent_test_support::config();
     model.base_url = url;
-    let result = generate(&request(), &snapshot(model, conversation()).await, None).await;
+    let result = generate(&request(), &snapshot(model, conversation()).await, &LocalModelClients::new(None)).await;
     assert!(result.text.is_none());
     assert_eq!(result.diagnostic, "failed: Provider request");
     received.await.unwrap();
@@ -491,7 +486,7 @@ async fn prompt_suggestion_http_errors_are_silent_and_pre_cancelled_requests_nev
     let request = request();
     request.cancel.cancel();
     assert!(
-        generate(&request, &snapshot(model, conversation()).await, None)
+        generate(&request, &snapshot(model, conversation()).await, &LocalModelClients::new(None))
             .await
             .text
             .is_none()

@@ -315,6 +315,7 @@ async fn a_cached_page_is_answered_again_without_a_second_download() {
         let result = fetch(
             fetch_input(&page, prompt),
             &cache,
+            Reach::Anywhere,
             &model,
             CancellationToken::new(),
         )
@@ -349,6 +350,7 @@ async fn a_cross_origin_redirect_asks_for_a_new_call_without_contacting_the_targ
     let result = fetch(
         fetch_input(&format!("{base}/start"), "Summarize \"it\""),
         &FetchCache::default(),
+        Reach::Anywhere,
         &model,
         CancellationToken::new(),
     )
@@ -389,7 +391,7 @@ async fn responses_over_ten_megabytes_are_rejected() {
     streamed.extend(std::iter::repeat_n(b'a', MAX_RESPONSE_BYTES + 1));
     for response in [declared, streamed] {
         let (base, _) = serve(vec![response]).await;
-        let error = fetch_page(url(&base), FETCH_TIMEOUT)
+        let error = fetch_page(url(&base), FETCH_TIMEOUT, Reach::Anywhere)
             .await
             .err()
             .expect("an oversized response is rejected");
@@ -400,7 +402,7 @@ async fn responses_over_ten_megabytes_are_rejected() {
     largest.extend(std::iter::repeat_n(b'a', MAX_RESPONSE_BYTES));
     let (base, _) = serve(vec![largest]).await;
     assert!(matches!(
-        fetch_page(url(&base), FETCH_TIMEOUT).await,
+        fetch_page(url(&base), FETCH_TIMEOUT, Reach::Anywhere).await,
         Ok(FetchedPage::Markdown(markdown)) if markdown.len() == MAX_RESPONSE_BYTES
     ));
 }
@@ -416,6 +418,7 @@ async fn a_silent_server_times_out_and_cancellation_stops_before_the_network() {
     let error = fetch_page(
         url(&format!("http://{address}/slow")),
         Duration::from_millis(50),
+        Reach::Anywhere,
     )
     .await
     .err()
@@ -430,6 +433,7 @@ async fn a_silent_server_times_out_and_cancellation_stops_before_the_network() {
         fetch(
             fetch_input(&base, "p"),
             &FetchCache::default(),
+            Reach::Anywhere,
             &RecordingModel::default(),
             cancel,
         )
@@ -548,4 +552,114 @@ No links found.
 
 REMINDER: You MUST include the sources above in your response to the user using markdown hyperlinks."
     );
+}
+
+#[tokio::test]
+async fn a_public_only_fetch_never_connects_to_a_name_that_resolves_to_loopback() {
+    let (base, connections) = serve(vec![http_response("200 OK", "", "private")]).await;
+    let port = url(&base).port().unwrap();
+    for (target, refusal) in [
+        (
+            format!("http://localhost:{port}/"),
+            "localhost resolves to ",
+        ),
+        (base.clone(), "127.0.0.1 is not a public address"),
+    ] {
+        let error = fetch_page(url(&target), FETCH_TIMEOUT, Reach::PublicAddresses)
+            .await
+            .err()
+            .expect("a loopback page is refused");
+        assert!(
+            matches!(&error, ToolError::Rejected(message) if message.starts_with(refusal)),
+            "{target}: {error}"
+        );
+    }
+    assert_eq!(connections.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_public_only_fetch_refuses_redirects_to_addresses_that_are_not_public() {
+    let page = url("https://documents.example.com/start");
+    for location in [
+        "http://127.0.0.1:8080/",
+        "https://10.0.0.1/admin",
+        "https://169.254.169.254/latest/meta-data",
+        "https://[::1]/",
+        "https://[fd00::1]/",
+        "https://[::ffff:192.168.1.1]/",
+        "https://[2002:c0a8:101::1]/",
+    ] {
+        assert!(
+            matches!(
+                redirect_target(&page, location, Reach::PublicAddresses),
+                Err(ToolError::Rejected(_))
+            ),
+            "{location}"
+        );
+        assert!(redirect_target(&page, location, Reach::Anywhere).is_ok());
+    }
+    for location in [
+        "/next",
+        "https://8.8.8.8/",
+        "https://[2606:4700:4700::1111]/",
+    ] {
+        assert!(redirect_target(&page, location, Reach::PublicAddresses).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn folderless_tools_prepare_only_web_fetch_of_public_addresses_and_write_nothing() {
+    let tools = crate::Tools::folderless();
+    let workspace = crate::Workspace {
+        folder: None,
+        additional_directories: Vec::new(),
+    };
+    assert!(tools.chat_directory().is_none());
+    assert!(tools.family_temp_directory().is_none());
+    let prepared = tools
+        .prepare(
+            &workspace,
+            WEB_FETCH_TOOL_NAME,
+            &json!({"url": "https://example.com/a", "prompt": "p"}),
+        )
+        .await
+        .unwrap();
+    assert!(prepared.requires_permission && prepared.is_read_only && !prepared.in_workspace);
+    for url in [
+        "http://127.0.0.1/",
+        "https://192.168.0.1/",
+        "https://[::1]/",
+        "https://[2002:7f00:1::]/",
+    ] {
+        assert!(
+            matches!(
+                tools
+                    .prepare(
+                        &workspace,
+                        WEB_FETCH_TOOL_NAME,
+                        &json!({"url": url, "prompt": "p"})
+                    )
+                    .await,
+                Err(ToolError::Rejected(_))
+            ),
+            "{url}"
+        );
+    }
+    for (name, input) in [
+        (crate::READ_TOOL_NAME, json!({"file_path": "/etc/hosts"})),
+        (crate::GLOB_TOOL_NAME, json!({"pattern": "*"})),
+        (
+            crate::WRITE_TOOL_NAME,
+            json!({"file_path": "/tmp/x", "content": "x"}),
+        ),
+        (BASH_TOOL_NAME, json!({"command": "true"})),
+    ] {
+        assert!(
+            matches!(
+                tools.prepare(&workspace, name, &input).await,
+                Err(ToolError::Rejected(message)) if message.contains("no Folder")
+            ),
+            "{name}"
+        );
+    }
 }

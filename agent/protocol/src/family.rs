@@ -198,7 +198,7 @@ impl AgentColor {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DelegationCeiling {
-    pub workdir: PathBuf,
+    pub folder: PathBuf,
     pub additional_directories: Vec<PathBuf>,
     pub policy: PermissionPolicy,
     #[serde(default)]

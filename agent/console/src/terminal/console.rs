@@ -3574,7 +3574,7 @@ impl Console {
                 &chat.commands,
                 &chat.user_shells,
                 &chat.artifact_ticks,
-                &chat.workdir,
+                super::shown_folder(chat.folder.as_deref()),
             );
         }
         for row in &state.monitor.subscriptions {
@@ -15981,7 +15981,7 @@ mod tests {
     #[tokio::test]
     async fn stale_parent_choice_releases_gate_without_dismissing_replacement_menu() {
         use crate::terminal::menus::Menus;
-        use tickloop_agent_model::HttpModelClient;
+        use tickloop_agent_model::{LocalModelClients};
         use tickloop_agent_protocol::{InputModality, ModelConfig, Protocol};
 
         let config = ModelConfig {
@@ -16002,7 +16002,7 @@ mod tests {
         };
         let agent = Agent::new_embedded(
             config.clone(),
-            Arc::new(HttpModelClient::new(config).unwrap()),
+            LocalModelClients::new(None).client(&config).unwrap(),
         );
         let mut state = State::new(true, 80, 24);
         state.prompt_enabled = true;
@@ -17122,7 +17122,7 @@ mod tests {
                 let document = crate::terminal::presentation::transcript_document(
                     &serde_json::from_value(serde_json::json!({
                         "id": chat,
-                        "workdir": "/work",
+                        "folder": "/work",
                         "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
                         "loops": [],
                     }))
@@ -20353,11 +20353,11 @@ mod tests {
         };
         let agent = Agent::new_embedded(
             config.clone(),
-            Arc::new(HttpModelClient::new(config.clone()).unwrap()),
+            LocalModelClients::new(None).client(&config).unwrap(),
         );
         let chat_id = Uuid::new_v4();
         let snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
-            "id":chat_id,"workdir":"/workspace","model":config,
+            "id":chat_id,"folder":"/workspace","model":config,
             "messages":[{"role":"user","content":[{"type":"text","text":"Recorded prompt"}]}],
             "operations":[],"loops":[],"last_sequence":0,
             "message_ids":{"0":Uuid::new_v4()},

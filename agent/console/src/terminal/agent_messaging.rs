@@ -618,7 +618,7 @@ mod tests {
             json!({"source":{"message_id":child_run,"sender_handle":"audit","sender_label":"audit","is_result":true},"message":report.text()})
         );
         serde_json::from_value(json!({
-            "id":Uuid::new_v4(),"workdir":"/work","messages":[
+            "id":Uuid::new_v4(),"folder":"/work","messages":[
                 {"role":"user","content":[{"type":"text","text":message}]}
             ],"loops":[],"message_ids":{"0":child_run},"agent_message_origins":{child_run.to_string():{"is_result":true}}
         }))

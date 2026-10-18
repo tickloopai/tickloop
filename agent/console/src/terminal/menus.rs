@@ -532,7 +532,7 @@ impl Menus {
     fn new_agent_directory(&self, agent: &Agent) -> PathBuf {
         self.new_agent_directory
             .clone()
-            .unwrap_or_else(|| agent.launch_spec().workdir)
+            .unwrap_or_else(|| agent.launch_spec().folder)
     }
 
     /// Opens the New Agent's Permissions view: saved policy and staged choices, with no activity
@@ -1880,7 +1880,7 @@ impl Menus {
                 safe_text(&format!("Service: {}", snapshot.model.base_url)),
                 safe_text(&format!(
                     "Working directory: {}",
-                    snapshot.workdir.display()
+                    super::shown_folder(snapshot.folder.as_deref()).display()
                 )),
                 format!("Execution mode: {}", snapshot.policy.mode),
                 format!(
@@ -4192,7 +4192,7 @@ mod tests {
     fn prompt_snapshot(prompts: &[&str]) -> ChatSnapshot {
         let mut snapshot: ChatSnapshot = serde_json::from_value(json!({
             "id": Uuid::from_u128(1),
-            "workdir": "/workspace",
+            "folder": "/workspace",
             "model": {"name":"fixture","protocol":"messages","base_url":"http://127.0.0.1","model":"fixture","api_key_env":"","max_output_tokens":1024},
             "messages": [],
             "loops": [],

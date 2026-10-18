@@ -1619,7 +1619,7 @@ impl ConsoleExecution {
     #[cfg(test)]
     pub(super) async fn create_chat(&self, workdir: PathBuf) -> Result<Uuid, AccessError> {
         let mut launch = self.inner.launch.clone();
-        launch.workdir = workdir;
+        launch.folder = workdir;
         launch.exact_chat = None;
         self.create(launch, None).await.map(|(chat, _)| chat)
     }
@@ -1860,7 +1860,12 @@ impl ConsoleExecution {
         Ok(match step {
             ReplayStep::ExecutionMode(mode) => ConfigurationChange::ExecutionMode { mode },
             ReplayStep::Directories(additional) => ConfigurationChange::Directories {
-                workdir: self.status(chat).await?.workdir,
+                folder: self.status(chat).await?.folder.ok_or_else(|| {
+                    AccessError::new(
+                        AccessErrorCode::Unsupported,
+                        "this Agent has no working directory",
+                    )
+                })?,
                 additional,
             },
             ReplayStep::Rule(change) => ConfigurationChange::PermissionChange {
@@ -2499,7 +2504,7 @@ impl ConsoleExecution {
         self.inner.draft.lock().unwrap().stage(
             &current,
             ConfigurationChange::Directories {
-                workdir: rule_project(project)?,
+                folder: rule_project(project)?,
                 additional,
             },
         )
@@ -2627,7 +2632,7 @@ impl ConsoleExecution {
         workdir: PathBuf,
     ) -> Result<(), AccessError> {
         let mut launch = self.inner.launch.clone();
-        launch.workdir = workdir;
+        launch.folder = workdir;
         launch.exact_chat = Some(chat);
         self.create(launch, None).await.map(|_| ())
     }
@@ -2811,7 +2816,7 @@ impl ConsoleExecution {
         self.configure(
             chat,
             ConfigurationChange::Directories {
-                workdir,
+                folder: workdir,
                 additional,
             },
         )
@@ -3623,7 +3628,7 @@ impl ConsoleExecution {
                 .inner
                 .access
                 .observe(ObservationRequest::SavedRecords {
-                    workdir: workdir.into(),
+                    folder: workdir.into(),
                     store_root: self.inner.launch.config_root.clone(),
                     page: Page {
                         offset: records.len(),
@@ -4321,8 +4326,8 @@ mod tests {
         );
         assert_eq!(captured["interaction"]["pane"]["tab_id"], "tab-moved");
         assert_eq!(
-            terminal.snapshot(chat).await.unwrap().workdir,
-            directory.path().canonicalize().unwrap()
+            terminal.snapshot(chat).await.unwrap().folder,
+            Some(directory.path().canonicalize().unwrap())
         );
         let current_source = terminal.origin().unwrap();
         assert_eq!(
@@ -4596,7 +4601,7 @@ mod tests {
                 && flag(&self.refuse_execution_mode)
             {
                 *change = ConfigurationChange::Directories {
-                    workdir: "/nonexistent/tickloop-refused-mode".into(),
+                    folder: "/nonexistent/tickloop-refused-mode".into(),
                     additional: Vec::new(),
                 };
             }
@@ -5061,7 +5066,7 @@ mod tests {
             .change_configuration(
                 ConfigTarget::NewDraft,
                 ConfigurationChange::Directories {
-                    workdir: directory.path().into(),
+                    folder: directory.path().into(),
                     additional: vec![extra.path().into()],
                 },
             )

@@ -525,7 +525,7 @@ impl Agent {
             .await
             .map_err(|error| error.to_string())?;
         if let Some(next) = next {
-            self.inner.tasks.lock().await.push(self.run_task(next));
+            self.run_task(next);
         }
         let reply = tokio::select! {
             biased;

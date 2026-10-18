@@ -117,7 +117,7 @@ async fn run_navigation(
         workspace: Some(workspace.into()),
     });
     let mut launch_b = launch_a.clone();
-    launch_b.workdir = work_b;
+    launch_b.folder = work_b;
     let (execution_a, chat_a) = create_execution(&access, launch_a.clone()).await;
     let (execution_b, chat_b) = create_execution(&access, launch_b).await;
     let caller_view = ViewRef {
@@ -310,7 +310,7 @@ async fn run_navigation(
         .iter()
         .find(|row| row.execution == execution_a)
         .unwrap();
-    assert_eq!(original.workdir, work_a.canonicalize().unwrap());
+    assert_eq!(original.folder, Some(work_a.canonicalize().unwrap()));
     assert_eq!(original.workspace.as_deref(), Some(workspace));
     shell_record(&agent, chat_a, UserShellState::Background).await;
     std::fs::write(work_a.join("finish"), "finish").unwrap();

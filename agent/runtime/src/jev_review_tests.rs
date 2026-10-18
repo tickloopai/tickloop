@@ -11,7 +11,7 @@ use uuid::Uuid;
 fn scenario(prompt: &str, command: &str) -> (ChatSnapshot, ChatBookkeeping, OperationRecord) {
     let mut snapshot = empty_snapshot(
         Uuid::new_v4(),
-        "/work/project".into(),
+        Some("/work/project".into()),
         tickloop_agent_model::cards::built_in_model_profiles().remove(0),
     );
     let loop_id = Uuid::new_v4();
@@ -54,6 +54,7 @@ fn review_request(
         bookkeeping,
         operation,
         None,
+        snapshot.folder.as_deref().unwrap(),
         tickloop_agent_config::AutoSettings::default().policy(),
     )
     .map_err(|_| AutoReview::Ask {
@@ -275,6 +276,7 @@ fn both_reviewers_receive_identical_state_and_policy_guidance() {
         &bookkeeping,
         &operation,
         None,
+        snapshot.folder.as_deref().unwrap(),
         tickloop_agent_config::AutoSettings::default().policy(),
     )
     .unwrap();
@@ -321,6 +323,7 @@ fn oversized_evidence_reaches_jev_only_after_a_marked_fit() {
             &bookkeeping,
             &operation,
             None,
+            snapshot.folder.as_deref().unwrap(),
             tickloop_agent_config::AutoSettings::default().policy(),
         )
         .unwrap();
@@ -522,6 +525,7 @@ async fn live_jev_full_policy_capacity_uses_the_production_request_builder() {
         &bookkeeping,
         &operation,
         None,
+        snapshot.folder.as_deref().unwrap(),
         tickloop_agent_config::AutoSettings::default().policy(),
     )
     .unwrap();

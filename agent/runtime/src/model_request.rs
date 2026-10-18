@@ -399,7 +399,8 @@ impl Agent {
             content: vec![Content::Text { text }],
         });
         snapshot.last_model_run = Some(receipt.run_id);
-        self.save(snapshot);
+        crate::lifecycle::claim_response_messages(chat);
+        self.save(&chat.snapshot);
         Ok(())
     }
 

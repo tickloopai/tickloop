@@ -546,6 +546,14 @@ impl Agent {
             {
                 return;
             }
+            // Event sources deliver into a Chat's local inbox, which a Chat without a Folder lacks.
+            let Some(loops_directory) = chat
+                .tools
+                .chat_directory()
+                .map(|directory| directory.join("loops"))
+            else {
+                return;
+            };
             if let Err(error) = self
                 .checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
                 .await
@@ -561,21 +569,12 @@ impl Agent {
             let cancel = CancellationToken::new();
             chat.event_cancellations.insert(loop_id, cancel.clone());
             let recorded = self
-                .record_loop_run_state_in(
-                    chat_id,
-                    loop_id,
-                    RunStateChange::Armed,
-                    chat.tools.chat_directory().join("loops"),
-                )
+                .record_loop_run_state_in(chat_id, loop_id, RunStateChange::Armed, loops_directory)
                 .await;
             self.warn_loop_run_state_failure(chat_id, loop_id, recorded);
             cancel
         };
-        self.inner
-            .tasks
-            .lock()
-            .await
-            .push(self.event_source_task(chat_id, loop_id, cancel));
+        self.event_source_task(chat_id, loop_id, cancel);
     }
 
     fn event_source_task(
@@ -583,9 +582,9 @@ impl Agent {
         chat_id: ChatId,
         loop_id: LoopId,
         cancel: CancellationToken,
-    ) -> tokio::task::JoinHandle<()> {
+    ) {
         let agent = self.clone();
-        tokio::spawn(async move {
+        self.inner.tasks.spawn(async move {
             let mut interval = tokio::time::interval(EVENT_POLL_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut next_poll = tokio::time::Instant::now();
@@ -609,7 +608,7 @@ impl Agent {
                 }
             }
             cancel.cancel();
-        })
+        });
     }
 
     async fn poll_event_sources_once(
@@ -1015,7 +1014,7 @@ impl Agent {
             chat.feedback_cleanup_started = true;
         }
         let agent = self.clone();
-        let task = tokio::spawn(async move {
+        self.inner.tasks.spawn(async move {
             let mut interval = tokio::time::interval(IDLE_EVENT_POLL_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -1077,7 +1076,6 @@ impl Agent {
                 }
             }
         });
-        self.inner.tasks.lock().await.push(task);
     }
 
     pub(super) async fn checkpoint_feedback_inputs(&self, chat_id: ChatId) -> Result<(), String> {

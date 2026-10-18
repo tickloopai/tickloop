@@ -53,7 +53,7 @@ async fn overview_filters_never_change_new_dispatch_directory_or_visible_executi
     console.interpret(Intent::Overview).unwrap();
     console
         .interpret(Intent::Filter(AgentFilter {
-            workdir: Some(other.path().into()),
+            folder: Some(other.path().into()),
             workspace: None,
         }))
         .unwrap();
@@ -79,8 +79,8 @@ async fn overview_filters_never_change_new_dispatch_directory_or_visible_executi
     };
     assert_ne!(execution, original);
     assert_eq!(
-        snapshot.conversation.workdir,
-        directory.path().canonicalize().unwrap()
+        snapshot.conversation.folder,
+        Some(directory.path().canonicalize().unwrap())
     );
     assert_eq!(console.projection().visible, Some(original));
     assert!(console.projection().overview);
@@ -489,7 +489,7 @@ async fn overview_prioritizes_a_waiting_child_family_before_an_independent_runni
     let other_directory = tempfile::tempdir().unwrap();
     console
         .interpret(Intent::Filter(AgentFilter {
-            workdir: Some(other_directory.path().into()),
+            folder: Some(other_directory.path().into()),
             workspace: None,
         }))
         .unwrap();
@@ -887,7 +887,7 @@ async fn an_accepted_dispatch_names_its_actual_execution_without_moving_filter_t
     console.visible_ready(Some(bravo));
     console.interpret(Intent::Overview).unwrap();
     let monitor = AgentFilter {
-        workdir: Some(monitored.path().canonicalize().unwrap()),
+        folder: Some(monitored.path().canonicalize().unwrap()),
         workspace: None,
     };
     console.interpret(Intent::Filter(monitor.clone())).unwrap();
@@ -927,10 +927,13 @@ async fn an_accepted_dispatch_names_its_actual_execution_without_moving_filter_t
             .rows
             .iter()
             .find(|row| row.execution == target)
-            .map(|row| (row.title.clone(), row.workdir.clone()))
+            .map(|row| (row.title.clone(), row.folder.clone()))
             .unwrap()
     };
-    assert_eq!(titles(execution), ("!pwd".into(), launch_directory.clone()));
+    assert_eq!(
+        titles(execution),
+        ("!pwd".into(), Some(launch_directory.clone()))
+    );
     assert_eq!(titles(older), titles(execution));
     assert_eq!(projection.created, Some(execution));
     console.interpret(Intent::Filter(monitor)).unwrap();

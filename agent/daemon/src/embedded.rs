@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, VecDeque},
-    path::Path,
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -14,28 +13,20 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{receipts::ReceiptStore, views::ViewRegistry};
-use tickloop_agent_model::{
-    ModelClient, ModelError, cards::model_for_persistent_selection, model_client,
-};
+use tickloop_agent_model::cards::model_for_persistent_selection;
 use tickloop_agent_protocol::{
     AccessError, AccessErrorCode, AfterTurnAction, AgentAccess, AgentCommand, AgentDetailQuery,
     AgentSummary, BranchRequest, CommandEnvelope, CommandReceipt, CommandResult,
     ConfigurationChange, Cursor, DirectedHumanSource, DisplayReceipt, DisplayUpdate, Event,
     ExecutionAvailability, ExecutionRef, FEED_CAPACITY, HerdrInteraction, HistoryAction,
     HostCallContext, InteractionSource, LaunchSpec, LiveChatSnapshot, LiveChatStatus, LoopAction,
-    LoopTriggerNotice, ModelConfig, Observation, ObservationChange, ObservationRequest,
-    ObservationUpdate, ObservationValue, PendingRequestKind, PersistenceState,
-    QueuedCommandFailure, REPLAY_CAPACITY, RequestRef, ResetReason, ShellTaskAction,
-    ShellTaskOrigin, SubagentRegistration, TaskAction, TaskNotification, TaskOrigin, TaskRef,
-    TranscriptRef, UserInput, UserShellRecord, bounded_update,
+    LoopTriggerNotice, Observation, ObservationChange, ObservationRequest, ObservationUpdate,
+    ObservationValue, PendingRequestKind, PersistenceState, QueuedCommandFailure, REPLAY_CAPACITY,
+    RequestRef, ResetReason, ShellTaskAction, ShellTaskOrigin, SubagentRegistration, TaskAction,
+    TaskNotification, TaskOrigin, TaskRef, TranscriptRef, UserInput, UserShellRecord,
+    bounded_update,
 };
 use tickloop_agent_runtime::{Agent, ShellTaskCenter};
-
-/// Builds the transport an Agent switches to from the chosen model and the Agent's configuration
-/// root.
-pub type ModelClientFactory = Arc<
-    dyn Fn(ModelConfig, Option<&Path>) -> Result<Arc<dyn ModelClient>, ModelError> + Send + Sync,
->;
 
 #[derive(Clone)]
 pub struct EmbeddedAgentAccess {
@@ -47,7 +38,6 @@ type QueuedAction = (ExecutionRef, Option<Uuid>, AfterTurnAction);
 struct Inner {
     agent: Agent,
     epoch: Uuid,
-    model_clients: ModelClientFactory,
     executions: Mutex<HashMap<ExecutionRef, Uuid>>,
     references: Mutex<HashMap<Uuid, ExecutionRef>>,
     launches: Mutex<HashMap<ExecutionRef, LaunchSpec>>,
@@ -92,17 +82,16 @@ impl EmbeddedAgentAccess {
     }
 
     pub fn with_epoch(agent: Agent, epoch: Uuid) -> Self {
-        Self::build(agent, epoch, Arc::new(model_client))
+        Self::build(agent, epoch)
     }
 
-    fn build(agent: Agent, epoch: Uuid, model_clients: ModelClientFactory) -> Self {
+    fn build(agent: Agent, epoch: Uuid) -> Self {
         let events = agent.subscribe();
         let shells = agent.subscribe_user_shells();
         let tasks = agent.subscribe_task_notifications();
         let inner = Arc::new(Inner {
             agent,
             epoch,
-            model_clients,
             executions: Mutex::new(HashMap::new()),
             references: Mutex::new(HashMap::new()),
             launches: Mutex::new(HashMap::new()),
@@ -131,15 +120,7 @@ impl EmbeddedAgentAccess {
     }
 
     pub fn for_worker(agent: Agent, epoch: Uuid) -> Self {
-        Self::for_worker_with_model_clients(agent, epoch, Arc::new(model_client))
-    }
-
-    pub fn for_worker_with_model_clients(
-        agent: Agent,
-        epoch: Uuid,
-        model_clients: ModelClientFactory,
-    ) -> Self {
-        let access = Self::build(agent, epoch, model_clients);
+        let access = Self::build(agent, epoch);
         access.inner.verified_sources.store(true, Ordering::SeqCst);
         access
             .inner
@@ -310,19 +291,23 @@ impl EmbeddedAgentAccess {
         let launch = self.inner.launches.lock().await.get(&execution).cloned();
         let context = launch.and_then(|launch| launch.host_work_context);
         let snapshot = self.inner.agent.snapshot(chat).await?;
+        // A Chat without a Folder has no host Work Context.
+        let Some(folder) = snapshot.folder.clone() else {
+            return Ok(None);
+        };
         let mut result = if let Some(delegation) = &snapshot.delegation {
             delegation
                 .ceiling
                 .host_context
                 .clone()
                 .map(|mut inherited| {
-                    inherited.workdir = snapshot.workdir.clone();
+                    inherited.folder = folder.clone();
                     inherited.interaction = None;
                     inherited
                 })
         } else {
             context.map(|context| HostCallContext {
-                workdir: snapshot.workdir.clone(),
+                folder: folder.clone(),
                 workspace_id: context.workspace,
                 interaction: None,
             })
@@ -352,7 +337,7 @@ impl EmbeddedAgentAccess {
                     foreground_cwd: None,
                 };
                 result = Some(HostCallContext {
-                    workdir: snapshot.workdir,
+                    folder,
                     workspace_id: result.and_then(|context| context.workspace_id),
                     interaction: Some(HerdrInteraction {
                         socket: host.socket,
@@ -555,16 +540,16 @@ impl EmbeddedAgentAccess {
                 if let Some(UserInput::Skill { name, arguments }) = &initial {
                     self.inner
                         .agent
-                        .check_user_skill(&launch.workdir, name, arguments)?;
+                        .check_user_skill(&launch.folder, name, arguments)?;
                 }
                 let chat = if let Some(chat) = launch.exact_chat {
                     self.inner
                         .agent
-                        .restore_empty_chat(chat, launch.workdir.clone())
+                        .restore_empty_chat(chat, launch.folder.clone())
                         .await?;
                     chat
                 } else {
-                    self.inner.agent.create_chat(launch.workdir.clone()).await?
+                    self.inner.agent.create_chat(launch.folder.clone()).await?
                 };
                 let execution = self.register(chat, launch.clone()).await;
                 self.inner
@@ -576,7 +561,7 @@ impl EmbeddedAgentAccess {
                     .set_host_work_context(
                         chat,
                         HostCallContext {
-                            workdir: launch.workdir,
+                            folder: launch.folder,
                             workspace_id: launch
                                 .host_work_context
                                 .and_then(|context| context.workspace),
@@ -642,15 +627,15 @@ impl EmbeddedAgentAccess {
                 } else {
                     self.inner.agent.resume_chat(record.chat_id).await?
                 };
-                let launch =
-                    launch.unwrap_or_else(|| LaunchSpec::embedded(snapshot.workdir.clone()));
+                let folder = chat_folder(&snapshot)?;
+                let launch = launch.unwrap_or_else(|| LaunchSpec::embedded(folder.clone()));
                 if snapshot.delegation.is_none() {
                     self.inner
                         .agent
                         .set_host_work_context(
                             snapshot.id,
                             HostCallContext {
-                                workdir: snapshot.workdir.clone(),
+                                folder,
                                 workspace_id: launch
                                     .host_work_context
                                     .as_ref()
@@ -889,8 +874,8 @@ impl EmbeddedAgentAccess {
                 )
                 .await
             }
-            AgentCommand::TrustWorkingDirectory { workdir } => {
-                self.inner.agent.trust_working_directory(workdir).await?;
+            AgentCommand::TrustWorkingDirectory { folder } => {
+                self.inner.agent.trust_working_directory(folder).await?;
                 Ok(CommandResult::Done)
             }
             AgentCommand::FlushTranscripts => {
@@ -978,22 +963,9 @@ impl EmbeddedAgentAccess {
             }
             ConfigurationChange::Model { config, thinking } => {
                 let config = self.builtin_config(config)?;
-                let root = self
-                    .inner
-                    .launches
-                    .lock()
-                    .await
-                    .get(&execution)
-                    .and_then(|launch| launch.config_root.clone());
-                let client = (self.inner.model_clients)(config.clone(), root.as_deref())
-                    .map_err(|error| AccessError::invalid(error.to_string()))?;
                 let change = match thinking {
-                    Some(effort) => {
-                        agent
-                            .set_model_with_thinking(chat, config, client, effort)
-                            .await?
-                    }
-                    None => agent.set_model(chat, config, client).await?,
+                    Some(effort) => agent.set_model_with_thinking(chat, config, effort).await?,
+                    None => agent.set_model(chat, config).await?,
                 };
                 return Ok(CommandResult::ModelChanged(change));
             }
@@ -1015,10 +987,9 @@ impl EmbeddedAgentAccess {
                 agent.set_context_window(chat, tokens).await?
             }
             ConfigurationChange::Search { config } => agent.set_search(chat, config).await?,
-            ConfigurationChange::Directories {
-                workdir,
-                additional,
-            } => agent.set_directories(chat, workdir, additional).await?,
+            ConfigurationChange::Directories { folder, additional } => {
+                agent.set_directories(chat, folder, additional).await?
+            }
             ConfigurationChange::ReplaceRules { rules } => {
                 agent.set_permission_rules(chat, rules).await?
             }
@@ -1081,7 +1052,10 @@ impl EmbeddedAgentAccess {
                     .await
                     .get(&execution)
                     .cloned()
-                    .unwrap_or_else(|| LaunchSpec::embedded(result.snapshot.workdir.clone()));
+                    .map_or_else(
+                        || chat_folder(&result.snapshot).map(LaunchSpec::embedded),
+                        Ok,
+                    )?;
                 let execution = self.register(result.child_chat_id, launch).await;
                 Ok(CommandResult::Branch {
                     execution,
@@ -1626,9 +1600,9 @@ impl AgentAccess for EmbeddedAgentAccess {
                 for (chat, execution) in references {
                     let summary = self.inner.agent.summary(chat).await?;
                     if filter
-                        .workdir
+                        .folder
                         .as_ref()
-                        .is_some_and(|path| path != &summary.workdir)
+                        .is_some_and(|path| Some(path) != summary.folder.as_ref())
                     {
                         continue;
                     }
@@ -1664,7 +1638,7 @@ impl AgentAccess for EmbeddedAgentAccess {
                             &summary.loops,
                             &summary.user_shells,
                         ),
-                        workdir: summary.workdir,
+                        folder: summary.folder,
                         run_id: super::summary::summary_run_id(&summary.loops, &state),
                         run_started_at: super::summary::run_started_at(&summary.loops, &state),
                         state,
@@ -1780,14 +1754,14 @@ impl AgentAccess for EmbeddedAgentAccess {
             )),
             ObservationRequest::SavedRecords {
                 store_root,
-                workdir,
+                folder,
                 page,
             } => {
                 if let Some(root) = store_root {
                     self.inner.agent.flush_transcripts().await;
                     return Ok(Observation::single(
                         tickloop_agent_runtime::transcript::records::saved_records(
-                            root, workdir, page,
+                            root, folder, page,
                         )
                         .await?,
                         Cursor {
@@ -1798,7 +1772,7 @@ impl AgentAccess for EmbeddedAgentAccess {
                         None,
                     ));
                 }
-                let records = self.inner.agent.saved_chats(&workdir).await?;
+                let records = self.inner.agent.saved_chats(&folder).await?;
                 let limit = page.bounded_limit();
                 Ok(Observation::single(
                     ObservationValue::Records(
@@ -2015,13 +1989,25 @@ fn action_label(action: &AfterTurnAction) -> String {
             action: HistoryAction::Compact { instructions },
         } => format!("/compact {}", instructions.as_deref().unwrap_or_default()),
         AfterTurnAction::Configure {
-            change: ConfigurationChange::Directories { workdir, .. },
-        } => format!("/cwd {}", workdir.display()),
+            change: ConfigurationChange::Directories { folder, .. },
+        } => format!("/cwd {}", folder.display()),
         AfterTurnAction::Configure { .. } => "/configure".into(),
         AfterTurnAction::History { .. } => "/history".into(),
         AfterTurnAction::Loop { .. } => "/loop".into(),
         AfterTurnAction::Submit { .. } => "/submit".into(),
     }
+}
+
+/// The Folder of a Chat a local launch shows; this daemon runs only Chats with one.
+fn chat_folder(
+    snapshot: &tickloop_agent_protocol::ChatSnapshot,
+) -> Result<std::path::PathBuf, AccessError> {
+    snapshot.folder.clone().ok_or_else(|| {
+        AccessError::new(
+            AccessErrorCode::Unsupported,
+            "this Chat has no Folder to launch in",
+        )
+    })
 }
 
 /// A hosted Tick lifecycle that may have reached the host is unknown, not refused.

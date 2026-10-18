@@ -97,7 +97,7 @@ async fn recovery_process_fixture() {
         }
         agent.compact(chat).await.unwrap();
         agent
-            .set_model(chat, config(), Arc::new(PendingModel))
+            .set_model(chat, config())
             .await
             .unwrap();
         Some(completed)

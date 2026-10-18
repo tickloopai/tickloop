@@ -4,7 +4,9 @@
 use std::{error::Error, os::unix::fs::PermissionsExt, path::PathBuf};
 
 use serde_json::json;
-use tickloop_agent_model::{ModelRequest, StructuredOutput, cards::ModelCatalog, model_client};
+use tickloop_agent_model::{
+    LocalModelClients, ModelClients, ModelRequest, StructuredOutput, cards::ModelCatalog,
+};
 use tickloop_agent_protocol::{Content, Message, ReasoningEffort, Role, ToolDefinition};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -39,7 +41,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .as_mut()
         .ok_or("model card missing")?
         .max_output_tokens = 4096;
-    let client = model_client(config, Some(&root))?;
+    let client = LocalModelClients::new(Some(root.to_path_buf())).client(&config)?;
     let (events, _receiver) = mpsc::unbounded_channel();
     let mut request = ModelRequest {
         history_sources: vec![None],

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use tickloop_agent_config::{AutoSettings, SettingsError};
 use tickloop_agent_tools::permissions::{canonical_directory, rule_views, validate_rule};
 
-use super::{Agent, AgentError, ChatBookkeeping};
+use super::{Agent, AgentError, ChatBookkeeping, require_folder};
 use tickloop_agent_protocol::{
     ApiKeyStatus, AutoReviewerHealth, AutoReviewerPreference, AutoSettingsRevision, ChatId,
     ChatSnapshot, PermissionChange, PermissionRule, PermissionsRevision, PermissionsView,
@@ -31,12 +31,8 @@ impl Agent {
     ) -> Result<PermissionsView, AgentError> {
         let workdir = {
             let chats = self.inner.chats.lock().await;
-            chats
-                .get(&chat_id)
-                .ok_or(AgentError::NotFound)?
-                .snapshot
-                .workdir
-                .clone()
+            require_folder(&chats.get(&chat_id).ok_or(AgentError::NotFound)?.snapshot)?
+                .to_path_buf()
         };
         let (saved_rules, warnings, project_rules) = self.read_project_rules(&workdir).await?;
         let (auto_settings, auto_settings_revision) = self.auto_settings_snapshot().await?;
@@ -49,7 +45,7 @@ impl Agent {
             .status(tokio::time::Instant::now());
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        if chat.snapshot.workdir != workdir {
+        if chat.snapshot.folder.as_ref() != Some(&workdir) {
             return Err(AgentError::Busy);
         }
         if let Some(saved_rules) =
@@ -77,6 +73,7 @@ impl Agent {
         }
         Ok(view_from_snapshot(
             &chat.snapshot,
+            &workdir,
             &chat.bookkeeping,
             chat.client.identity().requested_model,
             project_rules,
@@ -130,7 +127,7 @@ impl Agent {
                         &chat.bookkeeping,
                         &rules,
                     )?;
-                    (snapshot.workdir.clone(), rules, changes)
+                    (require_folder(snapshot)?.to_path_buf(), rules, changes)
                 };
                 self.apply_rule_change(chat_id, workdir, rules, changes, &expected_revision)
                     .await?;
@@ -162,7 +159,7 @@ impl Agent {
                         &chat.bookkeeping,
                         &rules,
                     )?;
-                    (snapshot.workdir.clone(), rules, changes)
+                    (require_folder(snapshot)?.to_path_buf(), rules, changes)
                 };
                 self.apply_rule_change(chat_id, workdir, rules, changes, &expected_revision)
                     .await?;
@@ -179,7 +176,7 @@ impl Agent {
                 let mut chats = self.inner.chats.lock().await;
                 let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
                 if chat.snapshot.policy.revision != expected_revision.local()
-                    || chat.snapshot.workdir != workdir
+                    || chat.snapshot.folder.as_ref() != Some(&workdir)
                 {
                     drop(chats);
                     let latest = self.permissions_view_locked(chat_id).await?;
@@ -208,7 +205,7 @@ impl Agent {
                 let mut chats = self.inner.chats.lock().await;
                 let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
                 if chat.snapshot.policy.revision != expected_revision.local()
-                    || chat.snapshot.workdir != workdir
+                    || chat.snapshot.folder.as_ref() != Some(&workdir)
                 {
                     drop(chats);
                     let latest = self.permissions_view_locked(chat_id).await?;
@@ -300,7 +297,9 @@ impl Agent {
     ) -> Result<(), PermissionChangeError> {
         let mut chats = self.inner.chats.lock().await;
         let snapshot = &chats.get(&chat_id).ok_or(AgentError::NotFound)?.snapshot;
-        if snapshot.policy.revision != expected.local() || snapshot.workdir != workdir {
+        if snapshot.policy.revision != expected.local()
+            || snapshot.folder.as_ref() != Some(&workdir)
+        {
             drop(chats);
             let latest = self.permissions_view_locked(chat_id).await?;
             return Err(PermissionChangeError::Conflict {
@@ -371,6 +370,7 @@ struct AutoViewState {
 
 fn view_from_snapshot(
     snapshot: &ChatSnapshot,
+    folder: &std::path::Path,
     bookkeeping: &ChatBookkeeping,
     chat_model_label: String,
     project_rules: String,
@@ -390,9 +390,9 @@ fn view_from_snapshot(
                 .persistent_rule_projects
                 .get(&rule.id)
                 .cloned()
-                .unwrap_or_else(|| snapshot.workdir.clone())
+                .unwrap_or_else(|| folder.to_path_buf())
         },
-        &snapshot.workdir,
+        folder,
         snapshot.policy.mode,
         &snapshot.policy.project_constraints,
         &snapshot.policy.managed_constraints,
@@ -407,14 +407,14 @@ fn view_from_snapshot(
         execution_mode: snapshot.policy.mode,
         chat_model_label,
         preferred_reviewer: auto_settings.reviewer,
-        auto_policy: auto_settings.policy_for_directory(&snapshot.workdir),
+        auto_policy: auto_settings.policy_for_directory(folder),
         auto_rule_settings: auto_settings.rules,
         auto_settings_revision,
         jev_key_status,
         auto_reviewer_health,
         selected_loop_id: snapshot.loops.last().map(|loop_snapshot| loop_snapshot.id),
         rules,
-        working_directory: snapshot.workdir.clone(),
+        working_directory: folder.to_path_buf(),
         additional_directories: snapshot.additional_directories.clone(),
         warnings,
     }

@@ -406,10 +406,10 @@ impl Agent {
     ) -> Result<(), AgentError> {
         let snapshot = &chats.get(&chat_id).ok_or(AgentError::NotFound)?.snapshot;
         let workspace = tickloop_agent_tools::Workspace {
-            workdir: snapshot.workdir.clone(),
+            folder: snapshot.folder.clone(),
             additional_directories: snapshot.additional_directories.clone(),
         };
-        if workspace.workdir != admission.workspace.workdir
+        if workspace.folder != admission.workspace.folder
             || workspace.additional_directories != admission.workspace.additional_directories
         {
             return Err(AgentError::Invalid(
@@ -472,6 +472,7 @@ pub(super) struct ContextSubmission {
     pub host_context: Option<HostCallContext>,
     pub directed_source: Option<DirectedHumanSource>,
     pub target_generation: Option<u64>,
+    pub ledger: Option<crate::lifecycle::LedgerInput>,
 }
 
 impl Agent {
@@ -550,6 +551,7 @@ impl Agent {
             host_context,
             directed_source: Some(source),
             target_generation: Some(target_generation),
+            ledger: None,
         })
         .await
     }

@@ -4,7 +4,7 @@ use model_http_support::{serve_response, serve_response_with_headers};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tickloop_agent_model::{
-    HttpModelClient, ModelClient, ModelDelta, ModelError, ModelFailureKind, ModelRequest,
+    LocalModelClients, ModelClients, ModelDelta, ModelError, ModelFailureKind, ModelRequest,
     ModelRequestStage, ModelResponseRejection,
 };
 use tickloop_agent_protocol::{
@@ -41,7 +41,9 @@ async fn responses_raw_reasoning_prefix_rejects_a_conflicting_completed_value() 
             model_http_support::raw_reasoning_prefix_reply(added_prefix, "Contradictory", false),
         )
         .await;
-        let client = HttpModelClient::new(configuration(url, Protocol::Responses)).unwrap();
+        let client = LocalModelClients::new(None)
+            .client(&configuration(url, Protocol::Responses))
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let result = client
             .complete(
@@ -71,7 +73,9 @@ async fn responses_raw_reasoning_prefix_completion_delivers_the_normal_answer() 
             model_http_support::raw_reasoning_prefix_reply(added_prefix, "Thinking", false),
         )
         .await;
-        let client = HttpModelClient::new(configuration(url, Protocol::Responses)).unwrap();
+        let client = LocalModelClients::new(None)
+            .client(&configuration(url, Protocol::Responses))
+            .unwrap();
         let (events, mut deltas) = mpsc::unbounded_channel();
         let result = client
             .complete(
@@ -137,7 +141,9 @@ async fn model_clients_recognize_context_limit_http_errors() {
     ];
     for (protocol, error_body) in cases {
         let (base_url, _) = serve_response(400, error_body.to_string()).await;
-        let client = HttpModelClient::new(configuration(base_url, protocol)).unwrap();
+        let client = LocalModelClients::new(None)
+            .client(&configuration(base_url, protocol))
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(
@@ -174,7 +180,9 @@ async fn unrelated_bad_requests_remain_http_errors() {
             .to_string(),
     )
     .await;
-    let client = HttpModelClient::new(configuration(base_url, Protocol::Messages)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::Messages))
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     let error = client
         .complete(
@@ -203,7 +211,9 @@ async fn billing_failure_is_distinct_from_a_rate_limit() {
         json!({"error":{"type":"billing_error","message":"Insufficient balance"}}).to_string(),
     )
     .await;
-    let client = HttpModelClient::new(configuration(base_url, Protocol::Messages)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::Messages))
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     let error = client
         .complete(
@@ -231,7 +241,9 @@ async fn spend_cap_429_disables_automatic_retry() {
         json!({"error":{"type":"rate_limit_error","message":"Spend limit reached","details":{"error_code":"enforced_spend_limit_reached"}}}).to_string(),
     )
     .await;
-    let client = HttpModelClient::new(configuration(base_url, Protocol::Messages)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::Messages))
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     let error = client
         .complete(
@@ -261,7 +273,9 @@ async fn http_client_preserves_server_retry_instructions() {
         &[("Retry-After", "2"), ("x-should-retry", "true")],
     )
     .await;
-    let client = HttpModelClient::new(configuration(base_url, Protocol::Messages)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::Messages))
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     let error = client
         .complete(
@@ -316,7 +330,9 @@ async fn streamed_service_errors_keep_retryable_error_categories() {
     ];
     for (protocol, stream, expected_status) in cases {
         let (base_url, _) = serve_response(200, stream).await;
-        let client = HttpModelClient::new(configuration(base_url, protocol)).unwrap();
+        let client = LocalModelClients::new(None)
+            .client(&configuration(base_url, protocol))
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(
@@ -366,7 +382,9 @@ async fn responses_client_recognizes_a_streamed_context_limit_failure() {
     ]
     .concat();
     let (base_url, _) = serve_response(200, stream).await;
-    let client = HttpModelClient::new(configuration(base_url, Protocol::Responses)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::Responses))
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     let error = client
         .complete(
@@ -410,7 +428,9 @@ async fn model_clients_recognize_streamed_context_limit_errors() {
     ];
     for (protocol, stream) in cases {
         let (base_url, _) = serve_response(200, stream).await;
-        let client = HttpModelClient::new(configuration(base_url, protocol)).unwrap();
+        let client = LocalModelClients::new(None)
+            .client(&configuration(base_url, protocol))
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(
@@ -463,7 +483,9 @@ fn responses_text_stream_with_usage(usage: Value) -> String {
 #[tokio::test]
 async fn responses_streams_text_with_complete_client_side_conversation_history() {
     let (base_url, captured) = serve_response(200, responses_text_stream()).await;
-    let client = HttpModelClient::new(configuration(base_url, Protocol::Responses)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::Responses))
+        .unwrap();
     let (events, mut receiver) = mpsc::unbounded_channel();
     let output = client
         .complete(
@@ -577,7 +599,9 @@ fn responses_tool_stream() -> String {
 #[tokio::test]
 async fn responses_round_trips_multiple_calls_and_protocol_specific_reasoning() {
     let (base_url, captured) = serve_response(200, responses_tool_stream()).await;
-    let client = HttpModelClient::new(configuration(base_url, Protocol::Responses)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::Responses))
+        .unwrap();
     let tools = vec![ToolDefinition {
         name: "Read".into(),
         description: "Read a file".into(),
@@ -630,7 +654,9 @@ async fn responses_round_trips_multiple_calls_and_protocol_specific_reasoning() 
         json!({"type":"function","name":"Read","description":"Read a file","parameters":tools[0].input_schema})
     );
     let (base_url, captured) = serve_response(200, responses_text_stream()).await;
-    let client = HttpModelClient::new(configuration(base_url, Protocol::Responses)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::Responses))
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     client
         .complete(
@@ -692,7 +718,9 @@ fn responses_tool_stream_without_argument_deltas() -> String {
 #[tokio::test]
 async fn responses_accepts_calls_whose_arguments_arrive_only_on_completion() {
     let (base_url, _) = serve_response(200, responses_tool_stream_without_argument_deltas()).await;
-    let client = HttpModelClient::new(configuration(base_url, Protocol::Responses)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::Responses))
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     let output = client
         .complete(
@@ -762,7 +790,9 @@ async fn responses_rejects_repeated_incomplete_mismatched_and_failed_streams() {
     ];
     for (index, body) in invalid.into_iter().enumerate() {
         let (base_url, _) = serve_response(200, body).await;
-        let client = HttpModelClient::new(configuration(base_url, Protocol::Responses)).unwrap();
+        let client = LocalModelClients::new(None)
+            .client(&configuration(base_url, Protocol::Responses))
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         assert!(
             client
@@ -831,7 +861,9 @@ fn chat_text_stream() -> String {
 #[tokio::test]
 async fn chat_completions_round_trips_thinking_and_tools_then_streams_the_answer() {
     let (base_url, captured) = serve_response(200, chat_tool_stream()).await;
-    let client = HttpModelClient::new(configuration(base_url, Protocol::ChatCompletions)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::ChatCompletions))
+        .unwrap();
     let tools = vec![ToolDefinition {
         name: "Read".into(),
         description: "Read file".into(),
@@ -883,7 +915,9 @@ async fn chat_completions_round_trips_thinking_and_tools_then_streams_the_answer
     assert_eq!(body["stream_options"]["include_usage"], true);
     assert_eq!(body["tools"][0]["function"]["name"], "Read");
     let (base_url, captured) = serve_response(200, chat_text_stream()).await;
-    let client = HttpModelClient::new(configuration(base_url, Protocol::ChatCompletions)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::ChatCompletions))
+        .unwrap();
     let (events, mut receiver) = mpsc::unbounded_channel();
     let answer = client
         .complete(
@@ -981,7 +1015,9 @@ fn block_tool_result_request() -> ModelRequest {
 #[tokio::test]
 async fn responses_sends_block_tool_results_as_input_text_items() {
     let (base_url, captured) = serve_response(200, responses_text_stream()).await;
-    let client = HttpModelClient::new(configuration(base_url, Protocol::Responses)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::Responses))
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     client
         .complete(
@@ -1003,7 +1039,9 @@ async fn responses_sends_block_tool_results_as_input_text_items() {
 #[tokio::test]
 async fn chat_completions_sends_block_tool_results_as_their_text() {
     let (base_url, captured) = serve_response(200, chat_text_stream()).await;
-    let client = HttpModelClient::new(configuration(base_url, Protocol::ChatCompletions)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::ChatCompletions))
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     client
         .complete(
@@ -1073,7 +1111,9 @@ fn tool_result_image_request() -> ModelRequest {
 #[tokio::test]
 async fn responses_sends_tool_result_images_as_input_image_items_of_the_call_output() {
     let (base_url, captured) = serve_response(200, responses_text_stream()).await;
-    let client = HttpModelClient::new(configuration(base_url, Protocol::Responses)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::Responses))
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     client
         .complete(
@@ -1100,7 +1140,9 @@ async fn responses_sends_tool_result_images_as_input_image_items_of_the_call_out
 #[tokio::test]
 async fn chat_completions_moves_tool_result_images_into_a_user_message_after_the_tool_messages() {
     let (base_url, captured) = serve_response(200, chat_text_stream()).await;
-    let client = HttpModelClient::new(configuration(base_url, Protocol::ChatCompletions)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::ChatCompletions))
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     client
         .complete(
@@ -1177,7 +1219,9 @@ fn user_image_request() -> ModelRequest {
 #[tokio::test]
 async fn responses_sends_user_images_as_input_image_data_urls() {
     let (base_url, captured) = serve_response(200, responses_text_stream()).await;
-    let client = HttpModelClient::new(configuration(base_url, Protocol::Responses)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::Responses))
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     client
         .complete(user_image_request(), events, CancellationToken::new())
@@ -1203,7 +1247,9 @@ async fn responses_sends_user_images_as_input_image_data_urls() {
 async fn chat_completions_sends_user_images_as_image_url_parts_and_keeps_text_only_turns_as_strings()
  {
     let (base_url, captured) = serve_response(200, chat_text_stream()).await;
-    let client = HttpModelClient::new(configuration(base_url, Protocol::ChatCompletions)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, Protocol::ChatCompletions))
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     client
         .complete(user_image_request(), events, CancellationToken::new())
@@ -1229,7 +1275,9 @@ async fn responses_and_chat_completions_refuse_images_outside_user_messages() {
     for protocol in [Protocol::Responses, Protocol::ChatCompletions] {
         for role in [Role::System, Role::Assistant] {
             let (base_url, _) = serve_response(200, String::new()).await;
-            let client = HttpModelClient::new(configuration(base_url, protocol)).unwrap();
+            let client = LocalModelClients::new(None)
+                .client(&configuration(base_url, protocol))
+                .unwrap();
             let (events, _) = mpsc::unbounded_channel();
             let error = client
                 .complete(
@@ -1287,7 +1335,9 @@ async fn responses_and_chat_completions_reject_invalid_cache_usage() {
     ];
     for (protocol, body) in cases {
         let (base_url, _) = serve_response(200, body).await;
-        let client = HttpModelClient::new(configuration(base_url, protocol)).unwrap();
+        let client = LocalModelClients::new(None)
+            .client(&configuration(base_url, protocol))
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(
@@ -1326,8 +1376,9 @@ async fn chat_completions_rejects_unfinished_duplicate_and_malformed_calls() {
         "data: [DONE]\n\n".into(),
     ] {
         let (base_url, _) = serve_response(200, body).await;
-        let client =
-            HttpModelClient::new(configuration(base_url, Protocol::ChatCompletions)).unwrap();
+        let client = LocalModelClients::new(None)
+            .client(&configuration(base_url, Protocol::ChatCompletions))
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         assert!(
             client
@@ -1368,8 +1419,9 @@ async fn chat_completions_rejects_noncomplete_finish_reasons_before_returning_te
             ),
         ] {
             let (base_url, _) = serve_response(200, body).await;
-            let client =
-                HttpModelClient::new(configuration(base_url, Protocol::ChatCompletions)).unwrap();
+            let client = LocalModelClients::new(None)
+                .client(&configuration(base_url, Protocol::ChatCompletions))
+                .unwrap();
             let (events, _) = mpsc::unbounded_channel();
             let error = client
                 .complete(

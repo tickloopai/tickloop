@@ -6,7 +6,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use model_http_support::serve_response;
 use serde_json::{Value, json};
-use tickloop_agent_model::{HttpModelClient, ModelClient, ModelRequest};
+use tickloop_agent_model::{LocalModelClients, ModelClients, ModelClient, ModelRequest};
 use tickloop_agent_protocol::{
     ChatId, Content, EventKind, ImageMediaType, ImageSource, InputContext, InputModality, Message,
     ModelConfig, Protocol, Role, ToolResultBlock, ToolResultContent,
@@ -152,7 +152,7 @@ async fn every_protocol_replaces_images_with_an_explanation_for_a_text_only_mode
     ] {
         let (base_url, request_receiver) = serve_response(200, text_stream(protocol)).await;
         let client =
-            HttpModelClient::new(configuration(base_url, protocol, &[InputModality::Text]))
+            LocalModelClients::new(None).client(&configuration(base_url, protocol, &[InputModality::Text]))
                 .unwrap();
         let (events, _) = mpsc::unbounded_channel();
 
@@ -175,7 +175,7 @@ async fn every_protocol_replaces_images_with_an_explanation_for_a_text_only_mode
 #[tokio::test]
 async fn messages_replaces_each_image_block_in_place() {
     let (base_url, request_receiver) = serve_response(200, text_stream(Protocol::Messages)).await;
-    let client = HttpModelClient::new(configuration(
+    let client = LocalModelClients::new(None).client(&configuration(
         base_url,
         Protocol::Messages,
         &[InputModality::Text],
@@ -247,7 +247,7 @@ async fn every_protocol_replaces_tool_result_images_for_a_text_only_model() {
     ] {
         let (base_url, request_receiver) = serve_response(200, text_stream(protocol)).await;
         let client =
-            HttpModelClient::new(configuration(base_url, protocol, &[InputModality::Text]))
+            LocalModelClients::new(None).client(&configuration(base_url, protocol, &[InputModality::Text]))
                 .unwrap();
         let (events, _) = mpsc::unbounded_channel();
 
@@ -309,8 +309,8 @@ async fn complete_turn(agent: &Agent, chat: ChatId, prompt: &str, paths: Vec<std
 }
 
 async fn switch_model(agent: &Agent, chat: ChatId, config: ModelConfig) {
-    let client = Arc::new(HttpModelClient::new(config.clone()).unwrap());
-    agent.set_model(chat, config, client).await.unwrap();
+    let client = LocalModelClients::new(None).client(&config).unwrap();
+    agent.set_model(chat, config).await.unwrap();
 }
 
 fn user_content(body: &Value) -> Vec<Value> {
@@ -337,7 +337,7 @@ async fn history_images_are_replaced_for_a_text_only_model_and_sent_again_after_
     let vision = configuration(vision_url, Protocol::Messages, &with_images);
     let agent = Agent::new_embedded(
         vision.clone(),
-        Arc::new(HttpModelClient::new(vision).unwrap()),
+        LocalModelClients::new(None).client(&vision).unwrap(),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     complete_turn(&agent, chat, "Describe @chart.png", vec![image]).await;

@@ -74,12 +74,12 @@ pub use auto_settings::{
 };
 pub use auto_setup::{AutoEnvironmentDraft, AutoSetupOptions, AutoSetupPurpose};
 pub use chat::{
-    AgentHostOptions, ChatSnapshot, DirectoryTrustPolicy, Event, EventKind, HostNote, LoopId,
-    OperationRecord, OperationState, PendingCommand, PendingInput, PermissionApprovalSource,
-    PermissionExecution, PermissionRequest, PromptPolicy, ProposedToolCall, QueuedInput,
-    QueuedInputKind, Receipt, RunId, SavedChat, ToolCallRecovery, UserShellReceipt,
-    UserShellRecord, UserShellState, chat_display_title, chat_has_work, chat_preview,
-    short_chat_title,
+    AgentHostOptions, ChatSnapshot, DirectoryTrustPolicy, Event, EventKind, HostNote, InputId,
+    LoopId, OperationRecord, OperationState, PendingCommand, PendingInput,
+    PermissionApprovalSource, PermissionExecution, PermissionRequest, PromptPolicy,
+    ProposedToolCall, QueuedInput, QueuedInputKind, Receipt, ResponseId, RunId, SavedChat,
+    ToolCallRecovery, UserShellReceipt, UserShellRecord, UserShellState, chat_display_title,
+    chat_has_work, chat_preview, short_chat_title,
 };
 pub use chat_status::ChatStatus;
 pub use context_usage::{

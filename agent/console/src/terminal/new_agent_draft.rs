@@ -255,7 +255,7 @@ impl NewAgentDraft {
     /// A staged model is replayed rather than launched, so the runtime clears the previous
     /// model's saved context window exactly as it does for a visible Agent.
     pub(super) fn into_first_create(self, mut launch: LaunchSpec, workdir: PathBuf) -> FirstCreate {
-        launch.workdir = workdir;
+        launch.folder = workdir;
         launch.exact_chat = None;
         let mut execution_mode = None;
         let mut changes = Vec::new();
@@ -382,7 +382,7 @@ mod tests {
             first.changes.as_slice(),
             [ConfigurationChange::ThinkingEnabled { enabled: false }]
         ));
-        assert_eq!(first.launch.workdir, PathBuf::from("/work"));
+        assert_eq!(first.launch.folder, PathBuf::from("/work"));
     }
 
     #[test]

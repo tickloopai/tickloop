@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
-use std::io;
-use std::path::Path;
 
 use uuid::Uuid;
 
 use tickloop_agent_base::timestamp::parse_timestamp_ms;
+use tickloop_agent_protocol::{Content, OriginalUserInput, Role, Usage};
 
 use super::entry::{ChainEntry, ContentReplacementEntry, FileHistorySnapshotEntry, Line};
-use super::writer::CachedMetadata;
+use super::outbox::CachedMetadata;
+use super::store::{StorePosition, StoredTranscript};
 
 pub(crate) struct LoadedTranscript {
     /// 从根到叶子的当前对话链。
@@ -21,6 +21,10 @@ pub(crate) struct LoadedTranscript {
     pub uuids: HashSet<Uuid>,
     /// 加载时需要让用户知道的问题，例如保留区段校验失败后加载了完整历史。
     pub warnings: Vec<String>,
+    /// The store position of the snapshot these Lines came from.
+    pub position: StorePosition,
+    /// The answer lifecycle and input ledger records, in store order.
+    pub lifecycle: Vec<Line>,
 }
 
 struct IndexedEntry {
@@ -29,97 +33,15 @@ struct IndexedEntry {
     entry: ChainEntry,
 }
 
-/// 照 Claude Code `SKIP_PRECOMPACT_THRESHOLD`：超过 5MB 的 Transcript 跳过压缩边界之前的内容。
-pub(crate) const SKIP_PRECOMPACT_THRESHOLD: u64 = 5 * 1024 * 1024;
-const COMPACT_BOUNDARY_MARKER: &[u8] = b"\"compact_boundary\"";
-const SYSTEM_LINE_PREFIX: &[u8] = b"{\"type\":\"system\"";
-const DELEGATION_LINE_PREFIX: &[u8] = b"{\"type\":\"delegation\"";
-/// 照 Claude Code `loadTranscriptFile` 与 `buildConversationChain` 加载 Transcript：
-/// 跳过无法解析的行（含截断的末行），重接部分压缩的保留区段，取时间最新的叶子沿父指针
-/// 重建对话链。没有任何 user／assistant 条目时返回 `None`。
-///
-/// 文件超过 5MB 时，照 Claude Code `readTranscriptForLoad` 丢弃最后一个不带保留区段的压缩边界
-/// 之前的内容，只从中读取 Chat 级元数据。与 Claude Code 不同，选出的叶子的祖先链走进被跳过的
-/// 区域时（rewind 越过该边界后继续的分支）改为加载完整文件，不截断对话。
-pub(crate) fn load(path: &Path) -> io::Result<Option<LoadedTranscript>> {
-    let bytes = std::fs::read(path)?;
-    let lines = split_lines(&bytes);
-    validate_delegation_records(&lines)?;
-    if bytes.len() as u64 > SKIP_PRECOMPACT_THRESHOLD {
-        let skip_before = last_unpreserved_boundary_offset(&lines);
-        if skip_before > 0 {
-            let (loaded, reaches_root) = load_lines(path, &lines, skip_before);
-            if reaches_root && loaded.is_some() {
-                return Ok(loaded);
-            }
-        }
-    }
-    Ok(load_lines(path, &lines, 0).0)
-}
-
-use super::entry::{MetadataHeader, MetadataKind};
-use tickloop_agent_protocol::{Content, OriginalUserInput, Role, Usage};
-
-fn validate_delegation_records(lines: &[(u64, &[u8])]) -> io::Result<()> {
-    let mut has_delegation_authorization = false;
-    let mut has_parent_origin = false;
-    for (_, raw) in lines {
-        match serde_json::from_slice::<MetadataHeader>(raw) {
-            Ok(header) => {
-                if matches!(header.kind, MetadataKind::System)
-                    && serde_json::from_slice::<serde_json::Value>(raw)
-                        .ok()
-                        .is_some_and(|entry| entry["loop"].get("subagentReport").is_some())
-                {
-                    serde_json::from_slice::<Line>(raw).map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Subagent report checkpoint is invalid or incompatible",
-                        )
-                    })?;
-                }
-                if matches!(header.kind, MetadataKind::Delegation) {
-                    serde_json::from_slice::<Line>(raw).map_err(|_| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "delegated Transcript authorization is invalid or incompatible",
-                        )
-                    })?;
-                    has_delegation_authorization = true;
-                }
-                has_parent_origin |= header
-                    .agent_origin
-                    .is_some_and(|origin| origin["sender_relationship"] == "parent");
-            }
-            Err(_) => {
-                if raw.trim_ascii_start().starts_with(DELEGATION_LINE_PREFIX) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "delegated Transcript authorization is invalid or incompatible",
-                    ));
-                }
-            }
-        }
-    }
-    if has_parent_origin && !has_delegation_authorization {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "delegated Transcript authorization is missing",
-        ));
-    }
-    Ok(())
-}
-
 /// Recovers original prompts from the logical ancestry of an active compact boundary.
-/// The ordinary large-file loader deliberately skips this ancestry for model context.
+/// The ordinary loader from the latest boundary deliberately skips this ancestry for model
+/// context.
 pub(crate) fn load_original_user_inputs(
-    path: &Path,
+    lines: &[Line],
     boundary_id: Uuid,
     chat_id: Uuid,
-) -> io::Result<Option<Vec<OriginalUserInput>>> {
-    let Some(ancestors) = load_compaction_ancestors(path, boundary_id, chat_id)? else {
-        return Ok(None);
-    };
+) -> Option<Vec<OriginalUserInput>> {
+    let ancestors = load_compaction_ancestors(lines, boundary_id, chat_id)?;
     let mut originals = Vec::new();
     for entry in ancestors {
         if entry.message.role != Role::User
@@ -131,7 +53,7 @@ pub(crate) fn load_original_user_inputs(
             continue;
         }
         let (Some(loop_id), Some(run_id)) = (entry.loop_id, entry.run_id) else {
-            return Ok(None);
+            return None;
         };
         let text = entry
             .message
@@ -144,7 +66,7 @@ pub(crate) fn load_original_user_inputs(
             .collect::<Vec<_>>()
             .join("\n\n");
         if text.is_empty() {
-            return Ok(None);
+            return None;
         }
         originals.push(OriginalUserInput {
             chat_id,
@@ -154,82 +76,58 @@ pub(crate) fn load_original_user_inputs(
             text,
         });
     }
-    Ok(Some(originals))
+    Some(originals)
 }
 
 pub(crate) fn load_compaction_ancestors(
-    path: &Path,
+    lines: &[Line],
     boundary_id: Uuid,
     chat_id: Uuid,
-) -> io::Result<Option<Vec<ChainEntry>>> {
-    let bytes = std::fs::read(path)?;
-    let mut entries = HashMap::new();
-    for (_, raw) in split_lines(&bytes) {
-        let Ok(line) = serde_json::from_slice::<Line>(raw) else {
-            continue;
-        };
-        if let Line::User(entry) | Line::Assistant(entry) | Line::System(entry) = line {
-            entries.insert(entry.uuid, entry);
-        }
-    }
-    let Some(boundary) = entries
+) -> Option<Vec<ChainEntry>> {
+    let entries = lines
+        .iter()
+        .filter_map(Line::chain_entry)
+        .map(|entry| (entry.uuid, entry))
+        .collect::<HashMap<_, _>>();
+    let boundary = entries
         .get(&boundary_id)
-        .filter(|entry| entry.chat_id == chat_id && entry.is_compact_boundary())
-    else {
-        return Ok(None);
-    };
-    let Some(logical_parent) = boundary.logical_parent_uuid else {
-        return Ok(None);
-    };
-    let mut cursor = Some(logical_parent);
+        .filter(|entry| entry.chat_id == chat_id && entry.is_compact_boundary())?;
+    let mut cursor = Some(boundary.logical_parent_uuid?);
     let mut visited = HashSet::new();
     let mut ancestors = Vec::new();
     while let Some(uuid) = cursor {
         if !visited.insert(uuid) {
-            return Ok(None);
+            return None;
         }
-        let Some(entry) = entries.get(&uuid).filter(|entry| entry.chat_id == chat_id) else {
-            return Ok(None);
-        };
-        ancestors.push(entry.clone());
+        let entry = entries
+            .get(&uuid)
+            .filter(|entry| entry.chat_id == chat_id)?;
+        ancestors.push((*entry).clone());
         cursor = if entry.is_compact_boundary() {
-            let Some(logical_parent) = entry.logical_parent_uuid else {
-                return Ok(None);
-            };
-            Some(logical_parent)
+            Some(entry.logical_parent_uuid?)
         } else {
             entry.parent_uuid
         };
     }
     ancestors.reverse();
-    Ok(Some(ancestors))
+    Some(ancestors)
 }
 
-/// 从 `skip_before` 偏移之后的行加载；之前的行只读取 Chat 级元数据。第二个返回值表示对话链
-/// 沿父指针一直走到了根，没有停在缺失的父条目上。
-fn load_lines(
-    path: &Path,
-    lines: &[(u64, &[u8])],
-    skip_before: u64,
+/// 照 Claude Code `loadTranscriptFile` 与 `buildConversationChain` 组装已读出的记录：重接部分
+/// 压缩的保留区段，从 `leaf`（缺省时取时间最新的叶子）沿父指针重建对话链。没有任何
+/// user／assistant 条目、或找不到 `leaf` 时返回 `None`。第二个返回值表示对话链沿父指针一直走到了
+/// 根，没有停在缺失的父条目上；记录只从最近的边界读起时，调用方据此改读完整历史。
+pub(crate) fn assemble(
+    stored: &StoredTranscript,
+    leaf: Option<Uuid>,
 ) -> (Option<LoadedTranscript>, bool) {
     let mut entries: HashMap<Uuid, IndexedEntry> = HashMap::new();
     let mut metadata = CachedMetadata::default();
     let mut file_history_snapshots = HashMap::new();
     let mut content_replacements = Vec::new();
-    for (file_index, &(line_offset, raw)) in lines.iter().enumerate() {
-        if raw.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        if line_offset < skip_before
-            && !serde_json::from_slice::<MetadataHeader>(raw)
-                .is_ok_and(|header| header.kind.is_retained())
-        {
-            continue;
-        }
-        let Ok(line) = serde_json::from_slice::<Line>(raw) else {
-            continue;
-        };
-        let role = match &line {
+    let mut lifecycle = Vec::new();
+    for (file_index, line) in stored.retained.iter().chain(&stored.lines).enumerate() {
+        let role = match line {
             Line::User(_) => Role::User,
             Line::Assistant(_) => Role::Assistant,
             Line::System(_) => Role::System,
@@ -289,11 +187,13 @@ fn load_lines(
                 content_replacements.push(entry.clone());
                 continue;
             }
+            Line::Response(_) | Line::Input(_) => {
+                lifecycle.push(line.clone());
+                continue;
+            }
             Line::Unknown => continue,
         };
-        let (Line::User(entry) | Line::Assistant(entry) | Line::System(entry)) = line else {
-            unreachable!();
-        };
+        let entry = line.chain_entry().expect("chain line").clone();
         entries.insert(
             entry.uuid,
             IndexedEntry {
@@ -304,9 +204,9 @@ fn load_lines(
         );
     }
     let uuids = entries.keys().copied().collect::<HashSet<_>>();
-    let mut warnings = Vec::new();
+    let mut warnings = stored.warnings.clone();
     let prune = apply_preserved_segment_relinks(&mut entries).unwrap_or_else(|warning| {
-        warnings.push(format!("{} in {}", warning, path.display()));
+        warnings.push(warning);
         None
     });
     // 有后续对话条目的条目。Loop 条目不算后续：它们挂在消息之后，不改变哪条消息是叶子。
@@ -326,16 +226,24 @@ fn load_lines(
                 .and_then(|parent| parent.entry.parent_uuid);
         }
     }
-    let leaf = entries
-        .values()
-        .filter(|indexed| indexed.role != Role::System && !parents.contains(&indexed.entry.uuid))
-        .max_by(|left, right| {
-            let left_time = parse_timestamp_ms(&left.entry.timestamp).unwrap_or(i64::MIN);
-            let right_time = parse_timestamp_ms(&right.entry.timestamp).unwrap_or(i64::MIN);
-            left_time
-                .cmp(&right_time)
-                .then_with(|| right.file_index.cmp(&left.file_index))
-        });
+    let leaf = match leaf {
+        Some(uuid) => match entries.get(&uuid) {
+            Some(indexed) => Some(indexed),
+            None => return (None, false),
+        },
+        None => entries
+            .values()
+            .filter(|indexed| {
+                indexed.role != Role::System && !parents.contains(&indexed.entry.uuid)
+            })
+            .max_by(|left, right| {
+                let left_time = parse_timestamp_ms(&left.entry.timestamp).unwrap_or(i64::MIN);
+                let right_time = parse_timestamp_ms(&right.entry.timestamp).unwrap_or(i64::MIN);
+                left_time
+                    .cmp(&right_time)
+                    .then_with(|| right.file_index.cmp(&left.file_index))
+            }),
+    };
     let Some(leaf) = leaf else {
         let has_chat_without_messages = metadata
             .artifact_ticks
@@ -352,6 +260,8 @@ fn load_lines(
             file_history_snapshots,
             content_replacements,
             warnings,
+            position: stored.position,
+            lifecycle,
         });
         return (loaded, true);
     };
@@ -389,6 +299,8 @@ fn load_lines(
         file_history_snapshots,
         content_replacements,
         warnings,
+        position: stored.position,
+        lifecycle,
     };
     (Some(loaded), reaches_root)
 }
@@ -426,48 +338,6 @@ fn append_trailing_loop_records(
         chain.push(next.entry.clone());
         tip = Some(next.entry.uuid);
     }
-}
-
-/// 每一行的文件偏移与内容（不含换行符）。
-fn split_lines(bytes: &[u8]) -> Vec<(u64, &[u8])> {
-    let mut offset = 0u64;
-    bytes
-        .split(|byte| *byte == b'\n')
-        .map(|raw| {
-            let line = (offset, raw);
-            offset += raw.len() as u64 + 1;
-            line
-        })
-        .collect()
-}
-
-/// 照 Claude Code `scanChunkLines`：最后一个不带保留区段的压缩边界所在行的偏移；带保留区段的
-/// 边界不截断（保留的消息在它之前）。被定向摘要重写到新边界之后的旧边界有父条目，不是对话链
-/// 的起点，同样不截断（Claude Code 写出的边界父指针总为空）。没有这样的边界时返回 0。
-fn last_unpreserved_boundary_offset(lines: &[(u64, &[u8])]) -> u64 {
-    lines
-        .iter()
-        .rev()
-        .filter(|(_, raw)| {
-            raw.starts_with(SYSTEM_LINE_PREFIX)
-                && raw
-                    .windows(COMPACT_BOUNDARY_MARKER.len())
-                    .any(|window| window == COMPACT_BOUNDARY_MARKER)
-        })
-        .find_map(|(offset, raw)| match serde_json::from_slice::<Line>(raw) {
-            Ok(Line::System(entry))
-                if entry.is_compact_boundary()
-                    && entry.parent_uuid.is_none()
-                    && entry
-                        .compact_metadata
-                        .as_ref()
-                        .is_none_or(|metadata| metadata.preserved_segment.is_none()) =>
-            {
-                Some(*offset)
-            }
-            _ => None,
-        })
-        .unwrap_or(0)
 }
 
 /// 带保留区段的文件在重接之后，按最后一个边界删除之前内容的依据。
@@ -664,12 +534,13 @@ fn is_tool_results(entry: &ChainEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
     use crate::transcript::entry::{
         COMPACT_BOUNDARY_SUBTYPE, CompactMetadata, CompactTriggerEntry, PreservedSegmentEntry,
     };
+    use crate::transcript::jsonl::{SKIP_PRECOMPACT_THRESHOLD, load_file as load};
     use tickloop_agent_base::timestamp::format_timestamp;
     use tickloop_agent_protocol::Message;
 
@@ -687,7 +558,7 @@ mod tests {
             is_sidechain: false,
             chat_id: Uuid::nil(),
             timestamp: format_timestamp(milliseconds),
-            cwd: PathBuf::from("/tmp"),
+            cwd: Some(PathBuf::from("/tmp")),
             version: "test".into(),
             git_branch: None,
             message,
@@ -712,6 +583,8 @@ mod tests {
             usage: None,
             model: None,
             private_source: None,
+            response_id: None,
+            input_id: None,
             loop_id: None,
             slug: None,
             loop_record: None,

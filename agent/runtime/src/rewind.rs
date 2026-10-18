@@ -42,7 +42,8 @@ impl Agent {
         mode: RewindMode,
     ) -> Result<RewindOutcome, AgentError> {
         self.require_root_chat(chat_id, "rewind history").await?;
-        let mut tasks = self.inner.tasks.lock().await;
+        // Held until the task is spawned: `shutdown` either refuses this or waits for the task.
+        let admission = self.inner.tasks.token();
         let (point, history, loops_at_start) = {
             let mut chats = self.inner.chats.lock().await;
             if self.inner.closed.load(Ordering::SeqCst) {
@@ -59,20 +60,26 @@ impl Agent {
                 .iter()
                 .map(|goal| goal.id)
                 .collect::<HashSet<_>>();
+            let history = match (mode.restores_code(), &chat.file_history) {
+                (false, _) => None,
+                (true, Some(history)) => Some(history.clone()),
+                (true, None) => return Err(AgentError::Invalid(super::FOLDERLESS_CHAT.into())),
+            };
             if mode.restores_conversation() {
                 conversation_before(&chat.snapshot, &chat.bookkeeping, &point, &loops_at_start)?;
             }
             chat.active = Some(CancellationToken::new());
-            (point, chat.file_history.clone(), loops_at_start)
+            (point, history, loops_at_start)
         };
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let agent = self.clone();
         // 放进宿主任务，调用方放弃等待时也会释放占用。
-        tasks.push(tokio::spawn(async move {
-            let restored = if mode.restores_code() {
-                Some(tokio::task::spawn_blocking(move || history.rewind(message_id)).await)
-            } else {
-                None
+        self.inner.tasks.spawn(async move {
+            let restored = match history {
+                Some(history) => {
+                    Some(tokio::task::spawn_blocking(move || history.rewind(message_id)).await)
+                }
+                None => None,
             };
             let (result, removed_loops) = {
                 let mut chats = agent.inner.chats.lock().await;
@@ -108,8 +115,8 @@ impl Agent {
             while let Some((receipt, request, cancel)) = next {
                 next = agent.run(receipt, request, cancel).await;
             }
-        }));
-        drop(tasks);
+        });
+        drop(admission);
         receiver
             .await
             .map_err(|_| AgentError::Invalid("rewind task ended unexpectedly".into()))?
@@ -264,7 +271,8 @@ impl Agent {
             .get(&chat_id)
             .ok_or(AgentError::NotFound)?
             .file_history
-            .clone();
+            .clone()
+            .ok_or_else(|| AgentError::Invalid(super::FOLDERLESS_CHAT.into()))?;
         tokio::task::spawn_blocking(move || history.files_changed_by_rewind(message_id))
             .await
             .map_err(|error| AgentError::Invalid(format!("file comparison ended: {error}")))
@@ -295,6 +303,7 @@ impl Agent {
             .any(|(_, note)| *note == HostNote::PlanModeExit);
         chat.snapshot = candidate;
         chat.bookkeeping = candidate_bookkeeping;
+        self.inner.ledger_changes.send_replace(());
         self.emit_conversation_rewound(chat, loop_id, point.message_id);
     }
 
@@ -318,13 +327,18 @@ impl Agent {
     pub(super) fn file_history_directory(
         &self,
         chat_id: ChatId,
-        workdir: &Path,
+        folder: &Path,
     ) -> PrivateDirectory {
-        match &self.inner.recorder {
-            Some(recorder) => PrivateDirectory::trusted(recorder.file_history_root()),
+        match self
+            .inner
+            .recorder
+            .as_ref()
+            .and_then(|recorder| recorder.file_history_root())
+        {
+            Some(directory) => PrivateDirectory::trusted(directory),
             // 不持久化时不在工作目录写文件，备份放在系统临时目录的项目目录下（工单 54），
             // 创建时逐层校验属主、权限位与符号链接。
-            None => private_project_temp_directory(workdir)
+            None => private_project_temp_directory(folder)
                 .join(crate::file_history::FILE_HISTORY_DIRECTORY),
         }
         .join(chat_id.to_string())
@@ -340,7 +354,7 @@ impl Agent {
                 let chats = self.inner.chats.lock().await;
                 let Some(plan) = chats
                     .get(&chat_id)
-                    .and_then(|chat| chat.file_history.next_snapshot_plan())
+                    .and_then(|chat| chat.file_history.as_ref()?.next_snapshot_plan())
                 else {
                     return;
                 };
@@ -353,7 +367,11 @@ impl Agent {
             let Some(chat) = chats.get_mut(&chat_id) else {
                 return;
             };
-            if let Some(snapshot) = chat.file_history.commit_snapshot(computed) {
+            if let Some(snapshot) = chat
+                .file_history
+                .as_mut()
+                .and_then(|history| history.commit_snapshot(computed))
+            {
                 self.record_file_history_snapshot(chat_id, snapshot.message_id, &snapshot, false);
             }
         }
@@ -382,13 +400,16 @@ impl Agent {
     pub(super) async fn track_file_edit(&self, chat_id: ChatId, path: &Path, message_id: Uuid) {
         let directory = {
             let chats = self.inner.chats.lock().await;
-            let Some(chat) = chats.get(&chat_id) else {
+            let Some(history) = chats
+                .get(&chat_id)
+                .and_then(|chat| chat.file_history.as_ref())
+            else {
                 return;
             };
-            if !chat.file_history.needs_backup(path) {
+            if !history.needs_backup(path) {
                 return;
             }
-            chat.file_history.backup_directory().clone()
+            history.backup_directory().clone()
         };
         let source = path.to_path_buf();
         let backup =
@@ -400,7 +421,11 @@ impl Agent {
         let Some(chat) = chats.get_mut(&chat_id) else {
             return;
         };
-        if let Some(snapshot) = chat.file_history.commit_tracked_edit(path, backup) {
+        if let Some(snapshot) = chat
+            .file_history
+            .as_mut()
+            .and_then(|history| history.commit_tracked_edit(path, backup))
+        {
             self.record_file_history_snapshot(chat_id, message_id, &snapshot, true);
         }
     }
@@ -434,6 +459,8 @@ fn conversation_before(
     candidate.message_runs.split_off(&index);
     candidate.message_contexts.split_off(&index);
     candidate_bookkeeping.denial_references.split_off(&index);
+    candidate_bookkeeping.message_responses.split_off(&index);
+    candidate_bookkeeping.lifecycle.restart_claims_at(index);
     candidate.message_ids.split_off(&index);
     candidate.original_message_ids.split_off(&index);
     candidate.prompt_execution_modes.split_off(&index);
@@ -468,6 +495,16 @@ fn conversation_before(
         .collect::<HashSet<_>>();
     for start in candidate_bookkeeping.loop_starts.values_mut() {
         *start = (*start).min(index);
+    }
+    for pending in &candidate.pending_inputs {
+        if removed_loops.contains(&pending.receipt.loop_id) {
+            candidate_bookkeeping.lifecycle.settle(
+                pending.receipt.run_id,
+                crate::transcript::SettledOutcome::Discarded {
+                    reason: crate::transcript::DiscardReason::LoopEnded,
+                },
+            );
+        }
     }
     candidate
         .pending_inputs
@@ -646,7 +683,7 @@ mod tests {
 
     use super::*;
     use crate::file_history::test_pause;
-    use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+    use tickloop_agent_model::{LocalModelClients, ModelClients, ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
     use tickloop_agent_protocol::{Event, Receipt, UserShellRecord};
     use tickloop_agent_protocol::{InputModality, ModelConfig, ModelIdentity, Protocol, Usage};
 
@@ -1058,7 +1095,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let agent = Agent::new_embedded(
             config(),
-            Arc::new(tickloop_agent_model::HttpModelClient::new(config()).unwrap()),
+            LocalModelClients::new(None).client(&config()).unwrap(),
         );
         let chat_id = agent.create_chat(directory.path().into()).await.unwrap();
         {

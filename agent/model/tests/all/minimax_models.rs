@@ -2,11 +2,11 @@ use tickloop_agent_test_support::model_http_support;
 
 use serde_json::{Value, json};
 use tickloop_agent_model::{
-    ModelConfigExt, ModelError, ModelRequest, StructuredOutput,
+    LocalModelClients, ModelClients, ModelConfigExt, ModelError, ModelRequest, StructuredOutput,
     auth::minimax::{MiniMaxAuth, MiniMaxRegion},
     cards::ModelCatalog,
     credentials::save_api_key,
-    model_client, validate_reasoning_effort,
+    validate_reasoning_effort,
 };
 use tickloop_agent_protocol::{
     Content, ImageMediaType, ImageSource, Message, ReasoningEffort, Role,
@@ -133,7 +133,8 @@ async fn regional_api_uses_bearer_messages_images_thinking_and_cache_usage() {
             height: 1,
         });
         let (events, _) = mpsc::unbounded_channel();
-        let output = model_client(config, Some(&root))
+        let output = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
             .unwrap()
             .complete(input, events, CancellationToken::new())
             .await
@@ -191,7 +192,8 @@ async fn structured_response_uses_prompted_json_and_rejects_extra_operations() {
             schema: json!({"type":"object","properties":{"allow":{"type":"boolean"}},"required":["allow"],"additionalProperties":false}),
         });
         let (events, _) = mpsc::unbounded_channel();
-        let output = model_client(config, Some(&root))
+        let output = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
             .unwrap()
             .complete(input, events, CancellationToken::new())
             .await;
@@ -291,7 +293,9 @@ async fn regional_oauth_credentials_reach_the_model_and_preview_cannot_disable_t
         )
         .await;
         config.base_url = url;
-        let client = model_client(config.clone(), Some(&root)).unwrap();
+        let client = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let result = client
             .complete(
@@ -368,7 +372,8 @@ async fn minimax_final_input_usage_corrects_provisional_cache_without_ledger_reg
         let (url, captured) = model_http_support::serve_response(200, body).await;
         config.base_url = url;
         let (events, mut receiver) = mpsc::unbounded_channel();
-        let result = model_client(config, Some(&root))
+        let result = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
             .unwrap()
             .complete(request(None), events, CancellationToken::new())
             .await;
@@ -431,7 +436,8 @@ async fn minimax_usage_preserves_nullable_cache_fallback_and_initial_output_befo
         let (url, captured) = model_http_support::serve_response(200, body).await;
         config.base_url = url;
         let (events, mut receiver) = mpsc::unbounded_channel();
-        let result = model_client(config, Some(&root))
+        let result = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
             .unwrap()
             .complete(request(None), events, CancellationToken::new())
             .await;

@@ -17,7 +17,7 @@ fn make_workspace(
     additional_directories: Vec<std::path::PathBuf>,
 ) -> Workspace {
     Workspace {
-        workdir: root.to_path_buf(),
+        folder: Some(root.to_path_buf()),
         additional_directories,
     }
 }

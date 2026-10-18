@@ -141,8 +141,8 @@ async fn two_chats_progress_independently_while_two_goals_share_only_their_own_c
     assert_eq!(snapshot.loops[0].state, LoopState::Running);
     assert_eq!(snapshot.loops[1].state, LoopState::Queued);
     assert_eq!(
-        snapshot.workdir,
-        alpha_directory.path().canonicalize().unwrap()
+        snapshot.folder,
+        Some(alpha_directory.path().canonicalize().unwrap())
     );
     let beta_history =
         serde_json::to_string(&agent.snapshot(beta).await.unwrap().messages).unwrap();

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tickloop_agent_model::{ModelConfigExt, cards::ModelCatalog};
+use tickloop_agent_model::{LocalModelClients, ModelClients, ModelConfigExt, cards::ModelCatalog};
 use tickloop_agent_protocol::{
     Content, Decision, EventKind, ModelChange, PermissionRule, Protocol, ReasoningEffort, Usage,
 };
@@ -210,7 +210,7 @@ async fn switching_an_idle_chat_keeps_the_goal_and_uses_the_new_model_with_histo
     let selected = tickloop_agent_model::cards::model_for_persistent_selection(selected);
     assert_eq!(
         agent
-            .set_model(chat, selected.clone(), replacement.clone())
+            .set_model(chat, selected.clone())
             .await
             .unwrap(),
         ModelChange::Applied
@@ -282,12 +282,7 @@ async fn switching_model_and_thinking_during_tool_approval_waits_until_the_old_r
     selected.api_key_env = "PATH".into();
     assert_eq!(
         agent
-            .set_model_with_thinking(
-                chat,
-                selected.clone(),
-                replacement.clone(),
-                Some(ReasoningEffort::High),
-            )
+            .set_model_with_thinking(chat, selected.clone(), Some(ReasoningEffort::High))
             .await
             .unwrap(),
         ModelChange::Pending
@@ -359,7 +354,7 @@ async fn model_switch_projects_private_history_and_rejects_invalid_configuration
     let replacement = Arc::new(ScriptedModel::new(vec![text("Model B reply")]));
     assert_eq!(
         agent
-            .set_model(chat, selected.clone(), replacement.clone())
+            .set_model(chat, selected.clone())
             .await
             .unwrap(),
         ModelChange::Applied
@@ -369,7 +364,7 @@ async fn model_switch_projects_private_history_and_rejects_invalid_configuration
     selected.base_url = "invalid".into();
     assert!(
         agent
-            .set_model(chat, selected, replacement.clone())
+            .set_model(chat, selected)
             .await
             .is_err()
     );
@@ -394,7 +389,7 @@ async fn model_switch_projects_private_history_and_rejects_invalid_configuration
         );
     }
     agent
-        .set_model(chat, config(), original.clone())
+        .set_model(chat, config())
         .await
         .unwrap();
     agent
@@ -463,7 +458,7 @@ async fn compaction_appends_a_boundary_and_restart_loads_only_the_compacted_chai
     selected.protocol = Protocol::Responses;
     let replacement = Arc::new(ScriptedModel::new(vec![text("Continued from the summary")]));
     agent
-        .set_model(chat, selected.clone(), replacement.clone())
+        .set_model(chat, selected.clone())
         .await
         .unwrap();
     agent
@@ -703,7 +698,7 @@ async fn conversation_output_budget_is_bounded_on_the_actual_http_request() {
     model.base_url = endpoint;
     model.max_output_tokens = 128_000;
     model.card.as_mut().unwrap().max_output_tokens = 128_000;
-    let client = Arc::new(tickloop_agent_model::HttpModelClient::new(model.clone()).unwrap());
+    let client = LocalModelClients::new(None).client(&model).unwrap();
     let agent = Agent::new_embedded(model, client);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
@@ -920,7 +915,7 @@ async fn context_window_maximum_follows_the_selected_model() {
     assert_eq!(snapshot.effective_context_window_tokens(), Some(1_000_000));
 
     agent
-        .set_model(chat, config(), Arc::new(ScriptedModel::new(Vec::new())))
+        .set_model(chat, config())
         .await
         .unwrap();
     assert_eq!(
@@ -932,7 +927,7 @@ async fn context_window_maximum_follows_the_selected_model() {
         None
     );
     agent
-        .set_model(chat, model_config, Arc::new(ScriptedModel::new(Vec::new())))
+        .set_model(chat, model_config)
         .await
         .unwrap();
     assert_eq!(

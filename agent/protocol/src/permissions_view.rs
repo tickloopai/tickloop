@@ -92,15 +92,16 @@ pub enum PermissionChange {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WorkspaceScope {
-    workdir: PathBuf,
+    /// `None` for a Chat without a Folder.
+    folder: Option<PathBuf>,
     additional_directories: Vec<PathBuf>,
 }
 
 impl WorkspaceScope {
-    /// A scope over canonical directories; `additional_directories` excludes `workdir`.
-    pub fn new(workdir: PathBuf, additional_directories: Vec<PathBuf>) -> Self {
+    /// A scope over canonical directories; `additional_directories` excludes `folder`.
+    pub fn new(folder: Option<PathBuf>, additional_directories: Vec<PathBuf>) -> Self {
         Self {
-            workdir,
+            folder,
             additional_directories,
         }
     }

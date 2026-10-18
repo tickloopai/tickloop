@@ -151,7 +151,7 @@ impl Agent {
     pub(super) async fn watch_commands(&self, chat_id: ChatId, tools: Arc<Tools>) {
         let mut updates = tools.subscribe_commands();
         let agent = self.clone();
-        self.inner.tasks.lock().await.push(tokio::spawn(async move {
+        self.inner.tasks.spawn(async move {
             loop {
                 tokio::select! {
                     _=agent.inner.shutdown.cancelled()=>break,
@@ -162,7 +162,7 @@ impl Agent {
                     }
                 }
             }
-        }));
+        });
     }
 
     async fn record_watched_command(&self, chat_id: ChatId, command: CommandSnapshot) {

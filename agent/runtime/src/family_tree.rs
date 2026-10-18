@@ -133,7 +133,14 @@ impl Agent {
                     run.cancel.cancel();
                 }
                 child.snapshot.pending_commands.clear();
-                child.snapshot.pending_inputs.clear();
+                let discarded = std::mem::take(&mut child.snapshot.pending_inputs);
+                self.settle_removed_inputs(
+                    child,
+                    &discarded,
+                    crate::transcript::SettledOutcome::Discarded {
+                        reason: crate::transcript::DiscardReason::Stopped,
+                    },
+                );
                 child.ready_runs.clear();
                 let parent = child.snapshot.delegation.as_ref().unwrap().parent_chat_id;
                 let loops = child

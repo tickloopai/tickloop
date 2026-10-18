@@ -16,11 +16,15 @@ mod family;
 mod family_tree;
 pub mod file_history;
 mod handback;
+mod harness;
+pub use harness::{HarnessOptions, HarnessSeams, ToolPolicy};
 mod host_context;
 mod host_notes;
 pub mod host_tools;
 pub mod hosted;
 mod jev_review;
+mod lifecycle;
+pub use lifecycle::InputLedgerState;
 mod loop_lease;
 mod mcp_http;
 mod mcp_resources;
@@ -46,6 +50,7 @@ mod context;
 mod delegation;
 mod denials;
 mod directed_summary;
+pub mod environment;
 mod event_sources;
 mod feedback_inbox;
 #[cfg(test)]
@@ -109,7 +114,7 @@ use tickloop_agent_protocol::{
     ApprovalFailureKind, ApprovalFallbackReason, ApprovalOutcome, ApprovalPath,
     ApprovalReviewerKind, AutoBlockKind, AutoReviewerHealth, ChatId, ChatSnapshot,
     CompactionMarker, Content, Decision, DelegationMetadata, DenialReference, DirectedHumanSource,
-    DirectoryTrustPolicy, Event, EventKind, ExecutionMode, HostCallContext, InputContext,
+    DirectoryTrustPolicy, Event, EventKind, ExecutionMode, HostCallContext, InputContext, InputId,
     LedgerError, LoopId, LoopSnapshot, LoopState, Message, ModelConfig, ModelRequestKind,
     MonitorMembership, OperationRecord, OperationState, PendingCommand, PendingInput,
     PermissionApprovalSource, PermissionExecution, PermissionPolicy, PermissionRequest,
@@ -147,6 +152,9 @@ pub enum AgentError {
     Usage(#[from] LedgerError),
     #[error("storage failure: {0}")]
     Storage(String),
+    /// A newer holder owns the Chat's Transcript; this Harness writes nothing more to it.
+    #[error("the Chat's Transcript belongs to a newer holder")]
+    Fenced,
     #[error("chat or goal does not exist")]
     NotFound,
     #[error("invalid request: {0}")]
@@ -159,6 +167,19 @@ pub enum AgentError {
         "the current model does not support image input; remove the attached images such as @image mentions, or switch to a model that accepts images with /model"
     )]
     ImageInputUnsupported,
+}
+
+impl From<transcript::TranscriptError> for AgentError {
+    fn from(error: transcript::TranscriptError) -> Self {
+        match error {
+            transcript::TranscriptError::Fenced => Self::Fenced,
+            transcript::TranscriptError::Unsupported => {
+                Self::Invalid("Unsupported: the Transcript store does not support this".into())
+            }
+            transcript::TranscriptError::Conflict(message)
+            | transcript::TranscriptError::Storage(message) => Self::Storage(message),
+        }
+    }
 }
 
 impl From<projection::InvalidConversation> for AgentError {
@@ -175,7 +196,7 @@ impl From<AgentError> for AccessError {
             AgentError::UntrustedWorkingDirectory { .. } => {
                 AccessErrorCode::UntrustedWorkingDirectory
             }
-            AgentError::Storage(_) => AccessErrorCode::Storage,
+            AgentError::Storage(_) | AgentError::Fenced => AccessErrorCode::Storage,
             AgentError::Invalid(message) if message.starts_with("Unsupported:") => {
                 AccessErrorCode::Unsupported
             }
@@ -279,6 +300,8 @@ impl Agent {
 struct Inner {
     /// 本进程当前选择的模型；新建与恢复的 Chat 使用它，`set_model` 随选择更新。
     selected_model: std::sync::Mutex<chat_settings::SelectedModel>,
+    /// Builds the client of each model a Chat selects.
+    models: Arc<dyn tickloop_agent_model::ModelClients>,
     /// 用户设置文件；不写设置的 Agent（测试等）为 `None`。
     settings: Option<tickloop_agent_config::UserSettings>,
     host_options: AgentHostOptions,
@@ -296,8 +319,9 @@ struct Inner {
     host_contexts: std::sync::Mutex<host_context::HostContexts>,
     subagent_invocations: Mutex<HashMap<(RunId, String), delegation::SubagentInvocation>>,
     family_mailbox: Mutex<family_mailbox::FamilyMailbox>,
-    input_wakeup: tokio::sync::watch::Sender<()>,
-    title_requests: Mutex<HashSet<ChatId>>,
+    /// Changes whenever a Chat's input ledger accepts or settles an input.
+    ledger_changes: tokio::sync::watch::Sender<()>,
+    title_requests: Mutex<HashMap<ChatId, chat_title::TitleJob>>,
     /// Display names generated for background Shells without a description of their own, by
     /// task: `None` while pending or after a failed attempt. Each task gets one attempt in this
     /// process, and model-facing text never uses them.
@@ -310,7 +334,8 @@ struct Inner {
     user_shell_events: broadcast::Sender<UserShellRecord>,
     user_shell_cancellations: std::sync::Mutex<HashMap<(ChatId, Uuid), CancellationToken>>,
     task_notifications: broadcast::Sender<TaskNotification>,
-    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Every task this instance spawns; `shutdown` waits for all of them.
+    tasks: tokio_util::task::TaskTracker,
     recorder: Option<persistence::ChatRecorder>,
     /// 本进程持有的 Trigger 租约；Inner 释放时随之归还。
     loop_leases: loop_lease::LoopLeases,
@@ -321,7 +346,10 @@ struct Inner {
     judgment: Mutex<Option<Arc<dyn tickloop_agent_model::judgment::JudgmentClient>>>,
     auto_health: Mutex<auto_health::AutoHealth>,
     host_tools: std::sync::RwLock<Option<Arc<dyn crate::host_tools::HostToolProvider>>>,
-    hosted_ticks: std::sync::RwLock<Option<Arc<crate::hosted::tools::HostedTickTools>>>,
+    /// Where Chats with a Folder run their commands and Ticks; `None` when Chats have no Folder.
+    environment: Option<Arc<dyn environment::ExecutionEnvironment>>,
+    tool_policy: ToolPolicy,
+    host_rules: Vec<PermissionRule>,
     /// Where every Chat's shell commands run: the Tickhost.
     shells: Arc<crate::hosted::shells::ShellTasks>,
     stopped_child_hook: std::sync::RwLock<Option<Arc<dyn StoppedChildHook>>>,
@@ -358,6 +386,9 @@ struct ChatBookkeeping {
     /// Shells whose completion notification is in the conversation but no turn has read yet.
     unread_notifications: Vec<tick_protocol::InstanceRef>,
     restored_skill_names: HashSet<String>,
+    lifecycle: lifecycle::Lifecycle,
+    /// The answer each message is part of.
+    message_responses: BTreeMap<usize, tickloop_agent_protocol::ResponseId>,
 }
 
 impl ChatBookkeeping {
@@ -365,7 +396,11 @@ impl ChatBookkeeping {
     fn add_loop(&mut self, snapshot: &mut ChatSnapshot, goal: LoopSnapshot) {
         self.dependency_baselines.insert(
             goal.id,
-            approval_context::dependency_fingerprints(&snapshot.workdir),
+            snapshot
+                .folder
+                .as_deref()
+                .map(approval_context::dependency_fingerprints)
+                .unwrap_or_default(),
         );
         self.loop_starts.insert(goal.id, snapshot.messages.len());
         snapshot.loops.push(goal);
@@ -399,7 +434,8 @@ struct Chat {
     skills: Arc<tickloop_agent_config::skills::SkillRegistry>,
     /// 照 Claude Code，替换决定只在运行期保存，恢复时由 Transcript 中的内容替换条目重建。
     content_replacements: tool_results::ContentReplacementState,
-    file_history: FileHistory,
+    /// `None` for a Chat without a Folder, which edits no local file.
+    file_history: Option<FileHistory>,
     watching_commands: bool,
     watching_user_shells: bool,
     user_shell_queue: Arc<Notify>,
@@ -454,6 +490,7 @@ struct SubmissionOptions {
     agent_message: Option<AgentMessageSource>,
     directed_human: Option<DirectedHumanSource>,
     goal_title: Option<String>,
+    ledger: Option<lifecycle::LedgerInput>,
 }
 
 #[derive(Clone, Copy)]
@@ -675,11 +712,40 @@ fn host_provider_is_confirmed(
         .is_none_or(|provider| provider.tool_set_is_confirmed())
 }
 
+/// The options of an Agent on this computer: every capability and no host rule.
+fn local_options(
+    model: ModelConfig,
+    settings: Option<tickloop_agent_config::UserSettings>,
+    host: AgentHostOptions,
+) -> HarnessOptions {
+    HarnessOptions {
+        model,
+        settings,
+        host,
+        tools: ToolPolicy::local(),
+        host_rules: Vec::new(),
+    }
+}
+
 fn configured_workspace_for_chat(chat: &Chat) -> tickloop_agent_tools::Workspace {
     tickloop_agent_tools::Workspace {
-        workdir: chat.snapshot.workdir.clone(),
+        folder: chat.snapshot.folder.clone(),
         additional_directories: chat.snapshot.additional_directories.clone(),
     }
+}
+
+/// Why a Chat without a Folder refuses what needs local files or commands.
+const FOLDERLESS_CHAT: &str = "Unsupported: this Chat has no Folder";
+
+/// Why an Agent without an Execution Environment refuses what concerns a local Folder.
+const NO_ENVIRONMENT: &str = "Unsupported: this Agent has no Execution Environment for a Folder";
+
+/// The Folder of a Chat that needs one for local files or commands.
+fn require_folder(snapshot: &ChatSnapshot) -> Result<&Path, AgentError> {
+    snapshot
+        .folder
+        .as_deref()
+        .ok_or_else(|| AgentError::Invalid(FOLDERLESS_CHAT.into()))
 }
 
 /// 新 Chat 的初始快照。
@@ -733,7 +799,7 @@ fn answerable_permission_request(
     Ok(request)
 }
 
-fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnapshot {
+fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> ChatSnapshot {
     ChatSnapshot {
         search_config: tickloop_agent_protocol::SearchConfig::enabled_default(),
         task_tools_enabled: false,
@@ -754,7 +820,7 @@ fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnaps
         family_inputs: BTreeMap::new(),
         sent_agent_messages: BTreeMap::new(),
         generated_title: None,
-        workdir,
+        folder,
         model,
         reasoning_effort: None,
         thinking_enabled: true,
@@ -808,11 +874,18 @@ impl Drop for Inner {
 }
 
 impl Agent {
-    fn discover_skills(&self, workdir: &Path) -> Arc<tickloop_agent_config::skills::SkillRegistry> {
-        Arc::new(tickloop_agent_config::skills::SkillRegistry::discover(
-            workdir,
-            self.inner.config_root.as_deref(),
-        ))
+    /// The Skills of a Chat with `folder`; a Chat without a Folder reads no Skill directory.
+    fn discover_skills(
+        &self,
+        folder: Option<&Path>,
+    ) -> Arc<tickloop_agent_config::skills::SkillRegistry> {
+        Arc::new(match folder {
+            Some(folder) => tickloop_agent_config::skills::SkillRegistry::discover(
+                folder,
+                self.inner.config_root.as_deref(),
+            ),
+            None => tickloop_agent_config::skills::SkillRegistry::builtin(),
+        })
     }
 
     /// Reads a Chat's Skills again, so a Tick package installed, updated or uninstalled by
@@ -820,20 +893,20 @@ impl Agent {
     /// the Chat at its next request or Skill invocation. Unchanged Skills give a byte-identical
     /// listing, so the model's prompt cache still holds.
     async fn rediscover_skills(&self, chat_id: ChatId) {
-        let Some(workdir) = self
+        let Some(Some(folder)) = self
             .inner
             .chats
             .lock()
             .await
             .get(&chat_id)
-            .map(|chat| chat.snapshot.workdir.clone())
+            .map(|chat| chat.snapshot.folder.clone())
         else {
             return;
         };
-        let skills = self.discover_skills(&workdir);
+        let skills = self.discover_skills(Some(&folder));
         let mut chats = self.inner.chats.lock().await;
         if let Some(chat) = chats.get_mut(&chat_id)
-            && chat.snapshot.workdir == workdir
+            && chat.snapshot.folder.as_ref() == Some(&folder)
         {
             chat.skills = skills;
         }
@@ -850,28 +923,32 @@ impl Agent {
             } else {
                 shared_tasks::TaskToolAccess::Disabled
             },
+            &self.inner.tool_policy,
         )
         .definitions()
     }
 
-    /// Installs the worker's hosted Ticks, which its Chats' Monitors list and close directly.
-    pub fn install_hosted_ticks(&self, tools: Arc<crate::hosted::tools::HostedTickTools>) {
-        *self.inner.hosted_ticks.write().unwrap() = Some(tools);
-    }
-
+    /// The environment's hosted Ticks, which its Chats' Monitors list and close directly.
     pub fn hosted_ticks(&self) -> Option<Arc<crate::hosted::tools::HostedTickTools>> {
-        self.inner.hosted_ticks.read().unwrap().clone()
+        self.inner.environment.as_ref()?.hosted_ticks()
     }
 
-    /// Lets the daemon grant this worker's Shell spawns and views in its Tickhost.
+    /// Grants this Agent's Shell spawns and views in a Tickhost after it was built, for an Agent
+    /// without a daemon such as a test's. Chats without a Folder run no command, so an Agent
+    /// without an environment ignores it.
     pub fn install_shell_grants(&self, grants: Arc<dyn crate::hosted::shells::ShellGrants>) {
-        self.inner.shells.install_grants(grants);
+        if self.inner.environment.is_some() {
+            self.inner.shells.install_grants(grants);
+        }
     }
 
     /// Runs and shows this Agent's shell commands in a Tickhost of its own, served inside this
     /// process, for an Agent without a daemon such as a test's.
     pub fn install_own_tickhost(&self) {
-        self.install_shell_grants(Arc::new(crate::hosted::shells::OwnTickhost::new()));
+        // An Agent without an environment runs no command, so it builds no Tickhost either.
+        if self.inner.environment.is_some() {
+            self.install_shell_grants(Arc::new(crate::hosted::shells::OwnTickhost::new()));
+        }
     }
 
     pub fn shell_tasks(&self) -> Arc<crate::hosted::shells::ShellTasks> {
@@ -1111,7 +1188,7 @@ impl Agent {
         cancel: CancellationToken,
         emit_permission: bool,
     ) -> Result<approval_assessment::ApprovalAssessment, AgentError> {
-        let (snapshot, bookkeeping, chat_client, boundary_id, legacy_path) = {
+        let (snapshot, bookkeeping, chat_client, boundary_id) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
             let boundary_id =
@@ -1127,8 +1204,6 @@ impl Agent {
                         }
                         _ => None,
                     });
-            let legacy_path = boundary_id
-                .and_then(|_| self.inner.recorder.as_ref()?.path_for_chat(receipt.chat_id));
             let mut snapshot = chat.snapshot.clone();
             snapshot.policy =
                 delegation::effective_policy(&chats, receipt).map_err(AgentError::Invalid)?;
@@ -1137,22 +1212,30 @@ impl Agent {
                 chat.bookkeeping.clone(),
                 chat.client.clone(),
                 boundary_id,
-                legacy_path,
             )
         };
-        let chat_id = receipt.chat_id;
-        let legacy = match (boundary_id, legacy_path) {
-            (Some(boundary_id), Some(path)) => tokio::task::spawn_blocking(move || {
-                crate::transcript::load_original_user_inputs(&path, boundary_id, chat_id)
-                    .ok()
-                    .flatten()
-            })
-            .await
-            .ok()
-            .flatten(),
-            _ => None,
+        // One load serves both the original prompts and the history before the boundary.
+        let has_boundary = snapshot
+            .message_compactions
+            .values()
+            .any(|marker| matches!(marker, CompactionMarker::Boundary(_)));
+        let lines = if has_boundary {
+            self.stored_lines(receipt.chat_id).await
+        } else {
+            None
         };
-        let ancestors = self.approval_history_ancestors(&snapshot).await;
+        let legacy = boundary_id
+            .zip(lines.as_deref())
+            .and_then(|(boundary_id, lines)| {
+                crate::transcript::load_original_user_inputs(lines, boundary_id, receipt.chat_id)
+            });
+        let ancestors = match &lines {
+            Some(lines) => {
+                self.approval_history_ancestors(&snapshot, Some(lines))
+                    .await
+            }
+            None => None,
+        };
         let (auto_settings, auto_revision) = match self.auto_settings_snapshot().await {
             Ok(settings) => settings,
             Err(error) => {
@@ -1177,12 +1260,33 @@ impl Agent {
                 ));
             }
         };
+        let Some(folder) = snapshot.folder.clone() else {
+            let reason =
+                "This Chat has no Folder to review this action in; review it manually.".to_owned();
+            if emit_permission {
+                self.emit_permission_check(
+                    receipt,
+                    self.apply_prompt_policy(Decision::Ask),
+                    reason.clone(),
+                )
+                .await;
+            }
+            return Ok(approval_assessment::ApprovalAssessment::missing_context(
+                operation,
+                snapshot.policy.revision,
+                reason,
+                tickloop_agent_protocol::ApprovalDiagnostic::ReviewerFailure {
+                    failure: ApprovalFailureKind::Configuration,
+                },
+            ));
+        };
         let context = approval_context::capture(
             &snapshot,
             &bookkeeping,
             operation,
             legacy,
-            auto_settings.policy_for_directory(&snapshot.workdir),
+            &folder,
+            auto_settings.policy_for_directory(&folder),
         );
         let mut context = match context {
             Ok(context) => context,
@@ -1531,26 +1635,18 @@ impl Agent {
         settings: Option<tickloop_agent_config::UserSettings>,
         host_options: AgentHostOptions,
     ) -> Result<Self, AgentError> {
-        tickloop_agent_base::private_fs::create_private_directory(&root)
+        let store = transcript::JsonlTranscriptStore::open(root)
             .map_err(|error| AgentError::Storage(error.to_string()))?;
-        let root = root
-            .canonicalize()
-            .map_err(|error| AgentError::Storage(error.to_string()))?;
-        if !root.is_dir() {
-            return Err(AgentError::Storage(
-                "session root is not a directory".into(),
-            ));
-        }
         let settings =
-            settings.unwrap_or_else(|| tickloop_agent_config::UserSettings::in_root(&root));
-        let recorder =
-            (!settings.skips_transcripts()).then(|| persistence::ChatRecorder::new(root));
+            settings.unwrap_or_else(|| tickloop_agent_config::UserSettings::in_root(store.root()));
+        let recorder = (!settings.skips_transcripts())
+            .then(|| persistence::ChatRecorder::new(Arc::new(store)));
         Ok(Self::build(
-            model,
+            local_options(model, Some(settings), host_options),
+            Arc::new(harness::OneClient(client.clone())),
             client,
             recorder,
-            Some(settings),
-            host_options,
+            Some(Arc::new(environment::LocalEnvironment::bare())),
         ))
     }
 
@@ -1572,17 +1668,11 @@ impl Agent {
 
     /// 不持久化、也不读写用户设置的 Agent：Chat 只存在于本进程内存中。
     pub fn new(model: ModelConfig, client: Arc<dyn ModelClient>) -> Self {
-        Self::build(model, client, None, None, AgentHostOptions::default())
+        Self::new_local(model, client, None, AgentHostOptions::default())
     }
 
     pub fn new_embedded(model: ModelConfig, client: Arc<dyn ModelClient>) -> Self {
-        Self::build(
-            model,
-            client,
-            None,
-            None,
-            AgentHostOptions::embedded_defaults(),
-        )
+        Self::new_local(model, client, None, AgentHostOptions::embedded_defaults())
     }
 
     pub fn new_with_options(
@@ -1590,7 +1680,7 @@ impl Agent {
         client: Arc<dyn ModelClient>,
         host_options: AgentHostOptions,
     ) -> Self {
-        Self::build(model, client, None, None, host_options)
+        Self::new_local(model, client, None, host_options)
     }
 
     /// 不保存 Chat、但照常读写用户设置的 Agent（`--no-session-persistence`）。
@@ -1599,13 +1689,7 @@ impl Agent {
         client: Arc<dyn ModelClient>,
         settings: tickloop_agent_config::UserSettings,
     ) -> Self {
-        Self::build(
-            model,
-            client,
-            None,
-            Some(settings),
-            AgentHostOptions::default(),
-        )
+        Self::new_local(model, client, Some(settings), AgentHostOptions::default())
     }
 
     pub fn new_with_user_settings_embedded(
@@ -1613,10 +1697,9 @@ impl Agent {
         client: Arc<dyn ModelClient>,
         settings: tickloop_agent_config::UserSettings,
     ) -> Self {
-        Self::build(
+        Self::new_local(
             model,
             client,
-            None,
             Some(settings),
             AgentHostOptions::embedded_defaults(),
         )
@@ -1628,16 +1711,40 @@ impl Agent {
         settings: tickloop_agent_config::UserSettings,
         host_options: AgentHostOptions,
     ) -> Self {
-        Self::build(model, client, None, Some(settings), host_options)
+        Self::new_local(model, client, Some(settings), host_options)
     }
 
-    fn build(
+    /// An Agent on this computer's files that keeps no Transcript.
+    fn new_local(
         model: ModelConfig,
         client: Arc<dyn ModelClient>,
-        recorder: Option<persistence::ChatRecorder>,
         settings: Option<tickloop_agent_config::UserSettings>,
         host_options: AgentHostOptions,
     ) -> Self {
+        Self::build(
+            local_options(model, settings, host_options),
+            Arc::new(harness::OneClient(client.clone())),
+            client,
+            None,
+            Some(Arc::new(environment::LocalEnvironment::bare())),
+        )
+    }
+
+    /// `client` is the one `models` built for `options.model`.
+    fn build(
+        options: HarnessOptions,
+        models: Arc<dyn tickloop_agent_model::ModelClients>,
+        client: Arc<dyn ModelClient>,
+        recorder: Option<persistence::ChatRecorder>,
+        environment: Option<Arc<dyn environment::ExecutionEnvironment>>,
+    ) -> Self {
+        let HarnessOptions {
+            model,
+            settings,
+            host: host_options,
+            tools: tool_policy,
+            host_rules,
+        } = options;
         let model = tickloop_agent_model::cards::model_for_persistent_selection(model);
         let config_root = settings
             .as_ref()
@@ -1652,6 +1759,7 @@ impl Agent {
                     config: model,
                     client,
                 }),
+                models,
                 settings,
                 host_options,
                 config_root,
@@ -1663,8 +1771,8 @@ impl Agent {
                 host_contexts: std::sync::Mutex::new(host_context::HostContexts::default()),
                 subagent_invocations: Mutex::new(HashMap::new()),
                 family_mailbox: Mutex::new(family_mailbox::FamilyMailbox::default()),
-                input_wakeup: tokio::sync::watch::channel(()).0,
-                title_requests: Mutex::new(HashSet::new()),
+                ledger_changes: tokio::sync::watch::channel(()).0,
+                title_requests: Mutex::new(HashMap::new()),
                 shell_descriptions: Mutex::new(HashMap::new()),
                 shell_description_events: broadcast::channel(256).0,
                 subagent_registry: Mutex::new(HashMap::new()),
@@ -1673,7 +1781,7 @@ impl Agent {
                 user_shell_events: broadcast::channel(256).0,
                 user_shell_cancellations: std::sync::Mutex::new(HashMap::new()),
                 task_notifications: broadcast::channel(256).0,
-                tasks: Mutex::new(Vec::new()),
+                tasks: tokio_util::task::TaskTracker::new(),
                 recorder,
                 loop_leases: loop_lease::LoopLeases::default(),
                 approvals: Mutex::new(HashMap::new()),
@@ -1683,12 +1791,17 @@ impl Agent {
                 judgment: Mutex::new(None),
                 auto_health: Mutex::new(auto_health::AutoHealth::default()),
                 host_tools: std::sync::RwLock::new(None),
-                hosted_ticks: std::sync::RwLock::new(None),
                 // Until a daemon grants its spawns and views, an Agent runs and shows no shell
                 // command.
-                shells: crate::hosted::shells::ShellTasks::new(Arc::new(
-                    crate::hosted::shells::NoDaemon,
-                )),
+                shells: crate::hosted::shells::ShellTasks::new(
+                    environment
+                        .as_ref()
+                        .and_then(|environment| environment.shell_grants())
+                        .unwrap_or_else(|| Arc::new(crate::hosted::shells::NoDaemon)),
+                ),
+                environment,
+                tool_policy,
+                host_rules,
                 stopped_child_hook: std::sync::RwLock::new(None),
                 tick_stream_installed: AtomicBool::new(false),
                 tick_deliveries: std::sync::Mutex::new(
@@ -1703,6 +1816,15 @@ impl Agent {
         };
         agent.inner.shells.follow_monitor(agent.downgrade());
         agent
+    }
+
+    /// Refuses a local-Folder operation before it reads anything local, in an Agent whose Chats
+    /// have no Folder.
+    fn require_environment(&self) -> Result<(), AgentError> {
+        match self.inner.environment {
+            Some(_) => Ok(()),
+            None => Err(AgentError::Invalid(NO_ENVIRONMENT.into())),
+        }
     }
 
     fn require_working_directory_trust(&self, workdir: &Path) -> Result<(), AgentError> {
@@ -1754,6 +1876,7 @@ impl Agent {
     }
 
     pub async fn trust_working_directory(&self, workdir: PathBuf) -> Result<(), AgentError> {
+        self.require_environment()?;
         let workdir = workdir
             .canonicalize()
             .map_err(|_| AgentError::Invalid("working directory does not exist".into()))?;
@@ -1771,34 +1894,64 @@ impl Agent {
             .map_err(|error| AgentError::Storage(error.to_string()))
     }
 
-    pub async fn create_chat(&self, workdir: PathBuf) -> Result<ChatId, AgentError> {
-        self.create_chat_with_id(Uuid::new_v4(), workdir).await
+    pub async fn create_chat(&self, folder: PathBuf) -> Result<ChatId, AgentError> {
+        self.create_chat_with_id(Uuid::new_v4(), Some(folder)).await
+    }
+
+    /// A new Chat without a Folder, in an Agent without an Execution Environment.
+    pub async fn create_chat_without_folder(&self) -> Result<ChatId, AgentError> {
+        self.create_chat_with_id(Uuid::new_v4(), None).await
     }
 
     pub async fn restore_empty_chat(
         &self,
         chat_id: ChatId,
-        workdir: PathBuf,
+        folder: PathBuf,
     ) -> Result<(), AgentError> {
         if self.inner.chats.lock().await.contains_key(&chat_id) {
             return Ok(());
         }
-        self.create_chat_with_id(chat_id, workdir).await?;
+        self.create_chat_with_id(chat_id, Some(folder)).await?;
         Ok(())
     }
 
     async fn create_chat_with_id(
         &self,
         id: ChatId,
-        workdir: PathBuf,
+        folder: Option<PathBuf>,
     ) -> Result<ChatId, AgentError> {
-        self.create_chat_with_delegation(id, workdir, None).await
+        self.create_chat_with_delegation(id, folder, None).await
+    }
+
+    /// The canonical Folder of a new Chat. Chats have a Folder exactly when the Agent has an
+    /// Execution Environment.
+    fn admit_folder(&self, folder: Option<PathBuf>) -> Result<Option<PathBuf>, AgentError> {
+        let folder = match (folder, &self.inner.environment) {
+            (None, None) => return Ok(None),
+            (Some(folder), Some(_)) => folder,
+            (Some(_), None) => {
+                return Err(AgentError::Invalid(NO_ENVIRONMENT.into()));
+            }
+            (None, Some(_)) => {
+                return Err(AgentError::Invalid("a new Chat needs a Folder".into()));
+            }
+        };
+        let folder = folder
+            .canonicalize()
+            .map_err(|_| AgentError::Invalid("working directory does not exist".into()))?;
+        if !folder.is_dir() {
+            return Err(AgentError::Invalid(
+                "working directory must be a directory".into(),
+            ));
+        }
+        self.require_working_directory_trust(&folder)?;
+        Ok(Some(folder))
     }
 
     async fn create_chat_with_delegation(
         &self,
         id: ChatId,
-        workdir: PathBuf,
+        folder: Option<PathBuf>,
         inherited: Option<(
             DelegationMetadata,
             ChatSnapshot,
@@ -1806,19 +1959,11 @@ impl Agent {
             OutputStyle,
         )>,
     ) -> Result<ChatId, AgentError> {
-        let workdir = workdir
-            .canonicalize()
-            .map_err(|_| AgentError::Invalid("working directory does not exist".into()))?;
-        if !workdir.is_dir() {
-            return Err(AgentError::Invalid(
-                "working directory must be a directory".into(),
-            ));
-        }
-        self.require_working_directory_trust(&workdir)?;
+        let folder = self.admit_folder(folder)?;
         if let Some(recorder) = &self.inner.recorder {
-            recorder.register_chat(id, &workdir);
+            recorder.register_chat(id, folder.as_deref()).await?;
         }
-        let mut snapshot = empty_snapshot(id, workdir, ModelConfig::unselected());
+        let mut snapshot = empty_snapshot(id, folder, ModelConfig::unselected());
         let mut bookkeeping = ChatBookkeeping::default();
         let _settings_gate = self.inner.settings_writes.lock().await;
         let (client, output_style) =
@@ -1841,8 +1986,11 @@ impl Agent {
             .entry(id)
             .or_default();
         let tools = self.create_chat_tools(&snapshot);
-        let skills = self.discover_skills(&snapshot.workdir);
-        let file_history = FileHistory::new(self.file_history_directory(id, &snapshot.workdir));
+        let skills = self.discover_skills(snapshot.folder.as_deref());
+        let file_history = snapshot
+            .folder
+            .as_deref()
+            .map(|folder| FileHistory::new(self.file_history_directory(id, folder)));
         let mut chats = self.inner.chats.lock().await;
         if let Some(metadata) = &mut snapshot.delegation {
             let sessions = self.inner.session_permissions.lock().await;
@@ -1903,8 +2051,24 @@ impl Agent {
         goal: Option<LoopId>,
         input: String,
     ) -> Result<Receipt, AgentError> {
-        self.submit_internal(chat_id, goal, input, SubmissionOptions::default())
-            .await
+        let ledger = lifecycle::LedgerInput::new(
+            Uuid::new_v4(),
+            transcript::InputOp::Continue,
+            goal,
+            &input,
+            &[],
+            &[],
+        );
+        self.submit_internal(
+            chat_id,
+            goal,
+            input,
+            SubmissionOptions {
+                ledger: Some(ledger),
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     pub async fn invoke_skill(
@@ -1944,6 +2108,14 @@ impl Agent {
         } else {
             format!("/{} {}", invoked.name, arguments.trim())
         };
+        let ledger = lifecycle::LedgerInput::new(
+            Uuid::new_v4(),
+            transcript::InputOp::Skill,
+            goal,
+            &input,
+            &[],
+            &[],
+        );
         self.submit_internal(
             chat_id,
             goal,
@@ -1951,6 +2123,7 @@ impl Agent {
             SubmissionOptions {
                 invoked_skill: Some(invoked),
                 host_context,
+                ledger: Some(ledger),
                 ..Default::default()
             },
         )
@@ -1971,14 +2144,15 @@ impl Agent {
             .to_vec())
     }
 
-    /// Checks that the user may invoke `name` in a new Chat at `workdir`, before any Chat exists.
+    /// Checks that the user may invoke `name` in a new Chat with `folder`, before any Chat exists.
     pub fn check_user_skill(
         &self,
-        workdir: &Path,
+        folder: &Path,
         name: &str,
         arguments: &str,
     ) -> Result<(), AgentError> {
-        self.discover_skills(workdir)
+        self.require_environment()?;
+        self.discover_skills(Some(folder))
             .expand(
                 name,
                 arguments,
@@ -2036,6 +2210,41 @@ impl Agent {
         paths: Vec<PathBuf>,
         host_context: Option<HostCallContext>,
     ) -> Result<Receipt, AgentError> {
+        self.submit_with_input_id(
+            chat_id,
+            Uuid::new_v4(),
+            goal,
+            input,
+            contexts,
+            paths,
+            host_context,
+        )
+        .await
+    }
+
+    /// Submits a prompt under the host's own input id, recorded in the Chat's input ledger. The
+    /// prompt's message id, and so its display id, is the input id. Submitting an id again with
+    /// the same payload returns its original receipt without running it again; with another
+    /// payload it is refused.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_with_input_id(
+        &self,
+        chat_id: ChatId,
+        input_id: InputId,
+        goal: Option<LoopId>,
+        input: String,
+        contexts: Vec<InputContext>,
+        paths: Vec<PathBuf>,
+        host_context: Option<HostCallContext>,
+    ) -> Result<Receipt, AgentError> {
+        let ledger = lifecycle::LedgerInput::new(
+            input_id,
+            transcript::InputOp::Continue,
+            goal,
+            &input,
+            &contexts,
+            &paths,
+        );
         self.submit_contexts(family::ContextSubmission {
             chat_id,
             goal,
@@ -2045,6 +2254,7 @@ impl Agent {
             host_context,
             directed_source: None,
             target_generation: None,
+            ledger: Some(ledger),
         })
         .await
     }
@@ -2062,6 +2272,7 @@ impl Agent {
             host_context,
             directed_source,
             target_generation,
+            ledger,
         } = submission;
         if contexts.len().saturating_add(paths.len()) > input_context::MAX_REFERENCES {
             return Err(AgentError::Invalid(format!(
@@ -2076,12 +2287,41 @@ impl Agent {
         }
         let admission = {
             let chats = self.inner.chats.lock().await;
-            let snapshot = &chats.get(&chat_id).ok_or(AgentError::NotFound)?.snapshot;
+            let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+            if let Some(ledger) = &ledger
+                && let Some(replay) = chat.bookkeeping.lifecycle.replay(chat_id, ledger)
+            {
+                return replay;
+            }
+            let snapshot = &chat.snapshot;
             if goal.is_some_and(|id| !snapshot.loops.iter().any(|existing| existing.id == id)) {
                 return Err(AgentError::NotFound);
             }
+            if snapshot.folder.is_none() {
+                if !paths.is_empty() || contexts.iter().any(|context| context.path().is_some()) {
+                    return Err(AgentError::Invalid(format!(
+                        "{FOLDERLESS_CHAT}, so a prompt cannot attach local files"
+                    )));
+                }
+                drop(chats);
+                return self
+                    .submit_internal(
+                        chat_id,
+                        goal,
+                        input,
+                        SubmissionOptions {
+                            contexts,
+                            directed_human: directed_source,
+                            family_generation: target_generation,
+                            host_context,
+                            ledger,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+            }
             let workspace = tickloop_agent_tools::Workspace {
-                workdir: snapshot.workdir.clone(),
+                folder: snapshot.folder.clone(),
                 additional_directories: snapshot.additional_directories.clone(),
             };
             let reads = paths
@@ -2134,6 +2374,7 @@ impl Agent {
                 family_generation: target_generation,
                 attachment_admission: Some(admission),
                 host_context,
+                ledger,
                 ..Default::default()
             },
         )
@@ -2162,6 +2403,7 @@ impl Agent {
             agent_message,
             directed_human,
             goal_title,
+            ledger,
         } = options;
         let is_feedback = feedback_input.is_some();
         let resumes_feedback = trigger_source.is_none() && agent_message.is_none();
@@ -2174,6 +2416,18 @@ impl Agent {
         let mut chats = self.inner.chats.lock().await;
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(AgentError::Invalid("agent host has shut down".into()));
+        }
+        // Checked again under this lock: a concurrent first submission of the same input may
+        // have been accepted while this one was being prepared.
+        if let Some(ledger) = &ledger
+            && let Some(replay) = chats
+                .get(&chat_id)
+                .ok_or(AgentError::NotFound)?
+                .bookkeeping
+                .lifecycle
+                .replay(chat_id, ledger)
+        {
+            return replay;
         }
         if let Some(admission) = &attachment_admission {
             let sessions = self.inner.session_permissions.lock().await;
@@ -2369,7 +2623,7 @@ impl Agent {
                 drop(chats);
                 let next = self.next_run(chat_id).await?;
                 if let Some(next) = next {
-                    self.inner.tasks.lock().await.push(self.run_task(next));
+                    self.run_task(next);
                 }
                 return Ok(pending_receipt);
             }
@@ -2396,6 +2650,9 @@ impl Agent {
         chat.snapshot.last_queue_sequence += 1;
         let queued_sequence = chat.snapshot.last_queue_sequence;
         let directed_origin = directed_human.clone();
+        if let Some(ledger) = &ledger {
+            chat.bookkeeping.lifecycle.accept(ledger, &receipt);
+        }
         chat.snapshot.pending_inputs.insert(
             index,
             PendingInput {
@@ -2416,8 +2673,12 @@ impl Agent {
         if let Some(feedback_input) = feedback_input {
             chat.feedback_inputs.insert(receipt.run_id, feedback_input);
         }
-        let watch = (!chat.watching_commands).then(|| chat.tools.clone());
-        chat.watching_commands = true;
+        // A Chat without a Folder runs no command, so nothing watches its commands.
+        let watch =
+            (chat.snapshot.folder.is_some() && !chat.watching_commands).then(|| chat.tools.clone());
+        if watch.is_some() {
+            chat.watching_commands = true;
+        }
         let mut session_context = None;
         let mut session_candidate = None;
         if inherit_branch_session {
@@ -2458,25 +2719,21 @@ impl Agent {
                 .record_loop_run_state(chat_id, loop_id, loop_lease::RunStateChange::Armed)
                 .await;
             self.warn_loop_run_state_failure(chat_id, loop_id, recorded);
-            self.inner
-                .tasks
-                .lock()
-                .await
-                .push(self.trigger_task(chat_id, loop_id, trigger, cancel));
+            self.trigger_task(chat_id, loop_id, trigger, cancel);
             self.sync_tick_subscriptions().await;
         }
         if let Some(tools) = watch {
             self.watch_commands(chat_id, tools).await;
         }
         if let Some(next) = next {
-            self.inner.tasks.lock().await.push(self.run_task(next));
+            self.run_task(next);
         }
         // Child completions held for this failed or interrupted Loop arrive once it is continued.
         if continues_ended_loop {
             self.flush_subagent_notifications(chat_id).await;
         }
 
-        self.inner.input_wakeup.send_replace(());
+        self.inner.ledger_changes.send_replace(());
         if resumes_feedback {
             Box::pin(self.resume_feedback_sources(chat_id)).await;
         }
@@ -2492,6 +2749,7 @@ impl Agent {
     }
 
     fn publish_event(&self, chat: &mut Chat, receipt: &Receipt, kind: EventKind) {
+        lifecycle::claim_response_messages(chat);
         chat.snapshot.last_sequence += 1;
         let event = Event {
             sequence: chat.snapshot.last_sequence,
@@ -2556,14 +2814,26 @@ impl Agent {
         // After compaction, which may drop earlier notes; boxed to keep the run future small.
         Box::pin(self.announce_host_tool_changes(receipt, host_tools)).await?;
         Box::pin(self.announce_plan_mode_exit(receipt)).await?;
-        let workspace_host = crate::host_tools::current_workspace_host(
-            self.inner.host_tools.read().unwrap().as_deref(),
-        );
+        // Only a Chat with a Folder probes the host it runs in.
+        let workspace_host = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&receipt.chat_id)
+            .is_some_and(|chat| chat.snapshot.folder.is_some())
+            .then(|| {
+                crate::host_tools::current_workspace_host(
+                    self.inner.host_tools.read().unwrap().as_deref(),
+                )
+            });
         let family_roster = self.family_agents(receipt.chat_id).await?;
         {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&receipt.chat_id).unwrap();
-            if workspace_host.runs_ticks()
+            if workspace_host
+                .as_ref()
+                .is_some_and(crate::host_tools::WorkspaceHostContext::runs_ticks)
                 && !chat
                     .snapshot
                     .invoked_skills
@@ -2585,33 +2855,49 @@ impl Agent {
             registry.refresh(chat);
             request.tools = registry.definitions();
             (request.messages, request.history_sources) = context::model_history(chat)?;
-            let replacements = tool_results::enforce_tool_result_budget(
-                &mut request.messages,
-                &mut chat.content_replacements,
-                chat.tools.chat_directory(),
-            );
-            if !replacements.is_empty() {
-                self.record_content_replacements(&chat.snapshot, replacements);
+            match chat.tools.chat_directory() {
+                Some(chat_directory) => {
+                    let replacements = tool_results::enforce_tool_result_budget(
+                        &mut request.messages,
+                        &mut chat.content_replacements,
+                        chat_directory,
+                    );
+                    if !replacements.is_empty() {
+                        self.record_content_replacements(&chat.snapshot, replacements);
+                    }
+                }
+                None => tool_results::cut_tool_results_over_budget(&mut request.messages),
             }
-            let state = serde_json::json!({
-                "workdir": chat.snapshot.workdir,
-                "family_temp_directory": chat.tools.family_temp_directory(),
-                "scratchpad": chat.tools.family_temp_directory().join(tickloop_agent_tools::SCRATCHPAD_SUBDIRECTORY),
-                "delegation": chat.snapshot.delegation,
-                "family_members": family_roster.iter().map(|member| serde_json::json!({
-                    "chat_id": member.chat_id, "parent_chat_id": member.parent_chat_id,
-                    "name": member.handle, "depth": member.depth, "state": member.availability,
-                })).collect::<Vec<_>>(),
-                "workspace_host": workspace_host,
-                "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
-                "artifact_ticks": chat.snapshot.artifact_ticks,
-                "goal": chat.snapshot.loops.iter().find(|goal| goal.id == receipt.loop_id),
-                "chat_goals": chat.snapshot.loops,
-                "execution_mode": chat.snapshot.policy.mode,
-                "web_search": { "enabled": chat.snapshot.search_config.is_some(), "settings_command": "/websearch" },
-                "plan": chat.snapshot.plans.iter().find(|plan| plan.loop_id == receipt.loop_id),
-                "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
-            });
+            let scope = system_prompt::PromptScope {
+                has_folder: chat.snapshot.folder.is_some(),
+                tools: self.inner.tool_policy,
+            };
+            let family_temp = chat.tools.family_temp_directory();
+            let state = match &chat.snapshot.folder {
+                Some(folder) => serde_json::json!({
+                    "workdir": folder,
+                    "family_temp_directory": family_temp,
+                    "scratchpad": family_temp.map(|family_temp| family_temp.join(tickloop_agent_tools::SCRATCHPAD_SUBDIRECTORY)),
+                    "delegation": chat.snapshot.delegation,
+                    "family_members": family_roster.iter().map(|member| serde_json::json!({
+                        "chat_id": member.chat_id, "parent_chat_id": member.parent_chat_id,
+                        "name": member.handle, "depth": member.depth, "state": member.availability,
+                    })).collect::<Vec<_>>(),
+                    "workspace_host": workspace_host,
+                    "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
+                    "artifact_ticks": chat.snapshot.artifact_ticks,
+                    "goal": chat.snapshot.loops.iter().find(|goal| goal.id == receipt.loop_id),
+                    "chat_goals": chat.snapshot.loops,
+                    "execution_mode": chat.snapshot.policy.mode,
+                    "web_search": { "enabled": chat.snapshot.search_config.is_some(), "settings_command": "/websearch" },
+                    "plan": chat.snapshot.plans.iter().find(|plan| plan.loop_id == receipt.loop_id),
+                    "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
+                }),
+                // Without a Folder the host state names no local path, Loop or host probe.
+                None => serde_json::json!({
+                    "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
+                }),
+            };
             let plan_mode = self.plan_mode_section(chat, receipt.loop_id);
             request.history_sources.insert(0, None);
             request.messages.insert(
@@ -2623,6 +2909,7 @@ impl Agent {
                             &state,
                             chat.output_style,
                             plan_mode.as_deref(),
+                            scope,
                         ),
                     }],
                 },
@@ -2827,7 +3114,26 @@ impl Agent {
                         skill.run_id = Some(active.run_id);
                     }
                 }
+                let index = candidate.snapshot.messages.len();
                 self.append_input_message(&mut candidate, pending);
+                if let Some(response) = candidate
+                    .bookkeeping
+                    .lifecycle
+                    .active_response(active.run_id)
+                    && index < candidate.snapshot.messages.len()
+                {
+                    candidate
+                        .bookkeeping
+                        .message_responses
+                        .insert(index, response);
+                }
+                self.settle_input(
+                    &mut candidate,
+                    receipt.run_id,
+                    transcript::SettledOutcome::Merged {
+                        into: active.run_id,
+                    },
+                );
                 candidate.snapshot.last_sequence += 1;
                 let event = Event {
                     sequence: candidate.snapshot.last_sequence,
@@ -2994,6 +3300,7 @@ impl Agent {
                         self.inner.tick_stream_installed.load(Ordering::SeqCst),
                         self.inner.host_options.prompt_policy,
                         shared_tasks::tool_access(&chats, &receipt),
+                        &self.inner.tool_policy,
                     )
                 };
                 request.tools = registry.definitions();
@@ -3213,6 +3520,30 @@ impl Agent {
                     EventKind::Failed(error)
                 }
             };
+        let is_closed = self.inner.closed.load(Ordering::SeqCst);
+        let (ending, usage) = match &event {
+            EventKind::Completed { usage } => {
+                (transcript::ResponseEnding::Completed, usage.clone())
+            }
+            EventKind::Failed(error) if !is_closed => (
+                transcript::ResponseEnding::Failed {
+                    error: error.clone(),
+                },
+                Usage::default(),
+            ),
+            // A Run that fails or stops while the host shuts down lost its host.
+            _ => (
+                transcript::ResponseEnding::Interrupted {
+                    by: if is_closed {
+                        transcript::InterruptedBy::Host
+                    } else {
+                        transcript::InterruptedBy::User
+                    },
+                },
+                Usage::default(),
+            ),
+        };
+        self.end_response(chat, receipt.run_id, ending, usage);
         let is_deliverable = chat
             .snapshot
             .loops
@@ -3330,7 +3661,7 @@ impl Agent {
             .await
             .map_err(|error| error.to_string())?;
         if let Some(next) = next {
-            self.inner.tasks.lock().await.push(self.run_task(next));
+            self.run_task(next);
         }
         tokio::select! {biased;_ = cancel.cancelled()=>Err("waiting run was cancelled".into()),_ = resume.notified()=>Ok(())}
     }
@@ -3405,10 +3736,15 @@ impl Agent {
             );
             return;
         }
-        let message_id = pending
-            .directed_human
-            .as_ref()
-            .map_or_else(Uuid::new_v4, |source| source.message_id);
+        let message_id = pending.directed_human.as_ref().map_or_else(
+            || {
+                chat.bookkeeping
+                    .lifecycle
+                    .open_input(pending.receipt.run_id)
+                    .unwrap_or_else(Uuid::new_v4)
+            },
+            |source| source.message_id,
+        );
         if let Some(source) = pending.directed_human {
             chat.snapshot
                 .human_family_origins
@@ -3418,7 +3754,9 @@ impl Agent {
         chat.snapshot
             .prompt_execution_modes
             .insert(message_index, chat.snapshot.policy.mode);
-        chat.file_history.begin_snapshot(message_id);
+        if let Some(file_history) = &mut chat.file_history {
+            file_history.begin_snapshot(message_id);
+        }
     }
 
     async fn next_run(
@@ -3573,7 +3911,14 @@ impl Agent {
                         && source.source != event_sources::ARTIFACT_FEEDBACK_SOURCE
                 }) && !triggers::can_trigger(goal))
             {
-                candidate.snapshot.pending_inputs.remove(index);
+                let discarded = candidate.snapshot.pending_inputs.remove(index);
+                self.settle_removed_inputs(
+                    &mut candidate,
+                    [&discarded],
+                    transcript::SettledOutcome::Discarded {
+                        reason: transcript::DiscardReason::LoopEnded,
+                    },
+                );
                 continue;
             }
             if let Some(source) = &pending.trigger_source
@@ -3681,6 +4026,13 @@ impl Agent {
                 let consumed = queued.receipt.clone();
                 self.merge_host_context(&receipt, &consumed);
                 self.append_input_message(&mut candidate, queued);
+                self.settle_input(
+                    &mut candidate,
+                    consumed.run_id,
+                    transcript::SettledOutcome::Merged {
+                        into: receipt.run_id,
+                    },
+                );
                 merged_receipts.push(consumed);
             }
             self.save(&candidate.snapshot);
@@ -3693,6 +4045,7 @@ impl Agent {
                     },
                 );
             }
+            self.start_response(&mut candidate, &receipt);
             self.emit(&mut candidate, &receipt, EventKind::Started);
             for consumed in merged_receipts {
                 self.emit(
@@ -3828,7 +4181,7 @@ impl Agent {
                 .await
                 .map_err(|error| error.to_string())?
         {
-            self.inner.tasks.lock().await.push(self.run_task(next));
+            self.run_task(next);
         }
         let answer = tokio::select! {biased; _ = cancel.cancelled() => Err("permission request cancelled".into()), answer = receiver => answer.map_err(|_| "permission request expired".to_owned())};
         let resumed = if answer.is_ok() {
@@ -3993,11 +4346,21 @@ impl Agent {
     pub async fn set_directories(
         &self,
         chat_id: ChatId,
-        workdir: PathBuf,
+        folder: PathBuf,
         additional: Vec<PathBuf>,
     ) -> Result<(), AgentError> {
         self.require_root_chat(chat_id, "change working directories")
             .await?;
+        require_folder(
+            &self
+                .inner
+                .chats
+                .lock()
+                .await
+                .get(&chat_id)
+                .ok_or(AgentError::NotFound)?
+                .snapshot,
+        )?;
         let canonical = |path: PathBuf| -> Result<PathBuf, AgentError> {
             let path = path
                 .canonicalize()
@@ -4007,22 +4370,23 @@ impl Agent {
             }
             Ok(path)
         };
-        let workdir = canonical(workdir)?;
+        let folder = canonical(folder)?;
         let additional = additional
             .into_iter()
             .map(canonical)
             .collect::<Result<Vec<_>, _>>()?;
-        self.require_working_directory_trust(&workdir)?;
+        self.require_working_directory_trust(&folder)?;
         let _settings_gate = self.inner.settings_writes.lock().await;
         let saved = self.load_user_settings().await?;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        let folder_changed = chat.snapshot.folder.as_ref() != Some(&folder);
         let directory_changed =
-            chat.snapshot.workdir != workdir || chat.snapshot.additional_directories != additional;
-        if chat.snapshot.workdir != workdir {
+            folder_changed || chat.snapshot.additional_directories != additional;
+        if folder_changed {
             // 持久规则属于工作目录的分区：换目录时换成新目录的持久规则，会话规则保留。
-            chat.skills = self.discover_skills(&workdir);
-            chat.snapshot.workdir = workdir;
+            chat.skills = self.discover_skills(Some(&folder));
+            chat.snapshot.folder = Some(folder);
             if let Some(saved) = saved {
                 self.replace_persistent_rules(&mut chat.snapshot, &mut chat.bookkeeping, saved);
             }
@@ -4268,6 +4632,15 @@ impl Agent {
             candidate.snapshot.pending_inputs.retain(|pending| {
                 pending.agent_message.is_some() || !ids.contains(&pending.receipt.run_id)
             });
+            for entry in &taken {
+                if entry.kind == QueuedInputKind::Message {
+                    self.settle_input(
+                        &mut candidate,
+                        entry.id,
+                        transcript::SettledOutcome::Withdrawn,
+                    );
+                }
+            }
             candidate
                 .snapshot
                 .pending_commands
@@ -4543,6 +4916,8 @@ impl Agent {
     pub async fn shutdown(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
         self.inner.shutdown.cancel();
+        // Inputs a lost answer leaves open stay open; waiters on them learn of the shutdown.
+        self.inner.ledger_changes.send_replace(());
         let chat_tools = self
             .inner
             .chats
@@ -4574,10 +4949,9 @@ impl Agent {
                 cancel.cancel();
             }
         }
-        let tasks = std::mem::take(&mut *self.inner.tasks.lock().await);
-        for task in tasks {
-            let _ = task.await;
-        }
+        self.stop_transcript_flushing();
+        self.inner.tasks.close();
+        self.inner.tasks.wait().await;
         let chat_clients = self
             .inner
             .chats
@@ -4716,7 +5090,7 @@ mod thinking_settings_tests {
     #[test]
     fn disabled_preference_applies_only_when_model_card_allows_it() {
         let model = tickloop_agent_model::cards::built_in_model_profiles().remove(0);
-        let mut snapshot = empty_snapshot(Uuid::new_v4(), PathBuf::new(), model.clone());
+        let mut snapshot = empty_snapshot(Uuid::new_v4(), Some(PathBuf::new()), model.clone());
         snapshot.thinking_enabled = false;
         assert_eq!(
             snapshot.effective_reasoning_effort(),

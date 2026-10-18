@@ -2,10 +2,9 @@ use tickloop_agent_test_support::model_http_support;
 
 use serde_json::{Value, json};
 use tickloop_agent_model::{
-    ModelDelta, ModelError, ModelRequest, StructuredOutput,
+    LocalModelClients, ModelClients, ModelDelta, ModelError, ModelRequest, StructuredOutput,
     cards::{ModelCatalog, built_in_model_profiles},
     credentials::save_api_key,
-    model_client,
 };
 use tickloop_agent_protocol::{
     Content, ImageMediaType, ImageSource, Message, ModelConfig, ReasoningEffort, Role,
@@ -79,7 +78,9 @@ async fn native_wire_encodes_images_thinking_schema_and_inclusive_usage() {
     let body = [frame(json!([{"thought":true,"text":"reason","thoughtSignature":"opaque-thought"}]), None, json!({"promptTokenCount":100,"cachedContentTokenCount":60,"thoughtsTokenCount":2})),
         frame(json!([{"text":"{\"allow\":false}","thoughtSignature":"opaque-final"}]), Some("STOP"), json!({"promptTokenCount":100,"cachedContentTokenCount":60,"thoughtsTokenCount":3,"candidatesTokenCount":5}))].concat();
     let (endpoint, captured) = model_http_support::serve_response(200, body).await;
-    let client = model_client(config(root.path(), endpoint), Some(root.path())).unwrap();
+    let client = LocalModelClients::new(Some(root.path().to_path_buf()))
+        .client(&config(root.path(), endpoint))
+        .unwrap();
     let mut request = request();
     request.messages.insert(
         0,
@@ -166,7 +167,9 @@ async fn signed_google_tool_roundtrip_survives_foreign_request_and_serialized_re
     ])
     .await;
     let config = config(root.path(), endpoint);
-    let client = model_client(config.clone(), Some(root.path())).unwrap();
+    let client = LocalModelClients::new(Some(root.path().to_path_buf()))
+        .client(&config)
+        .unwrap();
     let mut request = request();
     request.tools.push(ToolDefinition { name:"Echo".into(), description:"Fixture".into(), input_schema:json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}) });
     let (events, _) = mpsc::unbounded_channel();
@@ -212,7 +215,8 @@ async fn signed_google_tool_roundtrip_survives_foreign_request_and_serialized_re
         .unwrap();
     foreign.base_url = foreign_endpoint;
     save_api_key(root.path(), &foreign.api_key_env, "test-kimi-key").unwrap();
-    model_client(foreign, Some(root.path()))
+    LocalModelClients::new(Some(root.path().to_path_buf()))
+        .client(&foreign)
         .unwrap()
         .complete(request.clone(), events.clone(), CancellationToken::new())
         .await
@@ -225,7 +229,9 @@ async fn signed_google_tool_roundtrip_survives_foreign_request_and_serialized_re
             .to_string()
             .contains("google-private-signature")
     );
-    let restored = model_client(config, Some(root.path())).unwrap();
+    let restored = LocalModelClients::new(Some(root.path().to_path_buf()))
+        .client(&config)
+        .unwrap();
     restored
         .complete(request.clone(), events.clone(), CancellationToken::new())
         .await
@@ -261,7 +267,8 @@ async fn google_rejects_blocked_or_incomplete_stream_and_malformed_usage() {
         let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let (endpoint, _) = model_http_support::serve_response(200, body).await;
         let (events, _) = mpsc::unbounded_channel();
-        let result = model_client(config(root.path(), endpoint), Some(root.path()))
+        let result = LocalModelClients::new(Some(root.path().to_path_buf()))
+            .client(&config(root.path(), endpoint))
             .unwrap()
             .complete(request(), events, CancellationToken::new())
             .await;
@@ -274,7 +281,8 @@ async fn google_rejects_blocked_or_incomplete_stream_and_malformed_usage() {
     cancel.cancel();
     let (events, _) = mpsc::unbounded_channel();
     assert!(matches!(
-        model_client(config(root.path(), endpoint), Some(root.path()))
+        LocalModelClients::new(Some(root.path().to_path_buf()))
+            .client(&config(root.path(), endpoint))
             .unwrap()
             .complete(request(), events, cancel)
             .await,
@@ -301,7 +309,8 @@ async fn native_usage_keeps_independent_cumulative_counts_and_reports_valid_fiel
     .concat();
     let (endpoint, _) = model_http_support::serve_response(200, body).await;
     let (events, _) = mpsc::unbounded_channel();
-    let output = model_client(config(root.path(), endpoint), Some(root.path()))
+    let output = LocalModelClients::new(Some(root.path().to_path_buf()))
+        .client(&config(root.path(), endpoint))
         .unwrap()
         .complete(request(), events, CancellationToken::new())
         .await
@@ -319,7 +328,8 @@ async fn native_usage_keeps_independent_cumulative_counts_and_reports_valid_fiel
     .await;
     let (events, mut observations) = mpsc::unbounded_channel();
     assert!(
-        model_client(config(root.path(), endpoint), Some(root.path()))
+        LocalModelClients::new(Some(root.path().to_path_buf()))
+            .client(&config(root.path(), endpoint))
             .unwrap()
             .complete(request(), events, CancellationToken::new())
             .await
@@ -348,7 +358,8 @@ async fn truncated_google_tool_call_never_becomes_executable_output() {
     .await;
     let (events, _) = mpsc::unbounded_channel();
     assert!(
-        model_client(config(root.path(), endpoint), Some(root.path()))
+        LocalModelClients::new(Some(root.path().to_path_buf()))
+            .client(&config(root.path(), endpoint))
             .unwrap()
             .complete(request(), events, CancellationToken::new())
             .await

@@ -543,6 +543,7 @@ pub(super) fn capture(
     bookkeeping: &ChatBookkeeping,
     operation: &OperationRecord,
     legacy: Option<Vec<OriginalUserInput>>,
+    folder: &std::path::Path,
     auto_policy: AutoPolicy,
 ) -> Result<ApprovalSnapshot, ApprovalContextError> {
     let originals = originals_for_active_chain_with_legacy(
@@ -617,7 +618,7 @@ pub(super) fn capture(
             .dependency_baselines
             .get(&operation.loop_id)
             .map(|baseline| {
-                let current = dependency_fingerprints(&snapshot.workdir);
+                let current = dependency_fingerprints(folder);
                 baseline
                     .keys()
                     .chain(current.keys())
@@ -644,7 +645,7 @@ pub(super) fn capture(
                 .unwrap_or(Value::Null),
         },
         original_user_inputs,
-        working_directory: snapshot.workdir.clone(),
+        working_directory: folder.to_path_buf(),
         additional_directories: snapshot.additional_directories.clone(),
         permission_policy_revision: snapshot.policy.revision,
         auto_policy,
@@ -652,9 +653,11 @@ pub(super) fn capture(
 }
 
 impl crate::Agent {
+    /// `lines` are the Chat's stored Lines when the caller already loaded them.
     pub(super) async fn approval_history_ancestors(
         &self,
         snapshot: &ChatSnapshot,
+        lines: Option<&[crate::transcript::Line]>,
     ) -> Option<Vec<crate::transcript::ChainEntry>> {
         let boundary = snapshot
             .message_compactions
@@ -666,16 +669,15 @@ impl crate::Agent {
                 }
                 _ => None,
             })?;
-        let path = self.inner.recorder.as_ref()?.path_for_chat(snapshot.id)?;
-        let chat = snapshot.id;
-        tokio::task::spawn_blocking(move || {
-            crate::transcript::load_compaction_ancestors(&path, boundary, chat)
-                .ok()
-                .flatten()
-        })
-        .await
-        .ok()
-        .flatten()
+        match lines {
+            Some(lines) => {
+                crate::transcript::load_compaction_ancestors(lines, boundary, snapshot.id)
+            }
+            None => {
+                let lines = self.stored_lines(snapshot.id).await?;
+                crate::transcript::load_compaction_ancestors(&lines, boundary, snapshot.id)
+            }
+        }
     }
 }
 
@@ -687,8 +689,11 @@ mod tests {
     #[test]
     fn tool_outputs_cannot_claim_success_or_replace_a_host_unknown_outcome() {
         let run = Uuid::new_v4();
-        let mut snapshot =
-            crate::empty_snapshot(Uuid::new_v4(), "/project".into(), ModelConfig::unselected());
+        let mut snapshot = crate::empty_snapshot(
+            Uuid::new_v4(),
+            Some("/project".into()),
+            ModelConfig::unselected(),
+        );
         snapshot.messages = vec![
             Message {
                 role: Role::Assistant,

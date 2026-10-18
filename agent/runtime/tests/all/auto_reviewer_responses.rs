@@ -2,7 +2,7 @@ use tickloop_agent_test_support::model_http_support;
 
 use serde_json::{Value, json};
 use std::sync::Arc;
-use tickloop_agent_model::{HttpModelClient, cards::ModelCatalog};
+use tickloop_agent_model::{LocalModelClients, ModelClients, cards::ModelCatalog};
 use tickloop_agent_protocol::{
     Decision, EventKind, ExecutionMode, ModelAuthSource, ModelConfig, ModelRequestKind, Protocol,
     RequestOutcome,
@@ -117,7 +117,7 @@ async fn legacy_and_server_tool_shapes_are_terminal_before_text_is_parsed() {
         } else {
             url.trim_end_matches("/anthropic").into()
         };
-        let client = HttpModelClient::new(model).unwrap();
+        let client = LocalModelClients::new(None).client(&model).unwrap();
         let request = tickloop_agent_model::ModelRequest {
             history_sources: Vec::new(),
             messages: vec![Message {
@@ -235,10 +235,10 @@ async fn unexpected_tool_response_requires_manual(mut reviewer_config: ModelConf
             ])),
         );
         let reviewer = if reviewer_config.auth_source == ModelAuthSource::KimiOAuth {
-            tickloop_agent_model::model_client(reviewer_config.clone(), Some(credentials.path()))
+            tickloop_agent_model::LocalModelClients::new(Some(credentials.path().to_path_buf())).client(&reviewer_config)
                 .unwrap()
         } else {
-            Arc::new(HttpModelClient::new(reviewer_config.clone()).unwrap())
+            LocalModelClients::new(None).client(&reviewer_config).unwrap()
         };
         agent.set_auto_reviewer(reviewer).await;
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -518,7 +518,7 @@ async fn minimax_preview_and_deepseek_recover_malformed_review_without_relaxing_
         );
         agent.install_own_tickhost();
         agent
-            .set_auto_reviewer(Arc::new(HttpModelClient::new(reviewer_config).unwrap()))
+            .set_auto_reviewer(LocalModelClients::new(None).client(&reviewer_config).unwrap())
             .await;
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         agent

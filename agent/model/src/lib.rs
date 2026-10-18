@@ -1,8 +1,7 @@
 use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -15,9 +14,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-use tickloop_agent_base::network::{
-    HttpPolicy, NetworkDiagnostic, NetworkRoute, build_http_client, is_loopback,
-};
+use tickloop_agent_base::network::{NetworkDiagnostic, NetworkRoute, is_loopback};
 use tickloop_agent_protocol::{
     Adapter, Content, Message, ModelAuthSource, ModelConfig, ModelDiscovery, ModelIdentity,
     ModelProvider, PrivateHistorySource, Protocol, ProviderConnection, ProviderFailureClass,
@@ -38,12 +35,22 @@ mod codex;
 pub mod codex_test_support;
 pub mod connection;
 pub mod copilot;
+mod credential_source;
+pub use credential_source::{
+    AttemptGate, Credential, CredentialSource, LocalCredentials, RejectionOutcome,
+    ResolvedCredential,
+};
 pub use tickloop_agent_base::credentials;
+mod endpoint;
+pub use endpoint::{ModelEndpoint, ModelRoute, ProxyEndpoint, VendorEndpoint};
 mod glm;
 mod google;
 pub mod history;
 mod image_limits;
 mod kimi;
+mod model_clients;
+use model_clients::PrivateProvenance;
+pub use model_clients::{HttpModelClients, LocalModelClients, ModelClients};
 mod provider_directory;
 mod provider_failure;
 mod responses;
@@ -686,7 +693,13 @@ pub fn validate_model_config(config: &ModelConfig) -> Result<(), ModelError> {
             | ModelAuthSource::GoogleOAuth
             | ModelAuthSource::KimiOAuth
             | ModelAuthSource::XaiOAuth,
-        ) => HttpModelClient::deferred(config.clone()).map(|_| ()),
+        ) => HttpModelClient::assemble(
+            config.clone(),
+            Arc::new(VendorEndpoint),
+            Arc::new(LocalCredentials::new(None)),
+            Arc::default(),
+        )
+        .map(|_| ()),
         (ModelProvider::OpenAiCodex, ModelAuthSource::CodexSubscription) => {
             codex::validate_config(config)
         }
@@ -717,66 +730,21 @@ pub fn validate_model_for_resume_in_root(
     }
 }
 
-pub fn model_client(
-    config: ModelConfig,
-    state_dir: Option<&Path>,
-) -> Result<Arc<dyn ModelClient>, ModelError> {
-    validate_model_config(&config)?;
-    match config.provider {
-        ModelProvider::Api => {
-            if crate::auth::minimax::MiniMaxRegion::from_auth(config.auth_source).is_some()
-                && state_dir.is_none()
-            {
-                return Err(ModelError::Configuration(
-                    "MiniMax OAuth requires an Agent state directory".into(),
-                ));
-            }
-            if config.auth_source != ModelAuthSource::ApiKeyEnv && state_dir.is_none() {
-                return Err(ModelError::Configuration(
-                    "Provider sign-in requires an Agent state directory".into(),
-                ));
-            }
-            Ok(Arc::new(HttpModelClient::deferred_with_root(
-                config, state_dir,
-            )?))
-        }
-        ModelProvider::OpenAiCodex => {
-            let state_dir = state_dir.ok_or_else(|| {
-                ModelError::Configuration(
-                    "Codex subscription requires an Agent state directory".into(),
-                )
-            })?;
-            let client = codex::CodexModelClient::new(config, state_dir)?;
-            #[cfg(any(test, feature = "test-support"))]
-            let client = if let Some(endpoint) = std::env::var_os("TICKLOOP_TEST_CODEX_RESPONSES") {
-                let endpoint = endpoint.into_string().map_err(|_| {
-                    ModelError::Configuration(
-                        "Codex test endpoint must be numeric loopback HTTP".into(),
-                    )
-                })?;
-                client.with_loopback_test_endpoint(&endpoint)?
-            } else {
-                client
-            };
-            Ok(Arc::new(client))
-        }
-    }
-}
-
 pub struct HttpModelClient {
     config: ModelConfig,
     client: reqwest::Client,
     route: NetworkRoute,
-    state_root: Option<PathBuf>,
+    endpoint: Arc<dyn ModelEndpoint>,
+    credentials: Arc<dyn CredentialSource>,
+    provenance: Arc<PrivateProvenance>,
     cache_id: uuid::Uuid,
 }
 
-type PrivateBlockKey = (tickloop_agent_protocol::ChatId, [u8; 32], [u8; 32]);
-
-fn api_private_provenance() -> &'static Mutex<HashMap<PrivateBlockKey, Option<[u8; 32]>>> {
-    static PROVENANCE: OnceLock<Mutex<HashMap<PrivateBlockKey, Option<[u8; 32]>>>> =
-        OnceLock::new();
-    PROVENANCE.get_or_init(|| Mutex::new(HashMap::new()))
+fn is_private_block(content: &Content) -> bool {
+    matches!(
+        content,
+        Content::Thinking { .. } | Content::ProtocolData { .. }
+    )
 }
 
 impl HttpModelClient {
@@ -806,46 +774,40 @@ impl HttpModelClient {
         &self,
         chat_id: Option<tickloop_agent_protocol::ChatId>,
         request: &ModelRequest,
-        key: Option<&reqwest::header::HeaderValue>,
+        identity: Option<&str>,
     ) -> Result<(), ModelError> {
-        let Some(key) = key else {
+        let Some(identity) = identity else {
             return Ok(());
         };
-        let fingerprint: [u8; 32] = Sha256::digest(key.as_bytes()).into();
         let scope = self.credential_scope();
-        let provenance = api_private_provenance()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (index, message) in request.messages.iter().enumerate() {
-            let persisted = request.history_sources.get(index).and_then(Option::as_ref);
-            let trusted = persisted.is_some_and(|source| {
-                source.credential_identity.as_deref()
-                    == Some(credential_fingerprint(key.as_bytes()).as_str())
-                    && {
+        let mut unproven_blocks = request
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                let persisted = request.history_sources.get(*index).and_then(Option::as_ref);
+                !persisted.is_some_and(|source| {
+                    source.credential_identity.as_deref() == Some(identity) && {
                         let mut expected = source.clone();
                         expected.credential_identity = None;
                         Some(expected) == self.config.private_history_source()
                     }
-            });
-            for content in &message.content {
-                if matches!(
-                    content,
-                    Content::Thinking { .. } | Content::ProtocolData { .. }
-                ) && !trusted
-                    && chat_id
-                        .and_then(|chat_id| {
-                            provenance
-                                .get(&(chat_id, scope, Self::private_block_fingerprint(content)))
-                                .copied()
-                        })
-                        .flatten()
-                        != Some(fingerprint)
-                {
-                    return Err(ModelError::Configuration(
-                    "the API credential source cannot prove private model history is compatible; restart from public history or compact with the original credential".into(),
-                ));
-                }
-            }
+                })
+            })
+            .flat_map(|(_, message)| &message.content)
+            .filter(|content| is_private_block(content))
+            .map(Self::private_block_fingerprint);
+        let proven = match chat_id {
+            Some(chat_id) => self.provenance.proves_all(
+                unproven_blocks.map(|block| (chat_id, scope, block)),
+                identity,
+            ),
+            None => unproven_blocks.next().is_none(),
+        };
+        if !proven {
+            return Err(ModelError::Configuration(
+                "the API credential source cannot prove private model history is compatible; restart from public history or compact with the original credential".into(),
+            ));
         }
         Ok(())
     }
@@ -853,43 +815,28 @@ impl HttpModelClient {
     fn record_private_output(
         &self,
         chat_id: Option<tickloop_agent_protocol::ChatId>,
-        key: Option<&reqwest::header::HeaderValue>,
+        identity: Option<&str>,
         output: &ModelOutput,
     ) {
-        let (Some(chat_id), Some(key)) = (chat_id, key) else {
+        let (Some(chat_id), Some(identity)) = (chat_id, identity) else {
             return;
         };
-        let fingerprint: [u8; 32] = Sha256::digest(key.as_bytes()).into();
         let scope = self.credential_scope();
-        let mut provenance = api_private_provenance()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for content in &output.content {
-            if matches!(
-                content,
-                Content::Thinking { .. } | Content::ProtocolData { .. }
-            ) {
-                let key = (chat_id, scope, Self::private_block_fingerprint(content));
-                let recorded = provenance.entry(key).or_insert(Some(fingerprint));
-                if *recorded != Some(fingerprint) {
-                    *recorded = None;
-                }
-            }
-        }
+        self.provenance.record(
+            output
+                .content
+                .iter()
+                .filter(|content| is_private_block(content))
+                .map(|content| (chat_id, scope, Self::private_block_fingerprint(content))),
+            identity,
+        );
     }
 
-    pub fn new(config: ModelConfig) -> Result<Self, ModelError> {
-        api_key(&config, None)?;
-        Self::deferred(config)
-    }
-
-    pub fn deferred(config: ModelConfig) -> Result<Self, ModelError> {
-        Self::deferred_with_root(config, None)
-    }
-
-    fn deferred_with_root(
+    fn assemble(
         config: ModelConfig,
-        state_root: Option<&Path>,
+        endpoint: Arc<dyn ModelEndpoint>,
+        credentials: Arc<dyn CredentialSource>,
+        provenance: Arc<PrivateProvenance>,
     ) -> Result<Self, ModelError> {
         let config = cards::model_for_persistent_selection(config);
         if let Some(region) = crate::auth::minimax::MiniMaxRegion::from_auth(config.auth_source) {
@@ -992,13 +939,7 @@ impl HttpModelClient {
         let url = reqwest::Url::parse(&config.base_url).map_err(|_| {
             ModelError::Configuration("service address must be an HTTP(S) URL".into())
         })?;
-        let is_loopback = is_loopback(&url);
-        if !(url.scheme() == "https" || url.scheme() == "http" && is_loopback)
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
+        if !crate::endpoint::is_permitted_service_url(&url) {
             return Err(ModelError::Configuration("use an HTTPS service address without credentials, query or fragment; HTTP is allowed only for loopback".into()));
         }
         if config.model.trim().is_empty()
@@ -1011,22 +952,20 @@ impl HttpModelClient {
         }
         if config.auth_source == ModelAuthSource::ApiKeyEnv
             && config.api_key_env.is_empty()
-            && !is_loopback
+            && !is_loopback(&url)
         {
             return Err(ModelError::Configuration(
                 "an API key environment variable is required for remote services".into(),
             ));
         }
-        let mut policy = HttpPolicy::new(reqwest::redirect::Policy::none());
-        policy.connect_timeout = Some(Duration::from_secs(15));
-        policy.read_timeout = Some(Duration::from_secs(120));
-        let (client, route) =
-            build_http_client(&url, policy).map_err(|_| ModelError::Connection)?;
+        let (client, route) = endpoint.http_client(&config)?;
         Ok(Self {
             config,
             client,
             route,
-            state_root: state_root.map(Path::to_path_buf),
+            endpoint,
+            credentials,
+            provenance,
             cache_id: uuid::Uuid::new_v4(),
         })
     }
@@ -1046,6 +985,7 @@ impl HttpModelClient {
         let mut request = without_unsupported_images(&self.config, request);
         image_limits::limit_images_per_request(&mut request.messages);
         let image_free_request = image_limits::image_free_copy(&request);
+        let gate = AttemptGate::new(context);
         let mut rejected_images = false;
         let result = self
             .complete_once(
@@ -1054,17 +994,17 @@ impl HttpModelClient {
                 events.clone(),
                 cancel.clone(),
                 image_free_request.is_some().then_some(&mut rejected_images),
-                context,
+                gate,
             )
             .await;
         match image_free_request {
             Some(image_free_request) if rejected_images => {
-                if !context.is_none_or(ModelRequestContext::try_begin_attempt) {
+                if !gate.try_begin_attempt() {
                     return Err(ModelError::RequestBudgetExhausted {
                         stage: ModelRequestStage::RequestSend,
                     });
                 }
-                self.complete_once(chat_id, image_free_request, events, cancel, None, context)
+                self.complete_once(chat_id, image_free_request, events, cancel, None, gate)
                     .await
             }
             _ => result,
@@ -1079,125 +1019,17 @@ impl HttpModelClient {
         events: UnboundedSender<ModelDelta>,
         cancel: CancellationToken,
         rejected_images: Option<&mut bool>,
-        context: Option<&ModelRequestContext>,
+        gate: AttemptGate<'_>,
     ) -> Result<ModelOutput, ModelError> {
-        let region = crate::auth::minimax::MiniMaxRegion::from_auth(self.config.auth_source);
         let copilot_auth = self.config.auth_source == ModelAuthSource::GithubCopilot;
-        let mut copilot_api_base = None;
-        let google_auth = matches!(
-            self.config.auth_source,
-            ModelAuthSource::GoogleCloud | ModelAuthSource::GoogleOAuth
-        );
-        let subscription = crate::auth::device_subscriptions::DeviceSubscription::from_auth(
-            self.config.auth_source,
-        );
         let identity_from_sign_in = self.config.auth_source != ModelAuthSource::ApiKeyEnv;
-        let mut google_project = None;
-        let mut resolved_base = None;
-        let (key, credential_identity) = if let Some(region) = region {
-            let root = self.state_root.as_deref().ok_or_else(|| {
-                ModelError::Configuration("MiniMax OAuth requires an Agent state directory".into())
-            })?;
-            let credentials = crate::auth::minimax::MiniMaxAuth::new(root, region)
-                .resolve_credentials_with_refresh_gate(&cancel, || {
-                    context.is_none_or(ModelRequestContext::try_begin_attempt)
-                })
-                .await
-                .map_err(|error| match error {
-                    crate::auth::minimax::MiniMaxAuthError::Cancelled => ModelError::Cancelled,
-                    crate::auth::minimax::MiniMaxAuthError::NotLoggedIn => {
-                        ModelError::MiniMaxNotLoggedIn
-                    }
-                    crate::auth::minimax::MiniMaxAuthError::RefreshFailed => {
-                        ModelError::MiniMaxAuthentication
-                    }
-                    crate::auth::minimax::MiniMaxAuthError::BudgetExhausted => {
-                        ModelError::RequestBudgetExhausted {
-                            stage: ModelRequestStage::Credentials,
-                        }
-                    }
-                    crate::auth::minimax::MiniMaxAuthError::Network => ModelError::ConnectionAt {
-                        stage: ModelRequestStage::Credentials,
-                    },
-                    crate::auth::minimax::MiniMaxAuthError::Http(status) => {
-                        ModelError::Http { status }.at_stage(ModelRequestStage::Credentials)
-                    }
-                    _ => ModelError::Configuration(error.to_string()),
-                })?;
-            let mut key = reqwest::header::HeaderValue::from_str(&credentials.access_token)
-                .map_err(|_| {
-                    ModelError::Configuration("invalid MiniMax credential header".into())
-                })?;
-            key.set_sensitive(true);
-            (Some(key), Some(credentials.identity.to_string()))
-        } else if copilot_auth {
-            let root = self.state_root.as_deref().ok_or_else(|| {
-                ModelError::Configuration(
-                    "GitHub Copilot sign-in requires an Agent state directory".into(),
-                )
-            })?;
-            let access = crate::auth::copilot::CopilotAuth::new(root)
-                .resolve_access_with_refresh_gate(&cancel, || {
-                    context.is_none_or(ModelRequestContext::try_begin_attempt)
-                })
-                .await
-                .map_err(copilot::credential_error)?;
-            let mut key = reqwest::header::HeaderValue::from_str(&access.token).map_err(|_| {
-                ModelError::Configuration("invalid GitHub Copilot credential header".into())
-            })?;
-            key.set_sensitive(true);
-            copilot_api_base = access.api_base;
-            (Some(key), Some(access.identity.to_string()))
-        } else if google_auth {
-            let root = self.state_root.as_deref().ok_or_else(|| {
-                ModelError::Configuration(
-                    "Google authentication requires an Agent state directory".into(),
-                )
-            })?;
-            let access = crate::auth::google::GoogleAuth::new(root)
-                .resolve(&self.config, &cancel, context)
-                .await?;
-            let mut key = reqwest::header::HeaderValue::from_str(&access.token).map_err(|_| {
-                ModelError::Configuration("invalid Google credential header".into())
-            })?;
-            key.set_sensitive(true);
-            google_project = Some(access.project);
-            resolved_base = Some(access.base_url);
-            (
-                Some(key),
-                Some(credential_fingerprint(
-                    format!(
-                        "{}:{}",
-                        access.identity,
-                        resolved_base.as_deref().unwrap_or("")
-                    )
-                    .as_bytes(),
-                )),
-            )
-        } else if let Some(provider) = subscription {
-            let root = self.state_root.as_deref().ok_or_else(|| {
-                ModelError::Configuration(
-                    "Subscription authentication requires an Agent state directory".into(),
-                )
-            })?;
-            let access = crate::auth::device_subscriptions::SubscriptionAuth::new(root, provider)
-                .resolve(&cancel, context)
-                .await?;
-            let mut key = reqwest::header::HeaderValue::from_str(&access.token).map_err(|_| {
-                ModelError::Configuration("invalid subscription credential header".into())
-            })?;
-            key.set_sensitive(true);
-            (Some(key), Some(access.identity.to_string()))
-        } else {
-            let key = api_key(&self.config, self.state_root.as_deref())?;
-            let identity = key
-                .as_ref()
-                .map(|key| credential_fingerprint(key.as_bytes()));
-            (key, identity)
-        };
+        let mut credential = self
+            .credentials
+            .resolve(&self.config, gate, &cancel)
+            .await?;
         let mut source = self.config.private_history_source();
         if let Some(source) = &mut source {
-            source.credential_identity = credential_identity;
+            source.credential_identity = credential.identity().map(str::to_owned);
         }
         let mut request = request;
         if identity_from_sign_in && request.history_sources.len() != request.messages.len() {
@@ -1208,12 +1040,15 @@ impl HttpModelClient {
             request = copilot::without_connection_bound_reasoning(request);
         }
         if !identity_from_sign_in {
-            self.ensure_credential_history_compatible(chat_id, &request, key.as_ref())?;
+            self.ensure_credential_history_compatible(chat_id, &request, credential.identity())?;
         }
         let structured_response =
             structured_response::StructuredResponsePolicy::for_request(&request)?;
         let mut request_config = self.config.clone();
-        if let Some(limit) = context.and_then(|context| context.output_token_limit) {
+        if let Some(limit) = gate
+            .context()
+            .and_then(|context| context.output_token_limit)
+        {
             if limit == 0 {
                 return Err(ModelError::Configuration(
                     "output token limit must be positive".into(),
@@ -1259,84 +1094,70 @@ impl HttpModelClient {
                 .as_bytes()
             ));
         }
-        let base_url = resolved_base
-            .as_deref()
-            .or(copilot_api_base.as_deref())
-            .unwrap_or(&self.config.base_url);
-        let target = reqwest::Url::parse(&if self.config.protocol == Protocol::Google {
-            format!(
-                "{}/models/{}:streamGenerateContent?alt=sse",
-                base_url.trim_end_matches('/'),
-                self.config.model
-            )
-        } else {
-            format!("{}/{endpoint}", base_url.trim_end_matches('/'))
-        })
-        .map_err(|_| ModelError::Configuration("invalid model endpoint".into()))?;
-        let mut outgoing = self
-            .client
-            .post(target.clone())
-            .header("anthropic-version", "2023-06-01")
-            .json(&body);
-        if let Some(key) = key.as_ref() {
-            outgoing = match self.config.protocol {
-                Protocol::Google if self.config.auth_source == ModelAuthSource::ApiKeyEnv => {
-                    outgoing.header("x-goog-api-key", key.clone())
-                }
-                Protocol::Messages
-                    if self.config.adapter() != Adapter::MinimaxMessages
-                        && self.config.auth_source == ModelAuthSource::ApiKeyEnv =>
-                {
-                    outgoing.header("x-api-key", key.clone())
-                }
-                _ => {
-                    let mut value = reqwest::header::HeaderValue::from_str(&format!(
-                        "Bearer {}",
-                        key.to_str().map_err(|_| ModelError::Configuration(
-                            "API key must be ASCII".into()
-                        ))?
-                    ))
-                    .map_err(|_| ModelError::Configuration("invalid API key header".into()))?;
-                    value.set_sensitive(true);
-                    outgoing.header(reqwest::header::AUTHORIZATION, value)
-                }
-            };
-        }
-        if let Some(project) = google_project {
-            outgoing = outgoing.header("x-goog-user-project", project);
-        }
-        if self.config.auth_source == ModelAuthSource::XaiOAuth {
-            outgoing = outgoing
-                .header("X-XAI-Token-Auth", "xai-grok-cli")
-                .header("x-grok-client-version", XAI_GROK_CLIENT_VERSION)
-                .header(
-                    reqwest::header::USER_AGENT,
-                    format!("xai-grok-workspace/{XAI_GROK_CLIENT_VERSION}"),
+        let mut resent_after_rejection = false;
+        let mut response = loop {
+            let route = self.endpoint.route(&self.config, &credential)?;
+            let base_url = route.base_url.as_str().trim_end_matches('/');
+            let target = reqwest::Url::parse(&if self.config.protocol == Protocol::Google {
+                format!(
+                    "{base_url}/models/{}:streamGenerateContent?alt=sse",
+                    self.config.model
                 )
-                .header("x-grok-model-override", &self.config.model);
-        }
-        if copilot_auth {
-            for (name, value) in copilot::request_headers(&body) {
+            } else {
+                format!("{base_url}/{endpoint}")
+            })
+            .map_err(|_| ModelError::Configuration("invalid model endpoint".into()))?;
+            let mut outgoing = self
+                .client
+                .post(target.clone())
+                .header("anthropic-version", "2023-06-01")
+                .json(&body);
+            for (name, value) in route.headers {
                 outgoing = outgoing.header(name, value);
             }
-        }
-        let started = Instant::now();
-        let sent = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(ModelError::Cancelled),
-            result = outgoing.send() => result.map_err(request_transport_error),
+            if copilot_auth {
+                for (name, value) in copilot::request_headers(&body) {
+                    outgoing = outgoing.header(name, value);
+                }
+            }
+            let started = Instant::now();
+            let sent = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                result = outgoing.send() => result.map_err(request_transport_error),
+            };
+            NetworkDiagnostic::new(
+                "model_response_headers",
+                &target,
+                self.route,
+                sent.as_ref()
+                    .ok()
+                    .map(|response| response.status().as_u16()),
+                started.elapsed(),
+            )
+            .emit();
+            let response = sent?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                && !resent_after_rejection
+                && let Credential::Resolved(rejected) = &credential
+                && let RejectionOutcome::Refreshed(refreshed) = self
+                    .credentials
+                    .rejected(&self.config, rejected, gate, &cancel)
+                    .await?
+                // The body already carries history projected for the rejected identity.
+                && refreshed.identity == rejected.identity
+            {
+                if !gate.try_begin_attempt() {
+                    return Err(ModelError::RequestBudgetExhausted {
+                        stage: ModelRequestStage::RequestSend,
+                    });
+                }
+                credential = Credential::Resolved(refreshed);
+                resent_after_rejection = true;
+                continue;
+            }
+            break response;
         };
-        NetworkDiagnostic::new(
-            "model_response_headers",
-            &target,
-            self.route,
-            sent.as_ref()
-                .ok()
-                .map(|response| response.status().as_u16()),
-            started.elapsed(),
-        )
-        .emit();
-        let mut response = sent?;
         let (retry_after, should_retry) = provider_failure::retry_headers(response.headers());
         let status = response.status().as_u16();
         if !(200..=299).contains(&status) {
@@ -1362,9 +1183,9 @@ impl HttpModelClient {
                         .at_stage(ModelRequestStage::ResponseHeaders),
                 );
             }
-            let secrets = key
-                .as_ref()
-                .and_then(|key| std::str::from_utf8(key.as_bytes()).ok())
+            let secrets = credential
+                .secret()
+                .and_then(|secret| std::str::from_utf8(secret.as_bytes()).ok())
                 .into_iter()
                 .collect::<Vec<_>>();
             let mut failure = ProviderHttpFailure::from_response(
@@ -1428,7 +1249,7 @@ impl HttpModelClient {
         )
         .await?;
         output.private_source = source;
-        self.record_private_output(chat_id, key.as_ref(), &output);
+        self.record_private_output(chat_id, credential.identity(), &output);
         Ok(output)
     }
 }
@@ -1448,10 +1269,7 @@ impl ModelClient for HttpModelClient {
     }
 
     async fn close_chat(&self, chat_id: tickloop_agent_protocol::ChatId) {
-        api_private_provenance()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|(recorded_chat, _, _), _| *recorded_chat != chat_id);
+        self.provenance.close_chat(chat_id);
     }
 
     async fn complete_for_chat_with_context(
@@ -2546,6 +2364,15 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::{mpsc, oneshot};
 
+    /// Clients that reach vendors with environment API keys and share one private-history
+    /// provenance.
+    fn vendor_clients() -> HttpModelClients {
+        HttpModelClients::new(
+            Arc::new(VendorEndpoint),
+            Arc::new(LocalCredentials::new(None)),
+        )
+    }
+
     fn structured_request() -> ModelRequest {
         ModelRequest {
             history_sources: Vec::new(),
@@ -2645,8 +2472,9 @@ mod tests {
         let mut config = protocol_config(Protocol::Messages, "http://127.0.0.1:49321");
         config.provider_id = "credential-rotation-test".into();
         config.api_key_env = "TICKLOOP_TEST_CREDENTIAL_ROTATION".into();
-        let first_chat = HttpModelClient::deferred(config.clone()).unwrap();
-        let second_chat = HttpModelClient::deferred(config).unwrap();
+        let clients = vendor_clients();
+        let first_chat = clients.http_client(config.clone()).unwrap();
+        let second_chat = clients.http_client(config).unwrap();
         let public = structured_request();
         let private_content = Content::Thinking {
             thinking: "private reasoning".into(),
@@ -2657,8 +2485,8 @@ mod tests {
             role: Role::Assistant,
             content: vec![private_content.clone()],
         });
-        let first_key = reqwest::header::HeaderValue::from_static("first-secret-key");
-        let second_key = reqwest::header::HeaderValue::from_static("second-secret-key");
+        let first_key = credential_fingerprint(b"first-secret-key");
+        let second_key = credential_fingerprint(b"second-secret-key");
         let chat_a = uuid::Uuid::new_v4();
         let chat_b = uuid::Uuid::new_v4();
         let output = ModelOutput {
@@ -2667,42 +2495,46 @@ mod tests {
             usage: Usage::default(),
             stop_reason: "end_turn".into(),
         };
-        first_chat.record_private_output(Some(chat_a), Some(&first_key), &output);
+        first_chat.record_private_output(Some(chat_a), Some(first_key.as_str()), &output);
         first_chat
-            .ensure_credential_history_compatible(Some(chat_a), &private, Some(&first_key))
+            .ensure_credential_history_compatible(Some(chat_a), &private, Some(first_key.as_str()))
             .unwrap();
         second_chat
-            .ensure_credential_history_compatible(Some(chat_b), &public, Some(&second_key))
+            .ensure_credential_history_compatible(Some(chat_b), &public, Some(second_key.as_str()))
             .unwrap();
-        second_chat.record_private_output(Some(chat_b), Some(&second_key), &output);
+        second_chat.record_private_output(Some(chat_b), Some(second_key.as_str()), &output);
         second_chat
-            .ensure_credential_history_compatible(Some(chat_b), &private, Some(&second_key))
+            .ensure_credential_history_compatible(Some(chat_b), &private, Some(second_key.as_str()))
             .unwrap();
         let error = first_chat
-            .ensure_credential_history_compatible(Some(chat_a), &private, Some(&second_key))
+            .ensure_credential_history_compatible(Some(chat_a), &private, Some(second_key.as_str()))
             .unwrap_err();
         assert_eq!(error.kind(), ModelFailureKind::Configuration);
         assert!(!format!("{error:?}").contains("secret-key"));
         first_chat
-            .ensure_credential_history_compatible(Some(chat_a), &private, Some(&first_key))
+            .ensure_credential_history_compatible(Some(chat_a), &private, Some(first_key.as_str()))
             .unwrap();
 
         let mut unknown = protocol_config(Protocol::Messages, "http://127.0.0.1:49322");
         unknown.api_key_env = "TICKLOOP_TEST_UNKNOWN_CREDENTIAL".into();
-        let unknown = HttpModelClient::deferred(unknown).unwrap();
+        let unknown = clients.http_client(unknown).unwrap();
         let unknown_chat = uuid::Uuid::new_v4();
         assert!(
             unknown
                 .ensure_credential_history_compatible(
                     Some(unknown_chat),
                     &private,
-                    Some(&first_key)
+                    Some(first_key.as_str())
                 )
                 .is_err()
         );
         assert!(
             unknown
-                .ensure_credential_history_compatible(Some(unknown_chat), &public, Some(&first_key))
+                .ensure_credential_history_compatible(
+                    Some(unknown_chat),
+                    &public,
+                    Some(first_key.as_str())
+                )
                 .is_ok()
         );
         assert!(
@@ -2710,7 +2542,7 @@ mod tests {
                 .ensure_credential_history_compatible(
                     Some(unknown_chat),
                     &private,
-                    Some(&first_key)
+                    Some(first_key.as_str())
                 )
                 .is_err()
         );
@@ -2721,8 +2553,9 @@ mod tests {
         let original = default_model("anthropic-api", "claude-sonnet-4-6-messages");
         let mut equivalent = original.clone();
         equivalent.base_url = format!("{}:443", original.base_url);
-        let first = HttpModelClient::deferred(original).unwrap();
-        let second = HttpModelClient::deferred(equivalent).unwrap();
+        let clients = vendor_clients();
+        let first = clients.http_client(original).unwrap();
+        let second = clients.http_client(equivalent).unwrap();
         assert_eq!(first.credential_scope(), second.credential_scope());
     }
 
@@ -2918,7 +2751,7 @@ mod tests {
         patch.apply_to(config.card.as_mut().unwrap());
         let saved = serde_json::to_value(config).unwrap();
         let restored = serde_json::from_value(saved).unwrap();
-        let client = HttpModelClient::deferred(restored).unwrap();
+        let client = vendor_clients().http_client(restored).unwrap();
         let mut request = structured_request();
         request.reasoning_effort = Some(ReasoningEffort::Off);
         request.temperature = Some(0.0);
@@ -3062,7 +2895,9 @@ mod tests {
                     proxy_source: tickloop_agent_base::network::ProxySource::Direct,
                     direct_websocket_eligible: true,
                 },
-                state_root: None,
+                endpoint: Arc::new(VendorEndpoint),
+                credentials: Arc::new(LocalCredentials::new(None)),
+                provenance: Arc::default(),
             };
             let (events, mut receiver) = mpsc::unbounded_channel();
             let result = tokio::time::timeout(
@@ -3101,11 +2936,12 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
-        let client = HttpModelClient::new(protocol_config(
-            Protocol::Messages,
-            &format!("http://{address}"),
-        ))
-        .unwrap();
+        let client = vendor_clients()
+            .http_client(protocol_config(
+                Protocol::Messages,
+                &format!("http://{address}"),
+            ))
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(

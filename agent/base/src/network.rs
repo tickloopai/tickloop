@@ -1,15 +1,28 @@
-use std::{fmt, io::Write, time::Duration};
+use std::{
+    fmt,
+    io::Write,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::Arc,
+    time::Duration,
+};
 
 use hyper_util::client::proxy::matcher::Matcher;
-use reqwest::{Client, Url, redirect::Policy};
+use reqwest::{
+    Client, Url,
+    dns::{Addrs, Name, Resolve, Resolving},
+    redirect::Policy,
+};
 
 const DIAGNOSTICS_ENV: &str = "TICKLOOP_NETWORK_DIAGNOSTICS";
+/// The leading segment of 6to4 addresses (`2002::/16`), which carry an IPv4 address next.
+const SIX_TO_FOUR: u16 = 0x2002;
 
 pub struct HttpPolicy {
     pub timeout: Option<Duration>,
     pub connect_timeout: Option<Duration>,
     pub read_timeout: Option<Duration>,
     pub redirect: Policy,
+    pub reach: Reach,
 }
 
 impl HttpPolicy {
@@ -19,7 +32,150 @@ impl HttpPolicy {
             connect_timeout: None,
             read_timeout: None,
             redirect,
+            reach: Reach::Anywhere,
         }
+    }
+}
+
+/// Which addresses a client may reach.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Reach {
+    #[default]
+    Anywhere,
+    /// Public addresses only: a host name counts by every address it resolves to, the client
+    /// connects only to those, and no proxy resolves names where they cannot be checked. The
+    /// client follows no redirect itself; its caller checks each target with
+    /// [`check_public_url`] before requesting it. A Chat without a Folder reaches the network
+    /// this way.
+    PublicAddresses,
+}
+
+/// A host that is, or resolves to, an address that is not public.
+#[derive(Debug)]
+pub struct NotPublic {
+    /// The host name that resolved to `address`; `None` when the host is the address itself.
+    name: Option<String>,
+    address: IpAddr,
+}
+
+impl fmt::Display for NotPublic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.name {
+            Some(name) => write!(formatter, "{name} resolves to {}, which", self.address)?,
+            None => write!(formatter, "{}", self.address)?,
+        }
+        write!(
+            formatter,
+            " is not a public address; this Chat reaches only public addresses"
+        )
+    }
+}
+
+impl std::error::Error for NotPublic {}
+
+/// Refuses a URL whose host is an address that is not public; a host name is checked when it
+/// resolves.
+pub fn check_public_url(url: &Url) -> Result<(), NotPublic> {
+    let Some(host) = url.host_str() else {
+        return Ok(());
+    };
+    match host.trim_matches(['[', ']']).parse::<IpAddr>() {
+        Ok(address) if !is_public(address) => Err(NotPublic {
+            name: None,
+            address,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// The refusal among the causes of `error`, when an address that is not public stopped it.
+pub fn not_public_refusal<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a NotPublic> {
+    std::iter::successors(Some(error), |error| error.source())
+        .find_map(|error| error.downcast_ref::<NotPublic>())
+}
+
+pub fn is_public(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_v4(address),
+        IpAddr::V6(address) => match embedded_ipv4(address) {
+            Some(address) => is_public_v4(address),
+            None => is_public_v6(address),
+        },
+    }
+}
+
+fn is_public_v4(address: Ipv4Addr) -> bool {
+    let [first, second, third, _] = address.octets();
+    let is_this_network = first == 0;
+    let is_shared = first == 100 && (64..128).contains(&second);
+    let is_protocol_assignment = first == 192 && second == 0 && third == 0;
+    let is_benchmarking = first == 198 && (18..20).contains(&second);
+    let is_reserved = first >= 240;
+    !(address.is_loopback()
+        || address.is_private()
+        || address.is_link_local()
+        || address.is_multicast()
+        || address.is_documentation()
+        || is_this_network
+        || is_shared
+        || is_protocol_assignment
+        || is_benchmarking
+        || is_reserved)
+}
+
+fn is_public_v6(address: Ipv6Addr) -> bool {
+    let [first, second, third, ..] = address.segments();
+    let is_unique_local = first & 0xfe00 == 0xfc00;
+    let is_link_local = first & 0xffc0 == 0xfe80;
+    let is_site_local = first & 0xffc0 == 0xfec0;
+    let is_documentation = first == 0x2001 && second == 0x0db8;
+    let is_teredo = first == 0x2001 && second == 0;
+    let is_local_nat64 = first == 0x64 && second == 0xff9b && third == 1;
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || is_unique_local
+        || is_link_local
+        || is_site_local
+        || is_documentation
+        || is_teredo
+        || is_local_nat64)
+}
+
+/// The IPv4 address an IPv6 address reaches: IPv4-compatible (`::/96`, which holds `::` and
+/// `::1`), IPv4-mapped (`::ffff:0:0/96`), IPv4-translated (`::ffff:0:0:0/96`), NAT64
+/// (`64:ff9b::/96`) or 6to4 (`2002::/16`).
+fn embedded_ipv4(address: Ipv6Addr) -> Option<Ipv4Addr> {
+    let ipv4 = |high: u16, low: u16| Ipv4Addr::from((u32::from(high) << 16) | u32::from(low));
+    match address.segments() {
+        [0, 0, 0, 0, 0, 0 | 0xffff, high, low]
+        | [0, 0, 0, 0, 0xffff, 0, high, low]
+        | [0x64, 0xff9b, 0, 0, 0, 0, high, low] => Some(ipv4(high, low)),
+        [SIX_TO_FOUR, high, low, ..] => Some(ipv4(high, low)),
+        _ => None,
+    }
+}
+
+/// Resolves a host name to its addresses only when every one of them is public.
+struct PublicResolver;
+
+impl Resolve for PublicResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            let addresses = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .collect::<Vec<_>>();
+            if let Some(address) = addresses.iter().find(|address| !is_public(address.ip())) {
+                return Err(Box::new(NotPublic {
+                    name: Some(host),
+                    address: address.ip(),
+                }) as _);
+            }
+            Ok(Box::new(addresses.into_iter()) as Addrs)
+        })
     }
 }
 
@@ -50,8 +206,18 @@ pub fn build_http_client(
     target: &Url,
     policy: HttpPolicy,
 ) -> Result<(Client, NetworkRoute), reqwest::Error> {
-    let route = route_for(target);
-    let mut builder = Client::builder().redirect(policy.redirect);
+    let route = match policy.reach {
+        Reach::Anywhere => route_for(target),
+        Reach::PublicAddresses => NetworkRoute {
+            proxy_source: ProxySource::Direct,
+            direct_websocket_eligible: true,
+        },
+    };
+    let redirect = match policy.reach {
+        Reach::Anywhere => policy.redirect,
+        Reach::PublicAddresses => Policy::none(),
+    };
+    let mut builder = Client::builder().redirect(redirect);
     if let Some(timeout) = policy.timeout {
         builder = builder.timeout(timeout);
     }
@@ -61,8 +227,11 @@ pub fn build_http_client(
     if let Some(timeout) = policy.read_timeout {
         builder = builder.read_timeout(timeout);
     }
-    if is_loopback(target) {
+    if is_loopback(target) || policy.reach == Reach::PublicAddresses {
         builder = builder.no_proxy();
+    }
+    if policy.reach == Reach::PublicAddresses {
+        builder = builder.dns_resolver(Arc::new(PublicResolver));
     }
     builder.build().map(|client| (client, route))
 }
@@ -171,6 +340,15 @@ impl NetworkDiagnostic {
         }
     }
 
+    /// [`Self::emit`] for a client that may reach `reach`. Diagnostics follow the process's
+    /// configuration, which a client reaching public addresses only never reads, so it emits
+    /// nothing.
+    pub fn emit_for(&self, reach: Reach) {
+        if reach == Reach::Anywhere {
+            self.emit();
+        }
+    }
+
     fn emit_to(&self, output: &mut impl Write) {
         let _ = writeln!(output, "{self}");
     }
@@ -253,6 +431,98 @@ mod tests {
             );
         }
         event.emit_to(&mut BrokenSink);
+    }
+
+    #[test]
+    fn only_public_addresses_are_public() {
+        for address in [
+            "127.0.0.1",
+            "127.255.0.9",
+            "0.0.0.0",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "192.0.0.8",
+            "198.18.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::127.0.0.1",
+            "64:ff9b::10.0.0.1",
+            "fc00::1",
+            "fd12:3456::1",
+            "fe80::1",
+            "fec0::1",
+            "ff02::1",
+            "2001:db8::1",
+            "64:ff9b:1::808:808",
+            "2002:7f00:1::",
+            "2002:a00:1::1",
+            "2002:c0a8:101::1",
+            "2001::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "::ffff:0:127.0.0.1",
+            "::ffff:0:10.0.0.1",
+        ] {
+            assert!(!is_public(address.parse().unwrap()), "{address}");
+        }
+        for address in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "100.128.0.1",
+            "172.32.0.1",
+            "::ffff:8.8.8.8",
+            "::ffff:0:8.8.8.8",
+            "64:ff9b::808:808",
+            "2002:808:808::1",
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+        ] {
+            assert!(is_public(address.parse().unwrap()), "{address}");
+        }
+    }
+
+    #[test]
+    fn a_literal_address_that_is_not_public_is_refused_by_url() {
+        for url in [
+            "http://127.0.0.1:8080/",
+            "https://10.0.0.1/",
+            "https://[::1]/",
+            "https://[fe80::1]/",
+            "https://[2002:7f00:1::]/",
+        ] {
+            assert!(
+                check_public_url(&Url::parse(url).unwrap()).is_err(),
+                "{url}"
+            );
+        }
+        assert!(check_public_url(&Url::parse("https://8.8.8.8/").unwrap()).is_ok());
+        assert!(check_public_url(&Url::parse("https://example.com/").unwrap()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_name_resolving_to_an_address_that_is_not_public_is_refused_before_connecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let target = Url::parse(&format!("http://localhost:{port}/")).unwrap();
+        let mut policy = HttpPolicy::new(Policy::limited(5));
+        policy.reach = Reach::PublicAddresses;
+        policy.timeout = Some(Duration::from_secs(3));
+        let (client, route) = build_http_client(&target, policy).unwrap();
+        assert_eq!(route.proxy_source, ProxySource::Direct);
+        let error = client.get(target).send().await.unwrap_err();
+        let refusal = not_public_refusal(&error).map(ToString::to_string);
+        assert!(
+            refusal.is_some_and(|refusal| refusal.starts_with("localhost resolves to ")),
+            "{error:?}"
+        );
+        listener.set_nonblocking(true).unwrap();
+        assert!(listener.accept().is_err(), "no connection was made");
     }
 
     fn run_isolated_case(

@@ -25,7 +25,7 @@ impl Session {
     fn new() -> Self {
         let mut snapshot = empty_snapshot(
             Uuid::new_v4(),
-            "/project".into(),
+            Some("/project".into()),
             tickloop_agent_test_support::config(),
         );
         snapshot.context_window_tokens = Some(WINDOW_TOKENS);
@@ -101,6 +101,7 @@ impl Session {
             &self.bookkeeping,
             &operation,
             None,
+            self.snapshot.folder.as_deref().unwrap(),
             tickloop_agent_config::AutoSettings::default().policy(),
         )
         .unwrap();

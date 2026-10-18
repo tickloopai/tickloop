@@ -1,7 +1,7 @@
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tickloop_agent_model::ModelResponseRejection;
+use tickloop_agent_model::{LocalModelClients, ModelClients, ModelResponseRejection};
 use tickloop_agent_protocol::{
     AgentHostOptions, Content, Decision, DirectoryTrustPolicy, EventKind, ExecutionMode, LoopState,
     PermissionApprovalSource, PermissionRule, PermissionScope, PromptPolicy,
@@ -1914,7 +1914,7 @@ async fn real_automatic_checker_authorizes_an_explicitly_requested_temporary_fil
     checker.max_output_tokens = 1024;
     checker.card.as_mut().unwrap().max_output_tokens = 1024;
     agent
-        .set_auto_reviewer(Arc::new(HttpModelClient::new(checker).unwrap()))
+        .set_auto_reviewer(LocalModelClients::new(None).client(&checker).unwrap())
         .await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent

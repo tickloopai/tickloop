@@ -10,7 +10,7 @@ use tickloop_agent_protocol::{FileReadRecord, ToolResult};
 
 fn workspace(path: &Path) -> Workspace {
     Workspace {
-        workdir: path.to_path_buf(),
+        folder: Some(path.to_path_buf()),
         additional_directories: Vec::new(),
     }
 }
@@ -445,7 +445,7 @@ async fn family_temp_writes_edits_and_bash_are_allowed_but_other_families_and_li
     let other = tempfile::tempdir().unwrap();
     let tools = Tools::new(internal.path().canonicalize().unwrap());
     let workspace = Workspace {
-        workdir: directory.path().canonicalize().unwrap(),
+        folder: Some(directory.path().canonicalize().unwrap()),
         additional_directories: vec![],
     };
     let path = internal.path().join("scratch.txt");
@@ -1011,7 +1011,8 @@ async fn a_local_file_sent_elsewhere_follows_read_rules_and_refuses_sensitive_pa
     let elsewhere = tempfile::tempdir().unwrap();
     let output = tempfile::tempdir().unwrap();
     let files = chat_tools(&output)
-        .local_file_reader(&workspace(&project), std::sync::Arc::new(AdmissionByName));
+        .local_file_reader(&workspace(&project), std::sync::Arc::new(AdmissionByName))
+        .expect("a Chat with a Folder reads local files");
     std::fs::write(project.join("chart.png"), b"chart").unwrap();
     std::fs::write(elsewhere.path().join("photo.png"), b"photo").unwrap();
 

@@ -45,7 +45,7 @@ impl AgentAccess for Catalog {
 }
 
 fn row(epoch: Uuid, id: u128, parent: Option<ExecutionRef>, state: &str) -> AgentSummary {
-    serde_json::from_value(serde_json::json!({"execution":{"daemon_epoch":epoch,"agent_id":Uuid::from_u128(id),"generation":1},"chat_id":Uuid::from_u128(id+100),"workdir":"/test","state":state,"title":format!("Root title {id}"),"has_work":true,"waiting_permissions":0,"waiting_questions":0,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"updated_at":100000,"subagent":parent.map(|_|serde_json::json!({"child_chat_id":Uuid::from_u128(id+100),"handle":format!("child-{id}"),"description":"task","created_at":100000}))})).unwrap()
+    serde_json::from_value(serde_json::json!({"execution":{"daemon_epoch":epoch,"agent_id":Uuid::from_u128(id),"generation":1},"chat_id":Uuid::from_u128(id+100),"folder":"/test","state":state,"title":format!("Root title {id}"),"has_work":true,"waiting_permissions":0,"waiting_questions":0,"parent":parent,"record":null,"workspace":null,"capabilities":[],"views":[],"updated_at":100000,"subagent":parent.map(|_|serde_json::json!({"child_chat_id":Uuid::from_u128(id+100),"handle":format!("child-{id}"),"description":"task","created_at":100000}))})).unwrap()
 }
 
 #[tokio::test]

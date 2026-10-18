@@ -69,7 +69,7 @@ impl Agent {
             reasoning_effort,
         };
         let agent = self.clone();
-        let task = tokio::spawn(async move {
+        self.inner.tasks.spawn(async move {
             let cancel = agent.inner.shutdown.child_token();
             let output = agent
                 .tracked_model_request(
@@ -91,7 +91,6 @@ impl Agent {
                 agent.record_shell_description(task_id, description).await;
             }
         });
-        self.inner.tasks.lock().await.push(task);
     }
 
     /// Keeps a generated description for display and tells Shell task subscribers. Records,

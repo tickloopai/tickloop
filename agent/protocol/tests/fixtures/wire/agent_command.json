@@ -2,7 +2,7 @@
   {
     "kind": "create",
     "launch": {
-      "workdir": "/work/project",
+      "folder": "/work/project",
       "config_root": "/home/user/.tickloop",
       "model": {
         "connection": {

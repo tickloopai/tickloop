@@ -137,7 +137,9 @@ impl ShellInput {
     ) -> permission::ShellPermissionContext<'a> {
         permission::ShellPermissionContext {
             cwd,
-            working_directories: std::iter::once(&workspace.workdir)
+            working_directories: workspace
+                .folder
+                .iter()
                 .chain(&workspace.additional_directories)
                 .cloned()
                 .collect(),
@@ -581,6 +583,15 @@ impl Registry {
     /// A Registry that cannot run commands.
     pub(super) fn without_host() -> Self {
         Self::new(Arc::new(host::NoShellHost))
+    }
+
+    /// The Registry of a Chat without a Folder: it runs no command and selects no shell, so it
+    /// reads neither the process environment nor the file system.
+    pub(super) fn without_folder() -> Self {
+        Self::with_shell(
+            Err(super::FOLDERLESS_REJECTION.into()),
+            Arc::new(host::NoShellHost),
+        )
     }
 
     fn with_shell(shell: Result<PathBuf, String>, host: Arc<dyn ShellHost>) -> Self {
@@ -2121,7 +2132,7 @@ mod tests {
         let workdir = Workdir::new();
         let cwd = workdir.path.clone();
         let workspace = super::super::Workspace {
-            workdir: cwd.clone(),
+            folder: Some(cwd.clone()),
             additional_directories: Vec::new(),
         };
         let read_only = |command: &str| workdir.input(command).is_read_only(&cwd, &workspace);
@@ -2152,7 +2163,7 @@ mod tests {
         let internal = tempfile::tempdir().unwrap();
         let internal = internal.path().canonicalize().unwrap();
         let workspace = super::super::Workspace {
-            workdir: cwd.clone(),
+            folder: Some(cwd.clone()),
             additional_directories: Vec::new(),
         };
         let mut input = workdir.input(&format!("cat {}/task.output", internal.display()));

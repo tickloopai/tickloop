@@ -482,7 +482,7 @@ async fn a_model_without_image_input_refuses_image_prompts_and_leaves_the_chat_u
 
     let vision = Arc::new(ScriptedModel::new(vec![text("A chart.")]));
     agent
-        .set_model(chat, config(), vision.clone())
+        .set_model(chat, config())
         .await
         .unwrap();
     assert!(agent.accepts_images(chat).await.unwrap());
@@ -531,11 +531,7 @@ async fn a_pending_switch_to_a_text_only_model_refuses_image_prompts() {
     ) {}
 
     let change = agent
-        .set_model(
-            chat,
-            text_only_config(),
-            Arc::new(ScriptedModel::new(Vec::new())),
-        )
+        .set_model(chat, text_only_config())
         .await
         .unwrap();
 

@@ -696,7 +696,7 @@ async fn only_one_recovery_probe_runs_while_another_chat_uses_llm() {
     std::fs::create_dir(&other_workdir).unwrap();
     let other_chat = agent.create_chat(other_workdir).await.unwrap();
     agent
-        .set_model(other_chat, config(), other_model.clone())
+        .set_model(other_chat, config())
         .await
         .unwrap();
     agent

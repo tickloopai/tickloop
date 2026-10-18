@@ -161,7 +161,7 @@ impl HostToolProvider for CapturedHostSource {
 
 fn captured_view_context(workdir: &Path, view: &str) -> HostCallContext {
     HostCallContext {
-        workdir: workdir.into(),
+        folder: workdir.into(),
         workspace_id: Some("task-workspace".into()),
         interaction: Some(HerdrInteraction {
             socket: workdir.join(format!("{view}.sock")),
@@ -187,7 +187,7 @@ async fn assert_merged_host_source(headless: bool) {
         .unwrap();
     let chat = agent.create_chat(workdir.clone()).await.unwrap();
     let work_context = HostCallContext {
-        workdir: workdir.clone(),
+        folder: workdir.clone(),
         workspace_id: Some("task-workspace".into()),
         interaction: None,
     };

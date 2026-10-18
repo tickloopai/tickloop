@@ -136,7 +136,7 @@ pub struct RecordedMessage {
 pub struct RecordedTranscript {
     pub record: TranscriptRef,
     pub title: Option<String>,
-    pub workdir: PathBuf,
+    pub folder: PathBuf,
     pub messages: Vec<RecordedMessage>,
     pub total_messages: usize,
     pub warnings: Vec<String>,
@@ -197,7 +197,7 @@ pub struct ProviderCredentialScope {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LaunchSpec {
-    pub workdir: PathBuf,
+    pub folder: PathBuf,
     pub config_root: Option<PathBuf>,
     pub model: Option<ModelConfig>,
     pub host_options: AgentHostOptions,
@@ -208,9 +208,9 @@ pub struct LaunchSpec {
 }
 
 impl LaunchSpec {
-    pub fn embedded(workdir: PathBuf) -> Self {
+    pub fn embedded(folder: PathBuf) -> Self {
         Self {
-            workdir,
+            folder,
             config_root: None,
             model: None,
             host_options: AgentHostOptions::embedded_defaults(),
@@ -383,7 +383,7 @@ pub enum AgentCommand {
         execution: ExecutionRef,
     },
     TrustWorkingDirectory {
-        workdir: PathBuf,
+        folder: PathBuf,
     },
     FlushTranscripts,
     /// Stops the running Tickhost of another build than the daemon's, ending what it runs; the
@@ -454,7 +454,7 @@ pub enum ConfigurationChange {
         config: Option<SearchConfig>,
     },
     Directories {
-        workdir: PathBuf,
+        folder: PathBuf,
         additional: Vec<PathBuf>,
     },
     PermissionChange {
@@ -602,7 +602,7 @@ impl Page {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct AgentFilter {
-    pub workdir: Option<PathBuf>,
+    pub folder: Option<PathBuf>,
     pub workspace: Option<String>,
 }
 
@@ -671,7 +671,7 @@ pub enum ObservationRequest {
     },
     SavedRecords {
         store_root: Option<PathBuf>,
-        workdir: PathBuf,
+        folder: PathBuf,
         page: Page,
     },
     Receipt {
@@ -734,7 +734,7 @@ pub struct AgentSummary {
     pub availability: ExecutionAvailability,
     pub execution: ExecutionRef,
     pub chat_id: Uuid,
-    pub workdir: PathBuf,
+    pub folder: Option<PathBuf>,
     pub state: LoopState,
     pub run_id: Option<RunId>,
     /// Unix milliseconds when the current summarized run began.

@@ -3,7 +3,7 @@ use tickloop_agent_test_support::model_http_support;
 use model_http_support::serve_response;
 use serde_json::{Value, json};
 use tickloop_agent_model::{
-    HttpModelClient, ModelClient, ModelDelta, ModelError, ModelFailureKind, ModelOutput,
+    LocalModelClients, ModelClients, ModelDelta, ModelError, ModelFailureKind, ModelOutput,
     ModelRequest, ModelRequestStage, ModelResponseRejection,
 };
 use tickloop_agent_protocol::{InputModality, ModelConfig, ModelIdentity, Protocol, Usage};
@@ -79,7 +79,9 @@ async fn complete(
     body: String,
 ) -> (Result<ModelOutput, ModelError>, Vec<Usage>) {
     let (base_url, _) = serve_response(200, body).await;
-    let client = HttpModelClient::new(configuration(base_url, protocol)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url, protocol))
+        .unwrap();
     let (events, mut receiver) = mpsc::unbounded_channel();
     let result = client
         .complete(
@@ -115,7 +117,7 @@ fn identity_is_the_requested_profile_protocol_and_model_without_service_configur
             "http://127.0.0.1:1234/private-service-path".into(),
             protocol,
         );
-        let client = HttpModelClient::new(config).unwrap();
+        let client = LocalModelClients::new(None).client(&config).unwrap();
         let identity = client.identity();
         assert_eq!(
             identity,

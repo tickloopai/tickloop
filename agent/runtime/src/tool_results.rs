@@ -31,8 +31,9 @@ use tickloop_agent_protocol::{
     ChatSnapshot, Content, Message, Receipt, Role, ToolResult, ToolResultContent,
 };
 use tickloop_agent_tools::{
-    BASH_TOOL_NAME, GREP_TOOL_NAME, PERSISTED_OUTPUT_TAG, PREVIEW_LABEL, READ_TOOL_NAME,
-    SAVED_TO_LABEL, TASK_OUTPUT_SUBDIRECTORY, Tools, large_output_message, utf16_length,
+    BASH_TOOL_NAME, ChatDirectory, GREP_TOOL_NAME, PERSISTED_OUTPUT_TAG, PREVIEW_LABEL,
+    READ_TOOL_NAME, SAVED_TO_LABEL, TASK_OUTPUT_SUBDIRECTORY, Tools, generate_preview,
+    large_output_message, utf16_length,
 };
 
 /// Chat 目录中大工具结果的子目录。
@@ -52,8 +53,14 @@ const FALLBACK_STEM: &str = "tool-result";
 
 impl Agent {
     /// Each family owns one private temporary root; children share it without widening
-    /// access to other families in the same project.
+    /// access to other families in the same project. A Chat without a Folder has no directory.
     pub(super) fn create_chat_tools(&self, snapshot: &ChatSnapshot) -> Arc<Tools> {
+        if snapshot.folder.is_none() {
+            return Arc::new(Tools::folderless().with_search_configuration(
+                snapshot.search_config.clone(),
+                self.inner.config_root.clone(),
+            ));
+        }
         let chat_id = snapshot.id;
         let family_id = snapshot
             .delegation
@@ -64,7 +71,7 @@ impl Agent {
             .inner
             .recorder
             .as_ref()
-            .and_then(|recorder| recorder.project_directory_of(chat_id));
+            .and_then(|recorder| recorder.local_project_directory(chat_id));
         let temporary_chat = if family_id == chat_id {
             family_temp.clone()
         } else {
@@ -74,12 +81,14 @@ impl Agent {
             || temporary_chat.clone(),
             |project| PrivateDirectory::trusted(project).join(chat_id.to_string()),
         );
-        let task_output_directory = temporary_chat.join(TASK_OUTPUT_SUBDIRECTORY);
+        let task_output = temporary_chat.join(TASK_OUTPUT_SUBDIRECTORY);
         Arc::new(
             Tools::for_chat(
-                chat_directory,
-                task_output_directory,
-                family_temp,
+                ChatDirectory {
+                    chat: chat_directory,
+                    task_output,
+                    family_temp,
+                },
                 self.inner.shells.for_chat(chat_id),
             )
             .with_search_configuration(
@@ -90,7 +99,7 @@ impl Agent {
     }
 
     /// 工具结果写入对话前按阈值外存；外存后结果内容换成替换文本，未自带输出引用的结果
-    /// 指向外存文件。
+    /// 指向外存文件。A Chat without a Folder stores nothing, so the result is cut instead.
     pub(super) async fn persist_large_tool_result(
         &self,
         receipt: &Receipt,
@@ -107,7 +116,13 @@ impl Agent {
             .ok_or(AgentError::NotFound)?
             .tools
             .chat_directory()
-            .clone();
+            .cloned();
+        let Some(chat_directory) = chat_directory else {
+            if let Some(truncated) = truncate_large_tool_result(tool_name, &result.content) {
+                result.content = truncated;
+            }
+            return Ok(result);
+        };
         let tool_name = tool_name.to_owned();
         let tool_use_id = tool_use_id.to_owned();
         tokio::task::spawn_blocking(move || {
@@ -139,6 +154,74 @@ fn persistence_threshold(tool_name: &str) -> Option<usize> {
         _ => COMMON_MAX_RESULT_SIZE_CHARS,
     };
     Some(declared.min(DEFAULT_MAX_RESULT_SIZE_CHARS))
+}
+
+/// A result over its tool's threshold, cut to the threshold with a note on the rest, for a Chat
+/// with no Folder to store it in; `None` when it is within the threshold.
+fn truncate_large_tool_result(tool_name: &str, content: &str) -> Option<String> {
+    let threshold = persistence_threshold(tool_name)?;
+    (utf16_length(content) > threshold).then(|| truncated_result(content, threshold))
+}
+
+/// The start of `content`, at most `kept_units` UTF-16 code units, with a note on the rest.
+fn truncated_result(content: &str, kept_units: usize) -> String {
+    let (kept, _) = generate_preview(content, kept_units);
+    format!(
+        "{kept}\n\n[Output truncated: the result has {} characters; only the first {} are shown, and this Chat has no Folder to keep the rest.]",
+        utf16_length(content),
+        utf16_length(kept)
+    )
+}
+
+/// The per-message budget of [`enforce_tool_result_budget`] for a Chat without a Folder, which
+/// has nowhere to store results: each tool round over the budget has its largest results cut in
+/// place to an equal share of it. The cut depends only on the messages, so every request repeats
+/// it byte for byte.
+pub(super) fn cut_tool_results_over_budget(messages: &mut [Message]) {
+    let mut cuts = HashMap::new();
+    for group in candidate_groups(messages) {
+        let total = group.iter().map(|candidate| candidate.size).sum::<usize>();
+        if total <= MAX_TOOL_RESULTS_PER_MESSAGE_CHARS {
+            continue;
+        }
+        let share = MAX_TOOL_RESULTS_PER_MESSAGE_CHARS / group.len();
+        let mut largest_first = group.iter().collect::<Vec<_>>();
+        largest_first.sort_by(|left, right| {
+            right
+                .size
+                .cmp(&left.size)
+                .then_with(|| left.tool_use_id.cmp(right.tool_use_id))
+        });
+        let mut remaining = total;
+        for candidate in largest_first {
+            if remaining <= MAX_TOOL_RESULTS_PER_MESSAGE_CHARS || candidate.size <= share {
+                break;
+            }
+            cuts.insert(
+                candidate.tool_use_id.to_owned(),
+                truncated_result(&candidate.content, share),
+            );
+            remaining = remaining - candidate.size + share;
+        }
+    }
+    if cuts.is_empty() {
+        return;
+    }
+    for content in messages
+        .iter_mut()
+        .filter(|message| message.role == Role::User)
+        .flat_map(|message| message.content.iter_mut())
+    {
+        if let Content::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = content
+            && let Some(cut) = cuts.get(tool_use_id.as_str())
+        {
+            *content = ToolResultContent::Text(cut.clone());
+        }
+    }
 }
 
 pub(super) struct PersistedToolResult {
@@ -667,5 +750,76 @@ mod tests {
             Content::ToolResult { content: kept, .. } if *kept == content
         ));
         assert!(!directory.path().join(TOOL_RESULTS_SUBDIRECTORY).exists());
+    }
+
+    #[test]
+    fn a_large_result_without_a_folder_is_cut_at_its_threshold_with_a_note() {
+        let threshold = persistence_threshold("WebFetch").unwrap();
+        assert!(truncate_large_tool_result("WebFetch", &"a".repeat(threshold)).is_none());
+        let content = format!("{}{}", "a".repeat(threshold), "b".repeat(threshold));
+        let truncated = truncate_large_tool_result("WebFetch", &content).unwrap();
+        let (kept, note) = truncated.split_once("\n\n[Output truncated").unwrap();
+        assert_eq!(kept, "a".repeat(threshold));
+        assert!(note.contains(&format!("has {} characters", 2 * threshold)));
+        assert!(note.contains("no Folder"));
+        assert!(truncate_large_tool_result(READ_TOOL_NAME, &content).is_none());
+    }
+
+    #[test]
+    fn a_round_over_the_message_budget_without_a_folder_has_its_largest_results_cut_in_place() {
+        let small = "s".repeat(1_000);
+        let large = "l".repeat(MAX_TOOL_RESULTS_PER_MESSAGE_CHARS);
+        let round = |results: &[(&str, &str)]| {
+            vec![
+                Message {
+                    role: Role::Assistant,
+                    content: results
+                        .iter()
+                        .map(|(id, _)| Content::ToolUse {
+                            id: (*id).into(),
+                            name: "WebFetch".into(),
+                            input: serde_json::json!({}),
+                        })
+                        .collect(),
+                },
+                Message {
+                    role: Role::User,
+                    content: results
+                        .iter()
+                        .map(|(id, text)| Content::ToolResult {
+                            tool_use_id: (*id).into(),
+                            content: ToolResultContent::Text((*text).into()),
+                            is_error: false,
+                        })
+                        .collect(),
+                },
+            ]
+        };
+        let mut within = round(&[("a", &small), ("b", &small)]);
+        let unchanged = within.clone();
+        cut_tool_results_over_budget(&mut within);
+        assert_eq!(within, unchanged);
+
+        let mut over = round(&[("a", &small), ("b", &large), ("c", &large)]);
+        cut_tool_results_over_budget(&mut over);
+        let mut again = round(&[("a", &small), ("b", &large), ("c", &large)]);
+        cut_tool_results_over_budget(&mut again);
+        assert_eq!(over, again);
+        let texts = over[1]
+            .content
+            .iter()
+            .map(|content| match content {
+                Content::ToolResult { content, .. } => content.text().into_owned(),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts[0], small);
+        let share = MAX_TOOL_RESULTS_PER_MESSAGE_CHARS / 3;
+        for cut in &texts[1..] {
+            assert!(
+                cut.starts_with(&"l".repeat(share)) && !cut.starts_with(&"l".repeat(share + 1))
+            );
+            assert!(cut.contains("no Folder"));
+        }
     }
 }

@@ -1,4 +1,6 @@
-use tickloop_agent_model::{ModelRequest, credentials::save_api_key, model_client};
+use tickloop_agent_model::{
+    LocalModelClients, ModelClients, ModelRequest, credentials::save_api_key,
+};
 use tickloop_agent_protocol::{
     Message, ModelAuthSource, ModelConfig, ModelProvider, Protocol, Role,
 };
@@ -52,7 +54,9 @@ async fn model_factory_reads_saved_key_for_each_request() {
         card: None,
         input_modalities: vec![tickloop_agent_protocol::InputModality::Text],
     };
-    let client = model_client(config, Some(&root)).unwrap();
+    let client = LocalModelClients::new(Some(root.to_path_buf()))
+        .client(&config)
+        .unwrap();
     let request = || ModelRequest {
         history_sources: Vec::new(),
         messages: vec![Message {

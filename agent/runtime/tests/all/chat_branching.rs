@@ -140,7 +140,7 @@ async fn branch_is_insert_only_idempotent_and_continues_with_fresh_identity() {
             if contexts == std::slice::from_ref(&stored_context)
     )));
     assert_eq!(outcome.snapshot.model, source_before.model);
-    assert_eq!(outcome.snapshot.workdir, source_before.workdir);
+    assert_eq!(outcome.snapshot.folder, source_before.folder);
     assert_eq!(
         outcome.snapshot.additional_directories,
         source_before.additional_directories

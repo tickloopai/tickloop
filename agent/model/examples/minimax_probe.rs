@@ -2,10 +2,9 @@ use std::{error::Error, os::unix::fs::PermissionsExt, path::PathBuf};
 
 use serde_json::json;
 use tickloop_agent_model::{
-    ModelRequest, StructuredOutput,
+    LocalModelClients, ModelClients, ModelRequest, StructuredOutput,
     auth::minimax::{MiniMaxAuth, MiniMaxRegion},
     cards::ModelCatalog,
-    model_client,
 };
 use tickloop_agent_protocol::{Content, Message, ReasoningEffort, Role, ToolDefinition};
 use tokio::sync::mpsc;
@@ -79,7 +78,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else {
         ReasoningEffort::Max
     };
-    let client = model_client(config, Some(&root))?;
+    let client = LocalModelClients::new(Some(root.to_path_buf())).client(&config)?;
     let (events, _receiver) = mpsc::unbounded_channel();
     let mut request = ModelRequest {
         history_sources: vec![None],

@@ -10,8 +10,7 @@ use tokio_tungstenite::accept_async;
 use uuid::Uuid;
 
 use crate::Agent;
-use tickloop_agent_model::{
-    HttpModelClient, ModelClient,
+use tickloop_agent_model::{LocalModelClients, ModelClients, ModelClient,
     cards::ModelCatalog,
     codex_test_support::{
         LoopbackCodexClient, function_call_stream, reply_stream, send_ws_stream,
@@ -186,18 +185,18 @@ async fn source_switch_and_rewind_preserve_original_private_checkpoint() {
         .get("deepseek-api", "deepseek-flash-responses")
         .unwrap();
     api.api_key_env = "CODEX_HISTORY_TEST_MISSING_API_KEY".into();
-    let api_client = Arc::new(HttpModelClient::deferred(api.clone()).unwrap());
+    let api_client = LocalModelClients::new(None).client(&api).unwrap();
     agent
-        .set_model(chat, api.clone(), api_client.clone())
+        .set_model(chat, api.clone())
         .await
         .unwrap();
     agent
-        .set_model(chat, config(), client(&state, &endpoint))
+        .set_model(chat, config())
         .await
         .unwrap();
     let compacted = agent.compact(chat).await.unwrap();
     assert!(compacted.summary.contains("preserve source files"));
-    agent.set_model(chat, api, api_client).await.unwrap();
+    agent.set_model(chat, api).await.unwrap();
     agent
         .rewind(chat, checkpoint.message_id, RewindMode::Conversation)
         .await
@@ -209,7 +208,7 @@ async fn source_switch_and_rewind_preserve_original_private_checkpoint() {
     );
     assert!(!rewound.message_sources.is_empty());
     agent
-        .set_model(chat, config(), client(&state, &endpoint))
+        .set_model(chat, config())
         .await
         .unwrap();
     agent

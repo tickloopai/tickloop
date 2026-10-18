@@ -497,6 +497,7 @@ pub(super) fn project_event(event: &Event) -> Option<ConversationBlock> {
             },
         },
         EventKind::AssistantMessageCommitted { .. }
+        | EventKind::ResponseStarted { .. }
         | EventKind::Started
         | EventKind::ModelRetry { .. }
         | EventKind::InputMerged { .. }
@@ -688,7 +689,7 @@ mod tests {
     fn snapshot(chat_id: Uuid) -> ChatSnapshot {
         let mut snapshot: ChatSnapshot = serde_json::from_value(json!({
             "id": chat_id,
-            "workdir": "/work",
+            "folder": "/work",
             "messages": [],
             "loops": []
         }))

@@ -57,6 +57,7 @@ pub(super) fn remind(chat: &mut Chat, receipt: &Receipt) -> bool {
     chat.snapshot.messages.push(Message { role:Role::User, content:vec![Content::Text { text:
         "Finish by calling SubagentHandback with your complete report. Plain final text is not delivered to your caller; this reminder does not authorize any new work.".into()
     }] });
+    crate::lifecycle::claim_response_messages(chat);
     true
 }
 

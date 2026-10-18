@@ -916,8 +916,7 @@ impl Agent {
         self.inner
             .tick_stream_installed
             .store(true, Ordering::SeqCst);
-        let task = self.tick_delivery_task(handle.events);
-        self.inner.tasks.lock().await.push(task);
+        self.tick_delivery_task(handle.events);
         self.sync_tick_subscriptions().await;
     }
 
@@ -1647,13 +1646,11 @@ impl Agent {
             let configured: Vec<_> = chats
                 .iter()
                 .flat_map(|(chat_id, chat)| {
-                    let watermarks = saves_chats.then(|| {
-                        chat.tools
-                            .chat_directory()
-                            .join(WATERMARK_DIRECTORY)
-                            .path()
-                            .to_path_buf()
-                    });
+                    let watermarks = chat
+                        .tools
+                        .chat_directory()
+                        .filter(|_| saves_chats)
+                        .map(|directory| directory.join(WATERMARK_DIRECTORY).path().to_path_buf());
                     chat.snapshot
                         .loops
                         .iter()
@@ -1828,7 +1825,7 @@ impl Agent {
             for (watch, instance) in monitor_samples {
                 let port = port.clone();
                 let shutdown = self.inner.shutdown.clone();
-                tokio::spawn(async move {
+                self.inner.tasks.spawn(async move {
                     tokio::select! {
                         _ = shutdown.cancelled() => {},
                         _ = tokio::time::timeout(SAMPLE_TIMEOUT, port.sample(watch, &instance)) => {},
@@ -1881,7 +1878,9 @@ impl Agent {
             return;
         }
         let agent = self.clone();
-        tokio::spawn(async move { agent.deliver(chat_id, loop_id).await });
+        self.inner
+            .tasks
+            .spawn(async move { agent.deliver(chat_id, loop_id).await });
     }
 
     /// Hands one Loop's pending delivery to [`Agent::trigger`], or marks it due while the Loop
@@ -2235,9 +2234,9 @@ impl Agent {
     fn tick_delivery_task(
         &self,
         mut events: tokio::sync::mpsc::Receiver<TickStreamEvent>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) {
         let agent = self.clone();
-        tokio::spawn(async move {
+        self.inner.tasks.spawn(async move {
             loop {
                 let next_due = agent.tick_deliveries().next_due();
                 tokio::select! {
@@ -2263,7 +2262,7 @@ impl Agent {
                     }
                 }
             }
-        })
+        });
     }
 
     /// Samples the screen of every Terminal Tick whose subscription's period elapsed by `now`.
@@ -2292,7 +2291,7 @@ impl Agent {
             return;
         };
         let agent = self.clone();
-        tokio::spawn(async move {
+        self.inner.tasks.spawn(async move {
             let mut samples = tokio::task::JoinSet::new();
             for (watch, instance) in due {
                 let port = port.clone();
@@ -2399,7 +2398,7 @@ impl Agent {
                         .mark_observed(instance.clone(), crate::monitor_members::now_ms());
                     self.record_monitor_membership(
                         owner,
-                        &chat.snapshot.workdir,
+                        chat.snapshot.folder.as_deref(),
                         chat.snapshot.monitor.clone(),
                     );
                 }
@@ -2414,7 +2413,7 @@ impl Agent {
                     let instance = instance.clone();
                     let port = port.clone();
                     let shutdown = self.inner.shutdown.clone();
-                    tokio::spawn(async move {
+                    self.inner.tasks.spawn(async move {
                         tokio::select! {
                             _ = shutdown.cancelled() => {},
                             _ = tokio::time::timeout(SAMPLE_TIMEOUT, port.sample(watch, &instance)) => {},

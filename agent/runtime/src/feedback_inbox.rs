@@ -52,16 +52,24 @@ pub(super) struct FeedbackUnlink {
 }
 
 pub(super) struct FeedbackInbox {
-    root: PrivateDirectory,
+    /// `None` for a Chat without a Folder, which keeps no inbox.
+    root: Option<PrivateDirectory>,
     chat_id: Uuid,
 }
 
 impl FeedbackInbox {
-    pub(super) fn new(chat_directory: &PrivateDirectory, chat_id: Uuid) -> Self {
+    pub(super) fn new(chat_directory: Option<&PrivateDirectory>, chat_id: Uuid) -> Self {
         Self {
-            root: chat_directory.join("feedback"),
+            root: chat_directory.map(|directory| directory.join("feedback")),
             chat_id,
         }
+    }
+
+    fn directory(&self, name: &str) -> io::Result<PrivateDirectory> {
+        self.root
+            .as_ref()
+            .map(|root| root.join(name))
+            .ok_or_else(|| io::Error::other("this Chat has no Folder to keep Artifact feedback"))
     }
 
     fn key(identity: &FeedbackIdentity) -> String {
@@ -114,7 +122,7 @@ impl FeedbackInbox {
         }
         let key = Self::key(&input.identity);
         if let Some(received) =
-            Self::read::<FeedbackIdentity>(&self.root.join("received").path().join(&key))?
+            Self::read::<FeedbackIdentity>(&self.directory("received")?.path().join(&key))?
         {
             if received != input.identity {
                 return Err(io::Error::other("Feedback delivery identity changed"));
@@ -122,7 +130,7 @@ impl FeedbackInbox {
             return Ok(false);
         }
         if let Some(pending) =
-            Self::read::<FeedbackInput>(&self.root.join("pending").path().join(&key))?
+            Self::read::<FeedbackInput>(&self.directory("pending")?.path().join(&key))?
         {
             if pending.identity != input.identity {
                 return Err(io::Error::other("Feedback delivery identity changed"));
@@ -142,12 +150,12 @@ impl FeedbackInbox {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or_else(|| io::Error::other("Feedback inbox sequence exhausted"))?;
-        Self::write(&self.root.join("pending"), &key, &input)?;
+        Self::write(&self.directory("pending")?, &key, &input)?;
         Ok(true)
     }
 
     pub(super) fn pending(&self) -> io::Result<Vec<FeedbackInput>> {
-        let directory = self.root.join("pending");
+        let directory = self.directory("pending")?;
         match open_without_following_links(
             directory.path(),
             OpenTarget::Directory { create_mode: None },
@@ -178,8 +186,7 @@ impl FeedbackInbox {
             }
             if Self::read::<FeedbackIdentity>(
                 &self
-                    .root
-                    .join("received")
+                    .directory("received")?
                     .path()
                     .join(Self::key(&input.identity)),
             )?
@@ -207,11 +214,11 @@ impl FeedbackInbox {
     }
 
     pub(super) fn queue_unlink(&self, input: &FeedbackUnlink) -> io::Result<()> {
-        Self::write(&self.root.join("unlinks"), &Self::unlink_key(input), input)
+        Self::write(&self.directory("unlinks")?, &Self::unlink_key(input), input)
     }
 
     pub(super) fn unlinks(&self) -> io::Result<Vec<FeedbackUnlink>> {
-        let directory = self.root.join("unlinks");
+        let directory = self.directory("unlinks")?;
         match open_without_following_links(
             directory.path(),
             OpenTarget::Directory { create_mode: None },
@@ -239,7 +246,7 @@ impl FeedbackInbox {
     }
 
     pub(super) fn unlinked(&self, input: &FeedbackUnlink) -> io::Result<()> {
-        let directory = self.root.join("unlinks");
+        let directory = self.directory("unlinks")?;
         match fs::remove_file(directory.path().join(Self::unlink_key(input))) {
             Ok(()) => open_without_following_links(
                 directory.path(),
@@ -257,7 +264,7 @@ impl FeedbackInbox {
             .into_iter()
             .map(|input| input.identity)
             .collect::<Vec<_>>();
-        let directory = self.root.join("received");
+        let directory = self.directory("received")?;
         match open_without_following_links(
             directory.path(),
             OpenTarget::Directory { create_mode: None },
@@ -287,8 +294,8 @@ impl FeedbackInbox {
     /// The caller checkpoints model-visible history before replacing an input with its durable receipt.
     pub(super) fn received(&self, identity: &FeedbackIdentity) -> io::Result<()> {
         let key = Self::key(identity);
-        Self::write(&self.root.join("received"), &key, identity)?;
-        let pending = self.root.join("pending");
+        Self::write(&self.directory("received")?, &key, identity)?;
+        let pending = self.directory("pending")?;
         match fs::remove_file(pending.path().join(key)) {
             Ok(()) => open_without_following_links(
                 pending.path(),
@@ -325,24 +332,26 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let private = PrivateDirectory::trusted(directory.path().canonicalize().unwrap());
         let chat = Uuid::new_v4();
-        let inbox = FeedbackInbox::new(&private, chat);
+        let inbox = FeedbackInbox::new(Some(&private), chat);
         let first = input(chat);
         inbox.stage(first.clone()).unwrap();
         let mut reclaimed = first.clone();
         reclaimed.prompt = "Later thread context".into();
         inbox.stage(reclaimed).unwrap();
-        let restored = FeedbackInbox::new(&private, chat).pending().unwrap();
+        let restored = FeedbackInbox::new(Some(&private), chat).pending().unwrap();
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].prompt, first.prompt);
         inbox.received(&first.identity).unwrap();
         assert!(
-            FeedbackInbox::new(&private, chat)
+            FeedbackInbox::new(Some(&private), chat)
                 .pending()
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            FeedbackInbox::new(&private, chat).identities().unwrap(),
+            FeedbackInbox::new(Some(&private), chat)
+                .identities()
+                .unwrap(),
             vec![first.identity.clone()]
         );
         assert!(!inbox.stage(first).unwrap());
@@ -353,7 +362,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let private = PrivateDirectory::trusted(directory.path().canonicalize().unwrap());
         let chat = Uuid::new_v4();
-        let inbox = FeedbackInbox::new(&private, chat);
+        let inbox = FeedbackInbox::new(Some(&private), chat);
         let first = input(chat);
         inbox.stage(first.clone()).unwrap();
         let mut other_account = first.clone();

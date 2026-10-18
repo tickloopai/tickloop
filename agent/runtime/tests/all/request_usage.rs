@@ -874,7 +874,7 @@ async fn switching_models_never_relabels_old_requests() {
     ));
     assert_eq!(
         agent
-            .set_model(chat, config(&next_identity), next_model.clone())
+            .set_model(chat, config(&next_identity))
             .await
             .unwrap(),
         ModelChange::Applied

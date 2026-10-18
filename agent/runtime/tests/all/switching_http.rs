@@ -2,7 +2,7 @@ use tickloop_agent_test_support::model_http_support;
 
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
-use tickloop_agent_model::{HttpModelClient, cards::model_for_persistent_selection};
+use tickloop_agent_model::{LocalModelClients, ModelClients, cards::model_for_persistent_selection};
 use tickloop_agent_protocol::{
     BranchRequest, CommandState, Content, EventKind, ModelChange, ModelConfig, Protocol,
 };
@@ -31,7 +31,7 @@ async fn builtin_selection_with_a_mock_transport_completes_tools_and_resumes_his
     let agent = Agent::open_embedded(
         root.clone(),
         config.clone(),
-        Arc::new(HttpModelClient::new(config.clone()).unwrap()),
+        LocalModelClients::new(None).client(&config).unwrap(),
     )
     .unwrap();
     agent.install_own_tickhost();
@@ -57,7 +57,7 @@ async fn builtin_selection_with_a_mock_transport_completes_tools_and_resumes_his
     let reopened = Agent::open_embedded(
         root,
         config.clone(),
-        Arc::new(HttpModelClient::new(config).unwrap()),
+        LocalModelClients::new(None).client(&config).unwrap(),
     )
     .unwrap();
     reopened.install_own_tickhost();
@@ -110,7 +110,7 @@ async fn api_key_branch_uses_public_history_while_source_keeps_proven_private_hi
     config.api_key_env = "PATH".into();
     let agent = Agent::new_embedded(
         config.clone(),
-        Arc::new(HttpModelClient::new(config).unwrap()),
+        LocalModelClients::new(None).client(&config).unwrap(),
     );
     let source = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
@@ -391,7 +391,7 @@ async fn three_http_protocols_switch_only_after_the_running_shell_and_old_tool_r
         let selected = profile(new_url, new, "new-profile");
         let agent = Agent::new_embedded(
             original.clone(),
-            Arc::new(HttpModelClient::new(original.clone()).unwrap()),
+            LocalModelClients::new(None).client(&original).unwrap(),
         );
         agent.install_own_tickhost();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -428,11 +428,7 @@ async fn three_http_protocols_switch_only_after_the_running_shell_and_old_tool_r
         assert_eq!(command.state, CommandState::Running);
         assert_eq!(
             agent
-                .set_model(
-                    chat,
-                    selected.clone(),
-                    Arc::new(HttpModelClient::new(selected.clone()).unwrap())
-                )
+                .set_model(chat, selected.clone())
                 .await
                 .unwrap(),
             ModelChange::Pending
@@ -564,7 +560,7 @@ async fn messages_responses_roundtrip_and_restart_preserve_signed_cache_prefix()
     let agent = Agent::open_embedded(
         root.clone(),
         a.clone(),
-        tickloop_agent_model::model_client(a.clone(), Some(&root)).unwrap(),
+        tickloop_agent_model::LocalModelClients::new(Some(root.to_path_buf())).client(&a).unwrap(),
     )
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -572,11 +568,7 @@ async fn messages_responses_roundtrip_and_restart_preserve_signed_cache_prefix()
     finish_turn(&agent, chat, "Second prompt").await;
     let before = agent.snapshot(chat).await.unwrap();
     agent
-        .set_model(
-            chat,
-            b.clone(),
-            tickloop_agent_model::model_client(b.clone(), Some(&root)).unwrap(),
-        )
+        .set_model(chat, b.clone())
         .await
         .unwrap();
     assert_eq!(
@@ -590,7 +582,7 @@ async fn messages_responses_roundtrip_and_restart_preserve_signed_cache_prefix()
     let resumed = Agent::open_embedded(
         root.clone(),
         b.clone(),
-        tickloop_agent_model::model_client(b.clone(), Some(&root)).unwrap(),
+        tickloop_agent_model::LocalModelClients::new(Some(root.to_path_buf())).client(&b).unwrap(),
     )
     .unwrap();
     let restored = resumed.resume_chat(chat).await.unwrap();
@@ -599,11 +591,7 @@ async fn messages_responses_roundtrip_and_restart_preserve_signed_cache_prefix()
     assert!(restored.messages.iter().flat_map(|message| &message.content).any(|block| matches!(block, Content::Thinking { signature: Some(value), .. } if value == "original-signed-block")));
     finish_turn(&resumed, chat, "Continue after restart").await;
     resumed
-        .set_model(
-            chat,
-            a.clone(),
-            tickloop_agent_model::model_client(a, Some(&root)).unwrap(),
-        )
+        .set_model(chat, a.clone())
         .await
         .unwrap();
     finish_turn(&resumed, chat, "Return to A").await;

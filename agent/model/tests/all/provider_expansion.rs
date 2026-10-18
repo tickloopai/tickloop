@@ -2,10 +2,10 @@ use tickloop_agent_test_support::model_http_support;
 
 use serde_json::{Value, json};
 use tickloop_agent_model::{
-    ModelConfigExt, ModelFailureKind, ModelRequest, ModelRequestContext, StructuredOutput,
+    LocalModelClients, ModelClients, ModelConfigExt, ModelFailureKind, ModelRequest,
+    ModelRequestContext, StructuredOutput,
     cards::{ModelCatalog, built_in_model_profiles},
     credentials::save_api_key,
-    model_client,
 };
 use tickloop_agent_protocol::{
     Content, ImageMediaType, ImageSource, Message, ReasoningEffort, Role,
@@ -106,7 +106,9 @@ async fn request_output_budget_reaches_every_http_encoder_without_changing_the_n
         let original_limit = model.max_output_tokens;
         model.base_url = endpoint;
         save_api_key(root.path(), &model.api_key_env, "fixture-budget-key").unwrap();
-        let client = model_client(model, Some(root.path())).unwrap();
+        let client = LocalModelClients::new(Some(root.path().to_path_buf()))
+            .client(&model)
+            .unwrap();
         let chat = uuid::Uuid::new_v4();
         for limit in [Some(4096), None] {
             let context = ModelRequestContext::new(1);
@@ -159,7 +161,9 @@ async fn kimi_uses_completion_budget_preserved_thought_and_stable_cache_key() {
         .unwrap();
     config.base_url = endpoint;
     save_api_key(root.path(), &config.api_key_env, "test-kimi-key").unwrap();
-    let client = model_client(config, Some(root.path())).unwrap();
+    let client = LocalModelClients::new(Some(root.path().to_path_buf()))
+        .client(&config)
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     let first = client
         .complete(
@@ -223,7 +227,8 @@ async fn qwen_thinking_parameters_and_text_schema_follow_its_contract() {
             schema: json!({"type":"object","properties":{"allow":{"type":"boolean"}},"required":["allow"]}),
         });
         let (events, _) = mpsc::unbounded_channel();
-        model_client(config, Some(root.path()))
+        LocalModelClients::new(Some(root.path().to_path_buf()))
+            .client(&config)
             .unwrap()
             .complete(request, events, CancellationToken::new())
             .await
@@ -276,7 +281,8 @@ async fn qwen_image_schema_uses_prompted_json_and_rejects_tool_calls() {
             schema: json!({"type":"object","properties":{"allow":{"type":"boolean"}},"required":["allow"]}),
         });
         let (events, _) = mpsc::unbounded_channel();
-        let result = model_client(config, Some(root.path()))
+        let result = LocalModelClients::new(Some(root.path().to_path_buf()))
+            .client(&config)
             .unwrap()
             .complete(request, events, CancellationToken::new())
             .await;
@@ -324,7 +330,10 @@ fn registered_oauth_providers_cannot_be_overridden_to_api_key_auth() {
             .unwrap();
         config.auth_source = tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv;
         config.api_key_env = "TEST_API_KEY".into();
-        assert!(model_client(config, None).is_err(), "{provider}");
+        assert!(
+            LocalModelClients::new(None).client(&config).is_err(),
+            "{provider}"
+        );
     }
 }
 
@@ -347,7 +356,8 @@ async fn kimi_code_oauth_schema_uses_prompted_json_on_its_own_route() {
         schema: json!({"type":"object","properties":{"allow":{"type":"boolean"}},"required":["allow"]}),
     });
     let (events, _) = mpsc::unbounded_channel();
-    let output = model_client(config, Some(root.path()))
+    let output = LocalModelClients::new(Some(root.path().to_path_buf()))
+        .client(&config)
         .unwrap()
         .complete(request, events, CancellationToken::new())
         .await
@@ -396,7 +406,8 @@ async fn kimi_code_403_preserves_safe_provider_text_and_ambiguous_plan_guidance(
             .unwrap();
         config.base_url = endpoint;
         let (events, _) = mpsc::unbounded_channel();
-        let error = model_client(config, Some(root.path()))
+        let error = LocalModelClients::new(Some(root.path().to_path_buf()))
+            .client(&config)
             .unwrap()
             .complete(request(None), events, CancellationToken::new())
             .await
@@ -439,7 +450,9 @@ async fn xai_oauth_uses_responses_proxy_headers_and_preserves_encrypted_replay()
         .get("xai-oauth", "grok-4.6")
         .unwrap();
     config.base_url = endpoint;
-    let client = model_client(config, Some(root.path())).unwrap();
+    let client = LocalModelClients::new(Some(root.path().to_path_buf()))
+        .client(&config)
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     let first = client
         .complete(
@@ -484,7 +497,8 @@ async fn xai_api_does_not_send_grok_subscription_headers() {
     config.base_url = endpoint;
     save_api_key(root.path(), &config.api_key_env, "fixture-xai-api-key").unwrap();
     let (events, _) = mpsc::unbounded_channel();
-    model_client(config, Some(root.path()))
+    LocalModelClients::new(Some(root.path().to_path_buf()))
+        .client(&config)
         .unwrap()
         .complete(request(None), events, CancellationToken::new())
         .await

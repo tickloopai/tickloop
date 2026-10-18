@@ -175,7 +175,8 @@ impl Agent {
             }
             (chat.snapshot.clone(), chat.client.clone())
         };
-        self.require_working_directory_trust(&snapshot.workdir)?;
+        let folder = super::require_folder(&snapshot)?.to_path_buf();
+        self.require_working_directory_trust(&folder)?;
         if view.auto_rule_settings.environment_replacement.is_some() {
             return Err(AgentError::Invalid("Restore the built-in Environment in /permissions before setup; your legacy replacement has not been changed".into()));
         }
@@ -184,11 +185,11 @@ impl Agent {
                 "Choose at most eight repository directories".into(),
             ));
         }
-        let workdir = snapshot.workdir.clone();
+        let workdir = folder;
         let purpose = options.purpose;
         let (mut candidates, gaps) = tokio::task::spawn_blocking(move || {
             let mut scanner = SetupScanner {
-                workspace: Workspace { workdir: workdir.clone(), additional_directories: snapshot.additional_directories.clone() },
+                workspace: Workspace { folder: Some(workdir.clone()), additional_directories: snapshot.additional_directories.clone() },
                 policy: snapshot.policy,
                 loop_id: snapshot.loops.last().map_or(Uuid::nil(), |goal| goal.id),
                 gaps: Vec::new(),

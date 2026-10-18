@@ -86,8 +86,8 @@ async fn incompatible_startup_confirmation_opens_the_new_daemon_with_original_op
         let agents = catalog(&client).await;
         let opened = snapshot(&client, agents[0].execution).await;
         assert_eq!(
-            opened.conversation.workdir,
-            fixture.path("work").canonicalize().unwrap()
+            opened.conversation.folder,
+            Some(fixture.path("work").canonicalize().unwrap())
         );
         assert_eq!(
             opened.policy.mode,

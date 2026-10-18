@@ -1,5 +1,5 @@
 use std::{sync::Arc, time::Duration};
-use tickloop_agent_model::HttpModelClient;
+use tickloop_agent_model::{LocalModelClients};
 use tickloop_agent_protocol::{
     Content, EventKind, InputModality, LoopState, ModelConfig, Protocol, QuestionAnswer,
 };
@@ -27,7 +27,7 @@ async fn natural_language_creates_an_independent_goal_and_waits_for_its_answer()
     };
     let agent = Agent::new_embedded(
         config.clone(),
-        Arc::new(HttpModelClient::new(config).unwrap()),
+        LocalModelClients::new(None).client(&config).unwrap(),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();

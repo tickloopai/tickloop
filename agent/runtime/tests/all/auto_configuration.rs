@@ -218,7 +218,7 @@ async fn llm_approval_tracks_each_chat_effective_model_and_freezes_an_inflight_m
         .await
         .unwrap();
     agent
-        .set_model(other, other_model.configuration(), other_model.clone())
+        .set_model(other, other_model.configuration())
         .await
         .unwrap();
     let mut events = agent.subscribe();
@@ -240,7 +240,7 @@ async fn llm_approval_tracks_each_chat_effective_model_and_freezes_an_inflight_m
     let active_model = ChatModel::with_gate("active-chat-model", Some(gate.clone()));
     let pending_model = ChatModel::new("pending-chat-model");
     agent
-        .set_model(first, active_model.configuration(), active_model.clone())
+        .set_model(first, active_model.configuration())
         .await
         .unwrap();
     let receipt = agent
@@ -251,7 +251,7 @@ async fn llm_approval_tracks_each_chat_effective_model_and_freezes_an_inflight_m
         .await
         .unwrap();
     agent
-        .set_model(first, pending_model.configuration(), pending_model.clone())
+        .set_model(first, pending_model.configuration())
         .await
         .unwrap();
     gate.release.notify_one();

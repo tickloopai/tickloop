@@ -1,7 +1,7 @@
 use crate::support::provider_transport;
 use tickloop_agent_test_support::model_http_support;
 
-use tickloop_agent_model::{HttpModelClient, ModelClient, ModelRequest, model_client};
+use tickloop_agent_model::{LocalModelClients, ModelClients, ModelClient, ModelRequest};
 use tickloop_agent_protocol::{Protocol, ProviderFailureClass};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -15,7 +15,7 @@ async fn failure(protocol: Protocol, status: u16, body: &str) -> tickloop_agent_
     config.base_url = base_url;
     config.provider_id = "fixture-api".into();
     config.provider_name = "Kimi Code subscription".into();
-    let client = HttpModelClient::new(config).unwrap();
+    let client = LocalModelClients::new(None).client(&config).unwrap();
     let (events, _) = mpsc::unbounded_channel();
     client
         .complete(
@@ -51,7 +51,7 @@ async fn kimi_monthly_limit_explains_the_account_problem() {
             .get("kimi-code-oauth", selected_model)
             .unwrap();
         config.base_url = url;
-        let client = model_client(config, Some(&root_path)).unwrap();
+        let client = LocalModelClients::new(Some(root_path.to_path_buf())).client(&config).unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(
@@ -227,7 +227,7 @@ async fn rate_limit_preserves_retry_after_and_billing_ignores_server_retry_true(
         .await;
         let mut config = tickloop_agent_test_support::config();
         config.base_url = url;
-        let client = HttpModelClient::new(config).unwrap();
+        let client = LocalModelClients::new(None).client(&config).unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(request(), events, CancellationToken::new())
@@ -287,7 +287,7 @@ async fn quota_is_not_retried_and_success_clears_only_its_connection_failure() {
     config.protocol = Protocol::ChatCompletions;
     config.provider_id = "fixture-api".into();
     config.provider_name = "Fixture API".into();
-    let client = Arc::new(HttpModelClient::new(config.clone()).unwrap());
+    let client = LocalModelClients::new(None).client(&config).unwrap();
     let agent = Agent::new_embedded(
         config.clone(),
         provider_transport::without_title_requests(client),
@@ -337,13 +337,7 @@ async fn quota_is_not_retried_and_success_clears_only_its_connection_failure() {
     other.provider_id = "other-fixture".into();
     other.provider_name = "Other Fixture API".into();
     agent
-        .set_model(
-            chat,
-            other.clone(),
-            provider_transport::without_title_requests(Arc::new(
-                HttpModelClient::new(other).unwrap(),
-            )),
-        )
+        .set_model(chat, other.clone())
         .await
         .unwrap();
     assert!(
@@ -383,13 +377,7 @@ async fn quota_is_not_retried_and_success_clears_only_its_connection_failure() {
         "success on another connection must not clear this diagnostic"
     );
     agent
-        .set_model(
-            chat,
-            config.clone(),
-            provider_transport::without_title_requests(Arc::new(
-                HttpModelClient::new(config).unwrap(),
-            )),
-        )
+        .set_model(chat, config.clone())
         .await
         .unwrap();
     agent
@@ -434,9 +422,7 @@ async fn persisted_transcript_retains_provider_explanation_after_reload() {
     let agent = Agent::open_embedded(
         root.clone(),
         config.clone(),
-        provider_transport::without_title_requests(Arc::new(
-            HttpModelClient::new(config.clone()).unwrap(),
-        )),
+        provider_transport::without_title_requests(LocalModelClients::new(None).client(&config).unwrap(),),
     )
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -497,7 +483,7 @@ async fn echoed_request_credentials_never_enter_display_or_debug_text() {
     let mut config = tickloop_agent_test_support::config();
     config.base_url = url;
     config.api_key_env = "PROVIDER_ERROR_FIXTURE_KEY".into();
-    let client = model_client(config, Some(&root_path)).unwrap();
+    let client = LocalModelClients::new(Some(root_path.to_path_buf())).client(&config).unwrap();
     let (events, _) = mpsc::unbounded_channel();
     let error = client
         .complete(request(), events, CancellationToken::new())
@@ -530,7 +516,7 @@ async fn retry_after_http_date_is_preserved_and_hostile_delays_disable_automatic
         .await;
         let mut config = tickloop_agent_test_support::config();
         config.base_url = url;
-        let client = HttpModelClient::new(config).unwrap();
+        let client = LocalModelClients::new(None).client(&config).unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(request(), events, CancellationToken::new())
@@ -624,7 +610,7 @@ async fn normalization_and_url_decoding_cannot_restore_credentials() {
         let mut config = tickloop_agent_test_support::config();
         config.base_url = url;
         config.api_key_env = "PROVIDER_ERROR_FIXTURE_KEY".into();
-        let client = model_client(config, Some(&root_path)).unwrap();
+        let client = LocalModelClients::new(Some(root_path.to_path_buf())).client(&config).unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(request(), events, CancellationToken::new())

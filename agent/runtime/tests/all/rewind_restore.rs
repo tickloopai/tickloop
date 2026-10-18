@@ -744,11 +744,7 @@ async fn rewind_preserves_original_private_history_after_a_model_switch() {
     selected.model = "replacement-model".into();
     assert_eq!(
         agent
-            .set_model(
-                chat,
-                selected.clone(),
-                Arc::new(ScriptedModel::new(Vec::new())),
-            )
+            .set_model(chat, selected.clone())
             .await
             .unwrap(),
         ModelChange::Applied

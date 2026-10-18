@@ -24,7 +24,7 @@ impl Agent {
                 ));
             }
         }
-        context.workdir = chat.snapshot.workdir.clone();
+        context.folder = require_folder(&chat.snapshot)?.to_path_buf();
         context.interaction = None;
         self.inner
             .host_contexts
@@ -35,18 +35,21 @@ impl Agent {
         Ok(())
     }
 
+    /// The host's Work Context for a call of `receipt`'s Run in `folder`; a Chat without a Folder
+    /// has none.
     pub(super) fn host_call_context(
         &self,
         receipt: &Receipt,
-        workdir: &std::path::Path,
+        folder: Option<&std::path::Path>,
     ) -> Option<HostCallContext> {
+        let folder = folder?;
         let contexts = self.inner.host_contexts.lock().unwrap();
         let mut context = contexts
             .runs
             .get(&receipt.run_id)
             .cloned()
             .or_else(|| contexts.work.get(&receipt.chat_id).cloned())?;
-        context.workdir = workdir.into();
+        context.folder = folder.into();
         Some(context)
     }
 
