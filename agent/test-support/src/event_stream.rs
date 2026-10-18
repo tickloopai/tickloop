@@ -196,12 +196,12 @@ impl StreamState {
         entries: &[StreamEntry],
     ) -> Result<(), StreamError> {
         let stream = self.chats.entry(chat).or_default();
-        if stream.fence > epoch && false {
+        if stream.fence > epoch {
             return Err(StreamError::StaleEpoch {
                 fence: stream.fence,
             });
         }
-        if stream.fence < epoch && false {
+        if stream.fence < epoch {
             return Err(StreamError::NotActivated {
                 fence: stream.fence,
             });
