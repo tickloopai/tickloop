@@ -42,58 +42,48 @@ fn copilot_connection_binds_one_recommended_card_per_series() {
         .iter()
         .map(|series| {
             let card = catalog.get(PROVIDER, &series.model).unwrap();
-            (series.label(), card.name, card.model, card.protocol)
+            (series.name.clone(), card.name, card.model, card.protocol)
         })
         .collect::<Vec<_>>();
     let expected = [
         (
-            "Claude Sonnet (5.5)",
+            "Claude Sonnet",
             "Claude Sonnet 5.5",
             "claude-sonnet-5.5",
             Protocol::Messages,
         ),
         (
-            "Claude Opus (5.5)",
+            "Claude Opus",
             "Claude Opus 5.5",
             "claude-opus-5.5",
             Protocol::Messages,
         ),
         (
-            "Claude Fable (5.1)",
+            "Claude Fable",
             "Claude Fable 5.1",
             "claude-fable-5.1",
             Protocol::Messages,
         ),
         (
-            "Claude Haiku (4.5)",
-            "Claude Haiku 4.5",
-            "claude-haiku-4.5",
+            "Claude Haiku",
+            "Claude Haiku 5.5",
+            "claude-haiku-5.5",
             Protocol::Messages,
         ),
+        ("GPT Sol", "GPT-6.1 Sol", "gpt-6.1-sol", Protocol::Responses),
         (
-            "GPT Sol (6.1)",
-            "GPT-6.1 Sol",
-            "gpt-6.1-sol",
-            Protocol::Responses,
-        ),
-        (
-            "GPT Astra (6)",
+            "GPT Astra",
             "GPT-6 Astra",
             "gpt-6-astra",
             Protocol::Responses,
         ),
         (
-            "GPT Terra (5.6)",
+            "GPT Terra",
             "GPT-5.6 Terra",
             "gpt-5.6-terra",
             Protocol::Responses,
         ),
-        (
-            "GPT Luna (6)",
-            "GPT-6 Luna",
-            "gpt-6-luna",
-            Protocol::Responses,
-        ),
+        ("GPT Luna", "GPT-6 Luna", "gpt-6-luna", Protocol::Responses),
     ];
     assert_eq!(
         resolved,
@@ -186,14 +176,14 @@ display_name: "Mirror"
 auth: "github_copilot"
 endpoints: { messages: "https://api.githubcopilot.com" }
 models:
-  - { id: "m", service_model_id: "claude-sonnet-5.5", display_name: "M", adapter: "messages" }
+  - { id: "m", display_name: "M", adapter: "messages" }
 "#;
     assert!(patched(foreign_auth).is_err());
     let other_protocol = r#"
 id: "github-copilot"
 endpoints: { chat_completions: "https://api.githubcopilot.com" }
 models:
-  - { id: "chat", service_model_id: "gemini-3.8-flash", display_name: "Chat", adapter: "chat_completions" }
+  - { id: "chat", display_name: "Chat", adapter: "chat_completions" }
 "#;
     assert!(patched(other_protocol).is_err());
     let foreign_endpoint = r#"

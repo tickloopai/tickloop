@@ -15,9 +15,52 @@ api_key_env: ""
 endpoints:
   messages: "https://api.individual.githubcopilot.com"
   responses: "https://api.individual.githubcopilot.com"
+selection:
+  auxiliary_model: claude-haiku-5.5
+  notice: "Model access depends on your Copilot plan and organization policy; Opus, Fable, Sol and Astra need Pro+ or an organization seat. Anthropic retains Claude Fable data for safety classifiers by default."
+  series:
+    - id: "claude-sonnet"
+      name: "Claude Sonnet"
+      model: "claude-sonnet-5.5"
+      family_order: 1
+      capability_order: 2
+    - id: "claude-opus"
+      name: "Claude Opus"
+      model: "claude-opus-5.5"
+      family_order: 1
+      capability_order: 0
+    - id: "claude-fable"
+      name: "Claude Fable"
+      model: "claude-fable-5.1"
+      family_order: 1
+      capability_order: 1
+    - id: "claude-haiku"
+      name: "Claude Haiku"
+      model: "claude-haiku-5.5"
+      family_order: 1
+      capability_order: 3
+    - id: "gpt-sol"
+      name: "GPT Sol"
+      model: "gpt-6.1-sol"
+      family_order: 0
+      capability_order: 1
+    - id: "gpt-astra"
+      name: "GPT Astra"
+      model: "gpt-6-astra"
+      family_order: 0
+      capability_order: 0
+    - id: "gpt-terra"
+      name: "GPT Terra"
+      model: "gpt-5.6-terra"
+      family_order: 0
+      capability_order: 2
+    - id: "gpt-luna"
+      name: "GPT Luna"
+      model: "gpt-6-luna"
+      family_order: 0
+      capability_order: 3
 models:
   - id: "claude-sonnet-5.5"
-    service_model_id: "claude-sonnet-5.5"
     display_name: "Claude Sonnet 5.5"
     adapter: "messages"
     max_output_tokens: 32000
@@ -27,7 +70,6 @@ models:
     effort_levels: ["low", "medium", "high", "xhigh", "max"]
     input_modalities: ["text"]
   - id: "claude-opus-5.5"
-    service_model_id: "claude-opus-5.5"
     display_name: "Claude Opus 5.5"
     adapter: "messages"
     max_output_tokens: 32000
@@ -37,7 +79,6 @@ models:
     effort_levels: ["low", "medium", "high", "xhigh", "max"]
     input_modalities: ["text"]
   - id: "claude-fable-5.1"
-    service_model_id: "claude-fable-5.1"
     display_name: "Claude Fable 5.1"
     adapter: "messages"
     max_output_tokens: 32000
@@ -47,7 +88,6 @@ models:
     effort_levels: ["low", "medium", "high", "xhigh", "max"]
     input_modalities: ["text"]
   - id: "claude-haiku-4.5"
-    service_model_id: "claude-haiku-4.5"
     display_name: "Claude Haiku 4.5"
     adapter: "messages"
     max_output_tokens: 32000
@@ -56,8 +96,17 @@ models:
     effort_levels: ["low", "medium", "high"]
     thinking_budgets: { low: 2048, medium: 8192, high: 16384 }
     input_modalities: ["text"]
+  - id: "claude-haiku-5.5"
+    display_name: "Claude Haiku 5.5"
+    adapter: "messages"
+    temperature_control: "unsupported"
+    max_output_tokens: 32000
+    context_window_tokens: null
+    thinking: "toggle"
+    adaptive_by_default: true
+    effort_levels: ["low", "medium", "high", "xhigh", "max"]
+    input_modalities: ["text"]
   - id: "gpt-6.1-sol"
-    service_model_id: "gpt-6.1-sol"
     display_name: "GPT-6.1 Sol"
     adapter: "responses"
     max_output_tokens: 128000
@@ -66,7 +115,6 @@ models:
     effort_levels: ["low", "medium", "high", "xhigh", "max"]
     input_modalities: ["text"]
   - id: "gpt-6-astra"
-    service_model_id: "gpt-6-astra"
     display_name: "GPT-6 Astra"
     adapter: "responses"
     max_output_tokens: 128000
@@ -75,7 +123,6 @@ models:
     effort_levels: ["low", "medium", "high", "xhigh", "max"]
     input_modalities: ["text"]
   - id: "gpt-5.6-terra"
-    service_model_id: "gpt-5.6-terra"
     display_name: "GPT-5.6 Terra"
     adapter: "responses"
     max_output_tokens: 128000
@@ -84,7 +131,6 @@ models:
     effort_levels: ["low", "medium", "high", "xhigh", "max"]
     input_modalities: ["text"]
   - id: "gpt-6-luna"
-    service_model_id: "gpt-6-luna"
     display_name: "GPT-6 Luna"
     adapter: "responses"
     max_output_tokens: 128000

@@ -1,8 +1,0 @@
----
-provider: xai-api
-series:
-- id: grok
-  name: Grok
-  version: '4.7'
-  model: grok-4.7
-  capability_order: 0

@@ -858,6 +858,7 @@ mod tests {
             )
             .unwrap();
         let options = console.menu_snapshot(id).unwrap().unwrap().options;
+        assert!(options[0].contains("Kimi (k3)"), "{}", options[0]);
         assert!(
             options[0].contains("· Kimi Code subscription"),
             "{}",
@@ -1014,7 +1015,7 @@ mod tests {
                 "claude-opus-5.5",
                 "claude-fable-5.1",
                 "claude-sonnet-5.5",
-                "claude-haiku-4.5"
+                "claude-haiku-5.5"
             ]
         );
         assert_eq!(
@@ -1026,10 +1027,8 @@ mod tests {
     #[test]
     fn codex_menu_uses_current_families_and_keeps_retired_cards_loadable() {
         let catalog = tickloop_agent_model::cards::ModelCatalog::defaults();
-        let retired = catalog.get("openai-codex", "gpt-5.5-responses").unwrap();
-        let old_sol = catalog
-            .get("openai-codex", "gpt-5.6-sol-responses")
-            .unwrap();
+        let retired = catalog.get("openai-codex", "gpt-5.5").unwrap();
+        let old_sol = catalog.get("openai-codex", "gpt-5.6-sol").unwrap();
         let profiles = super::super::super::settings::model_choices_with_profiles(
             &old_sol,
             tickloop_agent_model::cards::built_in_model_profiles(),
@@ -1059,16 +1058,12 @@ mod tests {
     #[test]
     fn retired_glm_card_is_not_offered_even_as_the_current_model() {
         let defaults = tickloop_agent_model::cards::ModelCatalog::defaults();
-        let retired = defaults
-            .get("zhipu-cn-api", "glm-5.2-chat-completions")
-            .unwrap();
+        let retired = defaults.get("zhipu-cn-api", "glm-5.2").unwrap();
         let profiles = tickloop_agent_model::cards::built_in_model_profiles();
         let choices =
             super::super::super::settings::model_choices_with_profiles(&retired, profiles);
         assert!(!choices.contains(&retired));
-        let current = defaults
-            .get("zhipu-cn-api", "glm-5.3-flash-chat-completions")
-            .unwrap();
+        let current = defaults.get("zhipu-cn-api", "glm-5.3-flash").unwrap();
         let choices = super::super::super::settings::model_choices_with_profiles(
             &current,
             tickloop_agent_model::cards::built_in_model_profiles(),
@@ -1079,8 +1074,9 @@ mod tests {
             tickloop_agent_model::access::AccessCatalog::defaults()
                 .series_for(&current)
                 .unwrap()
-                .label(),
-            "GLM Flash (5.3)"
+                .name
+                .clone(),
+            "GLM Flash"
         );
     }
 }
@@ -2615,7 +2611,11 @@ impl Menus {
                         ReasoningEffort::label,
                     )
                 });
-                let name = &choice.config.name;
+                let name = format!(
+                    "{} ({})",
+                    super::super::settings::model_name(&choice.config),
+                    choice.config.model
+                );
                 let current =
                     if self
                         .provider
@@ -2763,11 +2763,16 @@ impl Menus {
         Ok(())
     }
 
-    /// A model matches on its display name, service id or the connection it belongs to.
+    /// A model matches on its series, card name, service id or connection.
     fn model_choice_matches(&self, choice: &ModelChoice, query: &str) -> bool {
-        [choice.config.name.clone(), choice.config.model_id.clone()]
-            .iter()
-            .any(|candidate| candidate.to_lowercase().contains(query))
+        [
+            super::super::settings::model_name(&choice.config),
+            choice.config.name.as_str(),
+            choice.config.model.as_str(),
+            choice.config.model_id.as_str(),
+        ]
+        .iter()
+        .any(|candidate| candidate.to_lowercase().contains(query))
             || self
                 .key_for_model(&choice.config)
                 .and_then(|key| self.connection(&key).ok())

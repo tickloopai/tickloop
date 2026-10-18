@@ -1,5 +1,5 @@
 use super::{
-    Agent, AgentError, Chat, ChatBookkeeping, PendingModelThinking,
+    Agent, AgentError, Chat, ChatBookkeeping, ChatSnapshotExt, PendingModelThinking,
     compaction::{CompactionLayout, MessageSource},
     model_request::RequestContext,
 };
@@ -473,7 +473,7 @@ impl Agent {
                     tools: Vec::new(),
                     structured_output: None,
                     temperature: None,
-                    reasoning_effort: None,
+                    reasoning_effort: original.effective_reasoning_effort(),
                 },
                 cancel.clone(),
                 None,
@@ -815,12 +815,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("state");
         let catalog = ModelCatalog::defaults();
-        let original = catalog
-            .get("deepseek-api", "deepseek-flash-messages")
-            .unwrap();
-        let replacement = catalog
-            .get("deepseek-api", "deepseek-flash-responses")
-            .unwrap();
+        let original = catalog.get("deepseek-api", "deepseek-flash").unwrap();
+        let replacement = catalog.get("openai-api", "gpt-6-luna").unwrap();
         let original_client = Arc::new(HttpModelClient::deferred(original.clone()).unwrap());
         let agent = Agent::open_embedded(root.clone(), original, original_client).unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();

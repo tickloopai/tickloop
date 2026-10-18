@@ -267,7 +267,7 @@ async fn summarize_models(
         .filter_map(|series| {
             ModelCatalog::defaults()
                 .get(PROVIDER, &series.model)
-                .map(|card| (series.label(), card.model, card.protocol))
+                .map(|card| (series.name.clone(), card.model, card.protocol))
         })
         .collect::<Vec<_>>();
     let entries = listing["data"].as_array().cloned().unwrap_or_default();

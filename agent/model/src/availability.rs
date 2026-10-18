@@ -833,14 +833,14 @@ mod tests {
     #[test]
     fn endpoints_use_the_declared_product_and_reject_other_origins() {
         let catalog = super::super::cards::ModelCatalog::defaults();
-        let mut api = catalog.get("openai-api", "gpt-6-astra-responses").unwrap();
+        let mut api = catalog.get("openai-api", "gpt-6-astra").unwrap();
         assert_eq!(
             discovery_endpoint(&api, ModelDiscovery::OpenAiApi)
                 .unwrap()
                 .as_str(),
             "https://api.openai.com/v1/models"
         );
-        let codex = catalog.get("openai-codex", "gpt-5.5-responses").unwrap();
+        let codex = catalog.get("openai-codex", "gpt-5.5").unwrap();
         assert_eq!(
             discovery_endpoint(&codex, ModelDiscovery::Codex)
                 .unwrap()

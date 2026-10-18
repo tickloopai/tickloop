@@ -1,9 +1,8 @@
 use super::{Agent, approval_context};
-use std::{sync::atomic::Ordering, time::Duration};
+use std::sync::atomic::Ordering;
 use tickloop_agent_model::{ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{ChatId, Content, Message, Role, short_chat_title};
 
-const TITLE_TIMEOUT: Duration = Duration::from_secs(15);
 const TITLE_PROMPT_CHARACTERS: usize = 1000;
 
 impl Agent {
@@ -78,7 +77,7 @@ impl Agent {
                     client,
                     request,
                     cancel.clone(),
-                    Some(TITLE_TIMEOUT),
+                    None,
                 )
                 .await
                 .ok()

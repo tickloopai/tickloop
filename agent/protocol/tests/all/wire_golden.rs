@@ -118,7 +118,6 @@ fn model_config() -> ModelConfig {
         model_id: "example-large".into(),
         card: Some(ModelCard {
             id: "example-large".into(),
-            service_model_id: "example-large-2026".into(),
             display_name: "Example Large".into(),
             adapter: Adapter::Messages,
             max_output_tokens: 32_000,
@@ -137,6 +136,23 @@ fn model_config() -> ModelConfig {
         }),
         input_modalities: vec![InputModality::Text, InputModality::Image],
     }
+}
+
+#[test]
+fn recorded_model_cards_load_the_retired_duplicate_field_without_reintroducing_it() {
+    let model = model_config();
+    let mut recorded = serde_json::to_value(&model).unwrap();
+    recorded["card"]["service_model_id"] = json!(model.model);
+    assert_eq!(
+        serde_json::from_value::<ModelConfig>(recorded.clone()).unwrap(),
+        model
+    );
+    assert!(serde_json::from_value::<ModelCard>(recorded["card"].clone()).is_err());
+    assert!(
+        serde_json::to_value(model).unwrap()["card"]
+            .get("service_model_id")
+            .is_none()
+    );
 }
 
 fn permission_rule(value: u128, decision: Decision, persistent: bool) -> PermissionRule {

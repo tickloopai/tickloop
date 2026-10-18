@@ -1430,7 +1430,7 @@ fn initialize_startup_console(
 ) -> Result<(), String> {
     console.update_status_area(
         execution_mode.to_string(),
-        safe_text(&config.model),
+        safe_text(settings::model_name(config)),
         initial_context_usage(config),
         None,
     )?;
@@ -2116,7 +2116,7 @@ async fn interact(
                 }
                 console.update_status_area(
                     status.policy.mode.to_string(),
-                    safe_text(&status.model.model),
+                    safe_text(settings::model_name(&status.model)),
                     context_usage(&status),
                     visible_task_board,
                 )?;
@@ -2297,7 +2297,7 @@ async fn interact(
                 if let Ok(draft) = draft {
                     console.update_status_area(
                         draft.execution_mode.to_string(),
-                        safe_text(&draft.model.model),
+                        safe_text(settings::model_name(&draft.model)),
                         initial_context_usage(&draft.model),
                         None,
                     )?;
@@ -8622,7 +8622,7 @@ mod tests {
             None
         );
         snapshot.model = tickloop_agent_model::cards::ModelCatalog::defaults()
-            .get("deepseek-api", "deepseek-flash-messages")
+            .get("anthropic-api", "claude-haiku-5-5")
             .unwrap();
         assert_eq!(
             context_usage(&tickloop_agent_protocol::ChatStatus::of(&snapshot)),

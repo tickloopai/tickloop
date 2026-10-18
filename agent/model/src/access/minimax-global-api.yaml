@@ -1,8 +1,0 @@
-provider: "minimax-global-api"
-notice: "API keys may carry different products and quotas; authentication alone does not establish pay-as-you-go billing."
-series:
-  - id: "minimax"
-    name: "MiniMax"
-    version: "M3"
-    model: "MiniMax-M3"
-    capability_order: 0

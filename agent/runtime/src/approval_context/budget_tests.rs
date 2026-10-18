@@ -218,7 +218,10 @@ fn a_long_session_fits_each_reviewer_and_marks_what_was_cut() {
     assert!(!complete_json.contains(IMAGE_DATA));
     assert!(complete_json.contains(crate::approval_context::IMAGE_PLACEHOLDER));
 
-    let budget = crate::auto_mode::review_budget_bytes(&session.snapshot);
+    let budget = crate::auto_mode::review_budget_bytes(
+        &session.snapshot.model,
+        crate::context::context_window(&session.snapshot),
+    );
     let fitted = fit(&complete, budget);
     assert!(json_len(&fitted) <= budget);
     assert_kept_evidence(&complete, &fitted);
@@ -282,7 +285,10 @@ fn a_short_session_is_reviewed_unchanged() {
     assert!(!complete_json.contains("context_truncation"));
     assert!(!complete_json.contains("capacity_exceeded"));
     for budget in [
-        crate::auto_mode::review_budget_bytes(&session.snapshot),
+        crate::auto_mode::review_budget_bytes(
+            &session.snapshot.model,
+            crate::context::context_window(&session.snapshot),
+        ),
         crate::jev_review::review_budget_bytes(),
     ] {
         let fitted = fit(&complete, budget);
@@ -418,7 +424,10 @@ fn a_context_limit_rejection_shrinks_the_evidence_once_to_half_of_what_was_sent(
     let (session, complete) = long_session("Run the workspace tests now");
     let mut evidence = ReviewEvidence::new(
         &complete,
-        crate::auto_mode::review_budget_bytes(&session.snapshot),
+        crate::auto_mode::review_budget_bytes(
+            &session.snapshot.model,
+            crate::context::context_window(&session.snapshot),
+        ),
     );
     let sent = json_len(evidence.snapshot());
     assert!(evidence.shrink());
@@ -429,7 +438,10 @@ fn a_context_limit_rejection_shrinks_the_evidence_once_to_half_of_what_was_sent(
     let (session, complete) = short_session();
     let mut evidence = ReviewEvidence::new(
         &complete,
-        crate::auto_mode::review_budget_bytes(&session.snapshot),
+        crate::auto_mode::review_budget_bytes(
+            &session.snapshot.model,
+            crate::context::context_window(&session.snapshot),
+        ),
     );
     assert!(
         !evidence.shrink(),

@@ -117,20 +117,17 @@ fn definition_catalog_keeps_concrete_cards_and_access_catalog_binds_one_per_seri
             .filter_map(|card| {
                 access
                     .series_for(card)
-                    .map(|series| (series.label(), card.name.clone()))
+                    .map(|series| (series.name.clone(), card.name.clone()))
             })
             .collect::<Vec<_>>();
         assert_eq!(
             series,
             [
-                ("GLM (5.3)".to_string(), "GLM-5.3".to_string()),
-                ("GLM Flash (5.3)".to_string(), "GLM-5.3-Flash".to_string()),
-                ("GLM FlashX (5.3)".to_string(), "GLM-5.3-FlashX".to_string()),
-                ("GLM Air (4.5)".to_string(), "GLM-4.5-Air".to_string()),
-                (
-                    "GLM Flash 30B (4.7)".to_string(),
-                    "GLM-4.7-Flash".to_string()
-                ),
+                ("GLM".to_string(), "GLM-5.3".to_string()),
+                ("GLM Flash".to_string(), "GLM-5.3-Flash".to_string()),
+                ("GLM FlashX".to_string(), "GLM-5.3-FlashX".to_string()),
+                ("GLM Air".to_string(), "GLM-4.5-Air".to_string()),
+                ("GLM Flash 30B".to_string(), "GLM-4.7-Flash".to_string()),
             ]
         );
         for card in &cards {
@@ -199,23 +196,19 @@ fn coding_plan_connections_are_separate_providers_with_plan_series_and_notice() 
                 assert_eq!(card.base_url, endpoint);
                 assert_eq!(card.api_key_env, key_env);
                 assert_eq!(card.adapter(), Adapter::GlmChatCompletions);
-                (series.label(), card.name)
+                (series.name.clone(), card.name)
             })
             .collect::<Vec<_>>();
         assert_eq!(
             labels,
             [
-                ("GLM (5.3)".to_string(), "GLM-5.3".to_string()),
-                ("GLM Flash (5.3)".to_string(), "GLM-5.3-Flash".to_string()),
+                ("GLM".to_string(), "GLM-5.3".to_string()),
+                ("GLM Flash".to_string(), "GLM-5.3-Flash".to_string()),
             ]
         );
-        assert!(
-            catalog
-                .get(plan, "glm-5.3-flashx-chat-completions")
-                .is_none()
-        );
-        let plan_card = catalog.get(plan, "glm-5.3-chat-completions").unwrap();
-        let ordinary_card = catalog.get(ordinary, "glm-5.3-chat-completions").unwrap();
+        assert!(catalog.get(plan, "glm-5.3-flashx").is_none());
+        let plan_card = catalog.get(plan, "glm-5.3").unwrap();
+        let ordinary_card = catalog.get(ordinary, "glm-5.3").unwrap();
         assert_ne!(
             plan_card.private_history_source(),
             ordinary_card.private_history_source(),
@@ -224,17 +217,15 @@ fn coding_plan_connections_are_separate_providers_with_plan_series_and_notice() 
     }
 }
 
-fn access_yaml(provider: &str, base: &str, flash: &str) -> String {
+fn selection_yaml(base: &str, flash: &str) -> String {
     format!(
-        "provider: {provider}\ngroup: Zhipu GLM\nseries:\n  - {{id: glm, name: GLM, version: \"{}\", model: {base}}}\n  - {{id: glm-flash, name: GLM Flash, version: \"5.3\", model: {flash}}}\n",
-        base.trim_start_matches("glm-")
-            .trim_end_matches("-chat-completions")
+        "series:\n  - {{id: glm, name: GLM, model: {base}}}\n  - {{id: glm-flash, name: GLM Flash, model: {flash}}}\n"
     )
 }
 
-fn catalog_with_card(id: &str, service_model_id: &str, display_name: &str) -> ModelCatalog {
+fn catalog_with_card(id: &str, display_name: &str) -> ModelCatalog {
     let patch: ProviderPatch = serde_yaml_ng::from_str(&format!(
-        "id: zai-global-api\nmodels:\n  - {{id: {id}, service_model_id: {service_model_id}, display_name: {display_name}, adapter: glm_chat_completions, max_output_tokens: 131072, context_window_tokens: 1000000, thinking: always_on, effort_levels: [low, high, max]}}\n"
+        "id: zai-global-api\nmodels:\n  - {{id: {id}, display_name: {display_name}, adapter: glm_chat_completions, max_output_tokens: 131072, context_window_tokens: 1000000, thinking: always_on, effort_levels: [low, high, max]}}\n"
     ))
     .unwrap();
     ModelCatalog::defaults()
@@ -244,23 +235,20 @@ fn catalog_with_card(id: &str, service_model_id: &str, display_name: &str) -> Mo
 
 #[test]
 fn series_upgrade_rebinds_one_entry_and_keeps_old_cards_resolvable() {
-    for (new_card, service, name, label) in [
-        (
-            "glm-5.4-chat-completions",
-            "glm-5.4",
-            "GLM-5.4",
-            "GLM (5.4)",
-        ),
-        ("glm-6-chat-completions", "glm-6", "GLM-6", "GLM (6)"),
+    for (new_card, service, name) in [
+        ("glm-5.4", "glm-5.4", "GLM-5.4"),
+        ("glm-6", "glm-6", "GLM-6"),
     ] {
-        let definitions = catalog_with_card(new_card, service, name);
-        let access = AccessCatalog::from_yaml(&[&access_yaml(
-            "zai-global-api",
-            new_card,
-            "glm-5.3-flash-chat-completions",
-        )])
-        .unwrap();
-        access.validate(&definitions).unwrap();
+        let mut definitions = catalog_with_card(new_card, name);
+        definitions
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == "zai-global-api")
+            .unwrap()
+            .selection =
+            Some(serde_yaml_ng::from_str(&selection_yaml(new_card, "glm-5.3-flash")).unwrap());
+        definitions.validate().unwrap();
+        let access = AccessCatalog::from_catalog(&definitions);
         let mut offered = definitions
             .profiles()
             .into_iter()
@@ -270,10 +258,10 @@ fn series_upgrade_rebinds_one_entry_and_keeps_old_cards_resolvable() {
         offered.sort_by_key(|profile| access.series_position(profile));
         let offered = offered
             .iter()
-            .map(|profile| access.series_for(profile).unwrap().label())
+            .map(|profile| access.series_for(profile).unwrap().name.clone())
             .collect::<Vec<_>>();
-        assert_eq!(offered, [label, "GLM Flash (5.3)"]);
-        for retired in ["glm-5.3-chat-completions", "glm-5.2-chat-completions"] {
+        assert_eq!(offered, ["GLM", "GLM Flash"]);
+        for retired in ["glm-5.3", "glm-5.2"] {
             let old = definitions.get("zai-global-api", retired).unwrap();
             assert!(old.name.starts_with("GLM-5."));
             assert_eq!(access.series_for(&old), None);
@@ -299,7 +287,7 @@ fn retained_builtin_version_uses_compiled_definition_without_external_example() 
 #[test]
 fn internal_catalog_fixtures_keep_retired_cards_out_and_custom_models_separate() {
     let patch: ProviderPatch = serde_yaml_ng::from_str(
-        "id: zhipu-cn-api\nmodels:\n  - {id: glm-5.2-chat-completions, max_output_tokens: 65536}\n  - {id: glm-5.3-chat-completions, max_output_tokens: 65536}\n  - {id: private-glm, service_model_id: glm-5.3, display_name: Private GLM, adapter: glm_chat_completions, max_output_tokens: 8192}\n",
+        "id: zhipu-cn-api\nmodels:\n  - {id: glm-5.2, max_output_tokens: 65536}\n  - {id: glm-5.3, max_output_tokens: 65536}\n  - {id: private-glm, display_name: Private GLM, adapter: glm_chat_completions, max_output_tokens: 8192}\n",
     )
     .unwrap();
     let defaults = ModelCatalog::defaults();
@@ -311,49 +299,60 @@ fn internal_catalog_fixtures_keep_retired_cards_out_and_custom_models_separate()
     let offered = |model_id: &str| {
         access.ordinary_candidate(&effective.get("zhipu-cn-api", model_id).unwrap(), &defaults)
     };
-    assert_eq!(offered("glm-5.2-chat-completions"), Some(false));
-    assert_eq!(offered("glm-5.3-chat-completions"), Some(true));
+    assert_eq!(offered("glm-5.2"), Some(false));
+    assert_eq!(offered("glm-5.3"), Some(true));
     assert_eq!(offered("private-glm"), Some(true));
-    let overridden = effective
-        .get("zhipu-cn-api", "glm-5.3-chat-completions")
-        .unwrap();
+    let overridden = effective.get("zhipu-cn-api", "glm-5.3").unwrap();
     assert_eq!(overridden.max_output_tokens, 65536);
-    assert_eq!(access.series_for(&overridden).unwrap().label(), "GLM (5.3)");
+    assert_eq!(access.series_for(&overridden).unwrap().name.clone(), "GLM");
 }
 
 #[test]
-fn access_bindings_reject_missing_foreign_duplicate_and_unknown_entries() {
+fn provider_selection_rejects_missing_foreign_duplicate_and_unknown_entries() {
     let models = ModelCatalog::defaults();
-    let binding = |provider: &str, model: &str| {
-        format!(
-            "provider: {provider}\nseries:\n  - {{id: glm, name: GLM, version: \"5.3\", model: {model}}}\n"
-        )
-    };
-    for files in [
-        vec![binding("zai-global-api", "glm-9-chat-completions")],
-        vec![binding("zai-global-api", "deepseek-flash-chat-completions")],
-        vec![binding("unknown-api", "glm-5.3-chat-completions")],
-        vec![
-            binding("zai-global-api", "glm-5.3-chat-completions"),
-            binding("zai-global-api", "glm-5.3-chat-completions"),
-        ],
-        vec![
-            "provider: zai-global-api\nseries:\n  - {id: glm, name: GLM, version: \"5.3\", model: glm-5.3-chat-completions}\n  - {id: glm-again, name: GLM again, version: \"5.3\", model: glm-5.3-chat-completions}\n".into(),
-        ],
-        vec![
-            "provider: zai-global-api\nseries:\n  - {id: glm, name: GLM, version: \"5.3\", model: glm-5.3-chat-completions}\n  - {id: glm, name: GLM Flash, version: \"5.3\", model: glm-5.3-flash-chat-completions}\n".into(),
-        ],
-        vec!["provider: zai-global-api\nseries: []\n".into()],
+    let provider = models
+        .providers
+        .iter()
+        .find(|provider| provider.id == "zai-global-api")
+        .unwrap();
+    let baseline = serde_json::to_value(provider).unwrap();
+    for selection in [
+        json!({"series": [{"id": "glm", "name": "GLM", "model": "glm-9"}]}),
+        json!({"series": [{"id": "glm", "name": "GLM", "model": "deepseek-flash"}]}),
+        json!({"series": []}),
+        json!({"notice": " ", "series": provider.selection.as_ref().unwrap().series}),
+        json!({"series": [
+            {"id": "glm", "name": "GLM", "model": "glm-5.3"},
+            {"id": "glm-again", "name": "GLM again", "model": "glm-5.3"}
+        ]}),
+        json!({"series": [
+            {"id": "glm", "name": "GLM", "model": "glm-5.3"},
+            {"id": "glm", "name": "GLM Flash", "model": "glm-5.3-flash"}
+        ]}),
+        json!({"group": "Zhipu GLM", "series": provider.selection.as_ref().unwrap().series}),
+        json!({"series": [{"id": "glm", "name": "GLM", "model": "glm-5.3", "latest": true}]}),
     ] {
-        let files = files.iter().map(String::as_str).collect::<Vec<_>>();
-        let catalog = AccessCatalog::from_yaml(&files).unwrap();
-        assert!(catalog.validate(&models).is_err(), "{files:?}");
+        let mut definition = baseline.clone();
+        definition["selection"] = selection;
+        if let Ok(provider) = serde_json::from_value(definition.clone()) {
+            assert!(
+                ModelCatalog::from_providers(vec![provider]).is_err(),
+                "{definition}"
+            );
+        }
     }
+    let mut retired_alias_field = baseline;
+    retired_alias_field["model_aliases"] = json!({"glm-5.3-chat-completions": "glm-5.3"});
     assert!(
-        AccessCatalog::from_yaml(&[
-            "provider: zai-global-api\nseries:\n  - {id: glm, name: GLM, version: \"5.3\", model: glm-5.3-chat-completions, latest: true}\n"
-        ])
+        serde_json::from_value::<tickloop_agent_model::cards::ProviderDefinition>(
+            retired_alias_field
+        )
         .is_err()
+    );
+    assert!(
+        models
+            .get("zai-global-api", "glm-5.3-chat-completions")
+            .is_none()
     );
 }
 
@@ -373,7 +372,7 @@ async fn regional_api_streams_preserved_thinking_tools_images_and_cached_usage()
         ]
         .concat();
         let (url, captured) = model_http_support::serve_response(200, reply).await;
-        let config = configured(provider, "glm-5.3-flash-chat-completions", &root, url);
+        let config = configured(provider, "glm-5.3-flash", &root, url);
         let mut input = user_request(Some(ReasoningEffort::High));
         input.messages[0].content.push(Content::Image {
             source: ImageSource::Base64 {
@@ -462,7 +461,7 @@ async fn streamed_tool_call_identity_stays_bound_to_one_index() {
         ]
         .concat();
         let (url, _) = model_http_support::serve_response(200, reply).await;
-        let config = configured("zai-global-api", "glm-5.3-chat-completions", &root, url);
+        let config = configured("zai-global-api", "glm-5.3", &root, url);
         let (events, _) = mpsc::unbounded_channel();
         let error = model_client(config, Some(&root))
             .unwrap()
@@ -504,7 +503,7 @@ async fn thinking_defaults_and_pinned_toggle_card_off_follow_the_model_card() {
         let config = if pinned {
             pinned_glm_5_2(&root, url)
         } else {
-            configured("zai-global-api", "glm-5.3-chat-completions", &root, url)
+            configured("zai-global-api", "glm-5.3", &root, url)
         };
         let model = config.model.clone();
         let (events, _) = mpsc::unbounded_channel();
@@ -522,7 +521,7 @@ async fn thinking_defaults_and_pinned_toggle_card_off_follow_the_model_card() {
     let root = root.path().canonicalize().unwrap();
     let config = configured(
         "zhipu-cn-api",
-        "glm-5.3-chat-completions",
+        "glm-5.3",
         &root,
         "http://127.0.0.1:9/api/paas/v4".into(),
     );
@@ -548,7 +547,7 @@ async fn same_source_reasoning_replays_unchanged_while_foreign_thinking_becomes_
         (200, text_reply("Second reasoning", "Second answer")),
     ])
     .await;
-    let config = configured("zhipu-cn-api", "glm-5.3-chat-completions", &root, url);
+    let config = configured("zhipu-cn-api", "glm-5.3", &root, url);
     let client = model_client(config, Some(&root)).unwrap();
     let (events, _) = mpsc::unbounded_channel();
     let first = client
@@ -612,7 +611,7 @@ async fn structured_output_uses_json_mode_with_schema_prompt_and_never_tools() {
     let root = root.path().canonicalize().unwrap();
     let (url, captured) =
         model_http_support::serve_response(200, text_reply("Assess.", "{\"allow\":false}")).await;
-    let config = configured("zai-global-api", "glm-5.3-chat-completions", &root, url);
+    let config = configured("zai-global-api", "glm-5.3", &root, url);
     let schema = json!({"type":"object","properties":{"allow":{"type":"boolean"}},"required":["allow"],"additionalProperties":false});
     let mut input = user_request(None);
     input.messages.insert(
@@ -675,7 +674,7 @@ async fn glm_finish_reasons_map_to_existing_rejections() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
         let (url, _) = model_http_support::serve_response(200, finish_reply(reason)).await;
-        let config = configured("zhipu-cn-api", "glm-5.3-chat-completions", &root, url);
+        let config = configured("zhipu-cn-api", "glm-5.3", &root, url);
         let (events, _) = mpsc::unbounded_channel();
         let error = model_client(config, Some(&root))
             .unwrap()
@@ -721,7 +720,7 @@ async fn business_error_codes_decide_retry_and_failure_kind() {
         let body =
             json!({"error":{"code":code,"message":"Request refused by the provider"}}).to_string();
         let (url, _) = model_http_support::serve_response(status, body).await;
-        let config = configured("zai-global-api", "glm-5.3-chat-completions", &root, url);
+        let config = configured("zai-global-api", "glm-5.3", &root, url);
         let (events, _) = mpsc::unbounded_channel();
         let error = model_client(config, Some(&root))
             .unwrap()
@@ -783,7 +782,7 @@ async fn glm_messages_restart_glm_keeps_original_history_and_same_source_prefix(
     .await;
     let (messages_url, mut messages_requests) =
         model_http_support::serve_responses(vec![(200, signed_messages_reply())]).await;
-    let glm = configured("zhipu-cn-api", "glm-5.3-chat-completions", &root, glm_url);
+    let glm = configured("zhipu-cn-api", "glm-5.3", &root, glm_url);
     let mut claude = ModelCatalog::defaults()
         .get("anthropic-api", "claude-sonnet-4-6")
         .unwrap();
@@ -885,7 +884,7 @@ async fn network_error_on_the_documented_empty_final_chunk_is_retried_by_the_run
         (200, text_reply("Retry reasoning", "Recovered answer")),
     ])
     .await;
-    let glm = configured("zai-global-api", "glm-5.3-chat-completions", &root, url);
+    let glm = configured("zai-global-api", "glm-5.3", &root, url);
     let agent = Agent::open_embedded(
         root.clone(),
         glm.clone(),
@@ -932,7 +931,7 @@ async fn typed_balance_and_allowance_codes_determine_http_classification() {
         let root = root.path().canonicalize().unwrap();
         let body = json!({"error":{"code":code,"message":"Account request refused"}}).to_string();
         let (url, _) = model_http_support::serve_response(429, body).await;
-        let config = configured("zai-global-api", "glm-5.3-chat-completions", &root, url);
+        let config = configured("zai-global-api", "glm-5.3", &root, url);
         let (events, _) = mpsc::unbounded_channel();
         let error = model_client(config, Some(&root))
             .unwrap()

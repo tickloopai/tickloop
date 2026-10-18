@@ -13,7 +13,7 @@ async fn minimax_thinking_toggle_and_on_preference_survive_new_chats() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let model = ModelCatalog::defaults()
-        .get("minimax-cn-api", "minimax-m3-messages")
+        .get("minimax-cn-api", "MiniMax-M3")
         .unwrap();
     tickloop_agent_model::credentials::save_api_key(&root, &model.api_key_env, "test-minimax-key")
         .unwrap();
@@ -277,7 +277,7 @@ async fn switching_model_and_thinking_during_tool_approval_waits_until_the_old_r
     };
     let replacement = Arc::new(ScriptedModel::new(vec![text("New round completed")]));
     let mut selected = ModelCatalog::defaults()
-        .get("deepseek-api", "deepseek-flash-responses")
+        .get("openai-api", "gpt-6-luna")
         .unwrap();
     selected.api_key_env = "PATH".into();
     assert_eq!(
@@ -546,7 +546,7 @@ async fn context_status_tracks_the_active_window_and_drops_immediately_after_com
             ..Usage::default()
         }],
     ));
-    let agent = Agent::new_embedded(config(), client);
+    let agent = Agent::new_embedded(tickloop_agent_test_support::config(), client);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent.set_context_window(chat, 1_000_000).await.unwrap();
     let mut events = agent.subscribe();
@@ -890,8 +890,9 @@ async fn automatic_compaction_does_not_treat_serialized_bytes_as_tokens() {
 #[tokio::test]
 async fn context_window_maximum_follows_the_selected_model() {
     let directory = tempfile::tempdir().unwrap();
-    let mut model_config = config();
-    model_config.base_url = "https://api.deepseek.com/anthropic".into();
+    let mut model_config = ModelCatalog::defaults()
+        .get("deepseek-api", "deepseek-flash")
+        .unwrap();
     model_config.model = "deepseek-flash".into();
     model_config.api_key_env = "DEEPSEEK_API_KEY".into();
     model_config.max_output_tokens = 64_000;
@@ -956,8 +957,9 @@ async fn saved_window_override_does_not_reduce_the_selected_model_window() {
         r#"{"contextWindowTokens":100000}"#,
     )
     .unwrap();
-    let mut model_config = config();
-    model_config.base_url = "https://api.deepseek.com/anthropic".into();
+    let mut model_config = ModelCatalog::defaults()
+        .get("deepseek-api", "deepseek-flash")
+        .unwrap();
     model_config.model = "deepseek-flash".into();
     model_config.api_key_env = "DEEPSEEK_API_KEY".into();
     let agent =

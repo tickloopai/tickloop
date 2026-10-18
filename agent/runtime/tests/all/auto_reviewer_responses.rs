@@ -334,16 +334,16 @@ async fn minimax_chat_json_unexpected_operations_are_terminal() {
 async fn deepseek_chat_json_unexpected_operations_are_terminal() {
     unexpected_tool_response_requires_manual(
         ModelCatalog::defaults()
-            .get("deepseek-api", "deepseek-flash-chat-completions")
+            .get("deepseek-api", "deepseek-flash")
             .unwrap(),
     )
     .await;
 }
 #[tokio::test]
-async fn deepseek_messages_unexpected_operations_are_terminal() {
+async fn anthropic_messages_unexpected_operations_are_terminal() {
     unexpected_tool_response_requires_manual(
         ModelCatalog::defaults()
-            .get("deepseek-api", "deepseek-flash-messages")
+            .get("anthropic-api", "claude-haiku-5-5")
             .unwrap(),
     )
     .await;
@@ -352,7 +352,7 @@ async fn deepseek_messages_unexpected_operations_are_terminal() {
 async fn minimax_messages_unexpected_operations_are_terminal() {
     unexpected_tool_response_requires_manual(
         ModelCatalog::defaults()
-            .get("minimax-cn-oauth", "minimax-m3-1-flash-preview-messages")
+            .get("minimax-cn-oauth", "MiniMax-M3.1-Flash-Preview")
             .unwrap(),
     )
     .await;
@@ -361,7 +361,7 @@ async fn minimax_messages_unexpected_operations_are_terminal() {
 async fn glm_json_unexpected_operations_are_terminal() {
     unexpected_tool_response_requires_manual(
         ModelCatalog::defaults()
-            .get("zai-global-api", "glm-5.3-chat-completions")
+            .get("zai-global-api", "glm-5.3")
             .unwrap(),
     )
     .await;
@@ -472,9 +472,8 @@ async fn unnormalized_model_tools_never_repair_into_allowing_findings() {
 #[tokio::test]
 async fn minimax_preview_and_deepseek_recover_malformed_review_without_relaxing_policy() {
     for (provider, model) in [
-        ("minimax-cn-oauth", "minimax-m3-1-flash-preview-messages"),
-        ("deepseek-api", "deepseek-flash-messages"),
-        ("deepseek-api", "deepseek-flash-chat-completions"),
+        ("minimax-cn-oauth", "MiniMax-M3.1-Flash-Preview"),
+        ("deepseek-api", "deepseek-flash"),
     ] {
         let directory = tempfile::tempdir().unwrap();
         let mut reviewer_config = ModelCatalog::defaults().get(provider, model).unwrap();
@@ -562,4 +561,124 @@ async fn minimax_preview_and_deepseek_recover_malformed_review_without_relaxing_
         assert_eq!(reviews[1].outcome, RequestOutcome::Accepted);
         agent.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn default_llm_review_uses_the_provider_auxiliary_model_and_records_its_identity() {
+    use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio_util::sync::CancellationToken;
+
+    struct RoutedConversation {
+        conversation: ScriptedModel,
+        transport: Arc<dyn ModelClient>,
+    }
+    #[async_trait::async_trait]
+    impl ModelClient for RoutedConversation {
+        fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
+            self.transport.identity()
+        }
+        fn auxiliary_client(
+            &self,
+            task: tickloop_agent_model::auxiliary::AuxiliaryTask,
+        ) -> Result<Option<Arc<dyn ModelClient>>, ModelError> {
+            self.transport.auxiliary_client(task)
+        }
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            events: UnboundedSender<ModelDelta>,
+            cancel: CancellationToken,
+        ) -> Result<ModelOutput, ModelError> {
+            self.conversation.complete(request, events, cancel).await
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().canonicalize().unwrap().join("state");
+    tickloop_agent_base::private_fs::create_private_directory(&state).unwrap();
+    let response = messages_response(vec![
+        json!({"type":"text","text":auto_classification(false).to_string()}),
+    ])
+    .replace(
+        "\"stop_reason\":\"tool_use\"",
+        "\"stop_reason\":\"end_turn\"",
+    );
+    let (endpoint, mut captured) = model_http_support::serve_responses(vec![(200, response)]).await;
+    let mut model = ModelCatalog::defaults()
+        .get("anthropic-api", "claude-sonnet-5-5")
+        .unwrap();
+    model.base_url = endpoint;
+    tickloop_agent_model::credentials::save_api_key(
+        &state,
+        &model.api_key_env,
+        "auxiliary-review-fixture",
+    )
+    .unwrap();
+    let transport = tickloop_agent_model::model_client(model.clone(), Some(&state)).unwrap();
+    let client = Arc::new(RoutedConversation {
+        conversation: ScriptedModel::new(vec![
+            call(
+                "link",
+                "Bash",
+                json!({"command":"ln -s missing-target auxiliary-link"}),
+            ),
+            text("done"),
+        ]),
+        transport,
+    });
+    let agent =
+        Agent::open_embedded(state, model, tickloop_agent_model::fixture_client(client)).unwrap();
+    agent.install_own_tickhost();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::Auto)
+        .await
+        .unwrap();
+    let mut events = agent.subscribe();
+    agent
+        .submit(
+            chat,
+            None,
+            "Create the auxiliary-link symlink to missing-target".into(),
+        )
+        .await
+        .unwrap();
+    loop {
+        match next_event(&mut events).await.kind {
+            EventKind::Completed { .. } => break,
+            EventKind::Failed(error) => panic!("{error}"),
+            EventKind::PermissionRequested { .. } => {
+                panic!("fixture reviewer should allow the isolated test operation")
+            }
+            _ => {}
+        }
+    }
+    let (_, body) = captured.recv().await.unwrap();
+    assert_eq!(body["model"], "claude-haiku-5-5");
+    assert_eq!(body["max_tokens"], 4096);
+    assert_eq!(body["thinking"]["type"], "disabled");
+    assert!(body.get("temperature").is_none());
+    assert!(body["output_config"]["format"].is_object());
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    let reviews = snapshot
+        .request_usage
+        .entries()
+        .iter()
+        .filter(|entry| entry.kind == ModelRequestKind::PermissionCheck)
+        .collect::<Vec<_>>();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].model.requested_model, "claude-haiku-5-5");
+    assert_eq!(reviews[0].outcome, RequestOutcome::Accepted);
+    assert_eq!(snapshot.model.model, "claude-sonnet-5-5");
+    assert!(
+        directory
+            .path()
+            .join("auxiliary-link")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    agent.shutdown().await;
 }

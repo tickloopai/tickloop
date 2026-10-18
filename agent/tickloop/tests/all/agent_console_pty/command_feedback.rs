@@ -42,7 +42,7 @@ impl LocalCommand {
         };
         if let Some(title) = model_title {
             view.wait_for("real model picker opens", |frame| {
-                frame.contains(title) && frame.contains("DeepSeek-V4.1-Flash")
+                frame.contains(title) && frame.contains("DeepSeek Flash (deepseek-flash)")
             })
             .await;
             view.send(b"\r");

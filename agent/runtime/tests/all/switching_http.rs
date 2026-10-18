@@ -80,7 +80,7 @@ async fn builtin_selection_with_a_mock_transport_completes_tools_and_resumes_his
         .unwrap()
         .unwrap();
     assert_eq!(requests.len(), 3);
-    assert_eq!(requests[0].1["model"], "assistant");
+    assert_eq!(requests[0].1["model"], "gpt-6-luna");
     assert_tool_history_with_output(Protocol::Responses, &requests[1].1, "gateway-tool");
     assert!(requests[2].1.to_string().contains("Tool handled"));
     reopened.shutdown().await;
@@ -303,15 +303,20 @@ async fn old_endpoint(
 }
 
 fn profile(base_url: String, protocol: Protocol, name: &str) -> ModelConfig {
-    ModelConfig {
-        provider: tickloop_agent_protocol::ModelProvider::Api,
-        auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
-        base_url: base_url.trim_end_matches("/anthropic").into(),
-        protocol,
-        name: name.into(),
-        model: name.into(),
-        ..tickloop_agent_test_support::persisted_config()
-    }
+    let (provider, id) = match protocol {
+        Protocol::Messages => ("anthropic-api", "claude-haiku-5-5"),
+        Protocol::Responses => ("openai-api", "gpt-6-luna"),
+        Protocol::ChatCompletions => ("deepseek-api", "deepseek-flash"),
+        _ => unreachable!(),
+    };
+    let mut config = tickloop_agent_model::cards::ModelCatalog::defaults()
+        .get(provider, id)
+        .unwrap();
+    config.base_url = base_url.trim_end_matches("/anthropic").into();
+    config.name = name.into();
+    config.card.as_mut().unwrap().display_name = name.into();
+    config.api_key_env.clear();
+    config
 }
 
 fn assert_tool_history(protocol: Protocol, body: &Value) {
@@ -469,7 +474,7 @@ async fn three_http_protocols_switch_only_after_the_running_shell_and_old_tool_r
         assert!(
             old_requests
                 .iter()
-                .all(|(_, body)| body["model"] == "old-profile")
+                .all(|(_, body)| body["model"] == original.model)
         );
         let next = agent
             .submit(
@@ -500,7 +505,7 @@ async fn three_http_protocols_switch_only_after_the_running_shell_and_old_tool_r
             Protocol::ChatCompletions => "/chat/completions",
         };
         assert!(headers.starts_with(&format!("POST {path} HTTP/1.1")));
-        assert_eq!(body["model"], "new-profile");
+        assert_eq!(body["model"], selected.model);
         assert!(body.to_string().contains("Old round completed"));
         let completed = agent.commands(chat).await.unwrap().pop().unwrap();
         assert_eq!(completed.operation_id, command.operation_id);

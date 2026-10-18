@@ -25,3 +25,9 @@ mod provider_expansion;
 
 #[path = "all/model_tiers.rs"]
 mod model_tiers;
+
+#[path = "all/haiku_models.rs"]
+mod haiku_models;
+
+#[path = "all/auxiliary_models.rs"]
+mod auxiliary_models;

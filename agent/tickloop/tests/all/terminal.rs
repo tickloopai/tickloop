@@ -151,10 +151,15 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
         let ansi = regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").unwrap();
         loop {
             let captured = output.lock().unwrap();
-            if captured
-                .get(after..)
-                .is_some_and(|suffix| ansi.replace_all(suffix, "").contains(needle))
-            {
+            if captured.get(after..).is_some_and(|suffix| {
+                let editor_ready = !needle.starts_with("⏵⏵")
+                    || suffix.rfind("\x1b[?25h").is_some_and(|shown| {
+                        suffix
+                            .rfind("\x1b[?25l")
+                            .is_none_or(|hidden| shown > hidden)
+                    });
+                editor_ready && ansi.replace_all(suffix, "").contains(needle)
+            }) {
                 return;
             }
             if std::time::Instant::now() >= deadline {
@@ -171,12 +176,12 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
     wait_for_output("Accessing workspace:", 0);
     writer.write_all(b"j\r").unwrap();
     writer.flush().unwrap();
-    wait_for_output("⏵⏵ Auto · deepseek-flash", 0);
+    wait_for_output("⏵⏵ Auto · DeepSeek Flash", 0);
     for mode in ["Ask", "Plan", "Full Access", "Auto"] {
         let output_start = output.lock().unwrap().len();
         writer.write_all(b"\x1b[Z").unwrap();
         writer.flush().unwrap();
-        wait_for_output(&format!("⏵⏵ {mode} · deepseek-flash"), output_start);
+        wait_for_output(&format!("⏵⏵ {mode} · DeepSeek Flash"), output_start);
     }
     writer.write_all(b"/exit\r\r").unwrap();
     writer.flush().unwrap();
@@ -203,7 +208,7 @@ fn interactive_pty_trusts_the_directory_and_cycles_all_execution_modes() {
         regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
             .unwrap()
             .replace_all(&output, "")
-            .contains("⏵⏵ Auto · deepseek-flash"),
+            .contains("⏵⏵ Auto · DeepSeek Flash"),
         "{output}"
     );
     assert!(UserSettings::in_root(&config_root).is_working_directory_trusted(directory.path()));
@@ -468,7 +473,7 @@ async fn piped_provider_model_and_settings_menus_apply_numbered_choices() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        transcript.contains("DeepSeek-V4.1-Flash    Thinking"),
+        transcript.contains("DeepSeek Flash (deepseek-flash)    Thinking"),
         "{transcript}"
     );
     assert!(
@@ -593,19 +598,10 @@ async fn piped_effort_controls_request_and_prints_returned_thinking() {
         let (mut socket, _) = listener.accept().await.unwrap();
         let request = read_request(&mut socket).await;
         let body = [
-            json!({"type":"message_start","message":{"id":"thinking-id","type":"message","role":"assistant","content":[],"usage":{"input_tokens":7,"output_tokens":0}}}),
-            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
-            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Compare both values."}}),
-            json!({"type":"content_block_stop","index":0}),
-            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
-            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"The second value is larger."}}),
-            json!({"type":"content_block_stop","index":1}),
-            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}),
-            json!({"type":"message_stop"}),
-        ]
-        .iter()
-        .map(|event| format!("data: {event}\n\n"))
-        .collect::<String>();
+            json!({"id":"thinking-id","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Compare both values."},"finish_reason":null}]}),
+            json!({"id":"thinking-id","choices":[{"index":0,"delta":{"content":"The second value is larger."},"finish_reason":null}]}),
+            json!({"id":"thinking-id","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":9}}),
+        ].iter().map(|event| format!("data: {event}\n\n")).collect::<String>() + "data: [DONE]\n\n";
         socket
             .write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes())
             .await
@@ -615,7 +611,7 @@ async fn piped_effort_controls_request_and_prints_returned_thinking() {
     });
     let directory = tempfile::tempdir().unwrap();
     let mut config = tickloop_agent_model::cards::ModelCatalog::defaults()
-        .get("deepseek-api", "deepseek-flash-messages")
+        .get("deepseek-api", "deepseek-flash")
         .unwrap();
     config.base_url = format!("http://{address}");
     config.api_key_env.clear();
@@ -649,7 +645,7 @@ async fn piped_effort_controls_request_and_prints_returned_thinking() {
     );
     let request = server.await.unwrap();
     assert_eq!(request["thinking"], json!({"type":"enabled"}));
-    assert_eq!(request["output_config"]["effort"], "max");
+    assert_eq!(request["reasoning_effort"], "max");
 }
 
 /// A `glyphSet` an earlier version saved, when Tickloop still offered a second glyph set, neither

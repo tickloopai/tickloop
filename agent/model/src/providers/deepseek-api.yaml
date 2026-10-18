@@ -1,7 +1,3 @@
-model_aliases:
-  "deepseek-flash-chat-completions": "deepseek-flash"
-  "deepseek-v4-pro-chat-completions": "deepseek-v4-pro"
-  "deepseek-v4-flash-chat-completions": "deepseek-v4-flash"
 connection:
   vendor: "DeepSeek"
   product: "Pay-as-you-go API"
@@ -13,41 +9,20 @@ display_name: "DeepSeek API"
 auth: "api_key_env"
 api_key_env: "DEEPSEEK_API_KEY"
 endpoints:
-  deepseek_messages: "https://api.deepseek.com/anthropic"
-  responses: "https://api.deepseek.com"
   deepseek_chat_completions: "https://api.deepseek.com"
+selection:
+  auxiliary_model: deepseek-flash
+  series:
+    - id: "deepseek-flash"
+      name: "DeepSeek Flash"
+      model: "deepseek-flash"
+      capability_order: 1
+    - id: "deepseek-pro"
+      name: "DeepSeek Pro"
+      model: "deepseek-v4-pro"
+      capability_order: 0
 models:
-  - id: "deepseek-flash-messages"
-    service_model_id: "deepseek-flash"
-    display_name: "DeepSeek-V4.1-Flash"
-    adapter: "deepseek_messages"
-    max_output_tokens: 64000
-    context_window_tokens: 1000000
-    thinking: "toggle"
-    adaptive_by_default: false
-    effort_levels:
-      - "low"
-      - "high"
-      - "max"
-    input_modalities:
-      - "text"
-      - "image"
-  - id: "deepseek-flash-responses"
-    service_model_id: "deepseek-flash"
-    display_name: "DeepSeek-V4.1-Flash"
-    adapter: "responses"
-    max_output_tokens: 64000
-    context_window_tokens: 1000000
-    thinking: "toggle"
-    adaptive_by_default: false
-    effort_levels:
-      - "low"
-      - "high"
-      - "max"
-    input_modalities:
-      - "text"
   - id: "deepseek-flash"
-    service_model_id: "deepseek-flash"
     display_name: "DeepSeek-V4.1-Flash"
     adapter: "deepseek_chat_completions"
     max_output_tokens: 64000
@@ -61,68 +36,11 @@ models:
     input_modalities:
       - "text"
       - "image"
-  - id: "deepseek-v4-pro-messages"
-    service_model_id: "deepseek-v4-pro"
-    display_name: "DeepSeek-V4-Pro-0813"
-    adapter: "deepseek_messages"
-    max_output_tokens: 64000
-    context_window_tokens: 1000000
-    thinking: "toggle"
-    adaptive_by_default: false
-    effort_levels:
-      - "low"
-      - "high"
-      - "max"
-    input_modalities:
-      - "text"
-  - id: "deepseek-v4-pro-responses"
-    service_model_id: "deepseek-v4-pro"
-    display_name: "DeepSeek-V4-Pro-0813"
-    adapter: "responses"
-    max_output_tokens: 64000
-    context_window_tokens: 1000000
-    thinking: "toggle"
-    adaptive_by_default: false
-    effort_levels:
-      - "low"
-      - "high"
-      - "max"
-    input_modalities:
-      - "text"
   - id: "deepseek-v4-pro"
-    service_model_id: "deepseek-v4-pro"
     display_name: "DeepSeek-V4-Pro-0813"
     adapter: "deepseek_chat_completions"
     max_output_tokens: 64000
     context_window_tokens: 1000000
-    thinking: "toggle"
-    adaptive_by_default: false
-    effort_levels:
-      - "low"
-      - "high"
-      - "max"
-    input_modalities:
-      - "text"
-  - id: "deepseek-v4-flash-messages"
-    service_model_id: "deepseek-v4-flash"
-    display_name: "DeepSeek-V4.1-Flash"
-    adapter: "deepseek_messages"
-    max_output_tokens: 64000
-    context_window_tokens: null
-    thinking: "toggle"
-    adaptive_by_default: false
-    effort_levels:
-      - "low"
-      - "high"
-      - "max"
-    input_modalities:
-      - "text"
-  - id: "deepseek-v4-flash-responses"
-    service_model_id: "deepseek-v4-flash"
-    display_name: "DeepSeek-V4.1-Flash"
-    adapter: "responses"
-    max_output_tokens: 64000
-    context_window_tokens: null
     thinking: "toggle"
     adaptive_by_default: false
     effort_levels:
@@ -132,7 +50,6 @@ models:
     input_modalities:
       - "text"
   - id: "deepseek-v4-flash"
-    service_model_id: "deepseek-v4-flash"
     display_name: "DeepSeek-V4.1-Flash"
     adapter: "deepseek_chat_completions"
     max_output_tokens: 64000

@@ -6,11 +6,11 @@ use serde_json::json;
 use super::approval_context::ApprovalSnapshot;
 use super::auto_rules::{Classification, RuleVerdict};
 use tickloop_agent_model::{
-    ModelError, ModelFailureKind, ModelOutput, ModelRequest, ModelResponseRejection,
-    REQUEST_OVERHEAD_TOKENS, StructuredOutput,
+    ModelConfigExt, ModelError, ModelFailureKind, ModelOutput, ModelRequest,
+    ModelResponseRejection, REQUEST_OVERHEAD_TOKENS, StructuredOutput,
 };
 use tickloop_agent_protocol::{
-    AUTO_REJECTION_PREFIX, ApprovalStage, AutoPolicy, ChatSnapshot, Content, Message, Role,
+    AUTO_REJECTION_PREFIX, ApprovalStage, AutoPolicy, Content, Message, ModelConfig, Role,
 };
 
 pub(super) const CLASSIFIER_RESULT_NAME: &str = "classify_result";
@@ -27,11 +27,12 @@ const CLASSIFIER_OUTPUT_GUIDANCE: &str = "Block categories follow the supplied r
 /// Bytes of approval snapshot the Chat model can review: its context window less the output
 /// reservation, request overhead and the longest classifier system prompt, using the same
 /// bytes-per-token estimate as context compaction.
-pub(super) fn review_budget_bytes(snapshot: &ChatSnapshot) -> usize {
-    let window =
-        super::context::context_window(snapshot).unwrap_or(DEFAULT_REVIEWER_CONTEXT_WINDOW_TOKENS);
+pub(super) fn review_budget_bytes(model: &ModelConfig, context_window: Option<usize>) -> usize {
+    let window = context_window
+        .or_else(|| model.maximum_context_window_tokens())
+        .unwrap_or(DEFAULT_REVIEWER_CONTEXT_WINDOW_TOKENS);
     let input_tokens = window
-        .saturating_sub(snapshot.model.max_output_tokens as usize)
+        .saturating_sub(model.max_output_tokens as usize)
         .saturating_sub(REQUEST_OVERHEAD_TOKENS);
     let system_prompt_bytes = [ApprovalStage::RiskScreen, ApprovalStage::Authorization]
         .into_iter()

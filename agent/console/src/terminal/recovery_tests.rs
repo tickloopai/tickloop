@@ -1834,7 +1834,7 @@ fn run_routine_restore_pty(route: &str) {
         _master: pair.master,
         timeout: RECOVERY_TIMEOUT,
     };
-    fixture.wait_for("deepseek-flash");
+    fixture.wait_for("DeepSeek Flash");
     fixture.send(format!("{ROUTINE_INPUT}\r").as_bytes());
     let completed = fixture.wait_for_phase(&phase_path, "completed");
     fixture.wait_for_turn_summary();

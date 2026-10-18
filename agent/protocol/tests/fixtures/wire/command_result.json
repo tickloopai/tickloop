@@ -467,7 +467,6 @@
           "model_id": "example-large",
           "card": {
             "id": "example-large",
-            "service_model_id": "example-large-2026",
             "display_name": "Example Large",
             "adapter": "messages",
             "max_output_tokens": 32000,
@@ -576,7 +575,6 @@
           "model_id": "example-large",
           "card": {
             "id": "example-large",
-            "service_model_id": "example-large-2026",
             "display_name": "Example Large",
             "adapter": "messages",
             "max_output_tokens": 32000,
@@ -1005,7 +1003,6 @@
           "model_id": "example-large",
           "card": {
             "id": "example-large",
-            "service_model_id": "example-large-2026",
             "display_name": "Example Large",
             "adapter": "messages",
             "max_output_tokens": 32000,
@@ -1114,7 +1111,6 @@
           "model_id": "example-large",
           "card": {
             "id": "example-large",
-            "service_model_id": "example-large-2026",
             "display_name": "Example Large",
             "adapter": "messages",
             "max_output_tokens": 32000,

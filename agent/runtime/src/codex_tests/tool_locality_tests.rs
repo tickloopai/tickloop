@@ -136,7 +136,7 @@ fn assert_wire_round_trip(requests: &[Value], codex: bool) {
     }));
     assert_eq!(
         requests[0]["model"],
-        if codex { "gpt-5.5" } else { "deepseek-flash" }
+        if codex { "gpt-5.5" } else { "gpt-6-luna" }
     );
 }
 
@@ -157,7 +157,7 @@ async fn one_new_host_tool_round_trips_through_the_real_api_adapter() {
     ])
     .await;
     let mut config = ModelCatalog::defaults()
-        .get("deepseek-api", "deepseek-flash-responses")
+        .get("openai-api", "gpt-6-luna")
         .unwrap();
     config.base_url = endpoint.as_str().trim_end_matches("/responses").into();
     config.api_key_env.clear();
@@ -182,7 +182,7 @@ async fn the_same_new_host_tool_round_trips_through_the_real_codex_adapter() {
     ])
     .await;
     let config = ModelCatalog::defaults()
-        .get("openai-codex", "gpt-5.5-responses")
+        .get("openai-codex", "gpt-5.5")
         .unwrap();
     let client = LoopbackCodexClient::new(config.clone(), &state_dir, endpoint.as_str());
     let agent = Agent::new_embedded(config, client.into_fixture_client());

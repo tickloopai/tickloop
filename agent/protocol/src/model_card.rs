@@ -88,7 +88,6 @@ impl ThinkingOffEncoding {
 #[serde(deny_unknown_fields)]
 pub struct ModelCard {
     pub id: String,
-    pub service_model_id: String,
     pub display_name: String,
     pub adapter: Adapter,
     #[serde(default = "default_max_output_tokens")]
@@ -152,8 +151,6 @@ const fn default_max_output_tokens() -> u32 {
 #[serde(deny_unknown_fields)]
 pub struct ProviderPatch {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_aliases: Option<BTreeMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub connection: Option<ProviderConnection>,
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -174,8 +171,6 @@ pub struct ProviderPatch {
 #[serde(deny_unknown_fields)]
 pub struct ModelPatch {
     pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_model_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -222,9 +217,6 @@ where
 
 impl ModelPatch {
     pub fn apply_to(self, model: &mut ModelCard) {
-        if let Some(value) = self.service_model_id {
-            model.service_model_id = value;
-        }
         if let Some(value) = self.display_name {
             model.display_name = value;
         }
@@ -264,9 +256,6 @@ impl ModelPatch {
         let location = format!("{provider_location}.models[{}]", self.id);
         Ok(ModelCard {
             id: self.id,
-            service_model_id: self
-                .service_model_id
-                .ok_or_else(|| format!("{location}.service_model_id: required for new model"))?,
             display_name: self
                 .display_name
                 .ok_or_else(|| format!("{location}.display_name: required for new model"))?,

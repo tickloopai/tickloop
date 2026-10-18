@@ -14,9 +14,19 @@ auth: api_key_env
 api_key_env: MOONSHOT_CN_API_KEY
 endpoints:
   kimi_chat_completions: https://api.moonshot.cn/v1
+selection:
+  auxiliary_model: kimi-k3
+  series:
+  - id: kimi
+    name: Kimi
+    model: kimi-k3
+    capability_order: 0
+  - id: kimi-code
+    name: Kimi Code
+    model: kimi-k2.7-code
+    capability_order: 1
 models:
 - id: kimi-k3
-  service_model_id: kimi-k3
   display_name: Kimi K3
   adapter: kimi_chat_completions
   max_output_tokens: 131072
@@ -30,7 +40,6 @@ models:
   - text
   - image
 - id: kimi-k2.7-code
-  service_model_id: kimi-k2.7-code
   display_name: Kimi K2.7 Code
   adapter: kimi_chat_completions
   max_output_tokens: 32768

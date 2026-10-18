@@ -938,7 +938,7 @@ async fn run_resize_matrix(fixture: &PrivateFixture) {
             );
             assert!(borders[0] >= 6, "{height}×{width}: {frame}");
             assert!(
-                rows[rows.len() - 2].contains("deepseek-flash"),
+                rows[rows.len() - 2].contains("DeepSeek Flash"),
                 "{height}×{width}: the core status sits right above the key hints: {frame}"
             );
             assert!(
@@ -964,7 +964,7 @@ async fn run_resize_matrix(fixture: &PrivateFixture) {
             view.wait_for("help restores actual status and key hints", |frame| {
                 let rows = frame.lines().collect::<Vec<_>>();
                 !frame.contains("ctrl+j newline")
-                    && rows[rows.len() - 2].contains("deepseek-flash")
+                    && rows[rows.len() - 2].contains("DeepSeek Flash")
                     && rows[rows.len() - 1].contains("? help")
             })
             .await;

@@ -104,12 +104,21 @@ async fn run_family_messaging(fixture: &PrivateFixture) {
     while requests.try_recv().is_ok() {}
     pty.send(b"@a");
     pty.wait_for("Agent completion group before Files", |frame| {
-        frame.contains("Agents") && frame.contains("Audit bounded evidence")
+        frame.lines().any(|line| line.trim() == "Agents")
+            && frame.lines().any(|line| {
+                line.trim_start().starts_with("audit ") && line.contains("Audit bounded evidence")
+            })
     })
     .await;
     pty.send(b"\x0e\r");
-    pty.wait_for("selected handle chip", |frame| frame.contains("@audit"))
-        .await;
+    pty.wait_for("selected handle chip", |frame| {
+        frame.lines().any(|line| {
+            line.trim_start()
+                .strip_prefix('❯')
+                .is_some_and(|draft| draft.trim_start().starts_with("@audit"))
+        })
+    })
+    .await;
     pty.send(b"DIRECT-HELLO\r");
     pty.wait_for("source receipt and response preview", |frame| {
         frame.contains("You → @audit") && frame.contains("Reply from @audit")

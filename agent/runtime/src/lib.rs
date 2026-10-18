@@ -1258,8 +1258,29 @@ impl Agent {
         let configured_reviewer = self.inner.auto_reviewer.lock().await.clone();
         let has_isolated_reviewer = configured_reviewer.is_some();
         let has_judgment_adapter = self.inner.judgment.lock().await.is_some();
-        let llm_client = configured_reviewer.unwrap_or(chat_client);
-        let llm_budget = auto_mode::review_budget_bytes(&snapshot);
+        let llm_client = if let Some(client) = configured_reviewer {
+            client
+        } else {
+            chat_client
+                .auxiliary_client(tickloop_agent_model::auxiliary::AuxiliaryTask::PermissionCheck)?
+                .unwrap_or(chat_client)
+        };
+        let auxiliary_model = (!has_isolated_reviewer)
+            .then(|| {
+                tickloop_agent_model::auxiliary::auxiliary_model_config(
+                    &snapshot.model,
+                    tickloop_agent_model::auxiliary::AuxiliaryTask::PermissionCheck,
+                )
+            })
+            .flatten();
+        let llm_budget = if let Some(model) = auxiliary_model.as_ref() {
+            auto_mode::review_budget_bytes(model, None)
+        } else {
+            auto_mode::review_budget_bytes(
+                &snapshot.model,
+                crate::context::context_window(&snapshot),
+            )
+        };
         let use_jev = preferred == tickloop_agent_protocol::AutoReviewerPreference::Jev
             || (has_judgment_adapter && !has_isolated_reviewer);
         let assess = |run: auto_approval::ReviewerRun,
@@ -4714,7 +4735,7 @@ mod thinking_settings_tests {
         );
 
         snapshot.model = tickloop_agent_model::cards::ModelCatalog::defaults()
-            .get("anthropic-api", "claude-fable-5-messages")
+            .get("anthropic-api", "claude-fable-5")
             .unwrap();
         assert_eq!(snapshot.effective_reasoning_effort(), None);
         assert!(!snapshot.thinking_enabled);

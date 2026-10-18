@@ -1148,11 +1148,18 @@ mod tests {
                         serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
                     assert!(body["input"].to_string().contains("hello from terminal"));
                     assert_eq!(body["store"], false);
-                    assert_eq!(body["model"], selected_model.unwrap_or("gpt-6-astra"));
                     let is_title = body["tools"].as_array().is_none_or(Vec::is_empty)
                         && body
                             .to_string()
                             .contains("Generate a short sentence-case Chat title");
+                    assert_eq!(
+                        body["model"],
+                        if is_title {
+                            "gpt-6-luna"
+                        } else {
+                            selected_model.unwrap_or("gpt-6-astra")
+                        }
+                    );
                     model_seen = !is_title;
                     let reply = if is_title {
                         "Terminal greeting"

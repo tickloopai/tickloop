@@ -1,8 +1,3 @@
-model_aliases:
-  "gpt-5.5-responses": "gpt-5.5"
-  "gpt-5.6-sol-responses": "gpt-5.6-sol"
-  "gpt-5.6-terra-responses": "gpt-5.6-terra"
-  "gpt-5.6-luna-responses": "gpt-5.6-luna"
 connection:
   vendor: "OpenAI"
   product: "Codex subscription"
@@ -15,9 +10,27 @@ auth: "codex_subscription"
 api_key_env: ""
 endpoints:
   codex_responses: "https://chatgpt.com/backend-api/codex/responses"
+selection:
+  auxiliary_model: gpt-6-luna
+  series:
+    - id: "sol"
+      name: "GPT Sol"
+      model: "gpt-6.1-sol"
+      capability_order: 1
+    - id: "astra"
+      name: "GPT Astra"
+      model: "gpt-6-astra"
+      capability_order: 0
+    - id: "terra"
+      name: "GPT Terra"
+      model: "gpt-5.6-terra"
+      capability_order: 2
+    - id: "luna"
+      name: "GPT Luna"
+      model: "gpt-6-luna"
+      capability_order: 3
 models:
   - id: "gpt-5.5"
-    service_model_id: "gpt-5.5"
     display_name: "GPT-5.5"
     adapter: "codex_responses"
     max_output_tokens: 128000
@@ -34,7 +47,6 @@ models:
       - "text"
       - "image"
   - id: "gpt-5.6-sol"
-    service_model_id: "gpt-5.6-sol"
     display_name: "GPT-5.6 Sol"
     adapter: "codex_responses"
     max_output_tokens: 128000
@@ -51,7 +63,6 @@ models:
       - "text"
       - "image"
   - id: "gpt-5.6-terra"
-    service_model_id: "gpt-5.6-terra"
     display_name: "GPT-5.6 Terra"
     adapter: "codex_responses"
     max_output_tokens: 128000
@@ -68,7 +79,6 @@ models:
       - "text"
       - "image"
   - id: "gpt-5.6-luna"
-    service_model_id: "gpt-5.6-luna"
     display_name: "GPT-5.6 Luna"
     adapter: "codex_responses"
     max_output_tokens: 128000
@@ -85,7 +95,6 @@ models:
       - "text"
       - "image"
   - id: gpt-6-astra
-    service_model_id: gpt-6-astra
     display_name: "GPT-6 Astra"
     adapter: "codex_responses"
     max_output_tokens: 128000
@@ -94,7 +103,6 @@ models:
     effort_levels: ["low", "medium", "high", "xhigh", "max"]
     input_modalities: ["text", "image"]
   - id: gpt-6.1-sol
-    service_model_id: gpt-6.1-sol
     display_name: "GPT-6.1 Sol"
     adapter: "codex_responses"
     max_output_tokens: 128000
@@ -103,7 +111,6 @@ models:
     effort_levels: ["low", "medium", "high", "xhigh", "max"]
     input_modalities: ["text", "image"]
   - id: gpt-6-luna
-    service_model_id: gpt-6-luna
     display_name: "GPT-6 Luna"
     adapter: "codex_responses"
     max_output_tokens: 128000

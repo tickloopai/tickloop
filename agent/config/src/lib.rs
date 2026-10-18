@@ -1404,7 +1404,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let settings = UserSettings::in_root(root.path());
         let selected = ModelCatalog::defaults()
-            .get("deepseek-api", "deepseek-flash-messages")
+            .get("deepseek-api", "deepseek-flash")
             .unwrap();
         settings.save_model(&selected, false).unwrap();
         assert!(!root.path().join("providers/deepseek-api.yaml").exists());

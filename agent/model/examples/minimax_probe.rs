@@ -58,9 +58,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     } else {
         "oauth"
     };
-    let model_id = arguments
-        .get(3)
-        .map_or("minimax-m3-messages", String::as_str);
+    let model_id = arguments.get(3).map_or("MiniMax-M3", String::as_str);
     let mut config = ModelCatalog::defaults()
         .get(&format!("minimax-{slug}-{mode}"), model_id)
         .ok_or("MiniMax model missing")?;

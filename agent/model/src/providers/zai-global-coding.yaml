@@ -1,6 +1,3 @@
-model_aliases:
-  "glm-5.3-chat-completions": "glm-5.3"
-  "glm-5.3-flash-chat-completions": "glm-5.3-flash"
 connection:
   vendor: "Zhipu GLM"
   product: "Coding Plan"
@@ -14,9 +11,20 @@ auth: "api_key_env"
 api_key_env: "ZAI_CODING_API_KEY"
 endpoints:
   glm_chat_completions: "https://api.z.ai/api/coding/paas/v4"
+selection:
+  auxiliary_model: glm-5.3-flash
+  notice: "GLM Coding Plan terms limit plan quota to officially listed tools; Tickloop is not listed, so use may be rate limited or suspended. FlashX is not part of the plan."
+  series:
+    - id: "glm"
+      name: "GLM"
+      model: "glm-5.3"
+      capability_order: 0
+    - id: "glm-flash"
+      name: "GLM Flash"
+      model: "glm-5.3-flash"
+      capability_order: 1
 models:
   - id: "glm-5.3"
-    service_model_id: "glm-5.3"
     display_name: "GLM-5.3"
     adapter: "glm_chat_completions"
     max_output_tokens: 131072
@@ -26,7 +34,6 @@ models:
     effort_levels: ["low", "high", "max"]
     input_modalities: ["text"]
   - id: "glm-5.3-flash"
-    service_model_id: "glm-5.3-flash"
     display_name: "GLM-5.3-Flash"
     adapter: "glm_chat_completions"
     max_output_tokens: 131072

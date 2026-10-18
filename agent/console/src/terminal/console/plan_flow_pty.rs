@@ -356,8 +356,14 @@ impl PlanFlow {
     }
 
     fn wait_for_mode(&self, mode: &str) -> String {
+        let route = std::fs::read_to_string(self.directory.path().join(ROUTE_FILE)).unwrap();
+        let model = if route == RESTORED_ROUTE {
+            "DeepSeek Flash"
+        } else {
+            "fixture"
+        };
         self.wait(&format!("mode {mode}"), |frame, _| {
-            frame.contains(&format!("⏵⏵ {mode} · fixture"))
+            frame.contains(&format!("⏵⏵ {mode} · {model}"))
         })
         .0
     }
@@ -644,7 +650,7 @@ fn plan_flow_pty_a_restarted_daemon_reopens_the_pending_approval_and_continues_e
     flow.fixture.send(b"j\r");
     let (_, state) = flow.wait("the restored continuation in Ask", |frame, state| {
         frame.contains("Restored implementation started.")
-            && frame.contains("⏵⏵ Ask · fixture")
+            && frame.contains("⏵⏵ Ask · DeepSeek Flash")
             && approval_dialog(frame).is_none()
             && state["loops"] == json!(["Completed"])
     });

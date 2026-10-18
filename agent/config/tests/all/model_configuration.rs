@@ -15,7 +15,7 @@ use tickloop_agent_protocol::{
 
 fn custom_provider(id: &str) -> ProviderDefinition {
     ProviderDefinition {
-        model_aliases: std::collections::BTreeMap::new(),
+        selection: None,
         connection: None,
         id: id.into(),
         display_name: format!("{id} gateway"),
@@ -23,8 +23,7 @@ fn custom_provider(id: &str) -> ProviderDefinition {
         api_key_env: "GATEWAY_API_KEY".into(),
         endpoints: BTreeMap::from([(Adapter::Responses, "http://127.0.0.1:3001".into())]),
         models: vec![ModelCard {
-            id: "assistant-responses".into(),
-            service_model_id: "assistant".into(),
+            id: "assistant".into(),
             display_name: "Gateway Assistant".into(),
             adapter: Adapter::Responses,
             max_output_tokens: 4096,
@@ -88,13 +87,9 @@ fn credentialless_api_provider_requires_only_loopback_endpoints() {
 fn builtin_deepseek_models_accept_images_only_where_verified() {
     let catalog = ModelCatalog::defaults();
     for (model_id, accepts_images) in [
-        ("deepseek-flash-messages", true),
-        ("deepseek-flash-chat-completions", true),
-        ("deepseek-flash-responses", false),
-        ("deepseek-v4-pro-messages", false),
-        ("deepseek-v4-pro-chat-completions", false),
-        ("deepseek-v4-flash-messages", false),
-        ("deepseek-v4-flash-chat-completions", false),
+        ("deepseek-flash", true),
+        ("deepseek-v4-pro", false),
+        ("deepseek-v4-flash", false),
     ] {
         let model = catalog.get("deepseek-api", model_id).unwrap();
         assert_eq!(model.accepts_images(), accepts_images, "{model_id}");
@@ -102,25 +97,25 @@ fn builtin_deepseek_models_accept_images_only_where_verified() {
 }
 
 #[test]
-fn provider_model_identity_and_service_id_are_distinct() {
+fn card_id_is_the_service_identity_on_each_connection() {
     let catalog = ModelCatalog::defaults();
     catalog.validate().unwrap();
-    let messages = catalog
-        .get("deepseek-api", "deepseek-flash-messages")
-        .unwrap();
-    let responses = catalog
-        .get("deepseek-api", "deepseek-flash-responses")
-        .unwrap();
-    assert_eq!(messages.model, responses.model);
-    assert_ne!(messages.model_id, responses.model_id);
-    assert_ne!(messages.protocol, responses.protocol);
-    assert_eq!(messages.provider_id, "deepseek-api");
+    let model = catalog.get("deepseek-api", "deepseek-flash").unwrap();
+    assert_eq!(model.model_id, model.model);
     assert_eq!(
+        model.protocol,
+        tickloop_agent_protocol::Protocol::ChatCompletions
+    );
+    assert_eq!(model.provider_id, "deepseek-api");
+    assert!(
         catalog
-            .get("openai-codex", "gpt-5.6-sol-responses")
-            .unwrap()
-            .provider_id,
-        "openai-codex"
+            .get("deepseek-api", "deepseek-flash-messages")
+            .is_none()
+    );
+    assert!(
+        catalog
+            .get("deepseek-api", "deepseek-flash-responses")
+            .is_none()
     );
 }
 
@@ -144,8 +139,7 @@ fn explicit_default_selection_resolves_from_catalog() {
         .with_providers(vec![custom_patch("gateway")])
         .unwrap();
     let selection: ModelSelection =
-        serde_json::from_value(json!({"provider":"gateway","model":"assistant-responses"}))
-            .unwrap();
+        serde_json::from_value(json!({"provider":"gateway","model":"assistant"})).unwrap();
     assert_eq!(
         catalog
             .get(&selection.provider, &selection.model)
@@ -175,13 +169,14 @@ fn saved_kimi_k3_selection_loads_the_current_context_window() {
 #[test]
 fn saved_legacy_builtin_uses_version_owned_limit_with_one_notice() {
     let mut legacy: ModelConfig =
-        serde_json::from_str(tickloop_agent_test_support::legacy_models::DEEPSEEK_CONFIG).unwrap();
+        serde_json::from_str(tickloop_agent_test_support::legacy_models::DEEPSEEK_CHAT_CONFIG)
+            .unwrap();
     legacy.max_output_tokens = 4096;
     let explicit = migrate_legacy_model(legacy.clone());
     assert_eq!(explicit.max_output_tokens, 4096);
     assert_eq!(
         explicit.card.as_ref().unwrap().adapter,
-        Adapter::DeepseekMessages
+        Adapter::DeepseekChatCompletions
     );
     assert_ne!(explicit.provider_id, "deepseek-api");
 
@@ -216,10 +211,7 @@ fn custom_legacy_deepseek_messages_is_migrated_without_losing_public_fields() {
         migrated.card.as_ref().unwrap().adapter,
         Adapter::DeepseekMessages
     );
-    assert_eq!(
-        migrated.card.as_ref().unwrap().context_window_tokens,
-        Some(1_000_000)
-    );
+    assert_eq!(migrated.card.as_ref().unwrap().context_window_tokens, None);
     assert_eq!(migrate_legacy_model(migrated.clone()), migrated);
 }
 
@@ -238,7 +230,7 @@ fn unknown_legacy_deepseek_model_gets_dialect_without_invented_capabilities() {
 }
 
 #[test]
-fn custom_legacy_deepseek_responses_keeps_known_capabilities() {
+fn custom_legacy_deepseek_responses_does_not_invent_retired_route_capabilities() {
     let mut legacy: ModelConfig =
         serde_json::from_str(tickloop_agent_test_support::legacy_models::DEEPSEEK_RESPONSES_CONFIG)
             .unwrap();
@@ -251,15 +243,15 @@ fn custom_legacy_deepseek_responses_keeps_known_capabilities() {
     assert_ne!(migrated.provider_id, "deepseek-api");
     let card = migrated.card.as_ref().unwrap();
     assert_eq!(card.adapter, Adapter::Responses);
-    assert_eq!(card.context_window_tokens, Some(1_000_000));
-    assert!(!card.effort_levels.is_empty());
+    assert_eq!(card.context_window_tokens, None);
+    assert!(card.effort_levels.is_empty());
     assert_eq!(migrate_legacy_model(migrated.clone()), migrated);
 }
 
 #[test]
 fn custom_legacy_codex_keeps_fixed_adapter_and_known_capabilities() {
     let mut legacy = ModelCatalog::defaults()
-        .get("openai-codex", "gpt-5.6-sol-responses")
+        .get("openai-codex", "gpt-5.6-sol")
         .unwrap();
     legacy.name = "Personal Codex".into();
     legacy.max_output_tokens = 16_384;
@@ -280,43 +272,11 @@ fn custom_legacy_codex_keeps_fixed_adapter_and_known_capabilities() {
 }
 
 #[test]
-fn official_primary_ids_and_aliases_preserve_routes_and_private_sources() {
+fn every_bundled_model_has_one_service_identity() {
     let catalog = ModelCatalog::defaults();
-    let mut aliases = 0;
     for provider in &catalog.providers {
-        for (old, canonical) in &provider.model_aliases {
-            aliases += 1;
-            let profile = catalog.get(&provider.id, old).unwrap();
-            assert_eq!(profile.model_id, *canonical);
-            assert_eq!(profile, catalog.get(&provider.id, canonical).unwrap());
-            let mut saved = profile.clone();
-            saved.model_id = old.clone();
-            saved.card.as_mut().unwrap().id = old.clone();
-            saved.base_url = "https://custom.example/retained-route".into();
-            saved.model = "user-retained-service-version".into();
-            saved.card.as_mut().unwrap().service_model_id = saved.model.clone();
-            saved.max_output_tokens = 1234;
-            saved.card.as_mut().unwrap().max_output_tokens = 1234;
-            saved.card.as_mut().unwrap().context_window_tokens = Some(4321);
-            saved.name = "User retained label".into();
-            saved.card.as_mut().unwrap().display_name = saved.name.clone();
-            let source = saved.private_history_source();
-            let migrated = model_for_persistent_selection(saved.clone());
-            assert_eq!(migrated.model_id, *canonical);
-            assert_eq!(migrated.private_history_source(), source);
-            saved.model_id = canonical.clone();
-            saved.card.as_mut().unwrap().id = canonical.clone();
-            assert_eq!(migrated, saved);
-        }
         for card in &provider.models {
-            if provider.id != "deepseek-api" || card.adapter == Adapter::DeepseekChatCompletions {
-                assert_eq!(card.id, card.service_model_id);
-            }
+            assert_eq!(catalog.get(&provider.id, &card.id).unwrap().model, card.id);
         }
-    }
-    assert!(aliases >= 36);
-    for legacy_route in ["deepseek-flash-messages", "deepseek-flash-responses"] {
-        let fixed = catalog.get("deepseek-api", legacy_route).unwrap();
-        assert_eq!(fixed.model_id, legacy_route);
     }
 }

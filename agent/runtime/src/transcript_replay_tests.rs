@@ -255,7 +255,10 @@ async fn live_recorded_artifact_reviews_without_dispatch() {
                     .review_with_llm(
                         &receipt,
                         &context,
-                        crate::auto_mode::review_budget_bytes(&snapshot),
+                        crate::auto_mode::review_budget_bytes(
+                            &snapshot.model,
+                            crate::context::context_window(&snapshot),
+                        ),
                         llm.clone(),
                         cancel,
                     )

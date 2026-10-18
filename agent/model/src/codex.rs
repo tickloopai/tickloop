@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -330,6 +331,25 @@ impl CodexModelClient {
 
 #[async_trait]
 impl ModelClient for CodexModelClient {
+    fn auxiliary_client(
+        &self,
+        task: super::auxiliary::AuxiliaryTask,
+    ) -> Result<Option<Arc<dyn ModelClient>>, ModelError> {
+        let Some(config) = super::auxiliary::auxiliary_model_config(&self.config, task) else {
+            return Ok(None);
+        };
+        validate_config(&config)?;
+        Ok(Some(Arc::new(Self {
+            config,
+            auth: self.auth.clone(),
+            client: self.client.clone(),
+            route: self.route,
+            endpoint: self.endpoint.clone(),
+            websocket_cache: transport::WebSocketCache::default(),
+            prefer_websocket: self.prefer_websocket,
+        })))
+    }
+
     fn connection_id(&self) -> Option<String> {
         Some(self.config.provider_id.clone())
     }

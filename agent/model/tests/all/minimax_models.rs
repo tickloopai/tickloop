@@ -64,7 +64,7 @@ fn regional_catalog_and_thinking_controls_match_actual_model_capabilities() {
     catalog.validate().unwrap();
     for region in ["cn", "global"] {
         let api = catalog
-            .get(&format!("minimax-{region}-api"), "minimax-m3-messages")
+            .get(&format!("minimax-{region}-api"), "MiniMax-M3")
             .unwrap();
         assert_eq!(
             api.card.as_ref().unwrap().context_window_tokens.unwrap(),
@@ -86,14 +86,14 @@ fn regional_catalog_and_thinking_controls_match_actual_model_capabilities() {
             catalog
                 .get(
                     &format!("minimax-{region}-api"),
-                    "minimax-m3-1-flash-preview-messages"
+                    "MiniMax-M3.1-Flash-Preview"
                 )
                 .is_none()
         );
         let preview = catalog
             .get(
                 &format!("minimax-{region}-oauth"),
-                "minimax-m3-1-flash-preview-messages",
+                "MiniMax-M3.1-Flash-Preview",
             )
             .unwrap();
         assert!(validate_reasoning_effort(&preview, Some(ReasoningEffort::Off)).is_err());
@@ -108,7 +108,7 @@ async fn regional_api_uses_bearer_messages_images_thinking_and_cache_usage() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
         let mut config = ModelCatalog::defaults()
-            .get(&format!("minimax-{region}-api"), "minimax-m3-messages")
+            .get(&format!("minimax-{region}-api"), "MiniMax-M3")
             .unwrap();
         save_api_key(&root, &config.api_key_env, "test-minimax-api-key").unwrap();
         let (url, captured) = model_http_support::serve_response(
@@ -170,7 +170,7 @@ async fn structured_response_uses_prompted_json_and_rejects_extra_operations() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
         let mut config = ModelCatalog::defaults()
-            .get("minimax-cn-api", "minimax-m3-messages")
+            .get("minimax-cn-api", "MiniMax-M3")
             .unwrap();
         save_api_key(&root, &config.api_key_env, "test-key").unwrap();
         let mut blocks = vec![json!({"type":"text","text":"{\"allow\":false}"})];
@@ -279,7 +279,7 @@ async fn regional_oauth_credentials_reach_the_model_and_preview_cannot_disable_t
         let mut config = ModelCatalog::defaults()
             .get(
                 &format!("minimax-{slug}-oauth"),
-                "minimax-m3-1-flash-preview-messages",
+                "MiniMax-M3.1-Flash-Preview",
             )
             .unwrap();
         let (url, captured) = model_http_support::serve_response(
@@ -338,14 +338,14 @@ async fn minimax_final_input_usage_corrects_provisional_cache_without_ledger_reg
     for (provider, initial_output, final_output, accepted) in [
         ("minimax-cn-api", 0, 92, true),
         ("minimax-cn-api", 5, 4, false),
-        ("deepseek-api", 0, 92, false),
+        ("anthropic-api", 0, 92, false),
     ] {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
-        let model_id = if provider == "deepseek-api" {
-            "deepseek-flash-messages"
+        let model_id = if provider == "anthropic-api" {
+            "claude-haiku-5-5"
         } else {
-            "minimax-m3-messages"
+            "MiniMax-M3"
         };
         let mut config = ModelCatalog::defaults().get(provider, model_id).unwrap();
         save_api_key(&root, &config.api_key_env, "test-key").unwrap();
@@ -407,7 +407,7 @@ async fn minimax_usage_preserves_nullable_cache_fallback_and_initial_output_befo
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
         let mut config = ModelCatalog::defaults()
-            .get("minimax-cn-api", "minimax-m3-messages")
+            .get("minimax-cn-api", "MiniMax-M3")
             .unwrap();
         save_api_key(&root, &config.api_key_env, "test-key").unwrap();
         let frame = |kind: &str, mut value: Value| {

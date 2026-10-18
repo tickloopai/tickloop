@@ -38,9 +38,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             interrupted.cancel();
         }
     });
-    let model_id = arguments
-        .get(2)
-        .map_or("glm-5.3-chat-completions", String::as_str);
+    let model_id = arguments.get(2).map_or("glm-5.3", String::as_str);
     let mut config = ModelCatalog::defaults()
         .get(provider, model_id)
         .ok_or("GLM model missing")?;
