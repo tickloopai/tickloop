@@ -274,9 +274,8 @@ fn kimi_code_only_recommends_k3_variants_and_keeps_legacy_history_loadable() {
 
 #[tokio::test]
 async fn quota_is_not_retried_and_success_clears_only_its_connection_failure() {
-    use std::sync::Arc;
     use tickloop_agent_protocol::EventKind;
-    use tickloop_agent_runtime::Agent;
+    use tickloop_agent_test_support::harness::{ChosenModels, embedded_agent};
     let (url,mut requests) = model_http_support::serve_responses(vec![
         (429,serde_json::json!({"error":{"code":"insufficient_quota","message":"Monthly usage limit reached"}}).to_string()),
         (200,"data: {\"id\":\"fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into()),
@@ -287,11 +286,11 @@ async fn quota_is_not_retried_and_success_clears_only_its_connection_failure() {
     config.protocol = Protocol::ChatCompletions;
     config.provider_id = "fixture-api".into();
     config.provider_name = "Fixture API".into();
-    let client = LocalModelClients::new(None).client(&config).unwrap();
-    let agent = Agent::new_embedded(
-        config.clone(),
-        provider_transport::without_title_requests(client),
-    );
+    let local = LocalModelClients::new(None);
+    let models = ChosenModels::new(provider_transport::without_title_requests(
+        local.client(&config).unwrap(),
+    ));
+    let agent = embedded_agent(config.clone(), models.clone());
     let directory = tempfile::tempdir().unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
@@ -336,6 +335,9 @@ async fn quota_is_not_retried_and_success_clears_only_its_connection_failure() {
     let mut other = config.clone();
     other.provider_id = "other-fixture".into();
     other.provider_name = "Other Fixture API".into();
+    models.choose(provider_transport::without_title_requests(
+        local.client(&other).unwrap(),
+    ));
     agent
         .set_model(chat, other.clone())
         .await
@@ -376,6 +378,9 @@ async fn quota_is_not_retried_and_success_clears_only_its_connection_failure() {
             .contains_key("fixture-api"),
         "success on another connection must not clear this diagnostic"
     );
+    models.choose(provider_transport::without_title_requests(
+        local.client(&config).unwrap(),
+    ));
     agent
         .set_model(chat, config.clone())
         .await

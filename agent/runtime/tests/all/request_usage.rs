@@ -854,12 +854,8 @@ async fn switching_models_never_relabels_old_requests() {
         main_identity(),
         vec![ResponseStep::reply(text("First"), counters(10, 1, 0, 0))],
     ));
-    let agent = Agent::open_embedded(
-        archive.clone(),
-        config(&main_identity()),
-        first_model.clone(),
-    )
-    .unwrap();
+    let models = ChosenModels::new(first_model.clone());
+    let agent = opened_agent(archive.clone(), config(&main_identity()), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let first = agent
@@ -872,6 +868,7 @@ async fn switching_models_never_relabels_old_requests() {
         next_identity.clone(),
         vec![ResponseStep::reply(text("Second"), counters(20, 2, 0, 0))],
     ));
+    models.choose(next_model.clone());
     assert_eq!(
         agent
             .set_model(chat, config(&next_identity))

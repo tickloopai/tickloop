@@ -1,7 +1,8 @@
 use crate::support::provider_transport;
 use tickloop_agent_test_support::model_http_support;
 
-use tickloop_agent_model::{LocalModelClients, ModelClients, ModelClient, ModelRequest};
+use tickloop_agent_model::{LocalModelClients, ModelClients, ModelRequest};
+use tickloop_agent_test_support::harness::{ChosenModels, opened_agent};
 use tickloop_agent_protocol::{EventKind, Protocol};
 use tickloop_agent_runtime::Agent;
 use tokio::sync::mpsc;
