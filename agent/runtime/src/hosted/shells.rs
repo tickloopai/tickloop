@@ -241,7 +241,10 @@ impl ShellTasks {
         let Some(agent) = self.agent.get().cloned() else {
             return;
         };
-        tokio::spawn(async move {
+        let Some(owner) = agent.upgrade() else {
+            return;
+        };
+        owner.inner.tasks.spawn(async move {
             let _connection = connection;
             loop {
                 let Some(listing) = agent.upgrade() else {

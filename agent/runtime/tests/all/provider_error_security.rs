@@ -2,9 +2,9 @@ use crate::support::provider_transport;
 use tickloop_agent_test_support::model_http_support;
 
 use tickloop_agent_model::{LocalModelClients, ModelClients, ModelRequest};
-use tickloop_agent_test_support::harness::{ChosenModels, opened_agent};
 use tickloop_agent_protocol::{EventKind, Protocol};
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_test_support::harness::{ChosenModels, opened_agent};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 fn request() -> ModelRequest {
@@ -120,7 +120,9 @@ async fn confirmation_secret_surfaces() {
         config.base_url = url;
         config.api_key_env = "PE_CONFIRM_FIXTURE_KEY".into();
         config.provider_id = "fixture-api".into();
-        let client = LocalModelClients::new(Some(root.to_path_buf())).client(&config).unwrap();
+        let client = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(request(), events, CancellationToken::new())
@@ -135,7 +137,9 @@ async fn confirmation_secret_surfaces() {
         )
         .await;
         config.base_url = url;
-        let client = LocalModelClients::new(Some(root.to_path_buf())).client(&config).unwrap();
+        let client = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
+            .unwrap();
         let agent = Agent::open_embedded(
             root.clone(),
             config,
@@ -249,7 +253,9 @@ async fn confirmation_shared_http_incomplete_quota() {
         let mut config = tickloop_agent_test_support::config();
         config.base_url = url;
         config.api_key_env = String::new();
-        let client = tickloop_agent_model::LocalModelClients::new(None).client(&config).unwrap();
+        let client = tickloop_agent_model::LocalModelClients::new(None)
+            .client(&config)
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(request(), events, CancellationToken::new())
@@ -310,8 +316,7 @@ async fn confirmation_shared_http_runtime_blind_retry() {
     config.protocol = Protocol::ChatCompletions;
     config.base_url = url;
     config.provider_id = "fixture-api".into();
-    let client =
-        LocalModelClients::new(None).client(&config).unwrap();
+    let client = LocalModelClients::new(None).client(&config).unwrap();
     let agent = Agent::open_embedded(
         directory.path().into(),
         config,
@@ -368,7 +373,9 @@ async fn confirmation_bounded_html_credential_prefix() {
         config.base_url = url;
         config.api_key_env = "PE_CONFIRM_FIXTURE_KEY".into();
         config.provider_id = "fixture-api".into();
-        let client = LocalModelClients::new(Some(root.to_path_buf())).client(&config).unwrap();
+        let client = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(request(), events, CancellationToken::new())
@@ -376,7 +383,9 @@ async fn confirmation_bounded_html_credential_prefix() {
             .unwrap_err();
         let (url, _) = model_http_support::serve_response(401, body).await;
         config.base_url = url;
-        let client = LocalModelClients::new(Some(root.to_path_buf())).client(&config).unwrap();
+        let client = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
+            .unwrap();
         let agent = Agent::open_embedded(
             root.clone(),
             config,
@@ -497,7 +506,9 @@ async fn all_64_confirmation_probe_variants_are_safe_on_all_surfaces() {
         config.protocol = Protocol::ChatCompletions;
         config.base_url = url;
         config.api_key_env = "PE_CONFIRM_FIXTURE_KEY".into();
-        let client = LocalModelClients::new(Some(root.to_path_buf())).client(&config).unwrap();
+        let client = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
+            .unwrap();
         let agent = Agent::open_embedded(
             root.clone(),
             config,
@@ -563,7 +574,9 @@ async fn assert_safe_provider_surfaces(cases: Vec<(String, String, String)>) {
         config.base_url = url;
         config.api_key_env = "PE_CONFIRM_FIXTURE_KEY".into();
         config.provider_id = "fixture-api".into();
-        let client = LocalModelClients::new(Some(root.to_path_buf())).client(&config).unwrap();
+        let client = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(request(), events, CancellationToken::new())
@@ -578,7 +591,9 @@ async fn assert_safe_provider_surfaces(cases: Vec<(String, String, String)>) {
         )
         .await;
         config.base_url = url;
-        let client = LocalModelClients::new(Some(root.to_path_buf())).client(&config).unwrap();
+        let client = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
+            .unwrap();
         let agent = Agent::open_embedded(
             root.clone(),
             config,
@@ -703,7 +718,9 @@ async fn incomplete_glm_rejections_keep_http_diagnostics_and_do_not_retry() {
         )
         .unwrap();
         config.base_url = incomplete_glm_server(status, code).await;
-        let client = LocalModelClients::new(Some(root.to_path_buf())).client(&config).unwrap();
+        let client = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(request(), events, CancellationToken::new())
@@ -718,7 +735,9 @@ async fn incomplete_glm_rejections_keep_http_diagnostics_and_do_not_retry() {
         assert!(!error.retry_hint().0);
 
         config.base_url = incomplete_glm_server(status, code).await;
-        let client = LocalModelClients::new(Some(root.to_path_buf())).client(&config).unwrap();
+        let client = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
+            .unwrap();
         let agent = Agent::open_embedded(
             root.clone(),
             config,
@@ -972,10 +991,7 @@ async fn redacted_presentation_ids_do_not_change_connection_retention_or_success
     models.choose(provider_transport::without_title_requests(
         local.client(&config).unwrap(),
     ));
-    agent
-        .set_model(chat, config)
-        .await
-        .unwrap();
+    agent.set_model(chat, config).await.unwrap();
     agent
         .submit(chat, None, "successful connection fixture".into())
         .await

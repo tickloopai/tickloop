@@ -765,8 +765,8 @@ fn estimate_tokens_for_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs::OpenOptions, time::Duration};
     use std::sync::Arc;
+    use std::{fs::OpenOptions, time::Duration};
     use tickloop_agent_model::{LocalModelClients, cards::ModelCatalog};
 
     #[tokio::test]

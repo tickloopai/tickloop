@@ -14,6 +14,7 @@ use tickloop_agent_protocol::{
     Protocol, Usage,
 };
 use tickloop_agent_runtime::{Agent, PermissionChangeError};
+use tickloop_agent_test_support::harness::{ChosenModels, embedded_agent};
 use tickloop_agent_test_support::{call, config, next_event, text};
 use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
@@ -210,13 +211,15 @@ async fn llm_approval_tracks_each_chat_effective_model_and_freezes_an_inflight_m
     let temp = tempfile::tempdir().unwrap();
     let first_model = ChatModel::new("first-chat-model");
     let other_model = ChatModel::new("other-chat-model");
-    let agent = Agent::new_embedded(first_model.configuration(), first_model.clone());
+    let models = ChosenModels::new(first_model.clone());
+    let agent = embedded_agent(first_model.configuration(), models.clone());
     let first = agent.create_chat(temp.path().into()).await.unwrap();
     let other = agent.create_chat(temp.path().into()).await.unwrap();
     agent
         .set_execution_mode(first, ExecutionMode::Auto)
         .await
         .unwrap();
+    models.choose(other_model.clone());
     agent
         .set_model(other, other_model.configuration())
         .await
@@ -239,6 +242,7 @@ async fn llm_approval_tracks_each_chat_effective_model_and_freezes_an_inflight_m
     });
     let active_model = ChatModel::with_gate("active-chat-model", Some(gate.clone()));
     let pending_model = ChatModel::new("pending-chat-model");
+    models.choose(active_model.clone());
     agent
         .set_model(first, active_model.configuration())
         .await
@@ -250,6 +254,7 @@ async fn llm_approval_tracks_each_chat_effective_model_and_freezes_an_inflight_m
     tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
         .await
         .unwrap();
+    models.choose(pending_model.clone());
     agent
         .set_model(first, pending_model.configuration())
         .await

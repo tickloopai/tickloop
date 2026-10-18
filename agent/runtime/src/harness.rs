@@ -4,7 +4,9 @@
 use std::{sync::Arc, time::Duration};
 
 use tickloop_agent_model::{ModelClient, ModelClients, ModelError};
-use tickloop_agent_protocol::{AgentHostOptions, ChatId, ModelConfig, PermissionRule};
+use tickloop_agent_protocol::{
+    AgentHostOptions, ChatId, ModelConfig, PermissionRule, UserShellState,
+};
 
 use crate::{
     Agent, AgentError, environment::ExecutionEnvironment, persistence::ChatRecorder,
@@ -98,7 +100,8 @@ impl ToolPolicy {
     }
 }
 
-/// Serves one client for every model the Chats select: an Agent built around a single client.
+/// Serves one client for every model the Chats select, so a model switch keeps it: the legacy
+/// constructors' Agent built around a single client, such as a test's scripted model.
 pub(crate) struct OneClient(pub(crate) Arc<dyn ModelClient>);
 
 impl ModelClients for OneClient {
@@ -146,19 +149,26 @@ impl Agent {
         ))
     }
 
-    /// Waits until the Chat has no active or ready Run and its title request has ended: one
-    /// still running after ten seconds is cancelled and awaited.
+    /// Waits until the Chat has no active or ready Run and the title request of its submissions
+    /// that have returned has ended: one still running after ten seconds is cancelled and awaited.
     pub async fn quiesce(&self, chat_id: ChatId) -> Quiescence {
         let mut events = self.subscribe();
         let quiescence = loop {
             let state = self.inner.chats.lock().await.get(&chat_id).map(|chat| {
+                let user_shell_in = |states: &[UserShellState]| {
+                    chat.snapshot
+                        .user_shells
+                        .iter()
+                        .any(|record| states.contains(&record.state))
+                };
                 let runs = chat.active.is_some()
                     || chat.active_run.is_some()
                     || !chat.ready_runs.is_empty()
-                    || chat.has_foreground_user_shell();
+                    || user_shell_in(&[UserShellState::Running, UserShellState::Cancelling]);
                 let waits = !chat.parked.is_empty()
                     || !chat.trigger_cancellations.is_empty()
-                    || !chat.event_cancellations.is_empty();
+                    || !chat.event_cancellations.is_empty()
+                    || user_shell_in(&[UserShellState::WaitingPermission]);
                 (runs, waits)
             });
             match state {
@@ -172,16 +182,25 @@ impl Agent {
                 _ = self.inner.shutdown.cancelled() => {}
             }
         };
-        let title = self.inner.title_requests.lock().await.get(&chat_id).cloned();
-        if let Some(title) = title {
-            if tokio::time::timeout(TITLE_SETTLE_LIMIT, title.done.cancelled())
+        let title = self
+            .inner
+            .title_requests
+            .lock()
+            .await
+            .get(&chat_id)
+            .cloned();
+        if let Some(title) = title
+            && tokio::time::timeout(TITLE_SETTLE_LIMIT, title.done.cancelled())
                 .await
                 .is_err()
-            {
-                title.cancel.cancel();
-                title.done.cancelled().await;
-            }
+        {
+            title.cancel.cancel();
+            title.done.cancelled().await;
         }
         quiescence
     }
 }
+
+#[cfg(test)]
+#[path = "harness_tests.rs"]
+mod tests;

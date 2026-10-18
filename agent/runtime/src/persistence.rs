@@ -2561,22 +2561,22 @@ impl Agent {
         let closed = recorder.closed.clone();
         self.inner.tasks.spawn_on(
             async move {
-            loop {
-                tokio::select! {
-                    _ = closed.cancelled() => break,
-                    _ = notify.notified() => {}
+                loop {
+                    tokio::select! {
+                        _ = closed.cancelled() => break,
+                        _ = notify.notified() => {}
+                    }
+                    tokio::select! {
+                        _ = closed.cancelled() => break,
+                        _ = flush_now.notified() => {}
+                        _ = tokio::time::sleep(FLUSH_INTERVAL) => {}
+                    }
+                    let Some(inner) = host.upgrade() else {
+                        break;
+                    };
+                    Agent { inner }.flush_dirty_transcripts().await;
                 }
-                tokio::select! {
-                    _ = closed.cancelled() => break,
-                    _ = flush_now.notified() => {}
-                    _ = tokio::time::sleep(FLUSH_INTERVAL) => {}
-                }
-                let Some(inner) = host.upgrade() else {
-                    break;
-                };
-                Agent { inner }.flush_dirty_transcripts().await;
-            }
-        },
+            },
             &runtime,
         );
     }

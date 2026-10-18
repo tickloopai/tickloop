@@ -17,7 +17,7 @@ use std::{
 use support::fixture_cli::{BUILD_IDENTITY_MODE, CLI_MODE, build_identity};
 use tickloop_agent_client::DAEMON_RUN_ARGUMENTS;
 use tickloop_agent_daemon::{EmbeddedAgentAccess, WORKER_ARGUMENT, serve_worker_listener};
-use tickloop_agent_model::model_client;
+use tickloop_agent_model::{LocalModelClients, ModelClients};
 use tickloop_agent_protocol::{ATTACH_ARGUMENTS, LaunchSpec, ModelConfig};
 use tickloop_agent_runtime::hosted::controller::TICKHOST_EXECUTABLE;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -161,26 +161,23 @@ async fn worker(arguments: &[OsString]) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let config: ModelConfig =
         serde_json::from_slice(&fixture).map_err(|error| error.to_string())?;
-    let inner = model_client(config.clone(), bootstrap.launch.config_root.as_deref())
-        .map_err(|error| error.to_string())?;
-    let client: Arc<dyn tickloop_agent_model::ModelClient> =
-        Arc::new(TransportClient { inner, config });
+    let local = LocalModelClients::new(bootstrap.launch.config_root.clone());
+    let inner = local.client(&config).map_err(|error| error.to_string())?;
+    let models = Arc::new(TransportModels {
+        local,
+        transport: Arc::new(TransportClient { inner, config }),
+    });
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let agent = tickloop_agent_daemon::build_runtime_with_client(
+    let agent = tickloop_agent_daemon::build_runtime_with_models(
         &bootstrap.launch,
-        client.clone(),
+        models,
         Some(bootstrap.control),
         &executable,
     )
     .await?;
-    let access = Arc::new(EmbeddedAgentAccess::for_worker_with_model_clients(
+    let access = Arc::new(EmbeddedAgentAccess::for_worker(
         agent.clone(),
         bootstrap.epoch,
-        // A switch still fails where the Provider client would, but keeps the fixture transport.
-        Arc::new(move |config, root| {
-            model_client(config, root)?;
-            Ok(client.clone())
-        }),
     ));
     let listener = tokio::net::UnixListener::bind(&endpoint).map_err(|error| error.to_string())?;
     use std::os::unix::fs::PermissionsExt;
@@ -194,6 +191,23 @@ async fn worker(arguments: &[OsString]) -> Result<(), String> {
     agent.shutdown().await;
     let _ = std::fs::remove_file(endpoint);
     result
+}
+
+/// Every model a Chat selects fails where the Provider client would, but keeps the fixture
+/// transport.
+struct TransportModels {
+    local: LocalModelClients,
+    transport: Arc<dyn tickloop_agent_model::ModelClient>,
+}
+
+impl ModelClients for TransportModels {
+    fn client(
+        &self,
+        config: &ModelConfig,
+    ) -> Result<Arc<dyn tickloop_agent_model::ModelClient>, tickloop_agent_model::ModelError> {
+        self.local.client(config)?;
+        Ok(self.transport.clone())
+    }
 }
 
 struct TransportClient {

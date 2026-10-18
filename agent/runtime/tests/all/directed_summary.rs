@@ -14,6 +14,7 @@ use tickloop_agent_protocol::{
     ResponseRejection, RewindMode, SummaryDirection, Usage, UserShellState,
 };
 use tickloop_agent_runtime::{Agent, AgentError};
+use tickloop_agent_test_support::harness::{ChosenModels, embedded_agent};
 use tickloop_agent_test_support::{ScriptedModel, call, config, next_event, text};
 use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
@@ -1064,7 +1065,8 @@ async fn assert_pending_model_after_summary(
         summary_started: Notify::new(),
         release_summary: Notify::new(),
     });
-    let agent = Agent::new_embedded(config(), model.clone());
+    let models = ChosenModels::new(model.clone());
+    let agent = embedded_agent(config(), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     run_prompt(&agent, &mut events, chat, "first prompt").await;
@@ -1093,19 +1095,16 @@ async fn assert_pending_model_after_summary(
     replacement.protocol = Protocol::Responses;
     replacement.model = "replacement".into();
     let replacement = tickloop_agent_model::cards::model_for_persistent_selection(replacement);
-    let replacement_client = Arc::new(UnusedReplacementModel {
+    models.choose(Arc::new(UnusedReplacementModel {
         identity: ModelIdentity {
             provider: tickloop_agent_protocol::ModelProvider::Api,
             profile: replacement.name.clone(),
             protocol: replacement.protocol,
             requested_model: replacement.model.clone(),
         },
-    });
+    }));
     assert_eq!(
-        agent
-            .set_model(chat, replacement.clone())
-            .await
-            .unwrap(),
+        agent.set_model(chat, replacement.clone()).await.unwrap(),
         ModelChange::Pending
     );
     let gated = agent.snapshot(chat).await.unwrap();

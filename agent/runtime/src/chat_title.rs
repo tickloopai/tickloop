@@ -19,6 +19,8 @@ pub(super) struct TitleJob {
 
 impl Agent {
     pub(super) async fn start_title_generation(&self, chat_id: ChatId) {
+        // Held until the task is spawned: `shutdown` either refuses this or waits for the task.
+        let admission = self.inner.tasks.token();
         let mut pending = self.inner.title_requests.lock().await;
         if pending.contains_key(&chat_id) || self.inner.closed.load(Ordering::SeqCst) {
             return;
@@ -124,6 +126,7 @@ impl Agent {
             }
             agent.inner.title_requests.lock().await.remove(&chat_id);
         });
+        drop(admission);
     }
 }
 

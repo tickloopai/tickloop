@@ -15,6 +15,7 @@ use tickloop_agent_protocol::{
     RequestFailure, RequestOutcome, ResponseRejection, RunId, Usage, UsageCounter,
 };
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_test_support::harness::{ChosenModels, opened_agent};
 use tokio::sync::{Notify, broadcast, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
@@ -870,10 +871,7 @@ async fn switching_models_never_relabels_old_requests() {
     ));
     models.choose(next_model.clone());
     assert_eq!(
-        agent
-            .set_model(chat, config(&next_identity))
-            .await
-            .unwrap(),
+        agent.set_model(chat, config(&next_identity)).await.unwrap(),
         ModelChange::Applied
     );
     let second = agent

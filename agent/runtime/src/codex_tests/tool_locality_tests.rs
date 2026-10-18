@@ -14,7 +14,9 @@ use crate::{
     Agent,
     host_tools::{HostToolPermission, HostToolProvider},
 };
-use tickloop_agent_model::{LocalModelClients, ModelClients, cards::ModelCatalog, codex_test_support::*};
+use tickloop_agent_model::{
+    LocalModelClients, ModelClients, cards::ModelCatalog, codex_test_support::*,
+};
 use tickloop_agent_protocol::{ChatId, EventKind, ToolDefinition, ToolResult};
 
 const TOOL_NAME: &str = "read_test_space";
@@ -162,10 +164,7 @@ async fn one_new_host_tool_round_trips_through_the_real_api_adapter() {
     config.base_url = endpoint.as_str().trim_end_matches("/responses").into();
     config.api_key_env.clear();
     let client = LocalModelClients::new(None).client(&config).unwrap();
-    let agent = Agent::new_embedded(
-        config,
-        tickloop_agent_model::fixture_client(Arc::new(client)),
-    );
+    let agent = Agent::new_embedded(config, tickloop_agent_model::fixture_client(client));
     run_agent_round_trip(agent, directory.path()).await;
     assert_wire_round_trip(&requests.await.unwrap(), false);
 }

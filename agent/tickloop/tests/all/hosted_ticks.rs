@@ -276,7 +276,7 @@ mod channel {
     use serde_json::{Value, json};
     use tickhost_connect::hosted::{CAPABILITY_DATA, CONTROL_TIMEOUT, HostConnection, Role};
     use tickloop_agent_daemon::{
-        DaemonServer, EmbeddedAgentAccess, WorkerFactory, build_runtime_with_client,
+        DaemonServer, EmbeddedAgentAccess, WorkerFactory, build_runtime_with_models,
         worker_control::WorkerControl,
     };
     use tickloop_agent_model::ModelClient;
@@ -304,6 +304,7 @@ mod channel {
             TickConnectionState, TickStreamEvent, TickStreamPort,
         },
     };
+    use tickloop_agent_test_support::harness::ChosenModels;
     use tokio::sync::{Mutex, mpsc};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
@@ -358,9 +359,9 @@ mod channel {
                         name: b"PATH".to_vec(),
                         value: b"/usr/bin:/bin".to_vec(),
                     }];
-                    build_runtime_with_client(
+                    build_runtime_with_models(
                         &launch,
-                        self.model.clone(),
+                        ChosenModels::new(self.model.clone()),
                         Some(grant.clone()),
                         &super::support::fixture_cli::executable(),
                     )
@@ -385,10 +386,10 @@ mod channel {
                                 Arc::new(DaemonControl::new(grant.clone())),
                                 tools.clone(),
                             ))),
+                            models: ChosenModels::new(self.model.clone()),
                         },
                         HarnessOptions {
                             model: tickloop_agent_test_support::config(),
-                            client: self.model.clone(),
                             settings: None,
                             host: AgentHostOptions::embedded_defaults(),
                             tools: ToolPolicy::local(),

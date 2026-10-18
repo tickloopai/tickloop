@@ -5,6 +5,7 @@ use tickloop_agent_model::{
 };
 use tickloop_agent_protocol::{Content, EventKind, LoopState, Receipt};
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_test_support::harness::{ChosenModels, opened_agent};
 use tickloop_agent_test_support::{ScriptedModel, next_event, persisted_config as config, text};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -79,7 +80,8 @@ async fn recovery_process_fixture() {
             },
         ]]))
     };
-    let agent = Agent::open_embedded(directory.join("archive"), config(), client).unwrap();
+    let models = ChosenModels::new(client);
+    let agent = opened_agent(directory.join("archive"), config(), models.clone());
     agent.install_own_tickhost();
     let chat = agent.create_chat(directory.clone()).await.unwrap();
     let mut events = agent.subscribe();
@@ -96,10 +98,8 @@ async fn recovery_process_fixture() {
             }
         }
         agent.compact(chat).await.unwrap();
-        agent
-            .set_model(chat, config())
-            .await
-            .unwrap();
+        models.choose(Arc::new(PendingModel));
+        agent.set_model(chat, config()).await.unwrap();
         Some(completed)
     } else {
         None

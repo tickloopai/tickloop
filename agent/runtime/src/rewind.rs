@@ -683,7 +683,10 @@ mod tests {
 
     use super::*;
     use crate::file_history::test_pause;
-    use tickloop_agent_model::{LocalModelClients, ModelClients, ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+    use tickloop_agent_model::{
+        LocalModelClients, ModelClient, ModelClients, ModelDelta, ModelError, ModelOutput,
+        ModelRequest,
+    };
     use tickloop_agent_protocol::{Event, Receipt, UserShellRecord};
     use tickloop_agent_protocol::{InputModality, ModelConfig, ModelIdentity, Protocol, Usage};
 

@@ -7,7 +7,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tickloop_agent_model::{LocalModelClients};
+use tickloop_agent_model::{LocalModelClients, ModelClients};
 use tickloop_agent_protocol::{EventKind, ModelConfig, Protocol};
 use tickloop_agent_runtime::Agent;
 use tokio::{

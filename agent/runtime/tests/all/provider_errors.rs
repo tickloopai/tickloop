@@ -1,7 +1,7 @@
 use crate::support::provider_transport;
 use tickloop_agent_test_support::model_http_support;
 
-use tickloop_agent_model::{LocalModelClients, ModelClients, ModelClient, ModelRequest};
+use tickloop_agent_model::{LocalModelClients, ModelClients, ModelRequest};
 use tickloop_agent_protocol::{Protocol, ProviderFailureClass};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -51,7 +51,9 @@ async fn kimi_monthly_limit_explains_the_account_problem() {
             .get("kimi-code-oauth", selected_model)
             .unwrap();
         config.base_url = url;
-        let client = LocalModelClients::new(Some(root_path.to_path_buf())).client(&config).unwrap();
+        let client = LocalModelClients::new(Some(root_path.to_path_buf()))
+            .client(&config)
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(
@@ -338,10 +340,7 @@ async fn quota_is_not_retried_and_success_clears_only_its_connection_failure() {
     models.choose(provider_transport::without_title_requests(
         local.client(&other).unwrap(),
     ));
-    agent
-        .set_model(chat, other.clone())
-        .await
-        .unwrap();
+    agent.set_model(chat, other.clone()).await.unwrap();
     assert!(
         agent
             .snapshot(chat)
@@ -381,10 +380,7 @@ async fn quota_is_not_retried_and_success_clears_only_its_connection_failure() {
     models.choose(provider_transport::without_title_requests(
         local.client(&config).unwrap(),
     ));
-    agent
-        .set_model(chat, config.clone())
-        .await
-        .unwrap();
+    agent.set_model(chat, config.clone()).await.unwrap();
     agent
         .submit(chat, None, "Third explicit attempt".into())
         .await
@@ -427,7 +423,9 @@ async fn persisted_transcript_retains_provider_explanation_after_reload() {
     let agent = Agent::open_embedded(
         root.clone(),
         config.clone(),
-        provider_transport::without_title_requests(LocalModelClients::new(None).client(&config).unwrap(),),
+        provider_transport::without_title_requests(
+            LocalModelClients::new(None).client(&config).unwrap(),
+        ),
     )
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -488,7 +486,9 @@ async fn echoed_request_credentials_never_enter_display_or_debug_text() {
     let mut config = tickloop_agent_test_support::config();
     config.base_url = url;
     config.api_key_env = "PROVIDER_ERROR_FIXTURE_KEY".into();
-    let client = LocalModelClients::new(Some(root_path.to_path_buf())).client(&config).unwrap();
+    let client = LocalModelClients::new(Some(root_path.to_path_buf()))
+        .client(&config)
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     let error = client
         .complete(request(), events, CancellationToken::new())
@@ -615,7 +615,9 @@ async fn normalization_and_url_decoding_cannot_restore_credentials() {
         let mut config = tickloop_agent_test_support::config();
         config.base_url = url;
         config.api_key_env = "PROVIDER_ERROR_FIXTURE_KEY".into();
-        let client = LocalModelClients::new(Some(root_path.to_path_buf())).client(&config).unwrap();
+        let client = LocalModelClients::new(Some(root_path.to_path_buf()))
+            .client(&config)
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(request(), events, CancellationToken::new())

@@ -252,7 +252,12 @@ async fn prompt_suggestion_compaction_then_provider_switch_never_resends_sensiti
             .flat_map(|message| &message.content)
             .any(|content| matches!(content, Content::Text { text } if text.contains(ORIGINAL)))
     );
-    assert!(generate(&request(), &snapshot, &LocalModelClients::new(None)).await.text.is_some());
+    assert!(
+        generate(&request(), &snapshot, &LocalModelClients::new(None))
+            .await
+            .text
+            .is_some()
+    );
     let (_, suggestion) = captured.recv().await.unwrap();
     assert!(
         !suggestion.to_string().contains(ORIGINAL),
@@ -296,7 +301,10 @@ async fn prompt_suggestion_openai_stream_hits_the_output_budget_before_the_deadl
     let context = snapshot(model, conversation()).await;
     let request = request();
     let running = request.clone();
-    let generation = tokio::spawn(async move { generate(&running, &context, &LocalModelClients::new(None)).await });
+    let generation =
+        tokio::spawn(
+            async move { generate(&running, &context, &LocalModelClients::new(None)).await },
+        );
     received.await.unwrap();
     let result = tokio::time::timeout(std::time::Duration::from_millis(500), generation).await;
     assert!(
@@ -338,10 +346,14 @@ async fn prompt_suggestion_http_uses_current_model_without_tools_or_private_hist
         input: json!({"file_path":"private tool fixture"}),
     });
     assert_eq!(
-        generate(&request(), &snapshot(model, messages).await, &LocalModelClients::new(None))
-            .await
-            .text
-            .as_deref(),
+        generate(
+            &request(),
+            &snapshot(model, messages).await,
+            &LocalModelClients::new(None)
+        )
+        .await
+        .text
+        .as_deref(),
         Some("进度怎么样了")
     );
     let (_, body) = received.await.unwrap();
@@ -377,10 +389,14 @@ async fn prompt_suggestion_http_filters_meta_errors_formatting_and_tool_proposal
         let mut model = tickloop_agent_test_support::config();
         model.base_url = url;
         assert!(
-            generate(&request(), &snapshot(model, conversation()).await, &LocalModelClients::new(None))
-                .await
-                .text
-                .is_none(),
+            generate(
+                &request(),
+                &snapshot(model, conversation()).await,
+                &LocalModelClients::new(None)
+            )
+            .await
+            .text
+            .is_none(),
             "{text}"
         );
     }
@@ -388,10 +404,14 @@ async fn prompt_suggestion_http_filters_meta_errors_formatting_and_tool_proposal
     let mut model = tickloop_agent_test_support::config();
     model.base_url = url;
     assert!(
-        generate(&request(), &snapshot(model, conversation()).await, &LocalModelClients::new(None))
-            .await
-            .text
-            .is_none()
+        generate(
+            &request(),
+            &snapshot(model, conversation()).await,
+            &LocalModelClients::new(None)
+        )
+        .await
+        .text
+        .is_none()
     );
 }
 
@@ -411,7 +431,12 @@ async fn prompt_suggestion_http_cancellation_and_deadline_drop_a_delayed_result(
         let request = request();
         let running = request.clone();
         let generation = tokio::spawn(async move {
-            generate(&running, &snapshot(model, conversation()).await, &LocalModelClients::new(None)).await
+            generate(
+                &running,
+                &snapshot(model, conversation()).await,
+                &LocalModelClients::new(None),
+            )
+            .await
         });
         received.recv().await.unwrap();
         if timeout {
@@ -460,7 +485,12 @@ async fn prompt_suggestion_diagnostics_distinguish_empty_filtered_and_incomplete
             http::serve_response(200, response(json!({"type":"text","text":text}), stop)).await;
         let mut model = tickloop_agent_test_support::config();
         model.base_url = url;
-        let result = generate(&request(), &snapshot(model, conversation()).await, &LocalModelClients::new(None)).await;
+        let result = generate(
+            &request(),
+            &snapshot(model, conversation()).await,
+            &LocalModelClients::new(None),
+        )
+        .await;
         assert_eq!(result.diagnostic, diagnostic);
         assert_eq!(result.text.as_deref(), expected);
         received.await.unwrap();
@@ -472,7 +502,12 @@ async fn prompt_suggestion_http_errors_are_silent_and_pre_cancelled_requests_nev
     let (url, received) = http::serve_response(500, "fixture private error payload".into()).await;
     let mut model = tickloop_agent_test_support::config();
     model.base_url = url;
-    let result = generate(&request(), &snapshot(model, conversation()).await, &LocalModelClients::new(None)).await;
+    let result = generate(
+        &request(),
+        &snapshot(model, conversation()).await,
+        &LocalModelClients::new(None),
+    )
+    .await;
     assert!(result.text.is_none());
     assert_eq!(result.diagnostic, "failed: Provider request");
     received.await.unwrap();
@@ -486,10 +521,14 @@ async fn prompt_suggestion_http_errors_are_silent_and_pre_cancelled_requests_nev
     let request = request();
     request.cancel.cancel();
     assert!(
-        generate(&request, &snapshot(model, conversation()).await, &LocalModelClients::new(None))
-            .await
-            .text
-            .is_none()
+        generate(
+            &request,
+            &snapshot(model, conversation()).await,
+            &LocalModelClients::new(None)
+        )
+        .await
+        .text
+        .is_none()
     );
     assert!(matches!(
         received.try_recv(),

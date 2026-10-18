@@ -10,7 +10,8 @@ use tokio_tungstenite::accept_async;
 use uuid::Uuid;
 
 use crate::Agent;
-use tickloop_agent_model::{LocalModelClients, ModelClients, ModelClient,
+use tickloop_agent_model::{
+    LocalModelClients, ModelClient, ModelClients,
     cards::ModelCatalog,
     codex_test_support::{
         LoopbackCodexClient, function_call_stream, reply_stream, send_ws_stream,
@@ -21,11 +22,33 @@ use tickloop_agent_protocol::{
     BranchRequest, Content, Event, EventKind, ExecutionMode, LoopState, ModelConfig,
     ModelRequestKind, RewindMode, Trigger, TriggerPromptSource, TriggerSource,
 };
+use tickloop_agent_test_support::harness::ChosenModels;
 
 fn config() -> ModelConfig {
     ModelCatalog::defaults()
         .get("openai-codex", "gpt-5.5")
         .unwrap()
+}
+
+/// `Agent::open_embedded` on `state` whose model switches get the client the test chooses.
+fn opened_with_models(state: &Path, models: Arc<ChosenModels>) -> Agent {
+    let store = crate::transcript::JsonlTranscriptStore::open(state.to_path_buf()).unwrap();
+    let settings = tickloop_agent_config::UserSettings::in_root(store.root());
+    Agent::with_seams(
+        crate::HarnessSeams {
+            transcripts: Some(Arc::new(store)),
+            environment: Some(Arc::new(crate::environment::LocalEnvironment::bare())),
+            models,
+        },
+        crate::HarnessOptions {
+            model: config(),
+            settings: Some(settings),
+            host: tickloop_agent_protocol::AgentHostOptions::embedded_defaults(),
+            tools: crate::ToolPolicy::local(),
+            host_rules: Vec::new(),
+        },
+    )
+    .unwrap()
 }
 
 fn client(state: &Path, endpoint: &reqwest::Url) -> Arc<dyn ModelClient> {
@@ -162,7 +185,8 @@ async fn source_switch_and_rewind_preserve_original_private_checkpoint() {
         (200, reply_stream("continue", "Continuing after rewind", 40)),
     ])
     .await;
-    let agent = Agent::open_embedded(state.clone(), config(), client(&state, &endpoint)).unwrap();
+    let models = ChosenModels::new(client(&state, &endpoint));
+    let agent = opened_with_models(&state, models.clone());
     let chat = agent.create_chat(state.clone()).await.unwrap();
     let mut events = agent.subscribe();
     agent
@@ -186,16 +210,13 @@ async fn source_switch_and_rewind_preserve_original_private_checkpoint() {
         .unwrap();
     api.api_key_env = "CODEX_HISTORY_TEST_MISSING_API_KEY".into();
     let api_client = LocalModelClients::new(None).client(&api).unwrap();
-    agent
-        .set_model(chat, api.clone())
-        .await
-        .unwrap();
-    agent
-        .set_model(chat, config())
-        .await
-        .unwrap();
+    models.choose(api_client.clone());
+    agent.set_model(chat, api.clone()).await.unwrap();
+    models.choose(client(&state, &endpoint));
+    agent.set_model(chat, config()).await.unwrap();
     let compacted = agent.compact(chat).await.unwrap();
     assert!(compacted.summary.contains("preserve source files"));
+    models.choose(api_client);
     agent.set_model(chat, api).await.unwrap();
     agent
         .rewind(chat, checkpoint.message_id, RewindMode::Conversation)
@@ -207,10 +228,8 @@ async fn source_switch_and_rewind_preserve_original_private_checkpoint() {
         before.messages[..checkpoint.message_index]
     );
     assert!(!rewound.message_sources.is_empty());
-    agent
-        .set_model(chat, config())
-        .await
-        .unwrap();
+    models.choose(client(&state, &endpoint));
+    agent.set_model(chat, config()).await.unwrap();
     agent
         .submit(chat, None, "Continue after rewind".into())
         .await

@@ -71,7 +71,9 @@ fn open_agent(archive: &Path, auth_root: &Path, config: &ModelConfig) -> Agent {
     Agent::open_embedded(
         archive.to_owned(),
         config.clone(),
-        LocalModelClients::new(Some(auth_root.to_path_buf())).client(&config).unwrap(),
+        LocalModelClients::new(Some(auth_root.to_path_buf()))
+            .client(config)
+            .unwrap(),
     )
     .unwrap()
 }
@@ -242,7 +244,9 @@ async fn environment_proxy_text_requests() {
         let config = ModelCatalog::defaults().get(provider, model).unwrap();
         let agent = Agent::new_embedded(
             config.clone(),
-            LocalModelClients::new(Some(auth_root.to_path_buf())).client(&config).unwrap(),
+            LocalModelClients::new(Some(auth_root.to_path_buf()))
+                .client(&config)
+                .unwrap(),
         );
         let chat = agent
             .create_chat(directory.path().to_owned())

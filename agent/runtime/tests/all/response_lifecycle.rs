@@ -149,10 +149,10 @@ fn agent(store: Arc<dyn TranscriptStore>, model: Arc<dyn ModelClient>) -> Agent 
         HarnessSeams {
             transcripts: Some(store),
             environment: Some(Arc::new(LocalEnvironment::bare())),
+            models: tickloop_agent_test_support::harness::ChosenModels::new(model),
         },
         HarnessOptions {
             model: config(),
-            client: model,
             settings: None,
             host: AgentHostOptions::embedded_defaults(),
             tools: ToolPolicy::local(),

@@ -4,6 +4,7 @@ use tickloop_agent_protocol::{
     Content, Decision, EventKind, ModelChange, PermissionRule, Protocol, Receipt, Role,
 };
 use tickloop_agent_runtime::{Agent, AgentError};
+use tickloop_agent_test_support::harness::{ChosenModels, embedded_agent};
 use tickloop_agent_test_support::{ScriptedModel, call, config, next_event, text};
 use uuid::Uuid;
 
@@ -94,7 +95,8 @@ async fn raw_legacy_model_name_change_keeps_same_source_private_history() {
             text: "First answer".into(),
         },
     ]]));
-    let agent = Agent::new_embedded(raw.clone(), first_client);
+    let models = ChosenModels::new(first_client);
+    let agent = embedded_agent(raw.clone(), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let first = agent
@@ -109,11 +111,9 @@ async fn raw_legacy_model_name_change_keeps_same_source_private_history() {
     let mut renamed = raw;
     renamed.name = "renamed fixture".into();
     let second_client = Arc::new(ScriptedModel::new(vec![text("Second answer")]));
+    models.choose(second_client.clone());
     assert_eq!(
-        agent
-            .set_model(chat, renamed)
-            .await
-            .unwrap(),
+        agent.set_model(chat, renamed).await.unwrap(),
         ModelChange::Applied
     );
     let selected = agent.snapshot(chat).await.unwrap();
@@ -190,7 +190,8 @@ async fn waiting_goals_project_paired_history_without_changing_raw_tool_identity
         let mut profile = config();
         profile.protocol = protocol;
         profile = model_for_persistent_selection(profile);
-        let agent = Agent::new_embedded(profile.clone(), model.clone());
+        let models = ChosenModels::new(model.clone());
+        let agent = embedded_agent(profile.clone(), models.clone());
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         require_workspace_write_approval(&agent, chat).await;
         let mut events = agent.subscribe();
@@ -240,11 +241,9 @@ async fn waiting_goals_project_paired_history_without_changing_raw_tool_identity
         ]));
         profile.name = "next-profile".into();
         profile.card.as_mut().unwrap().display_name = profile.name.clone();
+        models.choose(replacement.clone());
         assert_eq!(
-            agent
-                .set_model(chat, profile.clone())
-                .await
-                .unwrap(),
+            agent.set_model(chat, profile.clone()).await.unwrap(),
             ModelChange::Pending
         );
         assert_ne!(agent.snapshot(chat).await.unwrap().model.name, profile.name);

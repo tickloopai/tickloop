@@ -1592,7 +1592,7 @@ impl Agent {
     /// 用 [`Agent::resume_chat`] 按 id 恢复，用 [`Agent::saved_chats`] 列出已保存的 Chat。
     ///
     /// 照 Claude Code `shouldSkipPersistence`：用户设置的 `cleanupPeriodDays` 为 0 时不保存 Chat，与
-    /// [`Agent::new_with_user_settings`] 相同，仍读写用户设置。设置只在打开时读取一次。
+    /// [`Agent::new_with_user_settings_embedded`] 相同，仍读写用户设置。设置只在打开时读取一次。
     pub fn open(
         root: PathBuf,
         model: ModelConfig,
@@ -1615,30 +1615,9 @@ impl Agent {
         client: Arc<dyn ModelClient>,
         host_options: AgentHostOptions,
     ) -> Result<Self, AgentError> {
-        Self::open_with_settings_options(root, model, client, None, host_options)
-    }
-
-    pub fn open_with_user_settings_and_options(
-        root: PathBuf,
-        model: ModelConfig,
-        client: Arc<dyn ModelClient>,
-        settings: tickloop_agent_config::UserSettings,
-        host_options: AgentHostOptions,
-    ) -> Result<Self, AgentError> {
-        Self::open_with_settings_options(root, model, client, Some(settings), host_options)
-    }
-
-    fn open_with_settings_options(
-        root: PathBuf,
-        model: ModelConfig,
-        client: Arc<dyn ModelClient>,
-        settings: Option<tickloop_agent_config::UserSettings>,
-        host_options: AgentHostOptions,
-    ) -> Result<Self, AgentError> {
         let store = transcript::JsonlTranscriptStore::open(root)
             .map_err(|error| AgentError::Storage(error.to_string()))?;
-        let settings =
-            settings.unwrap_or_else(|| tickloop_agent_config::UserSettings::in_root(store.root()));
+        let settings = tickloop_agent_config::UserSettings::in_root(store.root());
         let recorder = (!settings.skips_transcripts())
             .then(|| persistence::ChatRecorder::new(Arc::new(store)));
         Ok(Self::build(
@@ -1683,15 +1662,7 @@ impl Agent {
         Self::new_local(model, client, None, host_options)
     }
 
-    /// 不保存 Chat、但照常读写用户设置的 Agent（`--no-session-persistence`）。
-    pub fn new_with_user_settings(
-        model: ModelConfig,
-        client: Arc<dyn ModelClient>,
-        settings: tickloop_agent_config::UserSettings,
-    ) -> Self {
-        Self::new_local(model, client, Some(settings), AgentHostOptions::default())
-    }
-
+    /// 不保存 Chat、但照常读写用户设置的 Agent。
     pub fn new_with_user_settings_embedded(
         model: ModelConfig,
         client: Arc<dyn ModelClient>,
@@ -1703,15 +1674,6 @@ impl Agent {
             Some(settings),
             AgentHostOptions::embedded_defaults(),
         )
-    }
-
-    pub fn new_with_user_settings_and_options(
-        model: ModelConfig,
-        client: Arc<dyn ModelClient>,
-        settings: tickloop_agent_config::UserSettings,
-        host_options: AgentHostOptions,
-    ) -> Self {
-        Self::new_local(model, client, Some(settings), host_options)
     }
 
     /// An Agent on this computer's files that keeps no Transcript.

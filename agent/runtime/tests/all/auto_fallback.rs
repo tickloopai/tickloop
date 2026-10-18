@@ -17,6 +17,7 @@ use tickloop_agent_protocol::{
     ModelProvider, PermissionChange, PromptPolicy, Protocol, Usage,
 };
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_test_support::harness::{ChosenModels, embedded_agent};
 use tickloop_agent_test_support::{call, config, text};
 use tokio::sync::{broadcast, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
@@ -312,6 +313,21 @@ async fn fixture(
     Arc<JevAdapter>,
     uuid::Uuid,
 ) {
+    let (root, agent, model, adapter, chat, _) = fixture_choosing_models(behavior).await;
+    (root, agent, model, adapter, chat)
+}
+
+/// `fixture` whose Agent switches to the model client the test chooses.
+async fn fixture_choosing_models(
+    behavior: JevBehavior,
+) -> (
+    tempfile::TempDir,
+    Agent,
+    Arc<ConversationModel>,
+    Arc<JevAdapter>,
+    uuid::Uuid,
+    Arc<ChosenModels>,
+) {
     let root = tempfile::tempdir().unwrap();
     let model = Arc::new(ConversationModel {
         normal_requests: AtomicUsize::new(0),
@@ -321,7 +337,8 @@ async fn fixture(
         behavior,
         calls: AtomicUsize::new(0),
     });
-    let agent = Agent::new_embedded(config(), model.clone());
+    let models = ChosenModels::new(model.clone());
+    let agent = embedded_agent(config(), models.clone());
     agent.install_own_tickhost();
     agent.set_judgment_client(adapter.clone()).await;
     let chat = agent.create_chat(root.path().into()).await.unwrap();
@@ -329,7 +346,7 @@ async fn fixture(
         .set_execution_mode(chat, ExecutionMode::Auto)
         .await
         .unwrap();
-    (root, agent, model, adapter, chat)
+    (root, agent, model, adapter, chat, models)
 }
 
 async fn completed(
@@ -679,7 +696,8 @@ async fn jev_capacity_routes_complete_policy_without_overriding_valid_denials() 
 
 #[tokio::test(start_paused = true)]
 async fn only_one_recovery_probe_runs_while_another_chat_uses_llm() {
-    let (root, agent, _, jev, first_chat) = fixture(JevBehavior::AuthThenWait).await;
+    let (root, agent, _, jev, first_chat, models) =
+        fixture_choosing_models(JevBehavior::AuthThenWait).await;
     let mut events = agent.subscribe();
     let first_run = agent
         .submit(first_chat, None, "Create the requested symlink".into())
@@ -695,10 +713,8 @@ async fn only_one_recovery_probe_runs_while_another_chat_uses_llm() {
     let other_workdir = root.path().join("other");
     std::fs::create_dir(&other_workdir).unwrap();
     let other_chat = agent.create_chat(other_workdir).await.unwrap();
-    agent
-        .set_model(other_chat, config())
-        .await
-        .unwrap();
+    models.choose(other_model.clone());
+    agent.set_model(other_chat, config()).await.unwrap();
     agent
         .set_execution_mode(other_chat, ExecutionMode::Auto)
         .await

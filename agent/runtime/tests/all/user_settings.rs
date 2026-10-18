@@ -9,6 +9,7 @@ use tickloop_agent_protocol::{
     PermissionScope, ReasoningEffort,
 };
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_test_support::harness::{ChosenModels, opened_agent};
 use tickloop_agent_test_support::{ScriptedModel, call, config, next_event, text};
 use tickloop_agent_tools::permissions::permission_rule_candidates;
 use tokio::sync::Barrier;
@@ -428,22 +429,15 @@ async fn builtin_model_and_rules_apply_after_restart_without_context_tuning() {
     )
     .unwrap();
     let shell = json!({"command":"env sh -c 'printf persisted'"});
-    let first = Agent::open_embedded(
-        root.clone(),
-        config(),
-        Arc::new(ScriptedModel::new(Vec::new())),
-    )
-    .unwrap();
+    let models = ChosenModels::new(Arc::new(ScriptedModel::new(Vec::new())));
+    let first = opened_agent(root.clone(), config(), models.clone());
     let chat = first.create_chat(workdir.clone()).await.unwrap();
-    let selected_client = Arc::new(ScriptedModel::new(vec![
+    models.choose(Arc::new(ScriptedModel::new(vec![
         call("persist", "Bash", shell.clone()),
         text("done"),
-    ]));
+    ])));
     assert_eq!(
-        first
-            .set_model(chat, selected_model())
-            .await
-            .unwrap(),
+        first.set_model(chat, selected_model()).await.unwrap(),
         ModelChange::Applied
     );
     assert!(first.set_context_window(chat, 64_000).await.is_err());
@@ -694,10 +688,7 @@ async fn an_explicit_host_model_takes_precedence_over_the_saved_selection() {
     )
     .unwrap();
     let chat = first.create_chat(workdir.clone()).await.unwrap();
-    first
-        .set_model(chat, selected_model())
-        .await
-        .unwrap();
+    first.set_model(chat, selected_model()).await.unwrap();
     first.shutdown().await;
     assert_eq!(UserSettings::in_root(&root).model(), Some(selected_model()));
 
@@ -758,10 +749,7 @@ async fn settings_writes_merge_unknown_keys_replace_atomically_and_refuse_invali
     let second_chat = second.create_chat(workdir.clone()).await.unwrap();
 
     let inode = std::fs::metadata(&path).unwrap().ino();
-    first
-        .set_model(first_chat, selected_model())
-        .await
-        .unwrap();
+    first.set_model(first_chat, selected_model()).await.unwrap();
     assert_ne!(
         std::fs::metadata(&path).unwrap().ino(),
         inode,
@@ -1148,12 +1136,7 @@ async fn invalid_settings_are_reported_and_never_overwritten() {
             .await
             .is_err()
     );
-    assert!(
-        reopened
-            .set_model(chat, selected_model())
-            .await
-            .is_err()
-    );
+    assert!(reopened.set_model(chat, selected_model()).await.is_err());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), trailing_comma);
     assert!(rules_of(&reopened, chat).await.is_empty());
 

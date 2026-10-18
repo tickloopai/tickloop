@@ -12,6 +12,7 @@ use tickloop_agent_runtime::transcript::{
 use tickloop_agent_runtime::{
     Agent, AgentError, HarnessOptions, HarnessSeams, ToolPolicy, environment::LocalEnvironment,
 };
+use tickloop_agent_test_support::harness::ChosenModels;
 use tickloop_agent_test_support::transcripts::{FaultyTranscriptStore, InMemoryTranscriptStore};
 use tickloop_agent_test_support::{ScriptedModel, next_event, text};
 use uuid::Uuid;
@@ -262,10 +263,9 @@ async fn retrying_a_committed_batch_commits_it_once() {
     }
 }
 
-fn options(model: Arc<ScriptedModel>, tools: ToolPolicy) -> HarnessOptions {
+fn options(tools: ToolPolicy) -> HarnessOptions {
     HarnessOptions {
         model: tickloop_agent_test_support::config(),
-        client: model,
         settings: None,
         host: AgentHostOptions::embedded_defaults(),
         tools,
@@ -283,8 +283,9 @@ fn local_agent(store: Arc<dyn TranscriptStore>, replies: usize) -> Agent {
         HarnessSeams {
             transcripts: Some(store),
             environment: Some(Arc::new(LocalEnvironment::bare())),
+            models: ChosenModels::new(Arc::new(model)),
         },
-        options(Arc::new(model), ToolPolicy::local()),
+        options(ToolPolicy::local()),
     )
     .unwrap()
 }
@@ -445,8 +446,9 @@ fn folderless_agent(store: Arc<dyn TranscriptStore>, model: Arc<ScriptedModel>) 
         HarnessSeams {
             transcripts: Some(store),
             environment: None,
+            models: ChosenModels::new(model),
         },
-        options(model, ToolPolicy::web_fetch_only()),
+        options(ToolPolicy::web_fetch_only()),
     )
     .unwrap()
 }

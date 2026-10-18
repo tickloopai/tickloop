@@ -577,12 +577,7 @@ impl Agent {
         self.event_source_task(chat_id, loop_id, cancel);
     }
 
-    fn event_source_task(
-        &self,
-        chat_id: ChatId,
-        loop_id: LoopId,
-        cancel: CancellationToken,
-    ) {
+    fn event_source_task(&self, chat_id: ChatId, loop_id: LoopId, cancel: CancellationToken) {
         let agent = self.clone();
         self.inner.tasks.spawn(async move {
             let mut interval = tokio::time::interval(EVENT_POLL_INTERVAL);

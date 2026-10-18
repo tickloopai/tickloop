@@ -1,5 +1,5 @@
-use std::{sync::Arc, time::Duration};
-use tickloop_agent_model::{LocalModelClients};
+use std::time::Duration;
+use tickloop_agent_model::{LocalModelClients, ModelClients};
 use tickloop_agent_protocol::{
     Content, EventKind, InputModality, LoopState, ModelConfig, Protocol, QuestionAnswer,
 };

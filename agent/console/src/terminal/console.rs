@@ -15981,7 +15981,7 @@ mod tests {
     #[tokio::test]
     async fn stale_parent_choice_releases_gate_without_dismissing_replacement_menu() {
         use crate::terminal::menus::Menus;
-        use tickloop_agent_model::{LocalModelClients};
+        use tickloop_agent_model::{LocalModelClients, ModelClients};
         use tickloop_agent_protocol::{InputModality, ModelConfig, Protocol};
 
         let config = ModelConfig {
@@ -20332,7 +20332,7 @@ mod tests {
     #[tokio::test]
     async fn rewind_menu_transitions_keep_keyboard_focus_and_the_insert_draft() {
         use crate::terminal::menus::Menus;
-        use tickloop_agent_model::HttpModelClient;
+        use tickloop_agent_model::{LocalModelClients, ModelClients};
         use tickloop_agent_protocol::ChatSnapshot;
         use tickloop_agent_protocol::{InputModality, ModelConfig, Protocol};
         let config = ModelConfig {

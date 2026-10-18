@@ -1,6 +1,6 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
-use tickloop_agent_model::{LocalModelClients};
+use tickloop_agent_model::{LocalModelClients, ModelClients};
 use tickloop_agent_protocol::{
     Content, EventKind, InputModality, LoopState, ModelConfig, Protocol, Role, Trigger,
     TriggerPromptSource,
@@ -29,7 +29,9 @@ fn live_agent() -> Agent {
     };
     Agent::new_embedded(
         config.clone(),
-        LocalModelClients::new(None).client(&config).expect("valid DeepSeek configuration and credentials"),,
+        LocalModelClients::new(None)
+            .client(&config)
+            .expect("valid DeepSeek configuration and credentials"),
     )
 }
 

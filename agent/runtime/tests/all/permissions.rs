@@ -1890,7 +1890,7 @@ async fn deny_rules_win_over_allow_and_ask() {
 #[tokio::test]
 #[ignore = "calls the configured real DeepSeek permission checker"]
 async fn real_automatic_checker_authorizes_an_explicitly_requested_temporary_file() {
-    use tickloop_agent_model::{HttpModelClient, cards::built_in_model_profiles};
+    use tickloop_agent_model::cards::built_in_model_profiles;
     let directory = tempfile::tempdir().unwrap();
     let external = tempfile::tempdir().unwrap();
     let output_path = external.path().join("audit.txt");

@@ -85,7 +85,7 @@ fn google_response(parts: Vec<Value>) -> String {
 
 #[tokio::test]
 async fn legacy_and_server_tool_shapes_are_terminal_before_text_is_parsed() {
-    use tickloop_agent_model::{ModelClient, ModelResponseRejection, StructuredOutput};
+    use tickloop_agent_model::{ModelResponseRejection, StructuredOutput};
     use tickloop_agent_protocol::{Message, Role};
     let text = auto_classification(false).to_string();
     for (protocol, response) in [
@@ -235,10 +235,13 @@ async fn unexpected_tool_response_requires_manual(mut reviewer_config: ModelConf
             ])),
         );
         let reviewer = if reviewer_config.auth_source == ModelAuthSource::KimiOAuth {
-            tickloop_agent_model::LocalModelClients::new(Some(credentials.path().to_path_buf())).client(&reviewer_config)
+            tickloop_agent_model::LocalModelClients::new(Some(credentials.path().to_path_buf()))
+                .client(&reviewer_config)
                 .unwrap()
         } else {
-            LocalModelClients::new(None).client(&reviewer_config).unwrap()
+            LocalModelClients::new(None)
+                .client(&reviewer_config)
+                .unwrap()
         };
         agent.set_auto_reviewer(reviewer).await;
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -518,7 +521,11 @@ async fn minimax_preview_and_deepseek_recover_malformed_review_without_relaxing_
         );
         agent.install_own_tickhost();
         agent
-            .set_auto_reviewer(LocalModelClients::new(None).client(&reviewer_config).unwrap())
+            .set_auto_reviewer(
+                LocalModelClients::new(None)
+                    .client(&reviewer_config)
+                    .unwrap(),
+            )
             .await;
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
         agent

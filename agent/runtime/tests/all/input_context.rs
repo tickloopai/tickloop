@@ -484,10 +484,7 @@ async fn a_model_without_image_input_refuses_image_prompts_and_leaves_the_chat_u
 
     let vision = Arc::new(ScriptedModel::new(vec![text("A chart.")]));
     models.choose(vision.clone());
-    agent
-        .set_model(chat, config())
-        .await
-        .unwrap();
+    agent.set_model(chat, config()).await.unwrap();
     assert!(agent.accepts_images(chat).await.unwrap());
     submit_and_wait(&agent, chat, "Describe @chart.png", vec![image]).await;
     assert_eq!(
@@ -533,10 +530,7 @@ async fn a_pending_switch_to_a_text_only_model_refuses_image_prompts() {
         EventKind::PermissionRequested { .. }
     ) {}
 
-    let change = agent
-        .set_model(chat, text_only_config())
-        .await
-        .unwrap();
+    let change = agent.set_model(chat, text_only_config()).await.unwrap();
 
     assert_eq!(change, ModelChange::Pending);
     assert!(!agent.accepts_images(chat).await.unwrap());

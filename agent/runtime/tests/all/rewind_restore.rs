@@ -743,10 +743,7 @@ async fn rewind_preserves_original_private_history_after_a_model_switch() {
     selected.protocol = Protocol::Responses;
     selected.model = "replacement-model".into();
     assert_eq!(
-        agent
-            .set_model(chat, selected.clone())
-            .await
-            .unwrap(),
+        agent.set_model(chat, selected.clone()).await.unwrap(),
         ModelChange::Applied
     );
     let before = agent.snapshot(chat).await.unwrap();

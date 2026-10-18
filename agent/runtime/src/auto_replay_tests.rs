@@ -1,7 +1,8 @@
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tickloop_agent_model::{LocalModelClients, ModelClients, ModelClient,
+use tickloop_agent_model::{
+    LocalModelClients, ModelClients,
     judgment::{JevClient, JevConfig, JudgmentClient},
 };
 use tickloop_agent_protocol::{OriginalUserInput, PreparedApprovalFacts};

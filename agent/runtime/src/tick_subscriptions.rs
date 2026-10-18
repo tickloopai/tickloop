@@ -1878,9 +1878,13 @@ impl Agent {
             return;
         }
         let agent = self.clone();
-        self.inner
-            .tasks
-            .spawn(async move { agent.deliver(chat_id, loop_id).await });
+        let shutdown = self.inner.shutdown.clone();
+        self.inner.tasks.spawn(async move {
+            tokio::select! {
+                _ = shutdown.cancelled() => {}
+                _ = agent.deliver(chat_id, loop_id) => {}
+            }
+        });
     }
 
     /// Hands one Loop's pending delivery to [`Agent::trigger`], or marks it due while the Loop
@@ -2231,10 +2235,7 @@ impl Agent {
     }
 
     /// Owns the stream events and every subscription's delivery schedule.
-    fn tick_delivery_task(
-        &self,
-        mut events: tokio::sync::mpsc::Receiver<TickStreamEvent>,
-    ) {
+    fn tick_delivery_task(&self, mut events: tokio::sync::mpsc::Receiver<TickStreamEvent>) {
         let agent = self.clone();
         self.inner.tasks.spawn(async move {
             loop {

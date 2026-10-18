@@ -4,7 +4,6 @@
 use std::{path::Path, sync::Arc};
 
 use serde_json::json;
-use tickloop_agent_model::ModelClient;
 use tickloop_agent_protocol::{
     AgentHostOptions, Content, Decision, EventKind, ImageContext, ImageOrigin, InputContext,
     PermissionRule, PromptPolicy, Role,
@@ -13,6 +12,7 @@ use tickloop_agent_runtime::{
     Agent, AgentError, HarnessOptions, HarnessSeams, ToolPolicy, environment::LocalEnvironment,
     transcript::JsonlTranscriptStore,
 };
+use tickloop_agent_test_support::harness::ChosenModels;
 use tickloop_agent_test_support::{ScriptedModel, call, next_event, text};
 use uuid::Uuid;
 
@@ -38,10 +38,10 @@ fn folderless_agent(model: Arc<ScriptedModel>) -> Agent {
         HarnessSeams {
             transcripts: None,
             environment: None,
+            models: ChosenModels::new(model),
         },
         HarnessOptions {
             model: tickloop_agent_test_support::config(),
-            client: model,
             settings: None,
             host: AgentHostOptions {
                 prompt_policy: PromptPolicy::DenyOnPrompt,
@@ -332,9 +332,9 @@ async fn a_folderless_chat_refuses_local_shells_files_and_attachments() {
 
 #[tokio::test]
 async fn a_folderless_harness_keeps_no_local_transcript_and_a_local_one_needs_a_folder() {
-    let options = |model: Arc<dyn ModelClient>| HarnessOptions {
+    let models = || ChosenModels::new(Arc::new(ScriptedModel::new(vec![text("answer")])));
+    let options = || HarnessOptions {
         model: tickloop_agent_test_support::config(),
-        client: model,
         settings: None,
         host: AgentHostOptions::embedded_defaults(),
         tools: ToolPolicy::local(),
@@ -346,10 +346,11 @@ async fn a_folderless_harness_keeps_no_local_transcript_and_a_local_one_needs_a_
         HarnessSeams {
             transcripts: Some(Arc::new(store)),
             environment: None,
+            models: models(),
         },
         HarnessOptions {
             tools: ToolPolicy::web_fetch_only(),
-            ..options(Arc::new(ScriptedModel::new(vec![text("answer")])))
+            ..options()
         },
     )
     .unwrap();
@@ -363,8 +364,9 @@ async fn a_folderless_harness_keeps_no_local_transcript_and_a_local_one_needs_a_
         HarnessSeams {
             transcripts: None,
             environment: Some(Arc::new(LocalEnvironment::bare())),
+            models: models(),
         },
-        options(Arc::new(ScriptedModel::new(Vec::new()))),
+        options(),
     )
     .unwrap();
     assert!(local.create_chat_without_folder().await.is_err());
@@ -374,12 +376,13 @@ async fn a_folderless_harness_keeps_no_local_transcript_and_a_local_one_needs_a_
         HarnessSeams {
             transcripts: None,
             environment: None,
+            models: models(),
         },
         HarnessOptions {
             settings: Some(tickloop_agent_config::UserSettings::in_root(
                 settings_root.path(),
             )),
-            ..options(Arc::new(ScriptedModel::new(Vec::new())))
+            ..options()
         },
     );
     assert!(matches!(with_settings, Err(AgentError::Invalid(_))));
