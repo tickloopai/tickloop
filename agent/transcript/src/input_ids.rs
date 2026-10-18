@@ -42,7 +42,11 @@ pub fn feedback(origin: &str, account: &str, delivery: Uuid) -> Uuid {
 pub fn family_message(sender_chat: Uuid, response: Uuid, call_id: &str) -> Uuid {
     named(
         FAMILY_MESSAGE,
-        &[sender_chat.as_bytes(), response.as_bytes(), call_id.as_bytes()],
+        &[
+            sender_chat.as_bytes(),
+            response.as_bytes(),
+            call_id.as_bytes(),
+        ],
     )
 }
 

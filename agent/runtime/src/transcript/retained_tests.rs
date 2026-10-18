@@ -32,10 +32,22 @@ struct Generator {
     counter: u64,
     parent: Option<Uuid>,
     entries: Vec<Uuid>,
+    /// The chain entries since the latest boundary.
+    chain_entries: Vec<Uuid>,
+    /// The chain entries the latest boundary compacted; a message it keeps carries one's id as
+    /// its original id.
+    compacted_entries: Vec<Uuid>,
+    /// The nodes answers without messages hang under.
+    answered_without_messages: Vec<Uuid>,
     tool_uses: Vec<String>,
     responses: Vec<Uuid>,
     /// The answers that have not ended: only they get more messages or records.
     live_responses: Vec<Uuid>,
+    /// The answers with messages on the chain since the latest boundary.
+    chain_responses: Vec<Uuid>,
+    /// The answers with messages on the chain the latest boundary compacted, which the
+    /// messages it keeps belong to.
+    compacted_responses: Vec<Uuid>,
     inputs: Vec<Uuid>,
     /// Inputs not settled yet, with their operation: only they get more records.
     open_inputs: Vec<(Uuid, &'static str)>,
@@ -52,9 +64,14 @@ impl Generator {
             counter: 0,
             parent: None,
             entries: Vec::new(),
+            chain_entries: Vec::new(),
+            compacted_entries: Vec::new(),
+            answered_without_messages: Vec::new(),
             tool_uses: Vec::new(),
             responses: Vec::new(),
             live_responses: Vec::new(),
+            chain_responses: Vec::new(),
+            compacted_responses: Vec::new(),
             inputs: Vec::new(),
             open_inputs: Vec::new(),
             waits: Vec::new(),
@@ -95,16 +112,30 @@ impl Generator {
             ];
         }
         let answers = match is_kept_by_compaction {
-            true => self.responses.clone(),
+            true => self.compacted_responses.clone(),
             false => self.live_responses.clone(),
         };
         let response = self.pick(&answers).filter(|_| self.random.bool());
+        self.chain_responses.extend(response);
         let input = self
             .pick(&self.inputs.clone())
             .filter(|_| self.random.u8(..4) == 0);
+        // Compaction often keeps the prompt an answer without messages hangs under.
+        let answered = self
+            .compacted_entries
+            .iter()
+            .filter(|entry| self.answered_without_messages.contains(entry))
+            .copied()
+            .collect::<Vec<_>>();
+        let original = match is_kept_by_compaction {
+            true if !answered.is_empty() && self.random.bool() => self.pick(&answered),
+            true => self.pick(&self.compacted_entries.clone()),
+            false => None,
+        };
         let line = parse(json!({
             "type": role,
             "uuid": uuid,
+            "originalMessageId": original,
             "parentUuid": self.parent,
             "chatId": self.chat,
             "timestamp": TIMESTAMP,
@@ -116,12 +147,15 @@ impl Generator {
         }));
         self.parent = Some(uuid);
         self.entries.push(uuid);
+        self.chain_entries.push(uuid);
         line
     }
 
     /// A compact boundary the chain starts again at; calls before it get no more results.
     fn boundary(&mut self) -> Line {
         self.tool_uses.clear();
+        self.compacted_responses = std::mem::take(&mut self.chain_responses);
+        self.compacted_entries = std::mem::take(&mut self.chain_entries);
         let uuid = Uuid::new_v4();
         let line = parse(json!({
             "type": "system",
@@ -203,11 +237,25 @@ impl Generator {
                 };
                 let input = self.pick(&self.inputs.clone());
                 let state = self.response_state();
-                if state["kind"] == "ended" {
+                let ended = state["kind"] == "ended";
+                if ended {
                     self.live_responses.retain(|live| *live != id);
                 }
+                // An answer that ends without messages hangs under the node it answered; it
+                // starts and ends with no message between.
+                let without_messages = ended
+                    && !self.chain_responses.contains(&id)
+                    && !self.compacted_responses.contains(&id)
+                    && self.random.u8(..2) == 0;
+                let parent = match without_messages {
+                    true => self.pick(&self.chain_entries.clone()).or(input),
+                    false => input,
+                };
+                if without_messages {
+                    self.answered_without_messages.extend(parent);
+                }
                 parse(
-                    json!({"type": "response", "responseId": id, "inputId": input, "attempt": 1, "runId": id, "loopId": chat, "displayParent": input, "timestamp": TIMESTAMP, "state": state}),
+                    json!({"type": "response", "responseId": id, "inputId": input, "attempt": 1, "runId": id, "loopId": chat, "displayParent": parent, "timestamp": TIMESTAMP, "state": state, "withoutMessages": without_messages}),
                 )
             }
             12..=13 => {
@@ -278,10 +326,10 @@ impl Generator {
         for _ in 0..LINES_PER_SEQUENCE {
             let group = match self.random.u8(..100) {
                 // Compaction writes the boundary and the messages it keeps in one group.
-                0..=2 => std::iter::once(self.boundary())
-                    .chain((0..self.random.usize(..3)).map(|_| self.chain_entry(true)))
+                0 => std::iter::once(self.boundary())
+                    .chain((0..self.random.usize(1..4)).map(|_| self.chain_entry(true)))
                     .collect::<Vec<_>>(),
-                3..=34 => vec![self.chain_entry(false)],
+                1..=34 => vec![self.chain_entry(false)],
                 _ => vec![self.retained()],
             };
             let restarts = group.iter().any(|line| {
@@ -329,7 +377,12 @@ fn without_snapshots(lines: &[Line]) -> Vec<Line> {
 
 /// A record a load of the chain needs: the conversation shows it, or the Chat may go on with
 /// it.
-fn needed_response(lifecycle: &Lifecycle, id: Uuid, chain_responses: &HashSet<Uuid>) -> bool {
+fn needed_response(
+    lifecycle: &Lifecycle,
+    id: Uuid,
+    chain_responses: &HashSet<Uuid>,
+    shown: &HashSet<Uuid>,
+) -> bool {
     let Some(response) = lifecycle.response(id) else {
         return false;
     };
@@ -346,7 +399,14 @@ fn needed_response(lifecycle: &Lifecycle, id: Uuid, chain_responses: &HashSet<Uu
             }
         }
     );
-    chain_responses.contains(&id) || !response.state.is_ended() || (lost_host && input_is_open)
+    let shows_without_messages = response.without_messages
+        && response
+            .display_parent
+            .is_some_and(|parent| shown.contains(&parent));
+    chain_responses.contains(&id)
+        || !response.state.is_ended()
+        || (lost_host && input_is_open)
+        || shows_without_messages
 }
 
 #[test]
@@ -435,8 +495,20 @@ fn a_load_from_a_snapshot_equals_a_load_of_every_retained_line() {
             .iter()
             .filter_map(|entry| entry.response_id)
             .collect::<HashSet<_>>();
+        // The display nodes of the loaded conversation: its entries under their original ids too,
+        // and its answers.
+        let shown = chain_entries
+            .iter()
+            .copied()
+            .chain(
+                full.chain
+                    .iter()
+                    .filter_map(|entry| entry.original_message_id),
+            )
+            .chain(chain_responses.iter().copied())
+            .collect::<HashSet<_>>();
         for id in &generator.responses {
-            if needed_response(&full_lifecycle, *id, &chain_responses) {
+            if needed_response(&full_lifecycle, *id, &chain_responses, &shown) {
                 assert_eq!(
                     folded_lifecycle.response(*id),
                     full_lifecycle.response(*id),
@@ -468,11 +540,7 @@ fn a_load_from_a_snapshot_equals_a_load_of_every_retained_line() {
         }
 
         // What the display shows of the loaded conversation.
-        let shown = chain_entries
-            .iter()
-            .copied()
-            .chain(chain_responses.iter().copied())
-            .collect::<HashSet<_>>();
+
         let display = |stored: StoredTranscript| {
             project(
                 &stored
@@ -482,9 +550,13 @@ fn a_load_from_a_snapshot_equals_a_load_of_every_retained_line() {
                     .collect::<Vec<_>>(),
             )
             .into_iter()
-            .filter(|node| shown.contains(&node.id))
+            .filter(|node| {
+                shown.contains(&node.id)
+                    || node.parent.is_some_and(|parent| shown.contains(&parent))
+            })
             .map(|node| serde_json::to_string(&node).unwrap())
-            .collect::<Vec<_>>()
+            // The order nodes first appeared in differs where the snapshot repeats records.
+            .collect::<std::collections::BTreeSet<_>>()
         };
         assert_eq!(
             display(from_latest_boundary(&lines)),

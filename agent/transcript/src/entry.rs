@@ -704,6 +704,18 @@ pub enum InputOp {
 }
 
 impl InputOp {
+    /// The user sent it, as a prompt, a Skill, an edit or a reply.
+    pub fn is_from_user(&self) -> bool {
+        matches!(
+            self,
+            Self::Continue
+                | Self::Skill
+                | Self::ReplacePrompt
+                | Self::RegenerateAnswer
+                | Self::Answer
+        )
+    }
+
     /// The host or the user sends it under its own id, which repeating it must find again; the
     /// others come from the Agent itself.
     pub fn is_external(&self) -> bool {
@@ -725,7 +737,9 @@ pub enum InputState {
     Accepted,
     /// Its Run started. Only an input whose prompt does not carry its id records this.
     Started,
-    Settled { outcome: SettledOutcome },
+    Settled {
+        outcome: SettledOutcome,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

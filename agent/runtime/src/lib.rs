@@ -53,6 +53,7 @@ mod context;
 mod delegation;
 mod denials;
 mod directed_summary;
+mod durable_queue;
 pub mod environment;
 mod event_sources;
 mod feedback_inbox;
@@ -71,7 +72,6 @@ mod run_supervision;
 mod session_permissions;
 mod shell_description;
 mod shell_task_center;
-mod durable_queue;
 mod suspension;
 mod system_prompt;
 mod tool_batch;
@@ -2419,14 +2419,9 @@ impl Agent {
             let (id, op) = match (&agent_message, &directed_human, &feedback_input) {
                 (Some(source), _, _) => (source.message_id, InputOp::AgentMessage),
                 (_, Some(source), _) => (source.message_id, InputOp::AgentMessage),
-                (_, _, Some(feedback)) => (
-                    tickloop_agent_transcript::input_ids::feedback(
-                        &feedback.origin,
-                        &feedback.account_id,
-                        feedback.delivery_id,
-                    ),
-                    InputOp::Feedback,
-                ),
+                // The local inbox delivers a request again after a restart; the delivery's own id
+                // names it once deliveries are pushed (H09g).
+                (_, _, Some(_)) => (Uuid::new_v4(), InputOp::Feedback),
                 _ if trigger_source.is_some() => (Uuid::new_v4(), InputOp::Trigger),
                 _ => (Uuid::new_v4(), InputOp::Continue),
             };

@@ -420,7 +420,9 @@ impl Agent {
         loop_id: LoopId,
         feedback_replay: bool,
     ) -> TriggerPermit {
-        if self.inner.recorder.is_none() {
+        // A host that keeps waits durably holds the Chat's whole family under its lease: no
+        // other process fires its Triggers.
+        if self.inner.recorder.is_none() || self.inner.waits == super::WaitHosting::Durable {
             return TriggerPermit::Fire;
         }
         let Some(directory) = self.lease_directory(chat_id).await else {

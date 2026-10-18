@@ -52,6 +52,7 @@ impl LoadableChain {
             self.inputs.clear();
         }
         self.entries.insert(entry.uuid);
+        self.entries.extend(entry.original_message_id);
         self.responses.extend(entry.response_id);
         self.inputs.extend(entry.input_id);
         self.tool_results
@@ -111,7 +112,11 @@ impl RetainedFold {
                 let Line::RetainedSnapshot(snapshot) = line else {
                     unreachable!("a snapshot kind is a snapshot");
                 };
-                let chain = std::mem::take(&mut self.chain);
+                // What compaction left behind is gone from the snapshot, and nothing refers to it
+                // later.
+                let mut chain = std::mem::take(&mut self.chain);
+                chain.compacted_entries.clear();
+                chain.compacted_tool_results.clear();
                 *self = Self {
                     next_order: self.next_order,
                     chain,
@@ -264,8 +269,16 @@ impl RetainedFold {
                 .get(&(MetadataKind::Input, input))
                 .is_some_and(|kept| matches!(&kept.line, Line::Input(input) if !matches!(input.state, InputState::Settled { .. })))
         });
+        // An answer that ended without messages of its own shows under the node it answered.
+        let shows_without_messages = entry.without_messages
+            && entry.display_parent.is_some_and(|parent| {
+                self.chain.entries.contains(&parent)
+                    || self.chain.inputs.contains(&parent)
+                    || self.chain.responses.contains(&parent)
+            });
         !entry.state.is_ended()
             || (lost_host && input_is_open)
+            || shows_without_messages
             || self.chain.responses.contains(&entry.response_id)
     }
 }

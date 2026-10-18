@@ -179,7 +179,10 @@ impl Lifecycle {
             input.record.queued = None;
             if !matches!(
                 input.record.op,
-                InputOp::Continue | InputOp::Skill | InputOp::ReplacePrompt | InputOp::RegenerateAnswer
+                InputOp::Continue
+                    | InputOp::Skill
+                    | InputOp::ReplacePrompt
+                    | InputOp::RegenerateAnswer
             ) {
                 input.record.state = InputState::Started;
             }
