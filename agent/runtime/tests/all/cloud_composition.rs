@@ -1261,3 +1261,56 @@ async fn an_artifact_the_user_shared_through_the_host_may_be_written() {
     );
     agent.shutdown().await;
 }
+
+/// A crafted call cannot borrow a create's admission: a create that also addresses an existing
+/// Artifact, or carries a field the host does not know, is refused before the service, and a
+/// plain create still goes through. (Copying from a source Artifact is checked like a target;
+/// the recorded service directory has no such field, so the unit tests cover it.)
+#[tokio::test]
+async fn a_create_cannot_carry_an_artifact_without_provenance() {
+    let service = ArtifactService::start().await;
+    let create = |extra: Value| {
+        let mut input =
+            json!({"action": "create", "title": "Notes", "format": "doc", "content": "# Notes"});
+        input
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        input
+    };
+    let (agent, _credentials) = artifact_agent(
+        &service,
+        Arc::new(InMemoryTranscriptStore::new()),
+        artifact_model(vec![
+            (
+                "addresses",
+                "ArtifactEdit",
+                create(json!({"artifact_id": UNSHARED_ARTIFACT})),
+            ),
+            (
+                "unknown",
+                "ArtifactEdit",
+                create(json!({"copy_from": UNSHARED_ARTIFACT})),
+            ),
+            ("plain", "ArtifactEdit", create(json!({}))),
+        ]),
+    )
+    .await;
+    let chat = agent.create_chat_without_folder().await.unwrap();
+    settle_turn(&agent, chat, "Keep notes.").await;
+    let snapshot = agent.snapshot(chat).await.unwrap();
+    let (text, is_error) = call_result(&snapshot, "addresses");
+    assert!(is_error && text.contains("cannot admit"), "{text}");
+    assert!(call_result(&snapshot, "unknown").1);
+    assert!(
+        !call_result(&snapshot, "plain").1,
+        "{:?}",
+        call_result(&snapshot, "plain")
+    );
+    assert_eq!(
+        service.tool_calls().len(),
+        1,
+        "only the plain create was sent"
+    );
+    agent.shutdown().await;
+}

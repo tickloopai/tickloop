@@ -174,7 +174,9 @@ impl Agent {
     }
 
     /// Whether an `ArtifactEdit` or `ArtifactComment` call may skip review, or why it is refused,
-    /// when the host asks Artifact writes for provenance.
+    /// when the host asks Artifact writes for provenance. The call must have exactly the shape of
+    /// one action the host knows, and every Artifact it names, as its target or as a source to copy
+    /// from, needs provenance; a call of any other shape is refused rather than guessed at.
     pub(super) async fn check_artifact_provenance(
         &self,
         receipt: &Receipt,
@@ -186,48 +188,125 @@ impl Agent {
         {
             return Ok(ArtifactAdmission::Ordinary);
         }
-        // A new Artifact belongs to this Chat from the start.
-        if name == ARTIFACT_EDIT_TOOL && input["action"].as_str() == Some("create") {
+        let named = artifacts_named(name, input)?;
+        if named.is_empty() {
+            // Only a create names no Artifact: a new one belongs to this Chat from the start.
             return Ok(ArtifactAdmission::Vouched);
         }
-        let Some(target) = input["artifact_id"].as_str().filter(|id| !id.is_empty()) else {
-            return Ok(ArtifactAdmission::Ordinary);
-        };
         let chats = self.inner.chats.lock().await;
-        let names_the_target = |id: &str| tickloop_agent_artifacts::artifact_ids_match(id, target);
-        let is_the_familys = family_of(&chats, receipt.chat_id).iter().any(|chat| {
-            chat.bookkeeping
-                .provenance
-                .artifacts
-                .iter()
-                .any(|id| names_the_target(id))
-                || chat
-                    .snapshot
-                    .loops
-                    .iter()
-                    .flat_map(|goal| &goal.event_sources)
-                    .any(|source| names_the_target(&source.artifact_id))
-        });
-        let is_named_by_the_user = delegation_line(&chats, receipt.chat_id)
+        let family = family_of(&chats, receipt.chat_id);
+        let user_texts = delegation_line(&chats, receipt.chat_id)
             .iter()
             .flat_map(|chat| user_texts(chat))
-            .any(|text| {
+            .collect::<Vec<_>>();
+        for artifact in named {
+            let names_it = |id: &str| tickloop_agent_artifacts::artifact_ids_match(id, artifact);
+            let is_the_familys = family.iter().any(|chat| {
+                chat.bookkeeping
+                    .provenance
+                    .artifacts
+                    .iter()
+                    .any(|id| names_it(id))
+                    || chat
+                        .snapshot
+                        .loops
+                        .iter()
+                        .flat_map(|goal| &goal.event_sources)
+                        .any(|source| names_it(&source.artifact_id))
+            });
+            let is_named_by_the_user = user_texts.iter().any(|text| {
                 text.split(|character: char| {
                     !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
                 })
                 .filter(|word| word.len() >= MIN_ARTIFACT_ID_CHARACTERS)
-                .any(names_the_target)
+                .any(names_it)
             });
-        if is_the_familys || is_named_by_the_user {
-            Ok(ArtifactAdmission::Vouched)
-        } else {
-            Err(format!(
-                "{name} only changes an Artifact this conversation created or the user shared; \
-                 {target} is neither. Ask the user to share the Artifact's link in the \
-                 conversation."
-            ))
+            if !is_the_familys && !is_named_by_the_user {
+                return Err(format!(
+                    "{name} only uses an Artifact this conversation created or the user shared; \
+                     {artifact} is neither. Ask the user to share the Artifact's link in the \
+                     conversation."
+                ));
+            }
         }
+        Ok(ArtifactAdmission::Vouched)
     }
+}
+
+/// The fields each action of the Artifact write tools may carry, the required ones first, and how
+/// many are required. `artifact_id` names the Artifact written to; `assets_from` names one copied
+/// from.
+const ARTIFACT_WRITE_SHAPES: [(&str, &str, &[&str], usize); 5] = [
+    (
+        ARTIFACT_EDIT_TOOL,
+        "create",
+        &["action", "title", "format", "content", "assets_from"],
+        3,
+    ),
+    (
+        ARTIFACT_EDIT_TOOL,
+        "patch",
+        &["action", "artifact_id", "patches"],
+        3,
+    ),
+    (
+        ARTIFACT_EDIT_TOOL,
+        "replace",
+        &["action", "artifact_id", "expected_revision", "content"],
+        4,
+    ),
+    (
+        ARTIFACT_EDIT_TOOL,
+        "rename",
+        &["action", "artifact_id", "title", "expected_title"],
+        4,
+    ),
+    (
+        ARTIFACT_COMMENT_TOOL,
+        "reply",
+        &["action", "artifact_id", "thread_id", "text"],
+        4,
+    ),
+];
+/// The fields by which an Artifact write names an Artifact.
+const ARTIFACT_REFERENCE_FIELDS: [&str; 2] = ["artifact_id", "assets_from"];
+
+/// The Artifacts a write call names, or why its shape is refused.
+fn artifacts_named<'a>(name: &str, input: &'a serde_json::Value) -> Result<Vec<&'a str>, String> {
+    let refusal = || {
+        format!(
+            "{name} was called with an action or fields this conversation cannot admit; use one \
+             of its documented actions with exactly its fields."
+        )
+    };
+    let fields = input.as_object().ok_or_else(refusal)?;
+    let action = fields
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(refusal)?;
+    let (_, _, allowed, required) = ARTIFACT_WRITE_SHAPES
+        .iter()
+        .find(|(tool, known, _, _)| *tool == name && *known == action)
+        .ok_or_else(refusal)?;
+    if fields
+        .keys()
+        .any(|field| !allowed.contains(&field.as_str()))
+        || allowed[..*required]
+            .iter()
+            .any(|field| !fields.contains_key(*field))
+    {
+        return Err(refusal());
+    }
+    ARTIFACT_REFERENCE_FIELDS
+        .iter()
+        .filter_map(|field| fields.get(*field))
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(refusal)
+        })
+        .collect()
 }
 
 /// Adds `items` to `kept` up to `limit` entries; whether anything was added.
@@ -299,4 +378,83 @@ fn search_results(chat: &Chat) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn a_write_names_its_target_and_any_source_and_has_exactly_one_known_shape() {
+        let create =
+            json!({"action": "create", "title": "Notes", "format": "doc", "content": "# Notes"});
+        assert_eq!(artifacts_named(ARTIFACT_EDIT_TOOL, &create), Ok(Vec::new()));
+        let copying = json!({"action": "create", "title": "Deck", "format": "slides", "assets_from": "their-deck"});
+        assert_eq!(
+            artifacts_named(ARTIFACT_EDIT_TOOL, &copying),
+            Ok(vec!["their-deck"])
+        );
+        let patch = json!({"action": "patch", "artifact_id": "notes-doc", "patches": []});
+        assert_eq!(
+            artifacts_named(ARTIFACT_EDIT_TOOL, &patch),
+            Ok(vec!["notes-doc"])
+        );
+        let reply =
+            json!({"action": "reply", "artifact_id": "notes-doc", "thread_id": "t", "text": "ok"});
+        assert_eq!(
+            artifacts_named(ARTIFACT_COMMENT_TOOL, &reply),
+            Ok(vec!["notes-doc"])
+        );
+        for (tool, refused) in [
+            // A create that also addresses an existing Artifact.
+            (
+                ARTIFACT_EDIT_TOOL,
+                json!({"action": "create", "title": "T", "format": "doc", "artifact_id": "theirs"}),
+            ),
+            // Fields the host does not know, such as another way to copy.
+            (
+                ARTIFACT_EDIT_TOOL,
+                json!({"action": "create", "title": "T", "format": "doc", "copy_from": "theirs"}),
+            ),
+            (
+                ARTIFACT_EDIT_TOOL,
+                json!({"action": "patch", "artifact_id": "mine", "patches": [], "source_id": "theirs"}),
+            ),
+            // Actions the host does not admit, or not as exact text.
+            (
+                ARTIFACT_EDIT_TOOL,
+                json!({"action": "delete", "artifact_id": "mine"}),
+            ),
+            (
+                ARTIFACT_EDIT_TOOL,
+                json!({"action": "Create", "title": "T", "format": "doc"}),
+            ),
+            (
+                ARTIFACT_EDIT_TOOL,
+                json!({"action": ["create"], "title": "T", "format": "doc"}),
+            ),
+            (
+                ARTIFACT_COMMENT_TOOL,
+                json!({"action": "create", "title": "T", "format": "doc"}),
+            ),
+            // References that are not plain ids, and missing required fields.
+            (
+                ARTIFACT_EDIT_TOOL,
+                json!({"action": "patch", "artifact_id": ["mine", "theirs"], "patches": []}),
+            ),
+            (
+                ARTIFACT_EDIT_TOOL,
+                json!({"action": "create", "title": "T", "format": "slides", "assets_from": 7}),
+            ),
+            (
+                ARTIFACT_EDIT_TOOL,
+                json!({"action": "patch", "patches": []}),
+            ),
+            (ARTIFACT_EDIT_TOOL, json!("create")),
+        ] {
+            assert!(artifacts_named(tool, &refused).is_err(), "{refused}");
+        }
+    }
 }
