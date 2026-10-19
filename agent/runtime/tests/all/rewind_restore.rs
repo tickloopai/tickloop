@@ -511,7 +511,10 @@ async fn conversation_rewind_to_a_triggered_loop_start_removes_the_loop_and_its_
                 id: trigger_id,
                 prompt: "check again when requested".into(),
                 prompt_source: TriggerPromptSource::Explicit,
-                interval_seconds: None,
+                schedule: None,
+                armed_at_ms: None,
+                last_fired_at_ms: None,
+                confirmation: None,
                 expires_at_ms: None,
                 accepts_events: true,
                 armed: true,
@@ -743,14 +746,7 @@ async fn rewind_preserves_original_private_history_after_a_model_switch() {
     selected.protocol = Protocol::Responses;
     selected.model = "replacement-model".into();
     assert_eq!(
-        agent
-            .set_model(
-                chat,
-                selected.clone(),
-                Arc::new(ScriptedModel::new(Vec::new())),
-            )
-            .await
-            .unwrap(),
+        agent.set_model(chat, selected.clone()).await.unwrap(),
         ModelChange::Applied
     );
     let before = agent.snapshot(chat).await.unwrap();

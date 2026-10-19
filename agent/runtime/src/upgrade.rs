@@ -28,12 +28,12 @@ pub struct AgentUpgradeCheckpoint {
     host_tools: Option<crate::host_tools::HostToolUpgradeCheckpoint>,
 }
 
+/// How far an armed Trigger's timer got: its schedule itself is wall-clock and on the Loop.
 #[derive(Clone, Serialize, Deserialize)]
 struct TimerCheckpoint {
     chat: ChatId,
     goal: LoopId,
-    #[serde(with = "instant")]
-    next: tokio::time::Instant,
+    tried_through_ms: u64,
 }
 
 impl AgentUpgradeCheckpoint {
@@ -68,7 +68,7 @@ struct ChatCheckpoint {
     auto_denials: auto_mode::DenialTracking,
     denial_window: denials::DenialWindow,
     content_replacements: tool_results::ContentReplacementState,
-    file_history: Value,
+    file_history: Option<Value>,
     shells: Value,
     waiting: Option<Receipt>,
     file_reads: Value,
@@ -103,8 +103,11 @@ impl Agent {
         };
         let chats = self.inner.chats.lock().await;
         if self.inner.closed.load(Ordering::SeqCst)
+            || self.inner.handover.is_cancelled()
             || chats.values().any(|chat| {
                 (chat.active.is_some() && chat.upgrade_wait.is_none())
+                    || !chat.releases.is_empty()
+                    || chat.branch_reservation.is_some()
                     || chat
                         .active
                         .as_ref()
@@ -152,7 +155,10 @@ impl Agent {
                 auto_denials: chat.auto_denials.clone(),
                 denial_window: chat.denial_window.clone(),
                 content_replacements: chat.content_replacements.clone(),
-                file_history: chat.file_history.upgrade_checkpoint(),
+                file_history: chat
+                    .file_history
+                    .as_ref()
+                    .map(FileHistory::upgrade_checkpoint),
                 shells,
                 waiting: chat.upgrade_wait.clone(),
                 file_reads: live_snapshot::checkpoint_reads(
@@ -171,14 +177,14 @@ impl Agent {
         let selected_model = self.inner.selected_model.lock().unwrap().config.clone();
         let timers = self
             .inner
-            .trigger_deadlines
+            .trigger_tried_through
             .lock()
             .unwrap()
             .iter()
-            .map(|((chat, goal), next)| TimerCheckpoint {
+            .map(|((chat, goal), tried_through_ms)| TimerCheckpoint {
                 chat: *chat,
                 goal: *goal,
-                next: *next,
+                tried_through_ms: *tried_through_ms,
             })
             .collect();
         let checkpoint = AgentUpgradeCheckpoint {
@@ -216,7 +222,7 @@ impl Agent {
         }
         let was_paused = self.inner.upgrade_paused.swap(false, Ordering::SeqCst);
         self.inner.upgrade_guard.lock().await.take();
-        self.inner.input_wakeup.send_replace(());
+        self.inner.ledger_changes.send_replace(());
         self.inner.tick_wake.notify_one();
         if was_paused && !self.inner.closed.load(Ordering::SeqCst) {
             let chats = self
@@ -230,7 +236,7 @@ impl Agent {
             for chat in chats {
                 let _ = self.start_user_shell_queue(chat).await;
                 if let Ok(Some(next)) = self.next_run(chat).await {
-                    self.inner.tasks.lock().await.push(self.run_task(next));
+                    self.run_task(next);
                 }
             }
         }
@@ -272,11 +278,11 @@ impl Agent {
         {
             let mut selected = self.inner.selected_model.lock().unwrap();
             if selected.config != checkpoint.selected_model {
-                let client = tickloop_agent_model::model_client(
-                    checkpoint.selected_model.clone(),
-                    self.inner.config_root.as_deref(),
-                )
-                .map_err(|error| AgentError::Invalid(error.to_string()))?;
+                let client = self
+                    .inner
+                    .models
+                    .client(&checkpoint.selected_model)
+                    .map_err(|error| AgentError::Invalid(error.to_string()))?;
                 *selected = chat_settings::SelectedModel {
                     config: checkpoint.selected_model.clone(),
                     client,
@@ -296,24 +302,25 @@ impl Agent {
         self.inner
             .task_tools_enabled
             .store(checkpoint.task_tools_enabled, Ordering::SeqCst);
-        *self.inner.trigger_deadlines.lock().unwrap() = checkpoint
+        *self.inner.trigger_tried_through.lock().unwrap() = checkpoint
             .timers
             .iter()
-            .map(|timer| ((timer.chat, timer.goal), timer.next))
+            .map(|timer| ((timer.chat, timer.goal), timer.tried_through_ms))
             .collect();
         for saved in &checkpoint.chats {
             let snapshot = saved.snapshot.clone();
-            self.require_working_directory_trust(&snapshot.workdir)?;
+            if let Some(folder) = &snapshot.folder {
+                self.require_working_directory_trust(folder)?;
+            }
             let client = {
                 let selected = self.inner.selected_model.lock().unwrap();
                 if selected.config == snapshot.model {
                     selected.client.clone()
                 } else {
-                    tickloop_agent_model::model_client(
-                        snapshot.model.clone(),
-                        self.inner.config_root.as_deref(),
-                    )
-                    .map_err(|error| AgentError::Invalid(error.to_string()))?
+                    self.inner
+                        .models
+                        .client(&snapshot.model)
+                        .map_err(|error| AgentError::Invalid(error.to_string()))?
                 }
             };
             self.adopt_upgrade_transcript(&snapshot, &saved.bookkeeping)
@@ -324,12 +331,22 @@ impl Agent {
             {
                 tools.file_reads().record(path, read);
             }
-            let skills = self.discover_skills(&snapshot.workdir);
-            let file_history = FileHistory::from_upgrade(
-                self.file_history_directory(snapshot.id, &snapshot.workdir),
-                saved.file_history.clone(),
-            )
-            .map_err(AgentError::Invalid)?;
+            let skills = self.discover_skills(snapshot.folder.as_deref());
+            let file_history = match (&snapshot.folder, saved.file_history.clone()) {
+                (Some(folder), Some(saved)) => Some(
+                    FileHistory::from_upgrade(
+                        self.file_history_directory(snapshot.id, folder),
+                        saved,
+                    )
+                    .map_err(AgentError::Invalid)?,
+                ),
+                (None, None) => None,
+                _ => {
+                    return Err(AgentError::Invalid(
+                        "a Chat's Folder changed during Worker upgrade".into(),
+                    ));
+                }
+            };
             self.inner.chats.lock().await.insert(
                 snapshot.id,
                 Chat {
@@ -348,6 +365,7 @@ impl Agent {
                     active_run: saved.waiting.as_ref().map(|receipt| receipt.run_id),
                     upgrade_wait: saved.waiting.clone(),
                     parked: HashMap::new(),
+                    releases: HashMap::new(),
                     ready_runs: VecDeque::new(),
                     client,
                     pending_client: None,
@@ -368,6 +386,7 @@ impl Agent {
                     output_style: saved.output_style,
                     auto_denials: saved.auto_denials.clone(),
                     denial_window: saved.denial_window.clone(),
+                    branch_reservation: None,
                 },
             );
         }
@@ -453,11 +472,7 @@ impl Agent {
                         .unwrap()
                         .trigger_cancellations
                         .insert(goal.id, cancel.clone());
-                    self.inner
-                        .tasks
-                        .lock()
-                        .await
-                        .push(self.trigger_task(id, goal.id, trigger, cancel));
+                    self.trigger_task(id, goal.id, trigger, cancel);
                 }
                 if goal
                     .event_sources
@@ -472,7 +487,7 @@ impl Agent {
             if let Some(receipt) = saved.waiting {
                 let cancel = self.inner.chats.lock().await[&id].active.clone().unwrap();
                 let agent = self.clone();
-                self.inner.tasks.lock().await.push(tokio::spawn(async move {
+                self.inner.tasks.spawn(async move {
                     let result = agent.after_complete_response(&receipt, &cancel).await;
                     let mut next = match result {
                         Ok(Some(request)) => Some((receipt, request, cancel)),
@@ -494,9 +509,9 @@ impl Agent {
                     while let Some((receipt, request, cancel)) = next {
                         next = agent.run(receipt, request, cancel).await;
                     }
-                }));
+                });
             } else if let Some(next) = self.next_run(id).await? {
-                self.inner.tasks.lock().await.push(self.run_task(next));
+                self.run_task(next);
             }
         }
         self.tick_deliveries().activate_upgrade();
@@ -508,10 +523,9 @@ impl Agent {
     pub async fn shutdown_for_upgrade(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
         self.inner.shutdown.cancel();
-        for task in std::mem::take(&mut *self.inner.tasks.lock().await) {
-            task.abort();
-            let _ = task.await;
-        }
+        self.inner.tasks.abort_all();
+        self.inner.tasks.close();
+        self.inner.tasks.wait().await;
         self.inner.loop_leases.release_all();
         self.close_transcripts().await;
         self.inner.upgrade_guard.lock().await.take();
@@ -531,7 +545,7 @@ impl Agent {
             .upgrade_wait = Some(receipt.clone());
         let waited = async {
             Ok::<_, String>(
-                self.wait_for_subagents(receipt, cancel).await?
+                self.wait_for_subagents(receipt, cancel, None).await?
                     || self.wait_for_task_commands(receipt, cancel).await?,
             )
         }

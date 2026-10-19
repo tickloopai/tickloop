@@ -1,6 +1,6 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
-use tickloop_agent_model::HttpModelClient;
+use tickloop_agent_model::{LocalModelClients, ModelClients};
 use tickloop_agent_protocol::{
     Content, EventKind, InputModality, LoopState, ModelConfig, Protocol, Role, Trigger,
     TriggerPromptSource,
@@ -29,9 +29,9 @@ fn live_agent() -> Agent {
     };
     Agent::new_embedded(
         config.clone(),
-        Arc::new(
-            HttpModelClient::new(config).expect("valid DeepSeek configuration and credentials"),
-        ),
+        LocalModelClients::new(None)
+            .client(&config)
+            .expect("valid DeepSeek configuration and credentials"),
     )
 }
 
@@ -112,7 +112,10 @@ async fn live_deepseek_interval_reuses_the_goal_and_stops_future_execution() {
             id:uuid::Uuid::new_v4(),
             prompt:"Use Read to read tick-source.txt in the current working directory, then reply with the exact marker from that file. Do not use other tools.".into(),
             prompt_source: TriggerPromptSource::Explicit,
-            interval_seconds:Some(INTERVAL_SECONDS),
+            schedule:Some(tickloop_agent_protocol::Recurrence::parse(&format!("every {INTERVAL_SECONDS}s")).unwrap()),
+            armed_at_ms:None,
+            last_fired_at_ms:None,
+            confirmation: None,
             expires_at_ms:None,
             accepts_events:false,
             armed:true,

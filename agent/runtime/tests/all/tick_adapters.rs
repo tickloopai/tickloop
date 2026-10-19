@@ -5,7 +5,9 @@ use tick_protocol::InstanceRef;
 use tickloop_agent_runtime::{
     Agent, ShellTaskCenter,
     tick_adapter::TickAdapters,
-    tick_stream::{TickObservation, TickStreamEvent, TickStreamHandle, TickStreamPort},
+    tick_stream::{
+        StreamTasks, TickObservation, TickStreamEvent, TickStreamHandle, TickStreamPort,
+    },
 };
 use tickloop_agent_test_support::{ScriptedModel, config};
 use uuid::Uuid;
@@ -157,7 +159,7 @@ async fn a_shell_updates_only_when_it_exits_and_a_late_watch_takes_the_exit_as_i
     };
     wait_for_output("baseline".len()).await;
     let adapters = TickAdapters::builtin(agent.clone(), None);
-    let mut stream = adapters.open();
+    let mut stream = adapters.open(&StreamTasks::default());
     let instance = InstanceRef::shell(task.command_id);
     let first = Uuid::new_v4();
     adapters.set_watch_chats(BTreeMap::from([(first, chat)]));
@@ -213,7 +215,7 @@ async fn a_shells_exit_update_is_the_end_its_record_tells() {
         .await
         .unwrap();
     let adapters = TickAdapters::builtin(agent.clone(), None);
-    let mut stream = adapters.open();
+    let mut stream = adapters.open(&StreamTasks::default());
     let watch = Uuid::new_v4();
     adapters.set_watch_chats(BTreeMap::from([(watch, chat)]));
     stream.desired.send_replace(BTreeMap::from([(
@@ -261,4 +263,38 @@ async fn a_shells_exit_update_is_the_end_its_record_tells() {
         })
     );
     agent.shutdown().await;
+}
+
+/// The stream a Worker installs runs under its Agent: when `shutdown` returns, the stream's
+/// tasks have ended though the Agent is still held, as a host holds it for its final `sync`.
+#[tokio::test]
+async fn shutdown_ends_the_tick_stream_tasks_of_an_agent_still_held() {
+    let metrics = tokio::runtime::Handle::current().metrics();
+    let baseline = metrics.num_alive_tasks();
+    let directory = tempfile::tempdir().unwrap();
+    let agent = Agent::open_embedded(
+        directory.path().join("state"),
+        config(),
+        Arc::new(ScriptedModel::new(vec![])),
+    )
+    .unwrap();
+    agent
+        .install_tick_stream(Arc::new(TickAdapters::builtin(agent.clone(), None)))
+        .await;
+    assert!(metrics.num_alive_tasks() > baseline);
+
+    agent.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while metrics.num_alive_tasks() > baseline {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{} tasks still alive after shutdown, {baseline} before",
+            metrics.num_alive_tasks()
+        )
+    });
+    agent.sync().await.unwrap();
 }

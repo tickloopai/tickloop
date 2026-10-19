@@ -33,7 +33,7 @@ pub struct ChatStatus {
     #[serde(default)]
     pub task_boards: BTreeMap<crate::LoopId, crate::TaskBoard>,
     pub id: ChatId,
-    pub workdir: PathBuf,
+    pub folder: Option<PathBuf>,
     pub additional_directories: Vec<PathBuf>,
     pub branch_origin: Option<BranchOrigin>,
     pub generated_title: Option<String>,
@@ -160,7 +160,7 @@ impl ChatStatus {
             task_board: conversation.task_board.clone(),
             task_boards: conversation.task_boards.clone(),
             id: conversation.id,
-            workdir: conversation.workdir.clone(),
+            folder: conversation.folder.clone(),
             additional_directories: process.additional_directories.to_vec(),
             branch_origin: conversation.branch_origin.clone(),
             generated_title: conversation.generated_title.clone(),

@@ -2,7 +2,7 @@
   {
     "kind": "overview",
     "filter": {
-      "workdir": "/work/project",
+      "folder": "/work/project",
       "workspace": null
     },
     "page": {

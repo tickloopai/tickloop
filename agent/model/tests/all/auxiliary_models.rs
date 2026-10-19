@@ -1,10 +1,10 @@
 use serde_json::json;
 use tickloop_agent_model::{
-    ModelRequest,
+    LocalModelClients, ModelClients, ModelRequest,
     auxiliary::{AuxiliaryTask, auxiliary_model_config},
     cards::ModelCatalog,
     credentials::save_api_key,
-    model_client, validate_model_config, validate_reasoning_effort,
+    validate_model_config, validate_reasoning_effort,
 };
 use tickloop_agent_protocol::{Content, Message, ModelRequestKind, Protocol, Role};
 use tickloop_agent_test_support::model_http_support;
@@ -146,7 +146,9 @@ async fn auxiliary_http_clients_share_credentials_and_transport_but_leave_chat_m
         let mut configuration = ModelCatalog::defaults().get(provider, main).unwrap();
         configuration.base_url = endpoint;
         save_api_key(&root, &configuration.api_key_env, "auxiliary-fixture-key").unwrap();
-        let client = model_client(configuration.clone(), Some(&root)).unwrap();
+        let client = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&configuration)
+            .unwrap();
         for (task, tokens) in [
             (AuxiliaryTask::Title, 512),
             (AuxiliaryTask::PermissionCheck, 4096),

@@ -15,6 +15,7 @@ use tickloop_agent_protocol::{
     RequestFailure, RequestOutcome, ResponseRejection, RunId, Usage, UsageCounter,
 };
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_test_support::harness::{ChosenModels, embedded_agent};
 use tokio::sync::{Notify, broadcast, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
@@ -848,7 +849,8 @@ async fn switching_models_never_relabels_old_requests() {
         main_identity(),
         vec![ResponseStep::reply(text("First"), counters(10, 1, 0, 0))],
     ));
-    let agent = Agent::new_embedded(config(&main_identity()), first_model.clone());
+    let models = ChosenModels::new(first_model.clone());
+    let agent = embedded_agent(config(&main_identity()), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let first = agent
@@ -861,11 +863,9 @@ async fn switching_models_never_relabels_old_requests() {
         next_identity.clone(),
         vec![ResponseStep::reply(text("Second"), counters(20, 2, 0, 0))],
     ));
+    models.choose(next_model.clone());
     assert_eq!(
-        agent
-            .set_model(chat, config(&next_identity), next_model.clone())
-            .await
-            .unwrap(),
+        agent.set_model(chat, config(&next_identity)).await.unwrap(),
         ModelChange::Applied
     );
     let second = agent

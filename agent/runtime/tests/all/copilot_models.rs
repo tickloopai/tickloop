@@ -4,15 +4,16 @@ use std::{collections::HashMap, path::Path};
 
 use model_http_support::serve_responses;
 use serde_json::{Value, json};
+use std::sync::Arc;
 use tickloop_agent_model::{
-    ModelConfigExt, ModelError, ModelFailureKind, ModelOutput, ModelRequest,
-    ModelResponseRejection,
+    LocalModelClients, ModelClients, ModelConfigExt, ModelError, ModelFailureKind, ModelOutput,
+    ModelRequest, ModelResponseRejection,
     access::AccessCatalog,
     auth::copilot::CopilotAuth,
     availability::AccountModelDiscovery,
     cards::{ModelCatalog, built_in_model_profiles},
     copilot::CLIENT_HEADERS,
-    model_client, validate_reasoning_effort,
+    validate_reasoning_effort,
 };
 use tickloop_agent_protocol::{
     Adapter, Content, EventKind, ImageMediaType, ImageSource, InputModality, Message,
@@ -20,6 +21,7 @@ use tickloop_agent_protocol::{
     ProviderPatch, ReasoningEffort, Role, ThinkingBudgets, ThinkingControl, ToolDefinition,
 };
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_test_support::harness::opened_agent;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
@@ -402,7 +404,9 @@ async fn complete(
     root: &Path,
     request: ModelRequest,
 ) -> Result<ModelOutput, ModelError> {
-    let client = model_client(config, Some(root)).unwrap();
+    let client = LocalModelClients::new(Some(root.to_path_buf()))
+        .client(&config)
+        .unwrap();
     let (events, _receiver) = mpsc::unbounded_channel();
     client
         .complete_for_chat(Uuid::new_v4(), request, events, CancellationToken::new())
@@ -488,7 +492,9 @@ async fn copilot_raw_reasoning_prefix_completion_delivers_normal_answers_and_rej
                 model_http_support::raw_reasoning_prefix_reply(added_prefix, completed, true),
             )])
             .await;
-            let client = model_client(configured("gpt-6-luna", &url), Some(&root)).unwrap();
+            let client = LocalModelClients::new(Some(root.to_path_buf()))
+                .client(&configured("gpt-6-luna", &url))
+                .unwrap();
             let (events, mut deltas) = mpsc::unbounded_channel();
             let result = client
                 .complete(
@@ -822,12 +828,11 @@ async fn claude_gpt_restart_claude_keeps_history_sources_and_same_source_signatu
     .await;
     let claude = configured("claude-sonnet-5.5", &claude_url);
     let gpt = configured("gpt-6-luna", &gpt_url);
-    let agent = Agent::open_embedded(
+    let agent = opened_agent(
         root.clone(),
         claude.clone(),
-        model_client(claude.clone(), Some(&root)).unwrap(),
-    )
-    .unwrap();
+        Arc::new(LocalModelClients::new(Some(root.clone()))),
+    );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     finish_turn(&agent, chat, "First prompt", || {
         (claude_requests.len(), gpt_requests.len())
@@ -837,14 +842,7 @@ async fn claude_gpt_restart_claude_keeps_history_sources_and_same_source_signatu
         (claude_requests.len(), gpt_requests.len())
     })
     .await;
-    agent
-        .set_model(
-            chat,
-            gpt.clone(),
-            model_client(gpt.clone(), Some(&root)).unwrap(),
-        )
-        .await
-        .unwrap();
+    agent.set_model(chat, gpt.clone()).await.unwrap();
     finish_turn(&agent, chat, "Use GPT", || {
         (claude_requests.len(), gpt_requests.len())
     })
@@ -852,23 +850,15 @@ async fn claude_gpt_restart_claude_keeps_history_sources_and_same_source_signatu
     let mixed = agent.snapshot(chat).await.unwrap();
     agent.shutdown().await;
 
-    let resumed = Agent::open_embedded(
+    let resumed = opened_agent(
         root.clone(),
         gpt.clone(),
-        model_client(gpt, Some(&root)).unwrap(),
-    )
-    .unwrap();
+        Arc::new(LocalModelClients::new(Some(root.clone()))),
+    );
     let restored = resumed.resume_chat(chat).await.unwrap();
     assert_eq!(restored.messages, mixed.messages);
     assert_eq!(restored.message_sources, mixed.message_sources);
-    resumed
-        .set_model(
-            chat,
-            claude.clone(),
-            model_client(claude, Some(&root)).unwrap(),
-        )
-        .await
-        .unwrap();
+    resumed.set_model(chat, claude.clone()).await.unwrap();
     finish_turn(&resumed, chat, "Return to Claude", || {
         (claude_requests.len(), gpt_requests.len())
     })

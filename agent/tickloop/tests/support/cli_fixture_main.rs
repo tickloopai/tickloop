@@ -20,7 +20,7 @@ use std::{
 use support::fixture_cli::{BUILD_IDENTITY_MODE, CLI_MODE, build_identity};
 use tickloop_agent_client::DAEMON_RUN_ARGUMENTS;
 use tickloop_agent_daemon::WORKER_ARGUMENT;
-use tickloop_agent_model::model_client;
+use tickloop_agent_model::{LocalModelClients, ModelClients};
 use tickloop_agent_protocol::{ATTACH_ARGUMENTS, ModelConfig};
 use tickloop_agent_runtime::hosted::controller::TICKHOST_EXECUTABLE;
 
@@ -315,18 +315,37 @@ async fn worker(arguments: &[OsString]) -> Result<(), String> {
     let transport: ModelConfig =
         serde_json::from_slice(&fixture).map_err(|error| error.to_string())?;
     tickloop_agent::name_this_build();
-    tickloop_agent_daemon::run_worker_with_model_clients(
-        &arguments[1..],
-        Arc::new(move |selection, root| {
-            model_client(selection, root)?;
-            let inner = model_client(transport.clone(), root)?;
-            Ok(Arc::new(TransportClient {
+    tickloop_agent_daemon::run_worker_with_models(&arguments[1..], move |config_root| {
+        let local = LocalModelClients::new(config_root);
+        let inner = local
+            .client(&transport)
+            .map_err(|error| error.to_string())?;
+        Ok(Arc::new(TransportModels {
+            local,
+            transport: Arc::new(TransportClient {
                 inner,
-                config: transport.clone(),
-            }))
-        }),
-    )
+                config: transport,
+            }),
+        }))
+    })
     .await
+}
+
+/// Every model a Chat selects fails where the Provider client would, but keeps the fixture
+/// transport.
+struct TransportModels {
+    local: LocalModelClients,
+    transport: Arc<dyn tickloop_agent_model::ModelClient>,
+}
+
+impl ModelClients for TransportModels {
+    fn client(
+        &self,
+        config: &ModelConfig,
+    ) -> Result<Arc<dyn tickloop_agent_model::ModelClient>, tickloop_agent_model::ModelError> {
+        self.local.client(config)?;
+        Ok(self.transport.clone())
+    }
 }
 
 struct TransportClient {

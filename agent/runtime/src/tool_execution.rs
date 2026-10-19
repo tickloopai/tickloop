@@ -52,6 +52,14 @@ enum ToolRoute {
     Host(Arc<dyn crate::host_tools::HostToolProvider>),
 }
 
+/// What a call's admission hands its dispatch besides the call itself.
+struct DispatchGrant {
+    /// The host authority a Tick watch was admitted under.
+    watch_authority: Option<HostToolAuthority>,
+    /// Whether a person approved the call: their confirmation of a schedule it creates.
+    was_approved_by_human: bool,
+}
+
 enum PreparedLocalCall {
     McpResource(crate::mcp_resources::PreparedResourceCall),
     Family(agent_messages::PreparedFamilyCall),
@@ -136,49 +144,82 @@ fn merge_tick_management(mut tools: Vec<RegisteredTool>) -> Vec<RegisteredTool> 
     tools
 }
 
+/// The result of a WebSearch call in a Chat whose host does not offer it.
+const UNOFFERED_WEB_SEARCH_MESSAGE: &str =
+    "WebSearch is not available in this Chat. This call was not executed.";
+/// The result of a Task tool call in a Chat whose host does not offer Task tools.
+const UNOFFERED_TASK_TOOLS_MESSAGE: &str = "Task tools are not available in this Chat; this call was not executed. Continue with the available tools.";
+
+/// Host tools that need the Chat's Folder: they show its Ticks or send its local files.
+const FOLDER_HOST_TOOLS: [&str; 6] = [
+    crate::tick_tools::READ_WORKSPACE,
+    crate::tick_tools::TICK_DESCRIBE,
+    crate::tick_tools::TICK_READ,
+    crate::tick_tools::TICK_CALL,
+    crate::tick_tools::TICK_MANAGE,
+    crate::mcp_tools::ARTIFACT_UPLOAD_TOOL,
+];
+
 pub(super) struct ToolRegistry {
     tools: Vec<RegisteredTool>,
+    /// Whether refreshing may offer WebSearch once the Chat's search setting turns it on.
+    offers_web_search: bool,
 }
 
 impl ToolRegistry {
+    /// The tools a request of `chat` offers: those `policy` admits, and the file tools, Bash and
+    /// TaskStop only when the Chat has a Folder.
     pub(super) fn for_chat(
         chat: &Chat,
         host_provider: Option<Arc<dyn crate::host_tools::HostToolProvider>>,
         tick_stream_installed: bool,
         prompt_policy: PromptPolicy,
         task_access: shared_tasks::TaskToolAccess,
+        policy: &crate::ToolPolicy,
     ) -> Self {
         let is_delegated = chat.snapshot.delegation.is_some();
+        let has_folder = chat.snapshot.folder.is_some();
         let mut tools = tickloop_agent_tools::Tools::definitions()
             .into_iter()
-            .filter(|definition| {
-                chat.snapshot.search_config.is_some()
-                    || definition.name != tickloop_agent_tools::WEB_SEARCH_TOOL_NAME
+            .filter(|definition| match definition.name.as_str() {
+                tickloop_agent_tools::WEB_FETCH_TOOL_NAME => policy.web_fetch,
+                tickloop_agent_tools::WEB_SEARCH_TOOL_NAME => {
+                    policy.web_search && chat.snapshot.search_config.is_some()
+                }
+                _ => has_folder,
             })
             .map(|definition| RegisteredTool {
                 definition,
                 route: ToolRoute::BuiltIn,
             })
             .collect::<Vec<_>>();
-        tools.extend(
-            plan::definitions(is_delegated)
-                .into_iter()
-                .map(|definition| RegisteredTool {
-                    definition,
-                    route: ToolRoute::Plan,
-                }),
-        );
+        if policy.plan {
+            tools.extend(
+                plan::definitions(is_delegated)
+                    .into_iter()
+                    .map(|definition| RegisteredTool {
+                        definition,
+                        route: ToolRoute::Plan,
+                    }),
+            );
+        }
         tools.extend(
             interaction::definitions(is_delegated)
                 .into_iter()
+                .filter(|definition| match definition.name.as_str() {
+                    ASK_USER_QUESTION_TOOL_NAME => policy.questions,
+                    _ => policy.goals,
+                })
                 .map(|definition| RegisteredTool {
                     definition,
                     route: ToolRoute::Interaction,
                 }),
         );
-        if chat.snapshot.delegation.as_ref().is_none_or(|delegation| {
-            delegation.depth() < tickloop_agent_protocol::MAX_SUBAGENT_DEPTH
-        }) {
+        if policy.delegation
+            && chat.snapshot.delegation.as_ref().is_none_or(|delegation| {
+                delegation.depth() < tickloop_agent_protocol::MAX_SUBAGENT_DEPTH
+            })
+        {
             tools.extend(
                 delegation::definitions()
                     .into_iter()
@@ -188,15 +229,15 @@ impl ToolRegistry {
                     }),
             );
         }
-        tools.extend(
-            agent_messages::definitions()
-                .into_iter()
-                .map(|definition| RegisteredTool {
+        if policy.family_messages {
+            tools.extend(agent_messages::definitions().into_iter().map(|definition| {
+                RegisteredTool {
                     definition,
                     route: ToolRoute::AgentMessage,
-                }),
-        );
-        if task_access != shared_tasks::TaskToolAccess::Disabled {
+                }
+            }));
+        }
+        if policy.tasks && task_access != shared_tasks::TaskToolAccess::Disabled {
             tools.extend(
                 shared_tasks::definitions(task_access)
                     .into_iter()
@@ -206,13 +247,13 @@ impl ToolRegistry {
                     }),
             );
         }
-        if crate::handback::available(chat, prompt_policy) {
+        if policy.delegation && crate::handback::available(chat, prompt_policy) {
             tools.push(RegisteredTool {
                 definition: crate::handback::definition(),
                 route: ToolRoute::Handback,
             });
         }
-        if tick_stream_installed {
+        if policy.tick_subscriptions && tick_stream_installed {
             tools.extend(
                 tick_subscriptions::definitions()
                     .into_iter()
@@ -222,16 +263,18 @@ impl ToolRegistry {
                     }),
             );
         }
-        tools.extend(
-            chat.skills
-                .tool_definition_for_context(context::context_window(&chat.snapshot))
-                .into_iter()
-                .map(|definition| RegisteredTool {
-                    definition,
-                    route: ToolRoute::Skill(chat.skills.clone()),
-                }),
-        );
-        if let Some(provider) = host_provider {
+        if policy.skills {
+            tools.extend(
+                chat.skills
+                    .tool_definition_for_context(context::context_window(&chat.snapshot))
+                    .into_iter()
+                    .map(|definition| RegisteredTool {
+                        definition,
+                        route: ToolRoute::Skill(chat.skills.clone()),
+                    }),
+            );
+        }
+        if let Some(provider) = host_provider.filter(|_| policy.artifacts) {
             if provider.mcp_resource_server().is_some_and(|server| {
                 crate::mcp_resource_authority_allowed(chat, &server.authority)
             }) {
@@ -249,9 +292,10 @@ impl ToolRegistry {
                     .definitions()
                     .into_iter()
                     .filter(|definition| {
-                        chat.snapshot.delegation.as_ref().is_none_or(|delegation| {
-                            delegation.ceiling.host_tools.contains_key(&definition.name)
-                        })
+                        (has_folder || !FOLDER_HOST_TOOLS.contains(&definition.name.as_str()))
+                            && chat.snapshot.delegation.as_ref().is_none_or(|delegation| {
+                                delegation.ceiling.host_tools.contains_key(&definition.name)
+                            })
                     })
                     .map(|definition| RegisteredTool {
                         definition,
@@ -261,6 +305,7 @@ impl ToolRegistry {
         }
         Self {
             tools: merge_tick_management(tools),
+            offers_web_search: policy.web_search,
         }
     }
 
@@ -272,7 +317,7 @@ impl ToolRegistry {
     }
 
     pub(super) fn refresh(&mut self, chat: &Chat) {
-        if chat.snapshot.search_config.is_none() {
+        if !self.offers_web_search || chat.snapshot.search_config.is_none() {
             self.tools
                 .retain(|tool| tool.definition.name != tickloop_agent_tools::WEB_SEARCH_TOOL_NAME);
         } else if !self
@@ -326,6 +371,7 @@ impl ToolRegistry {
         name: &str,
         input: &Value,
         workspace: &tickloop_agent_tools::Workspace,
+        waits: crate::WaitHosting,
     ) -> bool {
         let Some(tool) = self.tools.iter().find(|tool| tool.definition.name == name) else {
             return false;
@@ -333,7 +379,16 @@ impl ToolRegistry {
         match &tool.route {
             ToolRoute::BuiltIn => tickloop_agent_tools::is_concurrency_safe(workspace, name, input),
             ToolRoute::Host(provider) => provider.is_concurrency_safe(name, input),
-            ToolRoute::Delegation | ToolRoute::McpResource(_) => true,
+            // A foreground Subagent call suspends its Run on a durable wait, and a durably
+            // hosted Run goes on from exactly one waiting call.
+            ToolRoute::Delegation => {
+                waits == crate::WaitHosting::Process
+                    || input
+                        .get("run_in_background")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+            }
+            ToolRoute::McpResource(_) => true,
             ToolRoute::SharedTask => matches!(name, "TaskGet" | "TaskList"),
             _ => false,
         }
@@ -589,7 +644,7 @@ impl Agent {
         operation: &OperationRecord,
         registered: &RegisteredTool,
         prepared_local: Option<&PreparedLocalCall>,
-        authority: Option<HostToolAuthority>,
+        grant: DispatchGrant,
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
         match &registered.route {
@@ -639,8 +694,13 @@ impl Agent {
             ToolRoute::Skill(skills) => self.skill_tool(receipt, skills, &operation.input).await,
             ToolRoute::TickManage(_) => Err("TickManage route was not prepared".into()),
             ToolRoute::TickSubscription => {
-                self.tick_subscription_tool(receipt, &operation.name, &operation.input, authority)
-                    .await
+                self.tick_subscription_tool(
+                    receipt,
+                    &operation.name,
+                    &operation.input,
+                    grant.watch_authority,
+                )
+                .await
             }
             ToolRoute::Host(provider) => Ok(provider
                 .execute(
@@ -656,6 +716,7 @@ impl Agent {
                     &operation.call_id,
                     &operation.name,
                     &operation.input,
+                    grant.was_approved_by_human,
                     cancel,
                 )
                 .await
@@ -816,13 +877,22 @@ impl Agent {
                     .is_some_and(|chat| chat.snapshot.search_config.is_none()))
         {
             return Ok(ToolCallOutcome::not_admitted(
-                tickloop_agent_tools::web_search::DISABLED_MESSAGE.into(),
+                if self.inner.tool_policy.web_search {
+                    tickloop_agent_tools::web_search::DISABLED_MESSAGE
+                } else {
+                    UNOFFERED_WEB_SEARCH_MESSAGE
+                }
+                .into(),
             ));
         }
         if registration.is_none() && shared_tasks::is_task_tool(&name) {
             return Ok(ToolCallOutcome::not_admitted(
-                "Task tools are disabled or limited for this request; this call was not executed. Continue with the available tools. Task tools can be enabled in Settings."
-                    .into(),
+                if self.inner.tool_policy.tasks {
+                    "Task tools are disabled or limited for this request; this call was not executed. Continue with the available tools. Task tools can be enabled in Settings."
+                } else {
+                    UNOFFERED_TASK_TOOLS_MESSAGE
+                }
+                .into(),
             ));
         }
         self.refresh_task_binding_setting(receipt)
@@ -900,7 +970,7 @@ impl Agent {
             {
                 return Ok(ToolCallOutcome::not_admitted(error));
             }
-            let context = self.host_call_context(receipt, &workspace.workdir);
+            let context = self.host_call_context(receipt, workspace.folder.as_deref());
             let local_files = self
                 .inner
                 .chats
@@ -917,7 +987,7 @@ impl Agent {
                     }),
                 );
             let scope = crate::host_tools::HostCallScope {
-                local_files: &local_files,
+                local_files: local_files.as_ref(),
                 context: context.as_ref(),
             };
             let prepared = provider
@@ -1041,7 +1111,7 @@ impl Agent {
             registration.as_ref().map(|registered| &registered.route),
             Some(ToolRoute::Handback)
         ) {
-            match self.prepare_handback(receipt, &input).await {
+            match self.prepare_handback(receipt, &id, &input).await {
                 Ok(prepared) => Some(PreparedLocalCall::Handback(prepared)),
                 Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),
             }
@@ -1088,6 +1158,13 @@ impl Agent {
         {
             return Ok(ToolCallOutcome::not_admitted(error));
         }
+        let artifact_admission = match self
+            .check_artifact_provenance(receipt, normalized_name, normalized_input)
+            .await
+        {
+            Ok(admission) => admission,
+            Err(error) => return Ok(ToolCallOutcome::not_admitted(error)),
+        };
         let mut host_call_status = None;
         let mut host_effect = None;
         let result = if registration
@@ -1163,10 +1240,15 @@ impl Agent {
             // only a Deny rule or a host without prompts refuses it without asking.
             let requires_plan_mode_consent =
                 name == ENTER_PLAN_MODE_TOOL_NAME && execution_mode != ExecutionMode::Plan;
+            // A schedule the model creates runs only once the user confirms it: here the prompt
+            // confirms it, while a durable host registers it to await the user's decision. A
+            // process host without prompts has no one to confirm it and refuses it.
+            let requires_schedule_consent = crate::interaction::creates_schedule(&name, &input)
+                && self.inner.waits != WaitHosting::Durable;
             let decision = match decision {
                 Decision::Deny => Decision::Deny,
                 _ if name == EXIT_PLAN_MODE_TOOL_NAME => Decision::Allow,
-                _ if requires_plan_mode_consent => Decision::Ask,
+                _ if requires_plan_mode_consent || requires_schedule_consent => Decision::Ask,
                 Decision::Ask
                     if execution_mode == ExecutionMode::Auto
                         && !explicit_ask
@@ -1183,8 +1265,15 @@ impl Agent {
             let mut decision = self.apply_prompt_policy_with_explicit_ask(
                 decision,
                 explicit_ask
+                    || requires_schedule_consent
                     || host_permission == Some(crate::host_tools::HostToolPermission::Confirmation),
             );
+            // A write to an Artifact with provenance needs no review; rules still decide.
+            if decision == Decision::Check
+                && artifact_admission == super::web_provenance::ArtifactAdmission::Vouched
+            {
+                decision = Decision::Allow;
+            }
             let mut assessment_details = None;
             let mut approval_source = if explicit_ask {
                 PermissionApprovalSource::ExplicitAsk
@@ -1197,6 +1286,8 @@ impl Agent {
                     "an explicit Ask rule requires human approval"
                 } else if requires_plan_mode_consent {
                     "entering plan mode requires the user's confirmation"
+                } else if requires_schedule_consent {
+                    "a schedule the Agent creates runs only once the user confirms it"
                 } else {
                     "the permission policy requires human approval"
                 },
@@ -1514,6 +1605,15 @@ impl Agent {
                                 .await;
                             host_call_status = Some(host_result.status());
                             let (result, effect) = host_result.into_parts();
+                            if let Some(crate::host_tools::HostEffect::CreatedArtifact(created)) =
+                                &effect
+                            {
+                                self.remember_created_artifact(
+                                    receipt.chat_id,
+                                    &created.artifact_id,
+                                )
+                                .await;
+                            }
                             host_effect = effect;
                             Ok(result)
                         } else {
@@ -1529,7 +1629,10 @@ impl Agent {
                                     .as_ref()
                                     .expect("registered local or Host tool"),
                                 prepared_local.as_ref(),
-                                watch_authority,
+                                DispatchGrant {
+                                    watch_authority,
+                                    was_approved_by_human,
+                                },
                                 cancel.clone(),
                             )
                             .await
@@ -1568,6 +1671,9 @@ impl Agent {
                     {
                         return Ok(ToolCallOutcome::not_admitted(error));
                     }
+                    if let Err(error) = self.check_web_fetch_provenance(receipt, &prepared).await {
+                        return Ok(ToolCallOutcome::not_admitted(error));
+                    }
                     let session_operation =
                         SessionPermissionOperation::from_prepared(&prepared, &configured_workspace)
                             .map_err(|error| error.to_string())?;
@@ -1604,11 +1710,13 @@ impl Agent {
                         let sessions = self.inner.session_permissions.lock().await;
                         let session_evaluation =
                             sessions.evaluate(permission_owner, &session_operation);
-                        let plan_file = plan::current_plan_file(
-                            &chat.bookkeeping,
-                            self.plans_directory(&chat.snapshot.workdir).path(),
-                            receipt.loop_id,
-                        );
+                        let plan_file = chat.snapshot.folder.as_deref().and_then(|folder| {
+                            plan::current_plan_file(
+                                &chat.bookkeeping,
+                                self.plans_directory(folder).path(),
+                                receipt.loop_id,
+                            )
+                        });
                         let authority = delegation::permission_authority(
                             &chats,
                             &sessions,
@@ -1932,7 +2040,9 @@ impl Agent {
                         .map_err(ToolCallError::from)?;
                         let chat = chats.get(&receipt.chat_id).unwrap();
                         if let Err(error) =
-                            self.require_working_directory_trust(&chat.snapshot.workdir)
+                            chat.snapshot.folder.as_deref().map_or(Ok(()), |folder| {
+                                self.require_working_directory_trust(folder)
+                            })
                         {
                             let reason = error.to_string();
                             let record = super::denials::DenialCandidate::new(
@@ -2077,6 +2187,8 @@ impl Agent {
                                 context,
                                 &secondary_model,
                             )
+                            .await;
+                        self.remember_fetch_observations(receipt.chat_id, &tools)
                             .await;
                         images = execution.images;
                         execution.result.map_err(|error| error.to_string())
@@ -2286,6 +2398,7 @@ mod tests {
                 false,
                 PromptPolicy::Interactive,
                 shared_tasks::TaskToolAccess::Disabled,
+                &crate::ToolPolicy::local(),
             );
             for enabled in [false, true, false] {
                 chat.snapshot.search_config =
@@ -2330,6 +2443,7 @@ mod tests {
                 false,
                 PromptPolicy::Interactive,
                 shared_tasks::TaskToolAccess::Disabled,
+                &crate::ToolPolicy::local(),
             )
             .resolve(tickloop_agent_config::skills::SKILL_TOOL_NAME)
             .unwrap()

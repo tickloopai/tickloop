@@ -4,7 +4,7 @@ use std::{path::Path, sync::Arc};
 
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use serde_json::{Value, json};
-use tickloop_agent_model::{HttpModelClient, ModelClient, ModelError, ModelRequest};
+use tickloop_agent_model::{LocalModelClients, ModelClients, ModelError, ModelRequest};
 use tickloop_agent_protocol::{
     ChatId, Content, DirectedSummaryRequest, EventKind, ImageMediaType, ImageSource, Message,
     ModelConfig, Role, SummaryDirection, ToolResultBlock, ToolResultContent,
@@ -251,7 +251,9 @@ async fn complete(
     base_url: String,
     request: ModelRequest,
 ) -> Result<tickloop_agent_model::ModelOutput, ModelError> {
-    let client = HttpModelClient::new(http_config(base_url)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&http_config(base_url))
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     client
         .complete(request, events, CancellationToken::new())

@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::file_change::{ARTIFACT_DIRECTORY, FileChangeArtifactError, persist_file_change_review};
 use tickloop_agent_base::image::ImageError;
+use tickloop_agent_base::network::Reach;
 use tickloop_agent_base::private_fs::{OpenTarget, PrivateDirectory, open_without_following_links};
 use tickloop_agent_protocol::{
     CommandSnapshot, CommandState, FileReadRecord, Image, PreparedFileChange, SearchConfig,
@@ -34,6 +35,7 @@ pub use shell::{
     TASK_STOP_TOOL_NAME, UserCommandSnapshot,
 };
 mod web;
+pub mod web_provenance;
 pub mod web_search;
 pub use web::SecondaryModel;
 pub use web::{WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME};
@@ -55,17 +57,22 @@ const DEFAULT_OUTPUT_BYTES: usize = 16 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 pub const TASK_OUTPUT_SUBDIRECTORY: &str = "tasks";
 pub const SCRATCHPAD_SUBDIRECTORY: &str = "scratchpad";
+/// Why a tool that works on local files or commands refuses a Chat without a Folder.
+const FOLDERLESS_REJECTION: &str =
+    "This Chat has no Folder, so it cannot read or change files or run commands.";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Workspace {
-    pub workdir: PathBuf,
+    /// The Chat's Folder; `None` for a Chat without one, which prepares only the network tools.
+    pub folder: Option<PathBuf>,
     pub additional_directories: Vec<PathBuf>,
 }
 
 impl Workspace {
     /// Whether the canonical `path` lies in the canonical form of a workspace directory.
     fn contains(&self, path: &Path) -> bool {
-        std::iter::once(&self.workdir)
+        self.folder
+            .iter()
             .chain(&self.additional_directories)
             .filter_map(|directory| directory.canonicalize().ok())
             .any(|directory| path.starts_with(directory))
@@ -74,7 +81,8 @@ impl Workspace {
     /// `path` below the workspace directory that holds it, as written or in canonical form, or
     /// the whole path when no directory does.
     fn below_directory<'a>(&self, path: &'a Path) -> &'a Path {
-        std::iter::once(&self.workdir)
+        self.folder
+            .iter()
             .chain(&self.additional_directories)
             .flat_map(|directory| [Some(directory.clone()), directory.canonicalize().ok()])
             .flatten()
@@ -453,65 +461,83 @@ pub enum ToolError {
     FileChange(#[from] FileChangeArtifactError),
 }
 
+/// The local directories of one Chat with a Folder.
+#[derive(Clone, Debug)]
+pub struct ChatDirectory {
+    /// File change reviews and stored tool results go here.
+    pub chat: PrivateDirectory,
+    /// 后台任务输出目录，照 Claude Code 位于系统临时目录下的 `<chatId>/tasks`。
+    pub task_output: PrivateDirectory,
+    /// Canonical private family temp space, shared by the family's root and its children.
+    pub family_temp: PrivateDirectory,
+}
+
 #[derive(Clone)]
 pub struct Tools {
-    /// Chat 目录：文件改动 review 与外存的工具结果写在这里。
-    output_dir: PrivateDirectory,
-    /// 后台任务输出目录，照 Claude Code 位于系统临时目录下的 `<chatId>/tasks`。
-    task_output_dir: PrivateDirectory,
-    /// Canonical private family temp space, shared by the family's root and its children.
-    family_temp: PrivateDirectory,
+    /// `None` for a Chat without a Folder, whose tools write no local file.
+    directory: Option<ChatDirectory>,
     commands: shell::Registry,
     search: std::sync::Arc<tokio::sync::RwLock<Option<SearchConfig>>>,
     fetched_pages: web::FetchCache,
+    /// What this Chat's fetches saw that may give provenance to later URLs.
+    observed_urls: web_provenance::Observations,
     search_credential_root: Option<PathBuf>,
     file_reads: FileReadState,
+    /// The addresses `WebFetch` may reach.
+    reach: Reach,
 }
 
 impl Tools {
     /// 独立使用时，附属文件与任务输出都放在 `output_dir` 下；没有运行命令的宿主，Shell 命令被拒绝。
     pub fn new(output_dir: PathBuf) -> Self {
         let output_dir = PrivateDirectory::trusted(output_dir);
-        let task_output_dir = output_dir.join(TASK_OUTPUT_SUBDIRECTORY);
         Self::with_commands(
-            output_dir.clone(),
-            task_output_dir,
-            output_dir,
+            Some(ChatDirectory {
+                task_output: output_dir.join(TASK_OUTPUT_SUBDIRECTORY),
+                family_temp: output_dir.clone(),
+                chat: output_dir,
+            }),
             shell::Registry::without_host(),
+            Reach::Anywhere,
         )
     }
 
-    /// The tools of one Chat, whose shell commands run in `shells`.
-    pub fn for_chat(
-        chat_directory: PrivateDirectory,
-        task_output_dir: PrivateDirectory,
-        family_temp: PrivateDirectory,
-        shells: std::sync::Arc<dyn ShellHost>,
-    ) -> Self {
+    /// The tools of one Chat with a Folder, whose shell commands run in `shells`.
+    pub fn for_chat(directory: ChatDirectory, shells: std::sync::Arc<dyn ShellHost>) -> Self {
         Self::with_commands(
-            chat_directory,
-            task_output_dir,
-            family_temp,
+            Some(directory),
             shell::Registry::new(shells),
+            Reach::Anywhere,
         )
+    }
+
+    /// The tools of a Chat without a Folder: they touch no local file, run no command, and fetch
+    /// only from the addresses `reach` admits.
+    pub fn folderless(reach: Reach) -> Self {
+        Self::with_commands(None, shell::Registry::without_folder(), reach)
     }
 
     fn with_commands(
-        chat_directory: PrivateDirectory,
-        task_output_dir: PrivateDirectory,
-        family_temp: PrivateDirectory,
+        directory: Option<ChatDirectory>,
         commands: shell::Registry,
+        reach: Reach,
     ) -> Self {
         Self {
-            output_dir: chat_directory,
-            task_output_dir,
-            family_temp,
+            directory,
             commands,
             search: std::sync::Arc::new(tokio::sync::RwLock::new(SearchConfig::enabled_default())),
             fetched_pages: web::FetchCache::default(),
+            observed_urls: web_provenance::Observations::default(),
             search_credential_root: None,
             file_reads: FileReadState::default(),
+            reach,
         }
+    }
+
+    /// What this Chat's fetches saw since the last call: links on their pages' origins and
+    /// redirects within a site, for the host to keep.
+    pub fn take_fetch_observations(&self) -> web_provenance::FetchObservations {
+        self.observed_urls.take()
     }
 
     pub fn with_search_configuration(
@@ -530,11 +556,24 @@ impl Tools {
         name: &str,
         input: &Value,
     ) -> Result<PreparedTool, ToolError> {
+        let Some(directory) = self.directory.clone() else {
+            let prepared = prepare_with_readable_directories(
+                workspace,
+                name,
+                input,
+                &[],
+                None,
+                &self.file_reads,
+            )?;
+            if let Operation::WebFetch(fetch) = &prepared.operation {
+                web::check_reach(&fetch.url, self.reach)?;
+            }
+            return self.bind_search(prepared).await;
+        };
         let owned_workspace = workspace.clone();
         let owned_name = name.to_owned();
         let owned_input = input.clone();
-        let output_dir = self.output_dir.clone();
-        let family_temp = self.family_temp.clone();
+        let family_temp = directory.family_temp.clone();
         family_temp
             .create()
             .map_err(|error| io_error(family_temp.path(), error))?;
@@ -543,12 +582,13 @@ impl Tools {
             .create()
             .map_err(|error| io_error(scratchpad.path(), error))?;
         let readable_directories = vec![
-            self.output_dir.path().to_path_buf(),
+            directory.chat.path().to_path_buf(),
             family_temp.path().to_path_buf(),
         ];
         let file_reads = self.file_reads.clone();
+        let output_dir = directory.chat;
         let join_error_path = output_dir.path().to_path_buf();
-        let mut prepared = tokio::task::spawn_blocking(move || {
+        let prepared = tokio::task::spawn_blocking(move || {
             let mut prepared = prepare_with_readable_directories(
                 &owned_workspace,
                 &owned_name,
@@ -579,6 +619,12 @@ impl Tools {
         if let Operation::TaskStop(input) = &prepared.operation {
             self.commands.stoppable_task(&input.task_id).await?;
         }
+        self.bind_search(prepared).await
+    }
+
+    /// Binds a `WebSearch` call to the Chat's search service and its credential before
+    /// approval, with or without a Folder.
+    async fn bind_search(&self, mut prepared: PreparedTool) -> Result<PreparedTool, ToolError> {
         if let Operation::WebSearch(search) = &mut prepared.operation {
             let config = self
                 .search
@@ -601,21 +647,23 @@ impl Tools {
     }
 
     /// Read-only access to this Chat's local files in `workspace`, for a host tool that sends a
-    /// file elsewhere; `admission` decides each `Read` before the file is opened.
+    /// file elsewhere; `admission` decides each `Read` before the file is opened. A Chat without
+    /// a Folder has none.
     pub fn local_file_reader(
         &self,
         workspace: &Workspace,
         admission: std::sync::Arc<dyn LocalReadAdmission>,
-    ) -> LocalFileReader {
-        LocalFileReader {
+    ) -> Option<LocalFileReader> {
+        let directory = self.directory.as_ref()?;
+        Some(LocalFileReader {
             workspace: workspace.clone(),
             readable_directories: vec![
-                self.output_dir.path().to_path_buf(),
-                self.family_temp.path().to_path_buf(),
+                directory.chat.path().to_path_buf(),
+                directory.family_temp.path().to_path_buf(),
             ],
-            family_temp: self.family_temp.path().to_path_buf(),
+            family_temp: directory.family_temp.path().to_path_buf(),
             admission,
-        }
+        })
     }
 
     pub async fn set_search(&self, config: Option<SearchConfig>) -> Result<(), ToolError> {
@@ -675,17 +723,25 @@ impl Tools {
     ) -> Result<ToolResult, ToolError> {
         shell::command_output(command, offset, limit)
     }
-    pub fn family_temp_directory(&self) -> &Path {
-        self.family_temp.path()
+    pub fn family_temp_directory(&self) -> Option<&Path> {
+        Some(self.directory.as_ref()?.family_temp.path())
     }
 
-    pub fn chat_directory(&self) -> &PrivateDirectory {
-        &self.output_dir
+    /// Where this Chat keeps file change reviews and stored tool results; `None` without a Folder.
+    pub fn chat_directory(&self) -> Option<&PrivateDirectory> {
+        Some(&self.directory.as_ref()?.chat)
     }
 
     /// What this Chat's `Read` calls returned, for Claude Code's read-before-write checks.
     pub fn file_reads(&self) -> &FileReadState {
         &self.file_reads
+    }
+
+    fn task_output_directory(&self) -> Result<&PrivateDirectory, ToolError> {
+        self.directory
+            .as_ref()
+            .map(|directory| &directory.task_output)
+            .ok_or_else(|| ToolError::Rejected(FOLDERLESS_REJECTION.into()))
     }
 
     pub fn subscribe_commands(&self) -> tokio::sync::broadcast::Receiver<CommandSnapshot> {
@@ -715,7 +771,7 @@ impl Tools {
             .execute_user(
                 &prepared.resolved_path,
                 input,
-                &self.task_output_dir,
+                self.task_output_directory()?,
                 operation_id,
                 chat_id,
                 cancel,
@@ -786,9 +842,16 @@ impl Tools {
             return web::search(input.clone(), cancel).await.into();
         }
         if let Operation::WebFetch(input) = &prepared.operation {
-            return web::fetch(input.clone(), &self.fetched_pages, secondary_model, cancel)
-                .await
-                .into();
+            return web::fetch(
+                input.clone(),
+                &self.fetched_pages,
+                &self.observed_urls,
+                self.reach,
+                secondary_model,
+                cancel,
+            )
+            .await
+            .into();
         }
         if let Operation::TaskStop(input) = &prepared.operation {
             if cancel.is_cancelled() {
@@ -813,7 +876,7 @@ impl Tools {
                     .execute(
                         &prepared.resolved_path,
                         input.clone(),
-                        &self.task_output_dir,
+                        self.task_output_directory()?,
                         context.operation_id,
                         context.loop_id,
                         cancel,
@@ -904,7 +967,10 @@ impl Tools {
         };
         let outcome = joined.unwrap_or_else(|_| {
             Err(ToolError::Io {
-                path: self.output_dir.path().to_path_buf(),
+                path: self.chat_directory().map_or_else(
+                    || resolved_path.clone(),
+                    |directory| directory.path().into(),
+                ),
                 reason: "file task did not finish".into(),
             })
         });
@@ -1029,9 +1095,27 @@ fn prepare_with_readable_directories(
             "path must not be empty or contain NUL".into(),
         ));
     }
-    let original_path = workspace.workdir.join(&path);
+    let Some(folder) = workspace.folder.as_deref() else {
+        if !matches!(operation, Operation::WebFetch(_) | Operation::WebSearch(_)) {
+            return Err(ToolError::Rejected(FOLDERLESS_REJECTION.into()));
+        }
+        return Ok(PreparedTool {
+            name: name.into(),
+            input: normalized_input,
+            requires_permission: true,
+            is_read_only: true,
+            in_workspace: false,
+            file_change: None,
+            in_family_temp: false,
+            automatic_shell_workspace: None,
+            original_path: PathBuf::new(),
+            resolved_path: PathBuf::new(),
+            operation,
+        });
+    };
+    let original_path = folder.join(&path);
     if let Operation::Search(request) = &mut operation {
-        request.bind(&original_path, &path, &workspace.workdir)?;
+        request.bind(&original_path, &path, folder)?;
     }
     let mut automatic_shell_workspace = None;
     let is_read_only = match &mut operation {
@@ -1071,7 +1155,7 @@ fn prepare_with_readable_directories(
             &resolved_path,
             *operation,
             file_reads,
-            &workspace.workdir,
+            folder,
         )?)),
         other => other,
     };

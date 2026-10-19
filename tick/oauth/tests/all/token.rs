@@ -147,3 +147,39 @@ async fn revoking_names_the_refresh_token_or_else_the_access_token() {
     revoke(&http(), &unrevocable).await.unwrap();
     assert_eq!(server.requests_to(REVOCATION_PATH).len(), before);
 }
+
+#[tokio::test]
+async fn resource_refresh_rotates_the_refresh_token_and_keeps_the_selected_audience() {
+    let server = AuthorizationServer::start_with_path("/account");
+    server.answer_polls([TokenReply::Approve, TokenReply::Approve]);
+    let saved = token(&server, Some("refresh-old"));
+    let first = tick_oauth::refresh_for_resource(
+        &http(),
+        &saved,
+        "refresh-old",
+        Some("https://resource.example/artifact"),
+        |request| request,
+    )
+    .await
+    .unwrap();
+    let second = tick_oauth::refresh_for_resource(
+        &http(),
+        &first,
+        first.refresh_token().unwrap(),
+        Some("https://resource.example/other"),
+        |request| request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.refresh_token(), Some("refresh-2"));
+    let requests = server.requests_to(TOKEN_PATH);
+    assert_eq!(
+        requests[0].form["resource"],
+        "https://resource.example/artifact"
+    );
+    assert_eq!(
+        requests[1].form["resource"],
+        "https://resource.example/other"
+    );
+    assert_eq!(requests[1].form["refresh_token"], "refresh-1");
+}

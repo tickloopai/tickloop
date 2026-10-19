@@ -41,7 +41,7 @@
               "generation": 3
             },
             "chat_id": "00000000-0000-0000-0000-0000000000c1",
-            "workdir": "/work/project",
+            "folder": "/work/project",
             "state": "Running",
             "run_id": "00000000-0000-0000-0000-000000000020",
             "run_started_at": 1000,

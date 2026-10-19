@@ -399,3 +399,130 @@ async fn the_server_must_describe_itself_and_offer_the_device_grant() {
         "issuer http://auth.example.com/ is refused: only https is accepted, or http on this machine"
     );
 }
+
+#[tokio::test]
+async fn a_preregistered_client_uses_path_discovery_without_registration() {
+    use tick_oauth::ClientRegistration;
+    use tick_test_support::authorization_server::AuthorizationServer;
+    let fixture = Login::new();
+    let server = AuthorizationServer::start_with_path("/account");
+    server.edit_metadata(|metadata| {
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("registration_endpoint");
+    });
+    server.answer_polls([TokenReply::Approve]);
+    let login = DeviceLogin::start_with(
+        http(),
+        &fixture.credentials,
+        server.issuer(),
+        &["openid".into()],
+        ClientRegistration::Preregistered("public-cli"),
+        &[
+            "https://resource.example/one".into(),
+            "https://resource.example/two".into(),
+        ],
+    )
+    .await
+    .unwrap();
+    login
+        .finish(&CancellationToken::new(), |_| {})
+        .await
+        .unwrap();
+    let requests = server.requests();
+    assert_eq!(
+        requests[0].path,
+        "/.well-known/oauth-authorization-server/account"
+    );
+    assert!(server.requests_to(REGISTRATION_PATH).is_empty());
+    let authorization = &server.requests_to(DEVICE_AUTHORIZATION_PATH)[0];
+    assert_eq!(authorization.form["client_id"], "public-cli");
+    assert_eq!(
+        authorization
+            .form_pairs
+            .iter()
+            .filter(|(key, _)| key == "resource")
+            .count(),
+        2
+    );
+    assert_eq!(fixture.saved()["client_id"], "public-cli");
+    assert_eq!(fixture.saved()["issuer"], server.issuer());
+}
+
+#[tokio::test]
+async fn a_lost_device_exchange_is_refused_without_saving_a_token() {
+    let fixture = Login::new();
+    fixture.server.answer_polls([TokenReply::LostExchange]);
+    assert!(
+        matches!(fixture.run().await, Err(LoginError::Refused { code, .. }) if code == "invalid_grant")
+    );
+    assert!(!fixture.credentials.oauth_token_path().exists());
+    assert_eq!(fixture.server.requests_to(TOKEN_PATH).len(), 2);
+}
+
+#[tokio::test]
+async fn issuer_queries_and_fragments_are_rejected_before_discovery() {
+    let fixture = Login::new();
+    for suffix in ["?query=1", "#fragment"] {
+        assert!(
+            DeviceLogin::start(
+                http(),
+                &fixture.credentials,
+                &format!("{}{suffix}", fixture.server.issuer()),
+                &[]
+            )
+            .await
+            .is_err()
+        );
+    }
+    assert!(fixture.server.requests().is_empty());
+}
+
+#[tokio::test]
+async fn preregistered_clients_work_with_a_callers_store_and_never_fall_back_to_dcr() {
+    use std::sync::{Arc, Mutex};
+    use tick_oauth::{ClientRegistration, CredentialStore, OAuthToken};
+    #[derive(Clone, Default)]
+    struct Store(Arc<Mutex<Option<OAuthToken>>>);
+    #[async_trait::async_trait]
+    impl CredentialStore for Store {
+        async fn save_token(&self, token: &OAuthToken) -> Result<(), LoginError> {
+            *self.0.lock().unwrap() = Some(token.clone());
+            Ok(())
+        }
+    }
+    let server = tick_test_support::authorization_server::AuthorizationServer::start();
+    let store = Store::default();
+    server.answer_polls([TokenReply::Approve]);
+    DeviceLogin::start_with(
+        http(),
+        &store,
+        server.issuer(),
+        &[],
+        ClientRegistration::Preregistered("public-cli"),
+        &[],
+    )
+    .await
+    .unwrap()
+    .finish(&CancellationToken::new(), |_| {})
+    .await
+    .unwrap();
+    assert_eq!(
+        store.0.lock().unwrap().as_ref().unwrap().client_id,
+        "public-cli"
+    );
+    server.reject_client("public-cli");
+    let error = DeviceLogin::start_with(
+        http(),
+        &store,
+        server.issuer(),
+        &[],
+        ClientRegistration::Preregistered("public-cli"),
+        &[],
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, LoginError::Refused { code, .. } if code == "invalid_client"));
+    assert!(server.requests_to(REGISTRATION_PATH).is_empty());
+}

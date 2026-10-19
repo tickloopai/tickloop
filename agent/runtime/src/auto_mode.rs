@@ -324,7 +324,7 @@ mod tests {
     fn empty_snapshot() -> ChatSnapshot {
         super::super::empty_snapshot(
             uuid::Uuid::new_v4(),
-            "/work".into(),
+            Some("/work".into()),
             ModelConfig {
                 provider: tickloop_agent_protocol::ModelProvider::Api,
                 auth_source: tickloop_agent_protocol::ModelAuthSource::ApiKeyEnv,
@@ -542,6 +542,7 @@ mod tests {
             &bookkeeping,
             &operation,
             None,
+            snapshot.folder.as_deref().unwrap(),
             tickloop_agent_config::AutoSettings::default().policy(),
         )
         .unwrap();

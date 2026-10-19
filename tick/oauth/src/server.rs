@@ -36,6 +36,7 @@ pub(crate) struct Endpoints {
     pub(crate) device_authorization: Url,
     pub(crate) registration: Option<Url>,
     pub(crate) revocation: Option<Url>,
+    pub(crate) userinfo: Option<Url>,
 }
 
 #[derive(Deserialize)]
@@ -45,6 +46,7 @@ struct Metadata {
     device_authorization_endpoint: Option<String>,
     registration_endpoint: Option<String>,
     revocation_endpoint: Option<String>,
+    userinfo_endpoint: Option<String>,
     grant_types_supported: Option<Vec<String>>,
 }
 
@@ -95,6 +97,11 @@ impl Server {
             is_on_this_machine: is_on_this_machine(&url),
         };
         server.endpoint(issuer, "issuer")?;
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(LoginError::Failed(
+                "the issuer must have no query or fragment".into(),
+            ));
+        }
         Ok(server)
     }
 
@@ -146,6 +153,7 @@ impl Server {
                 .endpoint(&device_authorization, "device_authorization_endpoint")?,
             registration: optional(metadata.registration_endpoint, "registration_endpoint")?,
             revocation: optional(metadata.revocation_endpoint, "revocation_endpoint")?,
+            userinfo: optional(metadata.userinfo_endpoint, "userinfo_endpoint")?,
         })
     }
 

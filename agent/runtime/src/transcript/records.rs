@@ -5,14 +5,14 @@ use tickloop_agent_protocol::{
     SavedChat, TranscriptRef,
 };
 
-/// The saved Chats of `workdir` under the config `root`, one page of them.
+/// The saved Chats of `folder` under the config `root`, one page of them.
 pub async fn saved_records(
     root: PathBuf,
-    workdir: PathBuf,
+    folder: PathBuf,
     page: Page,
 ) -> Result<ObservationValue, AccessError> {
-    let directory = super::project_directory(&root, &workdir);
-    let records = tokio::task::spawn_blocking(move || super::list_project(&directory))
+    let directory = super::path::project_directory(&root, &folder);
+    let records = tokio::task::spawn_blocking(move || super::listing::list_project(&directory))
         .await
         .map_err(|error| AccessError::new(AccessErrorCode::Storage, error.to_string()))?
         .map_err(|error| AccessError::new(AccessErrorCode::Storage, error.to_string()))?;
@@ -42,10 +42,10 @@ pub async fn transcript(
 ) -> Result<ObservationValue, AccessError> {
     let requested = record.clone();
     let loaded = tokio::task::spawn_blocking(move || {
-        let Some(path) = super::locate(&requested.store_root, requested.chat_id)? else {
+        let Some(path) = super::path::locate(&requested.store_root, requested.chat_id)? else {
             return Ok(None);
         };
-        super::load(&path)
+        super::jsonl::load_file(&path)
     })
     .await
     .map_err(|error| AccessError::new(AccessErrorCode::Storage, error.to_string()))?
@@ -57,14 +57,15 @@ pub async fn transcript(
         )
     })?;
     let total_messages = loaded.chain.len();
-    let workdir = loaded
+    let folder = loaded
         .chain
         .first()
-        .map_or_else(PathBuf::new, |entry| entry.cwd.clone());
+        .and_then(|entry| entry.cwd.clone())
+        .unwrap_or_default();
     Ok(ObservationValue::Transcript(Box::new(RecordedTranscript {
         record,
         title: loaded.metadata.custom_title.map(|entry| entry.custom_title),
-        workdir,
+        folder,
         total_messages,
         warnings: loaded.warnings,
         messages: loaded

@@ -282,6 +282,12 @@ impl Agent {
             if cancel.is_cancelled() {
                 return Err(ModelError::Cancelled.into());
             }
+            // Waiting at the host's gates spends none of the review's time.
+            let _permits = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ModelError::Cancelled.into()),
+                permits = self.vendor_request_permits() => permits?,
+            };
             let sequence = {
                 let mut chats = self.inner.chats.lock().await;
                 let chat = chats

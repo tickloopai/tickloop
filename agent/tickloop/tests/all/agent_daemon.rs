@@ -1814,7 +1814,7 @@ async fn a_lost_worker_stays_visible_and_only_explicit_resume_creates_a_new_exec
     let saved = daemon
         .observe(ObservationRequest::SavedRecords {
             store_root: Some(root),
-            workdir: temporary.path().to_path_buf(),
+            folder: temporary.path().to_path_buf(),
             page: Page {
                 offset: 0,
                 limit: 256,
@@ -2562,7 +2562,7 @@ async fn an_oversized_accepted_receipt_stays_queryable_without_replaying_the_com
             provider: None,
             execution: target,
             change: ConfigurationChange::Directories {
-                workdir: temporary.path().to_path_buf(),
+                folder: temporary.path().to_path_buf(),
                 additional: vec![],
             },
         },
@@ -2597,7 +2597,7 @@ async fn an_oversized_accepted_receipt_stays_queryable_without_replaying_the_com
         .await
         .unwrap();
     assert!(
-        matches!(snapshot.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.workdir == temporary.path().canonicalize().unwrap())
+        matches!(snapshot.initial, ObservationValue::Agent(snapshot) if snapshot.conversation.folder == Some(temporary.path().canonicalize().unwrap()))
     );
     access.inner.shutdown().await;
     server.abort();
@@ -3070,7 +3070,7 @@ async fn default_history_pages_return_multiple_records_and_transcript_messages()
     let observed = client
         .observe(ObservationRequest::SavedRecords {
             store_root: Some(temporary.path().join("state")),
-            workdir: temporary.path().into(),
+            folder: temporary.path().into(),
             page: Page::default(),
         })
         .await

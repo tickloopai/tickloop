@@ -83,7 +83,7 @@ impl UseTarget {
                 .snapshot
                 .artifact_ticks
                 .iter()
-                .find(|tick| tick.artifact_id == id)
+                .find(|tick| tickloop_agent_artifacts::artifact_ids_match(&tick.artifact_id, &id))
                 .and_then(|tick| InstanceRef::artifact(&tick.origin, &tick.artifact_id).ok()),
         }
     }
@@ -122,7 +122,7 @@ impl Agent {
         chat.snapshot.monitor.mark_handled(instance, now_ms());
         self.record_monitor_membership(
             chat.snapshot.id,
-            &chat.snapshot.workdir,
+            chat.snapshot.folder.as_deref(),
             chat.snapshot.monitor.clone(),
         );
     }
@@ -215,7 +215,7 @@ impl Agent {
         if moved {
             self.record_monitor_membership(
                 chat.snapshot.id,
-                &chat.snapshot.workdir,
+                chat.snapshot.folder.as_deref(),
                 chat.snapshot.monitor.clone(),
             );
         }
@@ -234,7 +234,7 @@ impl Agent {
         if is_used || is_handled {
             self.record_monitor_membership(
                 chat.snapshot.id,
-                &chat.snapshot.workdir,
+                chat.snapshot.folder.as_deref(),
                 chat.snapshot.monitor.clone(),
             );
         }
@@ -278,7 +278,7 @@ impl Agent {
             }
             self.record_monitor_membership(
                 chat.snapshot.id,
-                &chat.snapshot.workdir,
+                chat.snapshot.folder.as_deref(),
                 chat.snapshot.monitor.clone(),
             );
         }
@@ -330,7 +330,11 @@ impl Agent {
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         change(&mut chat.snapshot.monitor);
         let membership = chat.snapshot.monitor.clone();
-        self.record_monitor_membership(chat_id, &chat.snapshot.workdir, membership.clone());
+        self.record_monitor_membership(
+            chat_id,
+            chat.snapshot.folder.as_deref(),
+            membership.clone(),
+        );
         Ok(membership)
     }
 }

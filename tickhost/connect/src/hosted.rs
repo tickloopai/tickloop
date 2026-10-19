@@ -414,6 +414,31 @@ fn verify_endpoint(endpoint: &Path) -> Result<u32, HostError> {
 }
 
 /// The user on the other end of a local socket.
+#[cfg(target_os = "linux")]
+pub fn peer_uid(stream: &UnixStream) -> Result<u32, HostError> {
+    // Linux has no getpeereid; SO_PEERCRED reports the peer's credentials.
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    if unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    } != 0
+    {
+        return Err(HostError::before(
+            "HostUnavailable",
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    Ok(credentials.uid)
+}
+
+/// The user on the other end of a local socket.
+#[cfg(not(target_os = "linux"))]
 pub fn peer_uid(stream: &UnixStream) -> Result<u32, HostError> {
     let mut uid = 0;
     let mut gid = 0;

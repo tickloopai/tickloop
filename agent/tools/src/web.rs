@@ -13,9 +13,12 @@ use async_trait::async_trait;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tickloop_agent_base::network::{HttpPolicy, NetworkDiagnostic, build_http_client};
+use tickloop_agent_base::network::{
+    HttpPolicy, NetworkDiagnostic, Reach, build_http_client, check_public_url, not_public_refusal,
+};
 use tokio_util::sync::CancellationToken;
 
+use super::web_provenance::{Observations, page_links};
 use super::web_search::DomainFilter;
 use super::web_search::{self, PreparedSearch, SearchRequest};
 use super::{Operation, ToolDefinition, ToolError, shell::BASH_TOOL_NAME, utf16_length};
@@ -61,7 +64,7 @@ pub trait SecondaryModel: Send + Sync {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct FetchInput {
-    url: String,
+    pub(super) url: String,
     prompt: String,
 }
 
@@ -407,20 +410,24 @@ impl SearchInput {
 
 /// Claude Code `WebFetchTool.call`: the page comes from the cache or the network, and only the
 /// secondary model's answer to the prompt reaches the conversation.
+/// The links of every page it reads and the target of every redirect it reports go to `observed`,
+/// which keeps those that may give provenance to the URLs the model fetches next.
 pub(super) async fn fetch(
     input: FetchInput,
     cache: &FetchCache,
+    observed: &Observations,
+    reach: Reach,
     secondary_model: &dyn SecondaryModel,
     cancel: CancellationToken,
 ) -> Result<ToolResult, ToolError> {
+    let url = validate_url(&input.url, false)?;
     let markdown = match cache.get(&input.url) {
         Some(markdown) => markdown,
         None => {
-            let url = validate_url(&input.url, false)?;
             let page = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(ToolError::Cancelled),
-                page = fetch_page(url, FETCH_TIMEOUT) => page?,
+                page = fetch_page(url.clone(), FETCH_TIMEOUT, reach) => page?,
             };
             match page {
                 FetchedPage::Markdown(markdown) => {
@@ -428,11 +435,13 @@ pub(super) async fn fetch(
                     markdown
                 }
                 FetchedPage::Redirect(redirect) => {
+                    observed.record_redirect(&redirect.original, &redirect.target);
                     return Ok(text_result(redirect_message(&redirect, &input.prompt)));
                 }
             }
         }
     };
+    observed.record_page(&url, page_links(&markdown, &url));
     let prompt = secondary_model_prompt(&truncate_markdown(&markdown), &input.prompt);
     let answer = secondary_model.respond(prompt, cancel).await?;
     Ok(text_result(answer))
@@ -443,9 +452,9 @@ enum FetchedPage {
     Redirect(CrossOriginRedirect),
 }
 
-async fn fetch_page(url: Url, timeout: Duration) -> Result<FetchedPage, ToolError> {
+async fn fetch_page(url: Url, timeout: Duration, reach: Reach) -> Result<FetchedPage, ToolError> {
     let fetch = async {
-        let (content_type, bytes) = match request(url, None, timeout).await? {
+        let (content_type, bytes) = match request(url, None, timeout, reach).await? {
             HttpResponse::Body {
                 content_type,
                 bytes,
@@ -632,16 +641,38 @@ struct CrossOriginRedirect {
     status: u16,
 }
 
+/// Refuses a URL that `reach` does not admit; a host name is checked again by every address it
+/// resolves to when it is requested.
+pub(super) fn check_reach(url: &str, reach: Reach) -> Result<(), ToolError> {
+    if reach == Reach::Anywhere {
+        return Ok(());
+    }
+    let url = validate_url(url, false)?;
+    check_public_url(&url).map_err(|refusal| ToolError::Rejected(refusal.to_string()))
+}
+
+/// Where a redirect from `url` to `location` leads, refused when `reach` does not admit it.
+fn redirect_target(url: &Url, location: &str, reach: Reach) -> Result<Url, ToolError> {
+    let next = url
+        .join(location)
+        .map_err(|_| ToolError::Network("redirect target is invalid".into()))?;
+    check_reach(next.as_str(), reach)?;
+    Ok(next)
+}
+
 async fn request(
     mut url: Url,
     key: Option<&str>,
     timeout: Duration,
+    reach: Reach,
 ) -> Result<HttpResponse, ToolError> {
     let mut policy = HttpPolicy::new(reqwest::redirect::Policy::none());
     policy.timeout = Some(timeout);
+    policy.reach = reach;
     let (client, route) = build_http_client(&url, policy)
         .map_err(|_| ToolError::Network("cannot initialize HTTP client".into()))?;
     for redirects in 0..=MAX_REDIRECTS {
+        check_reach(url.as_str(), reach)?;
         let mut request = client.get(url.clone()).header(
             reqwest::header::USER_AGENT,
             concat!("Tickloop-Agent/", env!("CARGO_PKG_VERSION")),
@@ -653,8 +684,12 @@ async fn request(
         let mut response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
-                NetworkDiagnostic::new("web_request", &url, route, None, started.elapsed()).emit();
-                return Err(network_error(error));
+                NetworkDiagnostic::new("web_request", &url, route, None, started.elapsed())
+                    .emit_for(reach);
+                return Err(match not_public_refusal(&error) {
+                    Some(refusal) => ToolError::Rejected(refusal.to_string()),
+                    None => network_error(error),
+                });
             }
         };
         let status = response.status().as_u16();
@@ -664,9 +699,7 @@ async fn request(
                 .get(reqwest::header::LOCATION)
                 .and_then(|value| value.to_str().ok())
                 .ok_or_else(|| ToolError::Network("redirect has no valid Location".into()))?;
-            let next = url
-                .join(location)
-                .map_err(|_| ToolError::Network("redirect target is invalid".into()))?;
+            let next = redirect_target(&url, location, reach)?;
             if url.origin() != next.origin() {
                 NetworkDiagnostic::new(
                     "web_redirect",
@@ -675,7 +708,7 @@ async fn request(
                     Some(status),
                     started.elapsed(),
                 )
-                .emit();
+                .emit_for(reach);
                 return Ok(HttpResponse::Redirect(CrossOriginRedirect {
                     original: url,
                     target: next,
@@ -690,7 +723,7 @@ async fn request(
                     Some(status),
                     started.elapsed(),
                 )
-                .emit();
+                .emit_for(reach);
                 return Err(ToolError::Network("too many redirects".into()));
             }
             url = validate_url(next.as_str(), false)?;
@@ -698,7 +731,7 @@ async fn request(
         }
         if !(200..300).contains(&status) {
             NetworkDiagnostic::new("web_request", &url, route, Some(status), started.elapsed())
-                .emit();
+                .emit_for(reach);
         }
         if status == 429 {
             return Err(ToolError::Network(

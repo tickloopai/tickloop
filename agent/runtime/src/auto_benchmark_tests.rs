@@ -5,7 +5,7 @@ use std::{collections::HashSet, path::Path, sync::Arc, time::Instant};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tickloop_agent_model::{
-    ModelClient,
+    ModelClient, ModelClients,
     judgment::{JevClient, JevConfig, JudgmentClient},
 };
 use tickloop_agent_protocol::{
@@ -130,7 +130,7 @@ fn cases() -> Vec<Case<'static>> {
 
 fn workspace(directory: &Path) -> tickloop_agent_tools::Workspace {
     tickloop_agent_tools::Workspace {
-        workdir: directory.canonicalize().unwrap(),
+        folder: Some(directory.canonicalize().unwrap()),
         additional_directories: Vec::new(),
     }
 }
@@ -500,7 +500,9 @@ async fn live_benchmark(use_jev: bool) {
         .as_ref()
         .map(|directory| directory.path().canonicalize().unwrap())
         .or_else(|| root.clone());
-    let llm = tickloop_agent_model::model_client(config.clone(), llm_root.as_deref()).unwrap();
+    let llm = tickloop_agent_model::LocalModelClients::new(llm_root.clone())
+        .client(&config)
+        .unwrap();
     let jev = use_jev.then(|| {
         Arc::new(JevClient::bind(JevConfig::default(), root).unwrap()) as Arc<dyn JudgmentClient>
     });

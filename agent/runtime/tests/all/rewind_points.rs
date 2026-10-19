@@ -452,7 +452,11 @@ async fn explicit_events_and_timer_runs_preserve_the_single_real_user_checkpoint
                     id: Uuid::new_v4(),
                     prompt: "Scheduled or external observation".into(),
                     prompt_source: TriggerPromptSource::Explicit,
-                    interval_seconds: timer.then_some(1),
+                    schedule: timer
+                        .then(|| tickloop_agent_protocol::Recurrence::parse("every 1s").unwrap()),
+                    armed_at_ms: None,
+                    last_fired_at_ms: None,
+                    confirmation: None,
                     expires_at_ms: None,
                     accepts_events: !timer,
                     armed: true,

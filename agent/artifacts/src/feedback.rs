@@ -5,7 +5,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::{ArtifactClient, ArtifactError, CredentialSnapshot, MAX_RESPONSE_BYTES, path_segment};
+use super::{
+    ArtifactClient, ArtifactError, CredentialSnapshot, MAX_RESPONSE_BYTES, artifact_ids_match,
+    parse_service_id, path_segment,
+};
 
 const MAX_CLAIM_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_REQUESTS_PER_PAGE: usize = 50;
@@ -26,6 +29,7 @@ pub struct AgentLinkRequest {
 #[derive(Clone, Debug, Deserialize)]
 pub struct AgentLink {
     pub artifact_id: String,
+    #[serde(deserialize_with = "super::deserialize_service_id")]
     pub binding_id: Uuid,
     pub epoch: u64,
 }
@@ -68,9 +72,13 @@ fn delivery_path(delivery_id: &str, action: &str) -> Result<String, ArtifactErro
 
 impl ArtifactClient {
     /// The current credential when it still belongs to `account_id`.
-    fn account_credential(&self, account_id: &str) -> Result<CredentialSnapshot, ArtifactError> {
+    async fn account_credential(
+        &self,
+        account_id: &str,
+    ) -> Result<CredentialSnapshot, ArtifactError> {
         let credential = self
-            .credential_snapshot()?
+            .access_snapshot()
+            .await?
             .ok_or(ArtifactError::AccessDenied)?;
         if credential.account_id != account_id {
             return Err(ArtifactError::AccountChanged);
@@ -86,7 +94,7 @@ impl ArtifactClient {
         artifact_id: &str,
         request: &AgentLinkRequest,
     ) -> Result<AgentLink, ArtifactError> {
-        let credential = self.account_credential(account_id)?;
+        let credential = self.account_credential(account_id).await?;
         let link: AgentLink = self
             .catalog_request_with_credential(
                 Method::PUT,
@@ -103,7 +111,7 @@ impl ArtifactClient {
                 &credential,
             )
             .await?;
-        if link.artifact_id != artifact_id
+        if !artifact_ids_match(artifact_id, &link.artifact_id)
             || link.binding_id != request.binding_id
             || !(1..=MAX_SAFE_EPOCH).contains(&link.epoch)
         {
@@ -118,7 +126,7 @@ impl ArtifactClient {
         link: &AgentLink,
         cursor: Option<&str>,
     ) -> Result<FeedbackPage, ArtifactError> {
-        let credential = self.account_credential(account_id)?;
+        let credential = self.account_credential(account_id).await?;
         let binding_id = link.binding_id.to_string();
         let epoch = link.epoch.to_string();
         let mut query = vec![
@@ -141,7 +149,7 @@ impl ArtifactClient {
             .await?;
         if page.items.len() > MAX_REQUESTS_PER_PAGE
             || page.items.iter().any(|item| {
-                Uuid::parse_str(&item.delivery_id).is_err()
+                parse_service_id(&item.delivery_id).is_none()
                     || !is_identifier(&item.feedback_id)
                     || !is_identifier(&item.thread_id)
             })
@@ -162,7 +170,7 @@ impl ArtifactClient {
         client_instance_id: Uuid,
         delivery_id: &str,
     ) -> Result<ClaimedFeedback, ArtifactError> {
-        let credential = self.account_credential(account_id)?;
+        let credential = self.account_credential(account_id).await?;
         let claim: ClaimedFeedback = self
             .catalog_request_with_credential(
                 Method::POST,
@@ -178,13 +186,16 @@ impl ArtifactClient {
                 &credential,
             )
             .await?;
-        if claim.delivery_id != delivery_id
+        if !artifact_ids_match(delivery_id, &claim.delivery_id)
             || !is_identifier(&claim.claim_id)
             || !is_identifier(&claim.fencing_token)
             || claim.lease_expires_at.is_empty()
             || claim.lease_expires_at.len() > MAX_LEASE_BYTES
-            || claim.input.get("artifact_id").and_then(Value::as_str)
-                != Some(link.artifact_id.as_str())
+            || claim
+                .input
+                .get("artifact_id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| !artifact_ids_match(&link.artifact_id, id))
         {
             return Err(ArtifactError::InvalidResponse);
         }
@@ -197,7 +208,7 @@ impl ArtifactClient {
         artifact_id: &str,
         claim: &ClaimedFeedback,
     ) -> Result<(), ArtifactError> {
-        let credential = self.account_credential(account_id)?;
+        let credential = self.account_credential(account_id).await?;
         self.catalog_request_with_credential::<Value>(
             Method::POST,
             &delivery_path(&claim.delivery_id, "release")?,
@@ -219,13 +230,16 @@ impl ArtifactClient {
         artifact_id: &str,
         claim: &ClaimedFeedback,
     ) -> Result<(), ArtifactError> {
-        let credential = self.account_credential(account_id)?;
+        let credential = self.account_credential(account_id).await?;
         let value: Value = self.catalog_request_with_credential(
             Method::POST, &delivery_path(&claim.delivery_id, "ack")?, &[],
             Some(json!({"artifact_id": artifact_id, "claim_id": claim.claim_id, "fencing_token": claim.fencing_token})),
             MAX_RESPONSE_BYTES, &credential,
         ).await?;
-        if value.get("delivery_id").and_then(Value::as_str) != Some(claim.delivery_id.as_str())
+        if value
+            .get("delivery_id")
+            .and_then(Value::as_str)
+            .is_none_or(|id| !artifact_ids_match(&claim.delivery_id, id))
             || value.get("accepted").and_then(Value::as_bool) != Some(true)
         {
             return Err(ArtifactError::InvalidResponse);
@@ -238,7 +252,7 @@ impl ArtifactClient {
         account_id: &str,
         link: &AgentLink,
     ) -> Result<(), ArtifactError> {
-        let credential = self.account_credential(account_id)?;
+        let credential = self.account_credential(account_id).await?;
         let value: Value = self
             .catalog_request_with_credential(
                 Method::DELETE,

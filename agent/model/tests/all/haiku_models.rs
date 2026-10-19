@@ -1,11 +1,12 @@
 use serde_json::{Value, json};
 use tickloop_agent_model::{
-    ModelConfigExt, ModelRequest, ModelRequestContext, StructuredOutput,
+    LocalModelClients, ModelClients, ModelConfigExt, ModelRequest, ModelRequestContext,
+    StructuredOutput,
     access::AccessCatalog,
     auth::copilot::CopilotAuth,
     cards::{ModelCatalog, built_in_model_profiles},
     credentials::save_api_key,
-    history, model_client, validate_reasoning_effort,
+    history, validate_reasoning_effort,
 };
 use tickloop_agent_protocol::{
     Content, Message, ModelConfig, ReasoningEffort, Role, ToolDefinition,
@@ -195,7 +196,9 @@ async fn haiku_adaptive_effort_schema_sampling_and_per_request_output_budget_fol
             model_http_support::serve_responses(vec![(200, response); modes.len()]).await;
         let config = configured(provider, model, root.path(), endpoint).await;
         let original_limit = config.max_output_tokens;
-        let client = model_client(config, Some(root.path())).unwrap();
+        let client = LocalModelClients::new(Some(root.path().to_path_buf()))
+            .client(&config)
+            .unwrap();
         for mode in modes {
             let mut query = request(mode);
             query.structured_output = Some(StructuredOutput {
@@ -265,7 +268,9 @@ async fn haiku_signature_only_thinking_roundtrips_without_foreign_replay_or_rewr
         let (endpoint, mut captured) =
             model_http_support::serve_responses(vec![(200, tool_reply), (200, response)]).await;
         let config = configured(provider, model, root.path(), endpoint).await;
-        let client = model_client(config.clone(), Some(root.path())).unwrap();
+        let client = LocalModelClients::new(Some(root.path().to_path_buf()))
+            .client(&config)
+            .unwrap();
         let mut query = request(Some(ReasoningEffort::Low));
         query.tools.push(ToolDefinition {name:"Echo".into(),description:"Inert fixture".into(),input_schema:json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]})});
         let (events, _) = mpsc::unbounded_channel();

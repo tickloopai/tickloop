@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use super::AgentError;
 use tickloop_agent_model::validate_model_for_resume_in_root;
 use tickloop_agent_protocol::projection;
@@ -12,22 +14,29 @@ pub(super) fn before_resume(
     loop_id: LoopId,
     state_root: Option<&std::path::Path>,
 ) -> Result<(), AgentError> {
-    for directory in std::iter::once(&snapshot.workdir).chain(&snapshot.additional_directories) {
-        let resolved = directory.canonicalize().map_err(|_| {
-            AgentError::Invalid(format!(
-                "working or authorized directory is unavailable: {}",
-                directory.display()
-            ))
-        })?;
-        if resolved != *directory || !resolved.is_dir() {
-            return Err(AgentError::Invalid(format!(
-                "working or authorized directory changed: {}",
-                directory.display()
-            )));
+    // A Chat without a Folder has no local directory or credential to check.
+    if snapshot.folder.is_some() {
+        for directory in snapshot
+            .folder
+            .iter()
+            .chain(&snapshot.additional_directories)
+        {
+            let resolved = directory.canonicalize().map_err(|_| {
+                AgentError::Invalid(format!(
+                    "working or authorized directory is unavailable: {}",
+                    directory.display()
+                ))
+            })?;
+            if resolved != *directory || !resolved.is_dir() {
+                return Err(AgentError::Invalid(format!(
+                    "working or authorized directory changed: {}",
+                    directory.display()
+                )));
+            }
         }
+        validate_model_for_resume_in_root(&snapshot.model, state_root)
+            .map_err(|error| AgentError::Invalid(error.to_string()))?;
     }
-    validate_model_for_resume_in_root(&snapshot.model, state_root)
-        .map_err(|error| AgentError::Invalid(error.to_string()))?;
     for pending in &mut snapshot.pending_inputs {
         if pending.receipt.loop_id == loop_id
             && pending.trigger_source.is_none()
@@ -39,9 +48,33 @@ pub(super) fn before_resume(
     Ok(())
 }
 
+/// The result a load finds recorded for a dangling call whose effect stayed inside the family,
+/// such as the child a `Subagent` call delegated; `None` when its outcome is unknown.
+pub(super) type CallReconciler<'a> =
+    dyn Fn(&ChatSnapshot, &projection::HistoryCall) -> Option<ToolResult> + 'a;
+
 pub(super) fn close_dangling_tool_calls(
     snapshot: &mut ChatSnapshot,
     only_run: Option<RunId>,
+) -> Result<(), AgentError> {
+    close_calls(snapshot, only_run, &HashSet::new(), &|_, _| None)
+}
+
+/// Closes the dangling calls of every Run except those in `kept`, whose Runs are rebuilt; a call
+/// `reconcile` finds the result of gets that result instead of an unknown outcome.
+pub(super) fn close_dangling_tool_calls_except(
+    snapshot: &mut ChatSnapshot,
+    kept: &HashSet<RunId>,
+    reconcile: &CallReconciler<'_>,
+) -> Result<(), AgentError> {
+    close_calls(snapshot, None, kept, reconcile)
+}
+
+fn close_calls(
+    snapshot: &mut ChatSnapshot,
+    only_run: Option<RunId>,
+    kept: &HashSet<RunId>,
+    reconcile: &CallReconciler<'_>,
 ) -> Result<(), AgentError> {
     for operation in &mut snapshot.operations {
         if only_run.is_none_or(|run| operation.run_id == run)
@@ -70,10 +103,12 @@ pub(super) fn close_dangling_tool_calls(
     let calls = projection::history_calls(snapshot)?;
     let mut groups: std::collections::BTreeMap<Option<RunId>, Vec<Content>> =
         std::collections::BTreeMap::new();
-    for call in calls
-        .into_iter()
-        .filter(|call| call.result.is_none() && only_run.is_none_or(|run| call.run_id == Some(run)))
-    {
+    for call in calls.into_iter().filter(|call| {
+        call.result.is_none()
+            && only_run.is_none_or(|run| call.run_id == Some(run))
+            && call.run_id.is_none_or(|run| !kept.contains(&run))
+    }) {
+        let reconciled = reconcile(snapshot, &call);
         let matching = snapshot
             .operations
             .iter()
@@ -94,12 +129,14 @@ pub(super) fn close_dangling_tool_calls(
             .as_ref()
             .map(|operation| operation.run_id)
             .or(call.run_id);
-        if recorded.as_ref().is_none_or(|operation| {
-            !matches!(
-                operation.state,
-                OperationState::Completed | OperationState::Failed
-            )
-        }) {
+        if reconciled.is_none()
+            && recorded.as_ref().is_none_or(|operation| {
+                !matches!(
+                    operation.state,
+                    OperationState::Completed | OperationState::Failed
+                )
+            })
+        {
             snapshot.tool_call_recoveries.push(ToolCallRecovery {
                 run_id: result_run,
                 call_id: call.call_id.clone(),
@@ -111,11 +148,22 @@ pub(super) fn close_dangling_tool_calls(
                 }),
             });
         }
-        let result = match recorded {
-            Some(operation) if matches!(operation.state, OperationState::Completed | OperationState::Failed) => operation.result.clone().ok_or_else(|| AgentError::Invalid(format!("completed operation {} has no durable result", operation.id)))?,
-            Some(operation) if matches!(operation.state, OperationState::Admitted | OperationState::Unknown) => {
-                operation.state = OperationState::Unknown;
-                ToolResult { content: format!("Operation {} has an unknown outcome after interruption. Do not automatically repeat it; inspect current state before proposing it again.", operation.id), is_error: true, output_ref: None }
+        let result = if let Some(result) = reconciled {
+            if let Some(operation) = recorded {
+                operation.state = if result.is_error {
+                    OperationState::Failed
+                } else {
+                    OperationState::Completed
+                };
+                operation.result = Some(result.clone());
+            }
+            result
+        } else {
+            match recorded {
+                Some(operation) if matches!(operation.state, OperationState::Completed | OperationState::Failed) => operation.result.clone().ok_or_else(|| AgentError::Invalid(format!("completed operation {} has no durable result", operation.id)))?,
+                Some(operation) if matches!(operation.state, OperationState::Admitted | OperationState::Unknown) => {
+                    operation.state = OperationState::Unknown;
+                    ToolResult { content: format!("Operation {} has an unknown outcome after interruption. Do not automatically repeat it; inspect current state before proposing it again.", operation.id), is_error: true, output_ref: None }
             }
             Some(operation) => {
                 let result = interrupted_before_admission();
@@ -124,6 +172,7 @@ pub(super) fn close_dangling_tool_calls(
                 result
             }
             None => ToolResult { content: "Tool call was interrupted and its outcome is unknown; inspect current state before proposing it again.".into(), is_error: true, output_ref: None },
+            }
         };
         groups
             .entry(result_run)

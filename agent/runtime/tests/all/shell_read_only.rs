@@ -11,7 +11,7 @@ const PIPED_GIT_DIFF: &str = "git diff --cached --stat | head -30";
 
 fn workspace(directory: &Path) -> Workspace {
     Workspace {
-        workdir: directory.to_path_buf(),
+        folder: Some(directory.to_path_buf()),
         additional_directories: Vec::new(),
     }
 }

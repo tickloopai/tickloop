@@ -58,8 +58,12 @@ impl Agent {
         }
         validate_snapshot(&source.snapshot)?;
         ensure_branchable(source)?;
-        let workdir = canonical_directory(&source.snapshot.workdir)?;
-        self.require_working_directory_trust(&workdir)?;
+        let folder = canonical_directory(super::require_folder(&source.snapshot)?)?;
+        self.require_working_directory_trust(&folder)?;
+        let mut source_file_history = source
+            .file_history
+            .clone()
+            .ok_or_else(|| AgentError::Invalid(super::FOLDERLESS_CHAT.into()))?;
         let additional_directories = source
             .snapshot
             .additional_directories
@@ -136,7 +140,7 @@ impl Agent {
             family_inputs: BTreeMap::new(),
             sent_agent_messages: BTreeMap::new(),
             generated_title: None,
-            workdir,
+            folder: Some(folder.clone()),
             model: source.snapshot.model.clone(),
             reasoning_effort: source.snapshot.reasoning_effort,
             thinking_enabled: source.snapshot.thinking_enabled,
@@ -193,7 +197,7 @@ impl Agent {
         carry_loops(&mut snapshot, &mut bookkeeping, source, &seed);
         carry_plans_and_progress(&mut snapshot, &mut bookkeeping, source);
         // 照 Claude Code `copyPlanForFork`：Branch 使用新的 slug 并复制计划文件，之后双方各自修改。
-        let plans_directory = self.plans_directory(&snapshot.workdir);
+        let plans_directory = self.plans_directory(&folder);
         super::plan::copy_plans_to_new_slug(
             &mut snapshot,
             &mut bookkeeping,
@@ -208,10 +212,8 @@ impl Agent {
             .values()
             .copied()
             .collect::<HashSet<_>>();
-        let mut source_file_history = source.file_history.clone();
         source_file_history.retain_messages(&child_prompts);
-        let child_file_history_directory =
-            self.file_history_directory(child_chat_id, &snapshot.workdir);
+        let child_file_history_directory = self.file_history_directory(child_chat_id, &folder);
         let file_history = source_file_history.relocated(child_file_history_directory.clone());
 
         let mut permission_context = self.inner.session_permissions.lock().await;
@@ -226,10 +228,12 @@ impl Agent {
         if let Some(recorder) = &self.inner.recorder
             && let Some(source) = chats.get(&request.source_chat_id)
         {
-            recorder.register_branch(&source.snapshot, &source.bookkeeping, child_chat_id, &name);
+            recorder
+                .register_branch(&source.snapshot, &source.bookkeeping, child_chat_id, &name)
+                .await?;
         }
         let tools = self.create_chat_tools(&snapshot);
-        let skills = self.discover_skills(&snapshot.workdir);
+        let skills = self.discover_skills(Some(&folder));
         // 照 Claude Code `/branch`：以子 Chat 的 id 重新记录来源中仍在复制对话里的替换决定。
         let source_replacements = chats
             .get(&request.source_chat_id)
@@ -262,6 +266,7 @@ impl Agent {
                 active_run: None,
                 upgrade_wait: None,
                 parked: Default::default(),
+                releases: Default::default(),
                 ready_runs: Default::default(),
                 client,
                 pending_client: None,
@@ -269,7 +274,7 @@ impl Agent {
                 tools,
                 skills,
                 content_replacements,
-                file_history,
+                file_history: Some(file_history),
                 watching_commands: false,
                 watching_user_shells: false,
                 user_shell_queue: Arc::new(Notify::new()),
@@ -281,6 +286,7 @@ impl Agent {
                 user_cancelled_runs: std::collections::HashSet::new(),
                 output_style,
                 auto_denials: super::auto_mode::DenialTracking::default(),
+                branch_reservation: None,
                 denial_window: super::denials::DenialWindow::default(),
             },
         );
@@ -314,7 +320,7 @@ impl Agent {
             None
         };
         if let Some(next) = next {
-            self.inner.tasks.lock().await.push(self.run_task(next));
+            self.run_task(next);
         }
         self.flush_transcripts().await;
         Ok(BranchOutcome {
@@ -330,22 +336,17 @@ impl Agent {
 impl Agent {
     /// 源 Chat 所在项目中已保存的标题，供 Branch 标题查重。
     async fn saved_titles_near(&self, source_chat_id: ChatId) -> Vec<String> {
-        let Some(directory) = self
+        let Some(local) = self
             .inner
             .recorder
             .as_ref()
-            .and_then(|recorder| recorder.project_directory_of(source_chat_id))
+            .and_then(|recorder| recorder.local_store())
         else {
             return Vec::new();
         };
-        tokio::task::spawn_blocking(move || crate::transcript::list_project(&directory))
+        tokio::task::spawn_blocking(move || local.project_titles(source_chat_id))
             .await
-            .ok()
-            .and_then(Result::ok)
             .unwrap_or_default()
-            .into_iter()
-            .filter_map(|summary| summary.title)
-            .collect()
     }
 }
 
@@ -787,7 +788,7 @@ fn source_fingerprint(
         snapshot.messages.len(),
         snapshot.last_sequence,
         &snapshot.model,
-        &snapshot.workdir,
+        &snapshot.folder,
         &snapshot.additional_directories,
         model_seed,
         public_seed,
@@ -1023,7 +1024,7 @@ mod tests {
                             loop_id,
                             command: "sleep 30".into(),
                             description: None,
-                            cwd: chat.snapshot.workdir.clone(),
+                            cwd: chat.snapshot.folder.clone().unwrap(),
                             pid: Some(42),
                             state: state.clone(),
                             was_background: false,
@@ -1034,6 +1035,7 @@ mod tests {
                             output_ref: chat
                                 .tools
                                 .chat_directory()
+                                .unwrap()
                                 .path()
                                 .join("busy-agent-shell.log"),
                             output_bytes: 0,
@@ -1048,7 +1050,7 @@ mod tests {
                             chat_id: chat.snapshot.id,
                             loop_id: Some(loop_id),
                             command: "sleep 30".into(),
-                            cwd: chat.snapshot.workdir.clone(),
+                            cwd: chat.snapshot.folder.clone().unwrap(),
                             starts_in_background: false,
                             queued_sequence: 1,
                             armed: true,
@@ -1061,6 +1063,7 @@ mod tests {
                             output_ref: Some(
                                 chat.tools
                                     .chat_directory()
+                                    .unwrap()
                                     .path()
                                     .join("busy-user-shell.log"),
                             ),

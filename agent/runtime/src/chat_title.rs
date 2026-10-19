@@ -2,13 +2,24 @@ use super::{Agent, approval_context};
 use std::sync::atomic::Ordering;
 use tickloop_agent_model::{ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{ChatId, Content, Message, Role, short_chat_title};
+use tokio_util::sync::CancellationToken;
 
 const TITLE_PROMPT_CHARACTERS: usize = 1000;
 
+/// A Chat's title request in flight.
+#[derive(Clone)]
+pub(super) struct TitleJob {
+    pub(super) cancel: CancellationToken,
+    /// Cancelled once the request's task has ended.
+    pub(super) done: CancellationToken,
+}
+
 impl Agent {
     pub(super) async fn start_title_generation(&self, chat_id: ChatId) {
+        // Held until the task is spawned: `shutdown` either refuses this or waits for the task.
+        let admission = self.inner.tasks.token();
         let mut pending = self.inner.title_requests.lock().await;
-        if pending.contains(&chat_id) || self.inner.closed.load(Ordering::SeqCst) {
+        if pending.contains_key(&chat_id) || self.inner.closed.load(Ordering::SeqCst) {
             return;
         }
         let (client, prompt, message_id) = {
@@ -47,10 +58,15 @@ impl Agent {
                 original.message_id,
             )
         };
-        pending.insert(chat_id);
+        let job = TitleJob {
+            cancel: self.inner.shutdown.child_token(),
+            done: CancellationToken::new(),
+        };
+        pending.insert(chat_id, job.clone());
         drop(pending);
         let agent = self.clone();
-        let task = tokio::spawn(async move {
+        self.inner.tasks.spawn(async move {
+            let _done = job.done.drop_guard();
             let _upgrade = agent.inner.upgrade_gate.read().await;
             let request = ModelRequest {
                 history_sources: Vec::new(),
@@ -71,7 +87,7 @@ impl Agent {
                 temperature: None,
                 reasoning_effort: None,
             };
-            let cancel = agent.inner.shutdown.child_token();
+            let cancel = job.cancel;
             let response = agent
                 .tracked_model_request(
                     super::model_request::RequestContext::title(chat_id),
@@ -117,7 +133,7 @@ impl Agent {
             }
             agent.inner.title_requests.lock().await.remove(&chat_id);
         });
-        self.inner.tasks.lock().await.push(task);
+        drop(admission);
     }
 }
 

@@ -393,7 +393,7 @@ impl Agent {
             .lock()
             .await
             .get(&chat_id)
-            .map(|chat| chat.tools.chat_directory().join(LEASE_DIRECTORY))
+            .and_then(|chat| Some(chat.tools.chat_directory()?.join(LEASE_DIRECTORY)))
     }
 
     /// Trigger 触发前调用：持有租约、读取停止状态，并确认 Loop 仍可触发。停止状态显示已在其他
@@ -420,7 +420,9 @@ impl Agent {
         loop_id: LoopId,
         feedback_replay: bool,
     ) -> TriggerPermit {
-        if self.inner.recorder.is_none() {
+        // A host that keeps waits durably holds the Chat's whole family under its lease: no
+        // other process fires its Triggers.
+        if self.inner.recorder.is_none() || self.inner.waits == super::WaitHosting::Durable {
             return TriggerPermit::Fire;
         }
         let Some(directory) = self.lease_directory(chat_id).await else {

@@ -44,7 +44,7 @@ fn transcript_initial(text: String) -> ObservationValue {
             chat_id: Uuid::new_v4(),
         },
         title: None,
-        workdir: "/tmp/workdir".into(),
+        folder: "/tmp/workdir".into(),
         messages: vec![RecordedMessage {
             id: Uuid::new_v4(),
             message: tickloop_agent_protocol::Message {
@@ -233,7 +233,7 @@ async fn frames_beyond_the_negotiated_limit_are_refused_on_both_sides() {
     let error = client
         .observe(ObservationRequest::Overview {
             filter: AgentFilter {
-                workdir: None,
+                folder: None,
                 workspace: Some("x".repeat(FRAME_BYTES)),
             },
             page: Page::default(),
@@ -620,7 +620,7 @@ async fn cancelling_a_backpressured_lookup_keeps_the_live_request_frame_whole() 
         observing
             .observe(ObservationRequest::Overview {
                 filter: AgentFilter {
-                    workdir: None,
+                    folder: None,
                     workspace: Some("x".repeat(3 * 1024 * 1024)),
                 },
                 page: Page::default(),
@@ -748,7 +748,7 @@ async fn dropped_opened_feed_cannot_keep_a_backpressured_client_alive() {
             observing
                 .observe(ObservationRequest::Overview {
                     filter: AgentFilter {
-                        workdir: None,
+                        folder: None,
                         workspace: Some("x".repeat(8 * 1024 * 1024)),
                     },
                     page: Page::default(),
@@ -827,7 +827,7 @@ async fn backpressured_observation_write_stops_on_eof_or_last_client_drop() {
             observing
                 .observe(ObservationRequest::Overview {
                     filter: AgentFilter {
-                        workdir: None,
+                        folder: None,
                         workspace: Some("x".repeat(8 * 1024 * 1024)),
                     },
                     page: Page::default(),

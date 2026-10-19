@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tickloop_agent_model::{
-    HttpModelClient, ModelClient,
+    LocalModelClients, ModelClients,
     judgment::{JevClient, JevConfig, JudgmentClient},
 };
 use tickloop_agent_protocol::{OriginalUserInput, PreparedApprovalFacts};
@@ -136,7 +136,7 @@ async fn replay(use_jev: bool) {
     let config = tickloop_agent_model::cards::ModelCatalog::defaults()
         .get("deepseek-api", "deepseek-flash")
         .unwrap();
-    let llm = (!use_jev).then(|| HttpModelClient::new(config.clone()).unwrap());
+    let llm = (!use_jev).then(|| LocalModelClients::new(None).client(&config).unwrap());
     let jev = use_jev.then(|| {
         JevClient::bind(
             JevConfig::default(),

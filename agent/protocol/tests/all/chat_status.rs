@@ -46,7 +46,7 @@ fn busy_chat() -> ChatSnapshot {
     let pasted = |id: u32| json!([{"kind":"image","origin":{"type":"pasted","id":id},"image":{"media_type":"image/png","data":"iVBORw0KGgo=","width":1,"height":1}}]);
     let mut snapshot: ChatSnapshot = serde_json::from_value(json!({
         "id": id(0xc1),
-        "workdir": "/work",
+        "folder": "/work",
         "messages": (0..200).map(|index| json!({
             "role": if index % 2 == 0 { "user" } else { "assistant" },
             "content": [{"type": "text", "text": format!("message {index} {}", "history ".repeat(50))}],

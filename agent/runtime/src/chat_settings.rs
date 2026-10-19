@@ -66,18 +66,32 @@ impl Agent {
         (client, output_style)
     }
 
+    /// Fills in the host's rules as they are now: a policy never records them, so every policy
+    /// built or loaded gets them here.
+    pub(super) fn apply_host_rules(&self, policy: &mut tickloop_agent_protocol::PermissionPolicy) {
+        policy.host_rules = self.inner.host_rules.clone();
+    }
+
     pub(super) fn apply_new_chat_settings(
         &self,
         snapshot: &mut ChatSnapshot,
         bookkeeping: &mut ChatBookkeeping,
     ) -> OutputStyle {
         let mut saved = self.inner.settings.as_ref().map(UserSettings::load);
-        snapshot.search_config = saved.as_mut().map_or_else(
-            tickloop_agent_protocol::SearchConfig::enabled_default,
-            |saved| saved.search_config(),
-        );
+        match &self.inner.search {
+            super::SearchDefaults::Fixed(config) => snapshot.search_config = config.clone(),
+            super::SearchDefaults::UserSettings => {
+                if let Some(saved) = &mut saved {
+                    snapshot.search_config = saved.search_config();
+                } else if snapshot.delegation.is_none() {
+                    snapshot.search_config =
+                        tickloop_agent_protocol::SearchConfig::enabled_default();
+                }
+            }
+        }
         let defaults = new_chat_settings(saved.as_mut(), &self.inner.host_options, &snapshot.model);
         snapshot.policy.mode = defaults.execution_mode;
+        self.apply_host_rules(&mut snapshot.policy);
         snapshot.task_tools_enabled = saved.as_ref().map_or_else(
             || {
                 self.inner
@@ -115,15 +129,17 @@ impl Agent {
         bookkeeping: &mut ChatBookkeeping,
         mut saved: LoadedSettings,
     ) {
+        // A Chat without a Folder belongs to no project, which persistent rules partition by.
+        let Some(folder) = snapshot.folder.clone() else {
+            return;
+        };
         if snapshot.delegation.is_some() {
             return;
         }
-        let rules = saved.permission_rules(&snapshot.workdir);
+        let rules = saved.permission_rules(&folder);
         snapshot.policy.rules.retain(|rule| !rule.persistent);
-        bookkeeping.persistent_rule_projects = rules
-            .iter()
-            .map(|rule| (rule.id, snapshot.workdir.clone()))
-            .collect();
+        bookkeeping.persistent_rule_projects =
+            rules.iter().map(|rule| (rule.id, folder.clone())).collect();
         snapshot.policy.rules.extend(rules);
         self.inner
             .settings_warnings
@@ -333,8 +349,9 @@ impl Agent {
             if Some(*chat_id) == skip || chat.snapshot.delegation.is_some() {
                 continue;
             }
-            if let Some(change) = changes.get(&chat.snapshot.workdir) {
-                let project = chat.snapshot.workdir.clone();
+            if let Some(project) = chat.snapshot.folder.clone()
+                && let Some(change) = changes.get(&project)
+            {
                 apply_rule_changes(chat, &project, change);
             }
         }
@@ -355,16 +372,20 @@ impl Agent {
             return Ok(());
         };
         let _settings_gate = self.inner.settings_writes.lock().await;
-        let workdir = {
-            let chats = self.inner.chats.lock().await;
-            chats
-                .get(&chat_id)
-                .ok_or(AgentError::NotFound)?
-                .snapshot
-                .workdir
-                .clone()
+        let Some(folder) = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&chat_id)
+            .ok_or(AgentError::NotFound)?
+            .snapshot
+            .folder
+            .clone()
+        else {
+            return Ok(());
         };
-        let project = workdir.clone();
+        let project = folder.clone();
         let (mut rules, warnings, _) =
             tokio::task::spawn_blocking(move || settings.project_rules_with_revision(&project))
                 .await
@@ -381,7 +402,7 @@ impl Agent {
         }
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        if chat.snapshot.workdir != workdir {
+        if chat.snapshot.folder.as_ref() != Some(&folder) {
             return Err(AgentError::Busy);
         }
         let current = chat
@@ -397,10 +418,8 @@ impl Agent {
             return Ok(());
         }
         chat.snapshot.policy.rules.retain(|rule| !rule.persistent);
-        chat.bookkeeping.persistent_rule_projects = rules
-            .iter()
-            .map(|rule| (rule.id, workdir.clone()))
-            .collect();
+        chat.bookkeeping.persistent_rule_projects =
+            rules.iter().map(|rule| (rule.id, folder.clone())).collect();
         chat.snapshot.policy.rules.extend(rules);
         chat.snapshot.policy.revision += 1;
         self.save(&chat.snapshot);
@@ -462,7 +481,7 @@ impl Agent {
                 loop_id: None,
                 persistent: true,
             };
-            (chat.snapshot.workdir.clone(), rule)
+            (super::require_folder(&chat.snapshot)?.to_path_buf(), rule)
         };
         let changes = RuleChanges::from([(
             project.clone(),
@@ -507,12 +526,22 @@ pub(super) fn persistent_rule_changes(
         .iter()
         .filter(|rule| rule.persistent)
         .collect::<Vec<_>>();
+    let Some(folder) = &snapshot.folder else {
+        return if current.is_empty() {
+            Ok(RuleChanges::new())
+        } else {
+            Err(AgentError::Invalid(format!(
+                "{}, so it has no project for persistent rules",
+                super::FOLDERLESS_CHAT
+            )))
+        };
+    };
     let project_of = |id: &Uuid| {
         bookkeeping
             .persistent_rule_projects
             .get(id)
             .cloned()
-            .unwrap_or_else(|| snapshot.workdir.clone())
+            .unwrap_or_else(|| folder.clone())
     };
     let mut changes = RuleChanges::new();
     for rule in &previous {

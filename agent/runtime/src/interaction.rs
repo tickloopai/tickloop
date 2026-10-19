@@ -1,14 +1,16 @@
 use super::*;
+use crate::QuestionReply;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use tickloop_agent_protocol::{
     EventKind, LoopSnapshot, LoopState, OperationState, PendingInput, Question, QuestionAnswer,
-    QuestionRequest, Receipt, ToolDefinition, ToolResult,
+    QuestionRequest, Receipt, ToolDefinition, ToolResult, Trigger,
 };
 use tickloop_agent_tools::{
     ASK_USER_QUESTION_TOOL_NAME, DECLINED_QUESTIONS_RESULT, EXIT_PLAN_MODE_TOOL_NAME,
     START_GOAL_TOOL_NAME,
 };
+use tickloop_agent_transcript::{ModelVisibleResult, SettledOutcome};
 
 const QUESTION_HEADER_MAX_CHARACTERS: usize = 12;
 const MIN_QUESTIONS: usize = 1;
@@ -20,8 +22,8 @@ const UNIQUENESS_ERROR: &str =
     "Question texts must be unique, option labels must be unique within each question";
 const QUESTION_SETTLED: &str = "question was already answered";
 
-/// How the user settled a pending `AskUserQuestion` call.
-pub(super) enum QuestionReply {
+/// How the user settled a pending `AskUserQuestion` call, as its waiting Run receives it.
+pub(crate) enum PendingReply {
     /// The tool result that reports the answers.
     Answered(String),
     /// Esc in the question dialog, as Claude Code's cancel: the call is rejected and the run
@@ -93,6 +95,19 @@ fn ensure_question_waits(chat: &Chat, request: &QuestionRequest) -> Result<(), A
         Ok(())
     } else {
         Err(AgentError::Invalid("question was cancelled".into()))
+    }
+}
+
+/// A question call's result as the conversation records it.
+fn reported_result(text: String, ends_run: bool) -> ModelVisibleResult {
+    ModelVisibleResult {
+        tool: ToolResult {
+            content: text.clone(),
+            is_error: ends_run,
+            output_ref: None,
+        },
+        content: text.into(),
+        ends_run,
     }
 }
 
@@ -258,9 +273,60 @@ Usage notes:
 pub(super) fn definitions(is_delegated: bool) -> Vec<ToolDefinition> {
     vec![ask_user_question_definition(is_delegated), ToolDefinition {
         name: START_GOAL_TOOL_NAME.into(),
-        description: "Create and queue a separate, explicitly requested independent user goal in this Chat. Follow-up requirements for the current goal stay on the current goal. Ask the user when attribution is unclear; do not execute this new goal's work in the current run.".into(),
-        input_schema: json!({"type":"object","properties":{"goal":{"type":"string"}},"required":["goal"],"additionalProperties":false}),
+        description: "Create and queue a separate, explicitly requested independent user goal in this Chat. Follow-up requirements for the current goal stay on the current goal. Ask the user when attribution is unclear; do not execute this new goal's work in the current run. Give a schedule only when the user asked for the goal to run at certain times: the goal then runs at each scheduled time, starting with the next one, instead of now.".into(),
+        input_schema: json!({"type":"object","properties":{
+            "goal":{"type":"string"},
+            "schedule":{"type":"string","description":"When the goal runs: `every <N>s|m|h|d` (counted from now), `daily HH:MM [±HH:MM]`, `weekly <day>[,<day>…] HH:MM [±HH:MM]` with days mon..sun, or `at <RFC 3339 time>` for once. Times without an offset are UTC. Runs missed while nothing could run are skipped, not caught up."}
+        },"required":["goal"],"additionalProperties":false}),
     }]
+}
+
+/// Whether the call is a StartGoal that creates a schedule.
+pub(crate) fn creates_schedule(name: &str, input: &Value) -> bool {
+    name == START_GOAL_TOOL_NAME
+        && input
+            .get("schedule")
+            .is_some_and(|schedule| !schedule.is_null())
+}
+
+/// What a StartGoal call that registered `goal` returns: the input queued for it, or for a
+/// scheduled goal its schedule, next scheduled time and expiry, or that it awaits the user's
+/// confirmation.
+pub(crate) fn started_goal_result(
+    chat_id: ChatId,
+    goal: &LoopSnapshot,
+    queued_run: Option<RunId>,
+) -> ToolResult {
+    let schedule = goal.trigger.as_ref().and_then(|trigger| trigger.schedule);
+    let content = match (schedule, queued_run) {
+        (Some(schedule), _) => {
+            let trigger = goal.trigger.as_ref();
+            let next_run_at = trigger
+                .filter(|trigger| trigger.armed)
+                .and_then(Trigger::next_scheduled_ms)
+                .map(tickloop_agent_base::timestamp::format_timestamp);
+            let expires_at = trigger
+                .and_then(|trigger| trigger.expires_at_ms)
+                .map(tickloop_agent_base::timestamp::format_timestamp);
+            let state = if trigger.is_some_and(Trigger::awaits_confirmation) {
+                "awaiting_user_confirmation"
+            } else {
+                "scheduled"
+            };
+            json!({"chat_id":chat_id,"loop_id":goal.id,"state":state,
+                "schedule":schedule.to_string(),"next_run_at":next_run_at,"expires_at":expires_at})
+        }
+        (None, Some(run_id)) => {
+            json!({"chat_id":chat_id,"loop_id":goal.id,"run_id":run_id,"state":"queued"})
+        }
+        // A goal whose schedule was removed since.
+        (None, None) => json!({"chat_id":chat_id,"loop_id":goal.id,"state":"registered"}),
+    };
+    ToolResult {
+        content: content.to_string(),
+        is_error: false,
+        output_ref: None,
+    }
 }
 
 impl Agent {
@@ -272,50 +338,9 @@ impl Agent {
         request_id: Uuid,
         answers: Vec<QuestionAnswer>,
     ) -> Result<(), AgentError> {
-        let mut chats = self.inner.chats.lock().await;
-        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        let request = pending_question(chat, request_id)?;
-        if answers.len() != request.questions.len() {
-            return Err(AgentError::Invalid(format!(
-                "answer each of the {} questions",
-                request.questions.len()
-            )));
-        }
-        for (question, answer) in request.questions.iter().zip(&answers) {
-            validate_answer(answer, question).map_err(AgentError::Invalid)?;
-        }
-        let result = answered_questions_result(&request.questions, &answers);
-        if result.len() > MAX_ANSWER_BYTES {
-            return Err(AgentError::Invalid(format!(
-                "answers must fit in {MAX_ANSWER_BYTES} bytes"
-            )));
-        }
-        ensure_question_waits(chat, &request)?;
-        let mut pending_answers = self.inner.question_answers.lock().await;
-        if !pending_answers.contains_key(&request_id) {
-            return Err(AgentError::Invalid(QUESTION_SETTLED.into()));
-        }
-        let mut snapshot = chat.snapshot.clone();
-        snapshot
-            .questions
-            .retain(|request| request.id != request_id);
-        if let Some(operation) = snapshot.operations.iter_mut().find(|operation| {
-            operation.run_id == request.run_id && operation.call_id == request.call_id
-        }) {
-            operation.state = OperationState::Completed;
-            operation.result = Some(ToolResult {
-                content: result.clone(),
-                is_error: false,
-                output_ref: None,
-            });
-        }
-        self.save(&snapshot);
-        chat.snapshot = snapshot;
-        pending_answers
-            .remove(&request_id)
-            .unwrap()
-            .send(QuestionReply::Answered(result))
-            .map_err(|_| AgentError::Invalid("question expired".into()))
+        self.reply_to_question(chat_id, request_id, QuestionReply::Answered(answers), None)
+            .await
+            .map(|_| ())
     }
 
     /// Declines a pending `AskUserQuestion` call, as Esc does in Claude Code's question dialog:
@@ -326,26 +351,108 @@ impl Agent {
         chat_id: ChatId,
         request_id: Uuid,
     ) -> Result<(), AgentError> {
+        self.reply_to_question(chat_id, request_id, QuestionReply::Declined, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Ends the wait of a pending question with `reply`. The result the call reports is decided
+    /// now and recorded with the wait, with the ledger input `ledger` the reply came as, merged
+    /// into the waiting Run; the Run puts the result on the chain once it holds the execution
+    /// slot again. Gives the reply's receipt.
+    pub(crate) async fn reply_to_question(
+        &self,
+        chat_id: ChatId,
+        request_id: Uuid,
+        reply: QuestionReply,
+        ledger: Option<lifecycle::LedgerInput>,
+    ) -> Result<Receipt, AgentError> {
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-        let request = pending_question(chat, request_id)?;
+        // A repeated reply, even one racing the first, finds it in the ledger under this lock.
+        if let Some(replayed) = ledger
+            .as_ref()
+            .and_then(|input| chat.bookkeeping.lifecycle.replay(chat_id, input))
+        {
+            return replayed;
+        }
+        let request = pending_question(chat, request_id).map_err(|error| match ledger {
+            Some(_) => AgentError::Invalid("the question is no longer pending".into()),
+            None => error,
+        })?;
+        let (pending, result) = match reply {
+            QuestionReply::Answered(answers) => {
+                if answers.len() != request.questions.len() {
+                    return Err(AgentError::Invalid(format!(
+                        "answer each of the {} questions",
+                        request.questions.len()
+                    )));
+                }
+                for (question, answer) in request.questions.iter().zip(&answers) {
+                    validate_answer(answer, question).map_err(AgentError::Invalid)?;
+                }
+                let text = answered_questions_result(&request.questions, &answers);
+                if text.len() > MAX_ANSWER_BYTES {
+                    return Err(AgentError::Invalid(format!(
+                        "answers must fit in {MAX_ANSWER_BYTES} bytes"
+                    )));
+                }
+                (
+                    PendingReply::Answered(text.clone()),
+                    reported_result(text, false),
+                )
+            }
+            QuestionReply::Declined => (
+                PendingReply::Declined,
+                reported_result(DECLINED_QUESTIONS_RESULT.into(), true),
+            ),
+        };
         ensure_question_waits(chat, &request)?;
-        let reply = self
-            .inner
-            .question_answers
-            .lock()
-            .await
-            .remove(&request_id)
-            .ok_or_else(|| AgentError::Invalid(QUESTION_SETTLED.into()))?;
+        let mut pending_answers = self.inner.question_answers.lock().await;
+        let Some(waiting) = pending_answers.get(&request_id) else {
+            return Err(AgentError::Invalid(QUESTION_SETTLED.into()));
+        };
+        // Nothing is recorded for a Run that no longer waits here, such as one just released.
+        if waiting.is_closed() || Self::release_of(chat, request.run_id).is_cancelled() {
+            return Err(AgentError::Invalid("question expired".into()));
+        }
         let mut snapshot = chat.snapshot.clone();
         snapshot
             .questions
             .retain(|request| request.id != request_id);
+        if let PendingReply::Answered(_) = &pending
+            && let Some(operation) = snapshot.operations.iter_mut().find(|operation| {
+                operation.run_id == request.run_id && operation.call_id == request.call_id
+            })
+        {
+            operation.state = OperationState::Completed;
+            operation.result = Some(result.tool.clone());
+        }
+        let receipt = Receipt {
+            chat_id,
+            loop_id: request.loop_id,
+            run_id: Uuid::new_v4(),
+        };
+        let lifecycle = &mut chat.bookkeeping.lifecycle;
+        lifecycle.resolve_wait(request_id, result, ledger.as_ref().map(|input| input.id));
+        if let Some(input) = &ledger {
+            lifecycle.record_settled(
+                input,
+                &receipt,
+                SettledOutcome::Merged {
+                    into: request.run_id,
+                },
+            );
+            self.inner.ledger_changes.send_replace(());
+        }
         self.save(&snapshot);
         chat.snapshot = snapshot;
-        reply
-            .send(QuestionReply::Declined)
-            .map_err(|_| AgentError::Invalid("question expired".into()))
+        pending_answers
+            .remove(&request_id)
+            .unwrap()
+            .send(pending)
+            .map_err(|_| AgentError::Invalid("question expired".into()))?;
+        Ok(receipt)
     }
 
     pub(super) async fn interaction_tool(
@@ -354,34 +461,51 @@ impl Agent {
         call_id: &str,
         name: &str,
         input: &Value,
+        was_approved_by_human: bool,
         cancel: CancellationToken,
     ) -> Option<Result<ToolResult, String>> {
         match name {
             ASK_USER_QUESTION_TOOL_NAME => {
                 Some(self.ask_question(receipt, call_id, input, cancel).await)
             }
-            START_GOAL_TOOL_NAME => Some(self.start_goal(receipt, call_id, input, cancel).await),
+            START_GOAL_TOOL_NAME => Some(
+                self.start_goal(receipt, call_id, input, was_approved_by_human, cancel)
+                    .await,
+            ),
             _ => None,
         }
     }
 
+    /// Registers the goal. A schedule it gives expires after the model's schedule lifetime and
+    /// runs only once the user confirms it: the call's approval when a person approved it,
+    /// otherwise a later `decide_schedule`.
     async fn start_goal(
         &self,
         receipt: &Receipt,
         call_id: &str,
         input: &Value,
+        was_approved_by_human: bool,
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Input {
             goal: String,
+            #[serde(default)]
+            schedule: Option<String>,
         }
-        let parsed: Input = serde_json::from_value(input.clone())
-            .map_err(|_| format!("{START_GOAL_TOOL_NAME} requires only a goal string"))?;
+        let parsed: Input = serde_json::from_value(input.clone()).map_err(|_| {
+            format!("{START_GOAL_TOOL_NAME} requires a goal string and an optional schedule string")
+        })?;
         if parsed.goal.trim().is_empty() || parsed.goal.len() > MAX_ANSWER_BYTES {
             return Err("goal must contain 1 to 65536 bytes".into());
         }
+        let schedule = parsed
+            .schedule
+            .as_deref()
+            .map(tickloop_agent_protocol::Recurrence::parse)
+            .transpose()
+            .map_err(|error| format!("invalid schedule: {error}"))?;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats
             .get_mut(&receipt.chat_id)
@@ -400,50 +524,127 @@ impl Agent {
         {
             return Err("run was cancelled before creating the new goal".into());
         }
+        // The Loop is named by the answer and call that register it, so a load finds what a
+        // call whose result was lost with its host registered.
+        let loop_id = chat
+            .bookkeeping
+            .lifecycle
+            .active_response(receipt.run_id)
+            .map_or_else(Uuid::new_v4, |response| {
+                tickloop_agent_transcript::input_ids::started_goal(
+                    receipt.chat_id,
+                    response,
+                    call_id,
+                )
+            });
+        if let Some(goal) = chat.snapshot.loops.iter().find(|goal| goal.id == loop_id) {
+            let queued_run = chat
+                .bookkeeping
+                .lifecycle
+                .input(tickloop_agent_transcript::input_ids::goal(loop_id))
+                .map(|accepted| accepted.run_id);
+            return Ok(started_goal_result(receipt.chat_id, goal, queued_run));
+        }
         let mut snapshot = chat.snapshot.clone();
         let new_receipt = Receipt {
             chat_id: receipt.chat_id,
-            loop_id: Uuid::new_v4(),
+            loop_id,
             run_id: Uuid::new_v4(),
+        };
+        let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
+        let trigger = match schedule {
+            Some(schedule) => {
+                if triggers::active_schedules(&chat.snapshot) >= triggers::MAX_ACTIVE_SCHEDULES {
+                    return Err(triggers::too_many_schedules());
+                }
+                let mut trigger = Trigger {
+                    id: Uuid::new_v4(),
+                    prompt: parsed.goal.clone(),
+                    prompt_source: tickloop_agent_protocol::TriggerPromptSource::Explicit,
+                    schedule: Some(schedule),
+                    expires_at_ms: Some(now.saturating_add(triggers::MODEL_SCHEDULE_LIFETIME_MS)),
+                    accepts_events: false,
+                    armed: was_approved_by_human,
+                    armed_at_ms: None,
+                    last_fired_at_ms: None,
+                    confirmation: Some(if was_approved_by_human {
+                        tickloop_agent_protocol::ScheduleConfirmation::Confirmed { at_ms: now }
+                    } else {
+                        tickloop_agent_protocol::ScheduleConfirmation::Pending
+                    }),
+                    subscriptions: Vec::new(),
+                };
+                let armed_at = self.inner.schedule_clock.now_ms();
+                if let Some(reason) =
+                    triggers::invalid_trigger(&trigger, self.inner.min_schedule_interval, armed_at)
+                {
+                    return Err(reason);
+                }
+                if trigger.armed {
+                    trigger.arm_at(armed_at);
+                }
+                Some(trigger)
+            }
+            None => None,
         };
         chat.bookkeeping.add_loop(
             &mut snapshot,
             LoopSnapshot {
                 id: new_receipt.loop_id,
                 goal: parsed.goal.clone(),
-                state: LoopState::Queued,
+                state: match trigger {
+                    Some(_) => LoopState::WaitingTrigger,
+                    None => LoopState::Queued,
+                },
                 run_id: None,
                 run_started_at: None,
-                trigger: None,
+                trigger: trigger.clone(),
                 event_sources: Vec::new(),
-                state_since: Some(tickloop_agent_base::private_fs::unix_time_milliseconds()),
+                state_since: Some(now),
             },
         );
-        let index = snapshot
-            .pending_inputs
+        let queued_run = match trigger {
+            Some(_) => None,
+            None => {
+                let index = snapshot
+                    .pending_inputs
+                    .iter()
+                    .position(|pending| pending.trigger_source.is_some())
+                    .unwrap_or(snapshot.pending_inputs.len());
+                snapshot.last_queue_sequence += 1;
+                let queued_sequence = snapshot.last_queue_sequence;
+                let queued = PendingInput {
+                    receipt: new_receipt.clone(),
+                    input: parsed.goal,
+                    contexts: Vec::new(),
+                    agent_message: None,
+                    directed_human: None,
+                    denial_reference: None,
+                    trigger_source: None,
+                    armed: true,
+                    queued_sequence,
+                    task_continuation: false,
+                    is_skill_invocation: false,
+                    attached_file_reads: Vec::new(),
+                };
+                chat.bookkeeping.lifecycle.accept(
+                    &lifecycle::LedgerInput::new(
+                        tickloop_agent_transcript::input_ids::goal(new_receipt.loop_id),
+                        tickloop_agent_transcript::InputOp::Goal,
+                        &queued.input,
+                    ),
+                    &queued,
+                );
+                snapshot.pending_inputs.insert(index, queued);
+                Some(new_receipt.run_id)
+            }
+        };
+        let goal = snapshot
+            .loops
             .iter()
-            .position(|pending| pending.trigger_source.is_some())
-            .unwrap_or(snapshot.pending_inputs.len());
-        snapshot.last_queue_sequence += 1;
-        let queued_sequence = snapshot.last_queue_sequence;
-        snapshot.pending_inputs.insert(
-            index,
-            PendingInput {
-                receipt: new_receipt.clone(),
-                input: parsed.goal,
-                contexts: Vec::new(),
-                agent_message: None,
-                directed_human: None,
-                denial_reference: None,
-                trigger_source: None,
-                armed: true,
-                queued_sequence,
-                task_continuation: false,
-                is_skill_invocation: false,
-                attached_file_reads: Vec::new(),
-            },
-        );
-        let result = ToolResult {content: json!({"chat_id":new_receipt.chat_id,"loop_id":new_receipt.loop_id,"run_id":new_receipt.run_id,"state":"queued"}).to_string(), is_error: false, output_ref: None};
+            .find(|goal| goal.id == loop_id)
+            .expect("the goal was just added");
+        let result = started_goal_result(receipt.chat_id, goal, queued_run);
         if let Some(operation) = snapshot
             .operations
             .iter_mut()
@@ -454,6 +655,21 @@ impl Agent {
         }
         self.save(&snapshot);
         chat.snapshot = snapshot;
+        let timer = trigger.map(|trigger| {
+            let cancel = CancellationToken::new();
+            chat.trigger_cancellations.insert(loop_id, cancel.clone());
+            (trigger, cancel)
+        });
+        drop(chats);
+        match timer {
+            Some((trigger, cancel)) if trigger.armed => {
+                self.start_armed_trigger(receipt.chat_id, loop_id, trigger, cancel)
+                    .await;
+            }
+            // A schedule awaiting confirmation keeps only its deadline.
+            Some((trigger, cancel)) => self.trigger_task(receipt.chat_id, loop_id, trigger, cancel),
+            None => {}
+        }
         Ok(result)
     }
 
@@ -478,7 +694,7 @@ impl Agent {
             questions: parsed.questions,
         };
         let (sender, receiver) = oneshot::channel();
-        {
+        let release = {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats
                 .get_mut(&receipt.chat_id)
@@ -505,8 +721,10 @@ impl Agent {
             snapshot.questions.push(request.clone());
             self.save(&snapshot);
             chat.snapshot = snapshot;
+            let release = self.suspend_for_question(chat, receipt, &request);
             self.park_run(chat, receipt, cancel.clone())
                 .map_err(|error| error.to_string())?;
+            self.save_now(&chat.snapshot);
             self.inner
                 .question_answers
                 .lock()
@@ -519,16 +737,18 @@ impl Agent {
                     request: request.clone(),
                 },
             );
-        }
+            release
+        };
         let next = self
             .next_run(receipt.chat_id)
             .await
             .map_err(|error| error.to_string())?;
         if let Some(next) = next {
-            self.inner.tasks.lock().await.push(self.run_task(next));
+            self.run_task(next);
         }
         let reply = tokio::select! {
             biased;
+            _ = release.cancelled() => return Err(super::suspension::RUN_RELEASED.into()),
             _ = cancel.cancelled() => Err("question was cancelled".to_string()),
             reply = receiver => reply.map_err(|_| "question expired".to_string()),
         };
@@ -537,6 +757,9 @@ impl Agent {
         } else {
             Ok(())
         };
+        if release.is_cancelled() {
+            return Err(super::suspension::RUN_RELEASED.into());
+        }
         let mut chats = self.inner.chats.lock().await;
         let chat = chats
             .get_mut(&receipt.chat_id)
@@ -562,13 +785,13 @@ impl Agent {
         }
         resumed?;
         match reply? {
-            QuestionReply::Answered(content) => Ok(ToolResult {
+            PendingReply::Answered(content) => Ok(ToolResult {
                 content,
                 is_error: false,
                 output_ref: None,
             }),
             // As a declined permission: the result reaches the conversation, then the run ends.
-            QuestionReply::Declined => {
+            PendingReply::Declined => {
                 chat.user_cancelled_runs.insert(receipt.run_id);
                 Ok(ToolResult {
                     content: DECLINED_QUESTIONS_RESULT.into(),

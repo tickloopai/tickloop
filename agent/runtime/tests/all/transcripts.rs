@@ -546,7 +546,10 @@ async fn restored_loops_are_interrupted_and_triggers_disarmed() {
                 id: Uuid::new_v4(),
                 prompt: "periodic check".into(),
                 prompt_source: TriggerPromptSource::Explicit,
-                interval_seconds: Some(3_600),
+                schedule: Some(tickloop_agent_protocol::Recurrence::parse("every 1h").unwrap()),
+                armed_at_ms: None,
+                last_fired_at_ms: None,
+                confirmation: None,
                 expires_at_ms: None,
                 accepts_events: false,
                 armed: true,
@@ -1333,7 +1336,10 @@ async fn the_working_directory_resumes_from_the_last_recorded_entry() {
     let restored =
         Agent::open_embedded(root, config(), Arc::new(ScriptedModel::new(Vec::new()))).unwrap();
     let snapshot = restored.resume_chat(chat).await.unwrap();
-    assert_eq!(snapshot.workdir, directories[1].canonicalize().unwrap());
+    assert_eq!(
+        snapshot.folder,
+        Some(directories[1].canonicalize().unwrap())
+    );
     restored.shutdown().await;
 }
 
@@ -1398,7 +1404,7 @@ async fn resume_filtering_after_a_compaction_keeps_the_boundary_chain_stable() {
 }
 
 /// 规格"会话内容的表示"中列出的 Transcript 条目类型。
-const SPECIFIED_LINE_TYPES: [&str; 13] = [
+const SPECIFIED_LINE_TYPES: [&str; 17] = [
     "user",
     "assistant",
     "system",
@@ -1412,6 +1418,10 @@ const SPECIFIED_LINE_TYPES: [&str; 13] = [
     "branch-origin",
     "file-history-snapshot",
     "content-replacement",
+    "response",
+    "input",
+    "wait",
+    "retained-snapshot",
 ];
 
 /// Loop id、目标、计划（版本与内容）与进度步骤。
@@ -1617,8 +1627,8 @@ async fn transcripts_hold_only_specified_entries_and_restart_rebuilds_the_chat_f
         Agent::open_embedded(root, config(), Arc::new(ScriptedModel::new(Vec::new()))).unwrap();
     let restored = restarted.resume_chat(chat).await.unwrap();
     let restored_child = restarted.resume_chat(child.child_chat_id).await.unwrap();
-    assert_eq!(restored.workdir, before.workdir);
-    assert_eq!(restored.workdir, other.canonicalize().unwrap());
+    assert_eq!(restored.folder, before.folder);
+    assert_eq!(restored.folder, Some(other.canonicalize().unwrap()));
     assert_eq!(plan_and_progress(&restored), plan_and_progress(&before));
     // 重启只加载最后一个压缩边界之后的链：进程内的位置减去边界下标后应一致。
     let chain_root = compaction_positions(&before)[0].0;
@@ -1656,7 +1666,7 @@ async fn transcripts_hold_only_specified_entries_and_restart_rebuilds_the_chat_f
         Some(chat)
     );
     assert_eq!(restored_child.branch_name(), child_before.branch_name());
-    assert_eq!(restored_child.workdir, child_before.workdir);
+    assert_eq!(restored_child.folder, child_before.folder);
     assert_eq!(
         plan_and_progress(&restored_child),
         plan_and_progress(&child_before)
@@ -1771,7 +1781,10 @@ async fn artifact_only_chat_survives_restart_before_its_first_message() {
     );
     let snapshot = reopened.resume_chat(chat).await.unwrap();
     assert_eq!(snapshot.artifact_ticks, vec![tick]);
-    assert_eq!(snapshot.workdir, directory.path().canonicalize().unwrap());
+    assert_eq!(
+        snapshot.folder,
+        Some(directory.path().canonicalize().unwrap())
+    );
     assert!(snapshot.messages.is_empty());
     reopened.shutdown().await;
 }

@@ -12,6 +12,7 @@ use tickloop_agent_protocol::{
 use tickloop_agent_runtime::{Agent, AgentError};
 use uuid::Uuid;
 
+use tickloop_agent_test_support::harness::{ChosenModels, embedded_agent};
 use tickloop_agent_test_support::{ScriptedModel, call, config, next_event, text};
 
 fn write_png(path: &Path, width: u32, height: u32) -> Vec<u8> {
@@ -449,7 +450,8 @@ async fn a_model_without_image_input_refuses_image_prompts_and_leaves_the_chat_u
     let notes = directory.path().join("notes.txt");
     std::fs::write(&notes, "delivery is Friday").unwrap();
     let model = Arc::new(ScriptedModel::new(vec![text("Read the notes.")]));
-    let agent = Agent::new_embedded(text_only_config(), model.clone());
+    let models = ChosenModels::new(model.clone());
+    let agent = embedded_agent(text_only_config(), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     assert!(!agent.accepts_images(chat).await.unwrap());
 
@@ -481,10 +483,8 @@ async fn a_model_without_image_input_refuses_image_prompts_and_leaves_the_chat_u
     assert_eq!(model.requests.lock().unwrap().len(), 1);
 
     let vision = Arc::new(ScriptedModel::new(vec![text("A chart.")]));
-    agent
-        .set_model(chat, config(), vision.clone())
-        .await
-        .unwrap();
+    models.choose(vision.clone());
+    agent.set_model(chat, config()).await.unwrap();
     assert!(agent.accepts_images(chat).await.unwrap());
     submit_and_wait(&agent, chat, "Describe @chart.png", vec![image]).await;
     assert_eq!(
@@ -530,14 +530,7 @@ async fn a_pending_switch_to_a_text_only_model_refuses_image_prompts() {
         EventKind::PermissionRequested { .. }
     ) {}
 
-    let change = agent
-        .set_model(
-            chat,
-            text_only_config(),
-            Arc::new(ScriptedModel::new(Vec::new())),
-        )
-        .await
-        .unwrap();
+    let change = agent.set_model(chat, text_only_config()).await.unwrap();
 
     assert_eq!(change, ModelChange::Pending);
     assert!(!agent.accepts_images(chat).await.unwrap());

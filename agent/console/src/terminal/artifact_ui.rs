@@ -320,7 +320,10 @@ async fn apply_choice_with_client(
                 ));
             }
             if let Some(chat) = chat {
-                let instance = tick_protocol::artifact_instance_id(client.origin(), &artifact.id);
+                let instance = tick_protocol::artifact_instance_id(
+                    client.origin(),
+                    &tickloop_agent_artifacts::canonical_artifact_id(&artifact.id),
+                );
                 remove_local_artifact(agent, console, chat, &instance)
                     .await
                     .map_err(|error| format!("Artifact deleted; local cleanup failed: {error}"))?;
@@ -342,6 +345,13 @@ mod tests {
     };
 
     async fn artifact_service() -> (String, tokio::task::JoinHandle<()>, Arc<Mutex<Vec<String>>>) {
+        artifact_service_with_id("doc").await
+    }
+
+    async fn artifact_service_with_id(
+        id: &str,
+    ) -> (String, tokio::task::JoinHandle<()>, Arc<Mutex<Vec<String>>>) {
+        let id = id.to_owned();
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},
             net::TcpListener,
@@ -361,22 +371,31 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(request.lines().next().unwrap().to_owned());
-                let user =
-                    serde_json::json!({"id":"owner","name":"Owner","email":"owner@example.test"});
-                let body = if request.starts_with("POST /artifact/api/v1/auth/device ") {
-                    serde_json::json!({"device_code":"device","user_code":"CODE","verification_uri":format!("{endpoint}/artifact/device?code=CODE"),"expires_in":60,"interval":1})
-                } else if request.starts_with("POST /artifact/api/v1/auth/device/token ") {
-                    serde_json::json!({"access_token":"test-token","token_type":"Bearer","expires_in":600,"user":user})
-                } else if request.starts_with("DELETE /artifact/api/v1/artifacts/doc ") {
+                let body = if request
+                    .starts_with("GET /.well-known/oauth-authorization-server/account ")
+                {
+                    serde_json::json!({"issuer":format!("{endpoint}/account"),"token_endpoint":format!("{endpoint}/account/token"),"device_authorization_endpoint":format!("{endpoint}/account/device"),"userinfo_endpoint":format!("{endpoint}/account/userinfo"),"revocation_endpoint":format!("{endpoint}/account/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]})
+                } else if request.starts_with("GET /account/userinfo ") {
+                    serde_json::json!({"sub":"owner","name":"Owner","email":"owner@example.test"})
+                } else if request.starts_with("POST /account/device ") {
+                    serde_json::json!({"device_code":"device","user_code":"CODE","verification_uri":format!("{endpoint}/account/device?code=CODE"),"expires_in":60,"interval":1})
+                } else if request.starts_with("POST /account/token ") {
+                    serde_json::json!({"access_token":"test-token","token_type":"Bearer","expires_in":600,"refresh_token":"refresh-test-token"})
+                } else if request.starts_with(&format!("DELETE /artifact/api/v1/artifacts/{id} "))
+                    || request.starts_with(&format!("PUT /artifact/api/v1/artifacts/{id}/pin "))
+                    || request.starts_with(&format!("DELETE /artifact/api/v1/artifacts/{id}/pin "))
+                    || request
+                        .starts_with(&format!("POST /artifact/api/v1/artifacts/{id}/metadata "))
+                {
                     let input: serde_json::Value =
                         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
                     serde_json::json!({"operation_id":input["operation_id"],"status":"committed"})
-                } else if request.starts_with("PUT /artifact/api/v1/agent/links/doc ") {
+                } else if request.starts_with(&format!("PUT /artifact/api/v1/agent/links/{id} ")) {
                     let input: serde_json::Value =
                         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-                    serde_json::json!({"artifact_id":"doc","binding_id":input["binding_id"],"epoch":2})
+                    serde_json::json!({"artifact_id":id,"binding_id":input["binding_id"],"epoch":2})
                 } else {
-                    serde_json::json!({"id":"doc","title":"Shared document","format":"markdown","access_role":"owner","url":format!("{endpoint}/a/doc"),"agent_links":[{"binding_id":Uuid::new_v4(),"chat_id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"epoch":1}]})
+                    serde_json::json!({"id":id,"title":"Shared document","format":"markdown","access_role":"owner","url":format!("{endpoint}/a/doc"),"agent_links":[{"binding_id":Uuid::new_v4(),"chat_id":Uuid::new_v4(),"loop_id":Uuid::new_v4(),"epoch":1}]})
                 };
                 let body = body.to_string();
                 socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
@@ -468,6 +487,65 @@ mod tests {
         assert_eq!((binding.artifact_id.as_str(), binding.epoch), ("doc", 2));
         server.abort();
         core.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn picker_pin_rename_and_delete_work_with_uuid_and_base62_artifacts() {
+        use super::super::artifacts_picker::{ArtifactChoice, ArtifactPickerAction};
+        for id in [
+            "e1b85a39-a57b-4c28-a8a5-ae9233aead3e",
+            "6rvWPvOnhVABug7llbHb26",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let (origin, server, requests) = artifact_service_with_id(id).await;
+            let client = sign_in(&root, &origin).await;
+            let (agent, core, chat) = artifact_fixture(directory.path(), &origin).await;
+            let artifact = client.read(id).await.unwrap();
+            agent
+                .add_artifact_tick(chat, artifact.tick(&origin, 1))
+                .await
+                .unwrap();
+            let console = Console::test_for_chat(chat);
+            console
+                .update_monitor_chat(agent.status(chat).await.unwrap())
+                .unwrap();
+            for action in [
+                ArtifactPickerAction::Pin(true),
+                ArtifactPickerAction::Pin(false),
+                ArtifactPickerAction::Rename("Renamed".into()),
+                ArtifactPickerAction::Delete,
+            ] {
+                apply_choice_with_client(
+                    &agent,
+                    &console,
+                    &root,
+                    Some(chat),
+                    ArtifactChoice {
+                        picker: Uuid::new_v4(),
+                        artifact: artifact.clone(),
+                        action,
+                    },
+                    &client,
+                )
+                .await
+                .unwrap();
+            }
+            assert!(agent.artifact_ticks(chat).await.unwrap().is_empty());
+            assert!(!console.monitor_has_entries().unwrap());
+            let requests = requests.lock().unwrap().clone();
+            for (method, suffix) in [
+                ("PUT", "/pin"),
+                ("DELETE", "/pin"),
+                ("POST", "/metadata"),
+                ("DELETE", ""),
+            ] {
+                assert!(requests.iter().any(|request| request
+                    == &format!("{method} /artifact/api/v1/artifacts/{id}{suffix} HTTP/1.1")));
+            }
+            core.shutdown().await;
+            server.abort();
+        }
     }
 
     #[tokio::test]

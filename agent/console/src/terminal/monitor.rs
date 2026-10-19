@@ -1217,7 +1217,7 @@ mod signal_tests {
         ChatStatus::of(
             &serde_json::from_value(serde_json::json!({
                 "id": uuid::Uuid::from_u128(1),
-                "workdir": "/fixture",
+                "folder": "/fixture",
                 "messages": [],
                 "loops": []
             }))
@@ -2200,7 +2200,7 @@ mod rebuild_benchmarks {
             .collect();
         serde_json::from_value(serde_json::json!({
             "id": uuid::Uuid::from_u128(1),
-            "workdir": "/fixture",
+            "folder": "/fixture",
             "messages": messages,
             "loops": [],
         }))

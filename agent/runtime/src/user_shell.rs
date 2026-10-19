@@ -104,6 +104,7 @@ impl Agent {
                 ));
             }
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+            let folder = super::require_folder(&chat.snapshot)?.to_path_buf();
             if loop_id
                 .is_some_and(|loop_id| !chat.snapshot.loops.iter().any(|goal| goal.id == loop_id))
             {
@@ -122,7 +123,7 @@ impl Agent {
                 chat_id,
                 loop_id,
                 command: command.clone(),
-                cwd: snapshot.workdir.clone(),
+                cwd: folder,
                 starts_in_background: background,
                 queued_sequence: snapshot.last_queue_sequence,
                 armed: true,
@@ -315,7 +316,7 @@ impl Agent {
         };
         let mut updates = tools.subscribe_user_shells();
         let agent = self.clone();
-        self.inner.tasks.lock().await.push(tokio::spawn(async move {
+        self.inner.tasks.spawn(async move {
             loop {
                 tokio::select! {
                     _ = agent.inner.shutdown.cancelled() => break,
@@ -339,7 +340,7 @@ impl Agent {
                     }
                 }
             }
-        }));
+        });
     }
 
     async fn record_watched_user_shell(
@@ -423,7 +424,7 @@ impl Agent {
             };
             let _ = self.inner.user_shell_events.send(record.clone());
             let agent = self.clone();
-            self.inner.tasks.lock().await.push(tokio::spawn(async move {
+            self.inner.tasks.spawn(async move {
                 if let Err(error) = agent
                     .admit_user_shell(chat_id, tools, &record, cancel)
                     .await
@@ -434,7 +435,7 @@ impl Agent {
                         .await;
                     let _ = agent.start_user_shell_queue(chat_id).await;
                 }
-            }));
+            });
             Ok(())
         })
     }
@@ -453,7 +454,7 @@ impl Agent {
         };
         let snapshot = self.snapshot(chat_id).await?;
         let workspace = tickloop_agent_tools::Workspace {
-            workdir: snapshot.workdir.clone(),
+            folder: snapshot.folder.clone(),
             additional_directories: snapshot.additional_directories.clone(),
         };
         let input = serde_json::json!({
@@ -615,7 +616,7 @@ impl Agent {
     pub(super) async fn start_next_agent_run(&self, chat_id: ChatId) -> Result<(), AgentError> {
         let next = self.next_run(chat_id).await?;
         if let Some(next) = next {
-            self.inner.tasks.lock().await.push(self.run_task(next));
+            self.run_task(next);
         }
         Ok(())
     }

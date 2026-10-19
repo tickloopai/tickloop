@@ -31,15 +31,21 @@ impl PermissionOwner {
 pub(crate) fn capture_workspace_scope(
     workspace: &Workspace,
 ) -> Result<WorkspaceScope, SessionPermissionError> {
-    let workdir = canonical_directory(&workspace.workdir)?;
+    let folder = workspace
+        .folder
+        .as_deref()
+        .map(canonical_directory)
+        .transpose()?;
     let mut additional_directories = workspace
         .additional_directories
         .iter()
         .map(|directory| canonical_directory(directory))
         .collect::<Result<BTreeSet<_>, _>>()?;
-    additional_directories.remove(&workdir);
+    if let Some(folder) = &folder {
+        additional_directories.remove(folder);
+    }
     Ok(WorkspaceScope::new(
-        workdir,
+        folder,
         additional_directories.into_iter().collect(),
     ))
 }

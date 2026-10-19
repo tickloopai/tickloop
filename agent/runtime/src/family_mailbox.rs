@@ -220,7 +220,7 @@ mod tests {
         };
         let mut snapshot = empty_snapshot(
             Uuid::new_v4(),
-            PathBuf::from("/tmp"),
+            Some(PathBuf::from("/tmp")),
             ModelConfig::unselected(),
         );
         for index in (0..20).rev() {

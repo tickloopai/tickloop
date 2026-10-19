@@ -16,8 +16,8 @@ use uuid::Uuid;
 
 use super::{
     ConnectionBudget, EventPublisher, InstanceObserver, InstanceRef, PreparedTickWatch,
-    RECONNECT_PAUSE, TickConnectionState, TickMetadata, TickObservation, TickStreamHandle,
-    TickStreamPort, WatchAdmission, WatchId, follow_instances,
+    RECONNECT_PAUSE, StreamTasks, TickConnectionState, TickMetadata, TickObservation,
+    TickStreamHandle, TickStreamPort, WatchAdmission, WatchId, follow_instances,
 };
 use crate::{Agent, ShellTaskCenter, WeakAgent};
 use tickloop_agent_protocol::{HostToolAuthority, ObservationKind, ShellTask};
@@ -216,6 +216,7 @@ impl InstanceObserver for ShellScope {
         instance: InstanceRef,
         wanted: watch::Receiver<BTreeSet<WatchId>>,
         publisher: EventPublisher,
+        _tasks: StreamTasks,
     ) {
         let (Some(task), Some(agent)) = (task_of(&instance), self.agent.upgrade()) else {
             return;
@@ -442,11 +443,12 @@ impl TickStreamPort for ShellTickStream {
         )))
     }
 
-    fn open(&self) -> TickStreamHandle {
+    fn open(&self, tasks: &StreamTasks) -> TickStreamHandle {
         let (desired, wanted) = watch::channel(BTreeMap::new());
-        let (publisher, events) = EventPublisher::channel();
+        let (publisher, events) = EventPublisher::channel(tasks);
         let scope = self.scope();
-        tokio::spawn(async move { follow_instances(scope, wanted, publisher).await });
+        let followers = tasks.clone();
+        tasks.spawn(async move { follow_instances(scope, wanted, publisher, followers).await });
         TickStreamHandle { desired, events }
     }
 }

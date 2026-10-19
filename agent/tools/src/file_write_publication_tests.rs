@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 fn workspace(path: &Path) -> Workspace {
     Workspace {
-        workdir: path.canonicalize().unwrap(),
+        folder: Some(path.canonicalize().unwrap()),
         additional_directories: Vec::new(),
     }
 }

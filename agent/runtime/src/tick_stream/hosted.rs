@@ -28,9 +28,9 @@ use uuid::Uuid;
 
 use super::{
     ConnectionBudget, DISCONNECTED_CODE, EventPublisher, InstanceObserver, InstanceRef,
-    PreparedTickWatch, ProtocolFeed, RECONNECT_PAUSE, TickConnectionState, TickMetadata,
-    TickObservation, TickStreamHandle, TickStreamPort, WatchAdmission, WatchId, connection_state,
-    current_observation, follow_instances, observe_protocol,
+    PreparedTickWatch, ProtocolFeed, RECONNECT_PAUSE, StreamTasks, TickConnectionState,
+    TickMetadata, TickObservation, TickStreamHandle, TickStreamPort, WatchAdmission, WatchId,
+    connection_state, current_observation, follow_instances, observe_protocol,
 };
 use crate::{host_tools::HostToolProvider, hosted::tools::HostedTickTools, tick_tools::TICK_READ};
 use tickloop_agent_protocol::{HostToolAuthority, ObservationKind};
@@ -194,9 +194,10 @@ impl InstanceObserver for HostedScope {
         instance: InstanceRef,
         wanted: watch::Receiver<BTreeSet<WatchId>>,
         publisher: EventPublisher,
+        tasks: StreamTasks,
     ) {
         let observer = Uuid::new_v4();
-        observe_hosted_instance(&self, observer, instance, wanted, publisher).await;
+        observe_hosted_instance(&self, observer, instance, wanted, publisher, tasks).await;
         // A later watch of this Tick starts from the screen as it is then.
         self.forget_screens(observer);
     }
@@ -208,6 +209,7 @@ async fn observe_hosted_instance(
     instance: InstanceRef,
     mut wanted: watch::Receiver<BTreeSet<WatchId>>,
     publisher: EventPublisher,
+    tasks: StreamTasks,
 ) {
     let mut ready_watches = BTreeSet::new();
     loop {
@@ -228,6 +230,7 @@ async fn observe_hosted_instance(
             tools: scope.tools.clone(),
             chat,
             instance: instance.clone(),
+            tasks: tasks.clone(),
         };
         match feed.check_binding().await {
             Err(error) => {
@@ -322,6 +325,7 @@ struct HostedFeed {
     tools: Arc<HostedTickTools>,
     chat: Uuid,
     instance: InstanceRef,
+    tasks: StreamTasks,
 }
 
 impl HostedFeed {
@@ -354,7 +358,11 @@ impl HostedFeed {
             .map_err(|error| error.to_string())?;
         let read: TerminalRead = serde_json::from_value(registered["read"].clone())
             .map_err(|error| error.to_string())?;
-        Ok((description, read, TerminalLink::new(connection)))
+        Ok((
+            description,
+            read,
+            TerminalLink::new(connection, &self.tasks),
+        ))
     }
 }
 
@@ -375,10 +383,10 @@ enum LinkEvent {
 }
 
 impl TerminalLink {
-    fn new(connection: HostConnection) -> Self {
+    fn new(connection: HostConnection, tasks: &StreamTasks) -> Self {
         let (mut reader, writer) = connection.into_parts();
         let (sender, frames) = mpsc::channel(LINK_FRAMES);
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             loop {
                 let frame = tokio::select! {
                     _ = sender.closed() => return,
@@ -825,7 +833,7 @@ impl ProtocolFeed for HostedFeed {
             received,
             state: SessionLinkState::Live,
         });
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             loop {
                 let event = tokio::select! {
                     event = connection.next_event_within(OBSERVATION_FRAME_BYTES) => event,
@@ -993,11 +1001,12 @@ impl TickStreamPort for HostedTickStream {
         answer.await.ok().flatten()
     }
 
-    fn open(&self) -> TickStreamHandle {
+    fn open(&self, tasks: &StreamTasks) -> TickStreamHandle {
         let (desired, wanted) = watch::channel(BTreeMap::new());
-        let (publisher, events) = EventPublisher::channel();
+        let (publisher, events) = EventPublisher::channel(tasks);
         let scope = self.scope();
-        tokio::spawn(async move { follow_instances(scope, wanted, publisher).await });
+        let followers = tasks.clone();
+        tasks.spawn(async move { follow_instances(scope, wanted, publisher, followers).await });
         TickStreamHandle { desired, events }
     }
 }

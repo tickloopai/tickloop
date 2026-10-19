@@ -771,7 +771,7 @@ async fn stopping_a_shell_also_terminates_descendants_that_ignore_sigterm() {
 fn bash_takes_claude_code_parameters_and_the_old_command_tools_are_gone() {
     let directory = tempfile::tempdir().unwrap();
     let workspace = Workspace {
-        workdir: directory.path().into(),
+        folder: Some(directory.path().into()),
         additional_directories: Vec::new(),
     };
     let definitions = Tools::definitions();

@@ -85,23 +85,34 @@ async fn console_creation_links_the_artifact_and_shows_only_the_artifact_tools()
             let origin = server_origin.clone();
             tokio::spawn(async move {
                 let (path, request) = read_request(&mut stream).await;
+                let path = path.replace(
+                    "e1b85a39-a57b-4c28-a8a5-ae9233aead3e",
+                    "6rvWPvOnhVABug7llbHb26",
+                );
                 let user =
                     json!({"id":"fixture-owner","name":"Fixture","email":"fixture@example.test"});
-                let (content_type, body) = if path.starts_with("POST /artifact/api/v1/auth/device ")
+                let (content_type, body) = if path
+                    .starts_with("GET /.well-known/oauth-authorization-server/account ")
                 {
-                    ("application/json", json!({"device_code":"fixture-device","user_code":"TEST","verification_uri":format!("{origin}/artifact/device?code=TEST"),"expires_in":30,"interval":1}).to_string())
-                } else if path.starts_with("POST /artifact/api/v1/auth/device/token ") {
-                    ("application/json", json!({"access_token":"fixture-token","token_type":"Bearer","expires_in":60,"user":user}).to_string())
-                } else if path.starts_with("GET /artifact/api/v1/auth/session ") {
+                    ("application/json", json!({"issuer":format!("{origin}/account"),"token_endpoint":format!("{origin}/account/token"),"device_authorization_endpoint":format!("{origin}/account/device"),"userinfo_endpoint":format!("{origin}/account/userinfo"),"revocation_endpoint":format!("{origin}/account/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]}).to_string())
+                } else if path.starts_with("POST /account/device ") {
+                    ("application/json", json!({"device_code":"fixture-device","user_code":"TEST","verification_uri":format!("{origin}/account/device?code=TEST"),"expires_in":30,"interval":1}).to_string())
+                } else if path.starts_with("POST /account/token ") {
+                    ("application/json", json!({"access_token":"fixture-token","token_type":"Bearer","expires_in":600,"refresh_token":"fixture-refresh"}).to_string())
+                } else if path.starts_with("GET /account/userinfo ") {
                     (
                         "application/json",
-                        json!({"user":user,"expires_at":"2099-01-01T00:00:00Z"}).to_string(),
+                        json!({"sub":user["id"],"name":user["name"],"email":user["email"]})
+                            .to_string(),
                     )
-                } else if path.starts_with("GET /artifact/api/v1/artifacts/fixture-artifact ") {
-                    ("application/json", json!({"id":"fixture-artifact","title":FIXTURE_ARTIFACT_TITLE,"format":"markdown","access_role":"owner","url":format!("{origin}/a/fixture-artifact"),"agent_links":[]}).to_string())
-                } else if path.starts_with("PUT /artifact/api/v1/agent/links/fixture-artifact ") {
+                } else if path.starts_with("GET /artifact/api/v1/artifacts/6rvWPvOnhVABug7llbHb26 ")
+                {
+                    ("application/json", json!({"id":"6rvWPvOnhVABug7llbHb26","title":FIXTURE_ARTIFACT_TITLE,"format":"markdown","access_role":"owner","url":format!("{origin}/artifact/6rvWPvOnhVABug7llbHb26"),"agent_links":[]}).to_string())
+                } else if path
+                    .starts_with("PUT /artifact/api/v1/agent/links/6rvWPvOnhVABug7llbHb26 ")
+                {
                     observed.linked.store(true, Ordering::SeqCst);
-                    ("application/json", json!({"artifact_id":"fixture-artifact","binding_id":request["binding_id"],"epoch":1}).to_string())
+                    ("application/json", json!({"artifact_id":"6rvWPvOnhVABug7llbHb26","binding_id":request["binding_id"],"epoch":1}).to_string())
                 } else if path.starts_with("GET /artifact/api/v1/agent/feedback?") {
                     observed.listened.store(true, Ordering::SeqCst);
                     (
@@ -122,7 +133,7 @@ async fn console_creation_links_the_artifact_and_shows_only_the_artifact_tools()
                         "tools/call" => {
                             assert_eq!(request["params"]["name"], "ArtifactEdit");
                             let args = &request["params"]["arguments"];
-                            json!({"content":[],"structuredContent":{"artifact_id":"fixture-artifact","title":args["title"],"format":args["format"],"url":format!("{origin}/a/fixture-artifact"),"revision":1}})
+                            json!({"content":[],"structuredContent":{"artifact_id":"6rvWPvOnhVABug7llbHb26","title":args["title"],"format":args["format"],"url":format!("{origin}/artifact/6rvWPvOnhVABug7llbHb26"),"revision":1}})
                         }
                         other => panic!("unexpected fixture MCP method: {other}"),
                     };

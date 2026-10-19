@@ -1,7 +1,30 @@
 //! Every agent/runtime integration test, compiled as one binary.
 
+#[path = "all/advance.rs"]
+mod advance;
 #[path = "all/agent_approval_routing.rs"]
 mod agent_approval_routing;
+#[path = "all/cloud_composition.rs"]
+mod cloud_composition;
+#[path = "all/durable_deliveries.rs"]
+mod durable_deliveries;
+#[path = "all/durable_family.rs"]
+mod durable_family;
+#[path = "all/durable_queue.rs"]
+mod durable_queue;
+#[path = "all/durable_tasks.rs"]
+mod durable_tasks;
+#[path = "all/durable_triggers.rs"]
+mod durable_triggers;
+#[path = "all/durable_waits.rs"]
+mod durable_waits;
+#[path = "all/retained_budget.rs"]
+mod retained_budget;
+#[path = "all/schedule_confirmation.rs"]
+mod schedule_confirmation;
+
+#[path = "all/response_lifecycle.rs"]
+mod response_lifecycle;
 
 #[path = "all/approval_budget.rs"]
 mod approval_budget;
@@ -62,6 +85,8 @@ mod explicit_ask_scopes;
 mod failed_replies;
 #[path = "all/file_tools.rs"]
 mod file_tools;
+#[path = "all/folderless_chats.rs"]
+mod folderless_chats;
 #[path = "all/glm_models.rs"]
 mod glm_models;
 #[path = "all/goal_routing_live.rs"]
@@ -168,6 +193,8 @@ mod tickhost_versions;
 mod tool_batches;
 #[path = "all/tool_results.rs"]
 mod tool_results;
+#[path = "all/transcript_stores.rs"]
+mod transcript_stores;
 #[path = "all/transcripts.rs"]
 mod transcripts;
 #[path = "all/triggers.rs"]

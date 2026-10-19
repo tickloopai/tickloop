@@ -3,9 +3,10 @@ use std::collections::{HashMap, HashSet};
 use tickloop_agent_protocol::{
     ChatSnapshot, CompactionMarker, Content, Message, OriginalUserInput, Role,
 };
+use tickloop_agent_transcript::ChainEntry;
 use uuid::Uuid;
 
-use crate::{ChatBookkeeping, transcript::ChainEntry};
+use crate::ChatBookkeeping;
 
 const REPLY_HISTORY_VERSION: u32 = 1;
 

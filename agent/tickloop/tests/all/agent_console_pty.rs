@@ -595,7 +595,10 @@ async fn run_lifecycle(fixture: &PrivateFixture) {
             let rows = catalog(&client).await;
             if let Some(row) = rows.first() {
                 assert_eq!(rows.len(), 1);
-                assert_eq!(row.workdir, fixture.path("work").canonicalize().unwrap());
+                assert_eq!(
+                    row.folder,
+                    Some(fixture.path("work").canonicalize().unwrap())
+                );
                 break row.execution;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1625,10 +1628,13 @@ async fn run_child_views(fixture: &PrivateFixture) {
     .await
     .expect("actual model-visible Subagent must create a real child");
     let child_before = snapshot(&client, child).await;
-    assert_eq!(child_before.conversation.workdir, parent_project);
     assert_eq!(
-        snapshot(&client, other).await.conversation.workdir,
-        other_project
+        child_before.conversation.folder,
+        Some(parent_project.clone())
+    );
+    assert_eq!(
+        snapshot(&client, other).await.conversation.folder,
+        Some(other_project.clone())
     );
     let child_loop = child_before.conversation.loops[0].id;
     let metadata =
@@ -1952,7 +1958,10 @@ async fn run_child_views(fixture: &PrivateFixture) {
         parent_after_follow_up.conversation.loops[0].run_id,
         parent_run
     );
-    assert_eq!(parent_after_follow_up.conversation.workdir, parent_project);
+    assert_eq!(
+        parent_after_follow_up.conversation.folder,
+        Some(parent_project.clone())
+    );
     finish_parent.send(()).unwrap();
     let parent_done = wait_snapshot(
         &client,
@@ -2248,8 +2257,8 @@ async fn run_reading_and_draft_return(fixture: &PrivateFixture) {
     })
     .await;
     assert_eq!(
-        snapshot(&client, other).await.conversation.workdir,
-        other_project
+        snapshot(&client, other).await.conversation.folder,
+        Some(other_project.clone())
     );
     std::fs::write(fixture.path("work/reading-finish"), "finish").unwrap();
     let completed = wait_snapshot(
@@ -2461,7 +2470,7 @@ async fn run_stashed_image_payload(fixture: &PrivateFixture, switch_roots: bool)
             },
         )
         .await;
-        assert_eq!(peer.conversation.workdir, other_project);
+        assert_eq!(peer.conversation.folder, Some(other_project.clone()));
         Some(execution)
     } else {
         None
@@ -2565,8 +2574,8 @@ async fn run_stashed_image_payload(fixture: &PrivateFixture, switch_roots: bool)
         assert_eq!(catalog(&client).await.len(), 2);
         let returned = snapshot(&client, first).await;
         assert_eq!(
-            returned.conversation.workdir,
-            first_before.conversation.workdir
+            returned.conversation.folder,
+            first_before.conversation.folder
         );
         assert_eq!(
             returned.conversation.loops[0].id,
@@ -2894,7 +2903,10 @@ async fn run_stashed_accepted_mention(fixture: &PrivateFixture) {
     )
     .await;
     let after_root_change = snapshot(&client, execution).await;
-    assert_eq!(after_root_change.conversation.workdir, new_root);
+    assert_eq!(
+        after_root_change.conversation.folder,
+        Some(new_root.clone())
+    );
     assert_eq!(
         after_root_change.last_model_run,
         before_root_change.last_model_run
@@ -2971,7 +2983,10 @@ async fn run_stashed_shell_mode(fixture: &PrivateFixture) {
     )
     .await;
     assert_eq!(submitted.user_shells[0].command, COMMAND);
-    assert_eq!(submitted.conversation.workdir, expected_directory);
+    assert_eq!(
+        submitted.conversation.folder,
+        Some(expected_directory.clone())
+    );
     assert!(submitted.last_model_run.is_none());
     assert!(submitted.conversation.loops.is_empty());
     view.wait_for("restored Shell output reaches the same View", |frame| {
@@ -3172,7 +3187,7 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
         .await;
     view.send(b"\t!pwd\r");
     let older = wait_new_execution(&client, &[], "the first launch-directory Shell").await;
-    assert_eq!(older.workdir, launch);
+    assert_eq!(older.folder, Some(launch.clone()));
     view.send(format!("/cwd {}\r", bravo_directory.display()).as_bytes());
     view.wait_for("dispatch directory moves to bravo", |frame| {
         frame
@@ -3182,7 +3197,7 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
     .await;
     view.send(b"!printf bravo\r");
     let bravo = wait_new_execution(&client, &[older.execution], "the bravo Shell").await;
-    assert_eq!(bravo.workdir, bravo_directory);
+    assert_eq!(bravo.folder, Some(bravo_directory.clone()));
     view.send(format!("/cwd {}\r", launch.display()).as_bytes());
     view.wait_for("dispatch directory returns to launch", |frame| {
         frame
@@ -3274,7 +3289,7 @@ async fn run_filter_hidden_dispatch(fixture: &PrivateFixture) {
         !frame.contains(&created.execution.agent_id.simple().to_string()[..4]),
         "no execution hash names the created Agent: {frame}"
     );
-    assert_eq!(created.workdir, launch);
+    assert_eq!(created.folder, Some(launch.clone()));
     view.send(b"\x1b[A");
     view.wait_for("empty Up keeps the monitored selection", |frame| {
         selected_row_title(frame).is_some_and(|title| title.starts_with("!printf bravo"))

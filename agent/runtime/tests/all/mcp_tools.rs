@@ -26,10 +26,125 @@ use tokio_util::sync::CancellationToken;
 use tickloop_agent_test_support::{ScriptedModel, call, config, text};
 
 #[path = "support/artifact_service.rs"]
-mod artifact_service;
+pub(super) mod artifact_service;
 use artifact_service::{ArtifactService, CREATED_ARTIFACT};
 
 const WAIT: Duration = Duration::from_secs(25);
+
+#[derive(Clone, Default)]
+struct WarningLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for WarningLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn mcp_directory_refresh_reports_failures_and_keeps_chats_running() {
+    use tracing::instrument::WithSubscriber;
+
+    for (method, error_class, host_managed) in [
+        ("server/discover", "session_unavailable", false),
+        ("tools/list", "tool_listing_unavailable", false),
+        ("server/discover", "session_unavailable", true),
+        ("tools/list", "tool_listing_unavailable", true),
+    ] {
+        let service = ArtifactService::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let provider = Arc::new(if host_managed {
+            McpHostToolProvider::with_credentials(
+                &service.origin,
+                "user-one",
+                Arc::new(HostTokens {
+                    token: Mutex::new("test-service-token-0".into()),
+                    invalidations: AtomicUsize::new(0),
+                }),
+                None,
+            )
+            .unwrap()
+        } else {
+            McpHostToolProvider::new(service.login(directory.path()).await, None)
+        });
+        provider.refresh(CancellationToken::new()).await.unwrap();
+        assert_eq!(provider.definitions().len(), 4);
+
+        if method == "server/discover" {
+            service
+                .control
+                .reject_discovery
+                .store(true, Ordering::SeqCst);
+        } else {
+            service
+                .control
+                .reject_tool_listing
+                .store(true, Ordering::SeqCst);
+        }
+        let log = WarningLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let error = provider
+            .refresh(CancellationToken::new())
+            .with_subscriber(subscriber)
+            .await
+            .expect_err("a failed MCP directory must not look like an empty successful load");
+        let warning = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(warning.contains("WARN"), "{warning}");
+        assert!(
+            warning.contains("MCP tool directory refresh failed"),
+            "{warning}"
+        );
+        for diagnostic in [&warning, &error] {
+            assert!(diagnostic.contains(&service.origin), "{diagnostic}");
+            assert!(diagnostic.contains(error_class), "{diagnostic}");
+            assert!(!diagnostic.contains("test-service-token-0"), "{diagnostic}");
+            assert!(!diagnostic.contains("Method not found"), "{diagnostic}");
+        }
+        assert!(provider.definitions().is_empty());
+        assert_eq!(
+            provider.service_connections()["artifacts"]["authentication"],
+            "signed_in"
+        );
+        assert_eq!(
+            provider.service_connections()["artifacts"]["tool_directory"],
+            "unavailable"
+        );
+
+        let model = Arc::new(ScriptedModel::new(vec![text("Still running.")]));
+        let agent =
+            Agent::open_embedded(directory.path().join("state"), config(), model.clone()).unwrap();
+        agent.install_host_tools(provider.clone()).unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        submit_and_wait(&agent, chat, "Keep going without Artifacts").await;
+        assert!(
+            !tool_names(&model.requests.lock().unwrap()[0])
+                .iter()
+                .any(|name| name.starts_with("Artifact"))
+        );
+        agent.shutdown().await;
+
+        service
+            .control
+            .reject_discovery
+            .store(false, Ordering::SeqCst);
+        service
+            .control
+            .reject_tool_listing
+            .store(false, Ordering::SeqCst);
+        provider.refresh(CancellationToken::new()).await.unwrap();
+        assert_eq!(provider.definitions().len(), 4);
+    }
+}
 
 #[tokio::test]
 async fn mcp_resources_list_and_read_work_without_the_skills_extension_and_follow_cursors() {
@@ -1092,7 +1207,13 @@ async fn a_server_other_than_tickloop_artifacts_provides_no_tools() {
     let directory = tempfile::tempdir().unwrap();
     let account = service.login(directory.path()).await;
     let provider = McpHostToolProvider::new(account, None);
-    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert!(
+        provider
+            .refresh(CancellationToken::new())
+            .await
+            .unwrap_err()
+            .contains("directory_rejected")
+    );
     assert!(provider.definitions().is_empty());
     assert_eq!(
         provider.service_connections()["artifacts"]["authentication"],
@@ -1114,7 +1235,13 @@ async fn a_directory_without_all_three_artifact_tools_provides_none() {
     let directory = tempfile::tempdir().unwrap();
     let account = service.login(directory.path()).await;
     let provider = McpHostToolProvider::new(account, None);
-    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert!(
+        provider
+            .refresh(CancellationToken::new())
+            .await
+            .unwrap_err()
+            .contains("directory_rejected")
+    );
     assert!(provider.definitions().is_empty());
     assert_eq!(
         provider.service_connections()["artifacts"]["tool_directory"],
@@ -1281,6 +1408,53 @@ async fn a_rename_prepares_dispatches_and_admits_like_a_content_edit_of_the_same
         prepare(&patch).await.permission(),
         HostToolPermission::ArtifactContinuation,
         "the confirmed rename admits later writes to the same private artifact"
+    );
+}
+
+#[tokio::test]
+async fn a_base62_write_receipt_admits_only_the_same_artifact_in_either_id_form() {
+    let service = ArtifactService::start().await;
+    service.control.compact_ids.store(true, Ordering::SeqCst);
+    *service.control.publication.lock().unwrap() =
+        Some(json!({"audience":"private","membership_revision":0}));
+    let directory = tempfile::tempdir().unwrap();
+    let provider = McpHostToolProvider::new(service.login(directory.path()).await, None);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let chat = uuid::Uuid::new_v4();
+    let uuid = "e1b85a39-a57b-4c28-a8a5-ae9233aead3e";
+    let short = "6rvWPvOnhVABug7llbHb26";
+    let prepare = async |id: &str| {
+        provider.prepare_call(chat, "ArtifactEdit", &json!({"action":"rename","artifact_id":id,"title":"Renamed","expected_title":"Fixture"}), CancellationToken::new()).await.unwrap()
+    };
+    let first = prepare(uuid).await;
+    assert_eq!(first.permission(), HostToolPermission::PrivateArtifactWrite);
+    let HostCallResult::CompletedWithEffect(result, effect) = provider
+        .execute_prepared(chat, first, CancellationToken::new())
+        .await
+    else {
+        panic!("a confirmed rename reports its effect");
+    };
+    assert!(!result.is_error);
+    let HostEffect::RenamedArtifact { instance, .. } = *effect else {
+        panic!("a rename effect");
+    };
+    assert_eq!(
+        instance,
+        tick_protocol::InstanceRef::artifact(&service.origin, uuid).unwrap()
+    );
+    assert_eq!(
+        prepare(uuid).await.permission(),
+        HostToolPermission::ArtifactContinuation
+    );
+    assert_eq!(
+        prepare(short).await.permission(),
+        HostToolPermission::ArtifactContinuation
+    );
+    assert_eq!(
+        prepare("11111111-1111-4111-8111-111111111111")
+            .await
+            .permission(),
+        HostToolPermission::PrivateArtifactWrite
     );
 }
 
@@ -1712,7 +1886,7 @@ async fn artifact_login_state_is_independent_of_directory_and_connection_failure
         .control
         .directory_unavailable
         .store(true, Ordering::SeqCst);
-    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert!(provider.refresh(CancellationToken::new()).await.is_err());
     assert!(provider.definitions().is_empty());
     assert_eq!(
         provider.service_connections()["artifacts"]["authentication"],
@@ -2065,14 +2239,14 @@ async fn native_tools_and_workspace_metadata_survive_mcp_composition() {
         NativeFixture.host_endpoint().unwrap()
     );
     let context = HostCallContext {
-        workdir: directory.path().into(),
+        folder: directory.path().into(),
         workspace_id: Some("work-context".into()),
         interaction: None,
     };
     let local_files = tickloop_agent_tools::Tools::new(directory.path().join("chat"))
         .local_file_reader(
             &tickloop_agent_tools::Workspace {
-                workdir: directory.path().into(),
+                folder: Some(directory.path().into()),
                 additional_directories: Vec::new(),
             },
             Arc::new(NoLocalReads),
@@ -2081,7 +2255,7 @@ async fn native_tools_and_workspace_metadata_survive_mcp_composition() {
         .prepare_call_in_scope(
             uuid::Uuid::new_v4(),
             &HostCallScope {
-                local_files: &local_files,
+                local_files: local_files.as_ref(),
                 context: Some(&context),
             },
             "native_fixture",
@@ -2093,7 +2267,7 @@ async fn native_tools_and_workspace_metadata_survive_mcp_composition() {
     let captured = prepared
         .payload::<HostCallContext>()
         .expect("Native preparation receives its context");
-    assert_eq!(captured.workdir, context.workdir);
+    assert_eq!(captured.folder, context.folder);
     assert_eq!(captured.workspace_id, context.workspace_id);
 }
 
@@ -2106,7 +2280,7 @@ async fn remote_unauthorized_hides_tools_and_invalidates_local_login() {
     provider.refresh(CancellationToken::new()).await.unwrap();
     assert!(!provider.definitions().is_empty());
     service.control.reject_mcp.store(true, Ordering::SeqCst);
-    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert!(provider.refresh(CancellationToken::new()).await.is_err());
     assert_eq!(
         provider
             .definitions()
@@ -2235,6 +2409,28 @@ async fn feedback_enters_the_linked_loop_once_without_a_completion_tool_or_priva
         Some(artifact_service::REQUEST_CREATED_AT_MS)
     );
     assert!(service.releases().is_empty());
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn base62_feedback_is_claimed_acknowledged_and_delivered_once() {
+    let service = ArtifactService::start().await;
+    service.control.compact_ids.store(true, Ordering::SeqCst);
+    let feedback = "e1b85a39-a57b-4c28-a8a5-ae9233aead3e";
+    service.request_feedback("doc", feedback);
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![text("Received.")]));
+    let (agent, chat, loop_id) = linked_chat(&service, directory.path(), model.clone()).await;
+    eventually(async || service.finished() == [(feedback.into(), "received".into())]).await;
+    wait_for_loop_state(&agent, chat, loop_id, LoopState::WaitingTrigger).await;
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        service
+            .lifecycle_requests("POST /artifact/api/v1/agent/feedback/")
+            .len(),
+        2
+    );
+    assert!(!agent.snapshot(chat).await.unwrap().loops[0].event_sources[0].resume_required);
     agent.shutdown().await;
 }
 
@@ -2487,6 +2683,103 @@ async fn feedback_account_provenance_survives_restart_and_stop_works_after_accou
 }
 
 #[tokio::test]
+async fn folderless_feedback_rejects_an_account_change_before_delivery_or_continuation() {
+    use tickloop_agent_runtime::{
+        HarnessOptions, HarnessSeams, ToolPolicy, TurnRequest, WaitHosting,
+    };
+    use tickloop_agent_test_support::harness::ChosenModels;
+
+    for switch_before_delivery in [true, false] {
+        let service = ArtifactService::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let client = service.login(directory.path()).await;
+        let model = Arc::new(ScriptedModel::new(vec![text("received")]));
+        let agent = Agent::with_seams(
+            HarnessSeams {
+                transcripts: None,
+                environment: None,
+                models: ChosenModels::new(model.clone()),
+            },
+            HarnessOptions {
+                search: Default::default(),
+                model: config(),
+                settings: None,
+                host: tickloop_agent_protocol::AgentHostOptions {
+                    prompt_policy: tickloop_agent_protocol::PromptPolicy::DenyOnPrompt,
+                    ..tickloop_agent_protocol::AgentHostOptions::product_defaults()
+                },
+                tools: ToolPolicy {
+                    artifacts: true,
+                    ..ToolPolicy::web_fetch_only()
+                },
+                host_rules: Vec::new(),
+                task_tools: None,
+                min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
+                waits: WaitHosting::Durable,
+                system_prompt_addition: None,
+                request_gates: Vec::new(),
+            },
+        )
+        .unwrap();
+        agent
+            .install_host_tools(Arc::new(McpHostToolProvider::new(client, None)))
+            .unwrap();
+        let chat = agent.create_chat_without_folder().await.unwrap();
+        agent
+            .link_artifact(
+                chat,
+                &artifact_tick(&service, "doc"),
+                tickloop_agent_protocol::ArtifactFeedbackHistory::All,
+            )
+            .await
+            .unwrap();
+        let goal = agent.snapshot(chat).await.unwrap().loops[0].clone();
+        let source = &goal.event_sources[0];
+        let delivery = tickloop_agent_runtime::ExternalDelivery::from_claim(
+            &source.origin,
+            &source.account_id,
+            &source.artifact_id,
+            &tickloop_agent_artifacts::ClaimedFeedback {
+                delivery_id: uuid::Uuid::new_v4().to_string(),
+                feedback_id: "private-feedback".into(),
+                claim_id: "claim".into(),
+                fencing_token: "secret-fence".into(),
+                lease_expires_at: "2026-10-20T00:00:00Z".into(),
+                input: json!({"messages": [{"text": "private input"}]}),
+            },
+        )
+        .unwrap();
+        if !switch_before_delivery {
+            let turn = agent
+                .advance(chat, TurnRequest::deliver(goal.id, delivery.clone()))
+                .await
+                .unwrap();
+            assert!(matches!(
+                turn.outcome().await.unwrap(),
+                tickloop_agent_runtime::TurnOutcome::Completed { .. }
+            ));
+        }
+        let requests = model.requests.lock().unwrap().len();
+        service.control.other_account.store(true, Ordering::SeqCst);
+        service.login(directory.path()).await;
+        if switch_before_delivery {
+            agent
+                .advance(chat, TurnRequest::deliver(goal.id, delivery))
+                .await
+                .unwrap();
+        } else {
+            agent
+                .submit(chat, Some(goal.id), "Continue".into())
+                .await
+                .unwrap();
+        }
+        wait_for_loop_state(&agent, chat, goal.id, LoopState::Failed).await;
+        assert_eq!(model.requests.lock().unwrap().len(), requests);
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn restart_waits_for_explicit_continue_which_links_again_and_claims_pending_requests() {
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
@@ -2563,6 +2856,89 @@ async fn restart_waits_for_explicit_continue_which_links_again_and_claims_pendin
     let binding = &restored.snapshot(chat).await.unwrap().loops[0].event_sources[0];
     assert_eq!(binding.binding_id.to_string(), renewed.binding_id);
     assert_eq!(binding.epoch, 2);
+    restored.shutdown().await;
+}
+
+/// A request received while its Loop was busy waits in the local inbox across a restart: the
+/// next Continue delivers it, it runs once, and the request that was running is not repeated.
+#[tokio::test]
+async fn a_received_request_still_queued_at_a_restart_runs_once_after_continue() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    service.login(directory.path()).await;
+    service.request_feedback("doc", "running-request");
+    let blocked = Arc::new(BlockingModel {
+        started: tokio::sync::Notify::new(),
+        turns: AtomicUsize::new(0),
+        requests: Mutex::new(Vec::new()),
+    });
+    let agent = Agent::open_embedded(root.clone(), config(), blocked.clone()).unwrap();
+    agent
+        .install_host_tools(Arc::new(McpHostToolProvider::new(
+            service.client(directory.path()),
+            None,
+        )))
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    agent
+        .link_artifact(
+            chat,
+            &artifact_tick(&service, "doc"),
+            tickloop_agent_protocol::ArtifactFeedbackHistory::All,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, blocked.started.notified())
+        .await
+        .unwrap();
+    service.request_feedback("doc", "queued-request");
+    eventually(async || service.finished().len() == 2).await;
+    let loop_id = agent.snapshot(chat).await.unwrap().loops[0].id;
+    agent.shutdown().await;
+    drop(agent);
+
+    let model = Arc::new(ScriptedModel::new(vec![
+        text("Continued."),
+        text("Handled the queued request."),
+    ]));
+    let restored = Agent::open_embedded(root, config(), model.clone()).unwrap();
+    restored
+        .install_host_tools(Arc::new(McpHostToolProvider::new(
+            service.client(directory.path()),
+            None,
+        )))
+        .unwrap();
+    restored.resume_chat(chat).await.unwrap();
+    restored
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    restored
+        .submit(chat, Some(loop_id), "Continue".into())
+        .await
+        .unwrap();
+    eventually(async || model.requests.lock().unwrap().len() == 2).await;
+    wait_for_loop_state(&restored, chat, loop_id, LoopState::WaitingTrigger).await;
+    let prompts = |feedback: &str| {
+        let heading = format!("@tickloop feedback {feedback} on artifact doc");
+        model.requests.lock().unwrap()[1]
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter(
+                |content| matches!(content, Content::Text { text } if text.starts_with(&heading)),
+            )
+            .count()
+    };
+    assert_eq!(prompts("running-request"), 1);
+    assert_eq!(prompts("queued-request"), 1);
+    assert_eq!(model.requests.lock().unwrap().len(), 2);
+    assert_eq!(service.finished().len(), 2);
     restored.shutdown().await;
 }
 
@@ -3017,6 +3393,11 @@ async fn a_read_artifact_has_one_canonical_monitor_row_across_pages_and_restore(
     let first = agent.snapshot(chat).await.unwrap();
     assert_eq!(first.artifact_ticks.len(), 1);
     assert_eq!(first.artifact_ticks[0].artifact_id, canonical_id);
+    let mut compact_body = body.clone();
+    compact_body["artifact_id"] = json!(short_id);
+    *service.control.read_result.lock().unwrap() = Some(
+        json!({"content":[{"type":"text","text":compact_body.to_string()}],"structuredContent":compact_body,"isError":false}),
+    );
     submit_and_wait(&agent, chat, "Read the next page and reread the document").await;
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(snapshot.artifact_ticks, first.artifact_ticks);
@@ -3547,6 +3928,48 @@ async fn signed_out_offers_only_artifact_login() {
     );
 }
 
+/// Shutdown ends a sign-in still waiting for approval: approving it afterwards reaches no poll,
+/// and no credential is saved, though the Agent is still held.
+#[tokio::test]
+async fn shutdown_ends_a_pending_artifact_sign_in_before_it_can_save_a_credential() {
+    const TOKEN_POLL: &str = "POST /account/token ";
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    service
+        .control
+        .hold_device_approval
+        .store(true, Ordering::SeqCst);
+    let model = Arc::new(ScriptedModel::new(vec![
+        call("login", "ArtifactLogin", json!({})),
+        text("Open the link and confirm the code."),
+    ]));
+    let agent = Agent::new_embedded(config(), model);
+    agent
+        .install_host_tools(Arc::new(McpHostToolProvider::new(
+            service.client(directory.path()),
+            None,
+        )))
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    submit_and_wait(&agent, chat, "Make me a design").await;
+    eventually(async || !service.lifecycle_requests(TOKEN_POLL).is_empty()).await;
+
+    agent.shutdown().await;
+    let polls = service.lifecycle_requests(TOKEN_POLL).len();
+    service
+        .control
+        .hold_device_approval
+        .store(false, Ordering::SeqCst);
+    // The fixture asks for a poll every second.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(service.lifecycle_requests(TOKEN_POLL).len(), polls);
+    assert!(matches!(
+        service.client(directory.path()).credential_snapshot(),
+        Ok(None)
+    ));
+    drop(agent);
+}
+
 #[tokio::test]
 async fn artifact_login_returns_the_link_and_code_and_approval_brings_the_tools() {
     let service = ArtifactService::start().await;
@@ -3578,7 +4001,7 @@ async fn artifact_login_returns_the_link_and_code_and_approval_brings_the_tools(
         let started = tool_result_text(&requests[1], "login");
         assert!(started.starts_with("Sign-in started."), "{started}");
         assert!(
-            started.contains(&format!("{}/artifact/device?code=TEST", service.origin))
+            started.contains(&format!("{}/account/device?code=TEST", service.origin))
                 && started.contains("confirm the code TEST"),
             "{started}"
         );
@@ -5313,5 +5736,275 @@ struct NoLocalReads;
 impl tickloop_agent_tools::LocalReadAdmission for NoLocalReads {
     async fn admit(&self, _: &tickloop_agent_tools::PreparedTool) -> Result<bool, String> {
         Err("no local file is read here".into())
+    }
+}
+
+#[tokio::test]
+async fn refreshing_an_expiring_accounts_resource_keeps_tools_available_in_the_same_refresh() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let account = service.login(directory.path()).await;
+    let provider = McpHostToolProvider::new(account, None);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let credentials = std::fs::read_dir(directory.path().join("artifacts/auth"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .unwrap();
+    let mut saved: Value = serde_json::from_slice(&std::fs::read(&credentials).unwrap()).unwrap();
+    for token in saved["resources"].as_object_mut().unwrap().values_mut() {
+        token["expires_at"] = json!(0);
+    }
+    std::fs::write(&credentials, serde_json::to_vec(&saved).unwrap()).unwrap();
+    service
+        .control
+        .credential_revision
+        .store(1, Ordering::SeqCst);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        provider.service_connections()["artifacts"]["authentication"],
+        "signed_in"
+    );
+    assert!(
+        provider
+            .definitions()
+            .iter()
+            .any(|tool| tool.name == "ArtifactRead")
+    );
+}
+
+struct HostTokens {
+    token: Mutex<String>,
+    invalidations: AtomicUsize,
+}
+
+#[async_trait]
+impl tickloop_agent_artifacts::ArtifactCredentials for HostTokens {
+    async fn bearer(&self) -> Result<Option<String>, tickloop_agent_artifacts::ArtifactError> {
+        Ok(Some(self.token.lock().unwrap().clone()))
+    }
+    async fn invalidate(
+        &self,
+        rejected: &str,
+    ) -> Result<(), tickloop_agent_artifacts::ArtifactError> {
+        self.invalidations.fetch_add(1, Ordering::SeqCst);
+        let mut token = self.token.lock().unwrap();
+        if *token == rejected {
+            *token = "renewed-chat-token".into();
+        }
+        Ok(())
+    }
+}
+
+/// A host source that scopes tokens by Chat: every Chat of the Agent acts as itself.
+struct ChatScopedTokens {
+    chat: Option<uuid::Uuid>,
+}
+
+#[async_trait]
+impl tickloop_agent_artifacts::ArtifactCredentials for ChatScopedTokens {
+    async fn bearer(&self) -> Result<Option<String>, tickloop_agent_artifacts::ArtifactError> {
+        Ok(Some(match self.chat {
+            Some(chat) => format!("chat-{chat}"),
+            None => "family-token".into(),
+        }))
+    }
+
+    fn for_chat(
+        &self,
+        chat_id: uuid::Uuid,
+    ) -> Option<Arc<dyn tickloop_agent_artifacts::ArtifactCredentials>> {
+        Some(Arc::new(ChatScopedTokens {
+            chat: Some(chat_id),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn each_chat_links_an_artifact_with_its_own_host_credentials() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let provider = Arc::new(
+        McpHostToolProvider::with_credentials(
+            &service.origin,
+            "user-one",
+            Arc::new(ChatScopedTokens { chat: None }),
+            None,
+        )
+        .unwrap(),
+    );
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![])));
+    agent.install_host_tools(provider).unwrap();
+    let mut chats = Vec::new();
+    for _ in 0..2 {
+        chats.push(agent.create_chat(directory.path().into()).await.unwrap());
+    }
+    for chat in &chats {
+        agent
+            .link_artifact(
+                *chat,
+                &artifact_tick(&service, "doc"),
+                tickloop_agent_protocol::ArtifactFeedbackHistory::NewOnly,
+            )
+            .await
+            .unwrap();
+    }
+    let links: Vec<String> = service
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            request["path"]
+                .as_str()
+                .unwrap()
+                .contains("/api/v1/agent/links/")
+        })
+        .map(|request| request["headers"].as_str().unwrap().to_ascii_lowercase())
+        .collect();
+    assert_eq!(links.len(), 2, "one link per Chat");
+    for (headers, chat) in links.iter().zip(&chats) {
+        assert!(
+            headers.contains(&format!("authorization: bearer chat-{chat}")),
+            "{headers}"
+        );
+    }
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn separate_chat_harnesses_use_their_injected_credentials_for_read_edit_and_comment() {
+    for token in ["first-chat-token", "second-chat-token"] {
+        let service = ArtifactService::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let source = Arc::new(HostTokens {
+            token: Mutex::new(token.into()),
+            invalidations: AtomicUsize::new(0),
+        });
+        let provider = Arc::new(
+            McpHostToolProvider::with_credentials(
+                &service.origin,
+                "user-one",
+                source.clone(),
+                None,
+            )
+            .unwrap(),
+        );
+        let model = Arc::new(ScriptedModel::new(vec![
+            call(
+                "read",
+                "ArtifactRead",
+                json!({"action":"read","artifact_id":"doc"}),
+            ),
+            call(
+                "edit",
+                "ArtifactEdit",
+                json!({"action":"patch","artifact_id":"doc","patches":[{"type":"replace","target":"b1","expected_hash":"h1","text":"# Edited"}]}),
+            ),
+            call(
+                "comment",
+                "ArtifactComment",
+                json!({"action":"reply","artifact_id":"doc","thread_id":"thread-1","text":"Updated."}),
+            ),
+            text("Done."),
+        ]));
+        let agent = Agent::new_embedded(config(), model);
+        agent.install_host_tools(provider).unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::FullAccess)
+            .await
+            .unwrap();
+        submit_and_wait(&agent, chat, "Read, edit and comment on this artifact").await;
+        let calls = service
+            .requests()
+            .into_iter()
+            .filter(|request| request["body"]["method"] == "tools/call")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|request| request["body"]["params"]["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["ArtifactRead", "ArtifactEdit", "ArtifactComment"]
+        );
+        assert!(calls.iter().all(|request| {
+            request["headers"]
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains(&format!("authorization: bearer {token}"))
+        }));
+        assert!(
+            !service
+                .requests()
+                .iter()
+                .any(|request| request["path"].as_str().unwrap().contains("/account/"))
+        );
+        assert!(!directory.path().join("artifacts/auth").exists());
+        assert_eq!(source.invalidations.load(Ordering::SeqCst), 0);
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn delegated_mcp_401_invalidates_and_retries_the_same_read_edit_and_comment_once() {
+    for (name, arguments) in [
+        ("ArtifactRead", json!({"action":"read","artifact_id":"doc"})),
+        (
+            "ArtifactEdit",
+            json!({"action":"patch","artifact_id":"doc","patches":[{"type":"replace","target":"b1","expected_hash":"h1","text":"# Edited"}]}),
+        ),
+        (
+            "ArtifactComment",
+            json!({"action":"reply","artifact_id":"doc","thread_id":"thread-1","text":"Updated."}),
+        ),
+    ] {
+        let service = ArtifactService::start().await;
+        *service.control.refuse_tool_bearer.lock().unwrap() = Some("expired-chat-token".into());
+        let source = Arc::new(HostTokens {
+            token: Mutex::new("expired-chat-token".into()),
+            invalidations: AtomicUsize::new(0),
+        });
+        let provider = McpHostToolProvider::with_credentials(
+            &service.origin,
+            "user-one",
+            source.clone(),
+            None,
+        )
+        .unwrap();
+        provider.refresh(CancellationToken::new()).await.unwrap();
+        let chat = uuid::Uuid::new_v4();
+        let prepared = provider
+            .prepare_call(chat, name, &arguments, CancellationToken::new())
+            .await
+            .unwrap();
+        let outcome = provider
+            .execute_prepared(chat, prepared, CancellationToken::new())
+            .await;
+        let result = match outcome {
+            HostCallResult::Completed(result) | HostCallResult::CompletedWithEffect(result, _) => {
+                result
+            }
+            _ => panic!("a rejected bearer is renewed and retried once"),
+        };
+        assert!(!result.is_error, "{}", result.content);
+        let calls = service
+            .requests()
+            .into_iter()
+            .filter(|request| request["body"]["method"] == "tools/call")
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["body"], calls[1]["body"]);
+        assert!(
+            calls[1]["headers"]
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("authorization: bearer renewed-chat-token")
+        );
+        assert_eq!(source.invalidations.load(Ordering::SeqCst), 1);
     }
 }

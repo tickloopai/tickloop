@@ -11,6 +11,10 @@ use uuid::Uuid;
 use crate::{Agent, Chat, agent_messages::PreparedFamilyCall};
 
 const MAX_REPORT_REMINDERS: u8 = 3;
+/// A report's call after its Agent waited for its own children to report: it is not delivered,
+/// so the Agent reads their reports first.
+pub(super) const CHILDREN_FINISHED: &str =
+    "Your delegated children have finished. Read their reports before preparing your final report.";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,6 +61,7 @@ pub(super) fn remind(chat: &mut Chat, receipt: &Receipt) -> bool {
     chat.snapshot.messages.push(Message { role:Role::User, content:vec![Content::Text { text:
         "Finish by calling SubagentHandback with your complete report. Plain final text is not delivered to your caller; this reminder does not authorize any new work.".into()
     }] });
+    crate::lifecycle::claim_response_messages(chat);
     true
 }
 
@@ -111,13 +116,14 @@ impl Agent {
     pub(super) async fn prepare_handback(
         &self,
         receipt: &Receipt,
+        call_id: &str,
         input: &Value,
     ) -> Result<PreparedHandback, String> {
         if self
-            .wait_for_subagents(receipt, &self.inner.shutdown)
+            .wait_for_subagents(receipt, &self.inner.shutdown, Some(call_id))
             .await?
         {
-            return Err("Your delegated children have finished. Read their reports before preparing your final report.".into());
+            return Err(CHILDREN_FINISHED.into());
         }
         let parsed: HandbackInput =
             serde_json::from_value(input.clone()).map_err(|error| error.to_string())?;

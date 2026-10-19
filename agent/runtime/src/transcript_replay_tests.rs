@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tickloop_agent_artifacts::ArtifactClient;
 use tickloop_agent_config::UserSettings;
-use tickloop_agent_model::judgment::JevClient;
+use tickloop_agent_model::{ModelClients, judgment::JevClient};
 use tickloop_agent_protocol::{Content, ExecutionMode, OperationRecord, OperationState, Receipt};
 use tickloop_agent_test_support::{ScriptedModel, config};
 use tokio_util::sync::CancellationToken;
@@ -120,7 +120,9 @@ async fn live_recorded_artifact_reviews_without_dispatch() {
             .unwrap();
         private_json(&directory.join("xai-oauth.json"), &state);
         Some(
-            tickloop_agent_model::model_client(llm_config.clone(), Some(&credential_root)).unwrap(),
+            tickloop_agent_model::LocalModelClients::new(Some(credential_root.clone()))
+                .client(&llm_config)
+                .unwrap(),
         )
     } else {
         None
@@ -134,7 +136,7 @@ async fn live_recorded_artifact_reviews_without_dispatch() {
         let cutoff = lines
             .iter()
             .position(|line| {
-                let Ok(line) = serde_json::from_str::<transcript::Line>(line) else {
+                let Ok(line) = serde_json::from_str::<tickloop_agent_transcript::Line>(line) else {
                     return false;
                 };
                 line.chain_entry().is_some_and(|entry| {
@@ -146,7 +148,7 @@ async fn live_recorded_artifact_reviews_without_dispatch() {
             .unwrap();
         let prefix = credentials.path().join("prefix.jsonl");
         std::fs::write(&prefix, lines[..=cutoff].join("\n")).unwrap();
-        let loaded = transcript::load(&prefix).unwrap().unwrap();
+        let loaded = transcript::load_file(&prefix).unwrap().unwrap();
         assert!(loaded.warnings.is_empty());
         let entry = loaded.chain.last().unwrap();
         let original = entry
@@ -219,12 +221,17 @@ async fn live_recorded_artifact_reviews_without_dispatch() {
                 variant
             };
             operation.input = input.clone();
+            let folder = snapshot
+                .folder
+                .as_deref()
+                .expect("the replayed Chat has a Folder");
             let mut context = approval_context::capture(
                 &snapshot,
                 &bookkeeping,
                 &operation,
                 None,
-                auto.policy_for_directory(&snapshot.workdir),
+                folder,
+                auto.policy_for_directory(folder),
             )
             .unwrap();
             let mut facts = prepared.approval_facts().clone();

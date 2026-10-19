@@ -532,7 +532,7 @@ impl Menus {
     fn new_agent_directory(&self, agent: &Agent) -> PathBuf {
         self.new_agent_directory
             .clone()
-            .unwrap_or_else(|| agent.launch_spec().workdir)
+            .unwrap_or_else(|| agent.launch_spec().folder)
     }
 
     /// Opens the New Agent's Permissions view: saved policy and staged choices, with no activity
@@ -772,9 +772,14 @@ impl Menus {
             .find(|item| item.id == goal)
             .ok_or("The selected goal no longer exists.")?;
         let trigger = selected.trigger.as_ref();
-        let seconds = trigger
-            .and_then(|trigger| trigger.interval_seconds)
-            .unwrap_or(60);
+        // An `every` schedule is edited as seconds; a wall-clock rule keeps its own text.
+        let schedule = trigger.and_then(|trigger| trigger.schedule).map_or_else(
+            || "60".to_owned(),
+            |schedule| match schedule.interval() {
+                Some(interval) => interval.as_secs().to_string(),
+                None => schedule.to_string(),
+            },
+        );
         let duration = trigger
             .and_then(|trigger| trigger.expires_at_ms)
             .map(|expiry| {
@@ -792,7 +797,7 @@ impl Menus {
             .filter(|prompt| !prompt.is_empty())
             .unwrap_or(&selected.goal);
         console.prepare_command(format!(
-            "/loops schedule {goal} {seconds}{duration} {prompt}"
+            "/loops schedule {goal} {schedule}{duration} {prompt}"
         ))
     }
     pub(super) fn workflow(
@@ -982,7 +987,7 @@ impl Menus {
             console,
             Menu {
                 id: Uuid::new_v4(),
-                title: "Sign out of Tickloop Artifacts?".into(),
+                title: "Sign out of Tickloop Accounts?".into(),
                 context: vec!["Stops feedback listening before revoking the credential.".into()],
                 options: vec!["Cancel".into(), "Sign out".into()],
                 selected: 0,
@@ -1566,7 +1571,7 @@ impl Menus {
         }
         let artifact_account = if let Some(root) = &self.config_root {
             match tickloop_agent_artifacts::ArtifactClient::new(root) {
-                Ok(client) => match client.status().await {
+                Ok(client) => match Box::pin(client.status()).await {
                     Ok(Some(user)) => {
                         format!("{} · Sign out", super::safe_text(user.display_name()))
                     }
@@ -1880,7 +1885,7 @@ impl Menus {
                 safe_text(&format!("Service: {}", snapshot.model.base_url)),
                 safe_text(&format!(
                     "Working directory: {}",
-                    snapshot.workdir.display()
+                    super::shown_folder(snapshot.folder.as_deref()).display()
                 )),
                 format!("Execution mode: {}", snapshot.policy.mode),
                 format!(
@@ -2959,8 +2964,8 @@ impl Menus {
                         let root = self.config_root.as_ref().ok_or("Tickloop Artifacts needs a state directory")?;
                         agent.disable_event_sources().await.map_err(|error| error.to_string())?;
                         let client = tickloop_agent_artifacts::ArtifactClient::new(root).map_err(|error| error.to_string())?;
-                        client.logout().await.map_err(|error| error.to_string())?;
-                        console.write("Signed out of Tickloop Artifacts.\n")?;
+                        Box::pin(client.logout()).await.map_err(|error| error.to_string())?;
+                        console.write("Signed out of Tickloop Accounts.\n")?;
                     } else if return_to_settings {
                         self.settings(agent, console, target).await?;
                     }
@@ -4192,7 +4197,7 @@ mod tests {
     fn prompt_snapshot(prompts: &[&str]) -> ChatSnapshot {
         let mut snapshot: ChatSnapshot = serde_json::from_value(json!({
             "id": Uuid::from_u128(1),
-            "workdir": "/workspace",
+            "folder": "/workspace",
             "model": {"name":"fixture","protocol":"messages","base_url":"http://127.0.0.1","model":"fixture","api_key_env":"","max_output_tokens":1024},
             "messages": [],
             "loops": [],

@@ -95,12 +95,8 @@ if [ -n "$RELEASE_TEST_MARKET" ]; then printf '%s\\n' "$RELEASE_TEST_MARKET"; el
   mkdirSync(join(repo, "distribution/cargo"), { recursive: true });
   writeFileSync(join(repo, "distribution/cargo/Cargo.toml"), '[package]\nname = "tickloop"\nversion = "0.2.0"\n');
   writeFileSync(join(repo, "distribution/cargo/Cargo.lock"), 'version = 4\n\n[[package]]\nname = "tickloop"\nversion = "0.2.0"\n');
-  for (const [directory, version] of [["artifact", "0.1.34"], ["site", "0.1.6"]]) {
-    json(join(repo, directory, "package.json"), { name: directory, version });
-    json(join(repo, directory, "package-lock.json"), { name: directory, version, lockfileVersion: 3, packages: { "": { name: directory, version } } });
-  }
   mkdirSync(join(repo, ".github/workflows"), { recursive: true });
-  for (const workflow of ["release", "release-ticks", "artifacts-deploy", "site-deploy"]) writeFileSync(join(repo, `.github/workflows/${workflow}.yml`), "name: Release\n");
+  for (const workflow of ["release", "release-ticks"]) writeFileSync(join(repo, `.github/workflows/${workflow}.yml`), "name: Release\n");
   writeFileSync(join(repo, "snapshot.txt"), "business code\n");
   git(["add", "."], setup); git(["commit", "-qm", "Initial snapshot"], setup);
   git(["remote", "add", "origin", `git@github.com:${expectedRepository}.git`], setup);
@@ -114,8 +110,6 @@ function release(setup, channel, mode, env = {}) {
 
 const scenarios = [
   { channel: "binary", tags: ["v0.2.1"], paths: ["Cargo.lock", "Cargo.toml", "distribution/cargo/Cargo.lock", "distribution/cargo/Cargo.toml"] },
-  { channel: "site", tags: ["site-v0.1.7"], paths: ["site/package-lock.json", "site/package.json"] },
-  { channel: "artifacts", tags: ["artifacts-v0.1.35"], paths: ["artifact/package-lock.json", "artifact/package.json"] },
   { channel: "ticks", tags: ["tick-futu-v0.4.1", "tick-longbridge-v0.2.1"], paths: ["Cargo.lock", "ticks/futu/Cargo.toml", "ticks/futu/tick-package.json", "ticks/longbridge/Cargo.toml", "ticks/longbridge/tick-package.json"] },
 ];
 
@@ -176,11 +170,11 @@ test("VERSION may explicitly advance each product but cannot reuse or downgrade 
 });
 
 test("local and remote future tags reject stale version files rather than silently skipping a version", t => {
-  const setup = fixture(t); git(["tag", "site-v0.1.8"], setup);
-  assert.match(release(setup, "site", "--check").stderr, /must be newer/);
-  git(["push", "origin", "refs/tags/site-v0.1.8"], setup); git(["tag", "-d", "site-v0.1.8"], setup);
-  assert.match(release(setup, "site", "--check").stderr, /must be newer/);
-  assert.equal(release(setup, "site", "--check", { VERSION: "0.2.0" }).status, 0);
+  const setup = fixture(t); git(["tag", "v0.2.2"], setup);
+  assert.match(release(setup, "binary", "--check").stderr, /must be newer/);
+  git(["push", "origin", "refs/tags/v0.2.2"], setup); git(["tag", "-d", "v0.2.2"], setup);
+  assert.match(release(setup, "binary", "--check").stderr, /must be newer/);
+  assert.equal(release(setup, "binary", "--check", { VERSION: "0.3.0" }).status, 0);
 });
 
 for (const scenario of scenarios) {
@@ -225,7 +219,7 @@ test("only selected release version files must be unchanged", t => {
 
 test("unrelated edits made while checks run are retained", t => {
   const setup = fixture(t);
-  const result = release(setup, "site", undefined, { RELEASE_TEST_DIRTY_ROOT: "1" });
+  const result = release(setup, "binary", undefined, { RELEASE_TEST_DIRTY_ROOT: "1" });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(readFileSync(join(setup.repo, "snapshot.txt"), "utf8"), "user edit\n");
   assert.equal(git(["show", "HEAD:snapshot.txt"], setup), "business code");
@@ -233,17 +227,17 @@ test("unrelated edits made while checks run are retained", t => {
 
 test("rejects detached HEAD, unknown channels, bad selections and unexpected destinations", t => {
   const setup = fixture(t);
-  for (const channel of ["docs", "artifact", "constructor"]) assert.match(release(setup, channel).stderr, /Usage:/);
+  for (const channel of ["docs", "artifacts", "site", "constructor"]) assert.match(release(setup, channel).stderr, /Usage:/);
   for (const selection of ["../futu", "missing", "futu futu"]) assert.equal(release(setup, "ticks", "--check", { TICK_PACKAGES: selection }).status, 1);
-  git(["checkout", "--detach", "-q"], setup); assert.match(release(setup, "site").stderr, /detached HEAD/);
+  git(["checkout", "--detach", "-q"], setup); assert.match(release(setup, "binary").stderr, /detached HEAD/);
   git(["checkout", "-q", "main"], setup); git(["remote", "set-url", "--push", "origin", "git@github.com:someone/other.git"], setup);
-  assert.match(release(setup, "site").stderr, /exactly one fetch and one push/);
+  assert.match(release(setup, "binary").stderr, /exactly one fetch and one push/);
 });
 
 test("requires its workflow and consistent version mirrors in the committed snapshot", t => {
   const setup = fixture(t);
-  git(["rm", ".github/workflows/artifacts-deploy.yml"], setup); git(["commit", "-qm", "Remove workflow"], setup);
-  assert.match(release(setup, "artifacts").stderr, /committed snapshot must contain/);
+  git(["rm", ".github/workflows/release.yml"], setup); git(["commit", "-qm", "Remove workflow"], setup);
+  assert.match(release(setup, "binary").stderr, /committed snapshot must contain/);
   json(join(setup.repo, "ticks/futu/tick-package.json"), { name: "futu", version: "9.0.0" });
   git(["add", "."], setup); git(["commit", "-qm", "Mismatch"], setup);
   assert.match(release(setup, "ticks").stderr, /must match its Cargo/);
@@ -252,15 +246,15 @@ test("requires its workflow and consistent version mirrors in the committed snap
 test("branch moves, unexpected build edits and racing tags stop finalization", t => {
   for (const variable of ["RELEASE_TEST_MOVE_HEAD", "RELEASE_TEST_SWITCH_BRANCH", "RELEASE_TEST_DIRTY_SNAPSHOT", "RELEASE_TEST_ADD_TAG"]) {
     const setup = fixture(t);
-    const result = release(setup, "site", undefined, { [variable]: variable === "RELEASE_TEST_ADD_TAG" ? "site-v0.1.7" : "1" });
+    const result = release(setup, "binary", undefined, { [variable]: variable === "RELEASE_TEST_ADD_TAG" ? "v0.2.1" : "1" });
     assert.equal(result.status, 1, variable);
-    assert.equal(readProducts(setup.repo, "site")[0].version, "0.1.6");
+    assert.equal(readProducts(setup.repo, "binary")[0].version, "0.2.0");
     assert.equal(git(["ls-remote", "--refs", "origin"], setup), "");
   }
 });
 
 test("unreadable remotes and marketplace failures stop before version changes", t => {
-  for (const [channel, env] of [["site", { RELEASE_TEST_REJECT_READ: "1" }], ["ticks", { RELEASE_TEST_MARKET_FAIL: "1" }], ["ticks", { RELEASE_TEST_MARKET: '{"packages":[{"name":"longbridge","version":"9.0.0"}]}' }]]) {
+  for (const [channel, env] of [["binary", { RELEASE_TEST_REJECT_READ: "1" }], ["ticks", { RELEASE_TEST_MARKET_FAIL: "1" }], ["ticks", { RELEASE_TEST_MARKET: '{"packages":[{"name":"longbridge","version":"9.0.0"}]}' }]]) {
     const setup = fixture(t); const result = release(setup, channel, undefined, env);
     assert.equal(result.status, 1);
     if (env.RELEASE_TEST_MARKET) assert.match(result.stderr, /not newer than marketplace version 9.0.0/);
@@ -269,9 +263,9 @@ test("unreadable remotes and marketplace failures stop before version changes", 
 });
 
 test("failed push keeps the release commit and tags with recovery instructions, without changing remote refs", t => {
-  const setup = fixture(t); const result = release(setup, "site", undefined, { RELEASE_TEST_REJECT_PUSH: "1" });
+  const setup = fixture(t); const result = release(setup, "binary", undefined, { RELEASE_TEST_REJECT_PUSH: "1" });
   assert.equal(result.status, 1); assert.match(result.stderr, /Do not rerun release to bump versions again/);
-  assert.equal(git(["rev-parse", "site-v0.1.7^{}"], setup), git(["rev-parse", "HEAD"], setup));
+  assert.equal(git(["rev-parse", "v0.2.1^{}"], setup), git(["rev-parse", "HEAD"], setup));
   assert.equal(git(["ls-remote", "--refs", "origin"], setup), ""); assert.equal(git(["status", "--porcelain"], setup), "");
 });
 
@@ -284,9 +278,9 @@ test("a rejected branch does not publish any tag in the same atomic push", t => 
 test("commit hook failure keeps version edits inspectable and never tags or pushes", t => {
   const setup = fixture(t); const hook = join(setup.repo, ".git/hooks/pre-commit");
   writeFileSync(hook, '#!/bin/sh\nexit 1\n'); chmodSync(hook, 0o700);
-  const result = release(setup, "site"); assert.equal(result.status, 1); assert.match(result.stderr, /Version commit failed/);
+  const result = release(setup, "binary"); assert.equal(result.status, 1); assert.match(result.stderr, /Version commit failed/);
   assert.equal(git(["rev-parse", "HEAD"], setup), setup.initial); assert.equal(git(["tag", "--list"], setup), "");
-  assert.equal(readProducts(setup.repo, "site")[0].version, "0.1.7");
+  assert.equal(readProducts(setup.repo, "binary")[0].version, "0.2.1");
 });
 
 test("Cargo version edits leave external dependency versions untouched and enforce the tag size limit", t => {
@@ -294,19 +288,19 @@ test("Cargo version edits leave external dependency versions untouched and enfor
   const changes = versionChanges(setup.repo, [{ ...product, nextVersion: "0.3.0" }]);
   assert.match(changes.get("Cargo.lock"), /name = "external"\nversion = "0.2.0"/);
   assert.match(changes.get("Cargo.lock"), /name = "tickloop-agent"\nversion = "0.3.0"/);
-  assert.equal(nextVersion({ ...product, tagPrefix: "artifacts-v", version: `1.0.${"9".repeat(16)}` }), `1.0.1${"0".repeat(16)}`);
-  assert.throws(() => nextVersion({ ...product, tagPrefix: "artifacts-v", version: `1.0.${"9".repeat(17)}` }), /exceeds/);
+  assert.equal(nextVersion({ ...product, tagPrefix: "tick-futu-v", version: `1.0.${"9".repeat(16)}` }), `1.0.1${"0".repeat(16)}`);
+  assert.throws(() => nextVersion({ ...product, tagPrefix: "tick-futu-v", version: `1.0.${"9".repeat(17)}` }), /exceeds/);
 });
 
 
 test("an advancing HEAD on the same branch is checked again before creating a version commit", t => {
   const setup = fixture(t);
-  const result = release(setup, "site", undefined, { RELEASE_TEST_MOVE_HEAD_ONCE: "1" });
+  const result = release(setup, "binary", undefined, { RELEASE_TEST_MOVE_HEAD_ONCE: "1" });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stderr, /HEAD advanced during checks/);
   assert.equal(git(["rev-list", "--count", `${setup.initial}..HEAD`], setup), "2");
   assert.equal(git(["log", "-1", "--format=%s", "HEAD^"], setup), "Concurrent work");
-  assert.equal(git(["rev-parse", "site-v0.1.7^{}"], setup), git(["rev-parse", "HEAD"], setup));
+  assert.equal(git(["rev-parse", "v0.2.1^{}"], setup), git(["rev-parse", "HEAD"], setup));
 });
 
 function startRelease(setup, channel, gate) {
@@ -333,13 +327,13 @@ async function waitUntil(predicate) {
 
 test("concurrent product releases wait for one shared lock and preserve both version commits", async t => {
   const setup = fixture(t);
-  const firstGate = join(setup.base, "site-gate"), secondGate = join(setup.base, "artifacts-gate");
+  const firstGate = join(setup.base, "binary-gate"), secondGate = join(setup.base, "ticks-gate");
   writeFileSync(`${secondGate}.continue`, "ready");
-  const first = startRelease(setup, "site", firstGate);
+  const first = startRelease(setup, "binary", firstGate);
   let second;
   try {
     await waitUntil(() => existsSync(`${firstGate}.started`));
-    second = startRelease(setup, "artifacts", secondGate);
+    second = startRelease(setup, "ticks", secondGate);
     await waitUntil(() => second.stderr().includes("waiting for the shared release lock"));
     assert.ok(!existsSync(`${secondGate}.started`), "the queued release must not check an obsolete HEAD");
   } finally {
@@ -350,7 +344,7 @@ test("concurrent product releases wait for one shared lock and preserve both ver
   assert.equal(firstResult.status, 0, firstResult.stderr);
   assert.equal(secondResult.status, 0, secondResult.stderr);
   assert.equal(git(["rev-list", "--count", `${setup.initial}..HEAD`], setup), "2");
-  assert.equal(git(["rev-parse", "site-v0.1.7^{}"], setup), git(["rev-parse", "HEAD^"], setup));
-  assert.equal(git(["rev-parse", "artifacts-v0.1.35^{}"], setup), git(["rev-parse", "HEAD"], setup));
+  assert.equal(git(["rev-parse", "v0.2.1^{}"], setup), git(["rev-parse", "HEAD^"], setup));
+  assert.equal(git(["rev-parse", "tick-longbridge-v0.2.1^{}"], setup), git(["rev-parse", "HEAD"], setup));
   assert.ok(!existsSync(join(setup.repo, ".git/tickloop-release.lock")));
 });

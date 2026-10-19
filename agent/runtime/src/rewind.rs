@@ -21,11 +21,12 @@ use tickloop_agent_base::private_fs::PrivateDirectory;
 use tickloop_agent_protocol::local_messages::LocalMessage;
 use tickloop_agent_protocol::projection;
 use tickloop_agent_protocol::{
-    ChatId, ChatSnapshot, CodeRewind, Content, Event, EventKind, HostNote, LoopId, LoopSnapshot,
-    LoopState, Message, RewindDraft, RewindMode, RewindOutcome, RewindPoint, Role, RunId,
-    TakenBackPrompt, UserShellRecord, UserShellState,
+    ChatId, ChatSnapshot, CodeRewind, Content, Event, EventKind, ExecutionMode, HostNote, LoopId,
+    LoopSnapshot, LoopState, Message, RewindDraft, RewindMode, RewindOutcome, RewindPoint, Role,
+    RunId, TakenBackPrompt, UserShellRecord, UserShellState,
 };
 use tickloop_agent_tools::Tools;
+use tickloop_agent_transcript::{DiscardReason, SettledOutcome};
 
 impl Agent {
     /// 照 Claude Code 的 Rewind 选择器：按模式恢复代码、对话或两者。先恢复代码，再截断对话；
@@ -42,7 +43,8 @@ impl Agent {
         mode: RewindMode,
     ) -> Result<RewindOutcome, AgentError> {
         self.require_root_chat(chat_id, "rewind history").await?;
-        let mut tasks = self.inner.tasks.lock().await;
+        // Held until the task is spawned: `shutdown` either refuses this or waits for the task.
+        let admission = self.inner.tasks.token();
         let (point, history, loops_at_start) = {
             let mut chats = self.inner.chats.lock().await;
             if self.inner.closed.load(Ordering::SeqCst) {
@@ -59,20 +61,32 @@ impl Agent {
                 .iter()
                 .map(|goal| goal.id)
                 .collect::<HashSet<_>>();
+            let history = match (mode.restores_code(), &chat.file_history) {
+                (false, _) => None,
+                (true, Some(history)) => Some(history.clone()),
+                (true, None) => return Err(AgentError::Invalid(super::FOLDERLESS_CHAT.into())),
+            };
             if mode.restores_conversation() {
-                conversation_before(&chat.snapshot, &chat.bookkeeping, &point, &loops_at_start)?;
+                conversation_before(
+                    &chat.snapshot,
+                    &chat.bookkeeping,
+                    point.message_index,
+                    Some(point.execution_mode),
+                    &loops_at_start,
+                )?;
             }
             chat.active = Some(CancellationToken::new());
-            (point, chat.file_history.clone(), loops_at_start)
+            (point, history, loops_at_start)
         };
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let agent = self.clone();
         // 放进宿主任务，调用方放弃等待时也会释放占用。
-        tasks.push(tokio::spawn(async move {
-            let restored = if mode.restores_code() {
-                Some(tokio::task::spawn_blocking(move || history.rewind(message_id)).await)
-            } else {
-                None
+        self.inner.tasks.spawn(async move {
+            let restored = match history {
+                Some(history) => {
+                    Some(tokio::task::spawn_blocking(move || history.rewind(message_id)).await)
+                }
+                None => None,
             };
             let (result, removed_loops) = {
                 let mut chats = agent.inner.chats.lock().await;
@@ -108,8 +122,8 @@ impl Agent {
             while let Some((receipt, request, cancel)) = next {
                 next = agent.run(receipt, request, cancel).await;
             }
-        }));
-        drop(tasks);
+        });
+        drop(admission);
         receiver
             .await
             .map_err(|_| AgentError::Invalid("rewind task ended unexpectedly".into()))?
@@ -141,14 +155,25 @@ impl Agent {
                 .iter()
                 .map(|goal| goal.id)
                 .collect::<HashSet<_>>();
-            let (candidate, candidate_bookkeeping) =
-                conversation_before(&chat.snapshot, &chat.bookkeeping, &point, &loops_at_start)?;
+            let (candidate, candidate_bookkeeping) = conversation_before(
+                &chat.snapshot,
+                &chat.bookkeeping,
+                point.message_index,
+                Some(point.execution_mode),
+                &loops_at_start,
+            )?;
             let loop_id = candidate
                 .loops
                 .iter()
                 .any(|goal| goal.id == prompt_loop)
                 .then_some(prompt_loop);
-            self.replace_conversation(chat, &point, candidate, candidate_bookkeeping, prompt_loop);
+            self.replace_conversation(
+                chat,
+                point.message_index,
+                point.message_id,
+                (candidate, candidate_bookkeeping),
+                prompt_loop,
+            );
             self.save(&chat.snapshot);
             let removed_loops = stop_listening_to_removed_loops(chat, loops_at_start);
             let taken_back = TakenBackPrompt {
@@ -165,7 +190,7 @@ impl Agent {
 
     /// 被截断移除的 Loop 若仍有后台命令在运行，随之停止。移除视为结束：先写结束状态再归还租约，
     /// 同一 Loop 在其他进程中的 Trigger 下一次到点时随之停止。
-    async fn retire_removed_loops(
+    pub(super) async fn retire_removed_loops(
         &self,
         chat_id: ChatId,
         removed_loops: Vec<LoopId>,
@@ -212,8 +237,13 @@ impl Agent {
             }),
         };
         let draft = if mode.restores_conversation() {
-            let (mut candidate, mut candidate_bookkeeping) =
-                conversation_before(&chat.snapshot, &chat.bookkeeping, &point, loops_at_start)?;
+            let (mut candidate, mut candidate_bookkeeping) = conversation_before(
+                &chat.snapshot,
+                &chat.bookkeeping,
+                point.message_index,
+                Some(point.execution_mode),
+                loops_at_start,
+            )?;
             let goal = prompt_loop_goal(&chat.snapshot, point.message_index)
                 .unwrap_or_else(|| point.prompt.clone());
             let loop_id = Uuid::new_v4();
@@ -230,7 +260,13 @@ impl Agent {
                     state_since: None,
                 },
             );
-            self.replace_conversation(chat, &point, candidate, candidate_bookkeeping, loop_id);
+            self.replace_conversation(
+                chat,
+                point.message_index,
+                point.message_id,
+                (candidate, candidate_bookkeeping),
+                loop_id,
+            );
             Some(RewindDraft {
                 loop_id,
                 prompt: point.prompt,
@@ -264,41 +300,48 @@ impl Agent {
             .get(&chat_id)
             .ok_or(AgentError::NotFound)?
             .file_history
-            .clone();
+            .clone()
+            .ok_or_else(|| AgentError::Invalid(super::FOLDERLESS_CHAT.into()))?;
         tokio::task::spawn_blocking(move || history.files_changed_by_rewind(message_id))
             .await
             .map_err(|error| AgentError::Invalid(format!("file comparison ended: {error}")))
     }
 
-    /// 换上截断到 `point` 之前的对话：Transcript 中下一条消息接在保留的最后一条之后，各 View
-    /// 收到 `ConversationRewound` 后重画对话。
-    fn replace_conversation(
+    /// 换上截断到第 `index` 条消息之前的对话（`message_id` 是被截掉的第一条）：Transcript 中
+    /// 下一条消息接在保留的最后一条之后，各 View 收到 `ConversationRewound` 后重画对话。
+    pub(super) fn replace_conversation(
         &self,
         chat: &mut Chat,
-        point: &RewindPoint,
-        candidate: ChatSnapshot,
-        candidate_bookkeeping: ChatBookkeeping,
+        index: usize,
+        message_id: Uuid,
+        (candidate, candidate_bookkeeping): (ChatSnapshot, ChatBookkeeping),
         loop_id: LoopId,
     ) {
         if let Some(recorder) = &self.inner.recorder {
-            recorder.truncate(&chat.snapshot, &chat.bookkeeping, point.message_index);
+            recorder.truncate(&chat.snapshot, &chat.bookkeeping, index);
         }
         // The kept history ends where the prompt was submitted, in the mode it restores. Only
         // an exited-plan-mode notice the prompt's first request carried is owed again.
-        let first_reply = (point.message_index..chat.snapshot.messages.len())
+        let first_reply = (index..chat.snapshot.messages.len())
             .find(|index| chat.snapshot.messages[*index].role == Role::Assistant)
             .unwrap_or(chat.snapshot.messages.len());
         chat.needs_plan_mode_exit_notice = chat
             .snapshot
             .host_notes
-            .range(point.message_index..first_reply)
+            .range(index..first_reply)
             .any(|(_, note)| *note == HostNote::PlanModeExit);
         chat.snapshot = candidate;
         chat.bookkeeping = candidate_bookkeeping;
-        self.emit_conversation_rewound(chat, loop_id, point.message_id);
+        self.inner.ledger_changes.send_replace(());
+        self.emit_conversation_rewound(chat, loop_id, message_id);
     }
 
-    fn emit_conversation_rewound(&self, chat: &mut Chat, loop_id: LoopId, message_id: Uuid) {
+    pub(super) fn emit_conversation_rewound(
+        &self,
+        chat: &mut Chat,
+        loop_id: LoopId,
+        message_id: Uuid,
+    ) {
         chat.snapshot.last_sequence += 1;
         let event = Event {
             sequence: chat.snapshot.last_sequence,
@@ -318,13 +361,18 @@ impl Agent {
     pub(super) fn file_history_directory(
         &self,
         chat_id: ChatId,
-        workdir: &Path,
+        folder: &Path,
     ) -> PrivateDirectory {
-        match &self.inner.recorder {
-            Some(recorder) => PrivateDirectory::trusted(recorder.file_history_root()),
+        match self
+            .inner
+            .recorder
+            .as_ref()
+            .and_then(|recorder| recorder.file_history_root())
+        {
+            Some(directory) => PrivateDirectory::trusted(directory),
             // 不持久化时不在工作目录写文件，备份放在系统临时目录的项目目录下（工单 54），
             // 创建时逐层校验属主、权限位与符号链接。
-            None => private_project_temp_directory(workdir)
+            None => private_project_temp_directory(folder)
                 .join(crate::file_history::FILE_HISTORY_DIRECTORY),
         }
         .join(chat_id.to_string())
@@ -340,7 +388,7 @@ impl Agent {
                 let chats = self.inner.chats.lock().await;
                 let Some(plan) = chats
                     .get(&chat_id)
-                    .and_then(|chat| chat.file_history.next_snapshot_plan())
+                    .and_then(|chat| chat.file_history.as_ref()?.next_snapshot_plan())
                 else {
                     return;
                 };
@@ -353,7 +401,11 @@ impl Agent {
             let Some(chat) = chats.get_mut(&chat_id) else {
                 return;
             };
-            if let Some(snapshot) = chat.file_history.commit_snapshot(computed) {
+            if let Some(snapshot) = chat
+                .file_history
+                .as_mut()
+                .and_then(|history| history.commit_snapshot(computed))
+            {
                 self.record_file_history_snapshot(chat_id, snapshot.message_id, &snapshot, false);
             }
         }
@@ -382,13 +434,16 @@ impl Agent {
     pub(super) async fn track_file_edit(&self, chat_id: ChatId, path: &Path, message_id: Uuid) {
         let directory = {
             let chats = self.inner.chats.lock().await;
-            let Some(chat) = chats.get(&chat_id) else {
+            let Some(history) = chats
+                .get(&chat_id)
+                .and_then(|chat| chat.file_history.as_ref())
+            else {
                 return;
             };
-            if !chat.file_history.needs_backup(path) {
+            if !history.needs_backup(path) {
                 return;
             }
-            chat.file_history.backup_directory().clone()
+            history.backup_directory().clone()
         };
         let source = path.to_path_buf();
         let backup =
@@ -400,23 +455,28 @@ impl Agent {
         let Some(chat) = chats.get_mut(&chat_id) else {
             return;
         };
-        if let Some(snapshot) = chat.file_history.commit_tracked_edit(path, backup) {
+        if let Some(snapshot) = chat
+            .file_history
+            .as_mut()
+            .and_then(|history| history.commit_tracked_edit(path, backup))
+        {
             self.record_file_history_snapshot(chat_id, message_id, &snapshot, true);
         }
     }
 }
 
-/// The conversation before the target prompt, in the execution mode the prompt was sent in.
+/// The conversation before message `index`, in `execution_mode` when given (the mode a prompt
+/// cut at its own index was sent in).
 ///
 /// `loops_at_start` 是 rewind 占用开始时存在的 Loop：只有它们会因创建位置在截断点之后而移除，
 /// 连同其排队输入、权限请求与提问；占用期间新建的 Loop 保留，创建位置移到截断点。
-fn conversation_before(
+pub(super) fn conversation_before(
     snapshot: &ChatSnapshot,
     bookkeeping: &ChatBookkeeping,
-    point: &RewindPoint,
+    index: usize,
+    execution_mode: Option<ExecutionMode>,
     loops_at_start: &HashSet<LoopId>,
 ) -> Result<(ChatSnapshot, ChatBookkeeping), AgentError> {
-    let index = point.message_index;
     let mut candidate = snapshot.clone();
     let mut candidate_bookkeeping = bookkeeping.clone();
     let kept_runs = candidate
@@ -434,6 +494,9 @@ fn conversation_before(
     candidate.message_runs.split_off(&index);
     candidate.message_contexts.split_off(&index);
     candidate_bookkeeping.denial_references.split_off(&index);
+    candidate_bookkeeping.message_responses.split_off(&index);
+    candidate_bookkeeping.lifecycle.restart_claims_at(index);
+    candidate_bookkeeping.lifecycle.forget_tail_answer();
     candidate.message_ids.split_off(&index);
     candidate.original_message_ids.split_off(&index);
     candidate.prompt_execution_modes.split_off(&index);
@@ -469,6 +532,16 @@ fn conversation_before(
     for start in candidate_bookkeeping.loop_starts.values_mut() {
         *start = (*start).min(index);
     }
+    for pending in &candidate.pending_inputs {
+        if removed_loops.contains(&pending.receipt.loop_id) {
+            candidate_bookkeeping.lifecycle.settle(
+                pending.receipt.run_id,
+                SettledOutcome::Discarded {
+                    reason: DiscardReason::LoopEnded,
+                },
+            );
+        }
+    }
     candidate
         .pending_inputs
         .retain(|pending| !removed_loops.contains(&pending.receipt.loop_id));
@@ -496,8 +569,10 @@ fn conversation_before(
     candidate
         .progress
         .retain(|progress| !removed_loops.contains(&progress.loop_id));
-    if candidate.policy.mode != point.execution_mode {
-        candidate.policy.mode = point.execution_mode;
+    if let Some(mode) = execution_mode
+        && candidate.policy.mode != mode
+    {
+        candidate.policy.mode = mode;
         candidate.policy.revision += 1;
     }
     projection::projected_messages(&candidate, &candidate_bookkeeping.denial_references)?;
@@ -543,7 +618,7 @@ fn prompt_loop_goal(snapshot: &ChatSnapshot, message_index: usize) -> Option<Str
 
 /// 截断后不在对话中的 Loop：停止它们的 Trigger 与事件来源，返回这些 Loop 供
 /// [`Agent::retire_removed_loops`] 结束。
-fn stop_listening_to_removed_loops(
+pub(super) fn stop_listening_to_removed_loops(
     chat: &mut Chat,
     loops_at_start: HashSet<LoopId>,
 ) -> Vec<LoopId> {
@@ -608,8 +683,9 @@ fn is_not_a_response(message: &Message) -> bool {
     }
 }
 
-fn ensure_idle(chat: &Chat) -> Result<(), AgentError> {
-    if chat.active.is_some()
+pub(super) fn ensure_idle(chat: &Chat) -> Result<(), AgentError> {
+    if chat.branch_reservation.is_some()
+        || chat.active.is_some()
         || !chat.parked.is_empty()
         || !chat.snapshot.pending_inputs.is_empty()
         || !chat.snapshot.pending_commands.is_empty()
@@ -646,7 +722,10 @@ mod tests {
 
     use super::*;
     use crate::file_history::test_pause;
-    use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+    use tickloop_agent_model::{
+        LocalModelClients, ModelClient, ModelClients, ModelDelta, ModelError, ModelOutput,
+        ModelRequest,
+    };
     use tickloop_agent_protocol::{Event, Receipt, UserShellRecord};
     use tickloop_agent_protocol::{InputModality, ModelConfig, ModelIdentity, Protocol, Usage};
 
@@ -859,7 +938,10 @@ mod tests {
                     id: Uuid::new_v4(),
                     prompt: "scheduled check".into(),
                     prompt_source: tickloop_agent_protocol::TriggerPromptSource::Explicit,
-                    interval_seconds: Some(1),
+                    schedule: Some(tickloop_agent_protocol::Recurrence::parse("every 1s").unwrap()),
+                    armed_at_ms: None,
+                    last_fired_at_ms: None,
+                    confirmation: None,
                     expires_at_ms: None,
                     accepts_events: false,
                     armed: true,
@@ -1058,7 +1140,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let agent = Agent::new_embedded(
             config(),
-            Arc::new(tickloop_agent_model::HttpModelClient::new(config()).unwrap()),
+            LocalModelClients::new(None).client(&config()).unwrap(),
         );
         let chat_id = agent.create_chat(directory.path().into()).await.unwrap();
         {

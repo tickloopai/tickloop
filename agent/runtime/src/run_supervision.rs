@@ -5,7 +5,8 @@ use tickloop_agent_model::ModelRequest;
 use tickloop_agent_protocol::{EventKind, LoopState, Receipt, RequestFailure, RunId};
 use tokio_util::sync::CancellationToken;
 
-use super::{Agent, Chat, LoopSnapshotExt, recovery};
+use super::{Agent, Chat, LoopSnapshotExt, RunStart, recovery};
+use tickloop_agent_transcript::ResponseEnding;
 
 const INTERNAL_RUN_ERROR: &str = "Agent internal error: execution panicked. The run stopped without automatically retrying. Review any operations with unknown outcomes before continuing.";
 const INTERNAL_COMPLETION_ERROR: &str = "Agent internal error while finishing the run. The run stopped without automatically retrying. Review any operations with unknown outcomes before continuing.";
@@ -24,39 +25,40 @@ pub(super) fn clear_run_state(chat: &mut Chat, run: RunId) {
         chat.active_run = None;
     }
     chat.parked.remove(&run);
+    chat.releases.remove(&run);
     chat.ready_runs.retain(|id| *id != run);
 }
 
 impl Agent {
-    pub(super) fn run_task(
-        &self,
-        first: (Receipt, ModelRequest, CancellationToken),
-    ) -> tokio::task::JoinHandle<()> {
+    pub(super) fn run_task(&self, first: (Receipt, ModelRequest, CancellationToken)) {
         let agent = self.clone();
-        tokio::spawn(Box::pin(async move {
+        self.inner.tasks.spawn(Box::pin(async move {
             let mut next = Some(first);
             while let Some((receipt, request, cancel)) = next {
                 next = agent.run(receipt, request, cancel).await;
             }
-        }))
+        }));
     }
 
     pub(super) async fn run(
         &self,
         receipt: Receipt,
-        request: ModelRequest,
+        start: impl Into<RunStart>,
         cancel: CancellationToken,
     ) -> Option<(Receipt, ModelRequest, CancellationToken)> {
         let mut is_awaiting_model = true;
         // Drop execution and its guards before reconciling shared state; panic payloads may contain secrets.
         let execution = AssertUnwindSafe(self.execute_run(
             receipt.clone(),
-            request,
+            start.into(),
             cancel.clone(),
             &mut is_awaiting_model,
         ))
         .catch_unwind()
         .await;
+        if self.leave_if_released(&receipt).await {
+            return None;
+        }
         let internal_failure = execution.is_err();
         let result = execution.unwrap_or_else(|_| Err(INTERNAL_RUN_ERROR.into()));
         if internal_failure {
@@ -141,6 +143,14 @@ impl Agent {
         } else {
             "Agent internal error while finishing the run. Tool history recovery also failed; reconcile pending operations before continuing. The run was not automatically retried."
         };
+        self.end_response(
+            chat,
+            receipt.run_id,
+            ResponseEnding::Failed {
+                error: message.into(),
+            },
+            Default::default(),
+        );
         self.emit(chat, receipt, EventKind::Failed(message.into()));
         let snapshot = chat.snapshot.clone();
         drop(chats);

@@ -3,10 +3,9 @@ use super::{
     compaction::{CompactionLayout, MessageSource},
     model_request::RequestContext,
 };
-use std::sync::Arc;
 use tickloop_agent_model::{
-    ModelClient, ModelConfigExt, ModelRequest, REQUEST_OVERHEAD_TOKENS, strip_images,
-    validate_model_config, validate_reasoning_effort,
+    ModelConfigExt, ModelRequest, REQUEST_OVERHEAD_TOKENS, strip_images, validate_model_config,
+    validate_reasoning_effort,
 };
 use tickloop_agent_protocol::projection;
 use tickloop_agent_protocol::{
@@ -146,20 +145,17 @@ impl Agent {
         &self,
         chat_id: ChatId,
         config: ModelConfig,
-        client: Arc<dyn ModelClient>,
     ) -> Result<ModelChange, AgentError> {
-        self.set_model_selection(chat_id, config, client, None)
-            .await
+        self.set_model_selection(chat_id, config, None).await
     }
 
     pub async fn set_model_with_thinking(
         &self,
         chat_id: ChatId,
         config: ModelConfig,
-        client: Arc<dyn ModelClient>,
         effort: Option<ReasoningEffort>,
     ) -> Result<ModelChange, AgentError> {
-        self.set_model_selection(chat_id, config, client, Some(effort))
+        self.set_model_selection(chat_id, config, Some(effort))
             .await
     }
 
@@ -167,10 +163,10 @@ impl Agent {
         &self,
         chat_id: ChatId,
         config: ModelConfig,
-        client: Arc<dyn ModelClient>,
         thinking_choice: Option<Option<ReasoningEffort>>,
     ) -> Result<ModelChange, AgentError> {
         let config = tickloop_agent_model::cards::model_for_persistent_selection(config);
+        let client = self.inner.models.client(&config)?;
         validate_model_config(&config).map_err(|error| AgentError::Invalid(error.to_string()))?;
         if let Some(effort) = thinking_choice {
             validate_reasoning_effort(&config, effort)
@@ -275,7 +271,8 @@ impl Agent {
         let instructions = instructions
             .map(|instructions| instructions.trim().to_owned())
             .filter(|instructions| !instructions.is_empty());
-        let mut tasks = self.inner.tasks.lock().await;
+        // Held until the task is spawned: `shutdown` either refuses this or waits for the task.
+        let admission = self.inner.tasks.token();
         let cancel = {
             let mut chats = self.inner.chats.lock().await;
             if self.inner.closed.load(std::sync::atomic::Ordering::SeqCst)
@@ -297,7 +294,7 @@ impl Agent {
         };
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let agent = self.clone();
-        tasks.push(tokio::spawn(async move {
+        self.inner.tasks.spawn(async move {
             let mut result = agent
                 .compact_history(chat_id, None, instructions, cancel)
                 .await;
@@ -329,8 +326,8 @@ impl Agent {
             while let Some((receipt, request, cancel)) = next {
                 next = agent.run(receipt, request, cancel).await;
             }
-        }));
-        drop(tasks);
+        });
+        drop(admission);
         receiver
             .await
             .map_err(|_| AgentError::Invalid("context compaction task ended unexpectedly".into()))?
@@ -564,6 +561,7 @@ impl Agent {
                         ),
                         summarize_metadata: None,
                     };
+                    crate::lifecycle::claim_response_messages(chat);
                     let (snapshot, bookkeeping) = layout.apply(&chat.snapshot, &chat.bookkeeping);
                     if let Some(window) = context_window(&snapshot) {
                         let candidate_messages = projection::projected_messages(
@@ -772,8 +770,9 @@ fn estimate_tokens_for_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::{fs::OpenOptions, time::Duration};
-    use tickloop_agent_model::{HttpModelClient, cards::ModelCatalog};
+    use tickloop_agent_model::{LocalModelClients, cards::ModelCatalog};
 
     #[tokio::test]
     async fn skill_reference_guidance_never_becomes_original_user_authority() {
@@ -822,8 +821,29 @@ mod tests {
         let catalog = ModelCatalog::defaults();
         let original = catalog.get("deepseek-api", "deepseek-flash").unwrap();
         let replacement = catalog.get("openai-api", "gpt-6-luna").unwrap();
-        let original_client = Arc::new(HttpModelClient::deferred(original.clone()).unwrap());
-        let agent = Agent::open_embedded(root.clone(), original, original_client).unwrap();
+        let store = crate::transcript::JsonlTranscriptStore::open(root.clone()).unwrap();
+        let settings = tickloop_agent_config::UserSettings::in_root(store.root());
+        let agent = Agent::with_seams(
+            crate::HarnessSeams {
+                transcripts: Some(Arc::new(store)),
+                environment: Some(Arc::new(crate::environment::LocalEnvironment::bare())),
+                models: Arc::new(LocalModelClients::new(None)),
+            },
+            crate::HarnessOptions {
+                search: Default::default(),
+                model: original,
+                settings: Some(settings),
+                host: tickloop_agent_protocol::AgentHostOptions::embedded_defaults(),
+                tools: crate::ToolPolicy::local(),
+                host_rules: Vec::new(),
+                task_tools: None,
+                min_schedule_interval: crate::LOCAL_MIN_SCHEDULE_INTERVAL,
+                waits: crate::WaitHosting::Process,
+                system_prompt_addition: None,
+                request_gates: Vec::new(),
+            },
+        )
+        .unwrap();
         let chat = agent.create_chat(directory.path().into()).await.unwrap();
 
         let lock_path = root.join("settings.json.lock");
@@ -839,15 +859,8 @@ mod tests {
         let selecting_agent = agent.clone();
         let selecting_replacement = replacement.clone();
         let selection = tokio::spawn(async move {
-            let client =
-                Arc::new(HttpModelClient::deferred(selecting_replacement.clone()).unwrap());
             selecting_agent
-                .set_model_with_thinking(
-                    chat,
-                    selecting_replacement,
-                    client,
-                    Some(ReasoningEffort::High),
-                )
+                .set_model_with_thinking(chat, selecting_replacement, Some(ReasoningEffort::High))
                 .await
         });
         tokio::time::timeout(Duration::from_secs(5), async {

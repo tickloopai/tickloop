@@ -901,7 +901,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1657,7 +1657,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "system-configuration 0.7.0",
  "tokio",
  "tower-service",
@@ -2712,7 +2712,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -3181,7 +3181,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.44",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -3219,9 +3219,9 @@ dependencies = [
  "cfg_aliases 0.2.2",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3687,7 +3687,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4411,7 +4411,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4618,6 +4618,7 @@ dependencies = [
 name = "tickloop-agent-artifacts"
 version = "0.2.13"
 dependencies = [
+ "async-trait",
  "libc",
  "reqwest 0.12.28",
  "serde",
@@ -4627,6 +4628,8 @@ dependencies = [
  "thiserror 2.0.20",
  "tickloop-agent-base",
  "tickloop-agent-protocol",
+ "tickloop-tick-oauth",
+ "tickloop-tick-test-support",
  "tokio",
  "tokio-util",
  "uuid",
@@ -4757,6 +4760,7 @@ dependencies = [
  "tickloop-agent-runtime",
  "tickloop-agent-test-support",
  "tickloop-agent-tools",
+ "tickloop-agent-transcript",
  "tickloop-agent-updater",
  "tickloop-tick-packages",
  "tickloop-tick-protocol",
@@ -4825,13 +4829,25 @@ name = "tickloop-agent-protocol"
 version = "0.2.13"
 dependencies = [
  "async-trait",
+ "chrono",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tickloop-agent-recurrence",
  "tickloop-tick-protocol",
  "tokio",
  "unicode-width",
  "uuid",
+]
+
+[[package]]
+name = "tickloop-agent-recurrence"
+version = "0.2.13"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -4864,6 +4880,7 @@ dependencies = [
  "tickloop-agent-protocol",
  "tickloop-agent-test-support",
  "tickloop-agent-tools",
+ "tickloop-agent-transcript",
  "tickloop-tick-packages",
  "tickloop-tick-protocol",
  "tickloop-tickhost",
@@ -4872,6 +4889,8 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -4880,10 +4899,16 @@ name = "tickloop-agent-test-support"
 version = "0.2.13"
 dependencies = [
  "async-trait",
+ "futures-util",
  "regex",
  "serde_json",
+ "tickloop-agent-artifacts",
+ "tickloop-agent-base",
+ "tickloop-agent-config",
  "tickloop-agent-model",
  "tickloop-agent-protocol",
+ "tickloop-agent-runtime",
+ "tickloop-agent-transcript",
  "tokio",
  "tokio-util",
  "unicode-width",
@@ -4915,6 +4940,17 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "tickloop-agent-transcript"
+version = "0.2.13"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tickloop-agent-protocol",
  "uuid",
 ]
 
@@ -5041,6 +5077,7 @@ dependencies = [
 name = "tickloop-tick-oauth"
 version = "0.2.13"
 dependencies = [
+ "async-trait",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -5278,9 +5315,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
@@ -5360,6 +5397,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",
@@ -6104,7 +6142,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

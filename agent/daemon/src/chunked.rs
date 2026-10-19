@@ -119,7 +119,7 @@ mod tests {
                     chat_id: Uuid::new_v4(),
                 },
                 title: None,
-                workdir: "/tmp/workdir".into(),
+                folder: "/tmp/workdir".into(),
                 messages: vec![RecordedMessage {
                     id: Uuid::new_v4(),
                     message: Message {

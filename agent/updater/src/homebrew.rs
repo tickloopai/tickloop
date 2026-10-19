@@ -20,7 +20,9 @@ pub(crate) async fn run(
     command
         .stdout(Stdio::from(slave.try_clone()?))
         .stderr(Stdio::from(slave));
-    let master = AsyncFd::new(master)?;
+    // SAFETY: a `File` keeps its descriptor open and returns the same one until the `AsyncFd`
+    // that owns it is dropped.
+    let master = unsafe { AsyncFd::register(master) }?;
     run_process_with_output(command, async {
         let mut parser = OutputParser::default();
         let mut buffer = [0; 4096];

@@ -261,12 +261,15 @@ impl ShellTasks {
         let Some(agent) = self.agent.get().cloned() else {
             return;
         };
+        let Some(owner) = agent.upgrade() else {
+            return;
+        };
         self.retained_handoffs
             .lock()
             .unwrap()
             .insert(task, (chat, handoff));
         let tasks = self.clone();
-        tokio::spawn(async move {
+        owner.inner.tasks.spawn(async move {
             loop {
                 let Some(listing) = agent.upgrade() else {
                     tasks.retained_handoffs.lock().unwrap().remove(&task);

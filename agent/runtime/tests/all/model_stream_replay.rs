@@ -7,7 +7,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tickloop_agent_model::HttpModelClient;
+use tickloop_agent_model::{LocalModelClients, ModelClients};
 use tickloop_agent_protocol::{EventKind, ModelConfig, Protocol};
 use tickloop_agent_runtime::Agent;
 use tokio::{
@@ -185,7 +185,7 @@ async fn run_agent_until_terminal(
     workdir: &Path,
 ) -> bool {
     let config = config(server.base_url.clone(), protocol);
-    let client = Arc::new(HttpModelClient::new(config.clone()).unwrap());
+    let client = LocalModelClients::new(None).client(&config).unwrap();
     let agent = Agent::new_embedded(config, client);
     let chat = agent.create_chat(workdir.to_path_buf()).await.unwrap();
     let mut events = agent.subscribe();

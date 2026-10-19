@@ -1,19 +1,21 @@
 use tickloop_agent_test_support::model_http_support;
 
 use serde_json::{Value, json};
+use std::sync::Arc;
 use tickloop_agent_model::{
-    ModelConfigExt, ModelError, ModelFailureKind, ModelRequest, ModelResponseRejection,
-    StructuredOutput,
+    LocalModelClients, ModelClients, ModelConfigExt, ModelError, ModelFailureKind, ModelRequest,
+    ModelResponseRejection, StructuredOutput,
     access::AccessCatalog,
     cards::{ModelCatalog, built_in_model_profiles, provider_group},
     credentials::save_api_key,
-    model_client, validate_reasoning_effort,
+    validate_reasoning_effort,
 };
 use tickloop_agent_protocol::{
     Adapter, Content, EventKind, ImageMediaType, ImageSource, Message, ModelConfig, Protocol,
     ProviderPatch, ReasoningEffort, Role, ThinkingControl, ToolDefinition,
 };
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_test_support::harness::opened_agent;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -388,7 +390,8 @@ async fn regional_api_streams_preserved_thinking_tools_images_and_cached_usage()
             input_schema: json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}),
         });
         let (events, _) = mpsc::unbounded_channel();
-        let output = model_client(config, Some(&root))
+        let output = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
             .unwrap()
             .complete(input, events, CancellationToken::new())
             .await
@@ -463,7 +466,8 @@ async fn streamed_tool_call_identity_stays_bound_to_one_index() {
         let (url, _) = model_http_support::serve_response(200, reply).await;
         let config = configured("zai-global-api", "glm-5.3", &root, url);
         let (events, _) = mpsc::unbounded_channel();
-        let error = model_client(config, Some(&root))
+        let error = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
             .unwrap()
             .complete(user_request(None), events, CancellationToken::new())
             .await
@@ -507,7 +511,8 @@ async fn thinking_defaults_and_pinned_toggle_card_off_follow_the_model_card() {
         };
         let model = config.model.clone();
         let (events, _) = mpsc::unbounded_channel();
-        model_client(config, Some(&root))
+        LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
             .unwrap()
             .complete(user_request(effort), events, CancellationToken::new())
             .await
@@ -526,7 +531,8 @@ async fn thinking_defaults_and_pinned_toggle_card_off_follow_the_model_card() {
         "http://127.0.0.1:9/api/paas/v4".into(),
     );
     let (events, _) = mpsc::unbounded_channel();
-    let error = model_client(config, Some(&root))
+    let error = LocalModelClients::new(Some(root.to_path_buf()))
+        .client(&config)
         .unwrap()
         .complete(
             user_request(Some(ReasoningEffort::Off)),
@@ -548,7 +554,9 @@ async fn same_source_reasoning_replays_unchanged_while_foreign_thinking_becomes_
     ])
     .await;
     let config = configured("zhipu-cn-api", "glm-5.3", &root, url);
-    let client = model_client(config, Some(&root)).unwrap();
+    let client = LocalModelClients::new(Some(root.to_path_buf()))
+        .client(&config)
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     let first = client
         .complete(user_request(None), events.clone(), CancellationToken::new())
@@ -629,7 +637,9 @@ async fn structured_output_uses_json_mode_with_schema_prompt_and_never_tools() {
         name: "verdict".into(),
         schema: schema.clone(),
     });
-    let client = model_client(config, Some(&root)).unwrap();
+    let client = LocalModelClients::new(Some(root.to_path_buf()))
+        .client(&config)
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     let output = client
         .complete(input.clone(), events.clone(), CancellationToken::new())
@@ -676,7 +686,8 @@ async fn glm_finish_reasons_map_to_existing_rejections() {
         let (url, _) = model_http_support::serve_response(200, finish_reply(reason)).await;
         let config = configured("zhipu-cn-api", "glm-5.3", &root, url);
         let (events, _) = mpsc::unbounded_channel();
-        let error = model_client(config, Some(&root))
+        let error = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
             .unwrap()
             .complete(user_request(None), events, CancellationToken::new())
             .await
@@ -722,7 +733,8 @@ async fn business_error_codes_decide_retry_and_failure_kind() {
         let (url, _) = model_http_support::serve_response(status, body).await;
         let config = configured("zai-global-api", "glm-5.3", &root, url);
         let (events, _) = mpsc::unbounded_channel();
-        let error = model_client(config, Some(&root))
+        let error = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
             .unwrap()
             .complete(user_request(None), events, CancellationToken::new())
             .await
@@ -788,40 +800,28 @@ async fn glm_messages_restart_glm_keeps_original_history_and_same_source_prefix(
         .unwrap();
     claude.base_url = messages_url;
     claude.api_key_env = glm.api_key_env.clone();
-    let agent = Agent::open_embedded(
+    let agent = opened_agent(
         root.clone(),
         glm.clone(),
-        model_client(glm.clone(), Some(&root)).unwrap(),
-    )
-    .unwrap();
+        Arc::new(LocalModelClients::new(Some(root.clone()))),
+    );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     finish_turn(&agent, chat, "First prompt").await;
     finish_turn(&agent, chat, "Second prompt").await;
-    agent
-        .set_model(
-            chat,
-            claude.clone(),
-            model_client(claude.clone(), Some(&root)).unwrap(),
-        )
-        .await
-        .unwrap();
+    agent.set_model(chat, claude.clone()).await.unwrap();
     finish_turn(&agent, chat, "Use Claude").await;
     let mixed = agent.snapshot(chat).await.unwrap();
     agent.shutdown().await;
 
-    let resumed = Agent::open_embedded(
+    let resumed = opened_agent(
         root.clone(),
         claude.clone(),
-        model_client(claude, Some(&root)).unwrap(),
-    )
-    .unwrap();
+        Arc::new(LocalModelClients::new(Some(root.clone()))),
+    );
     let restored = resumed.resume_chat(chat).await.unwrap();
     assert_eq!(restored.messages, mixed.messages);
     assert_eq!(restored.message_sources, mixed.message_sources);
-    resumed
-        .set_model(chat, glm.clone(), model_client(glm, Some(&root)).unwrap())
-        .await
-        .unwrap();
+    resumed.set_model(chat, glm.clone()).await.unwrap();
     finish_turn(&resumed, chat, "Return to GLM").await;
     resumed.shutdown().await;
 
@@ -888,7 +888,9 @@ async fn network_error_on_the_documented_empty_final_chunk_is_retried_by_the_run
     let agent = Agent::open_embedded(
         root.clone(),
         glm.clone(),
-        model_client(glm, Some(&root)).unwrap(),
+        LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&glm)
+            .unwrap(),
     )
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
@@ -933,7 +935,8 @@ async fn typed_balance_and_allowance_codes_determine_http_classification() {
         let (url, _) = model_http_support::serve_response(429, body).await;
         let config = configured("zai-global-api", "glm-5.3", &root, url);
         let (events, _) = mpsc::unbounded_channel();
-        let error = model_client(config, Some(&root))
+        let error = LocalModelClients::new(Some(root.to_path_buf()))
+            .client(&config)
             .unwrap()
             .complete(user_request(None), events, CancellationToken::new())
             .await

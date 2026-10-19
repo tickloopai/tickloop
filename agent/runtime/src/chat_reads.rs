@@ -9,7 +9,7 @@ use tickloop_agent_protocol::{ChatStatus, chat_display_title, chat_has_work, cha
 /// What an Agent row shows about a Chat.
 #[derive(Clone, Debug)]
 pub struct ChatSummary {
-    pub workdir: PathBuf,
+    pub folder: Option<PathBuf>,
     pub title: String,
     pub preview: Option<String>,
     pub has_work: bool,
@@ -36,7 +36,7 @@ impl Agent {
         let snapshot = &chats.get(&chat).ok_or(AgentError::NotFound)?.snapshot;
         let title = chat_display_title(snapshot, &snapshot.user_shells);
         Ok(ChatSummary {
-            workdir: snapshot.workdir.clone(),
+            folder: snapshot.folder.clone(),
             preview: chat_preview(snapshot, &title),
             title,
             has_work: chat_has_work(

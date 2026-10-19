@@ -1,8 +1,8 @@
-use std::{path::PathBuf, sync::LazyLock};
+use std::sync::LazyLock;
 
 use regex::Regex;
 use tickloop_agent_model::{
-    GenerationBudget, ModelError, ModelRequest, ModelResponseRejection, model_client,
+    GenerationBudget, ModelClients, ModelError, ModelRequest, ModelResponseRejection,
 };
 use tickloop_agent_protocol::{
     ChatSnapshot, ChatStatus, Content, ExecutionMode, LoopState, Message, Role,
@@ -62,7 +62,7 @@ pub(super) fn suppression(status: &ChatStatus) -> Option<&'static str> {
 pub(super) async fn generate(
     request: &SuggestionRequest,
     snapshot: &ChatSnapshot,
-    root: Option<PathBuf>,
+    models: &dyn ModelClients,
 ) -> SuggestionResult {
     if request.cancel.is_cancelled() {
         return SuggestionResult::empty("cancelled");
@@ -126,7 +126,7 @@ pub(super) async fn generate(
         policy.timeout(),
     );
     let model = budget.apply_model_limit(model);
-    let client = match model_client(model, root.as_deref()) {
+    let client = match models.client(&model) {
         Ok(client) => client,
         Err(error) => return SuggestionResult::empty(generation_error(&error)),
     };

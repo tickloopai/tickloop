@@ -8,7 +8,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use reqwest::{Client, Method, StatusCode, Url, header, redirect::Policy};
+use reqwest::{Client, Method, Url, header, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -22,10 +22,17 @@ use tickloop_agent_base::{
     },
 };
 
+mod accounts;
 mod catalog;
+#[cfg(test)]
+mod credential_tests;
+mod credentials;
 mod feedback;
 mod images;
+#[cfg(test)]
+mod migration_tests;
 pub use catalog::{AgentLinkMetadata, ArtifactMetadata, ArtifactOperation, ArtifactPage};
+pub use credentials::ArtifactCredentials;
 pub use feedback::{AgentLink, AgentLinkRequest, ClaimedFeedback, FeedbackDelivery, FeedbackPage};
 pub use images::{
     ArtifactImage, IMAGE_ARTIFACT_FORMAT, MAX_IMAGE_BYTES, MAX_SVG_BYTES, artifact_image_type,
@@ -82,8 +89,6 @@ const ORIGIN_ENV: &str = "TICKLOOP_ARTIFACT_ORIGIN";
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-const SLOW_DOWN_SECONDS: u64 = 5;
-const MAX_DEVICE_LIFETIME_SECONDS: u64 = 60 * 60;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY: Duration = Duration::from_millis(25);
 const USER_AGENT: &str = concat!(
@@ -98,15 +103,19 @@ pub enum ArtifactError {
         "invalid Tickloop Artifacts origin; use an HTTPS origin or an HTTP loopback test endpoint"
     )]
     InvalidOrigin,
+    #[error("login interrupted, try again")]
+    LoginInterrupted,
+    #[error("{0}")]
+    Login(tick_oauth::LoginError),
     #[error("Tickloop Artifacts connection failed")]
     Connection,
     #[error("Tickloop Artifacts returned an invalid response")]
     InvalidResponse,
-    #[error("Tickloop Artifacts authorization was denied")]
+    #[error("Tickloop Accounts authorization was denied")]
     AccessDenied,
-    #[error("Tickloop Artifacts device code expired")]
+    #[error("Tickloop Accounts device code expired")]
     Expired,
-    #[error("Tickloop Artifacts login cancelled")]
+    #[error("Tickloop Accounts login cancelled")]
     Cancelled,
     #[error("Artifact credentials changed while verifying the account")]
     AccountChanged,
@@ -119,6 +128,7 @@ pub enum ArtifactError {
         status: u16,
         code: String,
         message: String,
+        reason: Option<String>,
     },
     #[error("Tickloop Artifacts modification outcome unknown; operation {operation_id}: {outcome}")]
     OutcomeUnknown {
@@ -131,12 +141,13 @@ pub enum ArtifactError {
         "Tickloop Artifacts remote revocation is unconfirmed; local credential is retained for an explicit retry"
     )]
     RevocationUnknown,
+    #[error("Artifact credentials are managed by the host")]
+    HostManagedCredentials,
 }
 
 pub enum LogoutOutcome {
     AlreadySignedOut,
     Removed,
-    NewerLoginPresent,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -156,54 +167,47 @@ impl ArtifactUser {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum DevicePolling {
-    Interactive,
-    Background,
-}
-
-#[derive(Deserialize)]
 pub struct DeviceAuthorization {
-    device_code: String,
+    login: tick_oauth::DeviceLogin,
     pub user_code: String,
     pub verification_uri: String,
-    expires_in: u64,
-    interval: u64,
 }
 
 impl DeviceAuthorization {
     pub fn expires_in(&self) -> Duration {
-        Duration::from_secs(self.expires_in)
+        self.login.remaining()
     }
 }
 
-#[derive(Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    token_type: String,
-    expires_in: u64,
-    user: ArtifactUser,
+/// Decodes a service ID from its UUID or fixed-width base62 representation.
+pub fn parse_service_id(value: &str) -> Option<Uuid> {
+    if value.len() == 36 {
+        return Uuid::parse_str(value).ok();
+    }
+    if value.len() != SHORT_ID_LENGTH {
+        return None;
+    }
+    let mut decoded = 0_u128;
+    for digit in value.bytes() {
+        let digit = BASE62_ALPHABET
+            .iter()
+            .position(|candidate| *candidate == digit)?;
+        decoded = decoded.checked_mul(62)?.checked_add(digit as u128)?;
+    }
+    Some(Uuid::from_u128(decoded))
 }
 
-#[derive(Deserialize)]
-struct SessionResponse {
-    user: ArtifactUser,
-    expires_at: String,
+/// The stable local identity of an Artifact, independent of its service representation.
+pub fn canonical_artifact_id(value: &str) -> String {
+    parse_service_id(value).map_or_else(|| value.to_owned(), |id| id.to_string())
 }
 
-#[derive(Deserialize)]
-struct LogoutResponse {
-    revoked: bool,
-}
-
-#[derive(Deserialize)]
-struct ErrorEnvelope {
-    error: ServiceError,
-}
-
-#[derive(Deserialize)]
-struct ServiceError {
-    code: String,
+fn deserialize_service_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Uuid, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    parse_service_id(&value)
+        .ok_or_else(|| serde::de::Error::custom("expected a UUID or 22-character base62 ID"))
 }
 
 /// The URL form of an artifact ID: a UUID becomes the service's 22-character base62 short ID;
@@ -237,8 +241,7 @@ pub fn mcp_endpoint(origin: &str) -> String {
     format!("{origin}{APP_BASE_PATH}/mcp")
 }
 
-#[derive(Serialize, Deserialize)]
-struct StoredCredential {
+struct ArtifactCredential {
     origin: String,
     access_token: String,
     expires_at: u64,
@@ -250,8 +253,10 @@ pub struct ArtifactClient {
     origin: Url,
     http: Client,
     state_root: PathBuf,
+    hosted_credentials: Option<std::sync::Arc<credentials::HostedCredentials>>,
 }
 
+#[derive(Clone)]
 pub struct CredentialSnapshot {
     pub origin: String,
     pub account_id: String,
@@ -268,6 +273,9 @@ impl CredentialSnapshot {
 
 impl ArtifactClient {
     pub fn credential_snapshot(&self) -> Result<Option<CredentialSnapshot>, ArtifactError> {
+        if let Some(source) = &self.hosted_credentials {
+            return Ok(source.snapshot());
+        }
         Ok(self
             .read_credential()?
             .filter(|saved| saved.expires_at > now_seconds())
@@ -279,6 +287,9 @@ impl ArtifactClient {
     }
 
     pub async fn invalidate_credential(&self, token: &str) -> Result<(), ArtifactError> {
+        if let Some(source) = &self.hosted_credentials {
+            return source.invalidate(token).await;
+        }
         self.remove_if_same(token).await?;
         Ok(())
     }
@@ -312,202 +323,12 @@ impl ArtifactClient {
             origin,
             http,
             state_root: state_root.into(),
+            hosted_credentials: None,
         })
     }
 
     pub fn origin(&self) -> &str {
         self.origin.as_str().trim_end_matches('/')
-    }
-
-    pub async fn start_device_login(&self) -> Result<DeviceAuthorization, ArtifactError> {
-        let response = self
-            .request(Method::POST, "/api/v1/auth/device")?
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .map_err(|_| ArtifactError::Connection)?;
-        let device: DeviceAuthorization = self.success_json(response).await?;
-        let verification =
-            Url::parse(&device.verification_uri).map_err(|_| ArtifactError::InvalidResponse)?;
-        if device.device_code.is_empty()
-            || device.user_code.is_empty()
-            || device.expires_in == 0
-            || device.expires_in > MAX_DEVICE_LIFETIME_SECONDS
-            || device.interval == 0
-            || device.interval >= device.expires_in
-            || verification.origin() != self.origin.origin()
-            || verification.path() != format!("{APP_BASE_PATH}/device")
-            || verification
-                .query_pairs()
-                .filter(|(key, _)| key == "code")
-                .count()
-                != 1
-            || !verification
-                .query_pairs()
-                .any(|(key, value)| key == "code" && value == device.user_code)
-        {
-            return Err(ArtifactError::InvalidResponse);
-        }
-        Ok(device)
-    }
-
-    pub async fn finish_device_login(
-        &self,
-        device: DeviceAuthorization,
-        cancellation: &CancellationToken,
-    ) -> Result<ArtifactUser, ArtifactError> {
-        self.poll_device_login(device, cancellation, DevicePolling::Interactive)
-            .await?
-            .ok_or(ArtifactError::AccountChanged)
-    }
-
-    /// Completes a sign-in nobody is watching: connection and server failures are retried until
-    /// the code expires, and an account signed in meanwhile is kept, returning `Ok(None)`.
-    pub async fn finish_background_device_login(
-        &self,
-        device: DeviceAuthorization,
-        cancellation: &CancellationToken,
-    ) -> Result<Option<ArtifactUser>, ArtifactError> {
-        self.poll_device_login(device, cancellation, DevicePolling::Background)
-            .await
-    }
-
-    async fn poll_device_login(
-        &self,
-        device: DeviceAuthorization,
-        cancellation: &CancellationToken,
-        polling: DevicePolling,
-    ) -> Result<Option<ArtifactUser>, ArtifactError> {
-        let is_background = polling == DevicePolling::Background;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(device.expires_in);
-        let mut interval = device.interval;
-        loop {
-            if tokio::time::Instant::now() + Duration::from_secs(interval) >= deadline {
-                return Err(ArtifactError::Expired);
-            }
-            tokio::select! {
-                () = cancellation.cancelled() => return Err(ArtifactError::Cancelled),
-                () = tokio::time::sleep(Duration::from_secs(interval)) => {},
-            }
-            let request = self
-                .request(Method::POST, "/api/v1/auth/device/token")?
-                .json(&serde_json::json!({"device_code": device.device_code}));
-            let response = tokio::select! {
-                () = cancellation.cancelled() => return Err(ArtifactError::Cancelled),
-                result = request.send() => match result {
-                    Ok(response) => response,
-                    Err(_) if is_background => continue,
-                    Err(_) => return Err(ArtifactError::Connection),
-                },
-            };
-            if response.status().is_success() {
-                let token: TokenResponse = tokio::select! {
-                    () = cancellation.cancelled() => return Err(ArtifactError::Cancelled),
-                    result = self.success_json(response) => result?,
-                };
-                if token.token_type != "Bearer"
-                    || token.access_token.is_empty()
-                    || token.expires_in == 0
-                    || token.user.id.is_empty()
-                {
-                    return Err(ArtifactError::InvalidResponse);
-                }
-                if cancellation.is_cancelled() {
-                    return Err(ArtifactError::Cancelled);
-                }
-                let user = token.user.clone();
-                let credential = StoredCredential {
-                    origin: self.origin().to_owned(),
-                    access_token: token.access_token,
-                    expires_at: now_seconds().saturating_add(token.expires_in),
-                    user: token.user,
-                };
-                if is_background {
-                    return Ok(self.save_if_absent(&credential).await?.then_some(user));
-                }
-                self.save(&credential).await?;
-                return Ok(Some(user));
-            }
-            let status = response.status();
-            if is_background && status.is_server_error() {
-                continue;
-            }
-            let error: ErrorEnvelope = self.read_json(response).await?;
-            match error.error.code.as_str() {
-                "authorization_pending" if status == StatusCode::BAD_REQUEST => {}
-                "slow_down" if status == StatusCode::BAD_REQUEST => {
-                    interval = interval.saturating_add(SLOW_DOWN_SECONDS);
-                }
-                "access_denied" => return Err(ArtifactError::AccessDenied),
-                "expired_token" => return Err(ArtifactError::Expired),
-                _ => return Err(ArtifactError::Http(status.as_u16())),
-            }
-        }
-    }
-
-    pub async fn status(&self) -> Result<Option<ArtifactUser>, ArtifactError> {
-        let Some(credential) = self.read_credential()? else {
-            return Ok(None);
-        };
-        if credential.expires_at <= now_seconds() {
-            if !self.remove_if_same(&credential.access_token).await? {
-                return Err(ArtifactError::AccountChanged);
-            }
-            return Ok(None);
-        }
-        let response = self
-            .request(Method::GET, "/api/v1/auth/session")?
-            .header(header::AUTHORIZATION, bearer(&credential.access_token)?)
-            .send()
-            .await
-            .map_err(|_| ArtifactError::Connection)?;
-        if response.status() == StatusCode::UNAUTHORIZED {
-            if !self.remove_if_same(&credential.access_token).await? {
-                return Err(ArtifactError::AccountChanged);
-            }
-            return Ok(None);
-        }
-        let session: SessionResponse = self.success_json(response).await?;
-        if session.user.id != credential.user.id || session.expires_at.is_empty() {
-            return Err(ArtifactError::InvalidResponse);
-        }
-        if !self.credential_snapshot()?.is_some_and(|current| {
-            current.account_id == credential.user.id
-                && current.access_token == credential.access_token
-        }) {
-            return Err(ArtifactError::AccountChanged);
-        }
-        Ok(Some(session.user))
-    }
-
-    pub async fn logout(&self) -> Result<LogoutOutcome, ArtifactError> {
-        let Some(credential) = self.read_credential()? else {
-            return Ok(LogoutOutcome::AlreadySignedOut);
-        };
-        let response = self
-            .request(Method::POST, "/api/v1/auth/logout")?
-            .header(header::AUTHORIZATION, bearer(&credential.access_token)?)
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .map_err(|_| ArtifactError::RevocationUnknown)?;
-        if !response.status().is_success() && response.status() != StatusCode::UNAUTHORIZED {
-            return Err(ArtifactError::RevocationUnknown);
-        }
-        if response.status().is_success() {
-            let revoked: LogoutResponse = self
-                .read_json(response)
-                .await
-                .map_err(|_| ArtifactError::RevocationUnknown)?;
-            if !revoked.revoked {
-                return Err(ArtifactError::RevocationUnknown);
-            }
-        }
-        if self.remove_if_same(&credential.access_token).await? {
-            Ok(LogoutOutcome::Removed)
-        } else {
-            Ok(LogoutOutcome::NewerLoginPresent)
-        }
     }
 
     fn url(&self, path: &str) -> Result<Url, ArtifactError> {
@@ -526,24 +347,6 @@ impl ArtifactClient {
             .request(method, self.url(path)?)
             .header(header::USER_AGENT, USER_AGENT)
             .header(header::ACCEPT, "application/json"))
-    }
-
-    async fn success_json<T: for<'de> Deserialize<'de>>(
-        &self,
-        response: reqwest::Response,
-    ) -> Result<T, ArtifactError> {
-        if !response.status().is_success() {
-            return Err(ArtifactError::Http(response.status().as_u16()));
-        }
-        self.read_json(response).await
-    }
-
-    async fn read_json<T: for<'de> Deserialize<'de>>(
-        &self,
-        response: reqwest::Response,
-    ) -> Result<T, ArtifactError> {
-        self.read_json_with_limit(response, MAX_RESPONSE_BYTES)
-            .await
     }
 
     async fn read_json_with_limit<T: for<'de> Deserialize<'de>>(
@@ -566,6 +369,9 @@ impl ArtifactClient {
     }
 
     fn credential_directory(&self) -> Result<PathBuf, ArtifactError> {
+        if self.is_host_managed() {
+            return Err(ArtifactError::HostManagedCredentials);
+        }
         let path = self.state_root.join("artifacts").join("auth");
         open_without_following_links(
             &path,
@@ -580,7 +386,7 @@ impl ArtifactClient {
     }
 
     fn credential_path(&self) -> PathBuf {
-        let digest = Sha256::digest(self.origin().as_bytes());
+        let digest = Sha256::digest(self.accounts_issuer().as_bytes());
         let name = digest
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -588,10 +394,10 @@ impl ArtifactClient {
         self.state_root
             .join("artifacts")
             .join("auth")
-            .join(format!("{name}.json"))
+            .join(format!("accounts-{name}.json"))
     }
 
-    fn read_credential(&self) -> Result<Option<StoredCredential>, ArtifactError> {
+    fn read_account(&self) -> Result<Option<accounts::AccountCredential>, ArtifactError> {
         self.credential_directory()?;
         let path = self.credential_path();
         let file = match open_without_following_links(&path, OpenTarget::Entry) {
@@ -611,37 +417,45 @@ impl ArtifactClient {
         file.take(MAX_CREDENTIAL_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| ArtifactError::Storage)?;
-        let credential: StoredCredential =
+        let credential: accounts::AccountCredential =
             serde_json::from_slice(&bytes).map_err(|_| ArtifactError::Storage)?;
-        if credential.origin != self.origin()
-            || credential.access_token.is_empty()
+        if credential.oauth.issuer != self.accounts_issuer()
+            || credential.oauth.client_id != accounts::CLIENT_ID
+            || credential.oauth.access_token.is_empty()
+            || !credential.oauth.token_type.eq_ignore_ascii_case("Bearer")
+            || credential.oauth.refresh_token().is_none()
             || credential.user.id.is_empty()
-            || credential.expires_at == 0
+            || credential
+                .resources
+                .values()
+                .any(|token| token.access_token.is_empty())
         {
             return Err(ArtifactError::Storage);
         }
         Ok(Some(credential))
     }
 
-    async fn save(&self, credential: &StoredCredential) -> Result<(), ArtifactError> {
-        let _lock = self.lock().await?;
-        self.credential_directory()?;
-        self.read_credential()?;
-        let bytes = serde_json::to_vec(credential).map_err(|_| ArtifactError::Storage)?;
-        replace_file_atomically(&self.credential_path(), &bytes, PRIVATE_FILE_MODE)
-            .map_err(|_| ArtifactError::Storage)
+    fn read_credential(&self) -> Result<Option<ArtifactCredential>, ArtifactError> {
+        Ok(self.read_account()?.and_then(|account| {
+            account
+                .resources
+                .get(&self.resource())
+                .map(|token| ArtifactCredential {
+                    origin: self.origin().to_owned(),
+                    access_token: token.access_token.clone(),
+                    expires_at: token.expires_at,
+                    user: account.user,
+                })
+        }))
     }
 
-    /// Saves `credential` unless an account is already signed in; reports whether it saved.
-    async fn save_if_absent(&self, credential: &StoredCredential) -> Result<bool, ArtifactError> {
-        let _lock = self.lock().await?;
-        if self.read_credential()?.is_some() {
-            return Ok(false);
-        }
+    fn save_account(&self, credential: &accounts::AccountCredential) -> Result<(), ArtifactError> {
         let bytes = serde_json::to_vec(credential).map_err(|_| ArtifactError::Storage)?;
+        if bytes.len() > MAX_CREDENTIAL_BYTES {
+            return Err(ArtifactError::Storage);
+        }
         replace_file_atomically(&self.credential_path(), &bytes, PRIVATE_FILE_MODE)
-            .map_err(|_| ArtifactError::Storage)?;
-        Ok(true)
+            .map_err(|_| ArtifactError::Storage)
     }
 
     async fn remove_if_same(&self, token: &str) -> Result<bool, ArtifactError> {
@@ -654,6 +468,22 @@ impl ArtifactClient {
         }
         std::fs::remove_file(self.credential_path()).map_err(|_| ArtifactError::Storage)?;
         Ok(true)
+    }
+
+    fn remove_legacy_credential(&self) -> Result<(), ArtifactError> {
+        let name = format!("{:x}.json", Sha256::digest(self.origin().as_bytes()));
+        let path = self.credential_directory()?.join(name);
+        match open_without_following_links(&path, OpenTarget::Entry) {
+            Ok(file) => {
+                let metadata = file.metadata().map_err(|_| ArtifactError::Storage)?;
+                if !metadata.is_file() || metadata.uid() != unsafe { libc::getuid() } {
+                    return Err(ArtifactError::Storage);
+                }
+                std::fs::remove_file(path).map_err(|_| ArtifactError::Storage)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(ArtifactError::Storage),
+        }
     }
 
     async fn lock(&self) -> Result<File, ArtifactError> {
@@ -677,7 +507,10 @@ impl ArtifactClient {
                 return Err(ArtifactError::Storage);
             }
             match file.try_lock() {
-                Ok(()) => return Ok(file),
+                Ok(()) => {
+                    self.remove_legacy_credential()?;
+                    return Ok(file);
+                }
                 Err(std::fs::TryLockError::WouldBlock) => {
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
@@ -702,8 +535,8 @@ fn path_segment(value: &str) -> Result<&str, ArtifactError> {
     Ok(value)
 }
 
-/// The code and message of a service error envelope `{"error":{"code","message"}}`.
-fn service_error(envelope: &serde_json::Value) -> (String, String) {
+/// The code, message and optional conflict reason of a service error envelope `{"error":{"code","message"}}`.
+fn service_error(envelope: &serde_json::Value) -> (String, String, Option<String>) {
     let field = |name: &str| {
         envelope
             .pointer(&format!("/error/{name}"))
@@ -713,6 +546,7 @@ fn service_error(envelope: &serde_json::Value) -> (String, String) {
     (
         field("code").unwrap_or_else(|| "invalid_response".into()),
         field("message").unwrap_or_default(),
+        field("reason"),
     )
 }
 
@@ -732,16 +566,13 @@ fn now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        os::unix::fs::PermissionsExt,
-        sync::{Arc, Mutex},
-    };
+    use std::sync::{Arc, Mutex};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
 
-    async fn server(
+    pub(super) async fn server(
         reply: impl Fn(&str, usize, &str) -> (u16, String) + Send + Sync + 'static,
     ) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -793,26 +624,37 @@ mod tests {
         (origin, received)
     }
 
-    fn user_json() -> &'static str {
-        r#"{"id":"user-1","name":"A User","email":"a@example.test"}"#
-    }
-
-    async fn catalog_client(origin: &str) -> (tempfile::TempDir, ArtifactClient) {
+    pub(super) async fn catalog_client(origin: &str) -> (tempfile::TempDir, ArtifactClient) {
         let directory = tempfile::tempdir().unwrap();
         let client =
             ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), origin).unwrap();
+        let _lock = client.lock().await.unwrap();
         client
-            .save(&StoredCredential {
-                origin: origin.into(),
-                access_token: "test-token".into(),
-                expires_at: now_seconds() + 600,
+            .save_account(&accounts::AccountCredential {
+                oauth: tick_oauth::OAuthToken {
+                    issuer: client.accounts_issuer(),
+                    client_id: accounts::CLIENT_ID.into(),
+                    access_token: "userinfo-token".into(),
+                    token_type: "Bearer".into(),
+                    refresh_token: Some("refresh-token".into()),
+                    scope: None,
+                    expires_at: now_seconds() + 600,
+                    token_endpoint: format!("{}/token", client.accounts_issuer()),
+                    revocation_endpoint: Some(format!("{}/revoke", client.accounts_issuer())),
+                },
                 user: ArtifactUser {
                     id: "owner".into(),
                     name: "Owner".into(),
                     email: "owner@example.test".into(),
                 },
+                resources: std::collections::BTreeMap::from([(
+                    client.resource(),
+                    accounts::ResourceToken {
+                        access_token: "test-token".into(),
+                        expires_at: now_seconds() + 600,
+                    },
+                )]),
             })
-            .await
             .unwrap();
         (directory, client)
     }
@@ -940,7 +782,7 @@ mod tests {
         assert!(client.credential_snapshot().unwrap().is_some());
     }
 
-    fn png_bytes() -> Vec<u8> {
+    pub(super) fn png_bytes() -> Vec<u8> {
         [
             &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a][..],
             b"pixels",
@@ -948,7 +790,7 @@ mod tests {
         .concat()
     }
 
-    fn image_receipt(bytes: &[u8]) -> serde_json::Value {
+    pub(super) fn image_receipt(bytes: &[u8]) -> serde_json::Value {
         serde_json::json!({"asset_id":"asset-1","ref":"asset:asset-1","content_type":"image/png","bytes":bytes.len(),"sha256":format!("{:x}", Sha256::digest(bytes)),"width":4,"height":null})
     }
 
@@ -1030,7 +872,7 @@ mod tests {
             client
                 .upload_image("refused", "image/png", bytes.clone(), Uuid::new_v4(), &credential)
                 .await,
-            Err(ArtifactError::Service { status: 413, code, message }) if code == "asset_limit" && message == "full"
+            Err(ArtifactError::Service { status: 413, code, message, .. }) if code == "asset_limit" && message == "full"
         ));
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert!(matches!(
@@ -1100,7 +942,7 @@ mod tests {
             client
                 .upload_image("slides-1", "image/png", png_bytes(), Uuid::new_v4(), &credential)
                 .await,
-            Err(ArtifactError::Service { status: 429, code, message })
+            Err(ArtifactError::Service { status: 429, code, message, .. })
                 if code == "asset_busy" && message == "These Slides already have 4 uploads in progress"
         ));
         assert_eq!(requests.lock().unwrap().len(), 1);
@@ -1156,7 +998,7 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
-    fn request_body(request: &str) -> serde_json::Value {
+    pub(super) fn request_body(request: &str) -> serde_json::Value {
         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
     }
 
@@ -1280,149 +1122,6 @@ mod tests {
         ));
         assert_eq!(requests.lock().unwrap().len(), 2);
     }
-
-    #[tokio::test]
-    async fn login_polls_service_then_status_and_logout_use_the_same_origin() {
-        let (origin, requests) = server(|request, count, origin| {
-            let path = request.lines().next().unwrap_or("");
-            if path.starts_with("POST /artifact/api/v1/auth/device ") {
-                (200, format!(r#"{{"device_code":"private-device-code","user_code":"ABCD-EFGH","verification_uri":"{origin}/artifact/device?code=ABCD-EFGH","expires_in":30,"interval":1}}"#))
-            } else if path.starts_with("POST /artifact/api/v1/auth/device/token ") && count == 2 {
-                (400, r#"{"error":{"code":"authorization_pending","message":"wait"}}"#.into())
-            } else if path.starts_with("POST /artifact/api/v1/auth/device/token ") {
-                (200, format!(r#"{{"access_token":"private-service-token","token_type":"Bearer","expires_in":60,"user":{}}}"#, user_json()))
-            } else if path.starts_with("GET /artifact/api/v1/auth/session ") {
-                (200, format!(r#"{{"user":{},"expires_at":"2099-01-01T00:00:00Z"}}"#, user_json()))
-            } else if path.starts_with("POST /artifact/api/v1/auth/logout ") {
-                (200, r#"{"revoked":true}"#.into())
-            } else {
-                (404, r#"{"error":{"code":"not_found","message":"unknown"}}"#.into())
-            }
-        }).await;
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().canonicalize().unwrap();
-        let client = ArtifactClient::for_origin(&root, &origin).unwrap();
-        let device = client.start_device_login().await.unwrap();
-        assert_eq!(device.user_code, "ABCD-EFGH");
-        assert_eq!(
-            device.verification_uri,
-            format!("{origin}/artifact/device?code=ABCD-EFGH")
-        );
-        let user = client
-            .finish_device_login(device, &CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(user.id, "user-1");
-        assert_eq!(
-            client.status().await.unwrap().unwrap().email,
-            "a@example.test"
-        );
-        let stored_path = client.credential_path();
-        assert_eq!(
-            std::fs::metadata(&stored_path)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        assert_eq!(
-            std::fs::metadata(stored_path.parent().unwrap())
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
-        assert_eq!(
-            ArtifactClient::for_origin(&root, "https://tickloop.ai")
-                .unwrap()
-                .status()
-                .await
-                .unwrap()
-                .map(|user| user.id),
-            None
-        );
-        assert!(matches!(
-            client.logout().await.unwrap(),
-            LogoutOutcome::Removed
-        ));
-        assert!(!stored_path.exists());
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 5);
-        assert!(requests[1].contains("private-device-code"));
-        assert!(requests[2].contains("private-device-code"));
-        assert!(!requests[0].contains("authorization:"));
-        assert!(
-            requests[0]
-                .to_ascii_lowercase()
-                .contains("user-agent: tickloop-agent/")
-        );
-        assert!(
-            requests[0]
-                .to_ascii_lowercase()
-                .contains("accept: application/json")
-        );
-        assert!(!requests[1].contains("authorization:"));
-        assert!(
-            requests[3].contains("authorization: Bearer private-service-token")
-                || requests[3].contains("authorization: bearer private-service-token")
-        );
-        assert!(
-            requests[4]
-                .to_ascii_lowercase()
-                .contains("authorization: bearer private-service-token")
-        );
-    }
-
-    #[tokio::test]
-    async fn cancellation_and_unknown_token_result_stop_without_retry_or_persistence() {
-        let (origin, requests) = server(|request, _, origin| {
-            if request.starts_with("POST /artifact/api/v1/auth/device ") {
-                (200, format!(r#"{{"device_code":"private-code","user_code":"SAFE","verification_uri":"{origin}/artifact/device?code=SAFE","expires_in":30,"interval":1}}"#))
-            } else {
-                (503, r#"{"error":{"code":"unavailable","message":"retry later"}}"#.into())
-            }
-        }).await;
-        let directory = tempfile::tempdir().unwrap();
-        let client =
-            ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
-        let device = client.start_device_login().await.unwrap();
-        let cancellation = CancellationToken::new();
-        cancellation.cancel();
-        assert!(matches!(
-            client.finish_device_login(device, &cancellation).await,
-            Err(ArtifactError::Cancelled)
-        ));
-        assert_eq!(requests.lock().unwrap().len(), 1);
-        let device = client.start_device_login().await.unwrap();
-        assert!(matches!(
-            client
-                .finish_device_login(device, &CancellationToken::new())
-                .await,
-            Err(ArtifactError::Http(503))
-        ));
-        assert_eq!(requests.lock().unwrap().len(), 3);
-        assert!(client.status().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn invalid_verification_origin_and_cross_origin_redirect_are_rejected() {
-        let (origin, _) = server(|request, _, _| {
-            if request.starts_with("POST /artifact/api/v1/auth/device ") {
-                (200, r#"{"device_code":"secret","user_code":"CODE","verification_uri":"https://other.example/device?code=CODE","expires_in":30,"interval":1}"#.into())
-            } else {
-                (404, "{}".into())
-            }
-        }).await;
-        let directory = tempfile::tempdir().unwrap();
-        let client =
-            ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
-        assert!(matches!(
-            client.start_device_login().await,
-            Err(ArtifactError::InvalidResponse)
-        ));
-    }
 }
 
 #[cfg(test)]
@@ -1431,7 +1130,8 @@ mod address_tests {
 
     #[test]
     fn artifact_urls_use_the_services_fixed_width_short_ids_under_its_base_path() {
-        // The same values are pinned in artifact/tests/web-app-paths.test.ts, so both encoders agree.
+        // Tickloop Cloud pins the same values in web-artifacts/tests/web-app-paths.test.ts, so both
+        // encoders agree.
         assert_eq!(
             short_artifact_id("e1b85a39-a57b-4c28-a8a5-ae9233aead3e"),
             "6rvWPvOnhVABug7llbHb26"
@@ -1451,310 +1151,6 @@ mod address_tests {
         assert_eq!(
             mcp_endpoint("https://tickloop.ai"),
             "https://tickloop.ai/artifact/mcp"
-        );
-    }
-}
-
-#[cfg(test)]
-mod protocol_regression_tests {
-    use super::*;
-    use std::sync::{Arc, Mutex};
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        net::TcpListener,
-    };
-
-    async fn serve_one(listener: TcpListener, response: String) {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut bytes = [0_u8; 2048];
-        assert!(stream.read(&mut bytes).await.unwrap() > 0);
-        stream.write_all(response.as_bytes()).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn bearer_is_not_sent_to_a_redirect_target() {
-        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let target_url = format!("http://{}/stolen", target.local_addr().unwrap());
-        let service = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", service.local_addr().unwrap());
-        let redirect_response = format!(
-            "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        );
-        tokio::spawn(serve_one(service, redirect_response));
-        let directory = tempfile::tempdir().unwrap();
-        let client =
-            ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
-        client
-            .save(&StoredCredential {
-                origin: client.origin().into(),
-                access_token: "secret-for-service-only".into(),
-                expires_at: now_seconds() + 60,
-                user: ArtifactUser {
-                    id: "owner".into(),
-                    name: "Owner".into(),
-                    email: "owner@example.test".into(),
-                },
-            })
-            .await
-            .unwrap();
-        assert!(matches!(
-            client.status().await,
-            Err(ArtifactError::Http(302))
-        ));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), target.accept())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn slow_down_increases_poll_interval_and_expired_token_stops() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let service_origin = origin.clone();
-        let polls = Arc::new(Mutex::new(Vec::new()));
-        let recorded_polls = polls.clone();
-        tokio::spawn(async move {
-            for request_number in 0..3 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = [0_u8; 2048];
-                assert!(stream.read(&mut request).await.unwrap() > 0);
-                let (status, body) = match request_number {
-                    0 => (
-                        200,
-                        format!(
-                            r#"{{"device_code":"opaque","user_code":"CODE","verification_uri":"{service_origin}/artifact/device?code=CODE","expires_in":30,"interval":1}}"#
-                        ),
-                    ),
-                    1 => {
-                        recorded_polls
-                            .lock()
-                            .unwrap()
-                            .push(tokio::time::Instant::now());
-                        (
-                            400,
-                            r#"{"error":{"code":"slow_down","message":"wait"}}"#.into(),
-                        )
-                    }
-                    _ => {
-                        recorded_polls
-                            .lock()
-                            .unwrap()
-                            .push(tokio::time::Instant::now());
-                        (
-                            400,
-                            r#"{"error":{"code":"expired_token","message":"expired"}}"#.into(),
-                        )
-                    }
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-        let directory = tempfile::tempdir().unwrap();
-        let client =
-            ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
-        let device = client.start_device_login().await.unwrap();
-        assert!(matches!(
-            client
-                .finish_device_login(device, &CancellationToken::new())
-                .await,
-            Err(ArtifactError::Expired)
-        ));
-        {
-            let polls = polls.lock().unwrap();
-            assert_eq!(polls.len(), 2);
-            assert!(polls[1].duration_since(polls[0]) >= Duration::from_secs(6));
-        }
-        assert!(client.status().await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn background_sign_in_retries_server_failures_and_keeps_an_account_signed_in_meanwhile() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let service_origin = origin.clone();
-        tokio::spawn(async move {
-            for request_number in 0..3 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let mut request = [0_u8; 2048];
-                assert!(stream.read(&mut request).await.unwrap() > 0);
-                let (status, body) = match request_number {
-                    0 => (
-                        200,
-                        format!(
-                            r#"{{"device_code":"opaque","user_code":"CODE","verification_uri":"{service_origin}/artifact/device?code=CODE","expires_in":30,"interval":1}}"#
-                        ),
-                    ),
-                    1 => (503, "unavailable".into()),
-                    _ => (
-                        200,
-                        r#"{"access_token":"late-token","token_type":"Bearer","expires_in":600,"user":{"id":"late","name":"Late","email":"late@example.test"}}"#.into(),
-                    ),
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-        let directory = tempfile::tempdir().unwrap();
-        let client =
-            ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
-        let device = client.start_device_login().await.unwrap();
-        client
-            .save(&StoredCredential {
-                origin: client.origin().into(),
-                access_token: "existing-token".into(),
-                expires_at: now_seconds() + 60,
-                user: ArtifactUser {
-                    id: "owner".into(),
-                    name: "Owner".into(),
-                    email: "owner@example.test".into(),
-                },
-            })
-            .await
-            .unwrap();
-        assert!(
-            client
-                .finish_background_device_login(device, &CancellationToken::new())
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            client.read_credential().unwrap().unwrap().access_token,
-            "existing-token"
-        );
-    }
-
-    #[tokio::test]
-    async fn unauthorized_session_invalidates_only_the_matching_local_credential() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(serve_one(
-            listener,
-            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
-        ));
-        let directory = tempfile::tempdir().unwrap();
-        let client =
-            ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
-        client
-            .save(&StoredCredential {
-                origin: client.origin().into(),
-                access_token: "revoked-token".into(),
-                expires_at: now_seconds() + 60,
-                user: ArtifactUser {
-                    id: "owner".into(),
-                    name: "Owner".into(),
-                    email: "owner@example.test".into(),
-                },
-            })
-            .await
-            .unwrap();
-        assert!(client.status().await.unwrap().is_none());
-        assert!(client.read_credential().unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn logout_response_cannot_remove_a_new_login_saved_while_request_is_in_flight() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let (request_seen, seen) = tokio::sync::oneshot::channel();
-        let (release, response_allowed) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut bytes = [0_u8; 2048];
-            assert!(stream.read(&mut bytes).await.unwrap() > 0);
-            request_seen.send(()).unwrap();
-            response_allowed.await.unwrap();
-            let body = r#"{"revoked":true}"#;
-            stream.write_all(format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            ).as_bytes()).await.unwrap();
-        });
-        let directory = tempfile::tempdir().unwrap();
-        let client = Arc::new(
-            ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap(),
-        );
-        client
-            .save(&StoredCredential {
-                origin: client.origin().into(),
-                access_token: "old-token".into(),
-                expires_at: now_seconds() + 60,
-                user: ArtifactUser {
-                    id: "old-user".into(),
-                    name: "Old".into(),
-                    email: "old@example.test".into(),
-                },
-            })
-            .await
-            .unwrap();
-        let signing_out = client.clone();
-        let logout = tokio::spawn(async move { signing_out.logout().await });
-        seen.await.unwrap();
-        client
-            .save(&StoredCredential {
-                origin: client.origin().into(),
-                access_token: "new-token".into(),
-                expires_at: now_seconds() + 60,
-                user: ArtifactUser {
-                    id: "new-user".into(),
-                    name: "New".into(),
-                    email: "new@example.test".into(),
-                },
-            })
-            .await
-            .unwrap();
-        release.send(()).unwrap();
-        assert!(matches!(
-            logout.await.unwrap().unwrap(),
-            LogoutOutcome::NewerLoginPresent
-        ));
-        assert_eq!(
-            client.read_credential().unwrap().unwrap().access_token,
-            "new-token"
-        );
-    }
-
-    #[tokio::test]
-    async fn uncertain_remote_logout_keeps_credential_for_explicit_retry() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut bytes = [0_u8; 2048];
-            assert!(stream.read(&mut bytes).await.unwrap() > 0);
-        });
-        let directory = tempfile::tempdir().unwrap();
-        let client =
-            ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), &origin).unwrap();
-        client
-            .save(&StoredCredential {
-                origin: client.origin().into(),
-                access_token: "maybe-live-token".into(),
-                expires_at: now_seconds() + 60,
-                user: ArtifactUser {
-                    id: "owner".into(),
-                    name: "Owner".into(),
-                    email: "owner@example.test".into(),
-                },
-            })
-            .await
-            .unwrap();
-        assert!(matches!(
-            client.logout().await,
-            Err(ArtifactError::RevocationUnknown)
-        ));
-        assert_eq!(
-            client.read_credential().unwrap().unwrap().access_token,
-            "maybe-live-token"
         );
     }
 }

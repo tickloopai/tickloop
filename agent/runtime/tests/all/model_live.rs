@@ -1,7 +1,8 @@
 use std::{sync::Arc, time::Duration};
-use tickloop_agent_model::HttpModelClient;
+use tickloop_agent_model::{LocalModelClients, ModelClients};
 use tickloop_agent_protocol::{Content, EventKind, InputModality, ModelConfig, Protocol};
 use tickloop_agent_runtime::Agent;
+use tickloop_agent_test_support::harness::embedded_agent;
 
 async fn verify_deepseek_file_round_trip(protocol: Protocol) {
     assert!(
@@ -36,8 +37,8 @@ async fn verify_deepseek_file_round_trip(protocol: Protocol) {
         card: None,
         input_modalities: vec![InputModality::Text],
     };
-    let client = HttpModelClient::new(config.clone()).unwrap();
-    let agent = Agent::new_embedded(config, Arc::new(client));
+    let client = LocalModelClients::new(None).client(&config).unwrap();
+    let agent = Agent::new_embedded(config, client);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt=agent.submit(chat,None,"Use Read to read probe.txt in the current working directory. Reply with exactly the validation_marker value found inside. Use no other tool.".into()).await.unwrap();
@@ -171,7 +172,7 @@ async fn live_deepseek_messages_reads_images_in_tool_results() {
     };
     let agent = Agent::new_embedded(
         config.clone(),
-        Arc::new(HttpModelClient::new(config).unwrap()),
+        LocalModelClients::new(None).client(&config).unwrap(),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
@@ -232,10 +233,7 @@ async fn live_deepseek_switches_protocols_after_public_compaction() {
         input_modalities: vec![InputModality::Text],
     };
     let config = profile(Protocol::Messages);
-    let agent = Agent::new_embedded(
-        config.clone(),
-        Arc::new(HttpModelClient::new(config).unwrap()),
-    );
+    let agent = embedded_agent(config.clone(), Arc::new(LocalModelClients::new(None)));
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let mut goal = None;
@@ -273,14 +271,7 @@ async fn live_deepseek_switches_protocols_after_public_compaction() {
             }
             assert_eq!(agent.snapshot(chat).await.unwrap().messages, raw);
             let config = profile(protocol);
-            agent
-                .set_model(
-                    chat,
-                    config.clone(),
-                    Arc::new(HttpModelClient::new(config).unwrap()),
-                )
-                .await
-                .unwrap();
+            agent.set_model(chat, config.clone()).await.unwrap();
         }
         let input = if goal.is_none() {
             format!(
@@ -335,7 +326,7 @@ async fn live_deepseek_searches_and_reads_official_documentation() {
     };
     let agent = Agent::new_embedded(
         config.clone(),
-        Arc::new(HttpModelClient::new(config).unwrap()),
+        LocalModelClients::new(None).client(&config).unwrap(),
     );
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent

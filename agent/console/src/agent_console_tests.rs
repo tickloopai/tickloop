@@ -76,7 +76,7 @@ async fn view_upgrade_keeps_dispatch_directory_and_defers_an_unknown_creation() 
         .unwrap();
     console
         .interpret(Intent::Filter(AgentFilter {
-            workdir: Some("/chosen/project".into()),
+            folder: Some("/chosen/project".into()),
             workspace: Some("work".into()),
         }))
         .unwrap();
@@ -173,7 +173,7 @@ async fn an_explicitly_unknown_work_fact_stays_unknown() {
             generation: 1,
         },
         chat_id: Uuid::new_v4(),
-        workdir: temporary.path().to_path_buf(),
+        folder: Some(temporary.path().to_path_buf()),
         state: LoopState::Idle,
         run_id: None,
         title: "New Agent".into(),

@@ -44,12 +44,16 @@ async fn artifact_service() -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::Joi
                     .lock()
                     .unwrap()
                     .push(json!({"path":path,"body":body}));
-                let response = if path.starts_with("POST /artifact/api/v1/auth/device/token ") {
-                    json!({"access_token":"test-artifact-token","token_type":"Bearer","expires_in":3600,"user":{"id":"owner","name":"Owner","email":"owner@example.test"}})
-                } else if path.starts_with("POST /artifact/api/v1/auth/device ") {
-                    json!({"device_code":"device","user_code":"TEST","verification_uri":format!("{origin}/artifact/device?code=TEST"),"expires_in":30,"interval":1})
-                } else if path.starts_with("GET /artifact/api/v1/auth/session ") {
-                    json!({"user":{"id":"owner","name":"Owner","email":"owner@example.test"},"expires_at":"2099-01-01T00:00:00Z"})
+                let response = if path
+                    .starts_with("GET /.well-known/oauth-authorization-server/account ")
+                {
+                    json!({"issuer":format!("{origin}/account"),"token_endpoint":format!("{origin}/account/token"),"device_authorization_endpoint":format!("{origin}/account/device"),"userinfo_endpoint":format!("{origin}/account/userinfo"),"revocation_endpoint":format!("{origin}/account/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]})
+                } else if path.starts_with("POST /account/token ") {
+                    json!({"access_token":"test-artifact-token","token_type":"Bearer","expires_in":3600,"refresh_token":"fixture-refresh"})
+                } else if path.starts_with("POST /account/device ") {
+                    json!({"device_code":"device","user_code":"TEST","verification_uri":format!("{origin}/account/device?code=TEST"),"expires_in":30,"interval":1})
+                } else if path.starts_with("GET /account/userinfo ") {
+                    json!({"sub":"owner","name":"Owner","email":"owner@example.test"})
                 } else if path.starts_with("GET /artifact/api/v1/artifacts/document ") {
                     json!({"id":"document","title":CREATED_TITLE,"format":"markdown","access_role":"owner","url":format!("{origin}/artifact/document"),"publication":{"audience":"private","membership_revision":0}})
                 } else if path.starts_with("PUT /artifact/api/v1/agent/links/document ") {

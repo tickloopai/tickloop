@@ -206,6 +206,12 @@ impl Agent {
         parent: ChatId,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
+            // A durable host that shuts down leaves its notifications pending for the next one;
+            // nothing more is delivered here.
+            if self.inner.waits == WaitHosting::Durable && self.inner.closed.load(Ordering::SeqCst)
+            {
+                return;
+            }
             let pending = match self.snapshot(parent).await {
                 Ok(snapshot) => snapshot
                     .family_completions
@@ -231,6 +237,12 @@ impl Agent {
                 let Some(delegation) = snapshot.delegation else {
                     continue;
                 };
+                if self
+                    .returned_by_foreground_call(parent, &completion, &delegation)
+                    .await
+                {
+                    continue;
+                }
                 let target = Receipt {
                     chat_id: parent,
                     loop_id: delegation.parent_loop_id,
@@ -299,15 +311,26 @@ impl Agent {
     }
 
     pub(super) async fn record_family_completion(&self, child: &Receipt, snapshot: &ChatSnapshot) {
-        let Some(delegation) = snapshot.delegation.as_ref() else {
-            return;
-        };
+        if let Some(parent) = self.record_completion(child, snapshot).await {
+            self.flush_subagent_notifications(parent).await;
+        }
+    }
+
+    /// Records the end of the child run `child` with its parent; gives the parent when the
+    /// completion is a notification still to deliver.
+    pub(super) async fn record_completion(
+        &self,
+        child: &Receipt,
+        snapshot: &ChatSnapshot,
+    ) -> Option<ChatId> {
+        let delegation = snapshot.delegation.as_ref()?;
         let Ok(Some(registration)) = self.subagent_registration(child.chat_id).await else {
-            return;
+            return None;
         };
-        let Some(goal) = snapshot.loops.iter().find(|goal| goal.id == child.loop_id) else {
-            return;
-        };
+        let goal = snapshot
+            .loops
+            .iter()
+            .find(|goal| goal.id == child.loop_id)?;
         let result = crate::handback::completion_text(snapshot, child.run_id);
         let error = snapshot.events.iter().rev().find_map(|event| {
             if event.run_id == child.run_id
@@ -318,6 +341,8 @@ impl Agent {
                 None
             }
         });
+        let run_status = agent_messages::child_run_status(snapshot, child.loop_id, child.run_id)
+            .map(|(status, _)| status);
         // Held until the record is in place, so an interrupted foreground observation either
         // returns this ended run or releases its call before the run is classified.
         let invocations = self.inner.subagent_invocations.lock().await;
@@ -337,7 +362,7 @@ impl Agent {
             child_chat_id: child.chat_id,
             child_loop_id: child.loop_id,
             child_run_id: child.run_id,
-            handle: registration.handle,
+            handle: registration.handle.clone(),
             state: goal.state.clone(),
             result,
             error,
@@ -349,45 +374,233 @@ impl Agent {
                 .filter(|(_, run)| **run == child.run_id)
                 .filter_map(|(index, _)| snapshot.message_ids.get(index).copied())
                 .collect(),
+            run_status,
         };
         {
             let mut chats = self.inner.chats.lock().await;
-            let Some(parent) = chats.get_mut(&delegation.parent_chat_id) else {
-                return;
-            };
+            let parent = chats.get_mut(&delegation.parent_chat_id)?;
             if parent.snapshot.family_completions.iter().any(|record| {
                 record.child_chat_id == child.chat_id && record.child_run_id == child.run_id
             }) {
-                return;
+                return None;
             }
-            {
-                parent.snapshot.family_completions.push(completion.clone());
-                if let Some(recorder) = &self.inner.recorder {
-                    recorder.record_family_completions(
-                        parent.snapshot.id,
-                        parent.snapshot.family_completions.clone(),
-                    );
-                }
-                let parent_receipt = Receipt {
-                    chat_id: delegation.parent_chat_id,
-                    loop_id: delegation.parent_loop_id,
-                    run_id: delegation.parent_run_id,
-                };
-                self.emit(
-                    parent,
-                    &parent_receipt,
-                    EventKind::FamilyRunCompleted {
-                        completion: completion.clone(),
-                    },
+            parent.snapshot.family_completions.push(completion.clone());
+            // The foreground call's wait ends in the change that records what it returns.
+            if is_returned_by_foreground_call {
+                resolve_subagent_wait(parent, &completion, delegation, &registration);
+            }
+            prune_family_completions(&mut parent.snapshot);
+            if let Some(recorder) = &self.inner.recorder {
+                recorder.record_family_completions(
+                    parent.snapshot.id,
+                    parent.snapshot.family_completions.clone(),
                 );
-                self.save(&parent.snapshot);
             }
+            let parent_receipt = Receipt {
+                chat_id: delegation.parent_chat_id,
+                loop_id: delegation.parent_loop_id,
+                run_id: delegation.parent_run_id,
+            };
+            self.emit(
+                parent,
+                &parent_receipt,
+                EventKind::FamilyRunCompleted {
+                    completion: completion.clone(),
+                },
+            );
+            self.save(&parent.snapshot);
         }
         drop(invocations);
-        if completion.notification.is_background() {
-            self.flush_subagent_notifications(delegation.parent_chat_id)
-                .await;
+        completion
+            .notification
+            .is_background()
+            .then_some(delegation.parent_chat_id)
+    }
+
+    /// A pending completion whose run a foreground call waits on, such as one recorded before a
+    /// load rebuilt that call: the call returns it, so it is no notification. `false` otherwise.
+    async fn returned_by_foreground_call(
+        &self,
+        parent: ChatId,
+        completion: &FamilyCompletion,
+        delegation: &tickloop_agent_protocol::DelegationMetadata,
+    ) -> bool {
+        let invocations = self.inner.subagent_invocations.lock().await;
+        if !invocations.values().any(|invocation| {
+            invocation.receipt.run_id == completion.child_run_id && !invocation.run_in_background
+        }) {
+            return false;
         }
+        let Ok(Some(registration)) = self.subagent_registration(completion.child_chat_id).await
+        else {
+            return false;
+        };
+        let mut chats = self.inner.chats.lock().await;
+        let Some(chat) = chats.get_mut(&parent) else {
+            return false;
+        };
+        let Some(record) = chat
+            .snapshot
+            .family_completions
+            .iter_mut()
+            .find(|record| record.child_run_id == completion.child_run_id)
+        else {
+            return false;
+        };
+        record.notification = SubagentNotificationDelivery::Foreground;
+        let record = record.clone();
+        resolve_subagent_wait(chat, &record, delegation, &registration);
+        if let Some(recorder) = &self.inner.recorder {
+            recorder.record_family_completions(parent, chat.snapshot.family_completions.clone());
+        }
+        self.save(&chat.snapshot);
+        drop(chats);
+        drop(invocations);
+        true
+    }
+
+    /// What the foreground call on `child`'s run returns once the family records its end;
+    /// `None` while the run has not ended.
+    pub(super) async fn recorded_child_result(
+        &self,
+        parent: ChatId,
+        child: &Receipt,
+    ) -> Result<Option<tickloop_agent_protocol::ToolResult>, String> {
+        let (completion, delegation) = {
+            let chats = self.inner.chats.lock().await;
+            let Some(completion) = chats
+                .get(&parent)
+                .ok_or("parent is unavailable")?
+                .snapshot
+                .family_completions
+                .iter()
+                .find(|completion| {
+                    completion.child_chat_id == child.chat_id
+                        && completion.child_run_id == child.run_id
+                })
+                .cloned()
+            else {
+                return Ok(None);
+            };
+            let delegation = chats
+                .get(&child.chat_id)
+                .and_then(|chat| chat.snapshot.delegation.clone())
+                .ok_or("child Agent is unavailable")?;
+            (completion, delegation)
+        };
+        let registration = self
+            .subagent_registration(child.chat_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(agent_messages::child_run_result(
+            &completion,
+            &delegation,
+            registration.as_ref(),
+            parent,
+        ))
+    }
+}
+
+/// Ends the open wait of the foreground call that delegated `completion`'s run with what that
+/// call returns.
+pub(super) fn resolve_subagent_wait(
+    parent: &mut Chat,
+    completion: &FamilyCompletion,
+    delegation: &tickloop_agent_protocol::DelegationMetadata,
+    registration: &tickloop_agent_protocol::SubagentRegistration,
+) {
+    let Some(wait_id) = parent
+        .bookkeeping
+        .lifecycle
+        .open_subagent_wait(completion.child_run_id)
+        .map(|wait| wait.wait_id)
+    else {
+        return;
+    };
+    let Some(tool) = agent_messages::child_run_result(
+        completion,
+        delegation,
+        Some(registration),
+        parent.snapshot.id,
+    ) else {
+        return;
+    };
+    let tool = crate::tool_results::waited_call_result(
+        parent,
+        tickloop_agent_protocol::SUBAGENT_TOOL_NAME,
+        tool,
+    );
+    parent.bookkeeping.lifecycle.resolve_wait(
+        wait_id,
+        tickloop_agent_transcript::ModelVisibleResult {
+            content: tool.content.clone().into(),
+            tool,
+            ends_run: false,
+        },
+        None,
+    );
+}
+
+/// How many of a Chat's family completions and sent messages it keeps whatever else holds them.
+pub(super) const KEPT_FAMILY_RECORDS: usize = 64;
+
+/// Keeps the completions a Chat still needs: those whose notification has not reached the
+/// conversation, the latest of each child Loop (which a waiting member and a subtree stop look
+/// up), and the newest [`KEPT_FAMILY_RECORDS`]. Every other completion is final: a child run
+/// records one completion, once, when its input settles for good.
+pub(super) fn prune_family_completions(snapshot: &mut ChatSnapshot) {
+    let count = snapshot.family_completions.len();
+    if count <= KEPT_FAMILY_RECORDS {
+        return;
+    }
+    let latest_of_loop = snapshot
+        .family_completions
+        .iter()
+        .map(|completion| {
+            (
+                (completion.child_chat_id, completion.child_loop_id),
+                completion.child_run_id,
+            )
+        })
+        .collect::<HashMap<_, _>>()
+        .into_values()
+        .collect::<HashSet<_>>();
+    let queued = snapshot
+        .pending_inputs
+        .iter()
+        .filter_map(|pending| pending.agent_message.as_ref())
+        .map(|source| source.message_id)
+        .collect::<HashSet<_>>();
+    let newest_from = count - KEPT_FAMILY_RECORDS;
+    let mut index = 0;
+    snapshot.family_completions.retain(|completion| {
+        let kept = index >= newest_from
+            || latest_of_loop.contains(&completion.child_run_id)
+            || match completion.notification {
+                SubagentNotificationDelivery::Pending => true,
+                SubagentNotificationDelivery::Queued => queued.contains(&completion.child_run_id),
+                _ => false,
+            };
+        index += 1;
+        kept
+    });
+}
+
+/// Keeps the newest [`KEPT_FAMILY_RECORDS`] messages a Chat sent: its receivers' ledgers keep
+/// their ids, so an older one is never sent again.
+pub(super) fn prune_sent_agent_messages(snapshot: &mut ChatSnapshot) {
+    let count = snapshot.sent_agent_messages.len();
+    if count <= KEPT_FAMILY_RECORDS {
+        return;
+    }
+    let mut by_age = snapshot
+        .sent_agent_messages
+        .values()
+        .map(|source| (source.created_at, source.message_id))
+        .collect::<Vec<_>>();
+    by_age.sort();
+    for (_, id) in by_age.into_iter().take(count - KEPT_FAMILY_RECORDS) {
+        snapshot.sent_agent_messages.remove(&id);
     }
 }
 
@@ -406,10 +619,10 @@ impl Agent {
     ) -> Result<(), AgentError> {
         let snapshot = &chats.get(&chat_id).ok_or(AgentError::NotFound)?.snapshot;
         let workspace = tickloop_agent_tools::Workspace {
-            workdir: snapshot.workdir.clone(),
+            folder: snapshot.folder.clone(),
             additional_directories: snapshot.additional_directories.clone(),
         };
-        if workspace.workdir != admission.workspace.workdir
+        if workspace.folder != admission.workspace.folder
             || workspace.additional_directories != admission.workspace.additional_directories
         {
             return Err(AgentError::Invalid(
@@ -472,6 +685,8 @@ pub(super) struct ContextSubmission {
     pub host_context: Option<HostCallContext>,
     pub directed_source: Option<DirectedHumanSource>,
     pub target_generation: Option<u64>,
+    pub ledger: Option<crate::lifecycle::LedgerInput>,
+    pub turn: crate::TurnAdmission,
 }
 
 impl Agent {
@@ -550,6 +765,8 @@ impl Agent {
             host_context,
             directed_source: Some(source),
             target_generation: Some(target_generation),
+            ledger: None,
+            turn: Default::default(),
         })
         .await
     }

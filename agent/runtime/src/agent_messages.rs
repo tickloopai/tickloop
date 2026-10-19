@@ -3,10 +3,10 @@ use serde_json::{Value, json};
 use super::*;
 use tickloop_agent_protocol::local_messages;
 use tickloop_agent_protocol::{
-    AgentMessageSource, ChatSnapshot, EventKind, FamilyCompletion, FamilyMessageRejection,
-    FamilyMessageRejectionCode, LoopId, LoopState, MessageCause, PendingInput, Receipt,
-    SEND_AGENT_MESSAGE_TOOL_NAME, SubagentRegistration, ToolDefinition, ToolResult,
-    VerifiedUserRelay, chat_display_title,
+    AgentMessageSource, ChatSnapshot, ChildRunStatus, DelegationMetadata, EventKind,
+    FamilyCompletion, FamilyMessageRejection, FamilyMessageRejectionCode, LoopId, LoopState,
+    MessageCause, PendingInput, Receipt, SEND_AGENT_MESSAGE_TOOL_NAME, SubagentRegistration,
+    ToolDefinition, ToolResult, VerifiedUserRelay, chat_display_title,
 };
 
 pub const LIST_SUBAGENTS_TOOL_NAME: &str = "ListSubagents";
@@ -234,7 +234,69 @@ fn peer_target(
     ))
 }
 
+/// The result a foreground `Subagent` call returns for the child run `completion` records: a
+/// function of the family's records alone, so a parent rebuilt in another instance gets what it
+/// would have in the process that delegated. `None` without the child's registration.
 pub(super) fn child_run_result(
+    completion: &FamilyCompletion,
+    delegation: &DelegationMetadata,
+    registration: Option<&SubagentRegistration>,
+    parent_chat: ChatId,
+) -> Option<ToolResult> {
+    let registration = registration?;
+    let status = completion.status();
+    Some(ToolResult {
+        content: json!({"delegation_id":delegation.delegation_id,"child_chat_id":completion.child_chat_id,
+            "handle":registration.handle,"description":registration.description,"created_at":registration.created_at,
+            "child_loop_id":completion.child_loop_id,"child_run_id":completion.child_run_id,"parent_chat_id":parent_chat,
+            "status":status.label(),"child_state":format!("{:?}", completion.state).to_lowercase(),"result":completion.result,"error":completion.error,
+            "usage":completion.usage}).to_string(),
+        is_error: status != ChildRunStatus::Completed,
+        output_ref: None,
+    })
+}
+
+/// How the child run `run` of `snapshot` ended, as its events or its Loop tell; `None` while it
+/// has not ended.
+pub(super) fn child_run_status(
+    snapshot: &ChatSnapshot,
+    loop_id: LoopId,
+    run: RunId,
+) -> Option<(ChildRunStatus, Option<String>)> {
+    let goal = snapshot.loops.iter().find(|goal| goal.id == loop_id)?;
+    snapshot
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| {
+            if event.run_id != run {
+                return None;
+            }
+            match &event.kind {
+                EventKind::Completed { .. } => Some((ChildRunStatus::Completed, None)),
+                EventKind::Failed(error) => Some((ChildRunStatus::Failed, Some(error.clone()))),
+                EventKind::Interrupted => Some((ChildRunStatus::Interrupted, None)),
+                _ => None,
+            }
+        })
+        .or_else(|| {
+            (goal.run_id == Some(run))
+                .then_some(match goal.state {
+                    LoopState::Interrupted | LoopState::Stopped | LoopState::Expired => {
+                        Some((ChildRunStatus::Interrupted, None))
+                    }
+                    LoopState::Failed => Some((ChildRunStatus::Failed, None)),
+                    LoopState::Completed => Some((ChildRunStatus::Completed, None)),
+                    _ => None,
+                })
+                .flatten()
+        })
+}
+
+/// The result as the observing call built it from the child's in-memory events before the
+/// result was a function of records; the records must give the same.
+#[cfg(test)]
+pub(super) fn child_run_result_from_events(
     snapshot: &ChatSnapshot,
     child: &Receipt,
     parent: &Receipt,
@@ -244,42 +306,16 @@ pub(super) fn child_run_result(
         .loops
         .iter()
         .find(|goal| goal.id == child.loop_id)?;
-    let (status, error) = snapshot
-        .events
-        .iter()
-        .rev()
-        .find_map(|event| {
-            if event.run_id != child.run_id {
-                return None;
-            }
-            match &event.kind {
-                EventKind::Completed { .. } => Some(("completed", None)),
-                EventKind::Failed(error) => Some(("failed", Some(error.as_str()))),
-                EventKind::Interrupted => Some(("interrupted", None)),
-                _ => None,
-            }
-        })
-        .or_else(|| {
-            (goal.run_id == Some(child.run_id))
-                .then_some(match goal.state {
-                    LoopState::Interrupted | LoopState::Stopped | LoopState::Expired => {
-                        Some(("interrupted", None))
-                    }
-                    LoopState::Failed => Some(("failed", None)),
-                    LoopState::Completed => Some(("completed", None)),
-                    _ => None,
-                })
-                .flatten()
-        })?;
+    let (status, error) = child_run_status(snapshot, child.loop_id, child.run_id)?;
     let text = crate::handback::completion_text(snapshot, child.run_id);
     let metadata = snapshot.delegation.as_ref()?;
     Some(ToolResult {
         content: json!({"delegation_id":metadata.delegation_id,"child_chat_id":child.chat_id,
             "handle":registration?.handle,"description":registration?.description,"created_at":registration?.created_at,
             "child_loop_id":child.loop_id,"child_run_id":child.run_id,"parent_chat_id":parent.chat_id,
-            "status":status,"child_state":format!("{:?}", goal.state).to_lowercase(),"result":text,"error":error,
+            "status":status.label(),"child_state":format!("{:?}", goal.state).to_lowercase(),"result":text,"error":error,
             "usage":snapshot.request_usage.run_conversation_usage(child.run_id).unwrap_or_default()}).to_string(),
-        is_error:status != "completed", output_ref:None,
+        is_error:status != ChildRunStatus::Completed, output_ref:None,
     })
 }
 
@@ -556,10 +592,11 @@ impl Agent {
                 );
             }
             let target = &chats[&target_id].snapshot;
-            if target
-                .agent_message_origins
-                .values()
-                .any(|source| source["message_id"] == message_id.to_string())
+            if chats[&target_id].bookkeeping.lifecycle.is_input(message_id)
+                || target
+                    .agent_message_origins
+                    .values()
+                    .any(|source| source["message_id"] == message_id.to_string())
                 || target.pending_inputs.iter().any(|input| {
                     input
                         .agent_message
@@ -605,7 +642,12 @@ impl Agent {
                             .agent_message
                             .as_ref()
                             .is_some_and(|source| source.message_id == sender.run_id)
-                    }))
+                    })
+                // A report or notification the receiver's ledger accepted on an earlier host.
+                || chats[&target_id]
+                    .bookkeeping
+                    .lifecycle
+                    .is_input(sender.run_id))
         {
             return Ok(result(
                 json!({"status":"accepted","message_id":sender.run_id,"target_chat_id":target_id,"delivery":"already_accepted"}),
@@ -629,6 +671,31 @@ impl Agent {
             .map_err(|rejection| rejection.message)?
         };
         cause.depth = cause.depth.saturating_add(1);
+        let sender_response = chats[&sender.chat_id]
+            .bookkeeping
+            .lifecycle
+            .active_response(sender.run_id);
+        // A message's id names the answer and call that sent it, so the same send is one input
+        // on every host; another attempt at the answer sends anew.
+        let message_id = if is_result {
+            sender.run_id
+        } else {
+            task_message_id.unwrap_or_else(|| {
+                sender_response.map_or_else(Uuid::new_v4, |response| {
+                    tickloop_agent_transcript::input_ids::family_message(
+                        sender.chat_id,
+                        response,
+                        call_id,
+                    )
+                })
+            })
+        };
+        // A message the receiver already accepted, on this host or an earlier one, is sent.
+        if !is_result && chats[&target_id].bookkeeping.lifecycle.is_input(message_id) {
+            return Ok(result(
+                json!({"status":"accepted","message_id":message_id,"target_chat_id":target_id,"delivery":"already_accepted"}),
+            ));
+        }
         let original = chats.get_mut(&target_id).unwrap();
         if original.family_stopping {
             return Err("Subagent subtree is stopping".into());
@@ -701,11 +768,7 @@ impl Agent {
         }
         let source = AgentMessageSource {
             cause: cause.clone(),
-            message_id: if is_result {
-                sender.run_id
-            } else {
-                task_message_id.unwrap_or_else(Uuid::new_v4)
-            },
+            message_id,
             call_id: Some(call_id.into()),
             created_at: now,
             sender_chat_id: sender.chat_id,
@@ -738,23 +801,29 @@ impl Agent {
             .iter()
             .position(|pending| pending.trigger_source.is_some())
             .unwrap_or(receiver.snapshot.pending_inputs.len());
-        receiver.snapshot.pending_inputs.insert(
-            index,
-            PendingInput {
-                receipt: receipt.clone(),
-                input,
-                contexts: Vec::new(),
-                agent_message: Some(source.clone()),
-                directed_human: None,
-                denial_reference: None,
-                trigger_source: None,
-                armed: true,
-                queued_sequence,
-                task_continuation: false,
-                is_skill_invocation: false,
-                attached_file_reads: Vec::new(),
-            },
+        let queued = PendingInput {
+            receipt: receipt.clone(),
+            input,
+            contexts: Vec::new(),
+            agent_message: Some(source.clone()),
+            directed_human: None,
+            denial_reference: None,
+            trigger_source: None,
+            armed: true,
+            queued_sequence,
+            task_continuation: false,
+            is_skill_invocation: false,
+            attached_file_reads: Vec::new(),
+        };
+        receiver.bookkeeping.lifecycle.accept(
+            &super::lifecycle::LedgerInput::new(
+                source.message_id,
+                tickloop_agent_transcript::InputOp::AgentMessage,
+                &queued.input,
+            ),
+            &queued,
         );
+        receiver.snapshot.pending_inputs.insert(index, queued);
         self.remember_host_context(&receipt, None);
         self.emit(
             receiver,
@@ -779,6 +848,7 @@ impl Agent {
                 .snapshot
                 .sent_agent_messages
                 .insert(source.message_id, source.clone());
+            super::family::prune_sent_agent_messages(&mut sender_chat.snapshot);
             if let Some(recorder) = &self.inner.recorder {
                 recorder.record_sent_agent_messages(
                     sender.chat_id,
@@ -801,14 +871,20 @@ impl Agent {
         );
         drop(chats);
         drop(mailbox);
+        // The sender's call and then the receiver's acceptance are durable before the sender's
+        // result says the message went out. The receiver starts on it either way.
+        let durable = match is_result {
+            true => Ok(()),
+            false => self.make_durable(&[sender.chat_id, target_id]).await,
+        };
         let next = self
             .next_run(target_id)
             .await
             .map_err(|error| error.to_string())?;
-        self.inner.input_wakeup.send_replace(());
         if let Some(next) = next {
-            self.inner.tasks.lock().await.push(self.run_task(next));
+            self.run_task(next);
         }
+        durable?;
         Ok(delivered)
     }
 
@@ -870,6 +946,14 @@ impl Agent {
             )
             .await
             .map_err(|error| error.to_string())?;
+        // The stopped subtree is durable before the result says it stopped.
+        let mut stopped_members = prepared
+            .generations
+            .iter()
+            .map(|(member, _)| *member)
+            .collect::<Vec<_>>();
+        stopped_members.push(sender.chat_id);
+        self.make_durable(&stopped_members).await?;
         let failed = !stopped.failures.is_empty();
         Ok(ToolResult {
             content: json!({"status":if failed {"partial_failure"} else {"stopped"},"child_chat_id":prepared.target,
@@ -881,5 +965,130 @@ impl Agent {
     /// Installs the hook StopSubagent calls once a child is stopped.
     pub fn install_stopped_child_hook(&self, hook: Arc<dyn StoppedChildHook>) {
         *self.inner.stopped_child_hook.write().unwrap() = Some(hook);
+    }
+}
+
+#[cfg(test)]
+mod child_result_tests {
+    use std::sync::Arc;
+
+    use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
+    use tickloop_agent_protocol::{Content, Role, SUBAGENT_TOOL_NAME};
+    use tickloop_agent_test_support::routed::{has_tool_result, tool_result};
+    use tickloop_agent_test_support::{ScriptedModel, call, config, text};
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+
+    /// A root that delegates once in the foreground, and a child that answers or fails.
+    struct Family {
+        child_fails: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelClient for Family {
+        async fn generate_title(
+            &self,
+            request: ModelRequest,
+            _: UnboundedSender<ModelDelta>,
+            _: CancellationToken,
+        ) -> Result<ModelOutput, ModelError> {
+            Ok(tickloop_agent_test_support::title_output(request))
+        }
+
+        fn identity(&self) -> tickloop_agent_protocol::ModelIdentity {
+            ScriptedModel::new(Vec::new()).identity()
+        }
+
+        async fn complete(
+            &self,
+            request: ModelRequest,
+            _: UnboundedSender<ModelDelta>,
+            _: CancellationToken,
+        ) -> Result<ModelOutput, ModelError> {
+            let is_child = request
+                .messages
+                .iter()
+                .find(|message| message.role != Role::System)
+                .is_some_and(|message| {
+                    matches!(message.content.first(), Some(Content::Text { text }) if text.starts_with("<agent-message>"))
+                });
+            let content = match is_child {
+                true if self.child_fails => {
+                    return Err(ModelError::Configuration(
+                        "the child's model is gone".into(),
+                    ));
+                }
+                true => text("child report"),
+                false if !has_tool_result(&request, "delegate") => call(
+                    "delegate",
+                    SUBAGENT_TOOL_NAME,
+                    json!({"task": "check", "name": "checker"}),
+                ),
+                false => text("root done"),
+            };
+            Ok(ModelOutput {
+                private_source: None,
+                content,
+                usage: Default::default(),
+                stop_reason: "end_turn".into(),
+            })
+        }
+    }
+
+    /// What the foreground call returned, and what the child's events, read as the call used
+    /// to read them, give for the same run.
+    async fn both_results(child_fails: bool) -> (Value, Value) {
+        let directory = tempfile::tempdir().unwrap();
+        let agent = Agent::new_embedded(config(), Arc::new(Family { child_fails }));
+        let root = agent.create_chat(directory.path().into()).await.unwrap();
+        let mut events = agent.subscribe();
+        let receipt = agent.submit(root, None, "delegate".into()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.run_id == receipt.run_id
+                    && matches!(event.kind, EventKind::Completed { .. })
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let parent = agent.snapshot(root).await.unwrap();
+        let returned = tool_result(&parent.messages, "delegate").unwrap();
+        let completion = &parent.family_completions[0];
+        let child = Receipt {
+            chat_id: completion.child_chat_id,
+            loop_id: completion.child_loop_id,
+            run_id: completion.child_run_id,
+        };
+        let child_snapshot = agent.snapshot(child.chat_id).await.unwrap();
+        let registration = agent.subagent_registration(child.chat_id).await.unwrap();
+        let from_events =
+            child_run_result_from_events(&child_snapshot, &child, &receipt, registration.as_ref())
+                .unwrap();
+        agent.shutdown().await;
+        (
+            returned,
+            serde_json::from_str(&from_events.content).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_completed_childs_result_from_records_equals_the_one_its_events_gave() {
+        let (returned, from_events) = both_results(false).await;
+        assert_eq!(returned["status"], "completed");
+        assert_eq!(returned, from_events);
+    }
+
+    #[tokio::test]
+    async fn a_failed_childs_result_from_records_equals_the_one_its_events_gave() {
+        let (returned, from_events) = both_results(true).await;
+        assert_eq!(returned["status"], "failed");
+        assert!(returned["error"].as_str().is_some());
+        assert_eq!(returned, from_events);
     }
 }

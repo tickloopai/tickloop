@@ -1,7 +1,7 @@
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tickloop_agent_model::ModelResponseRejection;
+use tickloop_agent_model::{LocalModelClients, ModelClients, ModelResponseRejection};
 use tickloop_agent_protocol::{
     AgentHostOptions, Content, Decision, DirectoryTrustPolicy, EventKind, ExecutionMode, LoopState,
     PermissionApprovalSource, PermissionRule, PermissionScope, PromptPolicy,
@@ -1890,7 +1890,7 @@ async fn deny_rules_win_over_allow_and_ask() {
 #[tokio::test]
 #[ignore = "calls the configured real DeepSeek permission checker"]
 async fn real_automatic_checker_authorizes_an_explicitly_requested_temporary_file() {
-    use tickloop_agent_model::{HttpModelClient, cards::built_in_model_profiles};
+    use tickloop_agent_model::cards::built_in_model_profiles;
     let directory = tempfile::tempdir().unwrap();
     let external = tempfile::tempdir().unwrap();
     let output_path = external.path().join("audit.txt");
@@ -1914,7 +1914,7 @@ async fn real_automatic_checker_authorizes_an_explicitly_requested_temporary_fil
     checker.max_output_tokens = 1024;
     checker.card.as_mut().unwrap().max_output_tokens = 1024;
     agent
-        .set_auto_reviewer(Arc::new(HttpModelClient::new(checker).unwrap()))
+        .set_auto_reviewer(LocalModelClients::new(None).client(&checker).unwrap())
         .await;
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent

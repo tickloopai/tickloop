@@ -8,12 +8,11 @@ use std::{error::Error, os::unix::fs::PermissionsExt, path::PathBuf};
 
 use serde_json::{Value, json};
 use tickloop_agent_model::{
-    ModelRequest, StructuredOutput,
+    LocalModelClients, ModelClients, ModelRequest, StructuredOutput,
     access::AccessCatalog,
     auth::copilot::CopilotAuth,
     cards::ModelCatalog,
     copilot::{CLIENT_HEADERS, COPILOT_API_URL, GITHUB_API_VERSION},
-    model_client,
 };
 use tickloop_agent_protocol::{Content, Message, Role, ToolDefinition};
 use tokio::sync::mpsc;
@@ -309,7 +308,7 @@ async fn echo(
         "Probing {} ({}) via {:?}",
         config.name, config.model, config.protocol
     );
-    let client = model_client(config, Some(root))?;
+    let client = LocalModelClients::new(Some(root.to_path_buf())).client(&config)?;
     let (events, _receiver) = mpsc::unbounded_channel();
     let mut request = ModelRequest {
         history_sources: vec![None],

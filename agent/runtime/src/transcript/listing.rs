@@ -2,18 +2,18 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use tickloop_agent_protocol::Content;
+use tickloop_agent_transcript::{ForkedFrom, Line};
 use uuid::Uuid;
 
-use super::entry::{ForkedFrom, Line};
 use super::path::TRANSCRIPT_FILE_SUFFIX;
-use tickloop_agent_protocol::Content;
 
 /// 照 Claude Code `LITE_READ_BUF_SIZE`：列表只读每个文件的头尾各 64KB。
 pub(super) const LITE_READ_BUF_SIZE: usize = 64 * 1024;
 const FORKED_FROM_PATTERN: &str = "\"forkedFrom\":{";
 
 #[derive(Clone, Debug)]
-pub(crate) struct TranscriptSummary {
+pub struct TranscriptSummary {
     pub chat_id: Uuid,
     pub modified: SystemTime,
     pub cwd: Option<PathBuf>,

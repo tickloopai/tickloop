@@ -80,12 +80,12 @@ pub use auto_settings::{
 };
 pub use auto_setup::{AutoEnvironmentDraft, AutoSetupOptions, AutoSetupPurpose};
 pub use chat::{
-    AgentHostOptions, ChatSnapshot, DirectoryTrustPolicy, Event, EventKind, HostNote, LoopId,
-    OperationRecord, OperationState, PendingCommand, PendingInput, PermissionApprovalSource,
-    PermissionExecution, PermissionRequest, PromptPolicy, ProposedToolCall, QueuedInput,
-    QueuedInputKind, Receipt, RunId, SavedChat, ToolCallRecovery, UserShellReceipt,
-    UserShellRecord, UserShellState, chat_display_title, chat_has_work, chat_preview,
-    short_chat_title,
+    AgentHostOptions, ChatSnapshot, DirectoryTrustPolicy, Event, EventKind, HostNote, InputId,
+    LoopId, OperationRecord, OperationState, PendingCommand, PendingInput,
+    PermissionApprovalSource, PermissionExecution, PermissionRequest, PromptPolicy,
+    ProposedToolCall, QueuedInput, QueuedInputKind, Receipt, ResponseId, RunId, SavedChat,
+    ToolCallRecovery, UserShellReceipt, UserShellRecord, UserShellState, chat_display_title,
+    chat_has_work, chat_preview, short_chat_title,
 };
 pub use chat_status::ChatStatus;
 pub use context_usage::{
@@ -98,12 +98,12 @@ pub use denials::{
     DisplaySummary, MAX_RECENT_DENIALS, render_reference,
 };
 pub use family::{
-    AgentColor, AgentMessageSource, DelegationCeiling, DelegationMetadata, DelegationParent,
-    DirectedHumanSource, FamilyCompletion, FamilyInputRecord, FamilyMessageRejection,
-    FamilyMessageRejectionCode, MAX_SUBAGENT_DEPTH, MessageCause, SEND_AGENT_MESSAGE_TOOL_NAME,
-    SUBAGENT_HANDBACK_TOOL_NAME, SUBAGENT_MISSING_REPORT, SUBAGENT_REPORT_RECEIPT,
-    SUBAGENT_TOOL_NAME, SubagentNotificationDelivery, SubagentRegistration, SubagentReport,
-    VerifiedUserRelay,
+    AgentColor, AgentMessageSource, ChildRunStatus, DelegationCeiling, DelegationMetadata,
+    DelegationParent, DirectedHumanSource, FamilyCompletion, FamilyInputRecord,
+    FamilyMessageRejection, FamilyMessageRejectionCode, MAX_SUBAGENT_DEPTH, MessageCause,
+    SEND_AGENT_MESSAGE_TOOL_NAME, SUBAGENT_HANDBACK_TOOL_NAME, SUBAGENT_MISSING_REPORT,
+    SUBAGENT_REPORT_RECEIPT, SUBAGENT_TOOL_NAME, SubagentNotificationDelivery,
+    SubagentRegistration, SubagentReport, VerifiedUserRelay,
 };
 pub use file_change::{
     FileChangeAction, FileChangeArtifactRef, FileChangeReviewSummary, FileIdentity, FileVersion,
@@ -136,8 +136,8 @@ pub use local_messages::{
     SubagentReportMessage, TaskNotification, TaskNotificationStatus, TickDeliveryLine,
 };
 pub use loops::{
-    EventSourceBinding, LoopSnapshot, LoopState, LoopTriggerNotice, LoopTriggerNoticeKind, Trigger,
-    TriggerPromptSource, TriggerSource,
+    EventSourceBinding, LoopSnapshot, LoopState, LoopTriggerNotice, LoopTriggerNoticeKind,
+    ScheduleConfirmation, Trigger, TriggerPromptSource, TriggerSource,
 };
 pub use model::{
     ApiKeyStatus, Content, ImageSource, InputModality, Message, ModelAuthSource, ModelConfig,
@@ -172,6 +172,7 @@ pub use tick_subscriptions::{
     TICK_SUBSCRIPTION_SOURCE, TickLinkState, TickSubscription, TickSubscriptionChange,
     TickSubscriptionFrequency, TickSubscriptionStatus,
 };
+pub use tickloop_agent_recurrence::{ParseError as RecurrenceError, Recurrence};
 pub use tool::ToolDefinition;
 pub use tools::{
     CommandSnapshot, CommandState, FileReadRecord, SearchConfig, SearchProviderKind,

@@ -1120,7 +1120,7 @@ fn sticky_prompt_loaded_history_tracks_the_original_message_row() {
     console.select_chat(Some(chat)).unwrap();
     let snapshot: ChatSnapshot = serde_json::from_value(serde_json::json!({
         "id": chat,
-        "workdir": "/fixture",
+        "folder": "/fixture",
         "messages": [
             {"role": "user", "content": [{"type": "text", "text": "Loaded user request"}]},
             {"role": "user", "content": [{"type": "text", "text": "Legacy Agent message"}]},

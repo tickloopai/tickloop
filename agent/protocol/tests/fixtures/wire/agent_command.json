@@ -2,7 +2,7 @@
   {
     "kind": "create",
     "launch": {
-      "workdir": "/work/project",
+      "folder": "/work/project",
       "config_root": "/home/user/.tickloop",
       "model": {
         "connection": {
@@ -281,7 +281,7 @@
         "id": "00000000-0000-0000-0000-000000000030",
         "prompt": "Report changes",
         "prompt_source": "Explicit",
-        "interval_seconds": 60,
+        "schedule": "every 1m",
         "expires_at_ms": null,
         "accepts_events": true,
         "armed": true,

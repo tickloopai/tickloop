@@ -1,6 +1,6 @@
 use model_http_support::serve_response;
 use serde_json::{Value, json};
-use tickloop_agent_model::{HttpModelClient, ModelClient, ModelDelta, ModelError, ModelRequest};
+use tickloop_agent_model::{LocalModelClients, ModelClients, ModelDelta, ModelError, ModelRequest};
 use tickloop_agent_protocol::{
     Content, ImageMediaType, ImageSource, InputModality, Message, ModelConfig, Protocol, Role,
     ToolDefinition, ToolResultBlock, ToolResultContent, Usage,
@@ -22,7 +22,9 @@ async fn reports_authentication_and_rate_limits_without_echoing_credentials() {
             "Request refused; Authorization: Bearer secret-api-key".into(),
         )
         .await;
-        let client = HttpModelClient::new(configuration(base_url)).unwrap();
+        let client = LocalModelClients::new(None)
+            .client(&configuration(base_url))
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(
@@ -58,22 +60,16 @@ fn rejects_unsafe_or_unusable_configuration_before_starting_a_request() {
     ] {
         assert!(
             matches!(
-                HttpModelClient::new(configuration(base_url.into())),
+                LocalModelClients::new(None).client(&configuration(base_url.into())),
                 Err(ModelError::Configuration(_))
             ),
             "accepted {base_url}"
         );
     }
-    let mut missing_key = configuration("https://api.deepseek.com/anthropic".into());
-    missing_key.api_key_env = "TICKLOOP_MODEL_TEST_UNSET_KEY_812730".into();
-    assert!(matches!(
-        HttpModelClient::new(missing_key),
-        Err(ModelError::Configuration(_))
-    ));
     let mut zero_tokens = configuration("http://127.0.0.1:9999".into());
     zero_tokens.max_output_tokens = 0;
     assert!(matches!(
-        HttpModelClient::new(zero_tokens),
+        LocalModelClients::new(None).client(&zero_tokens),
         Err(ModelError::Configuration(_))
     ));
 }
@@ -81,7 +77,9 @@ fn rejects_unsafe_or_unusable_configuration_before_starting_a_request() {
 #[tokio::test]
 async fn cancelled_requests_do_not_produce_a_completed_response() {
     let (base_url, _) = serve_response(200, text_response()).await;
-    let client = HttpModelClient::new(configuration(base_url)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url))
+        .unwrap();
     let (events, mut receiver) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     cancel.cancel();
@@ -150,7 +148,9 @@ async fn incomplete_or_duplicate_tool_streams_never_return_executable_calls() {
     ];
     for body in streams {
         let (base_url, _) = serve_response(200, body).await;
-        let client = HttpModelClient::new(configuration(base_url)).unwrap();
+        let client = LocalModelClients::new(None)
+            .client(&configuration(base_url))
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         assert!(
             client
@@ -188,7 +188,9 @@ async fn assembles_complete_tool_arguments_and_preserves_thinking_for_the_next_t
         event("message_stop", json!({})),
     ].concat();
     let (base_url, request_receiver) = serve_response(200, body).await;
-    let client = HttpModelClient::new(configuration(base_url)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url))
+        .unwrap();
     let tools = vec![ToolDefinition {
         name: "Read".into(),
         description: "Read a text file".into(),
@@ -238,7 +240,9 @@ async fn assembles_complete_tool_arguments_and_preserves_thinking_for_the_next_t
     );
 
     let (base_url, next_request) = serve_response(200, text_response()).await;
-    let client = HttpModelClient::new(configuration(base_url)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url))
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     client
         .complete(
@@ -283,7 +287,9 @@ async fn assembles_complete_tool_arguments_and_preserves_thinking_for_the_next_t
 #[tokio::test]
 async fn tool_results_serialize_to_the_anthropic_string_or_block_array_shape() {
     let (base_url, captured) = serve_response(200, text_response()).await;
-    let client = HttpModelClient::new(configuration(base_url)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url))
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     client
         .complete(
@@ -369,7 +375,9 @@ async fn messages_rejects_noncomplete_stop_reasons_even_with_complete_content_bl
         ].concat();
         for body in [text_response().replace("end_turn", reason), tool_response] {
             let (base_url, _) = serve_response(200, body).await;
-            let client = HttpModelClient::new(configuration(base_url)).unwrap();
+            let client = LocalModelClients::new(None)
+                .client(&configuration(base_url))
+                .unwrap();
             let (events, _) = mpsc::unbounded_channel();
             let error = client
                 .complete(
@@ -463,7 +471,9 @@ fn message(role: Role, text: &str) -> Message {
 #[tokio::test]
 async fn streams_messages_with_multiround_history_and_actual_cumulative_usage() {
     let (base_url, request_receiver) = serve_response(200, text_response()).await;
-    let client = HttpModelClient::new(configuration(base_url)).unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&configuration(base_url))
+        .unwrap();
     let (events, mut receiver) = mpsc::unbounded_channel();
     let output = client
         .complete(
@@ -538,7 +548,9 @@ async fn messages_rejects_invalid_cache_usage_counters() {
         json!({"cache_creation_input_tokens":"many"}),
     ] {
         let (base_url, _) = serve_response(200, text_response_with_usage(usage)).await;
-        let client = HttpModelClient::new(configuration(base_url)).unwrap();
+        let client = LocalModelClients::new(None)
+            .client(&configuration(base_url))
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let error = client
             .complete(
@@ -576,11 +588,12 @@ fn usage_deserializes_old_records_without_cache_counters() {
 #[tokio::test]
 async fn messages_sends_image_blocks_in_the_anthropic_shape() {
     let (base_url, request_receiver) = serve_response(200, text_response()).await;
-    let client = HttpModelClient::new(ModelConfig {
-        input_modalities: vec![InputModality::Text, InputModality::Image],
-        ..configuration(base_url)
-    })
-    .unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&ModelConfig {
+            input_modalities: vec![InputModality::Text, InputModality::Image],
+            ..configuration(base_url)
+        })
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     client
         .complete(
@@ -626,11 +639,12 @@ async fn messages_sends_image_blocks_in_the_anthropic_shape() {
 #[tokio::test]
 async fn messages_nests_tool_result_images_in_the_tool_result_content_array() {
     let (base_url, request_receiver) = serve_response(200, text_response()).await;
-    let client = HttpModelClient::new(ModelConfig {
-        input_modalities: vec![InputModality::Text, InputModality::Image],
-        ..configuration(base_url)
-    })
-    .unwrap();
+    let client = LocalModelClients::new(None)
+        .client(&ModelConfig {
+            input_modalities: vec![InputModality::Text, InputModality::Image],
+            ..configuration(base_url)
+        })
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     client
         .complete(

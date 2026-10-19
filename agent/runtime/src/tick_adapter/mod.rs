@@ -6,7 +6,7 @@ mod builtin;
 pub use crate::tick_stream::ShellTickStream;
 pub use builtin::{HostedAdapter, ShellAdapter};
 
-use crate::tick_stream::{EventPublisher, TickStreamHandle, TickStreamPort, WatchId};
+use crate::tick_stream::{EventPublisher, StreamTasks, TickStreamHandle, TickStreamPort, WatchId};
 use std::{collections::BTreeMap, sync::Arc};
 use tick_protocol::InstanceRef;
 use tickloop_agent_protocol::HostToolAuthority;
@@ -119,18 +119,18 @@ impl TickStreamPort for TickAdapters {
             stream.set_watch_chats(chats.clone());
         }
     }
-    fn open(&self) -> TickStreamHandle {
+    fn open(&self, tasks: &StreamTasks) -> TickStreamHandle {
         let (desired, receiver) = watch::channel(BTreeMap::<WatchId, InstanceRef>::new());
-        let (publisher, events) = EventPublisher::channel();
+        let (publisher, events) = EventPublisher::channel(tasks);
         for adapter in self.adapters.values() {
             let Some(stream) = adapter.stream() else {
                 continue;
             };
-            let stream = stream.open();
+            let stream = stream.open(tasks);
             let access = adapter.access();
             let mut receiver = receiver.clone();
             let publisher = publisher.clone();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 let mut events = stream.events;
                 loop {
                     let targets = receiver
@@ -160,7 +160,7 @@ impl TickStreamPort for TickAdapters {
             .filter(|(_, adapter)| adapter.stream().is_some())
             .map(|(name, _)| *name)
             .collect::<Vec<_>>();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut receiver = receiver;
             loop {
                 let targets = receiver.borrow_and_update().clone();

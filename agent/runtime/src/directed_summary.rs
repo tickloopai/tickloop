@@ -50,7 +50,8 @@ impl Agent {
     ) -> Result<DirectedSummaryOutcome, AgentError> {
         self.require_root_chat(chat_id, "rewrite history with a directed summary")
             .await?;
-        let mut tasks = self.inner.tasks.lock().await;
+        // Held until the task is spawned: `shutdown` either refuses this or waits for the task.
+        let admission = self.inner.tasks.token();
         let (plan, sequence, client, cancel) = {
             let mut chats = self.inner.chats.lock().await;
             if self.inner.closed.load(std::sync::atomic::Ordering::SeqCst)
@@ -79,7 +80,7 @@ impl Agent {
         };
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let agent = self.clone();
-        tasks.push(tokio::spawn(async move {
+        self.inner.tasks.spawn(async move {
             let mut result = agent
                 .execute_directed_summary(chat_id, plan, sequence, client, cancel)
                 .await;
@@ -108,8 +109,8 @@ impl Agent {
             while let Some((receipt, request, cancel)) = next {
                 next = agent.run(receipt, request, cancel).await;
             }
-        }));
-        drop(tasks);
+        });
+        drop(admission);
         receiver
             .await
             .map_err(|_| AgentError::Invalid("directed summary task ended unexpectedly".into()))?
@@ -201,6 +202,7 @@ impl Agent {
                 direction: plan.direction,
             }),
         };
+        crate::lifecycle::claim_response_messages(chat);
         let (mut candidate, candidate_bookkeeping) =
             layout.apply(&chat.snapshot, &chat.bookkeeping);
         match context::directed_summary_fits(&candidate, &candidate_bookkeeping) {
@@ -228,7 +230,11 @@ impl Agent {
             .request_usage
             .finish(sequence, RequestOutcome::Accepted)?;
         let renamed = layout.renamed_message_ids(&chat.snapshot, &candidate);
-        let renamed_snapshots = chat.file_history.rename_messages(&renamed);
+        let renamed_snapshots = chat
+            .file_history
+            .as_mut()
+            .map(|history| history.rename_messages(&renamed))
+            .unwrap_or_default();
         if let Some(recorder) = &self.inner.recorder {
             recorder.compact(
                 chat,

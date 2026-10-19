@@ -597,7 +597,7 @@ async fn spawn_replacement(
     command
         .arg(crate::WORKER_ARGUMENT)
         .arg(&record.successor_endpoint)
-        .current_dir(&worker.launch.workdir)
+        .current_dir(&worker.launch.folder)
         .env_clear();
     for entry in &worker.launch.environment {
         command.env(

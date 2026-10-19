@@ -103,7 +103,9 @@ impl Pty {
         let slave = open_descriptor(&slave_path)?;
         set_nonblocking(master.as_raw_fd())?;
         let master = Self {
-            master: AsyncFd::new(master)?,
+            // SAFETY: an `OwnedFd` keeps its descriptor open and returns the same one until
+            // the `AsyncFd` that owns it is dropped.
+            master: unsafe { AsyncFd::register(master) }?,
             device: TerminalDevice::of(slave.as_raw_fd())?,
         };
         master.resize(size)?;

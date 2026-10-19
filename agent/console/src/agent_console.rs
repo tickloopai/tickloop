@@ -192,9 +192,9 @@ impl AgentConsole {
             .iter()
             .filter(|row| {
                 self.filter
-                    .workdir
+                    .folder
                     .as_ref()
-                    .is_none_or(|cwd| &row.workdir == cwd)
+                    .is_none_or(|cwd| row.folder.as_ref() == Some(cwd))
                     && self
                         .filter
                         .workspace
@@ -610,7 +610,7 @@ impl AgentConsole {
             ));
         }
         self.created = None;
-        launch.workdir = self.directory.clone();
+        launch.folder = self.directory.clone();
         launch.exact_chat = None;
         let command_id = Uuid::new_v4();
         match self

@@ -303,7 +303,7 @@ fn check_direct_call(
         name.to_owned(),
         input.clone(),
         super::session_permissions::capture_workspace_scope(&Workspace {
-            workdir: ceiling.workdir.clone(),
+            folder: ceiling.folder.clone(),
             additional_directories: ceiling.additional_directories.clone(),
         })
         .map_err(|error| error.to_string())?,
@@ -340,7 +340,7 @@ fn check_direct_call(
     }
     if let Some(prepared) = prepared {
         let workspace = Workspace {
-            workdir: ceiling.workdir.clone(),
+            folder: ceiling.folder.clone(),
             additional_directories: ceiling.additional_directories.clone(),
         };
         let is_plan_file_access = plan_file.is_some_and(|path| prepared.accesses_file(path))
@@ -495,10 +495,13 @@ pub(super) fn host_authority(
     let policy = effective_policy(chats, receipt)?;
     let decide = |policy: &tickloop_agent_protocol::PermissionPolicy, loop_id, session, human| {
         let explicit =
-            policy.explicit_match_with_session(&operation.name, permission_input, loop_id, session);
+            policy.explicit_rule_match(&operation.name, permission_input, loop_id, session);
         (
-            host_tool_decision(explicit.map(Decision::from), permission, policy.mode, human),
-            explicit == Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Ask),
+            host_tool_decision(explicit, permission, policy.mode, human),
+            explicit.is_some_and(|matched| {
+                matched.decision
+                    == tickloop_agent_tools::permissions::ExplicitPermissionDecision::Ask
+            }),
         )
     };
     let own = &chats[&receipt.chat_id];
@@ -657,7 +660,7 @@ fn direct_permission_authority(
         return Some(own);
     };
     let workspace = Workspace {
-        workdir: delegation.ceiling.workdir.clone(),
+        folder: delegation.ceiling.folder.clone(),
         additional_directories: delegation.ceiling.additional_directories.clone(),
     };
     let frozen = delegation.ceiling.policy.decide_with_plan_file(
@@ -746,7 +749,7 @@ impl Agent {
             return Ok(entries.clone());
         }
         let entries = match &self.inner.recorder {
-            Some(recorder) => recorder.read_subagents(parent)?,
+            Some(recorder) => recorder.read_subagents(parent).await?,
             None => return Err(AgentError::NotFound),
         };
         registry.insert(parent, entries.clone());
@@ -816,30 +819,23 @@ impl Agent {
         let Some(provider) = self.inner.host_tools.read().unwrap().clone() else {
             return Ok(());
         };
-        let changed = {
-            let mut chats = self.inner.chats.lock().await;
-            let mut members = super::family_tree::lineage(&chats, chat_id)?
-                .into_iter()
-                .map(|parent| parent.chat_id)
-                .collect::<Vec<_>>();
-            members.push(chat_id);
-            let mut changed = Vec::new();
-            for member in members {
-                if let Some(delegation) = chats
-                    .get_mut(&member)
-                    .and_then(|chat| chat.snapshot.delegation.as_mut())
-                    && record_artifact_account(
-                        &mut delegation.ceiling.host_tools,
-                        provider.as_ref(),
-                    )?
-                {
-                    changed.push((member, delegation.clone()));
-                }
+        let mut chats = self.inner.chats.lock().await;
+        let mut members = super::family_tree::lineage(&chats, chat_id)?
+            .into_iter()
+            .map(|parent| parent.chat_id)
+            .collect::<Vec<_>>();
+        members.push(chat_id);
+        for member in members {
+            if let Some(chat) = chats.get_mut(&member)
+                && let Some(delegation) = chat.snapshot.delegation.as_mut()
+                && record_artifact_account(&mut delegation.ceiling.host_tools, provider.as_ref())?
+            {
+                self.record_delegation(
+                    member,
+                    delegation.clone(),
+                    chat.snapshot.search_config.clone(),
+                );
             }
-            changed
-        };
-        for (member, delegation) in changed {
-            self.record_delegation(member, delegation);
         }
 
         Ok(())
@@ -904,7 +900,8 @@ impl Agent {
         let plan_file = chats.get(&receipt.chat_id).and_then(|chat| {
             super::plan::current_plan_file(
                 &chat.bookkeeping,
-                self.plans_directory(&chat.snapshot.workdir).path(),
+                self.plans_directory(chat.snapshot.folder.as_deref()?)
+                    .path(),
                 receipt.loop_id,
             )
         });
@@ -1079,7 +1076,8 @@ impl Agent {
                             rule.persistent = false;
                         }
                     }
-                    let mut host_context = self.host_call_context(parent, &snapshot.workdir);
+                    let folder = snapshot.folder.clone();
+                    let mut host_context = self.host_call_context(parent, folder.as_deref());
                     let mut host_tools: BTreeMap<_, _> = self
                         .inner
                         .host_tools
@@ -1151,7 +1149,7 @@ impl Agent {
                             .get_or_insert_with(Vec::new)
                             .extend(inherited);
                     }
-                    let history_ancestors = self.approval_history_ancestors(&snapshot).await;
+                    let history_ancestors = self.approval_history_ancestors(&snapshot, None).await;
                     let trusted_reply_history = trusted_user_inputs.as_ref().and_then(|inputs| {
                         serde_json::to_value(approval_context::capture_reply_history(
                             &snapshot,
@@ -1174,7 +1172,7 @@ impl Agent {
                             .and_then(|inputs| serde_json::to_value(inputs).ok()),
                         trusted_reply_history,
                         ceiling: DelegationCeiling {
-                            workdir: snapshot.workdir.clone(),
+                            folder: folder.clone(),
                             additional_directories: snapshot.additional_directories.clone(),
                             policy,
                             session_denials: Some(session_denials),
@@ -1202,7 +1200,7 @@ impl Agent {
                     let child_id = self
                         .create_chat_with_delegation(
                             registration.child_chat_id,
-                            snapshot.workdir.clone(),
+                            folder,
                             Some((metadata.clone(), snapshot, client, output_style)),
                         )
                         .await
@@ -1261,6 +1259,9 @@ impl Agent {
                         )
                         .await
                         .map_err(|error| error.to_string())?;
+                    // The child and its task are durable before anything of the parent tells
+                    // of it, so a load finds every child its parent's records name.
+                    self.make_durable(&[parent.chat_id, child_id]).await?;
                     let invocation = SubagentInvocation {
                         receipt,
                         run_in_background,
@@ -1276,34 +1277,16 @@ impl Agent {
                     .await
                     .map_err(|error| error.to_string())?
                     .ok_or("child handle is unavailable")?;
-                return Ok(ToolResult {
-                    content: json!({"status":"async_launched", "child_chat_id":child.chat_id,
-                        "child_loop_id":child.loop_id,"child_run_id":child.run_id,
-                        "handle":registration.handle,"description":registration.description,
-                        "created_at":registration.created_at})
-                    .to_string(),
-                    is_error: false,
-                    output_ref: None,
-                });
+                return Ok(launched_result(&child, &registration));
             }
+            let release = self.suspend_for_subagent(parent, call_id, &child).await?;
             loop {
-                let snapshot = self
-                    .snapshot(child.chat_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let registration = self
-                    .subagent_registration(child.chat_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if let Some(result) = agent_messages::child_run_result(
-                    &snapshot,
-                    &child,
-                    parent,
-                    registration.as_ref(),
-                ) {
+                if let Some(result) = self.recorded_child_result(parent.chat_id, &child).await? {
                     return Ok(result);
                 }
                 tokio::select! {
+                    biased;
+                    _ = release.cancelled() => return Err(super::suspension::RUN_RELEASED.into()),
                     _ = cancel.cancelled() => {
                         return self.end_interrupted_observation(parent, call_id, &child).await;
                     }
@@ -1320,33 +1303,48 @@ impl Agent {
     /// this call's result; otherwise the call stops returning that run, so its completion
     /// notifies the parent like background work. Deciding under the invocation lock that
     /// classifying the run's completion also holds leaves each run either returned or notified.
-    async fn end_interrupted_observation(
+    pub(super) async fn end_interrupted_observation(
         &self,
         parent: &Receipt,
         call_id: &str,
         child: &Receipt,
     ) -> Result<ToolResult, String> {
         let mut invocations = self.inner.subagent_invocations.lock().await;
-        let snapshot = self
-            .snapshot(child.chat_id)
-            .await
-            .map_err(|error| error.to_string())?;
+        if let Some(result) = self.recorded_child_result(parent.chat_id, child).await? {
+            return Ok(result);
+        }
         let registration = self
             .subagent_registration(child.chat_id)
             .await
             .map_err(|error| error.to_string())?;
-        if let Some(result) =
-            agent_messages::child_run_result(&snapshot, child, parent, registration.as_ref())
-        {
-            return Ok(result);
-        }
         if let Some(invocation) = invocations.get_mut(&(parent.run_id, call_id.to_owned())) {
             invocation.run_in_background = true;
         }
-        Ok(ToolResult {
-            content: json!({"status":"interrupted","child_chat_id":child.chat_id,"handle":registration.as_ref().map(|registration|registration.handle.as_str()),"description":registration.as_ref().map(|registration|registration.description.as_str()),"created_at":registration.as_ref().map(|registration|registration.created_at),"child_loop_id":child.loop_id,"child_run_id":child.run_id,"error":"Foreground observation interrupted; the child Agent remains independently active and its completion arrives as a task notification."}).to_string(),
-            is_error: true,
-            output_ref: None,
-        })
+        Ok(interrupted_observation_result(child, registration.as_ref()))
+    }
+}
+
+/// What a background `Subagent` call returns: the child it launched.
+pub(super) fn launched_result(child: &Receipt, registration: &SubagentRegistration) -> ToolResult {
+    ToolResult {
+        content: json!({"status":"async_launched", "child_chat_id":child.chat_id,
+            "child_loop_id":child.loop_id,"child_run_id":child.run_id,
+            "handle":registration.handle,"description":registration.description,
+            "created_at":registration.created_at})
+        .to_string(),
+        is_error: false,
+        output_ref: None,
+    }
+}
+
+/// What a foreground `Subagent` call returns when it stops observing a child that goes on.
+pub(super) fn interrupted_observation_result(
+    child: &Receipt,
+    registration: Option<&SubagentRegistration>,
+) -> ToolResult {
+    ToolResult {
+        content: json!({"status":"interrupted","child_chat_id":child.chat_id,"handle":registration.map(|registration|registration.handle.as_str()),"description":registration.map(|registration|registration.description.as_str()),"created_at":registration.map(|registration|registration.created_at),"child_loop_id":child.loop_id,"child_run_id":child.run_id,"error":"Foreground observation interrupted; the child Agent remains independently active and its completion arrives as a task notification."}).to_string(),
+        is_error: true,
+        output_ref: None,
     }
 }

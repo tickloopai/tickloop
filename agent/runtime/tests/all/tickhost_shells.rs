@@ -23,7 +23,7 @@ use tickloop_agent_runtime::{
     },
 };
 use tickloop_agent_tools::{
-    ExecutionContext, PreparedTool, SecondaryModel, ToolError, Tools, Workspace,
+    ChatDirectory, ExecutionContext, PreparedTool, SecondaryModel, ToolError, Tools, Workspace,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -65,16 +65,18 @@ impl Fixture {
         std::fs::create_dir(&workdir).unwrap();
         let output = PrivateDirectory::trusted(root.join("output"));
         let tools = Tools::for_chat(
-            output.clone(),
-            output.join("tasks"),
-            output,
+            ChatDirectory {
+                chat: output.clone(),
+                task_output: output.join("tasks"),
+                family_temp: output,
+            },
             agent.shell_tasks().for_chat(Uuid::new_v4()),
         );
         Self {
             _agent: agent,
             directory,
             workspace: Workspace {
-                workdir,
+                folder: Some(workdir),
                 additional_directories: Vec::new(),
             },
             tools,
@@ -145,7 +147,7 @@ async fn a_foreground_command_runs_in_its_directory_and_reports_its_output_and_e
         result.content,
         format!(
             "Exit code 3\nout|err|{}",
-            fixture.workspace.workdir.display()
+            fixture.workspace.folder.as_ref().unwrap().display()
         )
     );
 }
@@ -238,7 +240,7 @@ async fn a_user_command_beyond_sixty_four_mebibytes_is_cut_and_reported() {
 #[tokio::test]
 async fn a_directory_replaced_after_its_approval_runs_nothing() {
     let fixture = Fixture::new();
-    let approved = fixture.workspace.workdir.join("approved");
+    let approved = fixture.workspace.folder.as_ref().unwrap().join("approved");
     std::fs::create_dir(&approved).unwrap();
     let prepared = fixture
         .prepare(json!({"command":"touch probe","cwd":approved}))
@@ -266,7 +268,15 @@ async fn an_agent_without_a_daemon_refuses_to_run_a_command() {
         matches!(&error, ToolError::Rejected(message) if message.contains("Agent daemon")),
         "{error:?}"
     );
-    assert!(!fixture.workspace.workdir.join("probe").exists());
+    assert!(
+        !fixture
+            .workspace
+            .folder
+            .as_ref()
+            .unwrap()
+            .join("probe")
+            .exists()
+    );
     assert!(fixture.tools.commands().await.is_empty());
 }
 
@@ -345,7 +355,15 @@ async fn a_command_stopped_while_its_spawn_is_granted_never_starts() {
         )
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!fixture.workspace.workdir.join("probe").exists());
+    assert!(
+        !fixture
+            .workspace
+            .folder
+            .as_ref()
+            .unwrap()
+            .join("probe")
+            .exists()
+    );
 }
 
 /// Grants every spawn at a Tickhost that takes the spawn request and leaves without answering.

@@ -526,7 +526,7 @@ impl DaemonServer {
                     availability: ExecutionAvailability::Live,
                     execution,
                     chat_id: snapshot.conversation.id,
-                    workdir: snapshot.conversation.workdir.clone(),
+                    folder: snapshot.conversation.folder.clone(),
                     run_id: super::summary::summary_run_id(&snapshot.conversation.loops, &state),
                     run_started_at: super::summary::run_started_at(
                         &snapshot.conversation.loops,
@@ -741,7 +741,7 @@ impl DaemonServer {
                 }
                 Ok((CommandResult::Done, persistence))
             }
-            AgentCommand::TrustWorkingDirectory { workdir } => {
+            AgentCommand::TrustWorkingDirectory { folder } => {
                 let worker = self
                     .inner
                     .workers
@@ -749,7 +749,7 @@ impl DaemonServer {
                     .await
                     .iter()
                     .rev()
-                    .find(|worker| &worker.launch.workdir == workdir)
+                    .find(|worker| &worker.launch.folder == folder)
                     .map(|worker| worker.access.clone())
                     .ok_or_else(|| {
                         AccessError::new(
@@ -828,9 +828,9 @@ impl AgentAccess for DaemonServer {
                         .into_iter()
                         .filter(|entry| {
                             filter
-                                .workdir
+                                .folder
                                 .as_ref()
-                                .is_none_or(|path| path == &entry.workdir)
+                                .is_none_or(|path| Some(path) == entry.folder.as_ref())
                                 && filter.workspace.as_ref().is_none_or(|workspace| {
                                     Some(workspace) == entry.workspace.as_ref()
                                 })
@@ -885,7 +885,7 @@ impl AgentAccess for DaemonServer {
             }
             ObservationRequest::SavedRecords {
                 store_root,
-                workdir,
+                folder,
                 page,
             } => {
                 let root = match store_root {
@@ -912,7 +912,7 @@ impl AgentAccess for DaemonServer {
                         .await;
                 }
                 Ok(Observation::single(
-                    tickloop_agent_runtime::transcript::records::saved_records(root, workdir, page)
+                    tickloop_agent_runtime::transcript::records::saved_records(root, folder, page)
                         .await?,
                     self.cursor(),
                     None,

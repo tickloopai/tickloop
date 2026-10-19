@@ -93,12 +93,16 @@ async fn service() -> (String, Arc<ServiceControl>) {
                     control.release_call_response.notified().await;
                 }
                 let account = control.account.load(Ordering::SeqCst);
-                let response = if path.starts_with("POST /artifact/api/v1/auth/device ") {
-                    json!({"device_code":"test-device","user_code":"TEST","verification_uri":format!("{origin}/artifact/device?code=TEST"),"expires_in":30,"interval":1})
-                } else if path.starts_with("POST /artifact/api/v1/auth/device/token ") {
-                    json!({"access_token":format!("token-{account}"),"token_type":"Bearer","expires_in":60,"user":{"id":format!("user-{account}"),"name":"Test","email":"test@example.test"}})
-                } else if path.starts_with("GET /artifact/api/v1/auth/session ") {
-                    json!({"user":{"id":format!("user-{account}"),"name":"Test","email":"test@example.test"},"expires_at":"2099-01-01T00:00:00Z"})
+                let response = if path
+                    .starts_with("GET /.well-known/oauth-authorization-server/account ")
+                {
+                    json!({"issuer":format!("{origin}/account"),"token_endpoint":format!("{origin}/account/token"),"device_authorization_endpoint":format!("{origin}/account/device"),"userinfo_endpoint":format!("{origin}/account/userinfo"),"revocation_endpoint":format!("{origin}/account/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]})
+                } else if path.starts_with("POST /account/device ") {
+                    json!({"device_code":"test-device","user_code":"TEST","verification_uri":format!("{origin}/account/device?code=TEST"),"expires_in":30,"interval":1})
+                } else if path.starts_with("POST /account/token ") {
+                    json!({"access_token":format!("token-{account}"),"token_type":"Bearer","expires_in":600,"refresh_token":format!("refresh-{account}")})
+                } else if path.starts_with("GET /account/userinfo ") {
+                    json!({"sub":format!("user-{account}"),"name":"Test","email":"test@example.test"})
                 } else if path.starts_with("GET /artifact/api/v1/artifacts/doc ") {
                     json!({"id":"doc","title":"Report","format":"html","access_role":control.access_role.lock().unwrap().as_deref().unwrap_or("owner"),"publication":control.publication.lock().unwrap().clone()})
                 } else if path.starts_with("POST /artifact/mcp ") {
@@ -698,7 +702,10 @@ async fn artifact_creation_from_an_automated_turn_does_not_inherit_the_human_fas
                     id: Uuid::new_v4(),
                     prompt: "Summarize the new event.".into(),
                     prompt_source: TriggerPromptSource::Explicit,
-                    interval_seconds: None,
+                    schedule: None,
+                    armed_at_ms: None,
+                    last_fired_at_ms: None,
+                    confirmation: None,
                     expires_at_ms: None,
                     accepts_events: true,
                     armed: true,

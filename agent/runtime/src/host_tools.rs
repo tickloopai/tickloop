@@ -228,7 +228,8 @@ pub(crate) struct ArtifactAccountContext {
 /// What the calling Chat lends one host call: read-only access to its local files by the `Read`
 /// path rules in its workspace, and the host context of the View or Work Context it serves.
 pub struct HostCallScope<'a> {
-    pub local_files: &'a tickloop_agent_tools::LocalFileReader,
+    /// The calling Chat's local files; `None` for a Chat without a Folder.
+    pub local_files: Option<&'a tickloop_agent_tools::LocalFileReader>,
     pub context: Option<&'a HostCallContext>,
 }
 
@@ -426,6 +427,9 @@ pub trait HostToolProvider: Send + Sync {
         None
     }
 
+    /// Refreshes optional host capabilities. An error reports a failed refresh; callers may
+    /// continue chatting with the remaining definitions. MCP directory failures withdraw those
+    /// tools and return a diagnostic containing only the origin and a fixed error class.
     async fn refresh(&self, _cancel: CancellationToken) -> Result<(), String> {
         Ok(())
     }
@@ -513,6 +517,10 @@ pub trait HostToolProvider: Send + Sync {
     fn tool_set_is_confirmed(&self) -> bool {
         true
     }
+
+    /// Ends the work the provider keeps running between tool calls, and waits for it, when its
+    /// Agent shuts down.
+    async fn shutdown(&self) {}
 
     fn permission(&self, chat_id: ChatId, name: &str, input: &Value) -> HostToolPermission;
 

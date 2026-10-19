@@ -420,8 +420,38 @@ impl Agent {
             content: vec![Content::Text { text }],
         });
         snapshot.last_model_run = Some(receipt.run_id);
-        self.save(snapshot);
+        crate::lifecycle::claim_response_messages(chat);
+        self.save(&chat.snapshot);
         Ok(())
+    }
+
+    /// One permit of each of the host's request gates, taken in order, for a single request to
+    /// a model's vendor and its stream: whoever waits here holds no other permit, so requests
+    /// that wait on each other, such as a compaction's within a Run's, cannot deadlock.
+    pub(super) async fn vendor_request_permits(
+        &self,
+    ) -> Result<Vec<tokio::sync::OwnedSemaphorePermit>, ModelError> {
+        let mut permits = Vec::with_capacity(self.inner.request_gates.len());
+        for gate in &self.inner.request_gates {
+            // A gate the host closed admits no further request.
+            permits.push(
+                gate.clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| ModelError::Cancelled)?,
+            );
+        }
+        Ok(permits)
+    }
+
+    /// The handover that stops a request of `context` before it reaches the vendor: a Run's
+    /// conversation request stops at a handover, any other request never does.
+    fn handover_of(&self, context: &RequestContext) -> CancellationToken {
+        if context.kind == ModelRequestKind::Conversation && context.owner.run_id.is_some() {
+            self.inner.handover.clone()
+        } else {
+            CancellationToken::new()
+        }
     }
 
     pub(super) async fn tracked_model_request(
@@ -612,9 +642,12 @@ impl Agent {
                         },
                     );
                 }
+                // A Run's retry backoff is a safe point for a handover.
+                let handover = self.handover_of(&context);
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(ModelError::Cancelled.into()),
+                    _ = handover.cancelled() => return Err(ModelError::Cancelled.into()),
                     _ = tokio::time::sleep(delay) => {}
                 }
                 retries += 1;
@@ -700,6 +733,27 @@ impl Agent {
                 .await?;
             return Err(ModelError::Cancelled.into());
         }
+        // Waiting at the host's gates spends none of the request's time. A Run's conversation
+        // request sends nothing once a handover began: waiting here is a safe point.
+        let handover = self.handover_of(&context);
+        let permits = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(ModelError::Cancelled),
+            _ = handover.cancelled() => Err(ModelError::Cancelled),
+            permits = self.vendor_request_permits() => permits,
+        };
+        let _permits = match permits {
+            Ok(permits) => permits,
+            Err(error) => {
+                self.finish_model_request(
+                    context.owner.chat_id,
+                    sequence,
+                    RequestOutcome::Cancelled,
+                )
+                .await?;
+                return Err(error.into());
+            }
+        };
         let request_cancel = cancel.child_token();
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let mut progress = RequestProgress::default();

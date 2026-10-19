@@ -44,6 +44,23 @@ impl From<ExplicitPermissionDecision> for Decision {
     }
 }
 
+/// Whose rule decided a call: the host's, a managed or project constraint, or the user's own
+/// rules and session decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleSource {
+    Host,
+    Managed,
+    Project,
+    User,
+}
+
+/// An explicit decision for a call and the source whose rule made it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExplicitRuleMatch {
+    pub decision: ExplicitPermissionDecision,
+    pub source: RuleSource,
+}
+
 /// Rule matching and mode admission for a [`PermissionPolicy`]; the policy itself lives in the
 /// protocol crate.
 pub trait PermissionPolicyExt {
@@ -62,6 +79,17 @@ pub trait PermissionPolicyExt {
         loop_id: Uuid,
         session: Option<SessionPermissionDecision>,
     ) -> Option<ExplicitPermissionDecision>;
+
+    /// The explicit decision for a call, Deny before Ask before Allow, with the source of the rule
+    /// that made it. A session decision counts as the user's; an Allow that only rules of several
+    /// sources cover together counts as the user's too.
+    fn explicit_rule_match(
+        &self,
+        name: &str,
+        input: &Value,
+        loop_id: Uuid,
+        session: Option<SessionPermissionDecision>,
+    ) -> Option<ExplicitRuleMatch>;
 
     fn decide(&self, operation: &PreparedTool, workspace: &Workspace, loop_id: Uuid) -> Decision;
 
@@ -116,44 +144,73 @@ impl PermissionPolicyExt for PermissionPolicy {
         loop_id: Uuid,
         session: Option<SessionPermissionDecision>,
     ) -> Option<ExplicitPermissionDecision> {
-        let rules = self
-            .managed_constraints
-            .iter()
-            .chain(self.project_constraints.iter())
-            .chain(self.rules.iter())
-            .collect::<Vec<_>>();
+        self.explicit_rule_match(name, input, loop_id, session)
+            .map(|matched| matched.decision)
+    }
+
+    fn explicit_rule_match(
+        &self,
+        name: &str,
+        input: &Value,
+        loop_id: Uuid,
+        session: Option<SessionPermissionDecision>,
+    ) -> Option<ExplicitRuleMatch> {
+        let sources = rule_sources(self);
         for (decision, explicit) in [
             (Decision::Deny, ExplicitPermissionDecision::Deny),
             (Decision::Ask, ExplicitPermissionDecision::Ask),
         ] {
-            let session_matches =
-                session.is_some_and(|session| Decision::from(session) == decision);
-            if session_matches
-                || rules
+            if session.is_some_and(|session| Decision::from(session) == decision) {
+                return Some(ExplicitRuleMatch {
+                    decision: explicit,
+                    source: RuleSource::User,
+                });
+            }
+            if let Some((source, _)) = sources.iter().find(|(_, rules)| {
+                rules
                     .iter()
                     .any(|rule| rule_matches_any(rule, decision, name, input, loop_id))
-            {
-                return Some(explicit);
+            }) {
+                return Some(ExplicitRuleMatch {
+                    decision: explicit,
+                    source: *source,
+                });
             }
         }
-        let allow_rules = self
-            .managed_constraints
-            .iter()
-            .chain(
-                self.project_constraints
-                    .iter()
-                    .chain(self.rules.iter())
-                    .filter(|rule| {
-                        self.mode != ExecutionMode::Auto || !bypasses_auto_classifier(rule)
-                    }),
-            )
-            .collect::<Vec<_>>();
-        if session == Some(SessionPermissionDecision::Allow)
-            || allow_rules_cover_call(&allow_rules, name, input, loop_id)
-        {
-            return Some(ExplicitPermissionDecision::Allow);
+        let host_allows = allow_rules_cover_call(
+            &admitted_allow_rules(self.mode, RuleSource::Host, &self.host_rules),
+            name,
+            input,
+            loop_id,
+        );
+        if session == Some(SessionPermissionDecision::Allow) && !host_allows {
+            return Some(ExplicitRuleMatch {
+                decision: ExplicitPermissionDecision::Allow,
+                source: RuleSource::User,
+            });
         }
-        None
+        let allow_source = sources
+            .iter()
+            .find(|(source, rules)| {
+                allow_rules_cover_call(
+                    &admitted_allow_rules(self.mode, *source, rules),
+                    name,
+                    input,
+                    loop_id,
+                )
+            })
+            .map(|(source, _)| *source)
+            .or_else(|| {
+                let combined = sources
+                    .iter()
+                    .flat_map(|(source, rules)| admitted_allow_rules(self.mode, *source, rules))
+                    .collect::<Vec<_>>();
+                allow_rules_cover_call(&combined, name, input, loop_id).then_some(RuleSource::User)
+            });
+        allow_source.map(|source| ExplicitRuleMatch {
+            decision: ExplicitPermissionDecision::Allow,
+            source,
+        })
     }
 
     fn decide(&self, operation: &PreparedTool, workspace: &Workspace, loop_id: Uuid) -> Decision {
@@ -247,11 +304,9 @@ impl PermissionPolicyExt for PermissionPolicy {
     ) -> Option<String> {
         let content = permission_rule_content(name, input)?;
         let is_denied_by_content = session == Some(SessionPermissionDecision::Deny)
-            || self
-                .managed_constraints
-                .iter()
-                .chain(&self.project_constraints)
-                .chain(&self.rules)
+            || rule_sources(self)
+                .into_iter()
+                .flat_map(|(_, rules)| rules)
                 .filter(|rule| rule.specifier.is_some())
                 .any(|rule| rule_matches_any(rule, Decision::Deny, name, input, loop_id));
         is_denied_by_content.then(|| format!("{name} denied access to {content}."))
@@ -262,13 +317,39 @@ impl PermissionPolicyExt for PermissionPolicy {
 /// evaluates such rules inside the tool's own check, so they also stop the
 /// Accept Edits fast path, unlike whole-tool Ask rules.
 fn content_rule_asks(policy: &PermissionPolicy, name: &str, input: &Value, loop_id: Uuid) -> bool {
-    policy
-        .managed_constraints
-        .iter()
-        .chain(&policy.project_constraints)
-        .chain(&policy.rules)
+    rule_sources(policy)
+        .into_iter()
+        .flat_map(|(_, rules)| rules)
         .filter(|rule| rule.specifier.is_some() || rule.input.is_some())
         .any(|rule| rule_matches_any(rule, Decision::Ask, name, input, loop_id))
+}
+
+/// Every rule the policy evaluates, by source: the host's first, then the managed and project
+/// constraints, then the user's rules.
+fn rule_sources(policy: &PermissionPolicy) -> [(RuleSource, &[PermissionRule]); 4] {
+    [
+        (RuleSource::Host, &policy.host_rules),
+        (RuleSource::Managed, &policy.managed_constraints),
+        (RuleSource::Project, &policy.project_constraints),
+        (RuleSource::User, &policy.rules),
+    ]
+}
+
+/// The rules of `source` whose Allow counts under `mode`: Claude Code sets aside the user's and
+/// the project's broad Allow rules while Auto is on.
+fn admitted_allow_rules(
+    mode: ExecutionMode,
+    source: RuleSource,
+    rules: &[PermissionRule],
+) -> Vec<&PermissionRule> {
+    rules
+        .iter()
+        .filter(|rule| {
+            matches!(source, RuleSource::Host | RuleSource::Managed)
+                || mode != ExecutionMode::Auto
+                || !bypasses_auto_classifier(rule)
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -328,6 +409,7 @@ pub fn rule_views(
     mode: ExecutionMode,
     project_constraints: &[PermissionRule],
     managed_constraints: &[PermissionRule],
+    host_rules: &[PermissionRule],
 ) -> Vec<PermissionRuleView> {
     rules
         .iter()
@@ -362,6 +444,13 @@ pub fn rule_views(
             scope: PermissionRuleScope::Project(workdir.to_path_buf()),
             editable: false,
             effective_note: Some("managed constraint cannot be edited here".into()),
+        }))
+        .chain(host_rules.iter().map(|rule| PermissionRuleView {
+            rule: rule.clone(),
+            source: PermissionRuleSource::Host,
+            scope: PermissionRuleScope::Chat,
+            editable: false,
+            effective_note: Some("the host's rule cannot be edited".into()),
         }))
         .collect()
 }
@@ -731,7 +820,7 @@ mod tests {
 
     fn prepared_tool(directory: &std::path::Path) -> (Workspace, PreparedTool) {
         let workspace = Workspace {
-            workdir: directory.to_path_buf(),
+            folder: Some(directory.to_path_buf()),
             additional_directories: Vec::new(),
         };
         let operation = crate::prepare(
@@ -757,6 +846,95 @@ mod tests {
             loop_id: None,
             persistent: false,
         }
+    }
+
+    /// The host's rules are a source of their own: they decide like any rule, say which source
+    /// decided, and in Auto keep a broad Allow the user's rules would lose.
+    #[test]
+    fn host_rules_decide_as_their_own_source_and_user_denials_still_tighten_them() {
+        let loop_id = Uuid::new_v4();
+        let input = json!({"task":"check"});
+        let host_allow = PermissionPolicy {
+            host_rules: vec![tool_rule(Decision::Allow, "Subagent", None)],
+            ..PermissionPolicy::default()
+        };
+        assert_eq!(
+            host_allow.explicit_rule_match("Subagent", &input, loop_id, None),
+            Some(ExplicitRuleMatch {
+                decision: ExplicitPermissionDecision::Allow,
+                source: RuleSource::Host,
+            })
+        );
+        let user_allow = PermissionPolicy {
+            rules: vec![tool_rule(Decision::Allow, "Subagent", None)],
+            ..PermissionPolicy::default()
+        };
+        assert_eq!(
+            user_allow
+                .explicit_rule_match("Subagent", &input, loop_id, None)
+                .map(|matched| matched.source),
+            Some(RuleSource::User)
+        );
+        let user_deny = PermissionPolicy {
+            rules: vec![tool_rule(Decision::Deny, "Subagent", None)],
+            ..host_allow.clone()
+        };
+        assert_eq!(
+            user_deny.explicit_rule_match("Subagent", &input, loop_id, None),
+            Some(ExplicitRuleMatch {
+                decision: ExplicitPermissionDecision::Deny,
+                source: RuleSource::User,
+            })
+        );
+        assert_eq!(
+            host_allow.explicit_rule_match(
+                "Subagent",
+                &input,
+                loop_id,
+                Some(SessionPermissionDecision::Deny)
+            ),
+            Some(ExplicitRuleMatch {
+                decision: ExplicitPermissionDecision::Deny,
+                source: RuleSource::User,
+            })
+        );
+        assert_eq!(
+            host_allow
+                .explicit_rule_match(
+                    "Subagent",
+                    &input,
+                    loop_id,
+                    Some(SessionPermissionDecision::Allow)
+                )
+                .map(|matched| matched.source),
+            Some(RuleSource::Host),
+            "a session Allow does not hide the host's"
+        );
+        let broad_bash = PermissionPolicy {
+            mode: ExecutionMode::Auto,
+            host_rules: vec![tool_rule(Decision::Allow, BASH_TOOL_NAME, None)],
+            ..PermissionPolicy::default()
+        };
+        let command = json!({"command":"python script.py"});
+        assert_eq!(
+            broad_bash
+                .explicit_rule_match(BASH_TOOL_NAME, &command, loop_id, None)
+                .map(|matched| matched.source),
+            Some(RuleSource::Host)
+        );
+        let user_broad_bash = PermissionPolicy {
+            rules: broad_bash.host_rules.clone(),
+            host_rules: Vec::new(),
+            ..broad_bash.clone()
+        };
+        assert_eq!(
+            user_broad_bash.explicit_rule_match(BASH_TOOL_NAME, &command, loop_id, None),
+            None
+        );
+        assert_eq!(
+            PermissionPolicy::default().explicit_rule_match("Subagent", &input, loop_id, None),
+            None
+        );
     }
 
     #[test]

@@ -722,7 +722,7 @@ impl Agent {
             .inner
             .recorder
             .as_ref()?
-            .path_for_chat(receipt.chat_id)?;
+            .local_chat_path(receipt.chat_id)?;
         let directory = transcript.with_extension("auto-review");
         let path = directory.join(format!("{}.log", operation.id));
         let record = DenialCandidate::new(

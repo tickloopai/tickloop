@@ -3,12 +3,12 @@ use tickloop_agent_test_support::model_http_support;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path};
 use tickloop_agent_model::{
-    ModelRequest, StructuredOutput,
+    LocalModelClients, ModelClients, ModelRequest, StructuredOutput,
     access::AccessCatalog,
     availability::AccountModelDiscovery,
     cards::{ModelCatalog, built_in_model_profiles},
     credentials::{load_api_key, save_api_key},
-    model_client, validate_reasoning_effort,
+    validate_reasoning_effort,
 };
 use tickloop_agent_protocol::{
     Adapter, Content, ImageMediaType, ImageSource, Message, ModelAvailability, ModelConfig,
@@ -186,7 +186,9 @@ async fn real_client_encodes_api_auth_images_tools_schema_and_preserves_opaque_p
         endpoint.trim_end_matches("/anthropic").to_owned() + "/v1",
         "gpt-6.1-sol",
     );
-    let client = model_client(configuration.clone(), Some(&root)).unwrap();
+    let client = LocalModelClients::new(Some(root.to_path_buf()))
+        .client(&configuration)
+        .unwrap();
     let first_request = request();
     let (events, _) = mpsc::unbounded_channel();
     let first = client
@@ -243,7 +245,9 @@ async fn real_client_encodes_api_auth_images_tools_schema_and_preserves_opaque_p
     other_account.provider_id = "other-account-api".into();
     other_account.api_key_env = "OTHER_ACCOUNT_KEY".into();
     save_api_key(&root, &other_account.api_key_env, "test-other-account-key").unwrap();
-    let other = model_client(other_account, Some(&root)).unwrap();
+    let other = LocalModelClients::new(Some(root.to_path_buf()))
+        .client(&other_account)
+        .unwrap();
     let (events, _) = mpsc::unbounded_channel();
     other
         .complete(continuation.clone(), events, CancellationToken::new())

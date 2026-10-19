@@ -315,6 +315,8 @@ async fn a_cached_page_is_answered_again_without_a_second_download() {
         let result = fetch(
             fetch_input(&page, prompt),
             &cache,
+            &Observations::default(),
+            Reach::Anywhere,
             &model,
             CancellationToken::new(),
         )
@@ -349,6 +351,8 @@ async fn a_cross_origin_redirect_asks_for_a_new_call_without_contacting_the_targ
     let result = fetch(
         fetch_input(&format!("{base}/start"), "Summarize \"it\""),
         &FetchCache::default(),
+        &Observations::default(),
+        Reach::Anywhere,
         &model,
         CancellationToken::new(),
     )
@@ -389,7 +393,7 @@ async fn responses_over_ten_megabytes_are_rejected() {
     streamed.extend(std::iter::repeat_n(b'a', MAX_RESPONSE_BYTES + 1));
     for response in [declared, streamed] {
         let (base, _) = serve(vec![response]).await;
-        let error = fetch_page(url(&base), FETCH_TIMEOUT)
+        let error = fetch_page(url(&base), FETCH_TIMEOUT, Reach::Anywhere)
             .await
             .err()
             .expect("an oversized response is rejected");
@@ -400,7 +404,7 @@ async fn responses_over_ten_megabytes_are_rejected() {
     largest.extend(std::iter::repeat_n(b'a', MAX_RESPONSE_BYTES));
     let (base, _) = serve(vec![largest]).await;
     assert!(matches!(
-        fetch_page(url(&base), FETCH_TIMEOUT).await,
+        fetch_page(url(&base), FETCH_TIMEOUT, Reach::Anywhere).await,
         Ok(FetchedPage::Markdown(markdown)) if markdown.len() == MAX_RESPONSE_BYTES
     ));
 }
@@ -416,6 +420,7 @@ async fn a_silent_server_times_out_and_cancellation_stops_before_the_network() {
     let error = fetch_page(
         url(&format!("http://{address}/slow")),
         Duration::from_millis(50),
+        Reach::Anywhere,
     )
     .await
     .err()
@@ -430,6 +435,8 @@ async fn a_silent_server_times_out_and_cancellation_stops_before_the_network() {
         fetch(
             fetch_input(&base, "p"),
             &FetchCache::default(),
+            &Observations::default(),
+            Reach::Anywhere,
             &RecordingModel::default(),
             cancel,
         )
@@ -548,4 +555,240 @@ No links found.
 
 REMINDER: You MUST include the sources above in your response to the user using markdown hyperlinks."
     );
+}
+
+#[tokio::test]
+async fn a_public_only_fetch_never_connects_to_a_name_that_resolves_to_loopback() {
+    let (base, connections) = serve(vec![http_response("200 OK", "", "private")]).await;
+    let port = url(&base).port().unwrap();
+    for (target, refusal) in [
+        (
+            format!("http://localhost:{port}/"),
+            "localhost resolves to ",
+        ),
+        (base.clone(), "127.0.0.1 is not a public address"),
+    ] {
+        let error = fetch_page(url(&target), FETCH_TIMEOUT, Reach::PublicAddresses)
+            .await
+            .err()
+            .expect("a loopback page is refused");
+        assert!(
+            matches!(&error, ToolError::Rejected(message) if message.starts_with(refusal)),
+            "{target}: {error}"
+        );
+    }
+    assert_eq!(connections.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_public_only_fetch_refuses_redirects_to_addresses_that_are_not_public() {
+    let page = url("https://documents.example.com/start");
+    for location in [
+        "http://127.0.0.1:8080/",
+        "https://10.0.0.1/admin",
+        "https://169.254.169.254/latest/meta-data",
+        "https://[::1]/",
+        "https://[fd00::1]/",
+        "https://[::ffff:192.168.1.1]/",
+        "https://[2002:c0a8:101::1]/",
+    ] {
+        assert!(
+            matches!(
+                redirect_target(&page, location, Reach::PublicAddresses),
+                Err(ToolError::Rejected(_))
+            ),
+            "{location}"
+        );
+        assert!(redirect_target(&page, location, Reach::Anywhere).is_ok());
+    }
+    for location in [
+        "/next",
+        "https://8.8.8.8/",
+        "https://[2606:4700:4700::1111]/",
+    ] {
+        assert!(redirect_target(&page, location, Reach::PublicAddresses).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn folderless_tools_prepare_only_web_fetch_of_public_addresses_and_write_nothing() {
+    let tools = crate::Tools::folderless(Reach::PublicAddresses);
+    let workspace = crate::Workspace {
+        folder: None,
+        additional_directories: Vec::new(),
+    };
+    assert!(tools.chat_directory().is_none());
+    assert!(tools.family_temp_directory().is_none());
+    let prepared = tools
+        .prepare(
+            &workspace,
+            WEB_FETCH_TOOL_NAME,
+            &json!({"url": "https://example.com/a", "prompt": "p"}),
+        )
+        .await
+        .unwrap();
+    assert!(prepared.requires_permission && prepared.is_read_only && !prepared.in_workspace);
+    for url in [
+        "http://127.0.0.1/",
+        "https://192.168.0.1/",
+        "https://[::1]/",
+        "https://[2002:7f00:1::]/",
+    ] {
+        assert!(
+            matches!(
+                tools
+                    .prepare(
+                        &workspace,
+                        WEB_FETCH_TOOL_NAME,
+                        &json!({"url": url, "prompt": "p"})
+                    )
+                    .await,
+                Err(ToolError::Rejected(_))
+            ),
+            "{url}"
+        );
+    }
+    for (name, input) in [
+        (crate::READ_TOOL_NAME, json!({"file_path": "/etc/hosts"})),
+        (crate::GLOB_TOOL_NAME, json!({"pattern": "*"})),
+        (
+            crate::WRITE_TOOL_NAME,
+            json!({"file_path": "/tmp/x", "content": "x"}),
+        ),
+        (BASH_TOOL_NAME, json!({"command": "true"})),
+    ] {
+        assert!(
+            matches!(
+                tools.prepare(&workspace, name, &input).await,
+                Err(ToolError::Rejected(message)) if message.contains("no Folder")
+            ),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn folderless_tools_bind_web_search_to_the_chats_search_service() {
+    let workspace = crate::Workspace {
+        folder: None,
+        additional_directories: Vec::new(),
+    };
+    let input = json!({"query": "rust release notes"});
+    let config = tickloop_agent_protocol::SearchConfig {
+        provider: tickloop_agent_protocol::SearchProviderKind::Searxng,
+        endpoint: "http://127.0.0.1:8888/search".into(),
+        api_key_env: None,
+    };
+    let tools = crate::Tools::folderless(Reach::PublicAddresses)
+        .with_search_configuration(Some(config), None);
+    let prepared = tools
+        .prepare(&workspace, WEB_SEARCH_TOOL_NAME, &input)
+        .await
+        .unwrap();
+    assert!(prepared.requires_permission && !prepared.in_workspace);
+    assert_eq!(prepared.input["endpoint"], "http://127.0.0.1:8888/search");
+    assert!(matches!(
+        &prepared.operation,
+        crate::Operation::WebSearch(search) if search.prepared.is_some()
+    ));
+
+    let disabled =
+        crate::Tools::folderless(Reach::PublicAddresses).with_search_configuration(None, None);
+    assert!(matches!(
+        disabled.prepare(&workspace, WEB_SEARCH_TOOL_NAME, &input).await,
+        Err(ToolError::Network(message)) if message == web_search::DISABLED_MESSAGE
+    ));
+}
+
+#[tokio::test]
+async fn folderless_tools_fetch_a_private_address_only_when_the_host_chooses_anywhere() {
+    let (base, connections) = serve(vec![http_response(
+        "200 OK",
+        "Content-Type: text/html\r\n",
+        "<h1>Delivery</h1><p>Friday</p>",
+    )])
+    .await;
+    let port = url(&base).port().unwrap();
+    let workspace = crate::Workspace {
+        folder: None,
+        additional_directories: Vec::new(),
+    };
+    let input = json!({"url": format!("http://localhost:{port}/delivery"), "prompt": "When?"});
+    let context = || crate::ExecutionContext {
+        operation_id: uuid::Uuid::new_v4(),
+        loop_id: uuid::Uuid::nil(),
+        accepts_images: false,
+    };
+    let model = RecordingModel::default();
+
+    let public_only = crate::Tools::folderless(Reach::PublicAddresses);
+    let prepared = public_only
+        .prepare(&workspace, WEB_FETCH_TOOL_NAME, &input)
+        .await
+        .unwrap();
+    let refused = public_only
+        .execute_with_context(prepared, CancellationToken::new(), context(), &model)
+        .await
+        .result;
+    assert!(
+        matches!(
+            &refused,
+            Err(ToolError::Rejected(message))
+                if message.starts_with("localhost resolves to ")
+                    && message.contains("which is not a public address")
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(connections.load(Ordering::SeqCst), 0);
+
+    let anywhere = crate::Tools::folderless(Reach::Anywhere);
+    let prepared = anywhere
+        .prepare(&workspace, WEB_FETCH_TOOL_NAME, &input)
+        .await
+        .unwrap();
+    let fetched = anywhere
+        .execute_with_context(prepared, CancellationToken::new(), context(), &model)
+        .await
+        .result
+        .unwrap();
+    assert!(!fetched.is_error, "{fetched:?}");
+    assert_eq!(fetched.content, "The delivery is on Friday.");
+    assert_eq!(connections.load(Ordering::SeqCst), 1);
+}
+
+/// The search service is the host's choice, not the model's, so a Chat's reach does not limit it.
+#[tokio::test]
+async fn folderless_web_search_requests_the_hosts_search_service_whatever_the_reach() {
+    let workspace = crate::Workspace {
+        folder: None,
+        additional_directories: Vec::new(),
+    };
+    let input = json!({"query": "rust release notes"});
+    for reach in [Reach::PublicAddresses, Reach::Anywhere] {
+        let (base, connections) = serve(vec![http_response(
+            "200 OK",
+            "Content-Type: application/json\r\n",
+            r#"{"results":[{"title":"Rust 1.90","url":"https://blog.rust-lang.org/1.90","content":"Release notes"}]}"#,
+        )])
+        .await;
+        let config = tickloop_agent_protocol::SearchConfig {
+            provider: tickloop_agent_protocol::SearchProviderKind::Searxng,
+            endpoint: format!("{base}/search"),
+            api_key_env: None,
+        };
+        let tools = crate::Tools::folderless(reach).with_search_configuration(Some(config), None);
+        let prepared = tools
+            .prepare(&workspace, WEB_SEARCH_TOOL_NAME, &input)
+            .await
+            .unwrap();
+        let result = tools
+            .execute(prepared, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error && result.content.contains("https://blog.rust-lang.org/1.90"),
+            "{reach:?}: {result:?}"
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), 1, "{reach:?}");
+    }
 }

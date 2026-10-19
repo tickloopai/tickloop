@@ -126,7 +126,12 @@ impl ChangeCatalog {
 }
 
 fn build_catalog(snapshot: &ChatSnapshot) -> ChangeCatalog {
-    let mut sources = vec![current_source(&snapshot.workdir)];
+    let mut sources = snapshot
+        .folder
+        .as_deref()
+        .map(current_source)
+        .into_iter()
+        .collect::<Vec<_>>();
     sources.extend(agent_sources(snapshot));
     ChangeCatalog { sources }
 }
@@ -1225,7 +1230,7 @@ mod tests {
         let mut snapshot = agent.snapshot(chat).await.unwrap();
         let tools = Tools::new(output.path().join("catalog-output"));
         let workspace = Workspace {
-            workdir: directory.path().to_path_buf(),
+            folder: Some(directory.path().to_path_buf()),
             additional_directories: Vec::new(),
         };
         let available = prepared_change(&tools, &workspace, "available.txt").await;

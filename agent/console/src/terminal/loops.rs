@@ -2,9 +2,11 @@ use super::execution::ConsoleExecution as Agent;
 use uuid::Uuid;
 
 use super::{current_time_ms, safe_text};
-use tickloop_agent_protocol::{Trigger, TriggerPromptSource};
+use tickloop_agent_protocol::{Recurrence, Trigger, TriggerPromptSource};
 
-pub(super) const SYNTAX: &str = "use /loops [GOAL_ID|new|trigger [GOAL_ID]|schedule GOAL_ID SECONDS [--for DURATION_SECONDS] PROMPT]";
+pub(super) const SYNTAX: &str = "use /loops [GOAL_ID|new|trigger [GOAL_ID]|schedule GOAL_ID SECONDS|RULE [--for DURATION_SECONDS] PROMPT]";
+/// The most words a schedule rule takes, as in `weekly mon,fri 09:00 +08:00`.
+const MAX_RULE_WORDS: usize = 4;
 
 #[derive(Debug, PartialEq)]
 pub(super) enum LoopCommand<'a> {
@@ -51,24 +53,50 @@ impl<'a> LoopCommand<'a> {
     }
 }
 
+/// The schedule that starts `arguments` and the rest after it: a number of seconds, or a rule
+/// such as `daily 09:00 +08:00`, the longest that reads as one.
+fn parse_schedule(arguments: &str) -> Result<(Recurrence, &str), &'static str> {
+    let invalid = "interval must be a positive number of seconds or a rule such as \
+                   `every 5m`, `daily 09:00 +08:00` or `weekly mon,fri 09:00`";
+    let (first, rest) = arguments.split_once(char::is_whitespace).ok_or(SYNTAX)?;
+    if first.bytes().all(|byte| byte.is_ascii_digit()) {
+        let schedule = Recurrence::parse(&format!("every {first}s"))
+            .map_err(|_| "interval must be a positive number of seconds")?;
+        return Ok((schedule, rest));
+    }
+    let word_ends = arguments
+        .char_indices()
+        .filter(|(index, character)| {
+            character.is_whitespace()
+                && arguments[..*index]
+                    .chars()
+                    .last()
+                    .is_some_and(|previous| !previous.is_whitespace())
+        })
+        .map(|(index, _)| index)
+        .take(MAX_RULE_WORDS)
+        .collect::<Vec<_>>();
+    word_ends
+        .iter()
+        .rev()
+        .find_map(|end| {
+            Recurrence::parse(&arguments[..*end])
+                .ok()
+                .map(|schedule| (schedule, &arguments[*end..]))
+        })
+        .ok_or(invalid)
+}
+
 #[derive(Debug, PartialEq)]
 pub(super) struct TimerSchedule {
-    interval_seconds: u64,
+    schedule: Recurrence,
     duration_seconds: Option<u64>,
     prompt: String,
 }
 
 impl TimerSchedule {
     pub(super) fn parse(arguments: &str) -> Result<Self, &'static str> {
-        let (seconds, rest) = arguments
-            .trim()
-            .split_once(char::is_whitespace)
-            .ok_or(SYNTAX)?;
-        let interval_seconds = seconds
-            .parse::<u64>()
-            .ok()
-            .filter(|value| *value > 0)
-            .ok_or("interval must be a positive number of seconds")?;
+        let (schedule, rest) = parse_schedule(arguments.trim())?;
         let rest = rest.trim();
         let (duration_seconds, prompt) = if rest.split_whitespace().next() == Some("--for") {
             let (duration, prompt) = rest[5..]
@@ -87,13 +115,13 @@ impl TimerSchedule {
         if prompt.is_empty() {
             return Err("a timer prompt is required");
         }
-        let schedule = Self {
-            interval_seconds,
+        let timer = Self {
+            schedule,
             duration_seconds,
             prompt: prompt.into(),
         };
-        schedule.expires_at_ms()?;
-        Ok(schedule)
+        timer.expires_at_ms()?;
+        Ok(timer)
     }
 
     fn expires_at_ms(&self) -> Result<Option<u64>, &'static str> {
@@ -135,7 +163,10 @@ impl TimerSchedule {
             id: Uuid::new_v4(),
             prompt: String::new(),
             prompt_source: TriggerPromptSource::Explicit,
-            interval_seconds: None,
+            schedule: None,
+            armed_at_ms: None,
+            last_fired_at_ms: None,
+            confirmation: None,
             expires_at_ms: None,
             accepts_events: false,
             armed: true,
@@ -143,10 +174,21 @@ impl TimerSchedule {
         });
         trigger.id = Uuid::new_v4();
         trigger.armed = true;
-        trigger.interval_seconds = Some(self.interval_seconds);
+        trigger.schedule = Some(self.schedule);
         trigger.expires_at_ms = self.expires_at_ms()?;
         trigger.set_explicit_prompt(self.prompt);
         Ok(trigger)
+    }
+}
+
+/// How a Trigger's schedule reads in the Loop's details.
+pub(super) fn schedule_line(schedule: &Recurrence) -> String {
+    match schedule.interval() {
+        Some(interval) => format!(
+            "Interval: {} seconds while this Agent runs.",
+            interval.as_secs()
+        ),
+        None => format!("Schedule: {schedule} while this Agent runs."),
     }
 }
 
@@ -160,10 +202,8 @@ pub(super) fn trigger_lines(trigger: Option<&Trigger>) -> Vec<String> {
             trigger.id, trigger.armed, trigger.accepts_events
         ),
         trigger
-            .interval_seconds
-            .map_or("Timer: off".into(), |seconds| {
-                format!("Interval: {seconds} seconds while this Agent runs.")
-            }),
+            .schedule
+            .map_or("Timer: off".into(), |schedule| schedule_line(&schedule)),
         trigger
             .expires_at_ms
             .map_or("Deadline: none".into(), |expiry| {
@@ -224,7 +264,7 @@ mod tests {
         assert_eq!(
             TimerSchedule::parse("60 --for 3600 check the price"),
             Ok(TimerSchedule {
-                interval_seconds: 60,
+                schedule: Recurrence::parse("every 1m").unwrap(),
                 duration_seconds: Some(3600),
                 prompt: "check the price".into()
             })
@@ -233,7 +273,20 @@ mod tests {
             TimerSchedule::parse(" 60\tcheck\nprices ").unwrap().prompt,
             "check\nprices"
         );
+        let daily = TimerSchedule::parse("daily 09:00 +08:00 --for 60 check the price").unwrap();
+        assert_eq!(daily.schedule.to_string(), "daily 09:00 +08:00");
+        assert_eq!(daily.duration_seconds, Some(60));
+        assert_eq!(daily.prompt, "check the price");
+        assert_eq!(
+            TimerSchedule::parse("weekly mon,fri 09:00 check")
+                .unwrap()
+                .schedule
+                .to_string(),
+            "weekly mon,fri 09:00"
+        );
         for invalid in [
+            "daily check",
+            "every 0s check",
             "0 check",
             "-1 check",
             "60",

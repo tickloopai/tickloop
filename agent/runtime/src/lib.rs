@@ -1,4 +1,5 @@
 mod agent_messages;
+mod agent_tasks;
 mod approval_assessment;
 pub(crate) mod approval_context;
 mod auto_approval;
@@ -13,14 +14,26 @@ mod auto_settings;
 mod auto_setup;
 mod branch;
 mod family;
+mod family_load;
 mod family_tree;
 pub mod file_history;
 mod handback;
+mod handover;
+pub use handover::HandOver;
+mod harness;
+pub use harness::{
+    DeliveryBinding, HarnessOptions, HarnessSeams, LOCAL_MIN_SCHEDULE_INTERVAL, PersonWait,
+    PersonWaitKind, Quiescence, SearchDefaults, ToolPolicy, WaitHosting, Waits,
+    durable_chat_host_rules,
+};
+pub use triggers::ScheduleDecision;
 mod host_context;
 mod host_notes;
 pub mod host_tools;
 pub mod hosted;
 mod jev_review;
+mod lifecycle;
+pub use lifecycle::InputLedgerState;
 mod loop_lease;
 mod mcp_http;
 mod mcp_resources;
@@ -46,6 +59,8 @@ mod context;
 mod delegation;
 mod denials;
 mod directed_summary;
+mod durable_queue;
+pub mod environment;
 mod event_sources;
 mod feedback_inbox;
 #[cfg(test)]
@@ -63,13 +78,15 @@ mod run_supervision;
 mod session_permissions;
 mod shell_description;
 mod shell_task_center;
+mod suspension;
 mod system_prompt;
 mod tool_batch;
 mod tool_execution;
 mod tool_results;
 pub mod upgrade;
 mod web_fetch;
-use tool_execution::ToolRegistry;
+use tool_batch::{BatchExit, RunStart, ToolBatch};
+use tool_execution::{ToolCallOutcome, ToolInvocation, ToolRegistry};
 mod commands;
 mod permission_management;
 mod plan;
@@ -78,6 +95,13 @@ mod tick_content;
 mod tick_subscriptions;
 mod tick_trim;
 mod triggers;
+mod turn;
+mod web_provenance;
+pub use event_sources::ExternalDelivery;
+pub use turn::{
+    Delivery, MessageId, ParentSelection, QuestionReply, SkillInvocation, Turn, TurnOp,
+    TurnOutcome, TurnRequest, TurnWait, UserMessage,
+};
 mod user_shell;
 #[cfg(test)]
 mod user_shell_tests;
@@ -115,14 +139,17 @@ use tickloop_agent_protocol::{
     LedgerError, LoopId, LoopSnapshot, LoopState, Message, ModelConfig, ModelRequestKind,
     MonitorMembership, OperationRecord, OperationState, PendingCommand, PendingInput,
     PermissionApprovalSource, PermissionExecution, PermissionPolicy, PermissionRequest,
-    PermissionRule, PermissionScope, PromptPolicy, ProposedToolCall, QueuedInput, QueuedInputKind,
-    ReasoningEffort, Receipt, RequestOutcome, RequestUsageLedger, ResponseRejection, Role, RunId,
+    PermissionRule, PermissionScope, PromptPolicy, QueuedInput, QueuedInputKind, ReasoningEffort,
+    Receipt, RequestOutcome, RequestUsageLedger, ResponseRejection, Role, RunId,
     SubagentRegistration, TICK_MANUAL_SOURCE, TICK_SUBSCRIPTION_SOURCE, TaskNotification,
     TriggerSource, Usage, UserShellRecord, UserShellState, VerdictEvidence, projection,
 };
 use tickloop_agent_tools::permissions::SessionPermissionDecision;
 use tickloop_agent_tools::{
     file_change::load_file_change_review, permissions::PermissionPolicyExt,
+};
+use tickloop_agent_transcript::{
+    DiscardReason, InputOp, InterruptedBy, ResponseEnding, SettledOutcome,
 };
 
 const EVENT_REPLAY_LIMIT: usize = 1024;
@@ -148,6 +175,9 @@ pub enum AgentError {
     Usage(#[from] LedgerError),
     #[error("storage failure: {0}")]
     Storage(String),
+    /// A newer holder owns the Chat's Transcript; this Harness writes nothing more to it.
+    #[error("the Chat's Transcript belongs to a newer holder")]
+    Fenced,
     #[error("chat or goal does not exist")]
     NotFound,
     #[error("invalid request: {0}")]
@@ -160,6 +190,19 @@ pub enum AgentError {
         "the current model does not support image input; remove the attached images such as @image mentions, or switch to a model that accepts images with /model"
     )]
     ImageInputUnsupported,
+}
+
+impl From<transcript::TranscriptError> for AgentError {
+    fn from(error: transcript::TranscriptError) -> Self {
+        match error {
+            transcript::TranscriptError::Fenced => Self::Fenced,
+            transcript::TranscriptError::Unsupported => {
+                Self::Invalid("Unsupported: the Transcript store does not support this".into())
+            }
+            transcript::TranscriptError::Conflict(message)
+            | transcript::TranscriptError::Storage(message) => Self::Storage(message),
+        }
+    }
 }
 
 impl From<projection::InvalidConversation> for AgentError {
@@ -176,7 +219,7 @@ impl From<AgentError> for AccessError {
             AgentError::UntrustedWorkingDirectory { .. } => {
                 AccessErrorCode::UntrustedWorkingDirectory
             }
-            AgentError::Storage(_) => AccessErrorCode::Storage,
+            AgentError::Storage(_) | AgentError::Fenced => AccessErrorCode::Storage,
             AgentError::Invalid(message) if message.starts_with("Unsupported:") => {
                 AccessErrorCode::Unsupported
             }
@@ -280,9 +323,17 @@ impl Agent {
 struct Inner {
     /// 本进程当前选择的模型；新建与恢复的 Chat 使用它，`set_model` 随选择更新。
     selected_model: std::sync::Mutex<chat_settings::SelectedModel>,
+    /// Builds the client of each model a Chat selects.
+    models: Arc<dyn tickloop_agent_model::ModelClients>,
     /// 用户设置文件；不写设置的 Agent（测试等）为 `None`。
     settings: Option<tickloop_agent_config::UserSettings>,
+    search: SearchDefaults,
     host_options: AgentHostOptions,
+    waits: WaitHosting,
+    /// The shortest time a Trigger's schedule may leave between two runs.
+    min_schedule_interval: std::time::Duration,
+    /// The wall clock Trigger schedules run on.
+    schedule_clock: triggers::ScheduleClock,
     /// 设置文件所在的配置根；用户 Skill 与已安装 Tick 包的 Skill 从这里加载。
     config_root: Option<PathBuf>,
     /// 本进程内设置读写的次序：写入设置并同步已加载的 Chat、以及读取设置并加入新 Chat 都在
@@ -297,8 +348,9 @@ struct Inner {
     host_contexts: std::sync::Mutex<host_context::HostContexts>,
     subagent_invocations: Mutex<HashMap<(RunId, String), delegation::SubagentInvocation>>,
     family_mailbox: Mutex<family_mailbox::FamilyMailbox>,
-    input_wakeup: tokio::sync::watch::Sender<()>,
-    title_requests: Mutex<HashSet<ChatId>>,
+    /// Changes whenever a Chat's input ledger accepts or settles an input.
+    ledger_changes: tokio::sync::watch::Sender<()>,
+    title_requests: Mutex<HashMap<ChatId, chat_title::TitleJob>>,
     /// Display names generated for background Shells without a description of their own, by
     /// task: `None` while pending or after a failed attempt. Each task gets one attempt in this
     /// process, and model-facing text never uses them.
@@ -311,16 +363,18 @@ struct Inner {
     user_shell_events: broadcast::Sender<UserShellRecord>,
     user_shell_cancellations: std::sync::Mutex<HashMap<(ChatId, Uuid), CancellationToken>>,
     task_notifications: broadcast::Sender<TaskNotification>,
-    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Every task this instance spawns; `shutdown` waits for all of them.
+    tasks: agent_tasks::AgentTasks,
     recorder: Option<persistence::ChatRecorder>,
     /// 本进程持有的 Trigger 租约；Inner 释放时随之归还。
     loop_leases: loop_lease::LoopLeases,
     approvals: Mutex<HashMap<Uuid, PendingApproval>>,
-    question_answers: Mutex<HashMap<Uuid, oneshot::Sender<interaction::QuestionReply>>>,
+    question_answers: Mutex<HashMap<Uuid, oneshot::Sender<interaction::PendingReply>>>,
     closed: AtomicBool,
     upgrade_paused: AtomicBool,
     upgrade_adopted: AtomicBool,
-    trigger_deadlines: std::sync::Mutex<HashMap<(ChatId, LoopId), tokio::time::Instant>>,
+    /// The latest scheduled time each armed Trigger's timer has tried, fired or passed.
+    trigger_tried_through: std::sync::Mutex<HashMap<(ChatId, LoopId), u64>>,
     upgrade_gate: Arc<tokio::sync::RwLock<()>>,
     upgrade_guard: Mutex<Option<tokio::sync::OwnedRwLockWriteGuard<()>>>,
     upgrade_restore: Mutex<Option<upgrade::AgentUpgradeCheckpoint>>,
@@ -328,7 +382,14 @@ struct Inner {
     judgment: Mutex<Option<Arc<dyn tickloop_agent_model::judgment::JudgmentClient>>>,
     auto_health: Mutex<auto_health::AutoHealth>,
     host_tools: std::sync::RwLock<Option<Arc<dyn crate::host_tools::HostToolProvider>>>,
-    hosted_ticks: std::sync::RwLock<Option<Arc<crate::hosted::tools::HostedTickTools>>>,
+    /// Where Chats with a Folder run their commands and Ticks; `None` when Chats have no Folder.
+    environment: Option<Arc<dyn environment::ExecutionEnvironment>>,
+    tool_policy: ToolPolicy,
+    host_rules: Vec<PermissionRule>,
+    /// The host's own section of every conversation's system prompt.
+    system_prompt_addition: Option<String>,
+    /// The permits each request to a model's vendor takes, in order.
+    request_gates: Vec<Arc<tokio::sync::Semaphore>>,
     /// Where every Chat's shell commands run: the Tickhost.
     shells: Arc<crate::hosted::shells::ShellTasks>,
     stopped_child_hook: std::sync::RwLock<Option<Arc<dyn StoppedChildHook>>>,
@@ -340,12 +401,17 @@ struct Inner {
     tick_wake: Notify,
     session_permissions: Mutex<session_permissions::SessionPermissionContext>,
     shutdown: CancellationToken,
+    /// A voluntary handover began: no Run starts, and each running Run stops at its next safe
+    /// point.
+    handover: CancellationToken,
 }
 
 /// Runtime bookkeeping about a Chat's conversation that never leaves this process. Recovery and
 /// Branch copies rebuild it from the conversation chain.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ChatBookkeeping {
+    /// What the Chat's own work vouches for, as its Transcript keeps it.
+    provenance: tickloop_agent_transcript::ProvenanceEntry,
     dependency_baselines: BTreeMap<LoopId, BTreeMap<PathBuf, String>>,
     tick_creation_receipts: Vec<approval_context::TickCreationReceipt>,
     denial_references: BTreeMap<usize, DenialReference>,
@@ -365,6 +431,9 @@ struct ChatBookkeeping {
     /// Shells whose completion notification is in the conversation but no turn has read yet.
     unread_notifications: Vec<tick_protocol::InstanceRef>,
     restored_skill_names: HashSet<String>,
+    lifecycle: lifecycle::Lifecycle,
+    /// The answer each message is part of.
+    message_responses: BTreeMap<usize, tickloop_agent_protocol::ResponseId>,
 }
 
 impl ChatBookkeeping {
@@ -372,7 +441,11 @@ impl ChatBookkeeping {
     fn add_loop(&mut self, snapshot: &mut ChatSnapshot, goal: LoopSnapshot) {
         self.dependency_baselines.insert(
             goal.id,
-            approval_context::dependency_fingerprints(&snapshot.workdir),
+            snapshot
+                .folder
+                .as_deref()
+                .map(approval_context::dependency_fingerprints)
+                .unwrap_or_default(),
         );
         self.loop_starts.insert(goal.id, snapshot.messages.len());
         snapshot.loops.push(goal);
@@ -395,6 +468,9 @@ struct Chat {
     active_run: Option<RunId>,
     upgrade_wait: Option<Receipt>,
     parked: HashMap<RunId, ParkedRun>,
+    /// The release of each Run waiting durably, parked or holding the execution slot. A released
+    /// Run leaves this instance without writing anything; it goes on wherever the Chat loads next.
+    releases: HashMap<RunId, CancellationToken>,
     ready_runs: VecDeque<RunId>,
     client: Arc<dyn ModelClient>,
     pending_client: Option<Arc<dyn ModelClient>>,
@@ -407,7 +483,8 @@ struct Chat {
     skills: Arc<tickloop_agent_config::skills::SkillRegistry>,
     /// 照 Claude Code，替换决定只在运行期保存，恢复时由 Transcript 中的内容替换条目重建。
     content_replacements: tool_results::ContentReplacementState,
-    file_history: FileHistory,
+    /// `None` for a Chat without a Folder, which edits no local file.
+    file_history: Option<FileHistory>,
     watching_commands: bool,
     watching_user_shells: bool,
     user_shell_queue: Arc<Notify>,
@@ -424,6 +501,9 @@ struct Chat {
     /// Claude Code-style Auto classifier denial counts for this in-process Chat.
     auto_denials: auto_mode::DenialTracking,
     denial_window: denials::DenialWindow,
+    /// Another stored branch of the Chat is being restored to replace its conversation: until the
+    /// reservation's own input installs it, or the reservation ends, the Chat takes no input.
+    branch_reservation: Option<Uuid>,
 }
 
 enum RunAdmission {
@@ -457,11 +537,53 @@ struct SubmissionOptions {
     trigger_source: Option<TriggerSource>,
     trigger_cancel: Option<CancellationToken>,
     feedback_input: Option<feedback_inbox::FeedbackIdentity>,
+    requires_feedback_binding: bool,
     invoked_skill: Option<tickloop_agent_protocol::InvokedSkill>,
     host_context: Option<HostCallContext>,
     agent_message: Option<AgentMessageSource>,
     directed_human: Option<DirectedHumanSource>,
     goal_title: Option<String>,
+    ledger: Option<lifecycle::LedgerInput>,
+    /// The scheduled time, in Unix milliseconds, a Trigger's timer fires for.
+    scheduled_for: Option<u64>,
+    turn: TurnAdmission,
+}
+
+/// How a turn's input is admitted beyond queuing it.
+#[derive(Default)]
+pub(crate) struct TurnAdmission {
+    /// Interrupt the work ahead of it in the same change that queues it.
+    pub send_now: bool,
+    /// The explicitly selected place it goes: the Chat must be idle, and the conversation is
+    /// cut there in the same change that accepts it.
+    pub placement: Option<turn::Placement>,
+    /// The stored branch that place is on, staged under a reservation of the Chat and installed
+    /// in the same change that accepts the input.
+    pub branch: Option<turn::BranchSwitch>,
+}
+
+/// Queues a Run that continues the conversation without a message of its own.
+fn queue_continuation(chat: &mut Chat, receipt: Receipt) {
+    chat.snapshot.last_queue_sequence += 1;
+    let queued_sequence = chat.snapshot.last_queue_sequence;
+    chat.snapshot.pending_inputs.push(PendingInput {
+        receipt,
+        input: String::new(),
+        contexts: Vec::new(),
+        agent_message: None,
+        directed_human: None,
+        denial_reference: None,
+        trigger_source: None,
+        armed: true,
+        queued_sequence,
+        task_continuation: true,
+        is_skill_invocation: false,
+        attached_file_reads: Vec::new(),
+    });
+}
+
+pub(crate) fn chat_is_busy() -> AgentError {
+    AgentError::Invalid("chat is busy".into())
 }
 
 #[derive(Clone, Copy)]
@@ -527,19 +649,27 @@ fn permission_denial_message(comment: Option<&str>) -> String {
 }
 
 fn host_tool_decision(
-    configured: Option<Decision>,
+    configured: Option<tickloop_agent_tools::permissions::ExplicitRuleMatch>,
     host_permission: Option<crate::host_tools::HostToolPermission>,
     execution_mode: ExecutionMode,
     has_human_input: bool,
 ) -> Decision {
+    let is_allowed_by_host = configured.is_some_and(|matched| {
+        matched.decision == tickloop_agent_tools::permissions::ExplicitPermissionDecision::Allow
+            && matched.source == tickloop_agent_tools::permissions::RuleSource::Host
+    });
+    let configured = configured.map(|matched| Decision::from(matched.decision));
     if let Some(crate::host_tools::HostToolPermission::Classified {
         allow_rule_bypasses_review,
     }) = host_permission
     {
+        // The host's Allow is the host's own decision: no reviewer or person is there to ask.
         return match configured {
             Some(Decision::Deny) => Decision::Deny,
             Some(Decision::Ask) => Decision::Ask,
-            Some(Decision::Allow) if allow_rule_bypasses_review => Decision::Allow,
+            Some(Decision::Allow) if allow_rule_bypasses_review || is_allowed_by_host => {
+                Decision::Allow
+            }
             _ if matches!(execution_mode, ExecutionMode::Auto | ExecutionMode::Plan) => {
                 Decision::Check
             }
@@ -683,11 +813,46 @@ fn host_provider_is_confirmed(
         .is_none_or(|provider| provider.tool_set_is_confirmed())
 }
 
+/// The options of an Agent on this computer: every capability and no host rule.
+fn local_options(
+    model: ModelConfig,
+    settings: Option<tickloop_agent_config::UserSettings>,
+    host: AgentHostOptions,
+) -> HarnessOptions {
+    HarnessOptions {
+        search: Default::default(),
+        model,
+        settings,
+        host,
+        tools: ToolPolicy::local(),
+        host_rules: Vec::new(),
+        task_tools: None,
+        min_schedule_interval: LOCAL_MIN_SCHEDULE_INTERVAL,
+        waits: WaitHosting::Process,
+        system_prompt_addition: None,
+        request_gates: Vec::new(),
+    }
+}
+
 fn configured_workspace_for_chat(chat: &Chat) -> tickloop_agent_tools::Workspace {
     tickloop_agent_tools::Workspace {
-        workdir: chat.snapshot.workdir.clone(),
+        folder: chat.snapshot.folder.clone(),
         additional_directories: chat.snapshot.additional_directories.clone(),
     }
+}
+
+/// Why a Chat without a Folder refuses what needs local files or commands.
+const FOLDERLESS_CHAT: &str = "Unsupported: this Chat has no Folder";
+
+/// Why an Agent without an Execution Environment refuses what concerns a local Folder.
+const NO_ENVIRONMENT: &str = "Unsupported: this Agent has no Execution Environment for a Folder";
+
+/// The Folder of a Chat that needs one for local files or commands.
+fn require_folder(snapshot: &ChatSnapshot) -> Result<&Path, AgentError> {
+    snapshot
+        .folder
+        .as_deref()
+        .ok_or_else(|| AgentError::Invalid(FOLDERLESS_CHAT.into()))
 }
 
 /// 新 Chat 的初始快照。
@@ -741,7 +906,7 @@ fn answerable_permission_request(
     Ok(request)
 }
 
-fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnapshot {
+fn empty_snapshot(id: ChatId, folder: Option<PathBuf>, model: ModelConfig) -> ChatSnapshot {
     ChatSnapshot {
         search_config: tickloop_agent_protocol::SearchConfig::enabled_default(),
         task_tools_enabled: false,
@@ -762,7 +927,7 @@ fn empty_snapshot(id: ChatId, workdir: PathBuf, model: ModelConfig) -> ChatSnaps
         family_inputs: BTreeMap::new(),
         sent_agent_messages: BTreeMap::new(),
         generated_title: None,
-        workdir,
+        folder,
         model,
         reasoning_effort: None,
         thinking_enabled: true,
@@ -816,11 +981,18 @@ impl Drop for Inner {
 }
 
 impl Agent {
-    fn discover_skills(&self, workdir: &Path) -> Arc<tickloop_agent_config::skills::SkillRegistry> {
-        Arc::new(tickloop_agent_config::skills::SkillRegistry::discover(
-            workdir,
-            self.inner.config_root.as_deref(),
-        ))
+    /// The Skills of a Chat with `folder`; a Chat without a Folder reads no Skill directory.
+    fn discover_skills(
+        &self,
+        folder: Option<&Path>,
+    ) -> Arc<tickloop_agent_config::skills::SkillRegistry> {
+        Arc::new(match folder {
+            Some(folder) => tickloop_agent_config::skills::SkillRegistry::discover(
+                folder,
+                self.inner.config_root.as_deref(),
+            ),
+            None => tickloop_agent_config::skills::SkillRegistry::builtin(),
+        })
     }
 
     /// Reads a Chat's Skills again, so a Tick package installed, updated or uninstalled by
@@ -828,20 +1000,20 @@ impl Agent {
     /// the Chat at its next request or Skill invocation. Unchanged Skills give a byte-identical
     /// listing, so the model's prompt cache still holds.
     async fn rediscover_skills(&self, chat_id: ChatId) {
-        let Some(workdir) = self
+        let Some(Some(folder)) = self
             .inner
             .chats
             .lock()
             .await
             .get(&chat_id)
-            .map(|chat| chat.snapshot.workdir.clone())
+            .map(|chat| chat.snapshot.folder.clone())
         else {
             return;
         };
-        let skills = self.discover_skills(&workdir);
+        let skills = self.discover_skills(Some(&folder));
         let mut chats = self.inner.chats.lock().await;
         if let Some(chat) = chats.get_mut(&chat_id)
-            && chat.snapshot.workdir == workdir
+            && chat.snapshot.folder.as_ref() == Some(&folder)
         {
             chat.skills = skills;
         }
@@ -858,34 +1030,40 @@ impl Agent {
             } else {
                 shared_tasks::TaskToolAccess::Disabled
             },
+            &self.inner.tool_policy,
         )
         .definitions()
     }
 
-    /// Installs the worker's hosted Ticks, which its Chats' Monitors list and close directly.
-    pub fn install_hosted_ticks(&self, tools: Arc<crate::hosted::tools::HostedTickTools>) {
-        *self.inner.hosted_ticks.write().unwrap() = Some(tools);
-    }
-
+    /// The environment's hosted Ticks, which its Chats' Monitors list and close directly.
     pub fn hosted_ticks(&self) -> Option<Arc<crate::hosted::tools::HostedTickTools>> {
-        self.inner.hosted_ticks.read().unwrap().clone()
+        self.inner.environment.as_ref()?.hosted_ticks()
     }
 
-    /// Lets the daemon grant this worker's Shell spawns and views in its Tickhost.
+    /// Grants this Agent's Shell spawns and views in a Tickhost after it was built, for an Agent
+    /// without a daemon such as a test's. Chats without a Folder run no command, so an Agent
+    /// without an environment ignores it.
     pub fn install_shell_grants(&self, grants: Arc<dyn crate::hosted::shells::ShellGrants>) {
-        self.inner.shells.install_grants(grants);
+        if self.inner.environment.is_some() {
+            self.inner.shells.install_grants(grants);
+        }
     }
 
     /// Runs and shows this Agent's shell commands in a Tickhost of its own, served inside this
     /// process, for an Agent without a daemon such as a test's.
     pub fn install_own_tickhost(&self) {
-        self.install_shell_grants(Arc::new(crate::hosted::shells::OwnTickhost::new()));
+        // An Agent without an environment runs no command, so it builds no Tickhost either.
+        if self.inner.environment.is_some() {
+            self.install_shell_grants(Arc::new(crate::hosted::shells::OwnTickhost::new()));
+        }
     }
 
     pub fn shell_tasks(&self) -> Arc<crate::hosted::shells::ShellTasks> {
         self.inner.shells.clone()
     }
 
+    /// Registers the provider's current tools without refreshing remote directories. Call
+    /// [`crate::host_tools::HostToolProvider::refresh`] to observe discovery failures.
     pub fn install_host_tools(
         &self,
         provider: Arc<dyn crate::host_tools::HostToolProvider>,
@@ -1119,7 +1297,7 @@ impl Agent {
         cancel: CancellationToken,
         emit_permission: bool,
     ) -> Result<approval_assessment::ApprovalAssessment, AgentError> {
-        let (snapshot, bookkeeping, chat_client, boundary_id, legacy_path) = {
+        let (snapshot, bookkeeping, chat_client, boundary_id) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&receipt.chat_id).ok_or(AgentError::NotFound)?;
             let boundary_id =
@@ -1135,8 +1313,6 @@ impl Agent {
                         }
                         _ => None,
                     });
-            let legacy_path = boundary_id
-                .and_then(|_| self.inner.recorder.as_ref()?.path_for_chat(receipt.chat_id));
             let mut snapshot = chat.snapshot.clone();
             snapshot.policy =
                 delegation::effective_policy(&chats, receipt).map_err(AgentError::Invalid)?;
@@ -1145,22 +1321,30 @@ impl Agent {
                 chat.bookkeeping.clone(),
                 chat.client.clone(),
                 boundary_id,
-                legacy_path,
             )
         };
-        let chat_id = receipt.chat_id;
-        let legacy = match (boundary_id, legacy_path) {
-            (Some(boundary_id), Some(path)) => tokio::task::spawn_blocking(move || {
-                crate::transcript::load_original_user_inputs(&path, boundary_id, chat_id)
-                    .ok()
-                    .flatten()
-            })
-            .await
-            .ok()
-            .flatten(),
-            _ => None,
+        // One load serves both the original prompts and the history before the boundary.
+        let has_boundary = snapshot
+            .message_compactions
+            .values()
+            .any(|marker| matches!(marker, CompactionMarker::Boundary(_)));
+        let lines = if has_boundary {
+            self.stored_lines(receipt.chat_id).await
+        } else {
+            None
         };
-        let ancestors = self.approval_history_ancestors(&snapshot).await;
+        let legacy = boundary_id
+            .zip(lines.as_deref())
+            .and_then(|(boundary_id, lines)| {
+                crate::transcript::load_original_user_inputs(lines, boundary_id, receipt.chat_id)
+            });
+        let ancestors = match &lines {
+            Some(lines) => {
+                self.approval_history_ancestors(&snapshot, Some(lines))
+                    .await
+            }
+            None => None,
+        };
         let (auto_settings, auto_revision) = match self.auto_settings_snapshot().await {
             Ok(settings) => settings,
             Err(error) => {
@@ -1185,12 +1369,33 @@ impl Agent {
                 ));
             }
         };
+        let Some(folder) = snapshot.folder.clone() else {
+            let reason =
+                "This Chat has no Folder to review this action in; review it manually.".to_owned();
+            if emit_permission {
+                self.emit_permission_check(
+                    receipt,
+                    self.apply_prompt_policy(Decision::Ask),
+                    reason.clone(),
+                )
+                .await;
+            }
+            return Ok(approval_assessment::ApprovalAssessment::missing_context(
+                operation,
+                snapshot.policy.revision,
+                reason,
+                tickloop_agent_protocol::ApprovalDiagnostic::ReviewerFailure {
+                    failure: ApprovalFailureKind::Configuration,
+                },
+            ));
+        };
         let context = approval_context::capture(
             &snapshot,
             &bookkeeping,
             operation,
             legacy,
-            auto_settings.policy_for_directory(&snapshot.workdir),
+            &folder,
+            auto_settings.policy_for_directory(&folder),
         );
         let mut context = match context {
             Ok(context) => context,
@@ -1517,7 +1722,7 @@ impl Agent {
     /// 用 [`Agent::resume_chat`] 按 id 恢复，用 [`Agent::saved_chats`] 列出已保存的 Chat。
     ///
     /// 照 Claude Code `shouldSkipPersistence`：用户设置的 `cleanupPeriodDays` 为 0 时不保存 Chat，与
-    /// [`Agent::new_with_user_settings`] 相同，仍读写用户设置。设置只在打开时读取一次。
+    /// [`Agent::new_with_user_settings_embedded`] 相同，仍读写用户设置。设置只在打开时读取一次。
     pub fn open(
         root: PathBuf,
         model: ModelConfig,
@@ -1540,46 +1745,17 @@ impl Agent {
         client: Arc<dyn ModelClient>,
         host_options: AgentHostOptions,
     ) -> Result<Self, AgentError> {
-        Self::open_with_settings_options(root, model, client, None, host_options)
-    }
-
-    pub fn open_with_user_settings_and_options(
-        root: PathBuf,
-        model: ModelConfig,
-        client: Arc<dyn ModelClient>,
-        settings: tickloop_agent_config::UserSettings,
-        host_options: AgentHostOptions,
-    ) -> Result<Self, AgentError> {
-        Self::open_with_settings_options(root, model, client, Some(settings), host_options)
-    }
-
-    fn open_with_settings_options(
-        root: PathBuf,
-        model: ModelConfig,
-        client: Arc<dyn ModelClient>,
-        settings: Option<tickloop_agent_config::UserSettings>,
-        host_options: AgentHostOptions,
-    ) -> Result<Self, AgentError> {
-        tickloop_agent_base::private_fs::create_private_directory(&root)
+        let store = transcript::JsonlTranscriptStore::open(root)
             .map_err(|error| AgentError::Storage(error.to_string()))?;
-        let root = root
-            .canonicalize()
-            .map_err(|error| AgentError::Storage(error.to_string()))?;
-        if !root.is_dir() {
-            return Err(AgentError::Storage(
-                "session root is not a directory".into(),
-            ));
-        }
-        let settings =
-            settings.unwrap_or_else(|| tickloop_agent_config::UserSettings::in_root(&root));
-        let recorder =
-            (!settings.skips_transcripts()).then(|| persistence::ChatRecorder::new(root));
+        let settings = tickloop_agent_config::UserSettings::in_root(store.root());
+        let recorder = (!settings.skips_transcripts())
+            .then(|| persistence::ChatRecorder::new(Arc::new(store)));
         Ok(Self::build(
-            model,
+            local_options(model, Some(settings), host_options),
+            Arc::new(harness::OneClient(client.clone())),
             client,
             recorder,
-            Some(settings),
-            host_options,
+            Some(Arc::new(environment::LocalEnvironment::bare())),
         ))
     }
 
@@ -1601,17 +1777,11 @@ impl Agent {
 
     /// 不持久化、也不读写用户设置的 Agent：Chat 只存在于本进程内存中。
     pub fn new(model: ModelConfig, client: Arc<dyn ModelClient>) -> Self {
-        Self::build(model, client, None, None, AgentHostOptions::default())
+        Self::new_local(model, client, None, AgentHostOptions::default())
     }
 
     pub fn new_embedded(model: ModelConfig, client: Arc<dyn ModelClient>) -> Self {
-        Self::build(
-            model,
-            client,
-            None,
-            None,
-            AgentHostOptions::embedded_defaults(),
-        )
+        Self::new_local(model, client, None, AgentHostOptions::embedded_defaults())
     }
 
     pub fn new_with_options(
@@ -1619,54 +1789,60 @@ impl Agent {
         client: Arc<dyn ModelClient>,
         host_options: AgentHostOptions,
     ) -> Self {
-        Self::build(model, client, None, None, host_options)
+        Self::new_local(model, client, None, host_options)
     }
 
-    /// 不保存 Chat、但照常读写用户设置的 Agent（`--no-session-persistence`）。
-    pub fn new_with_user_settings(
-        model: ModelConfig,
-        client: Arc<dyn ModelClient>,
-        settings: tickloop_agent_config::UserSettings,
-    ) -> Self {
-        Self::build(
-            model,
-            client,
-            None,
-            Some(settings),
-            AgentHostOptions::default(),
-        )
-    }
-
+    /// 不保存 Chat、但照常读写用户设置的 Agent。
     pub fn new_with_user_settings_embedded(
         model: ModelConfig,
         client: Arc<dyn ModelClient>,
         settings: tickloop_agent_config::UserSettings,
     ) -> Self {
-        Self::build(
+        Self::new_local(
             model,
             client,
-            None,
             Some(settings),
             AgentHostOptions::embedded_defaults(),
         )
     }
 
-    pub fn new_with_user_settings_and_options(
+    /// An Agent on this computer's files that keeps no Transcript.
+    fn new_local(
         model: ModelConfig,
         client: Arc<dyn ModelClient>,
-        settings: tickloop_agent_config::UserSettings,
-        host_options: AgentHostOptions,
-    ) -> Self {
-        Self::build(model, client, None, Some(settings), host_options)
-    }
-
-    fn build(
-        model: ModelConfig,
-        client: Arc<dyn ModelClient>,
-        recorder: Option<persistence::ChatRecorder>,
         settings: Option<tickloop_agent_config::UserSettings>,
         host_options: AgentHostOptions,
     ) -> Self {
+        Self::build(
+            local_options(model, settings, host_options),
+            Arc::new(harness::OneClient(client.clone())),
+            client,
+            None,
+            Some(Arc::new(environment::LocalEnvironment::bare())),
+        )
+    }
+
+    /// `client` is the one `models` built for `options.model`.
+    fn build(
+        options: HarnessOptions,
+        models: Arc<dyn tickloop_agent_model::ModelClients>,
+        client: Arc<dyn ModelClient>,
+        recorder: Option<persistence::ChatRecorder>,
+        environment: Option<Arc<dyn environment::ExecutionEnvironment>>,
+    ) -> Self {
+        let HarnessOptions {
+            model,
+            settings,
+            search,
+            host: host_options,
+            tools: tool_policy,
+            host_rules,
+            task_tools,
+            min_schedule_interval,
+            waits,
+            system_prompt_addition,
+            request_gates,
+        } = options;
         let model = tickloop_agent_model::cards::model_for_persistent_selection(model);
         let config_root = settings
             .as_ref()
@@ -1674,15 +1850,22 @@ impl Agent {
             .map(Path::to_path_buf);
         let task_tools_enabled = settings
             .as_ref()
-            .is_some_and(|settings| settings.load().task_tools_enabled());
+            .map_or(task_tools.unwrap_or(false), |settings| {
+                settings.load().task_tools_enabled()
+            });
         let agent = Self {
             inner: Arc::new(Inner {
                 selected_model: std::sync::Mutex::new(chat_settings::SelectedModel {
                     config: model,
                     client,
                 }),
+                models,
                 settings,
+                search,
                 host_options,
+                waits,
+                min_schedule_interval,
+                schedule_clock: triggers::ScheduleClock::new(),
                 config_root,
                 settings_writes: Mutex::new(()),
                 task_tools_enabled: AtomicBool::new(task_tools_enabled),
@@ -1692,8 +1875,8 @@ impl Agent {
                 host_contexts: std::sync::Mutex::new(host_context::HostContexts::default()),
                 subagent_invocations: Mutex::new(HashMap::new()),
                 family_mailbox: Mutex::new(family_mailbox::FamilyMailbox::default()),
-                input_wakeup: tokio::sync::watch::channel(()).0,
-                title_requests: Mutex::new(HashSet::new()),
+                ledger_changes: tokio::sync::watch::channel(()).0,
+                title_requests: Mutex::new(HashMap::new()),
                 shell_descriptions: Mutex::new(HashMap::new()),
                 shell_description_events: broadcast::channel(256).0,
                 subagent_registry: Mutex::new(HashMap::new()),
@@ -1702,7 +1885,7 @@ impl Agent {
                 user_shell_events: broadcast::channel(256).0,
                 user_shell_cancellations: std::sync::Mutex::new(HashMap::new()),
                 task_notifications: broadcast::channel(256).0,
-                tasks: Mutex::new(Vec::new()),
+                tasks: agent_tasks::AgentTasks::default(),
                 recorder,
                 loop_leases: loop_lease::LoopLeases::default(),
                 approvals: Mutex::new(HashMap::new()),
@@ -1710,7 +1893,7 @@ impl Agent {
                 closed: AtomicBool::new(false),
                 upgrade_paused: AtomicBool::new(false),
                 upgrade_adopted: AtomicBool::new(false),
-                trigger_deadlines: std::sync::Mutex::new(HashMap::new()),
+                trigger_tried_through: std::sync::Mutex::new(HashMap::new()),
                 upgrade_gate: Arc::new(tokio::sync::RwLock::new(())),
                 upgrade_guard: Mutex::new(None),
                 upgrade_restore: Mutex::new(None),
@@ -1718,12 +1901,19 @@ impl Agent {
                 judgment: Mutex::new(None),
                 auto_health: Mutex::new(auto_health::AutoHealth::default()),
                 host_tools: std::sync::RwLock::new(None),
-                hosted_ticks: std::sync::RwLock::new(None),
                 // Until a daemon grants its spawns and views, an Agent runs and shows no shell
                 // command.
-                shells: crate::hosted::shells::ShellTasks::new(Arc::new(
-                    crate::hosted::shells::NoDaemon,
-                )),
+                shells: crate::hosted::shells::ShellTasks::new(
+                    environment
+                        .as_ref()
+                        .and_then(|environment| environment.shell_grants())
+                        .unwrap_or_else(|| Arc::new(crate::hosted::shells::NoDaemon)),
+                ),
+                environment,
+                tool_policy,
+                host_rules,
+                system_prompt_addition,
+                request_gates,
                 stopped_child_hook: std::sync::RwLock::new(None),
                 tick_stream_installed: AtomicBool::new(false),
                 tick_deliveries: std::sync::Mutex::new(
@@ -1734,10 +1924,20 @@ impl Agent {
                     session_permissions::SessionPermissionContext::default(),
                 ),
                 shutdown: CancellationToken::new(),
+                handover: CancellationToken::new(),
             }),
         };
         agent.inner.shells.follow_monitor(agent.downgrade());
         agent
+    }
+
+    /// Refuses a local-Folder operation before it reads anything local, in an Agent whose Chats
+    /// have no Folder.
+    fn require_environment(&self) -> Result<(), AgentError> {
+        match self.inner.environment {
+            Some(_) => Ok(()),
+            None => Err(AgentError::Invalid(NO_ENVIRONMENT.into())),
+        }
     }
 
     fn require_working_directory_trust(&self, workdir: &Path) -> Result<(), AgentError> {
@@ -1789,6 +1989,7 @@ impl Agent {
     }
 
     pub async fn trust_working_directory(&self, workdir: PathBuf) -> Result<(), AgentError> {
+        self.require_environment()?;
         let workdir = workdir
             .canonicalize()
             .map_err(|_| AgentError::Invalid("working directory does not exist".into()))?;
@@ -1806,34 +2007,64 @@ impl Agent {
             .map_err(|error| AgentError::Storage(error.to_string()))
     }
 
-    pub async fn create_chat(&self, workdir: PathBuf) -> Result<ChatId, AgentError> {
-        self.create_chat_with_id(Uuid::new_v4(), workdir).await
+    pub async fn create_chat(&self, folder: PathBuf) -> Result<ChatId, AgentError> {
+        self.create_chat_with_id(Uuid::new_v4(), Some(folder)).await
+    }
+
+    /// A new Chat without a Folder, in an Agent without an Execution Environment.
+    pub async fn create_chat_without_folder(&self) -> Result<ChatId, AgentError> {
+        self.create_chat_with_id(Uuid::new_v4(), None).await
     }
 
     pub async fn restore_empty_chat(
         &self,
         chat_id: ChatId,
-        workdir: PathBuf,
+        folder: PathBuf,
     ) -> Result<(), AgentError> {
         if self.inner.chats.lock().await.contains_key(&chat_id) {
             return Ok(());
         }
-        self.create_chat_with_id(chat_id, workdir).await?;
+        self.create_chat_with_id(chat_id, Some(folder)).await?;
         Ok(())
     }
 
     async fn create_chat_with_id(
         &self,
         id: ChatId,
-        workdir: PathBuf,
+        folder: Option<PathBuf>,
     ) -> Result<ChatId, AgentError> {
-        self.create_chat_with_delegation(id, workdir, None).await
+        self.create_chat_with_delegation(id, folder, None).await
+    }
+
+    /// The canonical Folder of a new Chat. Chats have a Folder exactly when the Agent has an
+    /// Execution Environment.
+    fn admit_folder(&self, folder: Option<PathBuf>) -> Result<Option<PathBuf>, AgentError> {
+        let folder = match (folder, &self.inner.environment) {
+            (None, None) => return Ok(None),
+            (Some(folder), Some(_)) => folder,
+            (Some(_), None) => {
+                return Err(AgentError::Invalid(NO_ENVIRONMENT.into()));
+            }
+            (None, Some(_)) => {
+                return Err(AgentError::Invalid("a new Chat needs a Folder".into()));
+            }
+        };
+        let folder = folder
+            .canonicalize()
+            .map_err(|_| AgentError::Invalid("working directory does not exist".into()))?;
+        if !folder.is_dir() {
+            return Err(AgentError::Invalid(
+                "working directory must be a directory".into(),
+            ));
+        }
+        self.require_working_directory_trust(&folder)?;
+        Ok(Some(folder))
     }
 
     async fn create_chat_with_delegation(
         &self,
         id: ChatId,
-        workdir: PathBuf,
+        folder: Option<PathBuf>,
         inherited: Option<(
             DelegationMetadata,
             ChatSnapshot,
@@ -1842,19 +2073,11 @@ impl Agent {
         )>,
     ) -> Result<ChatId, AgentError> {
         let _upgrade = self.inner.upgrade_gate.read().await;
-        let workdir = workdir
-            .canonicalize()
-            .map_err(|_| AgentError::Invalid("working directory does not exist".into()))?;
-        if !workdir.is_dir() {
-            return Err(AgentError::Invalid(
-                "working directory must be a directory".into(),
-            ));
-        }
-        self.require_working_directory_trust(&workdir)?;
+        let folder = self.admit_folder(folder)?;
         if let Some(recorder) = &self.inner.recorder {
-            recorder.register_chat(id, &workdir);
+            recorder.register_chat(id, folder.as_deref()).await?;
         }
-        let mut snapshot = empty_snapshot(id, workdir, ModelConfig::unselected());
+        let mut snapshot = empty_snapshot(id, folder, ModelConfig::unselected());
         let mut bookkeeping = ChatBookkeeping::default();
         let _settings_gate = self.inner.settings_writes.lock().await;
         let (client, output_style) =
@@ -1862,14 +2085,20 @@ impl Agent {
                 snapshot.model = parent.model;
                 snapshot.reasoning_effort = parent.reasoning_effort;
                 snapshot.thinking_enabled = parent.thinking_enabled;
+                snapshot.search_config = parent.search_config;
                 snapshot.task_tools_enabled = parent.task_tools_enabled;
                 snapshot.additional_directories = metadata.ceiling.additional_directories.clone();
+                let mut metadata = metadata;
+                self.apply_host_rules(&mut metadata.ceiling.policy);
                 snapshot.policy = metadata.ceiling.policy.clone();
                 snapshot.delegation = Some(metadata);
                 (client, output_style)
             } else {
                 self.apply_chat_defaults(&mut snapshot, &mut bookkeeping)
             };
+        if let SearchDefaults::Fixed(config) = &self.inner.search {
+            snapshot.search_config = config.clone();
+        }
         self.inner
             .subagent_registry
             .lock()
@@ -1877,8 +2106,11 @@ impl Agent {
             .entry(id)
             .or_default();
         let tools = self.create_chat_tools(&snapshot);
-        let skills = self.discover_skills(&snapshot.workdir);
-        let file_history = FileHistory::new(self.file_history_directory(id, &snapshot.workdir));
+        let skills = self.discover_skills(snapshot.folder.as_deref());
+        let file_history = snapshot
+            .folder
+            .as_deref()
+            .map(|folder| FileHistory::new(self.file_history_directory(id, folder)));
         let mut chats = self.inner.chats.lock().await;
         if let Some(metadata) = &mut snapshot.delegation {
             let sessions = self.inner.session_permissions.lock().await;
@@ -1891,7 +2123,7 @@ impl Agent {
                     }
                 }
             }
-            self.record_delegation(id, metadata.clone());
+            self.record_delegation(id, metadata.clone(), snapshot.search_config.clone());
         }
         self.save(&snapshot);
         chats.insert(
@@ -1909,6 +2141,7 @@ impl Agent {
                 active_run: None,
                 upgrade_wait: None,
                 parked: HashMap::new(),
+                releases: HashMap::new(),
                 ready_runs: VecDeque::new(),
                 client,
                 pending_client: None,
@@ -1929,6 +2162,7 @@ impl Agent {
                 output_style,
                 auto_denials: auto_mode::DenialTracking::default(),
                 denial_window: denials::DenialWindow::default(),
+                branch_reservation: None,
             },
         );
         Ok(id)
@@ -1940,8 +2174,8 @@ impl Agent {
         goal: Option<LoopId>,
         input: String,
     ) -> Result<Receipt, AgentError> {
-        self.submit_internal(chat_id, goal, input, SubmissionOptions::default())
-            .await
+        let request = TurnRequest::after_current_leaf(goal, input, Vec::new(), Vec::new(), None);
+        Ok(self.advance(chat_id, request).await?.receipt().clone())
     }
 
     pub async fn invoke_skill(
@@ -1955,6 +2189,8 @@ impl Agent {
             .await
     }
 
+    /// Queues a user Skill invocation after the current leaf as a new input, as the Worker's
+    /// Skill does.
     pub async fn invoke_skill_in_host_context(
         &self,
         chat_id: ChatId,
@@ -1963,23 +2199,54 @@ impl Agent {
         arguments: &str,
         host_context: Option<HostCallContext>,
     ) -> Result<Receipt, AgentError> {
+        let turn = self
+            .advance(
+                chat_id,
+                TurnRequest {
+                    input_id: Uuid::new_v4(),
+                    op: TurnOp::Skill {
+                        after: ParentSelection::CurrentLeaf,
+                        target_loop: goal,
+                        skill: SkillInvocation {
+                            name: name.into(),
+                            arguments: arguments.into(),
+                        },
+                    },
+                    delivery: Delivery::Queue,
+                    host_context,
+                },
+            )
+            .await?;
+        Ok(turn.receipt().clone())
+    }
+
+    /// Expands a user Skill and submits its invocation.
+    async fn submit_skill(
+        &self,
+        chat_id: ChatId,
+        goal: Option<LoopId>,
+        skill: SkillInvocation,
+        host_context: Option<HostCallContext>,
+        ledger: lifecycle::LedgerInput,
+        turn: TurnAdmission,
+    ) -> Result<Receipt, AgentError> {
         self.rediscover_skills(chat_id).await;
         let invoked = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
             chat.skills
                 .expand(
-                    name,
-                    arguments,
+                    &skill.name,
+                    &skill.arguments,
                     tickloop_agent_config::skills::SkillCaller::User,
                 )
                 .and_then(tickloop_agent_protocol::InvokedSkill::try_from)
                 .map_err(|error| AgentError::Invalid(error.to_string()))?
         };
-        let input = if arguments.trim().is_empty() {
+        let input = if skill.arguments.trim().is_empty() {
             format!("/{}", invoked.name)
         } else {
-            format!("/{} {}", invoked.name, arguments.trim())
+            format!("/{} {}", invoked.name, skill.arguments.trim())
         };
         self.submit_internal(
             chat_id,
@@ -1988,6 +2255,8 @@ impl Agent {
             SubmissionOptions {
                 invoked_skill: Some(invoked),
                 host_context,
+                ledger: Some(ledger),
+                turn,
                 ..Default::default()
             },
         )
@@ -2008,14 +2277,15 @@ impl Agent {
             .to_vec())
     }
 
-    /// Checks that the user may invoke `name` in a new Chat at `workdir`, before any Chat exists.
+    /// Checks that the user may invoke `name` in a new Chat with `folder`, before any Chat exists.
     pub fn check_user_skill(
         &self,
-        workdir: &Path,
+        folder: &Path,
         name: &str,
         arguments: &str,
     ) -> Result<(), AgentError> {
-        self.discover_skills(workdir)
+        self.require_environment()?;
+        self.discover_skills(Some(folder))
             .expand(
                 name,
                 arguments,
@@ -2046,8 +2316,8 @@ impl Agent {
         input: String,
         paths: Vec<PathBuf>,
     ) -> Result<Receipt, AgentError> {
-        self.submit_with_input_contexts(chat_id, goal, input, Vec::new(), paths)
-            .await
+        let request = TurnRequest::after_current_leaf(goal, input, Vec::new(), paths, None);
+        Ok(self.advance(chat_id, request).await?.receipt().clone())
     }
 
     /// Submits a prompt with attachments already in hand, such as pasted images or those
@@ -2060,10 +2330,11 @@ impl Agent {
         contexts: Vec<InputContext>,
         paths: Vec<PathBuf>,
     ) -> Result<Receipt, AgentError> {
-        self.submit_with_input_contexts_in_host_context(chat_id, goal, input, contexts, paths, None)
-            .await
+        let request = TurnRequest::after_current_leaf(goal, input, contexts, paths, None);
+        Ok(self.advance(chat_id, request).await?.receipt().clone())
     }
 
+    /// Queues a prompt after the current leaf as a new input, as the Worker's Submit does.
     pub async fn submit_with_input_contexts_in_host_context(
         &self,
         chat_id: ChatId,
@@ -2073,17 +2344,8 @@ impl Agent {
         paths: Vec<PathBuf>,
         host_context: Option<HostCallContext>,
     ) -> Result<Receipt, AgentError> {
-        self.submit_contexts(family::ContextSubmission {
-            chat_id,
-            goal,
-            input,
-            contexts,
-            paths,
-            host_context,
-            directed_source: None,
-            target_generation: None,
-        })
-        .await
+        let request = TurnRequest::after_current_leaf(goal, input, contexts, paths, host_context);
+        Ok(self.advance(chat_id, request).await?.receipt().clone())
     }
 
     async fn submit_contexts(
@@ -2099,6 +2361,8 @@ impl Agent {
             host_context,
             directed_source,
             target_generation,
+            ledger,
+            turn,
         } = submission;
         if contexts.len().saturating_add(paths.len()) > input_context::MAX_REFERENCES {
             return Err(AgentError::Invalid(format!(
@@ -2113,12 +2377,45 @@ impl Agent {
         }
         let admission = {
             let chats = self.inner.chats.lock().await;
-            let snapshot = &chats.get(&chat_id).ok_or(AgentError::NotFound)?.snapshot;
-            if goal.is_some_and(|id| !snapshot.loops.iter().any(|existing| existing.id == id)) {
+            let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
+            if let Some(ledger) = &ledger
+                && let Some(replay) = lifecycle::replay(chat, ledger)
+            {
+                return replay;
+            }
+            let snapshot = &chat.snapshot;
+            // A staged branch holds its own Loops; the input is checked against them on acceptance.
+            if turn.branch.is_none()
+                && goal.is_some_and(|id| !snapshot.loops.iter().any(|existing| existing.id == id))
+            {
                 return Err(AgentError::NotFound);
             }
+            if snapshot.folder.is_none() {
+                if !paths.is_empty() || contexts.iter().any(|context| context.path().is_some()) {
+                    return Err(AgentError::Invalid(format!(
+                        "{FOLDERLESS_CHAT}, so a prompt cannot attach local files"
+                    )));
+                }
+                drop(chats);
+                return self
+                    .submit_internal(
+                        chat_id,
+                        goal,
+                        input,
+                        SubmissionOptions {
+                            contexts,
+                            directed_human: directed_source,
+                            family_generation: target_generation,
+                            host_context,
+                            ledger,
+                            turn,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+            }
             let workspace = tickloop_agent_tools::Workspace {
-                workdir: snapshot.workdir.clone(),
+                folder: snapshot.folder.clone(),
                 additional_directories: snapshot.additional_directories.clone(),
             };
             let reads = paths
@@ -2140,7 +2437,7 @@ impl Agent {
             admission
         };
         let workspace = admission.workspace.clone();
-        let paths = admission
+        let paths: Vec<PathBuf> = admission
             .reads
             .iter()
             .take(paths.len())
@@ -2152,13 +2449,20 @@ impl Agent {
                 )
             })
             .collect();
-        let loaded = tokio::task::spawn_blocking(move || input_context::load(&workspace, paths))
-            .await
-            .map_err(|_| AgentError::Invalid("referenced paths could not be loaded".into()))?
-            .map_err(AgentError::Invalid)?;
-        for context in loaded.contexts {
-            contexts.retain(|existing| existing.path() != context.path());
-            contexts.push(context);
+        let mut attached_file_reads = Vec::new();
+        if !paths.is_empty() {
+            let loaded =
+                tokio::task::spawn_blocking(move || input_context::load(&workspace, paths))
+                    .await
+                    .map_err(|_| {
+                        AgentError::Invalid("referenced paths could not be loaded".into())
+                    })?
+                    .map_err(AgentError::Invalid)?;
+            for context in loaded.contexts {
+                contexts.retain(|existing| existing.path() != context.path());
+                contexts.push(context);
+            }
+            attached_file_reads = loaded.file_reads;
         }
         self.submit_internal(
             chat_id,
@@ -2166,11 +2470,13 @@ impl Agent {
             input,
             SubmissionOptions {
                 contexts,
-                attached_file_reads: loaded.file_reads,
+                attached_file_reads,
                 directed_human: directed_source,
                 family_generation: target_generation,
                 attachment_admission: Some(admission),
                 host_context,
+                ledger,
+                turn,
                 ..Default::default()
             },
         )
@@ -2194,14 +2500,43 @@ impl Agent {
             trigger_source,
             trigger_cancel,
             feedback_input,
+            requires_feedback_binding,
             invoked_skill,
             host_context,
             agent_message,
             directed_human,
             goal_title,
+            ledger,
+            scheduled_for,
+            mut turn,
         } = options;
         let is_feedback = feedback_input.is_some();
         let resumes_feedback = trigger_source.is_none() && agent_message.is_none();
+        // Every queued input has its ledger record; one the Agent queues for itself is named by
+        // its source where the source names it.
+        let ledger = ledger.unwrap_or_else(|| {
+            if let Some(identity) = &feedback_input {
+                return turn::delivery_ledger(
+                    identity.loop_id,
+                    event_sources::ExternalDelivery::received(identity, input.clone()),
+                );
+            }
+            let (id, op) = match (&agent_message, &directed_human) {
+                (Some(source), _) => (source.message_id, InputOp::AgentMessage),
+                (_, Some(source)) => (source.message_id, InputOp::AgentMessage),
+                // A timer's fire is named by its scheduled time, so every host fires it once.
+                _ if let (Some(scheduled), Some(loop_id)) = (scheduled_for, goal) => (
+                    tickloop_agent_transcript::input_ids::trigger(loop_id, scheduled),
+                    InputOp::Trigger,
+                ),
+                _ if trigger_source.is_some() => (Uuid::new_v4(), InputOp::Trigger),
+                _ => (Uuid::new_v4(), InputOp::Continue),
+            };
+            lifecycle::LedgerInput::new(id, op, &input)
+        });
+        // Held through every task this submission starts: `shutdown` either refuses it or waits
+        // for those tasks.
+        let _admission = self.inner.tasks.token();
         if self.inner.closed.load(Ordering::SeqCst)
             || self.inner.upgrade_paused.load(Ordering::SeqCst)
         {
@@ -2220,42 +2555,88 @@ impl Agent {
                 "agent is unavailable during shutdown or planned upgrade".into(),
             ));
         }
+        // Checked again under this lock: a concurrent first submission of the same input may
+        // have been accepted while this one was being prepared.
+        if let Some(replay) =
+            lifecycle::replay(chats.get(&chat_id).ok_or(AgentError::NotFound)?, &ledger)
+        {
+            return replay;
+        }
         if let Some(admission) = &attachment_admission {
             let sessions = self.inner.session_permissions.lock().await;
             Self::validate_attachment_admission(&chats, &sessions, chat_id, goal, admission)?;
         }
         let original = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        if let Some(identity) = &feedback_input
+            && !original.snapshot.loops.iter().any(|existing| {
+                existing.id == identity.loop_id
+                    && !matches!(existing.state, LoopState::Stopped | LoopState::Expired)
+            })
+        {
+            // A Loop the conversation lost, as a rewind cuts one, has ended; one the Chat never
+            // had is a misrouted delivery.
+            if !original
+                .snapshot
+                .loops
+                .iter()
+                .any(|existing| existing.id == identity.loop_id)
+                && !original.bookkeeping.lifecycle.knows_loop(identity.loop_id)
+            {
+                return Err(AgentError::Invalid("the Chat has no such Loop".into()));
+            }
+            let receipt = Receipt {
+                chat_id,
+                loop_id: identity.loop_id,
+                run_id: identity.delivery_id,
+            };
+            original.bookkeeping.lifecycle.record_settled(
+                &ledger,
+                &receipt,
+                SettledOutcome::Discarded {
+                    reason: DiscardReason::LoopEnded,
+                },
+            );
+            self.save(&original.snapshot);
+            self.inner.ledger_changes.send_replace(());
+            return Ok(receipt);
+        }
+        if requires_feedback_binding
+            && let Some(identity) = &feedback_input
+            && !original.snapshot.loops.iter().any(|goal| {
+                goal.id == identity.loop_id
+                    && goal.event_sources.iter().any(|source| {
+                        !source.resume_required
+                            && source.origin == identity.origin
+                            && source.account_id == identity.account_id
+                            && tickloop_agent_artifacts::artifact_ids_match(
+                                &source.artifact_id,
+                                &identity.artifact_id,
+                            )
+                    })
+            })
+        {
+            return Err(AgentError::Invalid(
+                "the Loop has no active binding for this Artifact delivery".into(),
+            ));
+        }
         if original.family_stopping {
             return Err(AgentError::Invalid("Subagent subtree is stopping".into()));
         }
-        if let Some(identity) = &feedback_input {
-            if let Some(pending) = original
-                .snapshot
-                .pending_inputs
-                .iter()
-                .find(|pending| pending.receipt.run_id == identity.delivery_id)
-            {
-                return Ok(pending.receipt.clone());
+        let staged = match (turn.branch.take(), original.branch_reservation) {
+            (Some(switch), Some(reserved)) if switch.reservation() == reserved => {
+                Some(switch.into_chat(original))
             }
-            if original
-                .snapshot
-                .message_runs
-                .values()
-                .any(|run| *run == identity.delivery_id)
-                || original
-                    .snapshot
-                    .messages
-                    .iter()
-                    .flat_map(|message| &message.content)
-                    .any(|content| matches!(content, Content::Text { text } if text == &input))
-            {
-                return Ok(Receipt {
-                    chat_id,
-                    loop_id: identity.loop_id,
-                    run_id: identity.delivery_id,
-                });
+            (None, None) => None,
+            _ => return Err(chat_is_busy()),
+        };
+        let base = staged.as_ref().map_or(&*original, |staged| &staged.chat);
+        let cut = match turn.placement {
+            Some(placement) => {
+                rewind::ensure_idle(base).map_err(|_| chat_is_busy())?;
+                turn::placement_cut(base, placement)?
             }
-        }
+            None => None,
+        };
         if family_generation.is_some_and(|expected| {
             expected != original.family_generation
                 || original
@@ -2277,9 +2658,11 @@ impl Agent {
                 "directed target changed while preparing the input".into(),
             ));
         }
+        let base = staged.as_ref().map_or(&*original, |staged| &staged.chat);
         let inherit_branch_session =
-            goal.is_none() && trigger_source.is_none() && original.snapshot.branch_origin.is_some();
-        let mut candidate = original.clone();
+            goal.is_none() && trigger_source.is_none() && base.snapshot.branch_origin.is_some();
+        let mut candidate = base.clone();
+        let loops_at_start = Self::prepare_cut(base, &mut candidate, cut)?;
         let chat = &mut candidate;
         let is_skill_invocation = invoked_skill.is_some();
 
@@ -2366,7 +2749,7 @@ impl Agent {
                         "goal deadline has passed; create a new goal".into(),
                     ));
                 }
-                trigger.armed = true;
+                trigger.arm_at(self.inner.schedule_clock.now_ms());
                 let trigger = trigger.clone();
                 chat.snapshot.resume_triggers.retain(|id| *id != loop_id);
                 let cancel = CancellationToken::new();
@@ -2392,29 +2775,48 @@ impl Agent {
                     "trigger configuration was replaced".into(),
                 ));
             }
-            if !triggers::can_trigger(goal) {
-                return Err(AgentError::Invalid(
-                    "goal is not eligible for a trigger".into(),
-                ));
-            }
+            let is_eligible = triggers::can_trigger(goal);
             let pending_receipt = chat
                 .snapshot
                 .pending_inputs
                 .iter()
                 .find(|pending| {
-                    pending.receipt.loop_id == loop_id
+                    is_eligible
+                        && pending.receipt.loop_id == loop_id
                         && pending
                             .trigger_source
                             .as_ref()
                             .is_some_and(|source| source.source != TICK_MANUAL_SOURCE)
                 })
                 .map(|pending| pending.receipt.clone());
+            // A fire deals with its scheduled time. So does a durable host when the Loop cannot
+            // take it or a fire is already queued: the next host does not fire it again. Locally
+            // the timer alone keeps track of those.
+            let fires = is_eligible && pending_receipt.is_none();
+            if let Some(scheduled) = scheduled_for
+                && (fires || self.inner.waits == WaitHosting::Durable)
+                && let Some(trigger) = &mut goal.trigger
+            {
+                trigger.note_scheduled(scheduled);
+            }
+            if !is_eligible {
+                if scheduled_for.is_some() && self.inner.waits == WaitHosting::Durable {
+                    *original = candidate;
+                    self.save(&original.snapshot);
+                }
+                return Err(AgentError::Invalid(
+                    "goal is not eligible for a trigger".into(),
+                ));
+            }
             if let Some(pending_receipt) = pending_receipt {
                 *original = candidate;
+                if scheduled_for.is_some() && self.inner.waits == WaitHosting::Durable {
+                    self.save(&original.snapshot);
+                }
                 drop(chats);
                 let next = self.next_run(chat_id).await?;
                 if let Some(next) = next {
-                    self.inner.tasks.lock().await.push(self.run_task(next));
+                    self.run_task(next);
                 }
                 return Ok(pending_receipt);
             }
@@ -2441,28 +2843,31 @@ impl Agent {
         chat.snapshot.last_queue_sequence += 1;
         let queued_sequence = chat.snapshot.last_queue_sequence;
         let directed_origin = directed_human.clone();
-        chat.snapshot.pending_inputs.insert(
-            index,
-            PendingInput {
-                receipt: receipt.clone(),
-                input,
-                contexts,
-                agent_message,
-                directed_human,
-                denial_reference,
-                trigger_source,
-                armed: true,
-                queued_sequence,
-                task_continuation: false,
-                is_skill_invocation,
-                attached_file_reads,
-            },
-        );
+        let queued = PendingInput {
+            receipt: receipt.clone(),
+            input,
+            contexts,
+            agent_message,
+            directed_human,
+            denial_reference,
+            trigger_source,
+            armed: true,
+            queued_sequence,
+            task_continuation: false,
+            is_skill_invocation,
+            attached_file_reads,
+        };
+        chat.bookkeeping.lifecycle.accept(&ledger, &queued);
+        chat.snapshot.pending_inputs.insert(index, queued);
         if let Some(feedback_input) = feedback_input {
             chat.feedback_inputs.insert(receipt.run_id, feedback_input);
         }
-        let watch = (!chat.watching_commands).then(|| chat.tools.clone());
-        chat.watching_commands = true;
+        // A Chat without a Folder runs no command, so nothing watches its commands.
+        let watch =
+            (chat.snapshot.folder.is_some() && !chat.watching_commands).then(|| chat.tools.clone());
+        if watch.is_some() {
+            chat.watching_commands = true;
+        }
         let mut session_context = None;
         let mut session_candidate = None;
         if inherit_branch_session {
@@ -2474,7 +2879,23 @@ impl Agent {
             session_context = Some(context);
             session_candidate = Some(candidate);
         }
+        let selected_leaf = staged.map(|staged| self.install_branch(original, staged));
+        if let Some((index, _)) = cut {
+            self.commit_cut(original, &mut candidate, index);
+        }
         *original = candidate;
+        if cut.is_none()
+            && let Some(leaf) = selected_leaf
+        {
+            self.emit_conversation_rewound(original, Uuid::nil(), leaf);
+        }
+        let removed_loops = match cut {
+            Some(_) => rewind::stop_listening_to_removed_loops(original, loops_at_start),
+            None => Vec::new(),
+        };
+        if turn.send_now && (original.active.is_some() || !original.parked.is_empty()) {
+            original.interrupt();
+        }
         if let Some(source) = directed_origin {
             let source_chat = chats
                 .get_mut(&source.source_chat_id)
@@ -2486,6 +2907,10 @@ impl Agent {
             *context = candidate;
         }
         drop(chats);
+        if !removed_loops.is_empty() {
+            // Boxed: rarely needed, and every submission path awaits this future inline.
+            Box::pin(self.retire_cut_loops(chat_id, removed_loops)).await;
+        }
         if let Some(parent) = task_delegation {
             self.bind_task_delegate(&parent, &receipt)
                 .await
@@ -2498,30 +2923,24 @@ impl Agent {
             }
         };
         if let Some((trigger, cancel)) = resume_watcher {
-            // 先写出重新武装再启动 Trigger 任务：任务第一次读取停止状态时已知道这次武装。
-            let recorded = self
-                .record_loop_run_state(chat_id, loop_id, loop_lease::RunStateChange::Armed)
+            self.start_armed_trigger(chat_id, loop_id, trigger, cancel)
                 .await;
-            self.warn_loop_run_state_failure(chat_id, loop_id, recorded);
-            self.inner
-                .tasks
-                .lock()
-                .await
-                .push(self.trigger_task(chat_id, loop_id, trigger, cancel));
             self.sync_tick_subscriptions().await;
         }
         if let Some(tools) = watch {
             self.watch_commands(chat_id, tools).await;
         }
+        #[cfg(test)]
+        turn::admission_pause::wait_if_paused(chat_id).await;
         if let Some(next) = next {
-            self.inner.tasks.lock().await.push(self.run_task(next));
+            self.run_task(next);
         }
         // Child completions held for this failed or interrupted Loop arrive once it is continued.
         if continues_ended_loop {
             self.flush_subagent_notifications(chat_id).await;
         }
 
-        self.inner.input_wakeup.send_replace(());
+        self.inner.ledger_changes.send_replace(());
         if resumes_feedback {
             Box::pin(self.resume_feedback_sources(chat_id)).await;
         }
@@ -2537,6 +2956,7 @@ impl Agent {
     }
 
     fn publish_event(&self, chat: &mut Chat, receipt: &Receipt, kind: EventKind) {
+        lifecycle::claim_response_messages(chat);
         chat.snapshot.last_sequence += 1;
         let event = Event {
             sequence: chat.snapshot.last_sequence,
@@ -2601,14 +3021,26 @@ impl Agent {
         // After compaction, which may drop earlier notes; boxed to keep the run future small.
         Box::pin(self.announce_host_tool_changes(receipt, host_tools)).await?;
         Box::pin(self.announce_plan_mode_exit(receipt)).await?;
-        let workspace_host = crate::host_tools::current_workspace_host(
-            self.inner.host_tools.read().unwrap().as_deref(),
-        );
+        // Only a Chat with a Folder probes the host it runs in.
+        let workspace_host = self
+            .inner
+            .chats
+            .lock()
+            .await
+            .get(&receipt.chat_id)
+            .is_some_and(|chat| chat.snapshot.folder.is_some())
+            .then(|| {
+                crate::host_tools::current_workspace_host(
+                    self.inner.host_tools.read().unwrap().as_deref(),
+                )
+            });
         let family_roster = self.family_agents(receipt.chat_id).await?;
         {
             let mut chats = self.inner.chats.lock().await;
             let chat = chats.get_mut(&receipt.chat_id).unwrap();
-            if workspace_host.runs_ticks()
+            if workspace_host
+                .as_ref()
+                .is_some_and(crate::host_tools::WorkspaceHostContext::runs_ticks)
                 && !chat
                     .snapshot
                     .invoked_skills
@@ -2630,33 +3062,52 @@ impl Agent {
             registry.refresh(chat);
             request.tools = registry.definitions();
             (request.messages, request.history_sources) = context::model_history(chat)?;
-            let replacements = tool_results::enforce_tool_result_budget(
-                &mut request.messages,
-                &mut chat.content_replacements,
-                chat.tools.chat_directory(),
-            );
-            if !replacements.is_empty() {
-                self.record_content_replacements(&chat.snapshot, replacements);
+            match chat.tools.chat_directory() {
+                Some(chat_directory) => {
+                    let replacements = tool_results::enforce_tool_result_budget(
+                        &mut request.messages,
+                        &mut chat.content_replacements,
+                        chat_directory,
+                    );
+                    if !replacements.is_empty() {
+                        self.record_content_replacements(&chat.snapshot, replacements);
+                    }
+                }
+                None => tool_results::cut_tool_results_over_budget(&mut request.messages),
             }
-            let state = serde_json::json!({
-                "workdir": chat.snapshot.workdir,
-                "family_temp_directory": chat.tools.family_temp_directory(),
-                "scratchpad": chat.tools.family_temp_directory().join(tickloop_agent_tools::SCRATCHPAD_SUBDIRECTORY),
-                "delegation": chat.snapshot.delegation,
-                "family_members": family_roster.iter().map(|member| serde_json::json!({
-                    "chat_id": member.chat_id, "parent_chat_id": member.parent_chat_id,
-                    "name": member.handle, "depth": member.depth, "state": member.availability,
-                })).collect::<Vec<_>>(),
-                "workspace_host": workspace_host,
-                "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
-                "artifact_ticks": chat.snapshot.artifact_ticks,
-                "goal": chat.snapshot.loops.iter().find(|goal| goal.id == receipt.loop_id),
-                "chat_goals": chat.snapshot.loops,
-                "execution_mode": chat.snapshot.policy.mode,
-                "web_search": { "enabled": chat.snapshot.search_config.is_some(), "settings_command": "/websearch" },
-                "plan": chat.snapshot.plans.iter().find(|plan| plan.loop_id == receipt.loop_id),
-                "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
-            });
+            let scope = system_prompt::PromptScope {
+                has_folder: chat.snapshot.folder.is_some(),
+                tools: self.inner.tool_policy,
+                waits: self.inner.waits,
+                min_schedule_interval: self.inner.min_schedule_interval,
+                host_section: self.inner.system_prompt_addition.as_deref(),
+            };
+            let family_temp = chat.tools.family_temp_directory();
+            let state = match &chat.snapshot.folder {
+                Some(folder) => serde_json::json!({
+                    "workdir": folder,
+                    "family_temp_directory": family_temp,
+                    "scratchpad": family_temp.map(|family_temp| family_temp.join(tickloop_agent_tools::SCRATCHPAD_SUBDIRECTORY)),
+                    "delegation": chat.snapshot.delegation,
+                    "family_members": family_roster.iter().map(|member| serde_json::json!({
+                        "chat_id": member.chat_id, "parent_chat_id": member.parent_chat_id,
+                        "name": member.handle, "depth": member.depth, "state": member.availability,
+                    })).collect::<Vec<_>>(),
+                    "workspace_host": workspace_host,
+                    "service_connections": self.inner.host_tools.read().unwrap().as_ref().map(|provider| provider.service_connections()).unwrap_or_else(|| serde_json::json!({})),
+                    "artifact_ticks": chat.snapshot.artifact_ticks,
+                    "goal": chat.snapshot.loops.iter().find(|goal| goal.id == receipt.loop_id),
+                    "chat_goals": chat.snapshot.loops,
+                    "execution_mode": chat.snapshot.policy.mode,
+                    "web_search": { "enabled": chat.snapshot.search_config.is_some(), "settings_command": "/websearch" },
+                    "plan": chat.snapshot.plans.iter().find(|plan| plan.loop_id == receipt.loop_id),
+                    "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
+                }),
+                // Without a Folder the host state names no local path, Loop or host probe.
+                None => serde_json::json!({
+                    "uncertain_operations": chat.snapshot.current_operation_uncertainties(),
+                }),
+            };
             let plan_mode = self.plan_mode_section(chat, receipt.loop_id);
             request.history_sources.insert(0, None);
             request.messages.insert(
@@ -2668,6 +3119,7 @@ impl Agent {
                             &state,
                             chat.output_style,
                             plan_mode.as_deref(),
+                            scope,
                         ),
                     }],
                 },
@@ -2872,7 +3324,26 @@ impl Agent {
                         skill.run_id = Some(active.run_id);
                     }
                 }
+                let index = candidate.snapshot.messages.len();
                 self.append_input_message(&mut candidate, pending);
+                if let Some(response) = candidate
+                    .bookkeeping
+                    .lifecycle
+                    .active_response(active.run_id)
+                    && index < candidate.snapshot.messages.len()
+                {
+                    candidate
+                        .bookkeeping
+                        .message_responses
+                        .insert(index, response);
+                }
+                self.settle_input(
+                    &mut candidate,
+                    receipt.run_id,
+                    SettledOutcome::Merged {
+                        into: active.run_id,
+                    },
+                );
                 candidate.snapshot.last_sequence += 1;
                 let event = Event {
                     sequence: candidate.snapshot.last_sequence,
@@ -3010,152 +3481,124 @@ impl Agent {
     async fn execute_run(
         &self,
         receipt: Receipt,
-        mut request: ModelRequest,
+        start: RunStart,
         cancel: CancellationToken,
         is_awaiting_model: &mut bool,
     ) -> Result<Usage, String> {
         self.complete_file_history_snapshots(receipt.chat_id).await;
-        let mut used_calls = HashSet::new();
-        async {
-            loop {
-                self.checkpoint_feedback_inputs(receipt.chat_id).await?;
-                self.feedback_account_context(&receipt).await?;
-                *is_awaiting_model = true;
-                let host_provider = self.inner.host_tools.read().unwrap().clone();
-                if let Some(provider) = host_provider {
-                    let _ = provider.refresh(cancel.clone()).await;
-                }
-                self.refresh_task_tools_setting()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                self.ensure_handback_requirement(&receipt).await?;
-                self.pin_delegated_artifact_account(receipt.chat_id).await?;
-                self.rediscover_skills(receipt.chat_id).await;
-                self.synchronize_remote_skills(&receipt).await;
-                let mut registry = {
-                    let chats = self.inner.chats.lock().await;
-                    let chat = chats.get(&receipt.chat_id).unwrap();
-                    ToolRegistry::for_chat(
-                        chat,
-                        self.inner.host_tools.read().unwrap().clone(),
-                        self.inner.tick_stream_installed.load(Ordering::SeqCst),
-                        self.inner.host_options.prompt_policy,
-                        shared_tasks::tool_access(&chats, &receipt),
-                    )
-                };
-                request.tools = registry.definitions();
-                let output = self
-                    .model_request(
-                        &receipt,
-                        request,
-                        &mut registry,
-                        cancel.clone(),
-                        &mut used_calls,
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
+        let mut used_calls = self.calls_on_chain(&receipt).await;
+        let mut request = match start {
+            RunStart::Request(request) => request,
+            RunStart::Resume { at, result } => {
                 *is_awaiting_model = false;
-                let assistant_message_id = Uuid::new_v4();
-                let calls = output
-                    .content
-                    .iter()
-                    .filter_map(|content| {
-                        if let Content::ToolUse { id, name, input } = content {
-                            Some(ProposedToolCall {
-                                call_id: id.clone(),
-                                name: name.clone(),
-                                input: input.clone(),
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                {
-                    let mut chats = self.inner.chats.lock().await;
-                    let chat = chats.get_mut(&receipt.chat_id).unwrap();
-                    chat.snapshot.pending_thinking.remove(&receipt.run_id);
-                    chat.snapshot
-                        .message_runs
-                        .insert(chat.snapshot.messages.len(), receipt.run_id);
-                    chat.snapshot
-                        .message_ids
-                        .insert(chat.snapshot.messages.len(), assistant_message_id);
-                    chat.snapshot
-                        .message_usage
-                        .insert(chat.snapshot.messages.len(), output.usage);
-                    let index = chat.snapshot.messages.len();
-                    chat.snapshot
-                        .message_models
-                        .insert(index, chat.snapshot.model.identity());
-                    if let Some(source) = output
-                        .private_source
-                        .or_else(|| chat.snapshot.model.private_history_source())
-                    {
-                        chat.snapshot.message_sources.insert(index, source);
-                    }
-                    chat.snapshot.messages.push(Message {
-                        role: Role::Assistant,
-                        content: output.content,
-                    });
-                    chat.snapshot.last_model_run = Some(receipt.run_id);
-                    self.emit(
-                        chat,
-                        &receipt,
-                        EventKind::AssistantMessageCommitted {
-                            message_id: assistant_message_id,
-                            tool_calls: calls.clone(),
-                        },
-                    );
+                match self.reenter_batch(&receipt, at, result, &cancel).await? {
+                    BatchExit::Continue(request) => request,
+                    BatchExit::Ended(usage) => return Ok(usage),
                 }
-                if calls.is_empty() {
-                    if let Some(continuation) =
-                        self.after_complete_response(&receipt, &cancel).await?
-                    {
-                        request = continuation;
-                        continue;
-                    }
-                    let chats = self.inner.chats.lock().await;
-                    return chats[&receipt.chat_id]
-                        .snapshot
-                        .request_usage
-                        .run_conversation_usage(receipt.run_id)
-                        .map_err(|error| error.to_string());
-                }
-                self.execute_tool_batch(
+            }
+        };
+        loop {
+            Box::pin(self.stop_at_safe_point(&receipt, None)).await?;
+            self.checkpoint_feedback_inputs(receipt.chat_id).await?;
+            self.feedback_account_context(&receipt).await?;
+            *is_awaiting_model = true;
+            let mut registry = self.prepare_tool_registry(&receipt, &cancel).await?;
+            request.tools = registry.definitions();
+            let output = match self
+                .model_request(
                     &receipt,
-                    assistant_message_id,
-                    calls,
-                    &registry,
+                    request,
+                    &mut registry,
                     cancel.clone(),
+                    &mut used_calls,
                 )
-                .await?;
+                .await
+            {
+                Ok(output) => output,
+                // A handover stopped the request before it reached the vendor, or in a retry
+                // backoff: the Run stops before its model request.
+                Err(AgentError::Model(ModelError::Cancelled))
+                    if self.stopped_for_handover(&cancel) =>
                 {
-                    let mut chats = self.inner.chats.lock().await;
-                    let chat = chats.get_mut(&receipt.chat_id).unwrap();
-                    self.flush_deferred_messages(chat, MessageBoundary::ToolResults)
-                        .map_err(|error| error.to_string())?;
-                    if matches!(
-                        chat.snapshot.subagent_reports.get(&receipt.run_id),
-                        Some(tickloop_agent_protocol::SubagentReport::Delivered { .. })
-                    ) {
-                        return chat
-                            .snapshot
-                            .request_usage
-                            .run_conversation_usage(receipt.run_id)
-                            .map_err(|error| error.to_string());
-                    }
+                    return Err(Box::pin(self.leave_before_model_request(&receipt)).await);
                 }
-                self.merge_queued_messages(&receipt)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                self.complete_file_history_snapshots(receipt.chat_id).await;
+                Err(error) => return Err(error.to_string()),
+            };
+            *is_awaiting_model = false;
+            let assistant_message_id = Uuid::new_v4();
+            let calls = tool_batch::batch_calls(&output.content);
+            {
+                let mut chats = self.inner.chats.lock().await;
+                let chat = chats.get_mut(&receipt.chat_id).unwrap();
+                // A Run ended at a handover's ceiling leaves without its reply.
+                if Agent::release_of(chat, receipt.run_id).is_cancelled() {
+                    return Err(suspension::RUN_RELEASED.into());
+                }
+                chat.snapshot.pending_thinking.remove(&receipt.run_id);
+                chat.snapshot
+                    .message_runs
+                    .insert(chat.snapshot.messages.len(), receipt.run_id);
+                chat.snapshot
+                    .message_ids
+                    .insert(chat.snapshot.messages.len(), assistant_message_id);
+                chat.snapshot
+                    .message_usage
+                    .insert(chat.snapshot.messages.len(), output.usage);
+                let index = chat.snapshot.messages.len();
+                chat.snapshot
+                    .message_models
+                    .insert(index, chat.snapshot.model.identity());
+                if let Some(source) = output
+                    .private_source
+                    .or_else(|| chat.snapshot.model.private_history_source())
+                {
+                    chat.snapshot.message_sources.insert(index, source);
+                }
+                chat.snapshot.messages.push(Message {
+                    role: Role::Assistant,
+                    content: output.content,
+                });
+                chat.snapshot.last_model_run = Some(receipt.run_id);
+                self.emit(
+                    chat,
+                    &receipt,
+                    EventKind::AssistantMessageCommitted {
+                        message_id: assistant_message_id,
+                        tool_calls: calls.clone(),
+                    },
+                );
+            }
+            if calls.is_empty() {
+                if let Some(continuation) = self.after_complete_response(&receipt, &cancel).await? {
+                    request = continuation;
+                    continue;
+                }
                 let chats = self.inner.chats.lock().await;
-                let chat = chats.get(&receipt.chat_id).unwrap();
-                request = self.continuation_request(chat)?;
+                return chats[&receipt.chat_id]
+                    .snapshot
+                    .request_usage
+                    .run_conversation_usage(receipt.run_id)
+                    .map_err(|error| error.to_string());
+            }
+            match self
+                .run_batch_from(
+                    &receipt,
+                    &registry,
+                    ToolBatch {
+                        message_id: assistant_message_id,
+                        calls,
+                        is_reentered: false,
+                    },
+                    0,
+                    None,
+                    &cancel,
+                )
+                .await?
+            {
+                BatchExit::Continue(next) => request = next,
+                BatchExit::Ended(usage) => return Ok(usage),
             }
         }
-        .await
     }
 
     async fn finish_run(
@@ -3233,6 +3676,35 @@ impl Agent {
                     EventKind::Failed(error)
                 }
             };
+        let is_closed = self.inner.closed.load(Ordering::SeqCst);
+        let (ending, usage) = match &event {
+            EventKind::Completed { usage } => (ResponseEnding::Completed, usage.clone()),
+            EventKind::Failed(error) if !is_closed => (
+                ResponseEnding::Failed {
+                    error: error.clone(),
+                },
+                Usage::default(),
+            ),
+            // A Run that fails or stops while the host shuts down lost its host.
+            _ => (
+                ResponseEnding::Interrupted {
+                    by: if is_closed {
+                        InterruptedBy::Host
+                    } else {
+                        InterruptedBy::User
+                    },
+                },
+                Usage::default(),
+            ),
+        };
+        // A durable host goes on with an answer whose host it lost: its input has not settled,
+        // so its child run has no completion yet.
+        let is_settled = !(self.inner.waits == WaitHosting::Durable
+            && ending
+                == ResponseEnding::Interrupted {
+                    by: InterruptedBy::Host,
+                });
+        self.end_response(chat, receipt.run_id, ending, usage);
         let is_deliverable = chat
             .snapshot
             .loops
@@ -3258,11 +3730,13 @@ impl Agent {
         }
         let finished_snapshot = chat.snapshot.clone();
         drop(chats);
-        self.settle_task_claims(&receipt).await;
+        if is_settled {
+            self.settle_task_claims(&receipt).await;
+        }
         self.flush_subagent_notifications(receipt.chat_id).await;
         self.record_directed_replies(&receipt, &finished_snapshot)
             .await;
-        if finished_snapshot.delegation.is_some() {
+        if finished_snapshot.delegation.is_some() && is_settled {
             self.record_family_completion(&receipt, &finished_snapshot)
                 .await;
         }
@@ -3341,6 +3815,7 @@ impl Agent {
             .ok_or_else(|| "waiting run expired".to_string())?
             .resume
             .clone();
+        let release = Self::release_of(chat, receipt.run_id);
         if !chat.ready_runs.contains(&receipt.run_id) {
             chat.ready_runs.push_back(receipt.run_id);
         }
@@ -3350,9 +3825,14 @@ impl Agent {
             .await
             .map_err(|error| error.to_string())?;
         if let Some(next) = next {
-            self.inner.tasks.lock().await.push(self.run_task(next));
+            self.run_task(next);
         }
-        tokio::select! {biased;_ = cancel.cancelled()=>Err("waiting run was cancelled".into()),_ = resume.notified()=>Ok(())}
+        tokio::select! {
+            biased;
+            _ = release.cancelled() => Err(suspension::RUN_RELEASED.into()),
+            _ = cancel.cancelled() => Err("waiting run was cancelled".into()),
+            _ = resume.notified() => Ok(()),
+        }
     }
 
     fn admit_operation(&self, chat: &mut Chat, operation_id: Uuid) -> Result<(), AgentError> {
@@ -3425,10 +3905,15 @@ impl Agent {
             );
             return;
         }
-        let message_id = pending
-            .directed_human
-            .as_ref()
-            .map_or_else(Uuid::new_v4, |source| source.message_id);
+        let message_id = pending.directed_human.as_ref().map_or_else(
+            || {
+                chat.bookkeeping
+                    .lifecycle
+                    .open_input(pending.receipt.run_id)
+                    .unwrap_or_else(Uuid::new_v4)
+            },
+            |source| source.message_id,
+        );
         if let Some(source) = pending.directed_human {
             chat.snapshot
                 .human_family_origins
@@ -3438,7 +3923,9 @@ impl Agent {
         chat.snapshot
             .prompt_execution_modes
             .insert(message_index, chat.snapshot.policy.mode);
-        chat.file_history.begin_snapshot(message_id);
+        if let Some(file_history) = &mut chat.file_history {
+            file_history.begin_snapshot(message_id);
+        }
     }
 
     async fn next_run(
@@ -3511,6 +3998,7 @@ impl Agent {
     ) -> Result<RunAdmission, AgentError> {
         self.flush_deferred_messages(chat, MessageBoundary::Idle)?;
         if self.inner.closed.load(Ordering::SeqCst)
+            || self.inner.handover.is_cancelled()
             || self.inner.upgrade_paused.load(Ordering::SeqCst)
             || chat.active.is_some()
             || chat.has_foreground_user_shell()
@@ -3594,7 +4082,14 @@ impl Agent {
                         && source.source != event_sources::ARTIFACT_FEEDBACK_SOURCE
                 }) && !triggers::can_trigger(goal))
             {
-                candidate.snapshot.pending_inputs.remove(index);
+                let discarded = candidate.snapshot.pending_inputs.remove(index);
+                self.settle_removed_inputs(
+                    &mut candidate,
+                    [&discarded],
+                    SettledOutcome::Discarded {
+                        reason: DiscardReason::LoopEnded,
+                    },
+                );
                 continue;
             }
             if let Some(source) = &pending.trigger_source
@@ -3675,6 +4170,13 @@ impl Agent {
                     {
                         let receipt = queued.receipt.clone();
                         self.append_input_message(&mut candidate, queued);
+                        self.settle_input(
+                            &mut candidate,
+                            receipt.run_id,
+                            SettledOutcome::Merged {
+                                into: pending.receipt.run_id,
+                            },
+                        );
                         agent_message_receipts.push(receipt);
                     } else {
                         retained.push(queued);
@@ -3696,12 +4198,20 @@ impl Agent {
             candidate.active_run = Some(pending.receipt.run_id);
             let receipt = pending.receipt.clone();
             self.mark_run_inputs_handled(&mut candidate, &pending);
+            candidate.bookkeeping.lifecycle.start_input(receipt.run_id);
             self.append_input_message(&mut candidate, pending);
             let mut merged_receipts = Vec::with_capacity(merged_inputs.len());
             for queued in merged_inputs {
                 let consumed = queued.receipt.clone();
                 self.merge_host_context(&receipt, &consumed);
                 self.append_input_message(&mut candidate, queued);
+                self.settle_input(
+                    &mut candidate,
+                    consumed.run_id,
+                    SettledOutcome::Merged {
+                        into: receipt.run_id,
+                    },
+                );
                 merged_receipts.push(consumed);
             }
             self.save(&candidate.snapshot);
@@ -3714,6 +4224,7 @@ impl Agent {
                     },
                 );
             }
+            self.start_response(&mut candidate, &receipt);
             self.emit(&mut candidate, &receipt, EventKind::Started);
             for consumed in merged_receipts {
                 self.emit(
@@ -3854,7 +4365,7 @@ impl Agent {
                 .await
                 .map_err(|error| error.to_string())?
         {
-            self.inner.tasks.lock().await.push(self.run_task(next));
+            self.run_task(next);
         }
         let answer = tokio::select! {biased; _ = cancel.cancelled() => Err("permission request cancelled".into()), answer = receiver => answer.map_err(|_| "permission request expired".to_owned())};
         let resumed = if answer.is_ok() {
@@ -3904,14 +4415,17 @@ impl Agent {
             .set_search(config.clone())
             .await
             .map_err(|error| AgentError::Invalid(error.to_string()))?;
-        self.inner
-            .chats
-            .lock()
-            .await
-            .get_mut(&chat_id)
-            .ok_or(AgentError::NotFound)?
-            .snapshot
-            .search_config = config;
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        chat.snapshot.search_config = config;
+        if let Some(delegation) = &chat.snapshot.delegation {
+            self.record_delegation(
+                chat_id,
+                delegation.clone(),
+                chat.snapshot.search_config.clone(),
+            );
+            self.save(&chat.snapshot);
+        }
         Ok(())
     }
 
@@ -4019,11 +4533,21 @@ impl Agent {
     pub async fn set_directories(
         &self,
         chat_id: ChatId,
-        workdir: PathBuf,
+        folder: PathBuf,
         additional: Vec<PathBuf>,
     ) -> Result<(), AgentError> {
         self.require_root_chat(chat_id, "change working directories")
             .await?;
+        require_folder(
+            &self
+                .inner
+                .chats
+                .lock()
+                .await
+                .get(&chat_id)
+                .ok_or(AgentError::NotFound)?
+                .snapshot,
+        )?;
         let canonical = |path: PathBuf| -> Result<PathBuf, AgentError> {
             let path = path
                 .canonicalize()
@@ -4033,22 +4557,23 @@ impl Agent {
             }
             Ok(path)
         };
-        let workdir = canonical(workdir)?;
+        let folder = canonical(folder)?;
         let additional = additional
             .into_iter()
             .map(canonical)
             .collect::<Result<Vec<_>, _>>()?;
-        self.require_working_directory_trust(&workdir)?;
+        self.require_working_directory_trust(&folder)?;
         let _settings_gate = self.inner.settings_writes.lock().await;
         let saved = self.load_user_settings().await?;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        let folder_changed = chat.snapshot.folder.as_ref() != Some(&folder);
         let directory_changed =
-            chat.snapshot.workdir != workdir || chat.snapshot.additional_directories != additional;
-        if chat.snapshot.workdir != workdir {
+            folder_changed || chat.snapshot.additional_directories != additional;
+        if folder_changed {
             // 持久规则属于工作目录的分区：换目录时换成新目录的持久规则，会话规则保留。
-            chat.skills = self.discover_skills(&workdir);
-            chat.snapshot.workdir = workdir;
+            chat.skills = self.discover_skills(Some(&folder));
+            chat.snapshot.folder = Some(folder);
             if let Some(saved) = saved {
                 self.replace_persistent_rules(&mut chat.snapshot, &mut chat.bookkeeping, saved);
             }
@@ -4215,7 +4740,11 @@ impl Agent {
                         }
                     }
                     if changed {
-                        self.record_delegation(child.snapshot.id, metadata.clone());
+                        self.record_delegation(
+                            child.snapshot.id,
+                            metadata.clone(),
+                            child.snapshot.search_config.clone(),
+                        );
                         self.save(&child.snapshot);
                     }
                 }
@@ -4294,6 +4823,11 @@ impl Agent {
             candidate.snapshot.pending_inputs.retain(|pending| {
                 pending.agent_message.is_some() || !ids.contains(&pending.receipt.run_id)
             });
+            for entry in &taken {
+                if entry.kind == QueuedInputKind::Message {
+                    self.settle_input(&mut candidate, entry.id, SettledOutcome::Withdrawn);
+                }
+            }
             candidate
                 .snapshot
                 .pending_commands
@@ -4515,26 +5049,12 @@ impl Agent {
         ) {
             goal.set_state(LoopState::Queued);
         }
-        chat.snapshot.last_queue_sequence += 1;
-        let queued_sequence = chat.snapshot.last_queue_sequence;
-        chat.snapshot.pending_inputs.push(PendingInput {
-            receipt: Receipt {
-                chat_id: chat.snapshot.id,
-                loop_id,
-                run_id: Uuid::new_v4(),
-            },
-            input: String::new(),
-            contexts: Vec::new(),
-            agent_message: None,
-            directed_human: None,
-            denial_reference: None,
-            trigger_source: None,
-            armed: true,
-            queued_sequence,
-            task_continuation: true,
-            is_skill_invocation: false,
-            attached_file_reads: Vec::new(),
-        });
+        let receipt = Receipt {
+            chat_id: chat.snapshot.id,
+            loop_id,
+            run_id: Uuid::new_v4(),
+        };
+        queue_continuation(chat, receipt);
         true
     }
 
@@ -4568,8 +5088,13 @@ impl Agent {
 
     pub async fn shutdown(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
+        for chat in self.inner.chats.lock().await.values() {
+            self.release_runs_at_shutdown(chat);
+        }
         self.cancel_upgrade().await;
         self.inner.shutdown.cancel();
+        // Inputs a lost answer leaves open stay open; waiters on them learn of the shutdown.
+        self.inner.ledger_changes.send_replace(());
         let chat_tools = self
             .inner
             .chats
@@ -4591,19 +5116,17 @@ impl Agent {
             }
         }
         for chat in self.inner.chats.lock().await.values() {
-            if let Some(cancel) = &chat.active {
-                cancel.cancel();
-            }
-            for waiting in chat.parked.values() {
-                waiting.cancel.cancel();
-            }
+            self.stop_runs_at_shutdown(chat);
             for cancel in chat.event_cancellations.values() {
                 cancel.cancel();
             }
         }
-        let tasks = std::mem::take(&mut *self.inner.tasks.lock().await);
-        for task in tasks {
-            let _ = task.await;
+        self.stop_transcript_flushing();
+        self.inner.tasks.close();
+        self.inner.tasks.wait().await;
+        let host_tools = self.inner.host_tools.read().unwrap().clone();
+        if let Some(host_tools) = host_tools {
+            host_tools.shutdown().await;
         }
         let chat_clients = self
             .inner
@@ -4743,7 +5266,7 @@ mod thinking_settings_tests {
     #[test]
     fn disabled_preference_applies_only_when_model_card_allows_it() {
         let model = tickloop_agent_model::cards::built_in_model_profiles().remove(0);
-        let mut snapshot = empty_snapshot(Uuid::new_v4(), PathBuf::new(), model.clone());
+        let mut snapshot = empty_snapshot(Uuid::new_v4(), Some(PathBuf::new()), model.clone());
         snapshot.thinking_enabled = false;
         assert_eq!(
             snapshot.effective_reasoning_effort(),

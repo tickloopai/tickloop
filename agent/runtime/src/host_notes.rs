@@ -60,12 +60,18 @@ impl Agent {
             {
                 return Ok(());
             }
-            let plan_file = crate::plan::current_plan_file(
-                &chat.bookkeeping,
-                self.plans_directory(&chat.snapshot.workdir).path(),
-                receipt.loop_id,
-            )
-            .filter(|path| path.exists());
+            let plan_file = chat
+                .snapshot
+                .folder
+                .as_deref()
+                .and_then(|folder| {
+                    crate::plan::current_plan_file(
+                        &chat.bookkeeping,
+                        self.plans_directory(folder).path(),
+                        receipt.loop_id,
+                    )
+                })
+                .filter(|path| path.exists());
             append_note(
                 &mut chat.snapshot,
                 receipt,

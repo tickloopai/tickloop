@@ -1,10 +1,11 @@
 use std::sync::Arc;
-use tickloop_agent_model::{ModelConfigExt, cards::ModelCatalog};
+use tickloop_agent_model::{LocalModelClients, ModelClients, ModelConfigExt, cards::ModelCatalog};
 use tickloop_agent_protocol::{
     Content, Decision, EventKind, ModelChange, PermissionRule, Protocol, ReasoningEffort, Usage,
 };
 use tickloop_agent_runtime::Agent;
 use tickloop_agent_runtime::ChatSnapshotExt;
+use tickloop_agent_test_support::harness::{ChosenModels, embedded_agent, opened_agent};
 use tickloop_agent_test_support::{ScriptedModel, next_event, persisted_config as config, text};
 use uuid::Uuid;
 
@@ -198,21 +199,20 @@ async fn wait_for_completion(
 async fn switching_an_idle_chat_keeps_the_goal_and_uses_the_new_model_with_history() {
     let directory = tempfile::tempdir().unwrap();
     let original = Arc::new(ScriptedModel::new(vec![text("Original answer")]));
-    let agent = Agent::new_embedded(config(), original.clone());
+    let models = ChosenModels::new(original.clone());
+    let agent = embedded_agent(config(), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent.submit(chat, None, "My goal".into()).await.unwrap();
     wait_for_completion(&mut events).await;
     let replacement = Arc::new(ScriptedModel::new(vec![text("New answer")]));
+    models.choose(replacement.clone());
     let mut selected = config();
     selected.name = "replacement".into();
     selected.model = "replacement".into();
     let selected = tickloop_agent_model::cards::model_for_persistent_selection(selected);
     assert_eq!(
-        agent
-            .set_model(chat, selected.clone(), replacement.clone())
-            .await
-            .unwrap(),
+        agent.set_model(chat, selected.clone()).await.unwrap(),
         ModelChange::Applied
     );
     agent
@@ -246,7 +246,8 @@ async fn switching_model_and_thinking_during_tool_approval_waits_until_the_old_r
         ),
         text("Old round completed"),
     ]));
-    let agent = Agent::new_embedded(config(), original.clone());
+    let models = ChosenModels::new(original.clone());
+    let agent = embedded_agent(config(), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     agent
         .set_permission_rules(
@@ -276,18 +277,14 @@ async fn switching_model_and_thinking_during_tool_approval_waits_until_the_old_r
         }
     };
     let replacement = Arc::new(ScriptedModel::new(vec![text("New round completed")]));
+    models.choose(replacement.clone());
     let mut selected = ModelCatalog::defaults()
         .get("openai-api", "gpt-6-luna")
         .unwrap();
     selected.api_key_env = "PATH".into();
     assert_eq!(
         agent
-            .set_model_with_thinking(
-                chat,
-                selected.clone(),
-                replacement.clone(),
-                Some(ReasoningEffort::High),
-            )
+            .set_model_with_thinking(chat, selected.clone(), Some(ReasoningEffort::High))
             .await
             .unwrap(),
         ModelChange::Pending
@@ -348,7 +345,8 @@ async fn model_switch_projects_private_history_and_rejects_invalid_configuration
         ],
         text("Back on A"),
     ]));
-    let agent = Agent::new_embedded(config(), original.clone());
+    let models = ChosenModels::new(original.clone());
+    let agent = embedded_agent(config(), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent.submit(chat, None, "My goal".into()).await.unwrap();
@@ -357,22 +355,15 @@ async fn model_switch_projects_private_history_and_rejects_invalid_configuration
     let mut selected = config();
     selected.protocol = Protocol::Responses;
     let replacement = Arc::new(ScriptedModel::new(vec![text("Model B reply")]));
+    models.choose(replacement.clone());
     assert_eq!(
-        agent
-            .set_model(chat, selected.clone(), replacement.clone())
-            .await
-            .unwrap(),
+        agent.set_model(chat, selected.clone()).await.unwrap(),
         ModelChange::Applied
     );
     let switched = agent.snapshot(chat).await.unwrap();
     assert_eq!(before.messages, switched.messages);
     selected.base_url = "invalid".into();
-    assert!(
-        agent
-            .set_model(chat, selected, replacement.clone())
-            .await
-            .is_err()
-    );
+    assert!(agent.set_model(chat, selected).await.is_err());
     assert_eq!(agent.snapshot(chat).await.unwrap().model, switched.model);
     agent
         .submit(chat, Some(receipt.loop_id), "Continue on B".into())
@@ -393,10 +384,8 @@ async fn model_switch_projects_private_history_and_rejects_invalid_configuration
                 ))
         );
     }
-    agent
-        .set_model(chat, config(), original.clone())
-        .await
-        .unwrap();
+    models.choose(original.clone());
+    agent.set_model(chat, config()).await.unwrap();
     agent
         .submit(chat, Some(receipt.loop_id), "Continue on A".into())
         .await
@@ -422,7 +411,8 @@ async fn compaction_appends_a_boundary_and_restart_loads_only_the_compacted_chai
         ],
         text("Summary: preserve the source; generate a separate report."),
     ]));
-    let agent = Agent::open_embedded(database.clone(), config(), original.clone()).unwrap();
+    let models = ChosenModels::new(original.clone());
+    let agent = opened_agent(database.clone(), config(), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let receipt = agent
@@ -462,10 +452,8 @@ async fn compaction_appends_a_boundary_and_restart_loads_only_the_compacted_chai
     let mut selected = config();
     selected.protocol = Protocol::Responses;
     let replacement = Arc::new(ScriptedModel::new(vec![text("Continued from the summary")]));
-    agent
-        .set_model(chat, selected.clone(), replacement.clone())
-        .await
-        .unwrap();
+    models.choose(replacement.clone());
+    agent.set_model(chat, selected.clone()).await.unwrap();
     agent
         .submit(chat, Some(receipt.loop_id), "Continue carefully".into())
         .await
@@ -703,7 +691,7 @@ async fn conversation_output_budget_is_bounded_on_the_actual_http_request() {
     model.base_url = endpoint;
     model.max_output_tokens = 128_000;
     model.card.as_mut().unwrap().max_output_tokens = 128_000;
-    let client = Arc::new(tickloop_agent_model::HttpModelClient::new(model.clone()).unwrap());
+    let client = LocalModelClients::new(None).client(&model).unwrap();
     let agent = Agent::new_embedded(model, client);
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
@@ -920,10 +908,7 @@ async fn context_window_maximum_follows_the_selected_model() {
     snapshot.context_window_tokens = Some(100_000);
     assert_eq!(snapshot.effective_context_window_tokens(), Some(1_000_000));
 
-    agent
-        .set_model(chat, config(), Arc::new(ScriptedModel::new(Vec::new())))
-        .await
-        .unwrap();
+    agent.set_model(chat, config()).await.unwrap();
     assert_eq!(
         agent
             .snapshot(chat)
@@ -932,10 +917,7 @@ async fn context_window_maximum_follows_the_selected_model() {
             .effective_context_window_tokens(),
         None
     );
-    agent
-        .set_model(chat, model_config, Arc::new(ScriptedModel::new(Vec::new())))
-        .await
-        .unwrap();
+    agent.set_model(chat, model_config).await.unwrap();
     assert_eq!(
         agent
             .snapshot(chat)

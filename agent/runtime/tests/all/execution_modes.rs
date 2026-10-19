@@ -266,8 +266,8 @@ async fn directory_trust_precedes_chat_creation_and_survives_restart() {
         Err(AgentError::UntrustedWorkingDirectory { .. })
     ));
     assert_eq!(
-        agent.snapshot(chat).await.unwrap().workdir,
-        workdir.canonicalize().unwrap()
+        agent.snapshot(chat).await.unwrap().folder,
+        Some(workdir.canonicalize().unwrap())
     );
     agent
         .trust_working_directory(other_workdir.clone())

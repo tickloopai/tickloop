@@ -206,6 +206,8 @@ fn permission_policy() -> PermissionPolicy {
         rules: vec![permission_rule(0x71, Decision::Allow, true)],
         project_constraints: vec![permission_rule(0x72, Decision::Ask, false)],
         managed_constraints: vec![permission_rule(0x73, Decision::Deny, true)],
+        // Never on the wire: the golden shows none.
+        host_rules: vec![permission_rule(0x74, Decision::Allow, false)],
         revision: 4,
     }
 }
@@ -315,7 +317,7 @@ fn messages() -> Vec<Message> {
 fn chat_snapshot() -> ChatSnapshot {
     let mut snapshot: ChatSnapshot = serde_json::from_value(json!({
         "id": id(0xc1),
-        "workdir": "/work/project",
+        "folder": "/work/project",
         "messages": messages(),
         "generated_title": "Counter check",
         "artifact_ticks": [{
@@ -335,16 +337,16 @@ fn chat_snapshot() -> ChatSnapshot {
             "parent_call_id": "call-subagent",
             "task": "Audit the counter",
             "ceiling": {
-                "workdir": "/work/project",
+                "folder": "/work/project",
                 "additional_directories": ["/work/shared"],
                 "policy": permission_policy(),
                 "session_denials": [{
                     "tool": "Bash",
                     "identity_sha256": "ab".repeat(32),
-                    "workspace": {"workdir": "/work/project", "additional_directories": []},
+                    "workspace": {"folder": "/work/project", "additional_directories": []},
                 }],
                 "host_context": {
-                    "workdir": "/work/project",
+                    "folder": "/work/project",
                     "workspace_id": "w1",
                     "interaction": {
                         "socket": "/run/herdr.sock",
@@ -400,7 +402,7 @@ fn chat_snapshot() -> ChatSnapshot {
                 "id": id(0x30),
                 "prompt": "Report changes",
                 "prompt_source": "LoopGoal",
-                "interval_seconds": 60,
+                "schedule": "every 1m",
                 "expires_at_ms": null,
                 "accepts_events": true,
                 "armed": true,
@@ -441,7 +443,7 @@ fn live_chat_snapshot() -> LiveChatSnapshot {
 
 fn launch_spec() -> LaunchSpec {
     LaunchSpec {
-        workdir: "/work/project".into(),
+        folder: "/work/project".into(),
         config_root: Some("/home/user/.tickloop".into()),
         model: Some(model_config()),
         host_options: AgentHostOptions::embedded_defaults(),
@@ -586,7 +588,7 @@ fn agent_commands_keep_their_recorded_wire() {
                         serde_json::from_value(json!({
                             "id": id(0x30),
                             "prompt": "Report changes",
-                            "interval_seconds": 60,
+                            "schedule": "every 1m",
                             "expires_at_ms": null,
                             "accepts_events": true,
                             "armed": true,
@@ -678,7 +680,7 @@ fn observation_requests_keep_their_recorded_wire() {
         &vec![
             ObservationRequest::Overview {
                 filter: AgentFilter {
-                    workdir: Some("/work/project".into()),
+                    folder: Some("/work/project".into()),
                     workspace: None,
                 },
                 page: Page {
@@ -746,7 +748,7 @@ fn observation_values_keep_their_recorded_wire() {
         availability: ExecutionAvailability::Live,
         execution: execution(),
         chat_id: id(0xc1),
-        workdir: "/work/project".into(),
+        folder: Some("/work/project".into()),
         state: tickloop_agent_protocol::LoopState::Running,
         run_id: Some(id(0x20)),
         title: "Counter check".into(),

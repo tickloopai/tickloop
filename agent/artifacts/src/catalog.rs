@@ -1,4 +1,4 @@
-use reqwest::{Method, StatusCode};
+use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -35,15 +35,18 @@ pub struct ArtifactMetadata {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AgentLinkMetadata {
+    #[serde(deserialize_with = "super::deserialize_service_id")]
     pub binding_id: Uuid,
+    #[serde(deserialize_with = "super::deserialize_service_id")]
     pub chat_id: Uuid,
+    #[serde(deserialize_with = "super::deserialize_service_id")]
     pub loop_id: Uuid,
     pub epoch: u64,
 }
 impl ArtifactMetadata {
     pub fn tick(&self, origin: &str, added_at_ms: u64) -> ArtifactTick {
         ArtifactTick {
-            artifact_id: self.id.clone(),
+            artifact_id: super::canonical_artifact_id(&self.id),
             origin: origin.trim_end_matches('/').into(),
             title: self.title.clone(),
             format: self.format.clone(),
@@ -79,7 +82,8 @@ impl ArtifactClient {
         limit: usize,
     ) -> Result<T, ArtifactError> {
         let credential = self
-            .credential_snapshot()?
+            .access_snapshot()
+            .await?
             .ok_or(ArtifactError::AccessDenied)?;
         self.catalog_request_with_credential(method, path, query, body, limit, &credential)
             .await
@@ -96,7 +100,7 @@ impl ArtifactClient {
     ) -> Result<T, ArtifactError> {
         if !self
             .credential_snapshot()?
-            .is_some_and(|current| current.identity_matches(credential))
+            .is_some_and(|current| self.credentials_match(credential, &current))
         {
             return Err(ArtifactError::AccountChanged);
         }
@@ -110,24 +114,18 @@ impl ArtifactClient {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|_| ArtifactError::Connection)?;
-        if response.status() == StatusCode::UNAUTHORIZED {
-            self.invalidate_credential(&credential.access_token).await?;
-            return Err(ArtifactError::AccessDenied);
-        }
+        let response = self.send_authenticated(request, credential).await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let envelope: Value = self
                 .read_json_with_limit(response, MAX_RESPONSE_BYTES)
                 .await?;
-            let (code, message) = service_error(&envelope);
+            let (code, message, reason) = service_error(&envelope);
             return Err(ArtifactError::Service {
                 status,
                 code,
                 message,
+                reason,
             });
         }
         self.read_json_with_limit(response, limit).await
@@ -172,7 +170,8 @@ impl ArtifactClient {
     }
     pub async fn read(&self, id: &str) -> Result<ArtifactMetadata, ArtifactError> {
         let credential = self
-            .credential_snapshot()?
+            .access_snapshot()
+            .await?
             .ok_or(ArtifactError::AccessDenied)?;
         self.read_with_credential(id, &credential).await
     }

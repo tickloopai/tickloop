@@ -36,7 +36,7 @@ pub struct HerdrInteraction {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HostCallContext {
-    pub workdir: PathBuf,
+    pub folder: PathBuf,
     pub workspace_id: Option<String>,
     pub interaction: Option<HerdrInteraction>,
 }

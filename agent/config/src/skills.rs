@@ -126,21 +126,31 @@ struct Frontmatter {
 }
 
 impl SkillRegistry {
-    /// The Skills a Chat working in `workdir` finds: the built-in ones, the user's and those of
-    /// the installed Tick packages in `config_root`, and the project's.
-    pub fn discover(workdir: &Path, config_root: Option<&Path>) -> Self {
-        Self::discover_with_builtins(workdir, config_root, BUILTIN_SKILLS)
+    /// The Skills a Chat with the Folder `folder` finds: the built-in ones, the user's and those
+    /// of the installed Tick packages in `config_root`, and the project's.
+    pub fn discover(folder: &Path, config_root: Option<&Path>) -> Self {
+        Self::discover_with_builtins(folder, config_root, BUILTIN_SKILLS)
     }
 
-    pub fn discover_with_builtins<'a>(
-        workdir: &Path,
-        config_root: Option<&Path>,
-        builtins: impl IntoIterator<Item = &'a str>,
-    ) -> Self {
+    /// Only the built-in Skills, read from no directory: those of a Chat without a Folder.
+    pub fn builtin() -> Self {
+        Self::with_builtins(BUILTIN_SKILLS)
+    }
+
+    fn with_builtins<'a>(builtins: impl IntoIterator<Item = &'a str>) -> Self {
         let mut registry = Self::default();
         for markdown in builtins {
             registry.load_markdown(markdown, SkillSource::BuiltIn, None);
         }
+        registry
+    }
+
+    pub fn discover_with_builtins<'a>(
+        folder: &Path,
+        config_root: Option<&Path>,
+        builtins: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let mut registry = Self::with_builtins(builtins);
         let mut seen_files = HashSet::new();
         if let Some(root) = config_root {
             registry.load_directory(
@@ -150,7 +160,7 @@ impl SkillRegistry {
             );
             registry.load_tick_packages(root, &mut seen_files);
         }
-        for directory in project_skill_directories(workdir) {
+        for directory in project_skill_directories(folder) {
             registry.load_directory(&directory, SkillOrigin::Project, &mut seen_files);
         }
         registry
@@ -551,12 +561,12 @@ fn display_source(path: Option<&Path>) -> String {
     )
 }
 
-fn project_skill_directories(workdir: &Path) -> Vec<PathBuf> {
-    let workdir = workdir
+fn project_skill_directories(folder: &Path) -> Vec<PathBuf> {
+    let folder = folder
         .canonicalize()
-        .unwrap_or_else(|_| workdir.to_path_buf());
+        .unwrap_or_else(|_| folder.to_path_buf());
     let mut directories = Vec::new();
-    for ancestor in workdir.ancestors() {
+    for ancestor in folder.ancestors() {
         directories.push(ancestor.join(PROJECT_SKILLS_DIRECTORY));
         if ancestor.join(".git").exists() {
             break;

@@ -257,7 +257,7 @@ impl HostedTickTools {
         context: Option<&HostCallContext>,
     ) -> Result<PreparedHostCall, String> {
         crate::tick_tools::check_call(name, input, self.views.is_some())?;
-        let workdir = context.map(|context| context.workdir.as_path());
+        let folder = context.map(|context| context.folder.as_path());
         let mut external_declaration = None;
         let mut normalized_input = input.clone();
         let (operation, permission, summary) = match (name, input["action"].as_str()) {
@@ -309,7 +309,7 @@ impl HostedTickTools {
                     .ok_or("command must be a nonempty array of strings")?;
                 let cwd = match input["cwd"].as_str() {
                     Some(cwd) => PathBuf::from(cwd),
-                    None => workdir
+                    None => folder
                         .map(Path::to_path_buf)
                         .ok_or("cwd is required without an Agent work directory")?,
                 }

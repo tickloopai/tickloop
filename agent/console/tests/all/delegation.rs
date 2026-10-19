@@ -776,7 +776,7 @@ async fn replacing_the_herdr_socket_blocks_a_prepared_workspace_read_before_disp
     let local_files = tickloop_agent_tools::Tools::new(directory.path().join("chat"))
         .local_file_reader(
             &tickloop_agent_tools::Workspace {
-                workdir: directory.path().into(),
+                folder: Some(directory.path().into()),
                 additional_directories: Vec::new(),
             },
             Arc::new(NoLocalReads),
@@ -785,9 +785,9 @@ async fn replacing_the_herdr_socket_blocks_a_prepared_workspace_read_before_disp
         .prepare_call_in_scope(
             uuid::Uuid::new_v4(),
             &tickloop_agent_runtime::host_tools::HostCallScope {
-                local_files: &local_files,
+                local_files: local_files.as_ref(),
                 context: Some(&HostCallContext {
-                    workdir: directory.path().into(),
+                    folder: directory.path().into(),
                     workspace_id: Some("W1".into()),
                     interaction: None,
                 }),
@@ -1125,8 +1125,8 @@ async fn model_delegates_a_real_child_and_observes_its_result() {
     let child_snapshot = agent.snapshot(child).await.unwrap();
     assert!(child_snapshot.branch_origin.is_none());
     assert_eq!(
-        child_snapshot.workdir,
-        directory.path().canonicalize().unwrap()
+        child_snapshot.folder,
+        Some(directory.path().canonicalize().unwrap())
     );
     assert_eq!(child_snapshot.loops.len(), 1);
     assert_ne!(child_snapshot.loops[0].id, parent_receipt.loop_id);

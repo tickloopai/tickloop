@@ -313,7 +313,7 @@ async fn a_shell_subscription_reaches_the_loop_once_when_the_shell_exits() {
 fn a_subscribed_instance_always_has_a_row_with_its_marker() {
     let instance = InstanceRef::new("cal", "remote").unwrap();
     let mut chat: tickloop_agent_protocol::ChatSnapshot = serde_json::from_value(
-        json!({"id":Uuid::new_v4(),"workdir":"/fixture","messages":[],"loops":[]}),
+        json!({"id":Uuid::new_v4(),"folder":"/fixture","messages":[],"loops":[]}),
     )
     .unwrap();
     chat.monitor.remove(instance.clone());
@@ -409,7 +409,7 @@ fn built_in_rows_describe_their_actions_as_intents() {
         subscription("calendar:pane"),
         subscription("artifact:https://docs.example/a"),
     );
-    let snapshot: tickloop_agent_protocol::ChatSnapshot = serde_json::from_value(json!({"id":chat,"workdir":"/fixture","messages":[],"loops":[],"artifact_ticks":[{"artifact_id":"a","origin":"https://docs.example","title":"Brief","format":"markdown","url":"https://docs.example/a","access_role":"owner","added_at_ms":1}]})).unwrap();
+    let snapshot: tickloop_agent_protocol::ChatSnapshot = serde_json::from_value(json!({"id":chat,"folder":"/fixture","messages":[],"loops":[],"artifact_ticks":[{"artifact_id":"a","origin":"https://docs.example","title":"Brief","format":"markdown","url":"https://docs.example/a","access_role":"owner","added_at_ms":1}]})).unwrap();
     let rows = MonitorRowsRegistry::builtin().list(&MonitorContext {
         chat: Some(std::sync::Arc::new(
             tickloop_agent_protocol::ChatStatus::of(&snapshot),
@@ -648,7 +648,10 @@ async fn shell_subscription_refuses_foreign_chat_before_baseline_and_restoration
                 id: Uuid::new_v4(),
                 prompt: "restored foreign watch".into(),
                 prompt_source: tickloop_agent_protocol::TriggerPromptSource::Explicit,
-                interval_seconds: None,
+                schedule: None,
+                armed_at_ms: None,
+                last_fired_at_ms: None,
+                confirmation: None,
                 expires_at_ms: None,
                 accepts_events: true,
                 armed: true,

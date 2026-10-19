@@ -21,6 +21,6 @@ tar = { version = "0.4", default-features = false }
 tempfile = "3"
 tickloop-agent-base = { path = "../base" }
 tickloop-tickhost-connect = { path = "../../tickhost/connect" }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 
 [dev-dependencies]

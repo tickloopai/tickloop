@@ -31,7 +31,7 @@ impl Chat {
 
     fn workspace(&self) -> Workspace {
         Workspace {
-            workdir: self.directory.path().to_path_buf(),
+            folder: Some(self.directory.path().to_path_buf()),
             additional_directories: Vec::new(),
         }
     }

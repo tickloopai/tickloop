@@ -20,7 +20,7 @@ impl Agent {
         upsert_artifact_tick(chat, tick);
         self.record_artifact_ticks(
             chat.snapshot.id,
-            &chat.snapshot.workdir,
+            chat.snapshot.folder.as_deref(),
             chat.snapshot.artifact_ticks.clone(),
             chat.snapshot.removed_artifact_ticks.clone(),
         );
@@ -47,7 +47,7 @@ impl Agent {
         tick.title = title.to_owned();
         self.record_artifact_ticks(
             chat.snapshot.id,
-            &chat.snapshot.workdir,
+            chat.snapshot.folder.as_deref(),
             chat.snapshot.artifact_ticks.clone(),
             chat.snapshot.removed_artifact_ticks.clone(),
         );
@@ -69,7 +69,7 @@ impl Agent {
         let ticks = chat.snapshot.artifact_ticks.clone();
         self.record_artifact_ticks(
             chat_id,
-            &chat.snapshot.workdir,
+            chat.snapshot.folder.as_deref(),
             ticks.clone(),
             chat.snapshot.removed_artifact_ticks.clone(),
         );
@@ -109,7 +109,7 @@ impl Agent {
             let ticks = chat.snapshot.artifact_ticks.clone();
             self.record_artifact_ticks(
                 chat_id,
-                &chat.snapshot.workdir,
+                chat.snapshot.folder.as_deref(),
                 ticks.clone(),
                 chat.snapshot.removed_artifact_ticks.clone(),
             );
@@ -155,6 +155,7 @@ fn normalize_artifact_tick(mut tick: ArtifactTick) -> Result<ArtifactTick, Agent
         return Err(AgentError::Invalid("invalid artifact Tick".into()));
     }
     tick.origin = tick.origin.trim_end_matches('/').to_owned();
+    tick.artifact_id = tickloop_agent_artifacts::canonical_artifact_id(&tick.artifact_id);
     tick_protocol::InstanceRef::artifact(&tick.origin, &tick.artifact_id)
         .map_err(|error| AgentError::Invalid(error.into()))?;
     Ok(tick)

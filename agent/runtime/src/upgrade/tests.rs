@@ -168,7 +168,10 @@ async fn planned_restore_preserves_armed_timer_and_session_permissions_without_m
                 id: Uuid::new_v4(),
                 prompt: "check later".into(),
                 prompt_source: Default::default(),
-                interval_seconds: Some(3600),
+                schedule: Some(tickloop_agent_protocol::Recurrence::parse("every 3600s").unwrap()),
+                armed_at_ms: None,
+                last_fired_at_ms: None,
+                confirmation: None,
                 accepts_events: false,
                 expires_at_ms: None,
                 armed: true,
@@ -182,7 +185,7 @@ async fn planned_restore_preserves_armed_timer_and_session_permissions_without_m
         "Read".into(),
         serde_json::json!({"path":"allowed"}),
         tickloop_agent_protocol::WorkspaceScope::new(
-            directory.path().canonicalize().unwrap(),
+            Some(directory.path().canonicalize().unwrap()),
             Vec::new(),
         ),
     )
@@ -560,7 +563,10 @@ async fn timer_due_while_prepared_waits_for_successor_and_input_cannot_dispatch_
                 id: Uuid::new_v4(),
                 prompt: "scheduled check".into(),
                 prompt_source: Default::default(),
-                interval_seconds: Some(1),
+                schedule: Some(tickloop_agent_protocol::Recurrence::parse("every 1s").unwrap()),
+                armed_at_ms: None,
+                last_fired_at_ms: None,
+                confirmation: None,
                 expires_at_ms: None,
                 accepts_events: false,
                 armed: true,
@@ -615,8 +621,11 @@ struct UpgradeStream {
 
 #[async_trait::async_trait]
 impl crate::tick_stream::TickStreamPort for UpgradeStream {
-    fn open(&self) -> crate::tick_stream::TickStreamHandle {
-        self.stream.open()
+    fn open(
+        &self,
+        tasks: &crate::tick_stream::StreamTasks,
+    ) -> crate::tick_stream::TickStreamHandle {
+        self.stream.open(tasks)
     }
     fn set_watch_authorities(
         &self,
@@ -938,14 +947,16 @@ async fn an_unsupported_retained_shell_reports_a_blocker_without_discarding_its_
     {
         let mut chats = original.inner.chats.lock().await;
         let state = chats.get_mut(&chat).unwrap();
-        let output = state.tools.chat_directory().clone();
+        let output = state.tools.chat_directory().unwrap().clone();
         let family = tickloop_agent_base::private_fs::PrivateDirectory::trusted(
-            state.tools.family_temp_directory().into(),
+            state.tools.family_temp_directory().unwrap().into(),
         );
         state.tools = Arc::new(tickloop_agent_tools::Tools::for_chat(
-            output.clone(),
-            output.join("tasks"),
-            family,
+            tickloop_agent_tools::ChatDirectory {
+                task_output: output.join("tasks"),
+                chat: output,
+                family_temp: family,
+            },
             host.clone(),
         ));
     }

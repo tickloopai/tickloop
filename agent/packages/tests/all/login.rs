@@ -5,7 +5,7 @@ use std::fs;
 
 use tick_packages::{ApiKey, LoginState, OAuthIssuer, OAuthToken, PackageAuth, PackageCredentials};
 use tick_test_support::authorization_server::{
-    AuthorizationServer, REVOCATION_PATH, TOKEN_PATH, TokenReply, USER_CODE,
+    AuthorizationServer, METADATA_PATH, REVOCATION_PATH, TOKEN_PATH, TokenReply, USER_CODE,
 };
 use tickloop_agent_packages::{LoggedOut, LoginError, log_out, start_login};
 use tokio_util::sync::CancellationToken;
@@ -23,7 +23,7 @@ impl Login {
         Self {
             _directory: directory,
             credentials,
-            server: AuthorizationServer::start(),
+            server: AuthorizationServer::start_with_path("/account"),
         }
     }
 
@@ -69,6 +69,10 @@ async fn the_agent_logs_in_through_its_own_http_client() {
         .await
         .unwrap();
     assert_eq!(login.state(), LoginState::LoggedIn);
+    assert_eq!(
+        login.server.requests_to(METADATA_PATH)[0].path,
+        "/.well-known/oauth-authorization-server/account"
+    );
     assert_eq!(login.server.requests_to(TOKEN_PATH).len(), 2);
 
     let remote = OAuthIssuer {

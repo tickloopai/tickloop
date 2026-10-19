@@ -1623,7 +1623,10 @@ async fn a_trigger_rejects_subscriptions_it_cannot_honour() {
         id: Uuid::new_v4(),
         prompt: "check the panel".into(),
         prompt_source: TriggerPromptSource::Explicit,
-        interval_seconds: None,
+        schedule: None,
+        armed_at_ms: None,
+        last_fired_at_ms: None,
+        confirmation: None,
         expires_at_ms: None,
         accepts_events: true,
         armed: true,
@@ -1658,7 +1661,7 @@ async fn a_trigger_rejects_subscriptions_it_cannot_honour() {
     }
     let mut events_only = trigger(vec![subscription(fixture_instance(1), High)]);
     events_only.accepts_events = false;
-    events_only.interval_seconds = Some(30);
+    events_only.schedule = Some(tickloop_agent_protocol::Recurrence::parse("every 30s").unwrap());
     assert!(
         agent
             .configure_trigger(chat, receipt.loop_id, Some(events_only))
@@ -2923,7 +2926,9 @@ async fn cancelled_watch_removes_queued_tick_without_removing_user_input() {
 
 async fn chat_reading_final_admission(cancel_during_check: bool) {
     use tickloop_agent_protocol::HostToolAuthority;
-    use tickloop_agent_runtime::tick_stream::{TickStreamHandle, TickStreamPort, WatchId};
+    use tickloop_agent_runtime::tick_stream::{
+        StreamTasks, TickStreamHandle, TickStreamPort, WatchId,
+    };
     struct ChatReadingStream {
         updates: InMemoryTickStream,
         agent: std::sync::Weak<Agent>,
@@ -2939,8 +2944,8 @@ async fn chat_reading_final_admission(cancel_during_check: bool) {
         ) {
             self.updates.set_watch_authorities(authorities);
         }
-        fn open(&self) -> TickStreamHandle {
-            self.updates.open()
+        fn open(&self, tasks: &StreamTasks) -> TickStreamHandle {
+            self.updates.open(tasks)
         }
         async fn revalidate_watch(
             &self,
@@ -3324,7 +3329,10 @@ async fn subscribe_loop(
                 id: Uuid::new_v4(),
                 prompt: "inspect changes".into(),
                 prompt_source: TriggerPromptSource::Explicit,
-                interval_seconds: None,
+                schedule: None,
+                armed_at_ms: None,
+                last_fired_at_ms: None,
+                confirmation: None,
                 expires_at_ms: None,
                 accepts_events: true,
                 armed: true,
@@ -3449,7 +3457,10 @@ async fn an_immediate_delivery_whose_watermark_failed_is_retried_until_it_lands(
                 id: Uuid::new_v4(),
                 prompt: "report the shell".into(),
                 prompt_source: TriggerPromptSource::Explicit,
-                interval_seconds: None,
+                schedule: None,
+                armed_at_ms: None,
+                last_fired_at_ms: None,
+                confirmation: None,
                 expires_at_ms: None,
                 accepts_events: true,
                 armed: true,
@@ -3587,8 +3598,11 @@ impl RefillingStream {
 
 #[async_trait::async_trait]
 impl tickloop_agent_runtime::tick_stream::TickStreamPort for RefillingStream {
-    fn open(&self) -> tickloop_agent_runtime::tick_stream::TickStreamHandle {
-        self.inner.open()
+    fn open(
+        &self,
+        tasks: &tickloop_agent_runtime::tick_stream::StreamTasks,
+    ) -> tickloop_agent_runtime::tick_stream::TickStreamHandle {
+        self.inner.open(tasks)
     }
     fn set_watch_authorities(
         &self,

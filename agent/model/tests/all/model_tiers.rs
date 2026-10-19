@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 use tickloop_agent_model::{
-    ModelRequest, StructuredOutput, access::AccessCatalog, cards::ModelCatalog,
-    credentials::save_api_key, model_client, validate_reasoning_effort,
+    LocalModelClients, ModelClients, ModelRequest, StructuredOutput, access::AccessCatalog,
+    cards::ModelCatalog, credentials::save_api_key, validate_reasoning_effort,
 };
 use tickloop_agent_protocol::{Content, Message, ReasoningEffort, Role, ToolDefinition};
 use tickloop_agent_test_support::model_http_support;
@@ -109,7 +109,9 @@ async fn glm_lightweight_tools_continue_with_supported_thinking_fields_and_json_
             let mut config = ModelCatalog::defaults().get(provider, model).unwrap();
             config.base_url = endpoint;
             save_api_key(root.path(), &config.api_key_env, "fixture-key").unwrap();
-            let client = model_client(config, Some(root.path())).unwrap();
+            let client = LocalModelClients::new(Some(root.path().to_path_buf()))
+                .client(&config)
+                .unwrap();
             let (events, _) = mpsc::unbounded_channel();
             let mut first = request(Some(ReasoningEffort::On));
             first.tools.push(ToolDefinition { name: "Echo".into(), description: "Inert fixture".into(), input_schema: json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}) });
@@ -182,7 +184,9 @@ async fn kimi_coding_line_uses_its_token_budget_and_prompted_schema_without_samp
             .unwrap();
         config.base_url = endpoint;
         save_api_key(root.path(), &config.api_key_env, "fixture-key").unwrap();
-        let client = model_client(config, Some(root.path())).unwrap();
+        let client = LocalModelClients::new(Some(root.path().to_path_buf()))
+            .client(&config)
+            .unwrap();
         let (events, _) = mpsc::unbounded_channel();
         let mut schema = request(None);
         schema.structured_output = Some(StructuredOutput {
@@ -234,7 +238,9 @@ async fn argon_native_schema_requests_use_only_documented_levels_and_single_deco
             .unwrap();
         config.base_url = endpoint;
         save_api_key(root.path(), &config.api_key_env, "fixture-key").unwrap();
-        let client = model_client(config, Some(root.path())).unwrap();
+        let client = LocalModelClients::new(Some(root.path().to_path_buf()))
+            .client(&config)
+            .unwrap();
         let mut schema = request(effort);
         schema.structured_output = Some(StructuredOutput {
             name: "verdict".into(),

@@ -22,6 +22,12 @@ pub type LoopId = Uuid;
 
 pub type RunId = Uuid;
 
+/// The identity a host gives one input, kept in the Chat's input ledger.
+pub type InputId = Uuid;
+
+/// One displayed answer: one attempt of one Run.
+pub type ResponseId = Uuid;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChatSnapshot {
     #[serde(
@@ -65,7 +71,8 @@ pub struct ChatSnapshot {
     pub sent_agent_messages: BTreeMap<Uuid, AgentMessageSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_title: Option<String>,
-    pub workdir: PathBuf,
+    /// The Chat's Folder; `None` for a Chat without one, which reaches no local files.
+    pub folder: Option<PathBuf>,
     /// Chat 当前使用的模型，只在本进程内有效；恢复时使用宿主当前选择的模型。
     #[serde(skip, default = "ModelConfig::unselected")]
     pub model: ModelConfig,
@@ -265,6 +272,13 @@ pub enum EventKind {
     FamilyRunCompleted {
         completion: FamilyCompletion,
     },
+    /// A new answer attempt began; its lifecycle record is written with this event.
+    ResponseStarted {
+        response_id: ResponseId,
+        attempt: u32,
+        /// The display id of the prompt the answer belongs under.
+        display_parent: Option<Uuid>,
+    },
     Started,
     Text(String),
     Thinking(String),
@@ -338,6 +352,17 @@ pub enum EventKind {
     CommandUpdated {
         command: CommandSnapshot,
     },
+}
+
+impl EventKind {
+    /// Streaming progress that no Transcript record reflects; a publisher may release it without
+    /// waiting for a commit.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::Text(_) | Self::Thinking(_) | Self::ModelRetry { .. }
+        )
+    }
 }
 
 /// What a host note tells the model.

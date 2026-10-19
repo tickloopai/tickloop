@@ -92,7 +92,9 @@ pub(super) fn load(workspace: &Workspace, paths: Vec<PathBuf>) -> Result<LoadedC
 }
 
 fn allowed_roots(workspace: &Workspace) -> Result<Vec<PathBuf>, String> {
-    std::iter::once(&workspace.workdir)
+    workspace
+        .folder
+        .iter()
         .chain(&workspace.additional_directories)
         .map(|root| {
             root.canonicalize()
@@ -257,7 +259,7 @@ mod tests {
         fs::create_dir(directory.path().join("src")).unwrap();
         fs::write(directory.path().join("src/main.rs"), "fn main() {}").unwrap();
         let workspace = Workspace {
-            workdir: directory.path().into(),
+            folder: Some(directory.path().into()),
             additional_directories: Vec::new(),
         };
 
@@ -315,7 +317,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
         let workspace = Workspace {
-            workdir: directory.path().into(),
+            folder: Some(directory.path().into()),
             additional_directories: Vec::new(),
         };
 
