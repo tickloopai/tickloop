@@ -92,6 +92,38 @@ async fn ready_chat(agent: &Agent) -> (ChatId, LoopId) {
     (chat, turn.receipt().loop_id)
 }
 
+fn prompt_for(target: LoopId, text: &str) -> TurnRequest {
+    let mut request = prompt(text, ParentSelection::CurrentLeaf);
+    if let tickloop_agent_runtime::TurnOp::Continue { target_loop, .. } = &mut request.op {
+        *target_loop = Some(target);
+    }
+    request
+}
+
+async fn bound_chat(
+    store: Arc<InMemoryTranscriptStore>,
+    model: Arc<Script>,
+) -> (Agent, ChatId, LoopId) {
+    let setup = harness(store.clone(), Script::new(Vec::new()), WaitHosting::Durable);
+    let (chat, target) = ready_chat(&setup).await;
+    setup.sync().await.unwrap();
+    setup.shutdown().await;
+    let mut lines = linked(store.lines(chat), target);
+    for line in &mut lines {
+        if let Line::System(entry) = line
+            && let Some(record) = &mut entry.loop_record
+            && record.loop_id == target
+            && !record.event_sources.is_empty()
+        {
+            record.state = serde_json::to_value(LoopState::Completed).unwrap();
+        }
+    }
+    store.seed(chat, lines, StorePosition(1));
+    let agent = harness(store, model, WaitHosting::Durable);
+    agent.wake(chat, None).await.unwrap();
+    (agent, chat, target)
+}
+
 async fn loop_state(agent: &Agent, chat: ChatId, loop_id: LoopId) -> LoopState {
     agent
         .snapshot(chat)
@@ -118,8 +150,7 @@ fn feedback_inputs(lines: &[Line]) -> HashSet<Uuid> {
 async fn a_delivery_repeated_on_another_instance_or_after_compaction_runs_once() {
     let store = Arc::new(InMemoryTranscriptStore::new());
     let model = Script::new(Vec::new());
-    let first = harness(store.clone(), model.clone(), WaitHosting::Durable);
-    let (chat, target) = ready_chat(&first).await;
+    let (first, chat, target) = bound_chat(store.clone(), model.clone()).await;
     let request = TurnRequest::deliver(target, delivery("request-1"));
     let delivered = first.advance(chat, request.clone()).await.unwrap();
     let delivery_id = request_delivery_id(&request);
@@ -131,10 +162,10 @@ async fn a_delivery_repeated_on_another_instance_or_after_compaction_runs_once()
         TurnOutcome::Completed { .. }
     ));
     let requests = model.requests();
-    assert_eq!(requests.len(), 2);
-    assert!(requests[1].contains(&heading("request-1")));
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains(&heading("request-1")));
     assert!(
-        !requests[1].contains("fence-secret"),
+        !requests[0].contains("fence-secret"),
         "the claim's fencing token never reaches the model"
     );
 
@@ -191,14 +222,10 @@ async fn a_delivery_repeated_on_another_instance_or_after_compaction_runs_once()
 async fn interrupted_failed_and_completed_loops_take_a_delivery_and_a_stopped_one_discards_it() {
     // Interrupted by the user.
     let model = Script::new(vec![Step::Hang]);
-    let agent = harness(
-        Arc::new(InMemoryTranscriptStore::new()),
-        model.clone(),
-        WaitHosting::Durable,
-    );
-    let chat = agent.create_chat_without_folder().await.unwrap();
+    let (agent, chat, target) =
+        bound_chat(Arc::new(InMemoryTranscriptStore::new()), model.clone()).await;
     let long = agent
-        .advance(chat, prompt("a long task", ParentSelection::CurrentLeaf))
+        .advance(chat, prompt_for(target, "a long task"))
         .await
         .unwrap();
     model.until_holding().await;
@@ -225,13 +252,9 @@ async fn interrupted_failed_and_completed_loops_take_a_delivery_and_a_stopped_on
 
     // Failed.
     let model = Script::new(vec![Step::Fail]);
-    let agent = harness(
-        Arc::new(InMemoryTranscriptStore::new()),
-        model.clone(),
-        WaitHosting::Durable,
-    );
-    let chat = agent.create_chat_without_folder().await.unwrap();
-    let broken = prompt("a broken task", ParentSelection::CurrentLeaf);
+    let (agent, chat, target) =
+        bound_chat(Arc::new(InMemoryTranscriptStore::new()), model.clone()).await;
+    let broken = prompt_for(target, "a broken task");
     let failing = agent.advance(chat, broken.clone()).await.unwrap();
     assert!(matches!(
         settled(&agent, chat, broken.input_id).await,
@@ -256,8 +279,7 @@ async fn interrupted_failed_and_completed_loops_take_a_delivery_and_a_stopped_on
     // Completed, then stopped.
     let store = Arc::new(InMemoryTranscriptStore::new());
     let model = Script::new(Vec::new());
-    let agent = harness(store.clone(), model.clone(), WaitHosting::Durable);
-    let (chat, target) = ready_chat(&agent).await;
+    let (agent, chat, target) = bound_chat(store.clone(), model.clone()).await;
     assert_eq!(loop_state(&agent, chat, target).await, LoopState::Completed);
     assert!(matches!(
         outcome(
@@ -310,9 +332,8 @@ async fn interrupted_failed_and_completed_loops_take_a_delivery_and_a_stopped_on
 async fn deliveries_queue_behind_the_work_a_load_restores() {
     let store = Arc::new(InMemoryTranscriptStore::new());
     let model = Script::new(vec![Step::Hang]);
-    let first = harness(store.clone(), model.clone(), WaitHosting::Durable);
-    let chat = first.create_chat_without_folder().await.unwrap();
-    let lost = prompt("first prompt", ParentSelection::CurrentLeaf);
+    let (first, chat, target) = bound_chat(store.clone(), model.clone()).await;
+    let lost = prompt_for(target, "first prompt");
     let running = first.advance(chat, lost.clone()).await.unwrap();
     model.until_holding().await;
     let target = running.receipt().loop_id;
@@ -434,6 +455,11 @@ async fn a_delivery_to_a_member_loads_its_whole_family() {
     let member = delegating.snapshot(root).await.unwrap().family_completions[0].clone();
     delegating.sync().await.unwrap();
     delegating.shutdown().await;
+    store.seed(
+        member.child_chat_id,
+        linked(store.lines(member.child_chat_id), member.child_loop_id),
+        StorePosition(1),
+    );
 
     let model = delegating_model();
     let next = family_harness(store.clone(), model.clone());
@@ -456,11 +482,10 @@ async fn a_delivery_to_a_member_loads_its_whole_family() {
     let requests = model.requests.lock().unwrap().clone();
     assert!(requests.iter().any(|request| is_member(request)
         && format!("{:?}", request.messages).contains(&heading("for-the-member"))));
-    tokio::time::timeout(WAIT, async {
-        while next.quiesce(root).await != Quiescence::Idle {}
-    })
-    .await
-    .expect("the family settles");
+    let Quiescence::Waiting(waits) = next.quiesce(root).await else {
+        panic!("the family waits for feedback");
+    };
+    assert_eq!(waits.deliveries.len(), 1);
     next.shutdown().await;
 }
 

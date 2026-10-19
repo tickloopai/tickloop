@@ -30,7 +30,7 @@ pub(super) fn can_trigger(goal: &LoopSnapshot) -> bool {
 /// The longest a Trigger's timer sleeps before it looks at the clock again, so that a computer
 /// waking from sleep fires what came due meanwhile without waiting out the rest of a long sleep.
 const SCHEDULE_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
-/// How far the system's clock may run ahead of the schedule clock before it catches up.
+/// The maximum drift from wall time before the schedule clock is rebased.
 const SCHEDULE_CLOCK_CATCH_UP_MS: u64 = 60_000;
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
@@ -83,7 +83,8 @@ pub enum ScheduleDecision {
 
 /// The wall clock Trigger schedules run on: the system's time when the Agent was built, carried
 /// on by the runtime's monotonic clock, so that a test's paused clock moves it too. It catches
-/// up when the system's time runs well ahead, such as after the computer slept.
+/// up after sleep and corrects an anchor ahead of wall time. Scheduled-time ordering is kept
+/// separately by `Trigger::note_scheduled`, even when wall time moves backwards.
 pub(crate) struct ScheduleClock {
     anchor: std::sync::Mutex<(u64, tokio::time::Instant)>,
 }
@@ -106,7 +107,7 @@ impl ScheduleClock {
         let carried =
             anchor_ms.saturating_add(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
         let system = tickloop_agent_base::private_fs::unix_time_milliseconds();
-        if system > carried.saturating_add(SCHEDULE_CLOCK_CATCH_UP_MS) {
+        if system.abs_diff(carried) > SCHEDULE_CLOCK_CATCH_UP_MS {
             *anchor = (system, tokio::time::Instant::now());
             return system;
         }
@@ -729,7 +730,11 @@ impl Agent {
                                 continue;
                             }
                         }
-                        agent.fire_scheduled(chat_id, loop_id, now, Some(cancel.clone())).await;
+                        if let Err(error) = agent.fire_scheduled(chat_id, loop_id, now, Some(cancel.clone())).await {
+                            agent.inner.loop_leases.set_notice(chat_id, loop_id,
+                                tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
+                                format!("Scheduled fire: {error}"));
+                        }
                     }
                 }
             }
@@ -771,25 +776,34 @@ impl Agent {
         loop_id: LoopId,
         until_ms: u64,
         cancel: Option<CancellationToken>,
-    ) {
+    ) -> Result<(), AgentError> {
         let (prompt, trigger_id, scheduled, cancel) = {
-            let chats = self.inner.chats.lock().await;
-            let Some(chat) = chats.get(&chat_id) else {
-                return;
+            let mut chats = self.inner.chats.lock().await;
+            let Some(chat) = chats.get_mut(&chat_id) else {
+                return Ok(());
             };
-            let Some(trigger) = chat
+            let Some(goal) = chat
                 .snapshot
                 .loops
-                .iter()
+                .iter_mut()
                 .find(|goal| goal.id == loop_id)
-                .and_then(|goal| goal.trigger.as_ref())
-                .filter(|trigger| trigger.armed)
             else {
-                return;
+                return Ok(());
+            };
+            let is_eligible = can_trigger(goal);
+            let Some(trigger) = goal.trigger.as_mut().filter(|trigger| trigger.armed) else {
+                return Ok(());
             };
             let Some(scheduled) = trigger.due_scheduled_ms(until_ms) else {
-                return;
+                return Ok(());
             };
+            if !is_eligible {
+                if self.inner.waits == WaitHosting::Durable {
+                    trigger.note_scheduled(scheduled);
+                    self.save(&chat.snapshot);
+                }
+                return Ok(());
+            }
             let cancel = cancel.or_else(|| chat.trigger_cancellations.get(&loop_id).cloned());
             (trigger.prompt.clone(), trigger.id, scheduled, cancel)
         };
@@ -797,19 +811,39 @@ impl Agent {
             source: TIMER_SOURCE.into(),
             payload: serde_json::json!({"trigger_id":trigger_id}),
         };
-        let _ = self
+        let result = self
             .submit_internal(
                 chat_id,
                 Some(loop_id),
                 prompt,
                 SubmissionOptions {
                     trigger_source: Some(source),
-                    trigger_cancel: cancel,
+                    trigger_cancel: cancel.clone(),
                     scheduled_for: Some(scheduled),
                     ..Default::default()
                 },
             )
             .await;
+        if result.is_err()
+            && self.inner.waits == WaitHosting::Durable
+            && !cancel.as_ref().is_some_and(CancellationToken::is_cancelled)
+        {
+            let mut chats = self.inner.chats.lock().await;
+            if let Some(chat) = chats.get_mut(&chat_id)
+                && let Some(trigger) = chat
+                    .snapshot
+                    .loops
+                    .iter_mut()
+                    .find(|goal| goal.id == loop_id)
+                    .and_then(|goal| goal.trigger.as_mut())
+                    .filter(|trigger| trigger.id == trigger_id && trigger.armed)
+                && trigger.last_fired_at_ms.is_none_or(|last| last < scheduled)
+            {
+                trigger.note_scheduled(scheduled);
+                self.save(&chat.snapshot);
+            }
+        }
+        result.map(|_| ())
     }
 
     /// With durable wait hosting, the loaded Chat's armed Triggers go on in this instance: each
@@ -826,7 +860,7 @@ impl Agent {
                 .snapshot
                 .loops
                 .iter()
-                .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
+                .filter(|goal| can_trigger(goal))
                 .filter_map(|goal| {
                     Some((
                         goal.id,
@@ -851,8 +885,17 @@ impl Agent {
         };
         let now = self.inner.schedule_clock.now_ms();
         for (loop_id, trigger, cancel) in armed {
-            self.fire_scheduled(chat_id, loop_id, now, Some(cancel.clone()))
-                .await;
+            if let Err(error) = self
+                .fire_scheduled(chat_id, loop_id, now, Some(cancel.clone()))
+                .await
+            {
+                self.inner.loop_leases.set_notice(
+                    chat_id,
+                    loop_id,
+                    tickloop_agent_protocol::LoopTriggerNoticeKind::Warning,
+                    format!("Scheduled fire: {error}"),
+                );
+            }
             self.trigger_task(chat_id, loop_id, trigger, cancel);
         }
     }
@@ -860,7 +903,11 @@ impl Agent {
     /// What is due by `until`, in Unix milliseconds, happens across the family of `chat_id`:
     /// each Trigger fires for its latest time due by then, and each Loop whose deadline came
     /// ends.
-    pub(crate) async fn fire_due_triggers(&self, chat_id: ChatId, until: u64) {
+    pub(crate) async fn fire_due_triggers(
+        &self,
+        chat_id: ChatId,
+        until: u64,
+    ) -> Result<(), AgentError> {
         let due = {
             let chats = self.inner.chats.lock().await;
             let members = crate::family_tree::root(&chats, chat_id)
@@ -890,15 +937,17 @@ impl Agent {
                 })
                 .collect::<Vec<_>>()
         };
+        let mut first_error = None;
         for (member, loop_id, expired) in due {
             if expired {
                 let _ = self
                     .end_goal(member, loop_id, LoopState::Expired, None)
                     .await;
-            } else {
-                self.fire_scheduled(member, loop_id, until, None).await;
+            } else if let Err(error) = self.fire_scheduled(member, loop_id, until, None).await {
+                first_error.get_or_insert(error);
             }
         }
+        first_error.map_or(Ok(()), Err)
     }
 
     pub(super) async fn end_goal(
@@ -1145,5 +1194,139 @@ impl Agent {
             },
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use tickloop_agent_test_support::{ScriptedModel, config, text};
+
+    #[tokio::test]
+    async fn schedule_clock_corrects_an_anchor_ahead_of_wall_time() {
+        let clock = ScheduleClock::new();
+        let system = tickloop_agent_base::private_fs::unix_time_milliseconds();
+        *clock.anchor.lock().unwrap() = (system + 3_600_000, tokio::time::Instant::now());
+        let corrected = clock.now_ms();
+        assert!(corrected < system + SCHEDULE_CLOCK_CATCH_UP_MS);
+        let minutes = (system / 60_000 + 10) % (24 * 60);
+        let mut trigger = Trigger::for_loop_goal("daily check");
+        trigger.schedule = Some(
+            format!("daily {:02}:{:02}", minutes / 60, minutes % 60)
+                .parse()
+                .unwrap(),
+        );
+        trigger.arm_at(system);
+        assert!(
+            trigger.due_scheduled_ms(corrected).is_none(),
+            "a clock ahead must not fire the daily check early"
+        );
+        let due = trigger.next_scheduled_ms().unwrap();
+        trigger.note_scheduled(due);
+        *clock.anchor.lock().unwrap() = (system - 3_600_000, tokio::time::Instant::now());
+        let corrected = clock.now_ms();
+        assert!(corrected >= system);
+        trigger.note_scheduled(corrected);
+        assert_eq!(trigger.last_fired_at_ms, Some(due));
+        assert!(
+            trigger.due_scheduled_ms(due).is_none(),
+            "rebasing never repeats a processed fire"
+        );
+    }
+
+    async fn scheduled_agent() -> (Agent, Receipt) {
+        let agent = Agent::with_seams(
+            HarnessSeams {
+                transcripts: None,
+                environment: None,
+                models: tickloop_agent_test_support::harness::ChosenModels::new(Arc::new(
+                    ScriptedModel::new(vec![text("ready")]),
+                )),
+            },
+            HarnessOptions {
+                model: config(),
+                settings: None,
+                host: AgentHostOptions::product_defaults(),
+                tools: ToolPolicy::web_fetch_only(),
+                host_rules: Vec::new(),
+                task_tools: None,
+                min_schedule_interval: LOCAL_MIN_SCHEDULE_INTERVAL,
+                waits: WaitHosting::Durable,
+            },
+        )
+        .unwrap();
+        let chat = agent.create_chat_without_folder().await.unwrap();
+        let receipt = agent.submit(chat, None, "watch".into()).await.unwrap();
+        loop {
+            if agent.snapshot(chat).await.unwrap().loops[0].state == LoopState::Completed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let mut chats = agent.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat).unwrap();
+        let mut trigger = Trigger::for_loop_goal("watch");
+        trigger.schedule = Some("every 1s".parse().unwrap());
+        trigger.arm_at(1_000);
+        chat.snapshot.loops[0].trigger = Some(trigger);
+        drop(chats);
+        (agent, receipt)
+    }
+
+    #[tokio::test]
+    async fn refused_scheduled_fire_advances_and_surfaces_its_error() {
+        for stopping in [true, false] {
+            let (agent, receipt) = scheduled_agent().await;
+            {
+                let mut chats = agent.inner.chats.lock().await;
+                let chat = chats.get_mut(&receipt.chat_id).unwrap();
+                chat.family_stopping = stopping;
+                if !stopping {
+                    chat.branch_reservation = Some(Uuid::new_v4());
+                }
+            }
+            assert!(
+                agent
+                    .wake(
+                        receipt.chat_id,
+                        Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(2_000))
+                    )
+                    .await
+                    .is_err()
+            );
+            let snapshot = agent.snapshot(receipt.chat_id).await.unwrap();
+            assert_eq!(
+                snapshot.loops[0].trigger.as_ref().unwrap().last_fired_at_ms,
+                Some(2_000)
+            );
+            assert_eq!(wake_at(&snapshot), Some(3_000));
+            agent.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_load_does_not_start_timers_for_failed_or_interrupted_loops() {
+        for state in [LoopState::Failed, LoopState::Interrupted] {
+            let (agent, receipt) = scheduled_agent().await;
+            {
+                let mut chats = agent.inner.chats.lock().await;
+                let chat = chats.get_mut(&receipt.chat_id).unwrap();
+                chat.snapshot.loops[0].state = state;
+            }
+            agent.resume_triggers_after_load(receipt.chat_id).await;
+            let chats = agent.inner.chats.lock().await;
+            let chat = chats.get(&receipt.chat_id).unwrap();
+            assert!(!chat.trigger_cancellations.contains_key(&receipt.loop_id));
+            assert_eq!(
+                chat.snapshot.loops[0]
+                    .trigger
+                    .as_ref()
+                    .unwrap()
+                    .last_fired_at_ms,
+                None
+            );
+            drop(chats);
+            agent.shutdown().await;
+        }
     }
 }

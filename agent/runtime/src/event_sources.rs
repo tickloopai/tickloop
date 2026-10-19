@@ -352,10 +352,8 @@ impl Agent {
         let (loop_id, creates_loop) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-            let identities =
-                super::feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat_id)
-                    .identities()
-                    .map_err(|error| AgentError::Storage(error.to_string()))?;
+            let identities = super::feedback_inbox::FeedbackInbox::identities_for(chat)
+                .map_err(|error| AgentError::Storage(error.to_string()))?;
             let open_loops = chat
                 .snapshot
                 .loops
@@ -388,10 +386,8 @@ impl Agent {
         {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
-            let identities =
-                super::feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), chat_id)
-                    .identities()
-                    .map_err(|error| AgentError::Storage(error.to_string()))?;
+            let identities = super::feedback_inbox::FeedbackInbox::identities_for(chat)
+                .map_err(|error| AgentError::Storage(error.to_string()))?;
             if identities.iter().any(|identity| {
                 identity.loop_id == loop_id
                     && (identity.origin != credential.origin
@@ -1013,12 +1009,12 @@ impl Agent {
             {
                 continue;
             }
-            // The same entry as a durable host's delivery: the ledger finds a request it holds.
-            let request = crate::TurnRequest::deliver(
-                loop_id,
-                ExternalDelivery::received(&input.identity, input.prompt),
-            );
-            if let Err(error) = Box::pin(self.advance(chat_id, request)).await {
+            // Already received inputs remain valid after unlinking; the inbox owns their admission.
+            let delivery = ExternalDelivery::received(&input.identity, input.prompt);
+            if let Err(error) = self
+                .advance_received_delivery(chat_id, loop_id, delivery)
+                .await
+            {
                 self.warn_feedback_delivery(
                     chat_id,
                     loop_id,
@@ -1039,6 +1035,18 @@ impl Agent {
         delivery: ExternalDelivery,
         ledger: LedgerInput,
     ) -> Result<Receipt, AgentError> {
+        self.take_received_delivery(chat_id, target_loop, delivery, ledger, true)
+            .await
+    }
+
+    pub(super) async fn take_received_delivery(
+        &self,
+        chat_id: ChatId,
+        target_loop: LoopId,
+        delivery: ExternalDelivery,
+        ledger: LedgerInput,
+        requires_binding: bool,
+    ) -> Result<Receipt, AgentError> {
         let identity = delivery.identity(chat_id, target_loop);
         let source = TriggerSource {
             source: ARTIFACT_FEEDBACK_SOURCE.into(),
@@ -1057,6 +1065,7 @@ impl Agent {
             SubmissionOptions {
                 trigger_source: Some(source),
                 feedback_input: Some(identity),
+                requires_feedback_binding: requires_binding,
                 ledger: Some(ledger),
                 ..Default::default()
             },
@@ -1071,20 +1080,31 @@ impl Agent {
         let Ok(client) = artifact_client(self) else {
             return Ok(None);
         };
-        let identities = {
+        let (identities, has_feedback) = {
             let chats = self.inner.chats.lock().await;
             let chat = chats
                 .get(&receipt.chat_id)
                 .ok_or("Feedback Chat is unavailable")?;
-            super::feedback_inbox::FeedbackInbox::new(chat.tools.chat_directory(), receipt.chat_id)
-                .identities()
-                .map_err(|error| error.to_string())?
+            (
+                super::feedback_inbox::FeedbackInbox::identities_for(chat)
+                    .map_err(|error| error.to_string())?,
+                chat.bookkeeping
+                    .lifecycle
+                    .feedback_entries()
+                    .any(|input| input.loop_id == receipt.loop_id),
+            )
         };
         let relevant = identities
             .into_iter()
             .filter(|identity| identity.loop_id == receipt.loop_id)
             .collect::<Vec<_>>();
         if relevant.is_empty() {
+            if has_feedback {
+                return Err(
+                    "Feedback account identity is unavailable; this Loop cannot use Artifact tools"
+                        .into(),
+                );
+            }
             return Ok(None);
         }
         let credential = client
@@ -1322,6 +1342,149 @@ impl Agent {
 mod feedback_admission_tests {
     use super::*;
     use tickloop_agent_test_support::{ScriptedModel, config, text};
+
+    async fn folderless_loop() -> (Agent, Receipt) {
+        let agent = Agent::with_seams(
+            crate::HarnessSeams {
+                transcripts: None,
+                environment: None,
+                models: tickloop_agent_test_support::harness::ChosenModels::new(Arc::new(
+                    ScriptedModel::new(vec![text("ready")]),
+                )),
+            },
+            crate::HarnessOptions {
+                model: config(),
+                settings: None,
+                host: tickloop_agent_protocol::AgentHostOptions::product_defaults(),
+                tools: crate::ToolPolicy::web_fetch_only(),
+                host_rules: Vec::new(),
+                task_tools: None,
+                min_schedule_interval: crate::LOCAL_MIN_SCHEDULE_INTERVAL,
+                waits: WaitHosting::Durable,
+            },
+        )
+        .unwrap();
+        let chat = agent.create_chat_without_folder().await.unwrap();
+        let receipt = agent.submit(chat, None, "prepare".into()).await.unwrap();
+        while agent.snapshot(chat).await.unwrap().loops[0].state != LoopState::Completed {
+            tokio::task::yield_now().await;
+        }
+        (agent, receipt)
+    }
+
+    fn feedback_identity(receipt: &Receipt) -> feedback_inbox::FeedbackIdentity {
+        feedback_inbox::FeedbackIdentity {
+            chat_id: receipt.chat_id,
+            loop_id: receipt.loop_id,
+            delivery_id: Uuid::new_v4(),
+            feedback_id: "feedback".into(),
+            origin: "https://docs.example".into(),
+            account_id: "owner".into(),
+            artifact_id: "document".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_requires_the_target_loops_active_artifact_binding() {
+        let (agent, receipt) = folderless_loop().await;
+        let identity = feedback_identity(&receipt);
+        let binding = EventSourceBinding {
+            origin: identity.origin.clone(),
+            account_id: identity.account_id.clone(),
+            artifact_id: identity.artifact_id.clone(),
+            binding_id: Uuid::new_v4(),
+            client_instance_id: Uuid::new_v4(),
+            epoch: 1,
+            resume_required: false,
+            last_request_at_ms: None,
+        };
+        for mismatch in ["missing", "origin", "account", "artifact", "resume"] {
+            let mut source = binding.clone();
+            match mismatch {
+                "origin" => source.origin.push_str(".other"),
+                "account" => source.account_id.push_str("-other"),
+                "artifact" => source.artifact_id.push_str("-other"),
+                "resume" => source.resume_required = true,
+                _ => {}
+            }
+            agent
+                .inner
+                .chats
+                .lock()
+                .await
+                .get_mut(&receipt.chat_id)
+                .unwrap()
+                .snapshot
+                .loops[0]
+                .event_sources = if mismatch == "missing" {
+                vec![]
+            } else {
+                vec![source]
+            };
+            let delivery = ExternalDelivery::received(&identity, "saved feedback".into());
+            let ledger = crate::turn::delivery_ledger(receipt.loop_id, delivery.clone());
+            assert!(
+                matches!(
+                    agent
+                        .take_delivery(receipt.chat_id, receipt.loop_id, delivery, ledger)
+                        .await,
+                    Err(AgentError::Invalid(_))
+                ),
+                "{mismatch}"
+            );
+        }
+        agent.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn folderless_feedback_account_context_does_not_fail_open() {
+        for provenance in ["memory", "queue", "ledger", "unknown"] {
+            let (agent, receipt) = folderless_loop().await;
+            let root = tempfile::tempdir().unwrap();
+            agent
+                .install_host_tools(Arc::new(crate::mcp_tools::McpHostToolProvider::new(
+                    ArtifactClient::for_origin(root.path(), "https://docs.example").unwrap(),
+                    None,
+                )))
+                .unwrap();
+            let identity = feedback_identity(&receipt);
+            let pending: PendingInput = serde_json::from_value(serde_json::json!({
+                "receipt": receipt, "input": "saved feedback", "trigger_source": {
+                    "source": ARTIFACT_FEEDBACK_SOURCE,
+                    "payload": {"origin": identity.origin, "account_id": identity.account_id,
+                        "artifact_id": identity.artifact_id, "delivery_id": identity.delivery_id,
+                        "feedback_id": identity.feedback_id}
+                }
+            }))
+            .unwrap();
+            {
+                let mut chats = agent.inner.chats.lock().await;
+                let chat = chats.get_mut(&receipt.chat_id).unwrap();
+                match provenance {
+                    "memory" => {
+                        chat.feedback_inputs
+                            .insert(receipt.run_id, identity.clone());
+                    }
+                    "queue" => chat.snapshot.pending_inputs.push(pending.clone()),
+                    _ => {
+                        let delivery = ExternalDelivery::received(&identity, pending.input.clone());
+                        chat.bookkeeping.lifecycle.accept(
+                            &crate::turn::delivery_ledger(receipt.loop_id, delivery),
+                            &pending,
+                        );
+                        if provenance == "unknown" {
+                            chat.bookkeeping.lifecycle.start_input(receipt.run_id);
+                        }
+                    }
+                }
+            }
+            assert!(
+                agent.feedback_account_context(&receipt).await.is_err(),
+                "{provenance}: unsigned feedback cannot use an unscoped account"
+            );
+            agent.shutdown().await;
+        }
+    }
 
     #[tokio::test]
     async fn concurrent_replays_enter_an_unlinked_loop_once() {

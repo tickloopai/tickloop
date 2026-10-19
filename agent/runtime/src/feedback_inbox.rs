@@ -70,6 +70,27 @@ pub(super) struct FeedbackInbox {
 }
 
 impl FeedbackInbox {
+    pub(super) fn identities_for(chat: &super::Chat) -> io::Result<Vec<FeedbackIdentity>> {
+        let mut identities =
+            Self::new(chat.tools.chat_directory(), chat.snapshot.id).identities()?;
+        identities.extend(chat.feedback_inputs.values().cloned());
+        let ledger_inputs = chat.bookkeeping.lifecycle.queued_inputs();
+        for input in chat
+            .snapshot
+            .pending_inputs
+            .iter()
+            .chain(&ledger_inputs)
+            .filter(|input| super::event_sources::is_feedback_input(input))
+        {
+            let identity = super::event_sources::queued_feedback_identity(chat.snapshot.id, input)
+                .ok_or_else(|| io::Error::other("Feedback account identity is unavailable"))?;
+            if !identities.contains(&identity) {
+                identities.push(identity);
+            }
+        }
+        Ok(identities)
+    }
+
     pub(super) fn new(chat_directory: Option<&PrivateDirectory>, chat_id: Uuid) -> Self {
         Self {
             root: chat_directory.map(|directory| directory.join("feedback")),
