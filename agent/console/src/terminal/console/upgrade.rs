@@ -463,6 +463,85 @@ mod tests {
     }
 
     #[test]
+    fn view_checkpoint_preserves_runtime_banner_scroll_for_current_and_cached_chats() {
+        let banner = vec![
+            ("Tickloop v2.0.0\n".into(), Some(Role::Title)),
+            ("Model\nDirectory\n".into(), Some(Role::MutedText)),
+        ];
+        let history = (0..120)
+            .map(|index| format!("content {index:03}\n"))
+            .collect::<String>();
+        for hidden in [false, true] {
+            for following in [false, true] {
+                let first = Uuid::new_v4();
+                let second = Uuid::new_v4();
+                let source = Console::test_interactive_for_chat(first);
+                let mut expected = HashMap::new();
+                for chat in [first, second] {
+                    source.ensure_chat_banner(chat, &banner).unwrap();
+                    source.reset_chat(chat).unwrap();
+                    source.state.lock().unwrap().scrollback.append(&history);
+                    source
+                        .set_agent_runtime(chat, Some("1.0.0+old".into()), true)
+                        .unwrap();
+                    if hidden {
+                        source.set_agent_runtime(chat, None, false).unwrap();
+                    }
+                    let mut state = source.state.lock().unwrap();
+                    state.scrollback.frame(80, 8);
+                    if following {
+                        state.scrollback.scroll(ScrollAction::Last);
+                    } else {
+                        let target = state
+                            .scrollback
+                            .row_texts(0..200)
+                            .iter()
+                            .position(|line| line == "content 040")
+                            .unwrap();
+                        state.scrollback.scroll(ScrollAction::First);
+                        state.scrollback.scroll(ScrollAction::LinesDown(target));
+                    }
+                    expected.insert(chat, state.scrollback.frame(80, 8).lines);
+                }
+                let saved: ConsoleUpgrade = serde_json::from_slice(
+                    &serde_json::to_vec(&source.test_upgrade_snapshot()).unwrap(),
+                )
+                .unwrap();
+                let restored = Console::test_interactive_for_chat(second);
+                restored.ensure_chat_banner(second, &banner).unwrap();
+                restored.reset_chat(second).unwrap();
+                restored.state.lock().unwrap().scrollback.append(&history);
+                restored.restore_upgrade(saved).unwrap();
+                for chat in [second, first] {
+                    if chat == first {
+                        assert!(
+                            restored
+                                .state
+                                .lock()
+                                .unwrap()
+                                .pending_upgrade_scroll
+                                .contains_key(&Some(chat))
+                        );
+                        restored.ensure_chat_banner(chat, &banner).unwrap();
+                        restored.reset_chat(chat).unwrap();
+                        restored.state.lock().unwrap().scrollback.append(&history);
+                    }
+                    assert_eq!(
+                        restored.state.lock().unwrap().scrollback.frame(80, 8).lines,
+                        expected[&chat]
+                    );
+                    restored
+                        .set_agent_runtime(chat, Some("2.0.0+new".into()), false)
+                        .unwrap();
+                    let mut state = restored.state.lock().unwrap();
+                    assert_eq!(state.scrollback.frame(80, 8).lines, expected[&chat]);
+                    assert_eq!(state.scrollback.is_following(), following);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn upgrade_waits_for_dialogs_attached_views_and_submitted_input() {
         let console = Console::test_interactive_for_chat(Uuid::new_v4());
         let mut state = console.state.lock().unwrap();

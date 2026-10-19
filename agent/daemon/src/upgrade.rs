@@ -115,6 +115,8 @@ struct WorkerHandoff {
     grant: WorkerControlGrant,
     launch: LaunchSpec,
     executable: PathBuf,
+    #[serde(default)]
+    upgrade_error: Option<String>,
 }
 
 pub(crate) fn duplicate(fd: RawFd) -> io::Result<OwnedFd> {
@@ -250,11 +252,14 @@ impl ProcessWorkerFactory {
         Ok(())
     }
 
-    pub(crate) async fn record_worker_upgrade_error(&self, error: String) {
+    pub(crate) async fn record_daemon_upgrade_error(&self, error: String) {
         self.upgrade.lock().await.error = Some(error);
     }
 
-    pub(crate) async fn version(&self) -> RuntimeVersion {
+    pub(crate) async fn version(
+        &self,
+        routes: &[(tickloop_agent_protocol::ExecutionRef, Arc<dyn AgentAccess>)],
+    ) -> RuntimeVersion {
         let (requested_executable, upgrading, error) = {
             let state = self.upgrade.lock().await;
             (
@@ -277,6 +282,12 @@ impl ProcessWorkerFactory {
                 executable: worker.executable.clone(),
                 build_id: worker.build_id.clone(),
                 upgrading: worker.preparation_uncertain || worker.executable != executable,
+                executions: routes
+                    .iter()
+                    .filter(|(_, access)| Arc::ptr_eq(access, &worker.access))
+                    .map(|(execution, _)| *execution)
+                    .collect(),
+                error: worker.upgrade_error.clone(),
             })
             .collect();
         RuntimeVersion {
@@ -340,6 +351,7 @@ impl ProcessWorkerFactory {
                 executable: worker.executable,
                 link,
                 preparation_uncertain: false,
+                upgrade_error: worker.upgrade_error,
             });
         }
         let access = restored
@@ -487,7 +499,7 @@ pub(crate) async fn drive_daemon_upgrade(
                 if current_target.as_ref() != Some(&selected.executable)
                     && let Err(error) = factory.select_upgrade(&selected.executable).await
                 {
-                    factory.record_worker_upgrade_error(error.to_string()).await;
+                    factory.record_daemon_upgrade_error(error.to_string()).await;
                     continue;
                 }
             }
@@ -575,6 +587,7 @@ async fn transfer_daemon(
             grant: worker.grant.clone(),
             launch: worker.launch.clone(),
             executable: worker.executable.clone(),
+            upgrade_error: worker.upgrade_error.clone(),
         });
         descriptors.push(lifeline);
     }
@@ -690,7 +703,7 @@ async fn transfer_daemon(
             Err(error) if !committed => return Err(error),
             Err(error) => {
                 factory
-                    .record_worker_upgrade_error(format!(
+                    .record_daemon_upgrade_error(format!(
                         "recovering committed daemon transfer: {error}"
                     ))
                     .await;
@@ -734,7 +747,7 @@ async fn transfer_daemon(
             let _ = successor.wait().await;
             record.phase = "committed".into();
             factory
-                .record_worker_upgrade_error(format!("cannot persist daemon activation: {error}"))
+                .record_daemon_upgrade_error(format!("cannot persist daemon activation: {error}"))
                 .await;
             tokio::time::sleep(CONNECT_RETRY).await;
             continue;

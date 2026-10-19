@@ -107,6 +107,7 @@ struct ManagedWorker {
     executable: PathBuf,
     link: Arc<std::sync::RwLock<upgrade::WorkerAddress>>,
     preparation_uncertain: bool,
+    upgrade_error: Option<String>,
     executable_lease: Option<tickhost_connect::executable_lease::ExecutableLease>,
 }
 
@@ -153,8 +154,11 @@ impl WorkerFactory for ProcessWorkerFactory {
         self.select_upgrade(executable).await
     }
 
-    async fn runtime_version(&self) -> tickloop_agent_protocol::RuntimeVersion {
-        self.version().await
+    async fn runtime_version(
+        &self,
+        routes: &[(tickloop_agent_protocol::ExecutionRef, Arc<dyn AgentAccess>)],
+    ) -> tickloop_agent_protocol::RuntimeVersion {
+        self.version(routes).await
     }
     async fn start(
         &self,
@@ -263,6 +267,7 @@ impl WorkerFactory for ProcessWorkerFactory {
                             executable,
                             link,
                             preparation_uncertain: false,
+                            upgrade_error: None,
                         });
                         self.control
                             .register(&grant, access.clone(), launch.config_root.as_deref())

@@ -311,11 +311,18 @@ async fn report_running_versions() {
                 worker.process_id,
                 worker.build_id.as_deref().unwrap_or("unknown build"),
                 if worker.upgrading {
-                    " (waiting for a safe point)"
+                    " (pending switch)"
                 } else {
                     ""
                 }
             );
+            if let Some(error) = worker.error {
+                println!(
+                    "Worker {} activation deferred: {}",
+                    worker.process_id,
+                    tickloop_agent_console::terminal::safe_text(&error)
+                );
+            }
         }
         if let Some(error) = version.error {
             println!(

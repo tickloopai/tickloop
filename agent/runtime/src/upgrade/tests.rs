@@ -839,3 +839,195 @@ async fn unread_completed_shell_keeps_its_host_view_after_upgrade_and_idle_timeo
     );
     successor.shutdown().await;
 }
+
+struct LegacyRetainedShellHost {
+    ended: tokio::sync::watch::Sender<Option<tickloop_agent_tools::ShellExit>>,
+    retained_checks: std::sync::atomic::AtomicUsize,
+    stops: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Default for LegacyRetainedShellHost {
+    fn default() -> Self {
+        Self {
+            ended: tokio::sync::watch::channel(None).0,
+            retained_checks: Default::default(),
+            stops: Default::default(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl tickloop_agent_tools::ShellHost for LegacyRetainedShellHost {
+    async fn start(
+        &self,
+        mut launch: tickloop_agent_tools::ShellLaunch,
+    ) -> Result<Box<dyn tickloop_agent_tools::ShellProcess>, tickloop_agent_tools::ShellStartError>
+    {
+        use std::io::Write;
+        launch.output.write_all(b"retained legacy output").unwrap();
+        Ok(Box::new(LegacyRetainedShellProcess {
+            ended: self.ended.subscribe(),
+            stops: self.stops.clone(),
+        }))
+    }
+
+    async fn retained_handoff(
+        &self,
+        _: Uuid,
+    ) -> Result<Option<Value>, tickloop_agent_tools::ToolError> {
+        self.retained_checks.fetch_add(1, Ordering::SeqCst);
+        Err(tickloop_agent_tools::ToolError::Rejected(
+            "the existing Tickhost cannot transfer this retained Shell".into(),
+        ))
+    }
+}
+
+struct LegacyRetainedShellProcess {
+    ended: tokio::sync::watch::Receiver<Option<tickloop_agent_tools::ShellExit>>,
+    stops: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl tickloop_agent_tools::ShellProcess for LegacyRetainedShellProcess {
+    fn pid(&self) -> u32 {
+        4242
+    }
+
+    async fn exited(&mut self) -> tickloop_agent_tools::ShellExit {
+        self.ended
+            .wait_for(Option::is_some)
+            .await
+            .unwrap()
+            .clone()
+            .unwrap()
+    }
+
+    async fn stop(&mut self, _: &str) {
+        self.stops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn an_unsupported_retained_shell_reports_a_blocker_without_discarding_its_result() {
+    let directory = tempfile::tempdir().unwrap();
+    const CONTINUE: &str = "continue using the original Agent";
+    const CONTINUED: &str = "the original Agent answered the new input";
+    let original = Agent::new_embedded(
+        config(),
+        Arc::new(tickloop_agent_test_support::routed::RoutedModel::new(
+            |request| {
+                use tickloop_agent_test_support::routed::{has_tool_result, history_text};
+                if history_text(request).contains(CONTINUE) {
+                    text(CONTINUED)
+                } else if !has_tool_result(request, "legacy") {
+                    call(
+                        "legacy",
+                        "Bash",
+                        serde_json::json!({
+                            "command":"legacy-task", "description":"Hold legacy output", "run_in_background":true,
+                        }),
+                    )
+                } else {
+                    text("waiting for the retained result")
+                }
+            },
+        )),
+    );
+    let chat = original.create_chat(directory.path().into()).await.unwrap();
+    let host = Arc::new(LegacyRetainedShellHost::default());
+    {
+        let mut chats = original.inner.chats.lock().await;
+        let state = chats.get_mut(&chat).unwrap();
+        let output = state.tools.chat_directory().clone();
+        let family = tickloop_agent_base::private_fs::PrivateDirectory::trusted(
+            state.tools.family_temp_directory().into(),
+        );
+        state.tools = Arc::new(tickloop_agent_tools::Tools::for_chat(
+            output.clone(),
+            output.join("tasks"),
+            family,
+            host.clone(),
+        ));
+    }
+    original
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    complete(&original, chat, "start a legacy background task").await;
+    host.ended
+        .send_replace(Some(tickloop_agent_tools::ShellExit {
+            exit_code: None,
+            signal: None,
+            reason: Some("cancelled".into()),
+            state: CommandState::Failed,
+        }));
+    let failed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = original.snapshot(chat).await.unwrap();
+            if snapshot
+                .commands
+                .first()
+                .is_some_and(|command| command.state == CommandState::Failed)
+            {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let prepared = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let prepared = original.prepare_upgrade().await;
+            if host.retained_checks.load(Ordering::SeqCst) > 0 {
+                break prepared;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let Err(error) = prepared else {
+        panic!(
+            "an unsupported retained Shell must report an upgrade blocker, not a busy safe point"
+        );
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("cannot transfer this retained Shell")
+    );
+    assert!(!original.inner.upgrade_paused.load(Ordering::SeqCst));
+    assert_eq!(host.stops.load(Ordering::SeqCst), 0);
+    let current = original.snapshot(chat).await.unwrap();
+    assert_eq!(current.monitor, failed.monitor);
+    assert_eq!(current.commands[0].state, CommandState::Failed);
+    assert_eq!(
+        current.commands[0].output_ref,
+        failed.commands[0].output_ref
+    );
+    assert_eq!(
+        std::fs::read(&current.commands[0].output_ref).unwrap(),
+        b"retained legacy output"
+    );
+    let mut events = original.subscribe();
+    original.submit(chat, None, CONTINUE.into()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.chat_id != chat { continue; }
+            match event.kind {
+                EventKind::Failed(error) => panic!("original Agent continuation failed: {error}"),
+                EventKind::Completed { .. } => {
+                    let current = original.snapshot(chat).await.unwrap();
+                    if current.messages.iter().any(|message| message.role == Role::Assistant
+                        && message.content.iter().any(|content| matches!(content, Content::Text { text } if text == CONTINUED))) {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }).await.expect("the original Agent must answer the new input after rejecting its upgrade");
+    original.shutdown().await;
+}

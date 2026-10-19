@@ -33,7 +33,10 @@ pub trait WorkerFactory: Send + Sync {
             "this runtime does not support process upgrades",
         ))
     }
-    async fn runtime_version(&self) -> RuntimeVersion {
+    async fn runtime_version(
+        &self,
+        _routes: &[(ExecutionRef, Arc<dyn AgentAccess>)],
+    ) -> RuntimeVersion {
         RuntimeVersion {
             executable: std::env::current_exe().unwrap_or_default(),
             build_id: tickloop_agent_protocol::build_identity()
@@ -776,13 +779,23 @@ impl AgentAccess for DaemonServer {
         let _admission = self.inner.admission.read().await;
         self.ensure_active()?;
         match query {
-            ObservationRequest::RuntimeVersion => Ok(Observation::single(
-                ObservationValue::RuntimeVersion(Box::new(
-                    self.inner.factory.runtime_version().await,
-                )),
-                self.cursor(),
-                None,
-            )),
+            ObservationRequest::RuntimeVersion => {
+                let routes = self
+                    .inner
+                    .routes
+                    .lock()
+                    .await
+                    .iter()
+                    .map(|(execution, worker)| (*execution, worker.clone()))
+                    .collect::<Vec<_>>();
+                Ok(Observation::single(
+                    ObservationValue::RuntimeVersion(Box::new(
+                        self.inner.factory.runtime_version(&routes).await,
+                    )),
+                    self.cursor(),
+                    None,
+                ))
+            }
             ObservationRequest::Receipt { epoch, command_id } => Ok(Observation::single(
                 ObservationValue::Receipt(
                     self.inner

@@ -768,11 +768,30 @@ fn signed_claude_reply(answer: &str) -> String {
     .concat()
 }
 
-async fn finish_turn(agent: &Agent, chat: Uuid, prompt: &str) {
+async fn finish_turn(
+    agent: &Agent,
+    chat: Uuid,
+    prompt: &str,
+    captured_request_counts: impl Fn() -> (usize, usize),
+) {
     let mut events = agent.subscribe();
     let receipt = agent.submit(chat, None, prompt.into()).await.unwrap();
+    let mut last_event = None;
     loop {
-        let event = tickloop_agent_test_support::next_event(&mut events).await;
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{prompt}: event timed out for run {}; last event: {last_event:?}; captured Claude/GPT request counts: {:?}", receipt.run_id, captured_request_counts()))
+            .unwrap_or_else(|error| panic!("{prompt}: event channel failed: {error}; last event: {last_event:?}"));
+        let kind = serde_json::to_value(&event.kind).unwrap();
+        let kind = kind
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| {
+                kind.as_object()
+                    .and_then(|object| object.keys().next().cloned())
+            })
+            .unwrap();
+        last_event = Some((event.sequence, event.run_id, kind));
         match event.kind {
             EventKind::Completed { .. } if event.run_id == receipt.run_id => return,
             EventKind::Failed(error) => panic!("{prompt}: {error}"),
@@ -810,8 +829,14 @@ async fn claude_gpt_restart_claude_keeps_history_sources_and_same_source_signatu
     )
     .unwrap();
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
-    finish_turn(&agent, chat, "First prompt").await;
-    finish_turn(&agent, chat, "Second prompt").await;
+    finish_turn(&agent, chat, "First prompt", || {
+        (claude_requests.len(), gpt_requests.len())
+    })
+    .await;
+    finish_turn(&agent, chat, "Second prompt", || {
+        (claude_requests.len(), gpt_requests.len())
+    })
+    .await;
     agent
         .set_model(
             chat,
@@ -820,7 +845,10 @@ async fn claude_gpt_restart_claude_keeps_history_sources_and_same_source_signatu
         )
         .await
         .unwrap();
-    finish_turn(&agent, chat, "Use GPT").await;
+    finish_turn(&agent, chat, "Use GPT", || {
+        (claude_requests.len(), gpt_requests.len())
+    })
+    .await;
     let mixed = agent.snapshot(chat).await.unwrap();
     agent.shutdown().await;
 
@@ -841,7 +869,10 @@ async fn claude_gpt_restart_claude_keeps_history_sources_and_same_source_signatu
         )
         .await
         .unwrap();
-    finish_turn(&resumed, chat, "Return to Claude").await;
+    finish_turn(&resumed, chat, "Return to Claude", || {
+        (claude_requests.len(), gpt_requests.len())
+    })
+    .await;
     resumed.shutdown().await;
 
     claude_requests.recv().await.unwrap();

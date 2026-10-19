@@ -629,7 +629,8 @@ impl Tools {
     pub async fn commands(&self) -> Vec<CommandSnapshot> {
         self.commands.snapshots().await
     }
-    pub async fn checkpoint_shells(&self) -> Result<Value, ToolError> {
+    /// A busy command returns `None`; unsupported ownership transfer remains an error.
+    pub async fn checkpoint_shells(&self) -> Result<Option<Value>, ToolError> {
         self.commands.checkpoint().await
     }
     pub async fn restore_shells(&self, checkpoint: Value) -> Result<(), ToolError> {

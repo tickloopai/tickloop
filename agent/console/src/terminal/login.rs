@@ -987,13 +987,27 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(std::fs::read_to_string(&credentials).unwrap(), original);
-        for title in ["Connection · OpenAI", "Choose Provider"] {
+        for title in ["Connection · OpenAI", "Choose Provider · All"] {
+            let title_with_details = format!("{title} · ");
             let mark = output.lock().unwrap().len();
             writer.write_all(TERMINAL_ESCAPE_KEY).unwrap();
             writer.flush().unwrap();
             let deadline = Instant::now() + PTY_TIMEOUT;
-            while !output.lock().unwrap()[mark..].contains(title) {
-                assert!(Instant::now() < deadline, "PTY missing fresh {title}");
+            loop {
+                let text = output.lock().unwrap().clone();
+                let frame = screen::visible_screen(&text, 150, 40);
+                if text[mark..].contains(SYNCHRONIZED_FRAME_END)
+                    && frame.lines().any(|line| {
+                        let line = line.trim();
+                        line == title || line.starts_with(&title_with_details)
+                    })
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "PTY missing fresh completed {title}; latest frame:\n{frame}"
+                );
                 std::thread::sleep(Duration::from_millis(20));
             }
         }

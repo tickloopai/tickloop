@@ -211,6 +211,14 @@ pub(super) enum RecoveryFact {
         run: Uuid,
         overview: bool,
     },
+    ActivityFrameBegin {
+        chat: Uuid,
+    },
+    ActivityFrameEnd {
+        chat: Uuid,
+        painted: bool,
+    },
+    TasksQueried,
     AgentOpened {
         chat: Uuid,
     },

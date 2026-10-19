@@ -726,6 +726,7 @@ pub(super) struct State {
     scrollback: Scrollback,
     /// Startup and local feedback from before this View's draft created its Chat.
     creation_prefixes: HashMap<Option<Uuid>, Vec<CreationPrefixEntry>>,
+    agent_runtime_banners: HashMap<Uuid, String>,
     echoed_inputs: HashSet<Uuid>,
     awaiting_input_echoes: HashSet<Uuid>,
     /// Agent Colors of every Agent this View has learned of, shared by all its conversations.
@@ -2503,6 +2504,62 @@ impl Console {
         Ok(())
     }
 
+    pub(super) fn ensure_chat_banner(
+        &self,
+        chat: Uuid,
+        banner: &[(String, Option<Role>)],
+    ) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if state.interactive {
+            state
+                .creation_prefixes
+                .entry(Some(chat))
+                .or_insert_with(|| {
+                    banner
+                        .iter()
+                        .map(|(text, role)| {
+                            CreationPrefixEntry::Output(ConversationPiece::Styled(
+                                text.clone(),
+                                *role,
+                            ))
+                        })
+                        .collect()
+                });
+        }
+        Ok(())
+    }
+
+    pub(super) fn set_agent_runtime(
+        &self,
+        chat: Uuid,
+        build: Option<String>,
+        pending: bool,
+    ) -> Result<(), String> {
+        let line = build
+            .map(|build| display_single_line(&build).trim().to_owned())
+            .filter(|build| !build.is_empty())
+            .map(|build| format!("Agent v{build}{}", if pending { " · pending" } else { "" }));
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        if !state.interactive || state.agent_runtime_banners.get(&chat) == line.as_ref() {
+            return Ok(());
+        }
+        match line {
+            Some(line) => {
+                state.agent_runtime_banners.insert(chat, line);
+            }
+            None => {
+                state.agent_runtime_banners.remove(&chat);
+            }
+        }
+        let changed = state.apply_agent_runtime_banner(chat);
+        if changed && state.chat == Some(chat) {
+            state
+                .draw(&mut io::stdout().lock())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     pub(super) fn select_created_chat(
         &self,
         chat: Uuid,
@@ -2546,6 +2603,7 @@ impl Console {
                     .collect(),
             );
         }
+        state.apply_agent_runtime_banner(chat);
         Ok(())
     }
 
@@ -5372,7 +5430,32 @@ impl State {
                 }
             }
         }
+        self.apply_agent_runtime_banner(chat);
         self.reset_chat_surfaces(chat, preserve_editor_context);
+    }
+
+    fn apply_agent_runtime_banner(&mut self, chat: Uuid) -> bool {
+        let Some(prefix) = self.creation_prefixes.get(&Some(chat)) else {
+            return false;
+        };
+        let mut at = 0;
+        for entry in prefix {
+            let CreationPrefixEntry::Output(ConversationPiece::Styled(text, _)) = entry else {
+                break;
+            };
+            at += text.bytes().filter(|byte| *byte == b'\n').count();
+        }
+        if at == 0 {
+            return false;
+        }
+        let text = self.agent_runtime_banners.get(&chat).map(String::as_str);
+        if self.chat == Some(chat) {
+            self.scrollback.set_agent_runtime_banner(at, text)
+        } else {
+            self.view_cache
+                .get_mut(&Some(chat))
+                .is_some_and(|view| view.scrollback.set_agent_runtime_banner(at, text))
+        }
     }
 
     fn switch_view_chat(&mut self, chat: Option<Uuid>) {
@@ -5576,6 +5659,7 @@ impl State {
             height: usize::from(height).max(1),
             scrollback: Scrollback::new(),
             creation_prefixes: HashMap::new(),
+            agent_runtime_banners: HashMap::new(),
             echoed_inputs: HashSet::new(),
             awaiting_input_echoes: HashSet::new(),
             agent_colors: AgentColors::default(),

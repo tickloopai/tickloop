@@ -48,35 +48,40 @@ pub struct ModelSelection {
 
 impl ModelCatalog {
     pub fn defaults() -> Self {
-        let providers = [
-            include_str!("providers/deepseek-api.yaml"),
-            include_str!("providers/anthropic-api.yaml"),
-            include_str!("providers/openai-api.yaml"),
-            include_str!("providers/openai-codex.yaml"),
-            include_str!("providers/minimax-cn-api.yaml"),
-            include_str!("providers/minimax-global-api.yaml"),
-            include_str!("providers/minimax-cn-oauth.yaml"),
-            include_str!("providers/minimax-global-oauth.yaml"),
-            include_str!("providers/zhipu-cn-api.yaml"),
-            include_str!("providers/zhipu-cn-coding.yaml"),
-            include_str!("providers/zai-global-api.yaml"),
-            include_str!("providers/zai-global-coding.yaml"),
-            include_str!("providers/github-copilot.yaml"),
-            include_str!("providers/kimi-cn-api.yaml"),
-            include_str!("providers/kimi-global-api.yaml"),
-            include_str!("providers/kimi-code-oauth.yaml"),
-            include_str!("providers/alibaba-cn-api.yaml"),
-            include_str!("providers/google-gemini-api.yaml"),
-            include_str!("providers/google-gemini-oauth.yaml"),
-            include_str!("providers/google-vertex-service-account.yaml"),
-            include_str!("providers/google-vertex-oauth.yaml"),
-            include_str!("providers/xai-api.yaml"),
-            include_str!("providers/xai-oauth.yaml"),
-        ]
-        .into_iter()
-        .map(|yaml| serde_yaml_ng::from_str(yaml).expect("bundled Provider YAML is valid"))
-        .collect();
-        Self { providers }
+        static BUNDLED: OnceLock<ModelCatalog> = OnceLock::new();
+        BUNDLED
+            .get_or_init(|| {
+                let providers = [
+                    include_str!("providers/deepseek-api.yaml"),
+                    include_str!("providers/anthropic-api.yaml"),
+                    include_str!("providers/openai-api.yaml"),
+                    include_str!("providers/openai-codex.yaml"),
+                    include_str!("providers/minimax-cn-api.yaml"),
+                    include_str!("providers/minimax-global-api.yaml"),
+                    include_str!("providers/minimax-cn-oauth.yaml"),
+                    include_str!("providers/minimax-global-oauth.yaml"),
+                    include_str!("providers/zhipu-cn-api.yaml"),
+                    include_str!("providers/zhipu-cn-coding.yaml"),
+                    include_str!("providers/zai-global-api.yaml"),
+                    include_str!("providers/zai-global-coding.yaml"),
+                    include_str!("providers/github-copilot.yaml"),
+                    include_str!("providers/kimi-cn-api.yaml"),
+                    include_str!("providers/kimi-global-api.yaml"),
+                    include_str!("providers/kimi-code-oauth.yaml"),
+                    include_str!("providers/alibaba-cn-api.yaml"),
+                    include_str!("providers/google-gemini-api.yaml"),
+                    include_str!("providers/google-gemini-oauth.yaml"),
+                    include_str!("providers/google-vertex-service-account.yaml"),
+                    include_str!("providers/google-vertex-oauth.yaml"),
+                    include_str!("providers/xai-api.yaml"),
+                    include_str!("providers/xai-oauth.yaml"),
+                ]
+                .into_iter()
+                .map(|yaml| serde_yaml_ng::from_str(yaml).expect("bundled Provider YAML is valid"))
+                .collect();
+                Self { providers }
+            })
+            .clone()
     }
 
     pub fn from_providers(providers: Vec<ProviderDefinition>) -> Result<Self, String> {
@@ -735,6 +740,47 @@ pub fn upgrade_saved_legacy_builtin_model(config: ModelConfig) -> ModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_catalog_copies_keep_nested_changes_local_to_each_caller() {
+        let original = ModelCatalog::defaults();
+        let mut edited = ModelCatalog::defaults();
+        let mut removed = ModelCatalog::defaults();
+        edited.providers[0].display_name = "Local display override".into();
+        edited.providers[0].endpoints.clear();
+        edited.providers[0].models[0].display_name = "Local model override".into();
+        edited.providers[0].models[0].input_modalities.clear();
+        removed.providers.clear();
+
+        assert_ne!(edited, original);
+        assert!(removed.providers.is_empty());
+        assert_eq!(ModelCatalog::defaults(), original);
+    }
+
+    #[test]
+    #[ignore = "manual construction-cost measurement; no machine-dependent pass threshold"]
+    fn measure_repeated_default_catalog_construction() {
+        use std::{hint::black_box, time::Instant};
+        const ITERATIONS: usize = 129;
+        let reference = ModelCatalog::defaults();
+        assert!(!reference.providers.is_empty());
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            black_box(ModelCatalog::defaults());
+        }
+        let defaults = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            black_box(reference.clone());
+        }
+        let cloning = started.elapsed();
+        eprintln!(
+            "catalog construction: iterations={ITERATIONS}, defaults_us={}, clone_us={}, defaults_to_clone_ratio={:.2}",
+            defaults.as_micros(),
+            cloning.as_micros(),
+            defaults.as_secs_f64() / cloning.as_secs_f64()
+        );
+    }
 
     #[test]
     fn saved_builtin_cards_inherit_new_capabilities_without_replacing_explicit_overrides() {

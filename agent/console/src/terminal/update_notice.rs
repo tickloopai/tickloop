@@ -17,7 +17,7 @@ pub(super) fn next_frame_ms(
     now_ms: u64,
 ) -> Option<u64> {
     let moving = match notice? {
-        UpdateNotice::Checking | UpdateNotice::Activating => true,
+        UpdateNotice::Checking => true,
         UpdateNotice::Installing { progress } => progress.percent.is_none(),
         _ => false,
     };
@@ -72,15 +72,8 @@ pub(super) fn line(
             ],
             Role::Success,
         ),
-        UpdateNotice::Activating => (
-            progress_messages(
-                "Applying update when ready…",
-                "Applying update…",
-                None,
-                None,
-                now_ms,
-                reduced_motion,
-            ),
+        UpdateNotice::PendingAgent => (
+            vec!["Agent update pending".into(), "Update pending".into()],
             Role::MutedText,
         ),
         UpdateNotice::Deferred { reason } => (
@@ -162,6 +155,16 @@ mod tests {
     use tickloop_agent_updater::UpdateProgress;
 
     #[test]
+    fn a_pending_agent_does_not_animate_an_update_in_progress() {
+        let display = DisplayProfile::default();
+        let notice = UpdateNotice::PendingAgent;
+        let first = line(&notice, 120, display, 0).text();
+        assert_eq!(first, "Agent update pending");
+        assert_eq!(first, line(&notice, 120, display, FRAME_INTERVAL_MS).text());
+        assert_eq!(next_frame_ms(Some(&notice), display, 0), None);
+    }
+
+    #[test]
     fn downloading_renders_a_real_bar_and_narrow_layouts_preserve_the_percentage() {
         let notice = UpdateNotice::Installing {
             progress: UpdateProgress {
@@ -197,7 +200,6 @@ mod tests {
                     downloaded_bytes: Some(1_048_576),
                 },
             },
-            UpdateNotice::Activating,
         ] {
             let first = line(&notice, 120, display, 0).text();
             let second = line(&notice, 120, display, FRAME_INTERVAL_MS).text();

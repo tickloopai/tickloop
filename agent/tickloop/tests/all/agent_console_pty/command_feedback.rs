@@ -391,3 +391,93 @@ async fn actual_cli_first_message_keeps_rule_command_and_feedback() {
         std::panic::resume_unwind(panic);
     }
 }
+
+#[tokio::test]
+async fn actual_cli_reopened_chat_keeps_its_banner_before_and_after_the_next_message() {
+    const OPENING: &str = "Open the banner conversation";
+    const FOLLOW_UP: &str = "Keep this conversation header";
+    const REOPENED_REPLY: &str = "The conversation header remains.";
+    let fixture = PrivateFixture::new();
+    let result = AssertUnwindSafe(async {
+        let (base_url, mut requests, release) =
+            model_http_support::serve_responses_with_gated_response(
+                vec![
+                    (200, chat_reply(None, FIRST_REPLY)),
+                    (200, chat_reply(None, REOPENED_REPLY)),
+                ],
+                1,
+            )
+            .await;
+        let model = fixture.set_chat_model(&base_url);
+        let mut first = PtyView::start_saving_chats(&fixture);
+        first
+            .wait_for("banner conversation ready", new_input_is_visible)
+            .await;
+        first.send(format!("{OPENING}\r").as_bytes());
+        first
+            .wait_for("opening reply completed", |frame| {
+                frame.contains(FIRST_REPLY) && TURN_SUMMARY.is_match(frame)
+            })
+            .await;
+        tokio::time::timeout(UI_TIMEOUT, requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let client = fixture.client().await;
+        let chat = catalog(&client).await[0].chat_id.to_string();
+        first.close().await;
+
+        let mut reopened = PtyView::launch(&fixture, &["--resume", &chat], &[], true);
+        let opened = reopened
+            .wait_for("the same conversation reopened", |frame| {
+                frame.contains("History opened.") && frame.contains(FIRST_REPLY)
+            })
+            .await;
+        let banner_model = format!("{} · {:?}", model.model, model.protocol);
+        let banner_directory = fixture.path("work").to_string_lossy().into_owned();
+        let assert_banner = |frame: &str| {
+            for text in [
+                STARTUP_BANNER_TITLE,
+                banner_model.as_str(),
+                banner_directory.as_str(),
+            ] {
+                assert_eq!(
+                    conversation_body(frame).matches(text).count(),
+                    1,
+                    "{text}: {frame}"
+                );
+            }
+            assert!(body_shows_once_in_order(
+                frame,
+                &[STARTUP_BANNER_TITLE, OPENING, FIRST_REPLY]
+            ));
+        };
+        assert_banner(&opened);
+        reopened.send(format!("{FOLLOW_UP}\r").as_bytes());
+        let (_, request) = tokio::time::timeout(UI_TIMEOUT, requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(request["messages"].to_string().contains(FOLLOW_UP));
+        let submitted = reopened
+            .wait_for("reopened message is visible before its reply", |frame| {
+                conversation_body(frame).contains(FOLLOW_UP)
+            })
+            .await;
+        assert_banner(&submitted);
+        release.send(()).unwrap();
+        let completed = reopened
+            .wait_for("reopened reply retains its header", |frame| {
+                frame.contains(REOPENED_REPLY)
+            })
+            .await;
+        assert_banner(&completed);
+        reopened.close().await;
+    })
+    .catch_unwind()
+    .await;
+    fixture.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

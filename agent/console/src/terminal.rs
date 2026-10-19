@@ -1643,7 +1643,11 @@ async fn interact(
     let mut activation_checks = tokio::task::JoinSet::new();
     let mut initial_activation = !matches!(&startup.chat, StartupChat::Upgrade(_, _));
     let mut ready_runtime: Option<tickloop_agent_updater::SelectedRuntime> = None;
-    let mut activation_notice = None;
+    let mut runtime_activation: Option<runtime_upgrade::Activation> = None;
+    let mut runtime_selection = None;
+    let mut runtime_presentation = None;
+    let mut installation_notice = None;
+    let mut view_activation_notice = None;
     let mut menus = Menus::new(user_settings.clone(), config_root.clone());
     let mut artifact_loads = tokio::task::JoinSet::new();
     let mut tick_package_tasks = ticks_work::TickPackageTasks::default();
@@ -2331,6 +2335,10 @@ async fn interact(
                 && let Some((cached_chat, status)) = &cached_activity_status
                 && *cached_chat == chat
             {
+                #[cfg(test)]
+                agent.record_recovery_fact(recovery_tests::RecoveryFact::ActivityFrameBegin {
+                    chat,
+                });
                 let activity = running_activity
                     .as_ref()
                     .filter(|activity| activity.chat_id == chat)
@@ -2344,6 +2352,11 @@ async fn interact(
                     })
                     .transpose()?;
                 console.set_activity_and_status(activity.as_deref(), status)?;
+                #[cfg(test)]
+                agent.record_recovery_fact(recovery_tests::RecoveryFact::ActivityFrameEnd {
+                    chat,
+                    painted: activity.is_some(),
+                });
             }
             activity_dirty = false;
         }
@@ -2428,10 +2441,44 @@ async fn interact(
             )
             .await
             {
-                activation_notice =
-                    Some(tickloop_agent_updater::UpdateNotice::Deferred { reason: error });
+                view_activation_notice = Some(tickloop_agent_updater::UpdateNotice::Deferred {
+                    reason: format!("View update · {error}"),
+                });
                 ready_runtime = None;
             }
+        }
+        if interactive {
+            let execution = selected_chat
+                .filter(|_| !overview_active)
+                .and_then(|chat| agent.cached_reference(chat));
+            if runtime_selection != execution {
+                runtime_selection = execution;
+                if execution.is_some() {
+                    activation_refresh.reset_immediately();
+                }
+            }
+            let worker =
+                execution.and_then(|execution| runtime_activation.as_ref()?.worker(execution));
+            if let Some(chat) = selected_chat.filter(|_| !overview_active) {
+                let presentation = (
+                    chat,
+                    worker.and_then(|worker| worker.build_id.clone()),
+                    worker.is_some_and(|worker| worker.upgrading),
+                );
+                if runtime_presentation.as_ref() != Some(&presentation) {
+                    console.set_agent_runtime(chat, presentation.1.clone(), presentation.2)?;
+                    runtime_presentation = Some(presentation);
+                }
+            }
+            let notice = view_activation_notice
+                .clone()
+                .or_else(|| {
+                    runtime_activation
+                        .as_ref()
+                        .and_then(|activation| activation.notice_for(execution))
+                })
+                .or_else(|| installation_notice.clone());
+            console.set_update_notice(notice)?;
         }
         let discovery_active = menus.discovery_active();
         let search_test_active = menus.search_test_active();
@@ -2453,25 +2500,25 @@ async fn interact(
             checked = activation_checks.join_next(), if !activation_checks.is_empty() => {
                 ready_runtime = None;
                 match checked {
-                Some(Ok(Ok(activation))) => {
-                    activation_notice = None;
-                    if let Some(target) = activation.target
-                        && !runtime_upgrade::is_current_executable(&target.executable)
-                    {
-                        ready_runtime = Some(target);
+                Some(Ok(Ok(mut activation))) => {
+                    if let Some(target) = activation.target.take() {
+                        if runtime_upgrade::is_current_executable(&target.executable) {
+                            view_activation_notice = None;
+                        } else {
+                            ready_runtime = Some(target);
+                        }
                     }
-                    if activation.waiting {
-                        activation_notice = Some(tickloop_agent_updater::UpdateNotice::Activating);
-                    }
-                    if let Some(error) = activation.error {
-                        activation_notice = Some(tickloop_agent_updater::UpdateNotice::Deferred { reason: error });
-                    }
+                    runtime_activation = Some(activation);
                 },
                 Some(Ok(Err(error))) => {
-                    activation_notice = Some(tickloop_agent_updater::UpdateNotice::Deferred { reason: error });
+                    if let Some(activation) = runtime_activation.as_mut() {
+                        activation.error = Some(error);
+                    }
                 },
                 Some(Err(error)) => {
-                    activation_notice = Some(tickloop_agent_updater::UpdateNotice::Deferred { reason: error.to_string() });
+                    if let Some(activation) = runtime_activation.as_mut() {
+                        activation.error = Some(error.to_string());
+                    }
                 },
                 None => {},
                 }
@@ -4661,8 +4708,8 @@ async fn interact(
                     }
                 }
             },
-            _ = update_notice_refresh.tick(), if interactive && !visual_pacing_pending && (update_monitor.is_some() || activation_notice.is_some()) => {
-                console.set_update_notice(activation_notice.clone().or_else(|| update_monitor.as_ref().and_then(|monitor| monitor.notice())))?;
+            _ = update_notice_refresh.tick(), if interactive && !visual_pacing_pending && update_monitor.is_some() => {
+                installation_notice = update_monitor.as_ref().and_then(|monitor| monitor.notice());
             },
             _ = animation_refresh.tick(), if interactive && !visual_pacing_pending && (thinking_frame_due || (!prefers_reduced_motion && (!pending.is_empty() || !directed_summaries.is_empty()))) => {
                 thinking_frame_due = false;
@@ -5383,6 +5430,10 @@ fn render_restored_observation(
     message_groups: &mut MessageGroups,
     observation: ExecutionObservation,
 ) -> Result<ExecutionObservation, String> {
+    console.ensure_chat_banner(
+        chat,
+        &startup_banner_spans(&observation.snapshot.model, &observation.snapshot.workdir),
+    )?;
     let conversation_events = observation.snapshot.conversation_events();
     console.select_chat(Some(chat))?;
     let failed_runs = conversation_events
@@ -7063,6 +7114,10 @@ fn show_opened_chat(
     snapshot: &tickloop_agent_protocol::ChatSnapshot,
     has_history: bool,
 ) -> Result<Option<uuid::Uuid>, String> {
+    console.ensure_chat_banner(
+        snapshot.id,
+        &startup_banner_spans(&snapshot.model, &snapshot.workdir),
+    )?;
     console.reset_chat(snapshot.id)?;
     let goal = snapshot.default_input_loop();
     outln!(console, "Chat: {}", snapshot.id);
@@ -7800,6 +7855,11 @@ async fn navigate_agent(
                 console.set_global_overview(None)?;
                 let restored = console.activate_agent(chat)?;
                 if !restored {
+                    console.ensure_chat_banner(
+                        chat,
+                        &startup_banner_spans(&snapshot.model, &snapshot.workdir),
+                    )?;
+                    console.reset_chat(chat)?;
                     learn_agent_colors(console, agent, &snapshot).await?;
                     workflows::write_public_history(console, &snapshot)?;
                 } else if let Some(observation) = observation {

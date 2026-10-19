@@ -118,3 +118,34 @@ fn builtin_selections_need_no_definition_file_or_notice() {
     );
     assert!(loaded.into_warnings().is_empty());
 }
+
+#[test]
+fn warmed_builtin_catalog_does_not_cache_the_users_saved_selection() {
+    let root = tempfile::tempdir().unwrap();
+    let settings = UserSettings::in_root(root.path());
+    for (provider, model, effort) in [
+        ("deepseek-api", "deepseek-flash", "low"),
+        ("anthropic-api", "claude-sonnet-5-5", "high"),
+    ] {
+        fs::write(
+            root.path().join("settings.json"),
+            serde_json::to_vec(&json!({
+                "defaultModel": {"provider":provider, "model":model},
+                "effortLevel": effort,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut loaded = settings.load();
+        let selected = loaded.configured_model().unwrap().unwrap();
+        assert_eq!(
+            selected,
+            ModelCatalog::defaults().get(provider, model).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(loaded.reasoning_effort()).unwrap(),
+            json!(effort)
+        );
+        assert!(loaded.into_warnings().is_empty());
+    }
+}

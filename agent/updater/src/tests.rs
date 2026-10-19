@@ -591,24 +591,47 @@ fn every_console_start_checks_again_even_after_a_recent_success_or_failure() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancellation_cleans_up_children_forked_as_the_installer_is_killed() {
+    use std::time::Duration;
+
     let root = tempfile::tempdir().unwrap();
     let script = root.path().join("forking.sh");
     std::fs::write(
         &script,
-        "printf started > \"$1\"\n(sleep 0.02; printf leaked > \"$2\") &\nwait\n",
+        "printf started > \"$1\"\n(while [ ! -f \"$3\" ]; do sleep 0.01; done; printf leaked > \"$2\") &\nwait\n",
     )
     .unwrap();
+    let spawn_installer = |started, finished, released| {
+        let script = script.clone();
+        tokio::spawn(async move {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.arg(script).arg(started).arg(finished).arg(released);
+            crate::run_process(&mut command).await
+        })
+    };
+    let started = root.path().join("started-control");
+    let finished = root.path().join("finished-control");
+    let released = root.path().join("released-control");
+    let control = spawn_installer(started.clone(), finished.clone(), released.clone());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the positive-control installer did not start");
+    assert!(!finished.exists(), "the installer must wait for release");
+    std::fs::write(released, "release").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), control)
+        .await
+        .expect("the released installer did not finish")
+        .unwrap()
+        .unwrap();
+    assert!(finished.exists(), "normal release must run the child");
     for attempt in 0..48 {
         let started = root.path().join(format!("started-{attempt}"));
         let finished = root.path().join(format!("finished-{attempt}"));
-        let task_started = started.clone();
-        let task_finished = finished.clone();
-        let script = script.clone();
-        let task = tokio::spawn(async move {
-            let mut command = tokio::process::Command::new("/bin/sh");
-            command.arg(script).arg(task_started).arg(task_finished);
-            crate::run_process(&mut command).await
-        });
+        let released = root.path().join(format!("released-{attempt}"));
+        let task = spawn_installer(started.clone(), finished.clone(), released.clone());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !started.exists() {
             assert!(
@@ -623,6 +646,7 @@ async fn cancellation_cleans_up_children_forked_as_the_installer_is_killed() {
         );
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
+        std::fs::write(released, "release").unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         assert!(
             !finished.exists(),

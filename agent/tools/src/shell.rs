@@ -593,30 +593,38 @@ pub(super) struct Registry {
 }
 
 impl Registry {
-    pub(super) async fn checkpoint(&self) -> Result<Value, ToolError> {
+    pub(super) async fn checkpoint(&self) -> Result<Option<Value>, ToolError> {
         let entries = self.entries.lock().await;
-        let mut checkpoints = entries
-            .iter()
-            .map(|(operation, entry)| {
-                let update = entry.updates.borrow().clone();
-                if matches!(
-                    update.snapshot.state(),
-                    CommandState::Running | CommandState::Cancelling
-                ) || (update.snapshot.state() == &CommandState::Background
-                    && entry.handoff.is_none())
-                {
-                    return Err(ToolError::Rejected(
-                        "Shell command has not reached a transferable state".into(),
-                    ));
+        let mut checkpoints = Vec::with_capacity(entries.len());
+        for (operation, entry) in entries.iter() {
+            let update = entry.updates.borrow().clone();
+            if matches!(
+                update.snapshot.state(),
+                CommandState::Running | CommandState::Cancelling
+            ) {
+                return Ok(None);
+            }
+            if update.snapshot.state() == &CommandState::Background {
+                let pid = match &update.snapshot {
+                    ProcessSnapshot::Agent(command) => command.pid,
+                    ProcessSnapshot::User(command) => command.pid,
+                };
+                if pid.is_none() {
+                    return Ok(None);
                 }
-                Ok(ShellCheckpoint {
-                    operation: *operation,
-                    update,
-                    is_stopped_by_model: entry.is_stopped_by_model,
-                    handoff: entry.handoff.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, ToolError>>()?;
+                if entry.handoff.is_none() {
+                    return Err(ToolError::Rejected(format!(
+                        "the existing Shell host cannot transfer background Shell {operation}"
+                    )));
+                }
+            }
+            checkpoints.push(ShellCheckpoint {
+                operation: *operation,
+                update,
+                is_stopped_by_model: entry.is_stopped_by_model,
+                handoff: entry.handoff.clone(),
+            });
+        }
         drop(entries);
         for checkpoint in &mut checkpoints {
             if checkpoint.update.snapshot.state() != &CommandState::Background {
@@ -624,6 +632,7 @@ impl Registry {
             }
         }
         serde_json::to_value(checkpoints)
+            .map(Some)
             .map_err(|error| ToolError::InvalidInput(error.to_string()))
     }
 

@@ -129,7 +129,7 @@ fn checking_installing_failure_and_a_cleared_notice_keep_the_same_layout() {
             }),
             "Updating Tickloop",
         ),
-        (Some(UpdateNotice::Activating), "Applying update"),
+        (Some(UpdateNotice::PendingAgent), "Agent update pending"),
         (
             Some(UpdateNotice::Deferred {
                 reason: "waiting for the current turn".into(),

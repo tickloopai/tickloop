@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::ExecutionRef;
+
 pub const RUNTIME_HANDOFF_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -30,4 +32,8 @@ pub struct WorkerRuntimeVersion {
     pub executable: PathBuf,
     pub build_id: Option<String>,
     pub upgrading: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub executions: Vec<ExecutionRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }

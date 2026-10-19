@@ -53,10 +53,11 @@ use crate::{
 /// 25.1 adds cancellable search connection checks in the selected Agent credential scope.
 /// 26.0 uses the service model ID as the sole ModelCard ID on the wire.
 /// 26.1 adds opt-in planned runtime upgrades and runtime version observations.
+/// 26.2 attributes each Worker's runtime version and upgrade error to its executions.
 /// Older business majors
 /// are refused before dispatch; the frozen daemon management protocol remains independent.
 pub const PROTOCOL_MAJOR: u16 = 26;
-pub const PROTOCOL_MINOR: u16 = 1;
+pub const PROTOCOL_MINOR: u16 = 2;
 
 static BUILD_IDENTITY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 

@@ -2001,15 +2001,20 @@ async fn terminal_can_background_read_and_stop_the_same_shell_process() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        for body in [
+        for (index, body) in [
             tool_stream(
                 "Bash",
-                json!({"command":"printf 'background marker'; sleep 30"}),
+                json!({"command":"printf 'background marker'; while [ ! -f background-release ]; do sleep 0.01; done", "description":"Run the controlled background command"}),
             ),
             messages_stream("The command is in the background."),
-        ] {
+            messages_stream("The stopped background command is accounted for."),
+        ].into_iter().enumerate() {
             let (mut socket, _) = listener.accept().await.unwrap();
-            read_request(&mut socket).await;
+            let request = read_request(&mut socket).await;
+            if index == 2 {
+                let request = serde_json::to_string(&request).unwrap();
+                assert!(request.contains("<task-notification>") && request.contains("<status>killed</status>"), "the final response must account for the stopped Shell: {request}");
+            }
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
             socket.write_all(body.as_bytes()).await.unwrap();
         }
@@ -2067,6 +2072,19 @@ async fn terminal_can_background_read_and_stop_the_same_shell_process() {
         .write_all(format!("/command-output {operation}\n/stop-command {operation}\n").as_bytes())
         .await
         .unwrap();
+    tokio::time::timeout(INTERACTION_TIMEOUT, async {
+        let mut stopped_reply = false;
+        loop {
+            let line = output.next_line().await.unwrap().unwrap();
+            transcript.push_str(&line);
+            stopped_reply |= line.contains("The stopped background command is accounted for.");
+            if stopped_reply && line.starts_with("Reply completed") {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the stopped Shell's continuation did not complete: {transcript}"));
     drop(input);
     tokio::time::timeout(INTERACTION_TIMEOUT, async {
         while let Some(line) = output.next_line().await.unwrap() {

@@ -14,7 +14,7 @@ pub enum UpdateNotice {
     Checking,
     Installing { progress: UpdateProgress },
     Ready { version: String },
-    Activating,
+    PendingAgent,
     Deferred { reason: String },
     Failed,
 }

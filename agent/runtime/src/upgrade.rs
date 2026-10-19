@@ -129,9 +129,13 @@ impl Agent {
         }
         let mut saved = Vec::with_capacity(chats.len());
         for chat in chats.values() {
-            let shells = match chat.tools.checkpoint_shells().await {
-                Ok(shells) => shells,
-                Err(_) => return Ok(None),
+            let Some(shells) = chat
+                .tools
+                .checkpoint_shells()
+                .await
+                .map_err(|error| AgentError::Invalid(error.to_string()))?
+            else {
+                return Ok(None);
             };
             self.checkpoint_transcript(&chat.snapshot, &chat.bookkeeping)
                 .await

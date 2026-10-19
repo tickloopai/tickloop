@@ -286,9 +286,7 @@ pub(crate) async fn drive(
             if shutdown.is_cancelled() {
                 return;
             }
-            if let Err(error) = rotate(&factory, &daemon, &endpoint, &executable).await {
-                factory.record_worker_upgrade_error(error).await;
-            }
+            rotate(&factory, &daemon, &endpoint, &executable).await;
         }
     }
 }
@@ -298,17 +296,28 @@ async fn rotate(
     daemon: &DaemonServer,
     endpoint: &Path,
     executable: &Path,
-) -> Result<(), String> {
+) {
     let Some(_daemon_admission) = daemon.try_pause() else {
-        return Ok(());
+        return;
     };
     let mut workers = factory.workers.lock().await;
     let Some(worker) = workers
         .iter_mut()
         .find(|worker| worker.endpoint == endpoint)
     else {
-        return Ok(());
+        return;
     };
+    if let Err(error) = rotate_worker(factory, worker, endpoint, executable).await {
+        worker.upgrade_error = Some(error);
+    }
+}
+
+async fn rotate_worker(
+    factory: &ProcessWorkerFactory,
+    worker: &mut crate::ManagedWorker,
+    endpoint: &Path,
+    executable: &Path,
+) -> Result<(), String> {
     if worker.preparation_uncertain {
         if !cancel_preparation(endpoint, &worker.grant.capability, worker.pid).await {
             return Err("waiting to cancel an unconfirmed Worker preparation".into());
@@ -319,7 +328,10 @@ async fn rotate(
         worker.preparation_uncertain = true;
         let prepared = request(endpoint, &worker.grant.capability, Operation::Prepare).await;
         let checkpoint = match prepared {
-            Ok(Reply::Prepared(Some(checkpoint))) => checkpoint,
+            Ok(Reply::Prepared(Some(checkpoint))) => {
+                worker.upgrade_error = None;
+                checkpoint
+            }
             Ok(Reply::Prepared(None)) => {
                 worker.preparation_uncertain = false;
                 return Ok(());
@@ -367,7 +379,7 @@ async fn rotate(
             {
                 return Err(error);
             }
-            Err(error) => factory.record_worker_upgrade_error(error).await,
+            Err(error) => worker.upgrade_error = Some(error),
         }
         // Inputs remain at the admission barrier until this committed ownership transfer settles.
         tokio::time::sleep(WORKER_UPGRADE_INTERVAL).await;
@@ -557,6 +569,7 @@ async fn advance(
     worker.executable_lease = upgrade::retain_executable(&pending.record.executable)
         .map_err(|error| error.to_string())?;
     worker.executable = pending.record.executable.clone();
+    worker.upgrade_error = None;
     drop(old_lifeline);
     if let Some(mut old_process) = old_process {
         let _ = tokio::time::timeout(HANDOFF_TIMEOUT, old_process.wait()).await;
@@ -648,8 +661,256 @@ async fn spawn_replacement(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tickloop_agent_protocol::{AccessErrorCode, AgentAccess, AgentCommand, CommandEnvelope};
     use tickloop_agent_runtime::Agent;
+    use tokio::sync::{Mutex, Notify};
+
+    #[tokio::test]
+    async fn worker_blockers_survive_busy_retries_and_clear_only_for_the_worker_that_recovers() {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let epoch = Uuid::new_v4();
+        let shutdown = CancellationToken::new();
+        let control = Arc::new(crate::worker_control::WorkerControl::new(
+            directory.path(),
+            epoch,
+            Arc::new(
+                tickloop_agent_runtime::hosted::controller::HostController::in_process(
+                    directory.path(),
+                    tickhost::paths::HostPaths {
+                        runtime: directory.path().join("host"),
+                    },
+                    epoch,
+                    tickhost::host::DEFAULT_IDLE_TIMEOUT,
+                ),
+            ),
+        ));
+        let mut workers = Vec::new();
+        let mut services = Vec::new();
+        let mut states = Vec::new();
+        let mut runtimes = Vec::new();
+        for label in ["alpha", "beta"] {
+            let worker_endpoint = directory.path().join(format!("{label}.sock"));
+            let (listener, _) = crate::private_listener(&endpoint(&worker_endpoint)).unwrap();
+            let busy = Arc::new(AtomicBool::new(false));
+            let attempts = Arc::new(AtomicUsize::new(0));
+            states.push((busy.clone(), attempts.clone()));
+            services.push(tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let request: Request = read(&mut stream).await.unwrap();
+                    let reply = match request.operation {
+                        Operation::Prepare => {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            if busy.load(Ordering::SeqCst) {
+                                Reply::Prepared(None)
+                            } else {
+                                Reply::Error(format!("{label} cannot transfer its retained Shell"))
+                            }
+                        }
+                        Operation::Cancel => Reply::Done,
+                        Operation::Retire => {
+                            panic!("the fixture has no running execution to retire")
+                        }
+                    };
+                    write(&mut stream, &reply).await.unwrap();
+                }
+            }));
+            let runtime = Agent::new_embedded(
+                tickloop_agent_test_support::config(),
+                Arc::new(tickloop_agent_test_support::ScriptedModel::new(Vec::new())),
+            );
+            runtimes.push(runtime.clone());
+            workers.push(crate::ManagedWorker {
+                access: Arc::new(EmbeddedAgentAccess::with_epoch(runtime, epoch)),
+                process: Arc::new(Mutex::new(None)),
+                lifeline: File::open("/dev/null").unwrap().into(),
+                pid: std::process::id(),
+                build_id: Some("previous-build".into()),
+                endpoint: worker_endpoint.clone(),
+                grant: control.grant(),
+                launch: tickloop_agent_protocol::LaunchSpec::embedded(directory.path().into()),
+                executable: directory.path().join("previous-runtime"),
+                link: Arc::new(std::sync::RwLock::new(upgrade::WorkerAddress {
+                    endpoint: worker_endpoint,
+                    pid: std::process::id(),
+                })),
+                preparation_uncertain: false,
+                upgrade_error: None,
+                executable_lease: None,
+            });
+        }
+        let execution = || tickloop_agent_protocol::ExecutionRef {
+            daemon_epoch: epoch,
+            agent_id: Uuid::new_v4(),
+            generation: 1,
+        };
+        let root = execution();
+        let child = execution();
+        let unrelated = execution();
+        let routes = vec![
+            (root, workers[0].access.clone()),
+            (child, workers[0].access.clone()),
+            (unrelated, workers[1].access.clone()),
+        ];
+        let factory = Arc::new(ProcessWorkerFactory {
+            directory: directory.path().into(),
+            listener_identity: (0, 0),
+            control_identity: (0, 0),
+            limits: tickloop_agent_test_support::TRANSPORT_LIMITS,
+            workers: Mutex::new(workers),
+            shutting_down: AtomicBool::new(false),
+            control,
+            upgrade: Mutex::new(upgrade::UpgradeState::default()),
+            upgrade_requested: Notify::new(),
+            lifecycle: Arc::new(crate::lifecycle::DaemonLifecycle::new(shutdown.clone())),
+            ingress: Arc::new(crate::ingress::DaemonIngress::new(
+                epoch,
+                tickloop_agent_test_support::TRANSPORT_LIMITS,
+            )),
+        });
+        let daemon = Arc::new(DaemonServer::new(epoch, factory.clone()));
+        let driver = tokio::spawn(drive(factory.clone(), daemon, shutdown.clone()));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while states
+                .iter()
+                .any(|(_, attempts)| attempts.load(Ordering::SeqCst) == 0)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let version = factory.version(&routes).await;
+        assert!(
+            version.error.is_none(),
+            "Worker errors must not become global notices"
+        );
+        assert!(
+            version.workers[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("alpha")
+        );
+        assert!(
+            version.workers[1]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("beta")
+        );
+        assert_eq!(version.workers[0].executions, [root, child]);
+        assert_eq!(version.workers[1].executions, [unrelated]);
+        assert!(
+            factory
+                .version(&[])
+                .await
+                .workers
+                .iter()
+                .all(|worker| worker.executions.is_empty())
+        );
+
+        let before_busy = states[0].1.load(Ordering::SeqCst);
+        states[0].0.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while states[0].1.load(Ordering::SeqCst) <= before_busy {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let version = factory.version(&routes).await;
+        assert!(version.error.is_none());
+        assert!(
+            version.workers[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("alpha"),
+            "busy is not proof the blocker was resolved"
+        );
+        assert!(
+            version.workers[1]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("beta")
+        );
+        shutdown.cancel();
+        driver.await.unwrap();
+
+        let (channel, mut peer) = UnixStream::pair().unwrap();
+        let activation = tokio::spawn(async move {
+            assert_eq!(peer.read_u8().await.unwrap(), RELEASED);
+            peer.write_u8(ACTIVATED).await.unwrap();
+        });
+        let process = Command::new("/bin/sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut workers = factory.workers.lock().await;
+        let mut pending = PendingUpgrade {
+            record: TransferRecord {
+                version: tickloop_agent_protocol::RUNTIME_HANDOFF_VERSION,
+                transfer_id: Uuid::new_v4(),
+                epoch,
+                phase: Phase::Activated,
+                previous_endpoint: workers[0].endpoint.clone(),
+                checkpoint: directory.path().join("checkpoint.json"),
+                executable: std::env::current_exe().unwrap(),
+                successor_endpoint: directory.path().join("alpha-successor.sock"),
+                successor_pid: process.id(),
+            },
+            record_path: directory.path().join("handoff.json"),
+            candidate: Some(Candidate {
+                process,
+                lifeline: File::open("/dev/null").unwrap().into(),
+                channel,
+                commit_sent: true,
+                adopted: true,
+                release_sent: false,
+            }),
+        };
+        assert!(
+            advance(&factory, &mut workers[0], &mut pending)
+                .await
+                .unwrap()
+        );
+        drop(workers);
+        activation.await.unwrap();
+        let version = factory.version(&routes).await;
+        assert!(version.error.is_none());
+        assert!(version.workers[0].error.is_none());
+        assert!(
+            version.workers[1]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("beta"),
+            "recovering alpha must not clear beta's blocker"
+        );
+        assert_eq!(version.workers[0].executions, [root, child]);
+        assert!(!version.workers[0].upgrading);
+        factory.workers.lock().await.remove(1);
+        assert!(
+            factory
+                .version(&routes)
+                .await
+                .workers
+                .iter()
+                .all(|worker| worker.error.is_none()),
+            "removed Worker blockers must not remain in runtime status"
+        );
+        factory.workers.lock().await.clear();
+        for service in services {
+            service.abort();
+        }
+        for runtime in runtimes {
+            runtime.shutdown().await;
+        }
+    }
 
     #[tokio::test]
     async fn a_lost_preparation_reply_is_cancelled_before_retrying() {

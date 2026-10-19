@@ -5,6 +5,9 @@ const ACTIVITY_FIXTURE: &str = "TICKLOOP_WORKING_ACTIVITY_FIXTURE";
 const ACTIVITY_ROUTE: &str = "TICKLOOP_WORKING_ACTIVITY_ROUTE";
 const ACTIVITY_STAGE: &str = "activity-stage";
 const ACTIVITY_QUERIES: &str = "activity-queries";
+const ACTIVITY_ANIMATION: &str = "activity-animation.json";
+const ANIMATION_MEASUREMENT_STAGE: &str = "measure-animation";
+const ANIMATION_FRAME_SAMPLE: usize = 6;
 const ACTIVITY_PHASE: &str = "activity-phase.json";
 const ACTIVITY_EXECUTIONS: &str = "activity-executions.json";
 const ACTIVITY_CREATED: &str = "activity-created.json";
@@ -71,6 +74,7 @@ impl ModelClient for ActivityModel {
 struct ActivityAccess {
     daemon: EmbeddedAgentAccess,
     queries: AtomicUsize,
+    probe: mpsc::UnboundedSender<RecoveryFact>,
 }
 
 #[async_trait]
@@ -83,6 +87,7 @@ impl AgentAccess for ActivityAccess {
                 ..
             }
         ) {
+            let _ = self.probe.send(RecoveryFact::TasksQueried);
             let count = self.queries.fetch_add(1, Ordering::Relaxed) + 1;
             std::fs::write(ACTIVITY_QUERIES, count.to_string()).unwrap();
         }
@@ -223,9 +228,11 @@ fn working_activity_pty_fixture() {
                     tickloop_agent_test_support::config(),
                     Arc::new(ActivityModel(AtomicUsize::new(0))),
                 );
+                let (probe, mut facts) = mpsc::unbounded_channel();
                 let access = Arc::new(ActivityAccess {
                     daemon: EmbeddedAgentAccess::new(core),
                     queries: AtomicUsize::new(0),
+                    probe: probe.clone(),
                 });
                 std::fs::write(ACTIVITY_QUERIES, "0").unwrap();
                 let workdir = std::env::current_dir().unwrap();
@@ -242,12 +249,43 @@ fn working_activity_pty_fixture() {
                     launch,
                     None,
                 );
-                let (probe,mut facts)=mpsc::unbounded_channel();
                 agent.set_recovery_probe(probe);
                 tokio::spawn(async move {
+                    let mut current_frame = None;
+                    let mut measured_frames = 0;
+                    let mut animation_queries = 0;
                     while let Some(fact)=facts.recv().await {
-                        if let RecoveryFact::LiveRunStarted {chat,run,overview}=fact {
-                            std::fs::write(ACTIVITY_OBSERVED_START,serde_json::json!({"phase":"observed-start","chat":chat,"run":run,"overview":overview}).to_string()).unwrap();
+                        match fact {
+                            RecoveryFact::LiveRunStarted {chat,run,overview} => {
+                                std::fs::write(ACTIVITY_OBSERVED_START,serde_json::json!({"phase":"observed-start","chat":chat,"run":run,"overview":overview}).to_string()).unwrap();
+                            }
+                            RecoveryFact::ActivityFrameBegin { chat } => {
+                                let measuring = measured_frames < ANIMATION_FRAME_SAMPLE
+                                    && std::fs::read_to_string(ACTIVITY_STAGE)
+                                        .is_ok_and(|stage| stage == ANIMATION_MEASUREMENT_STAGE);
+                                assert!(current_frame.replace((chat, measuring, 0)).is_none());
+                            }
+                            RecoveryFact::TasksQueried => {
+                                if let Some((_, _, queries)) = &mut current_frame {
+                                    *queries += 1;
+                                }
+                            }
+                            RecoveryFact::ActivityFrameEnd { chat, painted } => {
+                                let (started_chat, measuring, queries) = current_frame.take().unwrap();
+                                assert_eq!(started_chat, chat);
+                                if measuring && painted {
+                                    measured_frames += 1;
+                                    animation_queries += queries;
+                                    if measured_frames == ANIMATION_FRAME_SAMPLE {
+                                        std::fs::write(ACTIVITY_ANIMATION, serde_json::json!({
+                                            "phase": "measured",
+                                            "frames": measured_frames,
+                                            "task_queries": animation_queries,
+                                        }).to_string()).unwrap();
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 });
@@ -367,13 +405,17 @@ fn working_activity_tracks_observed_runs_without_model_duplication_and_esc_inter
         "ACTIVITY_ELAPSED seconds=2 total_task_queries={}",
         count() - queries
     );
-    let animation_queries = count();
-    std::thread::sleep(Duration::from_millis(200));
-    let animation_queries = count() - animation_queries;
-    println!("ACTIVITY_ANIMATION interval_ms=200 task_queries={animation_queries}");
-    assert!(
-        animation_queries == 0,
-        "local animation queried global tasks {animation_queries} times"
+    std::fs::write(
+        directory.path().join(ACTIVITY_STAGE),
+        ANIMATION_MEASUREMENT_STAGE,
+    )
+    .unwrap();
+    let animation = fixture.wait_for_phase(&directory.path().join(ACTIVITY_ANIMATION), "measured");
+    println!("ACTIVITY_ANIMATION {animation}");
+    assert_eq!(animation["frames"], ANIMATION_FRAME_SAMPLE);
+    assert_eq!(
+        animation["task_queries"], 0,
+        "local animation queried global tasks: {animation}"
     );
     let executions: serde_json::Value =
         serde_json::from_slice(&std::fs::read(directory.path().join(ACTIVITY_EXECUTIONS)).unwrap())

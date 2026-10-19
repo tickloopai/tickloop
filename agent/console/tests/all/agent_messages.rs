@@ -2954,26 +2954,86 @@ async fn family_human_main_input_uses_normal_multiple_loop_semantics_instead_of_
 #[tokio::test]
 async fn family_directory_aggregates_active_user_shell_instead_of_only_completed_loops() {
     let fixture = DirectedFixture::new().await;
+    let initial = fixture.core.snapshot(fixture.root_chat).await.unwrap();
+    assert!(
+        initial.delegation.is_none(),
+        "this aggregation case owns a root Chat"
+    );
+    assert!(initial.permissions.is_empty());
+    let workspace = tickloop_agent_tools::Workspace {
+        workdir: initial.workdir.clone(),
+        additional_directories: initial.additional_directories.clone(),
+    };
+    let input = json!({"command":"sleep 30", "cwd":initial.workdir, "run_in_background":false});
+    let preparation_started = std::time::Instant::now();
+    let (cold, warm) = tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let cold = tickloop_agent_tools::prepare(&workspace, "Bash", &input).unwrap();
+        let cold_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let warm = tickloop_agent_tools::prepare(&workspace, "Bash", &input).unwrap();
+        let warm_elapsed = started.elapsed();
+        assert_eq!(cold.input, warm.input);
+        (cold_elapsed, warm_elapsed)
+    })
+    .await
+    .unwrap();
+    eprintln!(
+        "family Shell validator setup: total_us={}, cold_us={}, warm_us={}",
+        preparation_started.elapsed().as_micros(),
+        cold.as_micros(),
+        warm.as_micros()
+    );
+    let mut shell_events = fixture.core.subscribe_user_shells();
     let shell = fixture
         .core
         .submit_user_shell_for_goal(fixture.root_chat, None, "sleep 30".into(), false)
         .await
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while fixture
-            .core
-            .snapshot(fixture.root_chat)
-            .await
-            .unwrap()
-            .user_shells
-            .iter()
-            .all(|shell| shell.state != tickloop_agent_protocol::UserShellState::Running)
-        {
-            tokio::task::yield_now().await;
+    let mut last_shell = None;
+    let started = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let record = shell_events.recv().await.unwrap();
+            if record.id != shell.command_id {
+                continue;
+            }
+            let state = record.state.clone();
+            last_shell = Some(record);
+            if state == tickloop_agent_protocol::UserShellState::Running {
+                break;
+            }
+            assert!(
+                !matches!(
+                    state,
+                    tickloop_agent_protocol::UserShellState::Failed
+                        | tickloop_agent_protocol::UserShellState::Unknown
+                        | tickloop_agent_protocol::UserShellState::Completed
+                ),
+                "Shell ended before its Running transition: {last_shell:?}"
+            );
         }
     })
-    .await
-    .unwrap();
+    .await;
+    if started.is_err() {
+        let snapshot = fixture.core.snapshot(fixture.root_chat).await.unwrap();
+        panic!(
+            "Shell {} did not reach Running; last state/reason: {:?}; pending permission requests: {:?}; Loop states: {:?}",
+            shell.command_id,
+            last_shell
+                .as_ref()
+                .map(|record| (&record.state, &record.reason)),
+            snapshot
+                .permissions
+                .iter()
+                .map(|request| (&request.name, &request.execution))
+                .collect::<Vec<_>>(),
+            snapshot
+                .loops
+                .iter()
+                .map(|goal| &goal.state)
+                .collect::<Vec<_>>()
+        );
+    }
     let root = fixture
         .core
         .family_agents(fixture.root_chat)

@@ -30,6 +30,39 @@ use tickloop_agent_protocol::{
     ToolResult, ToolResultBlock, ToolResultContent, TranscriptRef, UserInput, ViewRef,
 };
 
+#[test]
+fn worker_runtime_scope_defaults_to_unknown_for_older_daemons_and_round_trips_when_present() {
+    use tickloop_agent_protocol::WorkerRuntimeVersion;
+    let legacy = json!({
+        "process_id": 4242,
+        "executable": "/runtime/tickloop",
+        "build_id": "previous-build",
+        "upgrading": true,
+    });
+    let mut worker: WorkerRuntimeVersion = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(worker.executions.is_empty());
+    assert!(worker.error.is_none());
+    assert_eq!(serde_json::to_value(&worker).unwrap(), legacy);
+    let root = ExecutionRef {
+        daemon_epoch: Uuid::from_u128(1),
+        agent_id: Uuid::from_u128(2),
+        generation: 3,
+    };
+    let child = ExecutionRef {
+        agent_id: Uuid::from_u128(4),
+        ..root
+    };
+    worker.executions = vec![root, child];
+    worker.error = Some("retained Shell cannot transfer".into());
+    let wire = serde_json::to_value(&worker).unwrap();
+    assert_eq!(wire["executions"], json!([root, child]));
+    assert_eq!(wire["error"], "retained Shell cannot transfer");
+    assert_eq!(
+        serde_json::from_value::<WorkerRuntimeVersion>(wire).unwrap(),
+        worker
+    );
+}
+
 const BLESS_VARIABLE: &str = "TICKLOOP_BLESS_WIRE_FIXTURES";
 
 fn fixture_path(name: &str) -> PathBuf {

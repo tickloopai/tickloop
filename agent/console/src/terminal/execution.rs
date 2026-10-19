@@ -885,8 +885,12 @@ impl ConsoleExecution {
         }))
     }
 
+    pub(super) fn cached_reference(&self, chat: Uuid) -> Option<ExecutionRef> {
+        self.inner.references.read().unwrap().get(&chat).copied()
+    }
+
     pub(super) async fn reference(&self, chat: Uuid) -> Result<ExecutionRef, AccessError> {
-        if let Some(reference) = self.inner.references.read().unwrap().get(&chat).copied() {
+        if let Some(reference) = self.cached_reference(chat) {
             return Ok(reference);
         }
         self.catalog().await?;
