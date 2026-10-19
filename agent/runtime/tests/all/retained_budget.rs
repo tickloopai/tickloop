@@ -88,6 +88,7 @@ fn harness(store: Arc<dyn TranscriptStore>) -> Agent {
             },
             tools: ToolPolicy::web_fetch_only(),
             host_rules: Vec::new(),
+            task_tools: None,
             waits: WaitHosting::Durable,
         },
     )

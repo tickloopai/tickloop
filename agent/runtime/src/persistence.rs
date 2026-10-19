@@ -2138,7 +2138,11 @@ fn recover_transcript(
             .filter(|entry| entry.chat_id == chat_id)
             .map(|entry| entry.boards.clone())
             .unwrap_or_default();
-        for board in snapshot.task_boards.values_mut() {
+        for board in snapshot
+            .task_boards
+            .values_mut()
+            .filter(|_| waits == WaitHosting::Process)
+        {
             for task in &mut board.tasks {
                 if task.status == tickloop_agent_protocol::SharedTaskStatus::InProgress {
                     task.status = tickloop_agent_protocol::SharedTaskStatus::NeedsAttention;

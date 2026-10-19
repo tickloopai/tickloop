@@ -63,6 +63,7 @@ fn durable_harness(store: Arc<dyn TranscriptStore>, model: Arc<ScriptedModel>) -
                 ..ToolPolicy::web_fetch_only()
             },
             host_rules: vec![allow_web_fetch()],
+            task_tools: None,
             waits: WaitHosting::Durable,
         },
     )

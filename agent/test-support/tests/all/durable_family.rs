@@ -67,6 +67,14 @@ fn last_message(request: &ModelRequest) -> String {
 /// A cloud Harness whose Chats ask questions and delegate, with durable waits; the host lets
 /// every delegation through without review.
 fn family_harness(store: Arc<dyn TranscriptStore>, model: Arc<RoutedModel>) -> Agent {
+    family_harness_with_tasks(store, model, None)
+}
+
+fn family_harness_with_tasks(
+    store: Arc<dyn TranscriptStore>,
+    model: Arc<RoutedModel>,
+    task_tools: Option<bool>,
+) -> Agent {
     Agent::with_seams(
         HarnessSeams {
             transcripts: Some(store),
@@ -82,12 +90,14 @@ fn family_harness(store: Arc<dyn TranscriptStore>, model: Arc<RoutedModel>) -> A
                 ..AgentHostOptions::product_defaults()
             },
             tools: ToolPolicy {
+                tasks: task_tools.is_some(),
                 questions: true,
                 delegation: true,
                 family_messages: true,
                 ..ToolPolicy::web_fetch_only()
             },
             host_rules: Vec::new(),
+            task_tools,
             waits: WaitHosting::Durable,
         },
     )
@@ -101,6 +111,7 @@ struct Cloud {
     stream: Arc<MemoryEventStream>,
     model: Arc<RoutedModel>,
     chat: Uuid,
+    task_tools: Option<bool>,
 }
 
 impl Cloud {
@@ -112,18 +123,20 @@ impl Cloud {
             stream: Arc::new(MemoryEventStream::new()),
             model,
             chat: Uuid::new_v4(),
+            task_tools: None,
         }
     }
 
     fn host(&self, holder: &str) -> ReferenceHost {
         let model = self.model.clone();
+        let task_tools = self.task_tools;
         ReferenceHost::new(
             holder,
             self.chats.clone(),
             self.stream.clone(),
             self.clock.clone(),
             HostConfig::default(),
-            move |store| family_harness(store, model.clone()),
+            move |store| family_harness_with_tasks(store, model.clone(), task_tools),
         )
     }
 
@@ -703,4 +716,393 @@ async fn a_crash_before_the_receiver_holds_a_message_leaves_its_send_unknown() {
         results.iter().all(|result| result["status"] != "accepted"),
         "{results:?}"
     );
+}
+
+fn claiming_task() -> Arc<RoutedModel> {
+    use tickloop_agent_test_support::routed::tool_result;
+    Arc::new(RoutedModel::new(|request| {
+        if !has_tool_result(request, "create") {
+            return call(
+                "create",
+                "TaskCreate",
+                json!({"mutation_id":Uuid::from_u128(1),
+                "title":"Report", "description":"Prepare the authorized report"}),
+            );
+        }
+        let task = &tool_result(&request.messages, "create").unwrap()["task"];
+        if !has_tool_result(request, "claim") {
+            return call(
+                "claim",
+                "TaskUpdate",
+                json!({"mutation_id":Uuid::from_u128(2),
+                "task_id":task["id"], "expected_revision":1, "action":"claim"}),
+            );
+        }
+        if !has_tool_result(request, "question") {
+            return call(
+                "question",
+                "AskUserQuestion",
+                single_question("Which format?"),
+            );
+        }
+        if !has_tool_result(request, "complete") {
+            return call(
+                "complete",
+                "TaskUpdate",
+                json!({"mutation_id":Uuid::from_u128(3),
+                "task_id":task["id"], "expected_revision":2, "action":"complete", "result":"Report prepared."}),
+            );
+        }
+        text("Report prepared.")
+    }))
+}
+
+fn task_boards(
+    lines: &[Line],
+) -> std::collections::BTreeMap<Uuid, tickloop_agent_protocol::TaskBoard> {
+    lines
+        .iter()
+        .rev()
+        .find_map(|line| match line {
+            Line::TaskBoards(entry) => Some(entry.boards.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_claimed_task_waits_and_finishes_on_another_host_like_one_process() {
+    let model = claiming_task();
+    let agent = family_harness_with_tasks(
+        Arc::new(InMemoryTranscriptStore::new()),
+        model.clone(),
+        Some(true),
+    );
+    let root = agent.create_chat_without_folder().await.unwrap();
+    let turn = agent
+        .advance(root, prompt("Prepare the report."))
+        .await
+        .unwrap();
+    let TurnOutcome::Waiting(TurnWait::Question(question)) = turn.outcome().await.unwrap() else {
+        panic!("the Task owner waits");
+    };
+    agent
+        .advance(root, answer(&question))
+        .await
+        .unwrap()
+        .outcome()
+        .await
+        .unwrap();
+    agent.settled_input(root, turn.input_id()).await.unwrap();
+    agent.shutdown().await;
+    let in_process = requests(&model);
+
+    let mut cloud = Cloud::new(claiming_task());
+    cloud.task_tools = Some(true);
+    let asked = cloud
+        .host("a")
+        .deliver(cloud.chat, prompt("Prepare the report."))
+        .await
+        .unwrap();
+    acknowledged(&asked);
+    let Some(TurnOutcome::Waiting(TurnWait::Question(question))) = asked.outcome else {
+        panic!("the Task owner waits: {asked:?}");
+    };
+    let before = task_boards(&cloud.root_lines());
+    let board = before.values().next().unwrap();
+    assert_eq!(
+        board.tasks[0].status,
+        tickloop_agent_protocol::SharedTaskStatus::InProgress
+    );
+    assert_eq!(board.mutations.len(), 2);
+    cloud.clock.advance(Duration::from_secs(3 * 60 * 60));
+    let replied = cloud
+        .host("b")
+        .deliver(cloud.chat, answer(&question))
+        .await
+        .unwrap();
+    acknowledged(&replied);
+    assert_eq!(replied.waiting, None);
+    let after = task_boards(&cloud.root_lines());
+    let completed = &after.values().next().unwrap().tasks[0];
+    assert_eq!(completed.id, board.tasks[0].id);
+    assert_eq!(
+        completed.status,
+        tickloop_agent_protocol::SharedTaskStatus::Completed
+    );
+    assert_eq!(after.values().next().unwrap().mutations.len(), 3);
+    assert_eq!(requests(&cloud.model), in_process);
+}
+
+fn puts_the_create_result_on_the_chain(lines: &[Line]) -> bool {
+    !results_of(lines, "create").is_empty()
+}
+
+fn puts_the_claim_result_on_the_chain(lines: &[Line]) -> bool {
+    !results_of(lines, "claim").is_empty()
+}
+
+#[tokio::test]
+async fn task_mutation_receipts_reconcile_crashes_before_create_or_claim_results() {
+    for point in [
+        puts_the_create_result_on_the_chain as fn(&[Line]) -> bool,
+        puts_the_claim_result_on_the_chain,
+    ] {
+        let mut cloud = Cloud::new(claiming_task());
+        cloud.task_tools = Some(true);
+        let task = prompt("Prepare the report.");
+        let holding = cloud.host("crashing").acquire(cloud.chat).unwrap();
+        holding.crash_at(CrashPoint::BeforeCommit(point));
+        let crashed = holding.run(task.clone()).await;
+        assert_eq!(crashed.halt, Some(Halt::Crashed), "{crashed:?}");
+        let before = task_boards(&cloud.root_lines());
+        let board = before.values().next().unwrap();
+        assert_eq!(board.tasks.len(), 1);
+        let id = board.tasks[0].id;
+        cloud.clock.advance(LEASE_TTL + Duration::from_secs(1));
+        let resumed = cloud
+            .host("surviving")
+            .deliver(cloud.chat, task)
+            .await
+            .unwrap();
+        acknowledged(&resumed);
+        let Some(TurnOutcome::Waiting(TurnWait::Question(question))) = resumed.outcome else {
+            panic!("the original Task owner continued: {resumed:?}");
+        };
+        let boards = task_boards(&cloud.root_lines());
+        let board = boards.values().next().unwrap();
+        assert_eq!(board.tasks.len(), 1);
+        assert_eq!(board.tasks[0].id, id);
+        assert_eq!(
+            board.tasks[0].status,
+            tickloop_agent_protocol::SharedTaskStatus::InProgress
+        );
+        assert_eq!(board.mutations.len(), 2);
+        let lines = cloud.root_lines();
+        assert_eq!(results_of(&lines, "create").len(), 1);
+        assert_eq!(results_of(&lines, "claim").len(), 1);
+        assert!(
+            results_of(&lines, "create")
+                .iter()
+                .chain(results_of(&lines, "claim").iter())
+                .any(|result| result["status"] == "already_applied")
+        );
+        let replied = cloud
+            .host("later")
+            .deliver(cloud.chat, answer(&question))
+            .await
+            .unwrap();
+        acknowledged(&replied);
+        assert_eq!(
+            task_boards(&cloud.root_lines())
+                .values()
+                .next()
+                .unwrap()
+                .tasks[0]
+                .status,
+            tickloop_agent_protocol::SharedTaskStatus::Completed
+        );
+    }
+}
+
+fn assigning_task() -> Arc<RoutedModel> {
+    use tickloop_agent_test_support::routed::{history_text, tool_result};
+    Arc::new(RoutedModel::new(|request| {
+        if task_of(request).is_some() {
+            return text("Ready.");
+        }
+        if !has_tool_result(request, "create") {
+            return call(
+                "create",
+                "TaskCreate",
+                json!({"mutation_id":Uuid::from_u128(11),
+                "title":"Report", "description":"Prepare the authorized report"}),
+            );
+        }
+        if !has_tool_result(request, "delegate") {
+            return call(
+                "delegate",
+                "Subagent",
+                json!({"task":"stand by", "name":"writer", "run_in_background":true}),
+            );
+        }
+        let retry = history_text(request).contains("Assign the report again");
+        let call_id = if retry { "retry_assign" } else { "assign" };
+        if history_text(request).contains("Assign the report") && !has_tool_result(request, call_id)
+        {
+            let task = &tool_result(&request.messages, "create").unwrap()["task"];
+            return call(
+                call_id,
+                "TaskUpdate",
+                json!({"mutation_id":Uuid::from_u128(12),
+                "task_id":task["id"], "expected_revision":1, "action":"assign", "owner":"writer"}),
+            );
+        }
+        text("Noted.")
+    }))
+}
+
+fn accepts_the_assignment(lines: &[Line]) -> bool {
+    lines.iter().any(|line| {
+        matches!(line, Line::Input(entry)
+        if entry.input_id == Uuid::from_u128(12))
+    })
+}
+
+#[tokio::test]
+async fn task_assignment_is_delivered_once_when_the_receiver_commits_before_the_sender_result() {
+    let mut cloud = Cloud::new(assigning_task());
+    cloud.task_tools = Some(true);
+    acknowledged(
+        &cloud
+            .host("a")
+            .deliver(cloud.chat, prompt("Prepare the report."))
+            .await
+            .unwrap(),
+    );
+    let [child] = cloud
+        .chats
+        .members(cloud.chat)
+        .into_iter()
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("one member");
+    };
+    let loop_id = *task_boards(&cloud.root_lines()).keys().next().unwrap();
+    let mut task = prompt("Assign the report");
+    if let TurnOp::Continue { target_loop, .. } = &mut task.op {
+        *target_loop = Some(loop_id);
+    }
+    let holding = cloud.host("crashing").acquire(cloud.chat).unwrap();
+    holding.crash_at(CrashPoint::AfterCommit(accepts_the_assignment));
+    let crashed = holding.run(task.clone()).await;
+    assert_eq!(crashed.halt, Some(Halt::Crashed), "{crashed:?}");
+    cloud.clock.advance(LEASE_TTL + Duration::from_secs(1));
+    acknowledged(&cloud.host("b").deliver(cloud.chat, task).await.unwrap());
+    let mut retry = prompt("Assign the report again");
+    if let TurnOp::Continue { target_loop, .. } = &mut retry.op {
+        *target_loop = Some(loop_id);
+    }
+    acknowledged(&cloud.host("c").deliver(cloud.chat, retry).await.unwrap());
+    let inputs = cloud
+        .chats
+        .member_lines(child)
+        .iter()
+        .filter_map(|line| match line {
+            Line::Input(entry) if entry.input_id == Uuid::from_u128(12) => Some(entry.run_id),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(
+        messages_saying(&cloud.chats.member_lines(child), "Shared task assignment:"),
+        1
+    );
+    let boards = task_boards(&cloud.root_lines());
+    assert_eq!(boards.values().next().unwrap().mutations.len(), 2);
+}
+
+fn member_claiming_task() -> Arc<RoutedModel> {
+    use tickloop_agent_test_support::routed::tool_result;
+    Arc::new(RoutedModel::new(|request| {
+        if task_of(request).is_some() {
+            if !has_tool_result(request, "list") {
+                return call("list", "TaskList", json!({}));
+            }
+            let task = &tool_result(&request.messages, "list").unwrap()["board"]["tasks"][0];
+            if !has_tool_result(request, "claim") {
+                return call(
+                    "claim",
+                    "TaskUpdate",
+                    json!({"mutation_id":Uuid::from_u128(22),
+                    "task_id":task["id"], "expected_revision":1, "action":"claim"}),
+                );
+            }
+            if !has_tool_result(request, "question") {
+                return call(
+                    "question",
+                    "AskUserQuestion",
+                    single_question("Which format?"),
+                );
+            }
+            if !has_tool_result(request, "complete") {
+                return call(
+                    "complete",
+                    "TaskUpdate",
+                    json!({"mutation_id":Uuid::from_u128(23),
+                    "task_id":task["id"], "expected_revision":2, "action":"complete", "result":"Report prepared."}),
+                );
+            }
+            return text("Report prepared.");
+        }
+        if !has_tool_result(request, "create") {
+            return call(
+                "create",
+                "TaskCreate",
+                json!({"mutation_id":Uuid::from_u128(21),
+                "title":"Report", "description":"Prepare the authorized report"}),
+            );
+        }
+        if !has_tool_result(request, "delegate") {
+            return call(
+                "delegate",
+                "Subagent",
+                json!({"task":"prepare the report", "name":"writer"}),
+            );
+        }
+        text("Report delivered.")
+    }))
+}
+
+#[tokio::test]
+async fn a_members_claim_in_the_root_board_survives_family_reload() {
+    let mut cloud = Cloud::new(member_claiming_task());
+    cloud.task_tools = Some(true);
+    let asked = cloud
+        .host("a")
+        .deliver(cloud.chat, prompt("Prepare the report."))
+        .await
+        .unwrap();
+    acknowledged(&asked);
+    let Some(TurnOutcome::Waiting(TurnWait::Member { chat: child, wait })) = asked.outcome else {
+        panic!("the family waits for the Task owner: {asked:?}");
+    };
+    let TurnWait::Question(question) = *wait else {
+        panic!("the member waits for a person");
+    };
+    let before = task_boards(&cloud.root_lines());
+    let task = &before.values().next().unwrap().tasks[0];
+    assert_eq!(task.owner.as_ref().unwrap().chat_id, child);
+    assert_eq!(
+        task.status,
+        tickloop_agent_protocol::SharedTaskStatus::InProgress
+    );
+    cloud.clock.advance(Duration::from_secs(3 * 60 * 60));
+    let replied = cloud
+        .host("b")
+        .deliver_to(cloud.chat, child, answer(&question))
+        .await
+        .unwrap();
+    acknowledged(&replied);
+    assert_eq!(replied.waiting, None);
+    let boards = task_boards(&cloud.root_lines());
+    let board = boards.values().next().unwrap();
+    assert_eq!(board.tasks[0].id, task.id);
+    assert_eq!(
+        board.tasks[0].status,
+        tickloop_agent_protocol::SharedTaskStatus::Completed
+    );
+    assert_eq!(board.mutations.len(), 3);
+    assert_eq!(
+        results_of(&cloud.chats.member_lines(child), "complete")[0]["status"],
+        "applied"
+    );
+    assert!(cloud.model.requests.lock().unwrap().iter().all(|request| {
+        request
+            .tools
+            .iter()
+            .filter(|tool| tool.name.starts_with("Task"))
+            .count()
+            == 4
+    }));
 }

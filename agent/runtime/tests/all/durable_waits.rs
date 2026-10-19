@@ -60,6 +60,7 @@ fn options(waits: WaitHosting) -> HarnessOptions {
             ..ToolPolicy::web_fetch_only()
         },
         host_rules: Vec::new(),
+        task_tools: None,
         waits,
     }
 }
