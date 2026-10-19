@@ -2569,6 +2569,89 @@ async fn restart_waits_for_explicit_continue_which_links_again_and_claims_pendin
     restored.shutdown().await;
 }
 
+/// A request received while its Loop was busy waits in the local inbox across a restart: the
+/// next Continue delivers it, it runs once, and the request that was running is not repeated.
+#[tokio::test]
+async fn a_received_request_still_queued_at_a_restart_runs_once_after_continue() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("state");
+    service.login(directory.path()).await;
+    service.request_feedback("doc", "running-request");
+    let blocked = Arc::new(BlockingModel {
+        started: tokio::sync::Notify::new(),
+        turns: AtomicUsize::new(0),
+        requests: Mutex::new(Vec::new()),
+    });
+    let agent = Agent::open_embedded(root.clone(), config(), blocked.clone()).unwrap();
+    agent
+        .install_host_tools(Arc::new(McpHostToolProvider::new(
+            service.client(directory.path()),
+            None,
+        )))
+        .unwrap();
+    let chat = agent.create_chat(directory.path().into()).await.unwrap();
+    agent
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    agent
+        .link_artifact(
+            chat,
+            &artifact_tick(&service, "doc"),
+            tickloop_agent_protocol::ArtifactFeedbackHistory::All,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, blocked.started.notified())
+        .await
+        .unwrap();
+    service.request_feedback("doc", "queued-request");
+    eventually(async || service.finished().len() == 2).await;
+    let loop_id = agent.snapshot(chat).await.unwrap().loops[0].id;
+    agent.shutdown().await;
+    drop(agent);
+
+    let model = Arc::new(ScriptedModel::new(vec![
+        text("Continued."),
+        text("Handled the queued request."),
+    ]));
+    let restored = Agent::open_embedded(root, config(), model.clone()).unwrap();
+    restored
+        .install_host_tools(Arc::new(McpHostToolProvider::new(
+            service.client(directory.path()),
+            None,
+        )))
+        .unwrap();
+    restored.resume_chat(chat).await.unwrap();
+    restored
+        .set_execution_mode(chat, ExecutionMode::FullAccess)
+        .await
+        .unwrap();
+    restored
+        .submit(chat, Some(loop_id), "Continue".into())
+        .await
+        .unwrap();
+    eventually(async || model.requests.lock().unwrap().len() == 2).await;
+    wait_for_loop_state(&restored, chat, loop_id, LoopState::WaitingTrigger).await;
+    let prompts = |feedback: &str| {
+        let heading = format!("@tickloop feedback {feedback} on artifact doc");
+        model.requests.lock().unwrap()[1]
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter(
+                |content| matches!(content, Content::Text { text } if text.starts_with(&heading)),
+            )
+            .count()
+    };
+    assert_eq!(prompts("running-request"), 1);
+    assert_eq!(prompts("queued-request"), 1);
+    assert_eq!(model.requests.lock().unwrap().len(), 2);
+    assert_eq!(service.finished().len(), 2);
+    restored.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_copied_session_links_its_own_receiver_without_taking_the_original_agents_feedback() {
     let service = ArtifactService::start().await;

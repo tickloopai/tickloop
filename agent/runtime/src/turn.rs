@@ -18,6 +18,7 @@ use tickloop_agent_protocol::{
 };
 use uuid::Uuid;
 
+use crate::event_sources::ExternalDelivery;
 use crate::lifecycle::{LedgerInput, ledger_state};
 use crate::{
     Agent, AgentError, Chat, LoopSnapshotExt, TurnAdmission, WeakAgent, chat_is_busy, rewind,
@@ -69,6 +70,13 @@ pub enum TurnOp {
     },
     /// The user's reply to the question `request` a Run waits on; it joins that Run.
     Answer { request: Uuid, reply: QuestionReply },
+    /// An @tickloop request delivered to the Loop `target_loop`, under the input id its delivery
+    /// names. It queues behind the Loop's work, whatever the delivery mode, and a Loop that has
+    /// ended discards it.
+    Deliver {
+        target_loop: LoopId,
+        delivery: ExternalDelivery,
+    },
 }
 
 /// How the user settles a question.
@@ -351,6 +359,32 @@ impl TurnRequest {
     }
 }
 
+impl TurnRequest {
+    /// The delivery of an @tickloop request to the Loop `target_loop`, under the input id the
+    /// delivery names.
+    pub fn deliver(target_loop: LoopId, delivery: ExternalDelivery) -> Self {
+        Self {
+            input_id: delivery.input_id(),
+            op: TurnOp::Deliver {
+                target_loop,
+                delivery,
+            },
+            delivery: Delivery::Queue,
+            host_context: None,
+        }
+    }
+}
+
+/// The ledger input of a delivery to the Loop `target_loop`, as `advance` records it.
+pub(crate) fn delivery_ledger(target_loop: LoopId, delivery: ExternalDelivery) -> LedgerInput {
+    let input_id = delivery.input_id();
+    let op = TurnOp::Deliver {
+        target_loop,
+        delivery,
+    };
+    LedgerInput::new(input_id, op.kind(), &op)
+}
+
 impl TurnOp {
     fn kind(&self) -> InputOp {
         match self {
@@ -359,6 +393,7 @@ impl TurnOp {
             Self::RegenerateAnswer { .. } => InputOp::RegenerateAnswer,
             Self::Skill { .. } => InputOp::Skill,
             Self::Answer { .. } => InputOp::Answer,
+            Self::Deliver { .. } => InputOp::Feedback,
         }
     }
 }
@@ -379,6 +414,14 @@ impl Agent {
             delivery,
             host_context,
         } = request;
+        if let TurnOp::Deliver { delivery, .. } = &op
+            && delivery.input_id() != input_id
+        {
+            return Err(AgentError::Invalid(
+                "a delivery's input id is the one its delivery names".into(),
+            ));
+        }
+        // A delivery's prompt is no part of its payload: see `ExternalDelivery`.
         let mut ledger = LedgerInput::new(input_id, op.kind(), &op);
         let admission = {
             let chats = self.inner.chats.lock().await;
@@ -429,6 +472,14 @@ impl Agent {
                     .reply_to_question(chat_id, request, reply, Some(ledger))
                     .await;
             }
+            TurnOp::Deliver {
+                target_loop,
+                delivery,
+            } => {
+                return self
+                    .take_delivery(chat_id, target_loop, delivery, ledger)
+                    .await;
+            }
         };
         let turn = match self
             .admit_placement(chat_id, placement, delivery, &mut ledger)
@@ -471,8 +522,8 @@ impl Agent {
                 self.submit_skill(chat_id, target_loop, skill, host_context, ledger, turn)
                     .await
             }
-            TurnOp::RegenerateAnswer { .. } | TurnOp::Answer { .. } => {
-                unreachable!("regenerated or answered above")
+            TurnOp::RegenerateAnswer { .. } | TurnOp::Answer { .. } | TurnOp::Deliver { .. } => {
+                unreachable!("regenerated, answered or delivered above")
             }
         };
         // A refused input leaves the Chat as it was: the branch it staged is not installed.
@@ -885,7 +936,7 @@ impl Agent {
             let mut chats = self.inner.chats.lock().await;
             self.refuse_when_closed()?;
             let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
-            if let Some(replay) = chat.bookkeeping.lifecycle.replay(chat_id, &ledger) {
+            if let Some(replay) = crate::lifecycle::replay(chat, &ledger) {
                 return replay;
             }
             let staged = match (switch, chat.branch_reservation) {

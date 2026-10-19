@@ -10,7 +10,7 @@ use tickloop_agent_tools::{
     ASK_USER_QUESTION_TOOL_NAME, DECLINED_QUESTIONS_RESULT, EXIT_PLAN_MODE_TOOL_NAME,
     START_GOAL_TOOL_NAME,
 };
-use tickloop_agent_transcript::ModelVisibleResult;
+use tickloop_agent_transcript::{ModelVisibleResult, SettledOutcome};
 
 const QUESTION_HEADER_MAX_CHARACTERS: usize = 12;
 const MIN_QUESTIONS: usize = 1;
@@ -420,7 +420,13 @@ impl Agent {
         let lifecycle = &mut chat.bookkeeping.lifecycle;
         lifecycle.resolve_wait(request_id, result, ledger.as_ref().map(|input| input.id));
         if let Some(input) = &ledger {
-            lifecycle.record_merged(input, &receipt, request.run_id);
+            lifecycle.record_settled(
+                input,
+                &receipt,
+                SettledOutcome::Merged {
+                    into: request.run_id,
+                },
+            );
             self.inner.ledger_changes.send_replace(());
         }
         self.save(&snapshot);

@@ -4,10 +4,10 @@
 
 use tickloop_agent_protocol::{ChatId, EventKind, LoopSnapshot, LoopState, Receipt};
 use tickloop_agent_transcript::{
-    InputOp, InterruptedBy, ResponseEnding, ResponseState, SettledOutcome,
+    InputEntry, InputOp, InterruptedBy, ResponseEnding, ResponseState, SettledOutcome,
 };
 
-use super::{Agent, Chat, LoopSnapshotExt, WaitHosting, turn};
+use super::{Agent, Chat, LoopSnapshotExt, WaitHosting, event_sources, turn};
 
 /// An input whose answer lost its host this many times in a row fails instead of continuing.
 const LOST_HOST_LIMIT: usize = 3;
@@ -18,7 +18,8 @@ impl Agent {
     /// answer lost its host, unless it lost its host three times in a row; the inputs that were
     /// queued are queued again after them; suspended Runs are rebuilt. With process wait
     /// hosting, the inputs the Agent queued for itself are lost with the process, as they always
-    /// were.
+    /// were, and an @tickloop request that had not started waits for the local inbox, which
+    /// delivers it again.
     pub(crate) async fn restore_after_load(&self, chat_id: ChatId, waits: WaitHosting) {
         match waits {
             WaitHosting::Process => {
@@ -26,7 +27,8 @@ impl Agent {
                 let Some(chat) = chats.get_mut(&chat_id) else {
                     return;
                 };
-                self.forget_inputs(chat, |_| true);
+                let redelivered = event_sources::requests_the_inbox_delivers_again(chat);
+                self.forget_inputs(chat, |entry| !redelivered.contains(&entry.input_id));
                 self.save(&chat.snapshot);
             }
             WaitHosting::Durable => self.restore_family_after_load(&[chat_id], Vec::new()).await,
@@ -41,18 +43,16 @@ impl Agent {
         let Some(chat) = chats.get_mut(&chat_id) else {
             return;
         };
-        // A queued @tickloop request is delivered again by its source (H09g).
-        self.forget_inputs(chat, |op| op == InputOp::Feedback);
         self.continue_lost_inputs(chat);
         self.requeue_inputs(chat);
         self.save(&chat.snapshot);
     }
 
-    /// The open inputs of `ops` that the user did not send are lost with their host: nothing
+    /// The open inputs among `lost` that the user did not send are lost with their host: nothing
     /// sends them again.
-    fn forget_inputs(&self, chat: &mut Chat, ops: impl Fn(InputOp) -> bool) {
+    fn forget_inputs(&self, chat: &mut Chat, lost: impl Fn(&InputEntry) -> bool) {
         for entry in chat.bookkeeping.lifecycle.open_entries() {
-            if !entry.op.is_from_user() && ops(entry.op) {
+            if !entry.op.is_from_user() && lost(&entry) {
                 self.settle_input(
                     chat,
                     entry.run_id,
@@ -138,18 +138,7 @@ impl Agent {
     /// Queues again the inputs accepted and not started, behind the continuations, in the order
     /// they were queued: each goes where it went when it was queued.
     fn requeue_inputs(&self, chat: &mut Chat) {
-        let feedback = chat
-            .bookkeeping
-            .lifecycle
-            .open_entries()
-            .into_iter()
-            .filter(|entry| entry.op == InputOp::Feedback)
-            .map(|entry| entry.run_id)
-            .collect::<std::collections::HashSet<_>>();
         for pending in chat.bookkeeping.lifecycle.queued_inputs() {
-            if feedback.contains(&pending.receipt.run_id) {
-                continue;
-            }
             let is_queued = chat
                 .snapshot
                 .pending_inputs
@@ -216,6 +205,12 @@ impl Agent {
                     .take_while(|queued| queued.task_continuation)
                     .count(),
             );
+            if let Some(identity) =
+                event_sources::queued_feedback_identity(chat.snapshot.id, &pending)
+            {
+                chat.feedback_inputs
+                    .insert(pending.receipt.run_id, identity);
+            }
             chat.snapshot.pending_inputs.insert(index, pending);
         }
     }

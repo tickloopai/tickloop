@@ -19,8 +19,8 @@ pub mod file_history;
 mod handback;
 mod harness;
 pub use harness::{
-    HarnessOptions, HarnessSeams, LOCAL_MIN_SCHEDULE_INTERVAL, PersonWait, PersonWaitKind,
-    Quiescence, ToolPolicy, WaitHosting, Waits,
+    DeliveryBinding, HarnessOptions, HarnessSeams, LOCAL_MIN_SCHEDULE_INTERVAL, PersonWait,
+    PersonWaitKind, Quiescence, ToolPolicy, WaitHosting, Waits,
 };
 mod host_context;
 mod host_notes;
@@ -90,6 +90,7 @@ mod tick_subscriptions;
 mod tick_trim;
 mod triggers;
 mod turn;
+pub use event_sources::ExternalDelivery;
 pub use turn::{
     Delivery, MessageId, ParentSelection, QuestionReply, SkillInvocation, Turn, TurnOp,
     TurnOutcome, TurnRequest, TurnWait, UserMessage,
@@ -2299,7 +2300,7 @@ impl Agent {
             let chats = self.inner.chats.lock().await;
             let chat = chats.get(&chat_id).ok_or(AgentError::NotFound)?;
             if let Some(ledger) = &ledger
-                && let Some(replay) = chat.bookkeeping.lifecycle.replay(chat_id, ledger)
+                && let Some(replay) = lifecycle::replay(chat, ledger)
             {
                 return replay;
             }
@@ -2434,12 +2435,15 @@ impl Agent {
         // Every queued input has its ledger record; one the Agent queues for itself is named by
         // its source where the source names it.
         let ledger = ledger.unwrap_or_else(|| {
-            let (id, op) = match (&agent_message, &directed_human, &feedback_input) {
-                (Some(source), _, _) => (source.message_id, InputOp::AgentMessage),
-                (_, Some(source), _) => (source.message_id, InputOp::AgentMessage),
-                // The local inbox delivers a request again after a restart; the delivery's own id
-                // names it once deliveries are pushed (H09g).
-                (_, _, Some(_)) => (Uuid::new_v4(), InputOp::Feedback),
+            if let Some(identity) = &feedback_input {
+                return turn::delivery_ledger(
+                    identity.loop_id,
+                    event_sources::ExternalDelivery::received(identity, input.clone()),
+                );
+            }
+            let (id, op) = match (&agent_message, &directed_human) {
+                (Some(source), _) => (source.message_id, InputOp::AgentMessage),
+                (_, Some(source)) => (source.message_id, InputOp::AgentMessage),
                 // A timer's fire is named by its scheduled time, so every host fires it once.
                 _ if let (Some(scheduled), Some(loop_id)) = (scheduled_for, goal) => (
                     tickloop_agent_transcript::input_ids::trigger(loop_id, scheduled),
@@ -2465,12 +2469,8 @@ impl Agent {
         }
         // Checked again under this lock: a concurrent first submission of the same input may
         // have been accepted while this one was being prepared.
-        if let Some(replay) = chats
-            .get(&chat_id)
-            .ok_or(AgentError::NotFound)?
-            .bookkeeping
-            .lifecycle
-            .replay(chat_id, &ledger)
+        if let Some(replay) =
+            lifecycle::replay(chats.get(&chat_id).ok_or(AgentError::NotFound)?, &ledger)
         {
             return replay;
         }
@@ -2479,6 +2479,39 @@ impl Agent {
             Self::validate_attachment_admission(&chats, &sessions, chat_id, goal, admission)?;
         }
         let original = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        if let Some(identity) = &feedback_input
+            && !original.snapshot.loops.iter().any(|existing| {
+                existing.id == identity.loop_id
+                    && !matches!(existing.state, LoopState::Stopped | LoopState::Expired)
+            })
+        {
+            // A Loop the conversation lost, as a rewind cuts one, has ended; one the Chat never
+            // had is a misrouted delivery.
+            if !original
+                .snapshot
+                .loops
+                .iter()
+                .any(|existing| existing.id == identity.loop_id)
+                && !original.bookkeeping.lifecycle.knows_loop(identity.loop_id)
+            {
+                return Err(AgentError::Invalid("the Chat has no such Loop".into()));
+            }
+            let receipt = Receipt {
+                chat_id,
+                loop_id: identity.loop_id,
+                run_id: identity.delivery_id,
+            };
+            original.bookkeeping.lifecycle.record_settled(
+                &ledger,
+                &receipt,
+                SettledOutcome::Discarded {
+                    reason: DiscardReason::LoopEnded,
+                },
+            );
+            self.save(&original.snapshot);
+            self.inner.ledger_changes.send_replace(());
+            return Ok(receipt);
+        }
         if original.family_stopping {
             return Err(AgentError::Invalid("Subagent subtree is stopping".into()));
         }
@@ -2497,34 +2530,6 @@ impl Agent {
             }
             None => None,
         };
-        if let Some(identity) = &feedback_input {
-            if let Some(pending) = original
-                .snapshot
-                .pending_inputs
-                .iter()
-                .find(|pending| pending.receipt.run_id == identity.delivery_id)
-            {
-                return Ok(pending.receipt.clone());
-            }
-            if original
-                .snapshot
-                .message_runs
-                .values()
-                .any(|run| *run == identity.delivery_id)
-                || original
-                    .snapshot
-                    .messages
-                    .iter()
-                    .flat_map(|message| &message.content)
-                    .any(|content| matches!(content, Content::Text { text } if text == &input))
-            {
-                return Ok(Receipt {
-                    chat_id,
-                    loop_id: identity.loop_id,
-                    run_id: identity.delivery_id,
-                });
-            }
-        }
         if family_generation.is_some_and(|expected| {
             expected != original.family_generation
                 || original

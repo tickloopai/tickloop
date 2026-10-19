@@ -25,4 +25,5 @@ unicode-width = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+tickloop-agent-artifacts = { path = "../artifacts" }
 tickloop-agent-base = { path = "../base" }

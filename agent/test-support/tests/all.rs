@@ -1,5 +1,7 @@
 //! Every agent/test-support integration test, compiled as one binary.
 
+#[path = "all/durable_deliveries.rs"]
+mod durable_deliveries;
 #[path = "all/durable_family.rs"]
 mod durable_family;
 #[path = "all/durable_triggers.rs"]

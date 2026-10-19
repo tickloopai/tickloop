@@ -103,7 +103,8 @@ pub(super) fn recover_loops(snapshot: &mut ChatSnapshot) {
 
 /// [`recover_loops`], except that the Loops in `kept` keep their state: their Runs are rebuilt.
 /// A durable host keeps every armed Trigger armed and its Loop waiting for it: the schedule
-/// goes on from the times the Loop already dealt with.
+/// goes on from the times the Loop already dealt with. It keeps the Loop's artifact links
+/// receiving too, since the host delivers their requests rather than a watcher of this process.
 pub(super) fn recover_loops_keeping(
     snapshot: &mut ChatSnapshot,
     kept: &HashSet<LoopId>,
@@ -117,7 +118,7 @@ pub(super) fn recover_loops_keeping(
     {
         let keeps_its_trigger = waits == WaitHosting::Durable
             && goal.trigger.as_ref().is_some_and(|trigger| trigger.armed);
-        if !goal.event_sources.is_empty() {
+        if !goal.event_sources.is_empty() && waits == WaitHosting::Process {
             for source in &mut goal.event_sources {
                 source.resume_required = true;
             }

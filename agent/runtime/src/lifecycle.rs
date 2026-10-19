@@ -223,11 +223,18 @@ impl Lifecycle {
         true
     }
 
-    /// Records the ledger input `input` of a reply that ended a wait of the Run `into`, settled
-    /// as merged into it from the start: the reply has no Run of its own, so `receipt`'s Run is
-    /// only its identity.
-    pub(crate) fn record_merged(&mut self, input: &LedgerInput, receipt: &Receipt, into: RunId) {
+    /// Records the ledger input `input` settled as `outcome` from the start, without a Run of its
+    /// own: a reply that ended a wait merged into the waiting Run, or a delivery its ended Loop
+    /// discarded. `receipt`'s Run is only its identity.
+    pub(crate) fn record_settled(
+        &mut self,
+        input: &LedgerInput,
+        receipt: &Receipt,
+        outcome: SettledOutcome,
+    ) {
         let revision = self.next_revision();
+        // An earlier acceptance of the input that was lost before it started is settled too.
+        self.open_inputs.retain(|_, open| *open != input.id);
         self.inputs.insert(
             input.id,
             Revised {
@@ -239,14 +246,19 @@ impl Lifecycle {
                     loop_id: receipt.loop_id,
                     run_id: receipt.run_id,
                     timestamp: now(),
-                    state: InputState::Settled {
-                        outcome: SettledOutcome::Merged { into },
-                    },
+                    state: InputState::Settled { outcome },
                     queued: None,
                 },
                 revision,
             },
         );
+    }
+
+    /// The ledger holds an input of the Loop `loop_id`.
+    pub(crate) fn knows_loop(&self, loop_id: Uuid) -> bool {
+        self.inputs
+            .values()
+            .any(|input| input.record.loop_id == loop_id)
     }
 
     /// Every input the ledger has open: accepted or started, and not settled.
@@ -827,6 +839,24 @@ impl Lifecycle {
             prompt_in_conversation,
             entry,
         })
+    }
+}
+
+/// [`Lifecycle::replay`] in the Chat: an acceptance that replaces one lost before it started
+/// finds that acceptance live once another delivery of the input replaced it, and attaches to it.
+pub(crate) fn replay(chat: &Chat, input: &LedgerInput) -> Option<Result<Receipt, AgentError>> {
+    let chat_id = chat.snapshot.id;
+    match chat.bookkeeping.lifecycle.replay(chat_id, input) {
+        None if input.replaces.is_some() => ledger_state(chat, input.id)
+            .filter(|state| state.is_live)
+            .map(|state| {
+                Ok(Receipt {
+                    chat_id,
+                    loop_id: state.entry.loop_id,
+                    run_id: state.entry.run_id,
+                })
+            }),
+        replay => replay,
     }
 }
 

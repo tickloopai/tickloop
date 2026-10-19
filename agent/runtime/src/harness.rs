@@ -10,7 +10,7 @@ use std::{
 use tickloop_agent_base::network::Reach;
 use tickloop_agent_model::{ModelClient, ModelClients, ModelError};
 use tickloop_agent_protocol::{
-    AgentHostOptions, ChatId, ModelConfig, PermissionRule, UserShellState,
+    AgentHostOptions, ChatId, LoopId, LoopState, ModelConfig, PermissionRule, UserShellState,
 };
 
 use uuid::Uuid;
@@ -150,8 +150,8 @@ impl ModelClients for OneClient {
 pub enum Quiescence {
     /// Nothing of the Chat runs or waits to run.
     Idle,
-    /// Nothing runs, but a Run waits for a person, or a Loop waits for its Trigger or event
-    /// source.
+    /// Nothing runs, but a Run waits for a person, or a Loop waits for its Trigger or the
+    /// requests of an artifact it is linked to.
     Waiting(Waits),
 }
 
@@ -164,6 +164,20 @@ pub struct Waits {
     /// not ended reaches its deadline, whatever the Loop's state. It may be past already; the
     /// host wakes the family then with it as the due time.
     pub wake_at: Option<SystemTime>,
+    /// The artifact links whose @tickloop requests the family's Loops receive: the host
+    /// delivers each with `TurnOp::Deliver`.
+    pub deliveries: Vec<DeliveryBinding>,
+}
+
+/// A Loop's link to an artifact for one account's @tickloop requests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeliveryBinding {
+    pub chat: ChatId,
+    pub loop_id: LoopId,
+    /// The Artifacts service the artifact belongs to.
+    pub origin: String,
+    pub account_id: String,
+    pub artifact_id: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,6 +292,7 @@ fn family_state(
         if let Some(member_waits) = member_waits {
             let family_waits = waits.get_or_insert_with(Waits::default);
             family_waits.people.extend(member_waits.people);
+            family_waits.deliveries.extend(member_waits.deliveries);
             family_waits.wake_at = family_waits
                 .wake_at
                 .into_iter()
@@ -325,7 +340,9 @@ fn chat_state(chat_id: ChatId, chat: &Chat) -> (bool, Option<Waits>) {
         || chat.parked.keys().any(|run| !waits_for_person(run))
         || user_shell_in(&[UserShellState::Running, UserShellState::Cancelling]);
     let wake_at = crate::triggers::wake_at(&chat.snapshot);
+    let deliveries = deliveries_of(chat_id, &chat.snapshot);
     let waits = !chat.parked.is_empty()
+        || !deliveries.is_empty()
         || waits_for_member
         || !chat.trigger_cancellations.is_empty()
         || !chat.event_cancellations.is_empty()
@@ -336,9 +353,34 @@ fn chat_state(chat_id: ChatId, chat: &Chat) -> (bool, Option<Waits>) {
         waits.then(|| Waits {
             wake_at: wake_at
                 .map(|milliseconds| SystemTime::UNIX_EPOCH + Duration::from_millis(milliseconds)),
+            deliveries,
             ..waits_of(chat_id, &chat.snapshot)
         }),
     )
+}
+
+/// The links of the Chat's Loops that have not ended and receive their artifact's requests.
+fn deliveries_of(
+    chat: ChatId,
+    snapshot: &tickloop_agent_protocol::ChatSnapshot,
+) -> Vec<DeliveryBinding> {
+    snapshot
+        .loops
+        .iter()
+        .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
+        .flat_map(|goal| {
+            goal.event_sources
+                .iter()
+                .filter(|source| !source.resume_required)
+                .map(|source| DeliveryBinding {
+                    chat,
+                    loop_id: goal.id,
+                    origin: source.origin.clone(),
+                    account_id: source.account_id.clone(),
+                    artifact_id: source.artifact_id.clone(),
+                })
+        })
+        .collect()
 }
 
 fn waits_of(chat: ChatId, snapshot: &tickloop_agent_protocol::ChatSnapshot) -> Waits {
@@ -364,6 +406,7 @@ fn waits_of(chat: ChatId, snapshot: &tickloop_agent_protocol::ChatSnapshot) -> W
     Waits {
         people: questions.chain(permissions).chain(user_shells).collect(),
         wake_at: None,
+        deliveries: Vec::new(),
     }
 }
 
