@@ -56,11 +56,6 @@ export function readProducts(root, channel, selection = "") {
     if (tomlValue(read(launcherManifest), "package", "name") !== "tickloop" || tomlValue(read(launcherManifest), "package", "version") !== version) throw new Error("The Cargo launcher must be named tickloop and match the workspace version.");
     return [{ id: "binary", label: "Tickloop", scope: "tickloop", kind: "workspace", manifest: "Cargo.toml", launcherManifest, version, tagPrefix: "v", workflow: ".github/workflows/release.yml" }];
   }
-  if (channel === "artifacts" || channel === "site") {
-    const directory = channel === "artifacts" ? "artifact" : "site";
-    const manifest = `${directory}/package.json`;
-    return [{ id: channel, label: channel === "artifacts" ? "Artifacts" : "Site", scope: channel, kind: "node", directory, manifest, version: JSON.parse(read(manifest)).version, tagPrefix: `${channel}-v`, workflow: `.github/workflows/${channel}-deploy.yml` }];
-  }
   if (channel !== "ticks") throw new Error("Unknown release channel");
   const available = readdirSync(join(root, "ticks"), { withFileTypes: true }).filter(entry => entry.isDirectory()).map(entry => entry.name).sort();
   const names = selection.trim() ? selection.trim().split(/\s+/) : available;
@@ -81,15 +76,7 @@ export function versionChanges(root, products) {
   const cargoVersions = new Map();
   for (const product of products) {
     parseVersion(product.nextVersion);
-    if (product.kind === "node") {
-      const manifest = JSON.parse(read(product.manifest));
-      const lockPath = `${product.directory}/package-lock.json`;
-      const lock = JSON.parse(read(lockPath));
-      if (manifest.version !== product.version || lock.version !== product.version || lock.packages[""].version !== product.version) throw new Error(`${product.label} package and lock versions are inconsistent.`);
-      manifest.version = lock.version = lock.packages[""].version = product.nextVersion;
-      changes.set(product.manifest, JSON.stringify(manifest, null, 2) + "\n");
-      changes.set(lockPath, JSON.stringify(lock, null, 2) + "\n");
-    } else if (product.kind === "tick") {
+    if (product.kind === "tick") {
       changes.set(product.manifest, withTomlVersion(read(product.manifest), "package", product.nextVersion));
       const manifest = JSON.parse(read(product.packageManifest));
       manifest.version = product.nextVersion;
