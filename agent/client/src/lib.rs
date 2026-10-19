@@ -253,7 +253,9 @@ async fn connect_existing(
     }
 }
 
-async fn running_daemon_executable(endpoint: &Path) -> Option<PathBuf> {
+/// Reads the executable of the same-user process behind a verified private daemon socket.
+pub async fn running_daemon_executable(endpoint: &Path) -> Option<PathBuf> {
+    validate_socket(endpoint).ok()?;
     let stream = tokio::net::UnixStream::connect(endpoint).await.ok()?;
     let credentials = stream.peer_cred().ok()?;
     if credentials.uid() != unsafe { libc::geteuid() } {

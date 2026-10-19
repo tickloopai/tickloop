@@ -379,7 +379,7 @@ where
     (median(samples), last.unwrap())
 }
 
-/// One hop of a response a sender encodes to a temporary file: the encoding and, on the
+/// One hop of a buffered response: the encoding and, on the
 /// receiver, the decoding of the frame.
 fn encoded_hop(message: ServerMessage) -> (f64, f64, usize, ServerMessage) {
     let mut encode = Vec::new();
@@ -391,7 +391,7 @@ fn encoded_hop(message: ServerMessage) -> (f64, f64, usize, ServerMessage) {
         let mut encoded = EncodedResponse::new(message.clone(), CancellationToken::new()).unwrap();
         encode.push(started.elapsed());
         bytes.clear();
-        encoded.file.read_to_end(&mut bytes).unwrap();
+        encoded.storage.read_to_end(&mut bytes).unwrap();
         let started = Instant::now();
         decoded = Some(decode_frame::<ServerMessage>(&bytes).unwrap());
         decode.push(started.elapsed());
@@ -458,7 +458,7 @@ async fn status_refresh_of_a_long_busy_chat() {
         CancellationToken::new(),
     )
     .unwrap()
-    .file
+    .storage
     .read_to_end(&mut encoded)
     .unwrap();
     let (digest_ms, _) = measure(|| async { Sha256::digest(&encoded) }).await;

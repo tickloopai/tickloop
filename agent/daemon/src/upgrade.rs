@@ -390,6 +390,15 @@ async fn verify_successor(executable: &Path) -> Result<(PathBuf, RuntimeBinaryIn
             "upgrade executable must be a private executable owned by this user",
         ));
     }
+    let running_executable =
+        std::env::current_exe().map_err(|error| AccessError::unavailable(error.to_string()))?;
+    let candidate = executable.clone();
+    tokio::task::spawn_blocking(move || {
+        tickloop_agent_updater::ensure_same_runtime_source(&running_executable, &candidate)
+    })
+    .await
+    .map_err(|error| AccessError::unavailable(error.to_string()))?
+    .map_err(|error| AccessError::invalid(format!("{error:#}")))?;
     let output = tokio::time::timeout(
         STARTUP_DEADLINE,
         Command::new(&executable)

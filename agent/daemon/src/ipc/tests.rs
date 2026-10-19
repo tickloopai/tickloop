@@ -37,6 +37,29 @@ struct ControlledFeed {
     initial: Option<ObservationValue>,
 }
 
+fn transcript_initial(text: String) -> ObservationValue {
+    ObservationValue::Transcript(Box::new(RecordedTranscript {
+        record: TranscriptRef {
+            store_root: "/tmp/transcripts".into(),
+            chat_id: Uuid::new_v4(),
+        },
+        title: None,
+        workdir: "/tmp/workdir".into(),
+        messages: vec![RecordedMessage {
+            id: Uuid::new_v4(),
+            message: tickloop_agent_protocol::Message {
+                role: tickloop_agent_protocol::Role::User,
+                content: vec![tickloop_agent_protocol::Content::Text { text }],
+            },
+            loop_id: None,
+            run_id: None,
+            timestamp: String::new(),
+        }],
+        total_messages: 1,
+        warnings: Vec::new(),
+    }))
+}
+
 #[async_trait]
 impl AgentAccess for ControlledFeed {
     async fn observe(&self, query: ObservationRequest) -> Result<Observation, AccessError> {
@@ -1089,6 +1112,54 @@ async fn cancel_immediately_after_opened_closes_the_source_before_feed_start() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spilled_history_is_complete_in_single_frame_and_chunked_transfers() {
+    let text = "x".repeat(crate::chunked::RESPONSE_MEMORY_BYTES + 1);
+    for limits in [AccessLimits::DEFAULT, TRANSPORT_LIMITS] {
+        let temporary = tempfile::tempdir_in("/tmp").unwrap();
+        let socket = temporary.path().join("spilled.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let epoch = Uuid::new_v4();
+        let initial = transcript_initial(text.clone());
+        let expected = serde_json::to_vec(&initial).unwrap();
+        let source = Arc::new(ControlledFeed {
+            sender: Mutex::new(None),
+            epoch,
+            initial: Some(initial),
+        });
+        let server_source = source.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_connection(stream, server_source, epoch, limits)
+                .await
+                .unwrap();
+        });
+        let client = LocalAgentClient::connect(socket).await.unwrap();
+        let observation = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.observe(ObservationRequest::Overview {
+                filter: AgentFilter::default(),
+                page: Page::default(),
+                after: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(serde_json::to_vec(&observation.initial).unwrap(), expected);
+        drop(observation);
+        let sender = source.sender.lock().await.take().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), sender.closed())
+            .await
+            .expect("dropping a received snapshot must cancel its source feed");
+        drop(client);
+        server.abort();
+        if let Err(error) = server.await {
+            assert!(error.is_cancelled());
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disconnect_during_chunked_open_cancels_the_source_before_any_opened_is_published() {
     let temporary = tempfile::tempdir_in("/tmp").unwrap();
     let socket = temporary.path().join("chunk-cancel.sock");
@@ -1097,28 +1168,7 @@ async fn disconnect_during_chunked_open_cancels_the_source_before_any_opened_is_
     let source = Arc::new(ControlledFeed {
         sender: Mutex::new(None),
         epoch,
-        initial: Some(ObservationValue::Transcript(Box::new(RecordedTranscript {
-            record: TranscriptRef {
-                store_root: temporary.path().to_path_buf(),
-                chat_id: Uuid::new_v4(),
-            },
-            title: None,
-            workdir: temporary.path().to_path_buf(),
-            messages: vec![RecordedMessage {
-                id: Uuid::new_v4(),
-                message: tickloop_agent_protocol::Message {
-                    role: tickloop_agent_protocol::Role::User,
-                    content: vec![tickloop_agent_protocol::Content::Text {
-                        text: "x".repeat(FRAME_BYTES),
-                    }],
-                },
-                loop_id: None,
-                run_id: None,
-                timestamp: String::new(),
-            }],
-            total_messages: 1,
-            warnings: Vec::new(),
-        }))),
+        initial: Some(transcript_initial("x".repeat(FRAME_BYTES))),
     });
     let server_source = source.clone();
     let server = tokio::spawn(async move {

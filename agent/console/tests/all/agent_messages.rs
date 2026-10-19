@@ -3693,6 +3693,7 @@ async fn stopping_a_background_child_waiting_for_human_input_pushes_one_killed_n
 #[tokio::test]
 async fn background_completion_obeys_the_same_pending_inbox_limit() {
     use std::sync::atomic::Ordering;
+    const SNAPSHOT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
     let mut timing = SubagentTimingModel::new(true);
     timing.routed = RoutedModel::new(|request| {
         if !state(request)["delegation"].is_null() {
@@ -3753,31 +3754,39 @@ async fn background_completion_obeys_the_same_pending_inbox_limit() {
                     && operation.state == tickloop_agent_protocol::OperationState::Admitted
             })
         {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(SNAPSHOT_POLL_INTERVAL).await;
         }
     })
     .await
     .unwrap();
     model.release.notify_waiters();
+    let mut last_counts = (0, 0);
     let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let snapshot = core.snapshot(root).await.unwrap();
-            if snapshot.family_completions.len() == 129 {
+            last_counts = (
+                snapshot.family_completions.len(),
+                snapshot.pending_inputs.len(),
+            );
+            if last_counts == (129, 128) {
                 break snapshot;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(SNAPSHOT_POLL_INTERVAL).await;
         }
     })
-    .await
-    .unwrap();
-    tokio::task::yield_now().await;
-    let snapshot = core.snapshot(root).await.unwrap_or(snapshot);
+    .await;
+    let snapshot = snapshot.unwrap_or_else(|_| {
+        panic!(
+            "inbox did not reach 129 completion facts and 128 pending inputs; last observed: {} completion facts, {} pending inputs",
+            last_counts.0, last_counts.1
+        )
+    });
     std::fs::write(directory.path().join("inbox-release"), "release").unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while core.snapshot(root).await.unwrap().loops[0].state
             != tickloop_agent_protocol::LoopState::Completed
         {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(SNAPSHOT_POLL_INTERVAL).await;
         }
     })
     .await
@@ -3787,7 +3796,7 @@ async fn background_completion_obeys_the_same_pending_inbox_limit() {
             let current=core.snapshot(root).await.unwrap();
             let count=current.messages.iter().flat_map(|message|&message.content).filter(|content|matches!(content,Content::Text {text} if text.starts_with("<task-notification>"))).count();
             if count==129 {break;}
-            tokio::task::yield_now().await;
+            tokio::time::sleep(SNAPSHOT_POLL_INTERVAL).await;
         }
     }).await;
     core.shutdown().await;

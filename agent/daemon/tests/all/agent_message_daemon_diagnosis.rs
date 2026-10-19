@@ -378,10 +378,13 @@ async fn accepted_parent_child_messages_and_burst_feed_cancellation_keep_the_fam
         "actual SendMessage tools must be accepted before the stress"
     );
     model.emit_deltas.notify_waiters();
+    let mut completed_rounds = 0;
+    let mut stage = "starting feed churn".to_owned();
     // Forty rounds of feed churn; on a machine busy with parallel tests they took over 15 s.
     let result = tokio::time::timeout(Duration::from_secs(60), async {
-        for _ in 0..40 {
+        for round in 0..40 {
             for execution in &targets {
+                stage = format!("round {}/40: Snapshot for {execution:?}", round + 1);
                 drop(
                     client
                         .observe(ObservationRequest::Agent {
@@ -393,6 +396,7 @@ async fn accepted_parent_child_messages_and_burst_feed_cancellation_keep_the_fam
                         .unwrap(),
                 );
             }
+            stage = format!("round {}/40: Overview", round + 1);
             let ObservationValue::Overview(rows) =
                 client.observe(overview_query()).await.unwrap().initial
             else {
@@ -404,8 +408,10 @@ async fn accepted_parent_child_messages_and_burst_feed_cancellation_keep_the_fam
                     .all(|row| row.availability == ExecutionAvailability::Live),
                 "accepted messages caused family Lost: {rows:?}"
             );
+            completed_rounds = round + 1;
         }
         for execution in &targets {
+            stage = format!("final Snapshot for {execution:?}");
             let ObservationValue::Agent(_) = client
                 .observe(ObservationRequest::Agent {
                     execution: *execution,
@@ -429,5 +435,9 @@ async fn accepted_parent_child_messages_and_burst_feed_cancellation_keep_the_fam
         task.abort();
     }
     server.abort();
-    result.unwrap();
+    result.unwrap_or_else(|_| {
+        panic!(
+            "feed churn timed out after {completed_rounds}/40 completed rounds; awaiting {stage}"
+        )
+    });
 }

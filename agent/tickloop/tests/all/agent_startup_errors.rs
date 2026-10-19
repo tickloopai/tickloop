@@ -6,6 +6,10 @@ use std::{
     io::{Read, Write},
     os::unix::{fs::PermissionsExt, net::UnixListener},
     process::{Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::Duration,
 };
@@ -26,6 +30,8 @@ fn incompatible_daemon_output(terminal: bool) -> String {
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let endpoint = socket.clone();
+    let cli_finished = Arc::new(AtomicBool::new(false));
+    let daemon_cli_finished = cli_finished.clone();
     let daemon = thread::spawn(move || {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let (mut stream, _) = loop {
@@ -78,52 +84,36 @@ fn incompatible_daemon_output(terminal: bool) -> String {
                 Err(error) => panic!("{error}"),
             }
         };
-        identity_probe.set_nonblocking(false).unwrap();
-        let mut probe_bytes = Vec::new();
-        identity_probe.read_to_end(&mut probe_bytes).unwrap();
-        assert!(
-            probe_bytes.is_empty(),
-            "the peer identity probe must not dispatch a request"
-        );
-        if terminal {
-            let (mut control, _) = loop {
-                match listener.accept() {
-                    Ok(connection) => break connection,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "no management handshake"
-                        );
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("{error}"),
+        identity_probe.set_nonblocking(true).unwrap();
+        loop {
+            match identity_probe.read(&mut [0u8; 1]) {
+                Ok(0) => break,
+                Ok(_) => panic!("the peer identity probe must not dispatch a request"),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the peer identity probe did not close"
+                    );
+                    thread::sleep(Duration::from_millis(10));
                 }
-            };
-            control.set_nonblocking(false).unwrap();
-            control
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .unwrap();
-            control.read_exact(&mut header).unwrap();
-            let mut request = vec![0; u32::from_be_bytes(header) as usize];
-            control.read_exact(&mut request).unwrap();
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&request).unwrap(),
-                json!({"Hello":{"major":1,"minor":0}})
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("{error}"),
+            }
+        }
+        while !daemon_cli_finished.load(Ordering::Acquire) {
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+                "cancel must not open a management connection or send ShutdownDaemon"
             );
-            let response = serde_json::to_vec(
-                &json!({"Hello":{"major":1,"minor":0,"daemon_epoch":uuid::Uuid::new_v4()}}),
-            )
-            .unwrap();
-            control
-                .write_all(&(response.len() as u32).to_be_bytes())
-                .unwrap();
-            control.write_all(&response).unwrap();
-            let mut rest = Vec::new();
-            control.read_to_end(&mut rest).unwrap();
-            assert!(rest.is_empty(), "cancel must not send ShutdownDaemon");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "CLI did not finish after the incompatible daemon response"
+            );
+            thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "no extra connection may follow the peer identity probe"
         );
     });
     let canonical_executable = std::fs::canonicalize(env!("CARGO_BIN_EXE_tickloop")).unwrap();
@@ -205,6 +195,7 @@ fn incompatible_daemon_output(terminal: bool) -> String {
         assert!(output.stdout.is_empty());
         String::from_utf8(output.stderr).unwrap()
     };
+    cli_finished.store(true, Ordering::Release);
     let output = output.replace('\r', "");
     daemon.join().unwrap();
     assert!(socket.exists());

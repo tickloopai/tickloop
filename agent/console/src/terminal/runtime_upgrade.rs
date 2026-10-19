@@ -74,6 +74,23 @@ pub(super) async fn check(agent: Agent, initial_launch: bool) -> Result<Activati
         .executable
         .canonicalize()
         .map_err(|error| error.to_string())?;
+    let current_executable = running.executable.clone();
+    let candidate_executable = target_path.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        tickloop_agent_updater::ensure_same_runtime_source(
+            &current_executable,
+            &candidate_executable,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    {
+        return Ok(Activation {
+            target: None,
+            waiting: false,
+            error: Some(format!("{error:#}")),
+        });
+    }
     if running.requested_executable.as_ref() != Some(&target_path) && !running.upgrading {
         agent
             .request_runtime_upgrade(target_path)

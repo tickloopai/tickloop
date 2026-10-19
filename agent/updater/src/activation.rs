@@ -27,15 +27,14 @@ pub fn follow_daemon_runtime(
     expected_build: &str,
 ) -> Result<Option<SelectedRuntime>> {
     let current = std::env::current_exe()?.canonicalize()?;
-    if Installation::detect(&current)?
-        .is_some_and(|installation| !matches!(installation.source, Source::Checkout { .. }))
-    {
+    if Source::detect(&current)?.is_some_and(|source| !matches!(source, Source::Checkout { .. })) {
         return Ok(None);
     }
     let executable = executable.canonicalize()?;
     if executable == current {
         return Ok(None);
     }
+    crate::ensure_same_runtime_source(&current, &executable)?;
     let directory = executable
         .parent()
         .context("Running daemon has no program directory")?;
@@ -95,6 +94,11 @@ fn selected_runtime_for(
     if selected_version <= semver::Version::parse(&installation.build.version)? {
         return Ok(None);
     }
+    let source = Source::detect(&selected)?
+        .context("The selected release has no verified installation source")?;
+    if source != installation.source {
+        anyhow::bail!("The selected executable belongs to another installation");
+    }
     let directory = selected
         .parent()
         .context("Selected runtime has no directory")?;
@@ -103,11 +107,6 @@ fn selected_runtime_for(
         <= semver::Version::parse(&installation.build.version)?
     {
         return Ok(None);
-    }
-    let detected = Installation::detect(&selected)?
-        .context("The selected release has no verified installation source")?;
-    if detected.source != installation.source {
-        anyhow::bail!("The selected executable belongs to another installation");
     }
     bundle::verify(directory, &build)?;
     let executable = prepare_runtime(&selected, &selected, &build)?.unwrap_or(selected);
@@ -189,6 +188,103 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("another installation")
+        );
+    }
+
+    fn selected_candidate(directory: &Path, marker: &Path) -> PathBuf {
+        std::fs::create_dir_all(directory).unwrap();
+        let candidate = directory.join("tickloop");
+        std::fs::write(&candidate, format!(
+            "#!/bin/sh\n: > '{}'\ncase \"$1\" in\n--version) echo 'tickloop 2.0.0';;\n--build-identity) echo '2.0.0+fixture';;\n*) exit 2;;\nesac\n",
+            marker.display(),
+        )).unwrap();
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o700)).unwrap();
+        candidate
+    }
+
+    #[test]
+    fn activation_rejects_foreign_homebrew_before_probing_selected_executable() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let original = root.join("original-brew");
+        let foreign = root.join("foreign-brew");
+        for prefix in [&original, &foreign] {
+            std::fs::create_dir_all(prefix.join("bin")).unwrap();
+            std::fs::write(prefix.join("bin/brew"), "metadata-only Homebrew marker").unwrap();
+        }
+        let old = release(
+            &root.join("running"),
+            "1.0.0",
+            Source::Homebrew {
+                executable: original.join("bin/brew"),
+            },
+        );
+        let installation = Installation::read(old.parent().unwrap()).unwrap();
+        let prefix = foreign.join("Cellar/tickloop/2.0.0");
+        let marker = root.join("candidate-executed");
+        let candidate = selected_candidate(&prefix.join("bin"), &marker);
+        std::fs::write(
+            prefix.join("INSTALL_RECEIPT.json"),
+            serde_json::to_vec(&serde_json::json!({"source":{"tap":"tickloopai/tap"}})).unwrap(),
+        )
+        .unwrap();
+        symlink(candidate, original.join("bin/tickloop")).unwrap();
+        let error = selected_runtime_for(&installation, &old).unwrap_err();
+        assert!(
+            error.to_string().contains("another installation"),
+            "{error:#}"
+        );
+        assert!(
+            !marker.exists(),
+            "foreign Homebrew must be rejected before probing its program"
+        );
+    }
+
+    #[test]
+    fn activation_rejects_changed_cargo_repository_before_probing_selected_executable() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let cargo = root.join("cargo");
+        let old = release(
+            &root.join("running"),
+            "1.0.0",
+            Source::Cargo {
+                root: cargo.clone(),
+                repository: "https://example.test/original".into(),
+            },
+        );
+        let installation = Installation::read(old.parent().unwrap()).unwrap();
+        let marker = root.join("candidate-executed");
+        selected_candidate(&cargo.join("bin"), &marker);
+        let installs = [
+            "tickloop-agent",
+            "tickloop-tickhost",
+            "tickloop-tick-reader",
+        ]
+        .into_iter()
+        .map(|name| {
+            (
+                format!(
+                    "{name} 2.0.0 (git+https://example.test/another#{})",
+                    "a".repeat(40)
+                ),
+                serde_json::json!({}),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+        std::fs::write(
+            cargo.join(".crates2.json"),
+            serde_json::to_vec(&serde_json::json!({"installs":installs})).unwrap(),
+        )
+        .unwrap();
+        let error = selected_runtime_for(&installation, &old).unwrap_err();
+        assert!(
+            error.to_string().contains("another installation"),
+            "{error:#}"
+        );
+        assert!(
+            !marker.exists(),
+            "changed Cargo repository must be rejected before probing its program"
         );
     }
 }

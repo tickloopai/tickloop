@@ -741,27 +741,32 @@ async fn connect_daemon_at_startup(
     let Some(mismatch) = &error.mismatch else {
         return Err(error.to_string());
     };
-    if let Some(running) = &mismatch.running_executable {
-        use std::os::unix::process::CommandExt;
-        drop(startup_console.take());
-        let error = std::process::Command::new(running)
-            .args(launch_arguments)
-            .exec();
-        return Err(format!(
-            "Cannot open the running version {}: {error}",
-            running.display()
-        ));
-    }
-    let prepared = mismatch
-        .prepare_stop()
-        .await
-        .map_err(|reason| format!("{error}\n\n{reason}"))?
-        .ok_or("The Agent daemon changed before confirmation; launch tickloop again.")?;
     let running_executable = mismatch.running_executable.clone();
+    let running_version = if let Some(running) = running_executable.clone() {
+        tokio::task::spawn_blocking(move || tickloop_agent_updater::Installation::detect(&running))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .map(|installation| {
+                format!(
+                    "{} ({})",
+                    installation.build.version,
+                    installation.source.label()
+                )
+            })
+    } else {
+        None
+    };
     let mut context = vec![
-        "A different Tickloop version is running.".into(),
+        format!("Installed Tickloop: {}", env!("CARGO_PKG_VERSION")),
+        format!(
+            "Running daemon: {}",
+            safe_text(running_version.as_deref().unwrap_or("unknown version"))
+        ),
+        "The running daemon is incompatible; automatic switching is unavailable.".into(),
         safe_text(&mismatch.description),
-        "Stopping it stops all running Agents. Saved history is kept. Ticks keep running.".into(),
+        "Stopping it stops all running Agents and their Shell tasks. Saved history is kept. Ticks keep running.".into(),
         "After stopping, this version opens automatically with your current startup options."
             .into(),
     ];
@@ -802,6 +807,11 @@ async fn connect_daemon_at_startup(
             running.display()
         ));
     }
+    let prepared = mismatch
+        .prepare_stop()
+        .await
+        .map_err(|reason| format!("{error}\n\n{reason}"))?
+        .ok_or("The Agent daemon changed before confirmation; launch tickloop again.")?;
     let (console, _) = startup_console
         .as_ref()
         .expect("startup console initialized");

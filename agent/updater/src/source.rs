@@ -18,6 +18,16 @@ pub enum Source {
 }
 
 impl Source {
+    /// Reads installation provenance without executing any program.
+    pub(crate) fn detect(executable: &Path) -> Result<Option<Self>> {
+        Ok(
+            detect_installation(executable)?.map(|detected| match detected {
+                DetectedInstallation::Recorded(installation) => installation.source,
+                DetectedInstallation::Discovered(source) => source,
+            }),
+        )
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             Self::Native { .. } => "native",
@@ -38,63 +48,74 @@ pub struct Installation {
 
 const RECORD: &str = "installation.json";
 
+enum DetectedInstallation {
+    Recorded(Installation),
+    Discovered(Source),
+}
+
+fn detect_installation(executable: &Path) -> Result<Option<DetectedInstallation>> {
+    let bin = executable.parent().context("executable has no parent")?;
+    if bin.join(RECORD).exists() {
+        return Installation::read(bin).map(|record| Some(DetectedInstallation::Recorded(record)));
+    }
+    // Homebrew's real Cellar path is immutable even when its public symlink changes.
+    if let Some(cellar) = bin.parent().and_then(Path::parent).and_then(Path::parent)
+        && cellar.file_name().is_some_and(|name| name == "Cellar")
+        && bin
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "tickloop")
+        && bin
+            .parent()
+            .and_then(|prefix| std::fs::read(prefix.join("INSTALL_RECEIPT.json")).ok())
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|receipt| receipt["source"]["tap"] == "tickloopai/tap")
+    {
+        let brew = cellar
+            .parent()
+            .context("Cellar has no prefix")?
+            .join("bin/brew");
+        if !brew.is_file() {
+            bail!("Cannot find Homebrew beside {}", cellar.display());
+        }
+        return Ok(Some(DetectedInstallation::Discovered(Source::Homebrew {
+            executable: brew,
+        })));
+    }
+    if bin.file_name().is_some_and(|name| name == "bin")
+        && let Some(root) = bin.parent()
+        && let Some((repository, _)) = cargo_source(root)?
+    {
+        return Ok(Some(DetectedInstallation::Discovered(Source::Cargo {
+            root: root.into(),
+            repository,
+        })));
+    }
+    if bin.file_name().is_some_and(|name| name == "bin")
+        && let Some(root) = bin.parent()
+        && let Some(checkout) = cargo_checkout(root)?
+    {
+        return Ok(Some(DetectedInstallation::Discovered(Source::Checkout {
+            root: checkout,
+        })));
+    }
+    Ok(None)
+}
+
 impl Installation {
     pub fn detect(executable: &Path) -> Result<Option<Self>> {
-        let bin = executable.parent().context("executable has no parent")?;
-        if bin.join(RECORD).exists() {
-            return Self::read(bin).map(Some);
-        }
-        // Homebrew's real Cellar path is immutable even when its public symlink changes.
-        if let Some(cellar) = bin.parent().and_then(Path::parent).and_then(Path::parent)
-            && cellar.file_name().is_some_and(|name| name == "Cellar")
-            && bin
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::file_name)
-                .is_some_and(|name| name == "tickloop")
-            && bin
-                .parent()
-                .and_then(|prefix| std::fs::read(prefix.join("INSTALL_RECEIPT.json")).ok())
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                .is_some_and(|receipt| receipt["source"]["tap"] == "tickloopai/tap")
-        {
-            let brew = cellar
-                .parent()
-                .context("Cellar has no prefix")?
-                .join("bin/brew");
-            if !brew.is_file() {
-                bail!("Cannot find Homebrew beside {}", cellar.display());
-            }
-            return Ok(Some(Self {
-                source: Source::Homebrew { executable: brew },
-                build: crate::bundle::read_build(bin)?,
+        match detect_installation(executable)? {
+            Some(DetectedInstallation::Recorded(installation)) => Ok(Some(installation)),
+            Some(DetectedInstallation::Discovered(source)) => Ok(Some(Self {
+                source,
+                build: crate::bundle::read_build(
+                    executable.parent().context("executable has no parent")?,
+                )?,
                 pinned: false,
-            }));
+            })),
+            None => Ok(None),
         }
-        if bin.file_name().is_some_and(|name| name == "bin")
-            && let Some(root) = bin.parent()
-            && let Some((repository, _)) = cargo_source(root)?
-        {
-            return Ok(Some(Self {
-                source: Source::Cargo {
-                    root: root.into(),
-                    repository,
-                },
-                build: crate::bundle::read_build(bin)?,
-                pinned: false,
-            }));
-        }
-        if bin.file_name().is_some_and(|name| name == "bin")
-            && let Some(root) = bin.parent()
-            && let Some(checkout) = cargo_checkout(root)?
-        {
-            return Ok(Some(Self {
-                source: Source::Checkout { root: checkout },
-                build: crate::bundle::read_build(bin)?,
-                pinned: false,
-            }));
-        }
-        Ok(None)
     }
 
     pub(crate) fn read(directory: &Path) -> Result<Self> {

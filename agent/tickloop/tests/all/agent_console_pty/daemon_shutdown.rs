@@ -1,5 +1,127 @@
 use super::*;
 
+struct LegacyDaemon {
+    child: std::process::Child,
+    directory: std::path::PathBuf,
+}
+
+impl LegacyDaemon {
+    async fn start(fixture: &PrivateFixture, supports_management: bool) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = fixture.path("legacy");
+        std::fs::create_dir(&directory).unwrap();
+        let executable = directory.join("tickloop");
+        std::fs::copy(support::fixture_cli::executable(), &executable).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            directory.join("legacy-fixture.json"),
+            json!({"version":"0.2.8", "management":supports_management}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("installation.json"),
+            json!({
+                "source": {"kind":"native", "root": fixture.path("native")},
+                "build": {"version":"0.2.8", "identity":"0.2.8+legacy"},
+                "pinned": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let endpoint = fixture.path("runtime/daemon.sock");
+        let child = std::process::Command::new(executable)
+            .arg("--legacy-daemon-fixture")
+            .arg(&endpoint)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", fixture.path("home"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(fixture.path("legacy.log")).unwrap())
+            .spawn()
+            .unwrap();
+        let mut daemon = Self { child, directory };
+        tokio::time::timeout(UI_TIMEOUT, async {
+            while !endpoint.exists() {
+                assert!(
+                    daemon.child.try_wait().unwrap().is_none(),
+                    "{}",
+                    std::fs::read_to_string(fixture.path("legacy.log")).unwrap()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("private legacy daemon did not become ready");
+        daemon
+    }
+}
+
+impl Drop for LegacyDaemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[tokio::test]
+async fn incompatible_running_executable_requires_an_explicit_choice_and_explains_both_versions() {
+    for (continue_old, supports_management) in
+        [(false, true), (true, true), (false, false), (true, false)]
+    {
+        let fixture = PrivateFixture::new();
+        let mut old = LegacyDaemon::start(&fixture, supports_management).await;
+        let mut view = PtyView::start(&fixture);
+        let result = AssertUnwindSafe(async {
+            view.wait_for("explicit legacy migration choice", |frame| {
+                frame.contains(&format!(
+                    "Installed Tickloop: {}",
+                    env!("CARGO_PKG_VERSION")
+                )) && frame.contains("Running daemon: 0.2.8")
+                    && frame.contains("Stop the running daemon and continue?")
+            })
+            .await;
+            assert!(
+                !old.directory.join("legacy-ui-opened").exists(),
+                "startup must not silently execute the old View"
+            );
+            assert!(!old.directory.join("legacy-stopped").exists());
+            assert!(old.child.try_wait().unwrap().is_none());
+            view.send(if continue_old { b"k\r" } else { b"\x1b" });
+            tokio::time::timeout(UI_TIMEOUT, async {
+                loop {
+                    if let Some(status) = view.child.try_wait().unwrap() {
+                        assert!(status.success(), "{}", view.frame());
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                old.directory.join("legacy-ui-opened").exists(),
+                continue_old
+            );
+            assert!(!old.directory.join("legacy-stopped").exists());
+            assert!(
+                old.child.try_wait().unwrap().is_none(),
+                "cancel and explicit old View must preserve the old daemon"
+            );
+        })
+        .catch_unwind()
+        .await;
+        if view.child.try_wait().unwrap().is_none() {
+            view.child.kill().unwrap();
+            view.child.wait().unwrap();
+        }
+        drop(old);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
 async fn serve_incompatible_daemon(
     endpoint: std::path::PathBuf,
     acknowledge: bool,
@@ -259,4 +381,71 @@ async fn explicit_daemon_stop_stays_stopped_with_a_live_view_until_a_new_launch(
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
+}
+
+#[tokio::test]
+async fn update_status_reports_the_incompatible_daemon_without_migrating_or_opening_its_view() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = PrivateFixture::new();
+    let mut old = LegacyDaemon::start(&fixture, true).await;
+    let bundle = fixture.path("current");
+    std::fs::create_dir(&bundle).unwrap();
+    let executable = bundle.join("tickloop");
+    std::fs::copy(env!("CARGO_BIN_EXE_tickloop"), &executable).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        bundle.join("installation.json"),
+        json!({
+            "source": {"kind":"native", "root": fixture.path("native")},
+            "build": {"version":env!("CARGO_PKG_VERSION"), "identity":env!("TICKLOOP_BUILD_IDENTITY")},
+            "pinned": true,
+        }).to_string(),
+    ).unwrap();
+    let output = tokio::time::timeout(
+        UI_TIMEOUT,
+        tokio::process::Command::new(&executable)
+            .args(["update", "--status"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", fixture.path("home"))
+            .env("TICKLOOP_CONFIG_DIR", fixture.path("config"))
+            .env("TICKLOOP_DAEMON_RUNTIME_DIR", fixture.path("runtime"))
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("status query did not finish")
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        status.contains(&format!("Running: {}", env!("CARGO_PKG_VERSION"))),
+        "{status}"
+    );
+    assert!(status.contains("Daemon: 0.2.8+legacy"), "{status}");
+    assert!(status.contains("Daemon source: native"), "{status}");
+    assert!(
+        status.contains(
+            &old.directory
+                .join("tickloop")
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string()
+        ),
+        "{status}"
+    );
+    assert!(
+        status.contains("incompatible") && status.contains("manual migration required"),
+        "{status}"
+    );
+    assert!(!status.contains("not reachable"), "{status}");
+    assert!(!old.directory.join("legacy-ui-opened").exists());
+    assert!(!old.directory.join("legacy-stopped").exists());
+    assert!(old.child.try_wait().unwrap().is_none());
+    assert!(fixture.path("runtime/daemon.sock").exists());
 }

@@ -831,8 +831,8 @@ async fn write_encoded_frame<W: AsyncWrite + Unpin>(
         .write_u32(encoded.total_bytes as u32)
         .await
         .map_err(|error| AccessError::unavailable(error.to_string()))?;
-    let mut file = tokio::fs::File::from_std(encoded.file);
-    tokio::io::copy(&mut file, writer)
+    let mut reader = encoded.into_reader();
+    tokio::io::copy(&mut reader, writer)
         .await
         .map_err(|error| AccessError::unavailable(error.to_string()))?;
     writer
@@ -853,7 +853,7 @@ async fn write_chunked_response<W: AsyncWrite + Unpin>(
     let total_bytes = encoded.total_bytes;
     let frame_bytes = limits.frame_bytes();
     let chunk_bytes = limits.chunk_bytes();
-    let mut file = tokio::fs::File::from_std(encoded.file);
+    let mut reader = encoded.into_reader();
     let transfer = async {
         write_frame(
             writer,
@@ -872,7 +872,8 @@ async fn write_chunked_response<W: AsyncWrite + Unpin>(
         let mut digest = Sha256::new();
         while offset < total_bytes {
             let length = (total_bytes - offset).min(chunk_bytes as u64) as usize;
-            file.read_exact(&mut bytes[..length])
+            reader
+                .read_exact(&mut bytes[..length])
                 .await
                 .map_err(|error| AccessError::unavailable(error.to_string()))?;
             digest.update(&bytes[..length]);

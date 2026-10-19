@@ -213,26 +213,83 @@ fn fail_startup(arguments: &[std::ffi::OsString], message: &str) -> ! {
 
 async fn report_running_versions() {
     use tickloop_agent_client::daemon_endpoint::STARTUP_DEADLINE;
-    use tickloop_agent_protocol::{AgentAccess, ObservationRequest, ObservationValue};
+    use tickloop_agent_protocol::{
+        AccessErrorCode, AgentAccess, ObservationRequest, ObservationValue,
+    };
     let endpoint = tickloop_agent_client::daemon_endpoint::runtime_directory()
         .join(tickloop_agent_client::daemon_endpoint::SOCKET_NAME);
-    let Ok(Ok(client)) = tokio::time::timeout(
+    let client = match tokio::time::timeout(
         STARTUP_DEADLINE,
         tickloop_agent_client::LocalAgentClient::connect(&endpoint),
     )
     .await
-    else {
-        println!("Daemon: not reachable");
-        return;
+    {
+        Ok(Ok(client)) => Some(client),
+        Ok(Err(error)) if error.code == AccessErrorCode::VersionMismatch => None,
+        _ => {
+            println!("Daemon: not reachable");
+            return;
+        }
     };
+    let executable = tokio::time::timeout(
+        STARTUP_DEADLINE,
+        tickloop_agent_client::running_daemon_executable(&endpoint),
+    )
+    .await
+    .ok()
+    .flatten();
+    let installation = if let Some(executable) = executable.clone() {
+        match tokio::task::spawn_blocking(move || {
+            tickloop_agent_updater::Installation::detect(&executable)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result.map_err(|error| format!("{error:#}")))
+        {
+            Ok(installation) => installation,
+            Err(error) => {
+                println!(
+                    "Daemon installation details unavailable: {}",
+                    tickloop_agent_console::terminal::safe_text(&error)
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let build = client
+        .as_ref()
+        .and_then(|client| client.protocol().build)
+        .or_else(|| {
+            installation
+                .as_ref()
+                .map(|installation| installation.build.identity.clone())
+        })
+        .unwrap_or_else(|| "unknown build".into());
     println!(
         "Daemon: {}",
-        client
-            .protocol()
-            .build
-            .as_deref()
-            .unwrap_or("unknown build")
+        tickloop_agent_console::terminal::safe_text(&build)
     );
+    println!(
+        "Daemon source: {}",
+        installation
+            .as_ref()
+            .map_or("unmanaged/unknown", |installation| installation
+                .source
+                .label())
+    );
+    println!(
+        "Daemon executable: {}",
+        executable.as_ref().map_or_else(
+            || "unknown".into(),
+            |path| tickloop_agent_console::terminal::safe_text(&path.display().to_string())
+        )
+    );
+    let Some(client) = client else {
+        println!("Daemon compatibility: incompatible; manual migration required");
+        return;
+    };
     if client.protocol().upgrade_protocol != Some(tickloop_agent_protocol::RUNTIME_HANDOFF_VERSION)
     {
         println!("Automatic runtime handoff: unavailable in this daemon");

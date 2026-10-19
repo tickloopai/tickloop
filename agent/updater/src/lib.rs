@@ -12,8 +12,10 @@ use progress::ProgressReporter;
 pub use progress::{UpdateProgress, UpdateStage};
 mod release;
 mod retention;
+mod runtime_source;
 pub use notice::{UpdateMonitor, UpdateNotice};
 pub use retention::cleanup_unused_runtimes;
+pub use runtime_source::ensure_same_runtime_source;
 mod source;
 #[cfg(test)]
 mod tests;
@@ -33,7 +35,7 @@ use tickloop_agent_base::private_fs::{
     create_private_directory, replace_file_atomically, verify_private_directory,
 };
 
-use source::{Installation, Source};
+pub use source::{Installation, Source};
 
 pub const PROGRAMS: [&str; 3] = ["tickloop", "tickhost", "tick-reader"];
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
