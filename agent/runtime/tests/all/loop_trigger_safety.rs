@@ -107,8 +107,12 @@ fn periodic(prompt: &str, interval_seconds: Option<u64>) -> Trigger {
         id: Uuid::new_v4(),
         prompt: prompt.into(),
         prompt_source: TriggerPromptSource::Explicit,
-        interval_seconds,
+        schedule: interval_seconds.map(|seconds| {
+            tickloop_agent_protocol::Recurrence::parse(&format!("every {seconds}s")).unwrap()
+        }),
         expires_at_ms: None,
+        armed_at_ms: None,
+        last_fired_at_ms: None,
         accepts_events: true,
         armed: true,
         subscriptions: Vec::new(),

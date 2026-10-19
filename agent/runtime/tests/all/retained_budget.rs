@@ -88,6 +88,7 @@ fn harness(store: Arc<dyn TranscriptStore>) -> Agent {
             },
             tools: ToolPolicy::web_fetch_only(),
             host_rules: Vec::new(),
+            min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits: WaitHosting::Durable,
         },
     )
@@ -116,9 +117,10 @@ async fn fire_over_holdings(fires: usize, fires_per_holding: usize) {
     let agent = harness(store.clone());
     let chat = agent.create_chat_without_folder().await.unwrap();
     let mut events = agent.subscribe();
-    let turn = agent.advance(chat, check_feed(None)).await.unwrap();
+    let turn = agent.advance(chat, check_feed()).await.unwrap();
     let loop_id = turn.receipt().loop_id;
     until_completed(&mut events, turn.receipt().run_id).await;
+    arm(&agent, chat, loop_id).await;
     agent.sync().await.unwrap();
     agent.shutdown().await;
     for holding in 0..fires / fires_per_holding {
@@ -131,15 +133,8 @@ async fn fire_over_holdings(fires: usize, fires_per_holding: usize) {
             "loading took {:?}",
             started.elapsed()
         );
-        // A load disarms the Trigger and interrupts its Loop until H09f keeps them across
-        // holdings: the holding arms it again and continues the Loop.
+        // The Trigger stays armed and its Loop waits for it across holdings.
         let mut events = agent.subscribe();
-        arm(&agent, chat, loop_id).await;
-        let resumed = agent
-            .advance(chat, check_feed(Some(loop_id)))
-            .await
-            .unwrap();
-        until_completed(&mut events, resumed.receipt().run_id).await;
         for fire in holding * fires_per_holding..(holding + 1) * fires_per_holding {
             let receipt = agent
                 .trigger(
@@ -169,12 +164,12 @@ async fn fire_over_holdings(fires: usize, fires_per_holding: usize) {
     );
 }
 
-fn check_feed(target_loop: Option<Uuid>) -> TurnRequest {
+fn check_feed() -> TurnRequest {
     TurnRequest {
         input_id: Uuid::new_v4(),
         op: TurnOp::Continue {
             after: ParentSelection::CurrentLeaf,
-            target_loop,
+            target_loop: None,
             message: UserMessage {
                 text: "Check the feed whenever it changes.".into(),
                 ..Default::default()
@@ -194,7 +189,9 @@ async fn arm(agent: &Agent, chat: tickloop_agent_protocol::ChatId, loop_id: Uuid
                 id: Uuid::new_v4(),
                 prompt: "Check the feed".into(),
                 prompt_source: TriggerPromptSource::Explicit,
-                interval_seconds: None,
+                schedule: None,
+                armed_at_ms: None,
+                last_fired_at_ms: None,
                 expires_at_ms: None,
                 accepts_events: true,
                 armed: true,

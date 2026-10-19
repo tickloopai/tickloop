@@ -60,6 +60,7 @@ fn options(waits: WaitHosting) -> HarnessOptions {
             ..ToolPolicy::web_fetch_only()
         },
         host_rules: Vec::new(),
+        min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
         waits,
     }
 }
@@ -140,6 +141,7 @@ async fn asked_and_released(
                 request: request.id,
                 kind: PersonWaitKind::Question,
             }],
+            wake_at: None,
         })
     );
     asking.shutdown().await;

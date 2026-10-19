@@ -185,6 +185,7 @@ fn harness(
             host,
             tools: ToolPolicy::local(),
             host_rules,
+            min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits: tickloop_agent_runtime::WaitHosting::Process,
         },
     )

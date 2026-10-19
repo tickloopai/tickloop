@@ -772,9 +772,14 @@ impl Menus {
             .find(|item| item.id == goal)
             .ok_or("The selected goal no longer exists.")?;
         let trigger = selected.trigger.as_ref();
-        let seconds = trigger
-            .and_then(|trigger| trigger.interval_seconds)
-            .unwrap_or(60);
+        // An `every` schedule is edited as seconds; a wall-clock rule keeps its own text.
+        let schedule = trigger.and_then(|trigger| trigger.schedule).map_or_else(
+            || "60".to_owned(),
+            |schedule| match schedule.interval() {
+                Some(interval) => interval.as_secs().to_string(),
+                None => schedule.to_string(),
+            },
+        );
         let duration = trigger
             .and_then(|trigger| trigger.expires_at_ms)
             .map(|expiry| {
@@ -792,7 +797,7 @@ impl Menus {
             .filter(|prompt| !prompt.is_empty())
             .unwrap_or(&selected.goal);
         console.prepare_command(format!(
-            "/loops schedule {goal} {seconds}{duration} {prompt}"
+            "/loops schedule {goal} {schedule}{duration} {prompt}"
         ))
     }
     pub(super) fn workflow(

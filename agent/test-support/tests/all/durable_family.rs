@@ -88,6 +88,7 @@ fn family_harness(store: Arc<dyn TranscriptStore>, model: Arc<RoutedModel>) -> A
                 ..ToolPolicy::web_fetch_only()
             },
             host_rules: Vec::new(),
+            min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits: WaitHosting::Durable,
         },
     )
@@ -303,6 +304,7 @@ async fn a_foreground_child_answered_hours_later_in_another_holding_goes_on_as_i
                 request: request.id,
                 kind: PersonWaitKind::Question,
             }],
+            wake_at: None,
         })
     );
     assert_eq!(cloud.chats.waiting(cloud.chat), asked.waiting);

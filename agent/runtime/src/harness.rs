@@ -1,7 +1,11 @@
 //! How a host assembles an Agent: the seams it reaches the outside through, and the options it
 //! imposes on every Chat.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use tickloop_agent_base::network::Reach;
 use tickloop_agent_model::{ModelClient, ModelClients, ModelError};
@@ -41,8 +45,15 @@ pub struct HarnessOptions {
     /// Permission rules the host imposes on every Chat, at the level of session rules and never
     /// saved.
     pub host_rules: Vec<PermissionRule>,
+    /// The shortest time a Trigger's schedule may leave between two runs; a schedule that runs
+    /// more often is refused.
+    pub min_schedule_interval: Duration,
     pub waits: WaitHosting,
 }
+
+/// A local Agent's floor for Trigger schedules: runs one second apart, as local timers always
+/// allowed.
+pub const LOCAL_MIN_SCHEDULE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Who keeps a Run that waits for a person. The waits are recorded either way.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -146,6 +157,10 @@ pub enum Quiescence {
 pub struct Waits {
     /// The requests that wait for a person, in the order they were made.
     pub people: Vec<PersonWait>,
+    /// The earliest time a Trigger of a Loop that can take it is scheduled, or a Loop that has
+    /// not ended reaches its deadline, whatever the Loop's state. It may be past already; the
+    /// host wakes the family then with it as the due time.
+    pub wake_at: Option<SystemTime>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,10 +273,13 @@ fn family_state(
         let (member_runs, member_waits) = chat_state(*member, chat);
         runs |= member_runs;
         if let Some(member_waits) = member_waits {
-            waits
-                .get_or_insert_with(Waits::default)
-                .people
-                .extend(member_waits.people);
+            let family_waits = waits.get_or_insert_with(Waits::default);
+            family_waits.people.extend(member_waits.people);
+            family_waits.wake_at = family_waits
+                .wake_at
+                .into_iter()
+                .chain(member_waits.wake_at)
+                .min();
         }
     }
     found.then_some((runs, waits))
@@ -303,12 +321,21 @@ fn chat_state(chat_id: ChatId, chat: &Chat) -> (bool, Option<Waits>) {
         || !chat.ready_runs.is_empty()
         || chat.parked.keys().any(|run| !waits_for_person(run))
         || user_shell_in(&[UserShellState::Running, UserShellState::Cancelling]);
+    let wake_at = crate::triggers::wake_at(&chat.snapshot);
     let waits = !chat.parked.is_empty()
         || waits_for_member
         || !chat.trigger_cancellations.is_empty()
         || !chat.event_cancellations.is_empty()
+        || wake_at.is_some()
         || user_shell_in(&[UserShellState::WaitingPermission]);
-    (runs, waits.then(|| waits_of(chat_id, &chat.snapshot)))
+    (
+        runs,
+        waits.then(|| Waits {
+            wake_at: wake_at
+                .map(|milliseconds| SystemTime::UNIX_EPOCH + Duration::from_millis(milliseconds)),
+            ..waits_of(chat_id, &chat.snapshot)
+        }),
+    )
 }
 
 fn waits_of(chat: ChatId, snapshot: &tickloop_agent_protocol::ChatSnapshot) -> Waits {
@@ -333,6 +360,7 @@ fn waits_of(chat: ChatId, snapshot: &tickloop_agent_protocol::ChatSnapshot) -> W
         });
     Waits {
         people: questions.chain(permissions).chain(user_shells).collect(),
+        wake_at: None,
     }
 }
 

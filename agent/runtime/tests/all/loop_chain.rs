@@ -121,8 +121,12 @@ fn periodic(prompt: &str, interval_seconds: Option<u64>) -> Trigger {
         id: Uuid::new_v4(),
         prompt: prompt.into(),
         prompt_source: TriggerPromptSource::Explicit,
-        interval_seconds,
+        schedule: interval_seconds.map(|seconds| {
+            tickloop_agent_protocol::Recurrence::parse(&format!("every {seconds}s")).unwrap()
+        }),
         expires_at_ms: None,
+        armed_at_ms: None,
+        last_fired_at_ms: None,
         accepts_events: true,
         armed: true,
         subscriptions: Vec::new(),
@@ -515,7 +519,13 @@ async fn unfinished_loops_and_trigger_settings_survive_restart_after_compaction(
         let restored_trigger = restored_watch.trigger.as_ref().unwrap();
         assert_eq!(restored_trigger.id, trigger.id, "{label}");
         assert_eq!(restored_trigger.prompt, trigger.prompt, "{label}");
-        assert_eq!(restored_trigger.interval_seconds, Some(3_600), "{label}");
+        assert_eq!(
+            restored_trigger
+                .schedule
+                .map(|schedule| schedule.to_string()),
+            Some("every 1h".into()),
+            "{label}"
+        );
         assert!(restored_trigger.accepts_events, "{label}");
         assert!(!restored_trigger.armed, "{label}");
         assert_eq!(restored_watch.state, LoopState::Interrupted, "{label}");

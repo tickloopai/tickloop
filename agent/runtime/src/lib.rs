@@ -19,8 +19,8 @@ pub mod file_history;
 mod handback;
 mod harness;
 pub use harness::{
-    HarnessOptions, HarnessSeams, PersonWait, PersonWaitKind, Quiescence, ToolPolicy, WaitHosting,
-    Waits,
+    HarnessOptions, HarnessSeams, LOCAL_MIN_SCHEDULE_INTERVAL, PersonWait, PersonWaitKind,
+    Quiescence, ToolPolicy, WaitHosting, Waits,
 };
 mod host_context;
 mod host_notes;
@@ -321,6 +321,10 @@ struct Inner {
     settings: Option<tickloop_agent_config::UserSettings>,
     host_options: AgentHostOptions,
     waits: WaitHosting,
+    /// The shortest time a Trigger's schedule may leave between two runs.
+    min_schedule_interval: std::time::Duration,
+    /// The wall clock Trigger schedules run on.
+    schedule_clock: triggers::ScheduleClock,
     /// 设置文件所在的配置根；用户 Skill 与已安装 Tick 包的 Skill 从这里加载。
     config_root: Option<PathBuf>,
     /// 本进程内设置读写的次序：写入设置并同步已加载的 Chat、以及读取设置并加入新 Chat 都在
@@ -513,6 +517,8 @@ struct SubmissionOptions {
     directed_human: Option<DirectedHumanSource>,
     goal_title: Option<String>,
     ledger: Option<lifecycle::LedgerInput>,
+    /// The scheduled time, in Unix milliseconds, a Trigger's timer fires for.
+    scheduled_for: Option<u64>,
     turn: TurnAdmission,
 }
 
@@ -784,6 +790,7 @@ fn local_options(
         host,
         tools: ToolPolicy::local(),
         host_rules: Vec::new(),
+        min_schedule_interval: LOCAL_MIN_SCHEDULE_INTERVAL,
         waits: WaitHosting::Process,
     }
 }
@@ -1767,6 +1774,7 @@ impl Agent {
             host: host_options,
             tools: tool_policy,
             host_rules,
+            min_schedule_interval,
             waits,
         } = options;
         let model = tickloop_agent_model::cards::model_for_persistent_selection(model);
@@ -1787,6 +1795,8 @@ impl Agent {
                 settings,
                 host_options,
                 waits,
+                min_schedule_interval,
+                schedule_clock: triggers::ScheduleClock::new(),
                 config_root,
                 settings_writes: Mutex::new(()),
                 task_tools_enabled: AtomicBool::new(task_tools_enabled),
@@ -2412,6 +2422,7 @@ impl Agent {
             directed_human,
             goal_title,
             ledger,
+            scheduled_for,
             mut turn,
         } = options;
         let is_feedback = feedback_input.is_some();
@@ -2425,6 +2436,11 @@ impl Agent {
                 // The local inbox delivers a request again after a restart; the delivery's own id
                 // names it once deliveries are pushed (H09g).
                 (_, _, Some(_)) => (Uuid::new_v4(), InputOp::Feedback),
+                // A timer's fire is named by its scheduled time, so every host fires it once.
+                _ if let (Some(scheduled), Some(loop_id)) = (scheduled_for, goal) => (
+                    tickloop_agent_transcript::input_ids::trigger(loop_id, scheduled),
+                    InputOp::Trigger,
+                ),
                 _ if trigger_source.is_some() => (Uuid::new_v4(), InputOp::Trigger),
                 _ => (Uuid::new_v4(), InputOp::Continue),
             };
@@ -2617,7 +2633,7 @@ impl Agent {
                         "goal deadline has passed; create a new goal".into(),
                     ));
                 }
-                trigger.armed = true;
+                trigger.arm_at(self.inner.schedule_clock.now_ms());
                 let trigger = trigger.clone();
                 chat.snapshot.resume_triggers.retain(|id| *id != loop_id);
                 let cancel = CancellationToken::new();
@@ -2643,25 +2659,44 @@ impl Agent {
                     "trigger configuration was replaced".into(),
                 ));
             }
-            if !triggers::can_trigger(goal) {
-                return Err(AgentError::Invalid(
-                    "goal is not eligible for a trigger".into(),
-                ));
-            }
+            let is_eligible = triggers::can_trigger(goal);
             let pending_receipt = chat
                 .snapshot
                 .pending_inputs
                 .iter()
                 .find(|pending| {
-                    pending.receipt.loop_id == loop_id
+                    is_eligible
+                        && pending.receipt.loop_id == loop_id
                         && pending
                             .trigger_source
                             .as_ref()
                             .is_some_and(|source| source.source != TICK_MANUAL_SOURCE)
                 })
                 .map(|pending| pending.receipt.clone());
+            // A fire deals with its scheduled time. So does a durable host when the Loop cannot
+            // take it or a fire is already queued: the next host does not fire it again. Locally
+            // the timer alone keeps track of those.
+            let fires = is_eligible && pending_receipt.is_none();
+            if let Some(scheduled) = scheduled_for
+                && (fires || self.inner.waits == WaitHosting::Durable)
+                && let Some(trigger) = &mut goal.trigger
+            {
+                trigger.note_scheduled(scheduled);
+            }
+            if !is_eligible {
+                if scheduled_for.is_some() && self.inner.waits == WaitHosting::Durable {
+                    *original = candidate;
+                    self.save(&original.snapshot);
+                }
+                return Err(AgentError::Invalid(
+                    "goal is not eligible for a trigger".into(),
+                ));
+            }
             if let Some(pending_receipt) = pending_receipt {
                 *original = candidate;
+                if scheduled_for.is_some() && self.inner.waits == WaitHosting::Durable {
+                    self.save(&original.snapshot);
+                }
                 drop(chats);
                 let next = self.next_run(chat_id).await?;
                 if let Some(next) = next {
@@ -2772,12 +2807,8 @@ impl Agent {
             }
         };
         if let Some((trigger, cancel)) = resume_watcher {
-            // 先写出重新武装再启动 Trigger 任务：任务第一次读取停止状态时已知道这次武装。
-            let recorded = self
-                .record_loop_run_state(chat_id, loop_id, loop_lease::RunStateChange::Armed)
+            self.start_armed_trigger(chat_id, loop_id, trigger, cancel)
                 .await;
-            self.warn_loop_run_state_failure(chat_id, loop_id, recorded);
-            self.trigger_task(chat_id, loop_id, trigger, cancel);
             self.sync_tick_subscriptions().await;
         }
         if let Some(tools) = watch {

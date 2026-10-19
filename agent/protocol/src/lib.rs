@@ -166,6 +166,7 @@ pub use tick_subscriptions::{
     TICK_SUBSCRIPTION_SOURCE, TickLinkState, TickSubscription, TickSubscriptionChange,
     TickSubscriptionFrequency, TickSubscriptionStatus,
 };
+pub use tickloop_agent_recurrence::{ParseError as RecurrenceError, Recurrence};
 pub use tool::ToolDefinition;
 pub use tools::{
     CommandSnapshot, CommandState, FileReadRecord, SearchConfig, SearchProviderKind,

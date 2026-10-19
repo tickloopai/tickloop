@@ -166,6 +166,7 @@ fn cloud_harness(
                 },
                 tools: ToolPolicy::web_fetch_only(),
                 host_rules: Vec::new(),
+                min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
                 waits: tickloop_agent_runtime::WaitHosting::Process,
             },
         )

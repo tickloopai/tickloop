@@ -1,5 +1,6 @@
-//! Name-based ids of the inputs the Agent queues for itself. The same source names the same id
-//! on every host, so a repeated delivery finds the input's ledger record.
+//! Name-based ids of the inputs the Agent queues for itself, and of the Loops its calls
+//! register. The same source names the same id on every host, so a repeated delivery finds the
+//! input's ledger record and a load finds what a call registered.
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -8,6 +9,7 @@ const TRIGGER: &str = "tickloop.input.trigger";
 const FEEDBACK: &str = "tickloop.input.feedback";
 const FAMILY_MESSAGE: &str = "tickloop.input.family-message";
 const GOAL: &str = "tickloop.input.goal";
+const STARTED_GOAL: &str = "tickloop.loop.started-goal";
 
 /// The id named by `parts` within `namespace`, laid out as a name-based UUID.
 fn named(namespace: &str, parts: &[&[u8]]) -> Uuid {
@@ -47,6 +49,14 @@ pub fn family_message(sender_chat: Uuid, response: Uuid, call_id: &str) -> Uuid 
             response.as_bytes(),
             call_id.as_bytes(),
         ],
+    )
+}
+
+/// The Loop a StartGoal call of an answer registers.
+pub fn started_goal(chat: Uuid, response: Uuid, call_id: &str) -> Uuid {
+    named(
+        STARTED_GOAL,
+        &[chat.as_bytes(), response.as_bytes(), call_id.as_bytes()],
     )
 }
 

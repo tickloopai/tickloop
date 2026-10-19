@@ -46,6 +46,7 @@ fn opened_with_models(state: &Path, models: Arc<ChosenModels>) -> Agent {
             host: tickloop_agent_protocol::AgentHostOptions::embedded_defaults(),
             tools: crate::ToolPolicy::local(),
             host_rules: Vec::new(),
+            min_schedule_interval: crate::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits: crate::WaitHosting::Process,
         },
     )
@@ -106,8 +107,13 @@ async fn triggered_request_after_logout(interval_seconds: Option<u64>) {
                 id: Uuid::new_v4(),
                 prompt: "Check fresh evidence".into(),
                 prompt_source: TriggerPromptSource::Explicit,
-                interval_seconds,
+                schedule: interval_seconds.map(|seconds| {
+                    tickloop_agent_protocol::Recurrence::parse(&format!("every {seconds}s"))
+                        .unwrap()
+                }),
                 expires_at_ms: None,
+                armed_at_ms: None,
+                last_fired_at_ms: None,
                 accepts_events: true,
                 armed: true,
                 subscriptions: Vec::new(),

@@ -970,7 +970,7 @@ Mode and model stay right-aligned on the lower divider; Context appears only wit
 Divider edge titles have a short rule beyond the text; the expanded Subagents list has no items summary row.
 /loops opens Loop management; /loops new starts another goal in this Chat; /loops UUID selects one.
 /loops trigger [GOAL_ID] reads its trigger.
-/loops schedule GOAL_ID SECONDS [--for DURATION_SECONDS] PROMPT sets a local timer and optional deadline.
+/loops schedule GOAL_ID SECONDS|RULE [--for DURATION_SECONDS] PROMPT sets a local timer, such as 60 or `daily 09:00 +08:00`, and an optional deadline.
 /clear starts a new Chat and stops this Chat's Shell tasks that are not in the background.
 /branch [NAME] copies this conversation at its current point and switches to the child Chat.
 /resume opens the Chat picker; /resume CHAT switches to that Chat without running it.
@@ -5753,7 +5753,9 @@ async fn trigger_control(
         id: uuid::Uuid::new_v4(),
         prompt: String::new(),
         prompt_source: TriggerPromptSource::Explicit,
-        interval_seconds: None,
+        schedule: None,
+        armed_at_ms: None,
+        last_fired_at_ms: None,
         expires_at_ms: None,
         accepts_events: false,
         armed: true,
@@ -5919,7 +5921,9 @@ async fn parse_after_turn(
                     id: uuid::Uuid::new_v4(),
                     prompt: String::new(),
                     prompt_source: TriggerPromptSource::Explicit,
-                    interval_seconds: None,
+                    schedule: None,
+                    armed_at_ms: None,
+                    last_fired_at_ms: None,
                     expires_at_ms: None,
                     accepts_events: false,
                     armed: true,
@@ -5971,11 +5975,8 @@ fn print_trigger(console: &Console, trigger: &Trigger) -> Result<(), String> {
         trigger.armed,
         trigger.accepts_events
     );
-    if let Some(seconds) = trigger.interval_seconds {
-        outln!(
-            console,
-            "Interval: {seconds} seconds while this Agent runs."
-        );
+    if let Some(schedule) = &trigger.schedule {
+        outln!(console, "{}", loops::schedule_line(schedule));
     }
     if let Some(expiry) = trigger.expires_at_ms {
         outln!(

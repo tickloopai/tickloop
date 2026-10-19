@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use tickloop_agent_protocol::{
     EventKind, LoopSnapshot, LoopState, OperationState, PendingInput, Question, QuestionAnswer,
-    QuestionRequest, Receipt, ToolDefinition, ToolResult,
+    QuestionRequest, Receipt, ToolDefinition, ToolResult, Trigger,
 };
 use tickloop_agent_tools::{
     ASK_USER_QUESTION_TOOL_NAME, DECLINED_QUESTIONS_RESULT, EXIT_PLAN_MODE_TOOL_NAME,
@@ -273,9 +273,44 @@ Usage notes:
 pub(super) fn definitions(is_delegated: bool) -> Vec<ToolDefinition> {
     vec![ask_user_question_definition(is_delegated), ToolDefinition {
         name: START_GOAL_TOOL_NAME.into(),
-        description: "Create and queue a separate, explicitly requested independent user goal in this Chat. Follow-up requirements for the current goal stay on the current goal. Ask the user when attribution is unclear; do not execute this new goal's work in the current run.".into(),
-        input_schema: json!({"type":"object","properties":{"goal":{"type":"string"}},"required":["goal"],"additionalProperties":false}),
+        description: "Create and queue a separate, explicitly requested independent user goal in this Chat. Follow-up requirements for the current goal stay on the current goal. Ask the user when attribution is unclear; do not execute this new goal's work in the current run. Give a schedule only when the user asked for the goal to run at certain times: the goal then runs at each scheduled time, starting with the next one, instead of now.".into(),
+        input_schema: json!({"type":"object","properties":{
+            "goal":{"type":"string"},
+            "schedule":{"type":"string","description":"When the goal runs: `every <N>s|m|h|d` (counted from now), `daily HH:MM [±HH:MM]`, `weekly <day>[,<day>…] HH:MM [±HH:MM]` with days mon..sun, or `at <RFC 3339 time>` for once. Times without an offset are UTC. Runs missed while nothing could run are skipped, not caught up."}
+        },"required":["goal"],"additionalProperties":false}),
     }]
+}
+
+/// What a StartGoal call that registered `goal` returns: the input queued for it, or for a
+/// scheduled goal its schedule and next scheduled time.
+pub(crate) fn started_goal_result(
+    chat_id: ChatId,
+    goal: &LoopSnapshot,
+    queued_run: Option<RunId>,
+) -> ToolResult {
+    let schedule = goal.trigger.as_ref().and_then(|trigger| trigger.schedule);
+    let content = match (schedule, queued_run) {
+        (Some(schedule), _) => {
+            let next_run_at = goal
+                .trigger
+                .as_ref()
+                .filter(|trigger| trigger.armed)
+                .and_then(Trigger::next_scheduled_ms)
+                .map(tickloop_agent_base::timestamp::format_timestamp);
+            json!({"chat_id":chat_id,"loop_id":goal.id,"state":"scheduled",
+                "schedule":schedule.to_string(),"next_run_at":next_run_at})
+        }
+        (None, Some(run_id)) => {
+            json!({"chat_id":chat_id,"loop_id":goal.id,"run_id":run_id,"state":"queued"})
+        }
+        // A goal whose schedule was removed since.
+        (None, None) => json!({"chat_id":chat_id,"loop_id":goal.id,"state":"registered"}),
+    };
+    ToolResult {
+        content: content.to_string(),
+        is_error: false,
+        output_ref: None,
+    }
 }
 
 impl Agent {
@@ -426,12 +461,21 @@ impl Agent {
         #[serde(deny_unknown_fields)]
         struct Input {
             goal: String,
+            #[serde(default)]
+            schedule: Option<String>,
         }
-        let parsed: Input = serde_json::from_value(input.clone())
-            .map_err(|_| format!("{START_GOAL_TOOL_NAME} requires only a goal string"))?;
+        let parsed: Input = serde_json::from_value(input.clone()).map_err(|_| {
+            format!("{START_GOAL_TOOL_NAME} requires a goal string and an optional schedule string")
+        })?;
         if parsed.goal.trim().is_empty() || parsed.goal.len() > MAX_ANSWER_BYTES {
             return Err("goal must contain 1 to 65536 bytes".into());
         }
+        let schedule = parsed
+            .schedule
+            .as_deref()
+            .map(tickloop_agent_protocol::Recurrence::parse)
+            .transpose()
+            .map_err(|error| format!("invalid schedule: {error}"))?;
         let mut chats = self.inner.chats.lock().await;
         let chat = chats
             .get_mut(&receipt.chat_id)
@@ -450,56 +494,117 @@ impl Agent {
         {
             return Err("run was cancelled before creating the new goal".into());
         }
+        // The Loop is named by the answer and call that register it, so a load finds what a
+        // call whose result was lost with its host registered.
+        let loop_id = chat
+            .bookkeeping
+            .lifecycle
+            .active_response(receipt.run_id)
+            .map_or_else(Uuid::new_v4, |response| {
+                tickloop_agent_transcript::input_ids::started_goal(
+                    receipt.chat_id,
+                    response,
+                    call_id,
+                )
+            });
+        if let Some(goal) = chat.snapshot.loops.iter().find(|goal| goal.id == loop_id) {
+            let queued_run = chat
+                .bookkeeping
+                .lifecycle
+                .input(tickloop_agent_transcript::input_ids::goal(loop_id))
+                .map(|accepted| accepted.run_id);
+            return Ok(started_goal_result(receipt.chat_id, goal, queued_run));
+        }
         let mut snapshot = chat.snapshot.clone();
         let new_receipt = Receipt {
             chat_id: receipt.chat_id,
-            loop_id: Uuid::new_v4(),
+            loop_id,
             run_id: Uuid::new_v4(),
+        };
+        let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
+        let trigger = match schedule {
+            Some(schedule) => {
+                let mut trigger = Trigger {
+                    id: Uuid::new_v4(),
+                    prompt: parsed.goal.clone(),
+                    prompt_source: tickloop_agent_protocol::TriggerPromptSource::Explicit,
+                    schedule: Some(schedule),
+                    expires_at_ms: None,
+                    accepts_events: false,
+                    armed: true,
+                    armed_at_ms: None,
+                    last_fired_at_ms: None,
+                    subscriptions: Vec::new(),
+                };
+                let armed_at = self.inner.schedule_clock.now_ms();
+                if let Some(reason) =
+                    triggers::invalid_trigger(&trigger, self.inner.min_schedule_interval, armed_at)
+                {
+                    return Err(reason);
+                }
+                trigger.arm_at(armed_at);
+                Some(trigger)
+            }
+            None => None,
         };
         chat.bookkeeping.add_loop(
             &mut snapshot,
             LoopSnapshot {
                 id: new_receipt.loop_id,
                 goal: parsed.goal.clone(),
-                state: LoopState::Queued,
+                state: match trigger {
+                    Some(_) => LoopState::WaitingTrigger,
+                    None => LoopState::Queued,
+                },
                 run_id: None,
                 run_started_at: None,
-                trigger: None,
+                trigger: trigger.clone(),
                 event_sources: Vec::new(),
-                state_since: Some(tickloop_agent_base::private_fs::unix_time_milliseconds()),
+                state_since: Some(now),
             },
         );
-        let index = snapshot
-            .pending_inputs
-            .iter()
-            .position(|pending| pending.trigger_source.is_some())
-            .unwrap_or(snapshot.pending_inputs.len());
-        snapshot.last_queue_sequence += 1;
-        let queued_sequence = snapshot.last_queue_sequence;
-        let queued = PendingInput {
-            receipt: new_receipt.clone(),
-            input: parsed.goal,
-            contexts: Vec::new(),
-            agent_message: None,
-            directed_human: None,
-            denial_reference: None,
-            trigger_source: None,
-            armed: true,
-            queued_sequence,
-            task_continuation: false,
-            is_skill_invocation: false,
-            attached_file_reads: Vec::new(),
+        let queued_run = match trigger {
+            Some(_) => None,
+            None => {
+                let index = snapshot
+                    .pending_inputs
+                    .iter()
+                    .position(|pending| pending.trigger_source.is_some())
+                    .unwrap_or(snapshot.pending_inputs.len());
+                snapshot.last_queue_sequence += 1;
+                let queued_sequence = snapshot.last_queue_sequence;
+                let queued = PendingInput {
+                    receipt: new_receipt.clone(),
+                    input: parsed.goal,
+                    contexts: Vec::new(),
+                    agent_message: None,
+                    directed_human: None,
+                    denial_reference: None,
+                    trigger_source: None,
+                    armed: true,
+                    queued_sequence,
+                    task_continuation: false,
+                    is_skill_invocation: false,
+                    attached_file_reads: Vec::new(),
+                };
+                chat.bookkeeping.lifecycle.accept(
+                    &lifecycle::LedgerInput::new(
+                        tickloop_agent_transcript::input_ids::goal(new_receipt.loop_id),
+                        tickloop_agent_transcript::InputOp::Goal,
+                        &queued.input,
+                    ),
+                    &queued,
+                );
+                snapshot.pending_inputs.insert(index, queued);
+                Some(new_receipt.run_id)
+            }
         };
-        chat.bookkeeping.lifecycle.accept(
-            &lifecycle::LedgerInput::new(
-                tickloop_agent_transcript::input_ids::goal(new_receipt.loop_id),
-                tickloop_agent_transcript::InputOp::Goal,
-                &queued.input,
-            ),
-            &queued,
-        );
-        snapshot.pending_inputs.insert(index, queued);
-        let result = ToolResult {content: json!({"chat_id":new_receipt.chat_id,"loop_id":new_receipt.loop_id,"run_id":new_receipt.run_id,"state":"queued"}).to_string(), is_error: false, output_ref: None};
+        let goal = snapshot
+            .loops
+            .iter()
+            .find(|goal| goal.id == loop_id)
+            .expect("the goal was just added");
+        let result = started_goal_result(receipt.chat_id, goal, queued_run);
         if let Some(operation) = snapshot
             .operations
             .iter_mut()
@@ -510,6 +615,16 @@ impl Agent {
         }
         self.save(&snapshot);
         chat.snapshot = snapshot;
+        let timer = trigger.map(|trigger| {
+            let cancel = CancellationToken::new();
+            chat.trigger_cancellations.insert(loop_id, cancel.clone());
+            (trigger, cancel)
+        });
+        drop(chats);
+        if let Some((trigger, cancel)) = timer {
+            self.start_armed_trigger(receipt.chat_id, loop_id, trigger, cancel)
+                .await;
+        }
         Ok(result)
     }
 

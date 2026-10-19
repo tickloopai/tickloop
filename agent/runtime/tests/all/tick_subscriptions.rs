@@ -1623,7 +1623,9 @@ async fn a_trigger_rejects_subscriptions_it_cannot_honour() {
         id: Uuid::new_v4(),
         prompt: "check the panel".into(),
         prompt_source: TriggerPromptSource::Explicit,
-        interval_seconds: None,
+        schedule: None,
+        armed_at_ms: None,
+        last_fired_at_ms: None,
         expires_at_ms: None,
         accepts_events: true,
         armed: true,
@@ -1658,7 +1660,7 @@ async fn a_trigger_rejects_subscriptions_it_cannot_honour() {
     }
     let mut events_only = trigger(vec![subscription(fixture_instance(1), High)]);
     events_only.accepts_events = false;
-    events_only.interval_seconds = Some(30);
+    events_only.schedule = Some(tickloop_agent_protocol::Recurrence::parse("every 30s").unwrap());
     assert!(
         agent
             .configure_trigger(chat, receipt.loop_id, Some(events_only))
@@ -3326,7 +3328,9 @@ async fn subscribe_loop(
                 id: Uuid::new_v4(),
                 prompt: "inspect changes".into(),
                 prompt_source: TriggerPromptSource::Explicit,
-                interval_seconds: None,
+                schedule: None,
+                armed_at_ms: None,
+                last_fired_at_ms: None,
                 expires_at_ms: None,
                 accepts_events: true,
                 armed: true,
@@ -3451,7 +3455,9 @@ async fn an_immediate_delivery_whose_watermark_failed_is_retried_until_it_lands(
                 id: Uuid::new_v4(),
                 prompt: "report the shell".into(),
                 prompt_source: TriggerPromptSource::Explicit,
-                interval_seconds: None,
+                schedule: None,
+                armed_at_ms: None,
+                last_fired_at_ms: None,
                 expires_at_ms: None,
                 accepts_events: true,
                 armed: true,
