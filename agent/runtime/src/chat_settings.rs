@@ -78,10 +78,17 @@ impl Agent {
         bookkeeping: &mut ChatBookkeeping,
     ) -> OutputStyle {
         let mut saved = self.inner.settings.as_ref().map(UserSettings::load);
-        snapshot.search_config = saved.as_mut().map_or_else(
-            tickloop_agent_protocol::SearchConfig::enabled_default,
-            |saved| saved.search_config(),
-        );
+        match &self.inner.search {
+            super::SearchDefaults::Fixed(config) => snapshot.search_config = config.clone(),
+            super::SearchDefaults::UserSettings => {
+                if let Some(saved) = &mut saved {
+                    snapshot.search_config = saved.search_config();
+                } else if snapshot.delegation.is_none() {
+                    snapshot.search_config =
+                        tickloop_agent_protocol::SearchConfig::enabled_default();
+                }
+            }
+        }
         let defaults = new_chat_settings(saved.as_mut(), &self.inner.host_options, &snapshot.model);
         snapshot.policy.mode = defaults.execution_mode;
         self.apply_host_rules(&mut snapshot.policy);

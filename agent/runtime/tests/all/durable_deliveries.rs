@@ -418,6 +418,7 @@ fn family_harness(store: Arc<dyn TranscriptStore>, model: Arc<RoutedModel>) -> A
             models: ChosenModels::new(model),
         },
         HarnessOptions {
+            search: Default::default(),
             model: config(),
             settings: None,
             host: AgentHostOptions {

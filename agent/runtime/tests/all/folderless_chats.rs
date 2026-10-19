@@ -42,6 +42,7 @@ fn folderless_agent(model: Arc<ScriptedModel>, reach: Reach) -> Agent {
             models: ChosenModels::new(model),
         },
         HarnessOptions {
+            search: Default::default(),
             model: tickloop_agent_test_support::config(),
             settings: None,
             host: AgentHostOptions {
@@ -391,6 +392,7 @@ async fn a_folderless_chat_refuses_local_shells_files_and_attachments() {
 async fn a_folderless_harness_keeps_no_local_transcript_and_a_local_one_needs_a_folder() {
     let models = || ChosenModels::new(Arc::new(ScriptedModel::new(vec![text("answer")])));
     let options = || HarnessOptions {
+        search: Default::default(),
         model: tickloop_agent_test_support::config(),
         settings: None,
         host: AgentHostOptions::embedded_defaults(),

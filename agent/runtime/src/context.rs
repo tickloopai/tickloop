@@ -829,6 +829,7 @@ mod tests {
                 models: Arc::new(LocalModelClients::new(None)),
             },
             crate::HarnessOptions {
+                search: Default::default(),
                 model: original,
                 settings: Some(settings),
                 host: tickloop_agent_protocol::AgentHostOptions::embedded_defaults(),

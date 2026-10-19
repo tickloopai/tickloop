@@ -10,13 +10,14 @@ use serde_json::{Value, json};
 use tickloop_agent_model::{ModelClient, ModelDelta, ModelError, ModelOutput, ModelRequest};
 use tickloop_agent_protocol::{
     AgentHostOptions, ChatId, Content, ExecutionMode, FamilyCompletion, LoopState, PromptPolicy,
-    QuestionAnswer, QuestionRequest, Role, SubagentNotificationDelivery,
+    QuestionAnswer, QuestionRequest, Role, SearchConfig, SearchProviderKind,
+    SubagentNotificationDelivery,
 };
 use tickloop_agent_runtime::transcript::{LoadRange, StorePosition, TranscriptStore};
 use tickloop_agent_runtime::{
     Agent, Delivery, HarnessOptions, HarnessSeams, ParentSelection, PersonWait, PersonWaitKind,
-    QuestionReply, Quiescence, ToolPolicy, Turn, TurnOp, TurnOutcome, TurnRequest, TurnWait,
-    UserMessage, WaitHosting, Waits,
+    QuestionReply, Quiescence, SearchDefaults, ToolPolicy, Turn, TurnOp, TurnOutcome, TurnRequest,
+    TurnWait, UserMessage, WaitHosting, Waits,
 };
 use tickloop_agent_test_support::harness::ChosenModels;
 use tickloop_agent_test_support::routed::{has_tool_result, tool_result};
@@ -186,6 +187,7 @@ fn harness(store: Arc<dyn TranscriptStore>, model: Arc<FamilyModel>, waits: Wait
 /// delegation through without review.
 fn options(waits: WaitHosting) -> HarnessOptions {
     HarnessOptions {
+        search: Default::default(),
         model: config(),
         settings: None,
         host: AgentHostOptions {
@@ -260,9 +262,17 @@ async fn settled(agent: &Agent, chat: ChatId, input: Uuid) -> SettledOutcome {
 
 /// The member and question a turn waits on through its foreground call.
 fn member_question(outcome: TurnOutcome) -> (ChatId, QuestionRequest) {
-    let TurnOutcome::Waiting(TurnWait::Member { chat, wait }) = outcome else {
+    let TurnOutcome::Waiting(TurnWait::Member { mut chat, mut wait }) = outcome else {
         panic!("the turn waits for its child: {outcome:?}");
     };
+    while let TurnWait::Member {
+        chat: member,
+        wait: next,
+    } = *wait
+    {
+        chat = member;
+        wait = next;
+    }
     let TurnWait::Question(request) = *wait else {
         panic!("the child waits for its question");
     };
@@ -409,6 +419,268 @@ async fn asked_and_released(
     asking.shutdown().await;
     asking.sync().await.unwrap();
     (root, child, turn, request)
+}
+
+#[tokio::test]
+async fn subagent_search_inherits_the_direct_parent_without_following_later_root_changes() {
+    const GRANDCHILD_TASK: &str = "grandchild";
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = FamilyModel::new(|request| match task_of(request).as_deref() {
+        Some(CHILD_TASK) if !has_tool_result(request, QUESTION_CALL) => Reply::Says(call(
+            QUESTION_CALL,
+            ASK_USER_QUESTION_TOOL_NAME,
+            single_question("Delegate further?"),
+        )),
+        Some(CHILD_TASK) => Reply::Says(call(
+            "nested",
+            "Subagent",
+            json!({"task": GRANDCHILD_TASK, "name": "grandchild"}),
+        )),
+        Some(GRANDCHILD_TASK) => Reply::Says(call(
+            "nested-question",
+            ASK_USER_QUESTION_TOOL_NAME,
+            single_question("Which source?"),
+        )),
+        _ => Reply::Says(call(
+            DELEGATION_CALL,
+            "Subagent",
+            json!({"task": CHILD_TASK, "name": "child"}),
+        )),
+    });
+    let agent = harness(store, model, WaitHosting::Durable);
+    let root = agent.create_chat_without_folder().await.unwrap();
+    let search = Some(SearchConfig::for_provider(SearchProviderKind::Tavily));
+    agent.set_search(root, search.clone()).await.unwrap();
+    let turn = agent.advance(root, prompt("Delegate.")).await.unwrap();
+    let (child, question) = member_question(outcome(&turn).await);
+    assert_eq!(agent.snapshot(child).await.unwrap().search_config, search);
+
+    agent.set_search(root, None).await.unwrap();
+    assert_eq!(agent.snapshot(child).await.unwrap().search_config, search);
+    let reply = agent.advance(child, answer(&question)).await.unwrap();
+    assert!(matches!(outcome(&reply).await, TurnOutcome::Merged { .. }));
+    let (grandchild, _) = member_question(outcome(&turn).await);
+    assert_ne!(grandchild, child);
+    let snapshot = agent.snapshot(grandchild).await.unwrap();
+    assert_eq!(snapshot.delegation.unwrap().parent_chat_id, child);
+    assert_eq!(snapshot.search_config, search);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn subagent_search_disabled_on_the_parent_stays_disabled() {
+    let agent = harness(
+        Arc::new(InMemoryTranscriptStore::new()),
+        asking_family(),
+        WaitHosting::Durable,
+    );
+    let root = agent.create_chat_without_folder().await.unwrap();
+    assert_eq!(
+        agent.snapshot(root).await.unwrap().search_config,
+        SearchConfig::enabled_default()
+    );
+    agent.set_search(root, None).await.unwrap();
+    let turn = agent.advance(root, prompt("Delegate.")).await.unwrap();
+    let (child, _) = member_question(outcome(&turn).await);
+    assert_eq!(agent.snapshot(child).await.unwrap().search_config, None);
+    agent
+        .set_search(root, SearchConfig::enabled_default())
+        .await
+        .unwrap();
+    assert_eq!(agent.snapshot(child).await.unwrap().search_config, None);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn subagent_search_survives_durable_family_reload_including_disabled() {
+    for search in [
+        Some(SearchConfig::for_provider(SearchProviderKind::Tavily)),
+        None,
+    ] {
+        let store = Arc::new(InMemoryTranscriptStore::new());
+        let model = asking_family();
+        let agent = harness(store.clone(), model.clone(), WaitHosting::Durable);
+        let root = agent.create_chat_without_folder().await.unwrap();
+        agent.set_search(root, search.clone()).await.unwrap();
+        let turn = agent.advance(root, prompt("Delegate.")).await.unwrap();
+        let (child, question) = member_question(outcome(&turn).await);
+        agent
+            .set_search(root, SearchConfig::enabled_default())
+            .await
+            .unwrap();
+        until_parent_waits(&agent, &store, root).await;
+        agent.shutdown().await;
+        agent.sync().await.unwrap();
+
+        let reloaded_store = Arc::new(InMemoryTranscriptStore::new());
+        for member in [root, child] {
+            let serialized = serde_json::to_vec(&store.lines(member)).unwrap();
+            reloaded_store.seed(
+                member,
+                serde_json::from_slice(&serialized).unwrap(),
+                StorePosition(1),
+            );
+        }
+        let restored = harness(reloaded_store, model, WaitHosting::Durable);
+        restored.resume_chat(child).await.unwrap();
+        assert_eq!(
+            restored.snapshot(child).await.unwrap().search_config,
+            search
+        );
+        let reply = restored.advance(child, answer(&question)).await.unwrap();
+        assert!(matches!(outcome(&reply).await, TurnOutcome::Merged { .. }));
+        assert!(matches!(
+            settled(&restored, root, turn.input_id()).await,
+            SettledOutcome::Completed { .. }
+        ));
+        assert_eq!(
+            restored.snapshot(child).await.unwrap().search_config,
+            search
+        );
+        restored.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn subagent_search_local_reload_still_uses_saved_user_settings() {
+    let directory = tempfile::tempdir().unwrap();
+    let settings = tickloop_agent_config::UserSettings::in_root(directory.path());
+    settings.trust_working_directory(directory.path()).unwrap();
+    let search = Some(SearchConfig::for_provider(SearchProviderKind::Tavily));
+    settings.save_search_config(search.as_ref()).unwrap();
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = asking_family();
+    let local_options = || {
+        let mut options = options(WaitHosting::Durable);
+        options.settings = Some(settings.clone());
+        options
+    };
+    let seams = || HarnessSeams {
+        transcripts: Some(store.clone()),
+        environment: Some(Arc::new(
+            tickloop_agent_runtime::environment::LocalEnvironment::bare(),
+        )),
+        models: ChosenModels::new(model.clone()),
+    };
+    let agent = Agent::with_seams(seams(), local_options()).unwrap();
+    let root = agent.create_chat(directory.path().into()).await.unwrap();
+    assert_eq!(agent.snapshot(root).await.unwrap().search_config, search);
+    let turn = agent.advance(root, prompt("Delegate.")).await.unwrap();
+    let (child, _) = member_question(outcome(&turn).await);
+    assert_eq!(agent.snapshot(child).await.unwrap().search_config, search);
+    until_parent_waits(&agent, &store, root).await;
+    agent.shutdown().await;
+    agent.sync().await.unwrap();
+
+    settings.save_search_config(None).unwrap();
+    let restored = Agent::with_seams(seams(), local_options()).unwrap();
+    restored.resume_chat(child).await.unwrap();
+    assert_eq!(restored.snapshot(root).await.unwrap().search_config, None);
+    assert_eq!(restored.snapshot(child).await.unwrap().search_config, None);
+    restored.shutdown().await;
+}
+
+#[tokio::test]
+async fn fixed_search_defaults_reach_every_chat_and_override_stored_family_settings() {
+    const GRANDCHILD_TASK: &str = "grandchild";
+    for search in [
+        Some(SearchConfig::for_provider(SearchProviderKind::Tavily)),
+        None,
+    ] {
+        let store = Arc::new(InMemoryTranscriptStore::new());
+        let model = FamilyModel::new(|request| match task_of(request).as_deref() {
+            Some(GRANDCHILD_TASK) if !has_tool_result(request, QUESTION_CALL) => Reply::Says(call(
+                QUESTION_CALL,
+                ASK_USER_QUESTION_TOOL_NAME,
+                single_question("Which source?"),
+            )),
+            Some(CHILD_TASK) if !has_tool_result(request, "nested") => Reply::Says(call(
+                "nested",
+                "Subagent",
+                json!({"task": GRANDCHILD_TASK, "name": "grandchild"}),
+            )),
+            None if !has_tool_result(request, DELEGATION_CALL) => Reply::Says(call(
+                DELEGATION_CALL,
+                "Subagent",
+                json!({"task": CHILD_TASK, "name": "child"}),
+            )),
+            _ => Reply::Says(text("Done.")),
+        });
+        let fixed_options = || {
+            let mut options = options(WaitHosting::Durable);
+            options.search = SearchDefaults::Fixed(search.clone());
+            options.tools.web_search = true;
+            options
+        };
+        let seams = || HarnessSeams {
+            transcripts: Some(store.clone()),
+            environment: None,
+            models: ChosenModels::new(model.clone()),
+        };
+        let agent = Agent::with_seams(seams(), fixed_options()).unwrap();
+        let root = agent.create_chat_without_folder().await.unwrap();
+        assert_eq!(agent.snapshot(root).await.unwrap().search_config, search);
+        let turn = agent.advance(root, prompt("Delegate.")).await.unwrap();
+        let (grandchild, question) = member_question(outcome(&turn).await);
+        let child = agent
+            .snapshot(grandchild)
+            .await
+            .unwrap()
+            .delegation
+            .unwrap()
+            .parent_chat_id;
+        assert_ne!(root, child);
+        for member in [root, child, grandchild] {
+            assert_eq!(agent.snapshot(member).await.unwrap().search_config, search);
+        }
+        for request in model.requests.lock().unwrap().iter() {
+            assert_eq!(
+                request.tools.iter().any(|tool| tool.name == "WebSearch"),
+                search.is_some(),
+                "WebSearch availability follows the fixed host default for every member"
+            );
+        }
+
+        let explicit = if search.is_some() {
+            None
+        } else {
+            SearchConfig::enabled_default()
+        };
+        for member in [root, child, grandchild] {
+            agent.set_search(member, explicit.clone()).await.unwrap();
+            assert_eq!(
+                agent.snapshot(member).await.unwrap().search_config,
+                explicit
+            );
+        }
+        let another_root = agent.create_chat_without_folder().await.unwrap();
+        assert_eq!(
+            agent.snapshot(another_root).await.unwrap().search_config,
+            search
+        );
+        until_parent_waits(&agent, &store, root).await;
+        agent.shutdown().await;
+        agent.sync().await.unwrap();
+
+        let restored = Agent::with_seams(seams(), fixed_options()).unwrap();
+        restored.resume_chat(grandchild).await.unwrap();
+        for member in [root, child, grandchild] {
+            assert_eq!(
+                restored.snapshot(member).await.unwrap().search_config,
+                search
+            );
+        }
+        let reply = restored
+            .advance(grandchild, answer(&question))
+            .await
+            .unwrap();
+        assert!(matches!(outcome(&reply).await, TurnOutcome::Merged { .. }));
+        assert!(matches!(
+            settled(&restored, root, turn.input_id()).await,
+            SettledOutcome::Completed { .. }
+        ));
+        restored.shutdown().await;
+    }
 }
 
 #[tokio::test]

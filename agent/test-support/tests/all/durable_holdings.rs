@@ -190,6 +190,7 @@ fn harness(
             models: ChosenModels::new(model),
         },
         HarnessOptions {
+            search: Default::default(),
             model: config(),
             settings: None,
             host: AgentHostOptions {

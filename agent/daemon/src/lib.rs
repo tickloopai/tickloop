@@ -553,6 +553,7 @@ pub async fn build_runtime_with_models(
             models,
         },
         HarnessOptions {
+            search: Default::default(),
             model,
             settings,
             host: launch.host_options,

@@ -11,7 +11,7 @@ use tickloop_agent_base::network::Reach;
 use tickloop_agent_model::{ModelClient, ModelClients, ModelError};
 use tickloop_agent_protocol::{
     AgentHostOptions, ChatId, Decision, LoopId, LoopState, ModelConfig, PermissionRule,
-    PromptPolicy, UserShellState,
+    PromptPolicy, SearchConfig, UserShellState,
 };
 
 use uuid::Uuid;
@@ -41,6 +41,9 @@ pub struct HarnessOptions {
     pub model: ModelConfig,
     /// The user's settings file; `None` reads and writes no settings.
     pub settings: Option<tickloop_agent_config::UserSettings>,
+    /// The initial search configuration of every new or restored Chat. Fixed defaults are
+    /// reapplied on restore; `set_search` can still change an individual loaded Chat.
+    pub search: SearchDefaults,
     pub host: AgentHostOptions,
     pub tools: ToolPolicy,
     /// Permission rules the host imposes on every Chat, at the level of session rules and never
@@ -60,6 +63,17 @@ pub struct HarnessOptions {
     /// gate per holding and one per node; it holds them for that single request and its stream
     /// alone. Empty for a local Agent.
     pub request_gates: Vec<Arc<tokio::sync::Semaphore>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SearchDefaults {
+    /// Read local user settings when supplied; delegated Chats inherit their parent's current
+    /// configuration when created. Without settings, restored children keep that configuration.
+    #[default]
+    UserSettings,
+    /// Start every Chat with this configuration, regardless of user settings or its parent.
+    /// `None` disables WebSearch.
+    Fixed(Option<SearchConfig>),
 }
 
 /// A local Agent's floor for Trigger schedules: runs one second apart, as local timers always
@@ -311,6 +325,10 @@ impl Agent {
     /// An Agent whose Transcripts, Execution Environment, model clients and Chat policies the
     /// host chooses. Without an environment its Chats have no Folder.
     pub fn with_seams(seams: HarnessSeams, options: HarnessOptions) -> Result<Self, AgentError> {
+        if let SearchDefaults::Fixed(Some(config)) = &options.search {
+            tickloop_agent_tools::web_search::validate_config(config)
+                .map_err(AgentError::Invalid)?;
+        }
         if seams.environment.is_none() && options.settings.is_some() {
             return Err(AgentError::Invalid(
                 "Chats without a Folder read no local user settings".into(),

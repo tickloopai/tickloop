@@ -82,6 +82,7 @@ fn family_harness_with_tasks(
             models: ChosenModels::new(model),
         },
         HarnessOptions {
+            search: Default::default(),
             model: config(),
             settings: None,
             host: AgentHostOptions {

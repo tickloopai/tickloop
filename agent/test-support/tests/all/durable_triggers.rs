@@ -68,6 +68,7 @@ fn cloud_harness(store: Arc<dyn TranscriptStore>, model: Arc<RoutedModel>) -> Ag
             models: ChosenModels::new(model),
         },
         HarnessOptions {
+            search: Default::default(),
             model: config(),
             settings: None,
             host: AgentHostOptions {

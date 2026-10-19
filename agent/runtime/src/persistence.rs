@@ -2196,6 +2196,14 @@ fn recover_transcript(
         .as_ref()
         .filter(|entry| entry.chat_id == source_chat_id)
         .map(|entry| entry.delegation.clone());
+    if let Some(entry) = loaded
+        .metadata
+        .delegation
+        .as_ref()
+        .filter(|entry| entry.chat_id == source_chat_id)
+    {
+        snapshot.search_config = entry.search_config.clone();
+    }
     snapshot.artifact_ticks = loaded
         .metadata
         .artifact_ticks
@@ -2739,7 +2747,12 @@ impl Agent {
         self.ensure_flush_loop(recorder);
     }
 
-    pub(super) fn record_delegation(&self, child_id: ChatId, mut delegation: DelegationMetadata) {
+    pub(super) fn record_delegation(
+        &self,
+        child_id: ChatId,
+        mut delegation: DelegationMetadata,
+        search_config: Option<tickloop_agent_protocol::SearchConfig>,
+    ) {
         // A record never carries the host's rules: every load fills in the ones it then has.
         delegation.ceiling.policy.host_rules.clear();
         if let Some(recorder) = &self.inner.recorder {
@@ -2748,6 +2761,7 @@ impl Agent {
                 vec![Line::Delegation(DelegationEntry {
                     chat_id: child_id,
                     delegation,
+                    search_config,
                 })],
                 None,
             );

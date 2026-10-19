@@ -1244,6 +1244,7 @@ mod regression_tests {
                 )),
             },
             HarnessOptions {
+                search: Default::default(),
                 model: config(),
                 settings: None,
                 host: AgentHostOptions {

@@ -43,6 +43,7 @@ const CLOUD_MIN_SCHEDULE_INTERVAL: Duration = Duration::from_secs(60);
 /// The cloud's composition: what the private host configures for every Harness.
 fn cloud_options(host_rules: Vec<PermissionRule>) -> HarnessOptions {
     HarnessOptions {
+        search: Default::default(),
         model: config(),
         settings: None,
         host: AgentHostOptions {

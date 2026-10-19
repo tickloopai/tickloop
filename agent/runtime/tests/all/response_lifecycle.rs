@@ -156,6 +156,7 @@ fn agent(store: Arc<dyn TranscriptStore>, model: Arc<dyn ModelClient>) -> Agent 
             models: tickloop_agent_test_support::harness::ChosenModels::new(model),
         },
         HarnessOptions {
+            search: Default::default(),
             model: config(),
             settings: None,
             host: AgentHostOptions::embedded_defaults(),
