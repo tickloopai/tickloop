@@ -105,7 +105,10 @@ async fn accounts_login_discovers_path_issuer_refreshes_artifacts_and_revokes_th
     assert!(fixture.server.requests_to(REGISTRATION_PATH).is_empty());
     let requests = fixture.server.requests_to(DEVICE_AUTHORIZATION_PATH);
     assert_eq!(requests[0].form["client_id"], CLIENT_ID);
-    assert_eq!(requests[0].form["scope"], SCOPES);
+    assert_eq!(
+        requests[0].form["scope"],
+        "openid profile email offline_access artifacts.agent artifacts.console"
+    );
     assert!(!requests[0].form.contains_key("resource"));
     let tokens = fixture.server.requests_to(TOKEN_PATH);
     assert!(!tokens[0].form.contains_key("resource"));

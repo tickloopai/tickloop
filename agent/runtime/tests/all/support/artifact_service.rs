@@ -49,11 +49,13 @@ pub struct Link {
 #[derive(Default)]
 pub struct ServiceControl {
     pub requests: Mutex<Vec<Value>>,
+    pub compact_ids: AtomicBool,
     pub other_account: AtomicBool,
     pub credential_revision: AtomicUsize,
     pub signed_out: AtomicBool,
     pub hold_device_approval: AtomicBool,
     pub reject_mcp: AtomicBool,
+    pub refuse_tool_bearer: Mutex<Option<String>>,
     pub directory_unavailable: AtomicBool,
     pub skills_enabled: AtomicBool,
     pub resources_enabled: AtomicBool,
@@ -163,7 +165,7 @@ fn tool_error(code: &str, message: &str) -> Value {
 fn call_tool(control: &ServiceControl, origin: &str, params: &Value) -> Value {
     let arguments = &params["arguments"];
     let artifact_id = arguments["artifact_id"].as_str().unwrap_or("doc");
-    let structured = match (
+    let mut structured = match (
         params["name"].as_str().unwrap_or(""),
         arguments["action"].as_str().unwrap_or(""),
     ) {
@@ -208,6 +210,9 @@ fn call_tool(control: &ServiceControl, origin: &str, params: &Value) -> Value {
         }
         _ => json!({}),
     };
+    if let Some(id) = structured.get("artifact_id").and_then(Value::as_str) {
+        structured["artifact_id"] = json!(wire_service_id(control, id));
+    }
     json!({"content":[{"type":"text","text":structured.to_string()}],"structuredContent":structured,"isError":false})
 }
 
@@ -390,8 +395,24 @@ fn upload(control: &ServiceControl, target: &str, head: &str, body: &[u8]) -> (u
     (201, receipt)
 }
 
+fn wire_service_id(control: &ServiceControl, id: &str) -> String {
+    if control.compact_ids.load(Ordering::SeqCst) {
+        tickloop_agent_artifacts::short_artifact_id(id)
+    } else {
+        id.to_owned()
+    }
+}
+
 fn lifecycle(control: &ServiceControl, method: &str, target: &str, body: &Value) -> (u16, Value) {
     let path = target.split('?').next().unwrap_or("");
+    let path = path
+        .strip_prefix("/api/v1/agent/feedback/")
+        .and_then(|suffix| suffix.split_once('/'))
+        .and_then(|(id, action)| {
+            tickloop_agent_artifacts::parse_service_id(id)
+                .map(|id| format!("/api/v1/agent/feedback/{id}/{action}"))
+        })
+        .unwrap_or_else(|| path.to_owned());
     let segments = path.split('/').collect::<Vec<_>>();
     match (method, segments.as_slice()) {
         ("PUT", ["", "api", "v1", "agent", "links", artifact_id]) => {
@@ -470,7 +491,7 @@ fn lifecycle(control: &ServiceControl, method: &str, target: &str, body: &Value)
                 );
             }
             let items = control.deliveries.lock().unwrap().iter().filter(|(_, (id, _, receiver, ack))| *id == artifact && *receiver == binding && !ack)
-                .map(|(delivery, (_, feedback, _, _))| json!({"delivery_id":delivery,"feedback_id":feedback,"thread_id":"thread-1","created_at":REQUEST_CREATED_AT})).collect::<Vec<_>>();
+                .map(|(delivery, (_, feedback, _, _))| json!({"delivery_id":wire_service_id(control, delivery),"feedback_id":wire_service_id(control, feedback),"thread_id":wire_service_id(control, "e1b85a39-a57b-4c28-a8a5-ae9233aead3e"),"created_at":REQUEST_CREATED_AT})).collect::<Vec<_>>();
             (200, json!({"items":items,"next_cursor":null}))
         }
         ("POST", ["", "api", "v1", "agent", "feedback", delivery, "claim"]) => {
@@ -495,17 +516,23 @@ fn lifecycle(control: &ServiceControl, method: &str, target: &str, body: &Value)
                 return (404, json!({"error":{"code":"not_found"}}));
             };
             if id != artifact || receiver != binding || *ack {
-                return (409, json!({"error":{"code":"claim_conflict"}}));
+                return (
+                    409,
+                    json!({"error":{"code":"claim_conflict","reason":"delivered"}}),
+                );
             }
             let mut claims = control.claims.lock().unwrap();
             if claims.contains_key(*delivery) {
-                return (409, json!({"error":{"code":"claim_conflict"}}));
+                return (
+                    409,
+                    json!({"error":{"code":"claim_conflict","reason":"leased"}}),
+                );
             }
             let claim = uuid::Uuid::new_v4().to_string();
             claims.insert((*delivery).to_owned(), claim.clone());
             (
                 200,
-                json!({"delivery_id":delivery,"feedback_id":feedback,"claim_id":claim,"fencing_token":format!("fence-{delivery}"),"lease_expires_at":"2099-01-01T00:00:00Z","input":{"artifact_id":artifact,"thread_id":"thread-1","text":"@tickloop tighten the introduction","anchor":thread_anchor(),"anchor_description":ANCHOR_DESCRIPTION,"requested_by":"One","access_role":"owner","messages":[]}}),
+                json!({"delivery_id":wire_service_id(control, delivery),"feedback_id":wire_service_id(control, feedback),"claim_id":claim,"fencing_token":format!("fence-{delivery}"),"lease_expires_at":"2099-01-01T00:00:00Z","input":{"artifact_id":artifact,"thread_id":"thread-1","text":"@tickloop tighten the introduction","anchor":thread_anchor(),"anchor_description":ANCHOR_DESCRIPTION,"requested_by":"One","access_role":"owner","messages":[]}}),
             )
         }
         (
@@ -551,7 +578,10 @@ fn lifecycle(control: &ServiceControl, method: &str, target: &str, body: &Value)
                 }
                 *ack = true;
             }
-            (200, json!({"delivery_id":delivery,"accepted":true}))
+            (
+                200,
+                json!({"delivery_id":wire_service_id(control, delivery),"accepted":true}),
+            )
         }
         ("GET", ["", "api", "v1", "artifacts", artifact_id]) => {
             let links = control.links.lock().unwrap().iter().filter(|(key, _)| key.starts_with(&format!("{artifact_id}:"))).map(|(_, link)| json!({"binding_id":link.binding_id,"chat_id":link.chat_id,"loop_id":link.loop_id,"epoch":link.epoch})).collect::<Vec<_>>();
@@ -660,6 +690,23 @@ impl ArtifactService {
                         .unwrap()
                         .push(json!({"path":line,"headers":head,"body":body}));
                     let is_mcp = method == "POST" && target == "/mcp";
+                    let reject_tool = is_mcp
+                        && body["method"] == "tools/call"
+                        && control
+                            .refuse_tool_bearer
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .is_some_and(|token| {
+                                head.to_ascii_lowercase().contains(&format!(
+                                    "authorization: bearer {}",
+                                    token.to_ascii_lowercase()
+                                ))
+                            });
+                    if reject_tool {
+                        let _ = stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                        return;
+                    }
                     if is_mcp && body.get("id").is_none() {
                         let _ = stream
                             .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")

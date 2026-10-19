@@ -572,3 +572,31 @@ async fn a_durable_load_keeps_a_linked_loop_receiving_for_its_host_to_deliver_to
     assert_eq!(worker.quiesce(chat).await, Quiescence::Idle);
     worker.shutdown().await;
 }
+
+#[test]
+fn delivery_identity_and_input_id_are_independent_of_the_service_id_representation() {
+    let uuid = Uuid::parse_str("e1b85a39-a57b-4c28-a8a5-ae9233aead3e").unwrap();
+    let make = |id: String| {
+        ExternalDelivery::from_claim(
+            ORIGIN,
+            ACCOUNT,
+            ARTIFACT,
+            &ClaimedFeedback {
+                delivery_id: id,
+                feedback_id: "feedback".into(),
+                claim_id: "opaque-claim".into(),
+                fencing_token: "opaque-fence".into(),
+                lease_expires_at: "2099-01-01T00:00:00Z".into(),
+                input: json!({"text":"hello"}),
+            },
+        )
+    };
+    let canonical = make(uuid.to_string()).unwrap();
+    let compact = make(tickloop_agent_artifacts::short_artifact_id(
+        &uuid.to_string(),
+    ))
+    .unwrap();
+    assert_eq!(canonical.delivery_id(), compact.delivery_id());
+    assert_eq!(canonical.input_id(), compact.input_id());
+    assert!(make("zzzzzzzzzzzzzzzzzzzzzz".into()).is_none());
+}

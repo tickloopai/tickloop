@@ -182,7 +182,7 @@ struct PreparedMcpCall {
 /// its operation ID.
 struct PreparedArtifactUpload {
     credential: CredentialSnapshot,
-    /// The artifact as the call named it, which publication admissions key on.
+    /// The artifact as the call named it, retained for request and approval correspondence.
     requested_id: String,
     artifact_id: String,
     content_type: &'static str,
@@ -325,7 +325,7 @@ impl McpHostToolProvider {
             chat: chat_id,
             account: credential.account_id.clone(),
             origin: credential.origin.clone(),
-            artifact: artifact.to_owned(),
+            artifact: tickloop_agent_artifacts::canonical_artifact_id(artifact),
             audience,
         };
         Some(
@@ -358,7 +358,7 @@ impl McpHostToolProvider {
                 chat: chat_id,
                 account: credential.account_id.clone(),
                 origin: credential.origin.clone(),
-                artifact,
+                artifact: tickloop_agent_artifacts::canonical_artifact_id(&artifact),
                 audience,
             });
     }
@@ -400,9 +400,25 @@ impl McpHostToolProvider {
         }
     }
 
+    /// Constructs the Artifact tools a host installs on one Chat's Harness. The credential
+    /// source and verified account belong to that Chat; native host tools remain composed.
+    pub fn with_credentials(
+        origin: &str,
+        account_id: impl Into<String>,
+        credentials: Arc<dyn tickloop_agent_artifacts::ArtifactCredentials>,
+        native: Option<Arc<dyn HostToolProvider>>,
+    ) -> Result<Self, ArtifactError> {
+        Ok(Self::new(
+            ArtifactClient::with_credentials(origin, account_id, credentials)?,
+            native,
+        ))
+    }
+
     /// Sign-in is offered only while the last refresh confirmed that no account is signed in.
     fn offers_login(&self) -> bool {
-        self.service_status.read().unwrap().authentication == ArtifactAuthentication::SignedOut
+        !self.artifact.is_host_managed()
+            && self.service_status.read().unwrap().authentication
+                == ArtifactAuthentication::SignedOut
             && matches!(self.artifact.credential_snapshot(), Ok(None))
     }
 
@@ -499,14 +515,8 @@ impl McpHostToolProvider {
         self.skill_files.write().unwrap().clear();
     }
 
-    fn credential_key(snapshot: &CredentialSnapshot) -> [u8; 32] {
-        let mut digest = Sha256::new();
-        digest.update(snapshot.origin.as_bytes());
-        digest.update([0]);
-        digest.update(snapshot.account_id.as_bytes());
-        digest.update([0]);
-        digest.update(snapshot.access_token.as_bytes());
-        digest.finalize().into()
+    fn credential_key(&self, snapshot: &CredentialSnapshot) -> [u8; 32] {
+        self.artifact.credential_key(snapshot)
     }
 
     fn credential_is_current(&self, expected: &CredentialSnapshot) -> bool {
@@ -514,7 +524,7 @@ impl McpHostToolProvider {
             .credential_snapshot()
             .ok()
             .flatten()
-            .is_some_and(|current| expected.identity_matches(&current))
+            .is_some_and(|current| self.artifact.credentials_match(expected, &current))
     }
 
     fn is_mcp_name(&self, name: &str) -> bool {
@@ -550,7 +560,8 @@ impl McpHostToolProvider {
     ) -> Result<(RunningService<RoleClient, ClientConfig>, McpHttpClient), String> {
         let endpoint = reqwest::Url::parse(&mcp_endpoint(&credential.origin))
             .map_err(|_| "invalid MCP endpoint")?;
-        let http = McpHttpClient::new(endpoint.clone(), credential.access_token.clone())?;
+        let http = McpHttpClient::new(endpoint.clone(), credential.access_token.clone())?
+            .with_artifact_credentials(self.artifact.as_ref().clone());
         let config = StreamableHttpClientTransportConfig::with_uri(endpoint.as_str().to_owned())
             .auth_header(credential.access_token.clone())
             .reinit_on_expired_session(false);
@@ -698,7 +709,9 @@ impl McpHostToolProvider {
     }
 
     async fn invalidate(&self, token: &str) {
-        let _ = self.artifact.invalidate_credential(token).await;
+        if !self.artifact.is_host_managed() {
+            let _ = self.artifact.invalidate_credential(token).await;
+        }
         self.clear_directory();
     }
 
@@ -751,7 +764,7 @@ impl McpHostToolProvider {
         let serialized = serde_json::to_vec(&accepted)
             .map_err(|_| "MCP tool directory cannot be fingerprinted")?;
         Ok(Directory {
-            credential_key: Self::credential_key(credential),
+            credential_key: self.credential_key(credential),
             fingerprint: Sha256::digest(serialized).into(),
             protocol_version,
             tools: mapped,
@@ -816,7 +829,11 @@ impl McpHostToolProvider {
         }
         let origin = prepared.credential.origin.trim_end_matches('/');
         Some(HostEffect::RenamedArtifact {
-            instance: tick_protocol::InstanceRef::artifact(origin, artifact_id).ok()?,
+            instance: tick_protocol::InstanceRef::artifact(
+                origin,
+                &tickloop_agent_artifacts::canonical_artifact_id(artifact_id),
+            )
+            .ok()?,
             title: title.to_owned(),
         })
     }
@@ -862,10 +879,7 @@ impl McpHostToolProvider {
         }
         Some(HostEffect::ReadArtifact(
             tickloop_agent_protocol::ArtifactTick {
-                artifact_id: uuid::Uuid::parse_str(artifact_id)
-                    .ok()
-                    .filter(|_| artifact_id.len() == 36)
-                    .map_or_else(|| artifact_id.into(), |id| id.to_string()),
+                artifact_id: tickloop_agent_artifacts::canonical_artifact_id(artifact_id),
                 origin: origin.into(),
                 title: title.into(),
                 format: format.into(),
@@ -924,7 +938,7 @@ impl McpHostToolProvider {
             .credential_snapshot()
             .map_err(|_| "Artifact credential unavailable")?
             .ok_or("Artifact login is no longer active")?;
-        if Self::credential_key(&credential) != expected_key {
+        if self.credential_key(&credential) != expected_key {
             return Err("Artifact account changed before the upload was prepared".into());
         }
         let file = scope
@@ -1015,7 +1029,10 @@ impl McpHostToolProvider {
             .credential_snapshot()
             .map_err(|_| "Artifact credential unavailable")?
             .ok_or("Artifact login ended before the upload")?;
-        if !upload.credential.identity_matches(&current) {
+        if !self
+            .artifact
+            .credentials_match(&upload.credential, &current)
+        {
             return Err("Artifact account changed before the upload".into());
         }
         let metadata = tokio::select! {
@@ -1110,6 +1127,7 @@ impl McpHostToolProvider {
                 status,
                 code,
                 message,
+                ..
             }) => {
                 let explanation = if message.is_empty() {
                     String::new()
@@ -1307,10 +1325,11 @@ impl HostToolProvider for McpHostToolProvider {
             .map(|native| native.service_connections())
             .unwrap_or_else(|| json!({}));
         let status = self.service_status.read().unwrap();
-        let generation = self
-            .artifact
-            .credential_snapshot()
-            .map(|credential| credential.as_ref().map(Self::credential_key));
+        let generation = self.artifact.credential_snapshot().map(|credential| {
+            credential
+                .as_ref()
+                .map(|credential| self.credential_key(credential))
+        });
         connections["artifacts"] = if generation
             .as_ref()
             .is_ok_and(|generation| *generation == status.credential_generation)
@@ -1363,7 +1382,7 @@ impl HostToolProvider for McpHostToolProvider {
         let directory = self.directory.read().unwrap();
         let directory = directory.as_ref()?;
         if !directory.supports_resources
-            || directory.credential_key != Self::credential_key(&credential)
+            || directory.credential_key != self.credential_key(&credential)
         {
             return None;
         }
@@ -1429,7 +1448,7 @@ impl HostToolProvider for McpHostToolProvider {
             .read()
             .unwrap()
             .as_ref()
-            .filter(|directory| directory.credential_key == Self::credential_key(&credential))
+            .filter(|directory| directory.credential_key == self.credential_key(&credential))
             .map(|directory| directory.skills.clone())
             .unwrap_or_default()
     }
@@ -1456,7 +1475,7 @@ impl HostToolProvider for McpHostToolProvider {
             .ok_or("Artifact account signed out")?;
         let resource = crate::remote_skills::resource_entry(definition, relative)?;
         let key = SkillFileKey {
-            credential_key: Self::credential_key(&credential),
+            credential_key: self.credential_key(&credential),
             uri: resource.uri.clone(),
             digest: resource.digest.clone(),
         };
@@ -1502,16 +1521,18 @@ impl HostToolProvider for McpHostToolProvider {
         };
         let (mut status, credential) = match Box::pin(self.artifact.verified_snapshot()).await {
             Ok(Some((user, verified))) => match self.artifact.credential_snapshot() {
-                Ok(Some(credential)) if credential.identity_matches(&verified) => (
-                    ArtifactServiceStatus {
-                        authentication: ArtifactAuthentication::SignedIn,
-                        credential_generation: Some(Self::credential_key(&credential)),
-                        account_id: Some(user.id),
-                        email: Some(user.email),
-                        ..Default::default()
-                    },
-                    Some(credential),
-                ),
+                Ok(Some(credential)) if self.artifact.credentials_match(&verified, &credential) => {
+                    (
+                        ArtifactServiceStatus {
+                            authentication: ArtifactAuthentication::SignedIn,
+                            credential_generation: Some(self.credential_key(&credential)),
+                            account_id: Some(user.id),
+                            email: Some(user.email),
+                            ..Default::default()
+                        },
+                        Some(credential),
+                    )
+                }
                 Ok(None) => (signed_out(), None),
                 _ => (ArtifactServiceStatus::default(), None),
             },
@@ -1522,7 +1543,7 @@ impl HostToolProvider for McpHostToolProvider {
             let directory = self.load_directory(&credential).await;
             match self.artifact.credential_snapshot() {
                 Ok(Some(current))
-                    if Self::credential_key(&current) == Self::credential_key(&credential) =>
+                    if self.credential_key(&current) == self.credential_key(&credential) =>
                 {
                     match directory {
                         Ok(directory) => {
@@ -1552,7 +1573,10 @@ impl HostToolProvider for McpHostToolProvider {
             .artifact
             .credential_snapshot()
             .map(|credential| {
-                credential.as_ref().map(Self::credential_key) == status.credential_generation
+                credential
+                    .as_ref()
+                    .map(|credential| self.credential_key(credential))
+                    == status.credential_generation
             })
             .unwrap_or(false)
         {
@@ -1676,7 +1700,7 @@ impl HostToolProvider for McpHostToolProvider {
             .credential_snapshot()
             .map_err(|_| "Artifact credential unavailable")?
             .ok_or("Artifact login is no longer active")?;
-        if Self::credential_key(&credential) != expected_key {
+        if self.credential_key(&credential) != expected_key {
             return Err("Artifact account changed before MCP preparation".into());
         }
         let read_owned = if let Some(id) = artifact_read_id(name, input) {
@@ -1789,7 +1813,10 @@ impl HostToolProvider for McpHostToolProvider {
             .credential_snapshot()
             .map_err(|_| "Artifact credential unavailable")?
             .ok_or("Artifact login ended before MCP dispatch")?;
-        if !prepared.credential.identity_matches(&current) {
+        if !self
+            .artifact
+            .credentials_match(&prepared.credential, &current)
+        {
             return Err("Artifact account changed before MCP dispatch".into());
         }
         let directory = self.load_directory(&current).await?;
@@ -1944,8 +1971,9 @@ impl HostToolProvider for McpHostToolProvider {
                 _ => prepared.publication.as_ref().and_then(|publication| {
                     let id = artifact_update_id(&name, &prepared.arguments)?;
                     let saved = result.structured_content.as_ref()?;
-                    (saved["artifact_id"] == id
-                        && saved["revision"].is_u64()
+                    (saved["artifact_id"].as_str().is_some_and(|saved| {
+                        tickloop_agent_artifacts::artifact_ids_match(id, saved)
+                    }) && saved["revision"].is_u64()
                         && matches!(
                             publication.audience,
                             ArtifactAudience::Private | ArtifactAudience::Public
@@ -1957,7 +1985,12 @@ impl HostToolProvider for McpHostToolProvider {
                 self.admit_publication(chat_id, &prepared.credential, artifact, audience);
             }
         }
-        let tool_result = Self::model_result(result, &prepared.credential.access_token);
+        let mut tool_result = Self::model_result(result, &prepared.credential.access_token);
+        if let Ok(Some(current)) = self.artifact.credential_snapshot() {
+            tool_result.content = tool_result
+                .content
+                .replace(&current.access_token, "[redacted]");
+        }
         match effect {
             Some(effect) => HostCallResult::CompletedWithEffect(tool_result, Box::new(effect)),
             None => HostCallResult::Completed(tool_result),

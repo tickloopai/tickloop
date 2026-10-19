@@ -1285,6 +1285,53 @@ async fn a_rename_prepares_dispatches_and_admits_like_a_content_edit_of_the_same
 }
 
 #[tokio::test]
+async fn a_base62_write_receipt_admits_only_the_same_artifact_in_either_id_form() {
+    let service = ArtifactService::start().await;
+    service.control.compact_ids.store(true, Ordering::SeqCst);
+    *service.control.publication.lock().unwrap() =
+        Some(json!({"audience":"private","membership_revision":0}));
+    let directory = tempfile::tempdir().unwrap();
+    let provider = McpHostToolProvider::new(service.login(directory.path()).await, None);
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let chat = uuid::Uuid::new_v4();
+    let uuid = "e1b85a39-a57b-4c28-a8a5-ae9233aead3e";
+    let short = "6rvWPvOnhVABug7llbHb26";
+    let prepare = async |id: &str| {
+        provider.prepare_call(chat, "ArtifactEdit", &json!({"action":"rename","artifact_id":id,"title":"Renamed","expected_title":"Fixture"}), CancellationToken::new()).await.unwrap()
+    };
+    let first = prepare(uuid).await;
+    assert_eq!(first.permission(), HostToolPermission::PrivateArtifactWrite);
+    let HostCallResult::CompletedWithEffect(result, effect) = provider
+        .execute_prepared(chat, first, CancellationToken::new())
+        .await
+    else {
+        panic!("a confirmed rename reports its effect");
+    };
+    assert!(!result.is_error);
+    let HostEffect::RenamedArtifact { instance, .. } = *effect else {
+        panic!("a rename effect");
+    };
+    assert_eq!(
+        instance,
+        tick_protocol::InstanceRef::artifact(&service.origin, uuid).unwrap()
+    );
+    assert_eq!(
+        prepare(uuid).await.permission(),
+        HostToolPermission::ArtifactContinuation
+    );
+    assert_eq!(
+        prepare(short).await.permission(),
+        HostToolPermission::ArtifactContinuation
+    );
+    assert_eq!(
+        prepare("11111111-1111-4111-8111-111111111111")
+            .await
+            .permission(),
+        HostToolPermission::PrivateArtifactWrite
+    );
+}
+
+#[tokio::test]
 async fn an_approved_agent_rename_retitles_the_chat_artifact_and_a_refused_one_does_not() {
     let service = ArtifactService::start().await;
     let directory = tempfile::tempdir().unwrap();
@@ -2238,6 +2285,28 @@ async fn feedback_enters_the_linked_loop_once_without_a_completion_tool_or_priva
         Some(artifact_service::REQUEST_CREATED_AT_MS)
     );
     assert!(service.releases().is_empty());
+    agent.shutdown().await;
+}
+
+#[tokio::test]
+async fn base62_feedback_is_claimed_acknowledged_and_delivered_once() {
+    let service = ArtifactService::start().await;
+    service.control.compact_ids.store(true, Ordering::SeqCst);
+    let feedback = "e1b85a39-a57b-4c28-a8a5-ae9233aead3e";
+    service.request_feedback("doc", feedback);
+    let directory = tempfile::tempdir().unwrap();
+    let model = Arc::new(ScriptedModel::new(vec![text("Received.")]));
+    let (agent, chat, loop_id) = linked_chat(&service, directory.path(), model.clone()).await;
+    eventually(async || service.finished() == [(feedback.into(), "received".into())]).await;
+    wait_for_loop_state(&agent, chat, loop_id, LoopState::WaitingTrigger).await;
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        service
+            .lifecycle_requests("POST /artifact/api/v1/agent/feedback/")
+            .len(),
+        2
+    );
+    assert!(!agent.snapshot(chat).await.unwrap().loops[0].event_sources[0].resume_required);
     agent.shutdown().await;
 }
 
@@ -3199,6 +3268,11 @@ async fn a_read_artifact_has_one_canonical_monitor_row_across_pages_and_restore(
     let first = agent.snapshot(chat).await.unwrap();
     assert_eq!(first.artifact_ticks.len(), 1);
     assert_eq!(first.artifact_ticks[0].artifact_id, canonical_id);
+    let mut compact_body = body.clone();
+    compact_body["artifact_id"] = json!(short_id);
+    *service.control.read_result.lock().unwrap() = Some(
+        json!({"content":[{"type":"text","text":compact_body.to_string()}],"structuredContent":compact_body,"isError":false}),
+    );
     submit_and_wait(&agent, chat, "Read the next page and reread the document").await;
     let snapshot = agent.snapshot(chat).await.unwrap();
     assert_eq!(snapshot.artifact_ticks, first.artifact_ticks);
@@ -5575,4 +5649,162 @@ async fn refreshing_an_expiring_accounts_resource_keeps_tools_available_in_the_s
             .iter()
             .any(|tool| tool.name == "ArtifactRead")
     );
+}
+
+struct HostTokens {
+    token: Mutex<String>,
+    invalidations: AtomicUsize,
+}
+
+#[async_trait]
+impl tickloop_agent_artifacts::ArtifactCredentials for HostTokens {
+    async fn bearer(&self) -> Result<Option<String>, tickloop_agent_artifacts::ArtifactError> {
+        Ok(Some(self.token.lock().unwrap().clone()))
+    }
+    async fn invalidate(
+        &self,
+        rejected: &str,
+    ) -> Result<(), tickloop_agent_artifacts::ArtifactError> {
+        self.invalidations.fetch_add(1, Ordering::SeqCst);
+        let mut token = self.token.lock().unwrap();
+        if *token == rejected {
+            *token = "renewed-chat-token".into();
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn separate_chat_harnesses_use_their_injected_credentials_for_read_edit_and_comment() {
+    for token in ["first-chat-token", "second-chat-token"] {
+        let service = ArtifactService::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let source = Arc::new(HostTokens {
+            token: Mutex::new(token.into()),
+            invalidations: AtomicUsize::new(0),
+        });
+        let provider = Arc::new(
+            McpHostToolProvider::with_credentials(
+                &service.origin,
+                "user-one",
+                source.clone(),
+                None,
+            )
+            .unwrap(),
+        );
+        let model = Arc::new(ScriptedModel::new(vec![
+            call(
+                "read",
+                "ArtifactRead",
+                json!({"action":"read","artifact_id":"doc"}),
+            ),
+            call(
+                "edit",
+                "ArtifactEdit",
+                json!({"action":"patch","artifact_id":"doc","patches":[{"type":"replace","target":"b1","expected_hash":"h1","text":"# Edited"}]}),
+            ),
+            call(
+                "comment",
+                "ArtifactComment",
+                json!({"action":"reply","artifact_id":"doc","thread_id":"thread-1","text":"Updated."}),
+            ),
+            text("Done."),
+        ]));
+        let agent = Agent::new_embedded(config(), model);
+        agent.install_host_tools(provider).unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        agent
+            .set_execution_mode(chat, ExecutionMode::FullAccess)
+            .await
+            .unwrap();
+        submit_and_wait(&agent, chat, "Read, edit and comment on this artifact").await;
+        let calls = service
+            .requests()
+            .into_iter()
+            .filter(|request| request["body"]["method"] == "tools/call")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|request| request["body"]["params"]["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["ArtifactRead", "ArtifactEdit", "ArtifactComment"]
+        );
+        assert!(calls.iter().all(|request| {
+            request["headers"]
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains(&format!("authorization: bearer {token}"))
+        }));
+        assert!(
+            !service
+                .requests()
+                .iter()
+                .any(|request| request["path"].as_str().unwrap().contains("/account/"))
+        );
+        assert!(!directory.path().join("artifacts/auth").exists());
+        assert_eq!(source.invalidations.load(Ordering::SeqCst), 0);
+        agent.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn delegated_mcp_401_invalidates_and_retries_the_same_read_edit_and_comment_once() {
+    for (name, arguments) in [
+        ("ArtifactRead", json!({"action":"read","artifact_id":"doc"})),
+        (
+            "ArtifactEdit",
+            json!({"action":"patch","artifact_id":"doc","patches":[{"type":"replace","target":"b1","expected_hash":"h1","text":"# Edited"}]}),
+        ),
+        (
+            "ArtifactComment",
+            json!({"action":"reply","artifact_id":"doc","thread_id":"thread-1","text":"Updated."}),
+        ),
+    ] {
+        let service = ArtifactService::start().await;
+        *service.control.refuse_tool_bearer.lock().unwrap() = Some("expired-chat-token".into());
+        let source = Arc::new(HostTokens {
+            token: Mutex::new("expired-chat-token".into()),
+            invalidations: AtomicUsize::new(0),
+        });
+        let provider = McpHostToolProvider::with_credentials(
+            &service.origin,
+            "user-one",
+            source.clone(),
+            None,
+        )
+        .unwrap();
+        provider.refresh(CancellationToken::new()).await.unwrap();
+        let chat = uuid::Uuid::new_v4();
+        let prepared = provider
+            .prepare_call(chat, name, &arguments, CancellationToken::new())
+            .await
+            .unwrap();
+        let outcome = provider
+            .execute_prepared(chat, prepared, CancellationToken::new())
+            .await;
+        let result = match outcome {
+            HostCallResult::Completed(result) | HostCallResult::CompletedWithEffect(result, _) => {
+                result
+            }
+            _ => panic!("a rejected bearer is renewed and retried once"),
+        };
+        assert!(!result.is_error, "{}", result.content);
+        let calls = service
+            .requests()
+            .into_iter()
+            .filter(|request| request["body"]["method"] == "tools/call")
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["body"], calls[1]["body"]);
+        assert!(
+            calls[1]["headers"]
+                .as_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("authorization: bearer renewed-chat-token")
+        );
+        assert_eq!(source.invalidations.load(Ordering::SeqCst), 1);
+    }
 }

@@ -47,6 +47,9 @@ impl ArtifactClient {
     }
 
     pub async fn start_device_login(&self) -> Result<DeviceAuthorization, ArtifactError> {
+        if self.is_host_managed() {
+            return Err(ArtifactError::HostManagedCredentials);
+        }
         let scopes = SCOPES
             .split_whitespace()
             .map(str::to_owned)
@@ -177,6 +180,9 @@ impl ArtifactClient {
     /// Obtains a usable resource token under the issuer's cross-process lock. Snapshot checks
     /// for already-prepared operations stay synchronous and never replace their authority.
     pub async fn access_snapshot(&self) -> Result<Option<CredentialSnapshot>, ArtifactError> {
+        if self.is_host_managed() {
+            return self.host_snapshot().await;
+        }
         let _lock = self.lock().await?;
         let Some(mut account) = self.read_account()? else {
             return Ok(None);
@@ -206,6 +212,18 @@ impl ArtifactClient {
     pub async fn verified_snapshot(
         &self,
     ) -> Result<Option<(ArtifactUser, CredentialSnapshot)>, ArtifactError> {
+        if self.is_host_managed() {
+            return Ok(self.host_snapshot().await?.map(|snapshot| {
+                (
+                    ArtifactUser {
+                        id: snapshot.account_id.clone(),
+                        name: String::new(),
+                        email: String::new(),
+                    },
+                    snapshot,
+                )
+            }));
+        }
         let _lock = self.lock().await?;
         let Some(mut account) = self.read_account()? else {
             return Ok(None);
@@ -285,6 +303,9 @@ impl ArtifactClient {
     }
 
     pub async fn logout(&self) -> Result<LogoutOutcome, ArtifactError> {
+        if self.is_host_managed() {
+            return Err(ArtifactError::HostManagedCredentials);
+        }
         let _lock = self.lock().await?;
         let Some(account) = self.read_account()? else {
             return Ok(LogoutOutcome::AlreadySignedOut);

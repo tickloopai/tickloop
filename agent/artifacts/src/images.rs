@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use reqwest::{Method, StatusCode, header};
+use reqwest::{Method, header};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -47,7 +47,10 @@ impl SentImage<'_> {
         !image.asset_id.is_empty()
             && image.asset_id.len() <= MAX_ASSET_ID_BYTES
             && !image.asset_id.chars().any(char::is_control)
-            && image.reference == format!("asset:{}", image.asset_id)
+            && image
+                .reference
+                .strip_prefix("asset:")
+                .is_some_and(|id| super::artifact_ids_match(&image.asset_id, id))
             && image.content_type == self.content_type
             && (1..=MAX_IMAGE_BYTES as u64).contains(&image.bytes)
             && image.sha256.len() == SHA256_HEX_DIGITS
@@ -121,7 +124,7 @@ impl ArtifactClient {
     ) -> Result<ArtifactImage, ArtifactError> {
         if !self
             .credential_snapshot()?
-            .is_some_and(|current| current.identity_matches(credential))
+            .is_some_and(|current| self.credentials_match(credential, &current))
         {
             return Err(ArtifactError::AccountChanged);
         }
@@ -134,12 +137,12 @@ impl ArtifactClient {
             .header(header::CONTENT_TYPE, content_type)
             .timeout(UPLOAD_TIMEOUT)
             .body(bytes);
-        if let Ok(response) = request.send().await {
+        let response = self.send_authenticated(request, credential).await;
+        if matches!(response, Err(ArtifactError::AccessDenied)) {
+            return Err(ArtifactError::AccessDenied);
+        }
+        if let Ok(response) = response {
             let status = response.status();
-            if status == StatusCode::UNAUTHORIZED {
-                self.invalidate_credential(&credential.access_token).await?;
-                return Err(ArtifactError::AccessDenied);
-            }
             if status.is_success() {
                 if let Ok(image) = self
                     .read_json_with_limit::<ArtifactImage>(response, MAX_RESPONSE_BYTES)
@@ -149,7 +152,7 @@ impl ArtifactClient {
                     return Ok(image);
                 }
             } else if !status.is_server_error() {
-                let (code, message) = service_error(
+                let (code, message, reason) = service_error(
                     &self
                         .read_json_with_limit::<Value>(response, MAX_RESPONSE_BYTES)
                         .await
@@ -159,6 +162,7 @@ impl ArtifactClient {
                     status: status.as_u16(),
                     code,
                     message,
+                    reason,
                 });
             }
         }

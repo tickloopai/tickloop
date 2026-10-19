@@ -24,9 +24,15 @@ use tickloop_agent_base::{
 
 mod accounts;
 mod catalog;
+#[cfg(test)]
+mod credential_tests;
+mod credentials;
 mod feedback;
 mod images;
+#[cfg(test)]
+mod migration_tests;
 pub use catalog::{AgentLinkMetadata, ArtifactMetadata, ArtifactOperation, ArtifactPage};
+pub use credentials::ArtifactCredentials;
 pub use feedback::{AgentLink, AgentLinkRequest, ClaimedFeedback, FeedbackDelivery, FeedbackPage};
 pub use images::{
     ArtifactImage, IMAGE_ARTIFACT_FORMAT, MAX_IMAGE_BYTES, MAX_SVG_BYTES, artifact_image_type,
@@ -122,6 +128,7 @@ pub enum ArtifactError {
         status: u16,
         code: String,
         message: String,
+        reason: Option<String>,
     },
     #[error("Tickloop Artifacts modification outcome unknown; operation {operation_id}: {outcome}")]
     OutcomeUnknown {
@@ -134,6 +141,8 @@ pub enum ArtifactError {
         "Tickloop Artifacts remote revocation is unconfirmed; local credential is retained for an explicit retry"
     )]
     RevocationUnknown,
+    #[error("Artifact credentials are managed by the host")]
+    HostManagedCredentials,
 }
 
 pub enum LogoutOutcome {
@@ -168,6 +177,37 @@ impl DeviceAuthorization {
     pub fn expires_in(&self) -> Duration {
         self.login.remaining()
     }
+}
+
+/// Decodes a service ID from its UUID or fixed-width base62 representation.
+pub fn parse_service_id(value: &str) -> Option<Uuid> {
+    if value.len() == 36 {
+        return Uuid::parse_str(value).ok();
+    }
+    if value.len() != SHORT_ID_LENGTH {
+        return None;
+    }
+    let mut decoded = 0_u128;
+    for digit in value.bytes() {
+        let digit = BASE62_ALPHABET
+            .iter()
+            .position(|candidate| *candidate == digit)?;
+        decoded = decoded.checked_mul(62)?.checked_add(digit as u128)?;
+    }
+    Some(Uuid::from_u128(decoded))
+}
+
+/// The stable local identity of an Artifact, independent of its service representation.
+pub fn canonical_artifact_id(value: &str) -> String {
+    parse_service_id(value).map_or_else(|| value.to_owned(), |id| id.to_string())
+}
+
+fn deserialize_service_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Uuid, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    parse_service_id(&value)
+        .ok_or_else(|| serde::de::Error::custom("expected a UUID or 22-character base62 ID"))
 }
 
 /// The URL form of an artifact ID: a UUID becomes the service's 22-character base62 short ID;
@@ -213,8 +253,10 @@ pub struct ArtifactClient {
     origin: Url,
     http: Client,
     state_root: PathBuf,
+    hosted_credentials: Option<std::sync::Arc<credentials::HostedCredentials>>,
 }
 
+#[derive(Clone)]
 pub struct CredentialSnapshot {
     pub origin: String,
     pub account_id: String,
@@ -231,6 +273,9 @@ impl CredentialSnapshot {
 
 impl ArtifactClient {
     pub fn credential_snapshot(&self) -> Result<Option<CredentialSnapshot>, ArtifactError> {
+        if let Some(source) = &self.hosted_credentials {
+            return Ok(source.snapshot());
+        }
         Ok(self
             .read_credential()?
             .filter(|saved| saved.expires_at > now_seconds())
@@ -242,6 +287,9 @@ impl ArtifactClient {
     }
 
     pub async fn invalidate_credential(&self, token: &str) -> Result<(), ArtifactError> {
+        if let Some(source) = &self.hosted_credentials {
+            return source.invalidate(token).await;
+        }
         self.remove_if_same(token).await?;
         Ok(())
     }
@@ -275,6 +323,7 @@ impl ArtifactClient {
             origin,
             http,
             state_root: state_root.into(),
+            hosted_credentials: None,
         })
     }
 
@@ -320,6 +369,9 @@ impl ArtifactClient {
     }
 
     fn credential_directory(&self) -> Result<PathBuf, ArtifactError> {
+        if self.is_host_managed() {
+            return Err(ArtifactError::HostManagedCredentials);
+        }
         let path = self.state_root.join("artifacts").join("auth");
         open_without_following_links(
             &path,
@@ -483,8 +535,8 @@ fn path_segment(value: &str) -> Result<&str, ArtifactError> {
     Ok(value)
 }
 
-/// The code and message of a service error envelope `{"error":{"code","message"}}`.
-fn service_error(envelope: &serde_json::Value) -> (String, String) {
+/// The code, message and optional conflict reason of a service error envelope `{"error":{"code","message"}}`.
+fn service_error(envelope: &serde_json::Value) -> (String, String, Option<String>) {
     let field = |name: &str| {
         envelope
             .pointer(&format!("/error/{name}"))
@@ -494,6 +546,7 @@ fn service_error(envelope: &serde_json::Value) -> (String, String) {
     (
         field("code").unwrap_or_else(|| "invalid_response".into()),
         field("message").unwrap_or_default(),
+        field("reason"),
     )
 }
 
@@ -519,7 +572,7 @@ mod tests {
         net::TcpListener,
     };
 
-    async fn server(
+    pub(super) async fn server(
         reply: impl Fn(&str, usize, &str) -> (u16, String) + Send + Sync + 'static,
     ) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -571,7 +624,7 @@ mod tests {
         (origin, received)
     }
 
-    async fn catalog_client(origin: &str) -> (tempfile::TempDir, ArtifactClient) {
+    pub(super) async fn catalog_client(origin: &str) -> (tempfile::TempDir, ArtifactClient) {
         let directory = tempfile::tempdir().unwrap();
         let client =
             ArtifactClient::for_origin(directory.path().canonicalize().unwrap(), origin).unwrap();
@@ -729,7 +782,7 @@ mod tests {
         assert!(client.credential_snapshot().unwrap().is_some());
     }
 
-    fn png_bytes() -> Vec<u8> {
+    pub(super) fn png_bytes() -> Vec<u8> {
         [
             &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a][..],
             b"pixels",
@@ -737,7 +790,7 @@ mod tests {
         .concat()
     }
 
-    fn image_receipt(bytes: &[u8]) -> serde_json::Value {
+    pub(super) fn image_receipt(bytes: &[u8]) -> serde_json::Value {
         serde_json::json!({"asset_id":"asset-1","ref":"asset:asset-1","content_type":"image/png","bytes":bytes.len(),"sha256":format!("{:x}", Sha256::digest(bytes)),"width":4,"height":null})
     }
 
@@ -819,7 +872,7 @@ mod tests {
             client
                 .upload_image("refused", "image/png", bytes.clone(), Uuid::new_v4(), &credential)
                 .await,
-            Err(ArtifactError::Service { status: 413, code, message }) if code == "asset_limit" && message == "full"
+            Err(ArtifactError::Service { status: 413, code, message, .. }) if code == "asset_limit" && message == "full"
         ));
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert!(matches!(
@@ -889,7 +942,7 @@ mod tests {
             client
                 .upload_image("slides-1", "image/png", png_bytes(), Uuid::new_v4(), &credential)
                 .await,
-            Err(ArtifactError::Service { status: 429, code, message })
+            Err(ArtifactError::Service { status: 429, code, message, .. })
                 if code == "asset_busy" && message == "These Slides already have 4 uploads in progress"
         ));
         assert_eq!(requests.lock().unwrap().len(), 1);
@@ -945,7 +998,7 @@ mod tests {
         assert_eq!(requests.lock().unwrap().len(), 1);
     }
 
-    fn request_body(request: &str) -> serde_json::Value {
+    pub(super) fn request_body(request: &str) -> serde_json::Value {
         serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap()
     }
 
