@@ -15,7 +15,7 @@ use tickloop_agent_protocol::{
     RequestFailure, RequestOutcome, ResponseRejection, RunId, Usage, UsageCounter,
 };
 use tickloop_agent_runtime::Agent;
-use tickloop_agent_test_support::harness::{ChosenModels, opened_agent};
+use tickloop_agent_test_support::harness::{ChosenModels, embedded_agent};
 use tokio::sync::{Notify, broadcast, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
@@ -849,9 +849,8 @@ async fn switching_models_never_relabels_old_requests() {
         main_identity(),
         vec![ResponseStep::reply(text("First"), counters(10, 1, 0, 0))],
     ));
-    let archive = directory.path().join("archive");
     let models = ChosenModels::new(first_model.clone());
-    let agent = opened_agent(archive, config(&main_identity()), models.clone());
+    let agent = embedded_agent(config(&main_identity()), models.clone());
     let chat = agent.create_chat(directory.path().into()).await.unwrap();
     let mut events = agent.subscribe();
     let first = agent

@@ -286,22 +286,17 @@ async fn proxy_endpoint_keeps_vendor_paths_of_built_in_selections() {
     let selections = [
         (
             "deepseek-api",
-            "deepseek-flash-messages",
-            "/model-proxy/deepseek-api/anthropic/v1/messages",
-        ),
-        (
-            "deepseek-api",
             "deepseek-flash",
             "/model-proxy/deepseek-api/chat/completions",
         ),
         (
             "minimax-cn-api",
-            "minimax-m3-messages",
+            "MiniMax-M3",
             "/model-proxy/minimax-cn-api/anthropic/v1/messages",
         ),
         (
             "minimax-global-api",
-            "minimax-m3-messages",
+            "MiniMax-M3",
             "/model-proxy/minimax-global-api/anthropic/v1/messages",
         ),
     ];
