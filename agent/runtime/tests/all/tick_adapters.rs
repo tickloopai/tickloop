@@ -19,6 +19,7 @@ const SHELL_QUIET_WAIT: Duration = Duration::from_secs(1);
 #[tokio::test]
 async fn shell_subscription_preserves_its_policy_including_final_admission() {
     use support::tick_admission_contract::{AdmissionCase, verify_admission_policy};
+    use tickloop_agent_protocol::UserShellState;
     let directory = tempfile::tempdir().unwrap();
     let model = Arc::new(ScriptedModel::new(vec![]));
     let agent = Agent::new_embedded(config(), model.clone());
@@ -30,26 +31,43 @@ async fn shell_subscription_preserves_its_policy_including_final_admission() {
         .unwrap();
     let instance = InstanceRef::shell(task.command_id);
     // A later Shell exit legitimately starts another model turn; admission needs a settled baseline.
+    let mut last_shell_state = None;
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if agent
+            if let Some(record) = agent
                 .snapshot(chat)
                 .await
                 .unwrap()
                 .user_shells
-                .iter()
-                .any(|record| {
-                    record.id == task.command_id
-                        && record.state == tickloop_agent_protocol::UserShellState::Completed
-                })
+                .into_iter()
+                .find(|record| record.id == task.command_id)
             {
-                break;
+                let completed = record.state == UserShellState::Completed;
+                let failed = matches!(
+                    record.state,
+                    UserShellState::Failed | UserShellState::Unknown
+                );
+                last_shell_state =
+                    Some((record.state, record.pid, record.reason, record.exit_code));
+                assert!(
+                    !failed,
+                    "Shell baseline failed for {}: last (state, pid, reason, exit_code) = {last_shell_state:?}",
+                    task.command_id
+                );
+                if completed {
+                    break;
+                }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| {
+        panic!(
+            "Shell baseline timed out for {}: last (state, pid, reason, exit_code) = {last_shell_state:?}",
+            task.command_id
+        )
+    });
     agent
         .install_tick_stream(Arc::new(TickAdapters::builtin(agent.clone(), None)))
         .await;

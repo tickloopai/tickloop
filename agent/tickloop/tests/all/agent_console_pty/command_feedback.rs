@@ -245,7 +245,7 @@ async fn run_background_event_reset(fixture: &PrivateFixture) {
         .unwrap()
         .unwrap();
     view.wait_for("follow-up is echoed before leaving its Agent", |frame| {
-        conversation_body(frame).contains(SECOND_PROMPT)
+        try_conversation_body(frame).is_some_and(|body| body.contains(SECOND_PROMPT))
     })
     .await;
     view.send(b"/clear\r");
@@ -257,9 +257,10 @@ async fn run_background_event_reset(fixture: &PrivateFixture) {
     view.wait_for(
         "another Agent remains visible while background Thinking runs",
         |frame| {
-            conversation_body(frame)
-                .lines()
-                .any(|line| screen::response_line(line) == OTHER_OUTPUT)
+            try_conversation_body(frame).is_some_and(|body| {
+                body.lines()
+                    .any(|line| screen::response_line(line) == OTHER_OUTPUT)
+            })
         },
     )
     .await;
@@ -310,7 +311,8 @@ async fn run_background_event_reset(fixture: &PrivateFixture) {
         .wait_for(
             "background reply is restored after the event gap",
             |frame| {
-                !frame.contains("Agents · local") && conversation_body(frame).contains(SECOND_REPLY)
+                !frame.contains("Agents · local")
+                    && try_conversation_body(frame).is_some_and(|body| body.contains(SECOND_REPLY))
             },
         )
         .await;

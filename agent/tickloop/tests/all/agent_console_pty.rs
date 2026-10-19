@@ -1355,23 +1355,77 @@ async fn wait_snapshot(
     matches: impl Fn(&LiveChatSnapshot) -> bool,
 ) -> Box<LiveChatSnapshot> {
     let mut latest = String::new();
+    let mut queries = 0;
+    let mut query_time = Duration::ZERO;
+    let mut longest_query = Duration::ZERO;
+    let mut query_started = None;
     tokio::time::timeout(UI_TIMEOUT, async {
         loop {
+            let started = Instant::now();
+            query_started = Some(started);
             let snapshot = snapshot(client, execution).await;
+            let elapsed = started.elapsed();
+            query_started = None;
+            queries += 1;
+            query_time += elapsed;
+            longest_query = longest_query.max(elapsed);
             if matches(&snapshot) {
                 break snapshot;
             }
             latest = format!(
-                "loops: {:?}; questions: {:?}; latest events: {:?}",
-                snapshot.conversation.loops,
-                snapshot.questions,
-                snapshot.events.iter().rev().take(6).collect::<Vec<_>>()
+                "queries={queries} query_time_ms={} longest_query_ms={} {}",
+                query_time.as_millis(),
+                longest_query.as_millis(),
+                snapshot_diagnostic(&snapshot),
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("private Agent snapshot did not reach {label}: {latest}"))
+    .unwrap_or_else(|_| {
+        panic!(
+            "private Agent snapshot did not reach {label}: in_flight_query_ms={:?}; {latest}",
+            query_started.map(|started| started.elapsed().as_millis())
+        )
+    })
+}
+
+fn snapshot_diagnostic(snapshot: &LiveChatSnapshot) -> String {
+    format!(
+        "sequence={} loops={:?} permissions={:?} questions={} pending_thinking_chars={:?} operations={:?} commands={:?}",
+        snapshot.last_sequence,
+        snapshot
+            .conversation
+            .loops
+            .iter()
+            .map(|goal| (goal.id, goal.run_id, &goal.state))
+            .collect::<Vec<_>>(),
+        snapshot
+            .permissions
+            .iter()
+            .map(|request| request.name.as_str())
+            .collect::<Vec<_>>(),
+        snapshot.questions.len(),
+        snapshot
+            .pending_thinking
+            .iter()
+            .map(|(run, text)| (run, text.chars().count()))
+            .collect::<Vec<_>>(),
+        snapshot
+            .operations
+            .iter()
+            .map(|operation| (
+                operation.call_id.as_str(),
+                operation.name.as_str(),
+                &operation.state
+            ))
+            .collect::<Vec<_>>(),
+        snapshot
+            .commands
+            .iter()
+            .map(|command| (command.operation_id, &command.state, command.output_bytes))
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn request_dialog_visible(frame: &str, question: &str, requester: &str) -> bool {
@@ -3818,23 +3872,26 @@ const COMPOSER_PROMPTS: [&str; 2] = ["❯", "!\u{a0}"];
 /// Rows above the composer's upper rule; a sent prompt must be echoed there, not only left in the
 /// editor or the provider request.
 fn conversation_body(frame: &str) -> String {
+    try_conversation_body(frame).expect("the composer prompt is painted")
+}
+
+fn try_conversation_body(frame: &str) -> Option<String> {
     let frame = screen::message_flow(frame);
     let lines: Vec<&str> = frame.lines().collect();
-    let composer = lines
-        .iter()
-        .rposition(|line| {
-            let line = line.trim_start();
-            COMPOSER_PROMPTS
-                .iter()
-                .any(|prompt| line.starts_with(prompt))
-        })
-        .expect("the composer prompt is painted");
-    lines[..composer.saturating_sub(1)].join("\n")
+    let composer = lines.iter().rposition(|line| {
+        let line = line.trim_start();
+        COMPOSER_PROMPTS
+            .iter()
+            .any(|prompt| line.starts_with(prompt))
+    })?;
+    Some(lines[..composer.saturating_sub(1)].join("\n"))
 }
 
 /// Each marker appears exactly once in the conversation body, in the given order.
 fn body_shows_once_in_order(frame: &str, markers: &[&str]) -> bool {
-    let body = conversation_body(frame);
+    let Some(body) = try_conversation_body(frame) else {
+        return false;
+    };
     let mut earliest = 0;
     markers.iter().all(|marker| {
         let found = body.matches(marker).count() == 1
