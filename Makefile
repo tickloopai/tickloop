@@ -11,7 +11,7 @@ PACKAGE_TARGET ?= $(shell rustc -vV | sed -n 's/^host: //p')
 PACKAGE_ARCHIVE = dist/tickloop-$(PACKAGE_TARGET).tar.gz
 TICK_PACKAGES ?= $(notdir $(patsubst %/tick-package.json,%,$(wildcard ticks/*/tick-package.json)))
 
-.PHONY: dev build install package site test check release release-site release-artifacts prototype-earnings-review package-ticks dev-ticks release-ticks
+.PHONY: dev build install package site test check release prototype-earnings-review package-ticks dev-ticks release-ticks
 
 ## Start in the current directory with global config/login/Tick packages and worktree+branch service isolation. Example: make dev ARGS="-c"
 # Existing TICKLOOP_DAEMON_RUNTIME_DIR overrides the daemon (and default Tickhost subdirectory);
@@ -78,14 +78,6 @@ check:
 ## Tickloop 版本 patch +1，检查后提交版本文件并推送分支与标签；VERSION 可指定更高版本
 release:
 	@node scripts/release.mjs binary
-
-## 官网版本 patch +1，检查后提交版本文件并推送分支与标签；VERSION 可指定更高版本
-release-site:
-	@node scripts/release.mjs site
-
-## Artifacts 版本 patch +1，检查后提交版本文件并推送分支与标签；VERSION 可指定更高版本
-release-artifacts:
-	@node scripts/release.mjs artifacts
 
 ## 启动财报复盘原型；访问 http://127.0.0.1:8766/earnings-review.html?variant=A
 prototype-earnings-review:

@@ -16,7 +16,7 @@ const allowedRemoteUrls = new Set([
 const maximumTagsPerPush = 3;
 const maximumSnapshotAttempts = 3;
 const releaseLockPollMilliseconds = 100;
-const channels = new Set(["binary", "artifacts", "site", "ticks"]);
+const channels = new Set(["binary", "ticks"]);
 
 function command(program, args, options = {}) {
   const result = spawnSync(program, args, { encoding: "utf8", ...options });
@@ -155,9 +155,7 @@ function checksFor(channel, products) {
     ["make", ["build"]],
     ["cargo", ["package", "--locked", "--allow-dirty", "--no-verify", "--manifest-path", "distribution/cargo/Cargo.toml", "--target-dir", "target/cargo-launcher"]],
   ];
-  if (channel === "ticks") return [["cargo", ["check", "--locked", ...products.flatMap(product => ["-p", product.cargoName]), "--bins"]]];
-  const directory = channel === "artifacts" ? "artifact" : "site";
-  return [["npm", ["--prefix", directory, "ci"]], ...(channel === "artifacts" ? [["npm", ["--prefix", directory, "run", "typecheck"]]] : []), ["npm", ["--prefix", directory, "run", "build"]]];
+  return [["cargo", ["check", "--locked", ...products.flatMap(product => ["-p", product.cargoName]), "--bins"]]];
 }
 
 function prepareAndCheck(channel, state, mode) {
@@ -225,7 +223,7 @@ function finalizeRelease(products, state, changes) {
 
 try {
   const [channel, mode, ...extra] = process.argv.slice(2);
-  if (!channels.has(channel) || extra.length || mode && !["--check", "--dry-run"].includes(mode)) throw new Error("Usage: [VERSION=X.Y.Z] [TICK_PACKAGES='longbridge futu'] node scripts/release.mjs binary|artifacts|site|ticks [--check|--dry-run]");
+  if (!channels.has(channel) || extra.length || mode && !["--check", "--dry-run"].includes(mode)) throw new Error("Usage: [VERSION=X.Y.Z] [TICK_PACKAGES='longbridge futu'] node scripts/release.mjs binary|ticks [--check|--dry-run]");
   const releaseLock = acquireReleaseLock();
   try {
     const initial = preflight();
