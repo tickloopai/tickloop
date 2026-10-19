@@ -94,14 +94,14 @@ async fn service() -> (String, Arc<ServiceControl>) {
                 }
                 let account = control.account.load(Ordering::SeqCst);
                 let response = if path
-                    .starts_with("GET /.well-known/oauth-authorization-server/accounts ")
+                    .starts_with("GET /.well-known/oauth-authorization-server/account ")
                 {
-                    json!({"issuer":format!("{origin}/accounts"),"token_endpoint":format!("{origin}/accounts/token"),"device_authorization_endpoint":format!("{origin}/accounts/device"),"userinfo_endpoint":format!("{origin}/accounts/userinfo"),"revocation_endpoint":format!("{origin}/accounts/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]})
-                } else if path.starts_with("POST /accounts/device ") {
-                    json!({"device_code":"test-device","user_code":"TEST","verification_uri":format!("{origin}/accounts/device?code=TEST"),"expires_in":30,"interval":1})
-                } else if path.starts_with("POST /accounts/token ") {
+                    json!({"issuer":format!("{origin}/account"),"token_endpoint":format!("{origin}/account/token"),"device_authorization_endpoint":format!("{origin}/account/device"),"userinfo_endpoint":format!("{origin}/account/userinfo"),"revocation_endpoint":format!("{origin}/account/revoke"),"grant_types_supported":["urn:ietf:params:oauth:grant-type:device_code"]})
+                } else if path.starts_with("POST /account/device ") {
+                    json!({"device_code":"test-device","user_code":"TEST","verification_uri":format!("{origin}/account/device?code=TEST"),"expires_in":30,"interval":1})
+                } else if path.starts_with("POST /account/token ") {
                     json!({"access_token":format!("token-{account}"),"token_type":"Bearer","expires_in":600,"refresh_token":format!("refresh-{account}")})
-                } else if path.starts_with("GET /accounts/userinfo ") {
+                } else if path.starts_with("GET /account/userinfo ") {
                     json!({"sub":format!("user-{account}"),"name":"Test","email":"test@example.test"})
                 } else if path.starts_with("GET /artifact/api/v1/artifacts/doc ") {
                     json!({"id":"doc","title":"Report","format":"html","access_role":control.access_role.lock().unwrap().as_deref().unwrap_or("owner"),"publication":control.publication.lock().unwrap().clone()})
