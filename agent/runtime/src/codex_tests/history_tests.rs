@@ -49,6 +49,8 @@ fn opened_with_models(state: &Path, models: Arc<ChosenModels>) -> Agent {
             task_tools: None,
             min_schedule_interval: crate::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits: crate::WaitHosting::Process,
+            system_prompt_addition: None,
+            request_gates: Vec::new(),
         },
     )
     .unwrap()
@@ -115,6 +117,7 @@ async fn triggered_request_after_logout(interval_seconds: Option<u64>) {
                 expires_at_ms: None,
                 armed_at_ms: None,
                 last_fired_at_ms: None,
+                confirmation: None,
                 accepts_events: true,
                 armed: true,
                 subscriptions: Vec::new(),

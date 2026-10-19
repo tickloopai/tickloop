@@ -91,6 +91,8 @@ fn harness(store: Arc<dyn TranscriptStore>) -> Agent {
             task_tools: None,
             min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits: WaitHosting::Durable,
+            system_prompt_addition: None,
+            request_gates: Vec::new(),
         },
     )
     .unwrap()
@@ -193,6 +195,7 @@ async fn arm(agent: &Agent, chat: tickloop_agent_protocol::ChatId, loop_id: Uuid
                 schedule: None,
                 armed_at_ms: None,
                 last_fired_at_ms: None,
+                confirmation: None,
                 expires_at_ms: None,
                 accepts_events: true,
                 armed: true,

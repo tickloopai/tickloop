@@ -86,6 +86,9 @@ pub struct Trigger {
     /// take it. A later time is due once the clock reaches it; earlier ones never fire again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_fired_at_ms: Option<u64>,
+    /// Whether the user confirmed a schedule the model created; `None` for one the user made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<ScheduleConfirmation>,
     /// The Tick Instances this Loop receives Tick Updates from, each at its own frequency.
     pub subscriptions: Vec<TickSubscription>,
 }
@@ -112,6 +115,8 @@ struct TriggerRecord {
     #[serde(default)]
     last_fired_at_ms: Option<u64>,
     #[serde(default)]
+    confirmation: Option<ScheduleConfirmation>,
+    #[serde(default)]
     subscriptions: Vec<TickSubscription>,
 }
 
@@ -130,6 +135,7 @@ impl From<TriggerRecord> for Trigger {
             armed: record.armed,
             armed_at_ms: record.armed_at_ms,
             last_fired_at_ms: record.last_fired_at_ms,
+            confirmation: record.confirmation,
             subscriptions: record.subscriptions,
         }
     }
@@ -149,6 +155,7 @@ impl Trigger {
             armed: true,
             armed_at_ms: None,
             last_fired_at_ms: None,
+            confirmation: None,
             subscriptions: Vec::new(),
         }
     }
@@ -158,6 +165,11 @@ impl Trigger {
     pub fn set_explicit_prompt(&mut self, prompt: String) {
         self.prompt = prompt;
         self.prompt_source = TriggerPromptSource::Explicit;
+    }
+
+    /// Whether the schedule waits for the user to confirm it before it may run.
+    pub fn awaits_confirmation(&self) -> bool {
+        self.confirmation == Some(ScheduleConfirmation::Pending)
     }
 
     /// Arms the Trigger at `now_ms`: its schedule counts afresh from here.
@@ -214,6 +226,18 @@ fn from_ms(milliseconds: u64) -> Option<DateTime<Utc>> {
 
 fn to_ms(time: DateTime<Utc>) -> Option<u64> {
     u64::try_from(time.timestamp_millis()).ok()
+}
+
+/// Where a schedule the model created stands with the user: it runs only once confirmed.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", tag = "state")]
+pub enum ScheduleConfirmation {
+    /// Waits for the user; the Trigger stays disarmed meanwhile.
+    Pending,
+    /// The user confirmed it at `at_ms`, in Unix milliseconds.
+    Confirmed { at_ms: u64 },
+    /// The user rejected it at `at_ms`, which stopped its Loop.
+    Rejected { at_ms: u64 },
 }
 
 /// Where a Trigger's prompt came from, which decides how a firing presents it.

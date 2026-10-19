@@ -4,6 +4,8 @@
 mod advance;
 #[path = "all/agent_approval_routing.rs"]
 mod agent_approval_routing;
+#[path = "all/cloud_composition.rs"]
+mod cloud_composition;
 #[path = "all/durable_deliveries.rs"]
 mod durable_deliveries;
 #[path = "all/durable_family.rs"]
@@ -18,6 +20,8 @@ mod durable_triggers;
 mod durable_waits;
 #[path = "all/retained_budget.rs"]
 mod retained_budget;
+#[path = "all/schedule_confirmation.rs"]
+mod schedule_confirmation;
 
 #[path = "all/response_lifecycle.rs"]
 mod response_lifecycle;

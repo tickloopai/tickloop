@@ -217,6 +217,7 @@ fn source_label(source: PermissionRuleSource) -> &'static str {
         PermissionRuleSource::ProjectUser => "Project rule",
         PermissionRuleSource::ProjectConstraint => "Project constraint",
         PermissionRuleSource::ManagedConstraint => "Managed constraint",
+        PermissionRuleSource::Host => "Host rule",
     }
 }
 

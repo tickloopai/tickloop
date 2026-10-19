@@ -2712,8 +2712,8 @@ impl Agent {
     }
 
     pub(super) fn record_delegation(&self, child_id: ChatId, mut delegation: DelegationMetadata) {
-        // The host's rules apply as the loading host has them; the record keeps the user's.
-        self.strip_host_rules(&mut delegation.ceiling.policy);
+        // A record never carries the host's rules: every load fills in the ones it then has.
+        delegation.ceiling.policy.host_rules.clear();
         if let Some(recorder) = &self.inner.recorder {
             recorder.outbox.enqueue(
                 child_id,

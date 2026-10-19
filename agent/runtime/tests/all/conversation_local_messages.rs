@@ -722,6 +722,7 @@ async fn an_expired_loop_cancels_its_model_request_without_interrupt_messages() 
                 schedule: None,
                 armed_at_ms: None,
                 last_fired_at_ms: None,
+                confirmation: None,
                 expires_at_ms: Some(now_ms + 100),
                 accepts_events: true,
                 armed: true,

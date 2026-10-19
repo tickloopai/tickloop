@@ -56,6 +56,8 @@ fn folderless_agent(model: Arc<ScriptedModel>, reach: Reach) -> Agent {
             task_tools: None,
             min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits: tickloop_agent_runtime::WaitHosting::Process,
+            system_prompt_addition: None,
+            request_gates: Vec::new(),
         },
     )
     .unwrap()
@@ -397,6 +399,8 @@ async fn a_folderless_harness_keeps_no_local_transcript_and_a_local_one_needs_a_
         task_tools: None,
         min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
         waits: tickloop_agent_runtime::WaitHosting::Process,
+        system_prompt_addition: None,
+        request_gates: Vec::new(),
     };
     let root = tempfile::tempdir().unwrap();
     let store = JsonlTranscriptStore::open(root.path().join("state")).unwrap();

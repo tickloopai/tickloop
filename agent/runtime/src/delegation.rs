@@ -495,10 +495,13 @@ pub(super) fn host_authority(
     let policy = effective_policy(chats, receipt)?;
     let decide = |policy: &tickloop_agent_protocol::PermissionPolicy, loop_id, session, human| {
         let explicit =
-            policy.explicit_match_with_session(&operation.name, permission_input, loop_id, session);
+            policy.explicit_rule_match(&operation.name, permission_input, loop_id, session);
         (
-            host_tool_decision(explicit.map(Decision::from), permission, policy.mode, human),
-            explicit == Some(tickloop_agent_tools::permissions::ExplicitPermissionDecision::Ask),
+            host_tool_decision(explicit, permission, policy.mode, human),
+            explicit.is_some_and(|matched| {
+                matched.decision
+                    == tickloop_agent_tools::permissions::ExplicitPermissionDecision::Ask
+            }),
         )
     };
     let own = &chats[&receipt.chat_id];

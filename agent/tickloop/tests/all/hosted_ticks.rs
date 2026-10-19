@@ -398,6 +398,8 @@ mod channel {
                             min_schedule_interval:
                                 tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
                             waits: tickloop_agent_runtime::WaitHosting::Process,
+                            system_prompt_addition: None,
+                            request_gates: Vec::new(),
                         },
                     )
                     .map_err(|error| AccessError::unavailable(error.to_string()))?;

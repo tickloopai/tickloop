@@ -2,7 +2,8 @@
 //! family is next due, and the scheduler's wake for that time is a holding of its own on a
 //! fresh Harness. Every scheduled time fires once, however often or late the scheduler wakes
 //! the family, and a crash between registering a scheduled goal and its call's result neither
-//! loses the goal nor registers it twice.
+//! loses the goal nor registers it twice. A schedule the model creates waits for the user's
+//! confirmation, which the host brings as a holding of its own.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -13,8 +14,8 @@ use tickloop_agent_model::ModelRequest;
 use tickloop_agent_protocol::{AgentHostOptions, Content, PromptPolicy};
 use tickloop_agent_runtime::transcript::TranscriptStore;
 use tickloop_agent_runtime::{
-    Agent, Delivery, HarnessOptions, HarnessSeams, ParentSelection, ToolPolicy, TurnOp,
-    TurnRequest, UserMessage, WaitHosting,
+    Agent, Delivery, HarnessOptions, HarnessSeams, ParentSelection, PersonWaitKind,
+    ScheduleDecision, ToolPolicy, TurnOp, TurnRequest, UserMessage, WaitHosting,
 };
 use tickloop_agent_test_support::event_stream::MemoryEventStream;
 use tickloop_agent_test_support::harness::ChosenModels;
@@ -81,6 +82,8 @@ fn cloud_harness(store: Arc<dyn TranscriptStore>, model: Arc<RoutedModel>) -> Ag
             task_tools: None,
             min_schedule_interval: CLOUD_MIN_SCHEDULE_INTERVAL,
             waits: WaitHosting::Durable,
+            system_prompt_addition: None,
+            request_gates: Vec::new(),
         },
     )
     .unwrap()
@@ -129,6 +132,19 @@ impl Cloud {
             .acquire(self.chat)
             .unwrap()
             .wake(Uuid::new_v4(), Some(due_at))
+            .await;
+        assert!(report.acknowledged, "{report:?}");
+        report
+    }
+
+    /// The user's confirmation of the schedule the model created for `loop_id`, a holding of
+    /// its own on the host `holder`.
+    async fn confirm(&self, holder: &str, loop_id: Uuid) -> TurnReport {
+        let report = self
+            .host(holder)
+            .acquire(self.chat)
+            .unwrap()
+            .decide_schedule(Uuid::new_v4(), None, loop_id, ScheduleDecision::Confirm)
             .await;
         assert!(report.acknowledged, "{report:?}");
         report
@@ -236,9 +252,22 @@ async fn an_hourly_goal_runs_once_per_scheduled_time_across_holdings() {
     assert!(registered.acknowledged, "{registered:?}");
     let results = results_of(&cloud.lines(), "goal");
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0]["state"], "scheduled");
+    assert_eq!(results[0]["state"], "awaiting_user_confirmation");
+    let loop_id: Uuid = serde_json::from_value(results[0]["loop_id"].clone()).unwrap();
+    assert!(
+        registered
+            .waiting
+            .as_ref()
+            .unwrap()
+            .people
+            .iter()
+            .any(|person| person.kind == PersonWaitKind::Schedule && person.request == loop_id),
+        "{registered:?}"
+    );
     assert_eq!(cloud.runs(), 0);
-    let mut due = wake_at(&registered);
+    let confirmed = cloud.confirm("confirming", loop_id).await;
+    assert_eq!(cloud.runs(), 0);
+    let mut due = wake_at(&confirmed);
 
     for holding in 1..=3 {
         let report = cloud.wake(&format!("hourly {holding}"), due).await;
@@ -285,10 +314,12 @@ async fn a_crash_before_a_scheduled_goals_result_neither_loses_nor_repeats_the_g
     assert!(redelivered.acknowledged, "{redelivered:?}");
     let results = results_of(&cloud.lines(), "goal");
     assert_eq!(results.len(), 1, "{results:?}");
-    assert_eq!(results[0]["state"], "scheduled");
+    assert_eq!(results[0]["state"], "awaiting_user_confirmation");
     assert_eq!(scheduled_loops(&cloud.lines()).len(), 1);
 
-    let due = wake_at(&redelivered);
+    let loop_id: Uuid = serde_json::from_value(results[0]["loop_id"].clone()).unwrap();
+    let confirmed = cloud.confirm("confirming", loop_id).await;
+    let due = wake_at(&confirmed);
     cloud.wake("hourly", due).await;
     assert_eq!(cloud.runs(), 1);
 }

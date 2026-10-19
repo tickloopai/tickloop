@@ -62,6 +62,8 @@ pub enum PermissionRuleSource {
     ProjectUser,
     ProjectConstraint,
     ManagedConstraint,
+    /// Imposed by the host on every Chat; never editable.
+    Host,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

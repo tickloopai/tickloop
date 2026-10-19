@@ -651,6 +651,7 @@ async fn shell_subscription_refuses_foreign_chat_before_baseline_and_restoration
                 schedule: None,
                 armed_at_ms: None,
                 last_fired_at_ms: None,
+                confirmation: None,
                 expires_at_ms: None,
                 accepts_events: true,
                 armed: true,

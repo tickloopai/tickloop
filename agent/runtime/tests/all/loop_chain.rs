@@ -127,6 +127,7 @@ fn periodic(prompt: &str, interval_seconds: Option<u64>) -> Trigger {
         expires_at_ms: None,
         armed_at_ms: None,
         last_fired_at_ms: None,
+        confirmation: None,
         accepts_events: true,
         armed: true,
         subscriptions: Vec::new(),

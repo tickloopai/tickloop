@@ -135,15 +135,22 @@ pub(super) fn harness(
                 prompt_policy: PromptPolicy::DenyOnPrompt,
                 ..AgentHostOptions::product_defaults()
             },
-            tools: ToolPolicy {
-                goals: true,
-                questions: true,
-                ..ToolPolicy::web_fetch_only()
+            tools: match waits {
+                WaitHosting::Durable => ToolPolicy {
+                    goals: true,
+                    questions: true,
+                    ..ToolPolicy::web_fetch_only()
+                },
+                // Nothing of a Chat without a Folder outlives a process that keeps its waits:
+                // such a harness only loads what a durable one wrote.
+                WaitHosting::Process => ToolPolicy::web_fetch_only(),
             },
             host_rules: Vec::new(),
             task_tools: None,
             min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits,
+            system_prompt_addition: None,
+            request_gates: Vec::new(),
         },
     )
     .unwrap()
@@ -314,7 +321,7 @@ async fn a_goal_queued_for_itself_is_queued_again_only_under_durable_waits() {
             )),
             Step::Hang,
         ]);
-        let first = harness(store.clone(), model.clone(), waits);
+        let first = harness(store.clone(), model.clone(), WaitHosting::Durable);
         let chat = first.create_chat_without_folder().await.unwrap();
         first
             .advance(

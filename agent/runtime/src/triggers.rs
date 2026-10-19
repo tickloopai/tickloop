@@ -10,6 +10,7 @@ use tickloop_agent_transcript::{DiscardReason, SettledOutcome};
 pub(super) fn can_trigger(goal: &LoopSnapshot) -> bool {
     (goal.trigger.as_ref().is_some_and(|trigger| {
         trigger.armed
+            && !trigger.awaits_confirmation()
             && trigger.expires_at_ms.is_none_or(|deadline| {
                 deadline > tickloop_agent_base::private_fs::unix_time_milliseconds()
             })
@@ -36,6 +37,49 @@ const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
 const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
 /// The source a Trigger's timer fires as.
 const TIMER_SOURCE: &str = "timer";
+/// The most schedules a Chat keeps active at once, confirmed or awaiting confirmation.
+pub(crate) const MAX_ACTIVE_SCHEDULES: usize = 20;
+/// How long a schedule the model created runs before it expires, unless the user changes it.
+pub(crate) const MODEL_SCHEDULE_LIFETIME_MS: u64 = MODEL_SCHEDULE_LIFETIME_DAYS * MS_PER_DAY;
+pub(crate) const MODEL_SCHEDULE_LIFETIME_DAYS: u64 = 30;
+const MS_PER_DAY: u64 = SECONDS_PER_DAY * 1_000;
+
+/// How many of the Chat's Loops that have not ended keep a schedule armed or awaiting the user's
+/// confirmation.
+/// A schedule disarmed by a restart until the user continues its Loop counts as well.
+pub(crate) fn active_schedules(snapshot: &ChatSnapshot) -> usize {
+    snapshot
+        .loops
+        .iter()
+        .filter(|goal| has_active_schedule(snapshot, goal))
+        .count()
+}
+
+fn has_active_schedule(snapshot: &ChatSnapshot, goal: &LoopSnapshot) -> bool {
+    !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
+        && goal.trigger.as_ref().is_some_and(|trigger| {
+            trigger.schedule.is_some()
+                && (trigger.armed
+                    || trigger.awaits_confirmation()
+                    || snapshot.resume_triggers.contains(&goal.id))
+        })
+}
+
+pub(crate) fn too_many_schedules() -> String {
+    format!(
+        "this Chat already has {MAX_ACTIVE_SCHEDULES} active schedules; stop one before adding \
+         another"
+    )
+}
+
+/// The user's answer to a schedule the model created.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScheduleDecision {
+    /// Arms the schedule: it runs from now on.
+    Confirm,
+    /// Stops the schedule's Loop before it ever runs.
+    Reject,
+}
 
 /// The wall clock Trigger schedules run on: the system's time when the Agent was built, carried
 /// on by the runtime's monotonic clock, so that a test's paused clock moves it too. It catches
@@ -144,6 +188,7 @@ fn recover_triggers(snapshot: &mut ChatSnapshot, waits: WaitHosting) {
             continue;
         };
         let armed = trigger.armed;
+        let awaits_confirmation = trigger.awaits_confirmation();
         if !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
             && trigger.expires_at_ms.is_some_and(|deadline| {
                 deadline <= tickloop_agent_base::private_fs::unix_time_milliseconds()
@@ -152,6 +197,10 @@ fn recover_triggers(snapshot: &mut ChatSnapshot, waits: WaitHosting) {
             goal.recover_state(LoopState::Expired);
         }
         let has_ended = matches!(goal.state, LoopState::Stopped | LoopState::Expired);
+        // A schedule awaiting the user's confirmation never ran; it waits on, wherever it loads.
+        if !has_ended && awaits_confirmation {
+            continue;
+        }
         if has_ended {
             snapshot.resume_triggers.retain(|id| *id != goal.id);
         } else if waits == WaitHosting::Durable && armed {
@@ -288,6 +337,14 @@ impl Agent {
         let mut chats = self.inner.chats.lock().await;
         let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
         let mut snapshot = chat.snapshot.clone();
+        let adds_a_schedule = trigger
+            .as_ref()
+            .is_some_and(|trigger| trigger.schedule.is_some() && trigger.armed);
+        let other_schedules = snapshot
+            .loops
+            .iter()
+            .filter(|goal| goal.id != loop_id && has_active_schedule(&snapshot, goal))
+            .count();
         let goal = snapshot
             .loops
             .iter_mut()
@@ -297,6 +354,24 @@ impl Agent {
             return Err(AgentError::Invalid(
                 "ended goals cannot be rescheduled".into(),
             ));
+        }
+        let previous_confirmation = goal
+            .trigger
+            .as_ref()
+            .and_then(|trigger| trigger.confirmation);
+        if previous_confirmation == Some(tickloop_agent_protocol::ScheduleConfirmation::Pending) {
+            return Err(AgentError::Invalid(
+                "the goal's schedule awaits the user's confirmation; confirm or reject it first"
+                    .into(),
+            ));
+        }
+        if adds_a_schedule && other_schedules >= MAX_ACTIVE_SCHEDULES {
+            return Err(AgentError::Invalid(too_many_schedules()));
+        }
+        // Only the user's own decision confirms a schedule: a configuration carries the one the
+        // Loop's schedule has.
+        if let Some(trigger) = trigger.as_mut() {
+            trigger.confirmation = previous_confirmation;
         }
         goal.trigger = trigger.clone();
         if goal.state == LoopState::Completed
@@ -336,6 +411,169 @@ impl Agent {
         };
         self.start_armed_trigger(chat_id, loop_id, trigger, cancel)
             .await;
+        Ok(())
+    }
+
+    /// Settles a schedule the model created and the user has not confirmed yet: `Confirm` arms
+    /// it from now on, `Reject` stops its Loop. The decision is recorded with the Loop, and
+    /// repeating it changes nothing; a schedule whose deadline passed expires instead.
+    pub async fn decide_schedule(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        decision: ScheduleDecision,
+    ) -> Result<(), AgentError> {
+        use tickloop_agent_protocol::ScheduleConfirmation;
+        let _admission = self.inner.tasks.token();
+        self.refuse_when_closed()?;
+        self.make_resident(chat_id).await?;
+        let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
+        let armed = {
+            let mut chats = self.inner.chats.lock().await;
+            let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+            let goal = chat
+                .snapshot
+                .loops
+                .iter_mut()
+                .find(|goal| goal.id == loop_id)
+                .ok_or(AgentError::NotFound)?;
+            let has_ended = matches!(goal.state, LoopState::Stopped | LoopState::Expired);
+            let trigger = goal
+                .trigger
+                .as_mut()
+                .filter(|trigger| trigger.confirmation.is_some())
+                .ok_or_else(|| {
+                    AgentError::Invalid("the goal has no schedule the Agent created".into())
+                })?;
+            match (trigger.confirmation, decision) {
+                (Some(ScheduleConfirmation::Confirmed { .. }), ScheduleDecision::Confirm) => {
+                    return Ok(());
+                }
+                // A rejection whose Loop has not ended yet stops it now.
+                (Some(ScheduleConfirmation::Rejected { .. }), ScheduleDecision::Reject)
+                    if has_ended =>
+                {
+                    return Ok(());
+                }
+                (Some(ScheduleConfirmation::Rejected { .. }), ScheduleDecision::Confirm) => {
+                    return Err(AgentError::Invalid("the schedule was rejected".into()));
+                }
+                (Some(ScheduleConfirmation::Confirmed { .. }), ScheduleDecision::Reject) => {
+                    return Err(AgentError::Invalid(
+                        "the schedule was confirmed; stop its goal instead".into(),
+                    ));
+                }
+                _ => {}
+            }
+            if has_ended {
+                return Err(AgentError::Invalid("the schedule's goal has ended".into()));
+            }
+            if trigger
+                .expires_at_ms
+                .is_some_and(|deadline| deadline <= now)
+            {
+                drop(chats);
+                let _ = self
+                    .end_goal(chat_id, loop_id, LoopState::Expired, None)
+                    .await;
+                return Err(AgentError::Invalid(
+                    "the schedule expired before it was confirmed".into(),
+                ));
+            }
+            let now_on_schedule = self.inner.schedule_clock.now_ms();
+            if decision == ScheduleDecision::Confirm
+                && let Some(reason) =
+                    invalid_trigger(trigger, self.inner.min_schedule_interval, now_on_schedule)
+            {
+                return Err(AgentError::Invalid(reason));
+            }
+            match decision {
+                ScheduleDecision::Confirm => {
+                    trigger.confirmation = Some(ScheduleConfirmation::Confirmed { at_ms: now });
+                    trigger.arm_at(now_on_schedule);
+                    let trigger = trigger.clone();
+                    self.save(&chat.snapshot);
+                    let cancel = CancellationToken::new();
+                    if let Some(previous) =
+                        chat.trigger_cancellations.insert(loop_id, cancel.clone())
+                    {
+                        previous.cancel();
+                    }
+                    Some((trigger, cancel))
+                }
+                // Stopping the Loop records the rejection with its end.
+                ScheduleDecision::Reject => {
+                    trigger.confirmation = Some(ScheduleConfirmation::Rejected { at_ms: now });
+                    None
+                }
+            }
+        };
+        match armed {
+            Some((trigger, cancel)) => {
+                self.start_armed_trigger(chat_id, loop_id, trigger, cancel)
+                    .await;
+            }
+            None => {
+                self.end_goal(chat_id, loop_id, LoopState::Stopped, None)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Moves the deadline of a goal's schedule to `expires_at`, or clears it with `None`, as the
+    /// user extends or keeps a schedule; the schedule goes on from the times it already dealt
+    /// with.
+    pub async fn set_schedule_expiry(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        expires_at: Option<std::time::SystemTime>,
+    ) -> Result<(), AgentError> {
+        let _admission = self.inner.tasks.token();
+        self.refuse_when_closed()?;
+        self.make_resident(chat_id).await?;
+        let expires_at_ms = expires_at
+            .map(|expires_at| {
+                expires_at
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|since| u64::try_from(since.as_millis()).ok())
+                    .filter(|deadline| {
+                        *deadline > tickloop_agent_base::private_fs::unix_time_milliseconds()
+                    })
+                    .ok_or_else(|| AgentError::Invalid("the new deadline has passed".into()))
+            })
+            .transpose()?;
+        let mut chats = self.inner.chats.lock().await;
+        let chat = chats.get_mut(&chat_id).ok_or(AgentError::NotFound)?;
+        let goal = chat
+            .snapshot
+            .loops
+            .iter_mut()
+            .find(|goal| goal.id == loop_id)
+            .ok_or(AgentError::NotFound)?;
+        if matches!(goal.state, LoopState::Stopped | LoopState::Expired) {
+            return Err(AgentError::Invalid("the goal has ended".into()));
+        }
+        let trigger = goal
+            .trigger
+            .as_mut()
+            .filter(|trigger| trigger.schedule.is_some())
+            .ok_or_else(|| AgentError::Invalid("the goal has no schedule".into()))?;
+        trigger.expires_at_ms = expires_at_ms;
+        let timer = (trigger.armed || trigger.awaits_confirmation()).then(|| trigger.clone());
+        self.save(&chat.snapshot);
+        if let Some(previous) = chat.trigger_cancellations.remove(&loop_id) {
+            previous.cancel();
+        }
+        let Some(trigger) = timer else {
+            return Ok(());
+        };
+        let cancel = CancellationToken::new();
+        chat.trigger_cancellations.insert(loop_id, cancel.clone());
+        drop(chats);
+        self.trigger_task(chat_id, loop_id, trigger, cancel);
         Ok(())
     }
 
@@ -576,7 +814,8 @@ impl Agent {
 
     /// With durable wait hosting, the loaded Chat's armed Triggers go on in this instance: each
     /// gets its timer and deadline again, and what came due while no host held the Chat fires
-    /// once, its earlier missed times skipped.
+    /// once, its earlier missed times skipped. A schedule awaiting confirmation gets its deadline
+    /// alone.
     pub(crate) async fn resume_triggers_after_load(&self, chat_id: ChatId) {
         let armed = {
             let mut chats = self.inner.chats.lock().await;
@@ -591,7 +830,9 @@ impl Agent {
                 .filter_map(|goal| {
                     Some((
                         goal.id,
-                        goal.trigger.clone().filter(|trigger| trigger.armed)?,
+                        goal.trigger
+                            .clone()
+                            .filter(|trigger| trigger.armed || trigger.awaits_confirmation())?,
                     ))
                 })
                 .collect::<Vec<_>>();
