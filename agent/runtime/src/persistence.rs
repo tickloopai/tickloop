@@ -44,8 +44,8 @@ use tickloop_agent_transcript::{
     CustomTitleEntry, DelegationEntry, FamilyCompletionsEntry, FamilyInputsEntry,
     FileHistorySnapshotEntry, ForkedFrom, LOOP_CREATED_SUBTYPE, LOOP_ENDED_SUBTYPE,
     LOOP_STATE_SUBTYPE, LOOP_TRIGGER_SUBTYPE, LastPromptEntry, Line, LoopRecord,
-    MonitorMembersEntry, PartialCompactDirection, SentAgentMessagesEntry, SubagentsEntry,
-    SummarizeMetadataEntry,
+    MonitorMembersEntry, PartialCompactDirection, ProvenanceEntry, SentAgentMessagesEntry,
+    SubagentsEntry, SummarizeMetadataEntry,
 };
 
 /// 照 Claude Code：恢复时末尾是工具结果，追加这条 meta user 消息表示从中断处继续。
@@ -299,6 +299,11 @@ impl ChatRecorder {
             vec![Line::Subagents(SubagentsEntry { chat_id, subagents })],
             None,
         );
+    }
+
+    pub(super) fn record_provenance(&self, chat_id: ChatId, entry: ProvenanceEntry) {
+        self.outbox
+            .enqueue(chat_id, vec![Line::Provenance(entry)], None);
     }
 
     pub(super) fn record_sent_agent_messages(
@@ -2223,6 +2228,12 @@ fn recover_transcript(
             &loaded.lifecycle,
             chat_id == source_chat_id,
         ),
+        provenance: loaded
+            .metadata
+            .provenance
+            .clone()
+            .filter(|entry| entry.chat_id == source_chat_id)
+            .unwrap_or_default(),
         ..ChatBookkeeping::default()
     };
     bookkeeping.lifecycle.remember_compacted_leaf(

@@ -454,6 +454,9 @@ fn only_the_durable_chat_preset_asks_web_fetch_for_provenance() {
     assert!(ToolPolicy::durable_chat().web_fetch_requires_provenance);
     assert!(!ToolPolicy::local().web_fetch_requires_provenance);
     assert!(!ToolPolicy::web_fetch_only().web_fetch_requires_provenance);
+    assert!(ToolPolicy::durable_chat().artifact_writes_require_provenance);
+    assert!(!ToolPolicy::local().artifact_writes_require_provenance);
+    assert!(!ToolPolicy::web_fetch_only().artifact_writes_require_provenance);
     let allowed = durable_chat_host_rules()
         .into_iter()
         .map(|rule| rule.tool)
