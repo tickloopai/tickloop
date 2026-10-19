@@ -83,7 +83,7 @@ impl UseTarget {
                 .snapshot
                 .artifact_ticks
                 .iter()
-                .find(|tick| tick.artifact_id == id)
+                .find(|tick| tickloop_agent_artifacts::artifact_ids_match(&tick.artifact_id, &id))
                 .and_then(|tick| InstanceRef::artifact(&tick.origin, &tick.artifact_id).ok()),
         }
     }

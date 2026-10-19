@@ -2550,7 +2550,10 @@ impl Agent {
                         !source.resume_required
                             && source.origin == identity.origin
                             && source.account_id == identity.account_id
-                            && source.artifact_id == identity.artifact_id
+                            && tickloop_agent_artifacts::artifact_ids_match(
+                                &source.artifact_id,
+                                &identity.artifact_id,
+                            )
                     })
             })
         {

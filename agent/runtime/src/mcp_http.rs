@@ -35,6 +35,7 @@ pub(crate) struct McpHttpClient {
     endpoint: Url,
     token: Arc<str>,
     unauthorized: Arc<AtomicBool>,
+    artifact: Option<tickloop_agent_artifacts::ArtifactClient>,
 }
 
 impl McpHttpClient {
@@ -49,7 +50,38 @@ impl McpHttpClient {
             endpoint,
             token: token.into(),
             unauthorized: Arc::new(AtomicBool::new(false)),
+            artifact: None,
         })
+    }
+
+    pub(crate) fn with_artifact_credentials(
+        mut self,
+        artifact: tickloop_agent_artifacts::ArtifactClient,
+    ) -> Self {
+        self.artifact = artifact.is_host_managed().then_some(artifact);
+        self
+    }
+
+    async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, StreamableHttpError<reqwest::Error>> {
+        let Some(artifact) = &self.artifact else {
+            return request.send().await.map_err(StreamableHttpError::Client);
+        };
+        let credential = artifact
+            .access_snapshot()
+            .await
+            .map_err(|_| unexpected("MCP credential unavailable"))?
+            .ok_or_else(|| unexpected("MCP credential unavailable"))?;
+        match artifact.send_authenticated(request, &credential).await {
+            Ok(response) => Ok(response),
+            Err(tickloop_agent_artifacts::ArtifactError::AccessDenied) => {
+                self.unauthorized.store(true, Ordering::SeqCst);
+                Err(unexpected("MCP authorization rejected (HTTP 401)"))
+            }
+            Err(_) => Err(unexpected("MCP request failed")),
+        }
     }
 
     pub(crate) fn unauthorized(&self) -> bool {
@@ -192,11 +224,7 @@ impl StreamableHttpClient for McpHttpClient {
         if let Some(session_id) = session_id {
             request = request.header("Mcp-Session-Id", session_id.as_ref());
         }
-        let response = request
-            .json(&message)
-            .send()
-            .await
-            .map_err(StreamableHttpError::Client)?;
+        let response = self.send(request.json(&message)).await?;
         self.verify_status(response.status())?;
         if matches!(
             response.status(),
@@ -279,7 +307,7 @@ impl StreamableHttpClient for McpHttpClient {
         if let Some(last_event_id) = last_event_id {
             request = request.header("Last-Event-ID", last_event_id);
         }
-        let response = request.send().await.map_err(StreamableHttpError::Client)?;
+        let response = self.send(request).await?;
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             return Err(StreamableHttpError::ServerDoesNotSupportSse);
         }
@@ -303,11 +331,11 @@ impl StreamableHttpClient for McpHttpClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
         let response = self
-            .request(Method::DELETE, &uri, auth_header, custom_headers)?
-            .header("Mcp-Session-Id", session_id.as_ref())
-            .send()
-            .await
-            .map_err(StreamableHttpError::Client)?;
+            .send(
+                self.request(Method::DELETE, &uri, auth_header, custom_headers)?
+                    .header("Mcp-Session-Id", session_id.as_ref()),
+            )
+            .await?;
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
             return Ok(());
         }
