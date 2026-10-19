@@ -128,6 +128,7 @@ async fn a_scheduled_loop_in_a_background_chat_keeps_running_and_writes_only_to_
                 schedule: Some(tickloop_agent_protocol::Recurrence::parse("every 1s").unwrap()),
                 armed_at_ms: None,
                 last_fired_at_ms: None,
+                confirmation: None,
                 expires_at_ms: None,
                 accepts_events: false,
                 armed: true,

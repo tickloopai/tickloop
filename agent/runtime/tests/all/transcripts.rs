@@ -549,6 +549,7 @@ async fn restored_loops_are_interrupted_and_triggers_disarmed() {
                 schedule: Some(tickloop_agent_protocol::Recurrence::parse("every 1h").unwrap()),
                 armed_at_ms: None,
                 last_fired_at_ms: None,
+                confirmation: None,
                 expires_at_ms: None,
                 accepts_events: false,
                 armed: true,

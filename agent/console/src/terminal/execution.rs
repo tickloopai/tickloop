@@ -2323,6 +2323,7 @@ impl ConsoleExecution {
                 configuration.execution_mode,
                 &[],
                 &[],
+                &[],
             ),
             working_directory: project.clone(),
             additional_directories: configuration.additional_directories,

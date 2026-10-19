@@ -130,6 +130,7 @@ impl AgentAccess for ActivityAccess {
                         schedule: None,
                         armed_at_ms: None,
                         last_fired_at_ms: None,
+                        confirmation: None,
                         expires_at_ms: None,
                         accepts_events: true,
                         armed: true,

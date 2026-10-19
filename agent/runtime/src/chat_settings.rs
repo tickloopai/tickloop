@@ -66,24 +66,10 @@ impl Agent {
         (client, output_style)
     }
 
-    /// Puts the host's rules into `policy` as they are now, in place of any copy it holds.
+    /// Fills in the host's rules as they are now: a policy never records them, so every policy
+    /// built or loaded gets them here.
     pub(super) fn apply_host_rules(&self, policy: &mut tickloop_agent_protocol::PermissionPolicy) {
-        self.strip_host_rules(policy);
-        policy
-            .rules
-            .extend(self.inner.host_rules.iter().map(|rule| PermissionRule {
-                persistent: false,
-                ..rule.clone()
-            }));
-    }
-
-    /// Takes the host's rules out of `policy`, which is about to be recorded: they are host
-    /// configuration that every load applies as it then is, never a grant to keep.
-    pub(super) fn strip_host_rules(&self, policy: &mut tickloop_agent_protocol::PermissionPolicy) {
-        let host_rules = &self.inner.host_rules;
-        policy
-            .rules
-            .retain(|rule| !host_rules.iter().any(|host_rule| host_rule.id == rule.id));
+        policy.host_rules = self.inner.host_rules.clone();
     }
 
     pub(super) fn apply_new_chat_settings(

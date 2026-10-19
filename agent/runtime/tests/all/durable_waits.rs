@@ -55,14 +55,21 @@ fn options(waits: WaitHosting) -> HarnessOptions {
             prompt_policy: PromptPolicy::DenyOnPrompt,
             ..AgentHostOptions::product_defaults()
         },
-        tools: ToolPolicy {
-            questions: true,
-            ..ToolPolicy::web_fetch_only()
+        tools: match waits {
+            WaitHosting::Durable => ToolPolicy {
+                questions: true,
+                ..ToolPolicy::web_fetch_only()
+            },
+            // Nothing of a Chat without a Folder outlives a process that keeps its waits: such a
+            // harness only loads what a durable one wrote.
+            WaitHosting::Process => ToolPolicy::web_fetch_only(),
         },
         host_rules: Vec::new(),
         task_tools: None,
         min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
         waits,
+        system_prompt_addition: None,
+        request_gates: Vec::new(),
     }
 }
 
@@ -556,7 +563,8 @@ async fn a_prompt_sent_now_interrupts_a_rebuilt_question_as_it_does_the_asking_r
 async fn a_worker_restarted_mid_question_ends_it_as_a_lost_host_as_before() {
     let store = Arc::new(InMemoryTranscriptStore::new());
     let model = Arc::new(ScriptedModel::new(vec![asks()]));
-    let worker = harness(store.clone(), model, WaitHosting::Process);
+    // Waits are recorded alike under either hosting; only the load differs.
+    let worker = harness(store.clone(), model, WaitHosting::Durable);
     let chat = worker.create_chat_without_folder().await.unwrap();
     let mut events = worker.subscribe();
     let turn = worker

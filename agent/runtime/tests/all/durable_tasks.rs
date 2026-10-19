@@ -37,6 +37,8 @@ fn options(task_tools: Option<bool>, waits: WaitHosting) -> HarnessOptions {
         task_tools,
         min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
         waits,
+        system_prompt_addition: None,
+        request_gates: Vec::new(),
     }
 }
 
@@ -181,13 +183,19 @@ fn harness(
     task_tools: bool,
     waits: WaitHosting,
 ) -> Agent {
+    let mut options = options(Some(task_tools), waits);
+    // Nothing of a Chat without a Folder outlives a process that keeps its waits: such a
+    // harness only loads what a durable one wrote.
+    if waits == WaitHosting::Process {
+        options.tools = ToolPolicy::web_fetch_only();
+    }
     Agent::with_seams(
         HarnessSeams {
             transcripts: Some(store),
             environment: None,
             models: ChosenModels::new(model),
         },
-        options(Some(task_tools), waits),
+        options,
     )
     .unwrap()
 }
@@ -259,7 +267,7 @@ async fn durable_reload_preserves_claim_board_and_receipts_and_disabled_owner_ca
 async fn process_reload_keeps_existing_needs_attention_behavior() {
     let store = Arc::new(InMemoryTranscriptStore::new());
     let model = claiming_model();
-    let agent = harness(store.clone(), model.clone(), true, WaitHosting::Process);
+    let agent = harness(store.clone(), model.clone(), true, WaitHosting::Durable);
     let chat = agent.create_chat_without_folder().await.unwrap();
     let turn = agent.advance(chat, prompt()).await.unwrap();
     assert!(matches!(

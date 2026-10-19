@@ -20,8 +20,9 @@ mod handback;
 mod harness;
 pub use harness::{
     DeliveryBinding, HarnessOptions, HarnessSeams, LOCAL_MIN_SCHEDULE_INTERVAL, PersonWait,
-    PersonWaitKind, Quiescence, ToolPolicy, WaitHosting, Waits,
+    PersonWaitKind, Quiescence, ToolPolicy, WaitHosting, Waits, durable_chat_host_rules,
 };
+pub use triggers::ScheduleDecision;
 mod host_context;
 mod host_notes;
 pub mod host_tools;
@@ -371,6 +372,10 @@ struct Inner {
     environment: Option<Arc<dyn environment::ExecutionEnvironment>>,
     tool_policy: ToolPolicy,
     host_rules: Vec<PermissionRule>,
+    /// The host's own section of every conversation's system prompt.
+    system_prompt_addition: Option<String>,
+    /// The permits each request to a model's vendor takes, in order.
+    request_gates: Vec<Arc<tokio::sync::Semaphore>>,
     /// Where every Chat's shell commands run: the Tickhost.
     shells: Arc<crate::hosted::shells::ShellTasks>,
     stopped_child_hook: std::sync::RwLock<Option<Arc<dyn StoppedChildHook>>>,
@@ -623,19 +628,27 @@ fn permission_denial_message(comment: Option<&str>) -> String {
 }
 
 fn host_tool_decision(
-    configured: Option<Decision>,
+    configured: Option<tickloop_agent_tools::permissions::ExplicitRuleMatch>,
     host_permission: Option<crate::host_tools::HostToolPermission>,
     execution_mode: ExecutionMode,
     has_human_input: bool,
 ) -> Decision {
+    let is_allowed_by_host = configured.is_some_and(|matched| {
+        matched.decision == tickloop_agent_tools::permissions::ExplicitPermissionDecision::Allow
+            && matched.source == tickloop_agent_tools::permissions::RuleSource::Host
+    });
+    let configured = configured.map(|matched| Decision::from(matched.decision));
     if let Some(crate::host_tools::HostToolPermission::Classified {
         allow_rule_bypasses_review,
     }) = host_permission
     {
+        // The host's Allow is the host's own decision: no reviewer or person is there to ask.
         return match configured {
             Some(Decision::Deny) => Decision::Deny,
             Some(Decision::Ask) => Decision::Ask,
-            Some(Decision::Allow) if allow_rule_bypasses_review => Decision::Allow,
+            Some(Decision::Allow) if allow_rule_bypasses_review || is_allowed_by_host => {
+                Decision::Allow
+            }
             _ if matches!(execution_mode, ExecutionMode::Auto | ExecutionMode::Plan) => {
                 Decision::Check
             }
@@ -794,6 +807,8 @@ fn local_options(
         task_tools: None,
         min_schedule_interval: LOCAL_MIN_SCHEDULE_INTERVAL,
         waits: WaitHosting::Process,
+        system_prompt_addition: None,
+        request_gates: Vec::new(),
     }
 }
 
@@ -1779,6 +1794,8 @@ impl Agent {
             task_tools,
             min_schedule_interval,
             waits,
+            system_prompt_addition,
+            request_gates,
         } = options;
         let model = tickloop_agent_model::cards::model_for_persistent_selection(model);
         let config_root = settings
@@ -1842,6 +1859,8 @@ impl Agent {
                 environment,
                 tool_policy,
                 host_rules,
+                system_prompt_addition,
+                request_gates,
                 stopped_child_hook: std::sync::RwLock::new(None),
                 tick_stream_installed: AtomicBool::new(false),
                 tick_deliveries: std::sync::Mutex::new(
@@ -2971,6 +2990,9 @@ impl Agent {
             let scope = system_prompt::PromptScope {
                 has_folder: chat.snapshot.folder.is_some(),
                 tools: self.inner.tool_policy,
+                waits: self.inner.waits,
+                min_schedule_interval: self.inner.min_schedule_interval,
+                host_section: self.inner.system_prompt_addition.as_deref(),
             };
             let family_temp = chat.tools.family_temp_directory();
             let state = match &chat.snapshot.folder {

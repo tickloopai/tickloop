@@ -164,6 +164,8 @@ fn agent(store: Arc<dyn TranscriptStore>, model: Arc<dyn ModelClient>) -> Agent 
             task_tools: None,
             min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits: tickloop_agent_runtime::WaitHosting::Process,
+            system_prompt_addition: None,
+            request_gates: Vec::new(),
         },
     )
     .unwrap()
@@ -1345,6 +1347,7 @@ async fn an_input_queued_on_an_expiring_loop_settles_discarded_loop_ended() {
                 schedule: None,
                 armed_at_ms: None,
                 last_fired_at_ms: None,
+                confirmation: None,
                 expires_at_ms: Some(now + lifetime.as_millis() as u64),
                 accepts_events: true,
                 armed: true,

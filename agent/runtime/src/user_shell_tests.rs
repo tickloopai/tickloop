@@ -140,6 +140,7 @@ async fn restart_discards_a_stale_trigger_input_and_a_resumed_schedule_ticks_aga
         schedule: Some(tickloop_agent_protocol::Recurrence::parse("every 1s").unwrap()),
         armed_at_ms: None,
         last_fired_at_ms: None,
+        confirmation: None,
         expires_at_ms: None,
         accepts_events: false,
         armed: true,

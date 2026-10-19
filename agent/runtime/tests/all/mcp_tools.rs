@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use tickloop_agent_test_support::{ScriptedModel, call, config, text};
 
 #[path = "support/artifact_service.rs"]
-mod artifact_service;
+pub(super) mod artifact_service;
 use artifact_service::{ArtifactService, CREATED_ARTIFACT};
 
 const WAIT: Duration = Duration::from_secs(25);

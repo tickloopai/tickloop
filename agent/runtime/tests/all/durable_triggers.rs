@@ -16,7 +16,7 @@ use tickloop_agent_protocol::{
 use tickloop_agent_runtime::transcript::{StorePosition, TranscriptStore};
 use tickloop_agent_runtime::{
     Agent, Delivery, HarnessOptions, HarnessSeams, ParentSelection, QuestionReply, Quiescence,
-    ToolPolicy, TurnOp, TurnRequest, WaitHosting,
+    ScheduleDecision, ToolPolicy, TurnOp, TurnRequest, WaitHosting,
 };
 use tickloop_agent_test_support::harness::ChosenModels;
 use tickloop_agent_test_support::transcripts::InMemoryTranscriptStore;
@@ -30,7 +30,11 @@ const HOUR_MS: u64 = 3_600_000;
 const MINUTE_MS: u64 = 60_000;
 const CHECK: &str = "scheduled check";
 
-fn harness(store: Arc<dyn TranscriptStore>, model: Arc<Script>, floor: Duration) -> Agent {
+pub(super) fn harness(
+    store: Arc<dyn TranscriptStore>,
+    model: Arc<Script>,
+    floor: Duration,
+) -> Agent {
     Agent::with_seams(
         HarnessSeams {
             transcripts: Some(store),
@@ -53,12 +57,14 @@ fn harness(store: Arc<dyn TranscriptStore>, model: Arc<Script>, floor: Duration)
             task_tools: None,
             min_schedule_interval: floor,
             waits: WaitHosting::Durable,
+            system_prompt_addition: None,
+            request_gates: Vec::new(),
         },
     )
     .unwrap()
 }
 
-fn durable(store: Arc<dyn TranscriptStore>, model: Arc<Script>) -> Agent {
+pub(super) fn durable(store: Arc<dyn TranscriptStore>, model: Arc<Script>) -> Agent {
     harness(
         store,
         model,
@@ -66,7 +72,7 @@ fn durable(store: Arc<dyn TranscriptStore>, model: Arc<Script>) -> Agent {
     )
 }
 
-fn every(text: &str) -> Trigger {
+pub(super) fn every(text: &str) -> Trigger {
     Trigger {
         id: Uuid::new_v4(),
         prompt: CHECK.into(),
@@ -77,20 +83,21 @@ fn every(text: &str) -> Trigger {
         armed: true,
         armed_at_ms: None,
         last_fired_at_ms: None,
+        confirmation: None,
         subscriptions: Vec::new(),
     }
 }
 
-fn milliseconds(time: SystemTime) -> u64 {
+pub(super) fn milliseconds(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
-fn time(milliseconds: u64) -> SystemTime {
+pub(super) fn time(milliseconds: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(milliseconds)
 }
 
 /// A Chat whose first goal has completed, and that goal's Loop.
-async fn chat_with_goal(agent: &Agent) -> (ChatId, LoopId) {
+pub(super) async fn chat_with_goal(agent: &Agent) -> (ChatId, LoopId) {
     let chat = agent.create_chat_without_folder().await.unwrap();
     let request = prompt("watch the feed", ParentSelection::CurrentLeaf);
     let turn = agent.advance(chat, request.clone()).await.unwrap();
@@ -101,7 +108,7 @@ async fn chat_with_goal(agent: &Agent) -> (ChatId, LoopId) {
     (chat, turn.receipt().loop_id)
 }
 
-async fn trigger_of(agent: &Agent, chat: ChatId, loop_id: LoopId) -> Trigger {
+pub(super) async fn trigger_of(agent: &Agent, chat: ChatId, loop_id: LoopId) -> Trigger {
     agent
         .snapshot(chat)
         .await
@@ -114,7 +121,7 @@ async fn trigger_of(agent: &Agent, chat: ChatId, loop_id: LoopId) -> Trigger {
         .unwrap()
 }
 
-async fn loop_state(agent: &Agent, chat: ChatId, loop_id: LoopId) -> LoopState {
+pub(super) async fn loop_state(agent: &Agent, chat: ChatId, loop_id: LoopId) -> LoopState {
     agent
         .snapshot(chat)
         .await
@@ -126,7 +133,7 @@ async fn loop_state(agent: &Agent, chat: ChatId, loop_id: LoopId) -> LoopState {
         .state
 }
 
-async fn wake_at(agent: &Agent, chat: ChatId) -> Option<u64> {
+pub(super) async fn wake_at(agent: &Agent, chat: ChatId) -> Option<u64> {
     match agent.quiesce(chat).await {
         Quiescence::Waiting(waits) => waits.wake_at.map(milliseconds),
         Quiescence::Idle => None,
@@ -181,7 +188,7 @@ fn earlier_by(
 
 /// How many model requests the Trigger's fires made: each carries its prompt once, and a second
 /// fire's request would carry it twice.
-fn checks(model: &Script) -> usize {
+pub(super) fn checks(model: &Script) -> usize {
     model
         .requests()
         .iter()
@@ -189,7 +196,7 @@ fn checks(model: &Script) -> usize {
         .count()
 }
 
-async fn until_settled(agent: &Agent, chat: ChatId, input: Uuid) -> SettledOutcome {
+pub(super) async fn until_settled(agent: &Agent, chat: ChatId, input: Uuid) -> SettledOutcome {
     tokio::time::timeout(WAIT, settled(agent, chat, input))
         .await
         .expect("the fire settles")
@@ -464,7 +471,7 @@ async fn a_loop_waiting_on_a_question_expires_when_its_deadline_comes() {
     next.shutdown().await;
 }
 
-fn start_goal(schedule: &str) -> Step {
+pub(super) fn start_goal(schedule: &str) -> Step {
     Step::Reply(call(
         "goal",
         tickloop_agent_tools::START_GOAL_TOOL_NAME,
@@ -472,8 +479,9 @@ fn start_goal(schedule: &str) -> Step {
     ))
 }
 
-/// StartGoal with a schedule registers a Loop that waits for its first time instead of running
-/// now; the scheduler's wake at that time runs it on another instance.
+/// StartGoal with a schedule registers a Loop that waits for the user's confirmation and then
+/// for its first time instead of running now; the scheduler's wake at that time runs it on
+/// another instance.
 #[tokio::test]
 async fn start_goal_with_a_schedule_waits_for_its_first_time() {
     let store = Arc::new(InMemoryTranscriptStore::new());
@@ -491,22 +499,29 @@ async fn start_goal_with_a_schedule_waits_for_its_first_time() {
     until_settled(&first, chat, request.input_id).await;
     let snapshot = first.snapshot(chat).await.unwrap();
     assert_eq!(snapshot.loops.len(), 2);
-    let scheduled = &snapshot.loops[1];
+    let scheduled = snapshot.loops[1].clone();
     assert_eq!(scheduled.state, LoopState::WaitingTrigger);
     assert_eq!(scheduled.run_id, None);
-    let trigger = scheduled.trigger.clone().unwrap();
-    assert!(trigger.armed);
-    assert_eq!(trigger.prompt, "Summarize the news.");
-    assert_eq!(trigger.schedule.unwrap().to_string(), "every 1h");
-    let first_time = trigger.armed_at_ms.unwrap() + HOUR_MS;
+    let pending = scheduled.trigger.clone().unwrap();
+    assert!(pending.awaits_confirmation());
+    assert!(!pending.armed);
     let requests = model.requests();
     assert_eq!(requests.len(), 2);
     assert!(
-        requests[1].contains(r#"\"state\":\"scheduled\""#),
+        requests[1].contains(r#"\"state\":\"awaiting_user_confirmation\""#),
         "{}",
         requests[1]
     );
     assert!(requests[1].contains(r#"\"schedule\":\"every 1h\""#));
+    first
+        .decide_schedule(chat, scheduled.id, ScheduleDecision::Confirm)
+        .await
+        .unwrap();
+    let trigger = trigger_of(&first, chat, scheduled.id).await;
+    assert!(trigger.armed);
+    assert_eq!(trigger.prompt, "Summarize the news.");
+    assert_eq!(trigger.schedule.unwrap().to_string(), "every 1h");
+    let first_time = trigger.armed_at_ms.unwrap() + HOUR_MS;
     assert_eq!(wake_at(&first, chat).await, Some(first_time));
     first.sync().await.unwrap();
     first.shutdown().await;
@@ -602,7 +617,7 @@ async fn a_start_goal_whose_result_was_lost_is_settled_by_the_loop_it_registered
     let requests = model.requests();
     assert_eq!(requests.len(), 1);
     assert!(
-        requests[0].contains(r#"\"state\":\"scheduled\""#),
+        requests[0].contains(r#"\"state\":\"awaiting_user_confirmation\""#),
         "{}",
         requests[0]
     );

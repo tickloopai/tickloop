@@ -396,6 +396,7 @@ fn view_from_snapshot(
         snapshot.policy.mode,
         &snapshot.policy.project_constraints,
         &snapshot.policy.managed_constraints,
+        &snapshot.policy.host_rules,
     );
     PermissionsView {
         chat_id: snapshot.id,

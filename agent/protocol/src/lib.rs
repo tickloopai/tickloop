@@ -130,8 +130,8 @@ pub use local_messages::{
     SubagentReportMessage, TaskNotification, TaskNotificationStatus, TickDeliveryLine,
 };
 pub use loops::{
-    EventSourceBinding, LoopSnapshot, LoopState, LoopTriggerNotice, LoopTriggerNoticeKind, Trigger,
-    TriggerPromptSource, TriggerSource,
+    EventSourceBinding, LoopSnapshot, LoopState, LoopTriggerNotice, LoopTriggerNoticeKind,
+    ScheduleConfirmation, Trigger, TriggerPromptSource, TriggerSource,
 };
 pub use model::{
     ApiKeyStatus, Content, ImageSource, InputModality, Message, ModelAuthSource, ModelConfig,

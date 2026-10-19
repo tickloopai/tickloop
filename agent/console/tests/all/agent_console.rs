@@ -1156,6 +1156,7 @@ async fn an_armed_waiting_goal_is_not_masked_by_a_later_completed_loop() {
                 schedule: None,
                 armed_at_ms: None,
                 last_fired_at_ms: None,
+                confirmation: None,
                 expires_at_ms: None,
                 accepts_events: true,
                 armed: true,

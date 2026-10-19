@@ -420,6 +420,7 @@ async fn triggers_cannot_bypass_clarification_and_cancelled_answers_cannot_resum
                 schedule: None,
                 armed_at_ms: None,
                 last_fired_at_ms: None,
+                confirmation: None,
                 expires_at_ms: None,
                 accepts_events: true,
                 armed: true,

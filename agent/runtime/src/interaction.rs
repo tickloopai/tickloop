@@ -281,8 +281,17 @@ pub(super) fn definitions(is_delegated: bool) -> Vec<ToolDefinition> {
     }]
 }
 
+/// Whether the call is a StartGoal that creates a schedule.
+pub(crate) fn creates_schedule(name: &str, input: &Value) -> bool {
+    name == START_GOAL_TOOL_NAME
+        && input
+            .get("schedule")
+            .is_some_and(|schedule| !schedule.is_null())
+}
+
 /// What a StartGoal call that registered `goal` returns: the input queued for it, or for a
-/// scheduled goal its schedule and next scheduled time.
+/// scheduled goal its schedule, next scheduled time and expiry, or that it awaits the user's
+/// confirmation.
 pub(crate) fn started_goal_result(
     chat_id: ChatId,
     goal: &LoopSnapshot,
@@ -291,14 +300,21 @@ pub(crate) fn started_goal_result(
     let schedule = goal.trigger.as_ref().and_then(|trigger| trigger.schedule);
     let content = match (schedule, queued_run) {
         (Some(schedule), _) => {
-            let next_run_at = goal
-                .trigger
-                .as_ref()
+            let trigger = goal.trigger.as_ref();
+            let next_run_at = trigger
                 .filter(|trigger| trigger.armed)
                 .and_then(Trigger::next_scheduled_ms)
                 .map(tickloop_agent_base::timestamp::format_timestamp);
-            json!({"chat_id":chat_id,"loop_id":goal.id,"state":"scheduled",
-                "schedule":schedule.to_string(),"next_run_at":next_run_at})
+            let expires_at = trigger
+                .and_then(|trigger| trigger.expires_at_ms)
+                .map(tickloop_agent_base::timestamp::format_timestamp);
+            let state = if trigger.is_some_and(Trigger::awaits_confirmation) {
+                "awaiting_user_confirmation"
+            } else {
+                "scheduled"
+            };
+            json!({"chat_id":chat_id,"loop_id":goal.id,"state":state,
+                "schedule":schedule.to_string(),"next_run_at":next_run_at,"expires_at":expires_at})
         }
         (None, Some(run_id)) => {
             json!({"chat_id":chat_id,"loop_id":goal.id,"run_id":run_id,"state":"queued"})
@@ -445,22 +461,30 @@ impl Agent {
         call_id: &str,
         name: &str,
         input: &Value,
+        was_approved_by_human: bool,
         cancel: CancellationToken,
     ) -> Option<Result<ToolResult, String>> {
         match name {
             ASK_USER_QUESTION_TOOL_NAME => {
                 Some(self.ask_question(receipt, call_id, input, cancel).await)
             }
-            START_GOAL_TOOL_NAME => Some(self.start_goal(receipt, call_id, input, cancel).await),
+            START_GOAL_TOOL_NAME => Some(
+                self.start_goal(receipt, call_id, input, was_approved_by_human, cancel)
+                    .await,
+            ),
             _ => None,
         }
     }
 
+    /// Registers the goal. A schedule it gives expires after the model's schedule lifetime and
+    /// runs only once the user confirms it: the call's approval when a person approved it,
+    /// otherwise a later `decide_schedule`.
     async fn start_goal(
         &self,
         receipt: &Receipt,
         call_id: &str,
         input: &Value,
+        was_approved_by_human: bool,
         cancel: CancellationToken,
     ) -> Result<ToolResult, String> {
         #[derive(Deserialize)]
@@ -530,16 +554,24 @@ impl Agent {
         let now = tickloop_agent_base::private_fs::unix_time_milliseconds();
         let trigger = match schedule {
             Some(schedule) => {
+                if triggers::active_schedules(&chat.snapshot) >= triggers::MAX_ACTIVE_SCHEDULES {
+                    return Err(triggers::too_many_schedules());
+                }
                 let mut trigger = Trigger {
                     id: Uuid::new_v4(),
                     prompt: parsed.goal.clone(),
                     prompt_source: tickloop_agent_protocol::TriggerPromptSource::Explicit,
                     schedule: Some(schedule),
-                    expires_at_ms: None,
+                    expires_at_ms: Some(now.saturating_add(triggers::MODEL_SCHEDULE_LIFETIME_MS)),
                     accepts_events: false,
-                    armed: true,
+                    armed: was_approved_by_human,
                     armed_at_ms: None,
                     last_fired_at_ms: None,
+                    confirmation: Some(if was_approved_by_human {
+                        tickloop_agent_protocol::ScheduleConfirmation::Confirmed { at_ms: now }
+                    } else {
+                        tickloop_agent_protocol::ScheduleConfirmation::Pending
+                    }),
                     subscriptions: Vec::new(),
                 };
                 let armed_at = self.inner.schedule_clock.now_ms();
@@ -548,7 +580,9 @@ impl Agent {
                 {
                     return Err(reason);
                 }
-                trigger.arm_at(armed_at);
+                if trigger.armed {
+                    trigger.arm_at(armed_at);
+                }
                 Some(trigger)
             }
             None => None,
@@ -627,9 +661,14 @@ impl Agent {
             (trigger, cancel)
         });
         drop(chats);
-        if let Some((trigger, cancel)) = timer {
-            self.start_armed_trigger(receipt.chat_id, loop_id, trigger, cancel)
-                .await;
+        match timer {
+            Some((trigger, cancel)) if trigger.armed => {
+                self.start_armed_trigger(receipt.chat_id, loop_id, trigger, cancel)
+                    .await;
+            }
+            // A schedule awaiting confirmation keeps only its deadline.
+            Some((trigger, cancel)) => self.trigger_task(receipt.chat_id, loop_id, trigger, cancel),
+            None => {}
         }
         Ok(result)
     }

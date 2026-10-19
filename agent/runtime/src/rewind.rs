@@ -941,6 +941,7 @@ mod tests {
                     schedule: Some(tickloop_agent_protocol::Recurrence::parse("every 1s").unwrap()),
                     armed_at_ms: None,
                     last_fired_at_ms: None,
+                    confirmation: None,
                     expires_at_ms: None,
                     accepts_events: false,
                     armed: true,

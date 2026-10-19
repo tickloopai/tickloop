@@ -1,6 +1,6 @@
 //! Name-based ids of the inputs the Agent queues for itself, and of the Loops its calls
-//! register. The same source names the same id on every host, so a repeated delivery finds the
-//! input's ledger record and a load finds what a call registered.
+//! register, and of the host's own rules. The same source names the same id on every host, so a
+//! repeated delivery finds the input's ledger record and a load finds what a call registered.
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -10,6 +10,7 @@ const FEEDBACK: &str = "tickloop.input.feedback";
 const FAMILY_MESSAGE: &str = "tickloop.input.family-message";
 const GOAL: &str = "tickloop.input.goal";
 const STARTED_GOAL: &str = "tickloop.loop.started-goal";
+const HOST_RULE: &str = "tickloop.host-rule";
 
 /// The id named by `parts` within `namespace`, laid out as a name-based UUID.
 fn named(namespace: &str, parts: &[&[u8]]) -> Uuid {
@@ -63,6 +64,11 @@ pub fn started_goal(chat: Uuid, response: Uuid, call_id: &str) -> Uuid {
 /// The goal a StartGoal call registered as the Loop `loop_id`.
 pub fn goal(loop_id: Uuid) -> Uuid {
     named(GOAL, &[loop_id.as_bytes()])
+}
+
+/// The fixed id of a host rule that allows `tool`, the same on every host.
+pub fn host_rule(tool: &str) -> Uuid {
+    named(HOST_RULE, &[tool.as_bytes()])
 }
 
 #[cfg(test)]

@@ -837,6 +837,8 @@ mod tests {
                 task_tools: None,
                 min_schedule_interval: crate::LOCAL_MIN_SCHEDULE_INTERVAL,
                 waits: crate::WaitHosting::Process,
+                system_prompt_addition: None,
+                request_gates: Vec::new(),
             },
         )
         .unwrap();

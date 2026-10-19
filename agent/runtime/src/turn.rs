@@ -569,7 +569,7 @@ impl Agent {
         }))
     }
 
-    fn refuse_when_closed(&self) -> Result<(), AgentError> {
+    pub(crate) fn refuse_when_closed(&self) -> Result<(), AgentError> {
         match self.inner.closed.load(std::sync::atomic::Ordering::SeqCst) {
             true => Err(AgentError::Invalid("agent host has shut down".into())),
             false => Ok(()),
@@ -611,7 +611,7 @@ impl Agent {
     }
 
     /// Loads a saved Chat this instance does not hold yet.
-    async fn make_resident(&self, chat_id: ChatId) -> Result<(), AgentError> {
+    pub(crate) async fn make_resident(&self, chat_id: ChatId) -> Result<(), AgentError> {
         if self.inner.chats.lock().await.contains_key(&chat_id) {
             return Ok(());
         }

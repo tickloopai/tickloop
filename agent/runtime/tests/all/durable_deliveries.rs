@@ -413,6 +413,8 @@ fn family_harness(store: Arc<dyn TranscriptStore>, model: Arc<RoutedModel>) -> A
             task_tools: None,
             min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits: WaitHosting::Durable,
+            system_prompt_addition: None,
+            request_gates: Vec::new(),
         },
     )
     .unwrap()

@@ -115,6 +115,7 @@ async fn live_deepseek_interval_reuses_the_goal_and_stops_future_execution() {
             schedule:Some(tickloop_agent_protocol::Recurrence::parse(&format!("every {INTERVAL_SECONDS}s")).unwrap()),
             armed_at_ms:None,
             last_fired_at_ms:None,
+            confirmation: None,
             expires_at_ms:None,
             accepts_events:false,
             armed:true,

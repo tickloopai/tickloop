@@ -34,12 +34,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
-use tickloop_agent_protocol::{ChatId, Event};
+use tickloop_agent_protocol::{ChatId, Event, LoopId};
 use tickloop_agent_runtime::transcript::{
     AppendAck, AppendBatch, BatchId, ChatPlacement, LoadRange, StorePosition, StoredTranscript,
     TranscriptError, TranscriptStore,
 };
-use tickloop_agent_runtime::{Agent, AgentError, Quiescence, TurnOutcome, TurnRequest, Waits};
+use tickloop_agent_runtime::{
+    Agent, AgentError, Quiescence, ScheduleDecision, TurnOutcome, TurnRequest, Waits,
+};
 use tickloop_agent_transcript::Line;
 use tokio::sync::{Notify, broadcast, watch};
 use tokio::task::JoinHandle;
@@ -431,6 +433,13 @@ enum Task {
     },
     /// The scheduler's wake of the family for the time it was asked to come back at.
     Wake { due_at: Option<SystemTime> },
+    /// The user's answer to a schedule the model created in a Loop of the family member
+    /// `member`, or of the root Chat.
+    DecideSchedule {
+        member: Option<ChatId>,
+        loop_id: LoopId,
+        decision: ScheduleDecision,
+    },
 }
 
 /// What one holding of the lease did with its task.
@@ -615,6 +624,26 @@ impl Holding {
         self.hold(task, Task::Wake { due_at }).await
     }
 
+    /// Steps 2 to 8 for the user's task `task` that confirms or rejects the schedule the model
+    /// created for the Loop `loop_id` of the family member `member`, or of the root Chat.
+    pub async fn decide_schedule(
+        &self,
+        task: Uuid,
+        member: Option<ChatId>,
+        loop_id: LoopId,
+        decision: ScheduleDecision,
+    ) -> TurnReport {
+        self.hold(
+            task,
+            Task::DecideSchedule {
+                member,
+                loop_id,
+                decision,
+            },
+        )
+        .await
+    }
+
     async fn hold(&self, input: Uuid, task: Task) -> TurnReport {
         let lease = self.shared.lease.clone();
         let mut report = TurnReport {
@@ -751,6 +780,17 @@ impl Holding {
                     .await?
                     .map_err(|error| self.agent_failure(error))?;
                 (chat, None)
+            }
+            Task::DecideSchedule {
+                member,
+                loop_id,
+                decision,
+            } => {
+                let target = member.unwrap_or(chat);
+                self.until_halted(agent.decide_schedule(target, loop_id, decision))
+                    .await?
+                    .map_err(|error| self.agent_failure(error))?;
+                (target, None)
             }
         };
         if let Quiescence::Waiting(waits) = self.until_halted(agent.quiesce(target)).await? {

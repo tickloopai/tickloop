@@ -102,5 +102,9 @@ pub struct PermissionPolicy {
     pub project_constraints: Vec<PermissionRule>,
     #[serde(default)]
     pub managed_constraints: Vec<PermissionRule>,
+    /// The rules the host imposes on every Chat, as it has them now: filled in wherever a policy
+    /// is built or loaded and never recorded, so no record can carry or forge one.
+    #[serde(skip)]
+    pub host_rules: Vec<PermissionRule>,
     pub revision: u64,
 }

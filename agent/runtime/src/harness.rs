@@ -10,7 +10,8 @@ use std::{
 use tickloop_agent_base::network::Reach;
 use tickloop_agent_model::{ModelClient, ModelClients, ModelError};
 use tickloop_agent_protocol::{
-    AgentHostOptions, ChatId, LoopId, LoopState, ModelConfig, PermissionRule, UserShellState,
+    AgentHostOptions, ChatId, Decision, LoopId, LoopState, ModelConfig, PermissionRule,
+    PromptPolicy, UserShellState,
 };
 
 use uuid::Uuid;
@@ -52,6 +53,13 @@ pub struct HarnessOptions {
     /// more often is refused.
     pub min_schedule_interval: Duration,
     pub waits: WaitHosting,
+    /// Instructions the host adds to every conversation's system prompt, as a section of their
+    /// own after the Output Style; `None` adds nothing.
+    pub system_prompt_addition: Option<String>,
+    /// The permits a request to a model's vendor takes, one of each gate in order, such as one
+    /// gate per holding and one per node; it holds them for that single request and its stream
+    /// alone. Empty for a local Agent.
+    pub request_gates: Vec<Arc<tokio::sync::Semaphore>>,
 }
 
 /// A local Agent's floor for Trigger schedules: runs one second apart, as local timers always
@@ -78,7 +86,7 @@ pub struct ToolPolicy {
     pub web_fetch: bool,
     pub web_search: bool,
     pub skills: bool,
-    /// EnterPlanMode, ExitPlanMode and TodoWrite.
+    /// EnterPlanMode and ExitPlanMode.
     pub plan: bool,
     /// AskUserQuestion.
     pub questions: bool,
@@ -116,6 +124,35 @@ impl ToolPolicy {
         }
     }
 
+    /// A durable Chat's: WebFetch, questions, Subagents and their messages, Task tools, goals
+    /// with schedules and the host's tools, with waits the Transcript keeps.
+    pub const fn durable_chat() -> Self {
+        Self {
+            web_fetch: true,
+            web_search: false,
+            skills: false,
+            plan: false,
+            questions: true,
+            delegation: true,
+            family_messages: true,
+            tasks: true,
+            goals: true,
+            artifacts: true,
+            tick_subscriptions: false,
+            folderless_reach: Reach::PublicAddresses,
+        }
+    }
+
+    /// Whether a Chat with these tools may wait for a person or keep work past its turn.
+    fn waits_or_outlives_the_turn(&self) -> bool {
+        self.questions
+            || self.delegation
+            || self.family_messages
+            || self.tasks
+            || self.goals
+            || self.artifacts
+    }
+
     /// WebFetch alone: nothing waits for a person, and nothing outlives the turn.
     pub const fn web_fetch_only() -> Self {
         Self {
@@ -133,6 +170,61 @@ impl ToolPolicy {
             folderless_reach: Reach::PublicAddresses,
         }
     }
+}
+
+/// The tools whose calls a durable Chat's host admits by its own rule: under Auto they would
+/// otherwise wait for a reviewer the host does not have.
+const DURABLE_CHAT_ALLOWED_TOOLS: [&str; 7] = [
+    tickloop_agent_tools::WEB_FETCH_TOOL_NAME,
+    tickloop_agent_protocol::SEND_AGENT_MESSAGE_TOOL_NAME,
+    crate::agent_messages::STOP_SUBAGENT_TOOL_NAME,
+    tickloop_agent_protocol::SUBAGENT_TOOL_NAME,
+    crate::mcp_tools::ARTIFACT_READ_TOOL,
+    crate::mcp_tools::ARTIFACT_EDIT_TOOL,
+    crate::mcp_tools::ARTIFACT_COMMENT_TOOL,
+];
+
+/// The host rules of a durable Chat, beside [`ToolPolicy::durable_chat`]: each allows one of
+/// its tools whose calls Auto would otherwise review. Their ids are fixed, so every host has the
+/// same rules.
+pub fn durable_chat_host_rules() -> Vec<PermissionRule> {
+    DURABLE_CHAT_ALLOWED_TOOLS
+        .iter()
+        .map(|tool| PermissionRule {
+            id: tickloop_agent_transcript::input_ids::host_rule(tool),
+            decision: Decision::Allow,
+            tool: (*tool).into(),
+            specifier: None,
+            input: None,
+            loop_id: None,
+            persistent: false,
+        })
+        .collect()
+}
+
+/// Why the host's composition cannot keep its promises, or `None` when it can.
+fn invalid_composition(has_environment: bool, options: &HarnessOptions) -> Option<&'static str> {
+    let tools = &options.tools;
+    let durable = options.waits == WaitHosting::Durable;
+    if !has_environment
+        && options.waits == WaitHosting::Process
+        && tools.waits_or_outlives_the_turn()
+    {
+        return Some(
+            "Chats without a Folder that ask questions, delegate, keep tasks or goals, or use the \
+             host's tools need durable waits",
+        );
+    }
+    if durable && tools.tick_subscriptions {
+        return Some("durable waits offer no Tick Subscriptions");
+    }
+    if durable && !has_environment && tools.plan {
+        return Some("durable Chats without a Folder have no plan mode");
+    }
+    if durable && options.host.prompt_policy != PromptPolicy::DenyOnPrompt {
+        return Some("durable waits need a host that denies what would prompt");
+    }
+    None
 }
 
 /// Serves one client for every model the Chats select, so a model switch keeps it: the legacy
@@ -183,7 +275,8 @@ pub struct DeliveryBinding {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PersonWait {
     pub chat: ChatId,
-    /// The question's or permission's request id, or the user shell's operation id.
+    /// The question's or permission's request id, the user shell's operation id, or the Loop id
+    /// of a schedule that waits for confirmation.
     pub request: Uuid,
     pub kind: PersonWaitKind,
 }
@@ -191,6 +284,9 @@ pub struct PersonWait {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersonWaitKind {
     Question,
+    /// A schedule the model created waits for the user to confirm it; the request is its Loop's
+    /// id.
+    Schedule,
     /// Waits in this process only.
     Permission,
     /// Waits in this process only.
@@ -205,6 +301,9 @@ impl Agent {
             return Err(AgentError::Invalid(
                 "Chats without a Folder read no local user settings".into(),
             ));
+        }
+        if let Some(reason) = invalid_composition(seams.environment.is_some(), &options) {
+            return Err(AgentError::Invalid(reason.into()));
         }
         let client = seams.models.client(
             &tickloop_agent_model::cards::model_for_persistent_selection(options.model.clone()),
@@ -403,8 +502,27 @@ fn waits_of(chat: ChatId, snapshot: &tickloop_agent_protocol::ChatSnapshot) -> W
             request: record.id,
             kind: PersonWaitKind::UserShell,
         });
+    let schedules = snapshot
+        .loops
+        .iter()
+        .filter(|goal| {
+            !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
+                && goal
+                    .trigger
+                    .as_ref()
+                    .is_some_and(tickloop_agent_protocol::Trigger::awaits_confirmation)
+        })
+        .map(|goal| PersonWait {
+            chat,
+            request: goal.id,
+            kind: PersonWaitKind::Schedule,
+        });
     Waits {
-        people: questions.chain(permissions).chain(user_shells).collect(),
+        people: questions
+            .chain(permissions)
+            .chain(user_shells)
+            .chain(schedules)
+            .collect(),
         wake_at: None,
         deliveries: Vec::new(),
     }

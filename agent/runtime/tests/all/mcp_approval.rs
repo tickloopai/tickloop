@@ -523,6 +523,7 @@ async fn artifact_creation_from_an_automated_turn_does_not_inherit_the_human_fas
                     schedule: None,
                     armed_at_ms: None,
                     last_fired_at_ms: None,
+                    confirmation: None,
                     expires_at_ms: None,
                     accepts_events: true,
                     armed: true,

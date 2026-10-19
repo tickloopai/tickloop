@@ -514,6 +514,7 @@ async fn conversation_rewind_to_a_triggered_loop_start_removes_the_loop_and_its_
                 schedule: None,
                 armed_at_ms: None,
                 last_fired_at_ms: None,
+                confirmation: None,
                 expires_at_ms: None,
                 accepts_events: true,
                 armed: true,

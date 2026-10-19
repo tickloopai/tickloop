@@ -193,16 +193,23 @@ fn options(waits: WaitHosting) -> HarnessOptions {
             execution_mode_override: Some(ExecutionMode::FullAccess),
             ..AgentHostOptions::product_defaults()
         },
-        tools: ToolPolicy {
-            questions: true,
-            delegation: true,
-            family_messages: true,
-            ..ToolPolicy::web_fetch_only()
+        tools: match waits {
+            WaitHosting::Durable => ToolPolicy {
+                questions: true,
+                delegation: true,
+                family_messages: true,
+                ..ToolPolicy::web_fetch_only()
+            },
+            // Nothing of a Chat without a Folder outlives a process that keeps its waits: such a
+            // harness only loads what a durable one wrote.
+            WaitHosting::Process => ToolPolicy::web_fetch_only(),
         },
         host_rules: Vec::new(),
         task_tools: None,
         min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
         waits,
+        system_prompt_addition: None,
+        request_gates: Vec::new(),
     }
 }
 
@@ -476,7 +483,8 @@ async fn a_foreground_childs_question_suspends_the_family_and_another_instance_f
 async fn a_worker_restarted_during_a_foreground_subagent_ends_it_as_a_lost_host_as_before() {
     let store = Arc::new(InMemoryTranscriptStore::new());
     let model = asking_family();
-    let worker = harness(store.clone(), model, WaitHosting::Process);
+    // Waits are recorded alike under either hosting; only the load differs.
+    let worker = harness(store.clone(), model, WaitHosting::Durable);
     let root = worker.create_chat_without_folder().await.unwrap();
     let turn = worker
         .advance(root, prompt("Prepare the report."))
@@ -903,6 +911,133 @@ async fn a_member_waiting_for_its_children_holds_on_across_instances_without_pol
     )));
 }
 
+/// The cloud's composition: Auto without a reviewer, where a Subagent call is admitted by the
+/// host's rule and a member's report reaches its parent only through SubagentHandback.
+fn cloud_harness(store: Arc<dyn TranscriptStore>, model: Arc<FamilyModel>) -> Agent {
+    Agent::with_seams(
+        HarnessSeams {
+            transcripts: Some(store),
+            environment: None,
+            models: ChosenModels::new(model),
+        },
+        HarnessOptions {
+            host: AgentHostOptions {
+                prompt_policy: PromptPolicy::DenyOnPrompt,
+                ..AgentHostOptions::product_defaults()
+            },
+            host_rules: tickloop_agent_runtime::durable_chat_host_rules(),
+            ..options(WaitHosting::Durable)
+        },
+    )
+    .unwrap()
+}
+
+/// [`nested_family`] where each member hands its report back, as Auto requires: the member's
+/// first SubagentHandback waits there for its leaf, and once the leaf reports it hands back
+/// again with what it read.
+fn handing_back_family() -> Arc<FamilyModel> {
+    FamilyModel::new(|request| match task_of(request).as_deref() {
+        Some("member") if !has_tool_result(request, "leaf") => Reply::Says(call(
+            "leaf",
+            "Subagent",
+            json!({"task": "leaf", "name": "leaf", "run_in_background": true}),
+        )),
+        Some("member") if !has_tool_result(request, "handback") => Reply::Says(call(
+            "handback",
+            "SubagentHandback",
+            json!({"message": "too early"}),
+        )),
+        Some("member")
+            if format!("{:?}", request.messages).contains("leaf report")
+                && !has_tool_result(request, "handback-again") =>
+        {
+            Reply::Says(call(
+                "handback-again",
+                "SubagentHandback",
+                json!({"message": "member report"}),
+            ))
+        }
+        Some("member") => Reply::Says(text("Reported.")),
+        Some("leaf") if !has_tool_result(request, QUESTION_CALL) => Reply::Says(call(
+            QUESTION_CALL,
+            ASK_USER_QUESTION_TOOL_NAME,
+            single_question("Which source?"),
+        )),
+        Some("leaf") if !has_tool_result(request, "leaf-handback") => Reply::Says(call(
+            "leaf-handback",
+            "SubagentHandback",
+            json!({"message": "leaf report"}),
+        )),
+        Some("leaf") => Reply::Says(text("Reported.")),
+        _ if !has_tool_result(request, DELEGATION_CALL) => Reply::Says(call(
+            DELEGATION_CALL,
+            "Subagent",
+            json!({"task": "member", "name": "member"}),
+        )),
+        _ => Reply::Says(text(ROOT_DONE)),
+    })
+}
+
+/// Under the cloud's composition a member's SubagentHandback waits for its own children where it
+/// was called: the wait outlives the instance, another instance resumes it once the leaf
+/// reports, and the member's report reaches the root through the handback.
+#[tokio::test]
+async fn a_handback_waits_for_the_members_children_across_instances_under_the_cloud_composition() {
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let model = handing_back_family();
+    let asking = cloud_harness(store.clone(), model.clone());
+    let root = asking.create_chat_without_folder().await.unwrap();
+    let turn = asking
+        .advance(root, prompt("Prepare the report."))
+        .await
+        .unwrap();
+    let TurnOutcome::Waiting(TurnWait::Member { chat: member, wait }) = outcome(&turn).await else {
+        panic!("the root waits for its member");
+    };
+    let TurnWait::Member { chat: leaf, wait } = *wait else {
+        panic!("the member waits for its leaf");
+    };
+    let TurnWait::Question(request) = *wait else {
+        panic!("the leaf waits for its question");
+    };
+    asking.shutdown().await;
+    asking.sync().await.unwrap();
+    let children_wait = |lines: &[Line]| {
+        lines.iter().rev().find_map(|line| match line {
+            Line::Wait(entry) if matches!(entry.kind, WaitKind::Children { .. }) => {
+                Some((entry.resume.clone(), entry.state.clone()))
+            }
+            _ => None,
+        })
+    };
+    let (resume, state) = children_wait(&store.lines(member)).expect("the member waits");
+    assert_eq!(resume.call_id(), Some("handback"));
+    assert!(matches!(state, WaitState::Open));
+
+    let answering = cloud_harness(store.clone(), model.clone());
+    let reply = answering.advance(leaf, answer(&request)).await.unwrap();
+    assert!(matches!(outcome(&reply).await, TurnOutcome::Merged { .. }));
+    assert!(matches!(
+        settled(&answering, root, turn.input_id()).await,
+        SettledOutcome::Completed { .. }
+    ));
+    let snapshot = answering.snapshot(root).await.unwrap();
+    let result = tool_result(&snapshot.messages, DELEGATION_CALL).unwrap();
+    assert_eq!(
+        result["result"],
+        tickloop_agent_protocol::SUBAGENT_REPORT_RECEIPT
+    );
+    // The report itself arrives as the member's Agent message, the one it handed back after its
+    // leaf reported.
+    let conversation = format!("{:?}", snapshot.messages);
+    assert!(conversation.contains("member report"), "{conversation}");
+    assert!(!conversation.contains("too early"), "{conversation}");
+    answering.shutdown().await;
+    answering.sync().await.unwrap();
+    let (_, state) = children_wait(&store.lines(member)).unwrap();
+    assert!(matches!(state, WaitState::Appended), "{state:?}");
+}
+
 fn host_rule(tool: &str) -> tickloop_agent_protocol::PermissionRule {
     tickloop_agent_protocol::PermissionRule {
         id: Uuid::new_v4(),
@@ -950,12 +1085,15 @@ async fn host_rules_reach_a_child_live_and_are_never_recorded_with_its_delegatio
     let (child, _) = member_question(outcome(&turn).await);
     let rule_ids = |agent_policy: &tickloop_agent_protocol::PermissionPolicy| {
         agent_policy
-            .rules
+            .host_rules
             .iter()
+            .chain(&agent_policy.rules)
             .map(|rule| rule.id)
             .collect::<Vec<_>>()
     };
-    assert!(rule_ids(&asking.snapshot(child).await.unwrap().policy).contains(&first_rule.id));
+    let policy = asking.snapshot(child).await.unwrap().policy;
+    assert!(rule_ids(&policy).contains(&first_rule.id));
+    assert!(!policy.rules.iter().any(|rule| rule.id == first_rule.id));
     asking.shutdown().await;
     asking.sync().await.unwrap();
     let delegation = store

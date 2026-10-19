@@ -404,6 +404,25 @@ impl Agent {
         Ok(())
     }
 
+    /// One permit of each of the host's request gates, taken in order, for a single request to
+    /// a model's vendor and its stream: whoever waits here holds no other permit, so requests
+    /// that wait on each other, such as a compaction's within a Run's, cannot deadlock.
+    pub(super) async fn vendor_request_permits(
+        &self,
+    ) -> Result<Vec<tokio::sync::OwnedSemaphorePermit>, ModelError> {
+        let mut permits = Vec::with_capacity(self.inner.request_gates.len());
+        for gate in &self.inner.request_gates {
+            // A gate the host closed admits no further request.
+            permits.push(
+                gate.clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| ModelError::Cancelled)?,
+            );
+        }
+        Ok(permits)
+    }
+
     pub(super) async fn tracked_model_request(
         &self,
         context: RequestContext,
@@ -665,6 +684,24 @@ impl Agent {
                 .await?;
             return Err(ModelError::Cancelled.into());
         }
+        // Waiting at the host's gates spends none of the request's time.
+        let permits = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(ModelError::Cancelled),
+            permits = self.vendor_request_permits() => permits,
+        };
+        let _permits = match permits {
+            Ok(permits) => permits,
+            Err(error) => {
+                self.finish_model_request(
+                    context.owner.chat_id,
+                    sequence,
+                    RequestOutcome::Cancelled,
+                )
+                .await?;
+                return Err(error.into());
+            }
+        };
         let request_cancel = cancel.child_token();
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let mut progress = RequestProgress::default();
