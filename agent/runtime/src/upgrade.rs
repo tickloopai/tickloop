@@ -523,6 +523,7 @@ impl Agent {
     pub async fn shutdown_for_upgrade(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
         self.inner.shutdown.cancel();
+        self.inner.tasks.abort_all();
         self.inner.tasks.close();
         self.inner.tasks.wait().await;
         self.inner.loop_leases.release_all();

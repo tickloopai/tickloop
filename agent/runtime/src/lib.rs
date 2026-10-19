@@ -1,4 +1,5 @@
 mod agent_messages;
+mod agent_tasks;
 mod approval_assessment;
 pub(crate) mod approval_context;
 mod auto_approval;
@@ -363,7 +364,7 @@ struct Inner {
     user_shell_cancellations: std::sync::Mutex<HashMap<(ChatId, Uuid), CancellationToken>>,
     task_notifications: broadcast::Sender<TaskNotification>,
     /// Every task this instance spawns; `shutdown` waits for all of them.
-    tasks: tokio_util::task::TaskTracker,
+    tasks: agent_tasks::AgentTasks,
     recorder: Option<persistence::ChatRecorder>,
     /// 本进程持有的 Trigger 租约；Inner 释放时随之归还。
     loop_leases: loop_lease::LoopLeases,
@@ -1884,7 +1885,7 @@ impl Agent {
                 user_shell_events: broadcast::channel(256).0,
                 user_shell_cancellations: std::sync::Mutex::new(HashMap::new()),
                 task_notifications: broadcast::channel(256).0,
-                tasks: tokio_util::task::TaskTracker::new(),
+                tasks: agent_tasks::AgentTasks::default(),
                 recorder,
                 loop_leases: loop_lease::LoopLeases::default(),
                 approvals: Mutex::new(HashMap::new()),

@@ -970,7 +970,7 @@ impl Agent {
     /// The stream's tasks are this Agent's: `shutdown` cancels them and waits for them.
     pub async fn install_tick_stream(&self, port: Arc<dyn TickStreamPort>) {
         let handle = port.open(&crate::tick_stream::StreamTasks::new(
-            self.inner.tasks.clone(),
+            self.inner.tasks.tracker(),
             self.inner.shutdown.clone(),
         ));
         {
