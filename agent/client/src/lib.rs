@@ -7,10 +7,7 @@ use std::{
     io,
     os::{
         fd::AsRawFd,
-        unix::{
-            fs::{MetadataExt, OpenOptionsExt},
-            process::CommandExt,
-        },
+        unix::fs::{MetadataExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
     process::Stdio,
@@ -141,8 +138,9 @@ pub async fn connect_or_start_at(
         }
         remove_stale_socket(&endpoint)?;
         let lock_fd = lock.as_raw_fd();
-        let mut command = std::process::Command::new(&executable);
+        let mut command = tokio::process::Command::new(&executable);
         command
+            .kill_on_drop(false)
             .args(DAEMON_RUN_ARGUMENTS)
             .arg(&directory)
             .arg(lock_fd.to_string())

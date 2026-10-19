@@ -1252,26 +1252,30 @@ async fn actual_cli_sustained_daemon_loss_keeps_cached_output_draft_and_editing_
     let result = AssertUnwindSafe(run_sustained_daemon_loss(&fixture, &daemon_stopped))
         .catch_unwind()
         .await;
-    if fixture.path("owned-runtime").exists() {
-        std::fs::remove_file(fixture.path("runtime")).unwrap();
-        std::fs::rename(fixture.path("owned-runtime"), fixture.path("runtime")).unwrap();
-        if daemon_stopped.load(std::sync::atomic::Ordering::SeqCst) {
-            for entry in std::fs::read_dir(fixture.path("runtime"))
-                .unwrap()
-                .filter_map(Result::ok)
-            {
-                if entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension == "sock")
+    let cleanup = AssertUnwindSafe(async {
+        if fixture.path("owned-runtime").exists() {
+            std::fs::remove_file(fixture.path("runtime")).unwrap();
+            std::fs::rename(fixture.path("owned-runtime"), fixture.path("runtime")).unwrap();
+            if daemon_stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                for entry in std::fs::read_dir(fixture.path("runtime"))
+                    .unwrap()
+                    .filter_map(Result::ok)
                 {
-                    std::fs::remove_file(entry.path()).unwrap();
+                    if entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "sock")
+                    {
+                        std::fs::remove_file(entry.path()).unwrap();
+                    }
                 }
             }
         }
-    }
-    fixture.shutdown().await;
-    if let Err(panic) = result {
+        fixture.shutdown().await;
+    })
+    .catch_unwind()
+    .await;
+    if let Err(panic) = result.and(cleanup) {
         std::panic::resume_unwind(panic);
     }
 }
