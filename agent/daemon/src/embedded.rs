@@ -827,7 +827,7 @@ impl EmbeddedAgentAccess {
                 self.history(execution, action, envelope.command_id).await
             }
             AgentCommand::ManageLoop { execution, action } => {
-                self.manage_loop(execution, action).await
+                Box::pin(self.manage_loop(execution, action)).await
             }
             AgentCommand::ManageTask { execution, action } => {
                 self.manage_task(execution, action).await
