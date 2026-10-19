@@ -403,6 +403,9 @@ pub trait HostToolProvider: Send + Sync {
         None
     }
 
+    /// Refreshes optional host capabilities. An error reports a failed refresh; callers may
+    /// continue chatting with the remaining definitions. MCP directory failures withdraw those
+    /// tools and return a diagnostic containing only the origin and a fixed error class.
     async fn refresh(&self, _cancel: CancellationToken) -> Result<(), String> {
         Ok(())
     }

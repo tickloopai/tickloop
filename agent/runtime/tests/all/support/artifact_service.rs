@@ -55,6 +55,8 @@ pub struct ServiceControl {
     pub signed_out: AtomicBool,
     pub hold_device_approval: AtomicBool,
     pub reject_mcp: AtomicBool,
+    pub reject_discovery: AtomicBool,
+    pub reject_tool_listing: AtomicBool,
     pub refuse_tool_bearer: Mutex<Option<String>>,
     pub directory_unavailable: AtomicBool,
     pub skills_enabled: AtomicBool,
@@ -245,6 +247,11 @@ fn header_mismatch(head: &str, body: &Value) -> Option<Value> {
 }
 
 fn mcp(control: &ServiceControl, origin: &str, body: &Value) -> Value {
+    if (body["method"] == "server/discover" && control.reject_discovery.load(Ordering::SeqCst))
+        || (body["method"] == "tools/list" && control.reject_tool_listing.load(Ordering::SeqCst))
+    {
+        return json!({"jsonrpc":"2.0","id":body["id"],"error":{"code":-32601,"message":"Method not found: test-service-token-0","data":{"token":"test-service-token-0"}}});
+    }
     let name = control
         .server_name
         .lock()
