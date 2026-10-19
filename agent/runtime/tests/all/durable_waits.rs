@@ -656,3 +656,51 @@ async fn concurrent_deliveries_of_one_reply_apply_it_once() {
     assert_eq!(results_of(&snapshot.messages, QUESTION_CALL).len(), 1);
     answering.shutdown().await;
 }
+
+#[tokio::test]
+async fn durable_question_display_waits_then_completes_the_same_answer_after_reload() {
+    use tickloop_agent_transcript::display::{DisplayBlock, DisplayWait};
+
+    let store = Arc::new(InMemoryTranscriptStore::new());
+    let (chat, turn, request) = asked_and_released(&store).await;
+    let nodes = project(&store.lines(chat));
+    let waiting = nodes
+        .iter()
+        .find(|node| matches!(node.status, DisplayStatus::Waiting { .. }))
+        .unwrap();
+    let id = waiting.id;
+    assert_eq!(
+        waiting.status,
+        DisplayStatus::Waiting {
+            r#for: DisplayWait::Person {
+                request: request.id
+            }
+        }
+    );
+    assert!(waiting.blocks.iter().any(|block| matches!(block, DisplayBlock::Question { request_id, reply: None, .. } if *request_id == request.id)));
+
+    let model = Arc::new(ScriptedModel::new(vec![text(DONE)]));
+    let answering = harness(store.clone(), model, WaitHosting::Durable);
+    let reply = answering
+        .advance(chat, answer(&request, weekly()))
+        .await
+        .unwrap();
+    assert!(matches!(outcome(&reply).await, TurnOutcome::Merged { .. }));
+    answering
+        .settled_input(chat, turn.input_id())
+        .await
+        .unwrap();
+    answering.sync().await.unwrap();
+    let nodes = project(&store.lines(chat));
+    let completed = nodes.iter().find(|node| node.id == id).unwrap();
+    assert_eq!(completed.status, DisplayStatus::Complete);
+    assert!(completed.blocks.iter().any(|block| matches!(block,
+        DisplayBlock::Question { request_id, reply: Some(reply), .. }
+            if *request_id == request.id && reply.text.contains("Weekly") && !reply.is_error)));
+    assert!(
+        !nodes
+            .iter()
+            .any(|node| matches!(node.status, DisplayStatus::Waiting { .. }))
+    );
+    answering.shutdown().await;
+}

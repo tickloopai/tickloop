@@ -232,6 +232,8 @@ impl RetainedFold {
                 }
                 Line::Wait(entry) => {
                     matches!(entry.state, WaitState::Open | WaitState::Resolved { .. })
+                        || (matches!(entry.kind, tickloop_agent_transcript::WaitKind::Question { .. })
+                            && self.chain.responses.contains(&entry.response_id))
                 }
                 _ => false,
             }))

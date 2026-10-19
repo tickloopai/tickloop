@@ -5,18 +5,26 @@
 //! id). An answer's display id is its response id. Entries a compaction rewrote only alias the
 //! node they copy. Internal entries (Loop records, compaction markers, host notes, protocol
 //! data) are folded away: a prompt hangs under the display node its physical parent belongs to,
-//! and an answer under the prompt its lifecycle record names.
+//! and an answer under its Run's prompt or the parent its lifecycle record names. Loops and
+//! task boards have separate projections, without adding conversation nodes.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use tickloop_agent_protocol::{Content, ImageContext, InputContext, Protocol, Role};
+use tickloop_agent_protocol::{
+    AgentColor, AgentMessageSource, Content, ImageContext, InputContext, LocalMessage, LoopState,
+    Protocol, Question, Role, SharedTask, SubagentRegistration, TaskBoard, Trigger,
+};
 use uuid::Uuid;
 
-use crate::entry::{ChainEntry, InterruptedBy, Line, ResponseEnding, ResponseEntry, ResponseState};
+use crate::entry::{
+    ChainEntry, InputEntry, InputOp, InterruptedBy, Line, LoopRecord, ResponseEnding,
+    ResponseEntry, ResponseState, WaitEntry, WaitKind, WaitState,
+};
 
 /// The longest tool result text a tool card carries.
 pub const DISPLAY_TOOL_RESULT_CHARS: usize = 4096;
+const SUBAGENT_COMPLETION_CALL_ID: &str = "subagent-completion";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DisplayNode {
@@ -33,12 +41,43 @@ pub struct DisplayNode {
 pub enum DisplayKind {
     Prompt {
         input_id: Option<Uuid>,
+        #[serde(default)]
+        origin: PromptOrigin,
     },
     /// One attempt of one Run; `attempt` is 0 until its lifecycle record is known.
     Answer {
         input_id: Option<Uuid>,
         attempt: u32,
     },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PromptOrigin {
+    #[default]
+    User,
+    Trigger {
+        r#loop: Uuid,
+    },
+    Feedback {
+        artifact: String,
+    },
+    AgentMessage {
+        from: Uuid,
+    },
+    SubagentNotification {
+        child: Uuid,
+    },
+    Goal {
+        r#loop: Uuid,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DisplayMember {
+    pub chat: Uuid,
+    pub handle: String,
+    pub color: Option<AgentColor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -59,6 +98,13 @@ pub enum DisplayBlock {
         name: String,
         input: serde_json::Value,
         result: Option<DisplayToolResult>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        member: Option<DisplayMember>,
+    },
+    Question {
+        request_id: Uuid,
+        questions: Vec<Question>,
+        reply: Option<DisplayToolResult>,
     },
     /// A prompt that joined the answer at a tool boundary.
     FollowUp {
@@ -81,8 +127,16 @@ pub struct DisplayToolResult {
 pub enum DisplayStatus {
     Complete,
     Streaming,
+    Waiting { r#for: DisplayWait },
     Interrupted { by: InterruptedBy },
     Failed { error: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum DisplayWait {
+    Person { request: Uuid },
+    Member { chat: Uuid },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -98,6 +152,12 @@ pub struct DisplayProjector {
     order: Vec<Uuid>,
     /// The display node each applied chain entry is part of, or follows when it is internal.
     positions: HashMap<Uuid, Option<Uuid>>,
+    responses: HashMap<Uuid, ResponseEntry>,
+    waits: Vec<WaitEntry>,
+    subagents: Vec<SubagentRegistration>,
+    inputs: HashMap<Uuid, InputEntry>,
+    prompt_candidates: HashMap<Uuid, ChainEntry>,
+    prompts_by_run: HashMap<Uuid, Uuid>,
 }
 
 /// The display nodes of `lines`, in the order they first appeared.
@@ -107,6 +167,120 @@ pub fn project(lines: &[Line]) -> Vec<DisplayNode> {
         projector.apply(line);
     }
     projector.nodes().cloned().collect()
+}
+
+/// A Loop's latest recorded state; schedule times come from its Trigger's durable grid.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DisplayLoop {
+    pub id: Uuid,
+    pub goal: String,
+    pub state: LoopState,
+    pub trigger: Option<Trigger>,
+    pub next_scheduled_ms: Option<u64>,
+    pub trigger_awaits_resume: bool,
+    pub state_since: Option<u64>,
+    pub run_started_at: Option<u64>,
+}
+
+pub fn loops(lines: &[Line]) -> Vec<DisplayLoop> {
+    let mut records: Vec<LoopRecord> = Vec::new();
+    visit_lines(lines, &mut |line| {
+        if let Some(record) = line
+            .chain_entry()
+            .and_then(|entry| entry.loop_record.as_ref())
+        {
+            if let Some(previous) = records.iter_mut().find(|old| old.loop_id == record.loop_id) {
+                *previous = record.clone();
+            } else {
+                records.push(record.clone());
+            }
+        }
+    });
+    records
+        .into_iter()
+        .filter_map(|record| {
+            let state = serde_json::from_value(record.state).ok()?;
+            let trigger = record
+                .trigger
+                .and_then(|value| serde_json::from_value::<Trigger>(value).ok());
+            let next_scheduled_ms = trigger
+                .as_ref()
+                .filter(|trigger| {
+                    trigger.armed
+                        && !record.trigger_awaits_resume
+                        && !matches!(
+                            state,
+                            LoopState::Completed
+                                | LoopState::Failed
+                                | LoopState::Expired
+                                | LoopState::Stopped
+                        )
+                })
+                .and_then(Trigger::next_scheduled_ms);
+            Some(DisplayLoop {
+                id: record.loop_id,
+                goal: record.goal,
+                state,
+                trigger,
+                next_scheduled_ms,
+                trigger_awaits_resume: record.trigger_awaits_resume,
+                state_since: record.state_since.and_then(|value| value.as_u64()),
+                run_started_at: record.run_started_at,
+            })
+        })
+        .collect()
+}
+
+/// Public board state, without mutation receipts. Disabling Tasks hides, rather than clears, it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DisplayTaskBoard {
+    pub root_chat_id: Uuid,
+    pub root_loop_id: Uuid,
+    pub revision: u64,
+    pub is_team: bool,
+    pub task_number_offset: u64,
+    pub tasks: Vec<SharedTask>,
+}
+
+pub fn task_boards(lines: &[Line], enabled: bool) -> Vec<DisplayTaskBoard> {
+    if !enabled {
+        return Vec::new();
+    }
+    let mut boards = Vec::new();
+    visit_lines(lines, &mut |line| {
+        if let Line::TaskBoards(entry) = line {
+            boards = entry.boards.values().cloned().collect();
+        }
+    });
+    boards
+        .into_iter()
+        .filter(|board: &TaskBoard| !board.tasks.is_empty())
+        .map(|board| DisplayTaskBoard {
+            root_chat_id: board.root_chat_id,
+            root_loop_id: board.root_loop_id,
+            revision: board.revision,
+            is_team: board.is_team,
+            task_number_offset: board.task_number_offset,
+            tasks: board.tasks,
+        })
+        .collect()
+}
+
+fn visit_lines(lines: &[Line], visit: &mut impl FnMut(&Line)) {
+    for line in lines {
+        match line {
+            Line::RetainedSnapshot(snapshot) => visit_lines(&snapshot.lines, visit),
+            _ => visit(line),
+        }
+    }
+}
+
+fn display_result(text: &str, is_error: bool) -> DisplayToolResult {
+    DisplayToolResult {
+        text: text.chars().take(DISPLAY_TOOL_RESULT_CHARS).collect(),
+        is_error,
+        truncated: text.chars().count() > DISPLAY_TOOL_RESULT_CHARS,
+    }
 }
 
 impl DisplayProjector {
@@ -135,39 +309,279 @@ impl DisplayProjector {
                 .flat_map(|line| self.apply(line))
                 .collect();
         }
-        let changed = match line {
-            Line::Response(response) => Some(self.apply_response(response)),
-            _ => match line.chain_entry() {
-                Some(entry) => self.apply_entry(entry),
-                None => None,
-            },
+        let mut changed = match line {
+            Line::Response(response) => {
+                self.responses
+                    .insert(response.response_id, response.clone());
+                self.answer(
+                    response.response_id,
+                    response.display_parent,
+                    &response.timestamp,
+                );
+                vec![response.response_id]
+            }
+            Line::Wait(wait) => {
+                if let Some(previous) = self
+                    .waits
+                    .iter_mut()
+                    .find(|old| old.wait_id == wait.wait_id)
+                {
+                    *previous = wait.clone();
+                } else {
+                    self.waits.push(wait.clone());
+                }
+                vec![wait.response_id]
+            }
+            Line::Subagents(entry) => {
+                self.subagents = entry.subagents.clone();
+                self.order.clone()
+            }
+            Line::Input(input) if input.op != InputOp::Answer => {
+                self.inputs.insert(input.run_id, input.clone());
+                let mut changed = Vec::new();
+                if let Some(entry) = self.prompt_candidates.get(&input.run_id).cloned() {
+                    if !self.prompts_by_run.contains_key(&input.run_id) {
+                        self.positions.remove(&entry.uuid);
+                        changed.extend(self.apply_entry(&entry));
+                    } else if let Some(id) = self.prompts_by_run.get(&input.run_id).copied() {
+                        let origin = self.prompt_origin(&entry).unwrap_or_default();
+                        if let Some(node) = self.nodes.get_mut(&id)
+                            && let DisplayKind::Prompt { origin: shown, .. } = &mut node.kind
+                        {
+                            *shown = origin;
+                            changed.push(id);
+                        }
+                    }
+                    changed.extend(
+                        self.responses
+                            .values()
+                            .filter(|response| response.run_id == input.run_id)
+                            .map(|response| response.response_id),
+                    );
+                }
+                changed
+            }
+            _ => line
+                .chain_entry()
+                .and_then(|entry| self.apply_entry(entry))
+                .into_iter()
+                .collect(),
         };
+        // A prompt may arrive after its answer's lifecycle metadata in a retained snapshot.
+        let mut related = Vec::new();
+        for id in &changed {
+            if self
+                .nodes
+                .get(id)
+                .is_some_and(|node| matches!(node.kind, DisplayKind::Prompt { .. }))
+            {
+                related.extend(
+                    self.responses
+                        .values()
+                        .filter(|response| self.prompts_by_run.get(&response.run_id) == Some(id))
+                        .map(|response| response.response_id),
+                );
+            }
+        }
+        changed.extend(related);
+        let mut seen = std::collections::HashSet::new();
+        changed.retain(|id| seen.insert(*id));
+        for id in &changed {
+            self.refresh_answer(*id);
+        }
         changed
-            .and_then(|id| self.nodes.get(&id))
-            .map(|node| vec![DisplayChange::Upsert(node.clone())])
-            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|id| self.nodes.get(&id).cloned())
+            .map(DisplayChange::Upsert)
+            .collect()
     }
 
-    fn apply_response(&mut self, response: &ResponseEntry) -> Uuid {
-        let node = self.answer(response.response_id, None, &response.timestamp);
-        node.parent = response.display_parent;
-        node.kind = DisplayKind::Answer {
-            input_id: response.input_id,
-            attempt: response.attempt,
+    fn refresh_answer(&mut self, id: Uuid) {
+        let prompt_parent = self
+            .responses
+            .get(&id)
+            .and_then(|response| self.prompts_by_run.get(&response.run_id))
+            .copied()
+            .filter(|prompt| {
+                self.nodes.get(prompt).is_some_and(|node| {
+                    matches!(node.kind,
+                DisplayKind::Prompt { ref origin, .. } if *origin != PromptOrigin::User)
+                })
+            });
+        let Some(node) = self.nodes.get_mut(&id) else {
+            return;
         };
-        node.status = match &response.state {
-            ResponseState::Started | ResponseState::Suspended | ResponseState::Resumed => {
-                DisplayStatus::Streaming
-            }
-            ResponseState::Ended { ending } => match ending {
-                ResponseEnding::Completed => DisplayStatus::Complete,
-                ResponseEnding::Interrupted { by } => DisplayStatus::Interrupted { by: *by },
-                ResponseEnding::Failed { error } => DisplayStatus::Failed {
-                    error: error.clone(),
+        if !matches!(node.kind, DisplayKind::Answer { .. }) {
+            return;
+        }
+        if let Some(response) = self.responses.get(&id) {
+            node.parent = prompt_parent.or(response.display_parent);
+            node.kind = DisplayKind::Answer {
+                input_id: response.input_id,
+                attempt: response.attempt,
+            };
+            node.status = match &response.state {
+                ResponseState::Started | ResponseState::Suspended | ResponseState::Resumed => {
+                    DisplayStatus::Streaming
+                }
+                ResponseState::Ended { ending } => match ending {
+                    ResponseEnding::Completed => DisplayStatus::Complete,
+                    ResponseEnding::Interrupted {
+                        by: InterruptedBy::Handover,
+                    } => DisplayStatus::Streaming,
+                    ResponseEnding::Interrupted { by } => DisplayStatus::Interrupted { by: *by },
+                    ResponseEnding::Failed { error } => DisplayStatus::Failed {
+                        error: error.clone(),
+                    },
                 },
-            },
-        };
-        response.response_id
+            };
+            if response.state == ResponseState::Suspended
+                && let Some(wait) = self
+                    .waits
+                    .iter()
+                    .find(|wait| wait.response_id == id && matches!(wait.state, WaitState::Open))
+            {
+                let waiting = match &wait.kind {
+                    WaitKind::Question { request, .. } => Some(DisplayWait::Person {
+                        request: request.id,
+                    }),
+                    WaitKind::Subagent { child_chat, .. } => {
+                        Some(DisplayWait::Member { chat: *child_chat })
+                    }
+                    WaitKind::Children { children } => children
+                        .first()
+                        .map(|chat| DisplayWait::Member { chat: *chat }),
+                };
+                if let Some(waiting) = waiting {
+                    node.status = DisplayStatus::Waiting { r#for: waiting };
+                }
+            }
+        }
+        for block in &mut node.blocks {
+            if let DisplayBlock::ToolCall {
+                name,
+                input,
+                result,
+                member,
+                call_id,
+            } = block
+                && name == tickloop_agent_protocol::SUBAGENT_TOOL_NAME
+            {
+                let child = self
+                    .waits
+                    .iter()
+                    .find_map(|wait| {
+                        (wait.response_id == id && wait.resume.call_id() == Some(call_id.as_str()))
+                            .then_some(&wait.kind)
+                            .and_then(|kind| match kind {
+                                WaitKind::Subagent { child_chat, .. } => Some(*child_chat),
+                                _ => None,
+                            })
+                    })
+                    .or_else(|| {
+                        result.as_ref().and_then(|result| {
+                            let value: serde_json::Value =
+                                serde_json::from_str(&result.text).ok()?;
+                            serde_json::from_value(value["child_chat_id"].clone()).ok()
+                        })
+                    });
+                *member = self
+                    .subagents
+                    .iter()
+                    .find(|registration| {
+                        child.map_or_else(
+                            || {
+                                result.is_none()
+                                    && input["name"].as_str() == Some(registration.handle.as_str())
+                            },
+                            |chat| registration.child_chat_id == chat,
+                        )
+                    })
+                    .map(|registration| DisplayMember {
+                        chat: registration.child_chat_id,
+                        handle: registration.handle.clone(),
+                        color: registration.color,
+                    });
+            }
+        }
+        for wait in self.waits.iter().filter(|wait| wait.response_id == id) {
+            let WaitKind::Question { request, .. } = &wait.kind else {
+                continue;
+            };
+            let Some(call_index) = node.blocks.iter().position(|block| {
+                matches!(block,
+                DisplayBlock::ToolCall { call_id, .. } if call_id == &request.call_id)
+            }) else {
+                continue;
+            };
+            let reply = match &node.blocks[call_index] {
+                DisplayBlock::ToolCall {
+                    result: Some(result),
+                    ..
+                } => Some(result.clone()),
+                _ => match &wait.state {
+                    WaitState::Resolved { result, .. } => {
+                        Some(display_result(&result.content.text(), result.tool.is_error))
+                    }
+                    _ => None,
+                },
+            };
+            let block = DisplayBlock::Question {
+                request_id: request.id,
+                questions: request.questions.clone(),
+                reply,
+            };
+            if let Some(previous) = node.blocks.iter_mut().find(|block| {
+                matches!(block,
+                DisplayBlock::Question { request_id, .. } if *request_id == request.id)
+            }) {
+                *previous = block;
+            } else {
+                node.blocks.insert(call_index + 1, block);
+            }
+        }
+    }
+
+    fn prompt_origin(&self, entry: &ChainEntry) -> Option<PromptOrigin> {
+        if let Some(source) = entry
+            .agent_message_origin
+            .as_ref()
+            .and_then(|value| serde_json::from_value::<AgentMessageSource>(value.clone()).ok())
+        {
+            return Some(
+                if source.call_id.as_deref() == Some(SUBAGENT_COMPLETION_CALL_ID)
+                    && source.is_result
+                {
+                    PromptOrigin::SubagentNotification {
+                        child: source.sender_chat_id,
+                    }
+                } else {
+                    PromptOrigin::AgentMessage {
+                        from: source.sender_chat_id,
+                    }
+                },
+            );
+        }
+        let input = entry.run_id.and_then(|run| self.inputs.get(&run));
+        match input.map(|input| (input.op, input.loop_id)) {
+            Some((InputOp::Trigger, loop_id)) => Some(PromptOrigin::Trigger { r#loop: loop_id }),
+            Some((InputOp::Goal, loop_id)) => Some(PromptOrigin::Goal { r#loop: loop_id }),
+            Some((InputOp::Feedback, _)) => {
+                let artifact = match LocalMessage::parse(&message_text(&entry.message.content)) {
+                    Some(LocalMessage::ArtifactRequest { artifact_id, .. }) => Some(artifact_id),
+                    _ => input?
+                        .queued
+                        .as_ref()
+                        .and_then(|queued| {
+                            queued["trigger_source"]["payload"]["artifact_id"].as_str()
+                        })
+                        .map(str::to_owned),
+                }?;
+                Some(PromptOrigin::Feedback { artifact })
+            }
+            _ if entry.execution_mode.is_some() => Some(PromptOrigin::User),
+            _ => None,
+        }
     }
 
     fn apply_entry(&mut self, entry: &ChainEntry) -> Option<Uuid> {
@@ -187,10 +601,35 @@ impl DisplayProjector {
             self.positions.insert(entry.uuid, copied);
             return None;
         }
-        let is_prompt = entry.message.role == Role::User
-            && entry.execution_mode.is_some()
+        let is_candidate = entry.message.role == Role::User
+            && !entry.is_meta
             && !entry.is_compact_summary
-            && !entry.continues_message;
+            && !entry.continues_message
+            && (entry.execution_mode.is_some()
+                || entry
+                    .message
+                    .content
+                    .iter()
+                    .any(|content| matches!(content, Content::Text { .. })))
+            && !entry
+                .message
+                .content
+                .iter()
+                .any(|content| matches!(content, Content::ToolResult { .. }));
+        if is_candidate
+            && entry.response_id.is_none()
+            && let Some(run) = entry.run_id
+        {
+            self.prompt_candidates
+                .entry(run)
+                .or_insert_with(|| entry.clone());
+        }
+        let origin = is_candidate.then(|| self.prompt_origin(entry)).flatten();
+        let is_prompt = origin.is_some()
+            && (entry.execution_mode.is_some()
+                || entry
+                    .run_id
+                    .is_none_or(|run| !self.prompts_by_run.contains_key(&run)));
         let (position, changed) = match entry.response_id {
             Some(response) => {
                 let follow_up = is_prompt.then(|| DisplayBlock::FollowUp {
@@ -214,16 +653,28 @@ impl DisplayProjector {
                     blocks.push(DisplayBlock::Text { text });
                 }
                 blocks.extend(prompt_images(entry).into_iter().map(DisplayBlock::Image));
+                if let Some(run) = entry.run_id {
+                    self.prompts_by_run.insert(run, id);
+                }
                 self.insert(DisplayNode {
                     id,
                     parent: follows,
                     kind: DisplayKind::Prompt {
                         input_id: entry.input_id,
+                        origin: origin.unwrap_or_default(),
                     },
                     blocks,
                     status: DisplayStatus::Complete,
                     timestamp: entry.timestamp.clone(),
                 });
+                if let Some(answer_index) = self.order.iter().position(|answer| {
+                    self.responses
+                        .get(answer)
+                        .is_some_and(|response| Some(response.run_id) == entry.run_id)
+                }) {
+                    self.order.retain(|node| *node != id);
+                    self.order.insert(answer_index, id);
+                }
                 (Some(id), Some(id))
             }
             None => (follows, None),
@@ -344,6 +795,7 @@ fn add_answer_content(node: &mut DisplayNode, entry: &ChainEntry) {
                 name: name.clone(),
                 input: input.clone(),
                 result: None,
+                member: None,
             }),
             Content::ToolResult {
                 tool_use_id,
@@ -358,12 +810,7 @@ fn add_answer_content(node: &mut DisplayNode, entry: &ChainEntry) {
                 });
                 if let Some(result) = card {
                     let text = content.text();
-                    let truncated = text.chars().count() > DISPLAY_TOOL_RESULT_CHARS;
-                    *result = Some(DisplayToolResult {
-                        text: text.chars().take(DISPLAY_TOOL_RESULT_CHARS).collect(),
-                        is_error: *is_error,
-                        truncated,
-                    });
+                    *result = Some(display_result(&text, *is_error));
                 }
             }
             _ => {}
@@ -619,3 +1066,6 @@ mod tests {
         assert_eq!(results, [Some("result a".into()), Some("result b".into())]);
     }
 }
+
+#[cfg(test)]
+mod durable_tests;
