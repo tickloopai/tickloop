@@ -1,6 +1,6 @@
 //! Wall-clock recurrence rules of Loop Triggers.
 //!
-//! - `every <N>m|h|d`: every N minutes, hours or days from the previous run.
+//! - `every <N>s|m|h|d`: every N seconds, minutes, hours or days from the previous run.
 //! - `daily HH:MM [±HH:MM]`: every day at that wall-clock time in the given UTC offset (default UTC).
 //! - `weekly <day>[,<day>…] HH:MM [±HH:MM]`: on the listed weekdays (`mon`..`sun`) at that time.
 //! - `at <RFC 3339 time>`: once.
@@ -8,6 +8,8 @@
 //! Everything is computed in UTC with fixed offsets: there is no local timezone and no
 //! daylight-saving database, so a rule means the same instants on every host. Missed runs
 //! are skipped, never caught up: the next run is always strictly after the given instant.
+//! The rules allow runs one second apart; a host sets its own floor with
+//! [`Recurrence::shortest_gap`].
 
 use std::fmt;
 use std::str::FromStr;
@@ -18,16 +20,19 @@ use chrono::{
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+const SECONDS_PER_MINUTE: u32 = 60;
 const MINUTES_PER_HOUR: u32 = 60;
+const SECONDS_PER_HOUR: u32 = MINUTES_PER_HOUR * SECONDS_PER_MINUTE;
 const MINUTES_PER_DAY: u32 = 24 * MINUTES_PER_HOUR;
-const MIN_INTERVAL_MINUTES: u32 = 1;
+const SECONDS_PER_DAY: u32 = MINUTES_PER_DAY * SECONDS_PER_MINUTE;
+const MIN_INTERVAL_SECONDS: u32 = 1;
 const MAX_INTERVAL_DAYS: u32 = 366;
-const MAX_INTERVAL_MINUTES: u32 = MAX_INTERVAL_DAYS * MINUTES_PER_DAY;
+const MAX_INTERVAL_SECONDS: u32 = MAX_INTERVAL_DAYS * SECONDS_PER_DAY;
 const MAX_OFFSET_MINUTES: u32 = 14 * MINUTES_PER_HOUR;
 const DAYS_PER_WEEK: u64 = 7;
 const ALL_WEEKDAYS: WeekdaySet = WeekdaySet(0b111_1111);
 const ERROR_EXCERPT_CHARS: usize = 40;
-const USAGE: &str = "use `every 30m`, `every 2h`, `every 1d`, `daily 09:00 +08:00`, \
+const USAGE: &str = "use `every 30s`, `every 30m`, `every 2h`, `every 1d`, `daily 09:00 +08:00`, \
                      `weekly mon,fri 09:00 +08:00` or `at <RFC 3339 time>`";
 
 const WEEKDAY_NAMES: [(&str, Weekday); 7] = [
@@ -51,10 +56,10 @@ pub enum ParseError {
         rule: &'static str,
         expected: &'static str,
     },
-    #[error("`{0}` is not an interval like 30m, 2h or 1d")]
+    #[error("`{0}` is not an interval like 30s, 30m, 2h or 1d")]
     InvalidInterval(String),
     #[error(
-        "interval `{0}` is out of range; it must be between {MIN_INTERVAL_MINUTES} minute and {MAX_INTERVAL_DAYS} days"
+        "interval `{0}` is out of range; it must be between {MIN_INTERVAL_SECONDS} second and {MAX_INTERVAL_DAYS} days"
     )]
     IntervalOutOfRange(String),
     #[error("`{0}` is not a 24-hour time like 09:00")]
@@ -77,7 +82,7 @@ pub struct Recurrence(Rule);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Rule {
     Every {
-        minutes: u32,
+        seconds: u32,
     },
     Daily {
         time: NaiveTime,
@@ -114,9 +119,9 @@ impl Recurrence {
         let rule = match rule_word.to_ascii_lowercase().as_str() {
             "every" => match arguments {
                 [interval] => Rule::Every {
-                    minutes: parse_interval(interval)?,
+                    seconds: parse_interval(interval)?,
                 },
-                _ => return Err(wrong_arity("every", "every <N>m|h|d")),
+                _ => return Err(wrong_arity("every", "every <N>s|m|h|d")),
             },
             "daily" => match arguments {
                 [time] => Rule::Daily {
@@ -163,7 +168,7 @@ impl Recurrence {
     /// For `every`, `after` is taken as the previous run.
     pub fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
         match self.0 {
-            Rule::Every { minutes } => after.checked_add_signed(interval(minutes)),
+            Rule::Every { seconds } => after.checked_add_signed(interval(seconds)),
             Rule::Daily { time, offset } => next_wall_clock(after, ALL_WEEKDAYS, time, offset),
             Rule::Weekly { days, time, offset } => next_wall_clock(after, days, time, offset),
             Rule::At(instant) => {
@@ -182,10 +187,10 @@ impl Recurrence {
         previous: DateTime<Utc>,
         after: DateTime<Utc>,
     ) -> Option<DateTime<Utc>> {
-        let Rule::Every { minutes } = self.0 else {
+        let Rule::Every { seconds } = self.0 else {
             return self.next_after(after);
         };
-        let step = interval(minutes);
+        let step = interval(seconds);
         let first = previous.checked_add_signed(step)?;
         if first > after {
             return Some(first);
@@ -196,18 +201,78 @@ impl Recurrence {
         let offset = Duration::try_seconds(steps.checked_mul(step_seconds)?)?;
         previous.checked_add_signed(offset)
     }
+
+    /// The latest run strictly after `previous` and no later than `until`, on the grid
+    /// anchored at the `previous` run as in [`Recurrence::next_after_previous`]; `None` when no
+    /// run falls in between. When several runs were missed, this is the one a host that skips
+    /// missed runs takes.
+    pub fn latest_after_previous(
+        &self,
+        previous: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let latest = match self.0 {
+            Rule::Every { seconds } => {
+                let step_seconds = i64::from(seconds);
+                let elapsed_seconds = until.signed_duration_since(previous).num_seconds();
+                if elapsed_seconds < step_seconds {
+                    return None;
+                }
+                let steps = elapsed_seconds / step_seconds;
+                previous.checked_add_signed(Duration::try_seconds(steps * step_seconds)?)?
+            }
+            Rule::Daily { time, offset } => previous_wall_clock(until, ALL_WEEKDAYS, time, offset)?,
+            Rule::Weekly { days, time, offset } => previous_wall_clock(until, days, time, offset)?,
+            Rule::At(instant) => instant.with_timezone(&Utc),
+        };
+        (latest > previous && latest <= until).then_some(latest)
+    }
+
+    /// The shortest time between two runs of the rule, to hold against a host's floor; `None`
+    /// for a rule that runs once.
+    pub fn shortest_gap(&self) -> Option<std::time::Duration> {
+        let seconds = match self.0 {
+            Rule::Every { seconds } => seconds,
+            Rule::Daily { .. } => SECONDS_PER_DAY,
+            Rule::Weekly { days, .. } => {
+                let listed: Vec<u32> = WEEKDAY_NAMES
+                    .iter()
+                    .filter(|(_, day)| days.contains(*day))
+                    .map(|(_, day)| day.num_days_from_monday())
+                    .collect();
+                let wrap = listed.first()? + DAYS_PER_WEEK as u32 - listed.last()?;
+                let shortest_days = listed
+                    .windows(2)
+                    .map(|pair| pair[1] - pair[0])
+                    .fold(wrap, u32::min);
+                shortest_days * SECONDS_PER_DAY
+            }
+            Rule::At(_) => return None,
+        };
+        Some(std::time::Duration::from_secs(u64::from(seconds)))
+    }
+
+    /// The interval of an `every` rule; `None` for the rules on a wall-clock grid.
+    pub fn interval(&self) -> Option<std::time::Duration> {
+        match self.0 {
+            Rule::Every { seconds } => Some(std::time::Duration::from_secs(u64::from(seconds))),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Recurrence {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
-            Rule::Every { minutes } => {
-                if minutes % MINUTES_PER_DAY == 0 {
-                    write!(formatter, "every {}d", minutes / MINUTES_PER_DAY)
-                } else if minutes % MINUTES_PER_HOUR == 0 {
-                    write!(formatter, "every {}h", minutes / MINUTES_PER_HOUR)
+            Rule::Every { seconds } => {
+                if seconds.is_multiple_of(SECONDS_PER_DAY) {
+                    write!(formatter, "every {}d", seconds / SECONDS_PER_DAY)
+                } else if seconds.is_multiple_of(SECONDS_PER_HOUR) {
+                    write!(formatter, "every {}h", seconds / SECONDS_PER_HOUR)
+                } else if seconds.is_multiple_of(SECONDS_PER_MINUTE) {
+                    write!(formatter, "every {}m", seconds / SECONDS_PER_MINUTE)
                 } else {
-                    write!(formatter, "every {minutes}m")
+                    write!(formatter, "every {seconds}s")
                 }
             }
             Rule::Daily { time, offset } => {
@@ -279,8 +344,30 @@ fn next_wall_clock(
     })
 }
 
-fn interval(minutes: u32) -> Duration {
-    Duration::minutes(i64::from(minutes))
+/// The latest wall-clock run at or before `until`.
+fn previous_wall_clock(
+    until: DateTime<Utc>,
+    days: WeekdaySet,
+    time: NaiveTime,
+    offset: FixedOffset,
+) -> Option<DateTime<Utc>> {
+    let offset_duration = Duration::seconds(i64::from(offset.local_minus_utc()));
+    let until_utc = until.naive_utc();
+    let local_date = until_utc.checked_add_signed(offset_duration)?.date();
+    // The candidate on the local date of `until` may still be ahead, so a full week plus one
+    // day back always contains the previous allowed weekday.
+    (0..=DAYS_PER_WEEK).find_map(|day_index| {
+        let date = local_date.checked_sub_days(Days::new(day_index))?;
+        if !days.contains(date.weekday()) {
+            return None;
+        }
+        let candidate = date.and_time(time).checked_sub_signed(offset_duration)?;
+        (candidate <= until_utc).then(|| Utc.from_utc_datetime(&candidate))
+    })
+}
+
+fn interval(seconds: u32) -> Duration {
+    Duration::seconds(i64::from(seconds))
 }
 
 fn utc_offset() -> FixedOffset {
@@ -302,10 +389,11 @@ fn excerpt(text: &str) -> String {
 
 fn parse_interval(text: &str) -> Result<u32, ParseError> {
     let invalid = || ParseError::InvalidInterval(excerpt(text));
-    let unit_minutes = match text.chars().last() {
-        Some('m' | 'M') => 1,
-        Some('h' | 'H') => MINUTES_PER_HOUR,
-        Some('d' | 'D') => MINUTES_PER_DAY,
+    let unit_seconds = match text.chars().last() {
+        Some('s' | 'S') => 1,
+        Some('m' | 'M') => SECONDS_PER_MINUTE,
+        Some('h' | 'H') => SECONDS_PER_HOUR,
+        Some('d' | 'D') => SECONDS_PER_DAY,
         _ => return Err(invalid()),
     };
     let count = &text[..text.len() - 1];
@@ -313,15 +401,15 @@ fn parse_interval(text: &str) -> Result<u32, ParseError> {
         return Err(invalid());
     }
     let out_of_range = || ParseError::IntervalOutOfRange(excerpt(text));
-    let minutes = count
+    let seconds = count
         .parse::<u32>()
         .ok()
-        .and_then(|count| count.checked_mul(unit_minutes))
+        .and_then(|count| count.checked_mul(unit_seconds))
         .ok_or_else(out_of_range)?;
-    if !(MIN_INTERVAL_MINUTES..=MAX_INTERVAL_MINUTES).contains(&minutes) {
+    if !(MIN_INTERVAL_SECONDS..=MAX_INTERVAL_SECONDS).contains(&seconds) {
         return Err(out_of_range());
     }
-    Ok(minutes)
+    Ok(seconds)
 }
 
 /// Two ASCII digits each side of a colon: `HH:MM`.

@@ -43,7 +43,9 @@ fn rejects_unknown_rules_and_wrong_arity() {
 #[test]
 fn rejects_zero_overflowing_and_malformed_intervals() {
     for text in [
+        "0s",
         "0m",
+        "31622401s",
         "0h",
         "0d",
         "367d",
@@ -157,7 +159,7 @@ fn rejects_invalid_instants() {
 fn messages_explain_the_problem_and_shorten_long_input() {
     assert_eq!(
         error("every 0m").to_string(),
-        "interval `0m` is out of range; it must be between 1 minute and 366 days"
+        "interval `0m` is out of range; it must be between 1 second and 366 days"
     );
     assert_eq!(
         error("daily 09:00 +15:00").to_string(),
@@ -197,6 +199,8 @@ impl Random {
 const RULE_WORDS: &[&str] = &["every", "daily", "weekly", "at", "EVERY", "hourly", "", "é"];
 
 const ARGUMENTS: &[&str] = &[
+    "1s",
+    "45s",
     "1m",
     "30m",
     "60m",
@@ -222,6 +226,7 @@ const ARGUMENTS: &[&str] = &[
 ];
 
 const FRAGMENTS: &[&str] = &[
+    "s",
     "m",
     "h",
     "d",
@@ -294,6 +299,12 @@ fn random_input_never_panics_and_valid_rules_round_trip() {
             for previous in probes {
                 if let Some(run) = recurrence.next_after_previous(previous, after) {
                     assert!(run > after, "{text:?} after {after} from {previous}");
+                }
+                if let Some(run) = recurrence.latest_after_previous(previous, after) {
+                    assert!(
+                        run > previous && run <= after,
+                        "{text:?} until {after} from {previous}"
+                    );
                 }
             }
         }

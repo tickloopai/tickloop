@@ -12,6 +12,7 @@ use tickloop_agent_protocol::{
     RunId, SEND_AGENT_MESSAGE_TOOL_NAME, SUBAGENT_TOOL_NAME, SubagentNotificationDelivery,
     SubagentRegistration, TaskBoard, ToolResult, projection::HistoryCall,
 };
+use tickloop_agent_tools::START_GOAL_TOOL_NAME;
 use tickloop_agent_transcript::{Line, ModelVisibleResult, WaitKind};
 use uuid::Uuid;
 
@@ -104,8 +105,9 @@ impl FamilyRecords {
     }
 
     /// The result the family's records give a dangling call of `snapshot`'s Chat: the child a
-    /// `Subagent` call delegated, or the message a `SendMessage` call's receiver accepted. `None`
-    /// for any other call, and for one whose effect the records do not hold.
+    /// `Subagent` call delegated, the message a `SendMessage` call's receiver accepted, the Task
+    /// board's receipt of a Task mutation, or the Loop a `StartGoal` call registered. `None` for any other call, and for one whose effect
+    /// the records do not hold.
     pub(crate) fn reconcile(
         &self,
         snapshot: &ChatSnapshot,
@@ -181,13 +183,31 @@ impl FamilyRecords {
                     board, mutation,
                 ))
             }
+            START_GOAL_TOOL_NAME => {
+                let response = message_responses.get(&call.message_index)?;
+                let loop_id = tickloop_agent_transcript::input_ids::started_goal(
+                    snapshot.id,
+                    *response,
+                    &call.call_id,
+                );
+                let goal = snapshot.loops.iter().find(|goal| goal.id == loop_id)?;
+                let queued_run = self
+                    .accepted
+                    .get(&tickloop_agent_transcript::input_ids::goal(loop_id))
+                    .map(|receipt| receipt.run_id);
+                Some(crate::interaction::started_goal_result(
+                    snapshot.id,
+                    goal,
+                    queued_run,
+                ))
+            }
             _ => None,
         }
     }
 }
 
-/// The calls of `messages` whose effect stays inside the family: a delegation, a message or a
-/// subtree stop or a Task mutation.
+/// The calls of `messages` whose effect stays inside the family: a delegation, a message, a
+/// subtree stop, a Task mutation or a goal it registered.
 pub(crate) fn family_call_ids(messages: &[Message]) -> impl Iterator<Item = String> + '_ {
     messages
         .iter()
@@ -200,6 +220,7 @@ pub(crate) fn family_call_ids(messages: &[Message]) -> impl Iterator<Item = Stri
                     crate::agent_messages::STOP_SUBAGENT_TOOL_NAME,
                     "TaskCreate",
                     "TaskUpdate",
+                    START_GOAL_TOOL_NAME,
                 ]
                 .contains(&name.as_str()) =>
             {
@@ -340,7 +361,8 @@ impl Agent {
     /// After a durable load of the family whose members are `order`, root first: each member's
     /// lost answers go on and its queue comes back; suspended Runs wait again, a foreground call
     /// before its child goes on; the ends the load decided reach the parents; then the members
-    /// start, the deepest first so a waiting member finds its children holding their slots.
+    /// start, the deepest first so a waiting member finds its children holding their slots; and
+    /// last the armed Triggers go on, firing what came due meanwhile.
     pub(crate) async fn restore_family_after_load(&self, order: &[ChatId], lost: Vec<LostMember>) {
         for id in order {
             self.queue_after_load(*id).await;
@@ -364,6 +386,11 @@ impl Agent {
         self.start_rebuilt_runs(rebuilt);
         for id in order {
             self.flush_subagent_notifications(*id).await;
+        }
+        // Behind what was already queued: a time that came due meanwhile merges into a fire
+        // queued before.
+        for id in order {
+            self.resume_triggers_after_load(*id).await;
         }
     }
 

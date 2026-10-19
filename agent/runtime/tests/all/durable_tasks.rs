@@ -35,6 +35,7 @@ fn options(task_tools: Option<bool>, waits: WaitHosting) -> HarnessOptions {
         },
         host_rules: Vec::new(),
         task_tools,
+        min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
         waits,
     }
 }

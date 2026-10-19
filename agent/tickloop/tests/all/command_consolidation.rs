@@ -193,7 +193,10 @@ async fn loops_pipe_controls_preserve_history_scope_and_trigger_capabilities() {
     assert_eq!(after.messages.len(), before.messages.len());
     assert_eq!(after.loops.len(), 1);
     let trigger = after.loops[0].trigger.as_ref().unwrap();
-    assert_eq!(trigger.interval_seconds, Some(86400));
+    assert_eq!(
+        trigger.schedule.and_then(|schedule| schedule.interval()),
+        Some(std::time::Duration::from_secs(86400))
+    );
     assert!(trigger.expires_at_ms.is_some());
     assert!(trigger.accepts_events);
     assert_eq!(trigger.prompt, "scheduled review");

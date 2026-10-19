@@ -26,25 +26,102 @@ pub(super) fn can_trigger(goal: &LoopSnapshot) -> bool {
         )
 }
 
+/// The longest a Trigger's timer sleeps before it looks at the clock again, so that a computer
+/// waking from sleep fires what came due meanwhile without waiting out the rest of a long sleep.
+const SCHEDULE_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
+/// How far the system's clock may run ahead of the schedule clock before it catches up.
+const SCHEDULE_CLOCK_CATCH_UP_MS: u64 = 60_000;
+const SECONDS_PER_MINUTE: u64 = 60;
+const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
+const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
+/// The source a Trigger's timer fires as.
+const TIMER_SOURCE: &str = "timer";
+
+/// The wall clock Trigger schedules run on: the system's time when the Agent was built, carried
+/// on by the runtime's monotonic clock, so that a test's paused clock moves it too. It catches
+/// up when the system's time runs well ahead, such as after the computer slept.
+pub(crate) struct ScheduleClock {
+    anchor: std::sync::Mutex<(u64, tokio::time::Instant)>,
+}
+
+impl ScheduleClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            anchor: std::sync::Mutex::new((
+                tickloop_agent_base::private_fs::unix_time_milliseconds(),
+                tokio::time::Instant::now(),
+            )),
+        }
+    }
+
+    /// Unix milliseconds now.
+    pub(crate) fn now_ms(&self) -> u64 {
+        let mut anchor = self.anchor.lock().unwrap();
+        let (anchor_ms, anchor_instant) = *anchor;
+        let elapsed = tokio::time::Instant::now().saturating_duration_since(anchor_instant);
+        let carried =
+            anchor_ms.saturating_add(u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX));
+        let system = tickloop_agent_base::private_fs::unix_time_milliseconds();
+        if system > carried.saturating_add(SCHEDULE_CLOCK_CATCH_UP_MS) {
+            *anchor = (system, tokio::time::Instant::now());
+            return system;
+        }
+        carried
+    }
+
+    /// When the timer that waits for `milliseconds` looks at the clock next.
+    fn next_check(&self, milliseconds: u64) -> tokio::time::Instant {
+        let remaining =
+            std::time::Duration::from_millis(milliseconds.saturating_sub(self.now_ms()));
+        tokio::time::Instant::now() + remaining.min(SCHEDULE_RECHECK)
+    }
+}
+
+/// When a quiet Chat next needs its host, in Unix milliseconds: the earliest scheduled time of a
+/// Trigger whose Loop can take a fire, or deadline of a Loop that has not ended, whatever its
+/// state. It may be past already.
+pub(crate) fn wake_at(snapshot: &ChatSnapshot) -> Option<u64> {
+    snapshot
+        .loops
+        .iter()
+        .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
+        .filter_map(|goal| {
+            let trigger = goal.trigger.as_ref()?;
+            let scheduled = trigger
+                .next_scheduled_ms()
+                .filter(|_| trigger.armed && can_trigger(goal));
+            scheduled.into_iter().chain(trigger.expires_at_ms).min()
+        })
+        .min()
+}
+
 /// Loop 进入一个新进程（重启恢复、`--fork-session` 或 Branch 复制）时的恢复规则：运行或等待中的 Loop 转为
 /// 已中断；过期的 Trigger 标为已过期；武装中的 Trigger 解除武装，记入手动恢复时重新武装。
 pub(super) fn recover_loops(snapshot: &mut ChatSnapshot) {
-    recover_loops_keeping(snapshot, &HashSet::new());
+    recover_loops_keeping(snapshot, &HashSet::new(), WaitHosting::Process);
 }
 
 /// [`recover_loops`], except that the Loops in `kept` keep their state: their Runs are rebuilt.
-pub(super) fn recover_loops_keeping(snapshot: &mut ChatSnapshot, kept: &HashSet<LoopId>) {
-    recover_triggers(snapshot);
+/// A durable host keeps every armed Trigger armed and its Loop waiting for it: the schedule
+/// goes on from the times the Loop already dealt with.
+pub(super) fn recover_loops_keeping(
+    snapshot: &mut ChatSnapshot,
+    kept: &HashSet<LoopId>,
+    waits: WaitHosting,
+) {
+    recover_triggers(snapshot, waits);
     for goal in snapshot
         .loops
         .iter_mut()
         .filter(|goal| !kept.contains(&goal.id))
     {
+        let keeps_its_trigger = waits == WaitHosting::Durable
+            && goal.trigger.as_ref().is_some_and(|trigger| trigger.armed);
         if !goal.event_sources.is_empty() {
             for source in &mut goal.event_sources {
                 source.resume_required = true;
             }
-            if goal.state == LoopState::WaitingTrigger {
+            if goal.state == LoopState::WaitingTrigger && !keeps_its_trigger {
                 goal.recover_state(LoopState::Interrupted);
             }
         }
@@ -60,7 +137,7 @@ pub(super) fn recover_loops_keeping(snapshot: &mut ChatSnapshot, kept: &HashSet<
     }
 }
 
-fn recover_triggers(snapshot: &mut ChatSnapshot) {
+fn recover_triggers(snapshot: &mut ChatSnapshot, waits: WaitHosting) {
     for goal in &mut snapshot.loops {
         let Some(trigger) = &goal.trigger else {
             continue;
@@ -73,8 +150,11 @@ fn recover_triggers(snapshot: &mut ChatSnapshot) {
         {
             goal.recover_state(LoopState::Expired);
         }
-        if matches!(goal.state, LoopState::Stopped | LoopState::Expired) {
+        let has_ended = matches!(goal.state, LoopState::Stopped | LoopState::Expired);
+        if has_ended {
             snapshot.resume_triggers.retain(|id| *id != goal.id);
+        } else if waits == WaitHosting::Durable && armed {
+            continue;
         } else if armed && !snapshot.resume_triggers.contains(&goal.id) {
             snapshot.resume_triggers.push(goal.id);
         }
@@ -92,6 +172,59 @@ fn recover_triggers(snapshot: &mut ChatSnapshot) {
                     && !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
             })
     });
+}
+
+/// Why a Trigger armed at `now_ms` is refused, or `None` when it may be configured under the
+/// host's floor for schedules.
+pub(crate) fn invalid_trigger(
+    trigger: &Trigger,
+    floor: std::time::Duration,
+    now_ms: u64,
+) -> Option<String> {
+    if trigger.prompt.trim().is_empty()
+        || trigger.expires_at_ms.is_some_and(|deadline| {
+            deadline <= tickloop_agent_base::private_fs::unix_time_milliseconds()
+        })
+        || (trigger.schedule.is_none() && !trigger.accepts_events)
+    {
+        return Some(
+            "trigger requires a prompt and valid future schedule or explicit events".into(),
+        );
+    }
+    let schedule = trigger.schedule?;
+    if schedule.shortest_gap().is_some_and(|gap| gap < floor) {
+        return Some(format!(
+            "schedule `{schedule}` runs more often than this host allows: runs must be at least \
+             {} apart",
+            describe_interval(floor)
+        ));
+    }
+    let mut armed = trigger.clone();
+    armed.arm_at(now_ms);
+    if armed.next_scheduled_ms().is_none() {
+        return Some(format!("schedule `{schedule}` has no future run"));
+    }
+    None
+}
+
+/// An interval as a person reads it, such as `1 minute` or `90 seconds`.
+pub(crate) fn describe_interval(interval: std::time::Duration) -> String {
+    const UNITS: [(u64, &str); 3] = [
+        (SECONDS_PER_DAY, "day"),
+        (SECONDS_PER_HOUR, "hour"),
+        (SECONDS_PER_MINUTE, "minute"),
+    ];
+    let seconds = interval.as_secs();
+    let (count, unit) = UNITS
+        .iter()
+        .find(|(unit_seconds, _)| seconds > 0 && seconds.is_multiple_of(*unit_seconds))
+        .map_or((seconds, "second"), |(unit_seconds, unit)| {
+            (seconds / unit_seconds, *unit)
+        });
+    match count {
+        1 => format!("1 {unit}"),
+        _ => format!("{count} {unit}s"),
+    }
 }
 
 impl Agent {
@@ -137,20 +270,16 @@ impl Agent {
                 ));
             }
         }
-        if let Some(trigger) = &trigger
-            && (trigger.prompt.trim().is_empty()
-                || trigger.interval_seconds == Some(0)
-                || trigger
-                    .interval_seconds
-                    .is_some_and(|seconds| seconds > 31_536_000)
-                || trigger.expires_at_ms.is_some_and(|deadline| {
-                    deadline <= tickloop_agent_base::private_fs::unix_time_milliseconds()
-                })
-                || (trigger.interval_seconds.is_none() && !trigger.accepts_events))
+        let now_ms = self.inner.schedule_clock.now_ms();
+        if let Some(reason) = trigger
+            .as_ref()
+            .and_then(|trigger| invalid_trigger(trigger, self.inner.min_schedule_interval, now_ms))
         {
-            return Err(AgentError::Invalid(
-                "trigger requires a prompt and valid future interval or explicit events".into(),
-            ));
+            return Err(AgentError::Invalid(reason));
+        }
+        let mut trigger = trigger;
+        if let Some(trigger) = trigger.as_mut().filter(|trigger| trigger.armed) {
+            trigger.arm_at(now_ms);
         }
         if let Some(trigger) = &trigger {
             tick_subscriptions::validate(trigger).map_err(AgentError::Invalid)?;
@@ -204,12 +333,8 @@ impl Agent {
             self.warn_loop_run_state_failure(chat_id, loop_id, recorded);
             return Ok(());
         };
-        // 先写出武装状态再启动 Trigger 任务：任务第一次读取停止状态时已知道这次武装。
-        let recorded = self
-            .record_loop_run_state(chat_id, loop_id, RunStateChange::Armed)
+        self.start_armed_trigger(chat_id, loop_id, trigger, cancel)
             .await;
-        self.warn_loop_run_state_failure(chat_id, loop_id, recorded);
-        self.trigger_task(chat_id, loop_id, trigger, cancel);
         Ok(())
     }
 
@@ -269,6 +394,25 @@ impl Agent {
         self.sync_tick_subscriptions().await;
     }
 
+    /// Starts the Trigger just armed: the run state records the arming first, so the timer's
+    /// first look at it already sees this arming.
+    pub(super) async fn start_armed_trigger(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        trigger: Trigger,
+        cancel: CancellationToken,
+    ) {
+        let recorded = self
+            .record_loop_run_state(chat_id, loop_id, RunStateChange::Armed)
+            .await;
+        self.warn_loop_run_state_failure(chat_id, loop_id, recorded);
+        self.trigger_task(chat_id, loop_id, trigger, cancel);
+    }
+
+    /// Runs an armed Trigger in this instance: its timer fires each scheduled time that comes
+    /// due, and its deadline ends the Loop. A time that comes due while another process holds
+    /// the Loop, or while the Loop cannot take it, passes without a fire.
     pub(super) fn trigger_task(
         &self,
         chat_id: ChatId,
@@ -277,9 +421,8 @@ impl Agent {
         cancel: CancellationToken,
     ) {
         let agent = self.clone();
-        let started = tokio::time::Instant::now();
         let deadline = trigger.expires_at_ms.map(|deadline| {
-            started
+            tokio::time::Instant::now()
                 + std::time::Duration::from_millis(
                     deadline
                         .saturating_sub(tickloop_agent_base::private_fs::unix_time_milliseconds()),
@@ -288,12 +431,8 @@ impl Agent {
         self.inner.tasks.spawn(async move {
             // 拿不到租约时下一次重试获取的时间；期间到点的触发直接跳过。
             let mut lease_retry_at: Option<tokio::time::Instant> = None;
-            let mut interval = trigger.interval_seconds.map(|seconds| {
-                let period = std::time::Duration::from_secs(seconds);
-                let mut interval = tokio::time::interval_at(started + period, period);
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                interval
-            });
+            // The scheduled times this timer has tried so far, fired or passed.
+            let mut tried_through: Option<u64> = None;
             let expires = async {
                 if let Some(deadline) = deadline {
                     tokio::time::sleep_until(deadline).await;
@@ -303,6 +442,10 @@ impl Agent {
             };
             tokio::pin!(expires);
             loop {
+                let next = match trigger.schedule {
+                    Some(_) => agent.next_scheduled_time(chat_id, loop_id, trigger.id, tried_through).await,
+                    None => None,
+                };
                 tokio::select! {
                     biased;
                     _ = agent.inner.shutdown.cancelled() => break,
@@ -326,9 +469,16 @@ impl Agent {
                         };
                     },
                     _ = async {
-                        if let Some(interval) = &mut interval { interval.tick().await; }
-                        else { std::future::pending::<()>().await; }
+                        match next {
+                            Some(next) => tokio::time::sleep_until(agent.inner.schedule_clock.next_check(next)).await,
+                            None => std::future::pending::<()>().await,
+                        }
                     } => {
+                        let now = agent.inner.schedule_clock.now_ms();
+                        if next.is_none_or(|next| now < next) {
+                            continue;
+                        }
+                        tried_through = Some(now);
                         if lease_retry_at.is_some() {
                             continue;
                         }
@@ -340,12 +490,173 @@ impl Agent {
                                 continue;
                             }
                         }
-                        let source = TriggerSource {source: "timer".into(), payload: serde_json::json!({"trigger_id":trigger.id})};
-                        let _ = agent.submit_internal(chat_id, Some(loop_id), trigger.prompt.clone(), SubmissionOptions { trigger_source: Some(source), trigger_cancel: Some(cancel.clone()), ..Default::default() }).await;
+                        agent.fire_scheduled(chat_id, loop_id, now, Some(cancel.clone())).await;
                     }
                 }
             }
         });
+    }
+
+    /// The next scheduled time of the armed Trigger `trigger_id` after the ones its Loop dealt
+    /// with and after `tried_through`; `None` when the Trigger was replaced or has no further
+    /// time.
+    async fn next_scheduled_time(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        trigger_id: Uuid,
+        tried_through: Option<u64>,
+    ) -> Option<u64> {
+        let chats = self.inner.chats.lock().await;
+        let trigger = chats
+            .get(&chat_id)?
+            .snapshot
+            .loops
+            .iter()
+            .find(|goal| goal.id == loop_id)?
+            .trigger
+            .as_ref()
+            .filter(|trigger| trigger.armed && trigger.id == trigger_id)?;
+        match tried_through {
+            Some(after) => trigger.next_scheduled_after_ms(after),
+            None => trigger.next_scheduled_ms(),
+        }
+    }
+
+    /// Fires the Loop's armed Trigger for the latest scheduled time due by `until_ms` that the
+    /// Loop has not dealt with; the ones missed before it never fire. The fire is named by its
+    /// scheduled time, so a fire another instance made already is the same input.
+    pub(super) async fn fire_scheduled(
+        &self,
+        chat_id: ChatId,
+        loop_id: LoopId,
+        until_ms: u64,
+        cancel: Option<CancellationToken>,
+    ) {
+        let (prompt, trigger_id, scheduled, cancel) = {
+            let chats = self.inner.chats.lock().await;
+            let Some(chat) = chats.get(&chat_id) else {
+                return;
+            };
+            let Some(trigger) = chat
+                .snapshot
+                .loops
+                .iter()
+                .find(|goal| goal.id == loop_id)
+                .and_then(|goal| goal.trigger.as_ref())
+                .filter(|trigger| trigger.armed)
+            else {
+                return;
+            };
+            let Some(scheduled) = trigger.due_scheduled_ms(until_ms) else {
+                return;
+            };
+            let cancel = cancel.or_else(|| chat.trigger_cancellations.get(&loop_id).cloned());
+            (trigger.prompt.clone(), trigger.id, scheduled, cancel)
+        };
+        let source = TriggerSource {
+            source: TIMER_SOURCE.into(),
+            payload: serde_json::json!({"trigger_id":trigger_id}),
+        };
+        let _ = self
+            .submit_internal(
+                chat_id,
+                Some(loop_id),
+                prompt,
+                SubmissionOptions {
+                    trigger_source: Some(source),
+                    trigger_cancel: cancel,
+                    scheduled_for: Some(scheduled),
+                    ..Default::default()
+                },
+            )
+            .await;
+    }
+
+    /// With durable wait hosting, the loaded Chat's armed Triggers go on in this instance: each
+    /// gets its timer and deadline again, and what came due while no host held the Chat fires
+    /// once, its earlier missed times skipped.
+    pub(crate) async fn resume_triggers_after_load(&self, chat_id: ChatId) {
+        let armed = {
+            let mut chats = self.inner.chats.lock().await;
+            let Some(chat) = chats.get_mut(&chat_id) else {
+                return;
+            };
+            let armed = chat
+                .snapshot
+                .loops
+                .iter()
+                .filter(|goal| !matches!(goal.state, LoopState::Stopped | LoopState::Expired))
+                .filter_map(|goal| {
+                    Some((
+                        goal.id,
+                        goal.trigger.clone().filter(|trigger| trigger.armed)?,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            armed
+                .into_iter()
+                .map(|(loop_id, trigger)| {
+                    let cancel = CancellationToken::new();
+                    if let Some(previous) =
+                        chat.trigger_cancellations.insert(loop_id, cancel.clone())
+                    {
+                        previous.cancel();
+                    }
+                    (loop_id, trigger, cancel)
+                })
+                .collect::<Vec<_>>()
+        };
+        let now = self.inner.schedule_clock.now_ms();
+        for (loop_id, trigger, cancel) in armed {
+            self.fire_scheduled(chat_id, loop_id, now, Some(cancel.clone()))
+                .await;
+            self.trigger_task(chat_id, loop_id, trigger, cancel);
+        }
+    }
+
+    /// What is due by `until`, in Unix milliseconds, happens across the family of `chat_id`:
+    /// each Trigger fires for its latest time due by then, and each Loop whose deadline came
+    /// ends.
+    pub(crate) async fn fire_due_triggers(&self, chat_id: ChatId, until: u64) {
+        let due = {
+            let chats = self.inner.chats.lock().await;
+            let members = crate::family_tree::root(&chats, chat_id)
+                .map(|root| {
+                    std::iter::once(root)
+                        .chain(crate::family_tree::descendants(&chats, root).unwrap_or_default())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|_| vec![chat_id]);
+            members
+                .into_iter()
+                .filter_map(|member| Some((member, chats.get(&member)?)))
+                .flat_map(|(member, chat)| {
+                    chat.snapshot
+                        .loops
+                        .iter()
+                        .filter(|goal| {
+                            !matches!(goal.state, LoopState::Stopped | LoopState::Expired)
+                        })
+                        .filter_map(move |goal| {
+                            let trigger = goal.trigger.as_ref()?;
+                            let expired = trigger
+                                .expires_at_ms
+                                .is_some_and(|deadline| deadline <= until);
+                            Some((member, goal.id, expired))
+                        })
+                })
+                .collect::<Vec<_>>()
+        };
+        for (member, loop_id, expired) in due {
+            if expired {
+                let _ = self
+                    .end_goal(member, loop_id, LoopState::Expired, None)
+                    .await;
+            } else {
+                self.fire_scheduled(member, loop_id, until, None).await;
+            }
+        }
     }
 
     pub(super) async fn end_goal(

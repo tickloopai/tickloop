@@ -66,6 +66,44 @@ fn a_trigger_saved_before_prompt_sources_reads_as_explicit() {
 }
 
 #[test]
+fn a_trigger_saved_with_an_interval_in_seconds_reads_as_an_every_schedule() {
+    let trigger: Trigger = serde_json::from_value(serde_json::json!({
+        "id": "6f2c2d3e-8b4f-4a51-9f61-0a7b9c1d2e3f", "prompt": "Report changes",
+        "interval_seconds": 90, "expires_at_ms": null, "accepts_events": false, "armed": true
+    }))
+    .unwrap();
+    assert_eq!(trigger.schedule.unwrap().to_string(), "every 90s");
+    let written = serde_json::to_value(&trigger).unwrap();
+    assert_eq!(written["schedule"], "every 90s");
+    assert!(written.get("interval_seconds").is_none());
+    assert!(written.get("armed_at_ms").is_none());
+}
+
+#[test]
+fn a_schedule_counts_from_its_arming_until_it_first_fires_and_skips_missed_times() {
+    let mut trigger = Trigger::for_loop_goal("check");
+    trigger.schedule = Some(tickloop_agent_protocol::Recurrence::parse("every 1m").unwrap());
+    assert_eq!(trigger.next_scheduled_ms(), None);
+    trigger.arm_at(1_000);
+    assert_eq!(trigger.next_scheduled_ms(), Some(61_000));
+    assert_eq!(trigger.due_scheduled_ms(60_999), None);
+    // Three hours late: one fire, for the latest time on the grid.
+    assert_eq!(trigger.due_scheduled_ms(10_800_500), Some(10_741_000));
+    trigger.note_scheduled(10_741_000);
+    assert_eq!(trigger.due_scheduled_ms(10_800_500), None);
+    assert_eq!(trigger.next_scheduled_ms(), Some(10_801_000));
+    assert_eq!(
+        trigger.next_scheduled_after_ms(10_900_000),
+        Some(10_921_000)
+    );
+    trigger.note_scheduled(61_000);
+    assert_eq!(trigger.last_fired_at_ms, Some(10_741_000));
+    trigger.arm_at(20_000_000);
+    assert_eq!(trigger.last_fired_at_ms, None);
+    assert_eq!(trigger.next_scheduled_ms(), Some(20_060_000));
+}
+
+#[test]
 fn an_explicit_event_frames_the_trigger_prompt_the_same_way() {
     let source = TriggerSource {
         source: "manual".into(),

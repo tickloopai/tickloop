@@ -64,6 +64,7 @@ fn durable_harness(store: Arc<dyn TranscriptStore>, model: Arc<ScriptedModel>) -
             },
             host_rules: vec![allow_web_fetch()],
             task_tools: None,
+            min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits: WaitHosting::Durable,
         },
     )

@@ -270,3 +270,97 @@ fn no_run_beyond_the_representable_range() {
             .is_some()
     );
 }
+
+#[test]
+fn every_counts_seconds() {
+    let every = rule("every 1s");
+    let previous = utc("2026-10-19T10:00:00.500Z");
+    assert_eq!(
+        every.next_after_previous(previous, previous),
+        Some(utc("2026-10-19T10:00:01.500Z"))
+    );
+    assert_eq!(
+        every.next_after_previous(previous, utc("2026-10-19T10:00:05.200Z")),
+        Some(utc("2026-10-19T10:00:05.500Z"))
+    );
+    assert_eq!(
+        rule("every 90s").next_after(utc("2026-10-19T10:00:00Z")),
+        Some(utc("2026-10-19T10:01:30Z"))
+    );
+}
+
+#[test]
+fn the_latest_missed_run_is_the_one_taken() {
+    let every = rule("every 30m");
+    let previous = utc("2026-10-19T10:00:00Z");
+    assert_eq!(
+        every.latest_after_previous(previous, utc("2026-10-19T10:29:59Z")),
+        None
+    );
+    assert_eq!(
+        every.latest_after_previous(previous, utc("2026-10-19T10:30:00Z")),
+        Some(utc("2026-10-19T10:30:00Z"))
+    );
+    // Three hours late: one run, the latest on the grid.
+    assert_eq!(
+        every.latest_after_previous(previous, utc("2026-10-19T13:10:00Z")),
+        Some(utc("2026-10-19T13:00:00Z"))
+    );
+    assert_eq!(
+        every.latest_after_previous(previous, utc("2026-10-19T09:00:00Z")),
+        None
+    );
+
+    let daily = rule("daily 09:00 +08:00");
+    assert_eq!(
+        daily.latest_after_previous(utc("2026-10-17T01:00:00Z"), utc("2026-10-19T00:59:59Z")),
+        Some(utc("2026-10-18T01:00:00Z"))
+    );
+    assert_eq!(
+        daily.latest_after_previous(utc("2026-10-18T01:00:00Z"), utc("2026-10-19T00:59:59Z")),
+        None
+    );
+    assert_eq!(
+        rule("weekly mon,fri 09:00")
+            .latest_after_previous(utc("2026-10-01T00:00:00Z"), utc("2026-10-21T12:00:00Z")),
+        Some(utc("2026-10-19T09:00:00Z"))
+    );
+
+    let at = rule("at 2026-10-20T08:00:00+08:00");
+    assert_eq!(
+        at.latest_after_previous(utc("2026-10-19T00:00:00Z"), utc("2026-10-20T00:00:00Z")),
+        Some(utc("2026-10-20T00:00:00Z"))
+    );
+    assert_eq!(
+        at.latest_after_previous(utc("2026-10-20T00:00:00Z"), utc("2026-10-21T00:00:00Z")),
+        None
+    );
+}
+
+#[test]
+fn the_shortest_gap_is_what_a_host_floor_holds_against() {
+    use std::time::Duration;
+    assert_eq!(
+        rule("every 1s").shortest_gap(),
+        Some(Duration::from_secs(1))
+    );
+    assert_eq!(
+        rule("every 2h").shortest_gap(),
+        Some(Duration::from_secs(7_200))
+    );
+    assert_eq!(
+        rule("daily 09:00").shortest_gap(),
+        Some(Duration::from_secs(86_400))
+    );
+    assert_eq!(
+        rule("weekly mon,fri 09:00").shortest_gap(),
+        Some(Duration::from_secs(3 * 86_400))
+    );
+    assert_eq!(
+        rule("weekly sun 09:00").shortest_gap(),
+        Some(Duration::from_secs(7 * 86_400))
+    );
+    assert_eq!(rule("at 2026-10-20T08:00:00Z").shortest_gap(), None);
+    assert_eq!(rule("every 90s").interval(), Some(Duration::from_secs(90)));
+    assert_eq!(rule("daily 09:00").interval(), None);
+}

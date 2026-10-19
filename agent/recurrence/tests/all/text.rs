@@ -7,6 +7,11 @@ fn canonical(text: &str) -> String {
 #[test]
 fn canonical_text_normalises_spacing_case_units_and_order() {
     for (input, expected) in [
+        ("every 30s", "every 30s"),
+        ("every 90s", "every 90s"),
+        ("every 120S", "every 2m"),
+        ("every 3600s", "every 1h"),
+        ("every 86400s", "every 1d"),
         ("every 30m", "every 30m"),
         ("every 90m", "every 90m"),
         ("every 60m", "every 1h"),
@@ -38,6 +43,9 @@ fn canonical_text_normalises_spacing_case_units_and_order() {
 #[test]
 fn canonical_text_parses_back_to_an_equal_rule() {
     for text in [
+        "every 1s",
+        "every 59s",
+        "every 61s",
         "every 1m",
         "every 59m",
         "every 25h",

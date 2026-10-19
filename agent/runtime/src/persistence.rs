@@ -1562,6 +1562,17 @@ fn plan_entry_content(
     Some((record, run_id))
 }
 
+/// A recorded Trigger as configured: without the latest scheduled time its Loop dealt with,
+/// which each fire moves on without reconfiguring anything.
+fn configured_trigger(trigger: &Option<serde_json::Value>) -> Option<serde_json::Value> {
+    trigger.clone().map(|mut trigger| {
+        if let Some(fields) = trigger.as_object_mut() {
+            fields.remove("last_fired_at_ms");
+        }
+        trigger
+    })
+}
+
 /// 把 Loop 状态写成接在 `parent` 之后的 system 条目，并记为链上的最新状态。
 fn record_loop(
     log: &mut ChatLog,
@@ -1584,7 +1595,7 @@ fn record_loop(
         .recorded_loops
         .get(&loop_id)
         .is_some_and(|(previous, _)| {
-            previous.trigger != record.trigger
+            configured_trigger(&previous.trigger) != configured_trigger(&record.trigger)
                 || previous.trigger_awaits_resume != record.trigger_awaits_resume
         })
     {
@@ -2386,7 +2397,7 @@ fn recover_snapshot_for_resume(
         .filter(|goal| goal.run_id.is_some_and(|run| rebuilt.contains(&run)))
         .map(|goal| goal.id)
         .collect::<HashSet<_>>();
-    super::triggers::recover_loops_keeping(&mut snapshot, &rebuilt_loops);
+    super::triggers::recover_loops_keeping(&mut snapshot, &rebuilt_loops, waits);
     // A kept Loop whose deadline passed meanwhile expired: its Run is not rebuilt after all.
     let rebuilt = rebuilt_runs(&snapshot);
     // A family call's effect is in the family's records: its result is what they say.

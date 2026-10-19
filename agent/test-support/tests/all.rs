@@ -2,6 +2,8 @@
 
 #[path = "all/durable_family.rs"]
 mod durable_family;
+#[path = "all/durable_triggers.rs"]
+mod durable_triggers;
 #[path = "all/durable_waits.rs"]
 mod durable_waits;
 #[path = "all/stateless_host.rs"]

@@ -26,23 +26,23 @@ use tokio::sync::{Notify, mpsc::UnboundedSender};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(super) const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-enum Step {
+pub(super) enum Step {
     Reply(Vec<Content>),
     /// Holds the request until it is cancelled.
     Hang,
 }
 
 /// Follows its steps, then answers "answer"; records every request.
-struct Script {
+pub(super) struct Script {
     steps: Mutex<VecDeque<Step>>,
     requests: Mutex<Vec<ModelRequest>>,
     holding: Notify,
 }
 
 impl Script {
-    fn new(steps: Vec<Step>) -> Arc<Self> {
+    pub(super) fn new(steps: Vec<Step>) -> Arc<Self> {
         Arc::new(Self {
             steps: Mutex::new(steps.into()),
             requests: Mutex::new(Vec::new()),
@@ -50,13 +50,13 @@ impl Script {
         })
     }
 
-    async fn until_holding(&self) {
+    pub(super) async fn until_holding(&self) {
         tokio::time::timeout(WAIT, self.holding.notified())
             .await
             .expect("the model holds a request");
     }
 
-    fn requests(&self) -> Vec<String> {
+    pub(super) fn requests(&self) -> Vec<String> {
         self.requests
             .lock()
             .unwrap()
@@ -133,13 +133,14 @@ fn harness(store: Arc<dyn TranscriptStore>, model: Arc<Script>, waits: WaitHosti
             },
             host_rules: Vec::new(),
             task_tools: None,
+            min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits,
         },
     )
     .unwrap()
 }
 
-fn prompt(text: &str, after: ParentSelection) -> TurnRequest {
+pub(super) fn prompt(text: &str, after: ParentSelection) -> TurnRequest {
     TurnRequest {
         input_id: Uuid::new_v4(),
         op: TurnOp::Continue {
@@ -157,7 +158,7 @@ fn prompt(text: &str, after: ParentSelection) -> TurnRequest {
 
 /// What the store holds once the holder is lost without shutting down: a new store with its
 /// Lines.
-async fn lost_holder(
+pub(super) async fn lost_holder(
     agent: &Agent,
     store: &InMemoryTranscriptStore,
     chat: ChatId,
@@ -175,7 +176,7 @@ fn input_state(lines: &[Line], input: Uuid) -> Option<InputState> {
     })
 }
 
-async fn settled(agent: &Agent, chat: ChatId, input: Uuid) -> SettledOutcome {
+pub(super) async fn settled(agent: &Agent, chat: ChatId, input: Uuid) -> SettledOutcome {
     tokio::time::timeout(WAIT, agent.settled_input(chat, input))
         .await
         .expect("the input settles")

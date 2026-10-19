@@ -559,6 +559,7 @@ pub async fn build_runtime_with_models(
             tools: ToolPolicy::local(),
             host_rules: Vec::new(),
             task_tools: None,
+            min_schedule_interval: tickloop_agent_runtime::LOCAL_MIN_SCHEDULE_INTERVAL,
             waits: tickloop_agent_runtime::WaitHosting::Process,
         },
     )

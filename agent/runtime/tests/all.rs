@@ -10,6 +10,8 @@ mod durable_family;
 mod durable_queue;
 #[path = "all/durable_tasks.rs"]
 mod durable_tasks;
+#[path = "all/durable_triggers.rs"]
+mod durable_triggers;
 #[path = "all/durable_waits.rs"]
 mod durable_waits;
 #[path = "all/retained_budget.rs"]
