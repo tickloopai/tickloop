@@ -5675,6 +5675,81 @@ impl tickloop_agent_artifacts::ArtifactCredentials for HostTokens {
     }
 }
 
+/// A host source that scopes tokens by Chat: every Chat of the Agent acts as itself.
+struct ChatScopedTokens {
+    chat: Option<uuid::Uuid>,
+}
+
+#[async_trait]
+impl tickloop_agent_artifacts::ArtifactCredentials for ChatScopedTokens {
+    async fn bearer(&self) -> Result<Option<String>, tickloop_agent_artifacts::ArtifactError> {
+        Ok(Some(match self.chat {
+            Some(chat) => format!("chat-{chat}"),
+            None => "family-token".into(),
+        }))
+    }
+
+    fn for_chat(
+        &self,
+        chat_id: uuid::Uuid,
+    ) -> Option<Arc<dyn tickloop_agent_artifacts::ArtifactCredentials>> {
+        Some(Arc::new(ChatScopedTokens {
+            chat: Some(chat_id),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn each_chat_links_an_artifact_with_its_own_host_credentials() {
+    let service = ArtifactService::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let provider = Arc::new(
+        McpHostToolProvider::with_credentials(
+            &service.origin,
+            "user-one",
+            Arc::new(ChatScopedTokens { chat: None }),
+            None,
+        )
+        .unwrap(),
+    );
+    provider.refresh(CancellationToken::new()).await.unwrap();
+    let agent = Agent::new_embedded(config(), Arc::new(ScriptedModel::new(vec![])));
+    agent.install_host_tools(provider).unwrap();
+    let mut chats = Vec::new();
+    for _ in 0..2 {
+        chats.push(agent.create_chat(directory.path().into()).await.unwrap());
+    }
+    for chat in &chats {
+        agent
+            .link_artifact(
+                *chat,
+                &artifact_tick(&service, "doc"),
+                tickloop_agent_protocol::ArtifactFeedbackHistory::NewOnly,
+            )
+            .await
+            .unwrap();
+    }
+    let links: Vec<String> = service
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            request["path"]
+                .as_str()
+                .unwrap()
+                .contains("/api/v1/agent/links/")
+        })
+        .map(|request| request["headers"].as_str().unwrap().to_ascii_lowercase())
+        .collect();
+    assert_eq!(links.len(), 2, "one link per Chat");
+    for (headers, chat) in links.iter().zip(&chats) {
+        assert!(
+            headers.contains(&format!("authorization: bearer chat-{chat}")),
+            "{headers}"
+        );
+    }
+    agent.shutdown().await;
+}
+
 #[tokio::test]
 async fn separate_chat_harnesses_use_their_injected_credentials_for_read_edit_and_comment() {
     for token in ["first-chat-token", "second-chat-token"] {

@@ -149,3 +149,73 @@ async fn host_credential_cache_keys_are_private_to_the_constructed_chat_client()
         Err(ArtifactError::InvalidOrigin)
     ));
 }
+
+/// A source that scopes tokens by Chat, as a cloud host does for a family's members.
+struct ChatTokens {
+    chat: Option<Uuid>,
+}
+
+#[async_trait]
+impl ArtifactCredentials for ChatTokens {
+    async fn bearer(&self) -> Result<Option<String>, ArtifactError> {
+        Ok(Some(match self.chat {
+            Some(chat) => format!("chat-{chat}"),
+            None => "family-token".into(),
+        }))
+    }
+
+    fn for_chat(&self, chat_id: Uuid) -> Option<Arc<dyn ArtifactCredentials>> {
+        Some(Arc::new(ChatTokens {
+            chat: Some(chat_id),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn a_chat_scoped_client_links_with_that_chat_s_credentials() {
+    let (origin, requests) = server(|request, _, _| {
+        let body = request_body(request);
+        (
+            200,
+            json!({"artifact_id":"doc","binding_id":body["binding_id"],"epoch":1}).to_string(),
+        )
+    })
+    .await;
+    let client = ArtifactClient::with_credentials(
+        &origin,
+        "verified-user",
+        Arc::new(ChatTokens { chat: None }),
+    )
+    .unwrap();
+    let member = Uuid::new_v4();
+    let link = AgentLinkRequest {
+        binding_id: Uuid::new_v4(),
+        client_instance_id: Uuid::new_v4(),
+        chat_id: member,
+        loop_id: Uuid::new_v4(),
+        history: tickloop_agent_protocol::ArtifactFeedbackHistory::NewOnly,
+    };
+    client
+        .for_chat(member)
+        .link_agent("verified-user", "doc", &link)
+        .await
+        .unwrap();
+    assert!(
+        requests.lock().unwrap()[0]
+            .to_ascii_lowercase()
+            .contains(&format!("authorization: bearer chat-{member}"))
+    );
+
+    // Without a Chat-scoped source the client is unchanged.
+    let plain = ArtifactClient::with_credentials(&origin, "verified-user", tokens()).unwrap();
+    plain
+        .for_chat(member)
+        .link_agent("verified-user", "doc", &link)
+        .await
+        .unwrap();
+    assert!(
+        requests.lock().unwrap()[1]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer old-host-token")
+    );
+}
