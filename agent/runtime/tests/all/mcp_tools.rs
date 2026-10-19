@@ -31,6 +31,121 @@ use artifact_service::{ArtifactService, CREATED_ARTIFACT};
 
 const WAIT: Duration = Duration::from_secs(25);
 
+#[derive(Clone, Default)]
+struct WarningLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for WarningLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn mcp_directory_refresh_reports_failures_and_keeps_chats_running() {
+    use tracing::instrument::WithSubscriber;
+
+    for (method, error_class, host_managed) in [
+        ("server/discover", "session_unavailable", false),
+        ("tools/list", "tool_listing_unavailable", false),
+        ("server/discover", "session_unavailable", true),
+        ("tools/list", "tool_listing_unavailable", true),
+    ] {
+        let service = ArtifactService::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let provider = Arc::new(if host_managed {
+            McpHostToolProvider::with_credentials(
+                &service.origin,
+                "user-one",
+                Arc::new(HostTokens {
+                    token: Mutex::new("test-service-token-0".into()),
+                    invalidations: AtomicUsize::new(0),
+                }),
+                None,
+            )
+            .unwrap()
+        } else {
+            McpHostToolProvider::new(service.login(directory.path()).await, None)
+        });
+        provider.refresh(CancellationToken::new()).await.unwrap();
+        assert_eq!(provider.definitions().len(), 4);
+
+        if method == "server/discover" {
+            service
+                .control
+                .reject_discovery
+                .store(true, Ordering::SeqCst);
+        } else {
+            service
+                .control
+                .reject_tool_listing
+                .store(true, Ordering::SeqCst);
+        }
+        let log = WarningLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let error = provider
+            .refresh(CancellationToken::new())
+            .with_subscriber(subscriber)
+            .await
+            .expect_err("a failed MCP directory must not look like an empty successful load");
+        let warning = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(warning.contains("WARN"), "{warning}");
+        assert!(
+            warning.contains("MCP tool directory refresh failed"),
+            "{warning}"
+        );
+        for diagnostic in [&warning, &error] {
+            assert!(diagnostic.contains(&service.origin), "{diagnostic}");
+            assert!(diagnostic.contains(error_class), "{diagnostic}");
+            assert!(!diagnostic.contains("test-service-token-0"), "{diagnostic}");
+            assert!(!diagnostic.contains("Method not found"), "{diagnostic}");
+        }
+        assert!(provider.definitions().is_empty());
+        assert_eq!(
+            provider.service_connections()["artifacts"]["authentication"],
+            "signed_in"
+        );
+        assert_eq!(
+            provider.service_connections()["artifacts"]["tool_directory"],
+            "unavailable"
+        );
+
+        let model = Arc::new(ScriptedModel::new(vec![text("Still running.")]));
+        let agent =
+            Agent::open_embedded(directory.path().join("state"), config(), model.clone()).unwrap();
+        agent.install_host_tools(provider.clone()).unwrap();
+        let chat = agent.create_chat(directory.path().into()).await.unwrap();
+        submit_and_wait(&agent, chat, "Keep going without Artifacts").await;
+        assert!(
+            !tool_names(&model.requests.lock().unwrap()[0])
+                .iter()
+                .any(|name| name.starts_with("Artifact"))
+        );
+        agent.shutdown().await;
+
+        service
+            .control
+            .reject_discovery
+            .store(false, Ordering::SeqCst);
+        service
+            .control
+            .reject_tool_listing
+            .store(false, Ordering::SeqCst);
+        provider.refresh(CancellationToken::new()).await.unwrap();
+        assert_eq!(provider.definitions().len(), 4);
+    }
+}
+
 #[tokio::test]
 async fn mcp_resources_list_and_read_work_without_the_skills_extension_and_follow_cursors() {
     let service = ArtifactService::start().await;
@@ -1092,7 +1207,13 @@ async fn a_server_other_than_tickloop_artifacts_provides_no_tools() {
     let directory = tempfile::tempdir().unwrap();
     let account = service.login(directory.path()).await;
     let provider = McpHostToolProvider::new(account, None);
-    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert!(
+        provider
+            .refresh(CancellationToken::new())
+            .await
+            .unwrap_err()
+            .contains("directory_rejected")
+    );
     assert!(provider.definitions().is_empty());
     assert_eq!(
         provider.service_connections()["artifacts"]["authentication"],
@@ -1114,7 +1235,13 @@ async fn a_directory_without_all_three_artifact_tools_provides_none() {
     let directory = tempfile::tempdir().unwrap();
     let account = service.login(directory.path()).await;
     let provider = McpHostToolProvider::new(account, None);
-    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert!(
+        provider
+            .refresh(CancellationToken::new())
+            .await
+            .unwrap_err()
+            .contains("directory_rejected")
+    );
     assert!(provider.definitions().is_empty());
     assert_eq!(
         provider.service_connections()["artifacts"]["tool_directory"],
@@ -1759,7 +1886,7 @@ async fn artifact_login_state_is_independent_of_directory_and_connection_failure
         .control
         .directory_unavailable
         .store(true, Ordering::SeqCst);
-    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert!(provider.refresh(CancellationToken::new()).await.is_err());
     assert!(provider.definitions().is_empty());
     assert_eq!(
         provider.service_connections()["artifacts"]["authentication"],
@@ -2156,7 +2283,7 @@ async fn remote_unauthorized_hides_tools_and_invalidates_local_login() {
     provider.refresh(CancellationToken::new()).await.unwrap();
     assert!(!provider.definitions().is_empty());
     service.control.reject_mcp.store(true, Ordering::SeqCst);
-    provider.refresh(CancellationToken::new()).await.unwrap();
+    assert!(provider.refresh(CancellationToken::new()).await.is_err());
     assert_eq!(
         provider
             .definitions()

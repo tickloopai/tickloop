@@ -1052,6 +1052,8 @@ impl Agent {
         self.inner.shells.clone()
     }
 
+    /// Registers the provider's current tools without refreshing remote directories. Call
+    /// [`crate::host_tools::HostToolProvider::refresh`] to observe discovery failures.
     pub fn install_host_tools(
         &self,
         provider: Arc<dyn crate::host_tools::HostToolProvider>,

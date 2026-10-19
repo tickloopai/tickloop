@@ -132,17 +132,29 @@ struct Directory {
 
 struct PreparedArtifactLogin;
 
-/// Why the tool directory did not load: the service could not be reached, or it answered with a
-/// directory the host does not accept.
+/// Why the tool directory did not load: session establishment, tool listing, or validation failed.
 enum DirectoryFailure {
-    Unavailable(String),
+    SessionUnavailable(String),
+    ToolListingUnavailable(String),
     Rejected(String),
+}
+
+impl DirectoryFailure {
+    fn class(&self) -> &'static str {
+        match self {
+            Self::SessionUnavailable(_) => "session_unavailable",
+            Self::ToolListingUnavailable(_) => "tool_listing_unavailable",
+            Self::Rejected(_) => "directory_rejected",
+        }
+    }
 }
 
 impl From<DirectoryFailure> for String {
     fn from(failure: DirectoryFailure) -> Self {
         match failure {
-            DirectoryFailure::Unavailable(reason) | DirectoryFailure::Rejected(reason) => reason,
+            DirectoryFailure::SessionUnavailable(reason)
+            | DirectoryFailure::ToolListingUnavailable(reason)
+            | DirectoryFailure::Rejected(reason) => reason,
         }
     }
 }
@@ -597,9 +609,9 @@ impl McpHostToolProvider {
         let (service, http) = self
             .open_session(credential)
             .await
-            .map_err(DirectoryFailure::Unavailable)?;
+            .map_err(DirectoryFailure::SessionUnavailable)?;
         let peer = service.peer().peer_info().ok_or_else(|| {
-            DirectoryFailure::Unavailable(
+            DirectoryFailure::SessionUnavailable(
                 "MCP discovery did not negotiate a protocol version".into(),
             )
         })?;
@@ -616,7 +628,7 @@ impl McpHostToolProvider {
                     if http.unauthorized() {
                         self.invalidate(&credential.access_token).await;
                     }
-                    return Err(DirectoryFailure::Unavailable(
+                    return Err(DirectoryFailure::ToolListingUnavailable(
                         "MCP tool directory unavailable".into(),
                     ));
                 }
@@ -1515,6 +1527,7 @@ impl HostToolProvider for McpHostToolProvider {
         if cancel.is_cancelled() {
             return Ok(());
         }
+        let mut refresh_result = Ok(());
         let signed_out = || ArtifactServiceStatus {
             authentication: ArtifactAuthentication::SignedOut,
             ..Default::default()
@@ -1541,6 +1554,18 @@ impl HostToolProvider for McpHostToolProvider {
         };
         if let Some(credential) = credential {
             let directory = self.load_directory(&credential).await;
+            if let Err(failure) = &directory {
+                let error_class = failure.class();
+                tracing::warn!(
+                    origin = self.artifact.origin(),
+                    error_class,
+                    "MCP tool directory refresh failed"
+                );
+                refresh_result = Err(format!(
+                    "MCP tool directory refresh failed (origin={}, error_class={error_class})",
+                    self.artifact.origin()
+                ));
+            }
             match self.artifact.credential_snapshot() {
                 Ok(Some(current))
                     if self.credential_key(&current) == self.credential_key(&credential) =>
@@ -1587,7 +1612,7 @@ impl HostToolProvider for McpHostToolProvider {
             self.cancel_pending_login();
         }
         *self.service_status.write().unwrap() = status;
-        Ok(())
+        refresh_result
     }
 
     fn validate_input(&self, name: &str, schema: &Value, input: &Value) -> Result<(), String> {

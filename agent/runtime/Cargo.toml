@@ -38,6 +38,7 @@ tickloop-tickhost-connect = { path = "../../tickhost/connect" }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
@@ -48,3 +49,4 @@ tempfile = "3"
 tickloop-agent-test-support = { path = "../test-support" }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
